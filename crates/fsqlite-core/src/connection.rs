@@ -15855,6 +15855,10 @@ impl Connection {
     /// fails every open) can still be opened to drop+recreate the corrupt
     /// shadow. Use ONLY for FTS repair: FTS5 queries against such a connection
     /// see an empty index until the shadow is rebuilt.
+    ///
+    /// This repair-only open also admits the bounded duplicate FTS5 catalog
+    /// declarations left by historical repairs. Remove the duplicate rows
+    /// before reopening normally; ordinary opens reject them as corruption.
     pub async fn open_existing_schema_only_deferred_fts5(path: impl Into<String>) -> Result<Self> {
         Self::open_existing_schema_only_deferred_fts5_with_env(path, ConnectionEnv::default()).await
     }
@@ -48751,7 +48755,15 @@ impl Connection {
         let default_sqls = table
             .columns
             .iter()
-            .map(|column| column.default_value.clone())
+            .map(|column| {
+                // An omitted rowid alias allocates a key; its declared DEFAULT
+                // must not become an explicit key or a BEFORE trigger NEW value.
+                if column.is_ipk {
+                    None
+                } else {
+                    column.default_value.clone()
+                }
+            })
             .collect();
         let rowid_alias_col_idx = table.columns.iter().position(|column| column.is_ipk);
 
@@ -80558,7 +80570,7 @@ impl Connection {
             // must carry the genuine fts5 internal-content shadow shape, never a
             // leftover/user table that merely shares the suffix. See
             // `ddl_matches_fts5_internal_content_shadow` and
-            // `test_reopen_duplicate_fts5_rootpage_zero_allows_authoritative_repair`.
+            // `test_reopen_duplicate_fts5_rootpage_zero_requires_explicit_repair`.
             if exists
                 && ddl
                     .get(&content_shadow.to_ascii_lowercase())
@@ -107053,8 +107065,9 @@ impl Connection {
                     max_root_page,
                     &header,
                     &free_pages,
-                    // cass#503: only the deferred-FTS5 repair open may bind
-                    // a missing FTS5 shadow autoindex; it drops the shadow.
+                    // Only the deferred-FTS5 repair open may bind missing
+                    // shadow autoindexes or canonicalize duplicate FTS5
+                    // declarations before the caller repairs the catalog.
                     self.defer_fts5_hydration,
                 )?;
 
@@ -107282,7 +107295,7 @@ impl Connection {
                     tracing::debug!(
                         table = %name,
                         row_index,
-                        "skipping non-canonical duplicate virtual-table catalog row"
+                        "explicit FTS5 repair skips non-canonical duplicate catalog row"
                     );
                     continue;
                 }
@@ -155115,7 +155128,7 @@ fn virtual_table_option_value(args: &[String], option: &str) -> Option<String> {
 /// (not `STRICT`, not `WITHOUT ROWID`). A leftover/user `_content` table that
 /// declares column types (e.g. `c0 TEXT`), uses different names/counts, or adds
 /// constraints does NOT match and is preserved — the exact hazard verified by
-/// `test_reopen_duplicate_fts5_rootpage_zero_allows_authoritative_repair`.
+/// `test_reopen_duplicate_fts5_rootpage_zero_requires_explicit_repair`.
 ///
 /// This is deliberately restrictive: when the shape is anything but the
 /// canonical fts5 shadow, we preserve (never drop). A destructive reclaim must
@@ -231740,7 +231753,7 @@ SELECT x FROM t;
 
     #[cfg(feature = "ext-fts5")]
     #[test]
-    fn test_reopen_duplicate_fts5_rootpage_zero_allows_authoritative_repair() {
+    fn test_reopen_duplicate_fts5_rootpage_zero_requires_explicit_repair() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("duplicate_fts5_schema.db");
@@ -231785,10 +231798,31 @@ SELECT x FROM t;
                     .unwrap();
             }
 
+            let error = Connection::open(&db_str)
+                .await
+                .expect_err("ordinary open must not silently repair a duplicate FTS5 catalog");
+            assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+
+            {
+                let repair = Connection::open_existing_schema_only_deferred_fts5(&db_str)
+                    .await
+                    .expect("explicit FTS5 repair must retain access to the corrupt catalog");
+                repair.execute("PRAGMA writable_schema = ON").await.unwrap();
+                repair
+                    .execute(
+                        "DELETE FROM sqlite_master WHERE type = 'table' AND name = 'docs_fts' \
+                         AND sql = 'CREATE VIRTUAL TABLE docs_fts USING fts5(title, body)'",
+                    )
+                    .await
+                    .unwrap();
+                repair.execute("PRAGMA writable_schema = OFF").await.unwrap();
+                repair.close().await.unwrap();
+            }
+
             {
                 let conn = Connection::open(&db_str)
                     .await
-                    .expect("duplicate legacy FTS5 schema row should remain available for repair");
+                    .expect("normal open must succeed after explicit duplicate catalog repair");
                 let schema_rows = conn
                     .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'docs_fts';")
                     .await
@@ -232903,7 +232937,7 @@ fts5(title, body, content=docs, content_rowid=id)'
     }
 
     #[test]
-    fn test_reopen_prefers_materialized_virtual_table_over_legacy_rootpage_zero_duplicate() {
+    fn test_explicit_fts5_repair_can_drop_duplicate_rootpage_zero_rows() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("materialized_vtab_shadowed.db");
@@ -232937,7 +232971,13 @@ fts5(title, body, content=docs, content_rowid=id)'
                     .unwrap();
             }
 
-            let conn = Connection::open(&db_str).await.unwrap();
+            let error = Connection::open(&db_str)
+                .await
+                .expect_err("ordinary open must reject duplicate FTS5 declarations");
+            assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+            let conn = Connection::open_existing_schema_only_deferred_fts5(&db_str)
+                .await
+                .expect("the dedicated repair open must allow removing the duplicate table");
             let schema = conn.schema.borrow();
             let docs_tables: Vec<&TableSchema> = schema
                 .iter()
@@ -232946,12 +232986,12 @@ fts5(title, body, content=docs, content_rowid=id)'
             // FrankenSQLite-created FTS5 tables are now natively rootpage=0
             // (shadow-backed), so the original CREATE already wrote a rootpage=0
             // catalog row and the injected writable_schema row is a genuine
-            // duplicate of it. Schema reload must dedup the duplicate catalog rows
-            // down to exactly one live virtual table.
+            // duplicate of it. Only this explicit repair connection may reduce
+            // the duplicate catalog rows to one live virtual table.
             assert_eq!(
                 docs_tables.len(),
                 1,
-                "schema reload should dedup duplicate FTS5 catalog rows to exactly one virtual table"
+                "explicit repair should dedup FTS5 catalog rows to exactly one virtual table"
             );
             assert_eq!(
                 docs_tables[0].root_page, 0,
@@ -232969,6 +233009,13 @@ fts5(title, body, content=docs, content_rowid=id)'
                 SqliteValue::Integer(0),
                 "DROP TABLE should remove every duplicate rootpage=0 catalog row for the table"
             );
+            conn.close().await.unwrap();
+            Connection::open(&db_str)
+                .await
+                .expect("removing duplicate rows must restore ordinary open")
+                .close()
+                .await
+                .unwrap();
         });
     }
 
@@ -245530,7 +245577,7 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_insert_default_values_ipk_with_default() {
+    fn test_insert_default_values_ignores_ipk_default() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
@@ -245541,10 +245588,18 @@ mod pager_routing_tests {
             conn.execute("INSERT INTO dv2 DEFAULT VALUES;")
                 .await
                 .unwrap();
-            let rows = conn.query("SELECT id, val FROM dv2;").await.unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].values()[0], SqliteValue::Integer(100));
+            conn.execute("INSERT INTO dv2(val) VALUES ('y');")
+                .await
+                .unwrap();
+            let rows = conn
+                .query("SELECT id, val FROM dv2 ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
             assert_eq!(rows[0].values()[1], SqliteValue::Text("x".into()));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+            assert_eq!(rows[1].values()[1], SqliteValue::Text("y".into()));
         });
     }
 

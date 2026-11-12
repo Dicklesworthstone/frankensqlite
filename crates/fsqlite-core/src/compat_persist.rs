@@ -444,19 +444,27 @@ fn canonical_virtual_table_variant(
 
 fn claim_sqlite_master_virtual_table(
     row_index: usize,
-    name: &str,
-    root_page: i64,
+    entry: DecodedSqliteMasterEntry<'_>,
     module: &str,
     args: &[String],
     schema_names: &mut HashMap<String, SqliteMasterSchemaNameOwner>,
     variants: &mut HashMap<String, Vec<VirtualTableCatalogVariant>>,
+    allow_fts5_catalog_repair: bool,
 ) -> Result<()> {
+    let name = entry.name;
+    let root_page = entry.root_page;
     let key = name.to_ascii_lowercase();
     if let Some(existing_variants) = variants.get_mut(&key) {
         let Some(existing) = existing_variants.first() else {
             unreachable!("virtual-table variant map entries are never empty");
         };
-        if existing_variants.len() != 1
+        // A duplicate declaration is corrupt even when its SQL is identical.
+        // Only the explicit deferred-FTS5 repair open may select a canonical
+        // row from one of the narrowly supported historical repair shapes.
+        // Ordinary opens/imports must not silently hide an ambiguous catalog.
+        if !allow_fts5_catalog_repair
+            || !module.eq_ignore_ascii_case("fts5")
+            || existing_variants.len() != 1
             || (existing.root_page > 0 && root_page > 0)
             || !supported_virtual_table_duplicate(existing, root_page, module, args)
         {
@@ -602,8 +610,9 @@ fn claim_sqlite_master_root(
 /// before either mutates `MemDatabase`, because `create_table_at` replaces an
 /// existing root on collision.
 ///
-/// `tolerate_missing_fts5_shadow_autoindexes` is set only by the deferred-FTS5
-/// repair open. It binds a missing implicit autoindex of an FTS5 shadow table
+/// `allow_fts5_catalog_repair` is set only by the deferred-FTS5 repair open.
+/// It admits the bounded historical duplicate FTS5 declarations that the
+/// repair path can remove, and binds a missing implicit autoindex of a shadow table
 /// (`<vtab>_data|_idx|_content|_docsize|_config` of a declared `fts5` virtual
 /// table) as [`BoundImplicitAutoindexStorage::AbsentFts5ShadowIndex`] instead
 /// of refusing the whole open, so the repair can drop and recreate that
@@ -613,7 +622,7 @@ pub(crate) fn bind_implicit_autoindex_catalog(
     max_root_page: u32,
     header: &DatabaseHeader,
     free_pages: &HashSet<PageNumber>,
-    tolerate_missing_fts5_shadow_autoindexes: bool,
+    allow_fts5_catalog_repair: bool,
 ) -> Result<BoundImplicitAutoindexCatalog> {
     if max_root_page == 0 {
         return Err(sqlite_master_corrupt(
@@ -772,12 +781,12 @@ pub(crate) fn bind_implicit_autoindex_catalog(
             }
             claim_sqlite_master_virtual_table(
                 row_index,
-                entry.name,
-                entry.root_page,
+                *entry,
                 &create.module,
                 &create.args,
                 &mut schema_names,
                 &mut virtual_table_variants,
+                allow_fts5_catalog_repair,
             )?;
             continue;
         }
@@ -983,7 +992,7 @@ pub(crate) fn bind_implicit_autoindex_catalog(
         }
     }
 
-    let fts5_shadow_tables: HashSet<String> = if tolerate_missing_fts5_shadow_autoindexes {
+    let fts5_shadow_tables: HashSet<String> = if allow_fts5_catalog_repair {
         virtual_table_variants
             .values()
             .flatten()
@@ -6691,7 +6700,7 @@ PRAGMA integrity_check;
     }
 
     #[test]
-    fn virtual_table_catalog_canonical_row_is_order_independent() {
+    fn virtual_table_catalog_canonical_row_requires_explicit_fts5_repair() {
         let cases = [
             (
                 "contentless before stale default",
@@ -6796,12 +6805,17 @@ PRAGMA integrity_check;
         ];
 
         for (case_name, entries, expected_row) in cases {
+            assert_implicit_autoindex_catalog_corrupt(
+                case_name,
+                &entries,
+                "conflicting virtual-table entries",
+            );
             let catalog = bind_implicit_autoindex_catalog(
                 &entries,
                 2,
                 &DatabaseHeader::default(),
                 &HashSet::new(),
-                false,
+                true,
             )
             .unwrap_or_else(|error| panic!("{case_name}: unexpected bind failure: {error}"));
             for row_index in 0..entries.len() {
@@ -6953,16 +6967,58 @@ PRAGMA integrity_check;
             ),
         ];
 
+        assert_implicit_autoindex_catalog_corrupt(
+            "ordinary open must reject duplicate repair declarations",
+            &entries,
+            "conflicting virtual-table entries",
+        );
         let catalog = bind_implicit_autoindex_catalog(
             &entries,
             3,
             &DatabaseHeader::default(),
             &HashSet::new(),
-            false,
+            true,
         )
         .unwrap();
         assert!(catalog.table("PLAIN").is_some());
         assert!(catalog.table("docs").is_none());
+    }
+
+    #[test]
+    fn fts5_repair_does_not_admit_other_duplicate_virtual_tables() {
+        for first_root in [0, 2] {
+            let entries = vec![
+                implicit_autoindex_catalog_row(
+                    "table",
+                    "vt",
+                    "vt",
+                    first_root,
+                    Some("CREATE VIRTUAL TABLE vt USING rtree(id, min_x, max_x)"),
+                ),
+                implicit_autoindex_catalog_row(
+                    "table",
+                    "VT",
+                    "VT",
+                    0,
+                    Some("CREATE VIRTUAL TABLE vt USING rtree(id, min_x, max_x)"),
+                ),
+            ];
+            for allow_repair in [false, true] {
+                let error = bind_implicit_autoindex_catalog(
+                    &entries,
+                    2,
+                    &DatabaseHeader::default(),
+                    &HashSet::new(),
+                    allow_repair,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(error, FrankenError::DatabaseCorrupt { ref detail }
+                        if detail.contains("conflicting virtual-table entries")),
+                    "root={first_root}, repair={allow_repair}: {error}"
+                );
+            }
+        }
     }
 
     #[test]

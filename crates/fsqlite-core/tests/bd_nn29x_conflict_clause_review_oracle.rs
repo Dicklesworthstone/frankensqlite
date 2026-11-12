@@ -1113,6 +1113,221 @@ fn review_schema_ignore_returning_rows() {
     });
 }
 
+/// bd-ipk-default-used-as-rowid-yniw8: a rowid alias does not inherit its
+/// declared DEFAULT when omitted. All INSERT sources must request a fresh
+/// rowid, while explicit keys and defaults on ordinary columns remain intact.
+#[test]
+fn review_omitted_rowid_alias_ignores_defaults() {
+    asupersync::test_utils::run_test(|| async {
+        for schema in [
+            "CREATE TABLE k(id INTEGER PRIMARY KEY DEFAULT 13, v TEXT DEFAULT 'ordinary default')",
+            "CREATE TABLE k(id INTEGER DEFAULT 13, v TEXT DEFAULT 'ordinary default', PRIMARY KEY(id))",
+            "CREATE TABLE k(id INTEGER PRIMARY KEY AUTOINCREMENT DEFAULT 13, v TEXT DEFAULT 'ordinary default')",
+            "CREATE TABLE k(id INTEGER PRIMARY KEY DEFAULT 'not an integer', v TEXT DEFAULT 'ordinary default')",
+        ] {
+            for persistent in [false, true] {
+                for prepared in [false, true] {
+                    let stock = rusqlite::Connection::open_in_memory().expect("stock");
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = if persistent {
+                        dir.path().join("ipk-default.db").to_string_lossy().into_owned()
+                    } else {
+                        ":memory:".to_owned()
+                    };
+                    let conn = Connection::open(path).await.expect("fsqlite");
+                    for setup in [
+                        schema,
+                        "CREATE TABLE src(v TEXT)",
+                        "INSERT INTO src VALUES ('source one'), ('source two')",
+                    ] {
+                        stock.execute_batch(setup).expect("stock setup");
+                        conn.execute(setup).await.expect("fsqlite setup");
+                    }
+                    for sql in [
+                        "INSERT INTO k DEFAULT VALUES RETURNING id, v",
+                        "INSERT INTO k(v) VALUES ('values') RETURNING id, v",
+                        "INSERT INTO k(v) SELECT 'constant select' RETURNING id, v",
+                        "INSERT INTO k(v) SELECT v FROM src RETURNING id, v",
+                        "INSERT INTO k(id, v) VALUES (NULL, 'explicit null') RETURNING id, v",
+                        "INSERT INTO k(rowid, v) VALUES (100, 'explicit rowid') RETURNING id, v",
+                        "INSERT INTO k DEFAULT VALUES RETURNING id, v",
+                        "DELETE FROM k WHERE id = (SELECT max(id) FROM k) RETURNING id, v",
+                        "INSERT INTO k(v) VALUES ('after delete') RETURNING id, v",
+                    ] {
+                        let expected = stock_rows(&stock, sql);
+                        let returned = if prepared {
+                            conn.prepare(sql)
+                                .await
+                                .expect("prepare rowid-default statement")
+                                .query()
+                                .await
+                        } else {
+                            conn.query(sql).await
+                        }
+                        .unwrap_or_else(|error| panic!("{schema}; {sql}: {error}"));
+                        let observed: Rows = returned
+                            .iter()
+                            .map(|row| row.values().iter().map(tag_f).collect())
+                            .collect();
+                        assert_eq!(
+                            observed, expected,
+                            "{schema}; {sql}; persistent={persistent}, prepared={prepared}"
+                        );
+                        for query in [
+                            "SELECT changes(), last_insert_rowid()",
+                            "SELECT id, v FROM k ORDER BY id",
+                            "PRAGMA integrity_check",
+                        ] {
+                            assert_eq!(
+                                frank_rows(&conn, query).await,
+                                stock_rows(&stock, query),
+                                "{schema}; {sql}; {query}; persistent={persistent}, prepared={prepared}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The trigger path builds a candidate NEW row before bytecode runs. It must
+/// also leave an omitted rowid alias unset, even if its schema has a DEFAULT.
+#[test]
+fn review_rowid_alias_default_is_not_a_trigger_new_value() {
+    asupersync::test_utils::run_test(|| async {
+        for persistent in [false, true] {
+            for prepared in [false, true] {
+                let stock = rusqlite::Connection::open_in_memory().expect("stock");
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = if persistent {
+                    dir.path().join("trigger-ipk-default.db").to_string_lossy().into_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let conn = Connection::open(path).await.expect("fsqlite");
+                for setup in [
+                    "CREATE TABLE k(id INTEGER PRIMARY KEY DEFAULT 13, v TEXT DEFAULT 'ordinary default')",
+                    "CREATE TABLE audit(id INTEGER, v TEXT)",
+                    "CREATE TABLE src(v TEXT)",
+                    "INSERT INTO src VALUES ('source row')",
+                    "CREATE TRIGGER k_before BEFORE INSERT ON k WHEN NEW.id = 13 \
+                     BEGIN SELECT RAISE(ABORT, 'rowid DEFAULT leaked into NEW'); END",
+                    "CREATE TRIGGER k_after AFTER INSERT ON k \
+                     BEGIN INSERT INTO audit VALUES (NEW.id, NEW.v); END",
+                ] {
+                    stock.execute_batch(setup).expect("stock setup");
+                    conn.execute(setup).await.expect("fsqlite setup");
+                }
+                for sql in [
+                    "INSERT INTO k DEFAULT VALUES RETURNING id, v",
+                    "INSERT INTO k(v) VALUES ('values') RETURNING id, v",
+                    "INSERT INTO k(v) SELECT 'constant select' RETURNING id, v",
+                    "INSERT INTO k(v) SELECT v FROM src RETURNING id, v",
+                    "INSERT INTO k(id, v) VALUES (NULL, 'explicit null') RETURNING id, v",
+                    "INSERT INTO k(rowid, v) VALUES (42, 'explicit rowid') RETURNING id, v",
+                ] {
+                    let expected = stock_rows(&stock, sql);
+                    let returned = if prepared {
+                        conn.prepare(sql)
+                            .await
+                            .expect("prepare triggered default insert")
+                            .query()
+                            .await
+                    } else {
+                        conn.query(sql).await
+                    }
+                    .unwrap_or_else(|error| panic!("{sql}: {error}"));
+                    let observed: Rows = returned
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect();
+                    assert_eq!(
+                        observed, expected,
+                        "{sql}; persistent={persistent}, prepared={prepared}"
+                    );
+                    for query in [
+                        "SELECT id, v FROM k ORDER BY id",
+                        "SELECT id, v FROM audit ORDER BY id",
+                    ] {
+                        assert_eq!(
+                            frank_rows(&conn, query).await,
+                            stock_rows(&stock, query),
+                            "{sql}; {query}; persistent={persistent}, prepared={prepared}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// An INTEGER PRIMARY KEY is not a rowid alias in a WITHOUT ROWID table,
+/// nor when declared with column-level DESC or with the type name INT.
+/// Suppressing its DEFAULT there would lose actual primary-key values.
+#[test]
+fn review_non_alias_primary_key_preserves_defaults() {
+    asupersync::test_utils::run_test(|| async {
+        for schema in [
+            "CREATE TABLE k(id INTEGER PRIMARY KEY DEFAULT 13, v TEXT DEFAULT 'ordinary default') WITHOUT ROWID",
+            "CREATE TABLE k(id INTEGER PRIMARY KEY DESC DEFAULT 13, v TEXT DEFAULT 'ordinary default')",
+            "CREATE TABLE k(id INT PRIMARY KEY DEFAULT 13, v TEXT DEFAULT 'ordinary default')",
+        ] {
+            for persistent in [false, true] {
+                for prepared in [false, true] {
+                    let stock = rusqlite::Connection::open_in_memory().expect("stock");
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = if persistent {
+                        dir.path().join("pk-default.db").to_string_lossy().into_owned()
+                    } else {
+                        ":memory:".to_owned()
+                    };
+                    let conn = Connection::open(path).await.expect("fsqlite");
+                    for setup in [
+                        schema,
+                        "CREATE TABLE src(v TEXT)",
+                        "INSERT INTO src VALUES ('source one')",
+                    ] {
+                        stock.execute_batch(setup).expect("stock setup");
+                        conn.execute(setup).await.expect("fsqlite setup");
+                    }
+                    for sql in [
+                        "INSERT INTO k DEFAULT VALUES RETURNING id, v",
+                        "INSERT OR REPLACE INTO k(v) VALUES ('values') RETURNING id, v",
+                        "INSERT OR REPLACE INTO k(v) SELECT 'constant select' RETURNING id, v",
+                        "INSERT OR REPLACE INTO k(v) SELECT v FROM src RETURNING id, v",
+                    ] {
+                        let expected = stock_rows(&stock, sql);
+                        let returned = if prepared {
+                            conn.prepare(sql)
+                                .await
+                                .expect("prepare ordinary-default statement")
+                                .query()
+                                .await
+                        } else {
+                            conn.query(sql).await
+                        }
+                        .unwrap_or_else(|error| panic!("{schema}; {sql}: {error}"));
+                        let observed: Rows = returned
+                            .iter()
+                            .map(|row| row.values().iter().map(tag_f).collect())
+                            .collect();
+                        assert_eq!(
+                            observed, expected,
+                            "{schema}; {sql}; persistent={persistent}, prepared={prepared}"
+                        );
+                        assert_eq!(
+                            frank_rows(&conn, "SELECT id, v FROM k ORDER BY id").await,
+                            stock_rows(&stock, "SELECT id, v FROM k ORDER BY id"),
+                            "{schema}; {sql}; persistent={persistent}, prepared={prepared}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// bd-1rkcr: a NULL column with its own IGNORE skips the candidate before
 /// CHECK; a non-NULL row violating CHECK must still use the statement action.
 #[test]

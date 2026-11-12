@@ -81,6 +81,28 @@ fn malformed_catalogs_are_rejected_before_schema_publication() {
                 "UPDATE sqlite_schema SET sql='CREATE TABLE t(\"a b\" INTEGER, [A B] TEXT)' WHERE name='t'",
             ),
             (
+                "duplicate_fts5_table",
+                "CREATE VIRTUAL TABLE ft USING fts5(body)",
+                "INSERT INTO sqlite_schema SELECT * FROM sqlite_schema WHERE name='ft'",
+            ),
+            (
+                "case_variant_duplicate_fts5_table",
+                "CREATE VIRTUAL TABLE ft USING fts5(body)",
+                "INSERT INTO sqlite_schema VALUES('table', 'FT', 'FT', 0, \
+                 'CREATE VIRTUAL TABLE FT USING fts5(body)')",
+            ),
+            (
+                "duplicate_fts5_content_modes",
+                "CREATE VIRTUAL TABLE ft USING fts5(body, content='')",
+                "INSERT INTO sqlite_schema VALUES('table', 'ft', 'ft', 0, \
+                 'CREATE VIRTUAL TABLE ft USING fts5(body)')",
+            ),
+            (
+                "duplicate_rtree_table",
+                "CREATE VIRTUAL TABLE rt USING rtree(id, min_x, max_x)",
+                "INSERT INTO sqlite_schema SELECT * FROM sqlite_schema WHERE name='rt'",
+            ),
+            (
                 "before_trigger_on_virtual_table",
                 "CREATE VIRTUAL TABLE ft USING fts5(body)",
                 "INSERT INTO sqlite_schema VALUES('trigger', 'tr', 'ft', 0, \
@@ -121,10 +143,14 @@ fn malformed_catalogs_are_rejected_before_schema_publication() {
                     "{name}: {error}"
                 );
             }
-            for mode in ["existing", "schema_only", "import"] {
+            for mode in ["open", "existing", "schema_only", "writable_schema_only", "import"] {
                 let result = match mode {
+                    "open" => Connection::open(path.to_str().unwrap()).await,
                     "existing" => Connection::open_existing(path.to_str().unwrap()).await,
                     "schema_only" => Connection::open_schema_only(path.to_str().unwrap()).await,
+                    "writable_schema_only" => {
+                        Connection::open_existing_schema_only(path.to_str().unwrap()).await
+                    }
                     "import" => Connection::import_bytes(&original).await,
                     _ => unreachable!(),
                 };

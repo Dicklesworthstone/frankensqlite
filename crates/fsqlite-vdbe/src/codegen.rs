@@ -24657,7 +24657,8 @@ pub fn codegen_insert(
             )?;
         }
         InsertSource::DefaultValues => {
-            // Insert one row using column DEFAULT values (or NULL if none).
+            // A rowid alias ignores its declared DEFAULT. Allocate its key
+            // normally; every other column still uses its DEFAULT (or NULL).
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let n_cols = table.columns.len() as i32;
             let concurrent_flag = i32::from(ctx.concurrent_mode);
@@ -24665,44 +24666,25 @@ pub fn codegen_insert(
             for (idx, col) in table.columns.iter().enumerate() {
                 #[allow(clippy::cast_possible_wrap)]
                 let reg = col_regs + idx as i32;
-                emit_default_value(b, col, reg)?;
+                if ctx.rowid_alias_col_idx == Some(idx) {
+                    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                } else {
+                    emit_default_value(b, col, reg)?;
+                }
             }
             let rowid_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::NewRowid,
+                table_cursor,
+                rowid_reg,
+                concurrent_flag,
+                P4::None,
+                0,
+            );
             if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
-                // IPK column has a DEFAULT value — use it when non-NULL,
-                // otherwise auto-generate via NewRowid (matching VALUES path).
                 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                 let ipk_reg = col_regs + ipk_idx as i32;
-                let auto_label = b.emit_label();
-                let done_label = b.emit_label();
-
-                b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
-                emit_rowid_must_be_int(b, ipk_reg);
-                b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-
-                b.resolve_label(auto_label);
-                b.emit_op(
-                    Opcode::NewRowid,
-                    table_cursor,
-                    rowid_reg,
-                    concurrent_flag,
-                    P4::None,
-                    0,
-                );
                 b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
-
-                b.resolve_label(done_label);
-            } else {
-                // No IPK column — always auto-generate.
-                b.emit_op(
-                    Opcode::NewRowid,
-                    table_cursor,
-                    rowid_reg,
-                    concurrent_flag,
-                    P4::None,
-                    0,
-                );
             }
             // Evaluate STORED generated columns before packing the record.
             emit_stored_generated_columns(b, table, col_regs);
@@ -25410,6 +25392,9 @@ fn codegen_insert_values(
                         P4::None,
                         0,
                     );
+                } else if ctx.rowid_alias_col_idx == Some(tbl_idx) {
+                    // Omission requests a fresh rowid, regardless of DEFAULT.
+                    b.emit_op(Opcode::Null, 0, dest, 0, P4::None, 0);
                 } else {
                     emit_default_value(b, &table.columns[tbl_idx], dest)?;
                 }
@@ -25987,6 +25972,8 @@ fn codegen_insert_select(
                     P4::None,
                     0,
                 );
+            } else if ctx.rowid_alias_col_idx == Some(tbl_idx) {
+                b.emit_op(Opcode::Null, 0, dest, 0, P4::None, 0);
             } else {
                 emit_default_value(b, &target_table.columns[tbl_idx], dest)?;
             }
@@ -26234,6 +26221,8 @@ fn codegen_insert_select_without_from(
                     P4::None,
                     0,
                 );
+            } else if ctx.rowid_alias_col_idx == Some(tbl_idx) {
+                b.emit_op(Opcode::Null, 0, dest, 0, P4::None, 0);
             } else {
                 emit_default_value(b, &target_table.columns[tbl_idx], dest)?;
             }
