@@ -96105,8 +96105,9 @@ impl Connection {
             col_map.push((String::new(), alias.clone(), false));
         }
 
+        // The grouped rows are not read again: move their values (bd-w4pr1.12).
         let row_values: Vec<Vec<SqliteValue>> =
-            grouped_rows.iter().map(|r| r.values().to_vec()).collect();
+            grouped_rows.into_iter().map(|r| r.values).collect();
         let total_rows = row_values.len();
 
         // Compute window function values over grouped rows.
@@ -97063,8 +97064,9 @@ impl Connection {
             let custom_aggregate_keys = Arc::clone(&self.custom_aggregate_keys.borrow());
             SyncFunctionRegistryGuard::push(registry, custom_aggregate_keys)
         });
-        let row_values: Vec<Vec<SqliteValue>> =
-            raw_rows.iter().map(|r| r.values().to_vec()).collect();
+        // The scanned rows are not read again: move their values instead of
+        // holding a second copy of every row (bd-w4pr1.12).
+        let row_values: Vec<Vec<SqliteValue>> = raw_rows.into_iter().map(|r| r.values).collect();
 
         // Compute window function values.  Each window function may have its
         // own PARTITION BY / ORDER BY, so we build per-function partitions and
@@ -97990,7 +97992,7 @@ impl Connection {
                     // arm_rows + per-result-row binary search, instead of the
                     // earlier O(n*m) linear scan.
                     let mut arm_keys: Vec<Vec<SqliteValue>> =
-                        arm_rows.iter().map(|row| row.values().to_vec()).collect();
+                        arm_rows.into_iter().map(|row| row.values).collect();
                     arm_keys.sort_by(|a, b| {
                         compare_value_slices_collated_snapshot(a, b, &collations, &registry_snap)
                     });
@@ -98018,7 +98020,7 @@ impl Connection {
                     // L2: same sort+binary_search structure as INTERSECT, but
                     // we keep the rows that are NOT present in arm_keys.
                     let mut arm_keys: Vec<Vec<SqliteValue>> =
-                        arm_rows.iter().map(|row| row.values().to_vec()).collect();
+                        arm_rows.into_iter().map(|row| row.values).collect();
                     arm_keys.sort_by(|a, b| {
                         compare_value_slices_collated_snapshot(a, b, &collations, &registry_snap)
                     });
@@ -100347,7 +100349,7 @@ impl Connection {
             .execute_statement(&Statement::Select(base_select), params)
             .await?;
         let mut all_rows: Vec<Vec<SqliteValue>> =
-            base_rows.iter().map(|r| r.values().to_vec()).collect();
+            base_rows.into_iter().map(|r| r.values).collect();
         // GH #152: the CTE's own LIMIT caps the rows it produces (stock sqlite3
         // stops the recursion once the LIMIT is reached); OFFSET drops the first
         // rows from the output while they still feed the recursion. Stock
@@ -100386,10 +100388,10 @@ impl Connection {
                 .await?;
             match op {
                 CompoundOp::UnionAll => {
-                    all_rows.extend(arm_rows.iter().map(|row| row.values().to_vec()));
+                    all_rows.extend(arm_rows.into_iter().map(|row| row.values));
                 }
                 CompoundOp::Union => {
-                    all_rows.extend(arm_rows.iter().map(|row| row.values().to_vec()));
+                    all_rows.extend(arm_rows.into_iter().map(|row| row.values));
                     dedup_value_rows(&mut all_rows);
                 }
                 CompoundOp::Intersect | CompoundOp::Except => {
@@ -101316,7 +101318,7 @@ impl Connection {
                             lean_future(|| self.execute_statement(&subquery_statement, params))
                                 .await?;
                         let row_data: Vec<Vec<SqliteValue>> =
-                            rows.iter().map(|r| r.values().to_vec()).collect();
+                            rows.into_iter().map(|r| r.values).collect();
                         let resolved = Self::deduplicate_relation_column_names(
                             self.select_result_column_names(query, &visible_ctes, &mut Vec::new()),
                         );
@@ -101681,7 +101683,7 @@ impl Connection {
                     let _tt_guard = (!self.memdb_rows_loaded.get())
                         .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
                     let rows = lean_future(|| self.query(&scan_sql)).await?;
-                    rows.iter().map(|r| r.values().to_vec()).collect()
+                    rows.into_iter().map(|r| r.values).collect()
                 };
                 // Normalize every scanned row to the source's logical scan
                 // width. Physical records written before an ALTER TABLE ADD
