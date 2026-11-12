@@ -62,6 +62,69 @@ const DUMPS: &[&str] = &[
     "SELECT rowid, v FROM h WHERE rowid > 95 ORDER BY rowid",
 ];
 
+/// bd-w4pr1.13.21: an insert that lands as the table's rightmost row raises
+/// the concurrent allocator's floor to its own rowid without walking to the
+/// last row. Every way a row reaches a rowid table follows: appends from
+/// INSERT ... SELECT (one statement, many rows), explicit rowids above the
+/// largest (rightmost) and below it (not rightmost), implicit rowids after
+/// each, RETURNING, an AFTER INSERT trigger that appends to a second table and
+/// reads the first, OR REPLACE on the largest rowid, AUTOINCREMENT, and a
+/// table without an INTEGER PRIMARY KEY.
+const APPEND_SCHEMA: &str = "\
+CREATE TABLE p(id INTEGER PRIMARY KEY, v);\
+CREATE TABLE q(id INTEGER PRIMARY KEY AUTOINCREMENT, v);\
+CREATE TABLE r(v);\
+CREATE TABLE log(id INTEGER PRIMARY KEY, seen);\
+CREATE TRIGGER p_ai AFTER INSERT ON p WHEN new.v = 'trig' BEGIN \
+    INSERT INTO log(seen) SELECT max(id) FROM p; END;";
+
+const APPEND_STATEMENTS: &[&str] = &[
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 700) \
+        INSERT INTO p(v) SELECT i FROM n",
+    "INSERT INTO p(v) VALUES ('after append')",
+    "INSERT INTO p(id, v) VALUES (5000, 'explicit above')",
+    "INSERT INTO p(v) VALUES ('after explicit above')",
+    "INSERT INTO p(id, v) VALUES (3, 'explicit below') ON CONFLICT DO NOTHING",
+    "DELETE FROM p WHERE id = 3",
+    "INSERT INTO p(id, v) VALUES (3, 'explicit below')",
+    "INSERT INTO p(v) VALUES ('after explicit below')",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) \
+        INSERT INTO p(v) SELECT 'ret' || i FROM n RETURNING id, v",
+    "INSERT INTO p(v) VALUES ('trig')",
+    "INSERT INTO p(v) SELECT 'trig' FROM log UNION ALL SELECT 'trig'",
+    "INSERT OR REPLACE INTO p(id, v) SELECT max(id), 'replaced max' FROM p",
+    "INSERT INTO p(v) VALUES ('after replace')",
+    "BEGIN",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) \
+        INSERT INTO p(v) SELECT i FROM n",
+    "INSERT INTO p(id, v) VALUES (100000, 'explicit in txn')",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) \
+        INSERT INTO p(v) SELECT i FROM n",
+    "COMMIT",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) \
+        INSERT INTO q(v) SELECT i FROM n",
+    "DELETE FROM q WHERE id > 390",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4) \
+        INSERT INTO q(v) SELECT i FROM n",
+    "INSERT INTO q(id, v) VALUES (9000, 'explicit autoinc')",
+    "INSERT INTO q(v) VALUES ('after explicit autoinc')",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) \
+        INSERT INTO r(v) SELECT i FROM n",
+    "INSERT INTO r(rowid, v) VALUES (20, 'hidden explicit below')",
+    "INSERT INTO r(v) VALUES ('hidden after')",
+];
+
+const APPEND_DUMPS: &[&str] = &[
+    "SELECT count(*), max(id), sum(id) FROM p",
+    "SELECT id, v FROM p WHERE typeof(v) = 'text' ORDER BY id",
+    "SELECT id, seen FROM log ORDER BY id",
+    "SELECT count(*), max(id), sum(id) FROM q",
+    "SELECT id, v FROM q WHERE id > 385 ORDER BY id",
+    "SELECT name, seq FROM sqlite_sequence ORDER BY name",
+    "SELECT count(*), max(rowid), sum(rowid) FROM r",
+    "SELECT rowid, v FROM r WHERE typeof(v) = 'text' ORDER BY rowid",
+];
+
 fn render_fsqlite(value: &SqliteValue) -> String {
     match value {
         SqliteValue::Integer(v) => format!("i:{v}"),
@@ -95,8 +158,12 @@ fn render_rows(rows: &[Row]) -> Vec<String> {
 }
 
 fn stock_transcript() -> Vec<String> {
+    stock_transcript_of(SCHEMA, STATEMENTS, DUMPS)
+}
+
+fn stock_transcript_of(schema: &str, statements: &[&str], dumps: &[&str]) -> Vec<String> {
     let conn = rusqlite::Connection::open_in_memory().expect("stock open");
-    conn.execute_batch(SCHEMA).expect("stock schema");
+    conn.execute_batch(schema).expect("stock schema");
     let query = |sql: &str| -> Result<Vec<String>, String> {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let width = stmt.column_count();
@@ -113,7 +180,7 @@ fn stock_transcript() -> Vec<String> {
         Ok(out)
     };
     let mut transcript = Vec::new();
-    for sql in STATEMENTS {
+    for sql in statements {
         let outcome = match query(sql) {
             Ok(rows) => format!("ok {rows:?}"),
             Err(message) => format!("error:{message}"),
@@ -121,16 +188,25 @@ fn stock_transcript() -> Vec<String> {
         let last_rowid = conn.last_insert_rowid();
         transcript.push(format!("{sql} => {outcome} last_insert_rowid={last_rowid}"));
     }
-    for sql in DUMPS {
+    for sql in dumps {
         transcript.push(format!("{sql} => {:?}", query(sql).expect("stock dump")));
     }
     transcript
 }
 
 async fn fsqlite_transcript(conn: &Connection) -> Vec<String> {
-    conn.execute_batch(SCHEMA).await.expect("schema");
+    fsqlite_transcript_of(conn, SCHEMA, STATEMENTS, DUMPS).await
+}
+
+async fn fsqlite_transcript_of(
+    conn: &Connection,
+    schema: &str,
+    statements: &[&str],
+    dumps: &[&str],
+) -> Vec<String> {
+    conn.execute_batch(schema).await.expect("schema");
     let mut transcript = Vec::new();
-    for sql in STATEMENTS {
+    for sql in statements {
         let outcome = match conn.query(sql).await {
             Ok(rows) => format!("ok {:?}", render_rows(&rows)),
             Err(error) => format!("error:{error}"),
@@ -138,7 +214,7 @@ async fn fsqlite_transcript(conn: &Connection) -> Vec<String> {
         let last_rowid = conn.last_insert_rowid();
         transcript.push(format!("{sql} => {outcome} last_insert_rowid={last_rowid}"));
     }
-    for sql in DUMPS {
+    for sql in dumps {
         let rows = conn.query(sql).await.expect("dump");
         transcript.push(format!("{sql} => {:?}", render_rows(&rows)));
     }
@@ -172,6 +248,52 @@ fn rowid_allocation_after_same_rowid_updates_matches_stock_file_backed() {
         let conn = Connection::open(&path_str).await.expect("open");
         let got = fsqlite_transcript(&conn).await;
         assert_matches_stock("file-backed", &got, &expected);
+    });
+    let checked = rusqlite::Connection::open(&path).expect("stock open of fsqlite file");
+    let verdict: String = checked
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("integrity_check");
+    assert_eq!(verdict, "ok", "stock integrity_check of the fsqlite file");
+}
+
+#[test]
+fn rowid_allocation_after_appends_and_explicit_rowids_matches_stock_in_memory() {
+    let expected = stock_transcript_of(APPEND_SCHEMA, APPEND_STATEMENTS, APPEND_DUMPS);
+    asupersync::test_utils::run_test(|| async move {
+        let conn = Connection::open(":memory:").await.expect("open");
+        let got =
+            fsqlite_transcript_of(&conn, APPEND_SCHEMA, APPEND_STATEMENTS, APPEND_DUMPS).await;
+        assert_matches_stock("appends in-memory", &got, &expected);
+    });
+}
+
+#[test]
+fn rowid_allocation_after_appends_and_explicit_rowids_matches_stock_file_backed() {
+    let expected = stock_transcript_of(APPEND_SCHEMA, APPEND_STATEMENTS, APPEND_DUMPS);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("w4pr1_13_21_appends.db");
+    let path_str = path.to_str().expect("utf-8 path").to_owned();
+    asupersync::test_utils::run_test(|| async move {
+        let conn = Connection::open(&path_str).await.expect("open");
+        let got =
+            fsqlite_transcript_of(&conn, APPEND_SCHEMA, APPEND_STATEMENTS, APPEND_DUMPS).await;
+        assert_matches_stock("appends file-backed", &got, &expected);
+        // A second connection of the same process shares the allocator: its
+        // implicit rowids must continue above every row the first wrote.
+        let second = Connection::open(&path_str).await.expect("open second");
+        second
+            .execute_batch("INSERT INTO p(v) VALUES ('second'); INSERT INTO r(v) VALUES ('second');")
+            .await
+            .expect("second connection inserts");
+        let rows = second
+            .query("SELECT (SELECT max(id) FROM p), (SELECT max(rowid) FROM r)")
+            .await
+            .expect("second connection reads");
+        assert_eq!(
+            render_rows(&rows),
+            vec!["i:100006|i:502".to_owned()],
+            "the second connection allocates past the first's largest rowids"
+        );
     });
     let checked = rusqlite::Connection::open(&path).expect("stock open of fsqlite file");
     let verdict: String = checked

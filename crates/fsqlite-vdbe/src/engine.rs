@@ -10209,10 +10209,16 @@ impl VdbeEngine {
         sc: &mut StorageCursor,
         rowid: i64,
     ) -> Result<()> {
-        let visible_max = Self::storage_cursor_visible_max_rowid(sc)
-            .await?
-            .max(autoinc_max)
-            .max(rowid);
+        // A row this cursor just proved it inserted as the rightmost is the
+        // table's largest: walking to the last row would return `rowid`
+        // itself. That walk was a quarter of a bulk INSERT ... SELECT (a
+        // descent and a reload of the last leaf after every row).
+        let table_max = if sc.last_successful_insert_rowid == Some(rowid) {
+            rowid
+        } else {
+            Self::storage_cursor_visible_max_rowid(sc).await?
+        };
+        let visible_max = table_max.max(autoinc_max).max(rowid);
         let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
         allocator.ensure_table_floor(
             key,
