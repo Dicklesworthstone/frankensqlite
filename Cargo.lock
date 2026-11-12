@@ -1121,6 +1121,7 @@ dependencies = [
  "rand 0.10.3",
  "rusqlite",
  "sha2 0.11.1",
+ "stacker",
  "tempfile",
  "tracing",
 ]

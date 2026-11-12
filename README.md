@@ -1447,26 +1447,20 @@ results, and another moves a database file between the two. Differences: a
 user-defined functions, online backup, blob I/O, hooks and the
 `chrono`/`uuid`/`serde_json` conversions are not there yet.
 
-Debug builds need a bigger thread stack than rusqlite. Unoptimized, the engine
-uses up to 3 MiB of stack for ordinary statements, more than the 2 MiB Rust
-gives spawned and test threads, so `cargo test` aborts with "has overflowed its
-stack". Release builds run the same code in under 1 MiB. Until that is fixed
-(bd-w4pr1.28), either optimize dependencies in the application's dev profile:
+Unoptimized, the engine can use about 2 MiB of stack for one statement, as much
+as Rust gives spawned and test threads; release builds need under 512 KiB. A
+`fsqlite::blocking` call that finds too little stack left on the calling thread
+(under 4 MiB in a debug build, 1 MiB in a release build) runs on a fresh
+heap-allocated stack segment instead (bd-w4pr1.28), so an application's debug
+`cargo test` works on default-sized threads. Futures from the async
+`Connection` API are polled by your own executor on its threads; in a debug
+build give those threads a bigger stack, or optimize dependencies in the dev
+profile:
 
 ```toml
 [profile.dev.package."*"]
 opt-level = 2
 ```
-
-or raise the default thread stack in the application's `.cargo/config.toml`:
-
-```toml
-[env]
-RUST_MIN_STACK = "8388608"
-```
-
-With the second, a thread created with an explicit `stack_size` needs at least
-3 MiB in a debug build.
 
 ### Transaction API
 

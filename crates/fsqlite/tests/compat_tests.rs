@@ -3466,45 +3466,26 @@ fn read_only_snapshot_integrity_check_counts_the_durable_freelist() {
 
 /// bd-w4pr1.28: downstream applications do not inherit this workspace's
 /// RUST_MIN_STACK setting. A stack overflow aborts the process, so isolate
-/// the real blocking-API workload and explicitly request Rust's usual 2 MiB
-/// thread stack. Run at opt-level=0 as well as the workspace's dev profile.
+/// the real blocking-API workload in a child and explicitly request Rust's
+/// usual 2 MiB thread stack, then a 256 KiB one. Even an optimised engine
+/// needs more than 256 KiB for these statements, so the small thread passes
+/// only because `blocking` moves a call that lacks stack onto a fresh segment.
+/// Run at opt-level=0 as well as the workspace's dev profile.
 #[cfg(all(feature = "native", any(unix, windows)))]
 #[test]
 fn blocking_api_fits_default_thread_stack() {
     const CHILD_ENV: &str = "FSQLITE_DEFAULT_STACK_PROBE_CHILD";
     if std::env::var_os(CHILD_ENV).is_some() {
-        std::thread::Builder::new()
-            .name("blocking-default-stack".to_owned())
-            .stack_size(2 * 1024 * 1024)
-            .spawn(|| {
-                exercise_blocking_api_on_default_stack(std::path::Path::new(":memory:"));
-                let directory = tempfile::tempdir().unwrap();
-                let database = directory.path().join("default-stack.db");
-                exercise_blocking_api_on_default_stack(&database);
-
-                let reader = fsqlite::blocking::Connection::open_with_flags(
-                    &database,
-                    OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
+        for (label, stack_bytes) in [("2mib", 2 * 1024 * 1024), ("256kib", 256 * 1024)] {
+            eprintln!("default-stack probe: {label} thread");
+            std::thread::Builder::new()
+                .name(format!("blocking-stack-{label}"))
+                .stack_size(stack_bytes)
+                .spawn(move || exercise_blocking_api_on_stack(label))
+                .unwrap()
+                .join()
                 .unwrap();
-                assert_eq!(
-                    reader
-                        .query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
-                        .unwrap(),
-                    19
-                );
-                assert!(
-                    reader
-                        .prepare("SELECT id FROM items WHERE label = ?1")
-                        .unwrap()
-                        .exists(["item-7"])
-                        .unwrap()
-                );
-                reader.close().unwrap();
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        }
         return;
     }
 
@@ -3517,13 +3498,47 @@ fn blocking_api_fits_default_thread_stack() {
         .env(CHILD_ENV, "1")
         .output()
         .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "blocking API failed on a 2 MiB thread: {}\nstdout:\n{}\nstderr:\n{}",
+        "blocking API failed on a 2 MiB or 256 KiB thread: {}\nstdout:\n{}\nstderr:\n{stderr}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
+    // The child must really have run both threads' workloads.
+    for label in ["2mib", "256kib"] {
+        assert!(
+            stderr.contains(&format!("default-stack probe: {label} thread")),
+            "child did not reach the {label} thread:\n{stderr}"
+        );
+    }
+}
+
+/// The whole blocking-API probe, on whatever thread calls it.
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn exercise_blocking_api_on_stack(label: &str) {
+    exercise_blocking_api_on_default_stack(std::path::Path::new(":memory:"));
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join(format!("stack-{label}.db"));
+    exercise_blocking_api_on_default_stack(&database);
+
+    let reader =
+        fsqlite::blocking::Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(
+        reader
+            .query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        19
+    );
+    assert!(
+        reader
+            .prepare("SELECT id FROM items WHERE label = ?1")
+            .unwrap()
+            .exists(["item-7"])
+            .unwrap()
+    );
+    reader.close().unwrap();
 }
 
 #[cfg(all(feature = "native", any(unix, windows)))]

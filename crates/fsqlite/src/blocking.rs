@@ -68,7 +68,39 @@ pub use types::{FromSql, ToSql};
 ///
 /// This uses no thread-local state that can already be gone, so it also works
 /// for a connection dropped from another thread-local's destructor.
+///
+/// The call runs on the calling thread's stack when at least
+/// [`BLOCKING_CALL_STACK_RED_ZONE_BYTES`] of it are left, and otherwise on a
+/// heap-allocated segment (`stacker`, the crate rustc and fsqlite-core use for
+/// the same purpose). A rusqlite application's own `cargo test` builds this
+/// crate at opt-level 0, where one statement can need about 2 MiB of stack:
+/// as much as Rust gives every spawned and test thread (bd-w4pr1.28).
 fn block_on<F: Future>(future: F) -> F::Output {
+    stacker::maybe_grow(
+        BLOCKING_CALL_STACK_RED_ZONE_BYTES,
+        BLOCKING_CALL_STACK_SEGMENT_BYTES,
+        || drive_on_current_stack(future),
+    )
+}
+
+/// Stack a blocking call needs free before it drives the engine on the
+/// calling thread's stack. An unoptimised build of the engine reserves very
+/// large poll frames (each statement shape has its own chain of about 2 MiB);
+/// an optimised one fits a statement in under 512 KiB. The release value is
+/// below a 2 MiB thread's free stack, so an optimised build never switches
+/// stacks on an ordinary thread.
+#[cfg(debug_assertions)]
+const BLOCKING_CALL_STACK_RED_ZONE_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(not(debug_assertions))]
+const BLOCKING_CALL_STACK_RED_ZONE_BYTES: usize = 1024 * 1024;
+
+/// Size of the stack segment a blocking call moves to when the calling thread
+/// is short of [`BLOCKING_CALL_STACK_RED_ZONE_BYTES`]. Pages are committed only
+/// as they are touched.
+const BLOCKING_CALL_STACK_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// [`block_on`] on whatever stack the caller is running on.
+fn drive_on_current_stack<F: Future>(future: F) -> F::Output {
     /// Wakes the thread that is driving the future.
     struct Unpark {
         thread: Thread,
