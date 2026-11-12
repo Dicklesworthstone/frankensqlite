@@ -9710,6 +9710,7 @@ impl PreparedStatement<'_> {
             runtime_inputs.index_desc_flags_by_root_page,
             runtime_inputs.index_collations_by_root_page,
             runtime_inputs.record_slots_by_root_page,
+            runtime_inputs.real_columns_by_root_page,
             reject_mem,
             self.conn.memdb_rows_loaded.get(),
             self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -9891,6 +9892,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
                 runtime_inputs.record_slots_by_root_page,
+                runtime_inputs.real_columns_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -9945,6 +9947,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
                 runtime_inputs.record_slots_by_root_page,
+                runtime_inputs.real_columns_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -10080,6 +10083,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
                 runtime_inputs.record_slots_by_root_page,
+                runtime_inputs.real_columns_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -10137,6 +10141,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
                 runtime_inputs.record_slots_by_root_page,
+                runtime_inputs.real_columns_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -13058,6 +13063,11 @@ struct TableExecutionMetadataCacheEntry {
     /// generated column before a stored one (bd-w4pr1.31) or a non-leading
     /// WITHOUT ROWID PRIMARY KEY (bd-v6pjf). See `TableSchema::record_slot_map`.
     record_slots_by_root_page: Arc<HbHashMap<i32, Arc<[usize]>>>,
+    /// REAL-affinity flags per declared column of a table root page and per
+    /// key position of an index root page, for roots with at least one REAL
+    /// column (bd-real-affinity-on-read-lsjei). See
+    /// `VdbeEngine::set_shared_real_columns_by_root_page`.
+    real_columns_by_root_page: Arc<HbHashMap<i32, Arc<[bool]>>>,
     cached_read_runtime_inputs: TableExecutionRuntimeInputs,
 }
 
@@ -13074,6 +13084,7 @@ struct TableExecutionRuntimeInputs {
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
     record_slots_by_root_page: Arc<HbHashMap<i32, Arc<[usize]>>>,
+    real_columns_by_root_page: Arc<HbHashMap<i32, Arc<[bool]>>>,
 }
 
 // ── Time-travel snapshots ──────────────────────────────────────────────────
@@ -51296,6 +51307,7 @@ impl Connection {
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
             record_slots_by_root_page: Arc::clone(&metadata.record_slots_by_root_page),
+            real_columns_by_root_page: Arc::clone(&metadata.real_columns_by_root_page),
         })
     }
 
@@ -67623,6 +67635,7 @@ impl Connection {
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
             record_slots_by_root_page: Arc::clone(&metadata.record_slots_by_root_page),
+            real_columns_by_root_page: Arc::clone(&metadata.real_columns_by_root_page),
         }
     }
 
@@ -67658,6 +67671,7 @@ impl Connection {
         let mut index_desc_flags_by_root_page = HbHashMap::with_capacity(index_count);
         let mut index_collations_by_root_page = HbHashMap::with_capacity(index_count);
         let mut record_slots_by_root_page: HbHashMap<i32, Arc<[usize]>> = HbHashMap::new();
+        let mut real_columns_by_root_page: HbHashMap<i32, Arc<[bool]>> = HbHashMap::new();
 
         for table in schema.iter() {
             let table_name_key = table.name.to_ascii_lowercase();
@@ -67671,6 +67685,30 @@ impl Connection {
                 table.record_slot_map(!temp_names.contains(&table_name_key))
             {
                 record_slots_by_root_page.insert(table.root_page, Arc::from(slots));
+            }
+            // bd-real-affinity-on-read-lsjei: stock stores an integral real of
+            // a REAL column as an integer and reads it back as a real, so a
+            // cursor on the table or on an index over such a column does too.
+            // TEMP rows live in MemDatabase, which already holds them as reals.
+            if !temp_names.contains(&table_name_key) {
+                let real: Vec<bool> = table
+                    .columns
+                    .iter()
+                    .map(|column| column.affinity == 'E')
+                    .collect();
+                if real.contains(&true) {
+                    for index in &table.indexes {
+                        let key: Vec<bool> = index
+                            .columns
+                            .iter()
+                            .map(|name| table.column_index(name).is_some_and(|col| real[col]))
+                            .collect();
+                        if key.contains(&true) {
+                            real_columns_by_root_page.insert(index.root_page, Arc::from(key));
+                        }
+                    }
+                    real_columns_by_root_page.insert(table.root_page, Arc::from(real));
+                }
             }
             // Inspect the original AST, not column names alone: table-level PK
             // terms can override column collation and direction. Cache this
@@ -67841,6 +67879,7 @@ impl Connection {
         let index_desc_flags_by_root_page = Arc::new(index_desc_flags_by_root_page);
         let index_collations_by_root_page = Arc::new(index_collations_by_root_page);
         let record_slots_by_root_page = Arc::new(record_slots_by_root_page);
+        let real_columns_by_root_page = Arc::new(real_columns_by_root_page);
         let cached_read_runtime_inputs = TableExecutionRuntimeInputs {
             autoincrement_seq_by_root_page: HbHashMap::new(),
             rowid_alias_col_by_root_page: Arc::clone(&rowid_alias_col_by_root_page),
@@ -67853,6 +67892,7 @@ impl Connection {
             index_desc_flags_by_root_page: Arc::clone(&index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&index_collations_by_root_page),
             record_slots_by_root_page: Arc::clone(&record_slots_by_root_page),
+            real_columns_by_root_page: Arc::clone(&real_columns_by_root_page),
         };
 
         let entry = Arc::new(TableExecutionMetadataCacheEntry {
@@ -67867,6 +67907,7 @@ impl Connection {
             index_desc_flags_by_root_page,
             index_collations_by_root_page,
             record_slots_by_root_page,
+            real_columns_by_root_page,
             cached_read_runtime_inputs,
         });
         *self.table_execution_metadata_cache.borrow_mut() = Some(Arc::clone(&entry));
@@ -80852,13 +80893,26 @@ impl Connection {
                 }));
             }
         }
-        Self::inflate_table_row_values_from_payload_values(
+        let mut values = Self::inflate_table_row_values_from_payload_values(
             table,
             rowid,
             payload_values,
             rowid_alias_col_idx,
             |col_idx| Ok(precomputed.get(col_idx).cloned().flatten()),
-        )
+        )?;
+        // bd-real-affinity-on-read-lsjei: stock stores an integral real of a
+        // REAL column as an integer and reads it back as a real
+        // (`OP_RealAffinity`); a row read from storage does the same.
+        for (value, column) in values.iter_mut().zip(&table.columns) {
+            if column.affinity == 'E'
+                && let SqliteValue::Integer(i) = *value
+            {
+                #[allow(clippy::cast_precision_loss)]
+                let real = i as f64;
+                *value = SqliteValue::Float(real);
+            }
+        }
+        Ok(values)
     }
 
     #[cfg(test)]
@@ -104930,6 +104984,7 @@ impl Connection {
             runtime_inputs.index_desc_flags_by_root_page,
             runtime_inputs.index_collations_by_root_page,
             runtime_inputs.record_slots_by_root_page,
+            runtime_inputs.real_columns_by_root_page,
             reject_mem,
             self.memdb_rows_loaded.get(),
             self.memdb_storage_count_shortcuts_safe.get(),
@@ -143857,6 +143912,7 @@ async fn execute_table_program_with_db(
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
     record_slots_by_root_page: Arc<HbHashMap<i32, Arc<[usize]>>>,
+    real_columns_by_root_page: Arc<HbHashMap<i32, Arc<[bool]>>>,
     reject_mem_fallback: bool,
     memdb_rows_loaded: bool,
     storage_cursor_memdb_count_shortcuts_safe: bool,
@@ -143963,6 +144019,9 @@ async fn execute_table_program_with_db(
     // non-leading-PK WITHOUT ROWID record in stock's layout. Only such tables
     // have an entry; every other cursor opens with no map.
     engine.set_shared_record_slots_by_root_page(record_slots_by_root_page);
+    // bd-real-affinity-on-read-lsjei: and the REAL columns, whose stored
+    // integers a cursor reads back as reals as stock does.
+    engine.set_shared_real_columns_by_root_page(real_columns_by_root_page);
 
     // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
     // the engine so storage cursors route through the real pager/WAL stack.
@@ -144155,6 +144214,7 @@ async fn execute_table_program_exactly_one_row_with_db(
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
     record_slots_by_root_page: Arc<HbHashMap<i32, Arc<[usize]>>>,
+    real_columns_by_root_page: Arc<HbHashMap<i32, Arc<[bool]>>>,
     reject_mem_fallback: bool,
     memdb_rows_loaded: bool,
     storage_cursor_memdb_count_shortcuts_safe: bool,
@@ -144243,8 +144303,10 @@ async fn execute_table_program_exactly_one_row_with_db(
         text_encoding,
     });
 
-    // bd-w4pr1.31 / bd-v6pjf: see execute_table_program_with_db.
+    // bd-w4pr1.31 / bd-v6pjf, bd-real-affinity-on-read-lsjei: see
+    // execute_table_program_with_db.
     engine.set_shared_record_slots_by_root_page(record_slots_by_root_page);
+    engine.set_shared_real_columns_by_root_page(real_columns_by_root_page);
 
     if let Some(txn) = txn {
         if let Some(ctx) = concurrent_ctx {

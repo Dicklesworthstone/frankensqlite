@@ -410,25 +410,6 @@ fn legacy_setup(stock: &rusqlite::Connection) {
         .expect("legacy setup");
 }
 
-/// [`T1_QUERIES`] without the REAL column `c`.
-///
-/// Stock stores an integral value of a REAL column as an integer and turns
-/// it back into a real when it is read. FrankenSQLite does not do that
-/// conversion yet, so on a stock-written file `c` reads back as an integer
-/// whichever lane serves it. That difference is not a lane boundary, and
-/// leaving `c` out keeps it from masking one here.
-const STOCK_FILE_T1_QUERIES: [&str; 9] = [
-    "SELECT count(*), sum(a), sum(length(b)), count(d) FROM t1",
-    "SELECT id, a, length(b), substr(b, 1, 8), typeof(d), hex(d) FROM t1 WHERE a > 900 ORDER BY id",
-    "SELECT b, a, id FROM t1 WHERE id IN (1, 5, 10, 97, 194, 970, 2910, 3000) ORDER BY id",
-    "SELECT id, length(b), d FROM t1 ORDER BY id LIMIT 400 OFFSET 2000",
-    "SELECT a, count(*), min(id), max(id), sum(length(b)) FROM t1 GROUP BY a ORDER BY a",
-    "SELECT id FROM t1 WHERE b LIKE 'row-12%' ORDER BY id",
-    "SELECT rowid, id, a, d FROM t1 WHERE id BETWEEN 90 AND 100 ORDER BY rowid DESC",
-    "SELECT d, id FROM t1 WHERE a = 77 ORDER BY id",
-    "SELECT count(*), sum(t1.a), sum(length(t1.b)) FROM t3 JOIN t1 ON t1.id = t3.a",
-];
-
 /// A file written by stock SQLite, which stores a NULL in the rowid-alias
 /// slot of every record, read and then mutated by FrankenSQLite. Stock runs
 /// the same statements on its own copy of the file.
@@ -454,7 +435,7 @@ async fn run_stock_written_case(failures: &mut Vec<String>) {
     let stock = rusqlite::Connection::open(&stock_path).expect("stock open");
 
     let label = "[stock-written file] loaded";
-    compare(label, &frank, &stock, &STOCK_FILE_T1_QUERIES, failures).await;
+    compare(label, &frank, &stock, &T1_QUERIES, failures).await;
     compare(label, &frank, &stock, &OTHER_QUERIES, failures).await;
     compare(label, &frank, &stock, &INLINE_EDGE_QUERIES, failures).await;
     compare(label, &frank, &stock, &TOP_N_QUERIES, failures).await;
@@ -464,7 +445,7 @@ async fn run_stock_written_case(failures: &mut Vec<String>) {
         frank.execute_batch(mutation).await.expect("frank mutation");
         stock.execute_batch(mutation).expect("stock mutation");
         let label = format!("[stock-written file] after mutation {step}");
-        compare(&label, &frank, &stock, &STOCK_FILE_T1_QUERIES, failures).await;
+        compare(&label, &frank, &stock, &T1_QUERIES, failures).await;
         compare(&label, &frank, &stock, &OTHER_QUERIES[..4], failures).await;
     }
     frank.close().await.expect("close");

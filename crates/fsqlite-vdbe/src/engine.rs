@@ -5491,6 +5491,13 @@ struct StorageCursor {
     /// its columns at their declared positions (bd-w4pr1.31, bd-v6pjf); `None`
     /// for every other cursor, so its reads pay one `None` check.
     record_slots: Option<Arc<[usize]>>,
+    /// The columns this cursor's `Column` reads give REAL affinity: declared
+    /// columns of a table, key positions of an index. Stock stores an integral
+    /// real of such a column as an integer and turns it back into a real when
+    /// it reads it (`OP_RealAffinity`); see
+    /// [`VdbeEngine::set_shared_real_columns_by_root_page`]. `None` for a
+    /// cursor with no such column.
+    real_columns: Option<Arc<[bool]>>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -7719,6 +7726,11 @@ pub struct VdbeEngine {
     /// its table's entry at open (`StorageCursor::record_slots`), so every
     /// other table reads by declared position at the cost of one `None` check.
     record_slots_by_root_page: Arc<HashMap<i32, Arc<[usize]>>>,
+    /// The REAL-affinity columns of each table root page (by declared column)
+    /// and index root page (by key position) that has one; see
+    /// [`Self::set_shared_real_columns_by_root_page`]. A storage cursor takes
+    /// its entry at open (`StorageCursor::real_columns`).
+    real_columns_by_root_page: Arc<HashMap<i32, Arc<[bool]>>>,
     /// Mapping from cursor_id to root_page for default value lookup.
     cursor_root_pages: HashMap<i32, i32>,
     /// Virtual table instances keyed by cursor number (for transaction ops).
@@ -8384,6 +8396,7 @@ impl VdbeEngine {
             index_desc_flags_by_root_page: Arc::new(HashMap::new()),
             index_collations_by_root_page: Arc::new(HashMap::new()),
             record_slots_by_root_page: Arc::new(HashMap::new()),
+            real_columns_by_root_page: Arc::new(HashMap::new()),
             cursor_root_pages: HashMap::new(),
             vtab_instances: SwissIndex::new(),
             time_travel_cursors: HashMap::new(),
@@ -10588,6 +10601,36 @@ impl VdbeEngine {
         self.record_slots_by_root_page.get(&root_page).cloned()
     }
 
+    /// Provide the REAL-affinity columns keyed by root page
+    /// (bd-real-affinity-on-read-lsjei): for a table root page one flag per
+    /// declared column, for an index root page one per key position. Only
+    /// roots with at least one such column have an entry.
+    ///
+    /// Stock stores an integral real of a REAL column as an integer, which is
+    /// smaller, and turns it back into a real when it reads the column
+    /// (`OP_RealAffinity` after `OP_Column`). A `Column` read through a cursor
+    /// on such a root does the same.
+    pub fn set_shared_real_columns_by_root_page(&mut self, map: Arc<HashMap<i32, Arc<[bool]>>>) {
+        self.real_columns_by_root_page = map;
+    }
+
+    /// The REAL-affinity column flags a storage cursor on `root_page` reads
+    /// with.
+    fn real_columns_for_root(&self, root_page: i32) -> Option<Arc<[bool]>> {
+        if self.real_columns_by_root_page.is_empty() {
+            return None;
+        }
+        self.real_columns_by_root_page.get(&root_page).cloned()
+    }
+
+    /// Whether `Column` `col_idx` of storage cursor `cursor_id` has REAL
+    /// affinity.
+    fn column_has_real_affinity(&self, cursor_id: i32, col_idx: usize) -> bool {
+        self.storage_cursors.get(&cursor_id).is_some_and(|cursor| {
+            is_real_column(cursor.real_columns.as_deref(), col_idx)
+        })
+    }
+
     /// Provide per-index collation sequences keyed by index root page.
     pub fn set_index_collations_by_root_page(&mut self, map: HashMap<i32, Vec<Option<String>>>) {
         self.index_collations_by_root_page = Arc::new(map);
@@ -11830,6 +11873,7 @@ impl VdbeEngine {
                                 table_column_count: None,
                                 first_not_null_non_ipk_col: None,
                                 record_slots: None,
+                                real_columns: None,
                             },
                         );
                     }
@@ -17809,6 +17853,14 @@ impl VdbeEngine {
             prefix_len
         };
 
+        // The direct lanes work on the stored value. A REAL column's stored
+        // integer reads as a real, whose text differs ("291" vs "291.0"), so
+        // such a column takes the generic lane, which converts it.
+        if self.column_has_real_affinity(op.p1, col_idx) {
+            let value = self.cursor_column(op.p1, col_idx).await?;
+            self.set_reg_fast(op.p3, sqlite_substr_prefix_value(&value, prefix_len));
+            return Ok(());
+        }
         match self
             .column_substr_prefix_direct(op.p1, col_idx, prefix_len)
             .await?
@@ -17851,7 +17903,11 @@ impl VdbeEngine {
             self.set_reg_fast(op.p3, SqliteValue::Null);
             return Ok(());
         };
-        if let Some(value) = self.column_octet_length_direct(op.p1, col_idx).await? {
+        // A REAL column's stored integer reads as a real, whose text is
+        // longer, so it skips the direct lane (see the substr prefix above).
+        if !self.column_has_real_affinity(op.p1, col_idx)
+            && let Some(value) = self.column_octet_length_direct(op.p1, col_idx).await?
+        {
             self.set_reg_fast(op.p3, value);
             return Ok(());
         }
@@ -18683,6 +18739,7 @@ impl VdbeEngine {
                 table_column_count: old_sc.table_column_count,
                 first_not_null_non_ipk_col: old_sc.first_not_null_non_ipk_col,
                 record_slots: old_sc.record_slots,
+                real_columns: old_sc.real_columns,
             },
         );
         tracing::info!(
@@ -19582,6 +19639,13 @@ impl VdbeEngine {
                             SqliteValue::Float(f) if f.is_nan() => {
                                 self.registers[reg_idx] = SqliteValue::Null;
                             }
+                            // The cache holds the stored value; a REAL column's
+                            // stored integer reads as a real.
+                            SqliteValue::Integer(stored)
+                                if is_real_column(cursor.real_columns.as_deref(), col_idx) =>
+                            {
+                                self.registers[reg_idx] = integer_as_real(*stored);
+                            }
                             val => {
                                 self.registers[reg_idx] = val.clone();
                             }
@@ -19627,6 +19691,14 @@ impl VdbeEngine {
             // decode above produced `HeapShared`), so the cache stays populated
             // without a second per-row allocation.
             cursor.row_decode.cache_decoded(payload_idx, val.clone());
+            let val = match val {
+                SqliteValue::Integer(stored)
+                    if is_real_column(cursor.real_columns.as_deref(), col_idx) =>
+                {
+                    integer_as_real(stored)
+                }
+                val => val,
+            };
 
             // Write freshly decoded value to register (shares the cache's Arc).
             self.set_reg_fast(target, val);
@@ -19720,6 +19792,13 @@ impl VdbeEngine {
                             FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                             record_decoded_value_metrics(&val);
                         }
+                        // The cache holds the stored value; a REAL column's
+                        // stored integer reads as a real.
+                        if let SqliteValue::Integer(stored) = val
+                            && is_real_column(cursor.real_columns.as_deref(), col_idx)
+                        {
+                            return Ok(integer_as_real(stored));
+                        }
                         return Ok(val);
                     }
                 }
@@ -19747,6 +19826,11 @@ impl VdbeEngine {
                 // Cache the decoded value for repeated column reads while the
                 // cursor stays on the same physical row image.
                 cursor.row_decode.cache_decoded(payload_idx, val.clone());
+                if let SqliteValue::Integer(stored) = val
+                    && is_real_column(cursor.real_columns.as_deref(), col_idx)
+                {
+                    return Ok(integer_as_real(stored));
+                }
                 return Ok(val);
             }
             // Column beyond record width — check ALTER TABLE ADD COLUMN defaults.
@@ -20228,6 +20312,7 @@ impl VdbeEngine {
                         .get(&root_page)
                         .copied();
                     let record_slots = self.record_slots_for_root(root_page);
+                    let real_columns = self.real_columns_for_root(root_page);
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -20258,6 +20343,7 @@ impl VdbeEngine {
                             table_column_count,
                             first_not_null_non_ipk_col,
                             record_slots,
+                            real_columns,
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
@@ -20397,6 +20483,7 @@ impl VdbeEngine {
                         .get(&root_page)
                         .copied();
                     let record_slots = self.record_slots_for_root(root_page);
+                    let real_columns = self.real_columns_for_root(root_page);
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -20427,6 +20514,7 @@ impl VdbeEngine {
                             table_column_count,
                             first_not_null_non_ipk_col,
                             record_slots,
+                            real_columns,
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
@@ -20634,6 +20722,8 @@ impl VdbeEngine {
                 // The rows above were encoded from MemDatabase rows, which
                 // hold every declared column in declared order.
                 record_slots: None,
+                // Their REAL columns were made reals when the mirror was built.
+                real_columns: None,
             },
         );
         self.cursor_root_pages.insert(cursor_id, root_page);
@@ -22560,6 +22650,26 @@ fn try_ensure_storage_cursor_row_layout_local(
 /// Only `cursor.page_row` is written. The copying lane's state is neither
 /// read nor changed, so a `None` hands that lane the cursor as it would have
 /// found it.
+/// Whether column `col_idx` of a storage cursor whose
+/// [`StorageCursor::real_columns`] is `real_columns` has REAL affinity
+/// (bd-real-affinity-on-read-lsjei).
+///
+/// The `Column` lanes ask only after decoding an integer: stock stores an
+/// integral real of a REAL column as an integer and `OP_RealAffinity` turns it
+/// back into a real. Every other value, and every cursor without a REAL
+/// column, pays nothing more than that integer test.
+#[inline(always)]
+fn is_real_column(real_columns: Option<&[bool]>, col_idx: usize) -> bool {
+    real_columns.is_some_and(|real| real.get(col_idx).copied().unwrap_or(false))
+}
+
+/// The real a REAL column's stored integer `value` reads as.
+#[inline(always)]
+#[allow(clippy::cast_precision_loss)]
+const fn integer_as_real(value: i64) -> SqliteValue {
+    SqliteValue::Float(value as f64)
+}
+
 fn try_read_column_in_place(
     cursor: &mut StorageCursor,
     col_idx: usize,
@@ -22645,6 +22755,11 @@ fn try_read_column_in_place(
     // NULL, integers and reals are decoded here, without the general column
     // decoder's hint, profile and text-encoding handling.
     if let Some(value) = fsqlite_types::record::decode_scalar_value(col.serial_type, value_bytes) {
+        if let SqliteValue::Integer(stored) = value
+            && is_real_column(cursor.real_columns.as_deref(), col_idx)
+        {
+            return Ok(Some(integer_as_real(stored)));
+        }
         return Ok(Some(value));
     }
     if classify_serial_type(col.serial_type) == SerialTypeClass::Text
