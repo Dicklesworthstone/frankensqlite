@@ -281,6 +281,11 @@ const OPFLAG_PROBE_MEMBERSHIP_ONLY: u16 = 0x01;
 /// [`OPFLAG_PROBE_MEMBERSHIP_ONLY`]; no opcode positions the cursor or reads
 /// through it, so the engine may keep its keys in a `MembershipSet`.
 const OPFLAG_MEMBERSHIP_SET: u16 = 0x01;
+/// On `OpenAutoindex`: the program fills the ephemeral index with plain
+/// `IdxInsert`s, then runs `IdxBulkLoad` with P3 = P1 before anything reads
+/// it, so the engine may stage the inserted records and build the index from
+/// them in one pass ([`StagedIndexBuild`], bd-w4pr1.13.15).
+const OPFLAG_STAGED_BUILD: u16 = 0x02;
 /// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change
 /// (no rowid or INTEGER PRIMARY KEY assignment). The `Delete` only records the
 /// row; the paired `Insert` then rewrites it in place, overwriting the cell
@@ -4897,6 +4902,16 @@ impl CursorBackend {
         }
     }
 
+    /// Order two stored index keys as this cursor's index orders them
+    /// ([`BtCursor::compare_index_records`]).
+    fn compare_index_records(&self, lhs: &[u8], rhs: &[u8]) -> std::cmp::Ordering {
+        match self {
+            Self::Mem(c) => c.compare_index_records(lhs, rhs),
+            Self::Txn(c) => c.compare_index_records(lhs, rhs),
+            Self::TimeTravel(_) => lhs.cmp(rhs),
+        }
+    }
+
     /// Order two decoded index key prefixes as this cursor's index does.
     #[must_use]
     fn compare_index_key_prefixes(
@@ -5052,6 +5067,35 @@ impl MembershipMemo {
 /// A record with no canonical form ends set mode for the cursor:
 /// `VdbeEngine::spill_membership_set` inserts the keys held so far into the
 /// b-tree and the cursor continues as an ordinary index.
+/// The records inserted into an ephemeral index opened with
+/// [`OPFLAG_STAGED_BUILD`] (a join's automatic index, bd-w4pr1.13.15), held
+/// in one arena until `IdxBulkLoad` with P3 = P1 builds the index from them.
+///
+/// Inserting them one at a time in table order sought each one's place from
+/// the root and balanced a full leaf with two siblings. Sorted once with the
+/// index's own comparator ([`BtCursor::compare_index_records`]) they are laid
+/// out as pages in one pass. The arena costs the record bytes plus one offset
+/// per record; the general sorter kept a decoded copy of every key as well.
+#[derive(Debug, Default)]
+struct StagedIndexBuild {
+    /// The records, back to back.
+    bytes: Vec<u8>,
+    /// Where each record ends in `bytes`.
+    ends: Vec<usize>,
+}
+
+impl StagedIndexBuild {
+    fn push(&mut self, record: &[u8]) {
+        self.bytes.extend_from_slice(record);
+        self.ends.push(self.bytes.len());
+    }
+
+    fn record(&self, index: usize) -> &[u8] {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.bytes[start..self.ends[index]]
+    }
+}
+
 #[derive(Debug)]
 struct MembershipSet {
     keys: HashSet<Box<[u8]>>,
@@ -5415,6 +5459,9 @@ struct StorageCursor {
     /// The keys of an ephemeral index opened as a membership set, while they
     /// are held outside its b-tree; see [`MembershipSet`].
     membership_set: Option<Box<MembershipSet>>,
+    /// The records of an ephemeral index opened for a staged build, while
+    /// they are held outside its b-tree; see [`StagedIndexBuild`].
+    staged_build: Option<Box<StagedIndexBuild>>,
     /// Last rowid known to have been inserted on the right edge via this cursor.
     ///
     /// This is intentionally stricter than "last inserted rowid". We only keep
@@ -9358,6 +9405,63 @@ impl VdbeEngine {
         Ok(())
     }
 
+    /// Build an index opened with [`OPFLAG_STAGED_BUILD`] from the records it
+    /// staged, and end staging for the cursor. The records are sorted with
+    /// the index's own comparator; when each sorts strictly after the one
+    /// before it (a join's `(key, rowid)` entries always do, their rowids
+    /// differing) and the index is still one empty leaf, the pages are laid
+    /// out in one pass. Otherwise they are inserted one at a time in sorted
+    /// order. Either way the index holds exactly the staged records, as if
+    /// each had been inserted when it arrived.
+    async fn build_staged_index(&mut self, cursor_id: i32) -> Result<()> {
+        let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let Some(sc) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(());
+        };
+        let Some(staged) = sc.staged_build.take() else {
+            return Ok(());
+        };
+        if staged.ends.is_empty() {
+            return Ok(());
+        }
+        let mut order: Vec<usize> = (0..staged.ends.len()).collect();
+        order.sort_unstable_by(|&lhs, &rhs| {
+            sc.cursor
+                .compare_index_records(staged.record(lhs), staged.record(rhs))
+        });
+        let ascends = order.windows(2).all(|pair| {
+            sc.cursor
+                .compare_index_records(staged.record(pair[0]), staged.record(pair[1]))
+                == Ordering::Less
+        });
+        if ascends && sc.cursor.index_root_is_empty_leaf(&sc.cx).await? {
+            let stored = sc
+                .cursor
+                .index_bulk_load_sorted_keys(&sc.cx, order.iter().map(|&i| staged.record(i)))
+                .await?;
+            if usize::try_from(stored).ok() != Some(order.len()) {
+                return Err(FrankenError::internal(
+                    "staged index build stored a different number of records than it staged",
+                ));
+            }
+        } else {
+            for &i in &order {
+                lean_future(|| sc.cursor.index_insert(&sc.cx, staged.record(i))).await?;
+            }
+        }
+        sc.last_rightmost_unique_index_prefix = None;
+        sc.last_rightmost_unique_index_position = None;
+        invalidate_storage_cursor_row_cache_with_reason(
+            sc,
+            collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::WriteMutation,
+        );
+        if self.storage_cursor_memdb_count_shortcuts_safe {
+            self.mark_storage_table_dirty(cursor_id);
+        }
+        Ok(())
+    }
+
     async fn storage_cursor_find_exact_index_key(
         &mut self,
         cursor_id: i32,
@@ -11677,6 +11781,9 @@ impl VdbeEngine {
                                 text_is_bytewise,
                             }))
                         };
+                        let staged_build = (membership_set.is_none()
+                            && (op.p5 & OPFLAG_STAGED_BUILD) != 0)
+                            .then(Box::<StagedIndexBuild>::default);
                         if !autoindex_collations.is_empty() {
                             cursor.set_index_collation_context(
                                 autoindex_collations,
@@ -11707,6 +11814,7 @@ impl VdbeEngine {
                                 last_position_stamp: None,
                                 membership_memo: None,
                                 membership_set,
+                                staged_build,
                                 last_successful_insert_rowid: None,
                                 last_rightmost_unique_index_prefix: None,
                                 last_rightmost_unique_index_position: None,
@@ -13477,6 +13585,31 @@ impl VdbeEngine {
                     } else {
                         record_blob_bytes(&key_val).to_vec()
                     };
+
+                    // bd-w4pr1.13.15: a staged build keeps a plain insert's
+                    // record until IdxBulkLoad builds the index from all of
+                    // them. An insert with index semantics a plain one lacks
+                    // builds the index first and takes the ordinary path.
+                    if let Some(staged) = self
+                        .storage_cursors
+                        .get_mut(&cursor_id)
+                        .and_then(|sc| sc.staged_build.as_deref_mut())
+                    {
+                        if op.p5 == 0 {
+                            staged.push(&key_blob);
+                            if sideband_active {
+                                self.make_record_lookaside.replace_cleared_buf(key_blob);
+                            }
+                            pc += 1;
+                            continue;
+                        }
+                        if let Err(error) = self.build_staged_index(cursor_id).await {
+                            if sideband_active {
+                                self.make_record_lookaside.replace_cleared_buf(key_blob);
+                            }
+                            return Err(error);
+                        }
+                    }
 
                     // bd-w4pr1.13.15: a membership set takes the key into
                     // its hash set and leaves its b-tree empty. A key with no
@@ -15354,6 +15487,14 @@ impl VdbeEngine {
                 // of sorter P3, or jump to P2 so the program inserts them one
                 // at a time. P5 = number of UNIQUE key columns, P4 = the
                 // label a UNIQUE violation names.
+                Opcode::IdxBulkLoad if op.p3 == op.p1 => {
+                    // P3 = P1: the index's own records, staged by an
+                    // ephemeral index opened with OPFLAG_STAGED_BUILD. The
+                    // build never declines, so it never jumps.
+                    self.build_staged_index(op.p1).await?;
+                    pc += 1;
+                }
+
                 Opcode::IdxBulkLoad => {
                     let unique_key_columns = usize::from(op.p5);
                     if unique_key_columns > 0 {
@@ -18506,6 +18647,7 @@ impl VdbeEngine {
                 last_position_stamp: None,
                 membership_memo: None,
                 membership_set: None,
+                staged_build: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 last_successful_insert_rowid: None,
@@ -20083,6 +20225,7 @@ impl VdbeEngine {
                             last_position_stamp: None,
                             membership_memo: None,
                             membership_set: None,
+                            staged_build: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
                             ipk_col_idx,
@@ -20251,6 +20394,7 @@ impl VdbeEngine {
                             last_position_stamp: None,
                             membership_memo: None,
                             membership_set: None,
+                            staged_build: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
                             ipk_col_idx,
@@ -20455,6 +20599,7 @@ impl VdbeEngine {
                 last_position_stamp: None,
                 membership_memo: None,
                 membership_set: None,
+                staged_build: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 ipk_col_idx,

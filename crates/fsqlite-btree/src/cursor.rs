@@ -5417,6 +5417,41 @@ impl<P: PageReader> BtCursor<P> {
         Some(lhs.len().cmp(&rhs.len()))
     }
 
+    /// Order two stored index keys as this index orders them: exactly the
+    /// order an insert of `lhs` finds against `rhs` already in the index, so
+    /// sorting keys with it and laying them out in that order builds the index
+    /// the inserts would have built.
+    ///
+    /// Two keys whose leading terms are different INTEGERs are ordered by
+    /// that term (reversed for a DESC first term) without decoding the rest,
+    /// on an index that compares stored bytes; everything else goes through
+    /// [`Self::compare_index_key_bytes_with_bias`] with `rhs` decoded.
+    #[must_use]
+    pub fn compare_index_records(&self, lhs: &[u8], rhs: &[u8]) -> std::cmp::Ordering {
+        if matches!(self.index_key_compare_encoding(), TextEncoding::Utf8)
+            && let (Some(left), Some(right)) =
+                (record_leading_integer(lhs), record_leading_integer(rhs))
+            && left != right
+        {
+            let ord = left.cmp(&right);
+            return if self.index_desc_flags.first().copied().unwrap_or(false) {
+                ord.reverse()
+            } else {
+                ord
+            };
+        }
+        let parsed_rhs = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            self.decode_index_key_for_compare(rhs)
+        };
+        self.compare_index_key_bytes_with_bias(
+            lhs,
+            rhs,
+            parsed_rhs.as_deref(),
+            IndexSeekBias::LowerBound,
+        )
+    }
+
     /// Order two decoded key terms. TEXT compares its exact bytes (never the
     /// lossy `&str` view, which made distinct non-UTF-8 keys — e.g. raw
     /// UTF-16 — compare equal and misplaced index entries): built-in BINARY
@@ -6103,6 +6138,52 @@ struct LeadingIntegerProbe {
     descending: bool,
 }
 
+/// The leading field of the index key `record` when it is an INTEGER (serial
+/// types 1-6, 8, 9) and the record is well formed. The whole header is
+/// checked, as [`BtCursor::compare_index_key_record_with_values`] checks it,
+/// so every record that comparison falls back on (to byte order) is `None`
+/// here and left to it.
+fn record_leading_integer(record: &[u8]) -> Option<i64> {
+    let (header_size, header_varint_len) = read_varint(record)?;
+    let header_size = usize::try_from(header_size).ok()?;
+    if header_size > record.len() || header_size < header_varint_len {
+        return None;
+    }
+    let mut offset = header_varint_len;
+    let mut body = header_size;
+    let mut leading = None;
+    while offset < header_size {
+        let (serial_type, consumed) = read_varint(&record[offset..header_size])?;
+        offset += consumed;
+        let len = usize::try_from(serial_type_len(serial_type)?).ok()?;
+        let start = body;
+        body = body.checked_add(len)?;
+        if body > record.len() {
+            return None;
+        }
+        leading.get_or_insert((serial_type, start, len));
+    }
+    if body != record.len() {
+        return None;
+    }
+    let (serial_type, start, len) = leading?;
+    if !matches!(
+        classify_serial_type(serial_type),
+        SerialTypeClass::Integer | SerialTypeClass::Zero | SerialTypeClass::One
+    ) {
+        return None;
+    }
+    match decode_value_with_encoding(
+        serial_type,
+        &record[start..start + len],
+        TextEncoding::Utf8,
+        false,
+    ) {
+        Some(SqliteValue::Integer(value)) => Some(value),
+        _ => None,
+    }
+}
+
 impl LeadingIntegerProbe {
     /// The order of the stored key `record` against the probe, when its
     /// leading term decides it: what
@@ -6112,45 +6193,7 @@ impl LeadingIntegerProbe {
     /// when the record is malformed; the full comparison decides those, with
     /// its byte-order fallback for a malformed record.
     fn order_record(self, record: &[u8]) -> Option<std::cmp::Ordering> {
-        let (header_size, header_varint_len) = read_varint(record)?;
-        let header_size = usize::try_from(header_size).ok()?;
-        if header_size > record.len() || header_size < header_varint_len {
-            return None;
-        }
-        // The whole header is checked, as the full comparison checks it, so
-        // that every record it falls back on is left to it.
-        let mut offset = header_varint_len;
-        let mut body = header_size;
-        let mut leading = None;
-        while offset < header_size {
-            let (serial_type, consumed) = read_varint(&record[offset..header_size])?;
-            offset += consumed;
-            let len = usize::try_from(serial_type_len(serial_type)?).ok()?;
-            let start = body;
-            body = body.checked_add(len)?;
-            if body > record.len() {
-                return None;
-            }
-            leading.get_or_insert((serial_type, start, len));
-        }
-        if body != record.len() {
-            return None;
-        }
-        let (serial_type, start, len) = leading?;
-        if !matches!(
-            classify_serial_type(serial_type),
-            SerialTypeClass::Integer | SerialTypeClass::Zero | SerialTypeClass::One
-        ) {
-            return None;
-        }
-        let Some(SqliteValue::Integer(stored)) = decode_value_with_encoding(
-            serial_type,
-            &record[start..start + len],
-            TextEncoding::Utf8,
-            false,
-        ) else {
-            return None;
-        };
+        let stored = record_leading_integer(record)?;
         match stored.cmp(&self.value) {
             std::cmp::Ordering::Equal => None,
             ord if self.descending => Some(ord.reverse()),
@@ -17050,6 +17093,80 @@ mod tests {
                                 "{probe:?}, desc {desc}, {bias:?}"
                             );
                         }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_compare_index_records_sorts_keys_into_the_order_inserts_build() {
+        // Keys mixing every storage class (integers sharing a value, reals,
+        // text differing only in case, NULL, blobs), sorted with
+        // `compare_index_records`, come out in the order a scan of the index
+        // built by inserting them returns, in both directions and under BINARY
+        // and NOCASE; and the comparator is antisymmetric on every pair.
+        run_async(async {
+            let cx = Cx::new();
+            for (desc, collation) in [
+                (false, None),
+                (true, None),
+                (false, Some("NOCASE")),
+                (true, Some("NOCASE")),
+            ] {
+                let mut store = MemPageStore::new(USABLE);
+                store.pages.insert(2, build_leaf_index(&[]));
+                let mut cursor =
+                    BtCursor::new_with_index_desc(store, pn(2), USABLE, false, vec![desc, false]);
+                if let Some(name) = collation {
+                    cursor.set_index_collation_context(
+                        vec![Some(name.to_owned()), None],
+                        Arc::new(Mutex::new(CollationRegistry::new())),
+                        fsqlite_types::TextEncoding::Utf8,
+                    );
+                }
+                let keys: Vec<Vec<u8>> = (0..600_i32)
+                    .map(|i| {
+                        let leading = match i % 8 {
+                            0 => SqliteValue::Float(f64::from(i) / 4.0 - 70.5),
+                            1 => {
+                                let head = if i % 16 == 1 { "K" } else { "k" };
+                                SqliteValue::Text(format!("{head}{}", i % 37).as_str().into())
+                            }
+                            2 => SqliteValue::Null,
+                            3 => {
+                                SqliteValue::Blob(Arc::from(&[u8::try_from(i % 251).unwrap()][..]))
+                            }
+                            _ => SqliteValue::Integer(i64::from(i / 5 - 60)),
+                        };
+                        serialize_record(&[leading, SqliteValue::Integer(i64::from(i))])
+                    })
+                    .collect();
+                let mut sorted = keys.clone();
+                sorted.sort_by(|a, b| cursor.compare_index_records(a, b));
+                for step in 0..keys.len() {
+                    cursor
+                        .index_insert(&cx, &keys[(step * 7 + 3) % keys.len()])
+                        .await
+                        .unwrap();
+                }
+                let mut scanned = Vec::new();
+                if cursor.first(&cx).await.unwrap() {
+                    loop {
+                        scanned.push(cursor.payload(&cx).await.unwrap());
+                        if !cursor.next(&cx).await.unwrap() {
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(scanned, sorted, "desc {desc}, {collation:?}");
+                for a in keys.iter().step_by(7) {
+                    for b in keys.iter().step_by(11) {
+                        assert_eq!(
+                            cursor.compare_index_records(a, b),
+                            cursor.compare_index_records(b, a).reverse(),
+                            "desc {desc}, {collation:?}"
+                        );
                     }
                 }
             }

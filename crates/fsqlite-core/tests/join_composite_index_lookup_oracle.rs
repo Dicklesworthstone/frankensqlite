@@ -278,6 +278,105 @@ fn unindexed_equi_join_builds_an_automatic_index_like_sqlite() {
     }
 }
 
+/// bd-w4pr1.13.15: the automatic index of an unindexed equi-join stages its
+/// `(key, rowid)` entries and is built from them in one pass, sorted with the
+/// index's own comparator. The probes must find exactly stock's matches:
+/// hundreds of rows whose keys mix integers, equal reals, text that differs
+/// only in case (one run per NOCASE key), NULL and long runs of duplicates; an
+/// empty and a one-row right table; and an INSERT ... SELECT over the join
+/// whose UNIQUE conflicts are ignored while the index exists. On UTF-8 and
+/// UTF-16le databases, in memory and on a file.
+#[test]
+fn unindexed_equi_join_index_built_in_one_pass_matches_sqlite() {
+    const QUERIES: &[&str] = &[
+        "SELECT count(*), sum(l.id), sum(r.id) FROM l JOIN r ON r.k = l.k",
+        "SELECT count(*), sum(l.id * r.id) FROM l JOIN r ON r.k = l.k COLLATE NOCASE",
+        "SELECT count(*), count(r.id) FROM l LEFT JOIN r ON r.k = l.k",
+        "SELECT l.id, r.id FROM l JOIN r ON r.k = l.k WHERE l.id % 41 = 0 ORDER BY l.id, r.id",
+        "SELECT l.id, r.id FROM l JOIN r ON r.k = l.k COLLATE NOCASE \
+         WHERE l.id % 37 = 0 ORDER BY l.id, r.id",
+        "SELECT l.k, count(r.id) FROM l LEFT JOIN r ON r.k = l.k GROUP BY l.k ORDER BY 1",
+        "SELECT count(*), count(e.id) FROM l LEFT JOIN e ON e.k = l.k",
+        "SELECT count(*), sum(o.id) FROM l JOIN o ON o.k = l.k",
+        "SELECT count(*), sum(l.id) FROM o JOIN l ON l.k = o.k",
+    ];
+    // Key of row i: an integer, the same value as a REAL, two case variants of
+    // one text key, or NULL.
+    let key = |i: i64| match i % 6 {
+        0 => format!("{}", i % 23),
+        1 => format!("{}.0", i % 23),
+        2 => format!("'Key{}'", i % 17),
+        3 => format!("'kEY{}'", i % 17),
+        4 if i % 4 == 0 => "NULL".to_owned(),
+        _ => format!("{}", i % 29),
+    };
+    let rows = |table: &str, n: i64, step: i64| {
+        let values: Vec<String> = (1..=n)
+            .map(|i| format!("({i}, {})", key(i * step)))
+            .collect();
+        format!("INSERT INTO {table} VALUES {}", values.join(", "))
+    };
+    let setup = [
+        "CREATE TABLE l(id INTEGER PRIMARY KEY, k)".to_owned(),
+        "CREATE TABLE r(id INTEGER PRIMARY KEY, k)".to_owned(),
+        "CREATE TABLE e(id INTEGER PRIMARY KEY, k)".to_owned(),
+        "CREATE TABLE o(id INTEGER PRIMARY KEY, k)".to_owned(),
+        "CREATE TABLE sink(l_id INTEGER UNIQUE, r_id INTEGER)".to_owned(),
+        rows("l", 400, 7),
+        rows("r", 900, 5),
+        "INSERT INTO o VALUES (5, 4)".to_owned(),
+    ];
+    for encoding in ["UTF-8", "UTF-16le"] {
+        for file_backed in [false, true] {
+            let setup = setup.clone();
+            asupersync::test_utils::run_test(|| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let target = if file_backed {
+                    dir.path()
+                        .join("join_autoindex_staged.db")
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let f = Connection::open(&target).await.unwrap();
+                let r = rusqlite::Connection::open_in_memory().unwrap();
+                let pragma = format!("PRAGMA encoding = '{encoding}'");
+                f.execute(&pragma).await.unwrap();
+                r.execute_batch(&pragma).unwrap();
+                for sql in &setup {
+                    f.execute(sql).await.unwrap();
+                    r.execute(sql, []).unwrap();
+                }
+                for sql in QUERIES {
+                    let stock = rows_r(&r, sql);
+                    assert!(!stock.is_empty(), "fixture must give `{sql}` rows");
+                    assert_eq!(rows_f(&f, sql).await, stock, "{encoding} query `{sql}`");
+                    assert_eq!(
+                        rows_prepared(&f, sql).await,
+                        stock,
+                        "{encoding} prepared `{sql}`"
+                    );
+                }
+                // Many joined rows share an l.id; all but the first of each
+                // conflict on UNIQUE(l_id) and are ignored.
+                let insert = "INSERT OR IGNORE INTO sink SELECT l.id, r.id FROM l JOIN r ON r.k = l.k";
+                f.execute(insert).await.unwrap();
+                r.execute(insert, []).unwrap();
+                let sink = "SELECT count(*), sum(l_id), count(DISTINCT r_id) FROM sink";
+                assert_eq!(rows_f(&f, sink).await, rows_r(&r, sink), "{encoding} `{insert}`");
+                let ops = opcodes(&f, QUERIES[0]).await;
+                assert!(
+                    ops.iter().any(|op| op == "OpenAutoindex")
+                        && ops.iter().any(|op| op == "IdxBulkLoad"),
+                    "`{}` must build its automatic index in one pass: {ops:?}",
+                    QUERIES[0]
+                );
+            });
+        }
+    }
+}
+
 /// GH#502: v0.4.10 returned no rows for a join whose OUTER table is filtered
 /// through an index with a DESC column (`c(a, s DESC)`) while the inner table
 /// is looked up through its own index. Inner and LEFT joins, with or without

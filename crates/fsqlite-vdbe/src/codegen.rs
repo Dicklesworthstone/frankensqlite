@@ -244,6 +244,11 @@ const OPFLAG_PROBE_MEMBERSHIP_ONLY: u16 = 0x01;
 /// cursor (and `Close`), so the engine may hold its keys in a hash set
 /// instead of a b-tree (bd-w4pr1.13.15).
 const OPFLAG_MEMBERSHIP_SET: u16 = 0x01;
+/// On `OpenAutoindex`: the site fills the ephemeral index with plain
+/// `IdxInsert`s and then emits `IdxBulkLoad` with P3 = P1 before anything
+/// reads the cursor, so the engine may stage the records and build the index
+/// from them in one pass (bd-w4pr1.13.15).
+const OPFLAG_STAGED_BUILD: u16 = 0x02;
 /// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change; the
 /// engine then rewrites the row in place instead of deleting and re-inserting.
 const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
@@ -13708,6 +13713,11 @@ fn lookup_term_comparison_p4(target: &SingleJoinLookupTarget<'_>, term: usize) -
 /// `(key, rowid)` entry per right row whose join column is not NULL (a NULL
 /// key never equals a probe). It runs once, before the outer loop; the probe
 /// loop then reads it exactly like a one-column index (bd-w4pr1.10).
+///
+/// The index is opened for a staged build ([`OPFLAG_STAGED_BUILD`]): the
+/// engine keeps the inserted entries and `IdxBulkLoad` with P3 = P1 sorts
+/// them and lays the pages out in one pass, instead of each insert seeking
+/// its place from the root and splitting leaves (bd-w4pr1.13.15).
 fn emit_join_autoindex(
     b: &mut ProgramBuilder,
     right_cursor: i32,
@@ -13720,7 +13730,14 @@ fn emit_join_autoindex(
     let collation_p4 = collation
         .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
         .map_or(P4::None, |name| P4::Collation(name.to_owned()));
-    b.emit_op(Opcode::OpenAutoindex, cursor, 2, 0, collation_p4, 0);
+    b.emit_op(
+        Opcode::OpenAutoindex,
+        cursor,
+        2,
+        0,
+        collation_p4,
+        OPFLAG_STAGED_BUILD,
+    );
     let entry = b.alloc_regs(2);
     let record = b.alloc_reg();
     let built = b.emit_label();
@@ -13743,6 +13760,11 @@ fn emit_join_autoindex(
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     b.emit_op(Opcode::Next, right_cursor, loop_top as i32, 0, P4::None, 0);
     b.resolve_label(built);
+    // Build from the staged entries (none when the table is empty). A staged
+    // build never declines; P2 is the next instruction either way.
+    let after_build = b.emit_label();
+    b.emit_jump_to_label(Opcode::IdxBulkLoad, cursor, cursor, after_build, P4::None, 0);
+    b.resolve_label(after_build);
     cursor
 }
 
@@ -61759,6 +61781,86 @@ mod tests {
                 .any(|op| op.opcode == Opcode::Ne && op.p4 == nocase),
             "the probe's key comparison should use NOCASE"
         );
+    }
+
+    #[test]
+    fn test_codegen_join_autoindex_is_staged_and_built_in_one_pass() {
+        // bd-w4pr1.13.15: an unindexed equi-join opens its automatic index for
+        // a staged build, inserts every entry with a plain IdxInsert, and runs
+        // IdxBulkLoad on the index itself (P3 = P1) once the right table is
+        // read, before the outer loop starts. Nothing else touches the index
+        // in between. A join on an indexed column builds no automatic index.
+        let schema = test_schema_with_join_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let stmt =
+            select_sql("SELECT count(*) FROM customers c JOIN orders o ON o.status = c.region");
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+        let open = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::OpenAutoindex)
+            .expect("an automatic index");
+        assert_eq!(ops[open].p5, OPFLAG_STAGED_BUILD);
+        let cursor = ops[open].p1;
+        let build = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::IdxBulkLoad)
+            .expect("a build of the staged entries");
+        assert_eq!((ops[build].p1, ops[build].p3), (cursor, cursor));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let next = (build + 1) as i32;
+        assert_eq!(ops[build].p2, next, "the staged build never jumps elsewhere");
+        let inserts: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == Opcode::IdxInsert && op.p1 == cursor)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(inserts.len(), 1);
+        assert!(open < inserts[0] && inserts[0] < build);
+        assert_eq!(ops[inserts[0]].p5, 0, "staged entries are plain inserts");
+        assert!(
+            !ops[open + 1..build].iter().any(|op| op.p1 == cursor
+                && matches!(
+                    op.opcode,
+                    Opcode::SeekGE
+                        | Opcode::SeekGT
+                        | Opcode::SeekLE
+                        | Opcode::SeekLT
+                        | Opcode::IdxGE
+                        | Opcode::IdxGT
+                        | Opcode::IdxLE
+                        | Opcode::IdxLT
+                        | Opcode::Rewind
+                        | Opcode::Last
+                        | Opcode::Next
+                        | Opcode::Prev
+                        | Opcode::Column
+                        | Opcode::IdxRowid
+                        | Opcode::Found
+                        | Opcode::NotFound
+                        | Opcode::IdxDelete
+                )),
+            "nothing reads or positions the index before it is built: {ops:#?}"
+        );
+        let outer_rewind = ops
+            .iter()
+            .rposition(|op| op.opcode == Opcode::Rewind)
+            .expect("the outer loop");
+        assert!(build < outer_rewind, "{ops:#?}");
+        assert!(!ops.iter().any(|op| op.opcode == Opcode::SorterOpen));
+
+        let mut b = ProgramBuilder::new();
+        let stmt =
+            select_sql("SELECT count(*) FROM customers c JOIN orders o ON o.customer_id = c.id");
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        assert!(!prog.ops().iter().any(|op| matches!(
+            op.opcode,
+            Opcode::OpenAutoindex | Opcode::IdxBulkLoad
+        )));
     }
 
     #[test]
