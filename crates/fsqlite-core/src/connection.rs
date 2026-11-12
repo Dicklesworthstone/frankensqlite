@@ -25470,10 +25470,66 @@ impl Connection {
         self.pager.is_file_backed() && !self.time_travel_active.get()
     }
 
+    /// Whether the GROUP BY storage substrate may run `select`, decided before a
+    /// statement executes (prepare time): file-backed connections only.
     #[must_use]
     fn select_group_by_storage_substrate_is_vdbe_eligible(&self, select: &SelectStatement) -> bool {
-        if !self.can_execute_aggregate_window_storage_substrate()
-            || select.with.is_some()
+        self.can_execute_aggregate_window_storage_substrate()
+            && self.select_group_by_storage_substrate_shape_fits(select)
+    }
+
+    /// bd-w4pr1.13.23: on a private `:memory:` connection whose mirror rows are
+    /// not loaded, a single-table GROUP BY over a main-database table runs the
+    /// storage substrate (a VDBE program over the pager, as on a file) instead
+    /// of rebuilding the mirror or reading the pager into rows for the
+    /// in-memory path (20k rows: 69M against 91M and 82.5M). With the rows
+    /// loaded the mirror scan stays, as it is cheaper still (37.9M). TEMP and
+    /// materialized tables live only in the mirror and keep their path.
+    ///
+    /// A HAVING keeps the in-memory path: the substrate drops or keeps the
+    /// wrong groups when the HAVING's aggregate sits inside an expression
+    /// (`HAVING count(*) * 2 > 3` returns no rows) or is not a result column
+    /// (`SELECT max(id) ... HAVING count(*) > 1` keeps every group). File
+    /// connections give those wrong answers today (found here, reported on
+    /// bd-w4pr1.13.23); `:memory:` does not take them on.
+    fn group_by_substrate_replaces_unloaded_memory_mirror(&self, select: &SelectStatement) -> bool {
+        if self.path != ":memory:"
+            || self.memdb_rows_loaded.get()
+            || self.time_travel_active.get()
+        {
+            return false;
+        }
+        let SelectCore::Select {
+            from: Some(from),
+            having: None,
+            ..
+        } = &select.body.select
+        else {
+            return false;
+        };
+        let TableOrSubquery::Table { name, .. } = &from.source else {
+            return false;
+        };
+        if name.schema.is_some()
+            || self
+                .temp_table_names
+                .borrow()
+                .contains(&name.name.to_ascii_lowercase())
+        {
+            return false;
+        }
+        self.schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+            .is_some_and(|table| table.root_page > 0 && !self.is_memdb_only_root_page(table.root_page))
+    }
+
+    /// The statement shapes the GROUP BY storage substrate compiles, whatever
+    /// the storage.
+    #[must_use]
+    fn select_group_by_storage_substrate_shape_fits(&self, select: &SelectStatement) -> bool {
+        if select.with.is_some()
             || !select.body.compounds.is_empty()
             || has_ordered_aggregate(select)
             || has_window_functions(select)
@@ -25590,7 +25646,10 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         decision_reason: &'static str,
     ) -> Result<Option<Vec<Row>>> {
-        if !self.select_group_by_storage_substrate_is_vdbe_eligible(select) {
+        if !(self.can_execute_aggregate_window_storage_substrate()
+            || self.group_by_substrate_replaces_unloaded_memory_mirror(select))
+            || !self.select_group_by_storage_substrate_shape_fits(select)
+        {
             return Ok(None);
         }
 
@@ -42012,8 +42071,17 @@ impl Connection {
                 {
                     // GROUP BY (or implicit aggregation) + JOIN/non-table source/live vtab:
                     // materialize the join as a temp table, then GROUP BY on that.
-                    self.admit_select_mem_fallback(cx, "group_by_join_fallback")
-                        .await?;
+                    if select_reads_one_single_table_derived_source(select) {
+                        // Its one source runs as a nested statement that takes
+                        // its own route (a VDBE program or the GROUP BY storage
+                        // substrate); this fallback reads only the rows that
+                        // statement returns, so it does not rebuild the mirror
+                        // for it (bd-w4pr1.13.23).
+                        self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
+                    } else {
+                        self.admit_select_mem_fallback(cx, "group_by_join_fallback")
+                            .await?;
+                    }
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -114163,6 +114231,56 @@ fn join_expr_is_vdbe_eligible(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// bd-w4pr1.13.23: whether `select` reads tables only through one derived
+/// table whose body reads one base table directly, with no join, compound,
+/// WITH, window, table function or subquery in either. The body runs as a
+/// nested statement whose route is a VDBE program or the GROUP BY storage
+/// substrate, and the outer reads only the rows the body returns, so neither
+/// needs the `:memory:` row mirror.
+fn select_reads_one_single_table_derived_source(select: &SelectStatement) -> bool {
+    let SelectCore::Select {
+        from: Some(from),
+        windows,
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    let TableOrSubquery::Subquery { query, .. } = &from.source else {
+        return false;
+    };
+    if select.with.is_some()
+        || !select.body.compounds.is_empty()
+        || !from.joins.is_empty()
+        || !windows.is_empty()
+        || has_window_functions(select)
+        // Also covers subqueries inside the derived table's body.
+        || select_contains_rewritable_subquery(select)
+    {
+        return false;
+    }
+    let SelectCore::Select {
+        from: Some(body_from),
+        windows: body_windows,
+        ..
+    } = &query.body.select
+    else {
+        return false;
+    };
+    query.with.is_none()
+        && query.body.compounds.is_empty()
+        && body_from.joins.is_empty()
+        && body_windows.is_empty()
+        && !has_window_functions(query)
+        && matches!(
+            body_from.source,
+            TableOrSubquery::Table {
+                time_travel: None,
+                ..
+            }
+        )
 }
 
 /// Check if the FROM source contains a subquery (derived table) that
@@ -199159,6 +199277,16 @@ mod tests {
             conn.execute("INSERT INTO scores VALUES ('b', NULL);")
                 .await
                 .unwrap();
+            // The streaming path reads the row mirror; with its rows not
+            // loaded after the writes, the GROUP BY would run the storage
+            // substrate instead (bd-w4pr1.13.23). This test is about the
+            // streaming path, so load the mirror, after a read has flushed
+            // the parked autocommit batch (a reload does not load rows while
+            // one is parked).
+            conn.query("SELECT count(*) FROM scores;").await.unwrap();
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert!(conn.memdb_rows_loaded.get());
 
             let rows = conn
                 .query(
@@ -228392,21 +228520,12 @@ mod autocommit_txn_tests {
         });
     }
 
-    /// bd-w4pr1.13.23: on `:memory:` a read after a write leaves the row
-    /// mirror's rebuild owed. A VDBE read never pays it; the first in-memory
-    /// fallback does, and it must read every write since the mirror was last
-    /// loaded (a mirror marked current without the rebuild returns the old
-    /// sums). Every read matches stock across UPDATE, DELETE, INSERT, ROLLBACK,
-    /// ROLLBACK TO and a prepared re-run; turning parity cert off (PRAGMA or
-    /// setter) makes the mirror the row source of record again and pays.
-    #[test]
-    fn test_memory_mirror_rows_owed_until_a_fallback_reads_them_match_rusqlite() {
-        const VDBE_READ: &str = "SELECT count(*), sum(a), sum(c) FROM t WHERE a > 1";
-        const VDBE_READ_U: &str = "SELECT count(*), sum(length(name)) FROM u";
-        const JOIN_GROUP: &str = "SELECT u.name, count(*), sum(t.c), max(t.id) FROM t \
-                                  JOIN u ON u.a = t.a GROUP BY u.name ORDER BY u.name";
+    /// Statement-by-statement comparison with rusqlite for the `:memory:`
+    /// row-mirror tests (bd-w4pr1.13.23).
+    mod mirror_oracle {
+        use super::{Connection, SqliteValue};
 
-        fn render(values: &[SqliteValue]) -> String {
+        pub(super) fn render(values: &[SqliteValue]) -> String {
             values
                 .iter()
                 .map(|value| match value {
@@ -228420,7 +228539,7 @@ mod autocommit_txn_tests {
                 .join("|")
         }
 
-        fn oracle_rows(oracle: &rusqlite::Connection, sql: &str) -> Vec<String> {
+        pub(super) fn oracle_rows(oracle: &rusqlite::Connection, sql: &str) -> Vec<String> {
             let mut stmt = oracle.prepare(sql).unwrap();
             let width = stmt.column_count();
             stmt.query_map([], |row| {
@@ -228440,7 +228559,7 @@ mod autocommit_txn_tests {
             .collect()
         }
 
-        async fn check(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
+        pub(super) async fn check(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
             let rows: Vec<String> = conn
                 .query(sql)
                 .await
@@ -228451,14 +228570,15 @@ mod autocommit_txn_tests {
             assert_eq!(rows, oracle_rows(oracle, sql), "`{sql}`");
         }
 
-        async fn both(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
+        pub(super) async fn both(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
             conn.execute(sql)
                 .await
                 .unwrap_or_else(|error| panic!("`{sql}`: {error}"));
             oracle.execute_batch(sql).unwrap();
         }
 
-        async fn setup(conn: &Connection, oracle: &rusqlite::Connection) {
+        /// t (300 rows, a = id % 7, c = id * 1.5) and u (a 0..6, name 'n' || a).
+        pub(super) async fn setup(conn: &Connection, oracle: &rusqlite::Connection) {
             for sql in [
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, c REAL)",
                 "CREATE TABLE u(a INTEGER PRIMARY KEY, name TEXT)",
@@ -228485,6 +228605,127 @@ mod autocommit_txn_tests {
                 )
                 .unwrap();
         }
+    }
+
+    /// bd-w4pr1.13.23: on `:memory:`, a single-table GROUP BY whose mirror rows
+    /// are not loaded runs the storage substrate (no `group_by_fallback`
+    /// decision) and rebuilds nothing; so does an aggregate over such a GROUP
+    /// BY in a derived table (only the outer `group_by_join_fallback` is
+    /// recorded). With the mirror loaded the in-memory path runs; a NOCASE key
+    /// keeps the collation-aware path; a HAVING keeps the in-memory path (the
+    /// substrate's HAVING answers are wrong for an aggregate inside an
+    /// expression or outside the result columns); inside BEGIN the substrate
+    /// reads the transaction's writes. Every result matches rusqlite.
+    #[test]
+    fn test_memory_group_by_without_loaded_mirror_runs_substrate_match_rusqlite() {
+        const GROUP: &str = "SELECT a, count(*), sum(c), sum(id) FROM t GROUP BY a ORDER BY a";
+        const DERIVED: &str =
+            "SELECT count(*), sum(n), max(n), min(s) FROM (SELECT a, count(*) n, sum(c) s \
+             FROM t GROUP BY a)";
+        const HAVING_EXPR: &str =
+            "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) * 2 > 80 ORDER BY a";
+        const HAVING_HIDDEN: &str =
+            "SELECT max(id) FROM t GROUP BY a HAVING count(*) > 42 ORDER BY 1";
+        // lower(k): which spelling represents a NOCASE group is not specified.
+        const NOCASE: &str = "SELECT lower(k), count(*), sum(v) FROM tn GROUP BY k ORDER BY 1";
+        use mirror_oracle::{both, check, setup};
+
+        fn decisions(conn: &Connection) -> Vec<String> {
+            conn.fallback_decision_snapshot()
+                .decisions
+                .iter()
+                .map(|decision| decision.decision_reason.clone())
+                .collect()
+        }
+
+        async fn check_route(
+            conn: &Connection,
+            oracle: &rusqlite::Connection,
+            sql: &str,
+            expected: &[&str],
+        ) {
+            conn.reset_fallback_decision_evidence();
+            check(conn, oracle, sql).await;
+            let mut seen = decisions(conn);
+            seen.sort();
+            assert_eq!(seen, expected, "fallback decisions of `{sql}`");
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            setup(&conn, &oracle).await;
+            both(&conn, &oracle, "CREATE TABLE tn(k TEXT COLLATE NOCASE, v INTEGER)").await;
+            both(
+                &conn,
+                &oracle,
+                "INSERT INTO tn VALUES ('Apple', 1), ('apple', 2), ('APPLE', 3), ('pear', 4)",
+            )
+            .await;
+            conn.set_fallback_capture_enabled(true);
+
+            for write in [
+                "UPDATE t SET c = c + 100 WHERE a = 3",
+                "DELETE FROM t WHERE id % 11 = 0",
+                "INSERT INTO t VALUES (1001, 3, 0.25), (1002, 9, 2.5)",
+            ] {
+                both(&conn, &oracle, write).await;
+                // Unloaded mirror: the substrate, nothing rebuilt.
+                check_route(&conn, &oracle, GROUP, &[]).await;
+                check_route(&conn, &oracle, DERIVED, &["group_by_join_fallback"]).await;
+                assert!(
+                    !conn.memdb_rows_loaded.get(),
+                    "a GROUP BY after `{write}` must not rebuild the mirror"
+                );
+                // A HAVING keeps the in-memory path (the substrate drops or
+                // keeps the wrong groups for these on file connections), and
+                // so pays the rebuild.
+                check_route(&conn, &oracle, HAVING_EXPR, &["group_by_fallback"]).await;
+                check(&conn, &oracle, HAVING_HIDDEN).await;
+            }
+
+            // A NOCASE key stays on the collation-aware in-memory path.
+            check_route(&conn, &oracle, NOCASE, &["group_by_fallback"]).await;
+
+            // Loaded mirror: the in-memory path, and it still reads every write.
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            assert!(conn.memdb_rows_loaded.get());
+            check_route(&conn, &oracle, GROUP, &["group_by_fallback"]).await;
+            check_route(
+                &conn,
+                &oracle,
+                DERIVED,
+                &["group_by_fallback", "group_by_join_fallback"],
+            )
+            .await;
+
+            // Inside a transaction the substrate reads its uncommitted writes.
+            both(&conn, &oracle, "BEGIN").await;
+            both(&conn, &oracle, "UPDATE t SET a = (a + 2) % 9 WHERE id <= 40").await;
+            check(&conn, &oracle, GROUP).await;
+            check(&conn, &oracle, DERIVED).await;
+            both(&conn, &oracle, "ROLLBACK").await;
+            check(&conn, &oracle, GROUP).await;
+            check(&conn, &oracle, DERIVED).await;
+            conn.set_fallback_capture_enabled(false);
+        });
+    }
+
+    /// bd-w4pr1.13.23: on `:memory:` a read after a write leaves the row
+    /// mirror's rebuild owed. A VDBE read never pays it; the first in-memory
+    /// fallback does, and it must read every write since the mirror was last
+    /// loaded (a mirror marked current without the rebuild returns the old
+    /// sums). Every read matches stock across UPDATE, DELETE, INSERT, ROLLBACK,
+    /// ROLLBACK TO and a prepared re-run; turning parity cert off (PRAGMA or
+    /// setter) makes the mirror the row source of record again and pays.
+    #[test]
+    fn test_memory_mirror_rows_owed_until_a_fallback_reads_them_match_rusqlite() {
+        const VDBE_READ: &str = "SELECT count(*), sum(a), sum(c) FROM t WHERE a > 1";
+        const VDBE_READ_U: &str = "SELECT count(*), sum(length(name)) FROM u";
+        const JOIN_GROUP: &str = "SELECT u.name, count(*), sum(t.c), max(t.id) FROM t \
+                                  JOIN u ON u.a = t.a GROUP BY u.name ORDER BY u.name";
+        use mirror_oracle::{both, check, oracle_rows, render, setup};
 
         fn assert_owed(conn: &Connection, after: &str) {
             assert!(
