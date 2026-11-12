@@ -87,6 +87,115 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a page miss asks the transaction's pinned WAL snapshot once, not twice (bd-w4pr1.13.18)
+
+- Target: every page read that misses the caches in WAL mode. Touched:
+  `crates/fsqlite-pager/src/pager.rs` (`lookup_page_in_wal_backend`,
+  `PagerInner::read_page_copy_outside_wal`, `SimpleTransaction::get_page`).
+- Evidence before (callgrind, `SELECT count(*) FROM t` over the 1M-row table, 7.6k page
+  misses): `read_page_from_wal_backend` ran twice per miss, from `get_page`'s WAL fast path and
+  again inside `PagerInner::read_page_copy`, 620 instructions each; both asked the
+  transaction's pinned read snapshot, which changes only at a transaction boundary.
+- Change: the lookup reports whether the pinned snapshot answered; after a pinned miss
+  `get_page` reads through `read_page_copy_outside_wal` (cache, then file). An unpinned lookup
+  (the write-lock fallback reads the latest state) is still repeated, and every other caller of
+  `read_page_copy` is unchanged.
+- Result, stock sqlite3 3.46.1 live, io_uring refused, three runs per arm, repeatable to the
+  instruction (binary 63cecece... against its base 229f72bed): `SELECT count(*) FROM t` 67.9M ->
+  63.4M (-590 per miss; prediction -550 to -650, kill under -400; 14.4x -> 13.5x stock),
+  CPU 30.1 -> 27.6 ms; rowid-lookup join 3,078.8M -> 2,977.7M (-3.3%, 5.55x -> 5.37x);
+  scan_filter_agg 1,403.4M -> 1,398.9M.
+- Test: `test_get_page_asks_the_pinned_wal_snapshot_once_per_miss` (a WAL backend whose pinned
+  snapshot holds one page: one lookup for a page it lacks, served from the file; one for the page
+  it holds, served from the WAL and not from the older file image). The commit reached main
+  (21c0eaab3) before its gate ended; its clippy form and its test setup (the reading pager must
+  not hold the pages in its published set) were fixed in 8d28f41cd. Gate: on main after the commit
+  reached it (aef7cbf30 with 8d28f41cd and a1cd7b309): clippy -D warnings with all targets on
+  fsqlite-pager, -btree, -vdbe, -core and fsqlite clean; fsqlite-pager lib 1,105 pass and 1 fail
+  (`bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`, red on main, bd-5lvnd), the new
+  test among the passes.
+- Still open on bd-w4pr1.13.18: a miss is about 8.3k against stock's ~600; the eviction trace's
+  `forget` scans the whole trace on every eviction (1.45k).
+- Retry condition: none.
+
+## 2026-11-12 - WIN: a table-leaf delete raises the pointers below the removed cell in one pass and parses the removed cell once (bd-w4pr1.13.20)
+
+- Target: every row a DELETE (or the delete half of a rowid-changing UPDATE) removes from a table
+  leaf; measured on the scorecard's `DELETE FROM m WHERE id % 7 = 0` (300k rows, 42,857
+  deleted). Touched: `crates/fsqlite-btree/src/cursor.rs` (`remove_table_cell_from_leaf_deferred`,
+  `BtreeCursorOps::delete`).
+- Evidence before (callgrind, 42,857 deletes on compact descending leaves of about 150 cells): the
+  delete is 8.9k instructions per row, 141.5M of it in its own body. The pointers after the
+  removed one were raised one at a time through `u16::try_from(..).map_err(..)` (about 2.3k per
+  row), the minimum pointer was found by a scan before the descending check that made it the
+  last one (about 500), the removed cell was parsed through the cell-slot cache to read its
+  overflow head (804), and `delete()` cloned the whole stack entry for three fields (255).
+- Change: the pointer shift is converted once (the pointers it raises stay below the removed
+  cell's upper bound, a pointer or the usable size, so none leaves u16); a leaf whose pointers
+  descend takes its lowest pointer from the end of the array; the removed cell is parsed without
+  the cache; `delete()` reads the three fields in place. The page a delete writes is byte for
+  byte the same.
+- Result, stock sqlite3 3.46.1 live (binaries 3b973ac6... base main fc0408327, 48fe24c1... lever C;
+  user instructions of the process, minimum of 5 runs, `scratchpad/dml_probe.py`):
+  `DELETE FROM m WHERE id % 7 = 0` (scorecard `delete_14pct_300k`): stock 120.7M, base 1,198.7M
+  (9.9x), lever C 1,065.6M (8.8x): -133M to -146M over two runs, 3.1k to 3.4k per deleted row
+  (prediction 140M to 160M; kill under 85M: not met). UPDATE row inside the spread. Answers equal
+  stock's and stock's `PRAGMA integrity_check` passes on every file written).
+- Not the ground of the 2026-05-06 "Single-freeblock compact table-leaf DELETE" (that wrote
+  freeblocks instead of compacting; this keeps the compacted page) or of the 2026-05-12
+  `as_bytes_mut` hoist and 2026-05-17 micro-patch entries (the prepared direct-delete lane's
+  `TableLeafDeleteRun`, a different function).
+- Test: `test_table_delete_moves_exactly_the_cells_below_the_removed_one` deletes each row of a
+  9-cell leaf with payloads of distinct lengths, on a leaf whose pointers descend and on one whose
+  lowest cell sits mid-array, and checks every pointer, the content offset and every remaining
+  payload. Gate: on 804248ed0 (main fc0408327 with this commit and the one-pass DELETE):
+  fsqlite-btree lib 547 pass; clippy -D warnings on fsqlite-btree and -vdbe clean. Both commits
+  reached main (221ad0ef2, 45438b3db) before the rest of their gate ran; on main with the
+  fix-forward commits clippy -D warnings with all targets on fsqlite-pager, -btree, -vdbe, -core and
+  fsqlite is clean.
+- Retry condition: none. Still open on this bead: the delete is still about 5.5k per row
+  against stock's dropCell at about 1k (write_page_data 1.5k, the copy-on-write of the page, the
+  descending check over the whole pointer array).
+
+## 2026-11-12 - WIN: a DELETE that scans its table deletes each matching row in the scan (one pass) when nothing can observe it (bd-w4pr1.13.20)
+
+- Target: `DELETE ... WHERE <predicate>` that full-scans its table. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`codegen_delete`, new `emit_delete_collected_rowids`).
+- Evidence before (callgrind, same statement): pass 2 re-found every row the scan had stood on:
+  `table_advance_to` 163.3M (3.8k per deleted row), `RowSet::add` 7.3M, plus the Rowid /
+  RowSetAdd / RowSetRead / SeekRowid / Goto dispatch. Stock runs this shape in one pass
+  (`Rewind, Rowid, Remainder, Ne, Rowid, Delete, Next`).
+- Change: the full-scan branch emits the index deletes and the Delete where the scan stands when
+  the statement has no RETURNING and its WHERE holds no subquery, EXISTS, IN (SELECT) / IN table
+  or window function. Every seek shape (rowid =, IN, range, = with residual, indexed =) and every
+  other statement keeps the two passes; UPDATE is unchanged. Why nothing can observe the
+  difference in this engine: BEFORE triggers run before the program, FK checks / actions and AFTER
+  triggers after it, changes() and total_changes() move at statement end, and the engine's Delete
+  leaves the cursor on the next row (`pending_next_after_delete`) so the Next does not skip it.
+- Result, stock sqlite3 3.46.1 live (binary b449bcc4... on top of lever C, same run as above):
+  `DELETE FROM m WHERE id % 7 = 0`: lever C 1,065.6M (8.8x) -> 857.3M (7.1x), -208.3M
+  (prediction 170M to 185M; kill under 120M: not met). The two levers together: 1,198.7M -> 857.3M
+  (9.9x -> 7.1x, -28%); CPU median 225.8 -> 192.4 ms against stock's 36.0 (load about 15).
+  UPDATE unchanged (it keeps two passes). Answers equal stock's; stock's `PRAGMA integrity_check`
+  passes on every file written).
+- Tests: `one_pass_delete_oracle` (22 statements against rusqlite on `:memory:` and a file, direct
+  and prepared: consecutive matches, first / last / no row, leaf-emptying runs on 3,000 rows,
+  indexed tables, a WHERE reading the target through NOT EXISTS / a scalar count / IN (SELECT),
+  RETURNING, BEFORE + AFTER triggers, a trigger deleting the next row, FK cascade and SET NULL, a
+  self-referencing cascading FK, WITHOUT ROWID; plus the EXPLAIN shape);
+  `test_codegen_scan_delete_is_one_pass_only_when_nothing_observes_it`. Plan pins updated with the
+  shape: `test_codegen_delete_where_qualified_alias`,
+  `test_codegen_delete_where_shadowed_rowid_eq_uses_visible_column_filter`, the full-scan DELETE
+  controls of `dml_rowid_range_oracle`. Gate: on 804248ed0: fsqlite-vdbe lib 1,226 pass and 2 fail
+  (the two IN-list codegen tests red on main, bd-bhalc), bytecode goldens 8 pass; the fsqlite DELETE
+  tests (`delete_rowid_in_oracle`, `dml_rowid_range_oracle`, `update_rowid_in_oracle`) pass; the 22
+  fsqlite-core plan-pinning targets 117 pass and 1 fail (`bd_group_by_depth_oracle_probe`, red on
+  main, bd-gazf2). On main with a1cd7b309 (which stops comparing the one change count bd-n8g76 makes
+  differ, on the two-pass base as well): the 8 fsqlite-core DELETE oracle targets pass (22 tests),
+  and clippy -D warnings on the fsqlite-core tests is clean.
+- Retry condition: none for DELETE. UPDATE keeps two passes; stock runs it in one pass when no
+  trigger, FK, REPLACE, rowid change or subquery is involved, which is the next lever on this bead.
+
 ## 2026-11-12 - WIN: an insert proven rightmost raises the rowid floor without walking to the last row (bd-w4pr1.13.21)
 
 - Target: every INSERT through the concurrent rowid allocator (file-backed connections); the
