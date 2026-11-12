@@ -3045,6 +3045,167 @@ mod tests {
         }
     }
 
+    /// rusqlite code whose WHERE clauses carry terms that read no column,
+    /// compiled against module `$m`, on connection `$conn` (bd-w4pr1.13.22).
+    /// The engine tests such a term once before the scan instead of per row;
+    /// every statement must still answer, change rows and fail exactly as
+    /// stock does, including a term that raises (stock raises it even when the
+    /// table is empty), bound and named parameters, LEFT JOIN ON terms (not
+    /// WHERE terms), and `random()`, which must stay per row.
+    macro_rules! constant_where_scenario {
+        ($m:ident, $conn:expr) => {{
+            use $m::{named_params, params};
+            fn show<T: std::fmt::Debug>(result: $m::Result<T>) -> String {
+                match result {
+                    Ok(value) => format!("ok {value:?}"),
+                    Err($m::Error::SqliteFailure(error, message)) => {
+                        format!("err {:?} {} {message:?}", error.code, error.extended_code)
+                    }
+                    Err(other) => format!("err other {other}"),
+                }
+            }
+            let conn: $m::Connection = $conn;
+            let mut trace: Vec<String> = Vec::new();
+            let run = |sql: &str| show(conn.execute(sql, []));
+            let rows = |sql: &str| {
+                show(conn.prepare(sql).and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<$m::Result<Vec<_>>>()
+                }))
+            };
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+                 CREATE TABLE empty(x);
+                 CREATE TABLE u(id INTEGER PRIMARY KEY, t_id INTEGER);
+                 INSERT INTO u VALUES (1, 1), (2, 2), (3, 30);",
+            )
+            .unwrap();
+            {
+                let mut insert = conn.prepare("INSERT INTO t VALUES (?1, ?2, ?3)").unwrap();
+                for id in 1..=60_i64 {
+                    insert
+                        .execute(params![id, id % 7, format!("r{id}")])
+                        .unwrap();
+                }
+            }
+            for sql in [
+                "SELECT quote(count(*)) FROM t WHERE 0",
+                "SELECT quote(count(*)) FROM t WHERE 1 = 0",
+                "SELECT quote(count(*)) FROM t WHERE NULL",
+                "SELECT quote(count(*)) FROM t WHERE 1 != 1",
+                "SELECT quote(count(*)) FROM t WHERE 1 = 1 AND a > 3",
+                "SELECT quote(count(*)) FROM t WHERE abs(-1) = 1 AND id <= 9",
+                "SELECT quote(id) FROM t WHERE 0",
+                "SELECT quote(id) FROM t WHERE 'abc'",
+                "SELECT quote(id) FROM t WHERE 1 = 1 AND a = 2 ORDER BY id",
+                "SELECT quote(sum(a)) || '|' || quote(max(b)) || '|' || quote(count(*)) \
+                 FROM t WHERE 0",
+                "SELECT quote(sum(a)) FROM t WHERE 2 > 1 AND id <= 10",
+                // GROUP BY output kept to a bare key (the bare aggregate is read
+                // below): an expression over a key or an aggregate fails on a
+                // file today (bd-w4pr1.34).
+                "SELECT b FROM t WHERE 0 GROUP BY b",
+                "SELECT b FROM t WHERE 1 = 1 AND id <= 3 GROUP BY b ORDER BY b",
+                "SELECT quote(t.id) || '|' || quote(u.id) FROM t \
+                 LEFT JOIN u ON u.t_id = t.id AND 0 WHERE t.id <= 3 ORDER BY t.id",
+                "SELECT quote(t.id) || '|' || quote(u.id) FROM t \
+                 LEFT JOIN u ON u.t_id = t.id WHERE 0",
+                "SELECT quote(count(*)) FROM t WHERE abs(-9223372036854775808)",
+                "SELECT quote(count(*)) FROM empty WHERE abs(-9223372036854775808)",
+                "SELECT quote(count(*)) FROM t WHERE random() IS NOT NULL",
+                // bd-w4pr1.33: every "integer overflow" is SQLITE_ERROR in stock.
+                "SELECT quote(sum(x)) FROM (SELECT 9223372036854775807 AS x UNION ALL SELECT 1)",
+                "SELECT quote(sum(x) OVER ()) FROM \
+                 (SELECT 9223372036854775807 AS x UNION ALL SELECT 1)",
+            ] {
+                trace.push(rows(sql));
+            }
+            for sql in [
+                "SELECT count(*) FROM t WHERE 0 GROUP BY a",
+                "SELECT count(*) FROM t WHERE 1 = 1 AND id <= 14 GROUP BY a ORDER BY a",
+            ] {
+                trace.push(show(conn.prepare(sql).and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, i64>(0))?
+                        .collect::<$m::Result<Vec<_>>>()
+                })));
+            }
+            for flag in [0_i64, 1] {
+                trace.push(show(
+                    conn.prepare("SELECT count(*) FROM t WHERE ?1 = 1")
+                        .and_then(|mut stmt| {
+                            stmt.query_row(params![flag], |row| row.get::<_, i64>(0))
+                        }),
+                ));
+                trace.push(show(
+                    conn.prepare("SELECT count(*) FROM t WHERE :on AND a < 2")
+                        .and_then(|mut stmt| {
+                            stmt.query_row(named_params! {":on": flag}, |row| row.get::<_, i64>(0))
+                        }),
+                ));
+            }
+            trace.push(run("UPDATE t SET b = 'zero' WHERE 0"));
+            trace.push(run("UPDATE t SET b = 'one' WHERE 1 = 1 AND id = 3"));
+            trace.push(run(
+                "UPDATE t SET b = 'raise' WHERE abs(-9223372036854775808)",
+            ));
+            trace.push(run("DELETE FROM t WHERE 1 = 0"));
+            trace.push(rows("DELETE FROM t WHERE 0 RETURNING quote(id)"));
+            for flag in [0_i64, 1] {
+                trace.push(show(
+                    conn.prepare("DELETE FROM t WHERE ?1 = 1 AND id > 55")
+                        .and_then(|mut stmt| stmt.execute(params![flag])),
+                ));
+            }
+            trace.push(rows(
+                "SELECT quote(count(*)) || '|' || quote(sum(id)) || '|' || \
+                 group_concat(b, ',') FROM t",
+            ));
+            trace
+        }};
+    }
+
+    #[test]
+    fn constant_where_terms_match_rusqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = [
+            (
+                constant_where_scenario!(stock, stock::Connection::open_in_memory().unwrap()),
+                constant_where_scenario!(ours, ours::Connection::open_in_memory().unwrap()),
+            ),
+            (
+                constant_where_scenario!(
+                    stock,
+                    stock::Connection::open(temp_path(&dir, "const-where-stock.db")).unwrap()
+                ),
+                constant_where_scenario!(
+                    ours,
+                    ours::Connection::open(temp_path(&dir, "const-where-fsqlite.db")).unwrap()
+                ),
+            ),
+        ];
+        for (run, (theirs, mine)) in runs.iter().enumerate() {
+            for (index, (expected, actual)) in theirs.iter().zip(mine).enumerate() {
+                assert_eq!(actual, expected, "run {run} trace step {index}");
+            }
+            assert_eq!(mine.len(), theirs.len(), "run {run}");
+            // The comparison must cover the shapes that matter: a constant-false
+            // count that still returns its row, a raised term, and a filtered
+            // DELETE that really deleted rows.
+            for needle in [
+                r#"ok ["0"]"#,
+                "ok []",
+                "err Unknown 1 Some(\"integer overflow\")",
+                "ok 5",
+                "ok 0",
+            ] {
+                assert!(
+                    theirs.iter().any(|line| line == needle),
+                    "run {run}: the scenario must reach {needle}: {theirs:?}"
+                );
+            }
+        }
+    }
+
     /// The drop-in promise: a file rusqlite wrote opens here, takes writes,
     /// and opens again in rusqlite with every row and a clean integrity check.
     #[test]

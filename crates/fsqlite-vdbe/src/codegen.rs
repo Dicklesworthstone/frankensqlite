@@ -6818,6 +6818,8 @@ fn codegen_select_full_scan(
         0,
     );
     emit_set_snapshot(b, cursor, time_travel);
+    // bd-w4pr1.13.22: a constant-false term finishes as an empty table does.
+    let per_row_where = emit_loop_invariant_where_terms(b, where_clause, done_label);
 
     // Position at the first row in scan order (`Rewind` = ascending rowid, `Last` = descending); jump to
     // done if the table is empty.
@@ -6837,7 +6839,7 @@ fn codegen_select_full_scan(
 
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
-    if let Some(where_expr) = where_clause {
+    if let Some(where_expr) = per_row_where.as_deref() {
         emit_where_filter(
             b,
             where_expr,
@@ -8673,6 +8675,8 @@ fn codegen_select_count_star(
     );
 
     b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
+    // bd-w4pr1.13.22: a constant-false term reads no row and counts 0.
+    let per_row_where = emit_loop_invariant_where_terms(b, where_clause, done_label);
 
     let upper_reg = rowid_range.and_then(|range| {
         range.upper.map(|bound| {
@@ -8733,7 +8737,7 @@ fn codegen_select_count_star(
         );
     }
 
-    if let Some(where_expr) = where_clause {
+    if let Some(where_expr) = per_row_where.as_deref() {
         emit_where_filter(
             b,
             where_expr,
@@ -21652,13 +21656,16 @@ fn codegen_select_aggregate(
             0,
         );
 
+        // bd-w4pr1.13.22: a constant-false term aggregates over no row.
+        let per_row_where = emit_loop_invariant_where_terms(b, where_clause, finalize_label);
+
         // Rewind to first row; jump to finalize if table is empty.
         let loop_start = b.current_addr();
         b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
 
         // WHERE filter.
         let skip_label = b.emit_label();
-        if let Some(where_expr) = where_clause {
+        if let Some(where_expr) = per_row_where.as_deref() {
             emit_where_filter(
                 b,
                 where_expr,
@@ -26624,6 +26631,9 @@ pub fn codegen_update(
         matched_rowid_reg = b.alloc_reg();
         let scan_done_label = b.emit_label();
         let scan_skip_label = b.emit_label();
+        // bd-w4pr1.13.22: a constant-false term rewrites no row.
+        let per_row_where =
+            emit_loop_invariant_where_terms(b, stmt.where_clause.as_ref(), scan_done_label);
         let scan_start = b.current_addr();
         b.emit_jump_to_label(
             Opcode::Rewind,
@@ -26633,7 +26643,7 @@ pub fn codegen_update(
             P4::None,
             0,
         );
-        if let Some(where_expr) = &stmt.where_clause {
+        if let Some(where_expr) = per_row_where.as_deref() {
             b.set_next_anon_placeholder(set_placeholder_count + 1);
             emit_where_filter(
                 b,
@@ -26825,6 +26835,9 @@ pub fn codegen_update(
                 has_residual,
             );
         } else {
+            // bd-w4pr1.13.22: a constant-false term collects no row.
+            let per_row_where =
+                emit_loop_invariant_where_terms(b, stmt.where_clause.as_ref(), collect_done_label);
             let collect_start = b.current_addr();
             b.emit_jump_to_label(
                 Opcode::Rewind,
@@ -26836,7 +26849,7 @@ pub fn codegen_update(
             );
 
             let collect_skip_label = b.emit_label();
-            if let Some(where_expr) = &stmt.where_clause {
+            if let Some(where_expr) = per_row_where.as_deref() {
                 b.set_next_anon_placeholder(set_placeholder_count + 1);
                 emit_where_filter(
                     b,
@@ -29045,6 +29058,9 @@ pub fn codegen_delete(
             has_residual,
         );
     } else {
+        // bd-w4pr1.13.22: a constant-false term deletes no row.
+        let per_row_where =
+            emit_loop_invariant_where_terms(b, stmt.where_clause.as_ref(), collect_done_label);
         let collect_start = b.current_addr();
         b.emit_jump_to_label(
             Opcode::Rewind,
@@ -29056,7 +29072,7 @@ pub fn codegen_delete(
         );
 
         let collect_skip_label = b.emit_label();
-        if let Some(where_expr) = &stmt.where_clause {
+        if let Some(where_expr) = per_row_where.as_deref() {
             emit_where_filter(
                 b,
                 where_expr,
@@ -33720,6 +33736,74 @@ fn emit_having_expr(
             emit_expr(b, expr, dest_reg, None);
         }
     }
+}
+
+/// Whether a WHERE term has one value for the whole statement: it reads no
+/// column and is built only from literals, numbered or named parameters and
+/// deterministic scalar calls (the same operands a seek key may use).
+/// Anonymous `?` parameters stay out because their slots follow emission
+/// order.
+fn where_term_is_loop_invariant(term: &Expr) -> bool {
+    constant_seek_key_operand(term)
+}
+
+/// Evaluate the loop-invariant AND-terms of a scan's WHERE once, before the
+/// scan starts, as stock does (sqlite3WhereBegin codes every constant term
+/// with `sqlite3ExprIfFalse` ahead of the loops). A term that is false or
+/// NULL jumps to `no_rows_label`, the label the scan's `Rewind` takes on an
+/// empty table, so the statement finishes exactly as if no row matched
+/// (bd-w4pr1.13.22). `WHERE 0` or an ORM's `1 != 1` then reads no row instead
+/// of every row, and `1 = 1 AND ...` stops costing its constant work per row.
+///
+/// Returns the terms the scan must still test per row: `None` when every
+/// term was hoisted, the whole WHERE unchanged when none was.
+fn emit_loop_invariant_where_terms<'e>(
+    b: &mut ProgramBuilder,
+    where_clause: Option<&'e Expr>,
+    no_rows_label: crate::Label,
+) -> Option<std::borrow::Cow<'e, Expr>> {
+    fn and_terms<'e>(expr: &'e Expr, terms: &mut Vec<&'e Expr>) {
+        if let Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } = expr
+        {
+            and_terms(left, terms);
+            and_terms(right, terms);
+        } else {
+            terms.push(expr);
+        }
+    }
+
+    let where_expr = where_clause?;
+    let mut terms = Vec::new();
+    and_terms(where_expr, &mut terms);
+    if !terms.iter().any(|term| where_term_is_loop_invariant(term)) {
+        return Some(std::borrow::Cow::Borrowed(where_expr));
+    }
+    let mut per_row: Option<Expr> = None;
+    for term in terms {
+        if where_term_is_loop_invariant(term) {
+            let cond_reg = b.alloc_temp();
+            emit_expr(b, term, cond_reg, None);
+            // P3 = 1: a NULL term is false.
+            b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, no_rows_label, P4::None, 0);
+            b.free_temp(cond_reg);
+        } else {
+            per_row = Some(match per_row.take() {
+                None => term.clone(),
+                Some(previous) => Expr::BinaryOp {
+                    left: Box::new(previous),
+                    op: fsqlite_ast::BinaryOp::And,
+                    right: Box::new(term.clone()),
+                    span: term.span(),
+                },
+            });
+        }
+    }
+    per_row.map(std::borrow::Cow::Owned)
 }
 
 /// Emit a WHERE filter for scan-based UPDATE/DELETE.
@@ -56143,6 +56227,147 @@ mod tests {
             .find(|op| op.opcode == Opcode::ResultRow)
             .unwrap();
         assert_eq!(rr.p2, 1, "count(*) produces 1 result column");
+    }
+
+    /// Compile `sql` against `test_schema()` with the builtin function registry
+    /// installed, as the connection compiler does.
+    fn compile_select_with_builtins(sql: &str) -> crate::VdbeProgram {
+        let stmt = select_sql(sql);
+        let schema = test_schema();
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        with_connection_function_registry_context(
+            Some(Arc::new(registry)),
+            Vec::new(),
+            true,
+            true,
+            || {
+                let ctx = CodegenContext::default();
+                let mut b = ProgramBuilder::new();
+                codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+                b.finish().unwrap()
+            },
+        )
+    }
+
+    /// Positions of a single-table scan's `Rewind` and the `Next` closing it.
+    fn scan_loop_bounds(prog: &crate::VdbeProgram, sql: &str) -> (usize, usize) {
+        let ops = prog.ops();
+        let rewind = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Rewind)
+            .unwrap_or_else(|| panic!("{sql}: expected a scan Rewind"));
+        let next = ops
+            .iter()
+            .rposition(|op| op.opcode == Opcode::Next)
+            .unwrap_or_else(|| panic!("{sql}: expected a scan Next"));
+        (rewind, next)
+    }
+
+    /// bd-w4pr1.13.22: a WHERE term that reads no column is tested once, before
+    /// the scan's `Rewind`, and never inside the loop.
+    #[test]
+    fn test_constant_where_terms_are_tested_once_before_the_scan() {
+        for sql in [
+            "SELECT count(*) FROM t WHERE 0",
+            "SELECT count(*) FROM t WHERE 1 = 0",
+            "SELECT a FROM t WHERE 1 <> 1",
+            "SELECT sum(a) FROM t WHERE ?1 = 1",
+            "SELECT count(*) FROM t WHERE abs(-1) = 1",
+        ] {
+            let prog = compile_select_with_builtins(sql);
+            let (rewind, next) = scan_loop_bounds(&prog, sql);
+            let ops = prog.ops();
+            assert!(
+                ops[..rewind].iter().any(|op| op.opcode == Opcode::IfNot),
+                "{sql}: the constant term must be tested before the scan"
+            );
+            assert!(
+                !ops[rewind..next]
+                    .iter()
+                    .any(|op| matches!(op.opcode, Opcode::IfNot | Opcode::PureFunc)),
+                "{sql}: a constant term must not be evaluated per row"
+            );
+        }
+    }
+
+    /// bd-w4pr1.13.22: the full-scan UPDATE and DELETE test a constant WHERE
+    /// term before their scan as well.
+    #[test]
+    fn test_constant_where_terms_skip_the_dml_scan() {
+        let schema = test_schema();
+        for sql in [
+            "DELETE FROM t WHERE 0",
+            "DELETE FROM t WHERE 1 = 0",
+            "UPDATE t SET a = 1 WHERE 0",
+            "UPDATE t SET a = 1 WHERE 1 <> 1",
+        ] {
+            let Some((statement, _)) =
+                parse_first_statement_with_tail(sql).expect("test DML SQL should parse")
+            else {
+                unreachable!("expected a parsed statement for {sql}");
+            };
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            match &statement {
+                Statement::Delete(stmt) => codegen_delete(&mut b, stmt, &schema, &ctx).unwrap(),
+                Statement::Update(stmt) => codegen_update(&mut b, stmt, &schema, &ctx).unwrap(),
+                other => unreachable!("expected DML, got {other:?}"),
+            }
+            let prog = b.finish().unwrap();
+            let ops = prog.ops();
+            let rewind = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::Rewind)
+                .unwrap_or_else(|| panic!("{sql}: expected a scan Rewind"));
+            let next = rewind
+                + ops[rewind..]
+                    .iter()
+                    .position(|op| op.opcode == Opcode::Next)
+                    .unwrap_or_else(|| panic!("{sql}: expected the scan's Next"));
+            assert!(
+                ops[..rewind].iter().any(|op| op.opcode == Opcode::IfNot),
+                "{sql}: the constant term must be tested before the scan"
+            );
+            assert!(
+                !ops[rewind..next].iter().any(|op| op.opcode == Opcode::IfNot),
+                "{sql}: a constant term must not be evaluated per row"
+            );
+        }
+    }
+
+    /// bd-w4pr1.13.22 negatives: a column term beside a constant one is still
+    /// tested per row, and a non-deterministic call is never hoisted.
+    #[test]
+    fn test_column_and_random_where_terms_stay_in_the_scan() {
+        let sql = "SELECT count(*) FROM t WHERE 1 = 1 AND a > 5";
+        let prog = compile_select_with_builtins(sql);
+        let (rewind, next) = scan_loop_bounds(&prog, sql);
+        let ops = prog.ops();
+        assert!(ops[..rewind].iter().any(|op| op.opcode == Opcode::IfNot));
+        assert!(
+            ops[rewind..next]
+                .iter()
+                .any(|op| op.opcode == Opcode::Column),
+            "{sql}: the column term must stay in the loop"
+        );
+
+        let sql = "SELECT count(*) FROM t WHERE random() < 2";
+        let prog = compile_select_with_builtins(sql);
+        let (rewind, next) = scan_loop_bounds(&prog, sql);
+        let ops = prog.ops();
+        assert!(
+            !ops[..rewind]
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Function | Opcode::PureFunc)),
+            "{sql}: random() must not be evaluated before the scan"
+        );
+        assert!(
+            ops[rewind..next]
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Function | Opcode::PureFunc)),
+            "{sql}: random() must be evaluated per row"
+        );
     }
 
     #[test]
