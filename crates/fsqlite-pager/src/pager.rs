@@ -5966,6 +5966,26 @@ async fn read_page_from_wal_backend(
     cx: &Cx,
     page_no: PageNumber,
 ) -> Result<Option<Vec<u8>>> {
+    Ok(lookup_page_in_wal_backend(wal_backend, cx, page_no)
+        .await?
+        .data)
+}
+
+/// What one WAL lookup of a page found.
+struct WalPageLookup {
+    /// The page's latest image in the WAL, if the WAL holds one.
+    data: Option<Vec<u8>>,
+    /// Whether the reader's pinned snapshot answered. That snapshot changes
+    /// only at a transaction boundary, so within one page read a second
+    /// lookup through it gives the same answer.
+    pinned: bool,
+}
+
+async fn lookup_page_in_wal_backend(
+    wal_backend: &SharedWalBackend,
+    cx: &Cx,
+    page_no: PageNumber,
+) -> Result<WalPageLookup> {
     // [`with_wal_backend_read`] without its boxed callback: this runs once
     // per page read, so the lookup borrows the guard directly.
     let lookup = {
@@ -5980,10 +6000,12 @@ async fn read_page_from_wal_backend(
         }
     };
     match lookup {
-        WalReadLookup::Ready(data) => Ok(data),
-        WalReadLookup::NeedsWriteFallback => {
-            with_wal_backend(wal_backend, cx, |wal, cx| wal.read_page(cx, page_no.get())).await
-        }
+        WalReadLookup::Ready(data) => Ok(WalPageLookup { data, pinned: true }),
+        WalReadLookup::NeedsWriteFallback => Ok(WalPageLookup {
+            data: with_wal_backend(wal_backend, cx, |wal, cx| wal.read_page(cx, page_no.get()))
+                .await?,
+            pinned: false,
+        }),
     }
 }
 
@@ -10128,7 +10150,17 @@ impl<F: VfsFile> PagerInner<F> {
             cache.record_external_read();
             return Ok(data);
         }
+        self.read_page_copy_outside_wal(cx, cache, page_no).await
+    }
 
+    /// [`Self::read_page_copy`] for a page the WAL is already known not to
+    /// hold for this reader: cache → disk.
+    async fn read_page_copy_outside_wal(
+        &self,
+        cx: &Cx,
+        cache: &ShardedPageCache,
+        page_no: PageNumber,
+    ) -> Result<Vec<u8>> {
         // Reads of yet-unallocated pages should observe zero-filled content.
         // This is relied upon by savepoint rollback semantics for pages that
         // were allocated and then rolled back before commit.
@@ -26994,23 +27026,25 @@ where
             }
 
             // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
-            if self.journal_mode == JournalMode::Wal
-                && let Some(data) =
-                    read_page_from_wal_backend(&self.wal_backend, cx, page_no).await?
-            {
-                if dk9ra_trace_enabled()
-                    && page_no.get() > 1
-                    && data.iter().all(|&b| b == 0)
-                {
-                    eprintln!("DK9RA_O81OV GETPAGE_WAL_ZERO page={}", page_no.get());
+            let mut pinned_wal_miss = false;
+            if self.journal_mode == JournalMode::Wal {
+                let lookup = lookup_page_in_wal_backend(&self.wal_backend, cx, page_no).await?;
+                if let Some(data) = lookup.data {
+                    if dk9ra_trace_enabled()
+                        && page_no.get() > 1
+                        && data.iter().all(|&b| b == 0)
+                    {
+                        eprintln!("DK9RA_O81OV GETPAGE_WAL_ZERO page={}", page_no.get());
+                    }
+                    let page = PageData::from_vec(data);
+                    self.ensure_uncached_snapshot_sequence(
+                        page_no,
+                        self.published.snapshot().visible_commit_seq,
+                    )?;
+                    self.cache_transaction_read_page(page_no, &page);
+                    return Ok(page);
                 }
-                let page = PageData::from_vec(data);
-                self.ensure_uncached_snapshot_sequence(
-                    page_no,
-                    self.published.snapshot().visible_commit_seq,
-                )?;
-                self.cache_transaction_read_page(page_no, &page);
-                return Ok(page);
+                pinned_wal_miss = lookup.pinned;
             }
 
             let inner = self
@@ -27018,9 +27052,19 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             self.ensure_uncached_snapshot_sequence(page_no, inner.commit_seq)?;
-            let data = inner
-                .read_page_copy(cx, &self.cache, &self.wal_backend, page_no)
-                .await?;
+            // The transaction's pinned snapshot has just said the WAL holds
+            // no frame of this page; asking it again inside read_page_copy
+            // cost a second lookup (620 instructions) per page miss. An
+            // unpinned lookup reads the latest state, so it is asked again.
+            let data = if pinned_wal_miss {
+                inner
+                    .read_page_copy_outside_wal(cx, &self.cache, page_no)
+                    .await?
+            } else {
+                inner
+                    .read_page_copy(cx, &self.cache, &self.wal_backend, page_no)
+                    .await?
+            };
             let page = PageData::from_vec(data);
             let publish_update = PublishedPagerUpdate {
                 visible_commit_seq: inner.commit_seq,
@@ -66473,6 +66517,143 @@ mod tests {
                 *fallback_calls.lock().unwrap(),
                 0,
                 "bead_id=bd-db300.3.8.7 case=wal_read_scope_pinned_read_must_not_take_write_lock_fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn test_get_page_asks_the_pinned_wal_snapshot_once_per_miss() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::traits::WalBackend;
+
+            /// Holds one page (`wal_page`) in its pinned snapshot and counts
+            /// every lookup, pinned or not.
+            struct OnePageWal {
+                wal_page: u32,
+                image: Vec<u8>,
+                pinned_calls: Arc<Mutex<usize>>,
+                fallback_calls: Arc<Mutex<usize>>,
+            }
+
+            impl WalBackend for OnePageWal {
+                fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn append_frame<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                    _page_data: &'a [u8],
+                    _db_size_if_commit: u32,
+                ) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn read_page<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    page_number: u32,
+                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                    Box::pin(async move {
+                        *self.fallback_calls.lock().unwrap() += 1;
+                        Ok((page_number == self.wal_page).then(|| self.image.clone()))
+                    })
+                }
+
+                fn read_page_pinned<'a>(
+                    &'a self,
+                    _cx: &'a Cx,
+                    page_number: u32,
+                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                    Box::pin(async move {
+                        *self.pinned_calls.lock().unwrap() += 1;
+                        Ok((page_number == self.wal_page).then(|| self.image.clone()))
+                    })
+                }
+
+                fn supports_pinned_reads(&self) -> bool {
+                    true
+                }
+
+                fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                    Ok(())
+                }
+
+                fn frame_count(&self) -> usize {
+                    0
+                }
+
+                fn checkpoint<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    mode: crate::traits::CheckpointMode,
+                    _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
+                    _backfilled_frames: u32,
+                    _oldest_reader_frame: Option<u32>,
+                ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                    Box::pin(async move {
+                        Ok(crate::traits::CheckpointResult {
+                            total_frames: 0,
+                            frames_backfilled: 0,
+                            completed: true,
+                            wal_was_reset: false,
+                            requested_mode: mode,
+                            effective_mode: mode,
+                        })
+                    })
+                }
+            }
+
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let page_size = PageSize::DEFAULT.as_usize();
+            // Two pages in the database file, written before WAL mode.
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let file_page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, file_page, &vec![0x11; page_size])
+                .await
+                .unwrap();
+            let wal_page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, wal_page, &vec![0x22; page_size])
+                .await
+                .unwrap();
+            txn.commit(&cx).await.unwrap();
+
+            let pinned_calls = Arc::new(Mutex::new(0_usize));
+            let fallback_calls = Arc::new(Mutex::new(0_usize));
+            pager
+                .set_wal_backend(Box::new(OnePageWal {
+                    wal_page: wal_page.get(),
+                    image: vec![0x33; page_size],
+                    pinned_calls: Arc::clone(&pinned_calls),
+                    fallback_calls: Arc::clone(&fallback_calls),
+                }))
+                .unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            pager.cache.clear();
+
+            let reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let before = *pinned_calls.lock().unwrap();
+            let page = reader.get_page(&cx, file_page).await.unwrap();
+            assert_eq!(page.as_ref()[0], 0x11, "a page the WAL lacks comes from the file");
+            assert_eq!(
+                *pinned_calls.lock().unwrap() - before,
+                1,
+                "one pinned lookup per miss, not one in get_page and another in read_page_copy"
+            );
+
+            // The page the WAL holds is still served from the WAL, not from
+            // the older file image: skipping the lookup outright would fail
+            // here.
+            let before = *pinned_calls.lock().unwrap();
+            let page = reader.get_page(&cx, wal_page).await.unwrap();
+            assert_eq!(page.as_ref()[0], 0x33, "the WAL's image wins over the file's");
+            assert_eq!(*pinned_calls.lock().unwrap() - before, 1);
+            assert_eq!(
+                *fallback_calls.lock().unwrap(),
+                0,
+                "pinned reads never take the write-lock fallback"
             );
         });
     }
