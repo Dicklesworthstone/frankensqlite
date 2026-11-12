@@ -87,6 +87,65 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a plain statement skips placeholder renumbering and the subquery rewrite (bd-5310l)
+
+- Target: every INSERT, UPDATE, DELETE and SELECT that reaches the dispatcher, text or prepared.
+  Touched: `crates/fsqlite-core/src/connection.rs` (new `expr_is_plain`, `select_is_plain`,
+  `insert_is_plain`, `update_is_plain`, `delete_is_plain`; the DML renumbering in
+  `execute_statement_once_after_background_status`, the SELECT and UPDATE dispatch arms).
+- Evidence before (callgrind on the series at 7d9096bf4, per literal statement): the SELECT dispatch
+  ran `rewrite_subqueries` on every execution, 5.5k instructions for a statement with no subquery (a
+  clone of the tree to renumber placeholders, then every expression through a boxed future); an
+  UPDATE renumbered its placeholders twice, 1.5k each, a clone of the statement both times; an INSERT
+  once, 1.0k.
+- Change: one predicate per statement kind says the statement is plain: no WITH, compound, window,
+  FROM subquery or join, and expressions built only from literals, columns, `?NNN` placeholders in
+  range, operators, IS NULL, CAST, COLLATE, BETWEEN, LIKE and function calls without ORDER BY,
+  FILTER or OVER, with no AND that has a literal operand (the rewrite folds `x AND 0`). For a plain
+  statement both rewrites return the statement unchanged, so it is used as it is. Every other
+  expression kind is refused, including any added later.
+- Result: callgrind, 1,000 statements in one transaction, main d0a2c4f67 (sha256
+  cd112b036d5b355b) against this change built there (041153588, sha256 31b94da0c79fcb09), whole run:
+  literal INSERT 64.57M -> 62.17M, point SELECT 71.53M -> 65.23M, UPDATE 77.87M -> 73.06M: 2.4k, 6.3k
+  and 4.8k fewer instructions per statement, about 5%, 10% and 9% of a statement. Predicted 1.0k,
+  5.5k and 3.0k from the inclusive figures of the functions skipped; the rest of the difference is
+  not attributed. Stock-live probe (`perf stat`, three runs per arm,
+  stock 3.46.1 live): distinct-literal INSERT 43.7-51.4k -> 42.3-47.6k (stock 13.9k), point SELECT
+  60.5-64.0k -> 50.6-54.2k (stock 22.1k), UPDATE 52.0-59.0k -> 50.3-51.5k (stock 18.3k); with the
+  same text repeated SELECT 58.5-58.7k -> 51.0-53.3k and with bound parameters UPDATE 45.9-46.1k ->
+  39.1-39.5k, so prepared-style statements gain too. Ratios to stock from the callgrind difference:
+  INSERT about 3.3x -> 3.2x, SELECT about 2.8x -> 2.5x, UPDATE about 3.0x -> 2.8x. Scorecard rows,
+  three interleaved reps: `txn_1000x10_rows` 863.7M -> 838.6M (5.61x -> 5.45x stock's 153.9M), but
+  the reps spread 838-884M and 820-869M, so that row's move is within its spread;
+  `autocommit_5k_inserts` 1,593M -> 1,602M, reps 1,587-1,597M and 1,588-1,616M: no measurable change
+  (its statements are dominated by the commit). Shell output of base and candidate byte-identical
+  over the 768-run comparison.
+- Behaviour: unit tests `a_plain_statement_comes_back_from_the_rewrites_it_skips_unchanged` (more
+  than 500 generated SELECT / INSERT / UPDATE / DELETE statements: each is called plain and each comes
+  back from the renumbering and from `rewrite_subqueries` equal to itself) and
+  `a_statement_either_rewrite_could_change_is_not_plain` (anonymous and named placeholders, `x AND
+  0`, scalar and EXISTS subqueries are refused and the rewrites do change them; IN lists, FROM
+  subqueries, joins, WITH, compounds, windows, FILTER, CASE, row values, RETURNING, ON CONFLICT,
+  UPDATE FROM are refused; `?0` and `?32767` are not in range). Gate on the stacked tree is in the commit message.
+- Retry condition for widening (IN lists, CASE, RETURNING): a profile of a statement shape where the
+  rewrite of that construct is 2% or more, with a keeper showing the rewrite returns it unchanged.
+
+## 2026-11-11 - REJECTED before code: a statement savepoint name without format! (bd-5310l)
+
+- Target: every INSERT, UPDATE and DELETE outside an explicit savepoint stack, through
+  `with_internal_statement_savepoint_and_cx` in `crates/fsqlite-core/src/connection.rs`.
+- Evidence: callgrind on the bd-5310l series (main 05e4fd8f8 plus 8b6d0eb76), 1,000 statements in
+  one transaction: `next_internal_savepoint_name` is 0.9k instructions per DML statement inclusive
+  (a `format!` of a purpose string and two integers, then a scan of the savepoint stack for a
+  clash). That is 1.9% of a literal INSERT (47.9k) and 1.6% of an UPDATE (57k).
+- Verdict: under the 2% line even if the name cost nothing; a name built by hand would save about
+  0.7k (1.5% and 1.2%). Not built.
+- Retry condition: a literal INSERT at or under 40k instructions (then 0.8k is 2%), or as part of a
+  change that drops the per-statement savepoint for a single-row DML statement altogether (the name,
+  the pager and concurrent savepoint records and their release: about 3k to 4k per statement), which
+  needs its own bead and statement-atomicity keepers (a failing row of a multi-row INSERT, a
+  constraint failure under OR FAIL / OR ABORT / OR ROLLBACK, a trigger that fails after the row).
+
 ## 2026-11-12 - WIN: an implicit aggregate over a lookup join takes the VDBE lookup loop on :memory: too (bd-w4pr1.13.23)
 
 - Target: `SELECT <aggregates> FROM a JOIN b ON <lookup>` on `:memory:` (the scorecard's

@@ -12820,6 +12820,197 @@ mod rendered_statement_tests {
     }
 }
 
+#[cfg(test)]
+mod plain_statement_tests {
+    use super::*;
+
+    fn parsed(sql: &str) -> Statement {
+        Parser::from_sql(sql)
+            .parse_next_statement_with_tail()
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+            .unwrap_or_else(|| panic!("{sql}: no statement"))
+            .0
+    }
+
+    fn is_plain(statement: &Statement) -> bool {
+        match statement {
+            Statement::Select(select) => select_is_plain(select),
+            Statement::Insert(insert) => insert_is_plain(insert),
+            Statement::Update(update) => update_is_plain(update),
+            Statement::Delete(delete) => delete_is_plain(delete),
+            other => panic!("not a statement the predicates cover: {other}"),
+        }
+    }
+
+    /// `statement` after the rewrites a plain statement is spared.
+    async fn rewritten(conn: &Connection, statement: &Statement) -> Statement {
+        let bound: &[SqliteValue] = &[SqliteValue::Integer(1), SqliteValue::Integer(2)];
+        match statement {
+            Statement::Select(select) => {
+                let renumbered = canonicalize_select_placeholders(select).expect("renumber");
+                let rewritten = conn
+                    .rewrite_subqueries(select, Some(bound))
+                    .await
+                    .expect("rewrite");
+                // Whatever the renumbering changes, the rewrite carries.
+                if renumbered != *select {
+                    assert_ne!(rewritten, *select, "{select}");
+                }
+                Statement::Select(rewritten)
+            }
+            Statement::Insert(insert) => {
+                Statement::Insert(canonicalize_insert_placeholders(insert).expect("renumber"))
+            }
+            Statement::Update(update) => {
+                Statement::Update(canonicalize_update_placeholders(update).expect("renumber"))
+            }
+            Statement::Delete(delete) => {
+                Statement::Delete(canonicalize_delete_placeholders(delete).expect("renumber"))
+            }
+            other => panic!("not a statement the predicates cover: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_plain_statement_comes_back_from_the_rewrites_it_skips_unchanged() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.expect("open");
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);")
+                .await
+                .expect("create");
+            let values = [
+                "a",
+                "?1",
+                "?32766",
+                "5",
+                "'x'",
+                "NULL",
+                "a + 1",
+                "-a",
+                "a || b",
+                "CAST(a AS TEXT)",
+                "a COLLATE NOCASE",
+                "abs(a)",
+                "coalesce(a, b, ?2)",
+            ];
+            let filters = [
+                "id = ?1",
+                "a = ?1 AND b = ?2",
+                "a = 1 OR b = 2",
+                "a IS NULL",
+                "a IS NOT NULL",
+                "NOT a",
+                "a BETWEEN ?1 AND ?2",
+                "a LIKE 'x%'",
+                "a LIKE ?1 ESCAPE '!'",
+                "a > 0 AND (b < 5 OR b > 9)",
+                "length(a) = ?2 AND id = ?1",
+            ];
+            let mut sources = vec![
+                "SELECT * FROM t".to_owned(),
+                "SELECT t.* FROM t".to_owned(),
+                "SELECT count(*) FROM t".to_owned(),
+                "INSERT INTO t DEFAULT VALUES".to_owned(),
+                "DELETE FROM t".to_owned(),
+            ];
+            for value in values {
+                sources.push(format!("SELECT {value}"));
+                sources.push(format!("SELECT {value} FROM t"));
+                sources.push(format!("SELECT a, {value} AS v FROM t ORDER BY {value}"));
+                sources.push(format!("SELECT a FROM t LIMIT {value} OFFSET {value}"));
+                sources.push(format!("INSERT INTO t(a, b) VALUES ({value}, ?2)"));
+                sources.push(format!(
+                    "INSERT INTO t VALUES (1, {value}, 'x'), (2, ?1, {value})"
+                ));
+                sources.push(format!("UPDATE t SET a = {value}"));
+                for filter in filters {
+                    sources.push(format!("SELECT {value} FROM t WHERE {filter}"));
+                    sources.push(format!(
+                        "SELECT {value} FROM t GROUP BY {value} HAVING {filter}"
+                    ));
+                    sources.push(format!("UPDATE t SET a = {value}, b = ?2 WHERE {filter}"));
+                }
+            }
+            for filter in filters {
+                sources.push(format!("SELECT a, b FROM t WHERE {filter}"));
+                sources.push(format!("DELETE FROM t WHERE {filter}"));
+            }
+            assert!(sources.len() > 500, "{}", sources.len());
+            for sql in &sources {
+                let statement = parsed(sql);
+                assert!(is_plain(&statement), "{sql}");
+                assert_eq!(rewritten(&conn, &statement).await, statement, "{sql}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_statement_either_rewrite_could_change_is_not_plain() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.expect("open");
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);")
+                .await
+                .expect("create");
+            // Each of these the rewrites do change: a predicate that let one
+            // through would run a different statement from the one written.
+            for sql in [
+                "SELECT a FROM t WHERE id = ?",
+                "SELECT a FROM t WHERE id = :id",
+                "SELECT a FROM t ORDER BY ?",
+                "SELECT a FROM t LIMIT ?",
+                "INSERT INTO t(a, b) VALUES (?, ?)",
+                "INSERT INTO t(a) VALUES ($v)",
+                "UPDATE t SET a = ? WHERE id = ?",
+                "UPDATE t SET a = 1 WHERE id = @k",
+                "DELETE FROM t WHERE id = ?",
+                "SELECT a FROM t WHERE b = 1 AND 0",
+                "SELECT a FROM t WHERE 0 AND b = 1",
+                "SELECT a FROM t WHERE a = 2 OR (b = 1 AND 0)",
+                "SELECT a FROM t WHERE id = (SELECT 1)",
+                "SELECT a FROM t WHERE EXISTS (SELECT 1)",
+                "SELECT (SELECT 2) FROM t",
+            ] {
+                let statement = parsed(sql);
+                assert!(!is_plain(&statement), "{sql}");
+                assert_ne!(rewritten(&conn, &statement).await, statement, "{sql}");
+            }
+            // These are refused because a rewrite has work it may do on them.
+            for sql in [
+                "SELECT a FROM t WHERE a IN (1, 2)",
+                "SELECT a FROM t WHERE a IN (SELECT a FROM t)",
+                "SELECT a FROM t WHERE b = 1 AND NULL",
+                "SELECT a FROM (SELECT a FROM t) AS s",
+                "SELECT t.a FROM t JOIN t AS u ON t.id = u.id",
+                "SELECT t.a FROM t, t AS u",
+                "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+                "SELECT a FROM t UNION SELECT b FROM t",
+                "SELECT sum(a) OVER () FROM t",
+                "SELECT count(*) FILTER (WHERE a > 0) FROM t",
+                "SELECT CASE WHEN a THEN 1 ELSE 2 END FROM t",
+                "SELECT (a, b) = (1, 2) FROM t",
+                "INSERT INTO t(a) SELECT a FROM t",
+                "INSERT INTO t(a) VALUES (1) ON CONFLICT DO NOTHING",
+                "INSERT INTO t(a) VALUES (1) RETURNING id",
+                "INSERT INTO t(a) VALUES ((SELECT 1))",
+                "UPDATE t SET a = 1 FROM t AS u WHERE t.id = u.id",
+                "UPDATE t SET a = 1 RETURNING a",
+                "UPDATE t SET a = (SELECT 1)",
+                "DELETE FROM t WHERE id = 1 RETURNING a",
+                "DELETE FROM t WHERE id IN (SELECT id FROM t)",
+            ] {
+                assert!(!is_plain(&parsed(sql)), "{sql}");
+            }
+            // The placeholder numbers renumbering accepts, and only those.
+            let numbered =
+                |index: u32| Expr::Placeholder(PlaceholderType::Numbered(index), Span::ZERO);
+            assert!(expr_is_plain(&numbered(1)));
+            assert!(expr_is_plain(&numbered(MAX_VARIABLE_NUMBER)));
+            assert!(!expr_is_plain(&numbered(0)));
+            assert!(!expr_is_plain(&numbered(MAX_VARIABLE_NUMBER + 1)));
+        });
+    }
+}
+
 #[derive(Clone)]
 struct PlannerDirectiveCacheEntry {
     sql: String,
@@ -40273,20 +40464,21 @@ impl Connection {
             // param#1, updating zero rows, and gave DELETE ... RETURNING the wrong
             // param). The per-DML dispatch arms also canonicalize, but that runs
             // AFTER the fold; doing it here — idempotent for already-`Numbered`
-            // placeholders — is what makes it precede the fold.
+            // placeholders — is what makes it precede the fold. A plain
+            // statement has nothing to number and is used as it is.
             let dml_canonical_statement;
             let statement: &Statement = match statement {
-                Statement::Insert(insert) => {
+                Statement::Insert(insert) if !insert_is_plain(insert) => {
                     dml_canonical_statement =
                         Statement::Insert(canonicalize_insert_placeholders(insert)?);
                     &dml_canonical_statement
                 }
-                Statement::Update(update) => {
+                Statement::Update(update) if !update_is_plain(update) => {
                     dml_canonical_statement =
                         Statement::Update(canonicalize_update_placeholders(update)?);
                     &dml_canonical_statement
                 }
-                Statement::Delete(delete) => {
+                Statement::Delete(delete) if !delete_is_plain(delete) => {
                     dml_canonical_statement =
                         Statement::Delete(canonicalize_delete_placeholders(delete)?);
                     &dml_canonical_statement
@@ -41935,9 +42127,17 @@ impl Connection {
                         // cannot handle. Supported probes must retain their
                         // AST so ORDER/LIMIT staging, volatile projections,
                         // and RHS collation metadata reach codegen intact.
-                        let rewritten =
-                            lean_future(|| self.rewrite_subqueries(select, params)).await?;
-                        if let Some(rows) = self.try_direct_count_star_in_list(&rewritten)? {
+                        // A plain SELECT comes back from the rewrite equal to
+                        // what went in, so it is used without the clone.
+                        let rewritten_select;
+                        let rewritten: &SelectStatement = if select_is_plain(select) {
+                            select
+                        } else {
+                            rewritten_select =
+                                lean_future(|| self.rewrite_subqueries(select, params)).await?;
+                            &rewritten_select
+                        };
+                        if let Some(rows) = self.try_direct_count_star_in_list(rewritten)? {
                             return Ok(rows);
                         }
                         let plan_span = tracing::span!(
@@ -41954,12 +42154,12 @@ impl Connection {
                         // Use SelectStatement::to_string() directly to avoid
                         // cloning the entire AST into a Statement wrapper.
                         let (sql_text, sql_key) =
-                            self.dispatch_statement_text(params, &rewritten, |seen| {
+                            self.dispatch_statement_text(params, rewritten, |seen| {
                                 &mut seen.selects
                             });
                         arc_prog = lean_future(|| {
                             self.compile_with_cache(sql_key, &sql_text, async |conn| {
-                                conn.compile_table_select(&rewritten).await
+                                conn.compile_table_select(rewritten).await
                             })
                         })
                         .await?;
@@ -42103,9 +42303,17 @@ impl Connection {
                     self.log_mem_execution_fallback("update", "with_clause_materialization")?;
                     return boxed_future(|| self.execute_update_with_ctes(update, params)).await;
                 }
-                let canonical_update = canonicalize_update_placeholders(update)?;
+                // A plain UPDATE has nothing to number: it is its own
+                // canonical form.
+                let renumbered_update;
+                let canonical_update: &UpdateStatement = if update_is_plain(update) {
+                    update
+                } else {
+                    renumbered_update = canonicalize_update_placeholders(update)?;
+                    &renumbered_update
+                };
                 let (mut effective_update, _limited_row_count_hint) =
-                    lean_future(|| self.materialize_update_limit_scope(&canonical_update, params))
+                    lean_future(|| self.materialize_update_limit_scope(canonical_update, params))
                         .await?;
                 // A correlated subquery inside `IN (...)` in the WHERE cannot be
                 // lowered by VDBE codegen; resolve the matching rowids via the
@@ -155864,6 +156072,150 @@ fn placeholder_to_index(
         PlaceholderType::AtNamed(name) => bind_state.register_named('@', name),
         PlaceholderType::DollarNamed(name) => bind_state.register_named('$', name),
     }
+}
+
+/// Whether neither placeholder renumbering (`canonicalize_expr_placeholders`)
+/// nor the pre-dispatch subquery rewrite (`rewrite_in_expr`) can change `expr`.
+///
+/// Yes only for an expression built from literals, columns, `?NNN` placeholders
+/// in range, operators, `IS NULL`, `CAST`, `COLLATE`, `BETWEEN`, `LIKE` and
+/// function calls without `ORDER BY`, `FILTER` or `OVER`. An `AND` with a
+/// literal operand is refused because the rewrite folds `x AND 0`. Everything
+/// not listed (`IN`, `EXISTS`, subqueries, `CASE`, row values, anonymous and
+/// named placeholders, and any expression kind added later) is refused too, so
+/// an unrecognized shape always takes both rewrites.
+fn expr_is_plain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Column(_, _) => true,
+        Expr::Placeholder(PlaceholderType::Numbered(index), _) => {
+            (1..=MAX_VARIABLE_NUMBER).contains(index)
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            let folds_with_a_literal = matches!(op, BinaryOp::And)
+                && (matches!(left.as_ref(), Expr::Literal(_, _))
+                    || matches!(right.as_ref(), Expr::Literal(_, _)));
+            !folds_with_a_literal && expr_is_plain(left) && expr_is_plain(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_is_plain(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => expr_is_plain(inner) && expr_is_plain(low) && expr_is_plain(high),
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_is_plain(inner)
+                && expr_is_plain(pattern)
+                && escape.as_deref().is_none_or(expr_is_plain)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            order_by.is_empty()
+                && filter.is_none()
+                && over.is_none()
+                && match args {
+                    FunctionArgs::Star => true,
+                    FunctionArgs::List(args) => args.iter().all(expr_is_plain),
+                }
+        }
+        _ => false,
+    }
+}
+
+fn limit_clause_is_plain(limit: &LimitClause) -> bool {
+    expr_is_plain(&limit.limit) && limit.offset.as_ref().is_none_or(expr_is_plain)
+}
+
+/// Whether `Connection::rewrite_subqueries` returns `select` as it is: one
+/// SELECT without `WITH`, compound arms or windows, reading at most one named
+/// table, every expression of it [plain](expr_is_plain).
+///
+/// The rewrite renumbers placeholders, folds and evaluates subqueries in every
+/// expression, and flattens a FROM subquery; none of that finds anything to do
+/// here, so the dispatcher uses the statement without cloning it.
+fn select_is_plain(select: &SelectStatement) -> bool {
+    if select.with.is_some() || !select.body.compounds.is_empty() {
+        return false;
+    }
+    let SelectCore::Select {
+        columns,
+        from,
+        where_clause,
+        group_by,
+        having,
+        windows,
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    columns.iter().all(|column| match column {
+        ResultColumn::Expr { expr, .. } => expr_is_plain(expr),
+        ResultColumn::Star | ResultColumn::TableStar(_) => true,
+    }) && from.as_ref().is_none_or(|from| {
+        from.joins.is_empty() && matches!(from.source, TableOrSubquery::Table { .. })
+    }) && where_clause.as_deref().is_none_or(expr_is_plain)
+        && group_by.iter().all(expr_is_plain)
+        && having.as_deref().is_none_or(expr_is_plain)
+        && windows.is_empty()
+        && select.order_by.iter().all(|term| expr_is_plain(&term.expr))
+        && select.limit.as_ref().is_none_or(limit_clause_is_plain)
+}
+
+/// Whether `canonicalize_insert_placeholders` returns `insert` as it is: rows
+/// of [plain](expr_is_plain) values (or `DEFAULT VALUES`) and no `WITH`,
+/// `ON CONFLICT` or `RETURNING` clause.
+fn insert_is_plain(insert: &InsertStatement) -> bool {
+    insert.with.is_none()
+        && insert.upsert.is_empty()
+        && insert.returning.is_empty()
+        && match &insert.source {
+            InsertSource::Values(rows) => rows.iter().flatten().all(expr_is_plain),
+            InsertSource::DefaultValues => true,
+            InsertSource::Select(_) => false,
+        }
+}
+
+/// Whether `canonicalize_update_placeholders` returns `update` as it is:
+/// [plain](expr_is_plain) assigned values and `WHERE`, and no `WITH`, `FROM`,
+/// `RETURNING`, `ORDER BY` or `LIMIT` clause.
+fn update_is_plain(update: &UpdateStatement) -> bool {
+    update.with.is_none()
+        && update.from.is_none()
+        && update.returning.is_empty()
+        && update.order_by.is_empty()
+        && update.limit.is_none()
+        && update
+            .assignments
+            .iter()
+            .all(|assignment| expr_is_plain(&assignment.value))
+        && update.where_clause.as_ref().is_none_or(expr_is_plain)
+}
+
+/// Whether `canonicalize_delete_placeholders` returns `delete` as it is: a
+/// [plain](expr_is_plain) `WHERE` and no `WITH`, `RETURNING`, `ORDER BY` or
+/// `LIMIT` clause.
+fn delete_is_plain(delete: &DeleteStatement) -> bool {
+    delete.with.is_none()
+        && delete.returning.is_empty()
+        && delete.order_by.is_empty()
+        && delete.limit.is_none()
+        && delete.where_clause.as_ref().is_none_or(expr_is_plain)
 }
 
 fn canonicalize_update_placeholders(
