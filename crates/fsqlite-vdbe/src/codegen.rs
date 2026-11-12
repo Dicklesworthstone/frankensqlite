@@ -26458,7 +26458,14 @@ pub fn codegen_update(
     // Register table-to-index cursor metadata for REPLACE conflict resolution.
     register_table_index_meta(b, table, table_cursor);
 
-    let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table), None);
+    // The target's alias names its rowid too (`UPDATE t AS u ... WHERE u.rowid
+    // = ?`): without it that WHERE took the full scan, and only the second
+    // pass's SeekRowid made the plan look like a rowid lookup.
+    let rowid_target = extract_rowid_target_expr(
+        stmt.where_clause.as_ref(),
+        Some(table),
+        stmt.table.alias.as_deref(),
+    );
     // bd-update-rowid-in / bd-update-rowid-in-residual: `UPDATE ... WHERE <rowid> IN (<int literals>)
     // [AND <residual>]` collects the listed rows with one `SeekRowid` each (Pass 1) instead of
     // full-scanning; a residual is re-applied per seeked row. After `rowid = const`.
@@ -26548,6 +26555,18 @@ pub fn codegen_update(
         .as_ref()
         .map_or(0, count_anon_placeholders);
 
+    // A full-table scan rewrites each matching row while it stands on it (as
+    // stock's ONEPASS_MULTI does) when the second pass could not answer
+    // differently; see `update_scan_can_run_in_one_pass`.
+    let scan_updates_in_one_pass = rowid_target.is_none()
+        && rowid_in_list.is_none()
+        && rowid_in_const_list.is_none()
+        && rowid_range.is_none()
+        && rowid_eq_residual.is_none()
+        && index_eq.is_none()
+        && update_scan_can_run_in_one_pass(stmt, table, &assignment_targets, ctx);
+    let mut one_pass_scan = None;
+
     let matched_rowid_reg;
     let apply_done_label = b.emit_label();
     let (apply_seek_miss_label, apply_loop) = if let Some(target_expr) = rowid_target {
@@ -26576,6 +26595,45 @@ pub fn codegen_update(
             P4::None,
             0,
         );
+        (None, None)
+    } else if scan_updates_in_one_pass {
+        // One pass: the scan stops on each matching row and the rewrite
+        // below runs there; the Next emitted after it continues the scan.
+        matched_rowid_reg = b.alloc_reg();
+        let scan_done_label = b.emit_label();
+        let scan_skip_label = b.emit_label();
+        let scan_start = b.current_addr();
+        b.emit_jump_to_label(
+            Opcode::Rewind,
+            table_cursor,
+            0,
+            scan_done_label,
+            P4::None,
+            0,
+        );
+        if let Some(where_expr) = &stmt.where_clause {
+            b.set_next_anon_placeholder(set_placeholder_count + 1);
+            emit_where_filter(
+                b,
+                where_expr,
+                table_cursor,
+                table,
+                stmt.table.alias.as_deref(),
+                schema,
+                scan_skip_label,
+            );
+        }
+        b.emit_op(
+            Opcode::Rowid,
+            table_cursor,
+            matched_rowid_reg,
+            0,
+            P4::None,
+            0,
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let scan_body = (scan_start + 1) as i32;
+        one_pass_scan = Some((scan_skip_label, scan_body, scan_done_label));
         (None, None)
     } else {
         let rowset_reg = b.alloc_reg();
@@ -27096,6 +27154,13 @@ pub fn codegen_update(
         let apply_loop_addr = apply_loop as i32;
         b.emit_op(Opcode::Goto, 0, apply_loop_addr, 0, P4::None, 0);
     }
+    if let Some((scan_skip_label, scan_body, scan_done_label)) = one_pass_scan {
+        // The Insert left the cursor on the rewritten row, which kept its
+        // rowid, so Next moves to the row after it.
+        b.resolve_label(scan_skip_label);
+        b.emit_op(Opcode::Next, table_cursor, scan_body, 0, P4::None, 0);
+        b.resolve_label(scan_done_label);
+    }
 
     // Done: Close index cursors, then table cursor.
     b.resolve_label(apply_done_label);
@@ -27112,6 +27177,61 @@ pub fn codegen_update(
     b.resolve_label(end_label);
 
     Ok(())
+}
+
+/// Whether a full-table-scan UPDATE may rewrite each matching row while the
+/// scan stands on it instead of collecting the rowids first.
+///
+/// The two passes exist so that nothing the rewrite does is seen by the scan
+/// or by the evaluation of later rows. In this engine the connection runs
+/// BEFORE triggers and the foreign-key checks before the program and the
+/// foreign-key actions and AFTER triggers after it, so inside the program the
+/// rewrite can be observed only through:
+///
+/// - a subquery in the WHERE or in a SET value, which could read the table
+///   being rewritten;
+/// - a changed rowid (the hidden rowid or its INTEGER PRIMARY KEY alias),
+///   which could move the row ahead of the scan to be met again;
+/// - IGNORE or REPLACE from the statement or from any column or index
+///   constraint, which restore the old row or delete another one;
+/// - RETURNING, which re-reads the row after the rewrite.
+///
+/// None of these may be present. A row that keeps its rowid is rewritten in
+/// place, or deleted and re-inserted under the same key with the cursor left
+/// on it, so the scan's Next continues from that key.
+fn update_scan_can_run_in_one_pass(
+    stmt: &UpdateStatement,
+    table: &TableSchema,
+    assignment_targets: &UpdateAssignmentTargets,
+    ctx: &CodegenContext,
+) -> bool {
+    let observes = |action: Option<&ConflictAction>| {
+        matches!(action, Some(ConflictAction::Ignore | ConflictAction::Replace))
+    };
+    let assigns_rowid_alias = ctx
+        .rowid_alias_col_idx
+        .or_else(|| table.columns.iter().position(|col| col.is_ipk))
+        .is_some_and(|idx| assignment_targets.columns.contains(&idx));
+    stmt.returning.is_empty()
+        && !assignment_targets.assigns_hidden_rowid
+        && !assigns_rowid_alias
+        && !observes(stmt.or_conflict.as_ref())
+        && !table
+            .columns
+            .iter()
+            .any(|column| observes(column.conflict_action.as_ref()))
+        && !table
+            .indexes
+            .iter()
+            .any(|index| observes(index.conflict_action.as_ref()))
+        && !stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_contains_nested_subquery)
+        && !stmt
+            .assignments
+            .iter()
+            .any(|assignment| expr_contains_nested_subquery(&assignment.value))
 }
 
 /// Where an UPDATE `SET` target lands.
@@ -50131,11 +50251,13 @@ mod tests {
         );
     }
 
+    /// `UPDATE OR IGNORE` may restore a row it failed to rewrite, so its scan
+    /// collects the rowids before mutating anything (bd-w4pr1.13.20).
     #[test]
-    fn test_codegen_update_non_rowid_predicate_uses_two_pass_rowset() {
+    fn test_codegen_update_or_ignore_non_rowid_predicate_uses_two_pass_rowset() {
         let stmt = UpdateStatement {
             with: None,
-            or_conflict: None,
+            or_conflict: Some(ConflictAction::Ignore),
             table: QualifiedTableRef {
                 name: QualifiedName::bare("t"),
                 alias: None,
@@ -50210,6 +50332,90 @@ mod tests {
             OPFLAG_ISUPDATE,
             "UPDATE insert must carry OPFLAG_ISUPDATE so runtime last_insert_rowid() handling stays SQLite-compatible"
         );
+    }
+
+    /// A scan UPDATE rewrites in the scan (one pass) exactly when nothing
+    /// can observe the rewrite: the plain shape does; a changed rowid alias,
+    /// RETURNING, OR IGNORE / OR REPLACE, an ON CONFLICT REPLACE index, and a
+    /// subquery in SET or WHERE each keep the two passes (bd-w4pr1.13.20).
+    #[test]
+    fn test_codegen_scan_update_is_one_pass_only_when_nothing_observes_it() {
+        let column = |name: &str| Expr::Column(ColumnRef::bare(name), Span::ZERO);
+        let b_eq_param = Expr::BinaryOp {
+            left: Box::new(column("b")),
+            op: AstBinaryOp::Eq,
+            right: Box::new(placeholder(2)),
+            span: Span::ZERO,
+        };
+        let scalar_subquery =
+            || Expr::Subquery(Box::new(simple_select(&["a"], "t", None)), Span::ZERO);
+        let update = |target: &str, value: Expr, where_clause: Expr| UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column(target.to_owned()),
+                value,
+            }],
+            from: None,
+            where_clause: Some(where_clause),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let plain = update("b", placeholder(1), column("b"));
+        let mut or_ignore = plain.clone();
+        or_ignore.or_conflict = Some(ConflictAction::Ignore);
+        let mut or_replace = plain.clone();
+        or_replace.or_conflict = Some(ConflictAction::Replace);
+        let mut returning = plain.clone();
+        returning.returning = vec![ResultColumn::Expr {
+            expr: column("b"),
+            alias: None,
+        }];
+        let ipk_schema = schema_with_ipk_alias();
+        let mut replace_index_schema = test_schema_with_index();
+        replace_index_schema[0].indexes[0].conflict_action = Some(ConflictAction::Replace);
+        let schema = test_schema();
+        let cases = [
+            (&plain, &schema, true, "plain"),
+            (&update("b", placeholder(1), b_eq_param), &schema, true, "plain"),
+            (&update("a", column("b"), column("b")), &ipk_schema, false, "rowid alias set"),
+            (&returning, &schema, false, "RETURNING"),
+            (&or_ignore, &schema, false, "OR IGNORE"),
+            (&or_replace, &schema, false, "OR REPLACE"),
+            (&plain, &replace_index_schema, false, "REPLACE index"),
+            (&update("b", scalar_subquery(), column("b")), &schema, false, "SET subquery"),
+            (&update("b", placeholder(1), scalar_subquery()), &schema, false, "WHERE subquery"),
+        ];
+        for (stmt, schema, one_pass, label) in cases {
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            codegen_update(&mut b, stmt, schema, &ctx).unwrap();
+            let prog = b.finish().unwrap();
+            let ops = opcode_sequence(&prog);
+            assert_eq!(
+                ops.contains(&Opcode::RowSetAdd),
+                !one_pass,
+                "{label}: one pass expected {one_pass}: {ops:?}"
+            );
+            let insert_at = ops.iter().position(|op| *op == Opcode::Insert).unwrap();
+            let next_at = ops.iter().rposition(|op| *op == Opcode::Next).unwrap();
+            assert_eq!(
+                insert_at < next_at,
+                one_pass,
+                "{label}: the rewrite is inside the scan exactly in one pass: {ops:?}"
+            );
+            assert!(
+                !one_pass || !ops.contains(&Opcode::SeekRowid),
+                "{label}: a one-pass rewrite does not re-seek its row: {ops:?}"
+            );
+        }
     }
 
     #[test]
@@ -62027,8 +62233,10 @@ mod tests {
         codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // The qualified alias "u.rowid" should resolve to the rowid fast path.
+        // The qualified alias "u.rowid" should resolve to the rowid fast path:
+        // one seek, no scan.
         assert!(has_opcodes(&prog, &[Opcode::Variable, Opcode::SeekRowid]));
+        assert!(!has_opcodes(&prog, &[Opcode::Rewind]));
     }
 
     #[test]

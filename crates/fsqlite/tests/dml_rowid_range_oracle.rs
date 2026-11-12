@@ -73,11 +73,11 @@ async fn assert_range_plan(
 ) {
     let ops = explain_ops(c, sql).await;
     assert_eq!(op_count(&ops, "Next"), 1, "plan: {ops:?}");
-    // A DELETE that falls back to the Rewind walk deletes each row where the
-    // walk stands (one pass, bd-w4pr1.13.20); the range collector and every
-    // UPDATE collect the rowids first and reseek each in pass 2.
-    let one_pass_walk =
-        expected_range_ops.is_none() && sql.trim_start().to_ascii_uppercase().starts_with("DELETE");
+    // A DELETE or UPDATE that falls back to the Rewind walk deletes or
+    // rewrites each row where the walk stands (one pass, bd-w4pr1.13.20; none
+    // of these controls moves the rowid or has RETURNING); the range collector
+    // collects the rowids first and reseeks each in pass 2.
+    let one_pass_walk = expected_range_ops.is_none();
     if one_pass_walk {
         assert_eq!(op_count(&ops, "RowSetAdd"), 0, "plan: {ops:?}");
         assert_eq!(op_count(&ops, "RowSetRead"), 0, "plan: {ops:?}");

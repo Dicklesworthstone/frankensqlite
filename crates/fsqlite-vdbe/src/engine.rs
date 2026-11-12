@@ -12895,6 +12895,15 @@ impl VdbeEngine {
                                         } else {
                                             lean_future(|| sc.cursor.table_insert(&sc.cx, rowid, blob)).await?;
                                         }
+                                        // A one-pass UPDATE scan continues from
+                                        // this row (bd-w4pr1.13.20): leave the
+                                        // cursor on it, wherever the insert (and
+                                        // any split it caused) left it.
+                                        let landed = !sc.cursor.eof()
+                                            && lean_future(|| sc.cursor.rowid(&sc.cx)).await? == rowid;
+                                        if !landed {
+                                            lean_future(|| sc.cursor.table_move_to(&sc.cx, rowid)).await?;
+                                        }
                                     }
                                     if rowid == sc.last_alloc_rowid {
                                         sc.last_alloc_landed = true;

@@ -68,7 +68,18 @@ fn op_count(ops: &[String], opcode: &str) -> usize {
 
 async fn assert_update_plan(c: &Connection, sql: &str, unique_seek_values: Option<usize>) {
     let ops = explain_ops(c, sql).await;
-    assert_eq!(op_count(&ops, "RowSetRead"), 1, "plan: {ops:?}");
+    // GH #415: a rowid IN list of non-literal constants builds a probe set
+    // (OpenAutoindex) and loops it with one SeekRowid per member instead of
+    // scanning the table; the literal-only unrolled seeks below still decline.
+    let const_list_probe = op_count(&ops, "OpenAutoindex") == 1;
+    // A fallback that scans the table rewrites each row where the scan stands
+    // (one pass, bd-w4pr1.13.20); the seeks collect into a RowSet first.
+    let one_pass_scan = unique_seek_values.is_none() && !const_list_probe;
+    assert_eq!(
+        op_count(&ops, "RowSetRead"),
+        usize::from(!one_pass_scan),
+        "plan: {ops:?}"
+    );
     match unique_seek_values {
         Some(unique_values) => {
             assert_eq!(op_count(&ops, "Rewind"), 0, "plan: {ops:?}");
@@ -87,16 +98,25 @@ async fn assert_update_plan(c: &Connection, sql: &str, unique_seek_values: Optio
         None => {
             assert_eq!(op_count(&ops, "Rewind"), 1, "plan: {ops:?}");
             assert_eq!(op_count(&ops, "Next"), 1, "plan: {ops:?}");
-            assert_eq!(op_count(&ops, "RowSetAdd"), 1, "plan: {ops:?}");
-            // GH #415: a rowid IN list of non-literal constants builds a probe set
-            // (OpenAutoindex) and loops it with one SeekRowid per member instead of
-            // scanning the table; the literal-only unrolled seeks above still decline.
-            let const_list_probe = op_count(&ops, "OpenAutoindex") == 1;
+            assert_eq!(
+                op_count(&ops, "RowSetAdd"),
+                usize::from(!one_pass_scan),
+                "plan: {ops:?}"
+            );
             assert_eq!(
                 op_count(&ops, "SeekRowid"),
-                1 + usize::from(const_list_probe),
-                "fallback must retain only the Pass-2 seek (plus the probe-set seek): {ops:?}"
+                if one_pass_scan { 0 } else { 2 },
+                "a scan rewrites in place with no seek; the probe-set loop keeps its probe seek and \
+                 the Pass-2 seek: {ops:?}"
             );
+            if one_pass_scan {
+                let insert = ops.iter().position(|op| op == "Insert");
+                let next = ops.iter().position(|op| op == "Next");
+                assert!(
+                    insert.is_some() && insert < next,
+                    "the scan must rewrite inside the walk: {ops:?}"
+                );
+            }
         }
     }
 }

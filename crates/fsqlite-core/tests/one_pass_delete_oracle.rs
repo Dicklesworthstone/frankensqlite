@@ -14,6 +14,13 @@
 //! target table through a subquery (it must see the table as it was before
 //! the statement), BEFORE / AFTER triggers and foreign-key actions (run around
 //! the program in this engine), and RETURNING.
+//!
+//! An UPDATE that scans its table rewrites each matching row in the scan on
+//! the same terms, and also keeps the two passes when it moves the rowid
+//! (the scan could meet the row again) or resolves a conflict with IGNORE or
+//! REPLACE. Its cases add rows that grow across page splits while the scan
+//! continues, rows that shrink, an indexed and a UNIQUE indexed column, a
+//! WHERE reading the column being set, and a SET reading the target table.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -230,6 +237,142 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// 600 short rows: an UPDATE that widens every third row to 300 bytes
+/// splits leaves while the scan is still walking them.
+const GROW: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600) \
+     INSERT INTO t SELECT i, i % 7, 'r' || i FROM n",
+];
+const GROW_STATE: &[&str] = &[
+    "SELECT count(*), sum(id), sum(a), sum(length(b)), min(id), max(id) FROM t",
+    "SELECT group_concat(id || ':' || length(b)) FROM (SELECT id, b FROM t ORDER BY id LIMIT 60)",
+    "PRAGMA integrity_check",
+];
+
+const UPDATE_TRIGGERS: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v TEXT)",
+    "CREATE TABLE log(seq INTEGER PRIMARY KEY, what TEXT, id INTEGER, old_k INTEGER, new_k INTEGER, total INTEGER)",
+    "INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c'), (4, 4, 'd'), (5, 5, 'e'), (6, 6, 'f')",
+    "CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN \
+     INSERT INTO log(what, id, old_k, new_k, total) VALUES ('before', old.id, old.k, new.k, (SELECT sum(k) FROM t)); END",
+    "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN \
+     INSERT INTO log(what, id, old_k, new_k, total) VALUES ('after', old.id, old.k, new.k, (SELECT sum(k) FROM t)); END",
+];
+
+/// An UPDATE rewrites each matching row in the scan (one pass) when nothing
+/// can observe the rewrite, and keeps the two passes for a changed rowid,
+/// RETURNING, OR IGNORE / OR REPLACE and a subquery in SET or WHERE.
+const UPDATE_CASES: &[Case] = &[
+    // Consecutive matches; a row that grows a little; the WHERE reads the
+    // column being set (each row is still met once).
+    Case {
+        setup: SMALL,
+        statement: "UPDATE t SET v = v || 'xyz' WHERE k > 2",
+        states: ROWS_STATE,
+    },
+    Case {
+        setup: SMALL,
+        statement: "UPDATE t SET k = k + 10 WHERE k % 2 = 1",
+        states: ROWS_STATE,
+    },
+    Case {
+        setup: SMALL,
+        statement: "UPDATE t SET k = k * 2, v = NULL WHERE k < 5 OR k = 7",
+        states: ROWS_STATE,
+    },
+    // Rows that grow across page splits mid-scan, rows that shrink, and the
+    // scorecard's shape on 3,000 rows.
+    Case {
+        setup: GROW,
+        statement: "UPDATE t SET b = printf('%0300d', id) WHERE id % 3 = 0",
+        states: GROW_STATE,
+    },
+    Case {
+        setup: MANY,
+        statement: "UPDATE t SET b = b || b WHERE id % 5 = 0",
+        states: MANY_STATE,
+    },
+    Case {
+        setup: MANY,
+        statement: "UPDATE t SET b = '' WHERE id % 2 = 0",
+        states: MANY_STATE,
+    },
+    Case {
+        setup: MANY,
+        statement: "UPDATE t SET a = a + 1 WHERE id % 10 = 0",
+        states: MANY_STATE,
+    },
+    // An indexed column, a UNIQUE indexed column.
+    Case {
+        setup: INDEXED,
+        statement: "UPDATE t SET a = a + 1 WHERE id % 3 = 0",
+        states: INDEXED_STATE,
+    },
+    Case {
+        setup: INDEXED,
+        statement: "UPDATE t SET b = b || '-u' WHERE id % 4 = 0",
+        states: INDEXED_STATE,
+    },
+    // Two passes: OR IGNORE and OR REPLACE against the UNIQUE index.
+    Case {
+        setup: INDEXED,
+        statement: "UPDATE OR IGNORE t SET b = 'k1' WHERE id % 13 = 5",
+        states: INDEXED_STATE,
+    },
+    Case {
+        setup: INDEXED,
+        statement: "UPDATE OR REPLACE t SET b = 'k7' WHERE id % 13 = 5",
+        states: INDEXED_STATE,
+    },
+    // Two passes: the rowid alias moves (each row must move once), a SET and
+    // a WHERE that read the target table, RETURNING.
+    Case {
+        setup: SMALL,
+        statement: "UPDATE t SET id = id + 1 WHERE k > 2",
+        states: ROWS_STATE,
+    },
+    Case {
+        setup: SMALL,
+        statement: "UPDATE t SET k = (SELECT max(k) FROM t) + 1 WHERE k % 2 = 0",
+        states: ROWS_STATE,
+    },
+    Case {
+        setup: SMALL,
+        statement: "UPDATE t SET k = k + 10 WHERE k < (SELECT avg(k) FROM t)",
+        states: ROWS_STATE,
+    },
+    Case {
+        setup: SMALL,
+        statement: "UPDATE t SET v = 'z' WHERE k > 4 RETURNING id, v",
+        states: ROWS_STATE,
+    },
+    // Triggers and foreign keys run around the program.
+    Case {
+        setup: UPDATE_TRIGGERS,
+        statement: "UPDATE t SET k = k + 100 WHERE k % 2 = 1",
+        states: &[
+            "SELECT rowid, * FROM t ORDER BY rowid",
+            "SELECT what, id, old_k, new_k, total FROM log ORDER BY seq",
+        ],
+    },
+    Case {
+        setup: FK_CASCADE,
+        statement: "UPDATE p SET k = k + 1 WHERE k % 2 = 0",
+        states: FK_STATE,
+    },
+    Case {
+        setup: FK_CASCADE,
+        statement: "UPDATE c SET pid = 3 WHERE id % 2 = 0",
+        states: FK_STATE,
+    },
+    Case {
+        setup: WITHOUT_ROWID,
+        statement: "UPDATE t SET v = v || '!' WHERE k % 2 = 0",
+        states: WITHOUT_ROWID_STATE,
+    },
+];
+
 fn tag_f(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_owned(),
@@ -367,30 +510,97 @@ async fn check_case(case: &Case, file_backed: bool, prepared: bool) -> Vec<Strin
     failures
 }
 
+/// Every case on `:memory:` and on a file, direct and prepared.
+async fn check_cases(cases: &[Case]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for case in cases {
+        // RETURNING rows of a prepared DML statement are not readable
+        // through `PreparedStatement::query`; that case runs directly.
+        let modes: &[bool] = if case.statement.contains("RETURNING") {
+            &[false]
+        } else {
+            &[false, true]
+        };
+        for file_backed in [false, true] {
+            for &prepared in modes {
+                failures.extend(check_case(case, file_backed, prepared).await);
+            }
+        }
+    }
+    failures
+}
+
 #[test]
 fn scan_delete_matches_stock_in_one_pass_and_two() {
     asupersync::test_utils::run_test(|| async {
-        let mut failures = Vec::new();
-        for case in CASES {
-            // RETURNING rows of a prepared DML statement are not readable
-            // through `PreparedStatement::query`; that case runs directly.
-            let modes: &[bool] = if case.statement.contains("RETURNING") {
-                &[false]
-            } else {
-                &[false, true]
-            };
-            for file_backed in [false, true] {
-                for &prepared in modes {
-                    failures.extend(check_case(case, file_backed, prepared).await);
-                }
-            }
-        }
+        let failures = check_cases(CASES).await;
         assert!(
             failures.is_empty(),
             "{} differences from SQLite:\n{}",
             failures.len(),
             failures.join("\n")
         );
+    });
+}
+
+#[test]
+fn scan_update_matches_stock_in_one_pass_and_two() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(UPDATE_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+/// Opcode names of `EXPLAIN <statement>` on `f`.
+async fn explain_opcodes(f: &Connection, statement: &str) -> Vec<String> {
+    f.query(&format!("EXPLAIN {statement}"))
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| match &row.values()[1] {
+            SqliteValue::Text(name) => name.to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// The UPDATE shapes: the plain scan rewrites in place without a RowSet; a
+/// changed rowid alias, RETURNING, OR IGNORE and a subquery reading the
+/// target keep the two passes.
+#[test]
+fn scan_update_is_one_pass_only_where_nothing_can_observe_it() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("open");
+        for setup in SMALL {
+            f.execute(setup).await.expect("setup");
+        }
+        for (statement, one_pass) in [
+            ("UPDATE t SET v = v || 'xyz' WHERE k > 2", true),
+            ("UPDATE t SET k = k + 10 WHERE k % 2 = 1", true),
+            ("UPDATE t SET id = id + 1 WHERE k > 2", false),
+            ("UPDATE t SET v = 'z' WHERE k > 4 RETURNING id", false),
+            ("UPDATE OR IGNORE t SET v = 'z' WHERE k > 4", false),
+            ("UPDATE t SET k = (SELECT max(k) FROM t) WHERE k > 4", false),
+        ] {
+            let program = explain_opcodes(&f, statement).await;
+            assert_eq!(
+                !program.iter().any(|op| op == "RowSetAdd"),
+                one_pass,
+                "`{statement}` one pass expected {one_pass}: {program:?}"
+            );
+            let insert = program.iter().position(|op| op == "Insert").expect("Insert");
+            let next = program.iter().rposition(|op| op == "Next").expect("Next");
+            assert_eq!(
+                insert < next,
+                one_pass,
+                "`{statement}` rewrites inside the scan exactly in one pass: {program:?}"
+            );
+        }
     });
 }
 
