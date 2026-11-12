@@ -23,6 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [v0.5.0](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.5.0) | Tag | 2026-11-12 | Uniform release of all 26 public crates on asupersync 0.6 (**breaking**: `Cx` appears in public APIs, table rows are stored in stock's layout without VIRTUAL generated columns, `FrankenError::PrimaryKeyViolation` carries the conflict's columns, and `FrankenError` has a new `RowidViolation` variant). Known issues: bd-r5mmz (a `WITH ... INSERT ... ON CONFLICT DO UPDATE SET` that reads its CTE, with triggers, can return wrong rows), bd-xz5f4 (a seek on a `REAL` index column can return wrong rows past 2^53), bd-aoukl (secondary indexes of a `WITHOUT ROWID` table with a `DESC` primary-key term fail stock's `integrity_check`) and bd-1ucvb (slow WITH ... INSERT trigger replay). No GitHub Release |
 | [v0.4.13](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.13) | Release | 2026-11-01 | Uniform release of all 26 public crates, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format; a WITHOUT ROWID UPDATE or any upsert `DO UPDATE` read SET values the same SET had already assigned (bd-bymr0); UPDATE and DELETE with a correlated subquery over a join, view, derived table or OFFSET changed the wrong rows or stored wrong values (bd-h7hox), and such subqueries in RETURNING returned wrong values (bd-hga35, partly fixed). Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#526 (measured), GH#528 and GH#529 fixes, `random()`/`randomblob()` seeded per process instead of repeating one sequence (bd-w2sd6), seeks for correlated subqueries, simple views, join `LIMIT`, constant-expression keys and bare-column aggregates (one tied `min()` shape now differs from stock, bd-5kdea), `INSERT ... SELECT` that no longer loads a whole table or `generate_series` source (GH#491 still open), `json_each` over NULL input and table-valued functions listed before the table they read, stock's JSON error texts, `json_array_insert` and the jsonb_ aggregates, the JSON aggregates as window functions and with `->` arguments, contended checkpoints that failed with BusyRecovery, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524 and GH#525 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete`, geopoly return types and `JSON_TABLE_COLUMN_NAMES`, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run, and most from 2026-10-28 on record runs on macOS arm64 only; the release gate is under Qualification. The GH#530 streaming of table-function Cartesian aggregates was backed out before release, and GH#530 stays open |
 | [v0.4.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.12) | Release | 2026-10-13 | Uniform release of all 26 public crates, with an **upgrade advisory for 0.4.10**: a join whose outer table was read through an index with a `DESC` column returned no rows (GH#502); `:memory:` with `autocommit_retain = OFF` could lose every row of a table (GH#503); `DELETE ... WHERE EXISTS` over the same table deleted the wrong rows (bd-ntt2b). Plus FROM-less row-value comparisons (GH#450), attached-database DML and name resolution, conflict-clause and constraint parity, a full filesystem during WAL-index growth reported as an I/O error instead of a SIGBUS on Linux (GH#506), WAL-FEC attach/close fixes, and index seeks for `IN` lists and `WHERE k = ? ORDER BY id` |
 | [0.4.11](https://crates.io/crates/fsqlite-vfs/0.4.11) | crates.io only | 2026-10-09 | `fsqlite-vfs` alone: on macOS and other non-Linux Unix, a redundant main-DB descriptor opened while WAL lifetime locks were held is reused instead of parked forever, so long-running processes stop leaking about 2 fds per fresh connection (bd-l0rbc). Tag `fsqlite-vfs-v0.4.11`; no GitHub Release. The next uniform release must be >= 0.4.12 |
@@ -57,7 +58,608 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased]
+## [0.5.0] -- 2026-11-12 (tag; no GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.13...v0.5.0>
+
+### Breaking
+
+- **The engine uses asupersync 0.6 (0.6.2); the 0.4 line used asupersync 0.5.** `Cx` appears in
+  public APIs, and native context attachment and blocking-pool discovery share asupersync types and
+  thread-local state with the caller, so a caller moves its own `asupersync` dependency to 0.6
+  together with this release. This is why the version is 0.5.0 and not 0.4.14.
+- **Table rows are stored in stock's layout, without VIRTUAL generated columns.** FrankenSQLite
+  wrote a NULL placeholder for every VIRTUAL column, which stock SQLite leaves out of the record,
+  so every column after a VIRTUAL one was shifted, in both directions, and stock
+  `integrity_check` stayed ok. "Files FrankenSQLite wrote earlier with a non-trailing placeholder
+  are now read in stock's layout. There is no compatibility shim (early development)." So a file
+  that 0.4.x wrote with a VIRTUAL generated column before other columns reads differently under
+  0.5.0. Trailing placeholders still read correctly (bd-w4pr1.31;
+  [9c5b4511a](https://github.com/Dicklesworthstone/frankensqlite/commit/9c5b4511a)).
+- **`FrankenError::PrimaryKeyViolation` is now `PrimaryKeyViolation { columns: String }`.** It
+  carries the qualified label stock prints, and is empty when the layer that raised the conflict has
+  no schema (the B-tree, an FTS5 table). A pattern or a construction of the old unit variant no
+  longer compiles; match `PrimaryKeyViolation { .. }` instead, as three call sites in the
+  project's own integration tests now do (bd-w4pr1.22;
+  [fdc859d24](https://github.com/Dicklesworthstone/frankensqlite/commit/fdc859d24),
+  [f21d79568](https://github.com/Dicklesworthstone/frankensqlite/commit/f21d79568)).
+- **`FrankenError` has a new `RowidViolation { table }` variant.** A duplicate rowid on a table
+  with no `INTEGER PRIMARY KEY` now fails as stock does, with `SQLITE_CONSTRAINT_ROWID` (2579)
+  and `UNIQUE constraint failed: <table>.rowid`, where FrankenSQLite reported a plain constraint
+  or `PrimaryKeyViolation`. An exhaustive `match` on `FrankenError` needs a new arm. The variant
+  counts as a uniqueness conflict, so `OR IGNORE`, `OR REPLACE`, UPSERT and changeset conflict
+  handlers treat it as they treat `PRIMARY KEY` and `UNIQUE` conflicts. An `INTEGER PRIMARY KEY`
+  conflict still reports `SQLITE_CONSTRAINT_PRIMARYKEY` (1555) (bd-w4pr1.32;
+  [559db5ae6](https://github.com/Dicklesworthstone/frankensqlite/commit/559db5ae6),
+  [3be196539](https://github.com/Dicklesworthstone/frankensqlite/commit/3be196539)).
+- **`fsqlite_wal::TransactionConflictPageBaseline` replaces `page_hash: [u8; 32]` with
+  `page: PageData`.** The baseline keeps the page image the transaction saw, where it kept that
+  image's BLAKE3 hash, and the struct is no longer `Copy`. Code that builds the struct, reads
+  `page_hash` or copies a baseline must change (bd-w4pr1.7;
+  [afd4e5622](https://github.com/Dicklesworthstone/frankensqlite/commit/afd4e5622)).
+
+### Added
+
+- SQLite 3.54's `end of day`, `end of month` and `end of year` date modifiers: the last
+  millisecond, 23:59:59.999, of the current day, month or year.
+  `strftime('%Y-%m-%d %H:%M:%f', '2026-02-10', 'end of month')` is `2026-02-28 23:59:59.999`
+  ([23cf104fc](https://github.com/Dicklesworthstone/frankensqlite/commit/23cf104fc)).
+- SQLite 3.54's `weekday -N` modifier (N from 0 to 6, 0 is Sunday) moves back to the nearest day
+  that is weekday N, where `weekday N` moves forward; like `weekday N`, it leaves a date that is
+  already that weekday unchanged. `date('2026-11-11', 'weekday -1')` is `2026-11-09`
+  ([23cf104fc](https://github.com/Dicklesworthstone/frankensqlite/commit/23cf104fc)).
+- `fsqlite_error::SQLITE_CONSTRAINT_PRIMARYKEY` (1555), `SQLITE_CONSTRAINT_ROWID` (2579) and
+  `SQLITE_CONSTRAINT_UNIQUE` (2067) name the three extended codes, and
+  `FrankenError::is_unique_conflict()` is true for all three conflicts, for callers that still
+  treat a PRIMARY KEY or rowid conflict as a uniqueness conflict, as changeset application does
+  (bd-w4pr1.22, bd-w4pr1.32;
+  [fdc859d24](https://github.com/Dicklesworthstone/frankensqlite/commit/fdc859d24),
+  [559db5ae6](https://github.com/Dicklesworthstone/frankensqlite/commit/559db5ae6)).
+- `fsqlite_vfs::ShmRegion::atomic_first_zero_u16_ne(offset, count, ordering)` returns the index of
+  the first zero native-endian `u16` word among `count` words from `offset`, or `None`, holding
+  the region mutex once (bd-w4pr1.7;
+  [3daeda153](https://github.com/Dicklesworthstone/frankensqlite/commit/3daeda153)).
+
+### Changed
+
+- A PRIMARY KEY conflict reports the extended code `SQLITE_CONSTRAINT_PRIMARYKEY` (1555), as stock
+  does: a duplicate `INTEGER PRIMARY KEY` value, a conflict in the index behind a non-integer
+  PRIMARY KEY of a rowid table, and a conflict on a `WITHOUT ROWID` table's PRIMARY KEY.
+  FrankenSQLite raised `UniqueViolation` for these, with `SQLITE_CONSTRAINT_UNIQUE` (2067). Where
+  the schema is known the message stays stock's `UNIQUE constraint failed: ...`, so only the
+  extended code tells the two apart, and a caller that matches 2067 for primary-key conflicts must
+  now also accept 1555. The rusqlite facade (`fsqlite::blocking`) keeps the code, extended code
+  and message, where it flattened the conflict into a UNIQUE one; `OR IGNORE`, `OR REPLACE` and
+  UPSERT still treat both as uniqueness conflicts (bd-w4pr1.22;
+  [fdc859d24](https://github.com/Dicklesworthstone/frankensqlite/commit/fdc859d24),
+  [d0a2c4f67](https://github.com/Dicklesworthstone/frankensqlite/commit/d0a2c4f67)).
+
+### Fixed
+
+- `ALTER TABLE` refuses to add, drop or rename a column to or from a rowid alias name (`rowid`,
+  `_rowid_` or `oid`) on a table that has a rowid, as SQLite 3.54 does, with the error
+  `cannot <op> rowid alias: <name>`. FrankenSQLite allowed it, and the new column shadowed the
+  implicit rowid and changed what later statements resolved. Such a statement now fails; WITHOUT
+  ROWID tables are unaffected (bd-w4pr1.31;
+  [e161a32ee](https://github.com/Dicklesworthstone/frankensqlite/commit/e161a32ee)).
+- `printf()` empty results are `''` and `%j`/`%J` render JSON strings, as in SQLite 3.54: an
+  incomplete or unknown conversion with nothing accumulated, such as `printf('%5')` or
+  `printf('%a', 1)`, gives `''` as in 3.54.1 (bd-w4pr1.18, bd-w4pr1.30;
+  [2b61ca601](https://github.com/Dicklesworthstone/frankensqlite/commit/2b61ca601)).
+- A downstream app's debug build overflowed Rust's 2 MiB default thread stack inside fsqlite, so its
+  `cargo test` aborted. Statement-path futures are now kept out of debug stack frames, and a
+  `fsqlite::blocking` call with under 4 MiB of stack left (1 MiB in a release build) runs on a
+  fresh heap-allocated 8 MiB stack segment, so a debug `cargo test` works on default-sized
+  threads. Futures of the async `Connection` API run on the application's own executor, whose
+  threads may still need a bigger stack in a debug build (bd-w4pr1.28;
+  [da4468183](https://github.com/Dicklesworthstone/frankensqlite/commit/da4468183),
+  [28ca2042e](https://github.com/Dicklesworthstone/frankensqlite/commit/28ca2042e)).
+- Tooling: the user-shape scorecard script showed every arm of its multi-process row as failed,
+  stock `sqlite3` included, because a clean run reported `0 error lines`. A clean run now reports
+  no error, and a run with error lines still reports their count and fails (bd-w4pr1.4;
+  [6195307a3](https://github.com/Dicklesworthstone/frankensqlite/commit/6195307a3)).
+- An "integer overflow" error from `abs()`, `sum()` or window `sum()` reports `SQLITE_ERROR` (1), as
+  stock SQLite does, where it reported `SQLITE_RANGE` (25), which stock uses only for a
+  bind-parameter index out of range, so an application matching on the error code saw a different
+  code for the same error (bd-w4pr1.33,
+  [5bb27ba58](https://github.com/Dicklesworthstone/frankensqlite/commit/5bb27ba58)).
+- A subquery operand of a comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`) compares its
+  fields with its affinity but without its own collation, whether that is the column's declared one
+  or a `COLLATE` in the subquery's select list, as the bundled SQLite 3.54.1 does. `SELECT (SELECT
+  a,1 FROM t)=('a',1)` over a `TEXT COLLATE NOCASE` column now answers 0, where the interpreted path
+  followed SQLite 3.46.1 and answered 1. The other operand's explicit `COLLATE` still applies, and
+  `IN` still uses the left subquery's collation (bd-9sp6f,
+  [50faa244c](https://github.com/Dicklesworthstone/frankensqlite/commit/50faa244c)).
+- A prepared `SELECT` with `GROUP BY` whose result column wraps a key or an aggregate (`a || ':' ||
+  count(*)`, `upper(b)`, `quote(count(*))`, the shapes reports and ORMs emit) now prepares on a file
+  database, where it failed with "not implemented: result column not in GROUP BY clause" although
+  the same statement ran unprepared and on `:memory:`. When the code generator cannot express a
+  prepared `SELECT`, the statement runs through the general path as an unprepared one does, after
+  its column references are checked, so an unknown column still fails at prepare as in stock SQLite
+  (bd-w4pr1.34,
+  [355f5f78c](https://github.com/Dicklesworthstone/frankensqlite/commit/355f5f78c)).
+- `SELECT count(*) FROM t AS a WHERE t.x IN (...)`, which names an aliased table by its original
+  name, reports `NoSuchColumn` whether or not the `:memory:` row mirror is loaded, where it reported
+  the same message as a function error when the mirror was not loaded (bd-w4pr1.13.23,
+  [9859cd87d](https://github.com/Dicklesworthstone/frankensqlite/commit/9859cd87d)).
+- A commit verifies the `-wal-cert` certificate sidecar's append boundary before its durability
+  boundary. After garbage was appended to the sidecar, the first write met the corrupt suffix only
+  in the certificate append's boundary scan, which runs after `durability_started` is set, so a
+  refusal before any byte was written left the commit in doubt: `RESERVED` stayed held for a queue
+  reconciliation that met the same suffix, and the writer never came free. The hang came from an
+  earlier change in this release cycle; 0.4.13 is not affected. The pager now calls
+  `WalBackend::prepare_certificate_append` under the held append gate right before
+  `durability_started`, so a corrupt suffix fails the flush closed before anything is written, with
+  the scan's diagnostic. That commit's append takes the verified descriptor and offset instead of
+  verifying again, so a commit makes no extra system call; a failure after a write is issued stays
+  in doubt, as before (bd-o1wdd,
+  [947613f27](https://github.com/Dicklesworthstone/frankensqlite/commit/947613f27)).
+- An INSERT that omits an INTEGER PRIMARY KEY alias now allocates a rowid even when the column
+  declares a DEFAULT. This holds for DEFAULT VALUES, VALUES, both INSERT SELECT forms, and the
+  candidate metadata of triggers and foreign keys; WITHOUT ROWID tables, INTEGER PRIMARY KEY DESC
+  and INT primary keys keep their defaults. Opening or importing a database now rejects duplicate
+  virtual-table `sqlite_schema` entries; bounded FTS5 recovery stays available only through the
+  explicit deferred repair API (bd-ipk-default-used-as-rowid-yniw8, bd-2dtww,
+  [a86e2136b](https://github.com/Dicklesworthstone/frankensqlite/commit/a86e2136b)).
+- On a file database, a `GROUP BY` with `HAVING` answers like stock SQLite. The GROUP BY storage
+  substrate evaluated `HAVING` wrongly: with the aggregate inside an expression (`count(*) * 2 > 3`,
+  `sum(val) + 1 > 50`, `count(*) IN (2, 3)`) it dropped every group, so through `Connection::query`
+  a top-level `GROUP BY ... HAVING count(*) * 2 > 3` returned no rows where stock returns two, and
+  with the aggregate not a result column (`SELECT max(id) ... HAVING count(*) > 1`) it kept failing
+  groups. Inside a subquery it gave wrong `IN`-list members and empty derived tables, and
+  `DELETE FROM t3 WHERE id IN (SELECT max(id) FROM t3 GROUP BY a HAVING count(*) > 1)` deleted a row
+  stock keeps. A statement with a `HAVING` now skips the substrate and takes the in-memory grouped
+  path; fixing the substrate's own `HAVING` evaluation is left open on the bead (bd-23kpa,
+  [6f9e29ff1](https://github.com/Dicklesworthstone/frankensqlite/commit/6f9e29ff1)).
+
+### Performance
+
+- A one-row literal `INSERT ... VALUES`, and a `SELECT`, `UPDATE` or `DELETE` filtered by
+  `k = <integer>` where `k` is the rowid alias, runs with its literals bound as parameters, so
+  statements that differ only in their literals share the parse, compiled-program and prepared
+  caches. It applies only to an ordinary table of the connection; hex, exponents, blobs, integers
+  past i64, comments, quoted names, multi-row `VALUES` and any further clause take the text path
+  unchanged. Measured by the commit through the CLI against stock `sqlite3` 3.46.1, together with
+  the next entry's change, in user instructions per statement: INSERT 91-96k to 62-66k (6.7x to
+  4.6x stock), point SELECT 152-156k to 91-99k (7.0x to 4.3x), UPDATE 114-115k to 68-76k (6.3x
+  to 4.0x); still slower than stock (bd-5310l;
+  [4d926777b](https://github.com/Dicklesworthstone/frankensqlite/commit/4d926777b)).
+- A statement dispatched with bound parameters reuses the text its tree last rendered to: the last
+  four trees of each statement kind are kept with their text and cache key, so a cache hit no
+  longer renders the whole tree. Measured by the commit with callgrind, per statement: INSERT
+  dispatch 33.9k to 27.7k instructions, SELECT 44.9k to 37.9k, UPDATE 49.2k to 40.0k (bd-5310l;
+  [42e3e422a](https://github.com/Dicklesworthstone/frankensqlite/commit/42e3e422a)).
+- The `fsqlite` shell hands a chunk of input that is exactly one `INSERT`, `UPDATE`, `DELETE` or
+  `SELECT` straight to the engine, without parsing it first, when the output shows no column
+  names. If the statement fails, the shell parses it after all, so a syntax error is still
+  reported in the shell parser's words. Measured by the commit against stock: INSERT 62-66k to
+  47-49k user instructions per statement (4.6x to 3.5x stock), point SELECT 91-99k to 70-72k,
+  UPDATE 68-76k to 59-62k; shell output byte-identical over 768 runs (bd-5310l;
+  [d2d7514b3](https://github.com/Dicklesworthstone/frankensqlite/commit/d2d7514b3)).
+- The shell block-buffers standard output in 64 KiB blocks when it is not a terminal, writing it
+  out before it waits for input, before anything goes to standard error, and at exit; a terminal
+  keeps line buffering. Measured by the commit, a 100,000-row `SELECT` to a pipe made 635 write
+  calls instead of 100,026 (stock: 553) and used 98 ms of CPU instead of 177-190 ms (stock:
+  26 ms) (bd-5310l;
+  [4af710d0d](https://github.com/Dicklesworthstone/frankensqlite/commit/4af710d0d)).
+- The shell asks after every input line whether its input ends a statement. That check copied
+  every word into a new upper-cased string to compare it; now the first words of a statement drive
+  a five-state tracker and words are compared where they stand, ignoring case, with the same
+  answers. A test keeps the previous check and compares the two over 1,118,480 generated texts.
+  Measured by the commit with callgrind over 1,000 statements in one transaction: the check 3.2k
+  to 1.6k instructions per statement (literal INSERT), 3.1k to 1.4k (point SELECT), 3.4k to 1.6k
+  (UPDATE), and each statement 1.6k to 2.3k fewer in all (2.6% to 3.8%) (bd-5310l;
+  [8b6d0eb76](https://github.com/Dicklesworthstone/frankensqlite/commit/8b6d0eb76)).
+- `CREATE INDEX` and `REINDEX` scan the table into the sorter and build the index from the sorted
+  records, as stock's `sqlite3RefillIndex` does, instead of one `IdxInsert` per row in table order.
+  When every row sorts after the one before it, the new `IdxBulkLoad` opcode writes the leaves left
+  to right and full, and the interior levels the same way, with no seek and no balance; a `UNIQUE`
+  build fails on two adjacent rows that share a key with no NULL in it before any page is written.
+  Otherwise (rows out of index order, a non-empty index, a UTF-16 database) the sorted rows go
+  through `IdxInsert`. Index page counts now equal stock's. Measured by the commit before its
+  rebase, against stock `sqlite3` 3.46.1: `create_index_int_300k` 1.529 s to 0.529 s (16.18x to
+  5.60x stock); still slower than stock (bd-reality-check-1022-llk6g.8;
+  [8e505181f](https://github.com/Dicklesworthstone/frankensqlite/commit/8e505181f)).
+- A sorter row with one key column and a record of at most 23 bytes holds both inside itself and
+  owns no heap block; a longer record takes the record buffer over as before. Measured by the
+  commit before its rebase: `create_index_int_300k` 0.456 s to 0.265 s (4.97x to 2.89x stock),
+  `group_by_1000_groups` 1.214 s to 0.666 s (5.50x to 3.02x), and the index build's peak RSS 86 MB
+  to 68 MB (bd-reality-check-1022-llk6g.8;
+  [694b8860c](https://github.com/Dicklesworthstone/frankensqlite/commit/694b8860c)).
+- Once the sorter spills past its 100 MiB limit, each sorted run and the rows still in memory at
+  merge time try the single-integer (key, position) pair sort first, which gives the same stable
+  order, and the run reader reads each record straight into the row instead of through a `Vec`
+  per row; rows that do not spill are unchanged. Measured by the commit before its rebase, for
+  `CREATE INDEX` over 3M rows: user instructions 2.15x to 1.57x and 2.39x to 1.53x stock (1,000
+  distinct and unique scattered integer keys); no wall-time change is claimed
+  (bd-reality-check-1022-llk6g.8;
+  [fbd91e562](https://github.com/Dicklesworthstone/frankensqlite/commit/fbd91e562)).
+- A lookup join tests the `WHERE` terms that read only the outer table before it seeks the inner
+  one, and for an inner join also the `ON` terms the lookup did not consume; a `LEFT JOIN`'s `ON`
+  term, a term under `OR` and a term that reads the inner table are not moved. When the outer loop
+  is a table scan, an upper bound on the outer rowid by a literal or a numbered parameter ends the
+  scan at the first row past it, and an integer lower bound starts it with `SeekGT` or `SeekGE`
+  instead of `Rewind`. The join lanes compile `BETWEEN` as its two comparisons instead of leaving
+  bytecode for the materializing executor, and a two-table join written without a constraint
+  (`FROM t, u WHERE u.a = t.a`) returns its rows through the lookup loop when its `WHERE` gives a
+  lookup, keeping the written table order. Before these commits, `... WHERE t.id <= 100000` over
+  1M outer rows made 900k inner seeks for rows the `WHERE` discards (6.3G instructions against
+  stock's 0.29G); the `BETWEEN` and comma-join shapes cost 9.4G against 0.18G and 16.5G against
+  0.29G. The commits state no figure after the change. The `select_join_lookup` bytecode snapshot
+  now tests the outer `WHERE` term before the inner seek (bd-w4pr1.13.16;
+  [0fb84fe5c](https://github.com/Dicklesworthstone/frankensqlite/commit/0fb84fe5c),
+  [5b9f8778b](https://github.com/Dicklesworthstone/frankensqlite/commit/5b9f8778b),
+  [6e8bd1fe9](https://github.com/Dicklesworthstone/frankensqlite/commit/6e8bd1fe9),
+  [47d45b47e](https://github.com/Dicklesworthstone/frankensqlite/commit/47d45b47e),
+  [daa154ea5](https://github.com/Dicklesworthstone/frankensqlite/commit/daa154ea5),
+  [a3fec6ea6](https://github.com/Dicklesworthstone/frankensqlite/commit/a3fec6ea6)).
+- `SELECT DISTINCT` over an unindexed column and `x IN (list or subquery)` ask an ephemeral b-tree
+  whether a key is present once per row, about 8.5k instructions per probe. At the three probe
+  sites whose cursor nothing reads afterwards, the cursor now remembers the records it found
+  present or absent while the b-tree is unchanged, so a repeated probe is answered without a seek;
+  any mutation through the cursor empties the memo. A set's memo holds up to 8,192 records of up
+  to 256 bytes, and it sits out 32,768 probes after a 4,096-probe window in which fewer than one
+  in eight was answered from it. The `subquery_in_predicate` bytecode snapshot marks its `Found`
+  as a membership-only probe. The commit states no figure after the change (bd-w4pr1.13.15;
+  [6d2679a67](https://github.com/Dicklesworthstone/frankensqlite/commit/6d2679a67),
+  [a3fec6ea6](https://github.com/Dicklesworthstone/frankensqlite/commit/a3fec6ea6)).
+- The ephemeral index behind `SELECT DISTINCT`, an `IN` list and an `IN` probe source is only asked
+  whether a key is present, and an all-distinct `DISTINCT` spent 73% of the statement in that
+  b-tree (a seek for the probe, a second seek and a page balance for the insert). Those three
+  sites now keep their keys in a hash set of canonical record bytes and leave the b-tree empty. A
+  record is canonical when byte equality is the index's equality: `NULL`, an `INTEGER` in its
+  minimal encoding, a `BLOB`, `TEXT` whose key columns all compare with `BINARY` in a UTF-8
+  database, and a `REAL` that no `INTEGER` equals; a `REAL` that an `INTEGER` equals (`-0.0`
+  included) is kept as that `INTEGER`, since the index compares `1` and `1.0` equal. A record with
+  no canonical form (`TEXT` under another collation or encoding, a NaN, a malformed record), or an
+  insert with unique or change-counting semantics, moves the keys held so far into the b-tree, and
+  the cursor carries on as an ordinary index, memo included. In the `subquery_in_predicate`
+  bytecode snapshot, the `OpenAutoindex` of the IN probe set carries the set flag (P5 from 0 to
+  1); the program is otherwise identical. The commit states no figure after the change
+  (bd-w4pr1.13.15;
+  [0ec1c35ee](https://github.com/Dicklesworthstone/frankensqlite/commit/0ec1c35ee)).
+- More aggregates over a join run in the bytecode lookup loop instead of the materializing
+  executor. A lone inner or cross join written without a constraint takes its lookup from the
+  `WHERE` clause, and a cross join keeps its written order. A plain call of a scalar function
+  that is registered at that arity, constant for identical arguments and does not consume its
+  arguments' collations compiles inside the loop; the name is resolved in the connection's
+  registry when the call runs, so a replaced builtin is the one called. `ON` and `WHERE` may use
+  `/ % || & | << >>`, and aggregate arguments `/ % ||`. Other shapes keep the general path. The
+  commits state no figures (bd-w4pr1.13.6;
+  [845ca7e88](https://github.com/Dicklesworthstone/frankensqlite/commit/845ca7e88),
+  [f68e18296](https://github.com/Dicklesworthstone/frankensqlite/commit/f68e18296),
+  [5e33f2143](https://github.com/Dicklesworthstone/frankensqlite/commit/5e33f2143)).
+- Window partitions are the runs of equal keys after the sort, found with one comparison per row,
+  where each row searched every partition found so far; windows over grouped rows build their
+  partitions the same way; and a window query's output keeps the first window's sort order
+  instead of sorting every row a second time with the same comparator. Partitions, their order
+  and the row order inside them are unchanged. Before, on `row_number() OVER (PARTITION BY a
+  ORDER BY c)` with 1M rows and 1,000 partitions, the partition search was about 75% of the
+  statement's 62.5G instructions (stock: 8.2G); the commits state no figure after the change
+  (bd-w4pr1.12;
+  [bf822dce2](https://github.com/Dicklesworthstone/frankensqlite/commit/bf822dce2),
+  [1452410ce](https://github.com/Dicklesworthstone/frankensqlite/commit/1452410ce),
+  [0528d17e7](https://github.com/Dicklesworthstone/frankensqlite/commit/0528d17e7)).
+- The in-place `Column` lane parses a row's record header into a table of each column's serial type
+  and byte range, where it rebuilt a decode scratch that also sized and cleared a value slot per
+  column (181 instructions per row of a 1M-row filtered aggregate, against about 1,930 for the
+  whole row), and it decodes `NULL`, integers and reals from the column's own bytes, where the
+  general column decoder took about 80 instructions for an integer. What the lane serves is
+  unchanged (bd-w4pr1.13.4). A plain `AggStep` (not `DISTINCT`, no collation, not `min` or `max`,
+  at most eight arguments) calls its aggregate's step directly once its site is resolved, where an
+  `AggStep` cost about 390 instructions, of which the aggregate was about 65. A step whose
+  accumulator is missing or another function's, or whose arguments the lane cannot read as they
+  stand, takes the general path, having changed nothing (bd-w4pr1.13). Measured by the commits in
+  user instructions per statement over 1M rows, with stock `sqlite3` in the same run:
+  `scan_filter_agg` 1,675.8M to 1,587.9M with the `Column` lane, then to 1,409.8M with `AggStep`
+  (3.18x to 2.83x stock's 498.7M), and `count(*), sum(length(b)), sum(c)` 3,505.8M to 2,946.8M
+  with `AggStep`; `count(DISTINCT ..)` is unchanged
+  ([cc9928bd2](https://github.com/Dicklesworthstone/frankensqlite/commit/cc9928bd2),
+  [9c8c4a485](https://github.com/Dicklesworthstone/frankensqlite/commit/9c8c4a485),
+  [fc0408327](https://github.com/Dicklesworthstone/frankensqlite/commit/fc0408327)).
+- An `ORDER BY ... LIMIT` whose heap is full compares each candidate's packed sort key with the
+  heap's worst row where the key lies, where it decoded the whole key record, locked the collation
+  registry and compared the decoded values (about 940 instructions a row). `NULL`, integer and
+  real keys, and `TEXT` keys under `BINARY` on a UTF-8 database, take the new path; a `BLOB` key,
+  a collation on any key, a UTF-16 database, `TEXT` against a number, a record the decoder would
+  reject and keys of more than eight columns keep the decoding path. `AggStep` finds its resolved
+  function in a slot per opcode address and its accumulator in a slot per register, where each
+  step made two hash probes (about 50 of a plain step's ~150 instructions); a negative
+  accumulator register is now refused with an error (bd-w4pr1.13). Measured by the commits in
+  user instructions per statement over 1M rows, with stock `sqlite3` in the same run:
+  `order_by_text_limit10` 2,347.3M to 1,716.8M (3.02x to 2.21x stock's 778.0M), with a `NOCASE`
+  key, left to the decoder, about 35 instructions a row slower (3.29x to 3.33x);
+  `scan_filter_agg` 1,403.4M to 1,360.0M (2.81x to 2.73x stock's 498.7M); and
+  `count(*), sum(length(b)), sum(c)` 2,937.4M to 2,807.4M
+  ([c7c59ecc6](https://github.com/Dicklesworthstone/frankensqlite/commit/c7c59ecc6),
+  [9e7afd9cf](https://github.com/Dicklesworthstone/frankensqlite/commit/9e7afd9cf)).
+- An index binary search whose probe leads with an `INTEGER` term orders each visited cell by
+  that term read straight from the stored record, where every step parsed the cell, copied its
+  payload, walked the record header and decoded the leading field before comparing (about 450
+  instructions beside the cell parse, over 115,032 comparisons in an unindexed 5k by 5k join). It
+  applies to a cell held whole on its page in an index that compares stored bytes; equal leading
+  terms, a stored leading term that is not an integer, a malformed record, an overflowing cell and
+  every other probe keep the full comparison, and the whole record header is still validated
+  (bd-w4pr1.13.15,
+  [86a3d07a9](https://github.com/Dicklesworthstone/frankensqlite/commit/86a3d07a9)).
+- An implicit aggregate over a lookup join, such as
+  `SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`, takes the VDBE lookup loop on
+  a `:memory:` database as it already did on a file. It went to the general fallback, which copies
+  each table into the row mirror and joins in the tree-walking evaluator: 3,023M instructions for
+  that join against 1,216M on a WAL file and stock `sqlite3`'s 337M. Time travel still declines,
+  and a shape the code generator does not compile still takes the general path (bd-w4pr1.13.23,
+  [d32af3e9a](https://github.com/Dicklesworthstone/frankensqlite/commit/d32af3e9a)).
+- A full-scan `UPDATE` rewrites each matching row where the scan stands, in one pass, when nothing
+  can observe the rewrite, where it collected the matching rowids first and re-sought each one
+  before rewriting it (about 3.6k instructions per updated row, 108M of
+  `UPDATE m SET a = a + 1 WHERE id % 10 = 0` on a 300k-row table). The one pass needs no
+  `RETURNING`; no subquery, `EXISTS`, `IN (SELECT ...)` or window call in the `WHERE` or in a
+  `SET` value; no assignment to the rowid or its `INTEGER PRIMARY KEY` alias; and no `IGNORE` or
+  `REPLACE` conflict handling. Every other `UPDATE` keeps the two passes. An `UPDATE` through a
+  table alias whose `WHERE` names `alias.rowid` now seeks that rowid instead of scanning the
+  table (bd-w4pr1.13.20,
+  [4e768da5a](https://github.com/Dicklesworthstone/frankensqlite/commit/4e768da5a)).
+- A statement that neither the placeholder renumbering nor the subquery rewrite could change is used
+  as it is, where every execution cloned the statement and walked each expression through both
+  (about 5.5k instructions for a point `SELECT` with no subquery; an `UPDATE` was renumbered twice).
+  Such a statement has no `WITH`, compound, window, `FROM` subquery or join, no `AND` with a literal
+  operand, and expressions built only from literals, columns, in-range `?NNN` placeholders,
+  operators, `IS NULL`, `CAST`, `COLLATE`, `BETWEEN`, `LIKE` and function calls without `ORDER BY`,
+  `FILTER` or `OVER`; every other statement takes both rewrites as before. Over 1,000 statements in
+  one transaction it saves about 2.4k instructions per literal `INSERT`, 6.3k per point `SELECT` and
+  4.8k per `UPDATE` (bd-5310l,
+  [07e59f9ea](https://github.com/Dicklesworthstone/frankensqlite/commit/07e59f9ea)).
+- The shell's completeness scan, which runs after every input line, also notes whether the pending
+  input is one plain `SELECT`, `INSERT`, `UPDATE` or `DELETE` with a single semicolon and none of
+  the quote, bracket, backtick or comment bytes the fast reader refuses, and hands such input
+  straight to the engine, where the shell scanned the same text a second time (about 1.2k
+  instructions for a literal `INSERT`). Any other input is handled as before, and the shell's output
+  stayed byte-identical over 768 runs. It saves about 1.5k instructions per literal `INSERT`, 0.7k
+  per point `SELECT` and 1.2k per `UPDATE` (bd-5310l,
+  [f1281bea8](https://github.com/Dicklesworthstone/frankensqlite/commit/f1281bea8)).
+- A join's automatic index collects its entries while the right table is read, sorts them with the
+  index's own comparator and is built from them in one pass, where each entry was inserted in table
+  order with a seek from the root and a leaf split when full (107.8M of the 203.5M instructions of
+  an unindexed 5k by 5k join). Entries that strictly ascend into an empty index are laid out
+  directly, and any others are inserted one at a time in sorted order; an index insert that carries
+  conflict flags builds the index first and continues on the ordinary path. The probe loop is
+  unchanged (bd-w4pr1.13.15,
+  [9b4222f35](https://github.com/Dicklesworthstone/frankensqlite/commit/9b4222f35)).
+- `sum()`, `total()` and `avg()` take an `INTEGER` or `REAL` argument straight into the accumulator,
+  where every argument went through a numeric coercion that built an owned copy and dropped it
+  (about a third of a `sum()` step on an integer or real column). `TEXT` and `BLOB` arguments still
+  take the coercion, the result is the same and `NaN` is still ignored. Over 1M rows it saves about
+  52 instructions per `sum()` call (bd-w4pr1.13,
+  [158e13e75](https://github.com/Dicklesworthstone/frankensqlite/commit/158e13e75)).
+- A plain aggregate step of the built-in `sum(X)`, `count(*)` or `count(X)` updates the aggregate's
+  state directly, where every row went through a dynamic call, a downcast of the boxed state and
+  then the step. An aggregate an application registers under a built-in's name is a different type
+  and is still called on every row. It saves about 11 to 14 instructions per step (bd-w4pr1.13,
+  [9619f5245](https://github.com/Dicklesworthstone/frankensqlite/commit/9619f5245)).
+- A `WHERE` term that reads no column (literals, numbered or named parameters and deterministic
+  calls, such as `WHERE 0`, an ORM's `1 != 1` for an empty `IN` list or a query builder's `1 = 1 AND
+  ...`) is tested once before the scan, as stock SQLite does, where it was evaluated for every row:
+  `DELETE FROM t WHERE 0` read the whole table, 383.9M instructions on a 1M-row table against 3.36M
+  now and stock's 1.18M. The statement then finishes as if no row matched. Anonymous `?` parameters
+  and non-deterministic calls such as `random()` stay per row, `GROUP BY` and `INSERT ... SELECT`
+  keep per-row evaluation, and a term that raises an error now raises it once even on an empty
+  table, as in stock (bd-w4pr1.13.22,
+  [71196dbca](https://github.com/Dicklesworthstone/frankensqlite/commit/71196dbca)).
+- A B-tree cursor remembers the decoded header and checked cell-pointer array of up to eight page
+  images it loaded, keyed on the page number and the image's identity, where every load decoded and
+  range-checked the whole pointer array again (840 instructions per load of a 1,000-row table's
+  root, reloaded on each of about 405k seeks in a 1M-row join). Every change to a page gives it a
+  new identity, so a changed image is always decoded afresh, and only a page that passed its checks
+  is remembered, so corruption is still reported on every load (bd-w4pr1.13.26,
+  [ff30a1eed](https://github.com/Dicklesworthstone/frankensqlite/commit/ff30a1eed)).
+- Window queries, `GROUP BY` with window functions, `INTERSECT` and `EXCEPT`, recursive common table
+  expressions and two join source loads move each scanned row's values into their working set, where
+  they copied every value while the scanned rows stayed alive, so the peak held two full copies of
+  every column of every row (about 1.18 GB for `row_number()` over 1M rows before this change). The
+  values are the same values (bd-w4pr1.12,
+  [97974cf58](https://github.com/Dicklesworthstone/frankensqlite/commit/97974cf58)).
+- A window `SELECT` over a single table keeps only the columns the statement names while it scans,
+  where it held every column of every scanned row until the statement ended, and it sizes its
+  `PARTITION BY` and `ORDER BY` key vectors exactly, where a one-term key reserved four values.
+  `row_number() OVER (PARTITION BY a ORDER BY c)` over 1M rows now peaks at about 441 MB where it
+  peaked at about 852 MB. A `*` or `tbl.*` result column, or a virtual table, still keeps every
+  column, and a column name that does not resolve is an error, never a NULL (bd-w4pr1.12,
+  [bc91a8c47](https://github.com/Dicklesworthstone/frankensqlite/commit/bc91a8c47)).
+- A table window `SELECT` reads a `PARTITION BY` or `ORDER BY` key that is one plain column straight
+  from the scanned row, where every row carried its own key vectors (a heap allocation and a copy of
+  each key value, 2M allocations for 1M rows); any other key is evaluated once per row into one flat
+  vector, and no value or reported error changes. `row_number()` over a 1M-row partitioned window
+  now takes about 9,504M instructions and 1,287 ms of CPU where it took 10,682M and 1,443 ms (stock
+  `sqlite3` in the same run: 8,225M and 661 ms), and peaks at about 380 MB where it peaked at about
+  437 MB (bd-w4pr1.12,
+  [f572c5312](https://github.com/Dicklesworthstone/frankensqlite/commit/f572c5312)).
+- A checkpoint that resets the WAL (`RESTART` or `TRUNCATE`, the path every autocheckpoint after a
+  commit takes) reads each page it wrote back and matches it against its WAL source once, after its
+  last database write and sync, where it did so twice; the paths that do not reset verify once,
+  right before they publish, and a page that does not match still stops the checkpoint with
+  `DatabaseCorrupt` before it publishes anything or resets the WAL. The scorecard `UPDATE` now reads
+  6,931 WAL frames and 6,096 database pages where it read 9,186 and 8,712, and the 1M-row load reads
+  23,368 and 29,560 where it read 30,952 and 37,216; stock `sqlite3` in the same run read 2,250 and
+  2,264, and 6,931 and 6,933 (bd-w4pr1.13.20,
+  [ef84a64f7](https://github.com/Dicklesworthstone/frankensqlite/commit/ef84a64f7)).
+- On a private `:memory:` connection, the first read after a write no longer rebuilds the whole
+  in-memory row mirror (about 2.5k instructions per table row) when the statement runs in the VDBE
+  and never reads those rows; the rows are marked owed, and the first statement that does read them
+  (an in-memory fallback `SELECT`, or a prepared statement with a mirror fast path, at top level
+  outside any transaction) pays the same reload, while a write, `BEGIN` or `SAVEPOINT` drops the
+  debt. The scorecard's 200k-row memory script now takes about 6,488M instructions where it took
+  6,980M (3.39x stock `sqlite3` where it was 3.65x) and peaks at about 103 MB where it peaked at
+  about 130 MB, and a rowid-lookup join after the setup takes 2.4M instructions where it took 568M
+  (bd-w4pr1.13.23,
+  [9859cd87d](https://github.com/Dicklesworthstone/frankensqlite/commit/9859cd87d)).
+- A rowid seek that the B-tree cursor's four-slot seek cache serves moves that slot to the front in
+  place, where every seek that landed decoded its leaf's first and last rowid and rebuilt the cache
+  (263 instructions on each probe of a lookup join into a 1,000-row table); a seek that descends
+  from the root still reads the bounds afresh. A 1M-probe lookup join now takes about 4,451M
+  instructions where it took 4,689M (stock `sqlite3` in the same run: 1,721M), and rowid lookups are
+  unchanged (bd-w4pr1.13.27,
+  [06abdceec](https://github.com/Dicklesworthstone/frankensqlite/commit/06abdceec)).
+- On a WAL database, the checks that the database and `-wal` paths still name the same files run
+  once at a transaction's begin and once at its commit, where they ran before every file operation,
+  and a begin maps the shared WAL index once, where it mapped it twice. A database file replaced
+  between transactions is still caught at the next begin, and one replaced inside a transaction no
+  later than its commit, before anything is published; a database its own connection created empty
+  now gets the same treatment once it is non-empty
+  ([#416](https://github.com/Dicklesworthstone/frankensqlite/issues/416)). An autocommit `INSERT` on
+  a fresh database now makes about 30.5 system calls where it made 34.4, against 8.1 for stock
+  `sqlite3`, and a point `SELECT` by rowid makes 5 stat-family calls where it made 7 and takes about
+  42.5 us of CPU where it took 44.9 us, against 7.2 us for stock (bd-ih8ak,
+  [55c280ef6](https://github.com/Dicklesworthstone/frankensqlite/commit/55c280ef6),
+  [98411208f](https://github.com/Dicklesworthstone/frankensqlite/commit/98411208f)).
+- `length()` counts the characters of a valid TEXT value on its stored bytes (up to the first NUL,
+  and the byte length when the value is ASCII), where it ran UTF-8 validation again on every call,
+  about 120 instructions each; a value that is not valid UTF-8 keeps its old path. A 1M-probe lookup
+  join that sums `length()` of a column now takes about 4,314M instructions where it took 4,451M,
+  and `sum(length(b))` over 1M rows about 1,823M where it took 1,972M (bd-w4pr1.13.28,
+  [271254665](https://github.com/Dicklesworthstone/frankensqlite/commit/271254665)).
+- In the pager, b-tree and WAL: a page-cache eviction searches its access trace in 32-entry blocks
+  and moves the kept runs as block copies, where it walked the trace entry by entry (about 23k
+  user instructions per eviction, 32% of a rowid-lookup join on a table larger than the cache;
+  bd-w4pr1.13.12). A rowid seek loads one of its four remembered leaves only when the target lies
+  inside the rowids that leaf held (bd-w4pr1.13.13). A page read in WAL mode takes a free WAL read
+  lock without a full native checkpoint, under the read future's own admission and cancellation
+  rules, where that checkpoint was about 65% of the lookup's cost (bd-w4pr1.13.14). The WAL
+  frame-payload digest hands BLAKE3 whole 16 KiB blocks, where BLAKE3 was 12% of the
+  instructions of a 30,000-row `UPDATE`; every digest value and certificate on disk is unchanged
+  (bd-w4pr1.13.17). The commits state no figures after the change
+  ([7716f8ba8](https://github.com/Dicklesworthstone/frankensqlite/commit/7716f8ba8),
+  [31febe966](https://github.com/Dicklesworthstone/frankensqlite/commit/31febe966),
+  [fd95e747d](https://github.com/Dicklesworthstone/frankensqlite/commit/fd95e747d),
+  [2c2300d3b](https://github.com/Dicklesworthstone/frankensqlite/commit/2c2300d3b)).
+- In the VFS, b-tree and WAL: a page miss read inline, off the shared ring, takes one full native
+  checkpoint before its `pread`, where it took three of about 395 instructions each (over 20,000
+  rowid lookups, 1.07k of the 9.4k instructions a miss costs); after the `pread` it runs that
+  checkpoint only if a cancellation was published, so a deadline or budget that runs out during
+  the read is seen at the caller's next checkpoint (bd-w4pr1.13.18). An index seek decodes its
+  probe key once for the whole descent, where each page's binary search decoded it again (19,282
+  decodes for 10,000 seeks of a two-level index in an unindexed 5k x 5k join, 331 instructions
+  each), and both index binary searches parse each cell directly instead of through the cursor's
+  cell-slot cache (258 instructions per call, of which the parse it saves is 76); table searches
+  and positioned reads keep the cache (bd-w4pr1.13.15). A shared WAL-index header copy is read
+  under one hold of the region mutex, where each of its twelve words took its own range check and
+  lock (about 1.2k instructions per copy; an autocommit `INSERT` reads the header ten times, 24k
+  of its 292k instructions); the copy protocol is unchanged (bd-w4pr1.7). The commits state no
+  figures after the change
+  ([2704be73f](https://github.com/Dicklesworthstone/frankensqlite/commit/2704be73f),
+  [5e6017ac4](https://github.com/Dicklesworthstone/frankensqlite/commit/5e6017ac4),
+  [384723d1c](https://github.com/Dicklesworthstone/frankensqlite/commit/384723d1c),
+  [2418ac510](https://github.com/Dicklesworthstone/frankensqlite/commit/2418ac510)).
+- A WAL-index hash probe reads each stretch of the hash table under one hold of the region mutex,
+  where each slot took its own range check and lock (87 instructions a slot). Every mapping of a
+  page chains from that page's slot, so an insert load that commits each row probed 80.6 slots on
+  average, twice per commit: 14k instructions per commit. The probe reads the same slots in the
+  same order, under the WAL write lock as before. The commit states no figure after the change
+  (bd-w4pr1.7;
+  [3daeda153](https://github.com/Dicklesworthstone/frankensqlite/commit/3daeda153)).
+- The commit path reads its four diagnostic trace switches from the environment once per process,
+  where it asked eight times per transaction, each through `std::env::var_os` (about 725
+  instructions a call, 5.8k per commit). A switch is set in the environment a run starts with;
+  nothing sets one inside a running process. The commit states no figure after the change
+  (bd-w4pr1.7;
+  [09880d206](https://github.com/Dicklesworthstone/frankensqlite/commit/09880d206)).
+- A WAL commit no longer hashes the begin-time image of each conflict candidate with BLAKE3
+  (16.4k instructions for the one 4 KiB page an autocommit `INSERT` writes). The hash had one
+  consumer, the check that runs only when a checkpoint replaced the WAL generation between the
+  transaction's snapshot and its commit. The baseline now keeps the page image itself (a
+  reference-count bump for a shared page), and that check compares it byte for byte, with the same
+  verdicts. The commit states no figure after the change (bd-w4pr1.7;
+  [afd4e5622](https://github.com/Dicklesworthstone/frankensqlite/commit/afd4e5622)).
+- After an insert through the concurrent rowid allocator that the `Insert` opcode has just proven
+  to be the table's rightmost row, the allocator's rowid floor is raised to that rowid without
+  walking the write cursor to the last row; every other insert walks as before, and the floor gets
+  the same value either way. On the scorecard's 300k-row `INSERT ... SELECT` that walk was 24% of
+  the process, about 5k instructions per row, more than stock spends on the whole row. The commit
+  states no figure after the change (bd-w4pr1.13.21;
+  [77eb2f986](https://github.com/Dicklesworthstone/frankensqlite/commit/77eb2f986)).
+- In WAL mode a page miss asks the transaction's pinned WAL snapshot once, where it asked twice
+  and the second answer always repeated the first: 620 instructions per page miss (7,607 lookups
+  from each site in `count(*)` over a 1M-row table). An unpinned lookup, which reads the latest
+  state, is still repeated. The commit states no figure after the change (bd-w4pr1.13.18;
+  [21c0eaab3](https://github.com/Dicklesworthstone/frankensqlite/commit/21c0eaab3),
+  [8d28f41cd](https://github.com/Dicklesworthstone/frankensqlite/commit/8d28f41cd)).
+- A table-leaf delete raises the cell pointers below the removed cell in one pass with one
+  converted shift, takes the lowest pointer from the end of a descending pointer array, parses the
+  removed cell directly instead of through the cell-slot cache, and reads its stack entry in place
+  instead of cloning it. A `DELETE` by predicate on the scorecard's 300k-row table spent 8.9k
+  instructions per removed row in the delete, 141.5M of the statement; the pointer raises were
+  about 2,300 of those and the cell parse 804. The page a delete writes is byte for byte what it
+  was. The commit states no figure after the change (bd-w4pr1.13.20;
+  [221ad0ef2](https://github.com/Dicklesworthstone/frankensqlite/commit/221ad0ef2)).
+- A `DELETE` that scans its whole table deletes each matching row where the scan stands, in one
+  pass, when it has no `RETURNING` and its `WHERE` holds no subquery, `EXISTS`, `IN (SELECT)`,
+  `IN` table or window call; it collected the matching rowids first and then sought each one
+  again (3.8k instructions per deleted row, 163M of `DELETE FROM m WHERE id % 7 = 0` on the
+  scorecard's 300k-row table). Such a `DELETE` now plans as one `Rewind`/`Delete`/`Next` loop, as
+  stock's does, so `EXPLAIN` shows that loop; every seek shape and every other statement keep the
+  two passes. The commit states no figure after the change (bd-w4pr1.13.20;
+  [45438b3db](https://github.com/Dicklesworthstone/frankensqlite/commit/45438b3db),
+  [a1cd7b309](https://github.com/Dicklesworthstone/frankensqlite/commit/a1cd7b309)).
+- A page read whose bytes the kernel already holds is read inline instead of through the shared
+  io_uring ring, which cost each read two scheduler passes, the driver thread and about seven system
+  calls. Each file is probed at its first read: on tmpfs or ramfs every read of up to 64 KiB is
+  inline; elsewhere a read tries `preadv2(RWF_NOWAIT)` inline and goes to the ring when the kernel
+  answers EAGAIN, a short transfer or anything else; a file whose kernel refuses `RWF_NOWAIT`
+  (EOPNOTSUPP, EINVAL or ENOSYS) stays on the ring, as before. On the commit's host, `count(*)` over
+  a 1M-row table took 79.8 ms of CPU through the ring against about 25 ms with the ring refused.
+  Writes, reads larger than 64 KiB and callers with no native context are unchanged (bd-w4pr1.13.19,
+  [df77d4248](https://github.com/Dicklesworthstone/frankensqlite/commit/df77d4248)).
+- A WHERE comparison in which neither side is a column of the scanned table, such as
+  `WHERE id % 7 = 0` or `WHERE length(b) >= 2`, now emits its operands, NULL checks, collation and
+  affinity as before and then one jump on the inverse operator, instead of computing a 0/1/NULL
+  value and testing it with `IfNot`; the commit counts 11 opcodes per scanned row for such a DELETE
+  before the change, against 4 in stock SQLite. A NULL operand still skips the row, and comparisons
+  on a column keep their paths (bd-w4pr1.13.20,
+  [3b5bdc3d9](https://github.com/Dicklesworthstone/frankensqlite/commit/3b5bdc3d9)).
+- After an autocommit flush, the refresh of the published snapshot returns before its path probes
+  (the database path, the shared WAL index mapping and a `statx` of the `-wal` path) when the
+  carried signature is current (no active transaction, no checkpoint, no pending rollback recovery
+  and an unchanged commit sequence) and the shared header still equals the carried one; those probes
+  were two of an INSERT's thirteen `statx` calls. Any other publisher changes the header, so the
+  refresh takes the full path, and a swap of the database or `-wal` file is caught at the next
+  begin, which always probes in full (bd-ih8ak,
+  [e567dc636](https://github.com/Dicklesworthstone/frankensqlite/commit/e567dc636)).
+- A single-table GROUP BY on a private `:memory:` connection whose row mirror is not loaded now runs
+  the GROUP BY storage substrate (a VDBE program over the pager) for a main-database table, instead
+  of first paying the owed rebuild of the whole mirror, which the commit counts at 2.5k instructions
+  per row; with the mirror loaded the mirror scan stays, and prepare-time routing stays file-only.
+  An aggregate over one derived table whose body reads one base table no longer pays that rebuild
+  either: the body runs as a nested statement. A statement with HAVING keeps its old path, because
+  the commit reports that the substrate answers HAVING wrongly on file connections. Against stock
+  sqlite3 3.46.1, the commit measures `memory_script_200k` going from 6,488M to 6,216M instructions
+  (3.39x to 3.25x stock) and its peak RSS from 103 to 65 MB (bd-w4pr1.13.23,
+  [1dbe95855](https://github.com/Dicklesworthstone/frankensqlite/commit/1dbe95855)).
+- After a connection's own commit, the next refresh or checkpoint no longer reads back and
+  BLAKE3-hashes every frame that its certificate record covers; before, an UPDATE of 2,250 pages
+  re-read the 2,250 frames it had just written. Right after the commit is published, and only when
+  its certificate reached the sidecar and the appended frames are the digested ones, the record it
+  appended is promoted from pending to authorized, if its interval is the published one and it
+  belongs to the WAL's current generation. Not promoted: a failed or partial write or a failed
+  publish, a record digested from other bytes, another interval than the published one, and another
+  generation; a peer's later record still gets digested (bd-w4pr1.13.20,
+  [f4a003491](https://github.com/Dicklesworthstone/frankensqlite/commit/f4a003491)).
+- A WHERE comparison against a literal loads the literal once, in an `Init` prologue, instead of
+  reloading and NULL-checking it on every scanned row: `SELECT count(*) FROM t WHERE a > 500` ran
+  `Column`, `Integer 500`, `IsNull`, `IsNull`, `Le` per row, and `DELETE ... WHERE id % 7 = 0`
+  loaded 7 and 0 per row, while stock codes such constants once, after `Init`'s jump to the program
+  end. An integer, real or text literal now gets a dedicated register loaded in that prologue, and
+  the comparison reads it there and drops its NULL check, since a literal other than NULL is never
+  NULL (bd-w4pr1.13.31,
+  [c1076d876](https://github.com/Dicklesworthstone/frankensqlite/commit/c1076d876)).
+- `INSERT ... SELECT` from one base table runs as one VDBE program, which scans the source table and
+  inserts each row as it is read, instead of materializing the source rows and replaying them 32 at
+  a time through a prepared `INSERT ... VALUES`. Only a narrow shape takes it; among the conditions,
+  the source is one local rowid table scanned in rowid order, not the target, with no join,
+  compound, `DISTINCT`, grouping, aggregate, window, `ORDER BY`, `LIMIT`, `WITH` or subquery, and
+  the target is a rowid table with no `DELETE` trigger, `UPSERT` or `RETURNING`. Everything else
+  keeps the replay, a table-valued-function source included. Against stock sqlite3 3.46.1, the
+  commit measures `INSERT INTO m2 SELECT * FROM m` over 300k rows going from 4,565.6M to 3,323.1M
+  user instructions, or from 5.33x to 3.88x stock (bd-i3csr.1,
+  [befcad45c](https://github.com/Dicklesworthstone/frankensqlite/commit/befcad45c)).
 
 ### Data integrity
 
@@ -82,6 +684,18 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
   (`libsqlite3-sys` 0.39.1; previously 3.53.2). Also `parking_lot` 0.13, `lru` 0.19, `ftui` 0.10,
   `jsonschema` 0.61 and a compatible-range lockfile refresh. The `wasm-bindgen` family stays at
   0.2.128: 0.4.80 of `wasm-bindgen-futures` would add `tokio` to `Cargo.lock` (bd-w4pr1.3).
+
+### Not in this release (known issues)
+
+- **bd-r5mmz: `WITH ... INSERT ... ON CONFLICT DO UPDATE SET` reading a CTE, with triggers, can return
+  wrong rows; tracked in the bead.**
+- **bd-xz5f4: a seek on a `REAL` index column converts its probe with `REAL` affinity where stock
+  uses `NUMERIC`, so an integer probe past 2^53 rounds and a range seek can return rows the
+  comparison excludes; tracked in the bead.**
+- **bd-aoukl: a secondary index on a `WITHOUT ROWID` table with a `DESC` primary-key term orders
+  its primary-key suffix ascending; stock's `integrity_check` fails on such a file while
+  fsqlite's says `ok`, and stock reads wrong rows from it; tracked in the bead.**
+- **bd-1ucvb: WITH-INSERT trigger replay is about 28-30x slower than a plain INSERT ... SELECT.**
 
 ## [0.4.13] -- 2026-11-01 (GitHub Release)
 
