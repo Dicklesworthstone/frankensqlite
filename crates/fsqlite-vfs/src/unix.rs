@@ -65,7 +65,7 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
 /// A deadline, budget or e-process decision that has not been published yet
 /// is still seen before the first wait: the lock loop takes a full checkpoint
 /// before every backoff sleep and at the top of every retry.
-fn checkpoint_or_abort_if_cancel_published(cx: &Cx) -> Result<()> {
+pub(crate) fn checkpoint_or_abort_if_cancel_published(cx: &Cx) -> Result<()> {
     if cx.published_cancel_requested() {
         checkpoint_or_abort(cx)
     } else {
@@ -191,7 +191,7 @@ fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> io::Result
 /// statement), and with no asupersync runtime polling, `spawn_blocking_io`
 /// starts a fresh OS thread per call. Larger transfers — WAL group-commit
 /// consolidated writes can be arbitrarily large — still take the pool.
-const INLINE_IO_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const INLINE_IO_MAX_BYTES: usize = 64 * 1024;
 
 #[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
 fn read_owned_at(file: Arc<File>, len: usize, offset: u64) -> io::Result<(Vec<u8>, usize)> {
@@ -280,7 +280,12 @@ where
 ///
 /// Returns the number of bytes read before EOF (GH #200: interruption is
 /// retried in place instead of surfacing `Interrupted` mid-buffer).
-fn read_full_at<R>(mut read_at: R, buf: &mut [u8], offset: u64, what: &'static str) -> Result<usize>
+pub(crate) fn read_full_at<R>(
+    mut read_at: R,
+    buf: &mut [u8],
+    offset: u64,
+    what: &'static str,
+) -> Result<usize>
 where
     R: FnMut(&mut [u8], u64) -> std::io::Result<usize>,
 {

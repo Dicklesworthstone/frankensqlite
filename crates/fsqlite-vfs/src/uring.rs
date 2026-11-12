@@ -13,8 +13,9 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -43,7 +44,9 @@ use tracing::{info, trace, warn};
 
 use crate::shm::ShmRegion;
 use crate::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource};
-use crate::unix::{UnixFile, UnixVfs};
+use crate::unix::{
+    INLINE_IO_MAX_BYTES, UnixFile, UnixVfs, checkpoint_or_abort_if_cancel_published, read_full_at,
+};
 
 #[cfg(not(feature = "linux-asupersync-uring"))]
 compile_error!("fsqlite-vfs on Linux requires `linux-asupersync-uring`");
@@ -74,6 +77,84 @@ static FORCE_ASUPERSYNC_INIT_FAIL: AtomicBool = AtomicBool::new(false);
 static FORCE_ASUPERSYNC_READ_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_READ_ABORT: AtomicBool = AtomicBool::new(false);
+/// Route every read through the shared ring, hot or not: the tests of the
+/// ring's read path set it (see `io_uring_test_guard`).
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+static FORCE_RING_READS: AtomicBool = AtomicBool::new(false);
+
+/// How a file's hot reads are routed (bd-w4pr1.13.19). A read whose bytes
+/// the kernel already holds is done on the calling thread, as the Unix VFS
+/// does every page read; the shared ring takes only reads that would wait on
+/// the device. Unprobed until the file's first read.
+const HOT_READS_UNPROBED: u8 = 0;
+/// The file lives in memory (tmpfs, ramfs): no read of it waits on a device.
+const HOT_READS_MEMORY_BACKED: u8 = 1;
+/// Try `preadv2(RWF_NOWAIT)`, which answers `EAGAIN` instead of waiting.
+const HOT_READS_NOWAIT: u8 = 2;
+/// The filesystem refused `RWF_NOWAIT`: every read takes the ring.
+const HOT_READS_RING_ONLY: u8 = 3;
+
+/// Whether `file` lives on a memory-backed filesystem (tmpfs or ramfs).
+fn file_is_memory_backed(file: &File) -> bool {
+    const TMPFS_MAGIC: u32 = 0x0102_1994;
+    const RAMFS_MAGIC: u32 = 0x8584_58f6;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `file` is an open descriptor for the whole call, and
+    // `filesystem` points to writable memory of the exact `struct statfs`
+    // size the call fills.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `fstatfs` returned 0, so it initialized the whole struct.
+    let filesystem_type = unsafe { filesystem.assume_init() }.f_type;
+    // Filesystem magics are 32-bit; `f_type` is a signed word whose width
+    // depends on the target.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let magic = filesystem_type as u32;
+    magic == TMPFS_MAGIC || magic == RAMFS_MAGIC
+}
+
+/// One `preadv2(RWF_NOWAIT)` into `buf` at `offset`: the bytes the page cache
+/// already holds, or `EAGAIN` when the read would wait on the device.
+fn pread_nowait(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    let offset =
+        libc::off_t::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    loop {
+        // SAFETY: `iov` describes `buf`, writable for `buf.len()` bytes and
+        // exclusively borrowed for the whole call; the descriptor stays open
+        // while `file` is borrowed.
+        let read = unsafe {
+            libc::preadv2(
+                file.as_raw_fd(),
+                &raw const iov,
+                1,
+                offset,
+                libc::RWF_NOWAIT,
+            )
+        };
+        if read >= 0 {
+            return Ok(usize::try_from(read).expect("non-negative read length fits usize"));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Whether a `preadv2(RWF_NOWAIT)` failure means the file's filesystem (or the
+/// kernel) cannot do non-blocking reads at all, rather than that this read
+/// would have waited.
+fn nowait_reads_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS)
+    )
+}
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
@@ -1225,6 +1306,7 @@ impl IoUringVfs {
             IoUringFile {
                 inner: file,
                 runtime: Arc::clone(&self.runtime),
+                hot_reads: AtomicU8::new(HOT_READS_UNPROBED),
             },
             out_flags,
         )
@@ -1242,6 +1324,8 @@ impl Default for IoUringVfs {
 pub struct IoUringFile {
     inner: UnixFile,
     runtime: Arc<IoUringRuntime>,
+    /// One of the `HOT_READS_*` routes.
+    hot_reads: AtomicU8,
 }
 
 impl Vfs for IoUringVfs {
@@ -1592,6 +1676,21 @@ impl IoUringFile {
         checkpoint_or_abort(cx)?;
         let file = self.inner.canonical_file()?;
 
+        // bd-w4pr1.13.19: bytes the kernel already holds are read here, as the
+        // Unix VFS reads every page (and as this file reads all of them once the
+        // latency policy disables the ring). A hot read through the ring paid
+        // two scheduler passes, the driver thread and about seven syscalls,
+        // about 6k instructions and 9 us more than the read itself. The ring
+        // keeps every read that would wait on the device.
+        if buf.len() <= INLINE_IO_MAX_BYTES
+            && let Some(total) = self.read_hot_inline(&file, buf, offset)?
+        {
+            // The full checkpoint above ran a read ago and nothing waited
+            // since; only a cancellation published meanwhile can be new.
+            checkpoint_or_abort_if_cancel_published(cx)?;
+            return Ok(total);
+        }
+
         let start = Instant::now();
         let mut total = 0_usize;
         while total < buf.len() {
@@ -1698,6 +1797,47 @@ impl IoUringFile {
             );
         }
         Ok(total)
+    }
+
+    /// Read `buf` at `offset` on this thread when no byte of it waits on the
+    /// device: the bytes read, the tail past the end of the file zero-filled
+    /// as the ring path leaves it. `None` when the shared ring must read it
+    /// (not cached, partly cached, or the filesystem cannot tell).
+    fn read_hot_inline(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<Option<usize>> {
+        #[cfg(test)]
+        if FORCE_RING_READS.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut route = self.hot_reads.load(Ordering::Relaxed);
+        if route == HOT_READS_UNPROBED {
+            route = if file_is_memory_backed(file) {
+                HOT_READS_MEMORY_BACKED
+            } else {
+                HOT_READS_NOWAIT
+            };
+            self.hot_reads.store(route, Ordering::Relaxed);
+        }
+        match route {
+            HOT_READS_MEMORY_BACKED => {
+                let total =
+                    read_full_at(|chunk, off| file.read_at(chunk, off), buf, offset, "read")?;
+                buf[total..].fill(0);
+                Ok(Some(total))
+            }
+            HOT_READS_NOWAIT => match pread_nowait(file, buf, offset) {
+                Ok(read) if read == buf.len() => Ok(Some(read)),
+                // Partly cached, or the read reaches the end of the file: the
+                // ring read settles both.
+                Ok(_) => Ok(None),
+                Err(error) => {
+                    if nowait_reads_unsupported(&error) {
+                        self.hot_reads.store(HOT_READS_RING_ONLY, Ordering::Relaxed);
+                    }
+                    Ok(None)
+                }
+            },
+            _ => Ok(None),
+        }
     }
 
     async fn write_data_path(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
@@ -2265,10 +2405,145 @@ mod tests {
         }
     }
 
-    fn io_uring_test_guard() -> StdMutexGuard<'static, ()> {
-        IO_URING_TEST_LOCK
+    /// Serializes this module's tests. They prove the shared ring's read path,
+    /// so while one holds the guard every read goes through the ring, as all
+    /// reads did before hot reads were routed inline (bd-w4pr1.13.19); the
+    /// tests of that routing clear `FORCE_RING_READS` under the guard.
+    struct IoUringTestGuard {
+        _lock: StdMutexGuard<'static, ()>,
+    }
+
+    impl Drop for IoUringTestGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "linux-asupersync-uring")]
+            FORCE_RING_READS.store(false, Ordering::Release);
+        }
+    }
+
+    fn io_uring_test_guard() -> IoUringTestGuard {
+        let lock = IO_URING_TEST_LOCK
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(feature = "linux-asupersync-uring")]
+        FORCE_RING_READS.store(true, Ordering::Release);
+        IoUringTestGuard { _lock: lock }
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_hot_reads_route_inline_and_ring_only_files_keep_the_ring() {
+        const PAGE: usize = 4096;
+        let _guard = io_uring_test_guard();
+        FORCE_RING_READS.store(false, Ordering::Release);
+        // No latency-window reset: the window is process-global, and the ring
+        // tests that run after this one rely on the samples earlier tests left
+        // in it (an empty window lets one slow sample disable a runtime).
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        if !vfs.is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hot_read_routing.db");
+        // Two whole pages and half of a third, so the last read runs past the
+        // end of the file.
+        let seeded: Vec<u8> = (0..PAGE * 2 + PAGE / 2)
+            .map(|index| u8::try_from(index % 251).expect("below 251"))
+            .collect();
+        std::fs::write(&path, &seeded).expect("seed write");
+        let (file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create_unlocked())
+            .expect("open should succeed");
+        let read = |offset: usize| {
+            let mut page = vec![0xAA_u8; PAGE];
+            let offset = u64::try_from(offset).expect("offset fits u64");
+            let read = block_on_test(&cx, file.read(&cx, &mut page, offset)).expect("read");
+            (read, page)
+        };
+        let expected = |offset: usize| {
+            let end = (offset + PAGE).min(seeded.len());
+            let mut page = vec![0_u8; PAGE];
+            page[..end - offset].copy_from_slice(&seeded[offset..end]);
+            (end - offset, page)
+        };
+        let submitted = || file.runtime.submitted_requests.load(Ordering::Relaxed);
+        let canonical = file.inner.canonical_file().expect("canonical file");
+        let hot = |offset: usize| {
+            let mut page = vec![0xAA_u8; PAGE];
+            let offset = u64::try_from(offset).expect("offset fits u64");
+            file.read_hot_inline(&canonical, &mut page, offset)
+                .expect("hot read")
+                .map(move |read| (read, page))
+        };
+
+        // Through the whole read path: a ring-only file sends its page to the
+        // ring. This is the runtime's first read, so no latency verdict can
+        // have disabled the runtime before it.
+        file.hot_reads.store(HOT_READS_RING_ONLY, Ordering::Relaxed);
+        let before = submitted();
+        assert_eq!(read(PAGE), expected(PAGE));
+        assert_eq!(
+            submitted() - before,
+            1,
+            "a ring-only file must read a whole page through the ring"
+        );
+        // ... and a memory-backed file does not, its tail past the end of the
+        // file zero-filled as the ring path leaves it.
+        file.hot_reads
+            .store(HOT_READS_MEMORY_BACKED, Ordering::Relaxed);
+        let before = submitted();
+        assert_eq!(read(PAGE), expected(PAGE));
+        assert_eq!(read(PAGE * 2), expected(PAGE * 2));
+        assert_eq!(
+            submitted(),
+            before,
+            "a hot inline read must not reach the ring"
+        );
+
+        // The routing itself, read by read, with no ring or latency state in
+        // the way.
+        assert_eq!(hot(PAGE), Some(expected(PAGE)));
+        assert_eq!(hot(PAGE * 2), Some(expected(PAGE * 2)));
+        file.hot_reads.store(HOT_READS_RING_ONLY, Ordering::Relaxed);
+        assert_eq!(hot(PAGE), None, "a ring-only file reads nothing inline");
+        // RWF_NOWAIT: a whole cached page inline (or nothing, where the
+        // filesystem cannot say), and never a short read past the end.
+        file.hot_reads.store(HOT_READS_NOWAIT, Ordering::Relaxed);
+        if let Some(page) = hot(0) {
+            assert_eq!(page, expected(0));
+        }
+        assert_eq!(
+            hot(PAGE * 2),
+            None,
+            "a read past the end of the file is left to the ring"
+        );
+
+        // The first read probes the filesystem.
+        file.hot_reads.store(HOT_READS_UNPROBED, Ordering::Relaxed);
+        let first = hot(PAGE);
+        let route = file.hot_reads.load(Ordering::Relaxed);
+        if file_is_memory_backed(&canonical) {
+            assert_eq!(route, HOT_READS_MEMORY_BACKED);
+            assert_eq!(first, Some(expected(PAGE)));
+        } else {
+            assert!(matches!(route, HOT_READS_NOWAIT | HOT_READS_RING_ONLY));
+        }
+    }
+
+    #[test]
+    fn test_nowait_read_errors_split_unsupported_from_would_block() {
+        for errno in [libc::EOPNOTSUPP, libc::EINVAL, libc::ENOSYS] {
+            assert!(
+                nowait_reads_unsupported(&io::Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
+        for errno in [libc::EAGAIN, libc::EINTR, libc::EIO, libc::EBADF] {
+            assert!(
+                !nowait_reads_unsupported(&io::Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
     }
 
     #[test]
