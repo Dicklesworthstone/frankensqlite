@@ -87,6 +87,71 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: the shell's completeness scan also says whether the input is one plain statement (bd-5310l)
+
+- Target: every statement the CLI reads one per line (all the scorecard's statement rows). Touched:
+  `crates/fsqlite-cli/src/main.rs` (`scan_pending_input` and `PendingInput` replace the
+  production use of `statement_complete`; new `execute_lone_statement`, shared with `execute_sql`).
+- Evidence before (callgrind after 8b6d0eb76, per literal INSERT): `lone_plain_statement` 1.17k
+  instructions, passing over the text about five times (three substring searches, the verb, the
+  semicolon scan) after `statement_complete` had read it once (1.6k).
+- Change: the completeness scan notes what it already sees: a first word that is one of the four
+  verbs with no non-ASCII byte after it, only plain text and single-quoted strings (and no quote,
+  bracket, backtick, `--` or `/*` inside a string, which the byte reader refuses), exactly one
+  semicolon outside a string, and the input complete. When all hold, the read loop hands the trimmed
+  text to the engine directly; otherwise `execute_sql` runs as before and decides with
+  `lone_plain_statement`.
+- Result: callgrind, 1,000 statements in one transaction, the boxed-engine tree (aeaae6a83, sha256
+  d09f7f9c52c5bcb0; that change is rejected, entry below) against this change on it (f9985abba, sha256 1e5119bed8c3e426), whole run:
+  literal INSERT 59.10M -> 57.60M, point SELECT 62.12M -> 61.42M, UPDATE 70.76M -> 69.60M: 1.5k, 0.7k
+  and 1.2k fewer instructions per statement (predicted about 1.0k to 1.1k each), about 3.6%, 1.4% and
+  2.5% of a statement: above the 2% line on INSERT and UPDATE, under it on SELECT, so kept (the kill
+  line was under 2% on all three). Stock-live probe, three runs per arm: distinct-literal INSERT
+  39.5-44.5k -> 38.4-41.6k (stock 13.9k), point SELECT 51.3-51.4k -> 48.7-50.6k (stock 22.1k), UPDATE
+  46.5-54.1k -> 41.0-48.2k (stock 18.3k). Scorecard rows, two runs of three and four interleaved reps:
+  `txn_1000x10_rows` 798-803M -> 791-823M, then 796-864M -> 792-809M, and `autocommit_5k_inserts`
+  1,561-1,577M -> 1,566-1,585M, then 1,570-1,585M -> 1,570-1,611M: inside their spread both times.
+  A callgrind run of the txn script itself is not usable (5.45G against 1.51G instructions for the
+  same 10,000 rows: valgrind's thread scheduling, not the engine). Shell output of base and
+  candidate byte-identical over the 768-run comparison.
+- Behaviour: unit test `test_pending_input_scan_calls_a_statement_lone_only_where_the_reader_returns_it_whole`
+  (every sequence of up to five of 15 pieces: wherever the scan says lone, `lone_plain_statement`
+  returns the whole trimmed text; completeness still agrees with the previous implementation; named
+  cases it must not call lone: a second statement, a comment before or after, quoted names, `--`,
+  `/*` or a quote inside a string, a non-ASCII byte after the verb, a parenthesis or a no-break space
+  first, a trigger, an unterminated string).
+- Retry condition: for a faster scan of the same text: the completeness scan above 3% of
+  a statement shape (it is 1.4k to 1.6k now), or a reason to read each line once, such as the shell
+  handing the engine the scan's verb and literal positions.
+
+## 2026-11-12 - REJECTED on its prepared-statement kill line: the cached VDBE engine handed over in a Box (bd-5310l)
+
+- Target: every program run through `execute_table_program_with_db` or its exactly-one-row twin in
+  `crates/fsqlite-core/src/connection.rs` (text statements, prepared statements, the prepared lane's
+  reuse paths). Change tried (aeaae6a83, not landed): `Connection::cached_vdbe_engine` as
+  `Option<Box<VdbeEngine>>`, the two executors taking and returning the box.
+- Evidence before: gdb on the series at 3c5dee9aa, memcpy of 256 bytes or more over 400 literal
+  INSERTs: the 2,904-byte engine moves about 7 times per program run (about 20 KB of the 51 KB copied
+  per INSERT); callgrind 3.2k to 3.6k memcpy instructions per run in the two executor layers.
+- Text statements (callgrind, 1,000 statements in one transaction, against lever 6's tree 041153588):
+  literal INSERT 62.17M -> 59.10M, point SELECT 65.23M -> 62.12M, UPDATE 73.06M -> 70.76M (3.1k, 3.1k,
+  2.3k fewer per statement); `txn_1000x10_rows` 828-841M -> 797-803M; `autocommit_5k_inserts`
+  1,575-1,622M -> 1,574-1,588M. Clears the 2% line on all three text shapes.
+- Prepared statements (`blocking_vs_rusqlite_bench`, rusqlite in the same process, all three runs on
+  hz2 back to back: lever 6, this change, lever 6): fsqlite/stock point_rowid 2.32 / 2.15 / 2.39,
+  point_index 12.97 / 11.37 / 13.62, insert_txn 13.03 / 12.15 / 12.72, but insert_autocommit (a
+  prepared INSERT executed 1,000 times, each its own transaction) 5.70 / 7.16 / 6.36 and adhoc_update
+  6.88 / 9.50 / 7.42. The kill line agreed with the coordinator was a regression over 1% on a
+  prepared-statement row; insert_autocommit is one, so the change is rejected. The run with the
+  change was the noisiest of the three (stock itself 20% to 66% slower than in the bracketing runs,
+  A/A 1.07 on insert_autocommit and 1.13 on adhoc_update), and the two runs of the base differ by 12%
+  on that row, so this bench cannot resolve 1% there. Two earlier runs on different workers (hz2,
+  vmi1153651) differed by up to 2x in F/C and are not used.
+- Retry condition: an instruction-count A/B of a prepared autocommit INSERT (base and candidate in one
+  invocation on one host, three or more runs each), or a same-host interleaved bench of five or more
+  rounds per arm whose A/A on insert_autocommit is within 1.02, showing no regression over 1% there.
+  The text-statement saving above stands as the reason to retry.
+
 ## 2026-11-12 - WIN: a plain statement skips placeholder renumbering and the subquery rewrite (bd-5310l)
 
 - Target: every INSERT, UPDATE, DELETE and SELECT that reaches the dispatcher, text or prepared.

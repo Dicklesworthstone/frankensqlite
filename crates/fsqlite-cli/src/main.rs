@@ -1042,9 +1042,18 @@ where
         }
         pending_sql.push_str(line);
 
-        if statement_complete(&pending_sql) {
-            had_error |=
-                !execute_sql(connection, pending_sql.trim(), *output_options, out, err).await;
+        let pending = scan_pending_input(&pending_sql);
+        if pending.complete {
+            let sql = pending_sql.trim();
+            // The scan has already found what `execute_sql` would look for.
+            let ran = if pending.lone_plain_statement
+                && !output_uses_column_names(*output_options, false)
+            {
+                execute_lone_statement(connection, sql, sql, *output_options, out, err).await
+            } else {
+                execute_sql(connection, sql, *output_options, out, err).await
+            };
+            had_error |= !ran;
             pending_sql.clear();
         }
     }
@@ -1124,27 +1133,8 @@ where
         && !sql.contains('"')
         && let Some(statement_sql) = lone_plain_statement(sql)
     {
-        return match run_statement(
-            connection,
-            statement_sql,
-            false,
-            None,
-            output_options,
-            out,
-            err,
-        )
-        .await
-        {
-            Ok(printed) => printed,
-            Err(error) => {
-                let error = match Parser::from_sql(sql).parse_next_statement_with_tail() {
-                    Err(parse_error) => Connection::parse_error_to_franken_error(sql, parse_error),
-                    Ok(_) => error,
-                };
-                let _ = writeln!(err, "error: {error}");
-                false
-            }
-        };
+        return execute_lone_statement(connection, sql, statement_sql, output_options, out, err)
+            .await;
     }
     let mut parser = Parser::from_sql(sql);
     let mut statement_start = 0;
@@ -1199,6 +1189,47 @@ where
             }
         }
         statement_start = tail_offset;
+    }
+}
+
+/// Run `statement_sql`, the one INSERT, UPDATE, DELETE or SELECT that `sql`
+/// consists of, without parsing it in the shell first.
+///
+/// If it fails, `sql` is parsed after all, so a syntax error is reported in
+/// the shell parser's words and any other error in the engine's, exactly as
+/// the batch loop of [`execute_sql`] reports them.
+async fn execute_lone_statement<W, E>(
+    connection: &Connection,
+    sql: &str,
+    statement_sql: &str,
+    output_options: OutputOptions,
+    out: &mut W,
+    err: &mut E,
+) -> bool
+where
+    W: Write,
+    E: Write,
+{
+    match run_statement(
+        connection,
+        statement_sql,
+        false,
+        None,
+        output_options,
+        out,
+        err,
+    )
+    .await
+    {
+        Ok(printed) => printed,
+        Err(error) => {
+            let error = match Parser::from_sql(sql).parse_next_statement_with_tail() {
+                Err(parse_error) => Connection::parse_error_to_franken_error(sql, parse_error),
+                Ok(_) => error,
+            };
+            let _ = writeln!(err, "error: {error}");
+            false
+        }
     }
 }
 
@@ -2925,10 +2956,38 @@ fn is_block_comment_end(bytes: &[u8], i: usize) -> bool {
     bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/')
 }
 
+/// What one pass over the shell's pending input finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingInput {
+    /// The input ends a statement, as `sqlite3_complete()` judges it.
+    complete: bool,
+    /// The input is one complete INSERT, UPDATE, DELETE or SELECT in which
+    /// only a single-quoted string could hide a semicolon.
+    ///
+    /// [`lone_plain_statement`] then answers with the trimmed input itself,
+    /// so the read loop need not ask it. `false` promises nothing: text with
+    /// a comment or a quoted name is left for [`lone_plain_statement`] to
+    /// decide.
+    lone_plain_statement: bool,
+}
+
+#[cfg(test)]
 fn statement_complete(buffer: &str) -> bool {
+    scan_pending_input(buffer).complete
+}
+
+fn scan_pending_input(buffer: &str) -> PendingInput {
     let bytes = buffer.as_bytes();
     let mut state = StatementScanState::Normal;
     let mut last_significant: Option<u8> = None;
+    // For `lone_plain_statement`: the first thing in the input is one of the
+    // four verbs, nothing but plain text and single-quoted strings follows
+    // (and no string holds what `bytes_alone_delimit_statements` refuses),
+    // and there is exactly one semicolon outside a string.
+    let mut starts_with_verb = false;
+    let mut plain = true;
+    let mut semicolons = 0_u32;
+    let mut previous_in_string = b'\'';
     // Trigger awareness (like sqlite3_complete()): a statement starting with
     // CREATE [TEMP|TEMPORARY] TRIGGER contains `;`-terminated body statements
     // and is only complete when its final `;` follows the closing END keyword.
@@ -2952,12 +3011,14 @@ fn statement_complete(buffer: &str) -> bool {
 
                 if is_line_comment_start(bytes, i) {
                     state = StatementScanState::LineComment;
+                    plain = false;
                     i += 2;
                     continue;
                 }
 
                 if is_block_comment_start(bytes, i) {
                     state = StatementScanState::BlockComment;
+                    plain = false;
                     i += 2;
                     continue;
                 }
@@ -2971,6 +3032,13 @@ fn statement_complete(buffer: &str) -> bool {
                     let previous_significant = last_significant;
                     last_significant = Some(bytes[i - 1]);
                     let word = &bytes[start..i];
+                    if previous_significant.is_none() {
+                        // The lexer's word runs on through non-ASCII bytes.
+                        starts_with_verb = bytes.get(i).is_none_or(u8::is_ascii)
+                            && [&b"select"[..], b"insert", b"update", b"delete"]
+                                .iter()
+                                .any(|verb| word.eq_ignore_ascii_case(verb));
+                    }
                     head = head.after(word);
                     end_follows_semi = head == StatementHead::Trigger
                         && word.eq_ignore_ascii_case(b"END")
@@ -2981,6 +3049,7 @@ fn statement_complete(buffer: &str) -> bool {
                 last_significant = Some(b);
 
                 if b == b';' {
+                    semicolons += 1;
                     if head == StatementHead::Trigger {
                         // Only `; END ;` closes the trigger body; inner
                         // `;`-terminated body statements do not.
@@ -2998,16 +3067,37 @@ fn statement_complete(buffer: &str) -> bool {
                 end_follows_semi = false;
 
                 match b {
-                    b'\'' => state = StatementScanState::SingleQuote,
-                    b'"' => state = StatementScanState::DoubleQuote,
-                    b'`' => state = StatementScanState::Backtick,
-                    b'[' => state = StatementScanState::BracketIdent,
+                    b'\'' => {
+                        state = StatementScanState::SingleQuote;
+                        previous_in_string = b;
+                    }
+                    b'"' => {
+                        state = StatementScanState::DoubleQuote;
+                        plain = false;
+                    }
+                    b'`' => {
+                        state = StatementScanState::Backtick;
+                        plain = false;
+                    }
+                    b'[' => {
+                        state = StatementScanState::BracketIdent;
+                        plain = false;
+                    }
                     _ => {}
                 }
 
                 i += 1;
             }
             StatementScanState::SingleQuote => {
+                // What `bytes_alone_delimit_statements` refuses anywhere in
+                // the text, a string included.
+                if matches!(b, b'"' | b'`' | b'[')
+                    || (b == b'-' && previous_in_string == b'-')
+                    || (b == b'*' && previous_in_string == b'/')
+                {
+                    plain = false;
+                }
+                previous_in_string = b;
                 if b == b'\'' {
                     if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                         i += 2;
@@ -3072,11 +3162,13 @@ fn statement_complete(buffer: &str) -> bool {
         }
     }
 
-    if state.is_unterminated() {
-        return false;
+    let complete = !state.is_unterminated()
+        && last_significant == Some(b';')
+        && head != StatementHead::Trigger;
+    PendingInput {
+        complete,
+        lone_plain_statement: complete && starts_with_verb && plain && semicolons == 1,
     }
-
-    last_significant == Some(b';') && head != StatementHead::Trigger
 }
 
 fn write_usage<W>(out: &mut W) -> io::Result<()>
@@ -3155,8 +3247,8 @@ mod tests {
         format_row, highlight_sql, is_block_comment_end, is_block_comment_start,
         is_line_comment_start, lone_plain_statement, lone_plain_statement_by_bytes,
         lone_plain_statement_by_tokens, output_uses_column_names, parse_args, render_display_value,
-        render_prompt, run, run_with_shell_options, statement_complete, write_delimited_rows,
-        write_query_plan_tree, write_rows,
+        render_prompt, run, run_with_shell_options, scan_pending_input, statement_complete,
+        write_delimited_rows, write_query_plan_tree, write_rows,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -3821,6 +3913,92 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
         ] {
             assert!(statement_complete(closed), "{closed}");
             assert!(statement_complete_keeping_words(closed), "{closed}");
+        }
+    }
+
+    #[test]
+    fn test_pending_input_scan_calls_a_statement_lone_only_where_the_reader_returns_it_whole() {
+        // Every sequence of up to five of these pieces, joined by spaces:
+        // the four verbs, look-alikes, the semicolon, strings that hide a
+        // semicolon, a quote or a comment opener, a quoted name, comments,
+        // and a word that is not ASCII.
+        const PIECES: [&str; 15] = [
+            "SELECT", "insert", "Update", "DELETE", "selectx", "x1", "create", ";", "'a;b'",
+            "'a--b'", "'a''b'", "\"q\"", "-- c\n", "/* c */", "\u{e9}",
+        ];
+        let mut called_lone = 0_u32;
+        let mut indices = Vec::new();
+        for length in 1..=5 {
+            indices.clear();
+            indices.resize(length, 0_usize);
+            loop {
+                let text = indices
+                    .iter()
+                    .map(|&index| PIECES[index])
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let scan = scan_pending_input(&text);
+                assert_eq!(
+                    scan.complete,
+                    statement_complete_keeping_words(&text),
+                    "{text:?}"
+                );
+                if scan.lone_plain_statement {
+                    // The read loop hands the trimmed text to the engine as
+                    // the statement; the reader must name that same slice.
+                    let trimmed = text.trim();
+                    assert!(!trimmed.contains('"'), "{text:?}");
+                    assert_eq!(lone_plain_statement(trimmed), Some(trimmed), "{text:?}");
+                    called_lone += 1;
+                }
+                let Some(position) = indices.iter().rposition(|&index| index + 1 < PIECES.len())
+                else {
+                    break;
+                };
+                indices[position] += 1;
+                for index in &mut indices[position + 1..] {
+                    *index = 0;
+                }
+            }
+        }
+        assert!(called_lone > 4_000, "{called_lone}");
+
+        for lone in [
+            "SELECT 1;",
+            " insert into t values (1, 'a;b');\n",
+            "UPDATE t SET a = 'x''y' WHERE id = 1 ;",
+            "delete from t;",
+            "select '\u{e9}', a - -1, b / 2 * 3 from t;",
+        ] {
+            assert!(scan_pending_input(lone).lone_plain_statement, "{lone:?}");
+            let trimmed = lone.trim();
+            assert_eq!(lone_plain_statement(trimmed), Some(trimmed), "{lone:?}");
+        }
+        // Complete or not, none of these may be called lone: a second
+        // statement, anything that is not plain text and single-quoted
+        // strings, and a first word that only starts like a verb.
+        for other in [
+            "SELECT 1",
+            "SELECT 1; SELECT 2;",
+            "SELECT 1; -- done",
+            "-- first\nSELECT 1;",
+            "SELECT /* c */ 1;",
+            "SELECT \"a\" FROM t;",
+            "SELECT [a] FROM t;",
+            "SELECT `a` FROM t;",
+            "SELECT 'a--b';",
+            "SELECT '/*';",
+            "SELECT 'x\"y';",
+            "SELECT 'x`y';",
+            "SELECT 'x[y';",
+            "select\u{e9} 1;",
+            "(SELECT 1);",
+            "\u{a0}SELECT 1;",
+            "CREATE TABLE t(a);",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;",
+            "SELECT 'unterminated;",
+        ] {
+            assert!(!scan_pending_input(other).lone_plain_statement, "{other:?}");
         }
     }
 
