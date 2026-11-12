@@ -51017,6 +51017,12 @@ impl Connection {
     /// supported lookup chains into a loop that feeds each match to AggStep;
     /// `try_execute_join_aggregate_program` falls back to the general
     /// join-aggregate path for any shape codegen declines.
+    ///
+    /// The same on `:memory:` (bd-w4pr1.13.23): the program reads the pager,
+    /// which holds every committed and in-transaction row there as on a file
+    /// (the row mirror the general path joins is a copy of it), so the
+    /// general path's copy of every table into that mirror and its
+    /// tree-walking evaluation are not needed for these shapes either.
     fn select_join_aggregate_is_vdbe_candidate(&self, select: &SelectStatement) -> bool {
         use fsqlite_ast::{FunctionArgs, JoinConstraint, JoinKind};
 
@@ -51032,8 +51038,7 @@ impl Connection {
         else {
             return false;
         };
-        if !self.pager.is_file_backed()
-            || self.time_travel_active.get()
+        if self.time_travel_active.get()
             || from.joins.is_empty()
             || !group_by.is_empty()
             || having.is_some()
@@ -174550,40 +174555,63 @@ mod tests {
                 (
                     "CREATE TABLE l(a BLOB, b INTEGER); CREATE TABLE r(a INTEGER, b INTEGER); \
                      INSERT INTO l VALUES ('01', 7); INSERT INTO r VALUES (1, 7);",
-                    "SELECT count(*) FROM l JOIN r ON l.a = r.a AND l.b = r.b",
+                    "l.a = r.a AND l.b = r.b",
                 ),
                 (
                     "CREATE TABLE l(a BLOB); CREATE TABLE r(a BLOB); \
                      INSERT INTO l VALUES ('01'); INSERT INTO r VALUES (1);",
-                    "SELECT count(*) FROM l JOIN r ON l.a = r.a",
+                    "l.a = r.a",
                 ),
                 (
                     "CREATE TABLE l(a INTEGER, b TEXT); CREATE TABLE r(a NUMERIC, b TEXT); \
                      INSERT INTO l VALUES (9007199254740993, '01'); \
                      INSERT INTO r VALUES ('9007199254740993', '1');",
-                    "SELECT count(*) FROM l JOIN r ON l.a = r.a AND l.b = r.b",
+                    "l.a = r.a AND l.b = r.b",
                 ),
                 (
                     "CREATE TABLE l(a INTEGER); CREATE TABLE r(a NUMERIC); \
                      INSERT INTO l VALUES (9007199254740993); \
                      INSERT INTO r VALUES ('9007199254740993');",
-                    "SELECT count(*) FROM l JOIN r ON l.a = r.a",
+                    "l.a = r.a",
                 ),
             ];
 
-            for (setup, query) in cases {
+            for (setup, on) in cases {
                 let conn = Connection::open(":memory:").await.unwrap();
                 conn.execute(setup).await.unwrap();
+                let oracle = rusqlite::Connection::open_in_memory().unwrap();
+                oracle.execute_batch(setup).unwrap();
+
+                // The count takes the lookup loop on `:memory:` since
+                // bd-w4pr1.13.23; it must agree on the same affinity edges.
+                let count = format!("SELECT count(*) FROM l JOIN r ON {on}");
+                let expected: i64 = oracle.query_row(&count, [], |row| row.get(0)).unwrap();
+                let actual = conn.query(&count).await.unwrap();
+                assert_eq!(actual[0].values(), &[SqliteValue::Integer(expected)], "{count}");
+
+                // The joined rows still go through the hash candidate lane.
+                let query = format!("SELECT l.rowid, r.rowid FROM l JOIN r ON {on}");
                 FSQLITE_JOIN_HASH_FAST_PATH_HITS.with(|counter| counter.set(0));
                 FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.set(0));
                 FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS.with(|counter| counter.set(0));
-                let actual = conn.query(query).await.unwrap();
-
-                let oracle = rusqlite::Connection::open_in_memory().unwrap();
-                oracle.execute_batch(setup).unwrap();
-                let expected: i64 = oracle.query_row(query, [], |row| row.get(0)).unwrap();
-
-                assert_eq!(actual[0].values(), &[SqliteValue::Integer(expected)]);
+                let actual = conn.query(&query).await.unwrap();
+                let expected = oracle
+                    .prepare(&query)
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok(vec![
+                            SqliteValue::Integer(row.get(0)?),
+                            SqliteValue::Integer(row.get(1)?),
+                        ])
+                    })
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(
+                    actual.iter().map(row_values).collect::<Vec<_>>(),
+                    expected,
+                    "{query}"
+                );
                 assert_eq!(
                     FSQLITE_JOIN_HASH_FAST_PATH_HITS.with(|counter| counter.get()),
                     1,

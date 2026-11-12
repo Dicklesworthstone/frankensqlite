@@ -155,13 +155,22 @@ fn join_aggregate_unknown_column_reports_no_such_column() {
     }
 }
 
+/// On a file and on `:memory:`, where these shapes take the same lookup loop
+/// since bd-w4pr1.13.23.
 #[test]
 fn join_aggregates_over_lookups_match_sqlite() {
-    for indexed in [false, true] {
+    for (indexed, file_backed) in [(false, true), (true, true), (false, false), (true, false)] {
         asupersync::test_utils::run_test(|| async move {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("join_aggregate_lookup.db");
-            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let target = if file_backed {
+                dir.path()
+                    .join("join_aggregate_lookup.db")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&target).await.unwrap();
             let r = rusqlite::Connection::open_in_memory().unwrap();
             let indexes: &[&str] = if indexed { INDEXES } else { &[] };
             for sql in SETUP.iter().chain(indexes) {
@@ -189,6 +198,28 @@ fn join_aggregates_over_lookups_match_sqlite() {
                 );
                 let ops = opcodes(&f, "SELECT sum(t.c) FROM u JOIN t ON t.a = u.a").await;
                 assert!(ops.iter().any(|op| op == "SeekRowid"), "{ops:?}");
+            }
+
+            if !file_backed {
+                // A rowid-lookup aggregate runs the lookup loop on `:memory:`
+                // as well; a DISTINCT aggregate is not that loop's and still
+                // takes the general join path, which records its decision.
+                f.set_fallback_capture_enabled(true);
+                for (sql, general_path) in [
+                    ("SELECT count(*), sum(t.c) FROM u JOIN t ON t.id = u.id", false),
+                    ("SELECT count(*), sum(t.c) FROM u JOIN t ON t.id = u.a * 2", false),
+                    ("SELECT count(DISTINCT t.a) FROM u JOIN t ON t.a = u.a", true),
+                ] {
+                    f.reset_fallback_decision_evidence();
+                    f.query(sql).await.unwrap();
+                    let went_general = f
+                        .fallback_decision_snapshot()
+                        .decisions
+                        .iter()
+                        .any(|decision| decision.decision_reason == "group_by_join_fallback");
+                    assert_eq!(went_general, general_path, "`{sql}` on :memory:");
+                }
+                f.set_fallback_capture_enabled(false);
             }
         });
     }
