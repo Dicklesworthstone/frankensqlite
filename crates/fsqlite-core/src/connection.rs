@@ -42147,16 +42147,33 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    if let Some(mut rows) = boxed_future(|| {
-                        self.try_execute_group_by_storage_substrate(
-                            cx,
-                            &bound,
-                            None,
-                            "group_by_storage_substrate",
-                        )
-                    })
-                    .await?
-                    {
+                    // bd-23kpa: the substrate drops every group when a HAVING's
+                    // aggregate sits inside an expression (`count(*) * 2 > 3`)
+                    // and keeps failing groups when it is not a result column
+                    // (`SELECT max(id) ... HAVING count(*) > 1`): wrong IN-list
+                    // members, empty derived tables, wrong DELETEs. A HAVING
+                    // takes the in-memory path, which answers it like stock.
+                    let has_having = matches!(
+                        &bound.body.select,
+                        SelectCore::Select {
+                            having: Some(_),
+                            ..
+                        }
+                    );
+                    let substrate_rows = if has_having {
+                        None
+                    } else {
+                        boxed_future(|| {
+                            self.try_execute_group_by_storage_substrate(
+                                cx,
+                                &bound,
+                                None,
+                                "group_by_storage_substrate",
+                            )
+                        })
+                        .await?
+                    };
+                    if let Some(mut rows) = substrate_rows {
                         if distinct {
                             dedup_rows_collated(
                                 &mut rows,
@@ -207987,6 +208004,128 @@ mod tests {
             width: 0,
         };
         assert!(empty.key(5).is_empty());
+    }
+
+    /// bd-23kpa: a grouped HAVING inside a subquery on a file database answers
+    /// like stock. The GROUP BY storage substrate dropped every group when the
+    /// HAVING's aggregate sat inside an expression and kept failing groups when
+    /// it was not a result column: wrong IN-list members, an empty derived
+    /// table, and a DELETE that removed a row stock keeps.
+    #[test]
+    fn test_having_in_subqueries_on_file_matches_rusqlite() {
+        fn render(values: &[SqliteValue]) -> String {
+            values
+                .iter()
+                .map(|value| match value {
+                    SqliteValue::Null => "NULL".to_owned(),
+                    SqliteValue::Integer(n) => n.to_string(),
+                    SqliteValue::Float(f) => format!("{f:?}"),
+                    SqliteValue::Text(text) => format!("'{text}'"),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+
+        fn oracle_rows(oracle: &rusqlite::Connection, sql: &str) -> Vec<String> {
+            let mut stmt = oracle.prepare(sql).unwrap();
+            let width = stmt.column_count();
+            stmt.query_map([], |row| {
+                Ok((0..width)
+                    .map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
+                        rusqlite::types::Value::Null => "NULL".to_owned(),
+                        rusqlite::types::Value::Integer(n) => n.to_string(),
+                        rusqlite::types::Value::Real(f) => format!("{f:?}"),
+                        rusqlite::types::Value::Text(text) => format!("'{text}'"),
+                        rusqlite::types::Value::Blob(bytes) => format!("{bytes:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect()
+        }
+
+        async fn check(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
+            let rows: Vec<String> = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"))
+                .iter()
+                .map(|row| render(row.values()))
+                .collect();
+            assert_eq!(rows, oracle_rows(oracle, sql), "`{sql}`");
+        }
+
+        async fn both(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"));
+            oracle.execute_batch(sql).unwrap();
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("having_in_subqueries.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE t3(id INTEGER PRIMARY KEY, a)",
+                "INSERT INTO t3 VALUES (1,'x'),(2,'x'),(3,'y'),(4,'z'),(5,'z'),(6,'z')",
+                "CREATE TABLE hav1(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
+                "INSERT INTO hav1 VALUES (1,'a',10),(2,'a',20),(3,'a',30),(4,'b',40),(5,'b',50)",
+            ] {
+                both(&conn, &oracle, sql).await;
+            }
+            let havings = [
+                "count(*) > 1",
+                "count(*) * 2 > 3",
+                "2 * count(*) > 3",
+                "count(*) + 0 > 1",
+                "sum(val) + 1 > 50",
+                "-count(*) < -2",
+                "abs(count(*)) > 2",
+                "count(*) BETWEEN 2 AND 3",
+                "count(*) IN (2, 3)",
+                "max(val) - min(val) > 15",
+                "count(*) > 2 AND sum(val) > 50",
+                "count(*) > 2 OR sum(val) > 80",
+            ];
+            for having in havings {
+                for sql in [
+                    format!("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING {having} ORDER BY grp"),
+                    format!(
+                        "SELECT id FROM hav1 WHERE id IN \
+                         (SELECT max(id) FROM hav1 GROUP BY grp HAVING {having}) ORDER BY id"
+                    ),
+                    format!(
+                        "SELECT * FROM (SELECT grp, count(*) c FROM hav1 GROUP BY grp \
+                         HAVING {having}) ORDER BY grp"
+                    ),
+                    format!(
+                        "SELECT (SELECT count(*) FROM \
+                         (SELECT grp FROM hav1 GROUP BY grp HAVING {having}))"
+                    ),
+                ] {
+                    check(&conn, &oracle, &sql).await;
+                }
+            }
+            check(
+                &conn,
+                &oracle,
+                "SELECT id FROM t3 WHERE id IN \
+                 (SELECT max(id) FROM t3 GROUP BY a HAVING count(*) > 1) ORDER BY id",
+            )
+            .await;
+            both(
+                &conn,
+                &oracle,
+                "DELETE FROM t3 WHERE id IN (SELECT max(id) FROM t3 GROUP BY a HAVING count(*) > 1)",
+            )
+            .await;
+            check(&conn, &oracle, "SELECT * FROM t3 ORDER BY id").await;
+        });
     }
 
     /// bd-w4pr1.13.20: a WHERE comparison neither side of which is a column of
