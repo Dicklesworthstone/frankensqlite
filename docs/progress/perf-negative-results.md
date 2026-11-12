@@ -87,6 +87,122 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: an insert proven rightmost raises the rowid floor without walking to the last row (bd-w4pr1.13.21)
+
+- Target: every INSERT through the concurrent rowid allocator (file-backed connections); the
+  scorecard's bulk rows. Touched: `crates/fsqlite-vdbe/src/engine.rs`
+  (`bump_concurrent_storage_rowid_floor`).
+- Evidence before (perf, frame pointers, instructions:u): on the 300k-row INSERT ... SELECT the
+  bump was 24% of the process, all of it `storage_cursor_visible_max_rowid` walking the write
+  cursor to the table's last row after every insert (a descent and a reload of the last leaf
+  with its cell pointers), about 5k instructions per row; stock spends 3.5k on the whole row.
+- Change: when the Insert arm has just recorded `last_successful_insert_rowid == Some(rowid)`
+  (the row is proven rightmost), the walk would return `rowid`, so the bump uses it. Every
+  other insert walks as before; the allocator floor is max-monotonic either way.
+- Result, stock sqlite3 3.46.1 live, io_uring refused, three runs per arm, fresh database per
+  run, answers equal (binary 3f1830da... against its base 9f032470...): the scorecard mutation
+  setup (300k rows from generate_series, one transaction) 6,153.1M -> 5,058.6M user
+  instructions (-17.8%, 5.81x -> 4.78x stock), CPU 696 -> 567 ms; INSERT INTO m2 SELECT * FROM
+  m (300k rows) 6,831.8M -> 5,742.2M (-16.0%, 6.01x -> 5.05x), CPU 721 -> 574 ms. Prediction
+  -24%, kill under -15%: kept, short of the prediction.
+- Tests: bd_yb70u's oracle gains a case set run in memory and file-backed against stock: appends
+  from INSERT ... SELECT, explicit rowids above and below the largest, implicit rowids after
+  each, RETURNING, an AFTER INSERT trigger reading max(id), OR REPLACE on the largest rowid, a
+  transaction, AUTOINCREMENT after deleting its top rows, a table without an INTEGER PRIMARY
+  KEY, then a second connection allocating past the first; stock's integrity_check on the file.
+  Gate: the landing tree 229f72bed (main cb32a350b, the three commit-path cuts above and below, and
+  the rowid-floor commit): clippy -D warnings with all targets on fsqlite-vfs, -wal, -pager, -vdbe,
+  -core clean; fsqlite-vdbe lib 1,228 pass and 2 fail (the two IN-list codegen tests red on main,
+  bd-in-or-index-scan-fs7nd / bd-bhalc), bytecode goldens 8 pass; fsqlite-wal lib 1,165 pass;
+  fsqlite-pager lib 1,104 pass and 1 fail
+  (`bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`, red on main, bd-5lvnd); 12
+  fsqlite-core keeper targets (the bd-ih8ak pair, the GH#338 / GH#457 / GH#385 / GH#525 keepers, the
+  bulk-import and self-connection peer races, bd_yb70u, the rowid-rewind concurrent stress,
+  failed_insert_rowid_reuse_oracle, issue_491_bulk_insert) 204 pass. On fcf92f524 (the same
+  commit-path cuts on 0bf696af5): fsqlite-vfs shm units 133 pass; fsqlite-core generation-change,
+  WAL-adapter and conflict units 164 pass. The rowid-floor commit alone: 10 rowid-allocation oracle
+  targets pass.
+- Still a loss: 4.8x to 5.1x. What remains per row (bead): the INSERT ... SELECT source runs in
+  the tree-walking evaluator and every row is materialised and replayed through a prepared
+  multi-row INSERT (insert_select_row_by_row_fallback), and each append clones the 4 KiB leaf
+  for the pager (`PageData::clone` of an owned page).
+- Retry condition: none.
+
+## 2026-11-12 - WIN: a WAL-index hash probe searches each stretch of the table under one hold of the region mutex (bd-w4pr1.7)
+
+- Target: every commit; measured on autocommit INSERTs. Touched:
+  `crates/fsqlite-vfs/src/shm.rs` (`ShmRegion::atomic_first_zero_u16_ne`),
+  `crates/fsqlite-wal/src/wal_index.rs` (`first_empty_shared_hash_slot`, used by
+  `validate_clean_tail_append` and `append_shared_wal_index_entry`).
+- Evidence before (callgrind, 1,000 autocommit INSERTs): `ShmRegion::atomic_load_u16_ne` called
+  161,283 times, 80.6 per probe, twice per commit, 87 instructions each (a range check and one
+  hold of the region mutex per slot): 14k instructions per commit. Every frame of one page chains
+  from that page's hash slot, and an insert load rewrites the same leaf about 160 times.
+- Change: one primitive returns the index of the first zero u16 of a range under one hold,
+  loading the same slots in the same order and none after the first zero; both probes use it,
+  once around the table. The caller holds the WAL write lock at both sites, as before.
+- Result, stock live, io_uring refused, N=4000 against N=2000, two runs (binary 57b48519...
+  against 664179b36 f1150f6f...): 291.1k -> 271.1k and 281.5k -> 268.8k user instructions per
+  commit (-20.0k, -12.7k; prediction -11k to -13k, kill under 8k). CPU inside the spread.
+- Tests: the scan against a loop of single loads for every start and length on heap and mmap
+  regions, with bounds; the probe against the single-load loop for a page whose own slot is the
+  table's last (wrap, claimed slots, the slot reached last, a full table). Gate: the landing gate in
+  the rowid-floor entry above.
+- Retry condition: none.
+
+## 2026-11-12 - WIN: the pager's four diagnostic trace switches are read from the environment once per process (bd-w4pr1.7)
+
+- Target: every commit. Touched: `crates/fsqlite-pager/src/pager.rs` (`trace_switch_enabled`
+  and four callers replacing 33 `std::env::var_os` reads).
+- Evidence before: getenv ran 8,054 times in 1,000 autocommit INSERTs at about 725
+  instructions (it walks the whole environment): 5.8k per commit.
+- Result, stock live, io_uring refused, N=4000 against N=2000 (binary af1c683d... against
+  57b48519...): with this shell's environment (79 variables, 4.7 KB) passed into the measuring
+  service, 276.4k -> 270.8k and 280.3k -> 274.6k per commit (-5.6k, -5.7k; prediction -5k to
+  -6k, kill under 3.5k). With the service's own minimal environment the same pair differs by
+  -1.3k and +3.6k, inside the spread: the saving scales with the environment's size.
+- Test: the helper answers from the environment the first time and keeps that answer. Gate:
+  the landing gate in the rowid-floor entry above.
+- Retry condition: none.
+
+## 2026-11-12 - WIN: a conflict baseline keeps the page image and is compared only when the WAL generation changed (bd-w4pr1.7)
+
+- Target: every WAL commit. Touched: `crates/fsqlite-wal/src/group_commit.rs`
+  (`TransactionConflictPageBaseline` carries a `PageData`), `crates/fsqlite-pager/src/pager.rs`
+  (`conflict_page_baselines`), `crates/fsqlite-core/src/wal_adapter.rs`
+  (`conflicts_after_generation_change` compares bytes).
+- Evidence before: one BLAKE3 hash of each conflict candidate's begin-time image per commit,
+  16.4k instructions for the one page an autocommit INSERT writes; the hash's one consumer runs
+  only when a checkpoint replaced the WAL generation during the transaction.
+- Change: the baseline is a clone of the read-cache page (a reference-count bump when the page
+  is already shared; copy-on-write keeps it fixed); equal hashes meant equal images, so every
+  verdict is the same.
+- Result, stock live, io_uring refused, full shell environment, N=4000 against N=2000 (binary
+  61309442... against af1c683d...): 266.5k -> 254.3k and 270.2k -> 253.0k per commit (-12.2k,
+  -17.2k; prediction -15k to -16k, kill under 12k). CPU inside the spread.
+- Tests: the seven generation-change tests build baselines from images; a new one refuses a
+  baseline that differs from the committed page in its first or its last byte only and admits
+  the equal image. Gate: the landing gate in the rowid-floor entry above.
+- Retry condition: none.
+
+## 2026-11-12 - REJECTED: a WAL frame reader whose first read fetches one frame, not a 15-frame batch (bd-w4pr1.7)
+
+- Target: every commit after a checkpoint restarted the WAL in place. Candidate:
+  `crates/fsqlite-wal/src/wal.rs` (`WalFrameReader`), commit 0a6a83b91 on branch `walread` of
+  the perf lane's clone (tested: a refresh over a stale tail reads one frame; after a peer's 20
+  frames, one frame then two batches).
+- Evidence: after a restart the file keeps the old generation's frames past the new end, so
+  every refresh until the new generation outgrows the old reads a 62 KiB batch into a zeroed
+  buffer to look at one frame's salts: 3,324 of 4,000 autocommit INSERTs issued a 61,800-byte
+  pread, 207.7 MB read in all.
+- Result: bytes read per commit 50.7 KiB -> 7.5 KiB (strace), but CPU per commit over five
+  interleaved runs 132.5/136.7/149.6/140.5/146.5 us against 142.3/140.3/150.2/133.9/145.5 (means
+  141.2 vs 142.4), user instructions inside the spread; the prediction was 3 to 7 us of CPU
+  less. On tmpfs, and on any WAL the page cache holds, the read is a copy of hot pages that
+  does not show in a 140 us commit.
+- Retry condition: a WAL that misses the page cache (cold file on a disk), or a profile showing
+  the refresh's frame read above 2% of commit CPU.
+
 ## 2026-11-11 - WIN: a plain AggStep calls its aggregate directly once its site is resolved (bd-w4pr1.13)
 
 - Target: every scanning aggregate. An exact instruction profile (callgrind, line level) of
