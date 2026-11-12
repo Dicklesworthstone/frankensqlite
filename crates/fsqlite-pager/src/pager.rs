@@ -5473,7 +5473,7 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
     pub async fn acquire_reader(&self, cx: &Cx) -> Result<WalIndexReaderLease<F>> {
         let queue = self.cleanup_queue.upgrade().ok_or(FrankenError::BusyRecovery)?;
         let mut restore = BeginExternalLockState::new(&queue, Arc::clone(&self.db_file), cx);
-        match self.acquire_reader_into(cx, &mut restore, false).await? {
+        match self.acquire_reader_into(cx, &mut restore, false, None).await? {
             traits::WalNativeReadOutcome::Ready => {}
             traits::WalNativeReadOutcome::RecoveryRequired(_) => {
                 return Err(FrankenError::BusyRecovery);
@@ -5495,16 +5495,25 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
     /// `sqlite3WalBeginReadTransaction` retries without consulting the busy
     /// handler. Those races are retried here at stock's pace, so a reader with
     /// `busy_timeout = 0` does not fail just because a writer committed.
+    ///
+    /// `premapped_region`: region 0 of this file's shared index as the
+    /// caller's begin just mapped it, its backing checked against truncation
+    /// (bd-7do1d) by that map. The first attempt reads through it instead of
+    /// mapping again (bd-ih8ak); a retry maps and checks afresh.
     async fn acquire_reader_into(
         &self,
         cx: &Cx,
         owner: &mut BeginExternalLockState<F>,
         require_wal: bool,
+        mut premapped_region: Option<fsqlite_vfs::ShmRegion>,
     ) -> Result<traits::WalNativeReadOutcome> {
         let mut attempt = 1_u32;
         let mut torn_header_retries = 0_u32;
         loop {
-            let exhausted = match self.try_acquire_reader_into(cx, owner, require_wal).await? {
+            let exhausted = match self
+                .try_acquire_reader_into(cx, owner, require_wal, premapped_region.take())
+                .await?
+            {
                 NativeReaderAdmission::Admitted(outcome) => return Ok(outcome),
                 NativeReaderAdmission::Retry { exhausted, torn_header } => {
                     torn_header_retries += u32::from(torn_header);
@@ -5544,6 +5553,7 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
         cx: &Cx,
         owner: &mut BeginExternalLockState<F>,
         require_wal: bool,
+        premapped_region: Option<fsqlite_vfs::ShmRegion>,
     ) -> Result<NativeReaderAdmission> {
         use traits::{WalNativeReadBinding, WalNativeReadOutcome, WalNativeRecoveryReason};
         use fsqlite_vfs::shm::{SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, WAL_READ_LOCK_BASE};
@@ -5568,7 +5578,11 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
         if queue.has_relevant_process_root(shared_db_file_key(&self.db_file)) {
             return Err(FrankenError::BusyRecovery);
         }
-        let region = match file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false) {
+        let mapped = premapped_region.map_or_else(
+            || file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false),
+            Ok,
+        );
+        let region = match mapped {
             Ok(region) => region,
             Err(FrankenError::CannotOpen { .. }) => {
                 return Ok(Admitted(WalNativeReadOutcome::RecoveryRequired(
@@ -8242,7 +8256,8 @@ struct DurableDbSizeFloor {
 }
 
 /// The WAL-index header and `-wal` file of a WAL-mode database as they stand
-/// now, when this process can vouch for them (see [`WalRefreshSignature`]).
+/// now, when this process can vouch for them (see [`WalRefreshSignature`]),
+/// with the shared-index region the header was read from.
 async fn observe_wal_refresh_signature<V: Vfs>(
     cx: &Cx,
     vfs: &V,
@@ -8250,21 +8265,37 @@ async fn observe_wal_refresh_signature<V: Vfs>(
     db_file: &SharedDbFile<V::File>,
     wal_path: &Path,
     commit_seq: CommitSeq,
-) -> Result<Option<WalRefreshSignature>> {
+) -> Result<Option<(WalRefreshSignature, fsqlite_vfs::ShmRegion)>> {
     if vfs.is_memory() {
         return Ok(None);
     }
-    let Some(shm_header) = observe_vouched_wal_index_header(cx, wal_backend, db_file).await? else {
+    let Some((shm_header, shm_region)) =
+        observe_vouched_wal_index_header(cx, wal_backend, db_file).await?
+    else {
         return Ok(None);
     };
     let Some(wal_identity) = vfs.path_file_identity(cx, wal_path)? else {
         return Ok(None);
     };
-    Ok(Some(WalRefreshSignature {
-        shm_header,
-        wal_identity,
-        commit_seq,
-    }))
+    Ok(Some((
+        WalRefreshSignature {
+            shm_header,
+            wal_identity,
+            commit_seq,
+        },
+        shm_region,
+    )))
+}
+
+/// What a begin's refresh signature observed, offered to that begin's first
+/// native-reader binding attempt so it neither states the `-wal` path nor
+/// maps the shared index a second time (bd-ih8ak).
+struct BeginSignatureObservation {
+    /// The `-wal` path's identity, for the WAL backend's path check.
+    wal_identity: FileIdentity,
+    /// Region 0 of the shared index as the signature mapped it, its backing
+    /// checked against truncation (bd-7do1d) by that map.
+    shm_region: fsqlite_vfs::ShmRegion,
 }
 
 /// bd-sz9j5: a joiner of a live namespace generation takes its WAL-lifetime
@@ -8293,12 +8324,13 @@ fn claim_wal_lifetime_before_namespace_join<F: VfsFile>(
 }
 
 /// The shared WAL-index header, when a native WAL reader is attached and this
-/// process holds the main-file SHARED claim that makes it authoritative.
+/// process holds the main-file SHARED claim that makes it authoritative, with
+/// the region it was read from.
 async fn observe_vouched_wal_index_header<F: VfsFile>(
     cx: &Cx,
     wal_backend: &SharedWalBackend,
     db_file: &SharedDbFile<F>,
-) -> Result<Option<fsqlite_wal::wal_index::WalIndexHdr>> {
+) -> Result<Option<(fsqlite_wal::wal_index::WalIndexHdr, fsqlite_vfs::ShmRegion)>> {
     {
         let backend = wal_backend_handle(wal_backend)?;
         let wal = async_rwlock_read(&backend, cx, "refresh signature").await?;
@@ -8340,7 +8372,7 @@ async fn can_vouch_for_wal_index_header<F: VfsFile>(
 async fn vouched_wal_index_header_of_file<F: VfsFile>(
     cx: &Cx,
     db_file: &SharedDbFile<F>,
-) -> Result<Option<fsqlite_wal::wal_index::WalIndexHdr>> {
+) -> Result<Option<(fsqlite_wal::wal_index::WalIndexHdr, fsqlite_vfs::ShmRegion)>> {
     let mut file = shared_db_file_write(db_file, cx).await?;
     if !file.holds_main_wal_lifetime_read_lock() {
         return Ok(None);
@@ -8348,7 +8380,8 @@ async fn vouched_wal_index_header_of_file<F: VfsFile>(
     let Ok(region) = file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false) else {
         return Ok(None);
     };
-    fsqlite_wal::wal_index::read_shared_wal_index_header(&region)
+    Ok(fsqlite_wal::wal_index::read_shared_wal_index_header(&region)?
+        .map(|header| (header, region)))
 }
 
 /// What a flush knows about its own publication once it has landed (see
@@ -17708,7 +17741,7 @@ where
                 if wal.native_reader_required() {
                     let source = self.wal_index_shm_source()?;
                     match source
-                        .acquire_reader_into(cx, &mut admission.external_lock, false)
+                        .acquire_reader_into(cx, &mut admission.external_lock, false, None)
                         .await?
                     {
                         traits::WalNativeReadOutcome::Ready => {}
@@ -18026,12 +18059,13 @@ where
     }
 
     /// The WAL-index header and `-wal` file as they stand now, when this
-    /// connection can vouch for them (see [`WalRefreshSignature`]).
+    /// connection can vouch for them (see [`WalRefreshSignature`]), with the
+    /// shared-index region the header was read from.
     async fn current_wal_refresh_signature(
         &self,
         cx: &Cx,
         inner: &PagerInner<V::File>,
-    ) -> Result<Option<WalRefreshSignature>> {
+    ) -> Result<Option<(WalRefreshSignature, fsqlite_vfs::ShmRegion)>> {
         if inner.journal_mode != JournalMode::Wal {
             return Ok(None);
         }
@@ -18145,7 +18179,9 @@ where
         let pre_refresh_signature = if returning_open {
             None
         } else {
-            self.current_wal_refresh_signature(cx, &inner).await?
+            self.current_wal_refresh_signature(cx, &inner)
+                .await?
+                .map(|(signature, _)| signature)
         };
         if !returning_open && Self::standalone_refresh_is_unchanged(&inner, pre_refresh_signature) {
             return Ok(self.published.snapshot());
@@ -18942,15 +18978,16 @@ where
     }
 
     /// Native acquisition and backend binding share the caller's cleanup owner.
-    /// `observed_wal_identity`: the `-wal` path's identity this begin stated
-    /// for its refresh signature, which the backend's path check may use
-    /// instead of stating the path again (bd-ih8ak).
+    /// `observed`: what this begin's refresh signature found (bd-ih8ak). Its
+    /// `-wal` identity may stand in for the backend's own statement of the
+    /// path, and reader admission reads the index through the region it
+    /// mapped instead of mapping (and checking) it again.
     async fn try_bind_runtime_native_reader(
         &self,
         cx: &Cx,
         inner: &PagerInner<V::File>,
         external_lock: &mut BeginExternalLockState<V::File>,
-        observed_wal_identity: Option<FileIdentity>,
+        observed: Option<BeginSignatureObservation>,
     ) -> Result<traits::WalNativeReadOutcome> {
         use traits::WalNativeReadOutcome;
         if inner.journal_mode != JournalMode::Wal {
@@ -18977,7 +19014,10 @@ where
             cleanup_queue: Arc::downgrade(&self.group_commit_queue),
             can_publish_reader_marks: !inner.access_mode.is_readonly(),
         };
-        match source.acquire_reader_into(cx, external_lock, true).await? {
+        let (observed_wal_identity, premapped_region) = observed.map_or((None, None), |observed| {
+            (Some(observed.wal_identity), Some(observed.shm_region))
+        });
+        match source.acquire_reader_into(cx, external_lock, true, premapped_region).await? {
             WalNativeReadOutcome::Ready => {}
             outcome => return Ok(outcome),
         }
@@ -19050,8 +19090,8 @@ where
     }
 
     /// Retire the whole reader attempt before a separately classified recovery.
-    /// `observed_wal_identity` (bd-ih8ak) is offered to the first binding
-    /// attempt only; one after a recovery states the `-wal` path itself.
+    /// `observed` (bd-ih8ak) is offered to the first binding attempt only; one
+    /// after a recovery states the `-wal` path and maps the index itself.
     async fn prepare_runtime_native_reader(
         &self,
         cx: &Cx,
@@ -19059,7 +19099,7 @@ where
         inner: &mut PagerInner<V::File>,
         external_lock: &mut BeginExternalLockState<V::File>,
         reserve_writer: bool,
-        mut observed_wal_identity: Option<FileIdentity>,
+        mut observed: Option<BeginSignatureObservation>,
     ) -> Result<()> {
         let mut recovered_once = false;
         loop {
@@ -19074,7 +19114,7 @@ where
                 shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
             }
             let reason = match self
-                .try_bind_runtime_native_reader(cx, inner, external_lock, observed_wal_identity.take())
+                .try_bind_runtime_native_reader(cx, inner, external_lock, observed.take())
                 .await?
             {
                 traits::WalNativeReadOutcome::Ready => return Ok(()),
@@ -19355,14 +19395,18 @@ where
 
         // Observed before the reader binds: the refresh below reflects the
         // bound header, which can only be this one or newer.
-        let pre_refresh_signature = self.current_wal_refresh_signature(cx, inner).await?;
+        let pre_refresh = self.current_wal_refresh_signature(cx, inner).await?;
+        let pre_refresh_signature = pre_refresh.as_ref().map(|(signature, _)| *signature);
         let refresh_result = match self.prepare_runtime_native_reader(
             cx,
             maintenance_lease,
             inner,
             external_lock,
             reserve_writer,
-            pre_refresh_signature.map(|signature| signature.wal_identity),
+            pre_refresh.map(|(signature, shm_region)| BeginSignatureObservation {
+                wal_identity: signature.wal_identity,
+                shm_region,
+            }),
         ).await {
             Ok(()) => {
                 self.refresh_committed_state_unless_unchanged(cx, inner, pre_refresh_signature)
@@ -24934,7 +24978,8 @@ where
                     Some(_) => observe_vouched_wal_index_header(cx, wal_backend, &floor_db_file)
                         .await
                         .ok()
-                        .flatten(),
+                        .flatten()
+                        .map(|(header, _)| header),
                     None => None,
                 };
                 let durable_certified_db_size = if let Some(remembered) = remembered_floor
@@ -32093,7 +32138,7 @@ mod tests {
             );
             owner.acquire_snapshot(&cx).await.unwrap();
             assert_eq!(
-                source.acquire_reader_into(&cx, &mut owner, true).await.unwrap(),
+                source.acquire_reader_into(&cx, &mut owner, true, None).await.unwrap(),
                 traits::WalNativeReadOutcome::Ready,
             );
             let binding = owner.native_reader.as_ref().unwrap().validated.as_ref().unwrap();
