@@ -87,6 +87,73 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: an index search orders a cell by an INTEGER leading probe term straight from the stored record (bd-w4pr1.13.15)
+
+- Target: every index binary search whose probe starts with an INTEGER (seeks and inserts);
+  measured on the unindexed 5k x 5k join (its automatic index takes 4,707 inserts and 5,000
+  probes). Touched: `crates/fsqlite-btree/src/cursor.rs` (`LeadingIntegerProbe`, the two index
+  binary searches).
+- Evidence before (callgrind, main 9fb65c851): 9,707 searches and 115,032 comparisons. A step cost
+  about 603: the cell parse (105), an awaited borrowed copy of the payload (58), the comparison
+  (294: a header walk into a SmallVec, the leading field decoded into a SqliteValue,
+  SqliteValue::cmp, the record-profile scope entered a second time) and the loop (about 146).
+- Change: when the probe's first decoded term is an INTEGER and the index compares stored bytes
+  (UTF-8 compare encoding), a cell held whole on its page is ordered by that term alone, read from
+  the record, with nothing awaited. The whole header is still validated as the full comparison
+  validates it. Equal leading terms, a non-integer stored leading term, a malformed record, an
+  overflowing cell and every other probe take the full comparison unchanged. The order equals
+  `compare_index_key_record_with_values`' for those records (i64 order, reversed for a DESC first
+  term; the bias only decides ties, which this never does).
+- Result, stock sqlite3 3.46.1 live (ring refused, 3 runs, repeatable to the instruction; binaries
+  606ceebb... main 9fb65c851, 2d787607... lever bf278808d): `SELECT count(*) FROM v1 JOIN v2 ON
+  v1.k = v2.k` 200.7M -> 180.4M (7.73x -> 6.94x stock; CPU 22.1 -> 19.2 ms against 3.5);
+  the TEXT-key self-join control (`u JOIN u AS u2 ON u.name = u2.name`, the full comparison)
+  29.9M -> 30.0M; scan_filter_agg unchanged. Prediction -30M to -45M: missed; kill under -20M:
+  not met (-20.3M). Callgrind of the lever: a step is about 404, of which the fast order is 173
+  (the header walk 37, an out-of-line field decode 40) and the loop still about 126.
+- Tests: `test_leading_integer_order_agrees_with_the_record_comparison` (every storage class and
+  integer width, serial types 1 / 8 / 9 for 0 and 1, both directions, both biases: equal to the
+  record comparison wherever it decides, decides exactly the integer-led records whose leading term
+  differs, DESC reverses it, malformed records and non-integer or UTF-16-collated probes are left
+  alone); `test_index_seeks_with_an_integer_leading_probe_land_where_a_scan_says` (1,500 keys with
+  INTEGER, REAL, TEXT and NULL leading terms inserted out of order into a multi-level index, ASC
+  and DESC: every lower- and upper-bound seek lands where a scan in decoded order says). Gate on the
+  uncommitted tree, then on bf278808d (landed as 86a3d07a9, rebased onto 9e7afd9cf): clippy -D
+  warnings with all targets on fsqlite-btree clean; fsqlite-btree lib 549 pass; 28 fsqlite-core
+  index targets (`index_seek_random_differential`, the UTF-16 key-order and parity oracles, the
+  malformed and damaged index probes, the right-edge append, sorted-build, prefix, affinity and
+  collation oracles) 27 pass and 1 fail
+  (`gh497_in_list_text_index_seek::typed_index_membership_seeks_and_matches_stock`, the same
+  `r IN (9007199254740993)` count 2 against 0 on main's content, bd-xz5f4); fsqlite-vdbe lib
+  1,227 pass and 4 fail (the bd-bhalc IN-list pair and the bd-w4pr1.32 pair, all red on main).
+- Retry condition: none. Still open: the fast order's own 173 (a one-byte header and serial-type
+  fast path and a direct integer decode would take it under 60) and the loop's 126.
+
+## 2026-11-12 - REJECTED: an eviction forgets its page by the count of its trace entries (bd-w4pr1.13.18)
+
+- Target: every page-cache eviction (`S3FifoEvictionTracker::forget`); measured on `SELECT count(*)
+  FROM t` over the 1M-row scorecard table (about 7.1k evictions), with the rowid-lookup join and
+  scan_filter_agg (all hits) as controls. Touched (reverted): `crates/fsqlite-pager/src/page_cache.rs`.
+- Evidence before (callgrind, main 9fb65c851): `forget` 11.28M for 7,106 evictions (about 1,590
+  each), of which `first_access_trace_position` 8.24M over 28,391 linear scans of the access trace.
+- Candidate (022487c2b, reverted by af02cd91e on the clone branch; never on main): a per-page
+  count of trace entries (`HashMap<PageNumber, u32>` kept by `record_access` and by the trace's pop),
+  so `forget` removes exactly that many entries and returns at once for a page with none; the old
+  compaction above 4 entries.
+- Result, stock sqlite3 3.46.1 live (ring refused, 3 runs, repeatable to the instruction; binaries
+  606ceebb... main, 8249cd30... candidate): count(*) 63.4M -> 60.0M (prediction 54-56M); rowid
+  join 2,978.1M -> 2,900.0M; scan_filter_agg 1,398.9M -> 1,395.5M. About 450 net per eviction
+  against a kill line of 900: killed. Callgrind of the candidate: `forget` 6.68M (about 940 per
+  eviction) with 14,690 scans still finding each occurrence linearly and as many deque shifts, and
+  `record_access` about 190 more per page for the counting map.
+- Gate before measuring: clippy -D warnings with all targets on fsqlite-pager clean; fsqlite-pager
+  lib 1,106 pass and 1 fail (`bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`, red on
+  main, bd-5lvnd), the new `test_s3_fifo_counted_forget_matches_a_filtered_trace` among the passes.
+- Retry condition: not this shape. Retry only as lazy deletion, where `forget` touches no trace
+  entry and the trace's consumer skips entries of forgotten pages (an epoch per resident page,
+  compared when an entry is popped or counted). That needs a kill line on all-hits workloads,
+  since the skip moves to the trace's hot path.
+
 ## 2026-11-12 - WIN: AggStep finds its site and its accumulator by index, not by hash probe (bd-w4pr1.13)
 
 - Target: every aggregate step. Exact profile (callgrind) of scan_filter_agg (`SELECT count(*),
