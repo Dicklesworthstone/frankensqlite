@@ -87,6 +87,48 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: an implicit aggregate over a lookup join takes the VDBE lookup loop on :memory: too (bd-w4pr1.13.23)
+
+- Target: `SELECT <aggregates> FROM a JOIN b ON <lookup>` on `:memory:` (the scorecard's
+  memory_script_200k). Touched: `crates/fsqlite-core/src/connection.rs`
+  (`select_join_aggregate_is_vdbe_candidate`).
+- Evidence before: the predicate began `!self.pager.is_file_backed() || ...`, so on `:memory:` these
+  statements went to `group_by_join_fallback`. That path copies each table into the row mirror and
+  joins in the tree-walking evaluator: the scorecard's join cost 3,023M on `:memory:` against
+  1,216M on a WAL file and stock's 337M. The predicate came with bd-41o3t (1aee0b458, 2026-10-01),
+  whose message records no reason for the restriction.
+- Change: the file-backed condition is gone; time travel still declines. The program reads the
+  pager, which on `:memory:` holds every committed and in-transaction row as on a file (the
+  mirror's pending direct upserts are deferred writes into the mirror, not into the pager).
+- Result, stock sqlite3 3.46.1 live (3 runs, min instructions, median CPU; binaries 606ceebb...
+  main 9fb65c851, 53de1a9d... lever 8dc2c22d3; `scratchpad/memjoin_probe.py`, statement = setup +
+  statement minus setup + SELECT 1; every answer equal to stock's):
+
+  | statement | rows | stock | before | after |
+  |---|---|---|---|---|
+  | count, sum(length(u.name)) FROM t JOIN u ON u.a = t.a | 100 | 0.20M | 6.63M | 3.56M |
+  | same | 10k | 16.8M | 156.0M (9.3x) | 85.1M (5.1x) |
+  | same | 200k | 337.2M | 3,025.9M (9.0x) | 1,675.6M (5.0x) |
+  | count, sum(t.c) FROM u JOIN t ON t.id = u.a + 1 | 200k | 0.9M | 1,149.5M | 572.2M |
+  | count, count(u.a) FROM t LEFT JOIN u ON u.a = t.a + 500 | 200k | 302.2M | 2,467.6M | 1,633.1M |
+
+  The whole memory_script_200k: 8,277.9M -> 7,099.6M instructions (4.33x -> 3.71x stock), CPU
+  852.4 -> 674.5 ms (5.16x -> 4.08x). Prediction for the 200k join 1,000-1,300M: missed (1,675.6M);
+  kill under -1,000M: not met (-1,350M); faster at 100 and 10k rows on all three shapes, so no size
+  threshold is needed.
+- Tests: `join_aggregates_over_lookups_match_sqlite` now runs every case on `:memory:` too, and
+  checks through `fallback_decision_snapshot` that two rowid-lookup aggregates take the lookup loop
+  and a DISTINCT aggregate still records `group_by_join_fallback`.
+  `test_hash_join_candidate_prefilter_matches_sqlite_affinity_edges` compares the count form
+  (now the lookup loop) with stock and keeps its hash-lane assertions on the joined rows of the
+  same joins. Gate on the uncommitted tree: clippy -D warnings with all targets on fsqlite-core
+  clean; 25 fsqlite-core join and fallback-routing targets pass; fsqlite-core lib `join` 202 pass
+  and 2 fail (the t6741 pair, red on main's content, bd-nouem).
+- Retry condition: none. Still open on this bead: the u-driven row costs 572M for 1,000 rowid
+  lookups (stock 0.9M), about 2.8k per row of the 200k-row table, so something proportional to the
+  table runs before the statement on `:memory:` (probably the row mirror's reload); that is the next
+  lever here.
+
 ## 2026-11-12 - WIN: an index search orders a cell by an INTEGER leading probe term straight from the stored record (bd-w4pr1.13.15)
 
 - Target: every index binary search whose probe starts with an INTEGER (seeks and inserts);
