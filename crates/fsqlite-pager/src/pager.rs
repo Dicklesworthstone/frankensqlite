@@ -18168,6 +18168,30 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
         let returning_open = open_lease.is_some();
+        // bd-ih8ak lever 3: while the shared WAL-index header is still the
+        // one the last full refresh, or this connection's own flush, carried
+        // forward (see `WalRefreshSignature`), there is nothing to refresh,
+        // and nothing path-based happens: return before the path probes. Any
+        // other publisher moves that header and takes the full path below; a
+        // swap of the database or `-wal` after this connection's last commit
+        // is caught at its next begin, which always probes in full.
+        let mut observed_header = None;
+        if !returning_open
+            && let Some(previous) = inner.wal_refresh_signature
+            && inner.active_transactions == 0
+            && !inner.checkpoint_active
+            && !inner.rollback_journal_recovery_state.is_pending()
+            && inner.commit_seq == previous.commit_seq
+            && inner.journal_mode == JournalMode::Wal
+            && !self.vfs.is_memory()
+        {
+            observed_header = observe_vouched_wal_index_header(cx, &self.wal_backend, &inner.db_file)
+                .await?
+                .map(|(header, _)| header);
+            if observed_header == Some(previous.shm_header) {
+                return Ok(self.published.snapshot());
+            }
+        }
         if !returning_open {
             // Ordinary refresh preserves validation-before-adoption and the
             // exact existing recovery-owner admission check.
@@ -18178,6 +18202,18 @@ where
         // runs changes the header, so the next boundary still refreshes.
         let pre_refresh_signature = if returning_open {
             None
+        } else if let Some(shm_header) = observed_header {
+            // The header was observed above, before this refresh, so it is
+            // as good a "before" as one read here: only the `-wal` remains.
+            let mut wal_path = self.db_path.as_os_str().to_owned();
+            wal_path.push("-wal");
+            self.vfs
+                .path_file_identity(cx, Path::new(&wal_path))?
+                .map(|wal_identity| WalRefreshSignature {
+                    shm_header,
+                    wal_identity,
+                    commit_seq: inner.commit_seq,
+                })
         } else {
             self.current_wal_refresh_signature(cx, &inner)
                 .await?

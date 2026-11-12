@@ -228157,6 +228157,55 @@ mod autocommit_txn_tests {
         });
     }
 
+    /// bd-ih8ak lever 3: a connection's standalone refresh returns before its
+    /// path probes only while the shared WAL-index header is still the one
+    /// its last refresh or own flush carried forward. A peer's commit moves
+    /// that header and must be adopted; a version that returned the carried
+    /// snapshot without reading the header would miss it.
+    #[test]
+    fn test_standalone_refresh_skips_only_while_the_shared_header_is_unchanged() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("standalone_refresh_peer.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+
+            let writer = Connection::open(&db_str).await.unwrap();
+            writer.execute("PRAGMA journal_mode=WAL;").await.unwrap();
+            writer
+                .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            let peer = Connection::open(&db_str).await.unwrap();
+            writer
+                .execute("INSERT INTO t VALUES (1)")
+                .await
+                .expect("the writer's own autocommit INSERT");
+
+            let cx = writer.op_cx().unwrap();
+            let first = writer.pager.refresh_published_snapshot(&cx).await.unwrap();
+            let unchanged = writer.pager.refresh_published_snapshot(&cx).await.unwrap();
+            assert_eq!(
+                unchanged.snapshot_gen, first.snapshot_gen,
+                "nothing was published between the two refreshes"
+            );
+
+            peer.execute("INSERT INTO t VALUES (2)")
+                .await
+                .expect("the peer's autocommit INSERT");
+            let after_peer = writer.pager.refresh_published_snapshot(&cx).await.unwrap();
+            assert_ne!(
+                after_peer.snapshot_gen, first.snapshot_gen,
+                "the refresh after a peer's commit adopts it"
+            );
+            let rows = writer.query("SELECT count(*) FROM t").await.unwrap();
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(2)));
+
+            peer.close().await.unwrap();
+            writer.close().await.unwrap();
+        });
+    }
+
     #[test]
     fn test_filebacked_single_connection_autocommit_is_durable_and_visible_to_future_peer() {
         asupersync::test_utils::run_test(|| async {
