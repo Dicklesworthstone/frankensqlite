@@ -9138,7 +9138,9 @@ impl<P: PageWriter> BtCursor<P> {
             if delete_idx >= top.cell_pointers.len() {
                 return Err(FrankenError::internal("cursor position out of bounds"));
             }
-            let cell_ref = self.parse_cell_at(top, top.cell_idx)?;
+            // Only the overflow head is wanted, once: the cell-slot cache
+            // costs more to consult and fill than the parse it would save.
+            let cell_ref = self.parse_cell_at_uncached(top, top.cell_idx)?;
             (cell_ref.overflow_page, delete_idx, top.page_no)
         };
 
@@ -9159,10 +9161,19 @@ impl<P: PageWriter> BtCursor<P> {
                 ),
             });
         }
-        let compact_cell_area = header.first_freeblock == 0
-            && header.fragmented_free_bytes == 0
-            && ptrs.iter().copied().min().is_some_and(|min_ptr| {
-                usize::from(min_ptr) == header.content_offset(self.usable_size)
+        // A leaf whose pointers descend keeps its lowest cell last, so the
+        // content-offset check reads that one pointer; only a leaf whose
+        // pointer order was disturbed needs the scan for the minimum.
+        let no_free_gaps = header.first_freeblock == 0 && header.fragmented_free_bytes == 0;
+        let ptrs_descend = no_free_gaps && cell_ptrs_are_descending(&ptrs);
+        let lowest_ptr = if ptrs_descend {
+            ptrs.last().copied()
+        } else {
+            ptrs.iter().copied().min()
+        };
+        let compact_cell_area = no_free_gaps
+            && lowest_ptr.is_some_and(|lowest| {
+                usize::from(lowest) == header.content_offset(self.usable_size)
             });
 
         // Keep table-leaf deletes conservative: compact the remaining cells
@@ -9175,7 +9186,7 @@ impl<P: PageWriter> BtCursor<P> {
         let ptr_array_end =
             header_offset + usize::from(header.page_type.header_size()) + (ptrs.len() - 1) * 2;
 
-        if compact_cell_area && cell_ptrs_are_descending(&ptrs) {
+        if compact_cell_area && ptrs_descend {
             let deleted_ptr = usize::from(ptrs[delete_idx]);
             let deleted_upper = if delete_idx == 0 {
                 self.usable_size as usize
@@ -9209,19 +9220,26 @@ impl<P: PageWriter> BtCursor<P> {
                 });
             }
 
+            // The cells below the removed one move up by its size. Their
+            // pointers follow it in the array and are all lower than it (the
+            // order was checked above), so each raised pointer stays below
+            // `deleted_upper`, itself a pointer or the usable size: none can
+            // leave the u16 range. Converting each pointer separately cost
+            // 2,300 instructions per delete on a 150-cell leaf.
+            let pointer_shift =
+                u16::try_from(deleted_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf cell size {} exceeds u16 range on page {}",
+                        deleted_size,
+                        leaf_page_no.get()
+                    ),
+                })?;
             let page_bytes = page_data.as_bytes_mut();
             if old_content_offset < deleted_ptr {
                 page_bytes.copy_within(old_content_offset..deleted_ptr, new_content_offset);
             }
-            for ptr_slot in ptrs.iter_mut().skip(delete_idx + 1) {
-                let adjusted = usize::from(*ptr_slot) + deleted_size;
-                *ptr_slot = u16::try_from(adjusted).map_err(|_| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table leaf cell offset {} exceeds u16 range on page {}",
-                        adjusted,
-                        leaf_page_no.get()
-                    ),
-                })?;
+            for ptr_slot in &mut ptrs[delete_idx + 1..] {
+                *ptr_slot += pointer_shift;
             }
             ptrs.remove(delete_idx);
             header.first_freeblock = 0;
@@ -12369,14 +12387,22 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 }
             }
 
-            let top = cursor
-                .stack
-                .last()
-                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
-                .clone();
-            let separator_repair = cursor.separator_repair_for_deleted_leaf_max(&top)?;
+            // What the delete needs to know about the entry it is on, read
+            // in place: cloning the entry copied its pointer array and took a
+            // reference on its page for three facts.
+            let (separator_repair, top_is_leaf, top_cell_count) = {
+                let top = cursor
+                    .stack
+                    .last()
+                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                (
+                    cursor.separator_repair_for_deleted_leaf_max(top)?,
+                    top.header.page_type.is_leaf(),
+                    top.header.cell_count,
+                )
+            };
 
-            if !top.header.page_type.is_leaf() {
+            if !top_is_leaf {
                 // Interior node deletion (index B-trees):
                 // 1) identify successor payload, 2) replace interior key,
                 // 3) remove duplicate successor from leaf.
@@ -12482,7 +12508,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             // We must save the current key/rowid to re-establish position (at the successor)
             // after balancing.
             let depth = cursor.stack.len();
-            let needs_anchor = depth > 1 && top.header.cell_count == 1;
+            let needs_anchor = depth > 1 && top_cell_count == 1;
 
             #[allow(clippy::items_after_statements)]
             enum Anchor {
@@ -18345,6 +18371,140 @@ mod tests {
             assert_eq!(header.first_freeblock, 0);
             assert_eq!(header.fragmented_free_bytes, 0);
             assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+        });
+    }
+
+    /// Delete each row of the root table leaf `original` in turn, each from a
+    /// fresh copy, and check the page the delete writes: the cells physically
+    /// below the removed one have moved up by exactly its size, every other
+    /// pointer is where it was, the cell area has no free space inside it,
+    /// and every remaining row reads back whole and in order.
+    async fn assert_each_delete_closes_exactly_its_own_gap(
+        original: &[u8],
+        rows: &[(i64, Vec<u8>)],
+    ) {
+        let usable = USABLE as usize;
+        let original_header = BtreePageHeader::parse(original, 0).unwrap();
+        let original_ptrs = cell::read_cell_pointers(original, &original_header, 0).unwrap();
+        assert_eq!(original_ptrs.len(), rows.len());
+
+        for (removed, &(removed_rowid, _)) in rows.iter().enumerate() {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, original.to_vec());
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            assert!(
+                cursor
+                    .table_move_to(&cx, removed_rowid)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            cursor.delete(&cx).await.unwrap();
+
+            // The removed cell ends where the next cell up begins.
+            let removed_ptr = original_ptrs[removed];
+            let removed_end = original_ptrs
+                .iter()
+                .copied()
+                .filter(|&ptr| ptr > removed_ptr)
+                .min()
+                .map_or(usable, usize::from);
+            let removed_size = u16::try_from(removed_end - usize::from(removed_ptr)).unwrap();
+            let expected_ptrs: Vec<u16> = original_ptrs
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| index != removed)
+                .map(|(_, &ptr)| {
+                    if ptr < removed_ptr {
+                        ptr + removed_size
+                    } else {
+                        ptr
+                    }
+                })
+                .collect();
+
+            let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+            let header = BtreePageHeader::parse(&page, 0).unwrap();
+            let ptrs = cell::read_cell_pointers(&page, &header, 0).unwrap();
+            assert_eq!(ptrs, expected_ptrs, "row {removed_rowid}: cell pointers");
+            assert_eq!(header.first_freeblock, 0, "row {removed_rowid}");
+            assert_eq!(header.fragmented_free_bytes, 0, "row {removed_rowid}");
+            assert_eq!(
+                header.content_offset(USABLE),
+                original_header.content_offset(USABLE) + usize::from(removed_size),
+                "row {removed_rowid}: the cell area shrinks by the removed cell"
+            );
+
+            let mut remaining = rows.iter().filter(|(rowid, _)| *rowid != removed_rowid);
+            let mut positioned = cursor.first(&cx).await.unwrap();
+            while positioned {
+                let (rowid, payload) = remaining
+                    .next()
+                    .expect("the leaf holds a row the fixture does not");
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), *rowid);
+                assert_eq!(
+                    cursor.payload(&cx).await.unwrap(),
+                    *payload,
+                    "after removing {removed_rowid}: payload of row {rowid}"
+                );
+                positioned = cursor.next(&cx).await.unwrap();
+            }
+            assert!(
+                remaining.next().is_none(),
+                "after removing {removed_rowid}: a row was lost"
+            );
+        }
+    }
+
+    #[test]
+    fn test_table_delete_moves_exactly_the_cells_below_the_removed_one() {
+        run_async(async {
+            // Payloads of different lengths: a pointer raised by any size but
+            // the removed cell's own lands inside another cell.
+            let rows: Vec<(i64, Vec<u8>)> = (1_u8..=9)
+                .map(|n| (i64::from(n) * 10, vec![b'a' + n; usize::from(n) * 7 + 3]))
+                .collect();
+
+            // A leaf written in key order: its pointers descend.
+            let entries: Vec<(i64, &[u8])> = rows
+                .iter()
+                .map(|(rowid, payload)| (*rowid, payload.as_slice()))
+                .collect();
+            let ordered = build_leaf_table(&entries);
+            let ordered_header = BtreePageHeader::parse(&ordered, 0).unwrap();
+            let ordered_ptrs = cell::read_cell_pointers(&ordered, &ordered_header, 0).unwrap();
+            assert!(cell_ptrs_are_descending(&ordered_ptrs));
+            assert_each_delete_closes_exactly_its_own_gap(&ordered, &rows).await;
+
+            // The same rows with one inserted late: its cell is the lowest on
+            // the page while its pointer sits mid-array, so the lowest cell
+            // is not the last pointer and the pointers do not descend.
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let late = 4_usize;
+            for (index, (rowid, payload)) in rows.iter().enumerate() {
+                if index != late {
+                    cursor.table_insert(&cx, *rowid, payload).await.unwrap();
+                }
+            }
+            cursor
+                .table_insert(&cx, rows[late].0, &rows[late].1)
+                .await
+                .unwrap();
+            let disturbed = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+            let disturbed_header = BtreePageHeader::parse(&disturbed, 0).unwrap();
+            let disturbed_ptrs =
+                cell::read_cell_pointers(&disturbed, &disturbed_header, 0).unwrap();
+            assert!(!cell_ptrs_are_descending(&disturbed_ptrs));
+            assert_eq!(
+                usize::from(disturbed_ptrs[late]),
+                disturbed_header.content_offset(USABLE),
+                "the late row's cell is the lowest on the page"
+            );
+            assert_each_delete_closes_exactly_its_own_gap(&disturbed, &rows).await;
         });
     }
 
