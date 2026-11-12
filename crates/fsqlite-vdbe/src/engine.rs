@@ -9085,12 +9085,20 @@ impl VdbeEngine {
     /// with an INTEGER PRIMARY KEY the rowid *is* the PRIMARY KEY, so stock
     /// raises SQLITE_CONSTRAINT_PRIMARYKEY (bd-w4pr1.22). A hidden rowid is
     /// not a PRIMARY KEY: stock raises SQLITE_CONSTRAINT_ROWID with the label
-    /// "<table>.rowid" (bd-w4pr1.32).
+    /// "<table>.rowid" (bd-w4pr1.32). The code goes with that label: an engine
+    /// that has no label for the table words the conflict as the generic
+    /// "PRIMARY KEY constraint failed" and keeps the plain constraint code.
     fn rowid_conflict_halt_code(&self, root_page: i32) -> i32 {
         if self.rowid_alias_col_by_root_page.contains_key(&root_page) {
             SQLITE_CONSTRAINT_PRIMARYKEY
-        } else {
+        } else if self
+            .ipk_label_by_root_page
+            .get(&root_page)
+            .is_some_and(|label| label.ends_with(".rowid"))
+        {
             SQLITE_CONSTRAINT_ROWID
+        } else {
+            ErrorCode::Constraint as i32
         }
     }
 
