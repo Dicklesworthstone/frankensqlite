@@ -97215,8 +97215,22 @@ impl Connection {
             // which observable expression error wins.
             let mut application_args = (!is_builtin).then(|| Vec::with_capacity(total_rows));
             let mut filter_matches = Vec::with_capacity(total_rows);
-            let mut partition_keys = Vec::with_capacity(total_rows);
-            let mut order_keys = Vec::with_capacity(total_rows);
+            // A one-column plain key is read from the scanned rows in place;
+            // any other key is evaluated into one flat vector (bd-w4pr1.12).
+            let partition_column = match pb.as_slice() {
+                [expr] => window_key_row_column(expr, &row_values, &col_map),
+                _ => None,
+            };
+            let order_column = match ob.as_slice() {
+                [term] => window_key_row_column(&term.expr, &row_values, &col_map),
+                _ => None,
+            };
+            let mut partition_values = partition_column
+                .is_none()
+                .then(|| Vec::with_capacity(total_rows.saturating_mul(pb.len())));
+            let mut order_values = order_column
+                .is_none()
+                .then(|| Vec::with_capacity(total_rows.saturating_mul(ob.len())));
             for row in &row_values {
                 if let Some(args_by_row) = application_args.as_mut() {
                     args_by_row.push(build_window_args(
@@ -97234,24 +97248,45 @@ impl Connection {
                     true
                 };
                 filter_matches.push(filter_match);
-                // Exact-length key vectors (bd-w4pr1.12): collecting through
-                // `Result` gives the iterator no size hint, so `Vec` reserved
-                // four values for a one-term key, 192 bytes per row each for
-                // PARTITION BY and ORDER BY.
-                let mut partition_key = Vec::with_capacity(pb.len());
-                for expr in pb {
-                    partition_key.push(self.eval_join_expr_with_registry(expr, row, &col_map)?);
+                if let Some(values) = partition_values.as_mut() {
+                    for expr in pb {
+                        values.push(self.eval_join_expr_with_registry(expr, row, &col_map)?);
+                    }
                 }
-                partition_keys.push(partition_key);
-                let mut order_key = Vec::with_capacity(ob.len());
-                for term in ob {
-                    order_key.push(self.eval_join_expr_with_registry(&term.expr, row, &col_map)?);
+                if let Some(values) = order_values.as_mut() {
+                    for term in ob {
+                        values.push(self.eval_join_expr_with_registry(&term.expr, row, &col_map)?);
+                    }
                 }
-                order_keys.push(order_key);
             }
+            let partition_keys = match partition_column {
+                Some(column) => WindowKeys::RowColumn {
+                    rows: &row_values,
+                    column,
+                },
+                None => WindowKeys::Flat {
+                    values: partition_values.unwrap_or_default(),
+                    width: pb.len(),
+                },
+            };
+            let order_keys = match order_column {
+                Some(column) => WindowKeys::RowColumn {
+                    rows: &row_values,
+                    column,
+                },
+                None => WindowKeys::Flat {
+                    values: order_values.unwrap_or_default(),
+                    width: ob.len(),
+                },
+            };
             let mut sorted_indices: Vec<usize> = (0..total_rows).collect();
             sorted_indices.sort_by(|&a, &b| {
-                for (k, (va, vb)) in partition_keys[a].iter().zip(&partition_keys[b]).enumerate() {
+                for (k, (va, vb)) in partition_keys
+                    .key(a)
+                    .iter()
+                    .zip(partition_keys.key(b))
+                    .enumerate()
+                {
                     let coll = pb_coll.get(k).and_then(|c| c.as_deref());
                     let ord =
                         cmp_sqlite_values_collated_snapshot(va, vb, coll, &collation_registry_snap);
@@ -97262,8 +97297,8 @@ impl Connection {
                 let order = cmp_in_aggregate_order_keys(
                     ob,
                     ob_coll,
-                    &order_keys[a],
-                    &order_keys[b],
+                    order_keys.key(a),
+                    order_keys.key(b),
                     &collation_registry_snap,
                 );
                 if order != std::cmp::Ordering::Equal {
@@ -97292,8 +97327,8 @@ impl Connection {
                     match parts.last_mut() {
                         Some(part)
                             if group_keys_equal_collated(
-                                &partition_keys[part[0]],
-                                &partition_keys[ri],
+                                partition_keys.key(part[0]),
+                                partition_keys.key(ri),
                                 pb_coll,
                                 &collation_registry_snap,
                             ) =>
@@ -137230,9 +137265,75 @@ fn is_rows_sliding_frame(frame: Option<&FrameSpec>) -> bool {
     start_explicit || end_explicit
 }
 
+/// Window key values by raw row index: row `ri`'s PARTITION BY or ORDER BY
+/// values are `keys.key(ri)`. Implemented by the per-row vectors the GROUP BY
+/// and FROM-less window paths build and by [`WindowKeys`].
+trait WindowKeyRows {
+    fn key(&self, row: usize) -> &[SqliteValue];
+}
+
+impl WindowKeyRows for [Vec<SqliteValue>] {
+    fn key(&self, row: usize) -> &[SqliteValue] {
+        &self[row]
+    }
+}
+
+impl WindowKeyRows for Vec<Vec<SqliteValue>> {
+    fn key(&self, row: usize) -> &[SqliteValue] {
+        &self[row]
+    }
+}
+
+/// The PARTITION BY or ORDER BY values of a table window SELECT's rows
+/// (bd-w4pr1.12). A key that is one plain column is read from the scanned
+/// rows in place ([`window_key_row_column`]); any other key is evaluated once
+/// per row into one flat vector, `width` values a row, with no vector per row.
+enum WindowKeys<'r> {
+    RowColumn {
+        rows: &'r [Vec<SqliteValue>],
+        column: usize,
+    },
+    Flat {
+        values: Vec<SqliteValue>,
+        width: usize,
+    },
+}
+
+impl WindowKeyRows for WindowKeys<'_> {
+    fn key(&self, row: usize) -> &[SqliteValue] {
+        match self {
+            Self::RowColumn { rows, column } => std::slice::from_ref(&rows[row][*column]),
+            Self::Flat { values, width } => &values[row * width..(row + 1) * width],
+        }
+    }
+}
+
+/// The column of every scanned row that a one-expression window key reads,
+/// when the expression is a plain column reference evaluated exactly as
+/// [`eval_join_expr`] would: no USING projection answers it, it resolves in
+/// `col_map`, and every row is wide enough. Such a reference reads
+/// `row[column]` and cannot fail, so reading it in place changes neither a
+/// value nor which expression error a statement reports.
+fn window_key_row_column(
+    expr: &Expr,
+    rows: &[Vec<SqliteValue>],
+    col_map: &[(String, String, bool)],
+) -> Option<usize> {
+    let Expr::Column(col_ref, _) = expr else {
+        return None;
+    };
+    if col_ref.table.is_none() && current_join_using_column_projection(&col_ref.column).is_some() {
+        return None;
+    }
+    let column = resolve_join_expr_column_index(col_ref, col_map).ok()?;
+    rows.iter()
+        .all(|row| column < row.len())
+        .then_some(column)
+}
+
 fn build_peer_groups_collated_snapshot(
     partition_indices: &[usize],
-    order_keys: &[Vec<SqliteValue>],
+    order_keys: &(impl WindowKeyRows + ?Sized),
     order_collations: &[Option<String>],
     registry: &CollationRegistry,
 ) -> Vec<Vec<usize>> {
@@ -137268,13 +137369,14 @@ fn build_peer_groups_collated_snapshot(
 fn order_by_keys_equal_collated_snapshot(
     left_ri: usize,
     right_ri: usize,
-    order_keys: &[Vec<SqliteValue>],
+    order_keys: &(impl WindowKeyRows + ?Sized),
     order_collations: &[Option<String>],
     registry: &CollationRegistry,
 ) -> bool {
-    order_keys[left_ri]
+    order_keys
+        .key(left_ri)
         .iter()
-        .zip(&order_keys[right_ri])
+        .zip(order_keys.key(right_ri))
         .enumerate()
         .all(|(idx, (va, vb))| {
             let coll = order_collations.get(idx).and_then(|c| c.as_deref());
@@ -137295,7 +137397,7 @@ fn window_frame_rows_for_current(
     pos: usize,
     partition_indices: &[usize],
     order_by: &[OrderingTerm],
-    order_keys: &[Vec<SqliteValue>],
+    order_keys: &(impl WindowKeyRows + ?Sized),
     order_collations: &[Option<String>],
     registry: &CollationRegistry,
     frame: &FrameSpec,
@@ -137688,7 +137790,7 @@ fn range_value_frame_raw_bounds(
     pos: usize,
     partition_indices: &[usize],
     order_by: &[OrderingTerm],
-    order_keys: &[Vec<SqliteValue>],
+    order_keys: &(impl WindowKeyRows + ?Sized),
     order_collations: &[Option<String>],
     registry: &CollationRegistry,
     frame: &FrameSpec,
@@ -137704,7 +137806,7 @@ fn range_value_frame_raw_bounds(
 
     let order_values: Vec<SqliteValue> = partition_indices
         .iter()
-        .map(|&ri| order_keys[ri].first().cloned().unwrap_or(SqliteValue::Null))
+        .map(|&ri| order_keys.key(ri).first().cloned().unwrap_or(SqliteValue::Null))
         .collect();
     let current_value = order_values.get(pos).cloned().unwrap_or(SqliteValue::Null);
     let order_collation = order_collations
@@ -137812,7 +137914,7 @@ fn range_value_frame_bounds(
     pos: usize,
     partition_indices: &[usize],
     order_by: &[OrderingTerm],
-    order_keys: &[Vec<SqliteValue>],
+    order_keys: &(impl WindowKeyRows + ?Sized),
     order_collations: &[Option<String>],
     registry: &CollationRegistry,
     frame: &FrameSpec,
@@ -137922,7 +138024,7 @@ fn evaluate_application_window_partition(
     args_by_row: &[Vec<SqliteValue>],
     filter_matches: &[bool],
     order_by: &[OrderingTerm],
-    order_keys: &[Vec<SqliteValue>],
+    order_keys: &(impl WindowKeyRows + ?Sized),
     order_collations: &[Option<String>],
     collation_registry: &CollationRegistry,
     explicit_frame: Option<&FrameSpec>,
@@ -166034,7 +166136,7 @@ mod tests {
         substitute_outer_refs_in_select, take_trigger_stack_probe, trigger_depth_limit,
         trigger_program_depth_limit, validate_named_window_definitions,
         visit_select_qualified_names, wal_file_present_with_vfs, wal_path_for_db_path,
-        window_scan_named_columns,
+        WindowKeyRows, WindowKeys, window_key_row_column, window_scan_named_columns,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{
@@ -207434,6 +207536,115 @@ mod tests {
                 assert_eq!(rows.iter().map(row_values).collect::<Vec<_>>(), expected, "{sql}");
             }
         });
+    }
+
+    #[test]
+    fn test_table_window_select_reads_plain_column_keys_from_pruned_rows() {
+        // bd-w4pr1.12: a one-column PARTITION BY / ORDER BY key is read from the
+        // scanned row in place. The scan drops `x` and `y`, so `p` and `o` sit at
+        // positions 0 and 1 of each row, not at their table positions 2 and 3.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE kw (x TEXT, y INTEGER, p TEXT COLLATE NOCASE, o REAL);")
+                .await
+                .unwrap();
+            for (x, y, p, o) in [
+                ("q", 9, "A", "1.0"),
+                ("r", 8, "a", "2.0"),
+                ("s", 7, "a", "2.0"),
+                ("t", 6, "b", "5.0"),
+                ("u", 5, "B", "3.5"),
+            ] {
+                conn.execute(&format!("INSERT INTO kw VALUES ('{x}', {y}, '{p}', {o});"))
+                    .await
+                    .unwrap();
+            }
+            let int = SqliteValue::Integer;
+            let real = SqliteValue::Float;
+            let cases: [(&str, Vec<Vec<SqliteValue>>); 3] = [
+                (
+                    // NOCASE groups 'A' with 'a'; equal `o` values are peers.
+                    "SELECT o, rank() OVER (PARTITION BY p ORDER BY o) FROM kw ORDER BY 1, 2;",
+                    vec![
+                        vec![real(1.0), int(1)],
+                        vec![real(2.0), int(2)],
+                        vec![real(2.0), int(2)],
+                        vec![real(3.5), int(1)],
+                        vec![real(5.0), int(2)],
+                    ],
+                ),
+                (
+                    // A RANGE offset frame reads the first ORDER BY value.
+                    "SELECT o, sum(o) OVER (ORDER BY o RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                     FROM kw ORDER BY 1, 2;",
+                    vec![
+                        vec![real(1.0), real(1.0)],
+                        vec![real(2.0), real(5.0)],
+                        vec![real(2.0), real(5.0)],
+                        vec![real(3.5), real(3.5)],
+                        vec![real(5.0), real(5.0)],
+                    ],
+                ),
+                (
+                    // A computed key takes the flat layout beside a column key.
+                    "SELECT o, row_number() OVER (PARTITION BY p ORDER BY -o) FROM kw ORDER BY 1, 2;",
+                    vec![
+                        vec![real(1.0), int(3)],
+                        vec![real(2.0), int(1)],
+                        vec![real(2.0), int(2)],
+                        vec![real(3.5), int(2)],
+                        vec![real(5.0), int(1)],
+                    ],
+                ),
+            ];
+            for (sql, expected) in cases {
+                let rows = conn.query(sql).await.unwrap();
+                assert_eq!(rows.iter().map(row_values).collect::<Vec<_>>(), expected, "{sql}");
+            }
+        });
+    }
+
+    #[test]
+    fn test_window_keys_read_columns_in_place_and_flat_keys_by_stride() {
+        let rows = vec![
+            vec![SqliteValue::Integer(10), SqliteValue::Text("a".into())],
+            vec![SqliteValue::Integer(20), SqliteValue::Text("b".into())],
+        ];
+        let col_map = vec![
+            ("kw".to_owned(), "n".to_owned(), false),
+            ("kw".to_owned(), "s".to_owned(), false),
+        ];
+        let column = |name: &str| Expr::Column(fsqlite_ast::ColumnRef::bare(name), Span::ZERO);
+        assert_eq!(window_key_row_column(&column("s"), &rows, &col_map), Some(1));
+        // Not a plain column, not in the map, or a row too short: no in-place read.
+        assert_eq!(
+            window_key_row_column(&Expr::Literal(Literal::Null, Span::ZERO), &rows, &col_map),
+            None
+        );
+        assert_eq!(window_key_row_column(&column("zz"), &rows, &col_map), None);
+        let short = vec![vec![SqliteValue::Integer(1)]];
+        assert_eq!(window_key_row_column(&column("s"), &short, &col_map), None);
+
+        let in_place = WindowKeys::RowColumn {
+            rows: &rows,
+            column: 1,
+        };
+        assert_eq!(in_place.key(1), &[SqliteValue::Text("b".into())]);
+        let flat = WindowKeys::Flat {
+            values: vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(4),
+            ],
+            width: 2,
+        };
+        assert_eq!(flat.key(1), &[SqliteValue::Integer(3), SqliteValue::Integer(4)]);
+        let empty = WindowKeys::Flat {
+            values: Vec::new(),
+            width: 0,
+        };
+        assert!(empty.key(5).is_empty());
     }
 
     #[test]
