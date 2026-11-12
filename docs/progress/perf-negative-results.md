@@ -87,6 +87,40 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a cursor remembers the decoded header and pointer array of page images it loaded (bd-w4pr1.13.26)
+
+- Target: `load_page` parsed the page header and decoded and range-checked the whole cell-pointer
+  array on every load, even of an image the cursor had decoded on its previous seek. In the 1M-row
+  join to a 1,000-row table, that table's root was reloaded on each of about 405k seeks (840
+  instructions per load, about 300 of them the pointer array) and a binary search then read about 7
+  pointers. Touched: `crates/fsqlite-btree/src/cursor.rs` (`DecodedPageMemo`, `load_page`).
+- Ledger preflight: no entry on decoded-page reuse. The 2026-11-11 eviction-trace forget is a
+  different cost (trace bookkeeping per load), and that entry is REJECTED.
+- Change: eight direct-mapped slots per cursor key the decoded header and checked pointers on
+  (page number, `PageData::image_token`). A token names one exact immutable image: clones keep it
+  and every mutable access takes a fresh one. The pager read still happens, so an entry is used only
+  for the image the pager returns now; nothing depends on dirtiness, snapshots or eviction.
+- Result: user instructions per statement, CLI release-perf, scorecard databases built by stock,
+  stock sqlite3 3.46.1 live in the same script, best of 3 (`stable_probe.py`, io_uring refused).
+  Before main 9619f5245, after b0e75d426 (the memo on df65b45b3, a docs-only commit later; landed
+  as ff30a1eed). Answers equal stock's in all rows.
+
+  | statement | stock | before | after |
+  |---|---|---|---|
+  | `count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a` (1M x 1k) | 1,721.4M | 5,379.2M | 5,140.5M |
+  | `count(*), sum(t.a) FROM p CROSS JOIN t WHERE t.id = p.k` (rowid lookups) | 554.4M | 2,945.7M | 2,913.4M |
+  | `count(*) FROM v1 JOIN v2 ON v1.k = v2.k` (5k x 5k, automatic index) | 26.0M | 110.8M | 107.2M |
+  | `count(*) FROM t` (control) | 4.7M | 63.4M | 63.4M |
+  | `count(*), sum(a) FROM t WHERE a > 500` (control) | 498.7M | 1,318.1M | 1,319.2M |
+
+  CPU of the 1M join 549.1 to 531.0 ms (stock 203.3). The bead predicted -200 to -320M on the
+  join (met, -238.7M) and -150 to -300M on the rowid lookups (missed, -32M: those seeks land on
+  1M-row leaves that change from seek to seek, so the slots rarely hit). The kill line (join under
+  -120M, or the scan control worse by more than 1%) was not crossed.
+- Retry / widen: the rowid-lookup shape needs a cheaper per-load path on pages seen once (header
+  parse without the full pointer decode), not more slots. Retry that when a rowid-lookup profile
+  puts `load_page` decode above 5% of instructions.
+
 ## 2026-11-12 - WIN: a WHERE term that reads no column is tested once, before the scan (bd-w4pr1.13.22)
 
 - Target: WHERE terms built only from literals, numbered or named parameters and deterministic
