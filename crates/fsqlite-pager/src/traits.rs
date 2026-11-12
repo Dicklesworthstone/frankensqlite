@@ -304,6 +304,17 @@ pub trait WalBackend: Send + Sync {
     /// call. Leaving must discard anything proven inside.
     fn note_append_gate_held(&mut self, _held: bool) {}
 
+    /// Under the held append gate, before a commit's durability boundary:
+    /// verify that the certificate sidecar ends at a record boundary the
+    /// commit's certificate can be appended at, for that commit's append to
+    /// reuse (bd-o1wdd). A refusal here fails the commit before anything
+    /// durable is written, so a corrupt or foreign sidecar suffix fails closed
+    /// instead of leaving the commit in doubt. Backends without a certificate
+    /// sidecar have nothing to verify.
+    fn prepare_certificate_append<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// The shared WAL-index header this backend last read as its append
     /// baseline, or last published, inside the append gate it currently holds
     /// (see [`Self::note_append_gate_held`]). No other writer can change the

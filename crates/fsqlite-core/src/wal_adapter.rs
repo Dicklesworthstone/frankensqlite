@@ -3798,6 +3798,16 @@ struct CertificateAppendHandle<F> {
     end_offset: u64,
 }
 
+/// A certificate sidecar append boundary verified ahead of a commit's
+/// durability boundary (bd-o1wdd), for that commit's append under the same
+/// held append gate: the descriptor, the WAL generation it was verified for
+/// and the offset the next record goes at.
+struct PreparedCertificateAppend<F> {
+    file: F,
+    generation: WalGenerationIdentity,
+    append_offset: u64,
+}
+
 pub struct PathRefreshingWalBackend<V: Vfs>
 where
     V::File: Send + Sync + 'static,
@@ -3875,6 +3885,12 @@ where
     /// the append is `&self`; the lock is held only for the take and
     /// put-back, never across `.await`.
     cached_certificate_append: std::sync::Mutex<Option<CertificateAppendHandle<V::File>>>,
+    /// The append boundary [`WalBackend::prepare_certificate_append`] verified
+    /// under the current held append gate (bd-o1wdd), taken by the next
+    /// certificate append of the same WAL generation. Dropped when the gate
+    /// is entered or released, so it never outlives the gate that excluded
+    /// every other appender while it was verified.
+    prepared_certificate_append: std::sync::Mutex<Option<PreparedCertificateAppend<V::File>>>,
     /// The newest sidecar record already proven to authorize its WAL boundary.
     /// Its verdict depends only on the record itself, its WAL generation, the
     /// commit marker and the payload digest of the committed frames it covers,
@@ -3957,6 +3973,7 @@ where
             cached_verification_db: None,
             cached_certificate_read: std::sync::Mutex::new(None),
             cached_certificate_append: std::sync::Mutex::new(None),
+            prepared_certificate_append: std::sync::Mutex::new(None),
             authorized_certificate_record: std::sync::Mutex::new(None),
             append_gate_proof: None,
             db_file_identity: None,
@@ -5271,50 +5288,18 @@ where
                 ),
             });
         }
-        let held = self
-            .cached_certificate_append
+        // A boundary verified under this held gate before the commit's
+        // durability boundary (bd-o1wdd) is still the sidecar's end: no
+        // other appender ran since. Otherwise verify it here.
+        let prepared = self
+            .prepared_certificate_append
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let (mut file, known_tail) = match held {
-            Some(held) => (
-                held.file,
-                Some((held.generation, held.record_bytes, held.end_offset)),
-            ),
-            None => {
-                let certificate_path = self.certificate_sidecar_path();
-                let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
-                let (file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
-                (file, None)
-            }
-        };
-        // The sidecar still ends with the record this descriptor last wrote
-        // when a read of one byte more than that record, from where it began,
-        // returns exactly its bytes. That record was complete and valid when
-        // written, so its end is the boundary the scan would return. A read
-        // error, like every difference, takes the scan.
-        let mut known_boundary = None;
-        if let Some((generation, previous_bytes, end_offset)) = known_tail
-            && generation == record.wal_generation
-            && let Some(record_start) =
-                end_offset.checked_sub(u64::try_from(previous_bytes.len()).unwrap_or(u64::MAX))
-        {
-            let mut tail = vec![0_u8; previous_bytes.len() + 1];
-            if file
-                .read(cx, &mut tail, record_start)
-                .await
-                .is_ok_and(|read| read == previous_bytes.len())
-                && tail[..previous_bytes.len()] == previous_bytes[..]
-            {
-                known_boundary = Some(end_offset);
-            }
-        }
-        let append_offset = match known_boundary {
-            Some(end_offset) => end_offset,
-            None => {
-                Self::prepare_certificate_sidecar_for_append(&mut file, cx, record.wal_generation)
-                    .await?
-            }
+            .take()
+            .filter(|prepared| prepared.generation == record.wal_generation);
+        let (mut file, append_offset) = match prepared {
+            Some(prepared) => (prepared.file, prepared.append_offset),
+            None => self.certificate_append_boundary(cx, record.wal_generation).await?,
         };
         preflight.hand_off();
         drop(preflight);
@@ -5359,6 +5344,56 @@ where
             end_offset,
         });
         Ok(())
+    }
+
+    /// The certificate sidecar's descriptor and the offset its next record of
+    /// `generation` goes at, refusing a suffix that is not a record boundary.
+    /// Takes the held append descriptor when there is one.
+    async fn certificate_append_boundary(
+        &self,
+        cx: &Cx,
+        generation: WalGenerationIdentity,
+    ) -> Result<(V::File, u64)> {
+        let held = self
+            .cached_certificate_append
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let (mut file, known_tail) = match held {
+            Some(held) => (
+                held.file,
+                Some((held.generation, held.record_bytes, held.end_offset)),
+            ),
+            None => {
+                let certificate_path = self.certificate_sidecar_path();
+                let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+                let (file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
+                (file, None)
+            }
+        };
+        // The sidecar still ends with the record this descriptor last wrote
+        // when a read of one byte more than that record, from where it began,
+        // returns exactly its bytes. That record was complete and valid when
+        // written, so its end is the boundary the scan would return. A read
+        // error, like every difference, takes the scan.
+        if let Some((held_generation, previous_bytes, end_offset)) = known_tail
+            && held_generation == generation
+            && let Some(record_start) =
+                end_offset.checked_sub(u64::try_from(previous_bytes.len()).unwrap_or(u64::MAX))
+        {
+            let mut tail = vec![0_u8; previous_bytes.len() + 1];
+            if file
+                .read(cx, &mut tail, record_start)
+                .await
+                .is_ok_and(|read| read == previous_bytes.len())
+                && tail[..previous_bytes.len()] == previous_bytes[..]
+            {
+                return Ok((file, end_offset));
+            }
+        }
+        let append_offset =
+            Self::prepare_certificate_sidecar_for_append(&mut file, cx, generation).await?;
+        Ok((file, append_offset))
     }
 
     /// Close the held certificate append descriptor, so the next append
@@ -6179,6 +6214,31 @@ where
         self.inner.append_baseline_proven_under_gate = false;
         // A header read or published outside this gate says nothing inside it.
         self.inner.header_under_append_gate = None;
+        // Nor does a certificate boundary verified under another gate hold
+        // (bd-o1wdd): the next append verifies its own.
+        drop(
+            self.prepared_certificate_append
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    fn prepare_certificate_append<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            let generation = self.inner.inner().generation_identity();
+            let (file, append_offset) = self.certificate_append_boundary(cx, generation).await?;
+            *self
+                .prepared_certificate_append
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(PreparedCertificateAppend {
+                    file,
+                    generation,
+                    append_offset,
+                });
+            Ok(())
+        })
     }
 
     fn native_header_under_append_gate(&self) -> Option<fsqlite_wal::wal_index::WalIndexHdr> {
@@ -8382,6 +8442,60 @@ mod tests {
             backend.inner.frame_count(),
             1,
             "digest mismatch must preserve the live WAL for diagnosis and retry"
+        );
+    }
+
+    /// bd-o1wdd: a commit verifies the certificate sidecar's append boundary
+    /// before its durability boundary, so a corrupt suffix is refused before
+    /// anything durable is written. A boundary verified under one held gate
+    /// is never reused under the next: a version that kept it would append
+    /// the next record at the stale offset, over bytes it never inspected.
+    #[test]
+    fn certificate_append_boundary_is_verified_before_durability_and_scoped_to_its_gate() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let page = sample_page(0x71);
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let mut certificate = sample_certificate(1, 1, vec![1]);
+        certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
+            .expect("persist the first commit's certificate");
+        backend
+            .append_frame(&cx, 1, &page, 1)
+            .expect("append the first commit frame");
+        backend.sync(&cx).expect("publish the first commit");
+
+        backend.note_append_gate_held(true);
+        backend
+            .prepare_certificate_append(&cx)
+            .wait()
+            .expect("an intact sidecar is ready for the next record");
+        backend.note_append_gate_held(false);
+        let mut corrupted = read_certificate_sidecar(&vfs, &cx);
+        corrupted.extend_from_slice(b"GARBAGEGARBAGEGARBAGE");
+        replace_certificate_sidecar(&vfs, &cx, &corrupted);
+
+        backend.note_append_gate_held(true);
+        assert_wal_corrupt(
+            backend.prepare_certificate_append(&cx).wait(),
+            "a corrupt sidecar suffix at the pre-durability check",
+        );
+        let mut next = sample_certificate(2, 2, vec![1]);
+        next.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
+        next.certificate_crc32c = next.computed_crc32c();
+        assert_wal_corrupt(
+            backend
+                .persist_parallel_wal_commit_certificate(&cx, &next, 2, 2)
+                .wait(),
+            "an append after a boundary verified under an earlier gate",
+        );
+        backend.note_append_gate_held(false);
+        assert_eq!(
+            read_certificate_sidecar(&vfs, &cx),
+            corrupted,
+            "nothing is written over the corrupt suffix"
         );
     }
 

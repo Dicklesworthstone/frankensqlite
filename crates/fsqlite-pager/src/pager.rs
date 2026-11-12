@@ -25689,6 +25689,19 @@ where
                                 let _durability_mask = durability_cx.masked();
 
                                 let certificate = publication.certificate()?;
+                                // bd-o1wdd: verify the certificate sidecar's
+                                // append boundary before anything durable
+                                // starts. A corrupt or foreign suffix then
+                                // fails this flush closed with the scan's
+                                // diagnostic, instead of leaving the commit in
+                                // doubt with RESERVED held for a
+                                // reconciliation that meets the same suffix.
+                                if let Err(error) =
+                                    wal.prepare_certificate_append(&durability_cx).await
+                                {
+                                    publication.abort()?;
+                                    return Err(error);
+                                }
                                 let mut certificate_is_in_sidecar = false;
                                 let certificate_completion = VfsWriteCompletion::new();
                                 *sidecar_completion
