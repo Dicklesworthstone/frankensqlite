@@ -87,6 +87,50 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - REJECTED: a connection's own published commit authorizes its certificate without re-reading its frames (bd-w4pr1.13.20, lever D)
+
+- Target: the autocheckpoint after a large own commit, scorecard table `m` (300k rows):
+  `UPDATE m SET a = a + 1 WHERE id % 10 = 0` (2,250 changed pages) and
+  `DELETE FROM m WHERE id % 7 = 0`. Touched (not landed; the code is commit b6f4cd892 on top of
+  947613f27): `crates/fsqlite-core/src/wal_adapter.rs` (a pending own record promoted into
+  `authorized_certificate_record`), `crates/fsqlite-pager/src/traits.rs`
+  (`note_own_certificate_published`), `crates/fsqlite-pager/src/pager.rs` (the call after a
+  successful publish, gated on `certificate_is_in_sidecar && appended_frames_are_digested`, the flag
+  a4fc68b8d introduced).
+- Evidence before: after a connection's own commit, the next refresh or checkpoint walks
+  `latest_authorized_durable_certificate_record`, finds its own newest record outside the
+  authorized-record cache, and `wal_frame_payload_digest` re-reads and BLAKE3-hashes every frame it
+  covers: 2,250 WAL preads for the UPDATE.
+- Change: the adapter remembers the record it appended as pending, never authorized (the pager
+  appends the certificate before the frames). Once the commit is published with exactly the digested
+  bytes, the pager calls the hook, and the adapter promotes the record when its interval is the
+  published one, its own published horizon ends at the commit marker, and it is the WAL's current
+  generation. Negative test: the hook called for a record whose frame was never written authorizes
+  nothing; another interval than the published one authorizes nothing.
+- Result, stock sqlite3 3.46.1 live in the same runs (binaries base 947613f27 sha256 83e8...,
+  lever b6f4cd892 sha256 5a9b...; `scratchpad/mut_strace.py`, `mut_ckpt_probe.py --reps 7`,
+  `bulk_strace.py`; base.db in /dev/shm/fable_mut_27tsbror):
+
+  | | stock | base | lever |
+  |---|---|---|---|
+  | UPDATE WAL pread64 | 2,250 | 6,931 (37.3 MB) | 4,680 (28.1 MB) |
+  | UPDATE user instructions (with autocheckpoint) | 153.4M | 815.1M | 784.8M |
+  | UPDATE CPU | 38.5 ms | 140.1 ms | 135.7 ms |
+  | DELETE user instructions | 120.2M | 748.3M | 717.5M |
+  | DELETE CPU | 34.8 ms | 129.5 ms | 124.2 ms |
+  | bulk load (BASE_SETUP) WAL reads | - | 23,363 | 15,754 |
+
+  Prediction: WAL reads -2,250 on the UPDATE (met, -2,251); user instructions -60M to -75M
+  (missed: -30.3M). Kill (recorded before code on bd-w4pr1.13.20): fewer than 2,000 WAL reads OR
+  fewer than 40M instructions removed on the UPDATE: met by the instruction criterion, so rejected
+  and not landed. The 72M estimate came from a callgrind count, which counts each byte of a `rep
+  movsb` copy as an instruction; the read-back's user cost under perf stat is about 30M (13.5k per
+  frame: the pread path, the frame header parse and the hash).
+- Retry condition: as part of a change that removes the checkpoint's other own-commit read-backs
+  together (lever E's remaining passes on bd-w4pr1.13.20), judged against a joint kill line; or alone
+  once a named workload shows the own-certificate re-hash at 40M user instructions or more (perf
+  stat, not callgrind), for example commits several times larger than 2,250 pages.
+
 ## 2026-11-12 - REJECTED: a DML statement names its internal savepoint without format! and checks virtual tables without allocating (bd-w4pr1.13.29)
 
 - Target: per-statement overhead of single-row INSERTs inside one transaction (the scorecard txn
