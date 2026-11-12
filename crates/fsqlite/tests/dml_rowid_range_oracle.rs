@@ -72,19 +72,34 @@ async fn assert_range_plan(
     expected_range_ops: Option<(&str, Option<&str>)>,
 ) {
     let ops = explain_ops(c, sql).await;
-    assert_eq!(op_count(&ops, "RowSetRead"), 1, "plan: {ops:?}");
-    assert_eq!(op_count(&ops, "RowSetAdd"), 1, "plan: {ops:?}");
     assert_eq!(op_count(&ops, "Next"), 1, "plan: {ops:?}");
-
-    let rowset_read = ops
-        .iter()
-        .position(|op| op == "RowSetRead")
-        .expect("the exact RowSetRead count was checked above");
-    assert_eq!(
-        ops.get(rowset_read + 1).map(String::as_str),
-        Some("SeekRowid"),
-        "Pass 2 must reseek each collected rowid immediately after RowSetRead: {ops:?}"
-    );
+    // A DELETE that falls back to the Rewind walk deletes each row where the
+    // walk stands (one pass, bd-w4pr1.13.20); the range collector and every
+    // UPDATE collect the rowids first and reseek each in pass 2.
+    let one_pass_walk =
+        expected_range_ops.is_none() && sql.trim_start().to_ascii_uppercase().starts_with("DELETE");
+    if one_pass_walk {
+        assert_eq!(op_count(&ops, "RowSetAdd"), 0, "plan: {ops:?}");
+        assert_eq!(op_count(&ops, "RowSetRead"), 0, "plan: {ops:?}");
+        let delete = ops.iter().position(|op| op == "Delete");
+        let next = ops.iter().position(|op| op == "Next");
+        assert!(
+            delete.is_some() && delete < next,
+            "the walk must delete inside the scan: {ops:?}"
+        );
+    } else {
+        assert_eq!(op_count(&ops, "RowSetRead"), 1, "plan: {ops:?}");
+        assert_eq!(op_count(&ops, "RowSetAdd"), 1, "plan: {ops:?}");
+        let rowset_read = ops
+            .iter()
+            .position(|op| op == "RowSetRead")
+            .expect("the exact RowSetRead count was checked above");
+        assert_eq!(
+            ops.get(rowset_read + 1).map(String::as_str),
+            Some("SeekRowid"),
+            "Pass 2 must reseek each collected rowid immediately after RowSetRead: {ops:?}"
+        );
+    }
 
     if let Some((lower_seek, upper_stop)) = expected_range_ops {
         assert_eq!(op_count(&ops, "Rewind"), 0, "plan: {ops:?}");

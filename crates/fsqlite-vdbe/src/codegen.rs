@@ -28706,6 +28706,25 @@ pub fn codegen_delete(
     } else {
         None
     };
+    // A full-table scan deletes each matching row while it stands on it, as
+    // stock does (ONEPASS_MULTI), when nothing can observe the rows deleted
+    // so far: the program runs no trigger and no foreign-key action (the
+    // connection runs those around it), changes() moves only at statement
+    // end, so only a subquery in the WHERE could read the shrinking table, and
+    // RETURNING stays on the two passes as in stock. The Delete leaves the
+    // cursor on the next row and the Next after it does not move it. The
+    // second pass cost a re-seek per deleted row (3,800 instructions).
+    let scan_deletes_in_one_pass = rowid_target.is_none()
+        && rowid_in_list.is_none()
+        && rowid_in_const_list.is_none()
+        && rowid_range.is_none()
+        && rowid_eq_residual.is_none()
+        && index_eq.is_none()
+        && stmt.returning.is_empty()
+        && !stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_contains_nested_subquery);
 
     if let Some(target_expr) = rowid_target {
         emit_expr(b, target_expr, rowid_reg, None);
@@ -28907,9 +28926,23 @@ pub fn codegen_delete(
             );
         }
 
-        // Get rowid of matching row and add to rowset.
-        b.emit_op(Opcode::Rowid, table_cursor, rowid_reg, 0, P4::None, 0);
-        b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+        if scan_deletes_in_one_pass {
+            // Index maintenance, then the row, where the scan stands.
+            emit_index_deletes(b, table, table_cursor);
+            // P5 bit 0 = OPFLAG_NCHANGE: count this deletion in changes().
+            b.emit_op(
+                Opcode::Delete,
+                table_cursor,
+                0,
+                0,
+                P4::Table(table.name.clone()),
+                1,
+            );
+        } else {
+            // Get rowid of matching row and add to rowset.
+            b.emit_op(Opcode::Rowid, table_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+        }
 
         b.resolve_label(collect_skip_label);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -28919,7 +28952,40 @@ pub fn codegen_delete(
 
     b.resolve_label(collect_done_label);
 
-    // --- Pass 2: iterate rowset, seek, and delete ---
+    if !scan_deletes_in_one_pass {
+        emit_delete_collected_rowids(b, stmt, table, schema, table_cursor, rowset_reg, rowid_reg)?;
+    }
+
+    // Close table cursor.
+    b.emit_op(Opcode::Close, table_cursor, 0, 0, P4::None, 0);
+
+    // Close index cursors (bd-34se).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for idx_offset in 0..table.indexes.len() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
+
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End label.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Pass 2 of a two-pass DELETE: read each rowid pass 1 collected in
+/// `rowset_reg`, seek it, emit its RETURNING row, and delete it with its
+/// index entries.
+fn emit_delete_collected_rowids(
+    b: &mut ProgramBuilder,
+    stmt: &DeleteStatement,
+    table: &TableSchema,
+    schema: &[TableSchema],
+    table_cursor: i32,
+    rowset_reg: i32,
+    rowid_reg: i32,
+) -> Result<(), CodegenError> {
     let delete_done_label = b.emit_label();
     let delete_loop = b.current_addr();
     b.emit_jump_to_label(
@@ -28980,22 +29046,6 @@ pub fn codegen_delete(
     b.emit_op(Opcode::Goto, 0, delete_loop_addr, 0, P4::None, 0);
 
     b.resolve_label(delete_done_label);
-
-    // Close table cursor.
-    b.emit_op(Opcode::Close, table_cursor, 0, 0, P4::None, 0);
-
-    // Close index cursors (bd-34se).
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    for idx_offset in 0..table.indexes.len() {
-        let idx_cursor = table_cursor + 1 + idx_offset as i32;
-        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
-    }
-
-    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-
-    // End label.
-    b.resolve_label(end_label);
-
     Ok(())
 }
 
@@ -61824,21 +61874,93 @@ mod tests {
         codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // The qualified alias "u.a" should resolve correctly (two-pass delete).
+        // The qualified alias "u.a" should resolve correctly; nothing can
+        // observe the deletes, so the scan deletes in place (one pass).
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Rewind,
                 Opcode::Column, // read u.a for WHERE comparison
                 Opcode::Variable,
-                Opcode::Ne,    // filter non-matching rows
-                Opcode::Rowid, // collect matching rowid
-                Opcode::RowSetAdd,
-                Opcode::RowSetRead, // pass 2: delete collected rows
-                Opcode::SeekRowid,
-                Opcode::Delete,
+                Opcode::Ne,     // filter non-matching rows
+                Opcode::Delete, // delete where the scan stands
+                Opcode::Next,
             ]
         ));
+        assert!(
+            !has_opcodes(&prog, &[Opcode::RowSetAdd]),
+            "a one-pass scan delete collects no rowids"
+        );
+    }
+
+    /// A scan DELETE keeps its two passes exactly when something could
+    /// observe the rows deleted so far: a subquery in the WHERE (it must see
+    /// the table as it was) or RETURNING. The same WHERE without either
+    /// deletes in the scan.
+    #[test]
+    fn test_codegen_scan_delete_is_one_pass_only_when_nothing_observes_it() {
+        let column = |name: &str| Box::new(Expr::Column(ColumnRef::bare(name), Span::ZERO));
+        let a_gt_param = Expr::BinaryOp {
+            left: column("a"),
+            op: AstBinaryOp::Gt,
+            right: Box::new(placeholder(1)),
+            span: Span::ZERO,
+        };
+        let a_gt_count_of_t = Expr::BinaryOp {
+            left: column("a"),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Subquery(
+                Box::new(simple_select(&["a"], "t", None)),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        let delete = |where_clause: Expr, returning: Vec<ResultColumn>| DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            where_clause: Some(where_clause),
+            returning,
+            order_by: vec![],
+            limit: None,
+        };
+        let returning_a = vec![ResultColumn::Expr {
+            expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+            alias: None,
+        }];
+        let schema = test_schema();
+        for (stmt, one_pass) in [
+            (delete(a_gt_param.clone(), vec![]), true),
+            (delete(a_gt_count_of_t, vec![]), false),
+            (delete(a_gt_param, returning_a), false),
+        ] {
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+            let prog = b.finish().unwrap();
+            let ops = opcode_sequence(&prog);
+            let delete_at = ops.iter().position(|op| *op == Opcode::Delete).unwrap();
+            let next_at = ops.iter().rposition(|op| *op == Opcode::Next).unwrap();
+            assert_eq!(
+                ops.contains(&Opcode::RowSetAdd),
+                !one_pass,
+                "one pass expected {one_pass}: {ops:?}"
+            );
+            assert_eq!(
+                delete_at < next_at,
+                one_pass,
+                "the Delete is inside the scan exactly in one pass: {ops:?}"
+            );
+            assert_eq!(
+                ops.iter().filter(|op| **op == Opcode::Delete).count(),
+                1,
+                "{ops:?}"
+            );
+        }
     }
 
     #[test]
@@ -62515,6 +62637,8 @@ mod tests {
         codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
+        // The visible column named rowid is a plain filter, so the scan
+        // deletes the row it stands on (one pass), not a rowid seek.
         assert!(has_opcodes(
             &prog,
             &[
@@ -62522,13 +62646,12 @@ mod tests {
                 Opcode::Column, // visible rowid column comparison
                 Opcode::Variable,
                 Opcode::Ne,
-                Opcode::Rowid, // collect hidden rowid for deletion
-                Opcode::RowSetAdd,
-                Opcode::RowSetRead,
-                Opcode::SeekRowid,
                 Opcode::Delete,
+                Opcode::Next,
             ]
         ));
+        assert!(!has_opcodes(&prog, &[Opcode::SeekRowid]));
+        assert!(!has_opcodes(&prog, &[Opcode::RowSetAdd]));
     }
 
     // === Test: UPDATE SET with column self-reference (bd-2eau) ===
