@@ -104134,6 +104134,21 @@ impl Connection {
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
         let insert = self.resolve_insert_values_subqueries(insert, params).await?;
+        // bd-i3csr.1: an INSERT ... SELECT program emits its WHERE clause
+        // before its result columns, and the builder numbers a named or
+        // anonymous placeholder where it is first emitted. Number them in text
+        // order first, as stock does: a prepared statement reaches here
+        // without the dispatcher's numbering.
+        let numbers_select_placeholders = matches!(
+            &insert.source,
+            fsqlite_ast::InsertSource::Select(select)
+                if !matches!(select.body.select, SelectCore::Values(_))
+        );
+        let insert = if numbers_select_placeholders {
+            Cow::Owned(canonicalize_insert_placeholders(&insert)?)
+        } else {
+            insert
+        };
         let targets_shadowed_main = self.targets_shadowed_main(&insert.table);
         let rowid_alias_col_idx = {
             let visible_schema = self.schema.borrow();

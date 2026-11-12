@@ -25895,6 +25895,26 @@ fn codegen_insert_select(
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     let read_cursor = write_cursor + 1 + target_table.indexes.len() as i32;
 
+    // The WHERE filter and expression emitters do not report a column they
+    // cannot resolve, so check every reference first, as stock resolves them:
+    // the result columns, then the WHERE clause (bd-i3csr.1).
+    let source_scan = ScanCtx {
+        cursor: read_cursor,
+        table: src_table,
+        table_alias: src_table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
+    for column in columns {
+        if let ResultColumn::Expr { expr, .. } = column {
+            validate_scan_expr_columns(expr, &source_scan)?;
+        }
+    }
+    if let Some(where_expr) = where_clause {
+        validate_scan_expr_columns(where_expr, &source_scan)?;
+    }
+
     // Determine the number of output columns from the SELECT.
     let n_cols = result_column_count(columns, src_table);
     let n_cols_usize = usize::try_from(n_cols).unwrap_or(0);

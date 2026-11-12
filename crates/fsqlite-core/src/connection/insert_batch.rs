@@ -275,6 +275,131 @@ impl Connection {
         }))
     }
 
+    /// bd-i3csr.1 (GH#491): whether `INSERT INTO t [(cols)] SELECT ... FROM s
+    /// [WHERE ...]` runs as the one program `codegen_insert_select` emits
+    /// (scan `s`, insert each row as it is read) instead of materializing the
+    /// source and replaying it as INSERT ... VALUES. The caller has already
+    /// declined a WITH clause, INSERT triggers, an UPSERT that needs conflict
+    /// routing, foreign-key enforcement and a live virtual-table target.
+    ///
+    /// That program reads one base table in rowid order with an optional
+    /// WHERE and does nothing else, so every shape it would get wrong
+    /// declines here:
+    /// - the source: `insert_select_keyset_rowid` admits one local rowid table
+    ///   scanned in rowid order (no join, compound, DISTINCT, grouping,
+    ///   aggregate, window, ORDER BY, LIMIT or WITH, and no WHERE on a column
+    ///   an index leads with). Stock scans a covering index in index order,
+    ///   which fsqlite does not do yet (bd-1bs3h), so a source with an index
+    ///   holding every column the SELECT reads declines too, as does any
+    ///   expression or partial index and any index hint.
+    /// - reads during the inserts: the source is not the target (stock copies
+    ///   a self-read to an ephemeral table first), the SELECT has no subquery
+    ///   and no MATCH, and reads no change counter (each row would see the
+    ///   rows inserted before it).
+    /// - the target: an unqualified rowid table, no TEMP table in the
+    ///   connection, no DELETE trigger (an OR REPLACE victim), and no UPSERT
+    ///   or RETURNING.
+    fn insert_select_runs_as_one_program(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &SelectStatement,
+    ) -> bool {
+        if !insert.upsert.is_empty()
+            || !insert.returning.is_empty()
+            || insert.table.schema.is_some()
+            || is_sqlite_schema_name(&insert.table.name)
+            || insert.table.name.eq_ignore_ascii_case("sqlite_sequence")
+            || !self.temp_storage_roots().is_empty()
+            || select_may_observe_change_tracking(select_stmt)
+            || select_contains_subquery_matching(select_stmt, self, &|_, _| true)
+            || select_contains_match_operator(select_stmt)
+            || self.insert_select_keyset_rowid(select_stmt).is_none()
+        {
+            return false;
+        }
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause,
+            ..
+        } = &select_stmt.body.select
+        else {
+            return false;
+        };
+        let TableOrSubquery::Table {
+            name,
+            index_hint: None,
+            time_travel: None,
+            ..
+        } = &from.source
+        else {
+            return false;
+        };
+        let target = insert.table.name.as_str();
+        if name.schema.is_some()
+            || name.name.eq_ignore_ascii_case(target)
+            || name.name.to_ascii_lowercase().starts_with("sqlite_")
+        {
+            return false;
+        }
+        let target_is_rowid_table = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(target))
+            .is_some_and(|table| !table.without_rowid);
+        let delete_event = fsqlite_ast::TriggerEvent::Delete;
+        if !target_is_rowid_table
+            || self.has_matching_triggers(target, fsqlite_ast::TriggerTiming::Before, &delete_event)
+            || self.has_matching_triggers(target, fsqlite_ast::TriggerTiming::After, &delete_event)
+        {
+            return false;
+        }
+        let Some((source, _)) = self.local_join_binding_table(name) else {
+            return false;
+        };
+        // The source columns the SELECT reads, besides the rowid that every
+        // index entry carries.
+        let mut reads_every_column = false;
+        let mut read_columns: Vec<Arc<str>> = Vec::new();
+        let mut note_column = |column_ref: &ColumnRef| {
+            read_columns.push(Arc::clone(&column_ref.column));
+        };
+        for column in columns {
+            match column {
+                ResultColumn::Star | ResultColumn::TableStar(_) => reads_every_column = true,
+                ResultColumn::Expr { expr, .. } => {
+                    for_each_column_ref_in_expr(expr, &mut note_column);
+                }
+            }
+        }
+        if let Some(where_clause) = where_clause {
+            for_each_column_ref_in_expr(where_clause, &mut note_column);
+        }
+        let needed: Vec<&str> = source
+            .columns
+            .iter()
+            .filter(|column| !column.is_ipk)
+            .map(|column| column.name.as_str())
+            .filter(|column| {
+                reads_every_column
+                    || read_columns
+                        .iter()
+                        .any(|read| read.eq_ignore_ascii_case(column))
+            })
+            .collect();
+        !source.indexes.iter().any(|index| {
+            index.columns.is_empty()
+                || index.where_clause.is_some()
+                || needed.iter().all(|column| {
+                    index
+                        .columns
+                        .iter()
+                        .any(|indexed| indexed.eq_ignore_ascii_case(column))
+                })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_insert_dispatch(
         &self,
@@ -451,7 +576,13 @@ impl Connection {
                 || has_after_insert
                 || upsert_needs_conflict_plan
                 || self.fk_enforcement_enabled();
-            if !is_simple_values || needs_row_by_row_replay {
+            // bd-i3csr.1: a source the INSERT program can scan itself runs
+            // as that one program (the VDBE path below), not materialized
+            // and replayed.
+            let one_program = !is_simple_values
+                && !needs_row_by_row_replay
+                && self.insert_select_runs_as_one_program(insert, select_stmt);
+            if (!is_simple_values || needs_row_by_row_replay) && !one_program {
                 self.log_mem_execution_fallback(
                     "insert_select",
                     "insert_select_row_by_row_fallback",
