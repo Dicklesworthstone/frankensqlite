@@ -87,6 +87,63 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a top-N preflight compares the packed key with the heap's worst row without decoding it (bd-w4pr1.13)
+
+- Target: every `ORDER BY ... LIMIT` over a scan, scorecard row order_by_text_limit10. An exact
+  instruction profile (callgrind) of `SELECT count(*), sum(id) FROM (SELECT id FROM t ORDER BY b
+  DESC LIMIT 10)` over 1M rows at fc0408327 put 2,396 instructions on a row against stock's 778,
+  940 of them in the full-heap `SorterCompare` preflight: `parse_record_with_encoding` 482 (a
+  fresh `Vec` and UTF-8 validation of the text key), `would_retain_top_n` 196, the opcode body
+  173 (the collation registry lock, the lookaside buffer taken and put back), `free` about 90.
+  Touched: `crates/fsqlite-vdbe/src/engine.rs` (`compare_packed_sorter_key`,
+  `top_n_preflight_packed_verdict`, `execute_sorter_compare`).
+- Ledger preflight: no entry covers comparing a packed key; the 2026-05-06 broad-sweep entry asks
+  for narrow patches only, which this is (one opcode, no bytecode change).
+- Change: on a full heap, a UTF-8 database, no collation on any key and metrics off, the record's
+  header is walked with the record decoder's own checks (a record it would reject goes to the
+  existing path) and each key column is compared where it lies: NULL, integers and reals decoded
+  by `decode_scalar_value` and ordered by `SqliteValue::cmp`, TEXT by its stored bytes (the decoder
+  keeps UTF-8 bytes exactly, and BINARY on UTF-8 is a byte compare). A BLOB key, TEXT against a
+  number or more than eight key columns also go to the existing path.
+- Result, user instructions in millions per statement on the 1M-row scorecard table, stock sqlite3
+  3.46.1 live in the same run, io_uring reads refused in every arm (three runs each, identical),
+  every answer equal to stock's; base 3fe901b76 sha256 2f6ec2c8..., candidate e82b64aa...:
+  order_by_text_limit10 2,347.3 -> 1,716.8 (-630 per row; 3.02x -> 2.21x stock's 778.0; CPU
+  2.81x -> 2.04x), `ORDER BY a DESC, id LIMIT 10` 2,514.4 -> 2,131.7 (-383; 3.50x -> 2.97x
+  stock's 718.7), `ORDER BY c LIMIT 25` (a REAL key) 1,804.0 -> 1,500.0 (-304; 2.48x -> 2.06x
+  stock's 726.5), scan_filter_agg and group_by_1000_groups unchanged to the instruction.
+  `ORDER BY b COLLATE NOCASE DESC LIMIT 10`, which this leaves to the decoder, 2,704.7 -> 2,739.7
+  (+35 per row; 3.29x -> 3.33x stock's 821.5): the opcode grew, and a declined sorter pays the
+  larger frame and the eligibility tests (callgrind: `execute_sorter_compare` 1,288.0M -> 1,331.1M,
+  spread over the prologue, `Option` handling and the checks). An earlier run on 025a26070 gave
+  the same picture (-634 on order_by_text_limit10).
+  Predicted -600 per row on order_by_text_limit10 with a kill line at -300.
+- Two other shapes were measured and not kept. The first cut checked for a collation only when it
+  reached a TEXT column, after walking the header: a NOCASE key paid that walk on every row and
+  then decoded anyway, +211 per row (2,701.1 -> 2,912.2). A version with the comparison out of
+  line, called only when one sorter lookup said the heap was full and the keys packed, cut the
+  NOCASE cost to +24 but gave back 47 per row on order_by_text_limit10 (-583 instead of -630,
+  sha256 0c980e4a...). The landed version tests the sorter's collations and encoding before
+  reading the record, inline.
+- Keepers: a unit test holds the comparison to decoding the key for every pair of values of
+  every class under all four sort orders, one and two key columns, keys shorter and longer than
+  the sorter's, a NaN REAL, TEXT bytes that are not UTF-8 and a reserved serial type, and checks
+  that it answers every pair it takes; another drives each decline and six malformed records; an
+  engine test runs preflights from the sideband and from a copied register (a tie and NULL
+  rejected) and shows a NOCASE sorter leaving every preflight to the decoder; the lane-boundary
+  oracle compares thirteen `ORDER BY ... LIMIT` queries with stock, tie-decided ones, NULLS
+  FIRST/LAST, NOCASE and BLOB keys included.
+- What is left on order_by_text_limit10 (callgrind, candidate): the comparison itself 206 per
+  row (about 30 in its prologue, the eight-column array), the text column's UTF-8 validation when
+  `Column` reads it 165, `MakeRecord` of the key 63.
+- Retry condition for the +35 on a collated key: split `SorterCompare` into a small inline
+  dispatcher and an out-of-line general body (decode, registry lock), so neither path carries the
+  other's frame; keep it only if order_by_text_limit10 stays within 10 instructions of 1,716.8
+  and the NOCASE row comes back to its base. For a collated key (NOCASE, RTRIM) on the packed
+  path itself: a profile of an `ORDER BY x COLLATE NOCASE LIMIT n` row with the preflight's decode
+  above 15% of the row; compare with `compare_text_with_collation` on the stored bytes, holding
+  the registry lock only for such a sorter.
+
 ## 2026-11-12 - WIN: a page miss asks the transaction's pinned WAL snapshot once, not twice (bd-w4pr1.13.18)
 
 - Target: every page read that misses the caches in WAL mode. Touched:

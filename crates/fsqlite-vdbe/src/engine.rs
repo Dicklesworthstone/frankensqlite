@@ -6071,6 +6071,9 @@ thread_local! {
     static FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL: Cell<u64> = const { Cell::new(0) };
     /// Test-only per-thread count of `AggStep`s served by `plain_agg_step`.
     static FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL: Cell<u64> = const { Cell::new(0) };
+    /// Test-only per-thread count of top-N preflights decided from the packed
+    /// key by `top_n_preflight_packed_verdict`.
+    static FSQLITE_VDBE_PACKED_TOP_N_VERDICTS_TOTAL: Cell<u64> = const { Cell::new(0) };
 }
 /// bd-7vkes: Count times the BTREE_APPEND fast path was taken (skip seek).
 static FSQLITE_VDBE_INSERT_APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -16105,6 +16108,49 @@ impl VdbeEngine {
         Ok(())
     }
 
+    /// The verdict of a top-N preflight on a full heap, read from the packed
+    /// candidate key without decoding it: `Some(true)` keeps the candidate.
+    ///
+    /// `None` leaves the decision to the general path in
+    /// [`Self::execute_sorter_compare`]: no sorter, no bound or a bound of
+    /// zero, a heap that is not yet full, a sorter with a collation on any key
+    /// or on a database that is not UTF-8 (decided before the record is read,
+    /// so such a sorter pays one test per row), metrics collection on (the
+    /// general path counts its decode), a P3 that is neither the armed
+    /// `MakeRecord` sideband nor a blob register, or a key
+    /// [`compare_packed_sorter_key`] does not take. Reads only.
+    fn top_n_preflight_packed_verdict(&self, op: &VdbeOp) -> Option<bool> {
+        if self.collect_vdbe_metrics {
+            return None;
+        }
+        let sorter = self.sorters.get(&op.p1)?;
+        let limit = sorter.top_n_limit?;
+        if limit == 0
+            || sorter.rows.len() < limit
+            || !matches!(sorter.text_encoding, TextEncoding::Utf8)
+            || sorter.collations.iter().any(Option::is_some)
+        {
+            return None;
+        }
+        let worst = sorter.rows.first()?;
+        let record = if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
+            self.make_record_lookaside.as_slice()
+        } else if let SqliteValue::Blob(bytes) = self.get_reg(op.p3) {
+            bytes
+        } else {
+            return None;
+        };
+        let ordering = compare_packed_sorter_key(
+            record,
+            &worst.values,
+            sorter.key_columns,
+            &sorter.sort_key_orders,
+            &sorter.collations,
+            sorter.text_encoding,
+        )?;
+        Some(ordering == Ordering::Less)
+    }
+
     /// `SorterCompare`, including its jump.
     ///
     /// In preflight mode, compare a candidate key with the bounded sorter's
@@ -16115,13 +16161,37 @@ impl VdbeEngine {
     fn execute_sorter_compare(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
         let cursor_id = op.p1;
         let is_top_n_preflight = (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0;
-        let preflight_sorter_exists = !is_top_n_preflight || self.sorters.get(&cursor_id).is_some();
-        let preflight_needs_compare = is_top_n_preflight
-            && self.sorters.get(&cursor_id).is_some_and(|sorter| {
+        if is_top_n_preflight && let Some(retain) = self.top_n_preflight_packed_verdict(op) {
+            // The preflight consumes P3. The general path takes the sideband
+            // buffer, clears it and puts it back, leaving the lookaside reset;
+            // a blob register is left as it is.
+            if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
+                self.make_record_lookaside.reset();
+            }
+            #[cfg(test)]
+            FSQLITE_VDBE_PACKED_TOP_N_VERDICTS_TOTAL.with(|counter| {
+                counter.set(counter.get().saturating_add(1));
+            });
+            if retain {
+                *pc += 1;
+            } else {
+                *pc = op.p2 as usize;
+            }
+            return Ok(());
+        }
+        // One lookup answers both: whether the sorter exists and whether its
+        // bounded heap is full.
+        let preflight_heap_full = if is_top_n_preflight {
+            self.sorters.get(&cursor_id).map(|sorter| {
                 sorter
                     .top_n_limit
                     .is_some_and(|limit| sorter.rows.len() >= limit)
-            });
+            })
+        } else {
+            None
+        };
+        let preflight_sorter_exists = !is_top_n_preflight || preflight_heap_full.is_some();
+        let preflight_needs_compare = preflight_heap_full == Some(true);
         let preflight_probe = if is_top_n_preflight {
             if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
                 // Consume MakeRecord's sideband directly, then
@@ -22907,6 +22977,124 @@ fn compare_sorter_rows(
     // Rust's sort_by is stable, so equal-key rows stay in insertion order,
     // matching C SQLite's behavior (especially for COLLATE NOCASE DISTINCT).
     Ordering::Equal
+}
+
+/// The most columns a packed key may have for [`compare_packed_sorter_key`].
+const PACKED_SORTER_KEY_MAX_COLUMNS: usize = 8;
+
+/// Compare a packed sort-key record against a decoded key, giving what
+/// `compare_sorter_rows(&decoded_record, rhs, ..)` gives, without decoding the
+/// record (bd-w4pr1.13).
+///
+/// `None` means the general path must answer: a database that is not UTF-8,
+/// a record the record decoder would reject (the whole header is walked with
+/// its checks first, trailing bytes included) or one of more than
+/// [`PACKED_SORTER_KEY_MAX_COLUMNS`] columns, a key column holding a BLOB or
+/// a reserved serial type, TEXT under a collation, or TEXT against a value
+/// that is not TEXT.
+///
+/// On a UTF-8 database the decoder keeps a TEXT payload's bytes exactly, valid
+/// or not, and BINARY order is a byte compare of them (`binary_text_cmp`), so
+/// TEXT is compared as stored. Every other column is decoded by
+/// `decode_scalar_value`, which decodes as the record decoder does (NaN reads
+/// as NULL), and ordered by `SqliteValue::cmp`, as `cmp_values_collated` does
+/// for two values that are not both TEXT.
+fn compare_packed_sorter_key(
+    record: &[u8],
+    rhs: &[SqliteValue],
+    key_columns: usize,
+    sort_key_orders: &[SortKeyOrder],
+    collations: &[Option<String>],
+    enc: TextEncoding,
+) -> Option<Ordering> {
+    if !matches!(enc, TextEncoding::Utf8) {
+        return None;
+    }
+    let (header_size, size_len) = read_varint(record)?;
+    let header_size = usize::try_from(header_size).ok()?;
+    if header_size > record.len() || header_size < size_len {
+        return None;
+    }
+    let mut columns = [(0_u64, 0_usize, 0_usize); PACKED_SORTER_KEY_MAX_COLUMNS];
+    let mut column_count = 0;
+    let mut at = size_len;
+    let mut body = header_size;
+    while at < header_size {
+        let (serial_type, used) = read_varint(&record[at..header_size])?;
+        at += used;
+        let len = usize::try_from(serial_type_len(serial_type)?).ok()?;
+        let end = body.checked_add(len)?;
+        if end > record.len() {
+            return None;
+        }
+        *columns.get_mut(column_count)? = (serial_type, body, end);
+        column_count += 1;
+        body = end;
+    }
+    if body != record.len() {
+        return None;
+    }
+    let columns = &columns[..column_count];
+
+    for idx in 0..key_columns.max(1) {
+        let order = sort_key_orders
+            .get(idx)
+            .copied()
+            .unwrap_or(SortKeyOrder::Asc);
+        let is_desc = matches!(order, SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst);
+        let nulls_last = matches!(order, SortKeyOrder::Desc | SortKeyOrder::AscNullsLast);
+        let Some(&(serial_type, start, end)) = columns.get(idx) else {
+            return Some(match (rhs.get(idx).is_some(), is_desc) {
+                (false, _) => Ordering::Equal,
+                (true, true) => Ordering::Greater,
+                (true, false) => Ordering::Less,
+            });
+        };
+        let Some(rhs_value) = rhs.get(idx) else {
+            return Some(if is_desc {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            });
+        };
+        let bytes = &record[start..end];
+        let lhs_scalar = if classify_serial_type(serial_type) == SerialTypeClass::Text {
+            None
+        } else {
+            Some(fsqlite_types::record::decode_scalar_value(serial_type, bytes)?)
+        };
+
+        let l_null = matches!(lhs_scalar, Some(SqliteValue::Null));
+        let r_null = rhs_value.is_null();
+        if l_null || r_null {
+            if l_null && r_null {
+                continue;
+            }
+            return Some(if l_null == nulls_last {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            });
+        }
+
+        let mut ord = match (&lhs_scalar, rhs_value) {
+            (Some(lhs_value), _) => lhs_value.cmp(rhs_value),
+            (None, SqliteValue::Text(rhs_text))
+                if collations.get(idx).is_none_or(Option::is_none) =>
+            {
+                bytes.cmp(rhs_text.as_bytes_direct())
+            }
+            (None, _) => return None,
+        };
+        if ord == Ordering::Equal {
+            continue;
+        }
+        if is_desc {
+            ord = ord.reverse();
+        }
+        return Some(ord);
+    }
+    Some(Ordering::Equal)
 }
 
 fn opcode_trace_enabled() -> bool {
@@ -39625,6 +39813,414 @@ mod tests {
             &[SqliteValue::Null, SqliteValue::Text("zeta".into())],
             &collations,
         ));
+    }
+
+    const ALL_SORT_KEY_ORDERS: [SortKeyOrder; 4] = [
+        SortKeyOrder::Asc,
+        SortKeyOrder::Desc,
+        SortKeyOrder::AscNullsLast,
+        SortKeyOrder::DescNullsFirst,
+    ];
+
+    /// What the general top-N preflight compares: the packed key, decoded.
+    fn decode_packed_key(record: &[u8]) -> Vec<SqliteValue> {
+        fsqlite_types::record::parse_record_with_encoding(record, TextEncoding::Utf8)
+            .expect("test key records are well formed")
+    }
+
+    /// Whether every key column pairs values the packed comparison takes (a
+    /// candidate that is NULL, a number, or TEXT against TEXT or NULL; never a
+    /// BLOB candidate), so it must answer rather than decline.
+    fn packed_key_must_answer(candidate: &[SqliteValue], worst: &[SqliteValue]) -> bool {
+        candidate.len() == worst.len()
+            && candidate.iter().zip(worst).all(|(lhs, rhs)| match lhs {
+                SqliteValue::Text(_) => matches!(rhs, SqliteValue::Null | SqliteValue::Text(_)),
+                SqliteValue::Blob(_) => false,
+                _ => true,
+            })
+    }
+
+    /// Compare `record` both ways under BINARY and return whether the packed
+    /// comparison answered. An answer must equal the decoded comparison; a
+    /// decline is allowed only for pairs it does not take.
+    fn check_packed_key(
+        record: &[u8],
+        candidate: &[SqliteValue],
+        worst: &[SqliteValue],
+        key_columns: usize,
+        orders: &[SortKeyOrder],
+        registry: &CollationRegistry,
+    ) -> bool {
+        let collations = vec![None; key_columns];
+        let expected = compare_sorter_rows(
+            &decode_packed_key(record),
+            worst,
+            key_columns,
+            orders,
+            &collations,
+            registry,
+            TextEncoding::Utf8,
+        );
+        let packed = compare_packed_sorter_key(
+            record,
+            worst,
+            key_columns,
+            orders,
+            &collations,
+            TextEncoding::Utf8,
+        );
+        match packed {
+            Some(ordering) => {
+                assert_eq!(
+                    ordering, expected,
+                    "packed key {candidate:?} ({record:?}) against {worst:?} under {orders:?}"
+                );
+                true
+            }
+            None => {
+                assert!(
+                    !packed_key_must_answer(candidate, worst),
+                    "packed key {candidate:?} ({record:?}) against {worst:?} under {orders:?} declined"
+                );
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn test_packed_sorter_key_compare_agrees_with_decoding_the_key() {
+        let registry = CollationRegistry::new();
+        let wide = "z".repeat(40);
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(-1),
+            SqliteValue::Integer(7),
+            SqliteValue::Integer(1 << 40),
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Integer(i64::MIN),
+            SqliteValue::Float(-0.0),
+            SqliteValue::Float(0.5),
+            SqliteValue::Float(7.0),
+            SqliteValue::Float(9.3e18),
+            SqliteValue::Float(-1.5e300),
+            SqliteValue::Text("".into()),
+            SqliteValue::Text("a".into()),
+            SqliteValue::Text("ab".into()),
+            SqliteValue::Text("b".into()),
+            SqliteValue::Text("row-99999".into()),
+            SqliteValue::Text("row-999990".into()),
+            SqliteValue::Text("é".into()),
+            SqliteValue::Text(wide.as_str().into()),
+            SqliteValue::Blob(Arc::from(&[0x00_u8, 0xFF][..])),
+        ];
+        let mut answered = 0_usize;
+
+        // One-column keys: every value against every worst value, every order.
+        for order in ALL_SORT_KEY_ORDERS {
+            for candidate in &values {
+                for worst in &values {
+                    let candidate = std::slice::from_ref(candidate);
+                    let worst = std::slice::from_ref(worst);
+                    let record = serialize_record(candidate);
+                    if check_packed_key(&record, candidate, worst, 1, &[order], &registry) {
+                        answered += 1;
+                    }
+                }
+            }
+        }
+
+        // Two-column keys: a value of every class in each column, every pair of
+        // orders, so a tie in the first column hands the second the decision.
+        let pick = [
+            SqliteValue::Null,
+            SqliteValue::Integer(7),
+            SqliteValue::Float(7.0),
+            SqliteValue::Text("ab".into()),
+            SqliteValue::Text("b".into()),
+            SqliteValue::Blob(Arc::from(&[0x01_u8][..])),
+        ];
+        for first_order in ALL_SORT_KEY_ORDERS {
+            for second_order in ALL_SORT_KEY_ORDERS {
+                let orders = [first_order, second_order];
+                for c0 in &pick {
+                    for c1 in &pick {
+                        let candidate = [c0.clone(), c1.clone()];
+                        let record = serialize_record(&candidate);
+                        for w0 in &pick {
+                            for w1 in &pick {
+                                let worst = [w0.clone(), w1.clone()];
+                                if check_packed_key(
+                                    &record, &candidate, &worst, 2, &orders, &registry,
+                                ) {
+                                    answered += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // A key record shorter or longer than the key, and a worst row
+        // shorter than the key.
+        let short = [SqliteValue::Text("ab".into())];
+        let pair = [SqliteValue::Text("ab".into()), SqliteValue::Integer(3)];
+        for order in ALL_SORT_KEY_ORDERS {
+            let orders = [order, order];
+            for (candidate, worst) in [
+                (&short[..], &pair[..]),
+                (&pair[..], &short[..]),
+                (&short[..], &short[..]),
+            ] {
+                let record = serialize_record(candidate);
+                assert!(
+                    check_packed_key(&record, candidate, worst, 2, &orders, &registry)
+                        || !packed_key_must_answer(candidate, worst)
+                );
+            }
+            let record = serialize_record(&pair);
+            assert!(check_packed_key(
+                &record,
+                &pair,
+                &pair[..1],
+                1,
+                &orders[..1],
+                &registry
+            ));
+        }
+
+        // Records no serializer writes: a NaN REAL (it decodes as NULL), TEXT
+        // bytes that are not UTF-8 (kept and compared as stored), and a
+        // reserved serial type (left to the decoder).
+        let mut nan = vec![2_u8, 7];
+        nan.extend_from_slice(&f64::NAN.to_bits().to_be_bytes());
+        let not_utf8 = [2_u8, 17, 0xFF, 0xFE];
+        let reserved = [2_u8, 10];
+        for order in ALL_SORT_KEY_ORDERS {
+            for worst in &values {
+                let worst = std::slice::from_ref(worst);
+                for record in [&nan[..], &not_utf8[..]] {
+                    let candidate = decode_packed_key(record);
+                    let answer = check_packed_key(record, &candidate, worst, 1, &[order], &registry);
+                    if candidate[0].is_null() {
+                        assert!(answer, "a NaN key is a NULL key");
+                    }
+                }
+                assert_eq!(decode_packed_key(&reserved), vec![SqliteValue::Null]);
+                assert_eq!(
+                    compare_packed_sorter_key(
+                        &reserved,
+                        worst,
+                        1,
+                        &[order],
+                        &[None],
+                        TextEncoding::Utf8
+                    ),
+                    None,
+                    "a reserved serial type takes the decoder"
+                );
+            }
+        }
+
+        assert!(answered > 0);
+    }
+
+    #[test]
+    fn test_packed_sorter_key_compare_leaves_what_it_does_not_take_to_the_decoder() {
+        let utf8 = TextEncoding::Utf8;
+        let asc = [SortKeyOrder::Asc];
+        let a = serialize_record(&[SqliteValue::Text("a".into())]);
+        let text_b = [SqliteValue::Text("b".into())];
+
+        assert_eq!(
+            compare_packed_sorter_key(&a, &text_b, 1, &asc, &[None], utf8),
+            Some(Ordering::Less)
+        );
+        // TEXT under a collation, TEXT in a UTF-16 database, TEXT against a
+        // number, and a BLOB key.
+        assert_eq!(
+            compare_packed_sorter_key(&a, &text_b, 1, &asc, &[Some("NOCASE".to_owned())], utf8),
+            None
+        );
+        assert_eq!(
+            compare_packed_sorter_key(&a, &text_b, 1, &asc, &[None], TextEncoding::Utf16le),
+            None
+        );
+        assert_eq!(
+            compare_packed_sorter_key(&a, &[SqliteValue::Integer(1)], 1, &asc, &[None], utf8),
+            None
+        );
+        let blob = serialize_record(&[SqliteValue::Blob(Arc::from(&[1_u8][..]))]);
+        assert_eq!(
+            compare_packed_sorter_key(&blob, &[SqliteValue::Integer(1)], 1, &asc, &[None], utf8),
+            None
+        );
+        // A collation does not apply to a number, which is still answered.
+        let one = serialize_record(&[SqliteValue::Integer(1)]);
+        assert_eq!(
+            compare_packed_sorter_key(
+                &one,
+                &[SqliteValue::Integer(2)],
+                1,
+                &asc,
+                &[Some("NOCASE".to_owned())],
+                utf8
+            ),
+            Some(Ordering::Less)
+        );
+        // Nine columns: well formed, but past the column limit.
+        let nine = serialize_record(&vec![SqliteValue::Integer(1); 9]);
+        assert!(fsqlite_types::record::parse_record_with_encoding(&nine, utf8).is_some());
+        assert_eq!(
+            compare_packed_sorter_key(&nine, &[SqliteValue::Integer(2)], 1, &asc, &[None], utf8),
+            None
+        );
+        // Records the decoder rejects: empty, a header longer than the record,
+        // a body shorter than its header says, a trailing byte, and serial
+        // type varints cut off by the header's end.
+        let malformed: [&[u8]; 6] = [&[], &[5, 1], &[2, 1], &[2, 1, 5, 0], &[2, 0x81], &[0x80]];
+        for record in malformed {
+            assert!(
+                fsqlite_types::record::parse_record_with_encoding(record, utf8).is_none(),
+                "{record:?} should be malformed"
+            );
+            assert_eq!(
+                compare_packed_sorter_key(record, &[SqliteValue::Integer(2)], 1, &asc, &[None], utf8),
+                None,
+                "{record:?}"
+            );
+        }
+    }
+
+    fn packed_top_n_verdicts() -> u64 {
+        FSQLITE_VDBE_PACKED_TOP_N_VERDICTS_TOTAL.with(Cell::get)
+    }
+
+    /// Run top-N preflights against a full bound-2 heap holding `row-5` and
+    /// `row-9` under the sorter order `p4` (`-` for DESC, `-|NOCASE` adds a
+    /// collation); one result row per candidate, 1 when it is kept. Returns
+    /// the results and how many preflights were decided from the packed key.
+    fn run_top_n_preflight_candidates(p4: &str) -> (Vec<Vec<SqliteValue>>, u64) {
+        let before = packed_top_n_verdicts();
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_bound = b.alloc_reg();
+            let r_key = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_copy = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::Integer, 2, r_bound, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::SorterOpen,
+                0,
+                1,
+                r_bound,
+                P4::Str(p4.to_owned()),
+                SORTER_OPEN_TOP_N_REGISTER,
+            );
+            for retained in ["row-5", "row-9"] {
+                b.emit_op(Opcode::String8, 0, r_key, 0, P4::Str(retained.to_owned()), 0);
+                b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
+                b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            }
+
+            // (candidate, read from a copied register instead of the sideband)
+            let candidates = [
+                (Some("row-7"), false),
+                (Some("row-1"), false),
+                (Some("row-5"), false),
+                (Some("row-8"), true),
+                (None, false),
+            ];
+            for (candidate, copied) in candidates {
+                match candidate {
+                    Some(text) => {
+                        b.emit_op(Opcode::String8, 0, r_key, 0, P4::Str(text.to_owned()), 0);
+                    }
+                    None => {
+                        b.emit_op(Opcode::Null, 0, r_key, 0, P4::None, 0);
+                    }
+                }
+                b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
+                let probe = if copied {
+                    b.emit_op(Opcode::Copy, r_record, r_copy, 0, P4::None, 0);
+                    r_copy
+                } else {
+                    r_record
+                };
+                let rejected = b.emit_label();
+                let done = b.emit_label();
+                b.emit_jump_to_label(
+                    Opcode::SorterCompare,
+                    0,
+                    probe,
+                    rejected,
+                    P4::None,
+                    SORTER_COMPARE_TOP_N_PREFLIGHT,
+                );
+                b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+                b.resolve_label(rejected);
+                b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+                b.resolve_label(done);
+                b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            }
+            // An integer candidate: below every TEXT key, so worse under DESC.
+            b.emit_op(Opcode::Integer, 5, r_key, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
+            let rejected = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(
+                Opcode::SorterCompare,
+                0,
+                r_record,
+                rejected,
+                P4::None,
+                SORTER_COMPARE_TOP_N_PREFLIGHT,
+            );
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(rejected);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        (rows, packed_top_n_verdicts() - before)
+    }
+
+    #[test]
+    fn test_top_n_preflight_decides_from_the_packed_key_and_leaves_collations_to_the_decoder() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let metrics_were_enabled = vdbe_metrics_enabled();
+        set_vdbe_metrics_enabled(false);
+
+        // Kept: row-7 (above the worst, row-5) and row-8 (from a copied
+        // register). Rejected: row-1, the tie row-5, NULL (last under DESC)
+        // and the integer 5.
+        let expected: Vec<Vec<SqliteValue>> = [1, 0, 0, 1, 0, 0]
+            .into_iter()
+            .map(|kept| vec![SqliteValue::Integer(kept)])
+            .collect();
+
+        let (binary_rows, binary_packed) = run_top_n_preflight_candidates("-");
+        let (nocase_rows, nocase_packed) = run_top_n_preflight_candidates("-|NOCASE");
+        set_vdbe_metrics_enabled(metrics_were_enabled);
+
+        assert_eq!(binary_rows, expected);
+        assert_eq!(binary_packed, 6, "every BINARY preflight reads the packed key");
+        assert_eq!(nocase_rows, expected);
+        assert_eq!(
+            nocase_packed, 0,
+            "a sorter with a collation leaves every preflight to the decoder"
+        );
     }
 
     // ── bd-2ttd8.1: Pager routing and parity-cert tests ──────────────

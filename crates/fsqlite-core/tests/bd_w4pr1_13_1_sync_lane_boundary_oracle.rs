@@ -25,6 +25,11 @@
 //! - rows one column short of the table that hold their own rowid in the
 //!   alias slot (the shape old FrankenSQLite files have).
 //!
+//! bd-w4pr1.13 added a top-N preflight that compares a candidate's packed sort
+//! key with the heap's worst row without decoding it; `ORDER BY ... LIMIT`
+//! over every key class, ties, NULLS FIRST/LAST, NOCASE and BLOB keys (which
+//! take the decoding path) are compared here too.
+//!
 //! A lane that skipped or repeated a cell at a page boundary, read a stale
 //! row image, or mis-mapped a column past the rowid alias fails here.
 
@@ -284,6 +289,7 @@ async fn run_case(file_backed: bool, failures: &mut Vec<String>) {
     compare(&format!("[{mode}] loaded"), &frank, &stock, &T1_QUERIES, failures).await;
     compare(&format!("[{mode}] loaded"), &frank, &stock, &OTHER_QUERIES, failures).await;
     compare(&format!("[{mode}] loaded"), &frank, &stock, &INLINE_EDGE_QUERIES, failures).await;
+    compare(&format!("[{mode}] loaded"), &frank, &stock, &TOP_N_QUERIES, failures).await;
     for (step, mutation) in mutations().iter().enumerate() {
         frank.execute_batch(mutation).await.expect("frank mutation");
         stock.execute_batch(mutation).expect("stock mutation");
@@ -301,6 +307,28 @@ const INLINE_EDGE_QUERIES: [&str; 4] = [
     "SELECT s, s, id, id, n, n FROM edge WHERE length(s) BETWEEN 22 AND 25 ORDER BY id",
     "SELECT count(*), sum(n), sum(r), sum(length(s)), count(z) FROM edge WHERE s >= 'a'",
     "SELECT z, r, n, s, id FROM edge WHERE id % 7 = 3 ORDER BY id DESC",
+];
+
+/// `ORDER BY ... LIMIT` over `edge`: the top-N preflight compares each
+/// candidate's packed key with the heap's worst row without decoding it when
+/// the key is TEXT under BINARY, an integer, a real or NULL, and decodes it
+/// otherwise (BLOB keys, NOCASE, TEXT against a number). The first queries
+/// are decided by ties (`s` repeats every 41 rows), where only a strict
+/// "better than the worst row" admits a candidate.
+const TOP_N_QUERIES: [&str; 13] = [
+    "SELECT id, s FROM edge ORDER BY s DESC LIMIT 7",
+    "SELECT id, s FROM edge ORDER BY s LIMIT 5 OFFSET 30",
+    "SELECT count(*), sum(id) FROM (SELECT id FROM edge ORDER BY s DESC LIMIT 10)",
+    "SELECT id, n FROM edge ORDER BY n LIMIT 9",
+    "SELECT id, n FROM edge ORDER BY n DESC NULLS FIRST LIMIT 5",
+    "SELECT id, n FROM edge ORDER BY n NULLS LAST LIMIT 6",
+    "SELECT id, r FROM edge ORDER BY r DESC LIMIT 4",
+    "SELECT id, z FROM edge ORDER BY z DESC LIMIT 3",
+    "SELECT id, s FROM edge ORDER BY s COLLATE NOCASE DESC LIMIT 6",
+    "SELECT id FROM edge ORDER BY coalesce(n, r, s) LIMIT 8",
+    "SELECT id FROM edge ORDER BY coalesce(z, s, n) DESC LIMIT 8",
+    "SELECT id, s, n FROM edge ORDER BY length(s) DESC, n, id DESC LIMIT 10",
+    "SELECT id, s FROM edge ORDER BY s, r DESC LIMIT 12",
 ];
 
 fn inline_edge_setup() -> String {
@@ -410,6 +438,7 @@ async fn run_stock_written_case(failures: &mut Vec<String>) {
     compare(label, &frank, &stock, &STOCK_FILE_T1_QUERIES, failures).await;
     compare(label, &frank, &stock, &OTHER_QUERIES, failures).await;
     compare(label, &frank, &stock, &INLINE_EDGE_QUERIES, failures).await;
+    compare(label, &frank, &stock, &TOP_N_QUERIES, failures).await;
     compare(label, &frank, &stock, &LEGACY_QUERIES, failures).await;
     for (step, mutation) in mutations().iter().enumerate() {
         frank.execute_batch(mutation).await.expect("frank mutation");
