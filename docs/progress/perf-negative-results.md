@@ -87,6 +87,45 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a WHERE term that reads no column is tested once, before the scan (bd-w4pr1.13.22)
+
+- Target: WHERE terms built only from literals, numbered or named parameters and deterministic
+  calls (`WHERE 0`, an ORM's `1 != 1` for an empty IN list, a query builder's `1 = 1 AND ...`).
+  They were evaluated per row inside the scan, so `DELETE FROM t WHERE 0` read every row. Stock
+  codes each such term once ahead of the loops (sqlite3WhereBegin, sqlite3ExprIfFalse to iBreak).
+  Touched: `crates/fsqlite-vdbe/src/codegen.rs` (`emit_loop_invariant_where_terms`,
+  `where_term_is_loop_invariant`; the plain SELECT, COUNT(*) and aggregate full scans, and the
+  UPDATE and DELETE collect and one-pass scans).
+- Ledger preflight: no entry on constant WHERE terms. bd-0ivvf folds absorbing boolean constants in
+  AND/OR chains for evaluation, not for loop structure.
+- Change: the WHERE's AND-terms that are loop-invariant (the seek-key operand rule; anonymous `?`
+  and non-deterministic calls stay per row) are emitted once before the scan's Rewind, with IfNot to
+  the label Rewind takes on an empty table. The rest stays the per-row filter.
+- Result: user instructions per statement, CLI release-perf, 1M-row table built by stock, stock
+  sqlite3 3.46.1 live in the same script, best of 3; before main 4af710d0d, after 71196dbca's tree.
+  Stock / before / after:
+
+  | statement | stock | before | after |
+  |---|---|---|---|
+  | `SELECT 1` (open baseline) | 1.08M | 3.33M | 3.24M |
+  | `SELECT count(*) FROM t WHERE 0` | 1.19M | 413.8M | 3.41M |
+  | `UPDATE t SET a = 1 WHERE 0` | 1.18M | 395.4M | 3.37M |
+  | `DELETE FROM t WHERE 0` | 1.18M | 383.9M | 3.36M |
+  | `DELETE FROM t WHERE 1 = 0` | 1.18M | 741.8M | 3.36M |
+  | `count(*) WHERE 1 = 1 AND a > 500` | 405.5M | 1,717.4M | 1,005.1M |
+  | `count(*) WHERE a > 500` (control) | 405.5M | 1,261.8M | 1,010.9M |
+
+  The bead predicted under 0.1M per statement above open and program cost. Measured: 0.12-0.17M,
+  met within noise. The constant term beside a column term cost 456M per 1M rows within the before
+  binary and nothing within the after binary. (The control's own drop between the binaries comes
+  from other commits between the two bases.)
+- Semantics: a term that raises now raises once even on an empty table, as stock does (the per-row
+  form never raised there). The rusqlite differential test caught that difference when run without
+  the change.
+- Retry / widen: GROUP BY and INSERT ... SELECT scans keep per-row evaluation. Widen there only on
+  a measured workload. Constant OPERANDS inside a per-row term are a different lever (bd-w4pr1.13.24,
+  rejected above).
+
 ## 2026-11-12 - REJECTED: a scan WHERE comparing two expressions jumps on the comparison instead of testing its 0/1/NULL value (bd-w4pr1.13.24)
 
 - Target: a scan WHERE such as `id % 7 = 0`, where neither side is a bare column: per scanned row it
