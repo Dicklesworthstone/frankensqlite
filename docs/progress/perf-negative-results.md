@@ -190,6 +190,163 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
 - Retry condition for a lazy header walk (stop at the requested column, as stock does): a profile
   of a table with more than eight columns showing `RecordColumnTable::parse` above 5% of a scan.
 
+## 2026-11-11 - MEASURE: the shell reads hot pages through the shared io_uring driver until a latency policy trips; counts of page-reading statements are not repeatable as shipped (bd-w4pr1.13.19)
+
+- Target: any statement run through the CLI that reads pages from the database file. This is
+  the "file-backed paired A/B (unix-fallback vs uring-engaged CLI arm)" the 2026-07-27 entry
+  left open.
+- Mechanism: the CLI attaches a native context, so `IoUringFile::read_data_path` sends each
+  page read to the shared ring (enqueue, `yield_now`, the driver thread, a oneshot back: two
+  scheduler passes and about seven syscalls) until `enforce_conformal_breach_policy` disables
+  the ring on a slow sample. The library path (`Connection::open`) never attaches one and
+  always takes the inline `pread`.
+- Evidence, `SELECT count(*) FROM t` on the 1M-row scorecard table (7.8k leaf reads), one
+  binary (sha256 4795e044...): with `io_uring_setup` refused by a seccomp filter (every read
+  inline) 67.9M user instructions in each of five runs, 32 ms CPU; as shipped 71.5M to 98.1M
+  over six runs and 115.7M, 109 ms in one more. The number of ring reads before the policy
+  trips was 7 to 129 under strace and is larger without it. While the ring is engaged a page
+  read costs about 6k more instructions and about 9 us more CPU than the 1 us inline read.
+- Consequence for measurement: an A/B of a page-reading statement through the CLI needs both
+  arms with the ring refused (`scratchpad/stable_probe.py`: a transient user service with
+  `SystemCallFilter=~io_uring_setup`, `SystemCallErrorNumber=ENOSYS`), which repeats to the
+  instruction; every page-miss number in the entries below was taken that way.
+- Not changed here. On a quiet host the policy may trip late or never, so the shipped CLI can
+  be several times slower on page reads than these numbers. Candidate, with its own bead: try
+  the read inline without blocking (`preadv2` with `RWF_NOWAIT`) and go to the ring only when
+  the data is not in the page cache.
+- Retry condition: none; this is a measurement. The ring arm is worth another A/B on a cold
+  file on rotating or network storage, where an inline read blocks the executor.
+
+## 2026-11-11 - WIN: a DISTINCT or IN set keeps its keys in a hash set, not an index b-tree (bd-w4pr1.13.15)
+
+- Target: `SELECT DISTINCT` and `IN` over many distinct keys; the all-distinct shape stayed
+  at 10x stock after the membership memo. Touched: `crates/fsqlite-vdbe/src/engine.rs`
+  (`MembershipSet`, `membership_set_key`, `spill_membership_set`, `OpenAutoindex`, `Found`,
+  `IdxInsert`), `crates/fsqlite-vdbe/src/codegen.rs` (`OPFLAG_MEMBERSHIP_SET` at the three
+  sites).
+- Evidence before (callgrind): 73% of an all-distinct DISTINCT is the in-memory index: a seek
+  for the probe, a second seek and a page balance for the insert.
+- Change: an ephemeral index its site only fills and asks "is this key present" keeps its keys
+  as canonical record bytes in a hash set; the b-tree stays empty. Canonical means byte
+  equality is the index's equality: NULL, minimally encoded INTEGER, BLOB, TEXT when every key
+  column compares with built-in BINARY in a UTF-8 database, and REAL that no INTEGER equals; a
+  REAL that an INTEGER equals (-0.0 included) is rewritten as that INTEGER. Any other record
+  ends set mode: the keys go into the b-tree and the cursor continues as before.
+- Result, stock sqlite3 3.46.1 live (binary e6c4e3ca... against the previous main 79912ebe...;
+  the candidate carries four other cuts that do not act on a set that never reaches the
+  b-tree; user instructions, x stock):
+
+  | statement | stock M | before | after |
+  |---|---|---|---|
+  | DISTINCT b, 200k distinct texts | 1,340.7 | 13,480.5 (10.1x) | 2,205.1 (1.6x) |
+  | DISTINCT c, 200k distinct reals | 423.1 | 9,652.8 (22.8x) | 2,216.9 (5.2x) |
+  | DISTINCT a, b over 100k rows | 509.5 | 6,883.8 (13.5x) | 1,881.9 (3.7x) |
+  | DISTINCT a, 1,000 values | 1,068.7 | 2,273.8 (2.1x) | 2,253.1 (2.1x) |
+  | a IN (50 literals) | 914.5 | 3,103.0 (3.4x) | 2,998.2 (3.3x) |
+
+  CPU on the first three: 12.4x -> 2.8x, 23.8x -> 7.6x, 12.3x -> 4.3x. Kill criteria (under
+  50% removed on the all-distinct shape; over 3% added on the repeated-value shapes): not met.
+- Tests: `test_membership_set_matches_the_index_btree_for_binary_keys` and
+  `test_membership_set_falls_back_to_the_index_for_collated_text` run the same program with and
+  without the flag (1 / 1.0, 3.0 stored and 3 probed, -0.0 / 0, both sides of 2^53, NOCASE and
+  RTRIM keys arriving after keys the set holds);
+  `test_membership_set_key_is_canonical_exactly_when_the_index_compares_equal`;
+  `membership_sets_match_rusqlite_oracle` (UTF-8 and UTF-16 databases). GOLDEN-CHANGE:
+  `subquery_in_predicate`, OpenAutoindex P5 0 -> 1. Gate: the landing tree 0bf696af5 (main
+  d0a2c4f67, this set, and a compile fix for five stale `PrimaryKeyViolation` matches): clippy -D
+  warnings with all targets on fsqlite-vfs, -wal, -btree, -vdbe, -core clean; fsqlite-vdbe lib 1,225
+  pass and 2 fail (the two IN-list codegen tests red on main, bd-in-or-index-scan-fs7nd / bd-bhalc),
+  bytecode goldens 8 pass; the DISTINCT / IN / join oracle suites (11 fsqlite-core targets) pass;
+  the 22 fsqlite-core plan-pinning targets pass except
+  `bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans`
+  (red on main, bd-gazf2); fsqlite-btree lib 546 pass; fsqlite-vfs lib 525 pass; fsqlite-wal lib
+  1,164 pass; the 24 fsqlite plan-pinning targets pass (56 tests).
+  On the pre-rebase tip 664179b36: fsqlite-wal lib 1,164 pass in each of two runs; fsqlite-core
+  cancellation, DISTINCT and IN units 125 pass. One fsqlite-btree run on the seek2 tip failed
+  `test_balance_for_delete_defers_until_leaf_empties`, which reads a process-global balance counter
+  beside sibling tests (bd-pyygd); its rerun and the test alone pass.
+- Still a loss: 1.6x to 5.2x. About 11k instructions per row remain outside the set: the
+  range scan through a subquery, the record build, and three copies of the key record per row.
+  The automatic index of a join is read back in order and does not use the set.
+- Retry condition: none.
+
+## 2026-11-11 - WIN: an index seek decodes its probe key once and parses its cells without the cell-slot cache (bd-w4pr1.13.15)
+
+- Target: every index seek; measured on the unindexed 5k x 5k join, whose automatic index is
+  sought 10,000 times. Touched: `crates/fsqlite-btree/src/cursor.rs`
+  (`index_seek_for_insert_with_bias`, the two index binary searches).
+- Evidence before (callgrind): a seek is 11.4k instructions: 11.5 comparisons at about 780
+  plus two page loads; the probe record was decoded once per level (19,282 decodes for 10,000
+  seeks), and each comparison fetched its cell through the cell-slot cache (258 per call to
+  save a 76-instruction parse).
+- Two commits: the descent decodes the probe key once; the two index binary searches parse the
+  cell directly (`parse_cell_at_uncached`). Table searches keep the cache.
+- Result (callgrind, same statement): record decodes 19,282 -> 9,707 (-317 instructions per
+  seek; kill: under 250); cell fetch 29.66M -> 12.60M (-148 per comparison; kill: under 100);
+  the seek 114.4M -> 92.3M. Stock live: `join_no_index_5k_x_5k` 45,292 -> 40,929 instructions
+  per outer row (8.72x -> 7.88x), CPU 26.5 -> 23.3 ms; table-seek rows unchanged.
+- Not the ground of the 2026-05-06 entry (uncached parse in the same-size overwrite) or the
+  cache-rotation entry: this is a search that reads each cell once. Gate: the landing gate in the
+  hash-set entry above.
+- Still a loss: 7.9x. The automatic index build pays 162 three-sibling balances for 5,000
+  inserts (about 260k each) and each comparison still validates and decodes the whole record.
+- Retry condition: none.
+
+## 2026-11-11 - WIN: an inline file read takes one full checkpoint, not three (bd-w4pr1.13.18)
+
+- Target: every page read that reaches the file. Touched: `crates/fsqlite-vfs/src/unix.rs`
+  (`UnixFile::read`), `crates/fsqlite-vfs/src/uring.rs` (`read_data_path`).
+- Evidence before (callgrind, 20,000 rowid lookups): 64,989 native checkpoints for 21,079 page
+  reads, 1.07k of the 9.4k instructions a page miss costs (stock: about 350 for the miss).
+- Change: `read_data_path` leaves the checkpoint to the Unix read it hands over to;
+  `UnixFile::read` keeps the full checkpoint before the `pread` and after it runs one only if
+  a cancellation has been published.
+- Result, ring refused in both arms, repeatable to the instruction (79912ebe... -> 4795e044...):
+  `SELECT count(*) FROM t` 74.3M -> 67.9M (-820 per page read; kill: under 500);
+  rowid-lookup join 3,357.7M -> 3,198.9M (-4.7%, 6.06x -> 5.77x stock); scan_filter_agg
+  1,767.8M -> 1,761.4M; the all-hits control 1,819.6M -> 1,812.7M.
+- Test: `test_unix_vfs_read_aborts_on_a_cancelled_context_before_reading`. Gate: the landing gate in
+  the hash-set entry above.
+- Retry condition: none. Still open on bd-w4pr1.13.18: the miss is 8.6k against stock's 350.
+
+## 2026-11-11 - REJECTED: an eviction that forgets its page without searching the access trace (bd-w4pr1.13.18)
+
+- Target: the tracker's `forget` on every eviction (1.1k to 1.6k instructions after
+  bd-w4pr1.13.12). Candidate: `crates/fsqlite-pager/src/page_cache.rs`, trace entries tagged
+  with their page's admission stamp, `forget` retires the stamp, dead entries skipped and
+  swept lazily; the live sequence equals the eager trace (model test passes; pager unit suite
+  1,104 pass).
+- Result, ring refused in both arms (4795e044... -> e6c4e3ca...): `SELECT count(*) FROM t`
+  67.9M -> 61.2M, 860 instructions per eviction; rowid-lookup join 3,198.9M -> 3,021.1M, 936
+  per eviction; all-hits control +0.15%; CPU inside the noise at load 27. The kill criterion
+  was under 1,000 per eviction: met. Not landed; the commit is 13ba530fc (plus fixup
+  3c354e386) on branch `next3` of the perf lane's clone.
+- Why short: the scan it removes costs 1.1k to 1.2k here, and the tagged trace adds a map
+  insert per admission, a map removal per forget and the sweep, about 250 together.
+- Retry condition: a version whose bookkeeping per admission is under 100 instructions (the
+  stamp kept with the cache slot instead of in a map), or a quiet-host run that shows 5% of
+  CPU on `count(*)`.
+
+## 2026-11-11 - WIN: a shared WAL-index header copy is read under one hold of the region mutex (bd-w4pr1.7)
+
+- Target: every statement that commits; measured on autocommit INSERTs. Touched:
+  `crates/fsqlite-wal/src/wal_index.rs` (`read_shared_header_copy`).
+- Evidence before: per autocommit INSERT 292k to 305k user instructions against stock's 22k,
+  34.8 syscalls against 8.1 (statx 17, fcntl 8, pread64 6, pwrite64 2). The shared header is
+  read 10.1 times per commit (gdb count), each read two copies of twelve words, each word its
+  own `atomic_load_u32_ne` with its own range check and mutex hold: 26k per commit.
+- Change: the copy uses the existing `ShmRegion::atomic_copy_u32_ne` (one range check, one
+  hold, the same twelve Acquire loads in order).
+- Result, stock live, N=4000 against N=2000, ring refused, two runs: 305.2k -> 285.2k and
+  307.3k -> 291.2k per commit (-17k to -20k, about -6%); kill criterion (under 10k): not met.
+  CPU per commit inside the noise (about 160 us against stock's 14).
+- Tests: the existing torn-copy and concurrent-capture tests of the shared header. Gate:
+  the landing gate in the hash-set entry above.
+- Still a loss: 13x stock in instructions per commit. The commit re-validates the WAL index,
+  the certificate chain and the path identity on every statement; the decomposition is on
+  bd-w4pr1.7, and whether it is cut piecewise or by bd-i0tn6 is an open owner decision.
+- Retry condition: none.
+
 ## 2026-11-11 - WIN: the shell's statement_complete() keeps no copy of the words it reads (bd-5310l)
 
 - Target: every line the CLI reads (all the scorecard's statement rows). Touched:
