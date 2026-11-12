@@ -4640,7 +4640,7 @@ impl<P: PageReader> BtCursor<P> {
             entry.cell_idx = idx;
             self.stack.push(entry);
             self.at_eof = false;
-            self.remember_table_landing(target_rowid, cached.page_no, idx);
+            self.remember_table_cache_hit(slot_idx, target_rowid, cached.page_no, idx);
             self.record_point_witness(
                 cx,
                 WitnessKey::Cell {
@@ -4671,6 +4671,29 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(None);
         }
         Ok(Some(entry))
+    }
+
+    /// Remember a seek that cache slot `slot_idx` served: the slot takes the
+    /// new landing and moves to the front, the others keep their order
+    /// (bd-w4pr1.13.27). Its bounds just admitted the target and are kept, not
+    /// decoded again from the leaf: they are a filter only (see
+    /// [`TableSeekCacheEntry`]), and a landing by descent from the root
+    /// ([`Self::remember_table_landing`]) still reads them afresh.
+    fn remember_table_cache_hit(
+        &mut self,
+        slot_idx: usize,
+        rowid: i64,
+        page_no: PageNumber,
+        cell_idx: u16,
+    ) {
+        match self.seek_cache.get_mut(slot_idx) {
+            Some(Some(cached)) if cached.page_no == page_no => {
+                cached.rowid = rowid;
+                cached.cell_idx = cell_idx;
+                self.seek_cache[..=slot_idx].rotate_right(1);
+            }
+            _ => self.remember_table_landing(rowid, page_no, cell_idx),
+        }
     }
 
     /// Remember the table leaf a seek landed on, with the rowids it holds.
@@ -15403,6 +15426,91 @@ mod tests {
             let result = cursor.table_move_to(&cx, 12).await.unwrap();
             assert!(!result.is_found());
             assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+        });
+    }
+
+    /// bd-w4pr1.13.27: a seek served from the cache moves its slot to the
+    /// front with the new landing and keeps the slot's bounds; a landing by
+    /// descent still reads the leaf's bounds afresh, so stale ones are
+    /// replaced.
+    #[test]
+    fn test_table_seek_cache_hit_keeps_bounds_and_descent_refreshes_them() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
+            );
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+            for rowid in [10_i64, 30, 50, 70] {
+                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            }
+            let slot_of = |cursor: &BtCursor<SeekProbeStore>, page: u32| {
+                cursor
+                    .seek_cache
+                    .iter()
+                    .flatten()
+                    .find(|entry| entry.page_no == pn(page))
+                    .copied()
+                    .unwrap()
+            };
+
+            cursor.pager.clear_reads();
+            assert!(cursor.table_move_to(&cx, 20).await.unwrap().is_found());
+            assert_eq!(
+                cursor.pager.read_pages(),
+                vec![pn(3)],
+                "served from the cache"
+            );
+            let pages: Vec<PageNumber> = cursor
+                .seek_cache
+                .iter()
+                .flatten()
+                .map(|e| e.page_no)
+                .collect();
+            assert_eq!(pages, vec![pn(3), pn(6), pn(5), pn(4)]);
+            let hit = slot_of(&cursor, 3);
+            assert_eq!((hit.rowid, hit.cell_idx), (20, 1));
+            assert_eq!((hit.first_rowid, hit.last_rowid), (10, 20));
+
+            // Narrow page 4's remembered bounds as if the leaf had changed
+            // since they were read. 40 no longer passes them, so the seek
+            // descends from the root and lands on page 4, which must read the
+            // leaf's bounds again instead of keeping the stale ones.
+            for entry in cursor.seek_cache.iter_mut().flatten() {
+                if entry.page_no == pn(4) {
+                    entry.last_rowid = 30;
+                }
+            }
+            cursor.pager.clear_reads();
+            assert!(cursor.table_move_to(&cx, 40).await.unwrap().is_found());
+            assert_eq!(cursor.pager.read_pages(), vec![pn(2), pn(4)], "descended");
+            let pages: Vec<PageNumber> = cursor
+                .seek_cache
+                .iter()
+                .flatten()
+                .map(|e| e.page_no)
+                .collect();
+            assert_eq!(pages, vec![pn(4), pn(3), pn(6), pn(5)]);
+            let refreshed = slot_of(&cursor, 4);
+            assert_eq!((refreshed.first_rowid, refreshed.last_rowid), (30, 40));
+            assert_eq!((refreshed.rowid, refreshed.cell_idx), (40, 1));
         });
     }
 
