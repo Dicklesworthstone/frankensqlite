@@ -87,6 +87,28 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - REJECTED: a table window SELECT frees its scanned rows before building output that does not read them (bd-w4pr1.12)
+
+- Target: peak RSS of a window SELECT whose output holds only window columns (massif of the
+  in-place-keys binary f572c5312 put its peak at output assembly, with the scanned rows still
+  held). Candidate in `execute_window_select` (`crates/fsqlite-core/src/connection.rs`): free the
+  scanned rows before the output rows are built when no plain or wrapped result column and no
+  ORDER BY term outside the result columns reads them. Commit ef3c294e6 on the perf7 branch
+  `movrows`, patch in `scratchpad/rejected/`; never on main.
+- Result: CLI release-perf, scorecard database, stock sqlite3 3.46.1 live in the same script, 3
+  runs, min user instructions, median CPU and peak RSS (`rss_probe.py`, io_uring refused, load 3),
+  before f572c5312, after ef3c294e6. `row_number() OVER (PARTITION BY a ORDER BY c)` summed
+  outside: 378.4 -> 404.5 MB, 9,503M -> 9,500M, 1,208 -> 1,208 ms (stock 15.7 MB, 8,225M, 663
+  ms); `rank() OVER (ORDER BY b)` 402.3 -> 403.8 MB; `sum(c) OVER (PARTITION BY a)` 379.7 ->
+  403.2 MB; a wrapped column (which keeps the rows) 402.3 -> 403.5 MB. Prediction -60 to -130 MB;
+  kill under 40 MB: crossed (nothing removed). Answers equal stock's.
+- Why: massif shows the heap peak did fall (396 -> 373 MB), but peak RSS did not: glibc keeps the
+  million freed small allocations of the scanned rows inside the process, and every shape now
+  sits near 403 MB, so freeing earlier does not lower the high-water mark the process reaches.
+- Retry condition: only together with a change that stops the scanned rows being a million
+  separate heap allocations (one flat value buffer, or a sorter-backed streaming window), measured
+  on peak RSS, not on massif's heap.
+
 ## 2026-11-12 - WIN: a checkpoint reads its pages back once, right before it publishes (bd-w4pr1.13.20, lever E1)
 
 - Target: the read-back verification of the WAL checkpoint in
