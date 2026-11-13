@@ -3261,6 +3261,108 @@ mod tests {
         );
     }
 
+    /// bd-w4pr1.35: a SELECT that prepare defers to the dispatcher (GROUP BY
+    /// on `:memory:`, a view, sqlite_schema, an ordered aggregate, a join the
+    /// VDBE does not take) resolves its names at prepare, as stock does, so an
+    /// unknown column or table is a prepare error. Every valid deferred shape
+    /// must still prepare and answer as stock does.
+    macro_rules! deferred_prepare_scenario {
+        ($m:ident, $conn:expr) => {{
+            let conn: $m::Connection = $conn;
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+                 CREATE TABLE u(k INTEGER, v TEXT);
+                 CREATE VIEW tv AS SELECT a, b FROM t;
+                 INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y'), (2, 'z');
+                 INSERT INTO u VALUES (2, 'two'), (3, 'three');",
+            )
+            .unwrap();
+            let mut trace: Vec<String> = Vec::new();
+            for sql in [
+                // Unknown names: each must fail at prepare.
+                "SELECT quote(nosuch) || count(*) FROM t GROUP BY a",
+                "SELECT nosuch FROM tv",
+                "SELECT a, nosuch FROM tv GROUP BY a",
+                "SELECT group_concat(b ORDER BY nosuch) FROM t",
+                "SELECT name FROM sqlite_schema WHERE nosuch = 1",
+                "SELECT t.a FROM t LEFT JOIN u ON u.k = t.nosuch",
+                "SELECT t.a FROM t JOIN u ON u.k = t.a GROUP BY u.nosuch",
+                "SELECT a FROM t UNION SELECT nosuch FROM u",
+                "SELECT a, count(*) FROM nosuch_table GROUP BY a",
+                "SELECT max(a), nosuch FROM t",
+                // Valid deferred shapes: each must prepare and answer.
+                "WITH c AS (SELECT a FROM t) SELECT a, count(*) FROM c GROUP BY a ORDER BY a",
+                "SELECT a, count(*) FROM tv GROUP BY a ORDER BY a",
+                "SELECT a AS x, count(*) FROM t GROUP BY x ORDER BY x",
+                "SELECT a, (SELECT count(*) FROM u WHERE u.k = t.a) FROM t GROUP BY a ORDER BY a",
+                "SELECT a FROM t UNION SELECT k FROM u ORDER BY 1",
+                "SELECT a, row_number() OVER (ORDER BY id) FROM t ORDER BY id",
+                "SELECT group_concat(b, ',' ORDER BY b DESC) FROM t",
+                "SELECT t.a, u.v FROM t LEFT JOIN u ON u.k = t.a GROUP BY t.a ORDER BY t.a",
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table'",
+                "SELECT max(a), b FROM t",
+            ] {
+                let outcome = conn.prepare(sql).and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, $m::types::Value>(0))?
+                        .collect::<$m::Result<Vec<_>>>()
+                });
+                trace.push(match outcome {
+                    Ok(rows) => format!("ok {rows:?}"),
+                    Err(error) => {
+                        let message = error.to_string();
+                        ["no such column: ", "no such table: "]
+                            .iter()
+                            .find_map(|kind| {
+                                message.find(kind).map(|at| {
+                                    message[at..]
+                                        .split_whitespace()
+                                        .take(4)
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                })
+                            })
+                            .unwrap_or_else(|| format!("err {message}"))
+                    }
+                });
+            }
+            trace
+        }};
+    }
+
+    #[test]
+    fn deferred_prepared_selects_resolve_names_at_prepare_like_rusqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = [
+            (
+                deferred_prepare_scenario!(stock, stock::Connection::open_in_memory().unwrap()),
+                deferred_prepare_scenario!(ours, ours::Connection::open_in_memory().unwrap()),
+            ),
+            (
+                deferred_prepare_scenario!(
+                    stock,
+                    stock::Connection::open(temp_path(&dir, "deferred-stock.db")).unwrap()
+                ),
+                deferred_prepare_scenario!(
+                    ours,
+                    ours::Connection::open(temp_path(&dir, "deferred-fsqlite.db")).unwrap()
+                ),
+            ),
+        ];
+        for (run, (theirs, mine)) in runs.iter().enumerate() {
+            for (index, (expected, actual)) in theirs.iter().zip(mine).enumerate() {
+                assert_eq!(actual, expected, "run {run} step {index}");
+            }
+            assert_eq!(mine.len(), theirs.len(), "run {run}");
+            // Non-vacuity: the negatives are prepare errors in stock, the
+            // positives answer.
+            assert!(
+                theirs[0].starts_with("no such column: nosuch"),
+                "{theirs:?}"
+            );
+            assert!(theirs[10].starts_with("ok ["), "{theirs:?}");
+        }
+    }
+
     #[test]
     fn constant_where_terms_match_rusqlite() {
         let dir = tempfile::tempdir().unwrap();

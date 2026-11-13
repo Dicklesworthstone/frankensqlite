@@ -29371,7 +29371,8 @@ impl Connection {
                 }
                 rewrite_result.and_then(|statement| {
                     self.with_fallback_function_registry(|| {
-                        self.validate_statement_select_semantics(&statement)
+                        self.validate_statement_select_semantics(&statement)?;
+                        self.validate_deferred_select_names(&statement)
                     })?;
                     Ok(statement)
                 })
@@ -54868,6 +54869,34 @@ impl Connection {
         self.with_fallback_function_registry(|| {
             SelectColumnReferenceResolver::new(self).validate_select(select)
         })
+    }
+
+    /// bd-w4pr1.35: prepare resolves a SELECT's names by compiling it, but a
+    /// SELECT that runs through the dispatcher on every execution (GROUP BY on
+    /// `:memory:`, a view, sqlite_schema, an ordered aggregate, a join the VDBE
+    /// does not take) compiles nothing at prepare. Stock resolves every name at
+    /// prepare, so such a SELECT is resolved here, inside prepare's
+    /// registry-stability loop (a virtual-table metadata callback that changes
+    /// the registry makes prepare retry).
+    ///
+    /// Left out: SELECTs the column-reference preflight already resolved, ones
+    /// that compile at prepare, FROM-less SELECTs (no table names to resolve;
+    /// the resolver does not see a result alias in their WINDOW clauses), and
+    /// the dispatcher-only sources (a live virtual table as the primary source,
+    /// another schema).
+    fn validate_deferred_select_names(&self, statement: &Statement) -> Result<()> {
+        let Statement::Select(select) = statement else {
+            return Ok(());
+        };
+        if is_expression_only_select(select)
+            || select_requires_column_reference_preflight(select, self)
+            || !self.prepared_select_requires_dispatch(statement)
+            || self.has_primary_live_vtab_source(select)
+            || select_references_non_main_schema(select)
+        {
+            return Ok(());
+        }
+        self.validate_select_column_references(select)
     }
 
     fn in_lhs_column_count(&self, lhs: &Expr) -> usize {
@@ -178304,20 +178333,20 @@ mod tests {
         .await
         .unwrap();
 
-            let stmt = conn
+            // Unqualified ON columns are not reinterpreted as
+            // o.customer_id = c.id: `id` is ambiguous, and stock (3.54.1)
+            // rejects the statement at prepare (bd-w4pr1.35).
+            let result = conn
                 .prepare(
                     "SELECT c.name, COUNT(*), SUM(o.amount) \
                  FROM customers c JOIN orders o ON customer_id = id \
                  GROUP BY c.name;",
                 )
-                .await
-                .unwrap();
+                .await;
             assert!(
-                !matches!(
-                    stmt.prepared_query_fast_path.as_ref(),
-                    Some(&super::PreparedQueryFastPath::SimpleInnerJoinGroupedAggregate { .. })
-                ),
-                "unqualified ON columns in a two-table grouped join are not safe to reinterpret as o.customer_id = c.id"
+                matches!(&result, Err(FrankenError::AmbiguousColumn { name }) if name == "id"),
+                "ambiguous column name: id, got {:?}",
+                result.err()
             );
         });
     }
@@ -178335,20 +178364,20 @@ mod tests {
         .await
         .unwrap();
 
-            let stmt = conn
+            // A column qualified with the wrong table label does not match by
+            // bare column name: stock (3.54.1) rejects it at prepare
+            // (bd-w4pr1.35).
+            let result = conn
                 .prepare(
                     "SELECT c.name, COUNT(*), SUM(o.amount) \
                  FROM customers c JOIN orders o ON c.customer_id = c.id \
                  GROUP BY c.name;",
                 )
-                .await
-                .unwrap();
+                .await;
             assert!(
-                !matches!(
-                    stmt.prepared_query_fast_path.as_ref(),
-                    Some(&super::PreparedQueryFastPath::SimpleInnerJoinGroupedAggregate { .. })
-                ),
-                "a column qualified with the wrong table label must not match by bare column name"
+                matches!(&result, Err(FrankenError::NoSuchColumn { name }) if name == "c.customer_id"),
+                "no such column: c.customer_id, got {:?}",
+                result.err()
             );
         });
     }
@@ -178371,20 +178400,19 @@ mod tests {
             .await
             .unwrap();
 
-            let stmt = conn
+            // A bare group column that exists on both join inputs is
+            // ambiguous; stock (3.54.1) rejects it at prepare (bd-w4pr1.35).
+            let result = conn
                 .prepare(
                     "SELECT name, COUNT(*), SUM(o.amount) \
                  FROM customers c JOIN orders o ON o.customer_id = c.id \
                  GROUP BY name;",
                 )
-                .await
-                .unwrap();
+                .await;
             assert!(
-                !matches!(
-                    stmt.prepared_query_fast_path.as_ref(),
-                    Some(&super::PreparedQueryFastPath::SimpleInnerJoinGroupedAggregate { .. })
-                ),
-                "bare group columns that exist on both join inputs must stay on the normal resolver"
+                matches!(&result, Err(FrankenError::AmbiguousColumn { name }) if name == "name"),
+                "ambiguous column name: name, got {:?}",
+                result.err()
             );
         });
     }
@@ -178408,20 +178436,20 @@ mod tests {
             .await
             .unwrap();
 
-            let stmt = conn
+            // A bare aggregate argument that exists on both join inputs is
+            // ambiguous, not pinned to the right table; stock (3.54.1) rejects
+            // it at prepare (bd-w4pr1.35).
+            let result = conn
                 .prepare(
                     "SELECT c.name, COUNT(*), SUM(amount) \
                  FROM customers c JOIN orders o ON o.customer_id = c.id \
                  GROUP BY c.name;",
                 )
-                .await
-                .unwrap();
+                .await;
             assert!(
-                !matches!(
-                    stmt.prepared_query_fast_path.as_ref(),
-                    Some(&super::PreparedQueryFastPath::SimpleInnerJoinGroupedAggregate { .. })
-                ),
-                "bare aggregate arguments that exist on both join inputs must not be pinned to the right table"
+                matches!(&result, Err(FrankenError::AmbiguousColumn { name }) if name == "amount"),
+                "ambiguous column name: amount, got {:?}",
+                result.err()
             );
         });
     }
