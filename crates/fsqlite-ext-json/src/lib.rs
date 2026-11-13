@@ -72,9 +72,12 @@ const JSONB_OBJECT_TYPE: u8 = 0xC;
 ///
 /// Such a number is carried inside the `Value` tree as a `Value::String` whose
 /// bytes begin with this tag followed by the numeric text. Every renderer, the
-/// JSONB encoder, `json_type` and the SQL readers treat it as a REAL. The tag
-/// embeds NUL and SOH control bytes so it can never collide with a real JSON
-/// string value.
+/// JSONB encoder, `json_type` and the SQL readers treat it as a REAL.
+///
+/// Genuine strings can contain these control bytes too. Every string-value
+/// ingress doubles an initial tag, and every string-value output removes that
+/// extra tag exactly once. Numeric carriers keep a single tag followed by
+/// numeric text. Object labels remain raw strings outside this representation.
 const NUMBER_TEXT_TAG: &str = "\u{0}\u{0}fsqlite\u{1}nonfinite\u{0}";
 
 /// Build the tagged `Value::String` that carries a JSON number as its exact
@@ -83,10 +86,26 @@ fn number_text_value(raw: &str) -> Value {
     Value::String(format!("{NUMBER_TEXT_TAG}{raw}"))
 }
 
+/// Import genuine text without allowing it to impersonate a number carrier.
+fn json_string_value(mut text: String) -> Value {
+    if text.starts_with(NUMBER_TEXT_TAG) {
+        text.insert_str(0, NUMBER_TEXT_TAG);
+    }
+    Value::String(text)
+}
+
+/// Recover genuine text from an internal string value, removing one escape.
+fn json_string_text(text: &str) -> &str {
+    text.strip_prefix(NUMBER_TEXT_TAG)
+        .filter(|raw| raw.starts_with(NUMBER_TEXT_TAG))
+        .unwrap_or(text)
+}
+
 /// If `s` is a tagged number-text carrier, return its numeric text; otherwise
 /// `None` (a genuine string value).
 fn as_number_text(s: &str) -> Option<&str> {
     s.strip_prefix(NUMBER_TEXT_TAG)
+        .filter(|raw| !raw.starts_with(NUMBER_TEXT_TAG))
 }
 
 /// Whether a JSON number token must be carried as its text
@@ -219,19 +238,22 @@ fn float_renders_as(value: f64, text: &str) -> bool {
 /// written other than in Rust's shortest form keeps its source text, as stock
 /// keeps it (bd-1nxwh).
 ///
-/// The scanner walks bytes, copying string literals verbatim (respecting `\"` and
-/// `\\`) and identifying numeric tokens OUTSIDE strings: optional `-`, integer
-/// digits, optional `.`digits, optional `e`/`E` with optional sign and digits.
+/// The scanner walks bytes, respecting `\"` and `\\` in string literals and
+/// identifying numeric tokens OUTSIDE strings: optional `-`, integer digits,
+/// optional `.`digits, optional `e`/`E` with optional sign and digits. Original
+/// string values beginning with the reserved tag are escaped before any
+/// numeric carriers are synthesized; object labels remain unchanged.
 /// Such a token is replaced by the JSON string literal
 /// `"<escaped NUMBER_TEXT_TAG><raw>"` (serde escapes the tag's control bytes,
 /// keeping the output valid JSON). Returns `Some(rewritten)` iff at least one
-/// token was wrapped, else `None`, so the common document is parsed as given
-/// without a copy.
+/// token was wrapped or a genuine string escaped, else `None`, so the common
+/// document is parsed as given without a copy.
 /// Whether `input` can hold a float token: a `.`, or an exponent marker right
 /// after a digit. Only a float can need its text kept
 /// ([`number_token_needs_text`]), except an integer long enough to overflow
 /// f64, which the strict parse rejects so the callers rewrite on that error.
-/// A document with no float skips [`rewrite_number_text_tokens`]' scan.
+/// A document with no float or possible reserved string skips
+/// [`rewrite_number_text_tokens`]' scan.
 fn may_hold_float_token(input: &str) -> bool {
     let bytes = input.as_bytes();
     memchr::memchr(b'.', bytes).is_some()
@@ -241,7 +263,9 @@ fn may_hold_float_token(input: &str) -> bool {
 
 /// [`rewrite_number_text_tokens`] when the document may need it.
 fn number_text_rewrite_for_parse(input: &str) -> Option<String> {
-    if may_hold_float_token(input) {
+    // The tag starts with NUL, which strict JSON can spell only as \u0000.
+    // A float-free document can still contain genuine text needing escape.
+    if may_hold_float_token(input) || input.contains(r"\u0000") {
         rewrite_number_text_tokens(input)
     } else {
         None
@@ -262,9 +286,11 @@ fn rewrite_number_text_tokens(input: &str) -> Option<String> {
         // UTF-8 sequence, so byte-level scanning is safe.
         let b = bytes[i];
         if b == b'"' {
-            // String literal: skip it, honoring backslash escapes. (A plain
+            // String literal: scan it, honoring backslash escapes. (A plain
             // position search beats memchr2 here: JSON strings are mostly
             // short keys.)
+            let start = i;
+            let mut closed = false;
             i += 1;
             while i < n {
                 let Some(offset) = bytes[i..]
@@ -279,8 +305,28 @@ fn rewrite_number_text_tokens(input: &str) -> Option<String> {
                     i += 2; // skip the escape and its escaped byte
                 } else {
                     i += 1;
+                    closed = true;
                     break;
                 }
+            }
+            // Only original string VALUES need escaping. Keys stay raw for
+            // object lookup, and malformed literals must reach the parser
+            // unchanged. Checking the first escape avoids decoding ordinary
+            // strings; numeric carriers inserted below are never rescanned.
+            if closed
+                && input[start + 1..i].starts_with(r"\u0000")
+                && !input[i..]
+                    .trim_start_matches([' ', '\t', '\r', '\n'])
+                    .starts_with(':')
+                && let Ok(text) = serde_json::from_str::<String>(&input[start..i])
+                && text.starts_with(NUMBER_TEXT_TAG)
+            {
+                let literal = serde_json::to_string(&format!("{NUMBER_TEXT_TAG}{text}"))
+                    .expect("serializing a String to JSON is infallible");
+                let rewritten = out.get_or_insert_with(|| String::with_capacity(n + 32));
+                rewritten.push_str(&input[copied..start]);
+                rewritten.push_str(&literal);
+                copied = i;
             }
         } else if b.is_ascii_digit() || (b == b'-' && i + 1 < n && bytes[i + 1].is_ascii_digit()) {
             // Numeric token start (a bare `-` not followed by a digit is
@@ -779,7 +825,7 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
                 // are) — GH#212, bd-yalqc, bd-1nxwh.
                 out.push_str(raw);
             } else {
-                let escaped = serde_json::to_string(text).map_err(|error| {
+                let escaped = serde_json::to_string(json_string_text(text)).map_err(|error| {
                     FrankenError::function_error(format!("JSON string escape failed: {error}"))
                 })?;
                 out.push_str(&escaped);
@@ -1826,14 +1872,14 @@ impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::String(value.to_owned())))
+        Ok(Json5Value(json_string_value(value.to_owned())))
     }
 
     fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::String(value)))
+        Ok(Json5Value(json_string_value(value)))
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
@@ -1938,7 +1984,7 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
                 // bd-1nxwh).
                 append_jsonb_node(JSONB_FLOAT_TYPE, raw.as_bytes(), out)
             } else {
-                append_jsonb_string(text, out)
+                append_jsonb_string(json_string_text(text), out)
             }
         }
         Value::Array(array) => {
@@ -2114,24 +2160,8 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
                 number_text_value(normalized)
             }
         }
-        JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
-            let text = String::from_utf8(payload.to_vec()).map_err(|error| {
-                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
-            })?;
-            Value::String(text)
-        }
-        JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
-            // Escaped text: the payload carries RFC-8259 (TEXTJ) or JSON5
-            // (TEXT5) escape sequences that must be resolved to the raw
-            // string (bd-t75hg: previously returned verbatim, so stock-
-            // written escaped strings decoded with literal backslashes).
-            let text = std::str::from_utf8(payload).map_err(|error| {
-                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
-            })?;
-            Value::String(decode_jsonb_escaped_text(
-                text,
-                node_type == JSONB_TEXT5_TYPE,
-            )?)
+        JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE | JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
+            json_string_value(decode_jsonb_text(node_type, payload)?)
         }
         JSONB_ARRAY_TYPE => {
             let mut cursor = 0usize;
@@ -2147,13 +2177,12 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
             let mut cursor = 0usize;
             let mut map = Map::new();
             while cursor < payload.len() {
-                let (key_node, key_used) = decode_jsonb_value(&payload[cursor..])?;
+                let (key_type, key_payload, key_used) = decode_jsonb_node(&payload[cursor..])?;
                 cursor += key_used;
-                let Value::String(key) = key_node else {
-                    return Err(FrankenError::function_error(
-                        "invalid JSONB object key payload",
-                    ));
-                };
+                // Labels are raw strings, not escaped string values. Decode
+                // their wire type directly: a numeric carrier must never
+                // make a non-text key look like a valid Value::String.
+                let key = decode_jsonb_text(key_type, key_payload)?;
                 if cursor >= payload.len() {
                     return Err(FrankenError::function_error(
                         "invalid JSONB object missing value",
@@ -2171,6 +2200,28 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
     };
 
     Ok((value, consumed))
+}
+
+/// Decode raw text for either a JSONB string value or an object label. Only
+/// values subsequently enter the escaped internal string representation.
+fn decode_jsonb_text(node_type: u8, payload: &[u8]) -> Result<String> {
+    match node_type {
+        JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
+            String::from_utf8(payload.to_vec()).map_err(|error| {
+                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
+            })
+        }
+        JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
+            // TEXTJ carries RFC-8259 escapes; TEXT5 adds JSON5 escapes.
+            let text = std::str::from_utf8(payload).map_err(|error| {
+                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
+            })?;
+            decode_jsonb_escaped_text(text, node_type == JSONB_TEXT5_TYPE)
+        }
+        _ => Err(FrankenError::function_error(
+            "invalid JSONB object key payload",
+        )),
+    }
 }
 
 /// Resolve TEXTJ/TEXT5 escape sequences to the raw string. TEXT5 adds the
@@ -2804,7 +2855,7 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
                 // for a finite one (bd-1nxwh).
                 SqliteValue::Float(raw.parse::<f64>().unwrap_or(0.0))
             } else {
-                SqliteValue::Text(text.as_str().into())
+                SqliteValue::Text(json_string_text(text).into())
             }
         }
         Value::Array(_) | Value::Object(_) => {
@@ -2859,7 +2910,7 @@ fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
         SqliteValue::Null => Ok(Value::Null),
         SqliteValue::Integer(i) => Ok(Value::Number(Number::from(*i))),
         SqliteValue::Float(f) => float_to_json(*f),
-        SqliteValue::Text(text) => Ok(Value::String(text.to_string())),
+        SqliteValue::Text(text) => Ok(json_string_value(text.to_string())),
         // Stock `jsonAppendSqlValue`: a JSONB blob is embedded as the JSON
         // value it encodes; any other blob is an error.
         SqliteValue::Blob(bytes) => decode_jsonb_root(bytes)
@@ -5110,6 +5161,252 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
 mod tests {
     use super::*;
     use fsqlite_func::FunctionRegistry;
+
+    #[test]
+    fn reserved_number_tag_strings_remain_text() {
+        for repetitions in 1..=3 {
+            for suffix in ["", "9e999", "1.50", "null,0", "\"\\\n", "ordinary"] {
+                let raw = format!("{}{suffix}", NUMBER_TEXT_TAG.repeat(repetitions));
+                let quoted = serde_json::to_string(&raw).unwrap();
+                let value = SqliteValue::Text(raw.clone().into());
+                assert_eq!(json_type(&quoted, None).unwrap(), Some("text"));
+                assert_eq!(json_extract(&quoted, &["$"]).unwrap(), value);
+                assert_eq!(
+                    json_arrow(&quoted, "$").unwrap(),
+                    SqliteValue::Text(quoted.clone().into())
+                );
+                assert_eq!(json(&quoted).unwrap(), quoted);
+                assert_eq!(json_set(&quoted, &[]).unwrap(), quoted);
+                assert_eq!(json_pretty(&quoted, None).unwrap(), quoted);
+                assert_eq!(json_quote(&value).unwrap(), quoted);
+                let array = json_array(&[value]).unwrap();
+                assert_eq!(array, format!("[{quoted}]"));
+                assert_eq!(json_array_length(&array, None).unwrap(), Some(1));
+                let mut round_trip = quoted.clone();
+                for _ in 0..3 {
+                    round_trip = json_from_jsonb(&jsonb(&round_trip).unwrap()).unwrap();
+                    assert_eq!(round_trip, quoted);
+                }
+            }
+        }
+        for raw in [
+            "\0ordinary".to_owned(),
+            "\0\0fsqlite".to_owned(),
+            format!("ordinary{NUMBER_TEXT_TAG}9e999"),
+        ] {
+            let quoted = serde_json::to_string(&raw).unwrap();
+            assert_eq!(
+                json_extract(&quoted, &["$"]).unwrap(),
+                SqliteValue::Text(raw.into())
+            );
+            assert_eq!(json_set(&quoted, &[]).unwrap(), quoted);
+        }
+    }
+
+    #[test]
+    fn reserved_number_tag_values_and_keys_coexist_with_real_numbers() {
+        let raw = format!("{NUMBER_TEXT_TAG}null,0");
+        let quoted = serde_json::to_string(&raw).unwrap();
+        let doc = format!(r#"{{{quoted}:{quoted},"n":1e+02,"big":9e999}}"#);
+        let path = format!("$.{quoted}");
+        assert_eq!(json_type(&doc, Some(&path)).unwrap(), Some("text"));
+        assert_eq!(
+            json_extract(&doc, &[&path]).unwrap(),
+            SqliteValue::Text(raw.clone().into())
+        );
+        assert_eq!(json_type(&doc, Some("$.n")).unwrap(), Some("real"));
+        assert_eq!(
+            json_extract(&doc, &["$.n"]).unwrap(),
+            SqliteValue::Float(100.0)
+        );
+        assert_eq!(
+            json_extract(&doc, &["$.big"]).unwrap(),
+            SqliteValue::Float(f64::INFINITY)
+        );
+        assert_eq!(json_set(&doc, &[]).unwrap(), doc);
+        assert_eq!(json_from_jsonb(&jsonb(&doc).unwrap()).unwrap(), doc);
+        for rows in [
+            json_each(&doc, None).unwrap(),
+            json_each_blob(&jsonb(&doc).unwrap(), None).unwrap(),
+        ] {
+            assert_eq!(rows[0].key, SqliteValue::Text(raw.clone().into()));
+            assert_eq!(rows[0].value, SqliteValue::Text(raw.clone().into()));
+            assert_eq!(rows[0].atom, SqliteValue::Text(raw.clone().into()));
+            assert_eq!(rows[0].type_name, "text");
+        }
+        let tree = json_tree(&doc, None).unwrap();
+        assert_eq!(tree[1].value, SqliteValue::Text(raw.into()));
+        assert_eq!(tree[1].type_name, "text");
+
+        // A different escape spelling still denotes the same original text.
+        let escaped = r#""\u0000\u0000\u0066sqlite\u0001nonfinite\u00009e999""#;
+        assert_eq!(
+            json_extract(escaped, &["$"]).unwrap(),
+            SqliteValue::Text(format!("{NUMBER_TEXT_TAG}9e999").into())
+        );
+    }
+
+    #[test]
+    fn reserved_number_tag_json5_strings_are_not_numeric_carriers() {
+        let raw = format!("{NUMBER_TEXT_TAG}9e999");
+        let quoted = serde_json::to_string(&raw).unwrap();
+        let input = format!("{{s:{quoted},n:Infinity,}}");
+        assert_eq!(json_type(&input, Some("$.s")).unwrap(), Some("text"));
+        assert_eq!(
+            json_extract(&input, &["$.s"]).unwrap(),
+            SqliteValue::Text(raw.clone().into())
+        );
+        assert_eq!(
+            json_set(&input, &[]).unwrap(),
+            format!(r#"{{"s":{quoted},"n":9e999}}"#)
+        );
+        let single_quoted = r"'\0\0fsqlite\x01nonfinite\x009e999'";
+        assert_eq!(
+            json_extract(single_quoted, &["$"]).unwrap(),
+            SqliteValue::Text(raw.into())
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb(single_quoted).unwrap()).unwrap(),
+            quoted
+        );
+    }
+
+    #[test]
+    fn reserved_number_tag_constructors_mutations_and_subtypes_preserve_strings() {
+        let raw = format!("{NUMBER_TEXT_TAG}null,0");
+        let quoted = serde_json::to_string(&raw).unwrap();
+        let value = SqliteValue::Text(raw.clone().into());
+        let array = format!("[{quoted}]");
+        let object = format!("{{{quoted}:{quoted}}}");
+        assert_eq!(json_group_array(&[value.clone()]).unwrap(), array);
+        assert_eq!(
+            json_from_jsonb(&jsonb_group_array(&[value.clone()]).unwrap()).unwrap(),
+            array
+        );
+        assert_eq!(
+            json_object(&[value.clone(), value.clone()]).unwrap(),
+            object
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb_object(&[value.clone(), value.clone()]).unwrap()).unwrap(),
+            object
+        );
+        assert_eq!(
+            json_group_object(&[(value.clone(), value.clone())]).unwrap(),
+            object
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb_group_object(&[(value.clone(), value.clone())]).unwrap())
+                .unwrap(),
+            object
+        );
+        for edited in [
+            json_set("[]", &[("$[#]", value.clone())]).unwrap(),
+            json_insert("[]", &[("$[#]", value.clone())]).unwrap(),
+            json_replace("[0]", &[("$[0]", value.clone())]).unwrap(),
+            json_array_insert("[]", &[("$[0]", value.clone())]).unwrap(),
+        ] {
+            assert_eq!(edited, array);
+        }
+        let subtyped = [SqliteValue::Text(quoted.into())];
+        assert_eq!(
+            json_array_with_subtypes(&subtyped, &[JSON_SUBTYPE]).unwrap(),
+            array
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb_array_with_subtypes(&subtyped, &[JSON_SUBTYPE]).unwrap())
+                .unwrap(),
+            array
+        );
+        for window in JsonGroupWindowFunc::ALL {
+            let mut state = window.initial_state();
+            let args = if window.object {
+                vec![value.clone(), value.clone()]
+            } else {
+                vec![value.clone()]
+            };
+            window.step(&mut state, &args).unwrap();
+            let output = window.value(&state).unwrap();
+            let output = match output {
+                SqliteValue::Text(text) => text.to_string(),
+                SqliteValue::Blob(bytes) => json_from_jsonb(&bytes).unwrap(),
+                other => panic!("unexpected JSON window value: {other:?}"),
+            };
+            assert_eq!(&output, if window.object { &object } else { &array });
+            window.inverse(&mut state, &args).unwrap();
+            window.step(&mut state, &args).unwrap();
+            assert_eq!(state.len(), 1);
+        }
+    }
+
+    #[test]
+    fn reserved_number_tag_jsonb_text_nodes_and_labels_remain_text() {
+        let raw = format!("{NUMBER_TEXT_TAG}{NUMBER_TEXT_TAG}9e999");
+        let quoted = serde_json::to_string(&raw).unwrap();
+        for node_type in [
+            JSONB_TEXT_TYPE,
+            JSONB_TEXT_JSON_TYPE,
+            JSONB_TEXT5_TYPE,
+            JSONB_TEXTRAW_TYPE,
+        ] {
+            let payload = if matches!(node_type, JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE) {
+                &quoted.as_bytes()[1..quoted.len() - 1]
+            } else {
+                raw.as_bytes()
+            };
+            let mut node = Vec::new();
+            append_jsonb_node(node_type, payload, &mut node).unwrap();
+            assert_eq!(json_from_jsonb(&node).unwrap(), quoted);
+            let row = json_each_blob(&node, None).unwrap().remove(0);
+            assert_eq!(row.type_name, "text");
+            assert_eq!(row.value, SqliteValue::Text(raw.clone().into()));
+            let mut object_payload = node.clone();
+            object_payload.extend_from_slice(&node);
+            let mut object = Vec::new();
+            append_jsonb_node(JSONB_OBJECT_TYPE, &object_payload, &mut object).unwrap();
+            assert_eq!(
+                json_from_jsonb(&object).unwrap(),
+                format!("{{{quoted}:{quoted}}}")
+            );
+            let row = json_each_blob(&object, None).unwrap().remove(0);
+            assert_eq!(row.key, SqliteValue::Text(raw.clone().into()));
+            assert_eq!(row.value, SqliteValue::Text(raw.clone().into()));
+        }
+        for (node_type, payload) in [
+            (JSONB_FLOAT_TYPE, b"1e2".as_slice()),
+            (JSONB_FLOAT_TYPE, b"9e999".as_slice()),
+            (JSONB_INT_TYPE, b"1".as_slice()),
+            (JSONB_NULL_TYPE, b"".as_slice()),
+            (JSONB_ARRAY_TYPE, b"".as_slice()),
+        ] {
+            let mut payload_nodes = Vec::new();
+            append_jsonb_node(node_type, payload, &mut payload_nodes).unwrap();
+            append_jsonb_node(JSONB_NULL_TYPE, &[], &mut payload_nodes).unwrap();
+            let mut object = Vec::new();
+            append_jsonb_node(JSONB_OBJECT_TYPE, &payload_nodes, &mut object).unwrap();
+            assert!(json_from_jsonb(&object).is_err());
+            assert_eq!(
+                json_valid_blob(&object, Some(JSON_VALID_JSONB_STRICT_FLAG)),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_number_tag_rewrite_preserves_malformed_string_errors() {
+        let prefix = r#""\u0000\u0000fsqlite\u0001nonfinite\u0000"#;
+        for input in [
+            format!("{prefix}9e999"),
+            format!("{prefix}\\q\""),
+            format!("{prefix}\\\""),
+            format!("{prefix}9e999\" trailing"),
+            format!("{prefix}null,0\":1"),
+            format!("[{prefix}9e999\",]"),
+        ] {
+            assert!(parse_json_text(&input).is_err(), "{input}");
+            assert_eq!(json_valid(&input, None), 0, "{input}");
+        }
+    }
 
     #[test]
     fn number_text_rewrite_rejects_malformed_numbers() {

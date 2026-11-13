@@ -44,6 +44,99 @@ fn rval(conn: &rusqlite::Connection, sql: &str) -> String {
     .unwrap_or_else(|e| panic!("rusqlite `{sql}`: {e:?}"))
 }
 
+/// User strings can contain the private numeric-text tag, including its NUL
+/// bytes. They must remain strings across parsers, constructors, SQL subtype
+/// boundaries, table functions, aggregates, windows, and JSONB round trips.
+#[test]
+fn reserved_number_tag_strings_match_stock() {
+    const TAG_JSON: &str = r"\u0000\u0000fsqlite\u0001nonfinite\u0000";
+    const TAG_SQL: &str = "char(0,0) || 'fsqlite' || char(1) || 'nonfinite' || char(0)";
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = format!(
+            "CREATE TABLE tagged(id INTEGER PRIMARY KEY, k TEXT, v TEXT); \
+             INSERT INTO tagged VALUES \
+             (1, ({TAG_SQL}) || 'key', ({TAG_SQL}) || 'null,0'), \
+             (2, ({TAG_SQL}) || ({TAG_SQL}) || 'key', ({TAG_SQL}) || '9e999'), \
+             (3, 'normal', 'middle' || ({TAG_SQL}) || '1.50'), \
+             (4, ({TAG_SQL}) || 'empty', ({TAG_SQL}));"
+        );
+        f.execute_batch(&setup).await.unwrap();
+        r.execute_batch(&setup).unwrap();
+
+        let mut queries = Vec::new();
+        for repetitions in 1..=3 {
+            for suffix in ["", "9e999", "null,0", "1.50"] {
+                let doc = format!("\"{}{suffix}\"", TAG_JSON.repeat(repetitions));
+                queries.extend([
+                    format!("SELECT json_type('{doc}')"),
+                    format!("SELECT hex(json_extract('{doc}', '$'))"),
+                    format!("SELECT json_array(json_extract('{doc}', '$'))"),
+                    format!("SELECT '{doc}' -> '$'"),
+                    format!("SELECT hex('{doc}' ->> '$')"),
+                    format!("SELECT json_set('{doc}', '$', json('{doc}'))"),
+                    format!("SELECT json(jsonb('{doc}'))"),
+                    format!("SELECT json_type(CAST('{doc}' AS BLOB))"),
+                    format!("SELECT json_extract('{{s:{doc},n:Infinity}}', '$.s', '$.n')"),
+                ]);
+            }
+        }
+        for id in 1..=4 {
+            for expression in [
+                "json_array(v)",
+                "json_object(k, v)",
+                "json_array_length(json_array(v))",
+                "json_type(json_array(v), '$[0]')",
+                "hex(json_extract(json_array(v), '$[0]'))",
+                "json_set('{}', '$.value', v)",
+                "json_insert('[]', '$[#]', v)",
+                "json_replace('[0]', '$[0]', v)",
+                "json(jsonb_array(v))",
+                "json(jsonb_object(k, v))",
+                "json(jsonb(json(jsonb(json_array(v)))))",
+                "json_pretty(json_array(v))",
+            ] {
+                queries.push(format!("SELECT {expression} FROM tagged WHERE id = {id}"));
+            }
+        }
+        queries.extend([
+            "SELECT json_group_array(v) FROM tagged".to_owned(),
+            "SELECT json_group_object(k, v) FROM tagged".to_owned(),
+            "SELECT json(jsonb_group_array(v)) FROM tagged".to_owned(),
+            "SELECT json(jsonb_group_object(k, v)) FROM tagged".to_owned(),
+            "SELECT json_group_array(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING \
+             AND CURRENT ROW) FROM tagged ORDER BY id LIMIT 1 OFFSET 2"
+                .to_owned(),
+            "SELECT json(jsonb_group_object(k, v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING \
+             AND CURRENT ROW)) FROM tagged ORDER BY id LIMIT 1 OFFSET 2"
+                .to_owned(),
+            "SELECT type FROM json_each((SELECT json_array(v) FROM tagged WHERE id=1))"
+                .to_owned(),
+            "SELECT hex(value) FROM json_each((SELECT jsonb_array(v) FROM tagged WHERE id=1))"
+                .to_owned(),
+            "SELECT hex(atom) FROM json_tree((SELECT json_array(v) FROM tagged WHERE id=1)) \
+             WHERE type='text'"
+                .to_owned(),
+        ]);
+        let mut diffs = Vec::new();
+        for sql in queries {
+            let fv = fval(&f, &sql).await;
+            let rv = rval(&r, &sql);
+            if fv != rv {
+                diffs.push(format!("  `{sql}`\n     frank= {fv}\n     stock= {rv}"));
+            }
+        }
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "{} reserved-tag string divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
+
 #[test]
 fn json_scalar_functions_match_rusqlite_oracle() {
     asupersync::test_utils::run_test(|| async {
