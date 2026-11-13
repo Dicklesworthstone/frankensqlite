@@ -7145,6 +7145,68 @@ fn rows_into_value_vectors(rows: Vec<Row>) -> Vec<Vec<SqliteValue>> {
 
 type QueryRowHandler<'a> = dyn FnMut(&Row) -> Result<()> + 'a;
 
+/// Result rows that all have `width` values, stored back to back in one
+/// buffer: row `i` is `values[i * width..(i + 1) * width]` (bd-w4pr1.12).
+/// A million scanned rows are one growing allocation instead of a million
+/// small ones, so dropping the buffer gives the memory back to the system
+/// (glibc keeps a million freed small blocks inside the process).
+struct FlatRows {
+    values: Vec<SqliteValue>,
+    width: usize,
+    len: usize,
+}
+
+impl FlatRows {
+    const fn new(width: usize) -> Self {
+        Self {
+            values: Vec::new(),
+            width,
+            len: 0,
+        }
+    }
+
+    /// Appends one row; a row of any other width is refused, since it would
+    /// shift every later row off its stride.
+    fn push_row(&mut self, row: SmallVec<[SqliteValue; 16]>) -> Result<()> {
+        if row.len() != self.width {
+            return Err(FrankenError::Internal(format!(
+                "flat result row has {} values, expected {}",
+                row.len(),
+                self.width
+            )));
+        }
+        self.values.extend(row);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn row(&self, index: usize) -> &[SqliteValue] {
+        &self.values[index * self.width..(index + 1) * self.width]
+    }
+}
+
+/// Where a table program sends its result rows when it does not collect them.
+enum TableRowSink<'a, 'h> {
+    /// Each row is handed to the handler as a [`Row`].
+    Handler(&'a mut QueryRowHandler<'h>),
+    /// Each row's values are appended to one flat buffer.
+    Flat(&'a mut FlatRows),
+}
+
+impl TableRowSink<'_, '_> {
+    fn accept(&mut self, values: SmallVec<[SqliteValue; 16]>) -> Result<()> {
+        match self {
+            Self::Handler(handler) => {
+                let row = Row {
+                    values: values.into_vec(),
+                };
+                (*handler)(&row)
+            }
+            Self::Flat(rows) => rows.push_row(values),
+        }
+    }
+}
+
 /// bd-wjrs0: a captured connection-local `TEMP` table — its schema plus all
 /// `(rowid, row)` pairs — used to carry `TEMP` tables (and their data) across a
 /// destructive memdb reload that rebuilds state from the main `sqlite_master`.
@@ -10093,7 +10155,7 @@ impl PreparedStatement<'_> {
                 self.conn.db_text_encoding.get(),
                 collect_rows,
                 max_collected_result_rows,
-                row_handler,
+                row_handler.map(TableRowSink::Handler),
                 invalidate_memdb_count_shortcuts_on_success,
                 true,
                 cached,
@@ -10152,7 +10214,7 @@ impl PreparedStatement<'_> {
                 self.conn.db_text_encoding.get(),
                 collect_rows,
                 max_collected_result_rows,
-                row_handler,
+                row_handler.map(TableRowSink::Handler),
                 invalidate_memdb_count_shortcuts_on_success,
                 true,
                 cached,
@@ -25692,6 +25754,7 @@ impl Connection {
                 cx,
                 false,
                 Vec::new(),
+                None,
             )
             .await?;
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -42466,6 +42529,7 @@ impl Connection {
                             cx,
                             false,
                             Vec::new(),
+                            None,
                         )
                     })
                     .await?;
@@ -43021,6 +43085,7 @@ impl Connection {
                         cx,
                         true,
                         Vec::new(),
+                        None,
                     )
                 })
                 .await?;
@@ -43516,6 +43581,7 @@ impl Connection {
                         cx,
                         true,
                         Vec::new(),
+                        None,
                     )
                 })
                 .await?;
@@ -51682,6 +51748,7 @@ impl Connection {
                 cx,
                 false,
                 Vec::new(),
+                None,
             )
             .await?;
         Ok(Some(rows))
@@ -88245,6 +88312,7 @@ impl Connection {
                         cx,
                         false,
                         Vec::new(),
+                        None,
                     )
                     .await?;
                 rows
@@ -97492,12 +97560,30 @@ impl Connection {
                     .collect()
             };
         }
-        let raw_rows = if has_join {
-            self.execute_join_select(&raw_select, params).await?
+        // bd-w4pr1.12: the single-table scan streams its rows into one flat
+        // buffer, `col_map.len()` values a row: one allocation instead of one
+        // per row. The join materializer's rows keep their vectors, moved
+        // rather than copied.
+        let mut row_values = if has_join {
+            let rows = self.execute_join_select(&raw_select, params).await?;
+            WindowScanRows::Rows(rows.into_iter().map(|r| r.values).collect())
         } else {
             let program = self.compile_table_select(&raw_select).await?;
-            let (rows, _, _) = self.execute_table_program(&program, params, false).await?;
-            rows
+            let mut rows = FlatRows::new(col_map.len());
+            let execution_cx = self.op_cx()?;
+            self.sync_change_tracking_context();
+            self.execute_table_program_with_cx(
+                &program,
+                params,
+                false,
+                TableExecutionRuntimeRequirements::read_path(),
+                &execution_cx,
+                false,
+                Vec::new(),
+                Some(TableRowSink::Flat(&mut rows)),
+            )
+            .await?;
+            WindowScanRows::Flat(rows)
         };
 
         // The window computation below has no suspension points. Its shared
@@ -97512,9 +97598,6 @@ impl Connection {
             let custom_aggregate_keys = Arc::clone(&self.custom_aggregate_keys.borrow());
             SyncFunctionRegistryGuard::push(registry, custom_aggregate_keys)
         });
-        // The scanned rows are not read again: move their values instead of
-        // holding a second copy of every row (bd-w4pr1.12).
-        let row_values: Vec<Vec<SqliteValue>> = raw_rows.into_iter().map(|r| r.values).collect();
 
         // Compute window function values.  Each window function may have its
         // own PARTITION BY / ORDER BY, so we build per-function partitions and
@@ -97617,7 +97700,7 @@ impl Connection {
             let mut order_values = order_column
                 .is_none()
                 .then(|| Vec::with_capacity(total_rows.saturating_mul(ob.len())));
-            for row in &row_values {
+            for row in row_values.iter_rows() {
                 if let Some(args_by_row) = application_args.as_mut() {
                     args_by_row.push(build_window_args(
                         &win_args[wi],
@@ -98229,17 +98312,32 @@ impl Connection {
         let output_order = first_window_row_order.ok_or_else(|| {
             FrankenError::Internal("window SELECT has no first-window row order".to_owned())
         })?;
+        // bd-w4pr1.12: the output reads the scanned rows only for a plain or
+        // wrapped result column and for an ORDER BY term that is not a result
+        // column. When nothing reads them they are dropped before the output
+        // rows are built; a flat scan buffer is one allocation, so its memory
+        // goes back to the system and the two row sets are never resident at
+        // once.
+        let output_reads_rows = col_kinds
+            .iter()
+            .any(|kind| !matches!(kind, ColKind::Window(_)))
+            || select
+                .order_by
+                .iter()
+                .any(|term| resolve_order_term_idx(&term.expr, &expanded_columns).is_none());
+        if !output_reads_rows {
+            row_values = WindowScanRows::Rows(Vec::new());
+        }
         // window_results is indexed by [func][raw_row_index].
         let mut result = Vec::with_capacity(total_rows);
         let mut result_raw_indices: Vec<usize> = Vec::with_capacity(total_rows);
         for ri in output_order {
-            let row = &row_values[ri];
             let mut values = Vec::with_capacity(col_kinds.len());
             for kind in &col_kinds {
                 match kind {
                     ColKind::Plain(expr) => {
                         values.push(
-                            self.eval_row_expr_allowing_subqueries(expr, row, &col_map)
+                            self.eval_row_expr_allowing_subqueries(expr, &row_values[ri], &col_map)
                                 .await?,
                         );
                     }
@@ -98260,8 +98358,12 @@ impl Connection {
                             .collect();
                         let substituted = substitute_placeholder_values(outer_expr, &win_vals);
                         values.push(
-                            self.eval_row_expr_allowing_subqueries(&substituted, row, &col_map)
-                                .await?,
+                            self.eval_row_expr_allowing_subqueries(
+                                &substituted,
+                                &row_values[ri],
+                                &col_map,
+                            )
+                            .await?,
                         );
                     }
                 }
@@ -102639,8 +102741,12 @@ impl Connection {
         };
 
         let mut result: Vec<Row> = Vec::with_capacity(combined.len());
+        // bd-w4pr1.12: every projected row has the previous row's width, so
+        // reserve exactly that. Growing from empty reserved four values for a
+        // one-column row: 192 bytes a row, held for the whole result.
+        let mut projected_row_width = 0;
         for row in &combined {
-            let mut values = Vec::new();
+            let mut values = Vec::with_capacity(projected_row_width);
             for col in columns {
                 match col {
                     ResultColumn::Star => {
@@ -102712,6 +102818,7 @@ impl Connection {
                     );
                 }
             }
+            projected_row_width = values.len();
             result.push(Row { values });
         }
 
@@ -104954,13 +105061,15 @@ impl Connection {
             &execution_cx,
             false,
             Vec::new(),
+            None,
         )
         .await
     }
 
     /// Execute a VDBE program with the in-memory database attached using a
     /// caller-supplied operation context so autocommit begin/dispatch/commit
-    /// can stay on one execution lineage.
+    /// can stay on one execution lineage. With a `row_sink` the result rows
+    /// go to the sink and the returned row vector is empty.
     async fn execute_table_program_with_cx(
         &self,
         program: &VdbeProgram,
@@ -104970,6 +105079,7 @@ impl Connection {
         execution_cx: &Cx,
         invalidate_memdb_count_shortcuts_on_success: bool,
         vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
+        row_sink: Option<TableRowSink<'_, '_>>,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         self.last_replace_victims.borrow_mut().clear();
         let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
@@ -105032,9 +105142,9 @@ impl Connection {
             self.version_store_for_program(program),
             page_size,
             self.db_text_encoding.get(),
-            true,
+            row_sink.is_none(),
             None,
-            None,
+            row_sink,
             allow_retained_cursor_reuse,
             false,
             cached_engine,
@@ -137741,13 +137851,56 @@ impl WindowKeyRows for Vec<Vec<SqliteValue>> {
     }
 }
 
+/// The scanned rows of a table window SELECT (bd-w4pr1.12). The single-table
+/// scan streams its rows into one flat buffer ([`FlatRows`]); rows from the
+/// join materializer keep their own vectors.
+enum WindowScanRows {
+    Flat(FlatRows),
+    Rows(Vec<Vec<SqliteValue>>),
+}
+
+impl WindowScanRows {
+    fn len(&self) -> usize {
+        match self {
+            Self::Flat(rows) => rows.len,
+            Self::Rows(rows) => rows.len(),
+        }
+    }
+
+    fn row(&self, index: usize) -> &[SqliteValue] {
+        match self {
+            Self::Flat(rows) => rows.row(index),
+            Self::Rows(rows) => &rows[index],
+        }
+    }
+
+    fn every_row_has_column(&self, column: usize) -> bool {
+        match self {
+            Self::Flat(rows) => column < rows.width,
+            Self::Rows(rows) => rows.iter().all(|row| column < row.len()),
+        }
+    }
+
+    fn iter_rows(&self) -> impl Iterator<Item = &[SqliteValue]> {
+        (0..self.len()).map(|index| self.row(index))
+    }
+}
+
+impl std::ops::Index<usize> for WindowScanRows {
+    type Output = [SqliteValue];
+
+    fn index(&self, index: usize) -> &[SqliteValue] {
+        self.row(index)
+    }
+}
+
 /// The PARTITION BY or ORDER BY values of a table window SELECT's rows
 /// (bd-w4pr1.12). A key that is one plain column is read from the scanned
 /// rows in place ([`window_key_row_column`]); any other key is evaluated once
 /// per row into one flat vector, `width` values a row, with no vector per row.
 enum WindowKeys<'r> {
     RowColumn {
-        rows: &'r [Vec<SqliteValue>],
+        rows: &'r WindowScanRows,
         column: usize,
     },
     Flat {
@@ -137759,7 +137912,7 @@ enum WindowKeys<'r> {
 impl WindowKeyRows for WindowKeys<'_> {
     fn key(&self, row: usize) -> &[SqliteValue] {
         match self {
-            Self::RowColumn { rows, column } => std::slice::from_ref(&rows[row][*column]),
+            Self::RowColumn { rows, column } => std::slice::from_ref(&rows.row(row)[*column]),
             Self::Flat { values, width } => &values[row * width..(row + 1) * width],
         }
     }
@@ -137773,7 +137926,7 @@ impl WindowKeyRows for WindowKeys<'_> {
 /// value nor which expression error a statement reports.
 fn window_key_row_column(
     expr: &Expr,
-    rows: &[Vec<SqliteValue>],
+    rows: &WindowScanRows,
     col_map: &[(String, String, bool)],
 ) -> Option<usize> {
     let Expr::Column(col_ref, _) = expr else {
@@ -137783,9 +137936,7 @@ fn window_key_row_column(
         return None;
     }
     let column = resolve_join_expr_column_index(col_ref, col_map).ok()?;
-    rows.iter()
-        .all(|row| column < row.len())
-        .then_some(column)
+    rows.every_row_has_column(column).then_some(column)
 }
 
 fn build_peer_groups_collated_snapshot(
@@ -143963,7 +144114,7 @@ async fn execute_table_program_with_db(
     text_encoding: TextEncoding,
     collect_rows: bool,
     max_collected_result_rows: Option<usize>,
-    mut row_handler: Option<&mut QueryRowHandler<'_>>,
+    mut row_sink: Option<TableRowSink<'_, '_>>,
     allow_retained_cursor_reuse: bool,
     prepared_engine_reuse_profile: bool,
     cached_engine: Option<VdbeEngine>,
@@ -144117,38 +144268,18 @@ async fn execute_table_program_with_db(
     let trace_export_enabled =
         tracing::enabled!(target: "fsqlite.trace_export", tracing::Level::DEBUG);
     let export_started = trace_export_enabled.then(fsqlite_types::sync_primitives::Instant::now);
-    let exec_res = if let Some(params) = params {
-        if let Some(handler) = row_handler.as_mut() {
-            engine.set_collect_result_rows(false);
-            let mut bridge = |values: SmallVec<[SqliteValue; 16]>| {
-                let row = Row {
-                    values: values.into_vec(),
-                };
-                (*handler)(&row)
-            };
-            engine
-                .execute_with_borrowed_bindings_and_row_handler(program, Some(params), &mut bridge)
-                .await
-        } else {
-            engine
-                .execute_with_borrowed_bindings(program, Some(params))
-                .await
-        }
+    let exec_res = if let Some(sink) = row_sink.as_mut() {
+        engine.set_collect_result_rows(false);
+        let mut bridge = |values: SmallVec<[SqliteValue; 16]>| sink.accept(values);
+        engine
+            .execute_with_borrowed_bindings_and_row_handler(program, params, &mut bridge)
+            .await
+    } else if let Some(params) = params {
+        engine
+            .execute_with_borrowed_bindings(program, Some(params))
+            .await
     } else {
-        if let Some(handler) = row_handler.as_mut() {
-            engine.set_collect_result_rows(false);
-            let mut bridge = |values: SmallVec<[SqliteValue; 16]>| {
-                let row = Row {
-                    values: values.into_vec(),
-                };
-                (*handler)(&row)
-            };
-            engine
-                .execute_with_borrowed_bindings_and_row_handler(program, None, &mut bridge)
-                .await
-        } else {
-            engine.execute(program).await
-        }
+        engine.execute(program).await
     };
     if let Some(export_started) = export_started {
         let export_latency_us =
@@ -166618,7 +166749,8 @@ mod tests {
         substitute_outer_refs_in_select, take_trigger_stack_probe, trigger_depth_limit,
         trigger_program_depth_limit, validate_named_window_definitions,
         visit_select_qualified_names, wal_file_present_with_vfs, wal_path_for_db_path,
-        WindowKeyRows, WindowKeys, window_key_row_column, window_scan_named_columns,
+        FlatRows, TableRowSink, WindowKeyRows, WindowKeys, WindowScanRows, window_key_row_column,
+        window_scan_named_columns,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{
@@ -208110,11 +208242,130 @@ mod tests {
     }
 
     #[test]
+    fn test_flat_rows_store_rows_by_stride_and_refuse_other_widths() {
+        // bd-w4pr1.12: the single-table window scan's sink.
+        let mut flat = FlatRows::new(2);
+        let long_text = "a text value longer than the inline limit";
+        let mut sink = TableRowSink::Flat(&mut flat);
+        sink.accept(smallvec::smallvec![
+            SqliteValue::Integer(1),
+            SqliteValue::Text(long_text.into())
+        ])
+        .unwrap();
+        sink.accept(smallvec::smallvec![
+            SqliteValue::Null,
+            SqliteValue::Blob(vec![1_u8, 2].into())
+        ])
+        .unwrap();
+        // A row of another width would shift every later row off its stride.
+        assert!(sink.accept(smallvec::smallvec![SqliteValue::Integer(9)]).is_err());
+        assert!(
+            sink.accept(smallvec::smallvec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(3)
+            ])
+            .is_err()
+        );
+        assert_eq!(flat.len, 2);
+        assert_eq!(flat.values.len(), 4);
+        let rows = WindowScanRows::Flat(flat);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            &rows[0],
+            &[SqliteValue::Integer(1), SqliteValue::Text(long_text.into())]
+        );
+        assert_eq!(
+            &rows[1],
+            &[SqliteValue::Null, SqliteValue::Blob(vec![1_u8, 2].into())]
+        );
+        assert_eq!(rows.iter_rows().count(), 2);
+
+        // Zero-width rows still count, and read back empty.
+        let mut empty_rows = FlatRows::new(0);
+        empty_rows.push_row(smallvec::SmallVec::new()).unwrap();
+        empty_rows.push_row(smallvec::SmallVec::new()).unwrap();
+        let empty_rows = WindowScanRows::Flat(empty_rows);
+        assert_eq!(empty_rows.len(), 2);
+        assert!(empty_rows[1].is_empty());
+    }
+
+    #[test]
+    fn test_table_window_select_scans_into_flat_rows_and_drops_them_only_when_unread() {
+        // bd-w4pr1.12: every value class passes through the flat scan buffer;
+        // an output of window columns alone drops it before assembly, while a
+        // plain column, a wrapped window expression and an ORDER BY term that
+        // is not a result column still read it.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE fw (a INTEGER, b TEXT, c BLOB, d REAL);")
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO fw VALUES \
+                 (1, 'z', x'01', 0.5), \
+                 (2, 'a text value longer than the inline limit', NULL, 1.5), \
+                 (3, NULL, x'0203', NULL);",
+            )
+            .await
+            .unwrap();
+            let int = SqliteValue::Integer;
+            let text = |s: &str| SqliteValue::Text(s.into());
+            let blob = |b: &[u8]| SqliteValue::Blob(b.to_vec().into());
+            let long_text = "a text value longer than the inline limit";
+            let cases: [(&str, Vec<Vec<SqliteValue>>); 6] = [
+                (
+                    "SELECT a, b, c, d, row_number() OVER (ORDER BY a DESC) FROM fw;",
+                    vec![
+                        vec![int(3), SqliteValue::Null, blob(&[2, 3]), SqliteValue::Null, int(1)],
+                        vec![
+                            int(2),
+                            text(long_text),
+                            SqliteValue::Null,
+                            SqliteValue::Float(1.5),
+                            int(2),
+                        ],
+                        vec![int(1), text("z"), blob(&[1]), SqliteValue::Float(0.5), int(3)],
+                    ],
+                ),
+                (
+                    "SELECT row_number() OVER (ORDER BY a) FROM fw ORDER BY b;",
+                    vec![vec![int(3)], vec![int(2)], vec![int(1)]],
+                ),
+                (
+                    "SELECT row_number() OVER (ORDER BY a) AS rn FROM fw ORDER BY rn DESC;",
+                    vec![vec![int(3)], vec![int(2)], vec![int(1)]],
+                ),
+                (
+                    "SELECT row_number() OVER (ORDER BY a) + a FROM fw ORDER BY 1;",
+                    vec![vec![int(2)], vec![int(4)], vec![int(6)]],
+                ),
+                (
+                    "SELECT length(b), count(*) OVER (PARTITION BY c IS NULL) FROM fw ORDER BY 1;",
+                    vec![
+                        vec![SqliteValue::Null, int(2)],
+                        vec![int(1), int(2)],
+                        vec![int(41), int(1)],
+                    ],
+                ),
+                (
+                    "SELECT sum(rn) FROM (SELECT row_number() OVER (PARTITION BY a % 2 ORDER BY d) rn FROM fw);",
+                    vec![vec![int(4)]],
+                ),
+            ];
+            for (sql, expected) in cases {
+                let rows = conn.query(sql).await.unwrap();
+                assert_eq!(rows.iter().map(row_values).collect::<Vec<_>>(), expected, "{sql}");
+            }
+        });
+    }
+
+    #[test]
     fn test_window_keys_read_columns_in_place_and_flat_keys_by_stride() {
-        let rows = vec![
+        let rows = WindowScanRows::Rows(vec![
             vec![SqliteValue::Integer(10), SqliteValue::Text("a".into())],
             vec![SqliteValue::Integer(20), SqliteValue::Text("b".into())],
-        ];
+        ]);
         let col_map = vec![
             ("kw".to_owned(), "n".to_owned(), false),
             ("kw".to_owned(), "s".to_owned(), false),
@@ -208127,8 +208378,23 @@ mod tests {
             None
         );
         assert_eq!(window_key_row_column(&column("zz"), &rows, &col_map), None);
-        let short = vec![vec![SqliteValue::Integer(1)]];
+        let short = WindowScanRows::Rows(vec![vec![SqliteValue::Integer(1)]]);
         assert_eq!(window_key_row_column(&column("s"), &short, &col_map), None);
+        // Flat rows all have the scan's width.
+        let mut flat_rows = FlatRows::new(2);
+        flat_rows
+            .push_row(smallvec::smallvec![
+                SqliteValue::Integer(30),
+                SqliteValue::Text("c".into())
+            ])
+            .unwrap();
+        let flat_rows = WindowScanRows::Flat(flat_rows);
+        assert_eq!(window_key_row_column(&column("s"), &flat_rows, &col_map), Some(1));
+        let flat_in_place = WindowKeys::RowColumn {
+            rows: &flat_rows,
+            column: 1,
+        };
+        assert_eq!(flat_in_place.key(0), &[SqliteValue::Text("c".into())]);
 
         let in_place = WindowKeys::RowColumn {
             rows: &rows,

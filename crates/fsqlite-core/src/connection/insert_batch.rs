@@ -1104,6 +1104,7 @@ impl Connection {
                 cx,
                 true,
                 vtab_instances,
+                None,
             )
             .await?;
 
