@@ -80691,6 +80691,172 @@ impl Connection {
         schema
     }
 
+    /// bd-6jf9o: a sufficient check, much cheaper than the full ownership
+    /// walk, that no page is orphaned and nothing is owned twice.
+    ///
+    /// `Ok(true)` means every in-range page except the lock-byte page has
+    /// exactly one owner: a b-tree node, the durable freelist, or a page a
+    /// transaction has reserved. `Ok(false)` means not proven, and the caller
+    /// runs [`Self::validate_page_ownership_in_txn`].
+    ///
+    /// A b-tree leaf can own only overflow pages, so this reads interior pages
+    /// and the freelist only. A child pointer marks its child owned without
+    /// reading it. Each tree is walked level by level, and a level whose first
+    /// page is a leaf is taken to be all leaves (every leaf of a valid b-tree
+    /// is at the same depth). The pages marked here are a subset of those the
+    /// full walk marks, so "every page is owned" here implies the same there.
+    /// Anything unexpected answers `false`: an overflow page or an orphan (an
+    /// unowned page), a duplicate or out-of-range reference, a level that
+    /// mixes leaves and interior pages, an unparsable page.
+    async fn page_ownership_closes_without_leaf_reads(
+        cx: &Cx,
+        txn: &TransactionKind,
+        header: &DatabaseHeader,
+        total_pages: u32,
+        schema: &[TableSchema],
+    ) -> Result<bool> {
+        fn claim(owned: &mut [bool], page: u32, lock_byte: u32) -> bool {
+            let Some(slot) = usize::try_from(page)
+                .ok()
+                .filter(|_| page != 0 && page != lock_byte)
+                .and_then(|index| owned.get_mut(index))
+            else {
+                return false;
+            };
+            !std::mem::replace(slot, true)
+        }
+
+        let page_size = header.page_size;
+        let reserved = header.reserved_per_page;
+        let lock_byte = fsqlite_pager::lock_byte_page(page_size);
+        let Some(slots) = usize::try_from(total_pages)
+            .ok()
+            .and_then(|pages| pages.checked_add(1))
+        else {
+            return Ok(false);
+        };
+        let mut owned = vec![false; slots];
+
+        for page in txn.live_reserved_pages() {
+            if !claim(&mut owned, page.get(), lock_byte) {
+                return Ok(false);
+            }
+        }
+
+        // The durable freelist: every trunk and leaf page once, and the count
+        // the header declares.
+        let usable = usize::try_from(page_size.usable(reserved)).unwrap_or(usize::MAX);
+        let mut freelist_pages = 0_u32;
+        let mut next_trunk = PageNumber::new(header.freelist_trunk);
+        while let Some(trunk_page) = next_trunk {
+            if !claim(&mut owned, trunk_page.get(), lock_byte) {
+                return Ok(false);
+            }
+            let page = txn.get_page(cx, trunk_page).await?;
+            let bytes = page.as_ref();
+            let Ok(trunk) =
+                fsqlite_btree::freelist::FreelistTrunk::parse(&bytes[..usable.min(bytes.len())])
+            else {
+                return Ok(false);
+            };
+            freelist_pages = freelist_pages.saturating_add(1);
+            for leaf in &trunk.leaf_pages {
+                if !claim(&mut owned, leaf.get(), lock_byte) {
+                    return Ok(false);
+                }
+                freelist_pages = freelist_pages.saturating_add(1);
+            }
+            next_trunk = trunk.next_trunk;
+        }
+        if freelist_pages != header.freelist_count {
+            return Ok(false);
+        }
+
+        // The same roots the full walk visits.
+        let mut roots = vec![PageNumber::ONE];
+        for table in schema {
+            if table.root_page <= 0 {
+                continue;
+            }
+            let Ok(root) = page_number_from_schema_root(table.root_page, &table.name, "table")
+            else {
+                return Ok(false);
+            };
+            if root != PageNumber::ONE {
+                roots.push(root);
+            }
+            for index in &table.indexes {
+                let Ok(root) = page_number_from_schema_root(index.root_page, &index.name, "index")
+                else {
+                    return Ok(false);
+                };
+                roots.push(root);
+            }
+        }
+
+        for root in roots {
+            if !claim(&mut owned, root.get(), lock_byte) {
+                return Ok(false);
+            }
+            let mut level = vec![root];
+            loop {
+                let mut children = Vec::new();
+                for (position, &page_no) in level.iter().enumerate() {
+                    let page = txn.get_page(cx, page_no).await?;
+                    let bytes = page.as_ref();
+                    let Ok(page_header) = BTreePageHeader::parse(
+                        bytes,
+                        page_size,
+                        reserved,
+                        page_no == PageNumber::ONE,
+                    ) else {
+                        return Ok(false);
+                    };
+                    if page_header.page_type.is_leaf() {
+                        // A first leaf ends the tree; a later one means the
+                        // level mixes depths.
+                        if position == 0 {
+                            break;
+                        }
+                        return Ok(false);
+                    }
+                    let Ok(cell_pointers) =
+                        page_header.parse_cell_pointers(bytes, page_size, reserved)
+                    else {
+                        return Ok(false);
+                    };
+                    for cell_pointer in cell_pointers {
+                        let Ok(child) = fsqlite_btree::CellRef::read_interior_left_child(
+                            bytes,
+                            usize::from(cell_pointer),
+                        ) else {
+                            return Ok(false);
+                        };
+                        if !claim(&mut owned, child.get(), lock_byte) {
+                            return Ok(false);
+                        }
+                        children.push(child);
+                    }
+                    let Some(right_child) = page_header.right_most_child else {
+                        return Ok(false);
+                    };
+                    if !claim(&mut owned, right_child.get(), lock_byte) {
+                        return Ok(false);
+                    }
+                    children.push(right_child);
+                }
+                if children.is_empty() {
+                    break;
+                }
+                level = children;
+            }
+        }
+
+        Ok((1..=total_pages).all(|page| {
+            page == lock_byte || usize::try_from(page).is_ok_and(|index| owned[index])
+        }))
+    }
+
     /// bd-6jf9o: the page-ownership part of `integrity_check` on its own.
     ///
     /// Every b-tree page the schema reaches, every overflow chain and every
@@ -80704,7 +80870,9 @@ impl Connection {
     /// Those are the classes the first-open migration pass can repair
     /// (`repair_freelist`, `repair_orphaned_pages`), so the pass uses this to
     /// detect them. It runs inside the full check with the same inputs, so a
-    /// database this rejects also fails `integrity_check`.
+    /// database this rejects also fails `integrity_check`. When interior
+    /// pages and the freelist already account for every page
+    /// ([`Self::page_ownership_closes_without_leaf_reads`]), no leaf is read.
     pub(crate) async fn validate_page_ownership(&self) -> Result<()> {
         let active_state = self.integrity_active_state();
         self.with_integrity_txn(async |cx, txn| {
@@ -80715,6 +80883,22 @@ impl Connection {
                 return Ok(());
             };
             let schema = self.integrity_schema();
+            // Most databases have no overflow page, and then the interior
+            // pages and the freelist alone account for every page. Inside a
+            // write transaction the on-disk freelist is stale (GH#113), so
+            // only the full walk with the live freelist applies there.
+            if active_state.is_none()
+                && Self::page_ownership_closes_without_leaf_reads(
+                    cx,
+                    txn,
+                    &header,
+                    total_pages,
+                    &schema,
+                )
+                .await?
+            {
+                return Ok(());
+            }
             let mut owner_map = HashMap::new();
             let mut owners = PageOwnershipSink::Resident(&mut owner_map);
             Self::validate_page_ownership_in_txn(
@@ -226382,6 +226566,110 @@ mod root_page_allocation_tests {
             } else {
                 panic!("rootpage should be Integer, got {:?}", values[3]);
             }
+        });
+    }
+}
+
+// =========================================================================
+// First-open ownership fast path (bd-6jf9o)
+// =========================================================================
+#[cfg(test)]
+mod first_open_ownership_tests {
+    use super::*;
+
+    /// A stock-written database: a 20,000-row table with an index (several
+    /// interior levels), plus a dropped table so the freelist is not empty.
+    fn stock_database(directory: &std::path::Path, name: &str, extra_sql: &str) -> String {
+        let path = directory.join(name);
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        stock
+            .execute_batch(&format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+                 WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 20000)
+                 INSERT INTO t(a) SELECT 'row-' || i FROM c;
+                 CREATE INDEX t_a ON t(a);
+                 CREATE TABLE gone(x BLOB);
+                 WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 200)
+                 INSERT INTO gone SELECT zeroblob(500) FROM c;
+                 DROP TABLE gone;
+                 {extra_sql}"
+            ))
+            .unwrap();
+        drop(stock);
+        path.to_str().unwrap().to_owned()
+    }
+
+    /// The fast path's verdict, and the full ownership check's, on `path`.
+    async fn verdicts(path: &str) -> (bool, Result<()>) {
+        let conn = Connection::open_schema_only(path).await.unwrap();
+        let fast = conn
+            .with_integrity_txn(async |cx, txn| {
+                let (header, total_pages) = conn
+                    .integrity_page_extent_in_txn(cx, txn, None)
+                    .await?
+                    .expect("page 1 is initialized");
+                let schema = conn.integrity_schema();
+                Connection::page_ownership_closes_without_leaf_reads(
+                    cx,
+                    txn,
+                    &header,
+                    total_pages,
+                    &schema,
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        let full = conn.validate_page_ownership().await;
+        conn.close().await.unwrap();
+        (fast, full)
+    }
+
+    #[test]
+    fn interior_pages_and_freelist_account_for_a_database_without_overflow() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = stock_database(directory.path(), "plain.db", "");
+            let freelist = u32::from_be_bytes(
+                fsqlite_vfs::host_fs::read(std::path::Path::new(&path)).unwrap()[36..40]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert!(freelist > 0, "the fixture must have free pages");
+            let (fast, full) = verdicts(&path).await;
+            assert!(fast, "no overflow page: the interior walk must close");
+            full.unwrap();
+        });
+    }
+
+    #[test]
+    fn overflow_pages_send_the_check_to_the_full_walk() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = stock_database(
+                directory.path(),
+                "overflow.db",
+                "CREATE TABLE b(x BLOB); INSERT INTO b VALUES (zeroblob(20000));",
+            );
+            let (fast, full) = verdicts(&path).await;
+            assert!(!fast, "overflow pages are owned only through leaf cells");
+            full.unwrap();
+        });
+    }
+
+    #[test]
+    fn orphaned_pages_are_never_proven_clean() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = stock_database(directory.path(), "orphan.db", "");
+            // Forget the freelist: its pages become orphans ("never used").
+            let mut image = fsqlite_vfs::host_fs::read(std::path::Path::new(&path)).unwrap();
+            image[32..40].fill(0);
+            fsqlite_vfs::host_fs::write(std::path::Path::new(&path), &image).unwrap();
+            let (fast, full) = verdicts(&path).await;
+            assert!(!fast, "an orphaned page must not be proven owned");
+            let error = full.unwrap_err();
+            assert!(error.to_string().contains("never used"), "{error}");
         });
     }
 }

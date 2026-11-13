@@ -69,7 +69,7 @@ written; this is where their scope is recorded.
 | Page I/O submission | 2026-08-12 bd-q8501.1, 2026-07-27 bd-trfah | multi-SQE io_uring 1.93x slower; a pool hop is ~14 us per single page | registered or borrowed buffers with batch completion; inline I/O only under the dedicated-thread marker |
 | S3-FIFO membership map | 2026-09-09 | rejected on a noisy matrix | after isolating statistics reconstruction from runtime eviction |
 | Path-identity probes | 2026-07-23 bd-smxhz | deliberate defence; one statx each since bd-qduu1 | probing less often needs the owner's sign-off |
-| Skipping the first-open migration pass | 2026-10-05 bd-6jf9o; cheaper pass landed 2026-11-13 | skip reverted; the pass now walks page ownership only | a signal that proves no fsqlite build wrote the file; or a cheaper cell walk (2026-11-13 entry) |
+| Skipping the first-open migration pass | 2026-10-05 bd-6jf9o; cheaper pass landed 2026-11-13 | skip reverted; the pass now walks page ownership only, and reads no leaf when interior pages close the accounting | a signal that proves no fsqlite build wrote the file; for files with overflow pages, an overflow-only leaf scan (2026-11-13 entry) |
 | SIMD record encoding, `target-cpu` | 2026-07-10 (two) | blocked under `forbid(unsafe_code)`; comparison is fair at baseline ISA | a scope decision; a serialize-heavy row with profiled self time |
 | Dormant vectorized kernels | 2026-11-10 | not wireable as they stand | a new executor built stock-oracle first (bd-w4pr1.13.11) |
 | Join helpers in the fallback executor | 2026-05-04, 2026-09-06 bd-0pkki, 2026-10-28 GH#530 | widening rejected; four semantic exclusions recorded | replace the shape in bytecode (bd-w4pr1.13.6, .13.9) with those exclusions as oracle cases |
@@ -3676,11 +3676,22 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   86.3M (1.0M cells, 86 each), `get_page` 57.7M (6,931 pages, 8.3K each),
   `parse_cell_pointers` 22.8M (a Vec per page), and the walk's own loop
   about 36M.
-- Retry condition for a cheaper walk: an overflow-only scan of table-leaf
-  cells, which decodes only the payload-size varint and reads the overflow
-  pointer only when the payload exceeds max-local. It must stay inside the
-  migration detector, because integrity_check needs the full cell check.
-  Measure against this entry's 212.6M.
+- Follow-up, the same day: no leaf reads when the walk closes without them
+  (`page_ownership_closes_without_leaf_reads`). A leaf can own only overflow
+  pages, so interior pages and the freelist account for every page of a
+  database that has none. The check walks each tree level by level and
+  marks child pointers owned without reading the children. If any page is
+  unowned or anything is unexpected, the full walk runs. Release-perf
+  CLIs, main ce4774231 (ELF 6d771a0ddba4...) vs the fast path
+  (cd1a4090aed3...), stock live, two copies each: bare 212.8M / 40-46 ms
+  -> 5.0M / 6.8 ms; indexed 385M / 70 ms -> 5.5M / 7.6 ms; with 1,000 8 KB
+  blobs (overflow pages) 238.0M -> 238.0-238.3M (falls back). Second open
+  3.0-3.3M; stock 1.1M.
+- Retry condition, for files with overflow pages only: an overflow-only
+  scan of leaf cells in the fallback. Decode the payload-size varint, and
+  read the overflow pointer only when the payload exceeds max-local. It
+  must stay inside the migration detector, because integrity_check needs
+  the full cell check. Measure against the overflow row's 238M.
 
 ## 2026-11-10 - ASSESSED, not a shortcut: wiring the dormant vectorized kernels (`fsqlite-vdbe/src/vectorized*.rs`) into live queries
 
