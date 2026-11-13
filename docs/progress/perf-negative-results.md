@@ -87,6 +87,69 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: a leaf delete or same-size row rewrite changes the transaction's staged image of the leaf in place, with no page copy and no page write (bd-w4pr1.13.20, lever F)
+
+- Target: every row a DELETE removes from a table leaf and every same-size row an UPDATE rewrites,
+  once the transaction holds the leaf staged (all but the first change of each leaf); measured on
+  the scorecard's `delete_14pct_300k` and `update_10pct_300k`. Touched:
+  `crates/fsqlite-btree/src/cursor.rs` (`try_rewrite_top_page_in_staged_image`,
+  `remove_table_cell_from_leaf_deferred`, `overwrite_current_table_payload_same_size_no_overflow`,
+  the `PageWriter::try_mutate_staged_page_data` contract).
+- Evidence before (callgrind, main's DML code): per deleted row `write_page_data` 1.4k (the
+  engine's tier-0 write, whose MVCC prepare and stage-marker are no-ops for a page that already has
+  a staged write, then the pager replacing the staged entry) and `PageData::as_bytes_mut` 0.69k
+  (`Arc::make_mut` copying the 4 KiB leaf the stack entry and the staged image share); per updated
+  row `write_page_data` 1.57k and a 4 KiB copy in the `PageData` clone handed to the pager (0.72k).
+- Change: when the transaction's unpublished staged image of the top leaf is the image the stack
+  entry shows (equal `PageData::image_token`: clones keep it, every mutable access replaces it),
+  the entry drops its reference and the change is made in the staged image through the existing
+  `try_mutate_staged_page_data`, so `as_bytes_mut` finds one holder and copies nothing; the entry
+  then shares the result. Otherwise (first change of a leaf, a published or different staged image,
+  a store without staged images) the entry is restored and the old copy-and-write path runs. The
+  two compact delete branches now plan the cell move and run every refusal check before any byte
+  changes; the bytes written are the same operations. The pager's `journal_page_before_mutation`
+  still takes a savepoint before-image before the closure runs, and that image keeps its bytes
+  through copy-on-write.
+- Not the ground of 2026-05-05 "B-tree staged-page mutation for same-size UPDATE overwrite" or
+  2026-05-07 "Same-size UPDATE staged-page overwrite probe": both patched the stack image with a
+  copy-on-write and the staged page as well (a second copy). This meets their retry condition
+  (patch the authoritative staged page and the cursor stack without a copy-on-write) and that of
+  the 2026-11-12 NOT STARTED entry below (a cursor writes a page it holds without a copy).
+- Result, stock sqlite3 3.46.1 live in the same run (`sc_mut_probe`, minimum user instructions of
+  7, io_uring refused, load 1.8; binaries 26752db0... base main dd677073b, 0b1d45c5... base + this
+  production diff): `delete_14pct_300k` stock 120.7M, base 697.0M (5.78x), lever 622.8M (5.16x):
+  -74.2M, CPU 136.4 -> 125.3 ms (stock 38.1); `update_10pct_300k` stock 273.4M, base 1,042.2M
+  (3.81x), lever 990.7M (3.62x): -51.5M, CPU 172.3 -> 167.8 ms (stock 49.6). With io_uring allowed
+  (as the scorecard runs): 710.7M -> 638.1M and 1,055.2M -> 1,005.3M; wall 232.2 -> 225.1 ms and
+  272.5 -> 249.8 ms (stock 89.6 and 100.3). Prediction -55M to -80M and -40M to -60M met; kill
+  (DELETE under 35M or UPDATE under 25M removed) not met. Point DELETE / UPDATE by rowid on the
+  same table (first-touch path only): 63.9M and 340.6M on both binaries. Callgrind of the lever:
+  `write_page_data` calls in the DELETE 43,177 -> 2,570, the delete 5.3k -> 3.6k per row. Answers
+  equal stock's; stock's `PRAGMA integrity_check` passes on every file the lever wrote.
+- Tests: `test_delete_and_rewrite_change_the_staged_leaf_in_place_only_when_it_is_the_cursors`
+  (fsqlite-btree: seek deletes, leaf-draining runs, scan deletes and same-size rewrites over 1,200
+  rows end with every page byte-equal to the copy-and-write path; more than 300 changes made in
+  place; a store whose offered staged image is not the cursor's is never changed in place, which a
+  rewrite without the image check fails); `one_pass_delete_oracle::scan_dml_on_staged_leaves_rolls_back_like_stock`
+  (SAVEPOINT / ROLLBACK TO, then an UPDATE and a DELETE failing partway on staged leaves, against
+  rusqlite on `:memory:` and a file, state compared after every statement).
+- Gate, on dd677073b plus the change: clippy -D warnings on fsqlite-btree `--all-targets` and on
+  the fsqlite-core oracle target clean (again on the rebased tree); fsqlite-btree lib 553 pass;
+  fsqlite-vdbe lib 1,241 pass and 2 fail (bd-bhalc pair, red on main); fsqlite-core lib 4,165 pass
+  and 2 fail (t6741 pair, red on main); 48 fsqlite-core DML / trigger / FK / RETURNING / savepoint /
+  concurrency targets in six batches (the oracle target rerun after its new test stopped comparing
+  stock's carried-over change count on BEGIN / SAVEPOINT / COMMIT), 223 tests pass and 1 fails:
+  `gh516_returning_conformance::correlated_returning_unbound_parameters_do_not_alias_frozen_assignments`
+  (unbound RETURNING parameter refused with "bind parameter index out of range: 1"; the base CLI
+  of dd677073b refuses the same statement the same way, so red on main); 8 fsqlite DML oracle
+  targets, 26 pass.
+- Landed as e7996afb0 (rebased onto f20fd6c54; the measured binaries hold the same production
+  diff, the test fixes above came after the build).
+- Retry condition: none. Still on this bead: the scan's per-row Rowid / Remainder register writes
+  and the WHERE's per-row `Integer` / `IsNull` (about 870 instructions per scanned row against
+  stock's whole statement at 400), and the rest of the leaf delete (about 3.6k per row: the
+  descending check over the whole pointer array, the pointer-vector copy, the stack entry rebuild).
+
 ## 2026-11-13 - WIN: a WAL handle answers the frame headers it wrote or validated from memory, so the publication scan and the appended-tail index stop re-reading a peer's new frames (bd-w4pr1.8, M6)
 
 - Target: the scorecard's multiproc row (8 processes x 500 autocommit INSERTs into one WAL
