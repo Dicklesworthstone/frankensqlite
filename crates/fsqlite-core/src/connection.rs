@@ -17217,19 +17217,6 @@ impl Connection {
             .await
     }
 
-    async fn current_database_header(&self, cx: &Cx) -> Result<DatabaseHeader> {
-        let mut txn = self
-            .begin_pager_txn_with_busy_timeout(&self.pager, cx, TransactionMode::ReadOnly, false)
-            .await?;
-        let header = {
-            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
-            parse_database_header_checked(page1.as_ref())
-        }?;
-        let rollback_result = txn.rollback(cx).await;
-        rollback_result?;
-        Ok(header)
-    }
-
     fn bounded_ast_unsupported_refusal(
         object_name: &str,
         unsupported: BoundedAstUnsupported,
@@ -27054,6 +27041,7 @@ impl Connection {
         // savepoint ALTER-DROP-COLUMN tests.
         self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, true)
             .await
+            .map(|_| ())
     }
 
     async fn refresh_memdb_from_cached_write_txn_if_stale(&self, cx: &Cx) -> Result<()> {
@@ -27105,7 +27093,7 @@ impl Connection {
             self.cached_write_txn_memdb_row_mirror_exact
                 .set(hydrate_rows);
         }
-        reload_result
+        reload_result.map(|_| ())
     }
 
     async fn begin_pager_txn_with_busy_timeout(
@@ -64289,6 +64277,7 @@ impl Connection {
                                 false,
                             )
                             .await
+                            .map(|_| ())
                         };
                         // Park the retained transaction for the next autocommit.
                         let cookie = *self.schema_cookie.borrow();
@@ -70956,21 +70945,20 @@ impl Connection {
             Some(self.pager.capture_vacuum_source_image(&cx).await?)
         };
         let restore_hydrated_rows = self.memdb_rows_loaded.get();
-        // A receipt that reads through the WAL carries the main file's
-        // header, which the WAL may supersede; take the logical one. A
-        // read-only receipt never records a WAL horizon, so its empty horizon
-        // says nothing about the WAL another process holds.
-        let source_header = match source_receipt.as_ref() {
-            Some(receipt) if receipt.wal_horizon().is_none() && !self.pager.is_readonly() => {
-                receipt.header().clone()
-            }
-            _ => self.current_database_header(&cx).await?,
-        };
         #[cfg(test)]
         if let Some(hook) = self.vacuum_after_source_receipt_once.borrow_mut().take() {
             hook();
         }
-        self.reload_memdb_from_pager_with_mode(&cx, true).await?;
+        // The main-file receipt may predate WAL commits. Even a separate
+        // logical-header read can straddle a commit before row hydration.
+        // Rebuild with the header read by the very transaction that supplied
+        // the schema and rows (bd-ro-vacuum-receipt-binds-wal-tz4pk).
+        let source_header = self
+            .reload_memdb_from_pager_with_mode(&cx, true)
+            .await?
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "VACUUM source has no initialized database header".to_owned(),
+            })?;
         if let Some(source_receipt) = source_receipt.as_ref() {
             let hydrated_source_receipt = if vacuum_into {
                 self.pager.capture_vacuum_into_source_image(&cx).await?
@@ -104149,6 +104137,7 @@ impl Connection {
         }
         self.reload_memdb_from_pager_with_mode(cx, self.should_eagerly_hydrate_memdb_rows())
             .await
+            .map(|_| ())
     }
 
     /// Begin the reload read transaction, repairing an uninitialized (zeroed)
@@ -104247,7 +104236,11 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
+    async fn reload_memdb_from_pager_with_mode(
+        &self,
+        cx: &Cx,
+        hydrate_rows: bool,
+    ) -> Result<Option<DatabaseHeader>> {
         let hydrate_rows = self.pager_reload_may_hydrate_rows(hydrate_rows);
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         // ORCHESTRATOR RULING (2) (bd-dk9ra, release endgame): the reload
@@ -104279,16 +104272,17 @@ impl Connection {
                 "reload bind is newer than the live WAL (external reset); proceeding on the transaction's observed sequence (bd-dk9ra ruling 2)"
             );
         }
-        self.reload_memdb_from_txn_with_mode(
-            cx,
-            &mut txn,
-            txn_visible_commit_seq,
-            hydrate_rows,
-            true,
-        )
-        .await?;
+        let header = self
+            .reload_memdb_from_txn_with_mode(
+                cx,
+                &mut txn,
+                txn_visible_commit_seq,
+                hydrate_rows,
+                true,
+            )
+            .await?;
         self.publish_committed_schema_cookie(self.schema_cookie());
-        Ok(())
+        Ok(header)
     }
 
     async fn reload_memdb_rows_from_txn_preserving_schema(
@@ -105462,7 +105456,7 @@ impl Connection {
         bound_visible_commit_seq: CommitSeq,
         hydrate_rows: bool,
         allow_dirty_schema_only_fast_path: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DatabaseHeader>>> + 'a>> {
         Box::pin(async move {
             // The reload can rewrite mirror rows without advancing the
             // (visible_commit_seq, undo_version) key the prepared indexed-equality
@@ -105492,7 +105486,7 @@ impl Connection {
                 // itself; the local `force_full_schema_reload` copy read above
                 // stays valid for the full-rebuild path below.
                 self.publish_empty_database_reset(cx, bound_visible_commit_seq, hydrate_rows);
-                return Ok(());
+                return Ok(None);
             }
 
             let header = parse_database_header_checked(page1_bytes)?;
@@ -105659,7 +105653,7 @@ impl Connection {
                 self.memdb_rows_loaded.set(false);
                 self.memdb_requires_active_txn_reload.set(false);
                 self.memdb_storage_count_shortcuts_safe.set(false);
-                return Ok(());
+                return Ok(Some(header));
             }
             let user_version = if page1_bytes.len() >= 64 {
                 u32::from_be_bytes([
@@ -106818,7 +106812,7 @@ impl Connection {
                 );
             }
 
-            Ok(())
+            Ok(Some(header))
         })
     }
 }
@@ -194560,6 +194554,104 @@ mod tests {
                 .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(integrity, "ok");
+        });
+    }
+
+    #[test]
+    fn test_readonly_vacuum_header_and_rows_share_a_wal_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap().keep();
+            let source_path = dir.join("wal-generation-source.db");
+            let target_path = dir.join("wal-generation-copy.db");
+            let (commit_tx, commit_rx) = std::sync::mpsc::channel();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+            let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+            let writer_path = source_path.clone();
+            let writer = std::thread::spawn(move || {
+                asupersync::test_utils::run_test(|| async {
+                    let conn = Connection::open(writer_path.to_string_lossy().as_ref())
+                        .await
+                        .unwrap();
+                    for sql in [
+                        "PRAGMA journal_mode=WAL",
+                        "PRAGMA wal_autocheckpoint=0",
+                        "CREATE TABLE kept(id INTEGER PRIMARY KEY, value TEXT, payload BLOB)",
+                        "INSERT INTO kept VALUES(1, 'generation-one', X'0001')",
+                        "PRAGMA user_version=231",
+                        "PRAGMA application_id=4242",
+                        "PRAGMA wal_checkpoint(TRUNCATE)",
+                    ] {
+                        conn.execute(sql).await.unwrap();
+                    }
+                    ready_tx.send(()).unwrap();
+                    commit_rx.recv().unwrap();
+                    for sql in [
+                        "BEGIN",
+                        "UPDATE kept SET value='generation-two', payload=X'0102' WHERE id=1",
+                        "PRAGMA user_version=232",
+                        "PRAGMA application_id=4343",
+                        "COMMIT",
+                    ] {
+                        conn.execute(sql).await.unwrap();
+                    }
+                    committed_tx.send(()).unwrap();
+                    // Keep the writer open: closing it can checkpoint the WAL
+                    // and turn this into a main-file receipt refusal instead.
+                    let _ = finish_rx.recv();
+                    conn.close().await.unwrap();
+                });
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+            let reader = Connection::open_schema_only(source_path.to_string_lossy().as_ref())
+                .await
+                .unwrap();
+            assert!(reader.pager.is_readonly());
+            reader.execute("PRAGMA query_only=OFF").await.unwrap();
+            *reader.vacuum_after_source_receipt_once.borrow_mut() = Some(Box::new(move || {
+                commit_tx.send(()).unwrap();
+                committed_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+            }));
+            reader
+                .execute_with_params(
+                    "VACUUM INTO ?1",
+                    &[SqliteValue::Text(
+                        target_path.to_string_lossy().into_owned().into(),
+                    )],
+                )
+                .await
+                .expect("a WAL-only peer commit must still permit a consistent read-only copy");
+            reader.close().await.unwrap();
+
+            // The oracle opens the separate private output inode, never the
+            // live source whose writer and WAL snapshot are still held.
+            let copied = rusqlite::Connection::open_with_flags(
+                &target_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let tuple: (i64, i64, String, String) = copied
+                .query_row(
+                    "SELECT (SELECT user_version FROM pragma_user_version), \
+                     (SELECT application_id FROM pragma_application_id), value, hex(payload) \
+                     FROM kept WHERE id=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(tuple, (232, 4343, "generation-two".into(), "0102".into()));
+            let integrity: String = copied
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            drop(copied);
+            finish_tx.send(()).unwrap();
+            writer.join().unwrap();
         });
     }
 

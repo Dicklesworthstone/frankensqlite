@@ -151,7 +151,7 @@ fsqlite-ext-json = { version = "0.4.13", path = "crates/fsqlite-ext-json" }
 fsqlite-ext-session = { version = "0.4.13", path = "crates/fsqlite-ext-session" }
 fsqlite-ext-icu = { version = "0.4.13", path = "crates/fsqlite-ext-icu" }
 fsqlite-ext-misc = { version = "0.4.13", path = "crates/fsqlite-ext-misc" }
-fsqlite-core = { version = "0.4.13", path = "crates/fsqlite-core", default-features = false }
+fsqlite-core = { version = "0.4.14", path = "crates/fsqlite-core", default-features = false }
 fsqlite = { version = "0.4.13", path = "crates/fsqlite", default-features = false }
 fsqlite-cli = { version = "0.4.13", path = "crates/fsqlite-cli" }
 fsqlite-harness = { version = "0.4.13", path = "crates/fsqlite-harness" }
