@@ -5130,7 +5130,11 @@ mod tests {
             ] {
                 assert!(parse_json_text(&input).is_err(), "{input}");
                 assert_eq!(json_valid(&input, None), 0, "{input}");
-                assert_eq!(json_valid(&input, Some(JSON_VALID_JSON5_FLAG)), 0, "{input}");
+                assert_eq!(
+                    json_valid(&input, Some(JSON_VALID_JSON5_FLAG)),
+                    0,
+                    "{input}"
+                );
                 assert!(json(&input).is_err(), "{input}");
                 assert!(json_extract(&input, &["$"]).is_err(), "{input}");
                 assert!(jsonb(&input).is_err(), "{input}");
@@ -5155,7 +5159,11 @@ mod tests {
             ] {
                 assert!(parse_json_text(&input).is_err(), "{input}");
                 assert_eq!(json_valid(&input, None), 0, "{input}");
-                assert_eq!(json_valid(&input, Some(JSON_VALID_JSON5_FLAG)), 0, "{input}");
+                assert_eq!(
+                    json_valid(&input, Some(JSON_VALID_JSON5_FLAG)),
+                    0,
+                    "{input}"
+                );
                 assert!(json(&input).is_err(), "{input}");
                 assert!(json_extract(&input, &["$"]).is_err(), "{input}");
                 assert!(jsonb(&input).is_err(), "{input}");
@@ -5176,10 +5184,9 @@ mod tests {
 
     #[test]
     fn overflowing_json5_numbers_still_use_the_json5_fallback() {
-        for (input, expected, negative) in [
-            ("9.e999", "9.0e999", false),
-            ("-9.e999", "-9.0e999", true),
-        ] {
+        for (input, expected, negative) in
+            [("9.e999", "9.0e999", false), ("-9.e999", "-9.0e999", true)]
+        {
             assert!(parse_json_text(input).is_err(), "{input}");
             assert_eq!(json_valid(input, None), 0, "{input}");
             assert_eq!(json_valid(input, Some(JSON_VALID_JSON5_FLAG)), 1, "{input}");
@@ -5402,9 +5409,7 @@ mod tests {
         // This is both JSONB integer 456 and UTF-8 JSON text "3456".
         // JSONB decoding must retain precedence over the text fallback.
         assert_eq!(
-            JsonExtractFunc
-                .invoke(&[blob("3456"), text("$")])
-                .unwrap(),
+            JsonExtractFunc.invoke(&[blob("3456"), text("$")]).unwrap(),
             SqliteValue::Integer(456)
         );
     }
