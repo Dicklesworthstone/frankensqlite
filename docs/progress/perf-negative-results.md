@@ -87,6 +87,35 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: a same-size row rewrite parses its cell without the cell-slot cache (bd-w4pr1.13.20, lever Q)
+
+- Target: every UPDATE row rewritten in place at the same size (the scorecard's
+  `update_10pct_300k`: 30,000 rows). Touched: `crates/fsqlite-btree/src/cursor.rs`
+  (`overwrite_current_table_payload_same_size_no_overflow`).
+- Evidence before (callgrind of the UPDATE): the rewrite spent 24.3M of its 55.4M in `parse_cell_at`,
+  810 instructions per row: a cell-slot cache lookup, the parse, and the insert of a slot keyed by the
+  leaf's current image token, which the rewrite then replaces, so the slot is never read. The leaf
+  delete's uncached parse of the same cell costs 117 (lever C).
+- Change: the cell is parsed with `parse_cell_at_uncached`; the same `CellRef` and the same rowid,
+  overflow, payload-size and bounds checks.
+- Result, stock sqlite3 3.46.1 live in the same run (`sc_mut_probe`, minimum user instructions of
+  7, io_uring refused, load 3.4; binaries 325cb001... base main 7229098de, 4d2bdf32... base + this
+  production diff): `update_10pct_300k` stock 273.4M, base 868.2M (3.18x), lever 847.9M (3.10x):
+  -20.3M, CPU 147.6 -> 135.1 ms (stock 48.1); `delete_14pct_300k` 506.0M -> 505.9M. With io_uring
+  allowed: 879.4M -> 862.4M. Prediction (UPDATE -15M to -22M, DELETE within 2M) met; kill (UPDATE
+  under 10M, DELETE over 3M) not met. Answers equal stock's; stock's `PRAGMA integrity_check` passes on
+  every file the lever wrote.
+- Test: `test_table_overwrite_current_payload_same_size_no_overflow_preserves_cell_shape` gains a
+  refused overwrite for a rowid the cursor is not on (an overwrite that skipped the cell check would
+  write it) and a second rewrite on the image the first one wrote.
+- Gate, on 7229098de plus the change: clippy -D warnings on fsqlite-btree `--all-targets` clean (and
+  on the rebased tree, with the INSERT lane's c3cbcfe9f, where fsqlite-btree lib passes 555);
+  fsqlite-btree lib 554 pass; fsqlite-vdbe lib 1,244 pass and 2 fail (bd-bhalc pair, red on main);
+  fsqlite-core lib 4,170 pass and 2 fail (t6741 pair, red on main); 48 fsqlite-core DML / trigger /
+  FK / RETURNING / savepoint / concurrency targets 223 pass and 1 fails (bd-vy10l, red on main); 8
+  fsqlite DML targets 26 pass. Landed as c99b830e7 (rebased onto e1ec6bcc5).
+- Retry condition: none.
+
 ## 2026-11-13 - WIN: an INSERT builds the boxed future of a dispatch check only when the check can act on it (bd-w4pr1.13.35, lever 1)
 
 - Target: per-statement work outside the VDBE program on every INSERT through the dispatcher (text,
