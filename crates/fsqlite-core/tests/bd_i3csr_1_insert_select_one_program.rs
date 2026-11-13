@@ -33,11 +33,13 @@
 //! column keeps its sign (stock stores it as the integer 0, bd-kqb76); after a
 //! statement that inserted explicit rowids above the table's largest fails,
 //! the next automatic rowid of a file-backed table (or in an explicit
-//! transaction) skips past them (bd-u65rh); an INTEGER PRIMARY KEY ON CONFLICT
-//! REPLACE and a UNIQUE ON CONFLICT IGNORE violated by the same row replace
-//! instead of skipping it (bd-jlbrk); and a statement that fails to prepare
-//! resets `changes()` (bd-ulgsj), so the error scenario compares the other two
-//! counters.
+//! transaction) skips past them (bd-u65rh); and a statement that fails to
+//! prepare resets `changes()` (bd-ulgsj), so the error scenario compares the
+//! other two counters.
+//!
+//! bd-jlbrk: the dedicated conflict-order oracles below cover a rowid REPLACE
+//! competing with secondary UNIQUE constraints, including conflicts on the
+//! same row, statement overrides, and partial/expression index maintenance.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -993,5 +995,260 @@ fn prepared_series_insert_matches_stock() {
             diffs.len(),
             diffs.join("\n")
         );
+    });
+}
+
+async fn assert_rowid_replace_statement_matches_stock(
+    f: &Connection,
+    r: &rusqlite::Connection,
+    sql: &str,
+    prepared: bool,
+    context: &str,
+) {
+    let statement = if prepared {
+        Some(f.prepare(sql).await.map_err(|error| error.to_string()))
+    } else {
+        None
+    };
+    // Reuse the same prepared statement across both executions. The second
+    // execution also exercises flag resets after a conflict or source loop.
+    for execution in 0..2 {
+        let frank = match &statement {
+            Some(Ok(statement)) => statement
+                .query()
+                .await
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            Some(Err(error)) => Err(error.clone()),
+            None => fq(f, sql).await,
+        };
+        assert_eq!(
+            frank,
+            rq(r, sql),
+            "{context}, execution={execution}: statement outcome for {sql}"
+        );
+        for check in [
+            "SELECT id, a, payload FROM t ORDER BY id",
+            "SELECT id, payload FROM t INDEXED BY t_payload ORDER BY payload, id",
+            "SELECT * FROM marker",
+            COUNTERS,
+            "PRAGMA integrity_check",
+        ] {
+            assert_eq!(
+                fq(f, check).await,
+                rq(r, check),
+                "{context}, execution={execution}: {check} after {sql}"
+            );
+        }
+    }
+}
+
+/// bd-jlbrk: a rowid REPLACE must not erase the secondary UNIQUE conflict
+/// that should reject or ignore the candidate. The multi-row cases also
+/// distinguish FAIL (keep prior rows), ABORT (undo the statement), and
+/// ROLLBACK (undo the transaction's earlier marker insert).
+#[test]
+fn rowid_replace_unique_conflict_order_matches_stock() {
+    let cases = [
+        ("same victim", "VALUES (1, 'ALPHA', 'candidate')"),
+        ("different victim", "VALUES (1, 'beta', 'candidate')"),
+        ("nonconflicting literal", "VALUES (9, 'theta', 'literal')"),
+        ("SELECT without FROM", "SELECT 1, 'ALPHA', 'candidate'"),
+        ("SELECT one row", "SELECT id, a, payload FROM s WHERE id = 1"),
+        (
+            "multiple VALUES",
+            "VALUES (3, 'gamma', 'head'), (1, 'ALPHA', 'candidate'), (4, 'delta', 'tail')",
+        ),
+        ("SELECT source loop", "SELECT id, a, payload FROM s"),
+        (
+            "NULL unique keys",
+            "VALUES (1, NULL, 'null one'), (2, NULL, 'null two')",
+        ),
+        ("DEFAULT VALUES", "DEFAULT VALUES"),
+    ];
+    let policies = [
+        ("IGNORE", ""),
+        ("ABORT", ""),
+        ("FAIL", ""),
+        ("ROLLBACK", ""),
+        ("REPLACE", ""),
+        ("IGNORE", " OR REPLACE"),
+        ("REPLACE", " OR IGNORE"),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for (unique_action, statement_action) in policies {
+                    for (case, source) in cases {
+                        let dir = tempfile::tempdir().unwrap();
+                        let (f, r) = open_pair(file_backed, &dir).await;
+                        let setup = format!(
+                            "CREATE TABLE t(\
+                             id INTEGER PRIMARY KEY ON CONFLICT REPLACE, \
+                             a TEXT COLLATE NOCASE DEFAULT 'alpha' \
+                             UNIQUE ON CONFLICT {unique_action}, \
+                             payload TEXT DEFAULT 'default'); \
+                             CREATE INDEX t_payload ON t(payload); \
+                             CREATE TABLE s(id INTEGER, a TEXT, payload TEXT); \
+                             CREATE TABLE marker(value INTEGER); \
+                             INSERT INTO t VALUES (1, 'alpha', 'one'), (2, 'beta', 'two'); \
+                             INSERT INTO s VALUES (3, 'gamma', 'head'), \
+                             (1, 'ALPHA', 'candidate'), (4, 'delta', 'tail'); \
+                             BEGIN; INSERT INTO marker VALUES (7);"
+                        );
+                        f.execute_batch(&setup).await.unwrap();
+                        r.execute_batch(&setup).unwrap();
+                        let sql = format!(
+                            "INSERT{statement_action} INTO t {source} RETURNING id, a, payload"
+                        );
+                        let context = format!(
+                            "file={file_backed}, prepared={prepared}, \
+                             UNIQUE {unique_action}, statement={statement_action:?}, {case}"
+                        );
+                        assert_rowid_replace_statement_matches_stock(
+                            &f, &r, &sql, prepared, &context,
+                        )
+                        .await;
+                        f.close().await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Literal VALUES can carry the table record in P4 while MakeRecord keeps
+/// the unique-index record in its sideband and leaves its register NULL.
+/// The preflight inclusion flag must not mistake that record for an index
+/// entry excluded by a partial predicate.
+#[test]
+fn rowid_replace_literal_insert_keeps_unique_index_entry() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, \
+                         a TEXT UNIQUE ON CONFLICT IGNORE)";
+            f.execute(setup).await.unwrap();
+            r.execute_batch(setup).unwrap();
+            for sql in [
+                "INSERT INTO t VALUES (1, 'literal') RETURNING id, a",
+                "INSERT INTO t VALUES (1, 'different') RETURNING id, a",
+                "INSERT INTO t VALUES (2, 'literal') RETURNING id, a",
+            ] {
+                assert_eq!(fq(&f, sql).await, rq(&r, sql), "file={file_backed}: {sql}");
+                for check in [
+                    "SELECT id, a FROM t ORDER BY id",
+                    "SELECT id, a FROM t INDEXED BY sqlite_autoindex_t_1 ORDER BY a",
+                    COUNTERS,
+                    "PRAGMA integrity_check",
+                ] {
+                    assert_eq!(
+                        fq(&f, check).await,
+                        rq(&r, check),
+                        "file={file_backed}: {check} after {sql}"
+                    );
+                }
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+/// Preflight records must follow each source row's partial predicate, retain
+/// NULL-distinct UNIQUE semantics, and use the index's expression, collation
+/// and sort metadata. Repeating a prepared statement must not reuse a record
+/// from an earlier source row or execution.
+#[test]
+fn rowid_replace_preflight_preserves_partial_and_expression_indexes() {
+    const SETUP: &str = "\
+        CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, \
+                      a TEXT COLLATE NOCASE, payload TEXT); \
+        CREATE INDEX t_payload ON t(payload); \
+        CREATE UNIQUE INDEX t_partial ON t(lower(a)) WHERE id % 2 = 1; \
+        CREATE UNIQUE INDEX t_composite ON t(a COLLATE NOCASE, payload DESC); \
+        CREATE TABLE s(id INTEGER, a TEXT, payload TEXT); \
+        CREATE TABLE marker(value INTEGER); \
+        INSERT INTO t VALUES (1, 'alpha', 'one'), (2, 'alpha', 'two'), \
+                             (3, NULL, 'three'), (4, NULL, 'four'); \
+        INSERT INTO s VALUES (5, 'beta', 'five'), (6, 'beta', 'six'), \
+                             (7, NULL, 'seven'), (8, NULL, 'eight');";
+    const STEPS: &[&str] = &[
+        "INSERT INTO t SELECT id, a, payload FROM s RETURNING id, a, payload",
+        "INSERT INTO t VALUES (2, 'ALPHA', 'replacement') RETURNING id, a, payload",
+        "INSERT INTO t VALUES (5, 'ALPHA', 'conflicting partial') RETURNING id, a, payload",
+        "INSERT INTO t VALUES (5, 'ALPHA', 'unmatched upsert target') \
+         ON CONFLICT(a, payload) DO NOTHING RETURNING id, a, payload",
+        "INSERT INTO t VALUES (2, 'ALPHA', 'replacement') RETURNING id, a, payload",
+        "INSERT INTO t VALUES (3, NULL, 'three new'), (4, NULL, 'four new') \
+         RETURNING id, a, payload",
+        "INSERT OR REPLACE INTO t VALUES (1, 'alpha', 'one new') RETURNING id, a, payload",
+        "INSERT INTO t SELECT id, a, payload FROM s RETURNING id, a, payload",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (f, r) = open_pair(file_backed, &dir).await;
+                f.execute_batch(SETUP).await.unwrap();
+                r.execute_batch(SETUP).unwrap();
+                let context = format!("file={file_backed}, prepared={prepared}, partial indexes");
+                for sql in STEPS {
+                    assert_rowid_replace_statement_matches_stock(&f, &r, sql, prepared, &context)
+                        .await;
+                    let check = "SELECT id, lower(a) FROM t INDEXED BY t_partial \
+                                 WHERE id % 2 = 1 ORDER BY id";
+                    assert_eq!(fq(&f, check).await, rq(&r, check), "{context}: {check}");
+                }
+                f.close().await.unwrap();
+            }
+        }
+    });
+}
+
+/// Existing-row preflight must preserve a healthy AUTOINCREMENT sequence;
+/// free rowids retain the normal allocation and ignored-row bookkeeping.
+/// Deleting the high row leaves a sequence above the table's maximum without
+/// manually modifying sqlite_sequence.
+#[test]
+fn rowid_replace_preflight_preserves_autoincrement_sequence() {
+    const SETUP: &str = "\
+        CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE AUTOINCREMENT, \
+                      a TEXT UNIQUE ON CONFLICT IGNORE, payload TEXT); \
+        CREATE INDEX t_payload ON t(payload); \
+        CREATE TABLE marker(value INTEGER); \
+        INSERT INTO t VALUES (1, 'alpha', 'one'), (2, 'beta', 'two'), \
+                             (100, 'reserved', 'deleted'); \
+        DELETE FROM t WHERE id = 100;";
+    const STEPS: &[&str] = &[
+        "INSERT INTO t VALUES (1, 'alpha', 'same victim') RETURNING id, a, payload",
+        "INSERT INTO t VALUES (1, 'beta', 'different victim') RETURNING id, a, payload",
+        "INSERT INTO t VALUES (99, 'alpha', 'free rowid') RETURNING id, a, payload",
+        "INSERT INTO t VALUES (200, 'alpha', 'free high rowid') RETURNING id, a, payload",
+        "INSERT INTO t VALUES (NULL, 'alpha', 'burned rowid') RETURNING id, a, payload",
+        "INSERT INTO t VALUES (NULL, 'gamma', 'next rowid') RETURNING id, a, payload",
+        "INSERT OR REPLACE INTO t VALUES (2, 'beta', 'override') RETURNING id, a, payload",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (f, r) = open_pair(file_backed, &dir).await;
+                f.execute_batch(SETUP).await.unwrap();
+                r.execute_batch(SETUP).unwrap();
+                let context = format!("file={file_backed}, prepared={prepared}, AUTOINCREMENT");
+                for sql in STEPS {
+                    assert_rowid_replace_statement_matches_stock(&f, &r, sql, prepared, &context)
+                        .await;
+                    let check = "SELECT name, seq FROM sqlite_sequence ORDER BY name";
+                    assert_eq!(fq(&f, check).await, rq(&r, check), "{context}: {check}");
+                }
+                f.close().await.unwrap();
+            }
+        }
     });
 }

@@ -24736,6 +24736,16 @@ pub fn codegen_insert(
                 P4::Affinity(aff_str.clone()),
                 0,
             );
+            let row_done = b.emit_label();
+            let prechecked_records = emit_unique_checks_before_rowid_replace(
+                b,
+                table,
+                table_cursor,
+                col_regs,
+                rowid_reg,
+                stmt_level,
+                row_done,
+            );
             emit_table_row_record(b, table, col_regs, rec_reg, &aff_str, || {
                 make_insert_record_p4(table, &aff_str)
             });
@@ -24749,7 +24759,15 @@ pub fn codegen_insert(
             );
 
             // Index maintenance: insert into each index (bd-so1h).
-            emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, stmt_level);
+            emit_index_inserts(
+                b,
+                table,
+                table_cursor,
+                col_regs,
+                rowid_reg,
+                stmt_level,
+                &prechecked_records,
+            );
 
             if !stmt.returning.is_empty() {
                 let returning_done = b.emit_label();
@@ -24765,6 +24783,7 @@ pub fn codegen_insert(
                 )?;
                 b.resolve_label(returning_done);
             }
+            b.resolve_label(row_done);
         }
     }
 
@@ -25281,6 +25300,7 @@ fn emit_upsert_do_update_apply(
         existing_regs,
         final_rowid_reg,
         Some(ConflictAction::Abort),
+        &[],
     );
     if !returning.is_empty() {
         emit_returning(
@@ -25642,6 +25662,9 @@ fn codegen_insert_values(
             // (default ABORT), so a conflict on a constraint no clause targets
             // raises the error, matching stock. ---
             b.resolve_label(insert_label);
+            let prechecked_records = emit_unique_checks_before_rowid_replace(
+                b, table, cursor, val_regs, rowid_reg, stmt_level, done_label,
+            );
             let insert_p4 = emit_table_insert_record(
                 b,
                 val_regs,
@@ -25651,7 +25674,15 @@ fn codegen_insert_values(
                 preformatted_record.as_deref(),
             );
             b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
-            emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
+            emit_index_inserts(
+                b,
+                table,
+                cursor,
+                val_regs,
+                rowid_reg,
+                stmt_level,
+                &prechecked_records,
+            );
             if !returning.is_empty() {
                 // A non-target constraint may choose IGNORE even though no
                 // UPSERT clause matched. Return only rows actually written.
@@ -25677,6 +25708,10 @@ fn codegen_insert_values(
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
                 b.resolve_label(do_insert);
             }
+            let row_done = b.emit_label();
+            let prechecked_records = emit_unique_checks_before_rowid_replace(
+                b, table, cursor, val_regs, rowid_reg, stmt_level, row_done,
+            );
             let insert_p4 = emit_table_insert_record(
                 b,
                 val_regs,
@@ -25686,7 +25721,15 @@ fn codegen_insert_values(
                 preformatted_record.as_deref(),
             );
             b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
-            emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
+            emit_index_inserts(
+                b,
+                table,
+                cursor,
+                val_regs,
+                rowid_reg,
+                stmt_level,
+                &prechecked_records,
+            );
             if !returning.is_empty() {
                 // Schema-level IGNORE can be selected by the rowid or a
                 // secondary UNIQUE constraint, independently of the statement.
@@ -25695,6 +25738,7 @@ fn codegen_insert_values(
                 emit_returning(b, cursor, table, returning, table_alias, schema, rowid_reg)?;
                 b.resolve_label(returning_done);
             }
+            b.resolve_label(row_done);
         }
 
         // Resolve OR IGNORE skip label after all insert logic for this row.
@@ -26256,6 +26300,16 @@ fn codegen_insert_select(
         0,
     );
 
+    let prechecked_records = emit_unique_checks_before_rowid_replace(
+        b,
+        target_table,
+        write_cursor,
+        final_regs,
+        rowid_reg,
+        stmt_level,
+        skip_label,
+    );
+
     // MakeRecord from the read column values.
     emit_table_row_record(b, target_table, final_regs, rec_reg, &aff_str, || {
         make_insert_record_p4(target_table, &aff_str)
@@ -26279,6 +26333,7 @@ fn codegen_insert_select(
         final_regs,
         rowid_reg,
         stmt_level,
+        &prechecked_records,
     );
 
     // RETURNING clause: position cursor on inserted row and read columns.
@@ -26539,6 +26594,15 @@ fn codegen_insert_select_without_from(
         0,
     );
 
+    let prechecked_records = emit_unique_checks_before_rowid_replace(
+        b,
+        target_table,
+        write_cursor,
+        final_regs,
+        rowid_reg,
+        stmt_level,
+        done_label,
+    );
     emit_table_row_record(b, target_table, final_regs, rec_reg, &aff_str, || {
         make_insert_record_p4(target_table, &aff_str)
     });
@@ -26559,6 +26623,7 @@ fn codegen_insert_select_without_from(
         final_regs,
         rowid_reg,
         stmt_level,
+        &prechecked_records,
     );
 
     if !returning.is_empty() {
@@ -32987,6 +33052,165 @@ fn indexes_in_conflict_check_order(
     })
 }
 
+#[derive(Clone, Copy)]
+struct PrecheckedIndexRecord {
+    record_reg: i32,
+    included_reg: i32,
+}
+
+/// Check non-REPLACE UNIQUE constraints before a rowid REPLACE can erase
+/// their conflicting entries (bd-jlbrk). In particular, an index conflict on
+/// the very row being replaced still chooses IGNORE/FAIL/ABORT/ROLLBACK.
+/// Only an existing rowid needs this early decision. Free rowids keep the
+/// usual Insert/IdxInsert conflict path and its rowid-allocation bookkeeping.
+///
+/// Returned slots are indexed like `table.indexes`. Each populated slot
+/// holds the final record and whether its partial predicate included the row.
+/// Index maintenance reuses these records rather than evaluating predicates
+/// and key expressions a second time. The inclusion flag is separate because
+/// MakeRecord may leave a NULL register with its record in the VM's sideband.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_unique_checks_before_rowid_replace(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    col_regs: i32,
+    rowid_reg: i32,
+    stmt_conflict: Option<ConflictAction>,
+    row_done: Label,
+) -> Vec<Option<PrecheckedIndexRecord>> {
+    if effective_rowid_oe(table, stmt_conflict) != OE_REPLACE
+        || stmt_conflict == Some(ConflictAction::Replace)
+    {
+        return Vec::new();
+    }
+
+    if !table.indexes.iter().any(|index| {
+        index.is_unique
+            && index.key_term_count() != 0
+            && effective_oe(stmt_conflict, index.conflict_action) != OE_REPLACE
+    }) {
+        return Vec::new();
+    }
+
+    let rowid_exists_reg = b.alloc_reg();
+    let rowid_checked = b.emit_label();
+    b.emit_op(Opcode::Integer, 0, rowid_exists_reg, 0, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::NotExists,
+        table_cursor,
+        rowid_reg,
+        rowid_checked,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Integer, 1, rowid_exists_reg, 0, P4::None, 0);
+    b.resolve_label(rowid_checked);
+
+    let mut records = vec![None; table.indexes.len()];
+    for (idx_offset, index) in indexes_in_conflict_check_order(table) {
+        let oe_flag = effective_oe(stmt_conflict, index.conflict_action);
+        let n_idx_cols = index.key_term_count();
+        if !index.is_unique || n_idx_cols == 0 || oe_flag == OE_REPLACE {
+            continue;
+        }
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        let skip_index = b.emit_label();
+        let record_reg = b.alloc_reg();
+        let included_reg = b.alloc_reg();
+        // A SELECT loop reuses these registers for each source row. Reset the
+        // flag before the predicate so an excluded row cannot reuse the
+        // preceding row's record.
+        b.emit_op(Opcode::Integer, 0, included_reg, 0, P4::None, 0);
+        records[idx_offset] = Some(PrecheckedIndexRecord {
+            record_reg,
+            included_reg,
+        });
+
+        let scan_ctx = ScanCtx {
+            cursor: table_cursor,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(RegisterRow::with_rowid(col_regs, rowid_reg)),
+            secondaries: &[],
+        };
+        emit_index_predicate_guard(b, index, &scan_ctx, skip_index);
+
+        let key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
+        for key_pos in 0..n_idx_cols {
+            emit_index_key_term(b, index, key_pos, key_regs + key_pos as i32, &scan_ctx);
+        }
+        // Prepare every included index record, even on a free rowid. Only
+        // the early conflict decision is conditional: a free rowid must
+        // still reach the usual Insert/IdxInsert bookkeeping.
+        let unique_clear = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::IfNot,
+            rowid_exists_reg,
+            1,
+            unique_clear,
+            P4::None,
+            0,
+        );
+        // Probe only the logical key prefix, never the appended rowid:
+        // a same-row conflict must be visible before REPLACE removes it.
+        b.emit_op(
+            Opcode::MakeRecord,
+            key_regs,
+            n_idx_cols as i32,
+            record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::NoConflict,
+            idx_cursor,
+            record_reg,
+            unique_clear,
+            P4::None,
+            0,
+        );
+        if oe_flag == OE_IGNORE {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
+        } else {
+            b.emit_op(
+                Opcode::Halt,
+                ErrorCode::Constraint as i32,
+                halt_conflict_oe(oe_flag),
+                0,
+                P4::Str(index.key_label_qualified(&table.name)),
+                if table.index_is_primary_key(index) {
+                    OPFLAG_HALT_PRIMARY_KEY
+                } else {
+                    OPFLAG_HALT_UNIQUE
+                },
+            );
+        }
+        b.resolve_label(unique_clear);
+
+        b.emit_op(
+            Opcode::Copy,
+            rowid_reg,
+            key_regs + n_idx_cols as i32,
+            0,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::MakeRecord,
+            key_regs,
+            (n_idx_cols + 1) as i32,
+            record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::Integer, 1, included_reg, 0, P4::None, 0);
+        b.resolve_label(skip_index);
+    }
+    records
+}
+
 /// Emit `IdxInsert` opcodes for all indexes on the table (bd-so1h: Phase 5I.3).
 ///
 /// For each index, this reads the indexed column values from the provided
@@ -33006,6 +33230,7 @@ fn emit_index_inserts(
     col_regs: i32,
     rowid_reg: i32,
     stmt_conflict: Option<ConflictAction>,
+    prechecked_records: &[Option<PrecheckedIndexRecord>],
 ) {
     emit_index_inserts_filtered(
         b,
@@ -33015,6 +33240,7 @@ fn emit_index_inserts(
         rowid_reg,
         stmt_conflict,
         None,
+        prechecked_records,
     );
 }
 
@@ -33036,10 +33262,15 @@ fn emit_index_inserts_for_update(
         rowid_reg,
         stmt_conflict,
         Some(update_index_mask),
+        &[],
     );
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn emit_index_inserts_filtered(
     b: &mut ProgramBuilder,
     table: &TableSchema,
@@ -33048,6 +33279,7 @@ fn emit_index_inserts_filtered(
     rowid_reg: i32,
     stmt_conflict: Option<ConflictAction>,
     update_index_mask: Option<&[bool]>,
+    prechecked_records: &[Option<PrecheckedIndexRecord>],
 ) {
     // The engine decides each UNIQUE conflict at its IdxInsert, and a REPLACE
     // there deletes the conflicting row at once. Inserting in stock's check
@@ -33063,43 +33295,61 @@ fn emit_index_inserts_filtered(
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
         let skip_label = b.emit_label();
-        // bd-q6sdy: the image carries the row's rowid so a partial-index
-        // predicate naming `rowid` / `_rowid_` / `oid` tests the new row's key
-        // rather than NULL (which skipped the entry and corrupted the index).
-        let scan_ctx = ScanCtx {
-            cursor: table_cursor,
-            table,
-            table_alias: None,
-            schema: None,
-            register_base: Some(RegisterRow::with_rowid(col_regs, rowid_reg)),
-            secondaries: &[],
+        let idx_rec_reg = if let Some(prechecked) =
+            prechecked_records.get(idx_offset).copied().flatten()
+        {
+            // The preflight evaluated the predicate and key before the rowid
+            // REPLACE. Test the separate flag: MakeRecord can keep the record
+            // in its sideband while its destination register still holds NULL.
+            b.emit_jump_to_label(
+                Opcode::IfNot,
+                prechecked.included_reg,
+                1,
+                skip_label,
+                P4::None,
+                0,
+            );
+            prechecked.record_reg
+        } else {
+            // bd-q6sdy: the image carries the row's rowid so a partial-index
+            // predicate naming `rowid` / `_rowid_` / `oid` tests the new row's key
+            // rather than NULL (which skipped the entry and corrupted the index).
+            let scan_ctx = ScanCtx {
+                cursor: table_cursor,
+                table,
+                table_alias: None,
+                schema: None,
+                register_base: Some(RegisterRow::with_rowid(col_regs, rowid_reg)),
+                secondaries: &[],
+            };
+
+            emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
+
+            // Allocate registers for index key: (indexed_cols..., rowid).
+            let idx_key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
+
+            // Evaluate indexed key terms into the key registers.
+            for key_pos in 0..n_idx_cols {
+                let dst_reg = idx_key_regs + key_pos as i32;
+                emit_index_key_term(b, index, key_pos, dst_reg, &scan_ctx);
+            }
+
+            // Append rowid as the final key component.
+            let rowid_key_reg = idx_key_regs + n_idx_cols as i32;
+            b.emit_op(Opcode::Copy, rowid_reg, rowid_key_reg, 0, P4::None, 0);
+
+            // Build the index key record.
+            let idx_rec_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                idx_key_regs,
+                (n_idx_cols + 1) as i32,
+                idx_rec_reg,
+                P4::None,
+                0,
+            );
+            idx_rec_reg
         };
-
-        emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
-
-        // Allocate registers for index key: (indexed_cols..., rowid).
-        let idx_key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
-
-        // Evaluate indexed key terms into the key registers.
-        for key_pos in 0..n_idx_cols {
-            let dst_reg = idx_key_regs + key_pos as i32;
-            emit_index_key_term(b, index, key_pos, dst_reg, &scan_ctx);
-        }
-
-        // Append rowid as the final key component.
-        let rowid_key_reg = idx_key_regs + n_idx_cols as i32;
-        b.emit_op(Opcode::Copy, rowid_reg, rowid_key_reg, 0, P4::None, 0);
-
-        // Build the index key record.
-        let idx_rec_reg = b.alloc_reg();
-        b.emit_op(
-            Opcode::MakeRecord,
-            idx_key_regs,
-            (n_idx_cols + 1) as i32,
-            idx_rec_reg,
-            P4::None,
-            0,
-        );
 
         // Insert into the index.
         // For UNIQUE indexes, set P5=1 and P3=number of indexed columns
@@ -64813,7 +65063,7 @@ mod tests {
             let column_count = i32::try_from(table.columns.len()).expect("small test table");
             let col_regs = builder.alloc_regs(column_count);
             let rowid_reg = builder.alloc_reg();
-            emit_index_inserts(&mut builder, &table, 0, col_regs, rowid_reg, None);
+            emit_index_inserts(&mut builder, &table, 0, col_regs, rowid_reg, None, &[]);
             builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             let program = builder
                 .finish()
