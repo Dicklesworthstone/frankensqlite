@@ -12184,7 +12184,10 @@ impl<P: PageWriter> BtCursor<P> {
 
         let leaf_page_no = top.page_no;
         let cell_idx = top.cell_idx;
-        let cell = self.parse_cell_at(top, cell_idx)?;
+        // Parsed without the cell-slot cache: the rewrite below gives the
+        // leaf a new image token, so a slot cached under the current one
+        // could never be read again (bd-w4pr1.13.20).
+        let cell = self.parse_cell_at_uncached(top, cell_idx)?;
         if cell.rowid != Some(rowid)
             || cell.overflow_page.is_some()
             || usize::try_from(cell.payload_size).ok() != Some(payload.len())
@@ -21112,11 +21115,31 @@ mod tests {
                 "size-changing updates must fall back to delete+insert"
             );
             assert_eq!(cursor.payload(&cx).await.unwrap(), b"BBBBBBBB");
+            // The cursor stands on rowid 2: a same-size payload for another
+            // rowid is refused, and the cell keeps its bytes.
+            assert!(
+                !cursor
+                    .table_overwrite_current_payload_same_size_no_overflow(&cx, 3, b"CCCCCCCC")
+                    .await
+                    .unwrap(),
+                "an overwrite for a rowid the cursor is not on must be refused"
+            );
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"BBBBBBBB");
+            // A second rewrite of the same cell, on the image the first wrote.
+            assert!(
+                cursor
+                    .table_overwrite_current_payload_same_size_no_overflow(&cx, 2, b"bbbbBBBB")
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"bbbbBBBB");
 
             assert!(cursor.table_move_to(&cx, 1).await.unwrap().is_found());
             assert_eq!(cursor.payload(&cx).await.unwrap(), b"aaaaaaaa");
             assert!(cursor.next(&cx).await.unwrap());
             assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"bbbbBBBB");
             assert!(cursor.next(&cx).await.unwrap());
             assert_eq!(cursor.payload(&cx).await.unwrap(), b"cccccccc");
         });
