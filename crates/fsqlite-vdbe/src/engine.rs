@@ -17051,8 +17051,23 @@ impl VdbeEngine {
             Opcode::Remainder => {
                 let divisor = self.get_reg(op.p1);
                 let dividend = self.get_reg(op.p2);
-                let result = sql_rem(dividend, divisor);
-                self.set_reg_fast(op.p3, result);
+                // Two INTEGER operands take `sql_rem`'s integer path without
+                // its numeric-type tests and conversions, and update the
+                // result register in place (bd-w4pr1.13.20).
+                if let (SqliteValue::Integer(dividend), SqliteValue::Integer(divisor)) =
+                    (dividend, divisor)
+                {
+                    let (dividend, divisor) = (*dividend, *divisor);
+                    if divisor == 0 {
+                        self.set_reg_fast(op.p3, SqliteValue::Null);
+                    } else {
+                        // i64::MIN % -1 is 0, as in `sql_rem`.
+                        self.set_reg_int(op.p3, dividend.checked_rem(divisor).unwrap_or_default());
+                    }
+                } else {
+                    let result = sql_rem(dividend, divisor);
+                    self.set_reg_arith_result(op.p3, result);
+                }
                 *pc += 1;
                 Ok(true)
             }
@@ -17423,7 +17438,7 @@ impl VdbeEngine {
                 let Some(rowid) = try_storage_cursor_cached_rowid_local(cursor)? else {
                     return Ok(false);
                 };
-                self.set_reg_fast(op.p2, SqliteValue::Integer(rowid));
+                self.set_reg_int(op.p2, rowid);
                 *pc += 1;
                 Ok(true)
             }
