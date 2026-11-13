@@ -184,6 +184,27 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   (about 2.5k of memcpy, REJECTED 2026-11-12 on a prepared-statement row; retry needs an
   instruction-count A/B of a prepared autocommit INSERT), and the statement savepoint (about 2.5k).
 
+## 2026-11-13 - WIN: the first open of a file with overflow pages claims the overflow chains instead of re-walking every cell (bd-c83wi)
+
+- Target: the first-open migration pass on a file with overflow pages. The
+  interior-only accounting (bd-6jf9o follow-up) fell back to the full
+  ownership walk there: 238M instructions on a 35 MB stock file whose
+  blobs sit in their own table (stock 1.1M).
+- Lever (eec0a2329): the unowned pages left after interior pages and the
+  freelist can only be overflow pages or orphans. Read the cells that can
+  own a chain (index interior cells, then leaves, smallest tree first),
+  claim each chain under the full walk's rules, and stop once nothing is
+  unowned. Anything unexpected still runs the full walk.
+- Result (fo2_ab.py, stock 3.46.1 live, base 60a894992 vs fix): the
+  bead's file 237.9M / 48 ms -> 21.2M / 17 ms. Worst case, ten 9 KB rows
+  inside the 1M-row table: 213.2M -> 188.0M. The chains are in the
+  largest tree, so its leaves are still read.
+- Retry, for that worst case: a cheaper per-cell scan in this second
+  phase. Decode only the payload-size varint, and read the overflow
+  pointer only when the payload exceeds max-local, instead of
+  CellRef::parse (86 instructions per cell in the 2026-11-13 bd-6jf9o
+  profile). Measure against the worst-case row's 188M.
+
 ## 2026-11-13 - WIN: an indexed equality with a rowid range seeks the index bounded by the range, for keyset pages and aggregates (bd-z3a05)
 
 - Target: `WHERE <indexed col> = v AND <rowid range>`, both keyset pagination
