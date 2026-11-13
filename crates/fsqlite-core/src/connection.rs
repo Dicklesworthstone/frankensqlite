@@ -10427,12 +10427,14 @@ impl PreparedStatement<'_> {
         if let Some(column_count) = self.deferred_query_column_count {
             return column_count;
         }
+        // A DML statement dispatched at execution has only a placeholder
+        // program; its RETURNING names carry the width.
         self.program
             .ops()
             .iter()
             .find(|op| op.opcode == Opcode::ResultRow)
             .and_then(|op| usize::try_from(op.p2).ok())
-            .unwrap_or(0)
+            .unwrap_or(self.column_names.len())
     }
 
     /// Return best-effort result column labels inferred at prepare time, or
@@ -15741,6 +15743,122 @@ impl Drop for MaterializedTablesCleanupGuard<'_> {
         for marker in &self.owned_temp_markers {
             temp_table_names.remove(marker);
         }
+    }
+}
+
+/// Keep materialized tables alive under private names when their public names
+/// must resolve in a different SQL scope. Trigger WHEN/body expressions cannot
+/// see their caller's CTEs, and a DML target must resolve to a writable table
+/// even when a CTE of the same name remains visible to its read expressions.
+struct MaterializedBindingsVisibilityGuard<'a> {
+    conn: &'a Connection,
+    names: Vec<(i32, String)>,
+    _compiled_cache_guard: BoolCellRestoreGuard<'a>,
+}
+
+impl<'a> MaterializedBindingsVisibilityGuard<'a> {
+    fn private_name(
+        root_page: i32,
+        occupied_names: &mut HashSet<String>,
+        reserved_sql: &str,
+    ) -> String {
+        // Replay reparses these identifiers and semantic lookup keys reserve
+        // NUL as a namespace separator. Use ordinary SQL identifiers, checking
+        // both tables and views so a user-defined name cannot capture a read.
+        let base = format!("__fsqlite_materialized_{root_page}");
+        let mut suffix = 0usize;
+        loop {
+            let candidate = if suffix == 0 {
+                base.clone()
+            } else {
+                format!("{base}_{suffix}")
+            };
+            if !reserved_sql.contains(candidate.as_str())
+                && occupied_names.insert(candidate.clone())
+            {
+                return candidate;
+            }
+            suffix = suffix.saturating_add(1);
+        }
+    }
+
+    fn for_insert_target(conn: &'a Connection, insert: &mut fsqlite_ast::InsertStatement) -> Self {
+        let name = insert.table.name.clone();
+        // Nested WITH declarations have not been installed in the schema yet.
+        // Conservatively reserve the rendered statement too, so a later lexical
+        // binding cannot capture the private relation names inserted below.
+        let reserved_sql = insert.to_string().to_ascii_lowercase();
+        let guard = Self::hide_reserving(conn, Some(&name), &reserved_sql);
+        if let Some((root_page, _)) = guard.names.first() {
+            // Schema order is binding precedence: the first same-name CTE is
+            // the one that the source expressions could resolve before hiding.
+            let schema = conn.schema.borrow();
+            if let Some(table) = schema.iter().find(|table| table.root_page == *root_page) {
+                rebind_materialized_insert_reads(insert, &name, &table.name);
+            }
+        }
+        guard
+    }
+
+    fn hide(conn: &'a Connection, only_name: Option<&str>) -> Self {
+        Self::hide_reserving(conn, only_name, "")
+    }
+
+    fn hide_reserving(conn: &'a Connection, only_name: Option<&str>, reserved_sql: &str) -> Self {
+        let mut names = Vec::new();
+        {
+            let roots = conn.materialized_temp_root_pages.borrow();
+            if !roots.is_empty() {
+                let mut schema = conn.schema.borrow_mut();
+                let mut occupied_names: HashSet<String> = schema
+                    .iter()
+                    .map(|table| table.name.to_ascii_lowercase())
+                    .chain(
+                        conn.views
+                            .borrow()
+                            .iter()
+                            .map(|view| view.name.to_ascii_lowercase()),
+                    )
+                    .collect();
+                for table in schema.iter_mut().filter(|table| {
+                    roots.contains(&table.root_page)
+                        && only_name.is_none_or(|name| table.name.eq_ignore_ascii_case(name))
+                }) {
+                    let hidden =
+                        Self::private_name(table.root_page, &mut occupied_names, reserved_sql);
+                    names.push((table.root_page, std::mem::replace(&mut table.name, hidden)));
+                }
+            }
+        }
+        if !names.is_empty() {
+            conn.rebuild_schema_indices();
+        }
+        let bypass_cache = conn.bypass_compiled_cache.get() || !names.is_empty();
+        Self {
+            conn,
+            names,
+            _compiled_cache_guard: BoolCellRestoreGuard::new(
+                &conn.bypass_compiled_cache,
+                bypass_cache,
+            ),
+        }
+    }
+}
+
+impl Drop for MaterializedBindingsVisibilityGuard<'_> {
+    fn drop(&mut self) {
+        if self.names.is_empty() {
+            return;
+        }
+        {
+            let mut schema = self.conn.schema.borrow_mut();
+            for (root, name) in &self.names {
+                if let Some(table) = schema.iter_mut().find(|table| table.root_page == *root) {
+                    table.name.clone_from(name);
+                }
+            }
+        }
+        self.conn.rebuild_schema_indices();
     }
 }
 
@@ -53834,8 +53952,48 @@ impl Connection {
                 .iter()
                 .map(|name| (*name).to_owned())
                 .collect(),
+            Statement::Insert(insert) => {
+                self.returning_result_column_names(&insert.returning, &insert.table.name)
+            }
+            Statement::Update(update) => {
+                self.returning_result_column_names(&update.returning, &update.table.name.name)
+            }
+            Statement::Delete(delete) => {
+                self.returning_result_column_names(&delete.returning, &delete.table.name.name)
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// Result column names of a DML statement's RETURNING clause, as stock
+    /// names them: an alias, else a bare column's name, else the expression
+    /// (whose source text [`overlay_result_expression_source_names`] restores),
+    /// with `*` expanded to the target table's columns. Empty without
+    /// RETURNING, so a prepared DML statement reports its true width.
+    fn returning_result_column_names(&self, returning: &[ResultColumn], table: &str) -> Vec<String> {
+        let mut names = Vec::with_capacity(returning.len());
+        for column in returning {
+            match column {
+                ResultColumn::Star | ResultColumn::TableStar(_) => {
+                    let schema = self.schema.borrow();
+                    match schema
+                        .iter()
+                        .find(|candidate| candidate.name.eq_ignore_ascii_case(table))
+                    {
+                        Some(target) => {
+                            names.extend(target.columns.iter().map(|info| info.name.clone()));
+                        }
+                        None => names.push("*".to_owned()),
+                    }
+                }
+                ResultColumn::Expr { expr, alias } => names.push(match (alias, expr) {
+                    (Some(alias), _) => alias.clone(),
+                    (None, Expr::Column(column_ref, _)) => column_ref.column.to_string(),
+                    (None, other) => other.to_string(),
+                }),
+            }
+        }
+        names
     }
 
     fn select_result_column_names(
@@ -75823,6 +75981,7 @@ impl Connection {
             return Ok(false);
         }
 
+        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
         let new_loaded = match event {
             fsqlite_ast::TriggerEvent::Update(assigned_columns) => {
                 self.before_update_new_loaded_columns(table_name, assigned_columns, &matching)
@@ -75927,6 +76086,7 @@ impl Connection {
             return Ok(());
         }
 
+        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
         let base_frame =
             self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid, None)?;
         for trigger in matching {
@@ -76435,6 +76595,7 @@ impl Connection {
         if matching.is_empty() {
             return Ok(false);
         }
+        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
         let base_frame = TriggerFrame {
             table_name: view_name.to_owned(),
             trigger_name: String::new(),
@@ -77207,30 +77368,6 @@ impl Connection {
             let plan = self.plan_view_materialization(&mut executable_select, &view_defs)?;
 
             let exec_result = async {
-                // CRITICAL: probe pager-side cleanliness for `plan.len()`
-                // contiguous root pages before any `create_table()` call below.
-                //
-                // `MemDatabase::next_root_page` starts at 2 and is only bumped
-                // by MemDatabase-local allocations; it does NOT learn about
-                // root pages the pager has assigned for real persistent tables
-                // and indexes. If a view temp table inherits a root page
-                // number that already belongs to a real B-tree (e.g. an index
-                // root being walked by REINDEX), the VDBE's `StorageCursor`
-                // can read the pager page when it should have read the
-                // MemTable rows, producing the
-                //   "index_seek called on table page (type LeafTable, page N, root N)"
-                // corruption error reported in import_jsonl + UNION + REINDEX
-                // workloads (e.g. beads_rust `get_blocks_dep_edges`).
-                //
-                // The companion path `execute_with_materialized_sqlite_schema`
-                // has called this since inception (see comment at
-                // `execute_with_materialized_sqlite_schema`); the view
-                // materialization path was an unguarded shadow that the
-                // sqlite_schema fix never extended. UNION queries reach this
-                // path through `execute_compound_select` recursing into each
-                // arm's `execute_statement`.
-                self.reserve_clean_memdb_root_pages(plan.len()).await?;
-
                 // Materialize each planned view as a temp table, dependencies
                 // first. A body's view sources already name the tables of the
                 // views materialized before it.
@@ -77318,7 +77455,9 @@ impl Connection {
                             .collect()
                     };
 
-                    let root_page = self.db.borrow_mut().create_table(col_infos.len());
+                    let root_page = self
+                        .allocate_schema_table_root(true, col_infos.len(), false)
+                        .await?;
                     self.materialized_temp_root_pages
                         .borrow_mut()
                         .insert(root_page);
@@ -77412,13 +77551,8 @@ impl Connection {
     /// Materialize sqlite_master/sqlite_schema as temporary tables,
     /// execute the query, then clean up.
     ///
-    /// IMPORTANT: The temp table's root page in MemDatabase must not collide
-    /// with any page the pager has data for, because the VDBE's
-    /// `StorageCursor` reads from the pager B-tree first.  If the root page
-    /// collides with a stale pager page (e.g. from a previously-dropped
-    /// table), the VDBE would read that stale data instead of our virtual
-    /// rows.  We avoid this by probing candidate pages via `get_page` and
-    /// advancing `next_root_page` past any non-zero (occupied) pages.
+    /// The tables use the connection-local root namespace and explicit
+    /// MemDatabase cursor routing, including while the main pager grows.
     async fn execute_with_materialized_sqlite_schema(
         &self,
         select: &SelectStatement,
@@ -77444,11 +77578,11 @@ impl Connection {
             let virtual_columns = sqlite_master_column_infos();
             let mut materialized = MaterializedTablesCleanupGuard::new(self);
 
-            lean_future(|| self.reserve_clean_memdb_root_pages(referenced.len())).await?;
-
             for (table_name, is_temp) in referenced {
                 let virtual_rows = if is_temp { &temp_rows } else { &main_rows };
-                let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
+                let root_page = self
+                    .allocate_schema_table_root(true, virtual_columns.len(), false)
+                    .await?;
                 self.materialized_temp_root_pages
                     .borrow_mut()
                     .insert(root_page);
@@ -77515,35 +77649,6 @@ impl Connection {
         result
     }
 
-    /// Reserve `need` consecutive MemDatabase root pages whose corresponding
-    /// pager pages are unreadable or entirely zeroed.
-    ///
-    /// This avoids a cross-layer bug where VDBE `StorageCursor` opens a
-    /// transaction-backed cursor on a temp-table root page and reads a valid
-    /// stale pager B-tree instead of the MemDatabase-only rows we just
-    /// materialized there.
-    async fn reserve_clean_memdb_root_pages(&self, need: usize) -> Result<()> {
-        if need == 0 {
-            return Ok(());
-        }
-        let cx = self.op_cx_after_background_status();
-        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            return self
-                .reserve_clean_memdb_root_pages_with_txn(txn, &cx, need)
-                .await;
-        }
-
-        let mut txn = self
-            .begin_pager_txn_with_busy_timeout(&self.pager, &cx, TransactionMode::ReadOnly, false)
-            .await?;
-        let reserve_result = self
-            .reserve_clean_memdb_root_pages_with_txn(&txn, &cx, need)
-            .await;
-        let rollback_result = txn.rollback(&cx).await;
-        reserve_result?;
-        rollback_result
-    }
-
     /// Allocate a root for schema-visible table storage and create its
     /// `MemDatabase` representation.
     ///
@@ -77578,8 +77683,9 @@ impl Connection {
             // `create_table_at` normally advances MemDatabase's ordinary root
             // allocator. TEMP roots live in a separate descending namespace,
             // so restore that allocator immediately after inserting the table.
-            // This keeps ephemeral/materialized roots compact and prevents an
-            // overflow on their next allocation.
+            // Materialized CTE/view roots use this namespace too: a write may
+            // grow the pager while they remain live, so merely choosing the
+            // next unused main page would not keep their identities separate.
             let ordinary_next_root = db.next_root_page();
             db.create_table_at(root_page, num_columns);
             db.set_next_root_page(ordinary_next_root);
@@ -77596,63 +77702,13 @@ impl Connection {
         Ok(root_page)
     }
 
-    async fn reserve_clean_memdb_root_pages_with_txn(
-        &self,
-        txn: &TransactionKind,
-        cx: &Cx,
-        need: usize,
-    ) -> Result<()> {
-        let needed = i32::try_from(need).map_err(|_| {
-            FrankenError::internal(format!(
-                "requested too many temporary MemDatabase root pages: {need}"
-            ))
-        })?;
-        let mut start = self.db.borrow().next_root_page();
-        // Pages past the transaction's visible extent are unallocated, so
-        // they read back as zero: start the probe there. On a schema-only
-        // connection `next_root_page` stays near page 1 and every real page
-        // is non-zero, so starting below the extent read the whole file for
-        // each `sqlite_master` query (~4M pages on a 16 GB database). The
-        // loop below still verifies each candidate page.
-        let visible_extent = txn.visible_db_size_bound();
-        if let Some(past_extent) = i32::try_from(visible_extent)
-            .ok()
-            .and_then(|extent| extent.checked_add(1))
-            && visible_extent > 0
-            && past_extent > start
-        {
-            start = past_extent;
-        }
-        let mut clean = 0_i32;
-        while clean < needed {
-            let page = start + clean;
-            let Some(pgno) = u32::try_from(page).ok().and_then(PageNumber::new) else {
-                break;
-            };
-            let is_clean = match txn.get_page(cx, pgno).await {
-                Ok(data) => data.as_ref().iter().all(|&b| b == 0),
-                Err(_) => true,
-            };
-            if is_clean {
-                clean += 1;
-            } else {
-                start = page + 1;
-                clean = 0;
-            }
-        }
-        let mut db = self.db.borrow_mut();
-        if start > db.next_root_page() {
-            db.set_next_root_page(start);
-        }
-        Ok(())
-    }
-
     /// Build virtual sqlite_master rows from in-memory schema metadata.
     ///
     /// sqlite_master/sqlite_schema columns:
     /// (type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)
     fn build_sqlite_master_rows(&self) -> Vec<Vec<SqliteValue>> {
         let schema = self.schema.borrow();
+        let materialized_roots = self.materialized_temp_root_pages.borrow();
         let views = self.views.borrow();
         let triggers = self.triggers.borrow();
         let temp_table_names = self.temp_table_names.borrow();
@@ -77670,6 +77726,7 @@ impl Connection {
             .filter(|table| {
                 !is_sqlite_schema_name(&table.name)
                     && !temp_table_names.contains(&table.name.to_ascii_lowercase())
+                    && !materialized_roots.contains(&table.root_page)
             })
             .chain(shadowed_main_tables.values())
         {
@@ -78037,6 +78094,7 @@ impl Connection {
             .schema
             .iter()
             .enumerate()
+            .rev()
             .map(|(i, table)| (table.name.to_ascii_lowercase(), i))
             .collect();
         let new_views_by_name = build_scoped_view_index(&state.views);
@@ -87271,31 +87329,35 @@ impl Connection {
         directive
     }
 
-    /// bd-wjrs0: snapshot connection-local `TEMP` tables (schema + rows) before
-    /// a destructive memdb reload. `TEMP` tables never appear in the main
-    /// `sqlite_master`, so a reload that rebuilds `self.schema`/`self.db` from
-    /// page 1 would silently drop them; this captures them for re-insertion via
-    /// `restore_temp_tables_into`. Returns an empty Vec (taking no further
-    /// borrows) when no `TEMP` tables exist, so non-temp connections pay nothing.
+    /// bd-wjrs0: preserve connection-local tables across a pager-backed mirror
+    /// reload. Neither TEMP tables nor materialized CTE/view tables have a
+    /// main-pager image, so a reload that rebuilds `self.schema`/`self.db` from
+    /// page 1 would silently drop them (bd-r5mmz: a trigger fired during a WITH
+    /// INSERT replay emptied the CTE for every later row). Capture exact roots
+    /// in schema order: a CTE may shadow a TEMP or main table, and nested CTEs
+    /// may have the same name. Returns an empty Vec (taking no further borrows)
+    /// when neither exists, so other connections pay nothing.
     fn snapshot_temp_tables(&self) -> Vec<CapturedTempTable> {
-        if self.temp_table_names.borrow().is_empty() {
+        let temp_names = self.temp_table_names.borrow();
+        let materialized_roots = self.materialized_temp_root_pages.borrow();
+        if temp_names.is_empty() && materialized_roots.is_empty() {
             return Vec::new();
         }
-        let temp_names = self.temp_table_names.borrow();
         let schema = self.schema.borrow();
         let db = self.db.borrow();
-        temp_names
+        schema
             .iter()
-            .filter_map(|name_lc| {
-                let table = schema
-                    .iter()
-                    .find(|t| t.name.eq_ignore_ascii_case(name_lc))?;
+            .filter(|table| {
+                materialized_roots.contains(&table.root_page)
+                    || temp_names.contains(&table.name.to_ascii_lowercase())
+            })
+            .map(|table| {
                 let rows = db.get_table(table.root_page).map_or_else(Vec::new, |mt| {
                     mt.iter_rows()
                         .map(|(rowid, vals)| (rowid, vals.to_vec()))
                         .collect()
                 });
-                Some((table.clone(), rows))
+                (table.clone(), rows)
             })
             .collect()
     }
@@ -87310,13 +87372,22 @@ impl Connection {
         new_db: &mut MemDatabase,
         captured: Vec<CapturedTempTable>,
     ) {
+        // Preserve the captured order of both real TEMP tables and lexical
+        // materialized bindings; the latter precede persistent schema entries.
+        let mut materialized_schemas = Vec::new();
         for (temp_schema, rows) in captured {
             let name_lc = temp_schema.name.to_ascii_lowercase();
+            let materialized = self
+                .materialized_temp_root_pages
+                .borrow()
+                .contains(&temp_schema.root_page);
             // If the rebuild re-materialized a same-named main table, park it so
-            // the TEMP table remains the visible (unqualified) entry.
-            if let Some(pos) = new_schema
-                .iter()
-                .position(|t| t.name.eq_ignore_ascii_case(&name_lc))
+            // the TEMP table remains the visible (unqualified) entry. A
+            // materialized CTE shadows by schema order instead and parks nothing.
+            if !materialized
+                && let Some(pos) = new_schema
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(&name_lc))
             {
                 let main_table = new_schema.remove(pos);
                 self.shadowed_main_tables
@@ -87361,9 +87432,14 @@ impl Connection {
             for (rowid, vals) in rows {
                 new_db.upsert_row(temp_schema.root_page, rowid, vals);
             }
-            new_schema.push(temp_schema);
-            self.temp_table_names.borrow_mut().insert(name_lc);
+            if materialized {
+                materialized_schemas.push(temp_schema);
+            } else {
+                new_schema.push(temp_schema);
+                self.temp_table_names.borrow_mut().insert(name_lc);
+            }
         }
+        new_schema.splice(0..0, materialized_schemas);
     }
 
     /// bd-wjrs0: substitute shadowed `main` tables into a per-statement schema
@@ -87636,12 +87712,13 @@ impl Connection {
     }
 
     fn temp_storage_roots(&self) -> HashSet<i32> {
+        // WITH/view bindings exist only in MemDatabase, just like TEMP tables.
+        let mut roots = self.materialized_temp_root_pages.borrow().clone();
         let temp_names = self.temp_table_names.borrow();
         if temp_names.is_empty() {
-            return HashSet::new();
+            return roots;
         }
         let schema = self.schema.borrow();
-        let mut roots = HashSet::new();
         for table in schema
             .iter()
             .filter(|table| temp_names.contains(&table.name.to_ascii_lowercase()))
@@ -87668,11 +87745,25 @@ impl Connection {
     }
 
     fn route_temp_roots_in_program(
+        &self,
         mut program: VdbeProgram,
         temp_roots: &HashSet<i32>,
-    ) -> VdbeProgram {
+    ) -> Result<VdbeProgram> {
+        // Materialized bindings are read sources, never writable DML targets.
+        let materialized_roots = self.materialized_temp_root_pages.borrow();
+        if !materialized_roots.is_empty()
+            && let Some(usage) = program.storage_root_usages().find(|usage| {
+                usage.access == fsqlite_vdbe::StorageRootAccess::Write
+                    && materialized_roots.contains(&usage.root_page)
+            })
+        {
+            return Err(FrankenError::Internal(format!(
+                "write cursor targets read-only materialized root {}",
+                usage.root_page
+            )));
+        }
         program.route_storage_roots_to_temp_database(temp_roots.iter().copied());
-        program
+        Ok(program)
     }
 
     /// Compile a table-backed SELECT through the VDBE codegen.
@@ -87721,7 +87812,7 @@ impl Connection {
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
                 .await
         }?;
-        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
+        self.route_temp_roots_in_program(program, &temp_roots)
     }
 
     /// Shared tail of `compile_table_select`: plan the directive and emit the program.
@@ -100469,6 +100560,23 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // Freeze original slots before per-row replay introduces its own array.
+        let mut bind_state = BindParamState::default();
+        let mut bound_insert = canonicalize_insert_placeholders_with_state(insert, &mut bind_state)?;
+        let parameter_slots =
+            usize::try_from(bind_state.next_index.saturating_sub(1)).unwrap_or(0);
+        let mut original_params = params.unwrap_or(&[]).to_vec();
+        // Unbound query() slots read as NULL; explicit short slices still error.
+        if params.is_none() {
+            original_params.resize(original_params.len().max(parameter_slots), SqliteValue::Null);
+        }
+        bind_placeholders_in_insert_statement(
+            &mut bound_insert,
+            &mut BindParamState::default(),
+            &original_params,
+        )?;
+        let insert = &bound_insert;
+        let params = None;
         if let Some(target_schema) = self.attached_target_schema(&insert.table)? {
             self.prepare_attached_target_write_in_explicit_transaction(
                 "INSERT",
@@ -100525,6 +100633,8 @@ impl Connection {
             "insert",
             "with_clause_materialization",
         )?;
+        // Dynamic roots must not reuse programs from another WITH scope.
+        let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
         let _hydration_suppression = self
             .cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert))
             .then(|| self.suppress_memdb_row_hydration());
@@ -100543,10 +100653,18 @@ impl Connection {
             let source_rows = self
                 .execute_select_via_memdb_fallback(select_stmt, params)
                 .await?;
+            // The source is now owned. Restore the caller's normal policy
+            // before trigger replay so each row does not reload every table.
+            drop(_mem_fallback_guard);
             if source_rows.is_empty() {
                 self.reset_statement_change_count();
                 return Ok(Vec::new());
             }
+            // WITH t AS (...) INSERT INTO t reads its source from the CTE but
+            // writes the persistent/TEMP table. Keep later UPSERT/RETURNING
+            // subqueries bound to the materialized rows under a private name.
+            let _target_scope =
+                MaterializedBindingsVisibilityGuard::for_insert_target(self, &mut stripped);
             // Replay the materialized CTE rows through the per-row INSERT
             // machinery, which correctly threads the ON CONFLICT/UPSERT
             // clause and RETURNING (the previous bespoke loop here dropped
@@ -100558,6 +100676,8 @@ impl Connection {
             self.set_statement_change_count(outcome.changes);
             Ok(outcome.returning_rows)
         } else {
+            let _target_scope =
+                MaterializedBindingsVisibilityGuard::for_insert_target(self, &mut stripped);
             let _compiled_cache_guard =
                 BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
             self.execute_statement(&Statement::Insert(stripped), params)
@@ -100599,7 +100719,6 @@ impl Connection {
             let schema = self.schema.borrow().clone();
             CteResultMetadataResolver::new(self, &schema).resolve_with_clause(with_clause)
         };
-        self.reserve_clean_memdb_root_pages(ctes.len()).await?;
         for cte_index in materialization_order {
             let cte = &ctes[cte_index];
             let cte_name = &cte.name;
@@ -100664,7 +100783,9 @@ impl Connection {
                     })
                     .collect();
                 let num_columns = col_infos.len();
-                let root_page = self.db.borrow_mut().create_table(num_columns);
+                let root_page = self
+                    .allocate_schema_table_root(true, num_columns, false)
+                    .await?;
                 self.materialized_temp_root_pages
                     .borrow_mut()
                     .insert(root_page);
@@ -100752,11 +100873,11 @@ impl Connection {
         &self,
         temp_tables: &[MaterializedTempTable],
     ) -> Result<Vec<(String, i32)>> {
-        self.reserve_clean_memdb_root_pages(temp_tables.len())
-            .await?;
         let mut installed = Vec::with_capacity(temp_tables.len());
         for temp_table in temp_tables {
-            let root_page = self.db.borrow_mut().create_table(temp_table.columns.len());
+            let root_page = self
+                .allocate_schema_table_root(true, temp_table.columns.len(), false)
+                .await?;
             self.materialized_temp_root_pages
                 .borrow_mut()
                 .insert(root_page);
@@ -100974,7 +101095,9 @@ impl Connection {
             })
             .collect();
         let num_columns = col_infos.len();
-        let root_page = self.db.borrow_mut().create_table(num_columns);
+        let root_page = self
+            .allocate_schema_table_root(true, num_columns, false)
+            .await?;
         self.materialized_temp_root_pages
             .borrow_mut()
             .insert(root_page);
@@ -104488,7 +104611,7 @@ impl Connection {
             }
         })?;
         let program = builder.finish()?;
-        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
+        self.route_temp_roots_in_program(program, &temp_roots)
     }
 
     /// If the INSERT source contains VALUES rows with subquery expressions,
@@ -104644,7 +104767,7 @@ impl Connection {
             }
         })?;
         let program = builder.finish()?;
-        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
+        self.route_temp_roots_in_program(program, &temp_roots)
     }
 
     /// Compile a DELETE through the VDBE codegen.
@@ -104709,7 +104832,7 @@ impl Connection {
             }
         })?;
         let program = builder.finish()?;
-        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
+        self.route_temp_roots_in_program(program, &temp_roots)
     }
 
     /// Attempt to compile any statement into a `VdbeProgram` for EXPLAIN.
@@ -106000,12 +106123,15 @@ impl Connection {
 
         let schema = self.schema.borrow().clone();
         let temp_table_names = self.temp_table_names.borrow().clone();
+        let materialized_roots = self.materialized_temp_root_pages.borrow().clone();
         let rowid_alias_columns = self.rowid_alias_columns.borrow().clone();
         let mut new_db = self.db.borrow().clone();
         let mut new_sqlite_sequence_cache = HashMap::new();
 
         for table in &schema {
-            if temp_table_names.contains(&table.name.to_ascii_lowercase()) {
+            if temp_table_names.contains(&table.name.to_ascii_lowercase())
+                || materialized_roots.contains(&table.root_page)
+            {
                 continue;
             }
             if table.root_page <= 0 {
@@ -106026,7 +106152,9 @@ impl Connection {
         }
 
         for table in &schema {
-            if temp_table_names.contains(&table.name.to_ascii_lowercase()) {
+            if temp_table_names.contains(&table.name.to_ascii_lowercase())
+                || materialized_roots.contains(&table.root_page)
+            {
                 continue;
             }
             if table.root_page <= 0 {
@@ -108389,10 +108517,11 @@ impl Connection {
             // disagreed with their backing Vecs — a divergence observable by any
             // reentrant schema lookup running during that window. This is the same
             // work the rebuild did (matching its `to_ascii_lowercase` keying and
-            // last-wins insert order), just committed atomically alongside the data.
+            // first-binding-wins order), committed atomically alongside the data.
             let new_schema_by_name: HashMap<String, usize> = new_schema
                 .iter()
                 .enumerate()
+                .rev()
                 .map(|(i, table)| (table.name.to_ascii_lowercase(), i))
                 .collect();
             let new_views_by_name = build_scoped_view_index(&new_views);
@@ -119057,7 +119186,12 @@ fn inline_not_materialized_ctes(select: &SelectStatement) -> Option<SelectStatem
                 // subtree where its name is redefined. Calling the raw
                 // `subst_cte_refs_in_select` here ignored the body's own top-level
                 // WITH and inlined the outer body, yielding 1 where stock yields 2.
-                subst_cte_refs_in_nested_select(&mut body, prev_name, prev_body, &mut inner);
+                subst_cte_refs_in_nested_select(
+                    &mut body,
+                    prev_name,
+                    CteSourceSubstitution::Inline(prev_body),
+                    &mut inner,
+                );
             }
             inlinable.push((cte.name.clone(), body));
         }
@@ -119069,7 +119203,12 @@ fn inline_not_materialized_ctes(select: &SelectStatement) -> Option<SelectStatem
     let mut rewritten = select.clone();
     let mut inlined = 0usize;
     for (name, body) in &inlinable {
-        subst_cte_refs_in_select(&mut rewritten, name, body, &mut inlined);
+        subst_cte_refs_in_select(
+            &mut rewritten,
+            name,
+            CteSourceSubstitution::Inline(body),
+            &mut inlined,
+        );
     }
     (inlined > 0).then_some(rewritten)
 }
@@ -119115,10 +119254,70 @@ fn cte_inline_body(cte: &fsqlite_ast::Cte) -> Option<SelectStatement> {
     Some(body)
 }
 
+/// Rebind only relation references belonging to one lexical WITH scope.
+/// Materialized bindings keep a private storage name while a same-named DML
+/// target keeps its ordinary table name. The FROM alias remains unchanged,
+/// so target columns and correlated references need no textual rewriting.
+#[derive(Clone, Copy)]
+enum CteSourceSubstitution<'a> {
+    Inline(&'a SelectStatement),
+    Materialized(&'a str),
+}
+
+/// Retarget reads of a materialized CTE without rewriting the INSERT target,
+/// assignment targets, or direct target-column references. Nested WITH scopes
+/// retain their own bindings, and explicit schema qualifiers bypass the CTE.
+fn rebind_materialized_insert_reads(
+    insert: &mut fsqlite_ast::InsertStatement,
+    name: &str,
+    private_name: &str,
+) {
+    let body = CteSourceSubstitution::Materialized(private_name);
+    let mut rebound = 0;
+    match &mut insert.source {
+        InsertSource::Values(rows) => {
+            for expr in rows.iter_mut().flatten() {
+                subst_cte_refs_in_expr(expr, name, body, &mut rebound);
+            }
+        }
+        InsertSource::Select(select) => {
+            subst_cte_refs_in_nested_select(select, name, body, &mut rebound);
+        }
+        InsertSource::DefaultValues => {}
+    }
+    for upsert in &mut insert.upsert {
+        if let Some(target) = &mut upsert.target {
+            for column in &mut target.columns {
+                subst_cte_refs_in_expr(&mut column.expr, name, body, &mut rebound);
+            }
+            if let Some(predicate) = &mut target.where_clause {
+                subst_cte_refs_in_expr(predicate, name, body, &mut rebound);
+            }
+        }
+        if let fsqlite_ast::UpsertAction::Update {
+            assignments,
+            where_clause,
+        } = &mut upsert.action
+        {
+            for assignment in assignments {
+                subst_cte_refs_in_expr(&mut assignment.value, name, body, &mut rebound);
+            }
+            if let Some(predicate) = where_clause {
+                subst_cte_refs_in_expr(predicate, name, body, &mut rebound);
+            }
+        }
+    }
+    for column in &mut insert.returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            subst_cte_refs_in_expr(expr, name, body, &mut rebound);
+        }
+    }
+}
+
 fn subst_cte_refs_in_select(
     select: &mut SelectStatement,
     name: &str,
-    body: &SelectStatement,
+    body: CteSourceSubstitution<'_>,
     inlined: &mut usize,
 ) {
     if let Some(with) = &mut select.with {
@@ -119146,7 +119345,7 @@ fn subst_cte_refs_in_select(
 fn subst_cte_refs_in_nested_select(
     select: &mut SelectStatement,
     name: &str,
-    body: &SelectStatement,
+    body: CteSourceSubstitution<'_>,
     inlined: &mut usize,
 ) {
     if let Some(with) = &select.with
@@ -119163,9 +119362,15 @@ fn subst_cte_refs_in_nested_select(
 fn subst_cte_refs_in_core(
     core: &mut SelectCore,
     name: &str,
-    body: &SelectStatement,
+    body: CteSourceSubstitution<'_>,
     inlined: &mut usize,
 ) {
+    if let SelectCore::Values(rows) = core {
+        for expr in rows.iter_mut().flatten() {
+            subst_cte_refs_in_expr(expr, name, body, inlined);
+        }
+        return;
+    }
     let SelectCore::Select {
         columns,
         from,
@@ -119176,8 +119381,6 @@ fn subst_cte_refs_in_core(
         ..
     } = core
     else {
-        // `VALUES` rows are immutable in the AST; a CTE reference buried inside a
-        // VALUES subquery stays on the materialize path (a safe fallback).
         return;
     };
     for column in columns {
@@ -119205,7 +119408,7 @@ fn subst_cte_refs_in_core(
 fn subst_cte_refs_in_from(
     from: &mut FromClause,
     name: &str,
-    body: &SelectStatement,
+    body: CteSourceSubstitution<'_>,
     inlined: &mut usize,
 ) {
     subst_cte_refs_in_table(&mut from.source, name, body, inlined);
@@ -119220,7 +119423,7 @@ fn subst_cte_refs_in_from(
 fn subst_cte_refs_in_table(
     source: &mut TableOrSubquery,
     name: &str,
-    body: &SelectStatement,
+    body: CteSourceSubstitution<'_>,
     inlined: &mut usize,
 ) {
     match source {
@@ -119231,15 +119434,23 @@ fn subst_cte_refs_in_table(
             time_travel,
         } => {
             if qualified.schema.is_none()
-                && index_hint.is_none()
-                && time_travel.is_none()
                 && qualified.name.eq_ignore_ascii_case(name)
+                && (matches!(body, CteSourceSubstitution::Materialized(_))
+                    || (index_hint.is_none() && time_travel.is_none()))
             {
                 let preserved_alias = alias.clone().unwrap_or_else(|| qualified.name.clone());
-                *source = TableOrSubquery::Subquery {
-                    query: Box::new(body.clone()),
-                    alias: Some(preserved_alias),
-                };
+                match body {
+                    CteSourceSubstitution::Inline(query) => {
+                        *source = TableOrSubquery::Subquery {
+                            query: Box::new(query.clone()),
+                            alias: Some(preserved_alias),
+                        };
+                    }
+                    CteSourceSubstitution::Materialized(private_name) => {
+                        private_name.clone_into(&mut qualified.name);
+                        *alias = Some(preserved_alias);
+                    }
+                }
                 *inlined += 1;
             }
         }
@@ -119260,7 +119471,7 @@ fn subst_cte_refs_in_table(
 fn subst_cte_refs_in_expr(
     expr: &mut Expr,
     name: &str,
-    body: &SelectStatement,
+    body: CteSourceSubstitution<'_>,
     inlined: &mut usize,
 ) {
     match expr {
@@ -119282,7 +119493,16 @@ fn subst_cte_refs_in_expr(
                 }
                 InSet::Table(qualified) => {
                     if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name) {
-                        *set = InSet::Subquery(Box::new(select_star_from_derived(body, name)));
+                        match body {
+                            CteSourceSubstitution::Inline(query) => {
+                                *set = InSet::Subquery(Box::new(select_star_from_derived(
+                                    query, name,
+                                )));
+                            }
+                            CteSourceSubstitution::Materialized(private_name) => {
+                                private_name.clone_into(&mut qualified.name);
+                            }
+                        }
                         *inlined += 1;
                     }
                 }
@@ -119374,7 +119594,7 @@ fn subst_cte_refs_in_expr(
 fn subst_cte_refs_in_window_spec(
     window: &mut WindowSpec,
     name: &str,
-    body: &SelectStatement,
+    body: CteSourceSubstitution<'_>,
     inlined: &mut usize,
 ) {
     for expr in &mut window.partition_by {
@@ -119394,7 +119614,7 @@ fn subst_cte_refs_in_window_spec(
 fn subst_cte_refs_in_frame_bound(
     bound: &mut FrameBound,
     name: &str,
-    body: &SelectStatement,
+    body: CteSourceSubstitution<'_>,
     inlined: &mut usize,
 ) {
     if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
@@ -119487,10 +119707,13 @@ fn compound_op_error_name(op: CompoundOp) -> &'static str {
 /// it), not a rewritten one. Lists with `*` are left alone because their
 /// expansion shifts result positions.
 fn overlay_result_expression_source_names(names: &mut [String], original: &Statement, sql: &str) {
-    let Statement::Select(select) = original else {
-        return;
-    };
-    overlay_select_result_expression_source_names(names, select, sql);
+    match original {
+        Statement::Select(select) => overlay_select_result_expression_source_names(names, select, sql),
+        Statement::Insert(insert) => overlay_result_column_source_names(names, &insert.returning, sql),
+        Statement::Update(update) => overlay_result_column_source_names(names, &update.returning, sql),
+        Statement::Delete(delete) => overlay_result_column_source_names(names, &delete.returning, sql),
+        _ => {}
+    }
 }
 
 /// [`overlay_result_expression_source_names`] for a SELECT parsed from `sql`
@@ -119504,6 +119727,12 @@ fn overlay_select_result_expression_source_names(
     let SelectCore::Select { columns, .. } = &select.body.select else {
         return;
     };
+    overlay_result_column_source_names(names, columns, sql);
+}
+
+/// Name each unaliased, non-column result expression of `columns` (a SELECT
+/// result list or a RETURNING clause parsed from `sql`) by its source text.
+fn overlay_result_column_source_names(names: &mut [String], columns: &[ResultColumn], sql: &str) {
     if columns.len() != names.len()
         || columns
             .iter()
@@ -157207,23 +157436,29 @@ fn canonicalize_delete_placeholders_with_state(
 fn canonicalize_insert_placeholders(
     insert: &fsqlite_ast::InsertStatement,
 ) -> Result<fsqlite_ast::InsertStatement> {
+    canonicalize_insert_placeholders_with_state(insert, &mut BindParamState::default())
+}
+
+fn canonicalize_insert_placeholders_with_state(
+    insert: &fsqlite_ast::InsertStatement,
+    bind_state: &mut BindParamState,
+) -> Result<fsqlite_ast::InsertStatement> {
     let mut normalized = insert.clone();
-    let mut bind_state = BindParamState::default();
     if let Some(with_clause) = &mut normalized.with {
         for cte in &mut with_clause.ctes {
-            canonicalize_select_placeholders_in_statement(&mut cte.query, &mut bind_state)?;
+            canonicalize_select_placeholders_in_statement(&mut cte.query, bind_state)?;
         }
     }
     match &mut normalized.source {
         fsqlite_ast::InsertSource::Values(rows) => {
             for row in rows {
                 for value in row {
-                    canonicalize_expr_placeholders(value, &mut bind_state)?;
+                    canonicalize_expr_placeholders(value, bind_state)?;
                 }
             }
         }
         fsqlite_ast::InsertSource::Select(select) => {
-            canonicalize_select_placeholders_in_statement(select, &mut bind_state)?;
+            canonicalize_select_placeholders_in_statement(select, bind_state)?;
         }
         fsqlite_ast::InsertSource::DefaultValues => {}
     }
@@ -157231,7 +157466,7 @@ fn canonicalize_insert_placeholders(
         if let Some(target) = &mut upsert.target
             && let Some(where_clause) = &mut target.where_clause
         {
-            canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
+            canonicalize_expr_placeholders(where_clause, bind_state)?;
         }
         if let fsqlite_ast::UpsertAction::Update {
             assignments,
@@ -157239,16 +157474,16 @@ fn canonicalize_insert_placeholders(
         } = &mut upsert.action
         {
             for assignment in assignments {
-                canonicalize_expr_placeholders(&mut assignment.value, &mut bind_state)?;
+                canonicalize_expr_placeholders(&mut assignment.value, bind_state)?;
             }
             if let Some(where_clause) = where_clause {
-                canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
+                canonicalize_expr_placeholders(where_clause, bind_state)?;
             }
         }
     }
     for column in &mut normalized.returning {
         if let ResultColumn::Expr { expr, .. } = column {
-            canonicalize_expr_placeholders(expr, &mut bind_state)?;
+            canonicalize_expr_placeholders(expr, bind_state)?;
         }
     }
     Ok(normalized)

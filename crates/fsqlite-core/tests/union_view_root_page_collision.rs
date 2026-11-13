@@ -15,10 +15,13 @@
 //! companion `execute_with_materialized_sqlite_schema` path which has called
 //! it since inception.
 //!
-//! Fix: `self.reserve_clean_memdb_root_pages(referenced.len())?` at the top
-//! of `execute_with_materialized_views`'s exec_result closure. After the
-//! fix, view temp tables get root pages past any pager-occupied page so the
-//! collision cannot occur.
+//! First fix: `reserve_clean_memdb_root_pages` at the top of the view
+//! materialization, so view temp tables got root pages past any
+//! pager-occupied page. Since bd-6hy0g, materialized view, CTE and
+//! sqlite_schema tables take roots from the connection-local TEMP namespace
+//! (`allocate_schema_table_root(true, ..)`) and compiled programs route them
+//! to the MemDatabase, so they cannot meet a pager root at all. That probe
+//! was removed.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::SqliteValue;

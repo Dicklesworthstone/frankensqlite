@@ -2467,6 +2467,44 @@ mod tests {
                     insert.column_count()
                 ));
             }
+            // RETURNING rows read by index and by name, with the statement's
+            // column metadata: the usual way to read back an inserted id.
+            // A WITH insert, which dispatches at execution, reports its width
+            // too.
+            conn.execute_batch("CREATE TABLE ret(id INTEGER PRIMARY KEY, body TEXT);")
+                .unwrap();
+            trace.push(show(conn.query_row(
+                "INSERT INTO ret(body) VALUES (?1) RETURNING id, upper(body) AS shout, length(body)",
+                ["difference engine"],
+                |row| {
+                    let stmt = row.as_ref();
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>("shout")?,
+                        row.get::<_, i64>(2)?,
+                        stmt.column_count(),
+                        stmt.column_name(2)?.to_owned(),
+                    ))
+                },
+            )));
+            trace.push(show(
+                conn.prepare(
+                    "WITH c(b) AS (SELECT 'x' UNION ALL SELECT 'yy') \
+                     INSERT INTO ret(body) SELECT b FROM c RETURNING *",
+                )
+                .and_then(|mut stmt| {
+                    let columns = (
+                        stmt.column_count(),
+                        stmt.column_names().map(str::to_owned).collect::<Vec<_>>(),
+                    );
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((row.get::<_, i64>("id")?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<$m::Result<Vec<_>>>()?;
+                    Ok((columns, rows))
+                }),
+            ));
             trace.push(show(conn.query_row(
                 "SELECT id, name, age, score, data FROM person WHERE name = ?1",
                 ["Ada"],

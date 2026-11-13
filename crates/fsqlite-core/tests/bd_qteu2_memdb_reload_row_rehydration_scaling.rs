@@ -40,7 +40,7 @@ const LARGE_STABLE_ROWS: usize = 200;
 /// reaches the per-write memdb reload during nested-write ingestion (bd-420r8).
 /// Runs an ingestion burst and returns the number of user-table rows hydrated
 /// into the MemDatabase mirror DURING the burst.
-async fn hydration_during_ingestion(stable_rows_each: usize) -> u64 {
+async fn hydration_during_ingestion(stable_rows_each: usize, with_cte: bool) -> u64 {
     let conn = Connection::open(":memory:").await.unwrap();
 
     let mut ddl = String::new();
@@ -51,6 +51,9 @@ async fn hydration_during_ingestion(stable_rows_each: usize) -> u64 {
     }
     ddl.push_str("CREATE TABLE main(id INTEGER PRIMARY KEY, v TEXT);");
     ddl.push_str("CREATE TABLE sink(id INTEGER PRIMARY KEY, v TEXT);");
+    if with_cte {
+        ddl.push_str("CREATE TABLE source(v TEXT);");
+    }
     ddl.push_str(
         "CREATE TRIGGER main_guard BEFORE INSERT ON main \
          WHEN (SELECT count(*) FROM sink) >= 0 \
@@ -72,11 +75,30 @@ async fn hydration_during_ingestion(stable_rows_each: usize) -> u64 {
         conn.execute_batch(&batch).await.unwrap();
     }
 
+    if with_cte {
+        // Match bd-1ucvb's persistent SELECT source: materialization may load
+        // the initial row image once. Trigger replay must not keep reloading
+        // the untouched tables along with that source image.
+        let mut seed = String::from("BEGIN;");
+        for i in 0..INGEST_ROWS {
+            seed.push_str(&format!("INSERT INTO source(v) VALUES ('row-{i}');"));
+        }
+        seed.push_str("COMMIT;");
+        conn.execute_batch(&seed).await.unwrap();
+    }
+
     // Measure row hydrations across ONLY the ingestion phase.
     let before = conn.memdb_row_hydration_count();
     let mut batch = String::from("BEGIN;");
-    for i in 0..INGEST_ROWS {
-        batch.push_str(&format!("INSERT INTO main(v) VALUES ('row-{i}');"));
+    if with_cte {
+        batch.push_str(
+            "WITH c(v) AS (SELECT v FROM source) \
+             INSERT INTO main(v) SELECT v FROM c;",
+        );
+    } else {
+        for i in 0..INGEST_ROWS {
+            batch.push_str(&format!("INSERT INTO main(v) VALUES ('row-{i}');"));
+        }
     }
     batch.push_str("COMMIT;");
     conn.execute_batch(&batch).await.unwrap();
@@ -107,8 +129,8 @@ async fn hydration_during_ingestion(stable_rows_each: usize) -> u64 {
 #[test]
 fn ingestion_does_not_rehydrate_untouched_table_rows_per_write() {
     asupersync::test_utils::run_test(|| async {
-        let small = hydration_during_ingestion(SMALL_STABLE_ROWS).await;
-        let large = hydration_during_ingestion(LARGE_STABLE_ROWS).await;
+        let small = hydration_during_ingestion(SMALL_STABLE_ROWS, false).await;
+        let large = hydration_during_ingestion(LARGE_STABLE_ROWS, false).await;
 
         if std::env::var("BD_QTEU2_MEASURE").is_ok() {
             eprintln!(
@@ -138,6 +160,34 @@ fn ingestion_does_not_rehydrate_untouched_table_rows_per_write() {
              small={small}, large={large}, delta={} exceeds one-time bound {bound} \
              (per-write row re-hydration regression: expected O(total_rows + writes), \
              got O(writes × total_rows))",
+            large.saturating_sub(small)
+        );
+    });
+}
+
+/// bd-1ucvb: WITH INSERT's materialization may hydrate the source once, but
+/// replay through a trigger must not retain that fallback override and hydrate
+/// every untouched table again for every source row. Counters distinguish this
+/// from the one-time source load without depending on machine speed.
+#[test]
+fn with_insert_trigger_replay_does_not_rehydrate_untouched_rows_per_source_row() {
+    asupersync::test_utils::run_test(|| async {
+        let small = hydration_during_ingestion(SMALL_STABLE_ROWS, true).await;
+        let large = hydration_during_ingestion(LARGE_STABLE_ROWS, true).await;
+        let extra_stable_rows = (STABLE_TABLES * (LARGE_STABLE_ROWS - SMALL_STABLE_ROWS)) as u64;
+        let bound = extra_stable_rows * 2;
+
+        if std::env::var("BD_QTEU2_MEASURE").is_ok() {
+            eprintln!(
+                "BD_1UCVB: {INGEST_ROWS} CTE source rows replayed through a subquery-WHEN \
+                 trigger: small={small}, large={large}, extra-row hydration bound={bound}"
+            );
+        }
+
+        assert!(
+            large.saturating_sub(small) <= bound,
+            "bd-1ucvb: WITH INSERT trigger replay hydrated untouched tables per source row: \
+             small={small}, large={large}, delta={} exceeds one-time bound {bound}",
             large.saturating_sub(small)
         );
     });

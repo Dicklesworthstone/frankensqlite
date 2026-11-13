@@ -1,6 +1,16 @@
-# CTE INSERT replay: unapplied recovery checkpoint
+# CTE INSERT replay: recovery checkpoint (applied)
 
-**These are recovery patches, not active engine fixes. No bead is closed by this checkpoint.**
+**Applied 2026-11-13** by hand in the commit that names bd-r5mmz, bd-6hy0g,
+bd-n2ehh and bd-1ucvb, and gated there. Two changes against these files:
+- prepared DML now reports its RETURNING columns, which the prepared
+  RETURNING test needed;
+- the nested-scope test's RETURNING subqueries with their own WITH were
+  split into an ignored keeper for the separate bug bd-d8fxs.
+
+The patches below are kept as the record of the reconstruction; the engine
+no longer needs them applied.
+
+**Original note: these are recovery patches, not active engine fixes. No bead is closed by this checkpoint.**
 
 The execution environment became unavailable on 2026-11-13 before the edited working tree could be committed, rebased, formatted, or validated. The GitHub connector remained available but could not retrieve the 13 MB connection.rs. The engine changes below were reconstructed from retained patches and source reads; their application still needs verification in a working checkout. The regression insertion was recovered from the complete test-file contents and compared with the unchanged upstream original.
 

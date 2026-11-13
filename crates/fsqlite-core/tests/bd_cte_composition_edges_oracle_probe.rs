@@ -103,6 +103,611 @@ async fn assert_materialized_cte_query(
     }
 }
 
+// bd-r5mmz / bd-6hy0g / bd-n2ehh: a materialized CTE remains visible to
+// UPSERT and RETURNING for the whole statement, including after trigger DML
+// refreshes the persistent row image. Trigger programs have their own scope.
+// These helpers require successful queries; equal errors are never a pass.
+async fn cte_dml_frank_rows(
+    conn: &Connection,
+    sql: &str,
+    params: &[i64],
+    prepared: bool,
+) -> Vec<Vec<String>> {
+    let params: Vec<_> = params.iter().copied().map(SqliteValue::Integer).collect();
+    let rows = if prepared {
+        let statement = conn
+            .prepare(sql)
+            .await
+            .unwrap_or_else(|error| panic!("FrankenSQLite prepare {sql}: {error}"));
+        if statement.column_count() == 0 {
+            statement
+                .execute_with_params(&params)
+                .await
+                .map(|_| Vec::new())
+        } else {
+            statement.query_with_params(&params).await
+        }
+    } else {
+        conn.query_with_params(sql, &params).await
+    }
+    .unwrap_or_else(|error| panic!("FrankenSQLite query {sql}: {error}"));
+    rows.iter()
+        .map(|row| row.values().iter().map(tag_f).collect())
+        .collect()
+}
+
+fn cte_dml_stock_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[i64],
+) -> Vec<Vec<String>> {
+    let mut statement = conn
+        .prepare(sql)
+        .unwrap_or_else(|error| panic!("stock prepare {sql}: {error}"));
+    let width = statement.column_count();
+    statement
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            (0..width)
+                .map(|index| {
+                    row.get::<_, rusqlite::types::Value>(index)
+                        .map(|value| tag_r(&value))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_else(|error| panic!("stock query {sql}: {error}"))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| panic!("stock rows {sql}: {error}"))
+}
+
+async fn cte_dml_setup(f: &Connection, r: &rusqlite::Connection, triggers: bool) {
+    for sql in [
+        "CREATE TABLE t(k INTEGER PRIMARY KEY, v INTEGER, note TEXT)",
+        "CREATE TABLE src(x INTEGER)",
+        "CREATE TABLE log(id INTEGER PRIMARY KEY, msg TEXT)",
+        "INSERT INTO src VALUES (1),(2),(3)",
+        "INSERT INTO t VALUES (1,10,'old'),(2,20,'old')",
+    ] {
+        f.execute(sql)
+            .await
+            .unwrap_or_else(|error| panic!("FrankenSQLite fixture {sql}: {error}"));
+        r.execute_batch(sql)
+            .unwrap_or_else(|error| panic!("stock fixture {sql}: {error}"));
+    }
+    if triggers {
+        for sql in [
+            "CREATE TRIGGER t_ins BEFORE INSERT ON t \
+             WHEN (SELECT count(*) FROM log) >= 0 BEGIN \
+             INSERT INTO log(msg) VALUES \
+               ('ins ' || NEW.k || ' seen ' || (SELECT count(*) FROM log)); END",
+            "CREATE TRIGGER t_upd AFTER UPDATE ON t BEGIN \
+             INSERT INTO log(msg) VALUES ('upd ' || NEW.k || ' ' || NEW.v); END",
+        ] {
+            f.execute(sql).await.expect("FrankenSQLite trigger fixture");
+            r.execute_batch(sql).expect("stock trigger fixture");
+        }
+    }
+}
+
+async fn assert_cte_dml_state(f: &Connection, r: &rusqlite::Connection, label: &str) {
+    for sql in [
+        "SELECT changes()",
+        "SELECT k,v,note FROM t ORDER BY k",
+        "SELECT x FROM src ORDER BY x",
+        "SELECT id,msg FROM log ORDER BY id",
+    ] {
+        assert_eq!(
+            cte_dml_frank_rows(f, sql, &[], false).await,
+            cte_dml_stock_rows(r, sql, &[]),
+            "{label}: {sql}",
+        );
+    }
+}
+
+#[test]
+fn with_insert_upsert_cte_reads_survive_trigger_replay() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let sql = "WITH c(x) AS (SELECT x FROM src) \
+                   INSERT INTO t(k,v) SELECT x,x*100 FROM c WHERE true \
+                   ON CONFLICT(k) DO UPDATE SET v=(SELECT max(x) FROM c)";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                // Exercise the silent wrong-write report before the sibling
+                // no-trigger cursor error when this keeper is run on a base.
+                for triggers in [true, false] {
+                    let label = format!(
+                        "upsert-file-{file_backed}-prepared-{prepared}-triggers-{triggers}"
+                    );
+                    let path = directory.path().join(format!("{label}.db"));
+                    let f = Connection::open(if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .unwrap();
+                    let r = rusqlite::Connection::open_in_memory().unwrap();
+                    cte_dml_setup(&f, &r, triggers).await;
+                    // The second execution conflicts on all three keys. It also
+                    // catches cached programs retaining a cleaned-up CTE root.
+                    for execution in 0..2 {
+                        let expected = cte_dml_stock_rows(&r, sql, &[]);
+                        let actual = cte_dml_frank_rows(&f, sql, &[], prepared).await;
+                        assert!(expected.is_empty(), "stock UPSERT has no RETURNING");
+                        assert_eq!(actual, expected, "{label}, execution={execution}");
+                        assert_cte_dml_state(&f, &r, &label).await;
+                        let rows = cte_dml_stock_rows(&r, "SELECT k,v FROM t ORDER BY k", &[]);
+                        assert_eq!(rows[0], vec!["int:1", "int:3"]);
+                        assert_eq!(rows[1], vec!["int:2", "int:3"]);
+                        let error = f.query("SELECT x FROM c").await.expect_err("CTE is scoped");
+                        assert!(error.to_string().contains("no such table"), "{error}");
+                    }
+                    f.close().await.unwrap();
+                    if file_backed {
+                        let reopened = Connection::open(path.to_str().unwrap()).await.unwrap();
+                        for query in [
+                            "SELECT k,v,note FROM t ORDER BY k",
+                            "SELECT id,msg FROM log ORDER BY id",
+                        ] {
+                            assert_eq!(
+                                cte_dml_frank_rows(&reopened, query, &[], false).await,
+                                cte_dml_stock_rows(&r, query, &[]),
+                                "{label} after reopen: {query}"
+                            );
+                        }
+                        reopened.close().await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn with_insert_returning_cte_reads_preserve_parameters() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let sql = "WITH c(x) AS (SELECT x FROM src WHERE x<=?1) \
+                   INSERT INTO t(k,v) SELECT x+?2,x*?3 FROM c \
+                   RETURNING k,v,(SELECT count(*) FROM c),(SELECT max(x)+?4 FROM c)";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for triggers in [false, true] {
+                    let label = format!(
+                        "returning-file-{file_backed}-prepared-{prepared}-triggers-{triggers}"
+                    );
+                    let path = directory.path().join(format!("{label}.db"));
+                    let f = Connection::open(if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .unwrap();
+                    let r = rusqlite::Connection::open_in_memory().unwrap();
+                    cte_dml_setup(&f, &r, triggers).await;
+                    let params = [3, 10, 7, 20];
+                    let expected = cte_dml_stock_rows(&r, sql, &params);
+                    assert_eq!(
+                        expected,
+                        vec![
+                            vec!["int:11", "int:7", "int:3", "int:23"],
+                            vec!["int:12", "int:14", "int:3", "int:23"],
+                            vec!["int:13", "int:21", "int:3", "int:23"],
+                        ],
+                        "stock RETURNING fixture"
+                    );
+                    assert_eq!(
+                        cte_dml_frank_rows(&f, sql, &params, prepared).await,
+                        expected,
+                        "{label}"
+                    );
+                    assert_cte_dml_state(&f, &r, &label).await;
+                    f.close().await.unwrap();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn with_insert_unbound_parameters_do_not_alias_replayed_source_values() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let sql = "WITH c(x) AS (VALUES(1),(2)) \
+                   INSERT INTO t(k,v) SELECT x,x*100 FROM c WHERE true \
+                   ON CONFLICT(k) DO UPDATE SET v=coalesce(?1,excluded.v),note=:note \
+                   RETURNING k,v,?1,?4,?,:note,(SELECT count(*) FROM c)";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for triggers in [false, true] {
+                    let label = format!(
+                        "unbound-file-{file_backed}-prepared-{prepared}-triggers-{triggers}"
+                    );
+                    let path = directory.path().join(format!("{label}.db"));
+                    let f = Connection::open(if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .unwrap();
+                    let r = rusqlite::Connection::open_in_memory().unwrap();
+                    cte_dml_setup(&f, &r, triggers).await;
+                    // Native query() leaves parameters unbound. rusqlite's
+                    // raw_query mirrors SQLite's NULL bindings; query_map([])
+                    // rejects the parameter count before executing the SQL.
+                    let expected = {
+                        let mut statement = r.prepare(sql).unwrap();
+                        let width = statement.column_count();
+                        let mut rows = statement.raw_query();
+                        let mut result = Vec::new();
+                        while let Some(row) = rows.next().unwrap() {
+                            result.push(
+                                (0..width)
+                                    .map(|index| {
+                                        tag_r(&row.get::<_, rusqlite::types::Value>(index).unwrap())
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                        result
+                    };
+                    assert_eq!(
+                        expected,
+                        vec![
+                            vec!["int:1", "int:100", "NULL", "NULL", "NULL", "NULL", "int:2"],
+                            vec!["int:2", "int:200", "NULL", "NULL", "NULL", "NULL", "int:2"],
+                        ],
+                        "stock unbound-parameter fixture"
+                    );
+                    let actual = if prepared {
+                        f.prepare(sql).await.unwrap().query().await
+                    } else {
+                        f.query(sql).await
+                    }
+                    .unwrap_or_else(|error| panic!("{label}: {error}"));
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "{label}: original slots must remain NULL"
+                    );
+                    assert_cte_dml_state(&f, &r, &label).await;
+                    f.close().await.unwrap();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn with_insert_upsert_where_cte_reads_keep_bound_parameters() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let sql = "WITH c(x) AS (SELECT x FROM src) \
+                   INSERT INTO t(k,v) SELECT x,x*?1 FROM c WHERE true \
+                   ON CONFLICT(k) DO UPDATE SET v=excluded.v \
+                   WHERE EXISTS(SELECT 1 FROM c WHERE x=?2)";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for triggers in [false, true] {
+                    let label = format!(
+                        "where-file-{file_backed}-prepared-{prepared}-triggers-{triggers}"
+                    );
+                    let path = directory.path().join(format!("{label}.db"));
+                    let f = Connection::open(if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .unwrap();
+                    let r = rusqlite::Connection::open_in_memory().unwrap();
+                    cte_dml_setup(&f, &r, triggers).await;
+                    // A successful DO UPDATE followed by a false condition
+                    // proves the replay retained the predicate's bind slot.
+                    for (params, changes) in [([100, 3], 3), ([1000, 0], 0)] {
+                        let expected = cte_dml_stock_rows(&r, sql, &params);
+                        assert!(expected.is_empty());
+                        assert_eq!(
+                            cte_dml_frank_rows(&f, sql, &params, prepared).await,
+                            expected,
+                            "{label}: {params:?}"
+                        );
+                        assert_eq!(r.changes(), changes);
+                        assert_cte_dml_state(&f, &r, &label).await;
+                    }
+                    f.close().await.unwrap();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn with_insert_cte_is_hidden_from_trigger_body_and_when() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let sql = "WITH log(x) AS (SELECT x FROM src) \
+                   INSERT INTO t(k,v) SELECT x+20,x FROM log";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for temporary_trigger in [false, true] {
+                    let label = format!(
+                        "scope-file-{file_backed}-prepared-{prepared}-temp-{temporary_trigger}"
+                    );
+                    let path = directory.path().join(format!("{label}.db"));
+                    let f = Connection::open(if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .unwrap();
+                    let r = rusqlite::Connection::open_in_memory().unwrap();
+                    cte_dml_setup(&f, &r, false).await;
+                    let temp = if temporary_trigger { "TEMP " } else { "" };
+                    let trigger = format!(
+                        "CREATE {temp}TRIGGER t_ins BEFORE INSERT ON t \
+                         WHEN (SELECT count(*) FROM log WHERE msg LIKE 'ins%')<2 BEGIN \
+                         INSERT INTO log(msg) VALUES \
+                         ('ins ' || NEW.k || ' seen ' || (SELECT count(*) FROM log)); END"
+                    );
+                    f.execute(&trigger).await.unwrap();
+                    r.execute_batch(&trigger).unwrap();
+                    let expected = cte_dml_stock_rows(&r, sql, &[]);
+                    assert!(expected.is_empty());
+                    assert_eq!(
+                        cte_dml_frank_rows(&f, sql, &[], prepared).await,
+                        expected,
+                        "{label}"
+                    );
+                    assert_cte_dml_state(&f, &r, &label).await;
+                    assert_eq!(
+                        cte_dml_stock_rows(&r, "SELECT msg FROM log ORDER BY id", &[]),
+                        vec![vec!["text:ins 21 seen 0"], vec!["text:ins 22 seen 1"]]
+                    );
+                    // The persistent binding is restored after the WITH scope.
+                    f.execute("INSERT INTO log(msg) VALUES('outside')").await.unwrap();
+                    r.execute_batch("INSERT INTO log(msg) VALUES('outside')").unwrap();
+                    assert_cte_dml_state(&f, &r, &label).await;
+                    f.close().await.unwrap();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn with_insert_cte_shadowing_target_writes_the_persistent_table() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        // The FROM binding is the CTE, but an INSERT target is always a real
+        // table. Writing the materialized root would lose successful writes
+        // when the WITH cleanup runs.
+        let sql = "WITH t(k,v) AS (VALUES(7,70),(19,190)) \
+                   INSERT INTO t(k,v) SELECT k,v FROM t";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for triggers in [false, true] {
+                    let label = format!(
+                        "target-file-{file_backed}-prepared-{prepared}-triggers-{triggers}"
+                    );
+                    let path = directory.path().join(format!("{label}.db"));
+                    let f = Connection::open(if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .unwrap();
+                    let r = rusqlite::Connection::open_in_memory().unwrap();
+                    cte_dml_setup(&f, &r, triggers).await;
+                    let expected = cte_dml_stock_rows(&r, sql, &[]);
+                    assert!(expected.is_empty());
+                    assert_eq!(
+                        cte_dml_frank_rows(&f, sql, &[], prepared).await,
+                        expected,
+                        "{label}"
+                    );
+                    assert_cte_dml_state(&f, &r, &label).await;
+                    assert_eq!(
+                        cte_dml_stock_rows(&r, "SELECT k,v,note FROM t ORDER BY k", &[]),
+                        vec![
+                            vec!["int:1", "int:10", "text:old"],
+                            vec!["int:2", "int:20", "text:old"],
+                            vec!["int:7", "int:70", "NULL"],
+                            vec!["int:19", "int:190", "NULL"],
+                        ]
+                    );
+                    f.close().await.unwrap();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn with_insert_target_shadow_upsert_returning_respects_nested_scopes() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for (target, temporary_target) in [("t", false), ("main.t", false), ("t", true)] {
+                    for triggers in [false, true] {
+                        if temporary_target && triggers {
+                            continue;
+                        }
+                        let label = format!(
+                            "nested-file-{file_backed}-prepared-{prepared}-{target}-temp-{temporary_target}-triggers-{triggers}"
+                        );
+                        let path = directory.path().join(format!("{label}.db"));
+                        let f = Connection::open(if file_backed {
+                            path.to_str().unwrap()
+                        } else {
+                            ":memory:"
+                        })
+                        .await
+                        .unwrap();
+                        let r = rusqlite::Connection::open_in_memory().unwrap();
+                        cte_dml_setup(&f, &r, triggers).await;
+                        let anchor = "INSERT INTO main.t VALUES(99,999,'anchor')";
+                        f.execute(anchor).await.unwrap();
+                        r.execute_batch(anchor).unwrap();
+                        if temporary_target {
+                            for setup in [
+                                "CREATE TEMP TABLE t(k INTEGER PRIMARY KEY,v INTEGER,note TEXT)",
+                                "INSERT INTO temp.t VALUES(1,10,'temp-old'),(2,20,'temp-old')",
+                            ] {
+                                f.execute(setup).await.unwrap();
+                                r.execute_batch(setup).unwrap();
+                            }
+                        }
+                        // Read scopes differ in the same statement: INSERT
+                        // targets the real table, the SET and outer RETURNING
+                        // subqueries read the outer CTE, and main.t bypasses
+                        // it. A RETURNING subquery with its own WITH is
+                        // bd-d8fxs (see the ignored keeper below).
+                        let sql = format!(
+                            "WITH t(k,v) AS (VALUES(1,100),(2,200),(3,300)) \
+                             INSERT INTO {target}(k,v) SELECT k,v FROM t WHERE true \
+                             ON CONFLICT(k) DO UPDATE SET v=(SELECT max(v) FROM t) \
+                             RETURNING k,t.v,(SELECT count(*) FROM t), \
+                               (SELECT v FROM main.t WHERE k=99)"
+                        );
+                        let expected = cte_dml_stock_rows(&r, &sql, &[]);
+                        assert_eq!(
+                            expected,
+                            vec![
+                                vec!["int:1", "int:300", "int:3", "int:999"],
+                                vec!["int:2", "int:300", "int:3", "int:999"],
+                                vec!["int:3", "int:300", "int:3", "int:999"],
+                            ],
+                            "stock nested-scope fixture"
+                        );
+                        assert_eq!(
+                            cte_dml_frank_rows(&f, &sql, &[], prepared).await,
+                            expected,
+                            "{label}"
+                        );
+                        assert_cte_dml_state(&f, &r, &label).await;
+                        let query = "SELECT k,v,note FROM main.t ORDER BY k";
+                        assert_eq!(
+                            cte_dml_frank_rows(&f, query, &[], false).await,
+                            cte_dml_stock_rows(&r, query, &[]),
+                            "{label}: persistent main table"
+                        );
+                        f.close().await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// bd-d8fxs keeper: a RETURNING subquery with its own WITH sees that scope.
+/// A nested `WITH t` shadows the statement's CTE `t`, and `q` built over the
+/// outer `t` still reads the CTE. INSERT RETURNING compiles these subqueries
+/// to NULL today (it reads the real table `t` for the shadowing case), so
+/// the keeper is ignored until bd-d8fxs lands; run it with `--ignored`.
+#[test]
+#[ignore = "bd-d8fxs: INSERT RETURNING evaluates a scalar subquery over a CTE as NULL"]
+fn with_insert_returning_nested_with_scopes_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        for prepared in [false, true] {
+            let label = format!("nested-with-returning-prepared-{prepared}");
+            let f = Connection::open(":memory:").await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            cte_dml_setup(&f, &r, false).await;
+            let anchor = "INSERT INTO main.t VALUES(99,999,'anchor')";
+            f.execute(anchor).await.unwrap();
+            r.execute_batch(anchor).unwrap();
+            let sql = "WITH t(k,v) AS (VALUES(1,100),(2,200),(3,300)) \
+                       INSERT INTO t(k,v) SELECT k,v FROM t WHERE true \
+                       ON CONFLICT(k) DO UPDATE SET v=(SELECT max(v) FROM t) \
+                       RETURNING k,t.v,(SELECT count(*) FROM t), \
+                         (WITH t(v) AS (VALUES(99)) SELECT v FROM t), \
+                         (WITH q(n) AS (SELECT max(v) FROM t) SELECT n FROM q), \
+                         (SELECT v FROM main.t WHERE k=99)";
+            let expected = cte_dml_stock_rows(&r, sql, &[]);
+            assert_eq!(
+                expected,
+                vec![
+                    vec!["int:1", "int:300", "int:3", "int:99", "int:300", "int:999"],
+                    vec!["int:2", "int:300", "int:3", "int:99", "int:300", "int:999"],
+                    vec!["int:3", "int:300", "int:3", "int:99", "int:300", "int:999"],
+                ],
+                "stock nested-scope fixture"
+            );
+            assert_eq!(
+                cte_dml_frank_rows(&f, sql, &[], prepared).await,
+                expected,
+                "{label}"
+            );
+            assert_cte_dml_state(&f, &r, &label).await;
+            f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn with_insert_cte_abort_restores_rows_and_shadowed_names() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let sql = "WITH log(x) AS (VALUES(21),(22),(23)) \
+                   INSERT INTO t(k,v) SELECT x,x FROM log";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let label = format!("abort-file-{file_backed}-prepared-{prepared}");
+                let path = directory.path().join(format!("{label}.db"));
+                let f = Connection::open(if file_backed {
+                    path.to_str().unwrap()
+                } else {
+                    ":memory:"
+                })
+                .await
+                .unwrap();
+                let r = rusqlite::Connection::open_in_memory().unwrap();
+                cte_dml_setup(&f, &r, true).await;
+                for setup in [
+                    "CREATE TRIGGER t_stop BEFORE INSERT ON t WHEN NEW.k=22 \
+                     BEGIN SELECT RAISE(ABORT,'cte rollback'); END",
+                    "BEGIN",
+                    "INSERT INTO log(msg) VALUES('before')",
+                ] {
+                    f.execute(setup).await.unwrap();
+                    r.execute_batch(setup).unwrap();
+                }
+                let expected_error = r.execute(sql, []).expect_err("stock trigger aborts");
+                assert!(expected_error.to_string().contains("cte rollback"));
+                let actual_error = if prepared {
+                    f.prepare(sql).await.unwrap().execute().await.map(|_| ())
+                } else {
+                    f.query(sql).await.map(|_| ())
+                }
+                .expect_err("FrankenSQLite trigger aborts");
+                assert!(
+                    actual_error.to_string().contains("cte rollback"),
+                    "{label}: {actual_error}"
+                );
+                assert_cte_dml_state(&f, &r, &label).await;
+                // A later statement still reaches the persistent table and
+                // trigger, and the outer transaction remains usable.
+                f.execute("INSERT INTO t(k,v) VALUES(24,24)").await.unwrap();
+                r.execute_batch("INSERT INTO t(k,v) VALUES(24,24)").unwrap();
+                assert_cte_dml_state(&f, &r, &label).await;
+                f.execute("ROLLBACK").await.unwrap();
+                r.execute_batch("ROLLBACK").unwrap();
+                assert_cte_dml_state(&f, &r, &label).await;
+                f.close().await.unwrap();
+            }
+        }
+    });
+}
+
 #[test]
 fn materialized_cte_shadow_preserves_values_instead_of_inheriting_table_rowid() {
     asupersync::test_utils::run_test(|| async {
