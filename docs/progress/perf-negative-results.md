@@ -276,6 +276,68 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   sink to the GROUP BY window and join window paths when a measured statement there holds over
   100 MB of per-row vectors.
 
+## 2026-11-13 - WIN: Affinity leaves a register alone when its value already has the column's affinity (bd-i3csr.3)
+
+- Target: the per-row INSERT body both INSERT ... SELECT routes pay (bd-i3csr.1, .2), measured on
+  the scorecard's `bulk_insert_1M_one_txn`, the 300k-row mutation setup and `memory_script_200k`.
+  Touched: `crates/fsqlite-types/src/value.rs` (`SqliteValue::affinity_is_noop`),
+  `crates/fsqlite-vdbe/src/engine.rs` (the `Opcode::Affinity` arm,
+  `MakeRecordStatementLookaside::sideband_register`).
+- Evidence before (callgrind, main f9f4e3a1d, the bulk statement at 100k and 200k rows, per row =
+  the difference / 100k, in memory): 11.4k instructions a row. The table row body runs
+  `Affinity 2 4 XDBE` twice (before the CHECK / NOT NULL checks for GH#169, and before MakeRecord,
+  which does not apply affinity), so each row paid 8 take_reg + apply_affinity + set_reg rounds
+  (`set_reg` 86.7 instructions inclusive a call), ~1.3k a row, on values already INTEGER in the
+  INTEGER column, TEXT in the TEXT column and REAL in the REAL column.
+- Change: `affinity_is_noop` says where `apply_affinity` returns its input unchanged (any value
+  under BLOB; NULL / TEXT / BLOB under TEXT; NULL / INTEGER / BLOB under NUMERIC and INTEGER;
+  NULL / REAL / BLOB under REAL). The Affinity arm leaves such a register as it is and only clears
+  its subtype, which is all the take_reg / set_reg pair did to it; a NaN REAL (set_reg turns it into
+  NULL), every register of an op whose range holds the MakeRecord sideband register, and every
+  register with VDBE metrics on take the old path. The opcode stays in the main match (not the
+  2026-05-24 hot-dispatch promotion). No bytecode change.
+- Result, stock sqlite3 3.46.1 live in the same runs, 3 runs, base main f9f4e3a1d (57855a0c...),
+  lever (7038999a...), every answer equal to stock's: the 300k generate_series setup (io_uring
+  refused) 3,613.3M -> 3,250.5M user instructions (-10.0%; 3.41x -> 3.07x stock 1,058.2M); INSERT
+  INTO m2 SELECT * FROM m (300k) 4,077.5M -> 3,711.6M (-9.0%); the 1M bulk row (bulk_cpu_probe.py)
+  13,141.5M -> 11,944.5M (-9.1%), wall 1,640 -> 1,517 ms (3.25x -> 3.01x stock 505 ms);
+  memory_script_200k 5,089.3M -> 4,820.4M (-5.3%); update_10pct_300k 1,064.0M -> 1,021.7M
+  (-4.0%); txn_1000x10_rows -1.0%, autocommit_5k_inserts -0.7%. Callgrind per row in memory
+  11,384 -> 10,188 (-1,196: set_reg, apply_affinity, the pool returns and the sideband check;
+  the predicate costs 130). Prediction -8% to -10% on the 300k setup: met. Kill line under -5%:
+  passed.
+- Rows that read more, all inside the 2% kill line: create_index_int_300k +0.6% (984.5M ->
+  990.0M) and window_row_number +0.1% (9,543.0M -> 9,555.0M, on either arm's database, CPU
+  lower). Callgrind of the CREATE INDEX statement under both binaries does the same work outside
+  the wait loops (asupersync scheduler, the WAL-FEC flush at close, clock reads), whose counts
+  follow the run's timing; the window row is not attributed. Every other read row runs identical
+  instructions (count_star, scan_filter_agg, group_by, order_by_text_limit10, rowid_lookups_200k,
+  join_1M_to_pk_1000, join_no_index_5k_x_5k), each binary on each arm's base database.
+  Scorecard (2 runs, wall, stock first and last): bulk 1.521 -> 1.454 s (3.43x -> 3.27x),
+  memory_script 0.549 -> 0.514 s, update_10pct 0.206 -> 0.193 s, txn_1000x10 0.300 -> 0.284 s,
+  multiproc_8x500 0.907 -> 0.877 s; rows within their run-to-run spread elsewhere.
+- Tests: fsqlite-types `test_affinity_is_noop_only_where_apply_affinity_returns_the_value` (every
+  accepted value x affinity pair over 24 values incl. -0.0, NaN, infinities, i64 bounds, raw
+  non-UTF-8 text and blobs comes back identical by storage class and bits; the converting pairs a
+  naive predicate gets wrong, INTEGER under TEXT or REAL and REAL 3.0 or TEXT '5' under INTEGER /
+  NUMERIC, are refused); fsqlite-vdbe `test_affinity_converts_only_values_without_the_column_affinity`
+  (one op over mixed registers converts 7 -> '7', '7' -> 7, 3.0 -> 3, 7 -> 7.0 and keeps the
+  rest; a kept register's subtype is cleared, the subtype read before the op is 74) and
+  `test_affinity_over_the_make_record_register_keeps_the_record`.
+- Gate, f9f4e3a1d with the change (rch, 2026-11-13): clippy -D warnings with all targets on
+  fsqlite-types, fsqlite-vdbe and fsqlite-core clean; fsqlite-types lib 588 pass; fsqlite-vdbe
+  lib 1,243 pass and 2 fail (the bd-bhalc pair, red on main), bytecode goldens 8 pass; the 62
+  fsqlite-core INSERT, affinity and UPDATE targets (`ls tests | grep -i -E
+  "insert|bulk_import|491|affin|update"`) in 8 batches, 353 pass, 0 fail; fsqlite-core lib 4,162
+  pass and 2 fail (the t6741 pair, bd-nouem).
+- Retry condition: none. Next on the same row (callgrind of the lever, per row): the Insert
+  opcode ~3.1k in memory and ~4.5k file-backed, with the rowid-floor bump (`ensure_table_floor` +
+  `bump_explicit`: two SipHash lookups of one key and three mutex holds, ~630 a row, file-backed
+  only) and the 4 KiB `PageData` clone per append (~410); the hot-lane exits (~7 a row, one after
+  each opcode the main match runs: VColumn, both Affinity ops, Insert, VNext); and the second
+  Affinity op itself, which a codegen change could drop where no constraint rewrites a column
+  register (NOT NULL ON CONFLICT REPLACE with a default does).
+
 ## 2026-11-13 - REJECTED: a writer's close truncates the WAL it fully backfilled, as stock's last close deletes it (bd-w4pr1.13.33)
 
 - Target: every process that opens a database a writer closed. The close ran a PASSIVE checkpoint
