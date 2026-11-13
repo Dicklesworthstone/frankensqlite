@@ -1116,7 +1116,9 @@ impl Connection {
         // is evaluated before the next row and before AFTER triggers.
         let snapshot_statement = returning_projection.as_ref().map(|projection| {
             let mut snapshot_insert = insert.clone();
-            snapshot_insert.returning = projection.snapshot_columns.clone();
+            snapshot_insert
+                .returning
+                .clone_from(&projection.snapshot_columns);
             Statement::Insert(snapshot_insert)
         });
         let compiled_statement = snapshot_statement.as_ref().unwrap_or(statement);
