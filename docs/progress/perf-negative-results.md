@@ -273,13 +273,16 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   200 rows a key): `sum(c) ... id < 150000` 180,640k -> 2,414k (stock 426k);
   `count(*) ... id > 100000` 81,544k -> 1,594k (stock 75.7k); BETWEEN
   12,255k -> 333k (stock 79.7k). Every answer equals stock's.
+- The IN-list form landed the same day (5081a25cf): each value's probe
+  carries the rowid floor, and its run ends at the ceiling.
+  `sum(c) WHERE i IN (5, 7) AND id < 150000` went 282,958k -> 4,240k
+  (stock 819k), under its no-range control at 5,002k (in_ab.py).
 - Not done, so retry here first: (a) COUNT(*) is still 21x stock, because
   stock counts from the index and this walk reads each table row for the
-  residual filter; a covering variant when the residual is only the rowid
-  range. (b) `i IN (5, 7) AND id < N` is still 345x: index_in_seek has no
-  rowid bounds. (c) Parameter bounds in aggregates. The parameter-bound
-  keyset change has plan evidence only, because the CLI arms cannot bind
-  parameters.
+  residual filter. A covering variant, when the residual is only the rowid
+  range, is bd-qrn03. (b) Parameter bounds in aggregates. The
+  parameter-bound keyset change has plan evidence only, because the CLI
+  arms cannot bind parameters.
 
 ## 2026-11-13 - WIN: a leaf delete trusts the pointer order of the image the previous descending delete wrote (bd-w4pr1.13.20, lever P)
 
