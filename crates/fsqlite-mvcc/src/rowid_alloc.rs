@@ -9,6 +9,7 @@
 //! multi-process deployments serve reservations over IPC (`ROWID_RESERVE`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::sync_primitives::Mutex;
 use fsqlite_types::{RowId, RowIdMode, SchemaEpoch, TableId};
@@ -235,8 +236,11 @@ impl LocalRowIdCache {
 /// Used by both in-process connections and cross-process IPC.
 #[derive(Debug)]
 pub struct ConcurrentRowIdAllocator {
-    /// Current durable schema epoch (for cross-process validation).
-    current_epoch: Mutex<SchemaEpoch>,
+    /// Current durable schema epoch (for cross-process validation), as the
+    /// raw `SchemaEpoch` value. An atomic, not a mutex: every insert into a
+    /// file-backed table reads it, and only a newer epoch writes it
+    /// (bd-i3csr.4).
+    current_epoch: AtomicU64,
     /// Per-table allocator states.
     tables: Mutex<HashMap<AllocatorKey, TableAllocatorState>>,
     /// bd-gh-147 (GH #147): per-`(session, table)` count of rowids this session
@@ -326,7 +330,7 @@ impl ConcurrentRowIdAllocator {
     #[must_use]
     pub fn new(current_epoch: SchemaEpoch) -> Self {
         Self {
-            current_epoch: Mutex::new(current_epoch),
+            current_epoch: AtomicU64::new(current_epoch.get()),
             tables: Mutex::new(HashMap::new()),
             session_reservations: Mutex::new(HashMap::new()),
         }
@@ -597,11 +601,11 @@ impl ConcurrentRowIdAllocator {
     ) {
         let derived = TableAllocatorState::new(max_committed_rowid, sqlite_sequence_seq, mode);
 
-        {
-            let mut current_epoch = self.current_epoch.lock();
-            if key.schema_epoch.get() > current_epoch.get() {
-                *current_epoch = key.schema_epoch;
-            }
+        // Raise the epoch to the key's if it is newer: one load when it is not
+        // (every insert), one atomic max when it is.
+        let epoch = key.schema_epoch.get();
+        if epoch > self.current_epoch.load(Ordering::Acquire) {
+            self.current_epoch.fetch_max(epoch, Ordering::AcqRel);
         }
 
         let mut tables = self.tables.lock();
@@ -625,13 +629,13 @@ impl ConcurrentRowIdAllocator {
 
     /// Update the current durable schema epoch.
     pub fn set_current_epoch(&self, epoch: SchemaEpoch) {
-        *self.current_epoch.lock() = epoch;
+        self.current_epoch.store(epoch.get(), Ordering::Release);
     }
 
     /// Get the current durable schema epoch.
     #[must_use]
     pub fn current_epoch(&self) -> SchemaEpoch {
-        *self.current_epoch.lock()
+        SchemaEpoch::new(self.current_epoch.load(Ordering::Acquire))
     }
 
     /// Reserve a range of RowIds for a table.
@@ -1858,5 +1862,102 @@ mod tests {
         alloc.bump_explicit(k, RowId::new(5)).unwrap();
         assert_eq!(alloc.autoincrement_high_water(&k), Some(i64::MAX));
         assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
+    }
+
+    /// bd-i3csr.4: after an insert the engine raises the table's floor with
+    /// `ensure_table_floor(key, Some(visible), autoinc_max, mode)`, `visible`
+    /// at or above the inserted rowid, and no longer calls
+    /// `bump_explicit(key, rowid)` after it. Whatever the table held before,
+    /// the bump must find nothing left to change.
+    #[test]
+    fn a_floor_at_or_above_the_inserted_rowid_leaves_bump_explicit_nothing_to_do() {
+        #[derive(Clone, Copy, Debug)]
+        enum Prior {
+            Absent,
+            Committed(Option<i64>, i64),
+            PeerTail,
+            Exhausted,
+        }
+        let mut checked = 0;
+        for mode in [RowIdMode::Normal, RowIdMode::AutoIncrement] {
+            for prior in [
+                Prior::Absent,
+                Prior::Committed(None, 0),
+                Prior::Committed(Some(50), 0),
+                Prior::Committed(Some(10_000), 20_000),
+                Prior::PeerTail,
+                Prior::Exhausted,
+            ] {
+                for rowid in [-5, 0, 1, 7, 100, 10_000, i64::MAX - 1, i64::MAX] {
+                    for above in [0, 3] {
+                        for autoinc_max in [0, 200] {
+                            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+                            let k = key(1, 1);
+                            match prior {
+                                Prior::Absent => {}
+                                Prior::Committed(committed, sequence) => {
+                                    alloc.init_table(k, committed.map(RowId::new), sequence, mode);
+                                }
+                                Prior::PeerTail => {
+                                    alloc.init_table(k, Some(RowId::new(40)), 0, mode);
+                                    alloc.reserve_range(k, 64).unwrap();
+                                }
+                                Prior::Exhausted => {
+                                    alloc.init_table(k, Some(RowId::MAX), 0, mode);
+                                }
+                            }
+                            // As the engine computes it.
+                            let visible = rowid.saturating_add(above).max(autoinc_max);
+                            alloc.ensure_table_floor(
+                                k,
+                                (visible > 0).then(|| RowId::new(visible)),
+                                autoinc_max,
+                                mode,
+                            );
+                            let before = (alloc.next_rowid(&k), alloc.autoincrement_high_water(&k));
+                            alloc.bump_explicit(k, RowId::new(rowid)).unwrap();
+                            let after = (alloc.next_rowid(&k), alloc.autoincrement_high_water(&k));
+                            assert_eq!(
+                                before, after,
+                                "{mode:?} {prior:?} rowid {rowid} visible {visible} autoinc {autoinc_max}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 6 * 8 * 2 * 2);
+
+        // The bump does act when the floor seen was below the rowid, so the
+        // equality above is not vacuous.
+        for mode in [RowIdMode::Normal, RowIdMode::AutoIncrement] {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let k = key(1, 1);
+            alloc.ensure_table_floor(k, Some(RowId::new(4)), 0, mode);
+            assert_eq!(alloc.next_rowid(&k), Some(5));
+            alloc.bump_explicit(k, RowId::new(10)).unwrap();
+            assert_eq!(alloc.next_rowid(&k), Some(11), "{mode:?}");
+            if mode == RowIdMode::AutoIncrement {
+                assert_eq!(alloc.autoincrement_high_water(&k), Some(10));
+            }
+        }
+    }
+
+    /// bd-i3csr.4: `ensure_table_floor` raises the allocator's epoch to a
+    /// newer key epoch and never lowers it; `set_current_epoch` sets it.
+    #[test]
+    fn ensure_table_floor_only_raises_the_current_epoch() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        alloc.ensure_table_floor(key(5, 1), None, 0, RowIdMode::Normal);
+        assert_eq!(alloc.current_epoch(), epoch(5));
+        alloc.ensure_table_floor(key(3, 2), None, 0, RowIdMode::Normal);
+        assert_eq!(alloc.current_epoch(), epoch(5));
+        alloc.set_current_epoch(epoch(2));
+        assert_eq!(alloc.current_epoch(), epoch(2));
+        alloc.ensure_table_floor(key(2, 1), None, 0, RowIdMode::Normal);
+        assert_eq!(alloc.current_epoch(), epoch(2));
+        alloc.ensure_table_floor(key(4, 1), None, 0, RowIdMode::Normal);
+        assert_eq!(alloc.current_epoch(), epoch(4));
     }
 }

@@ -10398,15 +10398,18 @@ impl VdbeEngine {
         };
         let visible_max = table_max.max(autoinc_max).max(rowid);
         let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
+        // bd-i3csr.4: this floor is what `bump_explicit(key, rowid)` would
+        // set, so the bump is not called (it was a second lock and lookup per
+        // row). `visible_max >= rowid` leaves the table's next rowid at or above
+        // `rowid + 1` (or exhausted, which the bump also leaves alone) and an
+        // AUTOINCREMENT high-water at or above `rowid`, and creates a missing
+        // entry.
         allocator.ensure_table_floor(
             key,
             (visible_max > 0).then(|| RowId::new(visible_max)),
             autoinc_max,
             mode,
         );
-        allocator
-            .bump_explicit(key, RowId::new(rowid))
-            .map_err(|err| Self::map_rowid_allocator_error(err, "explicit rowid bump failed"))?;
         Ok(())
     }
 
