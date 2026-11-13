@@ -26858,3 +26858,30 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   wall time. Do not retry as a standalone lever while point_index and
   insert_txn are 18-25x stock: the gap is elsewhere (bd-w4pr1.24 read
   boundary and seek, bd-w4pr1.23).
+
+## 2026-11-13 — memchr2 string skip and a token-start table in the JSON number-text pre-scan (bd-1nxwh)
+
+- Workload: `SELECT sum(json_extract(doc, '$.x')) FROM j` over 200k
+  stock-written documents of about 70 bytes (five short keys, one short
+  string value, two floats and four integers). Release-perf CLI, user
+  instructions via `perf stat`, /usr/bin/sqlite3 live in the same run,
+  scratchpad `json_ab.py`. Base CLI 4aff2cd9b: 2,227.8M; stock 1,024.5M.
+- Context: bd-1nxwh keeps a parsed float's source text, using a pre-scan
+  (`rewrite_number_text_tokens`, `crates/fsqlite-ext-json/src/lib.rs`) before
+  the serde parse. A symbolized profile put that scan at about 7% self time.
+- Candidates:
+  1. Skip string literals with `memchr::memchr2(b'"', b'\\', ..)` instead of
+     `iter().position(..)`, together with a 256-entry token-start table.
+  2. The table alone, with the position search.
+- Result: both rejected. The plain per-byte loop with position search
+  measured 2,541.6M. Candidate 1 measured 2,574.5M. Candidate 2 (with the
+  precheck below) measured 2,564.7M. A/A pairs were within 0.1%. The
+  documents' strings are mostly 1-4 byte keys, so neither SIMD setup nor a
+  table lookup pays for itself.
+- Kept instead: a memchr precheck that skips the whole scan when a document
+  holds no `.` and no digit followed by `e`/`E`. Float-free documents then
+  measure 0.9997x the base (landed 2f3f455ae).
+- Retry condition: documents dominated by long string values (multi-KB
+  text), where memchr2's per-call setup is amortized. Measure on such a
+  corpus, not on small keyed documents. The real lever is a single-pass
+  parser that keeps number spans (bd-oahj7).
