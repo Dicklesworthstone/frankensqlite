@@ -34601,11 +34601,13 @@ fn emit_where_filter_with_ctx(
 /// operator (`=`, `<>`, `<`, `<=`, `>`, `>=`).
 ///
 /// This is [`emit_comparison`]'s test (the same operands, evaluated in the
-/// same order, the same two NULL checks, collation and affinity) as one jump
-/// on the inverse operator, where the value form stored 0, 1 or NULL and then
-/// tested it with `IfNot` (bd-w4pr1.13.20). For non-NULL operands under one
-/// collation and affinity, each operator and its inverse are complements, so
-/// the rows that pass are the same.
+/// same order, the same NULL test, collation and affinity) as one jump on the
+/// inverse operator, where the value form stored 0, 1 or NULL and then tested
+/// it with `IfNot` (bd-w4pr1.13.20). For non-NULL operands under one collation
+/// and affinity, each operator and its inverse are complements, so the rows
+/// that pass are the same. A NULL operand skips the row through the jump's
+/// JUMPIFNULL flag (0x10) instead of an `IsNull` per operand, as stock codes
+/// a WHERE comparison.
 fn emit_where_comparison_jump(
     b: &mut ProgramBuilder,
     left: &Expr,
@@ -34614,6 +34616,8 @@ fn emit_where_comparison_jump(
     scan: &ScanCtx<'_>,
     skip_label: crate::Label,
 ) {
+    const JUMPIFNULL: u16 = 0x10; // The jump is also taken when either operand is NULL.
+
     let skip_opcode = match op {
         fsqlite_ast::BinaryOp::Eq => Opcode::Ne,
         fsqlite_ast::BinaryOp::Ne => Opcode::Eq,
@@ -34631,21 +34635,21 @@ fn emit_where_comparison_jump(
     let right_hoisted = hoisted_where_literal(b, right);
     let r_right = right_hoisted.unwrap_or_else(|| b.alloc_temp());
     if left_hoisted.is_none() {
-        emit_expr(b, left, r_left, ctx);
+        emit_where_comparison_operand(b, left, r_left, ctx);
     }
     if right_hoisted.is_none() {
-        emit_expr(b, right, r_right, ctx);
+        emit_where_comparison_operand(b, right, r_right, ctx);
     }
     let p4 = comparison_collation_ctx(left, right, ctx).map_or(P4::None, P4::Collation);
-    if left_hoisted.is_none() {
-        b.emit_jump_to_label(Opcode::IsNull, r_left, 0, skip_label, P4::None, 0);
-    }
-    if right_hoisted.is_none() {
-        b.emit_jump_to_label(Opcode::IsNull, r_right, 0, skip_label, P4::None, 0);
-    }
-    let cmp_aff = comparison_affinity_p5(left, right, ctx);
+    // A hoisted literal is never NULL; any other operand may be.
+    let null_jump = if left_hoisted.is_none() || right_hoisted.is_none() {
+        JUMPIFNULL
+    } else {
+        0
+    };
+    let cmp_p5 = comparison_affinity_p5(left, right, ctx) | null_jump;
     // Comparison: p1=rhs_reg, p2=jump_target (label), p3=lhs_reg
-    b.emit_jump_to_label(skip_opcode, r_right, r_left, skip_label, p4, cmp_aff);
+    b.emit_jump_to_label(skip_opcode, r_right, r_left, skip_label, p4, cmp_p5);
     if right_hoisted.is_none() {
         b.free_temp(r_right);
     }
@@ -34666,6 +34670,54 @@ fn hoisted_where_literal(b: &mut ProgramBuilder, expr: &Expr) -> Option<i32> {
         _ => return None,
     };
     b.hoisted_literal(literal)
+}
+
+/// Evaluate a WHERE comparison operand into `reg`. An arithmetic operand
+/// whose right side is an integer or real literal (`id % 7`, `a + 1`) reads
+/// that literal from its prologue register (bd-w4pr1.13.20) instead of loading
+/// it per scanned row: the same opcode on the same values, as
+/// [`emit_binary_op`] would emit it, since an arithmetic opcode only reads its
+/// operand registers. Every other operand is [`emit_expr`]'s.
+fn emit_where_comparison_operand(
+    b: &mut ProgramBuilder,
+    expr: &Expr,
+    reg: i32,
+    ctx: Option<&ScanCtx<'_>>,
+) {
+    if let Expr::BinaryOp {
+        left,
+        op:
+            op @ (fsqlite_ast::BinaryOp::Add
+            | fsqlite_ast::BinaryOp::Subtract
+            | fsqlite_ast::BinaryOp::Multiply
+            | fsqlite_ast::BinaryOp::Divide
+            | fsqlite_ast::BinaryOp::Modulo
+            | fsqlite_ast::BinaryOp::BitAnd
+            | fsqlite_ast::BinaryOp::BitOr
+            | fsqlite_ast::BinaryOp::ShiftLeft
+            | fsqlite_ast::BinaryOp::ShiftRight),
+        right,
+        ..
+    } = expr
+        && matches!(
+            right.as_ref(),
+            Expr::Literal(Literal::Integer(_) | Literal::Float(_), _)
+        )
+        && let Some(literal_reg) = hoisted_where_literal(b, right)
+    {
+        emit_expr(b, left, reg, ctx);
+        // VDBE arithmetic: OP p1=rhs, p2=lhs, p3=dest
+        b.emit_op(
+            binary_op_to_opcode(*op),
+            literal_reg,
+            reg,
+            reg,
+            P4::None,
+            0,
+        );
+        return;
+    }
+    emit_expr(b, expr, reg, ctx);
 }
 
 struct ResolvedComparisonInfo {
@@ -63169,6 +63221,103 @@ mod tests {
                 "{ops:?}"
             );
         }
+    }
+
+    /// bd-w4pr1.13.20, lever G: `DELETE FROM t WHERE a % 7 = 0` runs no
+    /// `IsNull` and loads no literal per scanned row: the inverse comparison
+    /// carries JUMPIFNULL (and not NULLEQ), and the `%` reads 7 from the
+    /// prologue. A literal on the left of the arithmetic (`10 - a`) is the
+    /// operation's destination, so it is still loaded in the loop: hoisting it
+    /// there would let the first row overwrite the prologue's value.
+    #[test]
+    fn test_codegen_where_expression_comparison_has_no_per_row_null_check_or_literal_load() {
+        let column = |name: &str| Box::new(Expr::Column(ColumnRef::bare(name), Span::ZERO));
+        let int = |value: i64| Box::new(Expr::Literal(Literal::Integer(value), Span::ZERO));
+        let arithmetic = |left: Box<Expr>, op: AstBinaryOp, right: Box<Expr>| {
+            Box::new(Expr::BinaryOp {
+                left,
+                op,
+                right,
+                span: Span::ZERO,
+            })
+        };
+        let delete_where = |where_clause: Expr| DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            where_clause: Some(where_clause),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let compile = |where_clause: Expr| {
+            let ctx = CodegenContext::default();
+            let mut b = ProgramBuilder::new();
+            codegen_delete(&mut b, &delete_where(where_clause), &schema, &ctx).unwrap();
+            b.finish().unwrap()
+        };
+        let loop_bounds = |prog: &crate::VdbeProgram| {
+            let ops = prog.ops();
+            let start = ops.iter().position(|op| op.opcode == Opcode::Rewind).unwrap();
+            let end = ops.iter().rposition(|op| op.opcode == Opcode::Next).unwrap();
+            (start, end)
+        };
+
+        let modulo = compile(Expr::BinaryOp {
+            left: arithmetic(column("a"), AstBinaryOp::Modulo, int(7)),
+            op: AstBinaryOp::Eq,
+            right: int(0),
+            span: Span::ZERO,
+        });
+        let ops = modulo.ops();
+        let (start, end) = loop_bounds(&modulo);
+        let body = &ops[start..=end];
+        assert!(
+            body.iter()
+                .all(|op| !matches!(op.opcode, Opcode::IsNull | Opcode::Integer)),
+            "no NULL check and no literal load per row: {body:?}"
+        );
+        let skip = body.iter().find(|op| op.opcode == Opcode::Ne).unwrap();
+        assert_eq!(skip.p5 & 0x10, 0x10, "the skip jumps on a NULL operand: {skip:?}");
+        assert_eq!(skip.p5 & 0x80, 0, "not NULLEQ: {skip:?}");
+        let remainder = body
+            .iter()
+            .find(|op| op.opcode == Opcode::Remainder)
+            .unwrap();
+        let loads: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == Opcode::Integer && op.p2 == remainder.p1)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(loads.len(), 1, "one load of the divisor: {ops:?}");
+        assert!(loads[0] > end, "the divisor is loaded in the prologue: {ops:?}");
+        assert_eq!(ops[loads[0]].p1, 7);
+        assert_ne!(remainder.p3, remainder.p1, "the result never lands in the literal");
+
+        let subtract = compile(Expr::BinaryOp {
+            left: arithmetic(int(10), AstBinaryOp::Subtract, column("a")),
+            op: AstBinaryOp::Eq,
+            right: int(0),
+            span: Span::ZERO,
+        });
+        let ops = subtract.ops();
+        let (start, end) = loop_bounds(&subtract);
+        let minus = ops[start..=end]
+            .iter()
+            .find(|op| op.opcode == Opcode::Subtract)
+            .unwrap();
+        assert!(
+            ops[start..=end]
+                .iter()
+                .any(|op| op.opcode == Opcode::Integer && op.p1 == 10 && op.p2 == minus.p2),
+            "a left literal is loaded into the destination each row: {ops:?}"
+        );
     }
 
     #[test]

@@ -209247,7 +209247,36 @@ mod tests {
                     }
                 }
             }
+            // bd-w4pr1.13.20, lever G: no IsNull per operand (a NULL operand
+            // skips the row through the jump's JUMPIFNULL flag), and an
+            // arithmetic operand's integer or real right literal is read from
+            // the prologue. NULL rows (id 3, and b / c / d NULLs) must fail
+            // every operator, `<>` included; each query runs twice.
+            let arithmetic = [
+                "a % 7", "c * 2.5", "a - 3000000000", "id << 1", "a / 0", "c % 2", "b + 1",
+                "d * 1.0", "a & 6", "a | 1",
+            ];
+            let others = ["0", "1", "id % 2", "a + 0.5", "NULL", "c - 1", "'1'"];
+            for op in ["=", "<>", "<", "<=", ">", ">="] {
+                for left in arithmetic {
+                    for right in others {
+                        for sql in [
+                            format!(
+                                "SELECT count(*), sum(id), sum(id * id) FROM w WHERE {left} {op} {right}"
+                            ),
+                            format!(
+                                "SELECT count(*), sum(id), sum(id * id) FROM w WHERE {right} {op} {left}"
+                            ),
+                        ] {
+                            check(&conn, &oracle, &sql).await;
+                            check(&conn, &oracle, &sql).await;
+                        }
+                    }
+                }
+            }
             for sql in [
+                "UPDATE w SET d = 'n' WHERE a % 7 <> 1",
+                "UPDATE w SET c = c + 1 WHERE b + 1 <> 2",
                 "UPDATE w SET d = 'z' WHERE c >= 2.5",
                 "DELETE FROM w WHERE 7 = a",
                 "UPDATE w SET c = c + 1 WHERE id % 2 = 1",
