@@ -87,6 +87,73 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: a WAL handle answers the frame headers it wrote or validated from memory, so the publication scan and the appended-tail index stop re-reading a peer's new frames (bd-w4pr1.8, M6)
+
+- Target: the scorecard's multiproc row (8 processes x 500 autocommit INSERTs into one WAL
+  database). The lever 1 REJECT below found every adopted peer frame read three times: whole by
+  `WalFile::refresh` (checksum chain), its header by the publication scan, and its header again by
+  the appended-tail index (fold, rebuild and two checksum probes). On main dd677073b one contended
+  writer made 11.5-19.7 24-byte `-wal` preads per INSERT.
+- Touched: `crates/fsqlite-wal/src/wal.rs`: `WalFile.frame_headers` holds page number, commit size
+  and checksum (16 bytes) of frames `0..n` of the current generation exactly as this handle wrote
+  them (`append_frame`, `append_frames`, the finalized prepared-batch paths) or checked them
+  against the checksum chain (`open`, `refresh`, `rebuild_state_from_file`,
+  `refresh_preserving_append_prefix`). It is always a prefix of `frame_count`: replaced only after
+  a scan or append succeeded, cut with every frame-count cut, emptied before a reset or rebuild
+  does any I/O, never extended past a gap, bounded by `DEFAULT_RECORDED_FRAME_HEADER_CAP` (2^18
+  frames, 4 MiB) and `set_recorded_frame_header_cap`. `read_frame_header` answers from it; the new
+  `read_frame_header_on_disk` never does. The checks of the physical file keep reading it:
+  checkpoint chain seeds (`checkpoint_validation.rs`, `checkpoint_admission.rs`, as
+  `checkpoint_integrity_rejects_replaced_generation_and_bad_resume_seed` pins), native recovery's
+  terminal and mapping reads, and the unpublished-tail observation
+  (`crates/fsqlite-core/src/wal_adapter.rs`). Page payloads are always read from disk.
+  Tests: `test_recorded_frame_headers_match_disk_and_answer_without_reading_it` (all three append
+  paths, open and refresh equal the disk; a write no handle observes leaves the remembered answer,
+  while `read_frame_header_on_disk` and a bound of 0 see it),
+  `test_recorded_frame_headers_follow_a_peer_reset_to_the_new_generation` (negative case: a peer
+  resets the WAL and writes other pages into the same slots at the same size; kept headers would
+  still name the old pages), `test_publication_scan_takes_peer_frame_headers_from_the_refresh`
+  (adapter: adopting a peer commit makes at least 2 fewer header reads than with the bound at 0).
+  `test_publication_scan_io_failure_preserves_exact_prior_snapshot_and_retries` sets the bound to
+  0 so the disk read its fault targets still happens.
+- Ledger preflight: lever 1 REJECT (retry condition: this change, at least 10 single-header reads
+  removed per INSERT). The trust model is the one `native_append_baseline` already uses for its
+  cached commit marker: after a refresh confirms generation and length, a generation's committed
+  frames never change.
+- Prediction (bd-w4pr1.8, before code): 24-byte preads per contended INSERT about 15 -> 3 or
+  fewer; traced calls down 10-13; multiproc wall -3..-8%, CPU -3..-6%; autocommit and txn
+  unchanged. Kill: fewer than 10 removed per INSERT, or autocommit or txn user instructions up more
+  than 1%, or a keeper changing outcome.
+- Result (stock sqlite3 3.46.1 live in every probe; release-perf CLIs base dd677073b sha256
+  835bddb3..., candidate eecc0b7a... = dd677073b + patch 965fea8e...; load 2.0):
+  - `mp_ab.sh`, 3 interleaved traced runs of one of eight writers, per INSERT: 24-byte `-wal`
+    preads 19.66 / 13.94 / 11.47 -> 0.02 / 0.02 / 0.05; all `-wal` preads 30.2 / 19.7 / 17.9 ->
+    5.7 / 6.7 / 9.0; traced calls 93.8 / 55.4 / 59.8 -> 43.7 / 48.8 / 60.0 (the third run's
+    contention ran higher).
+  - `mp_probe.py --reps 5` (the row): wall 940.6 -> 864.3 ms (-8.1%), user+sys CPU 1,098.7 ->
+    1,003.8 ms (-8.6%); stock 192.5 ms wall, 95.3 ms CPU (4.89x -> 4.49x on wall).
+  - Exact per autocommit commit (callgrind, N=400 minus N=200, io_uring refused): 211,004 ->
+    209,729 instructions (-0.6%). `txn_row_probe.py` user instructions, 3 then 9 reps: txn
+    748.9M -> 743.0M and 746.3M -> 737.9M; autocommit 1,260.8M -> 1,272.5M (+0.93%) and 1,266.8M
+    -> 1,269.9M (+0.24%), per-arm sd 16.9M. CPU medians (9 reps): txn 276 -> 290 ms, autocommit
+    705 -> 717 ms, inside the arms' spread (base txn 265-385 ms; the txn means move the other way).
+  Prediction met on the reads and the row; the kill line is not crossed.
+- Gate (on dd677073b + the patch): clippy -D warnings (fsqlite-wal, fsqlite-core, all targets)
+  clean, and again on the rebased commit; fsqlite-wal lib 1,170 pass and 11 integration targets
+  129 pass (7 of them with `fault-injection`); fsqlite-core `wal_adapter` 123 pass; fsqlite-pager
+  `wal` 102 pass; 24 fsqlite-core multi-writer, WAL, certificate and checkpoint targets
+  (bd_ih8ak_*, gh338, gh384, gh385, gh416, gh443, gh457, gh524, gh525, gh534,
+  bulk_import_upsert_text_pk_phantom_pk, wal_cert_sidecar_compaction, wal_fec_commit_pipeline and
+  others) 298 pass; 7 fsqlite WAL targets 17 pass; 0 failures. Landed rebased on 8eb0279a5 as
+  e24d0d3cb.
+- What is left per contended INSERT after this: about 32 statx (path identity: database and -wal
+  lstat, -shm backing fstat per map; bd-ih8ak lever 4), 17 fcntl on -shm, 7.5 32-byte WAL header
+  reads (`WalFile::refresh`'s ABA check on every refresh; removing it means trusting the shared
+  WAL-index header as stock does, which needs a crash-safety argument first), 5-6 certificate
+  sidecar reads.
+- Retry condition: none (kept). Revisit the bound if a workload keeps a WAL above 2^18 frames
+  between checkpoints: those frames read their headers from disk as before.
+
 ## 2026-11-13 - WIN: a window SELECT summed outside stops holding freed rows at its outer phase: values go straight to their slots, and the join projection consumes its source rows (bd-w4pr1.12, steps 6+7)
 
 - Target: peak RSS of the scorecard's `window_row_number`, 242 MB against stock's 16.6 MB after
