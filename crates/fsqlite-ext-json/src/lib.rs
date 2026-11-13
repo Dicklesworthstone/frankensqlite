@@ -106,13 +106,15 @@ fn as_number_text(s: &str) -> Option<&str> {
 fn number_token_needs_text(raw: &str) -> bool {
     let bytes = raw.as_bytes();
     if !bytes.iter().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
-        return bytes.len() > 300 && raw.parse::<f64>().is_ok_and(f64::is_infinite);
+        return bytes.len() > 300
+            && is_strict_json_number(raw)
+            && raw.parse::<f64>().is_ok_and(f64::is_infinite);
     }
     if is_shortest_fixed_decimal(bytes) {
         return false;
     }
     match raw.parse::<f64>() {
-        Ok(value) if value.is_infinite() => true,
+        Ok(value) if value.is_infinite() => is_strict_json_number(raw),
         Ok(value) => is_strict_json_number(raw) && !float_renders_as(value, raw),
         Err(_) => false,
     }
@@ -313,6 +315,18 @@ fn rewrite_number_text_tokens(input: &str) -> Option<String> {
             }
             let raw = &input[start..i];
             if number_token_needs_text(raw) {
+                // A number is legal only as a value, never as an unquoted
+                // object key. Replacing a key such as 1e2 with a string would
+                // otherwise make malformed input acceptable to serde. In a
+                // valid rewritten document, a key must be followed by ':'
+                // after JSON whitespace, so leave that token for the parser
+                // to reject. Only inspect this uncommon rewritten-token path.
+                if input[i..]
+                    .trim_start_matches([' ', '\t', '\r', '\n'])
+                    .starts_with(':')
+                {
+                    continue;
+                }
                 // serde escapes the tag's control bytes; the raw numeric text is
                 // already JSON-string-safe. String serialization is infallible.
                 let literal = serde_json::to_string(&format!("{NUMBER_TEXT_TAG}{raw}"))
@@ -5090,6 +5104,95 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
 mod tests {
     use super::*;
     use fsqlite_func::FunctionRegistry;
+
+    #[test]
+    fn number_text_rewrite_rejects_malformed_numbers() {
+        let mut tokens = vec![
+            "01e999".to_owned(),
+            "-01e999".to_owned(),
+            "00e999".to_owned(),
+            "01.0e999".to_owned(),
+            "01.50".to_owned(),
+        ];
+        tokens.push(format!("0{}", "9".repeat(400)));
+        tokens.push(format!("-0{}", "9".repeat(400)));
+        for token in tokens {
+            for input in [
+                token.clone(),
+                format!("[{token}]"),
+                format!(r#"{{"n":{token}}}"#),
+            ] {
+                assert!(parse_json_text(&input).is_err(), "{input}");
+                assert_eq!(json_valid(&input, None), 0, "{input}");
+                assert_eq!(json_valid(&input, Some(JSON_VALID_JSON5_FLAG)), 0, "{input}");
+                assert!(json(&input).is_err(), "{input}");
+                assert!(json_extract(&input, &["$"]).is_err(), "{input}");
+                assert!(jsonb(&input).is_err(), "{input}");
+            }
+        }
+    }
+
+    #[test]
+    fn number_text_rewrite_never_quotes_an_unquoted_object_key() {
+        let tokens = [
+            "1e2".to_owned(),
+            "1.50".to_owned(),
+            "9e999".to_owned(),
+            "-9e999".to_owned(),
+            "9".repeat(400),
+        ];
+        for token in tokens {
+            for input in [
+                format!("{{{token}:0}}"),
+                format!("[{{{token} \t\r\n:0}}]"),
+                format!(r#"{{"first":1,{token}:0}}"#),
+            ] {
+                assert!(parse_json_text(&input).is_err(), "{input}");
+                assert_eq!(json_valid(&input, None), 0, "{input}");
+                assert_eq!(json_valid(&input, Some(JSON_VALID_JSON5_FLAG)), 0, "{input}");
+                assert!(json(&input).is_err(), "{input}");
+                assert!(json_extract(&input, &["$"]).is_err(), "{input}");
+                assert!(jsonb(&input).is_err(), "{input}");
+            }
+
+            // Quoted numeric keys and numeric values remain legal, including
+            // a preserved number beside a key that looks like the same token.
+            for input in [
+                token.clone(),
+                format!("[{token}]"),
+                format!(r#"{{"{token}":{token}}}"#),
+            ] {
+                assert_eq!(json_valid(&input, None), 1, "{input}");
+                assert_eq!(json(&input).unwrap(), input);
+            }
+        }
+    }
+
+    #[test]
+    fn overflowing_json5_numbers_still_use_the_json5_fallback() {
+        for (input, expected, negative) in [
+            ("9.e999", "9.0e999", false),
+            ("-9.e999", "-9.0e999", true),
+        ] {
+            assert!(parse_json_text(input).is_err(), "{input}");
+            assert_eq!(json_valid(input, None), 0, "{input}");
+            assert_eq!(json_valid(input, Some(JSON_VALID_JSON5_FLAG)), 1, "{input}");
+            assert_eq!(json(input).unwrap(), expected);
+            let SqliteValue::Float(value) = json_extract(input, &["$"]).unwrap() else {
+                panic!("{input} must extract as a REAL");
+            };
+            assert!(value.is_infinite(), "{input}");
+            assert_eq!(value.is_sign_negative(), negative, "{input}");
+        }
+        // Keep strict JSON numbers, including ones that overflow f64, in
+        // their source spelling instead of rejecting or quoting them.
+        for input in ["9e999", "-9e999", "9.0e+999", "1.50", "1E+2"] {
+            assert_eq!(json_valid(input, None), 1, "{input}");
+            assert_eq!(json(input).unwrap(), input);
+            let encoded = jsonb(input).unwrap();
+            assert_eq!(json_from_jsonb(&encoded).unwrap(), input);
+        }
+    }
 
     #[test]
     fn json5_nonfinite_scalars_preserve_sign_and_jsonb_round_trip() {
