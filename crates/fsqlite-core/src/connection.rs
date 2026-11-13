@@ -97841,16 +97841,15 @@ impl Connection {
                 );
             }
 
-            // Evaluate this window function across its partitions.
-            // Results are pushed in partition traversal order; we'll scatter
-            // them to raw row indices afterwards.
-            let mut func_vals: Vec<SqliteValue> = Vec::with_capacity(total_rows);
-            let mut func_row_order: Vec<usize> = Vec::with_capacity(total_rows);
+            // Evaluate this window function across its partitions. Values
+            // come out in partition traversal order and go straight to their
+            // rows' result slots (bd-w4pr1.12).
+            let mut func_vals = WindowResultSlots::new(&mut window_results[wi]);
             for partition_indices in &partitions {
                 if partition_indices.is_empty() {
                     continue;
                 }
-                func_row_order.extend_from_slice(partition_indices);
+                func_vals.begin_partition(partition_indices)?;
                 // Determine effective frame bounds.
                 let frame = &win_frame_specs[wi];
                 let has_order = !win_order_by[wi].is_empty();
@@ -98289,10 +98288,7 @@ impl Connection {
                 }
             }
 
-            // Scatter func_vals back to window_results indexed by raw row index.
-            for (i, &ri) in func_row_order.iter().enumerate() {
-                window_results[wi][ri] = std::mem::replace(&mut func_vals[i], SqliteValue::Null);
-            }
+            func_vals.check_complete()?;
             if wi == 0 {
                 first_window_row_order = Some(sorted_indices);
             }
@@ -102745,7 +102741,13 @@ impl Connection {
         // reserve exactly that. Growing from empty reserved four values for a
         // one-column row: 192 bytes a row, held for the whole result.
         let mut projected_row_width = 0;
-        for row in &combined {
+        // The source rows are not read after this loop: consume them, so each
+        // is freed as soon as it is projected and the next projected row of
+        // the same size reuses its block. Freeing them all after the loop left
+        // their blocks in the middle of the heap, where the next phase's large
+        // allocations never reuse them (bd-w4pr1.12).
+        for row in combined {
+            let row = &row;
             let mut values = Vec::with_capacity(projected_row_width);
             for col in columns {
                 match col {
@@ -137894,6 +137896,67 @@ impl std::ops::Index<usize> for WindowScanRows {
     }
 }
 
+/// One window function's results by raw row index, written as they are
+/// produced (bd-w4pr1.12). The values come out in partition traversal order;
+/// each goes straight to the slot of the row at its position in the current
+/// partition, so no vector of every value and of the row order is built and
+/// scattered afterwards. A partition that gets more or fewer values than it
+/// has rows is an error.
+struct WindowResultSlots<'s, 'p> {
+    slots: &'s mut [SqliteValue],
+    partition: &'p [usize],
+    written: usize,
+    overflowed: bool,
+}
+
+impl<'s, 'p> WindowResultSlots<'s, 'p> {
+    const fn new(slots: &'s mut [SqliteValue]) -> Self {
+        Self {
+            slots,
+            partition: &[],
+            written: 0,
+            overflowed: false,
+        }
+    }
+
+    /// Starts the next partition once the current one has one value a row.
+    fn begin_partition(&mut self, partition: &'p [usize]) -> Result<()> {
+        self.check_complete()?;
+        self.partition = partition;
+        self.written = 0;
+        Ok(())
+    }
+
+    /// Checks that the current partition got exactly one value a row.
+    fn check_complete(&self) -> Result<()> {
+        if self.overflowed || self.written != self.partition.len() {
+            return Err(FrankenError::Internal(format!(
+                "window partition of {} rows produced {}{} values",
+                self.partition.len(),
+                self.written,
+                if self.overflowed { " or more" } else { "" }
+            )));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, value: SqliteValue) {
+        match self.partition.get(self.written) {
+            Some(&row) => {
+                self.slots[row] = value;
+                self.written += 1;
+            }
+            None => self.overflowed = true,
+        }
+    }
+
+    fn extend(&mut self, values: impl IntoIterator<Item = SqliteValue>) {
+        for value in values {
+            self.push(value);
+        }
+    }
+}
+
 /// The PARTITION BY or ORDER BY values of a table window SELECT's rows
 /// (bd-w4pr1.12). A key that is one plain column is read from the scanned
 /// rows in place ([`window_key_row_column`]); any other key is evaluated once
@@ -166749,8 +166812,8 @@ mod tests {
         substitute_outer_refs_in_select, take_trigger_stack_probe, trigger_depth_limit,
         trigger_program_depth_limit, validate_named_window_definitions,
         visit_select_qualified_names, wal_file_present_with_vfs, wal_path_for_db_path,
-        FlatRows, TableRowSink, WindowKeyRows, WindowKeys, WindowScanRows, window_key_row_column,
-        window_scan_named_columns,
+        FlatRows, TableRowSink, WindowKeyRows, WindowKeys, WindowResultSlots, WindowScanRows,
+        window_key_row_column, window_scan_named_columns,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{
@@ -208288,6 +208351,41 @@ mod tests {
         let empty_rows = WindowScanRows::Flat(empty_rows);
         assert_eq!(empty_rows.len(), 2);
         assert!(empty_rows[1].is_empty());
+    }
+
+    #[test]
+    fn test_window_result_slots_write_partition_values_to_their_rows() {
+        // bd-w4pr1.12: values in partition traversal order land in the slots
+        // of the partition's rows, whatever the rows' order.
+        let int = SqliteValue::Integer;
+        let mut slots = vec![SqliteValue::Null; 5];
+        let first = [3_usize, 0];
+        let second = [4_usize, 1, 2];
+        let mut writer = WindowResultSlots::new(&mut slots);
+        writer.check_complete().unwrap();
+        writer.begin_partition(&first).unwrap();
+        writer.push(int(10));
+        writer.push(int(11));
+        writer.begin_partition(&second).unwrap();
+        writer.extend([int(20), int(21), int(22)]);
+        writer.check_complete().unwrap();
+        assert_eq!(slots, vec![int(11), int(21), int(22), int(10), int(20)]);
+
+        // A partition that gets fewer values than rows, or more, is refused.
+        let mut short_slots = vec![SqliteValue::Null; 5];
+        let mut short = WindowResultSlots::new(&mut short_slots);
+        short.begin_partition(&first).unwrap();
+        short.push(int(1));
+        assert!(short.check_complete().is_err());
+        assert!(short.begin_partition(&second).is_err());
+        let mut long_slots = vec![SqliteValue::Null; 5];
+        let mut long = WindowResultSlots::new(&mut long_slots);
+        long.begin_partition(&first).unwrap();
+        long.extend([int(1), int(2), int(3)]);
+        assert!(long.check_complete().is_err());
+        assert_eq!(long_slots[3], int(1));
+        assert_eq!(long_slots[0], int(2));
+        assert_eq!(long_slots[4], SqliteValue::Null);
     }
 
     #[test]
