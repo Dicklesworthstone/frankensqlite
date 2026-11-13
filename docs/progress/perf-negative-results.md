@@ -87,6 +87,38 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - REJECTED: a writer's close truncates the WAL it fully backfilled, as stock's last close deletes it (bd-w4pr1.13.33)
+
+- Target: every process that opens a database a writer closed. The close ran a PASSIVE checkpoint
+  and left every backfilled frame; the next open re-reads and re-verifies them (the scorecard's
+  base database keeps a 31.3 MB WAL; `SELECT 1` opens with 666 WAL preads, 2.6 MB). Touched (not
+  landed; patch `scratchpad/walclose_full_1b5af8537.patch` of the coordinator session, code diff
+  sha256 2108ddf6...): `crates/fsqlite-pager/src/pager.rs` (`checkpoint_without_waiting`, the zero
+  busy budget PASSIVE gets, for any mode), `crates/fsqlite-core/src/connection.rs` (`close_internal`
+  runs TRUNCATE through it; two tests, the positive one failing on the PASSIVE close).
+- Result (stock sqlite3 3.46.1 live; binaries d2522f1a... base 1b5af8537, e1b09ab3... candidate):
+  - Prediction recorded before code: DELETE -8..-12%, UPDATE -6..-10%, reads -2..-3.5 ms. Kill:
+    DELETE under 5% (`sc_mut_probe.py`, 7 reps, each arm building its own database). Two runs:
+    DELETE +0.4% and -5.1% wall (mean -2.4%): killed. UPDATE -6.8% and -12.4%.
+  - Second hypothesis, recorded on the bead before fresh runs: at least 4 of 6 read rows -3% or
+    more, UPDATE -5% or more, txn/autocommit regress under 5%. Fresh scorecard: scan -4.1%,
+    count_star -12%, join_no_index -12%, create_index -8.9%, rowid -0.6%, join_1M -1.4% (met);
+    fresh UPDATE probe -3.4% wall, CPU +3.8% (killed). txn -0.8%, autocommit +2.3% (7 reps).
+  - What replicates across both scorecards: a fixed ~3-5 ms per process opening a file a writer
+    closed. It shows on open-dominated rows (count_star, join_no_index, create_index -6..-12%
+    each); mutation rows and large reads move inside the noise. An earlier copy-based probe that
+    showed DELETE -10.7% timed the base binary's close in both arms, so it did not see the
+    candidate's own close-time truncation.
+- Gate (incomplete, the lever was rejected first): clippy clean; fsqlite-core lib close and
+  checkpoint filters 85 pass; fsqlite-pager lib checkpoint pass. Integration batch A:
+  `bd_yoa57_journal_size_limit_caps_the_wal` (control measured after close) and
+  `attaching_to_a_fully_backfilled_wal_creates_no_repair_artifacts` (setup relied on the old close)
+  fail as expected and were adjusted in the patch (adjusted versions not rerun);
+  `gh19_public_native_full_commits_grow_shared_segments_before_stock_refresh` hangs on base
+  1b5af8537 too.
+- Retry condition: as part of the stock-parity close behaviour (bd-reality-check-1022-llk6g.21),
+  with any perf claim limited to open-dominated rows and pre-registered before a fresh run.
+
 ## 2026-11-12 - REJECTED: the publication scan reads a peer's new frame headers in batched runs (bd-w4pr1.8, lever 1)
 
 - Target: the scorecard's multiproc row (8 processes x 500 autocommit INSERTs, one WAL database).
