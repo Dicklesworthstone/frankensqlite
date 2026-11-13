@@ -87,6 +87,74 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: an INSERT builds the boxed future of a dispatch check only when the check can act on it (bd-w4pr1.13.35, lever 1)
+
+- Target: per-statement work outside the VDBE program on every INSERT through the dispatcher (text,
+  parameterized literal, prepared re-dispatch), and the view-DML box on every statement; the
+  scorecard rows `txn_1000x10_rows` and `autocommit_5k_inserts`. Touched:
+  `crates/fsqlite-core/src/connection.rs` (`execute_statement_dispatch_impl`),
+  `crates/fsqlite-core/src/connection/insert_batch.rs` (`execute_insert_dispatch`).
+- Evidence before (callgrind, main 0f8b7c7f4, N=2000 minus N=1000 literal INSERTs in one
+  transaction through the CLI, io_uring refused): 41,981 instructions per INSERT (stock about
+  13.7k). Each INSERT heap-allocated and freed six futures for checks that answer "nothing to do"
+  for an ordinary table: delegation to an attached database (`maybe_execute_attached_target_statement`
+  returns a `Pin<Box<dyn Future>>`), the INSTEAD OF view check (`boxed_future`), and `Box::pin` of
+  both FTS5 command forms, the inbound-FK pass over REPLACE victims and the AUTOINCREMENT refresh.
+  The futures are kilobytes, past glibc's tcache sizes, so each paid `_int_malloc` and a merging
+  free; malloc and free together were about 5.3k of the statement.
+- Change: each future is built behind its helper's own first test, which the helper keeps: an
+  INSERT reaches an attached database only through its table's schema qualifier
+  (`attached_target_schema` answers None without one, in the WITH pre-check and the Insert arm);
+  `statement_targets_instead_of_view` (which also spares BEGIN, COMMIT and every other statement the
+  view-DML box); `fts5_insert_uses_command_column`, which both command forms require; a non-empty
+  `last_replace_victims`; `is_autoincrement_table` (`sqlite_sequence` keeps its own branch). The
+  recursion boxes and every other path are unchanged.
+- Not attempted: the bead's first candidate, skipping the statement savepoint for single-row DML
+  that cannot fail part-way. In concurrent mode the Insert opcode takes MVCC page locks page by
+  page as it writes (`SharedTxnPageIo::write_page_internal` -> `concurrent_prepare_write_page`); a
+  split that meets a peer's lock on the parent or a new page fails Busy after the leaf is written,
+  and only the statement savepoint (pager, concurrent write set, bd-8a8pr rowid rewind) undoes that.
+  Stock has no such mid-statement failure, so the proof does not hold.
+- Result (binaries 6d41bf19... = main 0f8b7c7f4, 30b8b968... = 0f8b7c7f4 plus this diff; stock
+  sqlite3 3.46.1 live in the same runs; every answer equal to stock's): exact per in-transaction
+  INSERT 41,981 -> 39,005 (-2,976, -7.1%; allocator internals -2.0k: `_int_malloc` -838,
+  `_int_free_merge_chunk` -357, `__libc_malloc2` -210, `_int_free_maybe_trim` -179,
+  `_int_free_chunk` -174; the skipped helpers' own frames and drops the rest); exact per autocommit
+  INSERT (N=800 minus N=400) 206,539 -> 202,605 (-3,934). perf stat, 7 interleaved reps
+  (`txn_row_probe.py`): `txn_1000x10_rows` 741.2M -> 702.6M mean (min 727.0M -> 690.1M; 4.82x ->
+  4.57x stock 153.9M), CPU best 272.2 -> 267.6 ms (stock 33.1 ms, stock A/A 1.19);
+  `autocommit_5k_inserts` 1,266.9M -> 1,259.4M mean, inside that row's run-to-run spread (base
+  1,239.6M-1,286.1M, lever 1,250.6M-1,268.3M; 11.28x -> 11.21x stock 112.3M), CPU best 649.3 ->
+  625.8 ms (stock 64.0 ms, A/A 1.10). No time ratio is claimed at those A/A values. Prediction -1.6k
+  to -2.4k per INSERT and -16M to -24M on the txn row: both beaten, because the estimate counted
+  the `malloc` entry and not the large-chunk path behind it; kill line (under 1.2k, under 10M) not
+  met.
+- Tests: `crates/fsqlite-core/tests/bd_w4pr1_13_35_insert_dispatch_checks_oracle.rs` runs, against
+  stock on file-backed databases, in autocommit and in one transaction, a statement each check
+  must still catch and a look-alike it must not: `INSERT INTO aux.t` beside main's `t`, an INSERT
+  on a view with an INSTEAD OF trigger, the three-column FTS5 `'delete'` on an external-content
+  table (`'rebuild'` and `'optimize'` in its setup), a plain table whose first column bears the
+  table's name, an OR REPLACE whose victim has an ON DELETE CASCADE child, and AUTOINCREMENT with a
+  deleted high row; each statement's outcome and `changes()` and the dumps are compared.
+- Gate (rch, 0f8b7c7f4 plus the change): clippy -D warnings on fsqlite-core `--all-targets` clean
+  (and again on the rebased tree); 40 fsqlite-core targets in five batches (attach, view / INSTEAD
+  OF / trigger, FTS5 / vtab, FK / REPLACE / AUTOINCREMENT, savepoint / conflict / RETURNING /
+  literal parameterization) 222 pass and 2 fail, and 8 fsqlite targets 117 pass and 1 fails, each
+  red on main with the same message: bd-vy10l `gh516_returning_conformance`, bd-mkon7
+  `review_omitted_rowid_alias_ignores_defaults` (102 where stock gives 101; the base CLI gives 102
+  on the same script) and bd-13m32 `gh294_read_only_namespace_recovery_changes_only_ns_use`;
+  fsqlite-core lib 4,170 pass and 2 fail (the t6741 pair). The new keeper first failed on a
+  difference main already has (after an FTS5 `'rebuild'` or `'optimize'` command fsqlite reports
+  `changes()` 0, stock 1; the base CLI does the same), so those two commands run in its setup.
+- Landed as 920137f76 (rebased onto f4be467d7; clippy reran on 49b67bbb6 plus the change, and
+  the two later upstream commits touch only fsqlite-vdbe codegen, a fsqlite test and this ledger;
+  the measured binaries hold the same production diff).
+- Retry condition: none. Next on this bead, per in-transaction INSERT after this lever (39.0k):
+  the shell's completeness scan (1.9k) and dot-command dispatch (0.5k), the literal scan's
+  per-parameter `to_string` and string copies (about 0.55k), the engine handed over by value
+  (about 2.5k of memcpy, REJECTED 2026-11-12 on a prepared-statement row; retry needs an
+  instruction-count A/B of a prepared autocommit INSERT), and the statement savepoint (about 2.5k).
+
 ## 2026-11-13 - WIN: an indexed equality with a rowid range seeks the index bounded by the range, for keyset pages and aggregates (bd-z3a05)
 
 - Target: `WHERE <indexed col> = v AND <rowid range>`, both keyset pagination
