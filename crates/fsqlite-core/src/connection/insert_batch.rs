@@ -572,6 +572,30 @@ impl Connection {
         Ok(instances)
     }
 
+    /// A RETURNING subquery left for execution must retain its own lexical
+    /// scope even when it is not correlated. The scalar/EXISTS emitters do
+    /// not handle WITH, derived tables or every LIMIT/aggregate shape; those
+    /// expressions are projected through SELECT at the changed-row boundary.
+    fn returning_has_uncompiled_subquery(&self, returning: &[ResultColumn]) -> bool {
+        returning.iter().any(|column| {
+            let ResultColumn::Expr { expr, .. } = column else {
+                return false;
+            };
+            expr_contains_subquery_matching_deep(expr, self, &|subquery, conn| match subquery {
+                SubqueryExprRef::Scalar(inner) => {
+                    !scalar_subquery_answered_by_table_scan(inner, conn)
+                }
+                SubqueryExprRef::Exists(inner) => {
+                    !exists_subquery_answered_by_table_scan(inner, conn)
+                }
+                SubqueryExprRef::In(inner) => {
+                    !in_subquery_supported_by_vdbe(inner, conn)
+                        || is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+                }
+            })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_insert_dispatch(
         &self,
@@ -689,6 +713,25 @@ impl Connection {
                 ));
             }
         }
+        // bd-d8fxs: INSERT needs the same changed-row projection boundary as
+        // UPDATE/DELETE. In particular, a nested WITH or derived table must
+        // not reach emit_scalar_subquery, which cannot preserve that scope.
+        let returning_projection = if !is_live_vtab
+            && self.returning_has_uncompiled_subquery(&insert.returning)
+        {
+            self.log_mem_execution_fallback("insert", "insert_row_by_row_returning_fallback")?;
+            Some(self.prepare_dml_returning_projection(
+                &fsqlite_ast::QualifiedTableRef {
+                    name: insert.table.clone(),
+                    alias: None,
+                    index_hint: None,
+                    time_travel: None,
+                },
+                &insert.returning,
+            )?)
+        } else {
+            None
+        };
         if !is_live_vtab
             && let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source
         {
@@ -747,6 +790,7 @@ impl Connection {
             let needs_row_by_row_replay = has_before_insert
                 || has_after_insert
                 || upsert_needs_conflict_plan
+                || returning_projection.is_some()
                 || self.fk_enforcement_enabled();
             // bd-i3csr.1: a source the INSERT program can scan itself runs
             // as that one program (the VDBE path below), not materialized
@@ -780,6 +824,7 @@ impl Connection {
             && (has_before_insert
                 || has_after_insert
                 || upsert_needs_conflict_plan
+                || returning_projection.is_some()
                 || self.fk_enforcement_enabled())
             && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
             && rows.len() > 1
@@ -1064,11 +1109,27 @@ impl Connection {
         // from the pager via StorageCursor instead of MemDatabase.
         // The VDBE path is correct; this is an optimization only.
 
+        // Capture the actual inserted/updated row in the VDBE. Projecting it
+        // later must not re-read a key that an UPSERT changed, nor use the
+        // candidate values when defaults, affinity or generated columns have
+        // changed them. Multi-row inputs were replayed above so this snapshot
+        // is evaluated before the next row and before AFTER triggers.
+        let snapshot_statement = returning_projection.as_ref().map(|projection| {
+            let mut snapshot_insert = insert.clone();
+            snapshot_insert.returning = projection.snapshot_columns.clone();
+            Statement::Insert(snapshot_insert)
+        });
+        let compiled_statement = snapshot_statement.as_ref().unwrap_or(statement);
+        let compiled_insert = match compiled_statement {
+            Statement::Insert(compiled_insert) => compiled_insert,
+            _ => insert,
+        };
         let arc_prog;
         // A BEFORE trigger can invalidate code compiled at batch entry.
         // Check again here, after BEFORE and immediately before the write.
         let program: &VdbeProgram = if let Some(p) = precompiled.filter(|_| {
-            replay_identity.is_none_or(|identity| self.insert_replay_identity() == identity)
+            returning_projection.is_none()
+                && replay_identity.is_none_or(|identity| self.insert_replay_identity() == identity)
         }) {
             p
         } else {
@@ -1081,14 +1142,16 @@ impl Connection {
             record_trace_span_created();
             let _plan_guard = plan_span.enter();
             let (sql_text, sql_key) =
-                self.dispatch_statement_text(params, statement, |seen| &mut seen.inserts);
-            // A program built from resolved VALUES subqueries holds
-            // their results for this execution: never reuse it.
-            let _values_subquery_cache_bypass = insert_values_have_subquery(insert)
-                .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
+                self.dispatch_statement_text(params, compiled_statement, |seen| &mut seen.inserts);
+            // Resolved VALUES subqueries hold this execution's values.
+            // A RETURNING snapshot also changes the compiled shape independently
+            // of any original SQL text retained by the dispatcher.
+            let _insert_cache_bypass = (insert_values_have_subquery(insert)
+                || returning_projection.is_some())
+            .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
             arc_prog = self
                 .compile_with_cache(sql_key, &sql_text, async |conn| {
-                    conn.compile_table_insert(insert, params).await
+                    conn.compile_table_insert(compiled_insert, params).await
                 })
                 .await?;
             &arc_prog
@@ -1120,6 +1183,12 @@ impl Connection {
         if affected > 0 && self.fk_enforcement_enabled() {
             Box::pin(self.enforce_fk_on_insert(insert, table_name, params)).await?;
         }
+
+        let rows = if let Some(projection) = &returning_projection {
+            Box::pin(self.project_dml_returning(projection, rows, params)).await?
+        } else {
+            rows
+        };
 
         // Patch trigger NEW rows: fill in auto-assigned INTEGER
         // PRIMARY KEY rowids that were NULL at pre-computation time.

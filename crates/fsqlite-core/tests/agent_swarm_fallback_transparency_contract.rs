@@ -12,6 +12,7 @@ const FALLBACK_BOUNDARY_INVENTORY: &str =
 const G9_FALLBACK_DENIAL_REPLAY_SCRIPT: &str =
     include_str!("../../../scripts/verify_g9_fallback_denial_replay.sh");
 const CONNECTION_SOURCE: &str = include_str!("../src/connection.rs");
+const INSERT_BATCH_SOURCE: &str = include_str!("../src/connection/insert_batch.rs");
 const E2E_EXECUTOR_SOURCE: &str = include_str!("../../fsqlite-e2e/src/fsqlite_executor.rs");
 const VDBE_ENGINE_SOURCE: &str = include_str!("../../fsqlite-vdbe/src/engine.rs");
 const INVENTORY_REQUIRED_FIELDS: &[&str] = &[
@@ -818,10 +819,12 @@ fn quoted_literals_after(source: &'static str, start: usize, max_len: usize) -> 
 
 fn connection_second_argument_reasons(needle: &str) -> BTreeSet<&'static str> {
     let mut reasons = BTreeSet::new();
-    for (index, _) in CONNECTION_SOURCE.match_indices(needle) {
-        let literals = quoted_literals_after(CONNECTION_SOURCE, index, 320);
-        if let Some(reason) = literals.get(1) {
-            reasons.insert(*reason);
+    for source in [CONNECTION_SOURCE, INSERT_BATCH_SOURCE] {
+        for (index, _) in source.match_indices(needle) {
+            let literals = quoted_literals_after(source, index, 320);
+            if let Some(reason) = literals.get(1) {
+                reasons.insert(*reason);
+            }
         }
     }
     reasons
@@ -887,6 +890,9 @@ fn runtime_fallback_boundary_reasons() -> BTreeSet<&'static str> {
 fn source_contains_anchor(source_file: &str, source_anchor: &str) -> bool {
     match source_file {
         "crates/fsqlite-core/src/connection.rs" => CONNECTION_SOURCE.contains(source_anchor),
+        "crates/fsqlite-core/src/connection/insert_batch.rs" => {
+            INSERT_BATCH_SOURCE.contains(source_anchor)
+        }
         "crates/fsqlite-e2e/src/fsqlite_executor.rs" => E2E_EXECUTOR_SOURCE.contains(source_anchor),
         "crates/fsqlite-vdbe/src/engine.rs" => VDBE_ENGINE_SOURCE.contains(source_anchor),
         _ => false,

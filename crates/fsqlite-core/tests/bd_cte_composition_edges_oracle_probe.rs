@@ -610,11 +610,9 @@ fn with_insert_target_shadow_upsert_returning_respects_nested_scopes() {
 
 /// bd-d8fxs keeper: a RETURNING subquery with its own WITH sees that scope.
 /// A nested `WITH t` shadows the statement's CTE `t`, and `q` built over the
-/// outer `t` still reads the CTE. INSERT RETURNING compiles these subqueries
-/// to NULL today (it reads the real table `t` for the shadowing case), so
-/// the keeper is ignored until bd-d8fxs lands; run it with `--ignored`.
+/// outer `t` still reads the CTE. The changed-row projection must preserve
+/// those scopes instead of compiling an unsupported subquery as NULL.
 #[test]
-#[ignore = "bd-d8fxs: INSERT RETURNING evaluates a scalar subquery over a CTE as NULL"]
 fn with_insert_returning_nested_with_scopes_match_stock() {
     asupersync::test_utils::run_test(|| async {
         for prepared in [false, true] {
@@ -649,6 +647,212 @@ fn with_insert_returning_nested_with_scopes_match_stock() {
             );
             assert_cte_dml_state(&f, &r, &label).await;
             f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn insert_returning_subquery_projection_observes_each_row_before_after_triggers() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let cases = [
+            ("values", "VALUES(?1,?2),(?1+1,?2+1)", [11, 20, 99], 2),
+            (
+                "select",
+                "SELECT ?1,?2 UNION ALL SELECT ?1+1,?2+1",
+                [11, 20, 99],
+                2,
+            ),
+            ("defaults", "DEFAULT VALUES", [11, 20, 99], 1),
+            (
+                "upsert",
+                "VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET k=excluded.k+10,v=excluded.v+1",
+                [1, 20, 99],
+                1,
+            ),
+        ];
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for triggers in [false, true] {
+                    for (case, source, params, expected_count) in cases {
+                        let label = format!(
+                            "projection-{case}-file-{file_backed}-prepared-{prepared}-triggers-{triggers}"
+                        );
+                        let path = directory.path().join(format!("{label}.db"));
+                        let f = Connection::open(if file_backed {
+                            path.to_str().unwrap()
+                        } else {
+                            ":memory:"
+                        })
+                        .await
+                        .unwrap();
+                        let r = rusqlite::Connection::open_in_memory().unwrap();
+                        for setup in [
+                            "CREATE TABLE t(k INTEGER PRIMARY KEY, v INTEGER DEFAULT 7)",
+                            "CREATE TABLE audit(n INTEGER)",
+                            "INSERT INTO t VALUES(1,5)",
+                        ] {
+                            f.execute(setup).await.unwrap();
+                            r.execute_batch(setup).unwrap();
+                        }
+                        if triggers {
+                            for setup in [
+                                "CREATE TRIGGER t_before BEFORE INSERT ON t BEGIN \
+                                 INSERT INTO audit VALUES(1); END",
+                                "CREATE TRIGGER t_after AFTER INSERT ON t BEGIN \
+                                 UPDATE t SET v=v+1000 WHERE k=NEW.k; \
+                                 INSERT INTO audit VALUES(2); END",
+                                "CREATE TRIGGER t_updated AFTER UPDATE ON t BEGIN \
+                                 INSERT INTO audit VALUES(3); END",
+                            ] {
+                                f.execute(setup).await.unwrap();
+                                r.execute_batch(setup).unwrap();
+                            }
+                        }
+                        let columns = if case == "defaults" { "" } else { "(k,v)" };
+                        let sql = format!(
+                            "INSERT INTO t{columns} {source} RETURNING k,v, \
+                             (SELECT n FROM (SELECT t.v AS n)), \
+                             (WITH w(n) AS (VALUES(?3)) SELECT n FROM w), \
+                             (SELECT count(*) FROM (SELECT k FROM t) AS q WHERE q.k<=t.k), \
+                             (SELECT count(*) FROM audit WHERE t.k>0)"
+                        );
+                        let expected = cte_dml_stock_rows(&r, &sql, &params);
+                        assert_eq!(expected.len(), expected_count, "stock fixture: {label}");
+                        assert_eq!(
+                            cte_dml_frank_rows(&f, &sql, &params, prepared).await,
+                            expected,
+                            "{label}"
+                        );
+                        for check in [
+                            "SELECT k,v FROM t ORDER BY k",
+                            "SELECT n FROM audit ORDER BY rowid",
+                            "SELECT changes(),total_changes(),last_insert_rowid()",
+                            "PRAGMA integrity_check",
+                        ] {
+                            assert_eq!(
+                                cte_dml_frank_rows(&f, check, &[], false).await,
+                                cte_dml_stock_rows(&r, check, &[]),
+                                "{label}: {check}"
+                            );
+                        }
+                        f.close().await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn insert_returning_projection_error_rolls_back_rows_and_trigger_effects() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for (explicit_transaction, with_triggers) in
+                    [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    for (case, source) in [
+                        ("one", "VALUES(11,?1)"),
+                        ("many", "VALUES(11,20),(12,?1)"),
+                    ] {
+                        let label = format!(
+                            "projection-error-{case}-file-{file_backed}-prepared-{prepared}-explicit-{explicit_transaction}-triggers-{with_triggers}"
+                        );
+                        let path = directory.path().join(format!("{label}.db"));
+                        let f = Connection::open(if file_backed {
+                            path.to_str().unwrap()
+                        } else {
+                            ":memory:"
+                        })
+                        .await
+                        .unwrap();
+                        let r = rusqlite::Connection::open_in_memory().unwrap();
+                        for setup in [
+                            "CREATE TABLE t(k INTEGER PRIMARY KEY,v INTEGER)",
+                            "CREATE TABLE audit(n INTEGER)",
+                        ] {
+                            f.execute(setup).await.unwrap();
+                            r.execute_batch(setup).unwrap();
+                        }
+                        if with_triggers {
+                            for setup in [
+                                "CREATE TRIGGER t_before BEFORE INSERT ON t BEGIN \
+                                 INSERT INTO audit VALUES(NEW.k); END",
+                                "CREATE TRIGGER t_after AFTER INSERT ON t BEGIN \
+                                 INSERT INTO audit VALUES(-NEW.k); END",
+                            ] {
+                                f.execute(setup).await.unwrap();
+                                r.execute_batch(setup).unwrap();
+                            }
+                        }
+                        if explicit_transaction {
+                            f.execute("BEGIN").await.unwrap();
+                            r.execute_batch("BEGIN").unwrap();
+                        }
+                        f.execute("INSERT INTO t VALUES(1,5)").await.unwrap();
+                        r.execute_batch("INSERT INTO t VALUES(1,5)").unwrap();
+                        let sql = format!(
+                            "INSERT INTO t(k,v) {source} RETURNING k, \
+                             (SELECT abs(n) FROM (SELECT t.v AS n))"
+                        );
+                        let stock_error = {
+                            let mut statement = r.prepare(&sql).unwrap();
+                            let mut rows = statement.query([i64::MIN]).unwrap();
+                            match rows.next() {
+                                Err(error) => error,
+                                Ok(_) => panic!("stock projection must overflow: {label}"),
+                            }
+                        };
+                        assert!(stock_error.to_string().contains("overflow"), "{label}");
+                        let params = [SqliteValue::Integer(i64::MIN)];
+                        let frank_error = if prepared {
+                            f.prepare(&sql)
+                                .await
+                                .unwrap()
+                                .query_with_params(&params)
+                                .await
+                                .unwrap_err()
+                        } else {
+                            f.query_with_params(&sql, &params).await.unwrap_err()
+                        };
+                        assert!(
+                            frank_error.to_string().contains("overflow"),
+                            "{label}: {frank_error}"
+                        );
+                        for check in [
+                            "SELECT k,v FROM t ORDER BY k",
+                            "SELECT n FROM audit ORDER BY rowid",
+                            "PRAGMA integrity_check",
+                        ] {
+                            assert_eq!(
+                                cte_dml_frank_rows(&f, check, &[], false).await,
+                                cte_dml_stock_rows(&r, check, &[]),
+                                "{label}: {check}"
+                            );
+                        }
+                        let later = "INSERT INTO t VALUES(90,90)";
+                        f.execute(later).await.unwrap();
+                        r.execute_batch(later).unwrap();
+                        if explicit_transaction {
+                            f.execute("COMMIT").await.unwrap();
+                            r.execute_batch("COMMIT").unwrap();
+                        }
+                        for check in [
+                            "SELECT k,v FROM t ORDER BY k",
+                            "SELECT n FROM audit ORDER BY rowid",
+                        ] {
+                            assert_eq!(
+                                cte_dml_frank_rows(&f, check, &[], false).await,
+                                cte_dml_stock_rows(&r, check, &[]),
+                                "{label}: after retry: {check}"
+                            );
+                        }
+                        f.close().await.unwrap();
+                    }
+                }
+            }
         }
     });
 }
