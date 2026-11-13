@@ -87,6 +87,45 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: a leaf delete trusts the pointer order of the image the previous descending delete wrote (bd-w4pr1.13.20, lever P)
+
+- Target: runs of deletes on one table leaf (a scan DELETE removes about 19 rows per leaf on the
+  scorecard's `delete_14pct_300k`). Touched: `crates/fsqlite-btree/src/cursor.rs`
+  (`BtCursor::descending_leaf_image`, `remove_table_cell_from_leaf_deferred`).
+- Evidence before (callgrind of the DELETE on main 0f8b7c7f4, 42,857 deletes on compact leaves of
+  about 150 cells): the compact descending branch was chosen by `cell_ptrs_are_descending` over the
+  whole pointer array on every delete (`ptrs.windows(2).all`, 10.7M + 10.6M in the delete closure,
+  about 500 instructions per row), re-proving what the previous delete on the leaf had produced.
+- Change: that branch's output is compact and still strictly descending (the pointers before the
+  removed one are unchanged; each after it rises by the removed size and stays below its
+  predecessor, because the cell after the removed one ended where the removed one began). The cursor
+  remembers the (page, `PageData::image_token`) it wrote; a delete whose top entry shows exactly that
+  image skips the scan. Any other image (an insert, an overwrite, another branch, another cursor)
+  has another token and is scanned; the no-free-gaps and content-offset tests run every time.
+- Result, stock sqlite3 3.46.1 live in the same run (`sc_mut_probe`, minimum user instructions of
+  7, io_uring refused, load 1.0; binaries 6d41bf19... base main 0f8b7c7f4, 9af6cfb5... base + this
+  production diff): `delete_14pct_300k` stock 120.7M, base 539.5M (4.47x), lever 506.0M (4.19x):
+  -33.5M, CPU 124.6 -> 114.4 ms (stock 36.8); `update_10pct_300k` 868.3M -> 868.2M (stock 273.4M).
+  With io_uring allowed: 554.6M -> 520.9M, CPU 159.9 -> 139.5 ms, wall 223.6 -> 207.5 ms (stock
+  93.7). Prediction (DELETE -15M to -22M) exceeded; kill (DELETE under 10M, UPDATE moving over 3M)
+  not met. Answers equal stock's; stock's `PRAGMA integrity_check` passes on every file the lever
+  wrote.
+- Test: `test_leaf_delete_reuses_the_pointer_order_only_for_the_image_it_wrote` (deletes, then two
+  inserts leaving the lowest cell last and a lower cell's pointer mid-array, then deletes; the page
+  ends byte-equal to a fresh cursor per step, and the remembered image is exactly each descending
+  delete's own). Mutation run: with the verdict keyed on the page number alone the test fails, the
+  delete taking the descending branch on the disturbed leaf and corrupting it ("cell pointer
+  outside the cell content area").
+- Gate, on 0f8b7c7f4 plus the change: clippy -D warnings on fsqlite-btree `--all-targets` clean
+  (again on the rebased tree); fsqlite-btree lib 554 pass; fsqlite-vdbe lib 1,244 pass and 2 fail
+  (bd-bhalc pair, red on main); fsqlite-core lib 4,169 pass and 2 fail (t6741 pair, red on main);
+  the 48 fsqlite-core DML / trigger / FK / RETURNING / savepoint / concurrency targets 223 pass and
+  1 fails (bd-vy10l, red on main); 8 fsqlite DML targets 26 pass. Landed as 2a02e5185 (rebased onto
+  2941aa1e4).
+- Retry condition: none. Seen in the same profile and not taken: 310 deletes on leaves with free
+  space gaps take the general defragmentation (a sort of every cell, about 42k instructions each,
+  13M on the statement).
+
 ## 2026-11-13 - WIN: a WHERE comparison on expressions tests NULL in its jump and reads an arithmetic operand's literal from the prologue (bd-w4pr1.13.20, lever G)
 
 - Target: every WHERE comparison neither side of which is a column of the scanned table and one
