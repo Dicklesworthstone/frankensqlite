@@ -18,6 +18,20 @@
 //! (its marker is already present), and from re-running the repair on every
 //! open.
 //!
+//! ## Detection
+//!
+//! The pass looks only for the damage it can repair (bd-6jf9o). Every database
+//! SQLite created arrives here without a marker, so a full `integrity_check`
+//! at this point was paid on the first open of every existing file, about
+//! 17 ms of CPU per MB. Instead the pass runs the page-ownership walk alone
+//! ([`Connection::validate_page_ownership`]), which finds illegal freelist
+//! entries, pages owned twice and orphaned pages, plus the schema-only check
+//! for orphaned FTS5 content shadows. Corruption outside those classes (a
+//! malformed record, an index that disagrees with its table) is neither
+//! detected nor repaired here, as in stock SQLite, which does not check a
+//! database when it opens it; `PRAGMA integrity_check` still reports it. After
+//! any repair the full `integrity_check` runs before the marker is written.
+//!
 //! ## Interrupt safety
 //!
 //! Repairs commit individually; completion is not inferred from an attempted
@@ -81,7 +95,7 @@ pub struct MigrationMarker {
 /// The operation that prevented a migration from completing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationFailureStage {
-    /// The initial check did not establish a corruption verdict.
+    /// The initial page-ownership walk did not establish a corruption verdict.
     IntegrityCheck,
     /// A mandatory pre-repair backup failed.
     Backup,
@@ -108,7 +122,7 @@ pub enum MigrationOutcome {
     AlreadyMigrated,
     /// Freshly created database — stamped with the marker at birth.
     MarkedAtBirth,
-    /// Pre-existing database whose `integrity_check` was already clean.
+    /// Pre-existing database with none of the damage the pass repairs.
     CleanNoRepair,
     /// Pre-existing database that was repaired; carries the applied-repair names.
     Repaired { repairs: Vec<String> },
@@ -294,9 +308,10 @@ pub(crate) async fn run_first_open_migration(
 
     let started = Instant::now();
 
-    // A pre-existing, unmarked database: check it, and repair the repairable
-    // corruption classes if any are present.
-    match conn.validate_database_integrity(false).await {
+    // A pre-existing, unmarked database: look for the repairable corruption
+    // classes, and repair them if any are present. The page-ownership walk is
+    // the part of integrity_check that finds them (see "Detection" above).
+    match conn.validate_page_ownership().await {
         Ok(()) => {
             // bd-7o1vu (GH#370): a legacy CONTENTLESS FTS5 table can carry an
             // orphaned `%_content` corpus shadow. It is integrity-CLEAN, so it
@@ -763,21 +778,36 @@ mod tests {
         });
     }
 
+    /// bd-6jf9o: the pass detects only what it can repair. Index corruption is
+    /// outside those classes, so the pass neither backs the database up nor
+    /// touches it, and it completes, so later opens skip the walk. Before
+    /// bd-6jf9o the full check ran here: it found this damage, backed up the
+    /// whole file and published no marker, so every later open of the file
+    /// repeated the full check and took another backup generation.
+    /// `integrity_check` still reports the damage.
     #[test]
-    fn unresolved_index_corruption_does_not_publish_completion() {
+    fn corruption_outside_the_repairable_classes_is_left_to_integrity_check() {
         run_migration_test(|| async {
             let (_directory, db_path) = migration_sqlite_fixture(true);
+            let before_bytes = host_fs::read(Path::new(&db_path)).unwrap();
             let conn = Connection::open_schema_only(&db_path).await.unwrap();
             let before = conn.validate_database_integrity(false).await.unwrap_err();
             assert!(permits_migration_repair(&before), "{before}");
-            assert!(matches!(
+            conn.validate_page_ownership().await.unwrap();
+            assert_eq!(
                 run_first_open_migration(&conn, false).await,
-                MigrationOutcome::Incomplete { .. }
-            ));
-            assert!(read_migration_marker(&db_path).is_none());
-            assert!(pre_migration_backup_path(&db_path).exists());
+                MigrationOutcome::CleanNoRepair
+            );
+            assert!(read_migration_marker(&db_path).is_some());
+            assert!(!pre_migration_backup_path(&db_path).exists());
+            assert!(!migration_backup_receipt_path(&db_path).exists());
+            assert_eq!(
+                run_first_open_migration(&conn, false).await,
+                MigrationOutcome::AlreadyMigrated
+            );
             assert!(conn.validate_database_integrity(false).await.is_err());
             conn.close().await.unwrap();
+            assert_eq!(host_fs::read(Path::new(&db_path)).unwrap(), before_bytes);
 
             let oracle = rusqlite::Connection::open(&db_path).unwrap();
             let values: (String, String) = oracle
@@ -794,13 +824,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(unix, windows))]
     fn required_backup_failure_is_incomplete_not_clean() {
         run_migration_test(|| async {
-            let (_directory, db_path) = migration_sqlite_fixture(true);
+            let (_directory, db_path, before, _) = orphaned_upgrade_fixture(false);
             let backup = migration_backup_receipt_path(&db_path);
             host_fs::create_dir_all(&backup).unwrap();
             host_fs::write(&backup.join("sentinel"), b"retain destination").unwrap();
-            let before = host_fs::read(Path::new(&db_path)).unwrap();
             let conn = Connection::open_schema_only(&db_path).await.unwrap();
             assert!(matches!(
                 run_first_open_migration(&conn, false).await,

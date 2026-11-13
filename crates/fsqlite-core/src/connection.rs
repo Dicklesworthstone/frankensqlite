@@ -80545,68 +80545,150 @@ impl Connection {
         result
     }
 
-    pub(crate) async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
-        // GH#113: when a write transaction is active, `with_integrity_txn`
-        // reuses it, so the integrity walk reads uncommitted btree pages. But
-        // frank's on-disk freelist trunk pages and the page-1 header (offsets
-        // 32/36) are a deferred, commit-time projection — they stay at the
-        // last-committed state until COMMIT runs `serialize_freelist_to_write_set`.
-        // Cross-referencing fresh btree pages against the stale on-disk trunk
-        // produced false "page referenced multiple times" / "freed earlier"
-        // reports for pages legitimately allocated-from-freelist this txn.
-        // The published db size likewise lags in-transaction growth, so capture
-        // both the live freelist set and the live db size here (before
-        // with_integrity_txn borrows active_txn). `None` (no active txn) keeps
-        // the committed-state walk, which validates the on-disk trunk structure
-        // and uses the published size.
-        //
-        // A read-only pager never loads its freelist (only allocation needs
-        // it), so its live set is always empty: inside BEGIN on a read-only
-        // connection every free page then read as "page N is never used" on a
-        // valid image. Such a pager cannot hold a write transaction, so the
-        // committed on-disk walk is exact there.
-        let active_state: Option<(Vec<PageNumber>, u32)> = if self.pager.is_readonly() {
-            None
-        } else {
-            self.active_txn
-                .borrow()
-                .as_ref()
-                .map(|txn| (txn.live_integrity_freelist_pages(), txn.live_db_size()))
-        };
-        self.with_integrity_txn(async |cx, txn| {
-            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
-            let page1_bytes = page1.as_ref();
-            if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < DATABASE_HEADER_SIZE {
-                return Ok(());
-            }
+    /// The live freelist and db size of the active write transaction, which an
+    /// integrity walk must use in place of the committed on-disk image.
+    ///
+    /// GH#113: when a write transaction is active, `with_integrity_txn`
+    /// reuses it, so the integrity walk reads uncommitted btree pages. But
+    /// frank's on-disk freelist trunk pages and the page-1 header (offsets
+    /// 32/36) are a deferred, commit-time projection — they stay at the
+    /// last-committed state until COMMIT runs `serialize_freelist_to_write_set`.
+    /// Cross-referencing fresh btree pages against the stale on-disk trunk
+    /// produced false "page referenced multiple times" / "freed earlier"
+    /// reports for pages legitimately allocated-from-freelist this txn.
+    /// The published db size likewise lags in-transaction growth, so the
+    /// caller captures both the live freelist set and the live db size here
+    /// (before with_integrity_txn borrows active_txn). `None` (no active txn)
+    /// keeps the committed-state walk, which validates the on-disk trunk
+    /// structure and uses the published size.
+    ///
+    /// A read-only pager never loads its freelist (only allocation needs
+    /// it), so its live set is always empty: inside BEGIN on a read-only
+    /// connection every free page then read as "page N is never used" on a
+    /// valid image. Such a pager cannot hold a write transaction, so the
+    /// committed on-disk walk is exact there.
+    fn integrity_active_state(&self) -> Option<(Vec<PageNumber>, u32)> {
+        if self.pager.is_readonly() {
+            return None;
+        }
+        self.active_txn
+            .borrow()
+            .as_ref()
+            .map(|txn| (txn.live_integrity_freelist_pages(), txn.live_db_size()))
+    }
 
-            let header = parse_database_header_checked(page1_bytes)?;
-            // Inside a write transaction, use the in-transaction db size (which
-            // includes uncommitted growth) as the page-extent bound; the
-            // published snapshot only counts committed pages, so it would flag
-            // legitimately in-txn-allocated btree pages as "past the end of the
-            // database" (GH#113).
-            let published_db_size = self.pager.refresh_published_snapshot(cx).await?.db_size;
-            // bd-2whq5: bound the orphan scan by the header's declared page-count
-            // (the *logical* database size), exactly as stock SQLite does — its
-            // integrity_check trusts the in-header size (offset 28) and ignores
-            // physical trailing slack whenever the header is not stale. The
-            // pager's committed db_size is `max(header.page_count, file_pages)`
-            // for crash-recovery visibility (pager.rs ~8672); feeding that
-            // inflated size into the scan falsely flags stock-legal trailing
-            // slack (pages past page_count) as "page N is never used". Trust the
-            // header size only when it is not stale (`version_valid_for ==
-            // change_counter`); otherwise fall back to the file-derived size,
-            // matching stock's own fallback. A db stock accepts has no b-tree
-            // page past page_count, so this never turns into "lies past the end".
-            let logical_db_size = if !header.is_page_count_stale() && header.page_count > 0 {
-                header.page_count.min(published_db_size)
-            } else {
-                published_db_size
+    /// The database header and the page extent an integrity walk covers, or
+    /// `None` when page 1 is uninitialized (an empty database).
+    ///
+    /// `active_db_size` is the live size of the active write transaction
+    /// ([`Self::integrity_active_state`]), if any.
+    async fn integrity_page_extent_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &TransactionKind,
+        active_db_size: Option<u32>,
+    ) -> Result<Option<(DatabaseHeader, u32)>> {
+        let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+        let page1_bytes = page1.as_ref();
+        if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < DATABASE_HEADER_SIZE {
+            return Ok(None);
+        }
+
+        let header = parse_database_header_checked(page1_bytes)?;
+        // Inside a write transaction, use the in-transaction db size (which
+        // includes uncommitted growth) as the page-extent bound; the
+        // published snapshot only counts committed pages, so it would flag
+        // legitimately in-txn-allocated btree pages as "past the end of the
+        // database" (GH#113).
+        let published_db_size = self.pager.refresh_published_snapshot(cx).await?.db_size;
+        // bd-2whq5: bound the orphan scan by the header's declared page-count
+        // (the *logical* database size), exactly as stock SQLite does — its
+        // integrity_check trusts the in-header size (offset 28) and ignores
+        // physical trailing slack whenever the header is not stale. The
+        // pager's committed db_size is `max(header.page_count, file_pages)`
+        // for crash-recovery visibility (pager.rs ~8672); feeding that
+        // inflated size into the scan falsely flags stock-legal trailing
+        // slack (pages past page_count) as "page N is never used". Trust the
+        // header size only when it is not stale (`version_valid_for ==
+        // change_counter`); otherwise fall back to the file-derived size,
+        // matching stock's own fallback. A db stock accepts has no b-tree
+        // page past page_count, so this never turns into "lies past the end".
+        let logical_db_size = if !header.is_page_count_stale() && header.page_count > 0 {
+            header.page_count.min(published_db_size)
+        } else {
+            published_db_size
+        };
+        let total_pages = active_db_size.map_or(logical_db_size, |sz| sz.max(logical_db_size));
+        Ok(Some((header, total_pages)))
+    }
+
+    /// The main-database tables an integrity walk visits: the connection's
+    /// schema without TEMP tables, plus main tables a TEMP table shadows.
+    fn integrity_schema(&self) -> Vec<TableSchema> {
+        let mut schema = self.schema.borrow().clone();
+        let temp_table_names = self.temp_table_names.borrow();
+        schema.retain(|table| !temp_table_names.contains(&table.name.to_ascii_lowercase()));
+        drop(temp_table_names);
+        schema.extend(self.shadowed_main_tables.borrow().values().cloned());
+        schema
+    }
+
+    /// bd-6jf9o: the page-ownership part of `integrity_check` on its own.
+    ///
+    /// Every b-tree page the schema reaches, every overflow chain and every
+    /// durable freelist page must be owned exactly once, none may be the
+    /// lock-byte page or lie past the end, and every other in-range page must
+    /// be owned (no "page N is never used"). The walk reads page headers, cell
+    /// pointers and cell payload sizes. It never decodes a record or compares
+    /// an index with its table, so it costs a page walk, not a full
+    /// `integrity_check`.
+    ///
+    /// Those are the classes the first-open migration pass can repair
+    /// (`repair_freelist`, `repair_orphaned_pages`), so the pass uses this to
+    /// detect them. It runs inside the full check with the same inputs, so a
+    /// database this rejects also fails `integrity_check`.
+    pub(crate) async fn validate_page_ownership(&self) -> Result<()> {
+        let active_state = self.integrity_active_state();
+        self.with_integrity_txn(async |cx, txn| {
+            let Some((header, total_pages)) = self
+                .integrity_page_extent_in_txn(cx, txn, active_state.as_ref().map(|(_, sz)| *sz))
+                .await?
+            else {
+                return Ok(());
             };
-            let total_pages = active_state
-                .as_ref()
-                .map_or(logical_db_size, |(_, sz)| (*sz).max(logical_db_size));
+            let schema = self.integrity_schema();
+            let mut owner_map = HashMap::new();
+            let mut owners = PageOwnershipSink::Resident(&mut owner_map);
+            Self::validate_page_ownership_in_txn(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                total_pages,
+                header.freelist_trunk,
+                header.freelist_count,
+                // Auto-vacuum pointer-map pages are not claimed by this walk,
+                // so they would read as orphans (integrity_check skips the
+                // scan there too).
+                header.largest_root_page != 0,
+                &schema,
+                active_state.as_ref().map(|(fl, _)| fl.as_slice()),
+                &mut owners,
+            )
+            .await
+        })
+        .await
+    }
+
+    pub(crate) async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
+        let active_state = self.integrity_active_state();
+        self.with_integrity_txn(async |cx, txn| {
+            let Some((header, total_pages)) = self
+                .integrity_page_extent_in_txn(cx, txn, active_state.as_ref().map(|(_, sz)| *sz))
+                .await?
+            else {
+                return Ok(());
+            };
             let master_rows = Self::read_sqlite_master_rows_in_txn(
                 cx,
                 txn,
@@ -80684,11 +80766,7 @@ impl Connection {
 
                 // Ownership set from the connection's authoritative schema —
                 // exactly the roots integrity_check walks.
-                let mut schema = self.schema.borrow().clone();
-                let temp_table_names = self.temp_table_names.borrow();
-                schema.retain(|table| !temp_table_names.contains(&table.name.to_ascii_lowercase()));
-                drop(temp_table_names);
-                schema.extend(self.shadowed_main_tables.borrow().values().cloned());
+                let schema = self.integrity_schema();
 
                 let mut owner_map = HashMap::new();
                 let mut owners = PageOwnershipSink::Resident(&mut owner_map);
@@ -82233,11 +82311,7 @@ impl Connection {
         auto_vacuum_enabled: bool,
         live_freelist: Option<&[PageNumber]>,
     ) -> Result<()> {
-        let mut schema = self.schema.borrow().clone();
-        let temp_table_names = self.temp_table_names.borrow();
-        schema.retain(|table| !temp_table_names.contains(&table.name.to_ascii_lowercase()));
-        drop(temp_table_names);
-        schema.extend(self.shadowed_main_tables.borrow().values().cloned());
+        let schema = self.integrity_schema();
         if !quick {
             for table in &schema {
                 self.validate_table_index_runtime_dependencies(table)?;

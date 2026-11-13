@@ -69,7 +69,7 @@ written; this is where their scope is recorded.
 | Page I/O submission | 2026-08-12 bd-q8501.1, 2026-07-27 bd-trfah | multi-SQE io_uring 1.93x slower; a pool hop is ~14 us per single page | registered or borrowed buffers with batch completion; inline I/O only under the dedicated-thread marker |
 | S3-FIFO membership map | 2026-09-09 | rejected on a noisy matrix | after isolating statistics reconstruction from runtime eviction |
 | Path-identity probes | 2026-07-23 bd-smxhz | deliberate defence; one statx each since bd-qduu1 | probing less often needs the owner's sign-off |
-| Skipping the first-open migration pass | 2026-10-05 bd-6jf9o | reverted | a signal that proves no fsqlite build wrote the file, or a cheaper pass |
+| Skipping the first-open migration pass | 2026-10-05 bd-6jf9o; cheaper pass landed 2026-11-13 | skip reverted; the pass now walks page ownership only | a signal that proves no fsqlite build wrote the file; or a cheaper cell walk (2026-11-13 entry) |
 | SIMD record encoding, `target-cpu` | 2026-07-10 (two) | blocked under `forbid(unsafe_code)`; comparison is fair at baseline ISA | a scope decision; a serialize-heavy row with profiled self time |
 | Dormant vectorized kernels | 2026-11-10 | not wireable as they stand | a new executor built stock-oracle first (bd-w4pr1.13.11) |
 | Join helpers in the fallback executor | 2026-05-04, 2026-09-06 bd-0pkki, 2026-10-28 GH#530 | widening rejected; four semantic exclusions recorded | replace the shape in bytecode (bd-w4pr1.13.6, .13.9) with those exclusions as oracle cases |
@@ -3523,6 +3523,34 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
 - What is left on these rows is the engine: ~9.9 us per prepared INSERT and ~43 us per prepared
   index equality lookup inside one `block_on` (bd-w4pr1.24).
 - The C API shim (`fsqlite-c-api`) still uses the per-call runtime pattern.
+
+## 2026-11-13 - WIN: the first open of an existing database walks page ownership instead of running integrity_check (bd-6jf9o)
+
+- This meets the retry condition of the 2026-10-05 entry: a cheaper pass.
+  `run_first_open_migration` now detects only what it can repair: illegal
+  freelist entries, pages owned twice, orphaned pages, and orphaned FTS5
+  content shadows. It does so with `Connection::validate_page_ownership`,
+  integrity_check's ownership walk on its own. The full integrity_check
+  still runs after any repair.
+- Result: release-perf CLIs base 900bc02b5 (ELF 7edab055f5eb...) and fix
+  (35aeda03a6d7...), /usr/bin/sqlite3 3.46.1 live in the same run, tmpfs,
+  files written by stock, open + `SELECT 1`, two fresh copies each (A/A
+  within 0.1%). Bare 1M-row table, 27 MB: first open 4,961M instructions,
+  515-551 ms, 59 MB peak RSS before; 212.6M, 45-47 ms, 30 MB after. Same
+  table plus an index on its TEXT column: 12,718M, 1.9-2.1 s, 284 MB
+  before; 384.9M, 63 ms, 30 MB after. Second opens 3.0-3.2M in both arms;
+  stock 1.1M, 1.4-1.8 ms.
+- Left: the walk is still O(pages), about 7.7M instructions per MB, against
+  4.3M for the whole open with the pass skipped. callgrind of the fix's
+  first open (symbolized CLI): of the walk's 209M, `CellRef::parse` is
+  86.3M (1.0M cells, 86 each), `get_page` 57.7M (6,931 pages, 8.3K each),
+  `parse_cell_pointers` 22.8M (a Vec per page), and the walk's own loop
+  about 36M.
+- Retry condition for a cheaper walk: an overflow-only scan of table-leaf
+  cells, which decodes only the payload-size varint and reads the overflow
+  pointer only when the payload exceeds max-local. It must stay inside the
+  migration detector, because integrity_check needs the full cell check.
+  Measure against this entry's 212.6M.
 
 ## 2026-11-10 - ASSESSED, not a shortcut: wiring the dormant vectorized kernels (`fsqlite-vdbe/src/vectorized*.rs`) into live queries
 
