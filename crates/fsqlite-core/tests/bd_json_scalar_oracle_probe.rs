@@ -198,3 +198,72 @@ fn json_subtype_flows_between_json_functions() {
         );
     });
 }
+
+/// bd-1nxwh: stock writes a REAL that enters JSON as an SQL value with its
+/// REAL-to-TEXT conversion (`1.0e+300`, `1.0e-05`, `0.33333333333333332`,
+/// `0.0` for -0.0), through every builder and through JSONB. Parsed JSON text
+/// keeps its own form: the negatives below fail if the conversion reformats it.
+#[test]
+fn constructed_reals_render_as_stock_writes_them() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let exprs = [
+            // Every builder, values on both sides of Rust's shortest form.
+            "SELECT json_array(1e300, 1e-5, 1.5e20, 1e15, 1e16, 1e17, 123.0, 0.1, 100.0, \
+             -2.5e-7, 1.0/3, 2.0/3, -0.0, 0.1 + 0.2, 123456789012345678.0)",
+            "SELECT json_object('a', 1e-5, 'b', 1.0/3, 'c', 0.5, 'd', 1e16)",
+            "SELECT json_group_array(v) FROM (SELECT 1e300 AS v UNION ALL SELECT 1.0/3 \
+             UNION ALL SELECT 0.25 UNION ALL SELECT -0.0)",
+            "SELECT json_group_object(k, v) FROM (SELECT 'a' AS k, 1e-5 AS v \
+             UNION ALL SELECT 'b', 2.0/3)",
+            "SELECT json_set('{}', '$.x', 1e300)",
+            "SELECT json_insert('[]', '$[#]', 1.0/3)",
+            "SELECT json_replace('{\"x\":1}', '$.x', 1e-5)",
+            "SELECT json_quote(1.0/3)",
+            "SELECT json(1e300)",
+            "SELECT json_array(json_array(1.0/3), json_object('k', 1e300))",
+            // JSONB: the stored payload text and the round trip.
+            "SELECT hex(jsonb_array(1.0/3, 1e300, 0.5))",
+            "SELECT json(jsonb_array(1e300, 1.0/3, -0.0))",
+            "SELECT json(jsonb(json_array(1e-5)))",
+            "SELECT json_array(jsonb_array(2.0/3))",
+            // Readers see the REAL.
+            "SELECT json_type(json_array(1.0/3), '$[0]')",
+            "SELECT json_extract(json_array(1.0/3), '$[0]') * 3",
+            "SELECT json_extract(json_array(1e300), '$[0]') = 1e300",
+            "SELECT json_array(1.0/3) ->> '$[0]'",
+            "SELECT json_array(1.0/3) -> '$[0]'",
+            "SELECT json_array(1e-5) -> '$[0]'",
+            "SELECT group_concat(type || ':' || quote(atom), ',') \
+             FROM json_each(json_array(1e300, 1.0/3, 0.5))",
+            // Negatives: parsed text is not the SQL REAL's text.
+            "SELECT json('[1e300, 0.30000000000000004, 1.50, 1E2, 0.333]')",
+            "SELECT json_array(json('1e300'), json('[1.0e+300]'))",
+            "SELECT json(jsonb('[1e300, 1.50]'))",
+            "SELECT json_extract('[1e300]', '$[0]')",
+            "SELECT json_set('[1e300, 1.50]', '$[2]', 2)",
+            "SELECT json_type('[1.0e+300]', '$[0]')",
+            "SELECT json_set('[9e+999, 1e+2, 1E2, 1.50]', '$[9]', 1)",
+            "SELECT json(jsonb('[1e+2, 9e+999, -0.0]'))",
+            "SELECT json_array(json('[1e+2, 1E2]')) -> '$[0][1]'",
+            // JSON5 input is still canonicalized, not kept as written.
+            "SELECT json('[5., .5, 0x1F, +1.5]')",
+            "SELECT json_extract('[5.]', '$[0]')",
+        ];
+        let mut diffs = Vec::new();
+        for sql in exprs {
+            let fv = fval(&f, sql).await;
+            let rv = rval(&r, sql);
+            if fv != rv {
+                diffs.push(format!("  `{sql}`\n     frank= {fv}\n     stock= {rv}"));
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} JSON real-rendering divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

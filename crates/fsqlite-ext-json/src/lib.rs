@@ -55,95 +55,234 @@ const JSONB_TEXTRAW_TYPE: u8 = 0xA;
 const JSONB_ARRAY_TYPE: u8 = 0xB;
 const JSONB_OBJECT_TYPE: u8 = 0xC;
 
-/// Private sentinel prefix that marks a `Value::String` as carrying a NON-FINITE
-/// JSON number literal (e.g. `9e999` -> +Inf) rather than genuine text.
+/// Private sentinel prefix that marks a `Value::String` as carrying a JSON NUMBER
+/// as its exact text, rather than genuine text.
 ///
-/// `serde_json::Number` cannot hold ±Inf, and with the viral `arbitrary_precision`
-/// feature deliberately OFF (bd-uxmhz / GH#375), serde's parser hard-errors on a
-/// number literal that overflows f64 to infinity. To keep stock SQLite's GH#212
-/// behavior (non-finite JSON numbers preserved through parse/extract/render) BY
-/// DEFAULT, a non-finite number is carried inside the `Value` tree as a
-/// `Value::String` whose bytes begin with this tag followed by the raw numeric
-/// source text. The tag embeds NUL and SOH control bytes so it can never collide
-/// with a real JSON string value (bd-yalqc).
-const NONFINITE_TAG: &str = "\u{0}\u{0}fsqlite\u{1}nonfinite\u{0}";
+/// Two kinds of number need their text kept, and a `serde_json::Number` keeps
+/// neither:
+/// - A non-finite number (`9e999` -> +Inf). `serde_json::Number` cannot hold
+///   ±Inf, and with the viral `arbitrary_precision` feature deliberately OFF
+///   (bd-uxmhz / GH#375), serde's parser hard-errors on a literal that
+///   overflows f64. Stock keeps it through parse/extract/render (GH#212,
+///   bd-yalqc).
+/// - A finite number whose stock text is not Rust's shortest form of its value
+///   (bd-1nxwh). Stock writes a REAL built from an SQL value as
+///   `1.0e+300` / `0.33333333333333332`, and copies a JSONB FLOAT payload as
+///   stored. A `Number` would render `1e300` / `0.3333333333333333`.
+///
+/// Such a number is carried inside the `Value` tree as a `Value::String` whose
+/// bytes begin with this tag followed by the numeric text. Every renderer, the
+/// JSONB encoder, `json_type` and the SQL readers treat it as a REAL. The tag
+/// embeds NUL and SOH control bytes so it can never collide with a real JSON
+/// string value.
+const NUMBER_TEXT_TAG: &str = "\u{0}\u{0}fsqlite\u{1}nonfinite\u{0}";
 
-/// Build the tagged `Value::String` that carries a non-finite JSON number's raw
-/// source text (`9e999`, `9.0e+999`, ...).
-fn nonfinite_value(raw: &str) -> Value {
-    Value::String(format!("{NONFINITE_TAG}{raw}"))
+/// Build the tagged `Value::String` that carries a JSON number as its exact
+/// text (`9e999`, `9.0e+999`, `1.0e+300`, `0.33333333333333332`, ...).
+fn number_text_value(raw: &str) -> Value {
+    Value::String(format!("{NUMBER_TEXT_TAG}{raw}"))
 }
 
-/// If `s` is a tagged non-finite-number carrier, return its raw numeric text;
-/// otherwise `None` (a genuine string value).
-fn as_nonfinite(s: &str) -> Option<&str> {
-    s.strip_prefix(NONFINITE_TAG)
+/// If `s` is a tagged number-text carrier, return its numeric text; otherwise
+/// `None` (a genuine string value).
+fn as_number_text(s: &str) -> Option<&str> {
+    s.strip_prefix(NUMBER_TEXT_TAG)
 }
 
-/// Render a non-finite JSON number from its raw source text the way stock SQLite
-/// prints it.
+/// Whether a JSON number token must be carried as its text
+/// ([`NUMBER_TEXT_TAG`]) rather than as a `serde_json::Number`.
 ///
-/// SQLite copies a number's source text verbatim, so a parsed `9e999` renders as
-/// `9e999` while a constructed +Inf carries the canonical `9.0e+999`. When the
-/// mantissa has NO fractional part we drop an inserted `+` after the exponent
-/// marker (`9e+999` -> `9e999`); a mantissa that already contains `.` (the
-/// constructed `9.0e+999`, or a source that wrote it) keeps its form, as does an
-/// uppercase `E` (bd-yalqc port of the former `render_non_finite_number`).
-fn render_non_finite_number_raw(raw: &str) -> String {
-    let Some(exp) = raw.find(['e', 'E']) else {
-        return raw.to_owned();
-    };
-    if raw[..exp].contains('.') {
-        return raw.to_owned();
+/// Stock copies a number's source text verbatim (3.54.1: `[9e+999, 1e+2, 1E2,
+/// 1.50]` stays exactly that through json(), json_set, jsonb and nesting). A
+/// `Number` renders in Rust's shortest form, so a token needs its text when
+/// it overflows f64 (GH#212), or when it is a float (`.`, `e` or `E`) whose
+/// text is not that shortest form (bd-1nxwh). Integers fit i64/u64 and render
+/// as written. A token that is not an RFC 8259 number (`5.`, `01`) is left to
+/// the strict parse to reject, so JSON5 input still reaches its fallback.
+///
+/// Every number of every parsed document passes through here, so the common
+/// tokens are decided without parsing: an integer cannot overflow f64 below
+/// 309 digits, and [`is_shortest_fixed_decimal`] recognizes the usual decimal.
+fn number_token_needs_text(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if !bytes.iter().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        return bytes.len() > 300 && raw.parse::<f64>().is_ok_and(f64::is_infinite);
     }
-    let mut rendered = String::with_capacity(raw.len());
-    rendered.push_str(&raw[..=exp]);
-    rendered.push_str(raw[exp + 1..].trim_start_matches('+'));
-    rendered
+    if is_shortest_fixed_decimal(bytes) {
+        return false;
+    }
+    match raw.parse::<f64>() {
+        Ok(value) if value.is_infinite() => true,
+        Ok(value) => is_strict_json_number(raw) && !float_renders_as(value, raw),
+        Err(_) => false,
+    }
 }
 
-/// JSON-aware rewrite that wraps every NUMERIC token which overflows f64 to ±Inf
-/// in a tagged JSON string literal, so serde_json (with `arbitrary_precision`
-/// off) can parse the document without hard-erroring on the out-of-range number.
+/// Whether `text` is a fixed-point decimal that is already the shortest
+/// round-trip form of its value, which is what Rust's `{:?}` prints for it
+/// (bd-1nxwh). That is `-?D+.D+` with:
+/// - no exponent;
+/// - at most 15 significant digits. Every such decimal round-trips through f64
+///   exactly, so no shorter decimal names the same value;
+/// - no trailing zero after the first fraction digit (`3.0`, not `3.00`);
+/// - a magnitude Rust prints in fixed notation (1e-4 <= |x| < 1e16, or zero).
+///
+/// `false` means "not decided here", not "different".
+fn is_shortest_fixed_decimal(text: &[u8]) -> bool {
+    let digits = text.strip_prefix(b"-").unwrap_or(text);
+    let Some(dot) = digits.iter().position(|&byte| byte == b'.') else {
+        return false;
+    };
+    let (int, frac) = (&digits[..dot], &digits[dot + 1..]);
+    if int.is_empty()
+        || frac.is_empty()
+        || int.len() > 16
+        || (int.len() > 1 && int[0] == b'0')
+        || !int.iter().all(u8::is_ascii_digit)
+        || !frac.iter().all(u8::is_ascii_digit)
+        || (frac.len() > 1 && frac.last() == Some(&b'0'))
+    {
+        return false;
+    }
+    let significant = if int == b"0" {
+        let leading_zeros = frac.iter().take_while(|&&byte| byte == b'0').count();
+        if leading_zeros == frac.len() {
+            return true;
+        }
+        if leading_zeros > 3 {
+            return false;
+        }
+        frac.len() - leading_zeros
+    } else if frac == b"0" {
+        int.len()
+    } else {
+        int.len() + frac.len()
+    };
+    significant <= 15
+}
+
+/// RFC 8259 `number`: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+fn is_strict_json_number(raw: &str) -> bool {
+    let bytes = raw.strip_prefix('-').unwrap_or(raw).as_bytes();
+    let int_len = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if int_len == 0 || (int_len > 1 && bytes[0] == b'0') {
+        return false;
+    }
+    let mut rest = &bytes[int_len..];
+    if let Some(fraction) = rest.strip_prefix(b".") {
+        let digits = fraction.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &fraction[digits..];
+    }
+    if let Some(exponent) = rest.strip_prefix(b"e").or_else(|| rest.strip_prefix(b"E")) {
+        let exponent = exponent
+            .strip_prefix(b"+")
+            .or_else(|| exponent.strip_prefix(b"-"))
+            .unwrap_or(exponent);
+        return !exponent.is_empty() && exponent.iter().all(u8::is_ascii_digit);
+    }
+    rest.is_empty()
+}
+
+/// Whether Rust's shortest form of `value` (`{value:?}`, what a JSON `Number`
+/// renders as) is exactly `text`, compared without allocating.
+fn float_renders_as(value: f64, text: &str) -> bool {
+    struct Matches<'a> {
+        rest: &'a [u8],
+        equal: bool,
+    }
+    impl std::fmt::Write for Matches<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            match self.rest.strip_prefix(s.as_bytes()) {
+                Some(rest) if self.equal => self.rest = rest,
+                _ => self.equal = false,
+            }
+            Ok(())
+        }
+    }
+    let mut matches = Matches {
+        rest: text.as_bytes(),
+        equal: true,
+    };
+    let _ = std::fmt::write(&mut matches, format_args!("{value:?}"));
+    matches.equal && matches.rest.is_empty()
+}
+
+/// JSON-aware rewrite that wraps every NUMERIC token that must keep its text
+/// ([`number_token_needs_text`]) in a tagged JSON string literal. serde_json
+/// (with `arbitrary_precision` off) can then parse a document holding an
+/// out-of-range number without hard-erroring (GH#212, bd-yalqc), and a float
+/// written other than in Rust's shortest form keeps its source text, as stock
+/// keeps it (bd-1nxwh).
 ///
 /// The scanner walks bytes, copying string literals verbatim (respecting `\"` and
 /// `\\`) and identifying numeric tokens OUTSIDE strings: optional `-`, integer
 /// digits, optional `.`digits, optional `e`/`E` with optional sign and digits.
-/// A token whose `f64` parse `.is_infinite()` is replaced by the JSON string
-/// literal `"<escaped NONFINITE_TAG><raw>"` (serde escapes the tag's control
-/// bytes, keeping the output valid JSON). Returns `Some(rewritten)` iff at least
-/// one token was wrapped, else `None` (so callers keep their original error /
-/// JSON5 fallback). bd-yalqc.
-fn rewrite_overflow_numbers(input: &str) -> Option<String> {
+/// Such a token is replaced by the JSON string literal
+/// `"<escaped NUMBER_TEXT_TAG><raw>"` (serde escapes the tag's control bytes,
+/// keeping the output valid JSON). Returns `Some(rewritten)` iff at least one
+/// token was wrapped, else `None`, so the common document is parsed as given
+/// without a copy.
+/// Whether `input` can hold a float token: a `.`, or an exponent marker right
+/// after a digit. Only a float can need its text kept
+/// ([`number_token_needs_text`]), except an integer long enough to overflow
+/// f64, which the strict parse rejects so the callers rewrite on that error.
+/// A document with no float skips [`rewrite_number_text_tokens`]' scan.
+fn may_hold_float_token(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    memchr::memchr(b'.', bytes).is_some()
+        || memchr::memchr2_iter(b'e', b'E', bytes)
+            .any(|at| at > 0 && bytes[at - 1].is_ascii_digit())
+}
+
+/// [`rewrite_number_text_tokens`] when the document may need it.
+fn number_text_rewrite_for_parse(input: &str) -> Option<String> {
+    if may_hold_float_token(input) {
+        rewrite_number_text_tokens(input)
+    } else {
+        None
+    }
+}
+
+fn rewrite_number_text_tokens(input: &str) -> Option<String> {
     let bytes = input.as_bytes();
     let n = bytes.len();
-    let mut out = String::with_capacity(n);
+    // Built only from the first wrapped token on: `input[copied..]` is still
+    // to be copied.
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
     let mut i = 0usize;
-    let mut wrapped = false;
 
     while i < n {
+        // `"`, `-` and the digits are ASCII and never part of a multibyte
+        // UTF-8 sequence, so byte-level scanning is safe.
         let b = bytes[i];
         if b == b'"' {
-            // String literal: copy verbatim, honoring backslash escapes. `"` and
-            // `\` are ASCII and never appear inside a multibyte UTF-8 sequence,
-            // so byte-level delimiter scanning is safe; we copy the whole literal
-            // as one &str slice to preserve any multibyte content.
-            let start = i;
+            // String literal: skip it, honoring backslash escapes. (A plain
+            // position search beats memchr2 here: JSON strings are mostly
+            // short keys.)
             i += 1;
             while i < n {
-                match bytes[i] {
-                    b'\\' => i += 2, // skip the escape and its escaped byte
-                    b'"' => {
-                        i += 1;
-                        break;
-                    }
-                    _ => i += 1,
+                let Some(offset) = bytes[i..]
+                    .iter()
+                    .position(|&byte| byte == b'"' || byte == b'\\')
+                else {
+                    i = n;
+                    break;
+                };
+                i += offset;
+                if bytes[i] == b'\\' {
+                    i += 2; // skip the escape and its escaped byte
+                } else {
+                    i += 1;
+                    break;
                 }
             }
-            out.push_str(&input[start..i.min(n)]);
         } else if b.is_ascii_digit() || (b == b'-' && i + 1 < n && bytes[i + 1].is_ascii_digit()) {
-            // Numeric token start (a bare `-` not followed by a digit falls
-            // through to the verbatim-copy arm below).
+            // Numeric token start (a bare `-` not followed by a digit is
+            // stepped over below).
             let start = i;
             if bytes[i] == b'-' {
                 i += 1;
@@ -173,30 +312,26 @@ fn rewrite_overflow_numbers(input: &str) -> Option<String> {
                 }
             }
             let raw = &input[start..i];
-            if raw.parse::<f64>().is_ok_and(f64::is_infinite) {
+            if number_token_needs_text(raw) {
                 // serde escapes the tag's control bytes; the raw numeric text is
                 // already JSON-string-safe. String serialization is infallible.
-                let literal = serde_json::to_string(&format!("{NONFINITE_TAG}{raw}"))
+                let literal = serde_json::to_string(&format!("{NUMBER_TEXT_TAG}{raw}"))
                     .expect("serializing a String to JSON is infallible");
-                out.push_str(&literal);
-                wrapped = true;
-            } else {
-                out.push_str(raw);
+                let rewritten = out.get_or_insert_with(|| String::with_capacity(n + 32));
+                rewritten.push_str(&input[copied..start]);
+                rewritten.push_str(&literal);
+                copied = i;
             }
         } else {
-            // Any other byte: copy one whole UTF-8 scalar verbatim (advance past
-            // continuation bytes) so stray multibyte content outside strings is
-            // never split or corrupted.
-            let mut end = i + 1;
-            while end < n && (bytes[end] & 0xC0) == 0x80 {
-                end += 1;
-            }
-            out.push_str(&input[i..end]);
-            i = end;
+            // Any other byte, or a bare `-`.
+            i += 1;
         }
     }
 
-    wrapped.then_some(out)
+    out.map(|mut rewritten| {
+        rewritten.push_str(&input[copied..]);
+        rewritten
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,11 +735,13 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
                 out.push_str(&number.to_string());
             } else if let Some(float) = number.as_f64().filter(|value| value.is_finite()) {
                 // Finite float: Rust's shortest round-trip text (`{float:?}` ->
-                // "1e300", "-0.0", "0.1") matches stock json()'s rendering of a
-                // JSONB numeric payload and of a constructed real. This branch is
-                // reached by json(BLOB) (decode -> Value -> render), json_object/
-                // json_array/json_set, and json_extract-to-JSON — NOT by the
-                // text-input json() path, which preserves the source literal via
+                // "1e300", "0.1"). A `Number` holds a float only when this text
+                // is also stock's: a constructed REAL or JSONB FLOAT payload whose
+                // stock text differs ("1.0e+300") is carried as its text instead
+                // (`number_text_value`, bd-1nxwh). This branch is reached by
+                // json(BLOB) (decode -> Value -> render), json_object/json_array/
+                // json_set, and json_extract-to-JSON — NOT by the text-input
+                // json() path, which preserves the source literal via
                 // `minify_json_text` (bd-6b0pe). `Number::to_string()` would emit
                 // the arbitrary_precision-normalized form, inserting a '+' into
                 // the exponent ("1e300" -> "1e+300"), which diverges from stock
@@ -615,18 +752,18 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
             } else {
                 // Unreachable: without `arbitrary_precision`, `serde_json::Number`
                 // only ever holds i64/u64/finite-f64. Non-finite JSON numbers are
-                // carried as tagged `Value::String` (see `nonfinite_value`), so
+                // carried as tagged `Value::String` (see `number_text_value`), so
                 // this arm just keeps the match exhaustive (bd-yalqc).
                 out.push_str(&number.to_string());
             }
         }
         Value::String(text) => {
-            if let Some(raw) = as_nonfinite(text) {
-                // Non-finite JSON number carried as a tagged string: emit the
-                // NUMBER text, reproducing stock's construct-vs-preserve forms
-                // (parsed `9e999` stays `9e999`; constructed `9.0e+999` stays
-                // `9.0e+999`) — GH#212, bd-yalqc.
-                out.push_str(&render_non_finite_number_raw(raw));
+            if let Some(raw) = as_number_text(text) {
+                // A number carried as its text: emit that text, reproducing
+                // stock's construct-vs-preserve forms (parsed `9e999` stays
+                // `9e999`; constructed `9.0e+999` and `1.0e+300` stay as they
+                // are) — GH#212, bd-yalqc, bd-1nxwh.
+                out.push_str(raw);
             } else {
                 let escaped = serde_json::to_string(text).map_err(|error| {
                     FrankenError::function_error(format!("JSON string escape failed: {error}"))
@@ -1584,14 +1721,17 @@ impl VirtualTableCursor for JsonTreeCursor {
 }
 
 fn parse_json_text(input: &str) -> Result<Value> {
-    match serde_json::from_str::<Value>(input) {
+    // Numbers that must keep their text (an f64 overflow, which serde with
+    // `arbitrary_precision` off rejects; a float not in Rust's shortest form)
+    // travel as tagged carriers (GH#212, bd-yalqc, bd-1nxwh).
+    let rewritten = number_text_rewrite_for_parse(input);
+    match serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input)) {
         Ok(value) => Ok(value),
-        // serde (with `arbitrary_precision` off) hard-errors on a JSON number
-        // literal that overflows f64 to ±Inf. Retry after wrapping every such
-        // overflow token in a tagged string carrier (GH#212, bd-yalqc).
-        Err(_) => rewrite_overflow_numbers(input)
+        // An integer that overflows f64 (no float token, so no rewrite yet).
+        Err(_) if rewritten.is_none() => rewrite_number_text_tokens(input)
             .and_then(|rewritten| serde_json::from_str::<Value>(&rewritten).ok())
             .ok_or_else(malformed_json),
+        Err(_) => Err(malformed_json()),
     }
 }
 
@@ -1651,7 +1791,7 @@ impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
         let value = if value.is_nan() {
             Value::Null
         } else if value.is_infinite() {
-            nonfinite_value(if value.is_sign_negative() {
+            number_text_value(if value.is_sign_negative() {
                 "-9e999"
             } else {
                 "9e999"
@@ -1714,14 +1854,18 @@ fn parse_json5_text(input: &str) -> Result<Value> {
 /// JSON is unaffected (the strict parse is tried first). JSON5 infinities use
 /// the existing non-finite numeric carriers, while NaN becomes JSON null.
 fn parse_json_value_lenient(input: &str) -> Result<Value> {
-    match serde_json::from_str::<Value>(input) {
+    // Numbers that must keep their text travel as tagged carriers, as in
+    // `parse_json_text` (GH#212, bd-yalqc, bd-1nxwh). If the strict parse
+    // fails, fall back to JSON5; on total failure report stock's
+    // "malformed JSON".
+    let rewritten = number_text_rewrite_for_parse(input);
+    match serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input)) {
         Ok(value) => Ok(value),
         Err(_) => {
-            // First retry with overflow numbers wrapped as tagged carriers so a
-            // non-finite literal (`9e999`) parses instead of hard-erroring
-            // (GH#212, bd-yalqc). If that does not yield a valid parse, fall back
-            // to JSON5; on total failure report stock's "malformed JSON".
-            if let Some(rewritten) = rewrite_overflow_numbers(input)
+            // An integer that overflows f64 (no float token, so no rewrite
+            // yet) parses once wrapped; anything else tries JSON5.
+            if rewritten.is_none()
+                && let Some(rewritten) = rewrite_number_text_tokens(input)
                 && let Ok(value) = serde_json::from_str::<Value>(&rewritten)
             {
                 return Ok(value);
@@ -1767,15 +1911,12 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
             }
         }
         Value::String(text) => {
-            if let Some(raw) = as_nonfinite(text) {
-                // Non-finite REAL carried as a tagged string (+Inf/-Inf as
-                // 9.0e+999 / 9e999): store the stock-rendered numeric text as a
-                // FLOAT payload so the JSONB value round-trips (GH#212, bd-yalqc).
-                append_jsonb_node(
-                    JSONB_FLOAT_TYPE,
-                    render_non_finite_number_raw(raw).as_bytes(),
-                    out,
-                )
+            if let Some(raw) = as_number_text(text) {
+                // A REAL carried as its text (+Inf/-Inf as 9.0e+999 / 9e999, a
+                // constructed 1.0e+300): store that text as a FLOAT payload, as
+                // stock does, so the JSONB value round-trips (GH#212, bd-yalqc,
+                // bd-1nxwh).
+                append_jsonb_node(JSONB_FLOAT_TYPE, raw.as_bytes(), out)
             } else {
                 append_jsonb_string(text, out)
             }
@@ -1935,16 +2076,22 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
                 FrankenError::function_error(format!("invalid JSONB float payload text: {error}"))
             })?;
             if float.is_finite() {
-                Value::Number(
-                    Number::from_f64(float).ok_or_else(|| {
+                // bd-1nxwh: a FLOAT payload is the number's text, which stock
+                // renders as stored (`1.0e+300`, `0.33333333333333332` from a
+                // constructed REAL). Keep that text when Rust's shortest form
+                // would print the value differently.
+                if node_type == JSONB_FLOAT_TYPE && normalized != format!("{float:?}") {
+                    number_text_value(normalized)
+                } else {
+                    Value::Number(Number::from_f64(float).ok_or_else(|| {
                         FrankenError::function_error("invalid JSONB float payload")
-                    })?,
-                )
+                    })?)
+                }
             } else {
                 // Non-finite payload (e.g. `9e999` +Inf): carry the raw source
                 // text in a tagged string so the JSONB value round-trips through
                 // extract/render (GH#212, bd-yalqc).
-                nonfinite_value(normalized)
+                number_text_value(normalized)
             }
         }
         JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
@@ -2591,9 +2738,9 @@ fn json_type_name(value: &Value) -> &'static str {
                 "real"
             }
         }
-        // A tagged non-finite-number carrier is a REAL, not text (GH#212).
+        // A tagged number-text carrier is a REAL, not text (GH#212, bd-1nxwh).
         Value::String(text) => {
-            if as_nonfinite(text).is_some() {
+            if as_number_text(text).is_some() {
                 "real"
             } else {
                 "text"
@@ -2631,10 +2778,10 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
             }
         }
         Value::String(text) => {
-            if let Some(raw) = as_nonfinite(text) {
-                // A tagged non-finite-number carrier reads back as a REAL ±Inf
-                // (GH#212: json_extract of a non-finite JSON number yields a REAL
-                // infinity).
+            if let Some(raw) = as_number_text(text) {
+                // A tagged number-text carrier reads back as the REAL its text
+                // names: ±Inf for a non-finite number (GH#212), the value itself
+                // for a finite one (bd-1nxwh).
                 SqliteValue::Float(raw.parse::<f64>().unwrap_or(0.0))
             } else {
                 SqliteValue::Text(text.as_str().into())
@@ -2663,11 +2810,24 @@ fn float_to_json(f: f64) -> Result<Value> {
         // (GH#212). `serde_json::Number` cannot hold a non-finite value, so the
         // constructed literal is carried as a tagged string (bd-yalqc); the
         // canonical `9.0e+999` form is preserved through render.
-        return Ok(nonfinite_value(if f > 0.0 {
+        return Ok(number_text_value(if f > 0.0 {
             "9.0e+999"
         } else {
             "-9.0e+999"
         }));
+    }
+    // bd-1nxwh: stock writes a REAL that enters JSON as an SQL value with its
+    // REAL-to-TEXT conversion (`%!.17g`): 1e300 is `1.0e+300`, 1e-5 is
+    // `1.0e-05`, 1.0/3 is `0.33333333333333332`, 42.333333333333 is
+    // `42.333333333333002`, -0.0 is `0.0`. A JSON `Number` renders in Rust's
+    // shortest form, which matches that only for an integral value below
+    // 1e15 (`3.0`, `150.0`). Any other REAL is carried as the stock text, as
+    // a non-finite number is, so every renderer, the JSONB encoder, json_type
+    // and json_extract treat it as the REAL it is.
+    if f.fract() != 0.0 || f.abs() >= 1e15 || (f == 0.0 && f.is_sign_negative()) {
+        return Ok(number_text_value(
+            &fsqlite_types::value::format_sqlite_float(f),
+        ));
     }
     Number::from_f64(f).map(Value::Number).ok_or_else(|| {
         FrankenError::function_error("failed to convert floating-point value to JSON")
@@ -4941,7 +5101,7 @@ mod tests {
             let value = parse_json5_text(input).expect("JSON5 infinity parses");
             assert_eq!(
                 value,
-                nonfinite_value(if negative { "-9e999" } else { "9e999" })
+                number_text_value(if negative { "-9e999" } else { "9e999" })
             );
             let SqliteValue::Float(number) = json_to_sqlite_scalar(&value) else {
                 panic!("{input} must extract as a REAL");
@@ -4961,11 +5121,11 @@ mod tests {
 
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)]
-    fn json5_nonfinite_values_survive_nested_containers() {
+    fn json5_number_text_values_survive_nested_containers() {
         let value = parse_json5_text("{a:[Infinity,{b:-Infinity,c:NaN}],s:'Infinity'}")
             .expect("nested JSON5 non-finite values parse");
-        assert_eq!(value["a"][0], nonfinite_value("9e999"));
-        assert_eq!(value["a"][1]["b"], nonfinite_value("-9e999"));
+        assert_eq!(value["a"][0], number_text_value("9e999"));
+        assert_eq!(value["a"][1]["b"], number_text_value("-9e999"));
         assert_eq!(value["a"][1]["c"], Value::Null);
         assert_eq!(value["s"], Value::String("Infinity".to_owned()));
         assert_eq!(
@@ -4999,7 +5159,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)]
-    fn json5_nonfinite_values_do_not_accept_malformed_input() {
+    fn json5_number_text_values_do_not_accept_malformed_input() {
         for input in [
             "Infinityx",
             "[Infinity,,NaN]",
@@ -7300,7 +7460,13 @@ mod tests {
         let (v_float, path) = super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)])
             .unwrap()
             .unwrap();
-        assert_eq!(v_float, Value::from(1.5));
+        // A non-integral REAL is carried as its stock text (bd-1nxwh); it is
+        // still a JSON real whose atom is 1.5.
+        assert_eq!(super::json_type_name(&v_float), "real");
+        assert_eq!(
+            super::json_to_sqlite_scalar(&v_float),
+            SqliteValue::Float(1.5)
+        );
         assert!(path.is_none());
         let (v_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)])
             .unwrap()
@@ -7313,7 +7479,7 @@ mod tests {
         let (v_inf, _) = super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)])
             .unwrap()
             .unwrap();
-        assert_eq!(v_inf, super::nonfinite_value("9.0e+999"));
+        assert_eq!(v_inf, super::number_text_value("9.0e+999"));
     }
 
     #[test]
@@ -7638,6 +7804,99 @@ mod tests {
             json_object(&[text("k"), SqliteValue::Float(f64::NAN)]).unwrap(),
             r#"{"k":null}"#
         );
+    }
+
+    /// bd-1nxwh: the parse-side fast path that keeps a token a plain `Number`
+    /// must only accept text Rust's `{:?}` prints for that value; everything
+    /// else goes to the exact check. On the construct side only an integral
+    /// REAL below 1e15 stays a `Number`: SQLite's text agrees with Rust's
+    /// there, and nowhere else reliably (42.333333333333 is 42.333333333333002).
+    #[test]
+    fn test_number_text_fast_paths_agree_with_the_formatters() {
+        for value in [
+            0.0_f64,
+            1.0,
+            -7.0,
+            150.0,
+            1500.0,
+            123_456_789.0,
+            999_999_999_999_999.0,
+        ] {
+            assert!(value.fract() == 0.0 && value.abs() < 1e15);
+            assert_eq!(
+                fsqlite_types::value::format_sqlite_float(value),
+                format!("{value:?}"),
+                "integral {value}"
+            );
+            assert!(matches!(float_to_json(value), Ok(Value::Number(_))));
+        }
+        for (value, stock) in [
+            (42.333_333_333_333, "42.333333333333002"),
+            (1.0 / 3.0, "0.33333333333333332"),
+            (1e300, "1.0e+300"),
+            (-0.0, "0.0"),
+            (0.25, "0.25"),
+        ] {
+            assert_eq!(
+                float_to_json(value).unwrap(),
+                number_text_value(stock),
+                "{value}"
+            );
+        }
+        let mut tokens: Vec<String> = Vec::new();
+        for int in ["0", "1", "7", "42", "1000", "123456789", "9999999999999999"] {
+            for frac in [
+                "0",
+                "5",
+                "25",
+                "001",
+                "0001",
+                "00001",
+                "125",
+                "333333333333",
+                "10",
+                "50",
+                "123456",
+                "0000001",
+            ] {
+                tokens.push(format!("{int}.{frac}"));
+                tokens.push(format!("-{int}.{frac}"));
+            }
+        }
+        let mut accepted = 0;
+        for token in &tokens {
+            if is_shortest_fixed_decimal(token.as_bytes()) {
+                accepted += 1;
+                let value: f64 = token.parse().unwrap();
+                assert_eq!(format!("{value:?}"), *token, "Rust form of {token}");
+            }
+        }
+        assert!(accepted > 40, "the fast path must cover the usual decimals");
+
+        // A document with no float skips the scan; an integer that overflows
+        // f64 still parses, through the strict parse's error path.
+        assert!(!may_hold_float_token(r#"{"name":"e","n":[1,2],"id":17}"#));
+        assert!(may_hold_float_token("[1e5]"));
+        assert!(may_hold_float_token("[0.5]"));
+        let huge = format!("[1{}]", "0".repeat(400));
+        assert!(!may_hold_float_token(&huge));
+        let parsed = parse_json_text(&huge).expect("an overflowing integer parses");
+        assert_eq!(json_type_name(&parsed[0]), "real");
+        assert!(parse_json_value_lenient(&huge).is_ok());
+        for token in [
+            "1.50",
+            "1E2",
+            "1e300",
+            "1.0e+300",
+            "0.00001",
+            "10000000000000000.0",
+            "0.30000000000000004",
+            "0.33333333333333332",
+            "1",
+            "-",
+        ] {
+            assert!(!is_shortest_fixed_decimal(token.as_bytes()), "{token}");
+        }
     }
 
     #[test]
