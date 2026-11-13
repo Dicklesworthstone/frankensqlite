@@ -101149,6 +101149,38 @@ impl Connection {
         if any_removed {
             self.rebuild_schema_indices();
         }
+        self.reclaim_free_temp_roots();
+    }
+
+    /// Give back the roots at the top of the descending TEMP root namespace
+    /// that no table holds any more.
+    ///
+    /// `allocate_schema_table_root(true, ..)` hands out roots downward from
+    /// `TEMP_MEMDB_ROOT_START`, so the live ones are `(next_temp_root_page,
+    /// TEMP_MEMDB_ROOT_START]`. Every materialized CTE, view and
+    /// `sqlite_schema` table takes one per statement (bd-6hy0g), so without
+    /// this a long-lived connection would walk the namespace down towards the
+    /// main database's roots and then fail with "TEMP root namespace
+    /// exhausted". The walk stops at the first root still in use, so a live
+    /// `CREATE TEMP TABLE` root or an enclosing scope's binding is never
+    /// reissued.
+    fn reclaim_free_temp_roots(&self) {
+        let db = self.db.borrow();
+        let schema = self.schema.borrow();
+        let materialized = self.materialized_temp_root_pages.borrow();
+        let in_use = |root: i32| {
+            db.get_table(root).is_some()
+                || materialized.contains(&root)
+                || schema.iter().any(|table| {
+                    table.root_page == root
+                        || table.indexes.iter().any(|index| index.root_page == root)
+                })
+        };
+        let mut next = self.next_temp_root_page.get();
+        while next < TEMP_MEMDB_ROOT_START && !in_use(next + 1) {
+            next += 1;
+        }
+        self.next_temp_root_page.set(next);
     }
 
     /// Materialize a recursive CTE by iterating until no new rows are produced.
@@ -226500,6 +226532,58 @@ mod root_page_allocation_tests {
     use fsqlite_btree::BtreeCursorOps;
     use fsqlite_btree::cursor::TransactionPageIo;
     use fsqlite_pager::traits::TransactionMode;
+
+    /// Materialized CTE, view and `sqlite_schema` tables take a root from the
+    /// descending TEMP namespace for each statement and must give it back, or
+    /// a long-lived connection exhausts the namespace. A live TEMP table's
+    /// root must never be given back.
+    #[test]
+    fn test_materialized_roots_return_to_the_temp_namespace() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            for sql in [
+                "CREATE TABLE t(a INTEGER)",
+                "INSERT INTO t VALUES (1), (2), (3)",
+                "CREATE VIEW v AS SELECT a FROM t WHERE a > 1",
+            ] {
+                conn.execute(sql).await.unwrap();
+            }
+            let start = conn.next_temp_root_page.get();
+            let queries = [
+                "WITH c(x) AS MATERIALIZED (SELECT a FROM t) SELECT count(*) FROM c",
+                "WITH c(x) AS MATERIALIZED (SELECT a FROM t), \
+                 d(y) AS MATERIALIZED (SELECT x FROM c) SELECT sum(y) FROM d",
+                "SELECT count(*) FROM v",
+                "SELECT count(*) FROM sqlite_master",
+            ];
+            for _ in 0..40 {
+                for sql in queries {
+                    conn.query(sql).await.unwrap();
+                }
+            }
+            assert_eq!(
+                conn.next_temp_root_page.get(),
+                start,
+                "every materialized root must return to the TEMP namespace"
+            );
+
+            conn.execute("CREATE TEMP TABLE keep(x)").await.unwrap();
+            conn.execute("INSERT INTO keep VALUES (7)").await.unwrap();
+            let with_temp = conn.next_temp_root_page.get();
+            assert!(with_temp < start, "a TEMP table takes a TEMP root");
+            for sql in queries {
+                conn.query(sql).await.unwrap();
+            }
+            assert_eq!(
+                conn.next_temp_root_page.get(),
+                with_temp,
+                "a live TEMP table's root is not given back"
+            );
+            let rows = conn.query("SELECT x FROM keep").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(7));
+        });
+    }
 
     #[test]
     fn test_create_table_allocates_real_page() {
