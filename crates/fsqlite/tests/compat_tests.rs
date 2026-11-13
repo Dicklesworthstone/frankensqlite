@@ -1416,6 +1416,7 @@ fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
             .expect("close copied-database read-write connection");
 
         let missing = dir.path().join("readonly_namespace_missing_main.db");
+        let missing_str = missing.to_str().unwrap();
         for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
             std::fs::copy(
                 suffixed_path(&source, suffix),
@@ -1423,19 +1424,51 @@ fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
             )
             .expect("copy orphan namespace sidecar");
         }
-        let missing_result = open_with_flags(
-            missing.to_str().unwrap(),
+        // A WAL or rollback journal beside the missing main database may hold
+        // committed data: stale namespace state must not create a replacement
+        // while either survives.
+        for survivor in ["-wal", "-journal"] {
+            std::fs::write(suffixed_path(&missing, survivor), b"surviving bytes")
+                .expect("write surviving companion");
+            let missing_result = open_with_flags(
+                missing_str,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .await;
+            assert!(
+                matches!(missing_result, Err(FrankenError::CannotOpen { .. })),
+                "a surviving {survivor} must refuse the open: {:?}",
+                missing_result.as_ref().err()
+            );
+            assert!(
+                !missing.exists(),
+                "stale namespace state must not create a replacement while {survivor} survives"
+            );
+            std::fs::remove_file(suffixed_path(&missing, survivor))
+                .expect("remove surviving companion");
+        }
+        // bd-w4pr1.21: with the main file, WAL and journal all gone (a database
+        // deleted the SQLite way) nothing can be lost, so the quiescent record
+        // gives way and the database is created, as stock SQLite does.
+        let created = open_with_flags(
+            missing_str,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )
-        .await;
-        assert!(matches!(
-            missing_result,
-            Err(FrankenError::CannotOpen { .. })
-        ));
+        .await
+        .expect("a deleted database is created again beside stale namespace sidecars");
+        created
+            .execute("CREATE TABLE fresh(x INTEGER)")
+            .await
+            .expect("write the recreated database");
         assert!(
-            !missing.exists(),
-            "stale namespace state must not create a replacement for a missing main database"
+            created
+                .query_row("SELECT value FROM copied_probe")
+                .await
+                .is_err(),
+            "the recreated database must not resurrect the copied table"
         );
+        created.close().await.expect("close the recreated database");
+        assert!(missing.exists(), "the main database is created");
     });
 }
 
