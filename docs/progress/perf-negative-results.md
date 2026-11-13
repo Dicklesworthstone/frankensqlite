@@ -183,6 +183,66 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
 - Retry condition: none. The row's syscall mass is elsewhere: 24-byte WAL frame-header preads
   (10-18 per INSERT, bd-w4pr1.8 lever 1), `-shm` fcntl (9.6) and path statx (~15).
 
+## 2026-11-13 - WIN: INSERT ... SELECT from generate_series runs as one VDBE program through a virtual-table cursor (bd-i3csr.2)
+
+- Target: the scorecard's `bulk_insert_1M_one_txn` (`INSERT INTO t SELECT value,
+  (value*7919)%1000, 'row-'||value, value*1.5 FROM generate_series(1,1000000)` in BEGIN/COMMIT)
+  and the 300k-row mutation setup of the same shape. Touched: `crates/fsqlite-vdbe/src/codegen.rs`
+  (`codegen_insert_select` compiles a table-valued-function source, `table_function_scan_schema`,
+  `CodegenContext::insert_select_function_columns`), `crates/fsqlite-vdbe/src/engine.rs` (VNext's
+  per-row cancellation check), `crates/fsqlite-core/src/connection/insert_batch.rs`
+  (`insert_select_series_source_admitted`, `builtin_generate_series_module`,
+  `insert_program_vtab_instances`), `crates/fsqlite-core/src/connection.rs` (the columns into
+  `compile_table_insert`, the instances through `execute_table_program_with_cx` /
+  `execute_table_program_with_db`).
+- Evidence before (callgrind, orchestrator, 5f6c600d9, 100k rows): the series materialized by the
+  interpreted scan 5.4k instructions a row, the replay ~9.9k, `table_insert` 3.6k; stock ~4k a row
+  in all.
+- Change: VOpen (P4 names the module) + xFilter(idx 0, no idx_str, the call's arguments, as the
+  interpreted scan calls it) + VColumn of each column the SELECT reads into a register row + the
+  WHERE and the projections evaluated over those registers + the table route's row body
+  (bytecode unchanged, goldens 8 pass) + VNext. Admitted: the builtin generate_series only (a
+  module the application registers under that name keeps the replay), 1 to 3 arguments that read
+  no column, no hidden start/stop/step or rowid read, and the bd-i3csr.1 statement and target
+  conditions. VNext's two full checkpoints per row became the requested-cancellation load the
+  engine uses around function calls (the loop's interval checkpoint covers the deadline plane;
+  the series cursor checkpoints itself in batches).
+- Result, stock sqlite3 3.46.1 live, 3 runs, against main abe603039 (f60b1d9f...); the route
+  alone (8b628c94...) and the route with the VNext change (4b8e27d2...): the 300k setup with
+  io_uring refused 5,032.5M -> 3,864.2M -> 3,615.1M user instructions (-23.2%, then -28.2%; 4.76x
+  -> 3.42x stock 1,058.2M), CPU 553 -> 432 ms; the 1M bulk row (bulk_cpu_probe.py, io_uring
+  allowed: stock's 1M load fails inside a transient service) 17,891.9M -> 13,148.5M (-26.5%),
+  wall 2,002 -> 1,508 ms (4.58x -> 3.45x stock 437 ms). Prediction -40% to -50%: missed; kill line
+  -25%: passed only with the VNext change (the route alone was -23.2% / -22.1%). The INSERT body
+  is the rest, as on the table route: callgrind of the route, 12.5k a row, Insert opcode 4.5k,
+  synchronous hot opcodes 3.1k, async-path dispatch ~1.9k, `set_reg` 0.8k, `sql_concat` 0.6k.
+- Scorecard (2 runs, wall): bulk row 1.902 -> 1.468 s (4.69x -> 3.62x); memory_script_200k (a
+  200k generate_series load) 0.585 -> 0.505 s. No read row runs different user instructions
+  (within 0.1%, each binary on each arm's base DB; both binaries build page-identical files, 8,187
+  pages). order_by_text_limit10 reads ~4% more CPU at identical instructions with the VNext
+  change (11 interleaved runs, min 135.1 -> 140.3 ms); the route alone does not move it. That is
+  code placement: the same row's CPU minimum is 141.3 ms on main df65b45b3 and 140.6 ms on
+  9ca28495e at the same instructions, and 134.5 ms on abe603039.
+- Correctness: keeper `bd_i3csr_1_insert_select_one_program` gains generate_series scenarios
+  against rusqlite (a recursive CTE with stock's series semantics stands in; in memory and in a
+  file: steps, aliases, qualified references, conflicts under every OR action, NOT NULL / CHECK /
+  UNIQUE, generated and AUTOINCREMENT columns, affinity, a runtime error part way, a transaction),
+  a prepared series with parameter bounds, the series values of the route against the replay
+  (`LIMIT -1`) on 16 argument cases where the interpreted scan matches the stock shell (negative,
+  zero and NULL steps; text, real, NULL and blob bounds; the default stop; the ends of the integer
+  range), and the routing of admitted and declined shapes (hidden column, ORDER BY, LIMIT,
+  DISTINCT, aggregate, join, json_each, a registered replacement module). An unknown column now
+  reports stock's "no such column" (the interpreted scan says "internal error: column not
+  found").
+- Gate, abe603039 with the change: clippy -D warnings with all targets on fsqlite-vdbe and
+  fsqlite-core clean; fsqlite-vdbe lib 1,241 pass and 2 fail (bd-bhalc pair), goldens 8 pass; the
+  24 fsqlite-core INSERT targets in batches of 8, 0 fail (the batched-replay, bd-qdve2, gh438 and
+  issue_491 series scenarios now take the route); fsqlite-core lib 4,162 pass and 2 fail (t6741
+  pair, bd-nouem).
+- Retry condition: none for this step. Next: the INSERT body both routes pay (the Affinity pair,
+  the per-row rowid-floor bump, the async dispatch of non-hot opcodes), and json_each / other
+  modules once their filter semantics are proven against stock.
+
 ## 2026-11-12 - WIN: a WHERE comparison's literal operand is loaded once in an Init prologue (bd-w4pr1.13.31)
 
 - Target: every scan whose WHERE compares against a literal (the scorecard's scan_filter_agg,
