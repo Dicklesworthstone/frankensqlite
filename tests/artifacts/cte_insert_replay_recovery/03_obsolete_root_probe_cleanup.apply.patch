@@ -1,0 +1,140 @@
+*** Begin Patch
+*** Update File: crates/fsqlite-core/src/connection.rs
+@@
+-                // CRITICAL: probe pager-side cleanliness for `plan.len()`
+-                // contiguous root pages before any `create_table()` call below.
+-                //
+-                // `MemDatabase::next_root_page` starts at 2 and is only bumped
+-                // by MemDatabase-local allocations; it does NOT learn about
+-                // root pages the pager has assigned for real persistent tables
+-                // and indexes. If a view temp table inherits a root page
+-                // number that already belongs to a real B-tree (e.g. an index
+-                // root being walked by REINDEX), the VDBE's `StorageCursor`
+-                // can read the pager page when it should have read the
+-                // MemTable rows, producing the
+-                //   "index_seek called on table page (type LeafTable, page N, root N)"
+-                // corruption error reported in import_jsonl + UNION + REINDEX
+-                // workloads (e.g. beads_rust `get_blocks_dep_edges`).
+-                //
+-                // The companion path `execute_with_materialized_sqlite_schema`
+-                // has called this since inception (see comment at
+-                // `execute_with_materialized_sqlite_schema`); the view
+-                // materialization path was an unguarded shadow that the
+-                // sqlite_schema fix never extended. UNION queries reach this
+-                // path through `execute_compound_select` recursing into each
+-                // arm's `execute_statement`.
+-
+                 // Materialize each planned view as a temp table, dependencies
+@@
+-    /// IMPORTANT: The temp table's root page in MemDatabase must not collide
+-    /// with any page the pager has data for, because the VDBE's
+-    /// `StorageCursor` reads from the pager B-tree first.  If the root page
+-    /// collides with a stale pager page (e.g. from a previously-dropped
+-    /// table), the VDBE would read that stale data instead of our virtual
+-    /// rows.  We avoid this by probing candidate pages via `get_page` and
+-    /// advancing `next_root_page` past any non-zero (occupied) pages.
++    /// The tables use the connection-local root namespace and explicit
++    /// MemDatabase cursor routing, including while the main pager grows.
+@@
+-    /// Reserve `need` consecutive MemDatabase root pages whose corresponding
+-    /// pager pages are unreadable or entirely zeroed.
+-    ///
+-    /// This avoids a cross-layer bug where VDBE `StorageCursor` opens a
+-    /// transaction-backed cursor on a temp-table root page and reads a valid
+-    /// stale pager B-tree instead of the MemDatabase-only rows we just
+-    /// materialized there.
+-    async fn reserve_clean_memdb_root_pages(&self, need: usize) -> Result<()> {
+-        if need == 0 {
+-            return Ok(());
+-        }
+-        let cx = self.op_cx_after_background_status();
+-        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+-            return self
+-                .reserve_clean_memdb_root_pages_with_txn(txn, &cx, need)
+-                .await;
+-        }
+-
+-        let mut txn = self
+-            .begin_pager_txn_with_busy_timeout(&self.pager, &cx, TransactionMode::ReadOnly, false)
+-            .await?;
+-        let reserve_result = self
+-            .reserve_clean_memdb_root_pages_with_txn(&txn, &cx, need)
+-            .await;
+-        let rollback_result = txn.rollback(&cx).await;
+-        reserve_result?;
+-        rollback_result
+-    }
+-
+@@
+-            // This keeps ephemeral/materialized roots compact and prevents an
+-            // overflow on their next allocation.
++            // Materialized CTE/view roots use this namespace too: a write may
++            // grow the pager while they remain live, so merely choosing the
++            // next unused main page would not keep their identities separate.
+@@
+-    async fn reserve_clean_memdb_root_pages_with_txn(
+-        &self,
+-        txn: &TransactionKind,
+-        cx: &Cx,
+-        need: usize,
+-    ) -> Result<()> {
+-        let needed = i32::try_from(need).map_err(|_| {
+-            FrankenError::internal(format!(
+-                "requested too many temporary MemDatabase root pages: {need}"
+-            ))
+-        })?;
+-        let mut start = self.db.borrow().next_root_page();
+-        // Pages past the transaction's visible extent are unallocated, so
+-        // they read back as zero: start the probe there. On a schema-only
+-        // connection `next_root_page` stays near page 1 and every real page
+-        // is non-zero, so starting below the extent read the whole file for
+-        // each `sqlite_master` query (~4M pages on a 16 GB database). The
+-        // loop below still verifies each candidate page.
+-        let visible_extent = txn.visible_db_size_bound();
+-        if let Some(past_extent) = i32::try_from(visible_extent)
+-            .ok()
+-            .and_then(|extent| extent.checked_add(1))
+-            && visible_extent > 0
+-            && past_extent > start
+-        {
+-            start = past_extent;
+-        }
+-        let mut clean = 0_i32;
+-        while clean < needed {
+-            let page = start + clean;
+-            let Some(pgno) = u32::try_from(page).ok().and_then(PageNumber::new) else {
+-                break;
+-            };
+-            let is_clean = match txn.get_page(cx, pgno).await {
+-                Ok(data) => data.as_ref().iter().all(|&b| b == 0),
+-                Err(_) => true,
+-            };
+-            if is_clean {
+-                clean += 1;
+-            } else {
+-                start = page + 1;
+-                clean = 0;
+-            }
+-        }
+-        let mut db = self.db.borrow_mut();
+-        if start > db.next_root_page() {
+-            db.set_next_root_page(start);
+-        }
+-        Ok(())
+-    }
+-
+@@
+-    /// bd-wjrs0: snapshot connection-local `TEMP` tables (schema + rows) before
+-    /// a destructive memdb reload. `TEMP` tables never appear in the main
+-    /// `sqlite_master`, so a reload that rebuilds `self.schema`/`self.db` from
+-    /// page 1 would silently drop them; this captures them for re-insertion via
+-    /// `restore_temp_tables_into`. Returns an empty Vec (taking no further
+-    /// borrows) when no `TEMP` tables exist, so non-temp connections pay nothing.
++    /// Preserve connection-local tables across a pager-backed mirror reload.
++    /// Neither TEMP tables nor materialized CTE/view tables have a main-pager
++    /// image. Capture exact roots in schema order: a CTE may shadow a TEMP or
++    /// main table, and nested CTEs may have the same name.
+@@
+-            // last-wins insert order), just committed atomically alongside the data.
++            // first-binding-wins order), committed atomically alongside the data.
+*** End Patch

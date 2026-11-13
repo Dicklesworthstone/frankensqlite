@@ -1,0 +1,281 @@
+*** Begin Patch
+*** Update File: crates/fsqlite-core/src/connection.rs
+@@
+-        let new_loaded = match event {
++        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
++        let new_loaded = match event {
+@@
+-        let base_frame =
+-            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid, None)?;
++        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
++        let base_frame =
++            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid, None)?;
+@@
+-        let base_frame = TriggerFrame {
+-            table_name: view_name.to_owned(),
++        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
++        let base_frame = TriggerFrame {
++            table_name: view_name.to_owned(),
+@@
+-                self.reserve_clean_memdb_root_pages(plan.len()).await?;
+@@
+-                    let root_page = self.db.borrow_mut().create_table(col_infos.len());
++                    let root_page = self
++                        .allocate_schema_table_root(true, col_infos.len(), false)
++                        .await?;
+@@
+-            lean_future(|| self.reserve_clean_memdb_root_pages(referenced.len())).await?;
+-
+             for (table_name, is_temp) in referenced {
+                 let virtual_rows = if is_temp { &temp_rows } else { &main_rows };
+-                let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
++                let root_page = self
++                    .allocate_schema_table_root(true, virtual_columns.len(), false)
++                    .await?;
+@@
+     fn build_sqlite_master_rows(&self) -> Vec<Vec<SqliteValue>> {
+         let schema = self.schema.borrow();
++        let materialized_roots = self.materialized_temp_root_pages.borrow();
+@@
+                 !is_sqlite_schema_name(&table.name)
+                     && !temp_table_names.contains(&table.name.to_ascii_lowercase())
++                    && !materialized_roots.contains(&table.root_page)
+@@
+             .iter()
+             .enumerate()
++            .rev()
+             .map(|(i, table)| (table.name.to_ascii_lowercase(), i))
+             .collect();
+@@
+-    fn snapshot_temp_tables(&self) -> Vec<CapturedTempTable> {
+-        if self.temp_table_names.borrow().is_empty() {
+-            return Vec::new();
+-        }
+-        let temp_names = self.temp_table_names.borrow();
+-        let schema = self.schema.borrow();
+-        let db = self.db.borrow();
+-        temp_names
+-            .iter()
+-            .filter_map(|name_lc| {
+-                let table = schema
+-                    .iter()
+-                    .find(|t| t.name.eq_ignore_ascii_case(name_lc))?;
+-                let rows = db.get_table(table.root_page).map_or_else(Vec::new, |mt| {
+-                    mt.iter_rows()
+-                        .map(|(rowid, vals)| (rowid, vals.to_vec()))
+-                        .collect()
+-                });
+-                Some((table.clone(), rows))
+-            })
+-            .collect()
+-    }
++    fn snapshot_temp_tables(&self) -> Vec<CapturedTempTable> {
++        let temp_names = self.temp_table_names.borrow();
++        let materialized_roots = self.materialized_temp_root_pages.borrow();
++        if temp_names.is_empty() && materialized_roots.is_empty() {
++            return Vec::new();
++        }
++        let schema = self.schema.borrow();
++        let db = self.db.borrow();
++        schema
++            .iter()
++            .filter(|table| {
++                materialized_roots.contains(&table.root_page)
++                    || temp_names.contains(&table.name.to_ascii_lowercase())
++            })
++            .map(|table| {
++                let rows = db.get_table(table.root_page).map_or_else(Vec::new, |mt| {
++                    mt.iter_rows()
++                        .map(|(rowid, vals)| (rowid, vals.to_vec()))
++                        .collect()
++                });
++                (table.clone(), rows)
++            })
++            .collect()
++    }
+@@
+         captured: Vec<CapturedTempTable>,
+     ) {
++        // Preserve the captured order of both real TEMP tables and lexical
++        // materialized bindings; the latter precede persistent schema entries.
++        let mut materialized_schemas = Vec::new();
+         for (temp_schema, rows) in captured {
+             let name_lc = temp_schema.name.to_ascii_lowercase();
++            let materialized = self
++                .materialized_temp_root_pages
++                .borrow()
++                .contains(&temp_schema.root_page);
+@@
+-            if let Some(pos) = new_schema
+-                .iter()
+-                .position(|t| t.name.eq_ignore_ascii_case(&name_lc))
++            if !materialized
++                && let Some(pos) = new_schema
++                    .iter()
++                    .position(|t| t.name.eq_ignore_ascii_case(&name_lc))
+@@
+-            new_schema.push(temp_schema);
+-            self.temp_table_names.borrow_mut().insert(name_lc);
++            if materialized {
++                materialized_schemas.push(temp_schema);
++            } else {
++                new_schema.push(temp_schema);
++                self.temp_table_names.borrow_mut().insert(name_lc);
++            }
+         }
++        new_schema.splice(0..0, materialized_schemas);
+@@
+     fn temp_storage_roots(&self) -> HashSet<i32> {
++        // WITH/view bindings exist only in MemDatabase, just like TEMP tables.
++        let mut roots = self.materialized_temp_root_pages.borrow().clone();
+         let temp_names = self.temp_table_names.borrow();
+         if temp_names.is_empty() {
+-            return HashSet::new();
++            return roots;
+         }
+         let schema = self.schema.borrow();
+-        let mut roots = HashSet::new();
+@@
+     fn route_temp_roots_in_program(
++        &self,
+         mut program: VdbeProgram,
+         temp_roots: &HashSet<i32>,
+-    ) -> VdbeProgram {
++    ) -> Result<VdbeProgram> {
++        // Materialized bindings are read sources, never writable DML targets.
++        let materialized_roots = self.materialized_temp_root_pages.borrow();
++        if !materialized_roots.is_empty()
++            && let Some(usage) = program.storage_root_usages().find(|usage| {
++                usage.access == fsqlite_vdbe::StorageRootAccess::Write
++                    && materialized_roots.contains(&usage.root_page)
++            })
++        {
++            return Err(FrankenError::Internal(format!(
++                "write cursor targets read-only materialized root {}",
++                usage.root_page
++            )));
++        }
+         program.route_storage_roots_to_temp_database(temp_roots.iter().copied());
+-        program
++        Ok(program)
+@@
+-        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
++        self.route_temp_roots_in_program(program, &temp_roots)
+@@
+     async fn execute_insert_with_ctes(
+         &self,
+         insert: &fsqlite_ast::InsertStatement,
+         params: Option<&[SqliteValue]>,
+     ) -> Result<Vec<Row>> {
++        // Freeze original slots before per-row replay introduces its own array.
++        let mut bind_state = BindParamState::default();
++        let mut bound_insert = canonicalize_insert_placeholders_with_state(insert, &mut bind_state)?;
++        let parameter_slots =
++            usize::try_from(bind_state.next_index.saturating_sub(1)).unwrap_or(0);
++        let mut original_params = params.unwrap_or(&[]).to_vec();
++        // Unbound query() slots read as NULL; explicit short slices still error.
++        if params.is_none() {
++            original_params.resize(original_params.len().max(parameter_slots), SqliteValue::Null);
++        }
++        bind_placeholders_in_insert_statement(
++            &mut bound_insert,
++            &mut BindParamState::default(),
++            &original_params,
++        )?;
++        let insert = &bound_insert;
++        let params = None;
+@@
+             "with_clause_materialization",
+         )?;
++        // Dynamic roots must not reuse programs from another WITH scope.
++        let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+         let _hydration_suppression = self
+             .cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert))
+@@
+-        self.reserve_clean_memdb_root_pages(ctes.len()).await?;
+         for cte_index in materialization_order {
+@@
+-                let root_page = self.db.borrow_mut().create_table(num_columns);
++                let root_page = self
++                    .allocate_schema_table_root(true, num_columns, false)
++                    .await?;
+@@
+-        self.reserve_clean_memdb_root_pages(temp_tables.len())
+-            .await?;
+         let mut installed = Vec::with_capacity(temp_tables.len());
+         for temp_table in temp_tables {
+-            let root_page = self.db.borrow_mut().create_table(temp_table.columns.len());
++            let root_page = self
++                .allocate_schema_table_root(true, temp_table.columns.len(), false)
++                .await?;
+@@
+         let num_columns = col_infos.len();
+-        let root_page = self.db.borrow_mut().create_table(num_columns);
++        let root_page = self
++            .allocate_schema_table_root(true, num_columns, false)
++            .await?;
+@@
+-        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
++        self.route_temp_roots_in_program(program, &temp_roots)
+@@
+-        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
++        self.route_temp_roots_in_program(program, &temp_roots)
+@@
+-        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
++        self.route_temp_roots_in_program(program, &temp_roots)
+@@
+         let schema = self.schema.borrow().clone();
+         let temp_table_names = self.temp_table_names.borrow().clone();
++        let materialized_roots = self.materialized_temp_root_pages.borrow().clone();
+         let rowid_alias_columns = self.rowid_alias_columns.borrow().clone();
+@@
+-            if temp_table_names.contains(&table.name.to_ascii_lowercase()) {
++            if temp_table_names.contains(&table.name.to_ascii_lowercase())
++                || materialized_roots.contains(&table.root_page)
++            {
+@@
+-            if temp_table_names.contains(&table.name.to_ascii_lowercase()) {
++            if temp_table_names.contains(&table.name.to_ascii_lowercase())
++                || materialized_roots.contains(&table.root_page)
++            {
+@@
+             let new_schema_by_name: HashMap<String, usize> = new_schema
+                 .iter()
+                 .enumerate()
++                .rev()
+@@
+ fn canonicalize_insert_placeholders(
+     insert: &fsqlite_ast::InsertStatement,
+ ) -> Result<fsqlite_ast::InsertStatement> {
++    canonicalize_insert_placeholders_with_state(insert, &mut BindParamState::default())
++}
++
++fn canonicalize_insert_placeholders_with_state(
++    insert: &fsqlite_ast::InsertStatement,
++    bind_state: &mut BindParamState,
++) -> Result<fsqlite_ast::InsertStatement> {
+     let mut normalized = insert.clone();
+-    let mut bind_state = BindParamState::default();
+     if let Some(with_clause) = &mut normalized.with {
+         for cte in &mut with_clause.ctes {
+-            canonicalize_select_placeholders_in_statement(&mut cte.query, &mut bind_state)?;
++            canonicalize_select_placeholders_in_statement(&mut cte.query, bind_state)?;
+@@
+-                    canonicalize_expr_placeholders(value, &mut bind_state)?;
++                    canonicalize_expr_placeholders(value, bind_state)?;
+@@
+-            canonicalize_select_placeholders_in_statement(select, &mut bind_state)?;
++            canonicalize_select_placeholders_in_statement(select, bind_state)?;
+@@
+-            canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
++            canonicalize_expr_placeholders(where_clause, bind_state)?;
+@@
+-                canonicalize_expr_placeholders(&mut assignment.value, &mut bind_state)?;
++                canonicalize_expr_placeholders(&mut assignment.value, bind_state)?;
+@@
+-                canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
++                canonicalize_expr_placeholders(where_clause, bind_state)?;
+@@
+-            canonicalize_expr_placeholders(expr, &mut bind_state)?;
++            canonicalize_expr_placeholders(expr, bind_state)?;
+*** End Patch
