@@ -87,6 +87,55 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: a WHERE comparison on expressions tests NULL in its jump and reads an arithmetic operand's literal from the prologue (bd-w4pr1.13.20, lever G)
+
+- Target: every WHERE comparison neither side of which is a column of the scanned table and one
+  side of which is not a literal (`id % 7 = 0`, `a + 1 > b`, `length(b) = 5`): the scorecard's
+  DELETE and UPDATE rows and SELECT scans with such filters. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`emit_where_comparison_jump`, new
+  `emit_where_comparison_operand`).
+- Evidence before: `EXPLAIN DELETE FROM m WHERE id % 7 = 0` on main 123e38af3 ran Rowid, Integer 7,
+  Remainder, IsNull, Ne, Next per scanned row; stock runs Rowid, Remainder, Ne with its constants in
+  the Init prologue and the NULL case in Ne's flags. The c1076d876 entry measured the same pair of
+  opcodes (literal load and NULL check) at about 95 instructions per scanned row.
+- Change: no `IsNull` per operand; the inverse comparison carries JUMPIFNULL (0x10) when an operand
+  is not a hoisted literal (both dispatch loops jump when either operand is NULL and NULLEQ is
+  clear; the affinity bits, mask 0x47, do not overlap). An arithmetic operand (+ - * / % & | << >>)
+  whose right side is an INTEGER or REAL literal reads it from the prologue register
+  (`hoisted_literal`, reusing c1076d876's prologue and its later-Init past-end handling unchanged);
+  the arithmetic opcode only reads its operand registers. A left literal is the operation's
+  destination and stays a per-row load. The column arms of `emit_where_filter_with_ctx` are not
+  touched.
+- Result, stock sqlite3 3.46.1 live in the same runs (ring refused; binaries e78a386a... base
+  main 123e38af3, c035173f... base + this production diff): `delete_14pct_300k` (sc_mut_probe, min
+  of 7) stock 120.7M, base 567.9M (4.71x), lever 539.4M (4.47x): -28.5M, CPU 121.6 -> 116.7 ms
+  (stock 35.0); `update_10pct_300k` stock 273.4M, base 897.3M (3.28x), lever 868.1M (3.18x):
+  -29.2M, CPU 144.7 -> 140.4 ms (stock 49.6). With io_uring allowed: 582.4M -> 553.9M and 912.5M ->
+  883.2M. 1M-row reads (stable_probe, 5 reps): `SELECT count(*) FROM t WHERE id % 7 = 0` 775.8M ->
+  680.6M (2.62x -> 2.30x stock, CPU 68.9 -> 64.5 ms); control `scan_filter_agg` 1,237.9M ->
+  1,237.9M. Prediction (DML -25M to -35M each, read row -80M to -110M, control within 2M) met; kill
+  (DML under 15M, read row under 50M, control over 2M) not met. Answers equal stock's; stock's
+  `PRAGMA integrity_check` passes on every file the lever wrote.
+- Tests: `test_codegen_where_expression_comparison_has_no_per_row_null_check_or_literal_load`
+  (no `IsNull` or `Integer` in the DELETE loop, JUMPIFNULL and not NULLEQ on the skip, one prologue
+  load of the divisor; a left literal stays the destination's per-row load, since hoisting it would
+  let the first row overwrite the prologue value); `test_where_expression_comparisons_match_rusqlite`
+  extended with ten arithmetic-with-literal operands (integer, Int64, real, shifts, a zero
+  divisor) against seven others on either side under six operators over rows with NULLs (a fold
+  without the flag lets NULL rows through `<>`), each query run twice, and two UPDATEs whose `<>`
+  must skip NULL rows.
+- Gate, on 123e38af3 plus the change: clippy -D warnings on fsqlite-vdbe `--all-targets` clean (and
+  on the rebased tree, with fsqlite-core's lib tests); fsqlite-vdbe lib 1,244 pass and 2 fail
+  (bd-bhalc pair, red on main); bytecode goldens 8 pass, unchanged (no snapshot has such a
+  comparison: no GOLDEN-CHANGE); fsqlite-core lib 4,169 pass and 2 fail (t6741 pair); 75
+  fsqlite-core targets (every EXPLAIN-reading one plus the DML / trigger / FK / RETURNING /
+  savepoint / concurrency batches) 364 pass and 2 fail, both red on main (bd-vy10l
+  `gh516_returning_conformance`, and `bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans`);
+  63 fsqlite targets (every EXPLAIN-reading one plus three DML oracles) 118 pass. Landed as
+  08b5fa96b (rebased onto 661434190).
+- Retry condition: none. Not done here: the column arms' `IsNull` guards (a column compared with a
+  non-literal value), which change nearly every WHERE's bytecode and its goldens.
+
 ## 2026-11-13 - WIN: the scan loop's Remainder of two integers and its Rowid write their register in place (bd-w4pr1.13.20, lever V)
 
 - Target: every scan that reads a rowid or takes `%` per row: the scorecard's DELETE and UPDATE rows
