@@ -131675,14 +131675,12 @@ fn eval_group_agg_join_expr(
                     let mut flat = Vec::with_capacity(pairs.len() * 2);
                     let mut subtypes = Vec::with_capacity(pairs.len() * 2);
                     for (key, (value, value_subtype)) in pairs {
-                        // As json_group_object reads its label: as text, and a
-                        // NULL label drops the row.
-                        let key = match key {
-                            SqliteValue::Null => continue,
-                            key @ SqliteValue::Text(_) => key,
-                            other => SqliteValue::Text(other.to_text().into()),
+                        // As json_group_object reads its label: as text, up to
+                        // its first NUL, and a NULL label drops the row.
+                        let Some(key) = fsqlite_ext_json::group_object_label(&key) else {
+                            continue;
                         };
-                        flat.push(key);
+                        flat.push(SqliteValue::Text(key.into()));
                         flat.push(value);
                         subtypes.push(0);
                         subtypes.push(value_subtype);

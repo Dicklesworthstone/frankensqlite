@@ -1352,6 +1352,25 @@ pub fn jsonb_group_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
     jsonb(&json_text)
 }
 
+/// The label a `json_group_object` row stores; `None` for a NULL label.
+///
+/// Stock's jsonObjectStep reads the label with `sqlite3_value_text`, so a
+/// number becomes its text, then measures it with `sqlite3Strlen30`, so the
+/// label ends at its first NUL. (`json_object` keeps the whole label.) A row
+/// with a NULL label adds no member. The connection's grouped aggregate
+/// evaluator builds these objects too, and reads its labels through this.
+#[must_use]
+pub fn group_object_label(label: &SqliteValue) -> Option<String> {
+    if label.is_null() {
+        return None;
+    }
+    let mut text = label.to_text();
+    if let Some(nul) = text.find('\0') {
+        text.truncate(nul);
+    }
+    Some(text)
+}
+
 /// Aggregate key/value pairs into a JSON object.
 ///
 /// Duplicate keys are preserved verbatim in row order, matching stock SQLite
@@ -1359,12 +1378,10 @@ pub fn jsonb_group_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
 pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<String> {
     let mut members = Vec::with_capacity(entries.len());
     for (key_value, value) in entries {
-        // Stock reads the label as text (`sqlite3_value_text`), so a number
-        // becomes its text, and a NULL label drops the row.
-        if key_value.is_null() {
+        let Some(label) = group_object_label(key_value) else {
             continue;
-        }
-        members.push((key_value.to_text(), sqlite_to_json(value)?));
+        };
+        members.push((label, sqlite_to_json(value)?));
     }
     encode_json_object_members(&members)
 }
@@ -1373,10 +1390,10 @@ pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Strin
 pub fn jsonb_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     for (key_value, value) in entries {
-        if key_value.is_null() {
+        let Some(label) = group_object_label(key_value) else {
             continue;
-        }
-        append_jsonb_string(&key_value.to_text(), &mut payload)?;
+        };
+        append_jsonb_string(&label, &mut payload)?;
         encode_jsonb_value(&sqlite_to_json(value)?, &mut payload)?;
     }
     let mut out = Vec::new();
@@ -4857,14 +4874,10 @@ impl AggregateFunction for JsonGroupObjectFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<()> {
-        // Stock reads the label as text (`sqlite3_value_text`), so a number
-        // becomes its text, and a NULL label drops the row.
-        let label = match &args[0] {
-            SqliteValue::Null => return Ok(()),
-            label @ SqliteValue::Text(_) => label.clone(),
-            other => SqliteValue::Text(SmallText::from_string(other.to_text())),
+        let Some(label) = group_object_label(&args[0]) else {
+            return Ok(());
         };
-        state.push((label, 0));
+        state.push((SqliteValue::Text(SmallText::from_string(label)), 0));
         state.push((args[1].clone(), arg_subtypes.get(1).copied().unwrap_or(0)));
         Ok(())
     }
@@ -4955,11 +4968,11 @@ impl AggregateFunction for JsonbGroupObjectFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<()> {
-        if args[0].is_null() {
+        let Some(label) = group_object_label(&args[0]) else {
             return Ok(());
-        }
+        };
         state.push((
-            args[0].to_text(),
+            label,
             args[1].clone(),
             arg_subtypes.get(1).copied().unwrap_or(0),
         ));
@@ -5054,12 +5067,9 @@ impl WindowFunction for JsonGroupWindowFunc {
             ));
             return Ok(());
         }
-        // The label is read as text, as for the aggregate.
-        let label = match &args[0] {
-            SqliteValue::Null => None,
-            label @ SqliteValue::Text(_) => Some(label.clone()),
-            other => Some(SqliteValue::Text(SmallText::from_string(other.to_text()))),
-        };
+        // The label is read as for the aggregate.
+        let label = group_object_label(&args[0])
+            .map(|text| SqliteValue::Text(SmallText::from_string(text)));
         state.push_back((
             label,
             args[1].clone(),
@@ -5291,14 +5301,18 @@ mod tests {
             json_from_jsonb(&jsonb_object(&[value.clone(), value.clone()]).unwrap()).unwrap(),
             object
         );
+        // The group-object label ends at its first NUL, as stock's
+        // jsonObjectStep measures it (sqlite3Strlen30): the tag starts with
+        // NUL, so the label is "". The value keeps every byte.
+        let group_object = format!("{{\"\":{quoted}}}");
         assert_eq!(
             json_group_object(&[(value.clone(), value.clone())]).unwrap(),
-            object
+            group_object
         );
         assert_eq!(
             json_from_jsonb(&jsonb_group_object(&[(value.clone(), value.clone())]).unwrap())
                 .unwrap(),
-            object
+            group_object
         );
         for edited in [
             json_set("[]", &[("$[#]", value.clone())]).unwrap(),
@@ -5332,7 +5346,7 @@ mod tests {
                 SqliteValue::Blob(bytes) => json_from_jsonb(&bytes).unwrap(),
                 other => panic!("unexpected JSON window value: {other:?}"),
             };
-            assert_eq!(&output, if window.object { &object } else { &array });
+            assert_eq!(&output, if window.object { &group_object } else { &array });
             window.inverse(&mut state, &args).unwrap();
             window.step(&mut state, &args).unwrap();
             assert_eq!(state.len(), 1);
@@ -7477,6 +7491,73 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(out, r#"{"k":1,"k":2}"#);
+    }
+
+    /// Stock's jsonObjectStep measures the label with `sqlite3Strlen30`, so
+    /// every group-object form ends a label at its first NUL; `json_object`
+    /// keeps the whole label.
+    #[test]
+    fn test_group_object_labels_end_at_the_first_nul() {
+        let text = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let rows = [
+            (text("a\0b"), SqliteValue::Integer(1)),
+            (text("\0hidden"), SqliteValue::Integer(2)),
+            (SqliteValue::Null, SqliteValue::Integer(3)),
+            (text("plain"), SqliteValue::Integer(4)),
+        ];
+        let expected = r#"{"a":1,"":2,"plain":4}"#;
+        assert_eq!(json_group_object(&rows).unwrap(), expected);
+        assert_eq!(
+            json_from_jsonb(&jsonb_group_object(&rows).unwrap()).unwrap(),
+            expected
+        );
+
+        let aggregate = JsonGroupObjectFunc;
+        let mut state = aggregate.initial_state();
+        for (label, value) in &rows {
+            aggregate
+                .step(&mut state, &[label.clone(), value.clone()])
+                .unwrap();
+        }
+        assert_eq!(
+            aggregate.finalize(state).unwrap(),
+            SqliteValue::Text(SmallText::from_string(expected))
+        );
+
+        let aggregate = JsonbGroupObjectFunc;
+        let mut state = aggregate.initial_state();
+        for (label, value) in &rows {
+            aggregate
+                .step(&mut state, &[label.clone(), value.clone()])
+                .unwrap();
+        }
+        let SqliteValue::Blob(blob) = aggregate.finalize(state).unwrap() else {
+            panic!("jsonb_group_object must return a BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), expected);
+
+        for window in JsonGroupWindowFunc::ALL
+            .iter()
+            .filter(|window| window.object)
+        {
+            let mut state = window.initial_state();
+            for (label, value) in &rows {
+                window
+                    .step(&mut state, &[label.clone(), value.clone()])
+                    .unwrap();
+            }
+            let rendered = match window.value(&state).unwrap() {
+                SqliteValue::Text(text) => text.to_string(),
+                SqliteValue::Blob(blob) => json_from_jsonb(&blob).unwrap(),
+                other => panic!("{} returned {other:?}", window.name),
+            };
+            assert_eq!(rendered, expected, "{}", window.name);
+        }
+
+        assert_eq!(
+            json_object(&[text("a\0b"), SqliteValue::Integer(1)]).unwrap(),
+            r#"{"a\u0000b":1}"#
+        );
     }
 
     #[test]
