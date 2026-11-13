@@ -87,6 +87,28 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - REJECTED (correctness, before measurement): a seek-cache hit takes a parked leaf instead of reloading it (bd-w4pr1.13.34)
+
+- Target: lookup joins that probe a small table by rowid (join_1M_to_pk_1000, the memory script's
+  join). Evidence before (callgrind, in-memory copy of the join, main abe603039): ~600 of 4.84k
+  instructions per probe in `get_page` + `read_btree_page_data`, because a seek-cache hit on a leaf
+  other than the cursor's current one reloads it. Touched (not landed; patch
+  `scratchpad/seekpool_f437189e1.patch` of the coordinator session):
+  `crates/fsqlite-btree/src/cursor.rs` (`seek_parked_leaves`, `park_displaced_table_leaf`,
+  `take_parked_table_leaf`; the pool is cleared with the seek cache and an entry is taken only
+  while `!pager.is_dirty(page)`, the rule the current-leaf reuse follows).
+- Prediction recorded before code: -300 to -500 instructions per probe; kill under 250.
+- Gate found a hang, so nothing was measured: `fsqlite-core --test
+  bd_2jbl5_update_from_triggers_oracle` (`update_from_with_triggers_and_fks_matches_stock_in_every_conflict_mode`)
+  ran over 70 minutes with the pool and was stopped; on clean main 546633e7e it passes 3/3 in
+  48.7 s. Ruled out as the cause: a rollback to savepoint (the pager then sets
+  `cursor_cache_reuse_disabled`, so every page reads dirty). Suspected, not proven: a page
+  written through a deferred direct-write run (`TableLeafPayloadPatchRun`, `TableLeafDeleteRun`)
+  reads clean until the run reaches the write set, so a parked pre-write image can be served.
+- Retry condition: a parked entry validated against a page-identity token the pager hands out
+  without a full read, or the pool limited to transactions with no pending writes or write runs;
+  put bd_2jbl5 in the first gate batch.
+
 ## 2026-11-13 - WIN: a table window SELECT scans into one flat buffer and drops it before output; join projections reserve their width (bd-w4pr1.12)
 
 - Target: peak RSS of the scorecard's `window_row_number` (`SELECT sum(rn) FROM (SELECT
