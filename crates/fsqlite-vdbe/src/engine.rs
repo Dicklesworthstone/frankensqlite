@@ -7443,6 +7443,13 @@ impl MakeRecordStatementLookaside {
         (self.sideband_reg != 0 && !self.buf.is_empty()).then_some(self.sideband_reg)
     }
 
+    /// The register a register write clears this lookaside for
+    /// ([`Self::clear_sideband_for_register`]), armed or not.
+    #[must_use]
+    const fn sideband_register(&self) -> i32 {
+        self.sideband_reg
+    }
+
     fn disarm(&mut self) {
         self.sideband_reg = 0;
     }
@@ -14313,11 +14320,37 @@ impl VdbeEngine {
                     // Uses p4 as affinity string.
                     if let P4::Affinity(aff) = &op.p4 {
                         let start = op.p1;
+                        // bd-i3csr.3: a value that already has the column's
+                        // affinity stays where it is (an INSERT row body runs
+                        // this twice per row, and take_reg + set_reg cost ~100
+                        // instructions a column). Of what that pair does
+                        // besides moving the value, only the subtype clear
+                        // applies then: a NaN REAL, which set_reg turns into
+                        // NULL, takes the full path, and so does every
+                        // register of an op whose range holds the MakeRecord
+                        // sideband register, which take_reg materializes and
+                        // set_reg resets. With metrics on, every register
+                        // takes the full path so coercions are counted.
+                        let in_place = !collect_vdbe_metrics
+                            && !Self::register_range_contains(
+                                start,
+                                aff.len(),
+                                self.make_record_lookaside.sideband_register(),
+                            );
                         for (i, ch) in aff.chars().enumerate() {
                             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                             let reg = start + i as i32;
-                            let val = self.take_reg(reg);
                             let affinity = char_to_affinity(ch);
+                            if in_place {
+                                let value = self.get_reg(reg);
+                                if value.affinity_is_noop(affinity)
+                                    && !matches!(value, SqliteValue::Float(f) if f.is_nan())
+                                {
+                                    self.clear_register_subtype(reg);
+                                    continue;
+                                }
+                            }
+                            let val = self.take_reg(reg);
                             if collect_vdbe_metrics {
                                 let before = val.clone();
                                 let coerced = val.apply_affinity(affinity);
@@ -32151,6 +32184,115 @@ mod tests {
             b.resolve_label(end);
         });
         assert_eq!(rows[0], vec![SqliteValue::Float(std::f64::consts::PI)]);
+    }
+
+    /// Storage class and payload, so 3 and 3.0 read differently (the value
+    /// `PartialEq` compares them equal).
+    fn typed_value(value: &SqliteValue) -> String {
+        match value {
+            SqliteValue::Null => "NULL".to_owned(),
+            SqliteValue::Integer(i) => format!("INTEGER {i}"),
+            SqliteValue::Float(f) => format!("REAL {f:?}"),
+            SqliteValue::Text(t) => format!("TEXT {}", t.as_str()),
+            SqliteValue::Blob(b) => format!("BLOB {:?}", &b[..]),
+        }
+    }
+
+    /// bd-i3csr.3: `Affinity` converts the registers whose value lacks the
+    /// column affinity and leaves the others, and a register it leaves still
+    /// loses its subtype, as when the value went through take_reg / set_reg.
+    #[test]
+    fn test_affinity_converts_only_values_without_the_column_affinity() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let first = b.alloc_regs(8);
+            let subtype_before = b.alloc_reg();
+            let subtype_after = b.alloc_reg();
+            let tag = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 7, first, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, first + 1, 0, P4::Str("7".to_owned()), 0);
+            b.emit_op(Opcode::Real, 0, first + 2, 0, P4::Real(3.0), 0);
+            b.emit_op(Opcode::Integer, 7, first + 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 9, first + 4, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, first + 5, 0, P4::Str("abc".to_owned()), 0);
+            b.emit_op(Opcode::Real, 0, first + 6, 0, P4::Real(1.5), 0);
+            b.emit_op(Opcode::Null, 0, first + 7, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 74, tag, 0, P4::None, 0);
+            b.emit_op(Opcode::SetSubtype, tag, first + 5, 0, P4::None, 0);
+            b.emit_op(Opcode::GetSubtype, first + 5, subtype_before, 0, P4::None, 0);
+            // TEXT, INTEGER, INTEGER, REAL, INTEGER, TEXT, REAL, NUMERIC.
+            b.emit_op(
+                Opcode::Affinity,
+                first,
+                8,
+                0,
+                P4::Affinity("BDDEDBEC".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::GetSubtype, first + 5, subtype_after, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, first, 10, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let got: Vec<String> = rows[0].iter().map(typed_value).collect();
+        assert_eq!(
+            got,
+            [
+                "TEXT 7",
+                "INTEGER 7",
+                "INTEGER 3",
+                "REAL 7.0",
+                "INTEGER 9",
+                "TEXT abc",
+                "REAL 1.5",
+                "NULL",
+                "INTEGER 74",
+                "INTEGER 0",
+            ]
+        );
+    }
+
+    /// bd-i3csr.3: an `Affinity` range that holds the register MakeRecord
+    /// left its record in reads that record (the full path materializes it).
+    #[test]
+    fn test_affinity_over_the_make_record_register_keeps_the_record() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let first = b.alloc_regs(3);
+            b.emit_op(Opcode::Integer, 1, first, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 2, first + 1, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                first,
+                2,
+                first + 2,
+                P4::Affinity("DD".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::Affinity,
+                first,
+                3,
+                0,
+                P4::Affinity("DDA".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, first, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let record = serialize_record(&[SqliteValue::Integer(1), SqliteValue::Integer(2)]);
+        let got: Vec<String> = rows[0].iter().map(typed_value).collect();
+        assert_eq!(
+            got,
+            [
+                "INTEGER 1".to_owned(),
+                "INTEGER 2".to_owned(),
+                format!("BLOB {:?}", &record[..]),
+            ]
+        );
     }
 
     // ── Error Handling ─────────────────────────────────────────────────

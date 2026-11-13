@@ -973,6 +973,27 @@ impl SqliteValue {
         }
     }
 
+    /// Whether [`Self::apply_affinity`] with `affinity` returns this value
+    /// unchanged because its storage class already has that affinity: any
+    /// value under BLOB affinity; NULL, TEXT and BLOB under TEXT; NULL,
+    /// INTEGER and BLOB under NUMERIC and INTEGER; NULL, REAL and BLOB under
+    /// REAL.
+    ///
+    /// `false` does not mean the value would change (TEXT `'abc'` under
+    /// INTEGER stays TEXT); it means only `apply_affinity` can tell. A caller
+    /// may skip the coercion of a value for which this is `true`.
+    #[must_use]
+    pub const fn affinity_is_noop(&self, affinity: TypeAffinity) -> bool {
+        match affinity {
+            TypeAffinity::Blob => true,
+            TypeAffinity::Text => matches!(self, Self::Null | Self::Text(_) | Self::Blob(_)),
+            TypeAffinity::Numeric | TypeAffinity::Integer => {
+                matches!(self, Self::Null | Self::Integer(_) | Self::Blob(_))
+            }
+            TypeAffinity::Real => matches!(self, Self::Null | Self::Float(_) | Self::Blob(_)),
+        }
+    }
+
     /// Apply column type affinity coercion (advisory mode).
     ///
     /// In non-STRICT tables, affinity is advisory: values are coerced when
@@ -3915,6 +3936,106 @@ mod tests {
         let val = SqliteValue::Text("9".into());
         let coerced = val.apply_affinity(TypeAffinity::Real);
         assert_eq!(coerced.as_float(), Some(9.0));
+    }
+
+    /// Same storage class and the same payload: float bits, text bytes, blob
+    /// bytes. Stricter than `PartialEq`, which compares 1 and 1.0 equal.
+    fn value_identical(a: &SqliteValue, b: &SqliteValue) -> bool {
+        match (a, b) {
+            (SqliteValue::Null, SqliteValue::Null) => true,
+            (SqliteValue::Integer(x), SqliteValue::Integer(y)) => x == y,
+            (SqliteValue::Float(x), SqliteValue::Float(y)) => x.to_bits() == y.to_bits(),
+            (SqliteValue::Text(x), SqliteValue::Text(y)) => {
+                x.as_bytes_direct() == y.as_bytes_direct()
+            }
+            (SqliteValue::Blob(x), SqliteValue::Blob(y)) => x[..] == y[..],
+            _ => false,
+        }
+    }
+
+    /// bd-i3csr.3: the Affinity opcode skips `apply_affinity` for a value
+    /// `affinity_is_noop` accepts, so every accepted pair must come back
+    /// identical, and the pairs that convert must be refused.
+    #[test]
+    fn test_affinity_is_noop_only_where_apply_affinity_returns_the_value() {
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(7),
+            SqliteValue::Integer(i64::MIN),
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Float(0.0),
+            SqliteValue::Float(-0.0),
+            SqliteValue::Float(3.0),
+            SqliteValue::Float(1.5),
+            SqliteValue::Float(1e300),
+            SqliteValue::Float(-9.223_372_036_854_776e18),
+            SqliteValue::Float(f64::INFINITY),
+            SqliteValue::Float(f64::NEG_INFINITY),
+            SqliteValue::Float(f64::NAN),
+            SqliteValue::Text("5".into()),
+            SqliteValue::Text(" 5 ".into()),
+            SqliteValue::Text("5.0".into()),
+            SqliteValue::Text("0x10".into()),
+            SqliteValue::Text("1e3".into()),
+            SqliteValue::Text("abc".into()),
+            SqliteValue::Text("".into()),
+            SqliteValue::Text(SmallText::from_record_text_bytes(
+                b"7\xff",
+                TextEncoding::Utf8,
+            )),
+            SqliteValue::Blob(Arc::from(&b"5"[..])),
+            SqliteValue::Blob(Arc::from(&b""[..])),
+        ];
+        let affinities = [
+            TypeAffinity::Blob,
+            TypeAffinity::Text,
+            TypeAffinity::Numeric,
+            TypeAffinity::Integer,
+            TypeAffinity::Real,
+        ];
+        let mut accepted = 0;
+        for value in &values {
+            for &affinity in &affinities {
+                if value.affinity_is_noop(affinity) {
+                    accepted += 1;
+                    let coerced = value.clone().apply_affinity(affinity);
+                    assert!(
+                        value_identical(value, &coerced),
+                        "{value:?} under {affinity:?} is accepted but becomes {coerced:?}"
+                    );
+                }
+            }
+        }
+        // Every value under BLOB, NULL / text / blob under TEXT, and so on:
+        // the predicate must not be vacuous.
+        assert!(
+            accepted >= values.len() + 20,
+            "only {accepted} pairs accepted"
+        );
+
+        // The conversions the opcode must still perform.
+        let converting = [
+            (SqliteValue::Integer(7), TypeAffinity::Text),
+            (SqliteValue::Float(1.5), TypeAffinity::Text),
+            (SqliteValue::Float(3.0), TypeAffinity::Integer),
+            (SqliteValue::Float(3.0), TypeAffinity::Numeric),
+            (SqliteValue::Integer(7), TypeAffinity::Real),
+            (SqliteValue::Text("5".into()), TypeAffinity::Integer),
+            (SqliteValue::Text("5".into()), TypeAffinity::Numeric),
+            (SqliteValue::Text("5".into()), TypeAffinity::Real),
+        ];
+        for (value, affinity) in converting {
+            let coerced = value.clone().apply_affinity(affinity);
+            assert!(
+                !value_identical(&value, &coerced),
+                "fixture: {value:?} under {affinity:?} must convert"
+            );
+            assert!(
+                !value.affinity_is_noop(affinity),
+                "{value:?} under {affinity:?} converts to {coerced:?} but is accepted"
+            );
+        }
     }
 
     #[test]
