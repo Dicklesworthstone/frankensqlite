@@ -2474,6 +2474,12 @@ pub struct CodegenContext {
     /// (`Last`/`Prev` instead of `Rewind`/`Next`). Only unordered scans are
     /// affected; a query with an ORDER BY keeps its required order (GH #236).
     pub reverse_unordered_selects: bool,
+    /// bd-i3csr.2: the declared columns of the table-valued function an
+    /// `INSERT ... SELECT` reads, when the connection has admitted that
+    /// function and will open its instance on the program's source cursor
+    /// (named in that cursor's `VOpen` P4). `None` keeps a table-valued
+    /// function source unsupported here.
+    pub insert_select_function_columns: Option<Vec<String>>,
 }
 
 /// Errors during code generation.
@@ -25884,8 +25890,36 @@ fn codegen_insert_select(
     // SAFETY: `from.is_none()` is handled above; `.expect` cannot panic.
     let from_clause = from.as_ref().expect("from already checked above");
 
-    let (src_table_name, src_table_alias) = match &from_clause.source {
-        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+    // bd-i3csr.2: a table-valued function the connection admitted is read
+    // through a virtual-table cursor. Its declared columns stand in for a
+    // table schema, so the SELECT's references resolve against them.
+    let function_table;
+    let (src_table, src_table_alias, function_source) = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => {
+            (find_table(schema, &name.name)?, alias.as_deref(), None)
+        }
+        fsqlite_ast::TableOrSubquery::TableFunction { name, args, alias } => {
+            let Some(function_columns) = ctx.insert_select_function_columns.as_deref() else {
+                return Err(CodegenError::Unsupported(
+                    "INSERT ... SELECT from non-table source".to_owned(),
+                ));
+            };
+            // `*` would also show the function's hidden argument columns.
+            if columns
+                .iter()
+                .any(|column| !matches!(column, ResultColumn::Expr { .. }))
+            {
+                return Err(CodegenError::Unsupported(
+                    "INSERT ... SELECT * from a table-valued function".to_owned(),
+                ));
+            }
+            function_table = table_function_scan_schema(name, function_columns);
+            (
+                &function_table,
+                alias.as_deref(),
+                Some((name.as_str(), args.as_slice())),
+            )
+        }
         _ => {
             return Err(CodegenError::Unsupported(
                 "INSERT ... SELECT from non-table source".to_owned(),
@@ -25893,7 +25927,6 @@ fn codegen_insert_select(
         }
     };
 
-    let src_table = find_table(schema, src_table_name)?;
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     let read_cursor = write_cursor + 1 + target_table.indexes.len() as i32;
 
@@ -25916,6 +25949,27 @@ fn codegen_insert_select(
     if let Some(where_expr) = where_clause {
         validate_scan_expr_columns(where_expr, &source_scan)?;
     }
+    // The function columns the SELECT reads: only those are fetched per row.
+    let function_reads = if function_source.is_some() {
+        let reads = RefCell::new(vec![false; src_table.columns.len()]);
+        let note_read = |col_ref: &ColumnRef| {
+            if let Some(index) = src_table.column_index(&col_ref.column) {
+                reads.borrow_mut()[index] = true;
+            }
+            Ok(())
+        };
+        for column in columns {
+            if let ResultColumn::Expr { expr, .. } = column {
+                validate_expr_columns_with(expr, &note_read)?;
+            }
+        }
+        if let Some(where_expr) = where_clause {
+            validate_expr_columns_with(where_expr, &note_read)?;
+        }
+        reads.into_inner()
+    } else {
+        Vec::new()
+    };
 
     // Determine the number of output columns from the SELECT.
     let n_cols = result_column_count(columns, src_table);
@@ -25938,44 +25992,120 @@ fn codegen_insert_select(
 
     let done_label = b.emit_label();
 
-    // OpenRead on source table.
-    b.emit_op(
-        Opcode::OpenRead,
-        read_cursor,
-        src_table.root_page,
-        0,
-        P4::Table(src_table.name.clone()),
-        0,
-    );
-
-    // Rewind to first row; jump to done if source is empty.
-    let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, read_cursor, 0, done_label, P4::None, 0);
-
-    // WHERE filter on source rows (skip non-matching).
-    let skip_label = b.emit_label();
-    if let Some(where_expr) = where_clause {
-        emit_where_filter(
-            b,
-            where_expr,
+    // A function source's current row is read into `function_row + i`
+    // (column `i`); its scan loops back to `function_body`.
+    let function_scan = if let Some((function_name, function_args)) = function_source {
+        let function_row = b.alloc_regs(src_table.columns.len() as i32);
+        let function_body = b.emit_label();
+        // P4 names the module whose instance the connection registers on this
+        // cursor before the program runs.
+        b.emit_op(
+            Opcode::VOpen,
             read_cursor,
+            0,
+            0,
+            P4::Str(function_name.to_owned()),
+            0,
+        );
+        // xFilter(idxNum 0, no idxStr, the call's arguments), as the
+        // interpreted scan calls it; an empty series jumps to done.
+        let n_args = function_args.len() as i32;
+        let filter_regs = b.alloc_regs(2 + n_args);
+        b.emit_op(Opcode::Integer, 0, filter_regs, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, n_args, filter_regs + 1, 0, P4::None, 0);
+        for (position, argument) in function_args.iter().enumerate() {
+            emit_expr(b, argument, filter_regs + 2 + position as i32, None);
+        }
+        b.emit_jump_to_label(
+            Opcode::VFilter,
+            read_cursor,
+            filter_regs,
+            done_label,
+            P4::None,
+            0,
+        );
+        b.resolve_label(function_body);
+        for (index, read) in function_reads.iter().enumerate() {
+            if *read {
+                b.emit_op(
+                    Opcode::VColumn,
+                    read_cursor,
+                    index as i32,
+                    function_row + index as i32,
+                    P4::None,
+                    0,
+                );
+            }
+        }
+        Some((function_row, function_body))
+    } else {
+        None
+    };
+
+    // OpenRead on source table; rewind to first row, or jump to done if the
+    // source is empty.
+    let mut loop_start = 0;
+    if function_scan.is_none() {
+        b.emit_op(
+            Opcode::OpenRead,
+            read_cursor,
+            src_table.root_page,
+            0,
+            P4::Table(src_table.name.clone()),
+            0,
+        );
+        loop_start = b.current_addr();
+        b.emit_jump_to_label(Opcode::Rewind, read_cursor, 0, done_label, P4::None, 0);
+    }
+
+    let skip_label = b.emit_label();
+    if let Some((function_row, _)) = function_scan {
+        // The function's row lives in registers: the WHERE clause and the
+        // projections read it from there.
+        let row_scan = ScanCtx {
+            cursor: read_cursor,
+            table: src_table,
+            table_alias: src_table_alias,
+            schema: Some(schema),
+            register_base: Some(RegisterRow::columns(function_row)),
+            secondaries: &[],
+        };
+        if let Some(where_expr) = where_clause {
+            let cond_reg = b.alloc_temp();
+            emit_expr(b, where_expr, cond_reg, Some(&row_scan));
+            b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+            b.free_temp(cond_reg);
+        }
+        for (position, column) in columns.iter().enumerate() {
+            if let ResultColumn::Expr { expr, .. } = column {
+                emit_expr(b, expr, val_regs + position as i32, Some(&row_scan));
+            }
+        }
+    } else {
+        // WHERE filter on source rows (skip non-matching).
+        if let Some(where_expr) = where_clause {
+            emit_where_filter(
+                b,
+                where_expr,
+                read_cursor,
+                src_table,
+                src_table_alias,
+                schema,
+                skip_label,
+            );
+        }
+
+        // Read projected columns from source into val_regs.
+        emit_column_reads(
+            b,
+            read_cursor,
+            columns,
             src_table,
             src_table_alias,
             schema,
-            skip_label,
-        );
+            val_regs,
+        )?;
     }
-
-    // Read projected columns from source into val_regs.
-    emit_column_reads(
-        b,
-        read_cursor,
-        columns,
-        src_table,
-        src_table_alias,
-        schema,
-        val_regs,
-    )?;
 
     // When an explicit column list is provided, reorder from SELECT output
     // order to table-schema order, filling unmentioned columns with defaults.
@@ -26169,14 +26299,52 @@ fn codegen_insert_select(
     b.resolve_label(skip_label);
 
     // Next: advance to next source row.
-    let loop_body = (loop_start + 1) as i32;
-    b.emit_op(Opcode::Next, read_cursor, loop_body, 0, P4::None, 0);
+    if let Some((_, function_body)) = function_scan {
+        b.emit_jump_to_label(Opcode::VNext, read_cursor, 0, function_body, P4::None, 0);
+    } else {
+        let loop_body = (loop_start + 1) as i32;
+        b.emit_op(Opcode::Next, read_cursor, loop_body, 0, P4::None, 0);
+    }
 
     // Done: close source cursor.
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, read_cursor, 0, 0, P4::None, 0);
 
     Ok(())
+}
+
+/// bd-i3csr.2: a table-valued function's declared columns as a table schema,
+/// so an `INSERT ... SELECT` reading it resolves `name.column` and `column`
+/// references like a table's. The columns are typeless, as stock declares
+/// generate_series's (`value, start HIDDEN, stop HIDDEN, step HIDDEN`).
+fn table_function_scan_schema(name: &str, columns: &[String]) -> TableSchema {
+    TableSchema {
+        name: name.to_owned(),
+        root_page: 0,
+        columns: columns
+            .iter()
+            .map(|column| ColumnInfo {
+                name: column.clone(),
+                affinity: 'A',
+                is_ipk: false,
+                type_name: None,
+                notnull: false,
+                unique: false,
+                default_value: None,
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: None,
+                conflict_action: None,
+            })
+            .collect(),
+        indexes: Vec::new(),
+        strict: false,
+        without_rowid: false,
+        primary_key_constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
+    }
 }
 
 #[allow(

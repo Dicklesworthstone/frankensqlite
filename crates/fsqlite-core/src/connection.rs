@@ -9723,6 +9723,7 @@ impl PreparedStatement<'_> {
             false,
             true,
             cached,
+            Vec::new(),
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10096,6 +10097,7 @@ impl PreparedStatement<'_> {
                 invalidate_memdb_count_shortcuts_on_success,
                 true,
                 cached,
+                Vec::new(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10154,6 +10156,7 @@ impl PreparedStatement<'_> {
                 invalidate_memdb_count_shortcuts_on_success,
                 true,
                 cached,
+                Vec::new(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -25688,6 +25691,7 @@ impl Connection {
                 TableExecutionRuntimeRequirements::read_path(),
                 cx,
                 false,
+                Vec::new(),
             )
             .await?;
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -42461,6 +42465,7 @@ impl Connection {
                             TableExecutionRuntimeRequirements::read_path(),
                             cx,
                             false,
+                            Vec::new(),
                         )
                     })
                     .await?;
@@ -43015,6 +43020,7 @@ impl Connection {
                         TableExecutionRuntimeRequirements::read_path(),
                         cx,
                         true,
+                        Vec::new(),
                     )
                 })
                 .await?;
@@ -43509,6 +43515,7 @@ impl Connection {
                         TableExecutionRuntimeRequirements::read_path(),
                         cx,
                         true,
+                        Vec::new(),
                     )
                 })
                 .await?;
@@ -51674,6 +51681,7 @@ impl Connection {
                 TableExecutionRuntimeRequirements::read_path(),
                 cx,
                 false,
+                Vec::new(),
             )
             .await?;
         Ok(Some(rows))
@@ -88236,6 +88244,7 @@ impl Connection {
                         TableExecutionRuntimeRequirements::read_path(),
                         cx,
                         false,
+                        Vec::new(),
                     )
                     .await?;
                 rows
@@ -104267,6 +104276,7 @@ impl Connection {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
             text_encoding: self.db_text_encoding.get(),
+            insert_select_function_columns: self.insert_select_function_columns(&insert),
             ..CodegenContext::default()
         };
         let temp_roots = self.temp_storage_roots();
@@ -104943,6 +104953,7 @@ impl Connection {
             TableExecutionRuntimeRequirements::read_path(),
             &execution_cx,
             false,
+            Vec::new(),
         )
         .await
     }
@@ -104958,6 +104969,7 @@ impl Connection {
         runtime_requirements: TableExecutionRuntimeRequirements,
         execution_cx: &Cx,
         invalidate_memdb_count_shortcuts_on_success: bool,
+        vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         self.last_replace_victims.borrow_mut().clear();
         let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
@@ -105026,6 +105038,7 @@ impl Connection {
             allow_retained_cursor_reuse,
             false,
             cached_engine,
+            vtab_instances,
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -143954,6 +143967,7 @@ async fn execute_table_program_with_db(
     allow_retained_cursor_reuse: bool,
     prepared_engine_reuse_profile: bool,
     cached_engine: Option<VdbeEngine>,
+    vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
 ) -> (TableProgramExecOutcome, Option<VdbeEngine>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
@@ -144005,6 +144019,11 @@ async fn execute_table_program_with_db(
         VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size)
     };
     engine.set_retain_storage_cursors_on_close(allow_retained_cursor_reuse);
+    // bd-i3csr.2: the table-valued-function instances the program's VOpen
+    // cursors scan.
+    for (cursor_id, instance) in vtab_instances {
+        engine.register_vtab_instance(cursor_id, instance);
+    }
     if let Some(params) = params
         && let Err(e) = validate_bound_parameters(program, params)
     {

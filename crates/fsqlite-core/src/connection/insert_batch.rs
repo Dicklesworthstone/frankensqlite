@@ -299,6 +299,10 @@ impl Connection {
     /// - the target: an unqualified rowid table, no TEMP table in the
     ///   connection, no DELETE trigger (an OR REPLACE victim), and no UPSERT
     ///   or RETURNING.
+    ///
+    /// A generate_series source (bd-i3csr.2) is scanned through a
+    /// virtual-table cursor instead; `insert_select_series_source_admitted`
+    /// says which.
     fn insert_select_runs_as_one_program(
         &self,
         insert: &fsqlite_ast::InsertStatement,
@@ -313,7 +317,6 @@ impl Connection {
             || select_may_observe_change_tracking(select_stmt)
             || select_contains_subquery_matching(select_stmt, self, &|_, _| true)
             || select_contains_match_operator(select_stmt)
-            || self.insert_select_keyset_rowid(select_stmt).is_none()
         {
             return false;
         }
@@ -326,22 +329,7 @@ impl Connection {
         else {
             return false;
         };
-        let TableOrSubquery::Table {
-            name,
-            index_hint: None,
-            time_travel: None,
-            ..
-        } = &from.source
-        else {
-            return false;
-        };
         let target = insert.table.name.as_str();
-        if name.schema.is_some()
-            || name.name.eq_ignore_ascii_case(target)
-            || name.name.to_ascii_lowercase().starts_with("sqlite_")
-        {
-            return false;
-        }
         let target_is_rowid_table = self
             .schema
             .borrow()
@@ -352,6 +340,31 @@ impl Connection {
         if !target_is_rowid_table
             || self.has_matching_triggers(target, fsqlite_ast::TriggerTiming::Before, &delete_event)
             || self.has_matching_triggers(target, fsqlite_ast::TriggerTiming::After, &delete_event)
+        {
+            return false;
+        }
+        let name = match &from.source {
+            TableOrSubquery::TableFunction { name, args, .. } => {
+                return self.insert_select_series_source_admitted(
+                    select_stmt,
+                    name,
+                    args,
+                    columns,
+                    where_clause.as_deref(),
+                );
+            }
+            TableOrSubquery::Table {
+                name,
+                index_hint: None,
+                time_travel: None,
+                ..
+            } => name,
+            _ => return false,
+        };
+        if self.insert_select_keyset_rowid(select_stmt).is_none()
+            || name.schema.is_some()
+            || name.name.eq_ignore_ascii_case(target)
+            || name.name.to_ascii_lowercase().starts_with("sqlite_")
         {
             return false;
         }
@@ -398,6 +411,165 @@ impl Connection {
                         .any(|indexed| indexed.eq_ignore_ascii_case(column))
                 })
         })
+    }
+
+    /// bd-i3csr.2: whether `INSERT ... SELECT ... FROM generate_series(...)`
+    /// runs as one program scanning the series through a virtual-table cursor.
+    /// The program calls the module's xFilter once with the call's arguments,
+    /// as the interpreted scan does, and reads each row as it is produced, so
+    /// it admits only a scan nothing has to see whole: one call to the
+    /// builtin module (an application that registered its own
+    /// generate_series keeps the interpreted scan) with 1 to 3 arguments that
+    /// read no column, no join, compound, DISTINCT, grouping, aggregate,
+    /// window, ORDER BY, LIMIT or WITH, and only `value` read: `*`, the hidden
+    /// start, stop and step columns and the rowid decline.
+    fn insert_select_series_source_admitted(
+        &self,
+        select_stmt: &SelectStatement,
+        name: &str,
+        args: &[Expr],
+        columns: &[ResultColumn],
+        where_clause: Option<&Expr>,
+    ) -> bool {
+        if !name.eq_ignore_ascii_case("generate_series")
+            || !(1..=3).contains(&args.len())
+            || self.builtin_generate_series_module().is_none()
+            || select_stmt.with.is_some()
+            || !select_stmt.body.compounds.is_empty()
+            || !select_stmt.order_by.is_empty()
+            || select_stmt.limit.is_some()
+            || has_window_functions(select_stmt)
+            || self.has_implicit_aggregation_with_registry(select_stmt)
+        {
+            return false;
+        }
+        let SelectCore::Select {
+            distinct,
+            from: Some(from),
+            group_by,
+            having,
+            windows,
+            ..
+        } = &select_stmt.body.select
+        else {
+            return false;
+        };
+        if *distinct != Distinctness::All
+            || !from.joins.is_empty()
+            || !group_by.is_empty()
+            || having.is_some()
+            || !windows.is_empty()
+            || columns.is_empty()
+        {
+            return false;
+        }
+        // A name the function does not declare is left to the code generator,
+        // which reports it as stock does ("no such column").
+        let mut reads_no_hidden_column = true;
+        let mut note_column = |column_ref: &ColumnRef| {
+            reads_no_hidden_column &= !["start", "stop", "step", "rowid", "_rowid_", "oid"]
+                .iter()
+                .any(|hidden| column_ref.column.eq_ignore_ascii_case(hidden));
+        };
+        for column in columns {
+            match column {
+                ResultColumn::Expr { expr, .. } => {
+                    for_each_column_ref_in_expr(expr, &mut note_column);
+                }
+                ResultColumn::Star | ResultColumn::TableStar(_) => return false,
+            }
+        }
+        if let Some(where_clause) = where_clause {
+            for_each_column_ref_in_expr(where_clause, &mut note_column);
+        }
+        let mut arguments_read_columns = false;
+        for argument in args {
+            for_each_column_ref_in_expr(argument, &mut |_| arguments_read_columns = true);
+        }
+        reads_no_hidden_column && !arguments_read_columns
+    }
+
+    /// bd-i3csr.2: the builtin generate_series module, unless the application
+    /// registered its own under that name.
+    fn builtin_generate_series_module(&self) -> Option<Arc<dyn VtabModuleFactory>> {
+        let modules = self.vtab_modules.borrow();
+        let registered = modules.get("GENERATE_SERIES")?;
+        let builtin = shared_default_vtab_module_registry().get("GENERATE_SERIES")?;
+        Arc::ptr_eq(registered, builtin).then(|| Arc::clone(registered))
+    }
+
+    /// bd-i3csr.2: the columns `codegen_insert_select` resolves a
+    /// generate_series source against, when the INSERT ... SELECT reads the
+    /// builtin module.
+    pub(super) fn insert_select_function_columns(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Option<Vec<String>> {
+        let InsertSource::Select(select_stmt) = &insert.source else {
+            return None;
+        };
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select_stmt.body.select
+        else {
+            return None;
+        };
+        let TableOrSubquery::TableFunction { name, .. } = &from.source else {
+            return None;
+        };
+        (name.eq_ignore_ascii_case("generate_series")
+            && self.builtin_generate_series_module().is_some())
+        .then(|| {
+            GENERATE_SERIES_TABLE_COLUMN_NAMES
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect()
+        })
+    }
+
+    /// bd-i3csr.2: the instances an INSERT ... SELECT program scans, one per
+    /// `VOpen` cursor, connected from the module its P4 names: the builtin
+    /// generate_series, the only one `insert_select_function_columns` hands
+    /// to the code generator.
+    fn insert_program_vtab_instances(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        program: &VdbeProgram,
+    ) -> Result<Vec<(i32, Box<dyn ErasedVtabInstance>)>> {
+        let reads_function = matches!(
+            &insert.source,
+            InsertSource::Select(select_stmt) if matches!(
+                &select_stmt.body.select,
+                SelectCore::Select { from: Some(from), .. }
+                    if matches!(from.source, TableOrSubquery::TableFunction { .. })
+            )
+        );
+        if !reads_function {
+            return Ok(Vec::new());
+        }
+        let mut instances = Vec::new();
+        for op in program.ops() {
+            if op.opcode != Opcode::VOpen {
+                continue;
+            }
+            let P4::Str(name) = &op.p4 else {
+                continue;
+            };
+            let factory = name
+                .eq_ignore_ascii_case("generate_series")
+                .then(|| self.builtin_generate_series_module())
+                .flatten()
+                .ok_or_else(|| {
+                    FrankenError::internal(format!(
+                        "INSERT ... SELECT program scans table-valued function {name} \
+                         without its module"
+                    ))
+                })?;
+            let cx = self.op_cx()?;
+            let factory_args = [name.as_str(), "main", name.as_str()];
+            instances.push((op.p1, factory.connect(&cx, &factory_args)?));
+        }
+        Ok(instances)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -922,6 +1094,7 @@ impl Connection {
             &arc_prog
         };
         let runtime_requirements = self.insert_runtime_requirements(insert)?;
+        let vtab_instances = self.insert_program_vtab_instances(insert, program)?;
         let (rows, affected, last_insert_rowid) = self
             .execute_table_program_with_cx(
                 program,
@@ -930,6 +1103,7 @@ impl Connection {
                 runtime_requirements,
                 cx,
                 true,
+                vtab_instances,
             )
             .await?;
 

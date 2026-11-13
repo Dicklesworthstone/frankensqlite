@@ -15940,11 +15940,16 @@ impl VdbeEngine {
                             pc += 1;
                             continue;
                         }
-                        observe_execution_cancellation(&cx)?;
+                        // bd-i3csr.2: a per-row boundary, like a function
+                        // call's: a requested cancellation is one atomic load,
+                        // and the loop's interval checkpoint covers the
+                        // deadline plane (two full checkpoints were ~700
+                        // instructions a row on a generate_series scan).
+                        observe_requested_execution_cancellation(&cx)?;
                         if let Err(e) = state.cursor.next(&cx) {
                             break vtab_exec_outcome("VNext", e)?;
                         }
-                        observe_execution_cancellation(&cx)?;
+                        observe_requested_execution_cancellation(&cx)?;
                         if !state.cursor.eof() {
                             #[allow(clippy::cast_sign_loss)]
                             {

@@ -20,6 +20,14 @@
 //! TEMP table). `insert_select_routes_as_one_program` checks which way each
 //! statement went, so the oracle cannot pass by never taking the route.
 //!
+//! bd-i3csr.2: a `generate_series` source runs as the same program, scanning
+//! the series through a virtual-table cursor (the scorecard's bulk-load
+//! shape). rusqlite has no generate_series, so the stock side reads a
+//! recursive CTE with stock's series semantics (`stock_sql`); the series
+//! values themselves are checked against the interpreted scan, which matches
+//! the stock sqlite3 shell on the same argument cases, by
+//! `series_route_matches_the_interpreted_scan`.
+//!
 //! Not covered, as fsqlite differs from stock there with or without the route
 //! (checked on the replay build df65b45b3): a negative zero stored in a REAL
 //! column keeps its sign (stock stores it as the integer 0, bd-kqb76); after a
@@ -89,7 +97,10 @@ fn rq(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String
 }
 
 /// rusqlite's bundled SQLite has no generate_series, so stock reads the same
-/// rows from a recursive CTE. Used only to fill the source tables.
+/// rows from a recursive CTE with stock's series semantics for integer literal
+/// arguments: STOP defaults to 4294967295, a zero STEP is 1, a negative STEP
+/// counts down from START to STOP. The subquery is named `generate_series`
+/// unless the call has an alias, so `generate_series.value` resolves.
 fn stock_sql(sql: &str) -> String {
     const CALL: &str = "generate_series(";
     let mut out = String::with_capacity(sql.len());
@@ -98,13 +109,28 @@ fn stock_sql(sql: &str) -> String {
         out.push_str(&rest[..start]);
         let args_start = start + CALL.len();
         let close = args_start + rest[args_start..].find(')').expect("closing paren");
-        let (lo, hi) = rest[args_start..close]
-            .split_once(',')
-            .expect("two arguments");
-        let (lo, hi) = (lo.trim(), hi.trim());
+        let args: Vec<&str> = rest[args_start..close].split(',').map(str::trim).collect();
+        let (lo, hi, step) = match args.as_slice() {
+            [lo] => (*lo, "4294967295", "1"),
+            [lo, hi] => (*lo, *hi, "1"),
+            [lo, hi, step] => (*lo, *hi, *step),
+            _ => panic!("generate_series takes one to three arguments"),
+        };
+        let stride = format!("(CASE WHEN ({step}) = 0 THEN 1 ELSE ({step}) END)");
+        let alias = if rest[close + 1..]
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("AS ")
+        {
+            ""
+        } else {
+            " AS generate_series"
+        };
         out.push_str(&format!(
-            "(WITH RECURSIVE gs(value) AS (SELECT {lo} WHERE {lo} <= {hi} \
-             UNION ALL SELECT value + 1 FROM gs WHERE value < {hi}) SELECT value FROM gs)"
+            "(WITH RECURSIVE gs(value) AS (SELECT {lo} WHERE {stride} > 0 AND {lo} <= {hi} \
+             OR {stride} < 0 AND {lo} >= {hi} UNION ALL SELECT value + {stride} FROM gs \
+             WHERE {stride} > 0 AND value + {stride} <= {hi} \
+             OR {stride} < 0 AND value + {stride} >= {hi}) SELECT value FROM gs){alias}"
         ));
         rest = &rest[close + 1..];
     }
@@ -405,6 +431,60 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "generate_series source: the bulk-load shape, steps, aliases, conflicts",
+        steps: &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL)",
+            "INSERT INTO t SELECT value, (value * 7919) % 1000, 'row-' || value, value * 1.5 \
+             FROM generate_series(1, 300)",
+            "INSERT INTO t(a, b) SELECT value, 'x' || value FROM generate_series(5, 50, 5)",
+            "INSERT INTO t SELECT value + 1000, value, NULL, NULL FROM generate_series(10, 1, -3)",
+            "INSERT INTO t SELECT g.value + 2000, g.value % 7, 'g', 0.5 \
+             FROM generate_series(1, 40) AS g WHERE g.value % 3 = 0",
+            "INSERT INTO t SELECT generate_series.value + 3000, 1, 'q', 1 \
+             FROM generate_series(1, 3)",
+            "INSERT INTO t SELECT value + 4000, 0, 'zero step', 0 FROM generate_series(1, 4, 0)",
+            "INSERT INTO t VALUES (5305, 0, 'pre', 0)",
+            "INSERT INTO t SELECT value, value, 'abort', 0 FROM generate_series(5301, 5310)",
+            "INSERT OR IGNORE INTO t SELECT value, value, 'ignore', 0 \
+             FROM generate_series(5301, 5310)",
+            "INSERT OR REPLACE INTO t SELECT value, -value, 'replace', 0 FROM generate_series(1, 5)",
+            "INSERT INTO t SELECT value, value, 'empty', 0 FROM generate_series(5, 1)",
+            "INSERT INTO t(b) SELECT 'no column read' FROM generate_series(1, 2)",
+            "BEGIN",
+            "INSERT INTO t SELECT value + 6000, (value * 7919) % 1000, 'row-' || value, \
+             value * 1.5 FROM generate_series(1, 100)",
+            "COMMIT",
+        ],
+        checks: &[
+            "SELECT count(*), sum(id), sum(a), sum(length(b)), sum(c), max(id) FROM t",
+            "SELECT * FROM t WHERE id % 23 = 0 OR id > 5000 ORDER BY id",
+            "PRAGMA integrity_check",
+        ],
+    },
+    Scenario {
+        name: "generate_series source: constraints, generated columns, affinity, AUTOINCREMENT",
+        steps: &[
+            "CREATE TABLE u(a INT UNIQUE, b TEXT NOT NULL, c REAL CHECK (c < 100), \
+             d INT GENERATED ALWAYS AS (a * 2) STORED)",
+            "INSERT INTO u(a, b, c) SELECT value, 'v' || value, value * 1.5 \
+             FROM generate_series(1, 80)",
+            "INSERT INTO u(a, b, c) SELECT value, 'v' || value, value FROM generate_series(1, 50)",
+            "INSERT OR IGNORE INTO u(a, b, c) SELECT value % 60, \
+             CASE WHEN value % 11 = 0 THEN NULL ELSE 'w' END, value FROM generate_series(40, 99)",
+            "INSERT OR FAIL INTO u(a, b, c) SELECT value + 100, 'f', value \
+             FROM generate_series(1, 120)",
+            "CREATE TABLE au(id INTEGER PRIMARY KEY AUTOINCREMENT, r REAL, t TEXT, n NUMERIC)",
+            "INSERT INTO au(r, t, n) SELECT value, value, value * 0.5 FROM generate_series(1, 6)",
+            "INSERT INTO au SELECT value * 10, value, value, value FROM generate_series(1, 3)",
+        ],
+        checks: &[
+            "SELECT rowid, * FROM u ORDER BY rowid",
+            "SELECT id, typeof(r), r, typeof(t), t, typeof(n), n FROM au ORDER BY id",
+            "SELECT name, seq FROM sqlite_sequence",
+            "PRAGMA integrity_check",
+        ],
+    },
+    Scenario {
         name: "declined shapes keep stock's answers",
         steps: &[
             SOURCE,
@@ -458,6 +538,10 @@ const PREPARE_ERRORS: Scenario = Scenario {
         "CREATE TABLE g(a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL, d TEXT)",
         "INSERT INTO g(a, b) SELECT 1, 2 FROM s WHERE x = 1",
         "INSERT INTO g SELECT x FROM s",
+        "INSERT INTO t SELECT nosuch, 1 FROM generate_series(1, 3)",
+        "INSERT INTO t SELECT value, 1 FROM generate_series(1, 3) WHERE nosuch > 1",
+        "INSERT INTO t SELECT q.value, 1 FROM generate_series(1, 3)",
+        "INSERT INTO t SELECT value FROM generate_series(1, 3)",
         "INSERT INTO t SELECT x, y FROM s WHERE x = 1",
     ],
     checks: &[
@@ -482,6 +566,9 @@ const SOURCE_ERROR: Scenario = Scenario {
         "INSERT INTO t SELECT x + 200, CASE WHEN x = 4 \
          THEN abs(-9223372036854775807 - 1) ELSE x END FROM src",
         "COMMIT",
+        "INSERT INTO t SELECT value + 300, CASE WHEN value = 7 \
+         THEN abs(-9223372036854775807 - 1) ELSE value END FROM generate_series(1, 10)",
+        "INSERT INTO t SELECT value + 400, value FROM generate_series(1, 3)",
     ],
     checks: &["SELECT count(*), sum(a) FROM t", "PRAGMA integrity_check"],
 };
@@ -655,6 +742,11 @@ fn insert_select_routes_as_one_program() {
         "INSERT INTO t SELECT * FROM s",
         // e has an index on x: it neither serves this WHERE nor covers y
         "INSERT INTO t SELECT x + 1, y FROM e WHERE y > 'y1'",
+        // bd-i3csr.2: generate_series through a virtual-table cursor
+        "INSERT INTO t SELECT value, 'g' FROM generate_series(1, 3)",
+        "INSERT INTO t(a) SELECT g.value * 2 FROM generate_series(1, 9, 2) AS g WHERE g.value > 3",
+        "INSERT OR IGNORE INTO u SELECT value, 'i' FROM generate_series(1, 6)",
+        "INSERT INTO t(b) SELECT 'none read' FROM generate_series(4294967294)",
     ];
     let replayed = [
         // self-reference, ORDER BY, LIMIT, DISTINCT, aggregate, join, subquery
@@ -677,8 +769,15 @@ fn insert_select_routes_as_one_program() {
         "INSERT INTO u SELECT x, y FROM s WHERE true ON CONFLICT(a) DO NOTHING",
         // a DELETE trigger on the target (an OR REPLACE victim would fire it)
         "INSERT INTO d SELECT x, y FROM s",
-        // a table-valued function (step 2 of bd-i3csr)
-        "INSERT INTO t SELECT value, 'g' FROM generate_series(1, 3)",
+        // generate_series: a hidden column, ORDER BY, LIMIT, DISTINCT, an
+        // aggregate, a join; another table-valued function
+        "INSERT INTO t SELECT value, start FROM generate_series(1, 3)",
+        "INSERT INTO t SELECT value, 'o' FROM generate_series(1, 3) ORDER BY value DESC",
+        "INSERT INTO t SELECT value, 'l' FROM generate_series(1, 3) LIMIT 2",
+        "INSERT INTO t SELECT DISTINCT value % 2, 'd' FROM generate_series(1, 3)",
+        "INSERT INTO t SELECT count(*), 'c' FROM generate_series(1, 3)",
+        "INSERT INTO t SELECT g.value, s.y FROM generate_series(1, 3) AS g JOIN s ON s.x = g.value",
+        "INSERT INTO t SELECT key, value FROM json_each('[1, 2]')",
     ];
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
@@ -720,7 +819,179 @@ fn insert_select_routes_as_one_program() {
                 ));
             }
         }
+        // An application's own generate_series (here the same table type,
+        // registered again) keeps the interpreted scan: the program opens only
+        // the builtin module.
+        f.register_module(
+            "generate_series",
+            Box::new(fsqlite_func::vtab::module_factory_from::<
+                fsqlite_ext_misc::GenerateSeriesTable,
+            >()),
+        );
+        let sql = "INSERT INTO t SELECT value, 'r' FROM generate_series(1, 3)";
+        f.reset_fallback_decision_evidence();
+        match f.query(sql).await {
+            Err(error) => wrong.push(format!("  `{sql}` failed: {error}")),
+            Ok(_) => {
+                if !f
+                    .fallback_decision_snapshot()
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.decision_reason == REPLAYED)
+                {
+                    wrong.push(format!(
+                        "  `{sql}` with a registered module: replayed = false, expected true"
+                    ));
+                }
+            }
+        }
         f.close().await.unwrap();
         assert!(wrong.is_empty(), "routing:\n{}", wrong.join("\n"));
+    });
+}
+
+/// bd-i3csr.2: the series a routed INSERT ... SELECT inserts equals what the
+/// interpreted scan inserts (the same statement with `LIMIT -1`, which keeps
+/// the replay) on argument cases where that scan matches the stock sqlite3
+/// shell: negative, zero and NULL steps, text, real and NULL bounds, the
+/// default STOP, and the ends of the integer range. The error text and change
+/// count agree too, and each statement went the expected way.
+#[test]
+fn series_route_matches_the_interpreted_scan() {
+    let cases = [
+        "10, 1, -2",
+        "1, 10, -2",
+        "1, 10, 0",
+        "5, 1",
+        "NULL, 3",
+        "'2', '4.9'",
+        "1.7, 3.2",
+        "4294967290",
+        "9223372036854775800, 9223372036854775807, 3",
+        "-9223372036854775807, -9223372036854775805",
+        "1, 3, NULL",
+        "'abc', 2",
+        "3, 1, -1",
+        "-3, 3, 4",
+        "1, 3, 9223372036854775807",
+        "x'01', 3",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        f.set_fallback_capture_enabled(true);
+        let mut wrong = Vec::new();
+        for (n, args) in cases.iter().enumerate() {
+            let (routed, replayed) = (format!("r{n}"), format!("f{n}"));
+            for table in [&routed, &replayed] {
+                f.execute(&format!("CREATE TABLE {table}(a, b)"))
+                    .await
+                    .unwrap();
+            }
+            let mut outcomes = Vec::new();
+            for (table, suffix, expect_replayed) in
+                [(&routed, "", false), (&replayed, " LIMIT -1", true)]
+            {
+                let sql = format!(
+                    "INSERT INTO {table} SELECT value, typeof(value) \
+                     FROM generate_series({args}){suffix}"
+                );
+                f.reset_fallback_decision_evidence();
+                let outcome = f.execute(&sql).await.map_err(|e| e.to_string());
+                let was_replayed = f
+                    .fallback_decision_snapshot()
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.decision_reason == REPLAYED);
+                if was_replayed != expect_replayed {
+                    wrong.push(format!(
+                        "  `{sql}`: replayed = {was_replayed}, expected {expect_replayed}"
+                    ));
+                }
+                let rows = fq(
+                    &f,
+                    &format!("SELECT rowid, a, b FROM {table} ORDER BY rowid"),
+                )
+                .await;
+                outcomes.push((outcome, rows));
+            }
+            if outcomes[0] != outcomes[1] {
+                wrong.push(format!(
+                    "  generate_series({args})\n     routed=   {:?}\n     replayed= {:?}",
+                    outcomes[0], outcomes[1]
+                ));
+            }
+        }
+        f.close().await.unwrap();
+        assert!(wrong.is_empty(), "series:\n{}", wrong.join("\n"));
+    });
+}
+
+/// bd-i3csr.2: a prepared INSERT ... SELECT whose series bounds are
+/// parameters, run several times; the last run conflicts part way through.
+/// Stock's text spells the series as the recursive CTE with the same
+/// numbered parameters.
+#[test]
+fn prepared_series_insert_matches_stock() {
+    const SQL: &str = "INSERT INTO t(a, b) SELECT value + ?1, ?2 || value \
+                       FROM generate_series(?3, ?4)";
+    const STOCK: &str = "INSERT INTO t(a, b) SELECT value + ?1, ?2 || value \
+                         FROM (WITH RECURSIVE gs(value) AS (SELECT ?3 WHERE ?3 <= ?4 \
+                         UNION ALL SELECT value + 1 FROM gs WHERE value < ?4) SELECT value FROM gs)";
+    let runs: [(i64, &str, i64, i64); 4] = [
+        (0, "p", 1, 5),
+        (100, "q", 3, 4),
+        (1000, "r", 6, 5),
+        (0, "z", 4, 8),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT UNIQUE, b TEXT)";
+            f.execute(setup).await.unwrap();
+            r.execute_batch(setup).unwrap();
+            let fp = f.prepare(SQL).await.unwrap();
+            let mut rp = r.prepare(STOCK).unwrap();
+            for (off, tag, lo, hi) in runs {
+                let values = [
+                    SqliteValue::Integer(off),
+                    SqliteValue::Text(tag.into()),
+                    SqliteValue::Integer(lo),
+                    SqliteValue::Integer(hi),
+                ];
+                let fr = fp
+                    .execute_with_params(&values)
+                    .await
+                    .map_err(|e| e.to_string());
+                let rr = rp
+                    .execute(rusqlite::params![off, tag, lo, hi])
+                    .map_err(stock_err);
+                if fr != rr {
+                    diffs.push(format!(
+                        "  [file={file_backed}] ({off}, {tag}, {lo}, {hi})\n     \
+                         frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+                for check in [COUNTERS, "SELECT * FROM t ORDER BY id"] {
+                    let fr = fq(&f, check).await;
+                    let rr = rq(&r, check);
+                    if fr != rr {
+                        diffs.push(format!(
+                            "  [file={file_backed}] after ({off}, {tag}, {lo}, {hi}): `{check}`\n     \
+                             frank= {fr:?}\n     stock= {rr:?}"
+                        ));
+                    }
+                }
+            }
+            drop(fp);
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} divergence(s) from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }
