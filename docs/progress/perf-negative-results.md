@@ -87,6 +87,49 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: the scan loop's Remainder of two integers and its Rowid write their register in place (bd-w4pr1.13.20, lever V)
+
+- Target: every scan that reads a rowid or takes `%` per row: the scorecard's DELETE and UPDATE rows
+  (`WHERE id % 7 = 0`, `WHERE id % 10 = 0`) and any SELECT filtering or projecting a remainder.
+  Touched: `crates/fsqlite-vdbe/src/engine.rs` (the `Remainder` and `Rowid` arms of
+  `try_execute_hot_opcode_sync`).
+- Evidence before (callgrind of `delete_14pct_300k` on the lever-F binary, 300k scanned rows): the
+  scan loop is 261M, 870 per scanned row; `sql_rem` 33.0M (110 per row: `both_integer_numeric_type`
+  and two `to_integer` conversions for two INTEGER registers) and `pool_return_reusable` 10.8M over
+  600k calls: `Rowid` and `Remainder` wrote through `set_reg_fast` (bounds and resize test, NaN
+  normalisation, a whole-value replace and a drop of the old value) where the four other arithmetic
+  opcodes already use `set_reg_arith_result`.
+- Change: `Remainder` with two INTEGER operands computes `sql_rem`'s integer path in place (a zero
+  divisor gives NULL, `i64::MIN % -1` gives 0, the sign follows the dividend) and writes through
+  `set_reg_int`; any other pair keeps `sql_rem` and writes through `set_reg_arith_result`. `Rowid`
+  writes through `set_reg_int`. No bytecode change.
+- Result, stock sqlite3 3.46.1 live in the same run (`sc_mut_probe`, minimum user instructions of
+  7, io_uring refused, load 2.1; binaries a4bbf1cf... base main 09ddffb43, 9c7a4b38... base + this
+  production diff): `delete_14pct_300k` stock 120.7M, base 620.8M (5.14x), lever 568.0M (4.71x):
+  -52.8M, CPU 127.1 -> 120.5 ms (stock 37.9); `update_10pct_300k` stock 273.4M, base 952.6M
+  (3.48x), lever 897.4M (3.28x): -55.2M, CPU 152.8 -> 151.7 ms (stock 49.9). With io_uring allowed:
+  636.1M -> 583.3M and 965.1M -> 908.7M; CPU 159.2 -> 155.0 and 217.9 -> 179.3 ms. Prediction
+  (-30M to -45M each) exceeded; kill (either row under 15M) not met. Read rows on the 1M-row
+  scorecard table (`stable_probe`, ring refused, 5 reps): `SELECT count(*) FROM t WHERE id % 7 = 0`
+  951.8M -> 775.8M (3.22x -> 2.62x stock, CPU 79.8 -> 73.0 ms); `scan_filter_agg` control
+  1,237.8M -> 1,237.9M. Answers equal stock's; stock's `PRAGMA integrity_check` passes on every file
+  the lever wrote.
+- Test: `bd_integer_arithmetic_edges_oracle_probe::remainder_over_scanned_rows_matches_rusqlite_oracle`
+  (`%` over table rows against rusqlite with `typeof`: INTEGER, REAL, TEXT, BLOB and NULL operands
+  on both sides, a zero divisor (a fast path without the zero test answers 0 instead of NULL),
+  `i64::MIN % -1`, result types changing from row to row in one register, `rowid % n`).
+- Found on the way, red on main and not touched here: a non-numeric TEXT operand of `%` or `/`
+  (`'x' % 3`, `'' % 4`) gives REAL 0.0 where stock gives INTEGER 0 (`sql_rem` / `sql_div` treat such
+  text as not integer-typed; stock's numericType reads it as the integer 0). Left out of the new
+  test's rows.
+- Gate, on 09ddffb43 plus the change: clippy -D warnings on fsqlite-vdbe `--all-targets` and on the
+  new test's target clean (again on the rebased tree); fsqlite-vdbe lib 1,243 pass and 2 fail
+  (bd-bhalc pair, red on main); fsqlite-core lib 4,166 pass and 2 fail (t6741 pair, red on main);
+  16 fsqlite-core arithmetic / affinity / DML / rowid targets in two batches, 116 tests pass; 8
+  fsqlite rowid DML oracle targets, 18 pass. Landed as 25a17a1c8 (rebased onto eb6ee587d).
+- Retry condition: none. Next on the scan: the WHERE's per-row `Integer` (the `%` operand literal)
+  and `IsNull` (foldable into the comparison's JUMPIFNULL), a bytecode change.
+
 ## 2026-11-13 - WIN: a leaf delete or same-size row rewrite changes the transaction's staged image of the leaf in place, with no page copy and no page write (bd-w4pr1.13.20, lever F)
 
 - Target: every row a DELETE removes from a table leaf and every same-size row an UPDATE rewrites,
