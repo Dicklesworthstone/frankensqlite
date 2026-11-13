@@ -621,15 +621,20 @@ impl Connection {
                 insert.table.name
             )));
         }
-        if Box::pin(self.execute_fts5_maintenance_insert(insert)).await? {
-            return Ok(Vec::new());
-        }
-        #[cfg(feature = "ext-fts5")]
-        if let Some(affected) =
-            Box::pin(self.execute_fts5_magic_delete_insert(insert, params)).await?
-        {
-            self.record_statement_changes(affected);
-            return Ok(Vec::new());
+        // Both FTS5 command forms name the table itself as the first column
+        // (`INSERT INTO ft(ft, ...)`). Any other INSERT is neither, so it does
+        // not allocate their futures (bd-w4pr1.13.35).
+        if fts5_insert_uses_command_column(insert) {
+            if Box::pin(self.execute_fts5_maintenance_insert(insert)).await? {
+                return Ok(Vec::new());
+            }
+            #[cfg(feature = "ext-fts5")]
+            if let Some(affected) =
+                Box::pin(self.execute_fts5_magic_delete_insert(insert, params)).await?
+            {
+                self.record_statement_changes(affected);
+                return Ok(Vec::new());
+            }
         }
         if insert.with.is_some() {
             self.log_mem_execution_fallback("insert", "with_clause_materialization")?;
@@ -1175,8 +1180,11 @@ impl Connection {
 
         // Implicit REPLACE deletes are parent-row deletions for inbound
         // FK purposes. Enforce their exact OLD rows before child-side
-        // validation and AFTER INSERT processing.
-        Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
+        // validation and AFTER INSERT processing. Only a program that
+        // deleted rows left victims; without any the boxed pass is skipped.
+        if !self.last_replace_victims.borrow().is_empty() {
+            Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
+        }
 
         // bd-thqgm: FK constraint checking on INSERT.
         // Skip FK enforcement when no row was written (e.g. an OR IGNORE
@@ -1270,7 +1278,9 @@ impl Connection {
 
         if table_name.eq_ignore_ascii_case("sqlite_sequence") {
             Box::pin(self.refresh_sqlite_sequence_cache()).await?;
-        } else {
+        } else if self.is_autoincrement_table(table_name) {
+            // Only an AUTOINCREMENT table has a high-water to refresh; other
+            // tables do not allocate the refresh future.
             Box::pin(self.refresh_autoincrement_sequence_after_insert(
                 table_name,
                 affected,

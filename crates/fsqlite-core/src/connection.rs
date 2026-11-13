@@ -41728,12 +41728,20 @@ impl Connection {
         // They are built through `boxed_future` and hot-path futures through
         // `lean_future`, so an unoptimized build does not reserve every one of
         // them in this frame (bd-w4pr1.28).
-        if let Some(rows) =
-            lean_future(|| self.maybe_execute_attached_target_statement(statement, params))
-                .await
-                .map_err(|error| {
-                    self.remap_unknown_attached_schema_for_statement(error, statement)
-                })?
+        //
+        // An INSERT reaches an attached database only through its table's
+        // schema qualifier (`attached_target_schema` answers None without one),
+        // so an unqualified INSERT does not allocate the delegation future
+        // (bd-w4pr1.13.35).
+        let may_target_attached_schema =
+            !matches!(statement, Statement::Insert(insert) if insert.table.schema.is_none());
+        if may_target_attached_schema
+            && let Some(rows) =
+                lean_future(|| self.maybe_execute_attached_target_statement(statement, params))
+                    .await
+                    .map_err(|error| {
+                        self.remap_unknown_attached_schema_for_statement(error, statement)
+                    })?
         {
             return Ok(rows);
         }
@@ -41792,9 +41800,11 @@ impl Connection {
         // INSTEAD OF triggers make a view writable: route INSERT/UPDATE/DELETE on
         // a view with a matching INSTEAD OF trigger to the trigger body instead of
         // normal table DML (which would fail "no such table" — a view has no
-        // B-tree). bd-ffkpv.
-        if let Some(rows) =
-            boxed_future(|| self.maybe_execute_instead_of_view_dml(statement, params)).await?
+        // B-tree). bd-ffkpv. The boxed future is built only for such a statement
+        // (bd-w4pr1.13.35).
+        if self.statement_targets_instead_of_view(statement)
+            && let Some(rows) =
+                boxed_future(|| self.maybe_execute_instead_of_view_dml(statement, params)).await?
         {
             return Ok(rows);
         }
