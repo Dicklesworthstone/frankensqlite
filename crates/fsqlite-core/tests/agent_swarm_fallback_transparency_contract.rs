@@ -191,7 +191,10 @@ const STRICT_SQL_REPLAY_SCENARIOS: &[StrictSqlReplayScenario] = &[
             "INSERT INTO g9_insert_select_src(x) VALUES (1), (2);",
         ],
         operation: ReplayOperation::Execute,
-        sql: "INSERT INTO g9_insert_select_dst(x) SELECT x FROM g9_insert_select_src WHERE x > 0;",
+        // ORDER BY keeps this source on the row-by-row replay: since
+        // bd-i3csr.1 a plain one-table scan runs as one VDBE program, with no
+        // fallback for strict mode to deny.
+        sql: "INSERT INTO g9_insert_select_dst(x) SELECT x FROM g9_insert_select_src WHERE x > 0 ORDER BY x;",
         statement_kind: "insert_select",
         decision_reason: "insert_select_row_by_row_fallback",
         fallback_boundary: "conn.insert_select.insert_select_row_by_row_fallback",
