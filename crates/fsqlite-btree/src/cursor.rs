@@ -1465,6 +1465,17 @@ impl Drop for RightmostLeafCacheEntry {
     }
 }
 
+/// What an append to the cached rightmost leaf did in the transaction's
+/// staged image of that leaf (bd-i3csr.4).
+enum StagedLeafAppend {
+    /// The store holds no unpublished staged image of the leaf, or a
+    /// different one; nothing changed.
+    NotStaged,
+    /// The append ran there: the row's index and cell offset, or `None` when
+    /// it does not fit the leaf.
+    Ran(Option<(u16, u16)>),
+}
+
 /// Opaque retained append hint for monotonic table inserts.
 ///
 /// Short-lived callers can carry this between cursor instances to keep the
@@ -10494,6 +10505,90 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some(result))
     }
 
+    /// bd-i3csr.4: appends the row to the cached rightmost leaf inside the
+    /// transaction's staged image of that leaf, when that staged image is the
+    /// one the cache holds (equal `PageData::image_token`: clones keep it,
+    /// every mutable access replaces it, so equal tokens mean equal bytes).
+    ///
+    /// The cache and the stack's top entry (which the previous append left
+    /// sharing the image) give up their references before the bytes change,
+    /// so the staged image is normally their only holder and takes the row
+    /// with no page copy and no page write; any other holder (a savepoint's
+    /// before-image) keeps its bytes through the copy-on-write of
+    /// `as_bytes_mut`. Afterwards the cache shares the staged image, and so
+    /// does the stack entry when the row did not go in.
+    ///
+    /// `NotStaged` when the store holds no unpublished staged image of the
+    /// leaf or a different one: nothing changed, and the caller appends to the
+    /// cache's own copy and writes it.
+    fn try_append_in_staged_image_of_cached_leaf(
+        &mut self,
+        cached: &mut RightmostLeafCacheEntry,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<StagedLeafAppend> {
+        let page_no = cached.page_no;
+        let shown_token = cached.page_data.image_token();
+        let usable_size = self.usable_size;
+        let stack_top = self.stack.last_mut().filter(|entry| {
+            entry.page_no == page_no && entry.page_data.image_token() == shown_token
+        });
+        let mut stack_shown = stack_top
+            .map(|entry| std::mem::replace(&mut entry.page_data, PageData::from_vec(Vec::new())));
+        let restore_stack = stack_shown.is_some();
+        let mut shown = Some(std::mem::replace(
+            &mut cached.page_data,
+            PageData::from_vec(Vec::new()),
+        ));
+        let mut header = cached.header;
+        let mut outcome = None;
+        let mut append_staged = |staged: &mut PageData| {
+            if outcome.is_some() || staged.image_token() != shown_token {
+                return;
+            }
+            drop(shown.take());
+            drop(stack_shown.take());
+            let appended = Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only(
+                usable_size,
+                page_no,
+                staged,
+                &mut header,
+                rowid,
+                payload,
+            );
+            outcome = Some((appended, staged.clone()));
+        };
+        self.pager
+            .try_mutate_staged_page_data(page_no, &mut append_staged);
+        let Some((appended, image)) = outcome else {
+            if let Some(page_data) = shown {
+                cached.page_data = page_data;
+            }
+            if let (Some(page_data), Some(entry)) = (stack_shown, self.stack.last_mut()) {
+                entry.page_data = page_data;
+            }
+            return Ok(StagedLeafAppend::NotStaged);
+        };
+        let appended = match appended {
+            Ok(appended) => appended,
+            Err(error) => {
+                // The append refused before changing a byte.
+                if restore_stack && let Some(entry) = self.stack.last_mut() {
+                    entry.page_data = image.clone();
+                }
+                cached.page_data = image;
+                return Err(error);
+            }
+        };
+        if appended.is_some() {
+            cached.header = header;
+        } else if restore_stack && let Some(entry) = self.stack.last_mut() {
+            entry.page_data = image.clone();
+        }
+        cached.page_data = image;
+        Ok(StagedLeafAppend::Ran(appended))
+    }
+
     async fn try_append_on_cached_rightmost_leaf(
         &mut self,
         cx: &Cx,
@@ -10508,17 +10603,22 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        if let Some((insert_idx, new_cell_offset)) = self
-            .try_append_table_leaf_payload_in_place_no_overflow(
-                cx,
-                cached.page_no,
-                &mut cached.page_data,
-                &mut cached.header,
-                rowid,
-                data,
-            )
-            .await?
-        {
+        let appended =
+            match self.try_append_in_staged_image_of_cached_leaf(&mut cached, rowid, data)? {
+                StagedLeafAppend::Ran(appended) => appended,
+                StagedLeafAppend::NotStaged => {
+                    self.try_append_table_leaf_payload_in_place_no_overflow(
+                        cx,
+                        cached.page_no,
+                        &mut cached.page_data,
+                        &mut cached.header,
+                        rowid,
+                        data,
+                    )
+                    .await?
+                }
+            };
+        if let Some((insert_idx, new_cell_offset)) = appended {
             self.last_insert_rowid = Some(rowid);
             self.last_known_depth = Some(cached.tree_depth);
             cached.rowid = rowid;
@@ -19739,6 +19839,92 @@ mod tests {
             assert_eq!(leaf.cell_count, 5);
             let ptrs = cell::read_cell_pointers(&expected, &leaf, 0).unwrap();
             assert!(cell_ptrs_are_descending(&ptrs));
+        });
+    }
+
+    /// 3,000 rows appended past the end of the table (variable sizes, every
+    /// 257th with an overflow chain), and every 500 appends one row inserted
+    /// below the end, which drops the cached rightmost leaf. Returns the cursor
+    /// and the rows the table must hold.
+    async fn append_rows<P: PageWriter>(store: P) -> (BtCursor<P>, BTreeMap<i64, Vec<u8>>) {
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut expected = BTreeMap::new();
+        for i in 1..=3_000_i64 {
+            let rowid = 2 * i;
+            let payload = payload_for_rowid(rowid);
+            cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            expected.insert(rowid, payload);
+            if i % 500 == 0 {
+                let below = rowid - 401;
+                let payload = payload_for_rowid(below);
+                cursor.table_insert(&cx, below, &payload).await.unwrap();
+                expected.insert(below, payload);
+            }
+        }
+        (cursor, expected)
+    }
+
+    /// bd-i3csr.4: a row appended to the cached rightmost leaf goes into the
+    /// store's staged image of that leaf when it is the cache's image, and
+    /// every page ends byte for byte as the copy-and-write path leaves it (the
+    /// store without staged images). A store whose staged image is a different
+    /// one (the page before its last write) is never changed in place: an
+    /// append planned from the cache's view would corrupt it.
+    #[test]
+    fn test_appends_change_the_staged_rightmost_leaf_in_place_only_when_it_is_the_caches() {
+        // Leaf splits feed the global balance counter that
+        // `test_balance_for_delete_defers_until_leaf_empties` reads (bd-pyygd).
+        let _leaf_cursor_guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        run_async(async {
+            let (mut reference, expected) =
+                append_rows(MemPageStore::with_empty_table(pn(2), USABLE)).await;
+            assert_eq!(scan_table_rows(&mut reference).await, expected);
+            let reference_pages: BTreeMap<u32, Vec<u8>> = reference
+                .pager
+                .pages_iter()
+                .map(|(page_no, bytes)| (*page_no, bytes.to_vec()))
+                .collect();
+
+            for offer_previous_image in [false, true] {
+                let store = ImageKeepingStore::new(
+                    MemPageStore::with_empty_table(pn(2), USABLE),
+                    offer_previous_image,
+                );
+                let (mut cursor, rows) = append_rows(store).await;
+                assert_eq!(rows, expected);
+                assert_eq!(
+                    scan_table_rows(&mut cursor).await,
+                    expected,
+                    "offer_previous_image={offer_previous_image}: the table reads back"
+                );
+                for (page_no, bytes) in &reference_pages {
+                    assert_eq!(
+                        cursor.pager.page_bytes(*page_no).as_ref(),
+                        Some(bytes),
+                        "offer_previous_image={offer_previous_image}: page {page_no} differs \
+                         from the copy-and-write path"
+                    );
+                }
+                assert_eq!(
+                    cursor.pager.inner.pages_iter().count(),
+                    reference_pages.len()
+                );
+                if offer_previous_image {
+                    assert_eq!(
+                        cursor.pager.in_place_changes, 0,
+                        "a staged image other than the cache's is never changed in place"
+                    );
+                } else {
+                    assert!(
+                        cursor.pager.in_place_changes > 2_000,
+                        "appends to the cached leaf change its staged image in place: {}",
+                        cursor.pager.in_place_changes
+                    );
+                }
+            }
         });
     }
 
