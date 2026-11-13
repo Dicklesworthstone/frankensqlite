@@ -1,0 +1,329 @@
+*** Begin Patch
+*** Update File: crates/fsqlite-core/src/connection.rs
+@@
+-/// Pager admission used by the schema-only connection constructor.
++/// Keep materialized tables alive under private names when their public names
++/// must resolve in a different SQL scope. Trigger WHEN/body expressions cannot
++/// see their caller's CTEs, and a DML target must resolve to a writable table
++/// even when a CTE of the same name remains visible to its read expressions.
++struct MaterializedBindingsVisibilityGuard<'a> {
++    conn: &'a Connection,
++    names: Vec<(i32, String)>,
++    _compiled_cache_guard: BoolCellRestoreGuard<'a>,
++}
++
++impl<'a> MaterializedBindingsVisibilityGuard<'a> {
++    fn private_name(
++        root_page: i32,
++        occupied_names: &mut HashSet<String>,
++        reserved_sql: &str,
++    ) -> String {
++        // Replay reparses these identifiers and semantic lookup keys reserve
++        // NUL as a namespace separator. Use ordinary SQL identifiers, checking
++        // both tables and views so a user-defined name cannot capture a read.
++        let base = format!("__fsqlite_materialized_{root_page}");
++        let mut suffix = 0usize;
++        loop {
++            let candidate = if suffix == 0 {
++                base.clone()
++            } else {
++                format!("{base}_{suffix}")
++            };
++            if !reserved_sql.contains(candidate.as_str())
++                && occupied_names.insert(candidate.clone())
++            {
++                return candidate;
++            }
++            suffix = suffix.saturating_add(1);
++        }
++    }
++
++    fn for_insert_target(conn: &'a Connection, insert: &mut fsqlite_ast::InsertStatement) -> Self {
++        let name = insert.table.name.clone();
++        // Nested WITH declarations have not been installed in the schema yet.
++        // Conservatively reserve the rendered statement too, so a later lexical
++        // binding cannot capture the private relation names inserted below.
++        let reserved_sql = insert.to_string().to_ascii_lowercase();
++        let guard = Self::hide_reserving(conn, Some(&name), &reserved_sql);
++        if let Some((root_page, _)) = guard.names.first() {
++            // Schema order is binding precedence: the first same-name CTE is
++            // the one that the source expressions could resolve before hiding.
++            let schema = conn.schema.borrow();
++            if let Some(table) = schema.iter().find(|table| table.root_page == *root_page) {
++                rebind_materialized_insert_reads(insert, &name, &table.name);
++            }
++        }
++        guard
++    }
++
++    fn hide(conn: &'a Connection, only_name: Option<&str>) -> Self {
++        Self::hide_reserving(conn, only_name, "")
++    }
++
++    fn hide_reserving(conn: &'a Connection, only_name: Option<&str>, reserved_sql: &str) -> Self {
++        let mut names = Vec::new();
++        {
++            let roots = conn.materialized_temp_root_pages.borrow();
++            if !roots.is_empty() {
++                let mut schema = conn.schema.borrow_mut();
++                let mut occupied_names: HashSet<String> = schema
++                    .iter()
++                    .map(|table| table.name.to_ascii_lowercase())
++                    .chain(
++                        conn.views
++                            .borrow()
++                            .iter()
++                            .map(|view| view.name.to_ascii_lowercase()),
++                    )
++                    .collect();
++                for table in schema.iter_mut().filter(|table| {
++                    roots.contains(&table.root_page)
++                        && only_name.is_none_or(|name| table.name.eq_ignore_ascii_case(name))
++                }) {
++                    let hidden =
++                        Self::private_name(table.root_page, &mut occupied_names, reserved_sql);
++                    names.push((table.root_page, std::mem::replace(&mut table.name, hidden)));
++                }
++            }
++        }
++        if !names.is_empty() {
++            conn.rebuild_schema_indices();
++        }
++        let bypass_cache = conn.bypass_compiled_cache.get() || !names.is_empty();
++        Self {
++            conn,
++            names,
++            _compiled_cache_guard: BoolCellRestoreGuard::new(
++                &conn.bypass_compiled_cache,
++                bypass_cache,
++            ),
++        }
++    }
++}
++
++impl Drop for MaterializedBindingsVisibilityGuard<'_> {
++    fn drop(&mut self) {
++        if self.names.is_empty() {
++            return;
++        }
++        {
++            let mut schema = self.conn.schema.borrow_mut();
++            for (root, name) in &self.names {
++                if let Some(table) = schema.iter_mut().find(|table| table.root_page == *root) {
++                    table.name.clone_from(name);
++                }
++            }
++        }
++        self.conn.rebuild_schema_indices();
++    }
++}
++
++/// Pager admission used by the schema-only connection constructor.
+@@
+         if let InsertSource::Select(ref select_stmt) = stripped.source {
+             let source_rows = self
+                 .execute_select_via_memdb_fallback(select_stmt, params)
+                 .await?;
+             if source_rows.is_empty() {
+                 self.reset_statement_change_count();
+                 return Ok(Vec::new());
+             }
++            // WITH t AS (...) INSERT INTO t reads its source from the CTE but
++            // writes the persistent/TEMP table. Keep later UPSERT/RETURNING
++            // subqueries bound to the materialized rows under a private name.
++            let _target_scope =
++                MaterializedBindingsVisibilityGuard::for_insert_target(self, &mut stripped);
+             // Replay the materialized CTE rows through the per-row INSERT
+             // machinery, which correctly threads the ON CONFLICT/UPSERT
+@@
+             self.set_statement_change_count(outcome.changes);
+             Ok(outcome.returning_rows)
+         } else {
++            let _target_scope =
++                MaterializedBindingsVisibilityGuard::for_insert_target(self, &mut stripped);
+             let _compiled_cache_guard =
+                 BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+@@
+-                subst_cte_refs_in_nested_select(&mut body, prev_name, prev_body, &mut inner);
++                subst_cte_refs_in_nested_select(
++                    &mut body,
++                    prev_name,
++                    CteSourceSubstitution::Inline(prev_body),
++                    &mut inner,
++                );
+@@
+-        subst_cte_refs_in_select(&mut rewritten, name, body, &mut inlined);
++        subst_cte_refs_in_select(
++            &mut rewritten,
++            name,
++            CteSourceSubstitution::Inline(body),
++            &mut inlined,
++        );
+@@
+-fn subst_cte_refs_in_select(
++/// Rebind only relation references belonging to one lexical WITH scope.
++/// Materialized bindings keep a private storage name while a same-named DML
++/// target keeps its ordinary table name. The FROM alias remains unchanged,
++/// so target columns and correlated references need no textual rewriting.
++#[derive(Clone, Copy)]
++enum CteSourceSubstitution<'a> {
++    Inline(&'a SelectStatement),
++    Materialized(&'a str),
++}
++
++/// Retarget reads of a materialized CTE without rewriting the INSERT target,
++/// assignment targets, or direct target-column references. Nested WITH scopes
++/// retain their own bindings, and explicit schema qualifiers bypass the CTE.
++fn rebind_materialized_insert_reads(
++    insert: &mut fsqlite_ast::InsertStatement,
++    name: &str,
++    private_name: &str,
++) {
++    let body = CteSourceSubstitution::Materialized(private_name);
++    let mut rebound = 0;
++    match &mut insert.source {
++        InsertSource::Values(rows) => {
++            for expr in rows.iter_mut().flatten() {
++                subst_cte_refs_in_expr(expr, name, body, &mut rebound);
++            }
++        }
++        InsertSource::Select(select) => {
++            subst_cte_refs_in_nested_select(select, name, body, &mut rebound);
++        }
++        InsertSource::DefaultValues => {}
++    }
++    for upsert in &mut insert.upsert {
++        if let Some(target) = &mut upsert.target {
++            for column in &mut target.columns {
++                subst_cte_refs_in_expr(&mut column.expr, name, body, &mut rebound);
++            }
++            if let Some(predicate) = &mut target.where_clause {
++                subst_cte_refs_in_expr(predicate, name, body, &mut rebound);
++            }
++        }
++        if let fsqlite_ast::UpsertAction::Update {
++            assignments,
++            where_clause,
++        } = &mut upsert.action
++        {
++            for assignment in assignments {
++                subst_cte_refs_in_expr(&mut assignment.value, name, body, &mut rebound);
++            }
++            if let Some(predicate) = where_clause {
++                subst_cte_refs_in_expr(predicate, name, body, &mut rebound);
++            }
++        }
++    }
++    for column in &mut insert.returning {
++        if let ResultColumn::Expr { expr, .. } = column {
++            subst_cte_refs_in_expr(expr, name, body, &mut rebound);
++        }
++    }
++}
++
++fn subst_cte_refs_in_select(
+     select: &mut SelectStatement,
+     name: &str,
+-    body: &SelectStatement,
++    body: CteSourceSubstitution<'_>,
+     inlined: &mut usize,
+@@
+ fn subst_cte_refs_in_nested_select(
+     select: &mut SelectStatement,
+     name: &str,
+-    body: &SelectStatement,
++    body: CteSourceSubstitution<'_>,
+     inlined: &mut usize,
+@@
+ fn subst_cte_refs_in_core(
+     core: &mut SelectCore,
+     name: &str,
+-    body: &SelectStatement,
++    body: CteSourceSubstitution<'_>,
+     inlined: &mut usize,
+ ) {
++    if let SelectCore::Values(rows) = core {
++        for expr in rows.iter_mut().flatten() {
++            subst_cte_refs_in_expr(expr, name, body, inlined);
++        }
++        return;
++    }
+     let SelectCore::Select {
+@@
+-        // `VALUES` rows are immutable in the AST; a CTE reference buried inside a
+-        // VALUES subquery stays on the materialize path (a safe fallback).
+@@
+ fn subst_cte_refs_in_from(
+     from: &mut FromClause,
+     name: &str,
+-    body: &SelectStatement,
++    body: CteSourceSubstitution<'_>,
+     inlined: &mut usize,
+@@
+ fn subst_cte_refs_in_table(
+     source: &mut TableOrSubquery,
+     name: &str,
+-    body: &SelectStatement,
++    body: CteSourceSubstitution<'_>,
+     inlined: &mut usize,
+@@
+             if qualified.schema.is_none()
+-                && index_hint.is_none()
+-                && time_travel.is_none()
+                 && qualified.name.eq_ignore_ascii_case(name)
++                && (matches!(body, CteSourceSubstitution::Materialized(_))
++                    || (index_hint.is_none() && time_travel.is_none()))
+             {
+                 let preserved_alias = alias.clone().unwrap_or_else(|| qualified.name.clone());
+-                *source = TableOrSubquery::Subquery {
+-                    query: Box::new(body.clone()),
+-                    alias: Some(preserved_alias),
+-                };
++                match body {
++                    CteSourceSubstitution::Inline(query) => {
++                        *source = TableOrSubquery::Subquery {
++                            query: Box::new(query.clone()),
++                            alias: Some(preserved_alias),
++                        };
++                    }
++                    CteSourceSubstitution::Materialized(private_name) => {
++                        private_name.clone_into(&mut qualified.name);
++                        *alias = Some(preserved_alias);
++                    }
++                }
+                 *inlined += 1;
+@@
+ fn subst_cte_refs_in_expr(
+     expr: &mut Expr,
+     name: &str,
+-    body: &SelectStatement,
++    body: CteSourceSubstitution<'_>,
+     inlined: &mut usize,
+@@
+                 InSet::Table(qualified) => {
+                     if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name) {
+-                        *set = InSet::Subquery(Box::new(select_star_from_derived(body, name)));
++                        match body {
++                            CteSourceSubstitution::Inline(query) => {
++                                *set = InSet::Subquery(Box::new(select_star_from_derived(query, name)));
++                            }
++                            CteSourceSubstitution::Materialized(private_name) => {
++                                private_name.clone_into(&mut qualified.name);
++                            }
++                        }
+                         *inlined += 1;
+@@
+ fn subst_cte_refs_in_window_spec(
+     window: &mut WindowSpec,
+     name: &str,
+-    body: &SelectStatement,
++    body: CteSourceSubstitution<'_>,
+     inlined: &mut usize,
+@@
+ fn subst_cte_refs_in_frame_bound(
+     bound: &mut FrameBound,
+     name: &str,
+-    body: &SelectStatement,
++    body: CteSourceSubstitution<'_>,
+     inlined: &mut usize,
+*** End Patch

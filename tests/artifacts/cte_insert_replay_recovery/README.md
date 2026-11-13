@@ -13,14 +13,15 @@ The execution environment became unavailable on 2026-11-13 before the edited wor
 
 The planned changes preserve materialized roots through mirror refreshes, explicitly route them to MemDatabase, isolate trigger namespaces, separate a same-named writable target from its CTE read binding, and freeze the original parameter slots before per-row replay.
 
-## Checkpoint completeness and application
+## Patch application
 
-The files use Codex apply_patch format with repository-relative paths. They are intentionally stored outside compiled source.
+The files use Codex apply_patch format with repository-relative paths. They are intentionally stored outside compiled source. From the repository root, feed each file to apply_patch in numeric order; these are not git diff-format patches. Review context matching before accepting the reconstructed engine edits.
 
 1. 01_roots_and_binding.apply.patch: storage routing, row preservation, original parameter binding.
-2. 02_cte_scope_and_target.apply.patch: required visibility guard and lexical read rebinding. **Pending the next recovery commit; do not apply this checkpoint without it.**
+2. 02_cte_scope_and_target.apply.patch: required visibility guard and lexical read rebinding.
 3. 03_obsolete_root_probe_cleanup.apply.patch: remove superseded root-probing functions and update their comments.
 4. 04_sqlite_oracles.apply.patch: eight targeted regression tests, including memory/file, prepared/ad hoc, trigger, parameter, nested-scope, repeated-execution, and rollback cases.
+5. 05_trigger_replay_hydration.apply.patch: the reviewed early release of the materialization fallback override, plus a deterministic hydration-counter regression for 150 source rows and 15 untouched tables. The test was written before environment loss; the small production edit was reconstructed afterward and has not executed.
 
 Apply all correctness patches before compiling; patch 01 references the guard defined by patch 02. Work began at f437189e13ffe3b37bff2160c4c770b894d3a280. Four unrelated upstream commits reached main at 716b6ddc258493da9da8aba885fda2561a219659 while work was in progress. Preserve those changes when applying and reviewing this reconstruction.
 
@@ -28,6 +29,7 @@ Apply all correctness patches before compiling; patch 01 references the guard de
 
 - Starting-revision cargo fmt --check passed.
 - The new regression files passed rustfmt checks and whitespace checks before the environment failure.
+- After recovery, both test patches matched the exact original upstream file contents; the oracle patch reconstructed the recovered full test file exactly. This was a text-integrity check, not Rust execution.
 - SQLite 3.53.1 independently confirmed selected fixture expectations, including the unbound-parameter and nested-scope results.
 - Workspace cargo check and an initial targeted cargo test were killed while compiling asupersync 0.6.2.
 - An isolated baseline CTE test build timed out after 1,201 seconds in dependencies; no SQL tests executed.
