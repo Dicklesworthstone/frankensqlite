@@ -370,6 +370,10 @@ pub trait PageWriter: PageReader {
     }
 
     /// Mutate an unpublished staged page already owned by the transaction.
+    ///
+    /// Returns whether `f` ran. When it runs, the image `f` receives is the
+    /// transaction's staged image of the page, and it keeps every change `f`
+    /// makes.
     fn try_mutate_staged_page_data(
         &mut self,
         _page_no: PageNumber,
@@ -6344,6 +6348,21 @@ pub enum TeardownTask {
     },
 }
 
+/// How a table-leaf delete changes its page, decided after every check that
+/// can refuse the delete.
+enum TableLeafDeleteRewrite {
+    /// The cell area is compact: the content from `old_content_offset` up to
+    /// the removed cell at `removed_offset` moves to `new_content_offset`,
+    /// then the header and the pointer array are rewritten.
+    CompactMove {
+        old_content_offset: usize,
+        removed_offset: usize,
+        new_content_offset: usize,
+    },
+    /// The page was rebuilt into this new image.
+    Rebuilt(PageData),
+}
+
 impl<P: PageWriter> BtCursor<P> {
     /// Free all pages in the B-tree rooted at `page_no`, including `page_no`
     /// itself, any overflow chains attached to cells, and all child subtrees.
@@ -9380,6 +9399,56 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
+    /// Applies `rewrite` to the transaction's staged image of `page_no`, the
+    /// page of stack entry `depth - 1`, when that staged image is the one the
+    /// entry shows, and returns the rewritten image for the entry.
+    ///
+    /// The images are compared by `PageData::image_token`, which clones keep
+    /// and every mutable access replaces, so equal tokens mean equal bytes and
+    /// `rewrite`, planned from the entry's view, applies to exactly those
+    /// bytes. The entry gives up its reference before the bytes change: the
+    /// staged image is then normally their only holder and changes in place,
+    /// with no copy of the page and no second write of it. Any other holder
+    /// (a savepoint's before-image) still keeps its own bytes through the
+    /// copy-on-write of `as_bytes_mut`.
+    ///
+    /// `None` when the transaction holds no unpublished staged image of the
+    /// page or holds a different one; the entry then shows its page as before
+    /// and the caller writes a rewritten copy through `write_page_data`.
+    fn try_rewrite_top_page_in_staged_image(
+        &mut self,
+        depth: usize,
+        page_no: PageNumber,
+        rewrite: &mut dyn FnMut(&mut [u8]),
+    ) -> Option<PageData> {
+        let entry = &mut self.stack[depth - 1];
+        let shown_token = entry.page_data.image_token();
+        let mut shown = Some(std::mem::replace(
+            &mut entry.page_data,
+            PageData::from_vec(Vec::new()),
+        ));
+        let mut rewritten = None;
+        let mut rewrite_staged = |staged: &mut PageData| {
+            if rewritten.is_some() || staged.image_token() != shown_token {
+                return;
+            }
+            drop(shown.take());
+            rewrite(staged.as_bytes_mut());
+            rewritten = Some(staged.clone());
+        };
+        let ran = self
+            .pager
+            .try_mutate_staged_page_data(page_no, &mut rewrite_staged);
+        if let Some(image) = rewritten {
+            debug_assert!(ran, "a store that ran the rewrite must report it");
+            return Some(image);
+        }
+        if let Some(page_data) = shown {
+            self.stack[depth - 1].page_data = page_data;
+        }
+        None
+    }
+
     async fn remove_table_cell_from_leaf_deferred(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
@@ -9406,7 +9475,6 @@ impl<P: PageWriter> BtCursor<P> {
 
         let top = &self.stack[depth - 1];
         let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let mut page_data = top.page_data.clone();
         let mut header = top.header;
         let mut ptrs = take_pooled_cell_pointers();
         ptrs.extend_from_slice(&top.cell_pointers);
@@ -9446,7 +9514,10 @@ impl<P: PageWriter> BtCursor<P> {
         let ptr_array_end =
             header_offset + usize::from(header.page_type.header_size()) + (ptrs.len() - 1) * 2;
 
-        if compact_cell_area && ptrs_descend {
+        // Every check that can refuse the delete runs before any page byte
+        // changes: the compact branches only plan the move, which may then be
+        // made in the transaction's own staged image of the leaf.
+        let rewrite = if compact_cell_area && ptrs_descend {
             let deleted_ptr = usize::from(ptrs[delete_idx]);
             let deleted_upper = if delete_idx == 0 {
                 self.usable_size as usize
@@ -9494,10 +9565,6 @@ impl<P: PageWriter> BtCursor<P> {
                         leaf_page_no.get()
                     ),
                 })?;
-            let page_bytes = page_data.as_bytes_mut();
-            if old_content_offset < deleted_ptr {
-                page_bytes.copy_within(old_content_offset..deleted_ptr, new_content_offset);
-            }
             for ptr_slot in &mut ptrs[delete_idx + 1..] {
                 *ptr_slot += pointer_shift;
             }
@@ -9521,8 +9588,11 @@ impl<P: PageWriter> BtCursor<P> {
                     ),
                 })?;
 
-            header.write(page_bytes, header_offset);
-            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+            TableLeafDeleteRewrite::CompactMove {
+                old_content_offset,
+                removed_offset: deleted_ptr,
+                new_content_offset,
+            }
         } else if compact_cell_area && self.usable_size <= 4096 {
             let deleted_ptr = usize::from(ptrs[delete_idx]);
 
@@ -9603,10 +9673,6 @@ impl<P: PageWriter> BtCursor<P> {
                 }
             }
 
-            let page_bytes = page_data.as_bytes_mut();
-            if old_content_offset < deleted_ptr {
-                page_bytes.copy_within(old_content_offset..deleted_ptr, new_content_offset);
-            }
             ptrs.remove(delete_idx);
             header.first_freeblock = 0;
             header.fragmented_free_bytes = 0;
@@ -9627,9 +9693,13 @@ impl<P: PageWriter> BtCursor<P> {
                     ),
                 })?;
 
-            header.write(page_bytes, header_offset);
-            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+            TableLeafDeleteRewrite::CompactMove {
+                old_content_offset,
+                removed_offset: deleted_ptr,
+                new_content_offset,
+            }
         } else {
+            let mut page_data = self.stack[depth - 1].page_data.clone();
             let mut cells_to_move = std::mem::take(&mut self.defrag_cells_scratch);
             cells_to_move.clear();
             cells_to_move.reserve(ptrs.len());
@@ -9735,16 +9805,44 @@ impl<P: PageWriter> BtCursor<P> {
                 cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
             }
             self.defrag_cells_scratch = cells_to_move;
-        }
+            TableLeafDeleteRewrite::Rebuilt(page_data)
+        };
 
-        let refreshed_page_data = page_data.clone();
-        let write_result = self
-            .pager
-            .write_page_data(cx, leaf_page_no, page_data)
-            .await;
-        if let Err(error) = write_result {
-            recycle_cell_pointers(ptrs);
-            return Err(error);
+        let (refreshed_page_data, page_to_write) = match rewrite {
+            TableLeafDeleteRewrite::CompactMove {
+                old_content_offset,
+                removed_offset,
+                new_content_offset,
+            } => {
+                let mut move_cells = |page_bytes: &mut [u8]| {
+                    if old_content_offset < removed_offset {
+                        page_bytes
+                            .copy_within(old_content_offset..removed_offset, new_content_offset);
+                    }
+                    header.write(page_bytes, header_offset);
+                    cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+                };
+                if let Some(rewritten) =
+                    self.try_rewrite_top_page_in_staged_image(depth, leaf_page_no, &mut move_cells)
+                {
+                    (rewritten, None)
+                } else {
+                    let mut page_data = self.stack[depth - 1].page_data.clone();
+                    move_cells(page_data.as_bytes_mut());
+                    (page_data.clone(), Some(page_data))
+                }
+            }
+            TableLeafDeleteRewrite::Rebuilt(page_data) => (page_data.clone(), Some(page_data)),
+        };
+        if let Some(page_data) = page_to_write {
+            let write_result = self
+                .pager
+                .write_page_data(cx, leaf_page_no, page_data)
+                .await;
+            if let Err(error) = write_result {
+                recycle_cell_pointers(ptrs);
+                return Err(error);
+            }
         }
 
         let new_count = header.cell_count;
@@ -11986,16 +12084,29 @@ impl<P: PageWriter> BtCursor<P> {
                 detail: "same-size payload overwrite offset overflow".to_owned(),
             })?;
 
+        let depth = self.stack.len();
+        if end > self.stack[depth - 1].page_data.as_bytes().len() || end > usable_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "same-size payload overwrite extends past usable page".to_owned(),
+            });
+        }
+        let mut write_payload =
+            |page_bytes: &mut [u8]| page_bytes[cell.payload_offset..end].copy_from_slice(payload);
+        if let Some(rewritten) =
+            self.try_rewrite_top_page_in_staged_image(depth, leaf_page_no, &mut write_payload)
+        {
+            let entry = &mut self.stack[depth - 1];
+            entry.mutation_counter = Self::page_mutation_counter(&rewritten);
+            entry.page_data = rewritten;
+            self.at_eof = false;
+            return Ok(true);
+        }
+
         let staged_page = {
             let entry = self
                 .stack
                 .last_mut()
                 .ok_or_else(|| FrankenError::internal("cursor stack empty during overwrite"))?;
-            if end > entry.page_data.as_bytes().len() || end > usable_size {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "same-size payload overwrite extends past usable page".to_owned(),
-                });
-            }
             entry.page_data.as_bytes_mut()[cell.payload_offset..end].copy_from_slice(payload);
             entry.mutation_counter = Self::page_mutation_counter(&entry.page_data);
             entry.page_data.clone()
@@ -13451,6 +13562,155 @@ mod tests {
             page_no: PageNumber,
         ) -> impl Future<Output = Result<()>> + 'a {
             async move { self.inner.free_page(cx, page_no).await }
+        }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    /// Keeps each page image written to it as given, the way a transaction
+    /// keeps its staged pages, and shares it with reads, so a cursor can
+    /// change a staged image in place. Counts page writes and in-place
+    /// changes. With `offer_previous_image`, `try_mutate_staged_page_data`
+    /// hands out the image the page had before its last write, and keeps
+    /// what the closure makes of it: a staged image other than the one the
+    /// cursor shows.
+    struct ImageKeepingStore {
+        inner: MemPageStore,
+        images: std::collections::HashMap<u32, PageData>,
+        previous_images: std::collections::HashMap<u32, PageData>,
+        offer_previous_image: bool,
+        page_writes: usize,
+        in_place_changes: usize,
+    }
+
+    impl ImageKeepingStore {
+        fn new(inner: MemPageStore, offer_previous_image: bool) -> Self {
+            Self {
+                inner,
+                images: std::collections::HashMap::new(),
+                previous_images: std::collections::HashMap::new(),
+                offer_previous_image,
+                page_writes: 0,
+                in_place_changes: 0,
+            }
+        }
+
+        /// The bytes a reader of `page_no` gets.
+        fn page_bytes(&self, page_no: u32) -> Option<Vec<u8>> {
+            self.images.get(&page_no).map_or_else(
+                || self.inner.pages.get(&page_no).cloned(),
+                |image| Some(image.as_bytes().to_vec()),
+            )
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PageReader for ImageKeepingStore {
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move {
+                if let Some(image) = self.images.get(&page_no.get()) {
+                    return Ok(image.as_bytes().to_vec());
+                }
+                self.inner.read_page(cx, page_no).await
+            }
+        }
+
+        fn read_page_data<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<PageData>> + 'a {
+            async move {
+                if let Some(image) = self.images.get(&page_no.get()) {
+                    return Ok(image.clone());
+                }
+                self.inner.read_page_data(cx, page_no).await
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PageWriter for ImageKeepingStore {
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                self.write_page_data(cx, page_no, PageData::from_vec(data.to_vec()))
+                    .await
+            }
+        }
+
+        fn write_page_data<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: PageData,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                self.page_writes += 1;
+                self.inner.write_page(cx, page_no, data.as_bytes()).await?;
+                // The previous image is the last one that differs from the
+                // current: a rewrite of the same image keeps it.
+                let token = data.image_token();
+                if let Some(previous) = self.images.insert(page_no.get(), data)
+                    && previous.image_token() != token
+                {
+                    self.previous_images.insert(page_no.get(), previous);
+                }
+                Ok(())
+            }
+        }
+
+        fn try_mutate_staged_page_data(
+            &mut self,
+            page_no: PageNumber,
+            f: &mut dyn FnMut(&mut PageData),
+        ) -> bool {
+            let key = page_no.get();
+            let offered = if self.offer_previous_image {
+                self.previous_images.get_mut(&key)
+            } else {
+                self.images.get_mut(&key)
+            };
+            let Some(image) = offered else {
+                return false;
+            };
+            let token_before = image.image_token();
+            f(image);
+            if image.image_token() != token_before {
+                self.in_place_changes += 1;
+                let changed = image.clone();
+                self.inner.pages.insert(key, changed.as_bytes().to_vec());
+                self.inner.set_page_slot_present(page_no, true);
+                self.images.insert(key, changed);
+            }
+            true
+        }
+
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.allocate_page(cx).await }
+        }
+
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                self.images.remove(&page_no.get());
+                self.previous_images.remove(&page_no.get());
+                self.inner.free_page(cx, page_no).await
+            }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -19237,6 +19497,138 @@ mod tests {
                 "the late row's cell is the lowest on the page"
             );
             assert_each_delete_closes_exactly_its_own_gap(&disturbed, &rows).await;
+        });
+    }
+
+    /// 1,200 rows, then: every seventh deleted by seek, a run deleted that
+    /// drains whole leaves, every eleventh deleted during a scan (the cursor
+    /// stays on the successor, as a one-pass DELETE uses it), and every fifth
+    /// remaining row held whole on its page rewritten at the same size.
+    /// Returns the cursor and the rows the table must hold.
+    async fn delete_and_rewrite_rows<P: PageWriter>(
+        store: P,
+    ) -> (BtCursor<P>, BTreeMap<i64, Vec<u8>>) {
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut expected = BTreeMap::new();
+        for rowid in 1..=1_200 {
+            let payload = payload_for_rowid(rowid);
+            cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            expected.insert(rowid, payload);
+        }
+        for rowid in (7..=1_200).step_by(7).chain(400..=520) {
+            if expected.remove(&rowid).is_none() {
+                continue;
+            }
+            assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            cursor.delete(&cx).await.unwrap();
+        }
+        assert!(cursor.first(&cx).await.unwrap());
+        while !cursor.eof() {
+            let rowid = cursor.rowid(&cx).await.unwrap();
+            if rowid % 11 == 0 {
+                expected.remove(&rowid);
+                cursor.delete(&cx).await.unwrap();
+            } else if !cursor.next(&cx).await.unwrap() {
+                break;
+            }
+        }
+        for rowid in (5..=1_200).step_by(5) {
+            if rowid % 257 == 0 {
+                continue;
+            }
+            let Some(payload) = expected.get_mut(&rowid) else {
+                continue;
+            };
+            let rewritten: Vec<u8> = payload.iter().map(|byte| byte.wrapping_add(1)).collect();
+            assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            assert!(
+                cursor
+                    .table_overwrite_current_payload_same_size_no_overflow(&cx, rowid, &rewritten)
+                    .await
+                    .unwrap()
+            );
+            *payload = rewritten;
+        }
+        (cursor, expected)
+    }
+
+    /// Every row the cursor's table holds, in order.
+    async fn scan_table_rows<P: PageWriter>(cursor: &mut BtCursor<P>) -> BTreeMap<i64, Vec<u8>> {
+        let cx = Cx::new();
+        let mut rows = BTreeMap::new();
+        if cursor.first(&cx).await.unwrap() {
+            loop {
+                let rowid = cursor.rowid(&cx).await.unwrap();
+                rows.insert(rowid, cursor.payload(&cx).await.unwrap());
+                if !cursor.next(&cx).await.unwrap() {
+                    break;
+                }
+            }
+        }
+        rows
+    }
+
+    /// bd-w4pr1.13.20 lever F: deletes and same-size rewrites on a leaf the
+    /// store already holds as the image the cursor shows change that image in
+    /// place, and every page ends byte for byte as the copy-and-write path
+    /// leaves it (the store without staged images). A store whose staged image
+    /// is a different one (the page before its last write) must never be
+    /// changed in place: a rewrite planned from the cursor's view would
+    /// corrupt it; the cursor writes its own copy instead.
+    #[test]
+    fn test_delete_and_rewrite_change_the_staged_leaf_in_place_only_when_it_is_the_cursors() {
+        // The deletes empty leaves: hold the lock that
+        // `test_balance_for_delete_defers_until_leaf_empties` takes first, so
+        // they do not land in its global balance counter (bd-pyygd).
+        let _leaf_cursor_guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        run_async(async {
+            let (mut reference, expected) =
+                delete_and_rewrite_rows(MemPageStore::with_empty_table(pn(2), USABLE)).await;
+            assert_eq!(scan_table_rows(&mut reference).await, expected);
+            let reference_pages: BTreeMap<u32, Vec<u8>> = reference
+                .pager
+                .pages_iter()
+                .map(|(page_no, bytes)| (*page_no, bytes.to_vec()))
+                .collect();
+
+            for offer_previous_image in [false, true] {
+                let store = ImageKeepingStore::new(
+                    MemPageStore::with_empty_table(pn(2), USABLE),
+                    offer_previous_image,
+                );
+                let (mut cursor, rows) = delete_and_rewrite_rows(store).await;
+                assert_eq!(rows, expected);
+                assert_eq!(
+                    scan_table_rows(&mut cursor).await,
+                    expected,
+                    "offer_previous_image={offer_previous_image}: the table reads back"
+                );
+                for (page_no, bytes) in &reference_pages {
+                    assert_eq!(
+                        cursor.pager.page_bytes(*page_no).as_ref(),
+                        Some(bytes),
+                        "offer_previous_image={offer_previous_image}: page {page_no} differs \
+                         from the copy-and-write path"
+                    );
+                }
+                let pages_in_use = cursor.pager.inner.pages_iter().count();
+                assert_eq!(pages_in_use, reference_pages.len());
+                if offer_previous_image {
+                    assert_eq!(
+                        cursor.pager.in_place_changes, 0,
+                        "a staged image other than the cursor's is never changed in place"
+                    );
+                } else {
+                    assert!(
+                        cursor.pager.in_place_changes > 300,
+                        "deletes and rewrites on staged leaves change them in place: {}",
+                        cursor.pager.in_place_changes
+                    );
+                }
+            }
         });
     }
 

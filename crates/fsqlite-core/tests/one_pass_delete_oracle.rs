@@ -556,6 +556,106 @@ fn scan_update_matches_stock_in_one_pass_and_two() {
     });
 }
 
+/// Deletes and same-size rewrites on a leaf the transaction already staged
+/// change the staged image in place (bd-w4pr1.13.20, lever F), so what a
+/// savepoint and a failed statement undo was changed in place as well. The
+/// first statements stage every leaf; the ones after the savepoint and the
+/// two that fail partway (an integer overflow past a given rowid, after
+/// rewriting or deleting the rows before it) run on staged leaves.
+const IN_PLACE_SCRIPT: &[&str] = &[
+    "BEGIN",
+    "DELETE FROM t WHERE id % 7 = 0",
+    "UPDATE t SET a = a + 1 WHERE id % 10 = 0",
+    "SAVEPOINT s1",
+    "DELETE FROM t WHERE id % 5 = 0",
+    "UPDATE t SET a = a + 2 WHERE id % 3 = 0",
+    "ROLLBACK TO s1",
+    "UPDATE t SET a = a + 3 WHERE id % 4 = 0",
+    "UPDATE t SET a = a + 1 WHERE id % 2 = 0 AND \
+     (CASE WHEN id > 2500 THEN abs(id - id - 9223372036854775807 - 1) ELSE 1 END)",
+    "DELETE FROM t WHERE id % 3 = 0 AND \
+     (CASE WHEN id > 2600 THEN abs(id - id - 9223372036854775807 - 1) ELSE 1 END)",
+    "RELEASE s1",
+    "DELETE FROM t WHERE id % 11 = 0",
+    "COMMIT",
+];
+
+/// An outcome with an error's text dropped (the two engines word errors
+/// differently), and with no count for a transaction-control statement
+/// (stock's `execute` reports the last DML statement's count for those).
+fn outcome_kind<'a>(statement: &str, outcome: &'a str) -> &'a str {
+    if outcome.starts_with("error") {
+        "error"
+    } else if statement.starts_with("DELETE") || statement.starts_with("UPDATE") {
+        outcome
+    } else {
+        "ok"
+    }
+}
+
+#[test]
+fn scan_dml_on_staged_leaves_rolls_back_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let mut failures = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = if file_backed {
+                dir.path()
+                    .join("in_place.db")
+                    .to_str()
+                    .expect("utf-8 path")
+                    .to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&path).await.expect("open");
+            let r = rusqlite::Connection::open_in_memory().expect("stock open");
+            for setup in MANY {
+                f.execute(setup).await.expect("frank setup");
+                r.execute_batch(setup).expect("stock setup");
+            }
+            let mut errors = 0;
+            for statement in IN_PLACE_SCRIPT {
+                let fo = frank_outcome(&f, statement, false).await;
+                let so = stock_outcome(&r, statement);
+                if so.starts_with("error") {
+                    errors += 1;
+                }
+                if outcome_kind(statement, &fo) != outcome_kind(statement, &so) {
+                    failures.push(format!(
+                        "[file_backed={file_backed}] `{statement}`: frank {fo:?} vs stock {so:?}"
+                    ));
+                }
+                let state = "SELECT count(*), sum(id), sum(a), total(length(b)) FROM t";
+                let fv = f.query(state).await.map(|rows| frank_rows(&rows));
+                let sv = stock_rows(&r, state);
+                if !matches!((&fv, &sv), (Ok(a), Ok(b)) if a == b) {
+                    failures.push(format!(
+                        "[file_backed={file_backed}] after `{statement}`: frank {fv:?} vs stock {sv:?}"
+                    ));
+                }
+            }
+            assert_eq!(errors, 2, "the two failing statements fail on stock");
+            for state in MANY_STATE {
+                let fv = f.query(state).await.map(|rows| frank_rows(&rows));
+                let sv = stock_rows(&r, state);
+                if !matches!((&fv, &sv), (Ok(a), Ok(b)) if a == b) {
+                    failures.push(format!(
+                        "[file_backed={file_backed}] final `{state}`: frank {fv:?} vs stock {sv:?}"
+                    ));
+                }
+            }
+            f.close().await.expect("close");
+        }
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
 /// Opcode names of `EXPLAIN <statement>` on `f`.
 async fn explain_opcodes(f: &Connection, statement: &str) -> Vec<String> {
     f.query(&format!("EXPLAIN {statement}"))
