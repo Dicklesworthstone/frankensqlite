@@ -3277,7 +3277,7 @@ pub fn codegen_select(
                     where_clause.as_deref(),
                     table,
                     table_alias,
-                    None,
+                    PrefixIndexShape::AnyPrefix,
                 )
                 .is_some()
                 || extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
@@ -3455,7 +3455,7 @@ pub fn codegen_select(
             where_clause.as_deref(),
             table,
             table_alias,
-            Some(1),
+            PrefixIndexShape::SingleColumn,
         )
         .filter(|(_idx, prefix)| prefix.len() == 1)
         .map(|(idx, prefix)| (idx, prefix[0]))
@@ -3487,7 +3487,7 @@ pub fn codegen_select(
                 where_clause.as_deref(),
                 table,
                 table_alias,
-                Some(1),
+                PrefixIndexShape::SingleColumn,
             )?;
             (prefix.len() == 1).then(|| (idx, prefix[0], bounds))
         })
@@ -19599,6 +19599,18 @@ fn aggregate_index_range_seek_target<'t, 'e>(
     None
 }
 
+/// Which indexes [`aggregate_index_prefix_literal_residual_target`] may return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixIndexShape {
+    /// Any index with a non-empty equality prefix.
+    AnyPrefix,
+    /// A one-column index: one value's entries are in rowid order.
+    SingleColumn,
+    /// An index whose every key column the prefix pins, so the next record
+    /// field is the rowid and the pinned block is in rowid order.
+    FullKey,
+}
+
 /// The index and equality prefix a
 /// `COUNT(*)/SUM(...) WHERE a = <literal> AND <residual>` aggregate can seek:
 /// pin the leading key column(s) with an integer- or text-literal equality,
@@ -19609,15 +19621,15 @@ fn aggregate_index_range_seek_target<'t, 'e>(
 /// consumes no placeholders, so bound parameters in the residual keep the
 /// same numbering as the scan path; (3) there is at least one residual
 /// conjunct beyond the prefix (otherwise the exact eq-seek already handles
-/// it). `required_key_term_count` lets callers that depend on rowid ordering
-/// reject composite indexes while aggregate callers retain prefix support.
+/// it). `shape` lets callers that depend on rowid ordering skip indexes whose
+/// block is not in rowid order (see [`PrefixIndexShape`]).
 /// The residual filter enforces the whole predicate, so a dropped-predicate
 /// class of bug cannot occur.
 fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
-    required_key_term_count: Option<usize>,
+    shape: PrefixIndexShape,
 ) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
     let where_expr = where_clause?;
     // A bound parameter is allowed only in the RESIDUAL: the prefix is required to be an integer/text
@@ -19632,7 +19644,7 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
         if index.key_term_descending(0)
             || index.columns.is_empty()
             || index.columns.len() != index.key_term_count()
-            || required_key_term_count.is_some_and(|required| index.key_term_count() != required)
+            || (shape == PrefixIndexShape::SingleColumn && index.key_term_count() != 1)
             || !index_partial_predicate_is_covered_by_query_conjuncts(
                 index,
                 &conjuncts,
@@ -19644,7 +19656,10 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
         }
         let prefix = extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
         // Need a non-empty prefix AND at least one residual conjunct (else the exact eq-seek owns it).
-        if prefix.is_empty() || prefix.len() >= conjuncts.len() {
+        if prefix.is_empty()
+            || prefix.len() >= conjuncts.len()
+            || (shape == PrefixIndexShape::FullKey && prefix.len() != index.key_term_count())
+        {
             continue;
         }
         // The seek probe must land on a SUPERSET of the matching rows (the residual filter re-applies
@@ -20597,7 +20612,12 @@ fn codegen_select_aggregate(
         && index_range_seek.is_none()
         && composite_prefix_range_seek.is_none()
     {
-        aggregate_index_prefix_literal_residual_target(where_clause, table, table_alias, None)
+        aggregate_index_prefix_literal_residual_target(
+            where_clause,
+            table,
+            table_alias,
+            PrefixIndexShape::AnyPrefix,
+        )
     } else {
         None
     };
@@ -20646,6 +20666,31 @@ fn codegen_select_aggregate(
             .filter(|rhs| matches!(rhs, Expr::Literal(Literal::Integer(_), _)))
     } else {
         None
+    };
+
+    // bd-z3a05: `SUM(c) WHERE a = <lit> AND id < <int>` took `rowid_range_seek`,
+    // which walks the rowid slice (usually most of the table) and filters on `a`.
+    // When literal equalities pin every key column of an index, that index
+    // stores the matching entries in rowid order, so the walk below seeks
+    // `(prefix, lower)` and leaves once the rowid passes `upper`: it visits only
+    // rows that satisfy both, as stock's `SEARCH t USING INDEX (a=? AND
+    // rowid<?)` does. Only integer-literal rowid bounds; the residual filter
+    // still applies the whole WHERE. Every gate after `rowid_range_seek` saw it
+    // set and declined, so taking it over here changes no other choice.
+    let index_prefix_rowid_bounded = rowid_range_seek.as_ref().and_then(|(range, _)| {
+        let bounds = IndexEqRowidBounds::from_range(range)?;
+        let (idx, prefix) = aggregate_index_prefix_literal_residual_target(
+            where_clause,
+            table,
+            table_alias,
+            PrefixIndexShape::FullKey,
+        )?;
+        Some((idx, prefix, bounds))
+    });
+    let rowid_range_seek = rowid_range_seek.filter(|_| index_prefix_rowid_bounded.is_none());
+    let index_prefix_residual_seek = match index_prefix_rowid_bounded {
+        Some((idx, prefix, bounds)) => Some((idx, prefix, Some(bounds))),
+        None => index_prefix_residual_seek.map(|(idx, prefix)| (idx, prefix, None)),
     };
 
     let finalize_label = b.emit_label();
@@ -21633,16 +21678,20 @@ fn codegen_select_aggregate(
         let loop_body = loop_top as i32;
         b.emit_op(Opcode::Next, idx_cursor, loop_body, 0, P4::None, 0);
         skip_scan = true;
-    } else if let Some((idx_schema, prefix_exprs)) = index_prefix_residual_seek {
+    } else if let Some((idx_schema, prefix_exprs, rowid_bounds)) = index_prefix_residual_seek {
         // bd-agg-leading-eq-residual: seek the storage-class-exact equality-prefix block, then apply
         // the full WHERE per row so the residual predicate is enforced (no dropped-predicate bug),
         // and accumulate. Always non-covering — the residual filter reads table columns.
+        // bd-z3a05: `rowid_bounds` is set only when the prefix pins every key column, so the
+        // next record field is the rowid and the block is in rowid order.
         let idx_cursor = 1_i32;
         let duplicate_run_done = b.emit_label();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let prefix_len = prefix_exprs.len() as i32;
+        let rowid_floor = rowid_bounds.and_then(|bounds| bounds.lower);
+        let probe_field_count = prefix_len + i32::from(rowid_floor.is_some());
 
-        let probe_key_regs = b.alloc_regs(prefix_len);
+        let probe_key_regs = b.alloc_regs(probe_field_count);
         for (i, expr) in prefix_exprs.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let reg = probe_key_regs + i as i32;
@@ -21652,12 +21701,30 @@ fn codegen_select_aggregate(
         // A true partial record is the floor of the entire prefix block. A
         // synthetic `i64::MIN` next term would sort after NULL on an ASC
         // trailing key (and at the wrong end of a DESC key), silently dropping
-        // matching entries.
+        // matching entries. The rowid floor is a real bound on the rowid
+        // field, which is never NULL.
+        if let Some(floor) = rowid_floor {
+            b.emit_op(
+                Opcode::Int64,
+                0,
+                probe_key_regs + prefix_len,
+                0,
+                P4::Int64(floor),
+                0,
+            );
+        }
+        let rowid_ceiling_reg = rowid_bounds
+            .and_then(|bounds| bounds.upper)
+            .map(|ceiling| {
+                let reg = b.alloc_reg();
+                b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(ceiling), 0);
+                reg
+            });
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             probe_key_regs,
-            prefix_len,
+            probe_field_count,
             probe_record_reg,
             P4::None,
             0,
@@ -21711,6 +21778,18 @@ fn codegen_select_aggregate(
         let skip_label = b.emit_label();
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        // bd-z3a05: the block is in rowid order, so once an entry's rowid
+        // passes the ceiling no later entry can satisfy the WHERE.
+        if let Some(ceiling_reg) = rowid_ceiling_reg {
+            b.emit_jump_to_label(
+                Opcode::Gt,
+                ceiling_reg,
+                rowid_reg,
+                duplicate_run_done,
+                P4::None,
+                0,
+            );
+        }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             cursor,
@@ -56425,7 +56504,7 @@ mod tests {
                 Some(&function_where),
                 &function_table,
                 None,
-                None,
+                PrefixIndexShape::AnyPrefix,
             )
             .is_some(),
             "fixture must exercise the partial-index equality-prefix residual heuristic"
@@ -56456,7 +56535,7 @@ mod tests {
                     Some(&function_where),
                     &function_table,
                     None,
-                    None,
+                    PrefixIndexShape::AnyPrefix,
                 )
                 .is_none(),
                 "a scalar replacement must keep the function-bearing partial index \
@@ -56476,7 +56555,7 @@ mod tests {
                     Some(&plain_where),
                     &plain_table,
                     None,
-                    None,
+                    PrefixIndexShape::AnyPrefix,
                 )
                 .is_some(),
                 "the function-free partial index must remain eligible for the residual heuristic"

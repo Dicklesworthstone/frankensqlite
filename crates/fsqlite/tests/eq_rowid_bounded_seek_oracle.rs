@@ -196,11 +196,11 @@ fn sqlite_rows_with(
     .collect()
 }
 
-/// Whether the index seek's probe record carries a second field (the rowid
-/// bound): a two-field `MakeRecord` immediately before the `SeekGE`/`SeekLE`.
-async fn seek_probe_has_rowid_field(c: &Connection, sql: &str) -> bool {
-    let rows = c.query(&format!("EXPLAIN {sql}")).await.unwrap();
-    let ops: Vec<(String, i64)> = rows
+/// The program's `(opcode, p2)` pairs in address order.
+async fn explain_ops(c: &Connection, sql: &str) -> Vec<(String, i64)> {
+    c.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
         .iter()
         .map(|row| {
             let values = row.values();
@@ -214,12 +214,33 @@ async fn seek_probe_has_rowid_field(c: &Connection, sql: &str) -> bool {
             };
             (opcode, p2)
         })
-        .collect();
-    ops.windows(2).any(|pair| {
-        pair[0].0 == "MakeRecord"
-            && pair[0].1 == 2
-            && (pair[1].0 == "SeekGE" || pair[1].0 == "SeekLE")
-    })
+        .collect()
+}
+
+/// The field count of the index seek's probe record: the last `MakeRecord`
+/// before the first `SeekGE`/`SeekLE`.
+fn seek_probe_fields(ops: &[(String, i64)]) -> Option<i64> {
+    let seek = ops
+        .iter()
+        .position(|(op, _)| op == "SeekGE" || op == "SeekLE")?;
+    ops[..seek]
+        .iter()
+        .rev()
+        .find(|(op, _)| op == "MakeRecord")
+        .map(|(_, fields)| *fields)
+}
+
+/// Whether the walk leaves the key's block once the rowid passes a ceiling:
+/// an `IdxRowid` immediately followed by a `Gt` jump.
+fn has_rowid_ceiling(ops: &[(String, i64)]) -> bool {
+    ops.windows(2)
+        .any(|pair| pair[0].0 == "IdxRowid" && pair[1].0 == "Gt")
+}
+
+/// Whether the index seek's probe record carries a second field (the rowid
+/// bound) after a one-column key.
+async fn seek_probe_has_rowid_field(c: &Connection, sql: &str) -> bool {
+    seek_probe_fields(&explain_ops(c, sql).await) == Some(2)
 }
 
 /// bd-z3a05, bound parameters: keyset pagination as applications write it.
@@ -302,5 +323,167 @@ fn eq_rowid_bound_parameters_start_the_seek_and_match_sqlite() {
             "`{composite}`"
         );
         assert!(!seek_probe_has_rowid_field(&f, composite).await);
+    });
+}
+
+/// bd-z3a05, aggregates: `SUM(c) WHERE a = 5 AND id < 900` walked the rowid
+/// slice and filtered on `a`. When literal equalities pin every key column of
+/// an index, the aggregate seeks `(key, floor)` and leaves the block past the
+/// ceiling, as stock's `SEARCH t USING INDEX t_a (a=? AND rowid<?)` does.
+/// `group_concat` pins the visiting order (rowid order, as stock's).
+#[test]
+fn eq_rowid_bounded_aggregates_seek_the_index_and_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        // (query, index, probe fields when the rowid floor is in the probe, ceiling check)
+        let bounded: [(&str, &str, i64, bool); 12] = [
+            (
+                "SELECT sum(c) FROM t WHERE a = 5 AND id < 900",
+                "t_a",
+                1,
+                true,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE a = 5 AND id > 100",
+                "t_a",
+                2,
+                false,
+            ),
+            (
+                "SELECT sum(c), count(*), min(id), max(id), avg(c) FROM t \
+                 WHERE a = 5 AND id BETWEEN 100 AND 900",
+                "t_a",
+                2,
+                true,
+            ),
+            (
+                "SELECT group_concat(id) FROM t WHERE a = 5 AND id > 1300",
+                "t_a",
+                2,
+                false,
+            ),
+            (
+                "SELECT group_concat(id) FROM t WHERE a = 5 AND id <= 300",
+                "t_a",
+                1,
+                true,
+            ),
+            (
+                "SELECT total(c), count(x) FROM t WHERE x = 'v3' AND id >= 1400",
+                "t_x",
+                2,
+                false,
+            ),
+            (
+                "SELECT sum(c) FROM t WHERE a = 5 AND id > 100 AND id < 700 AND c = 3",
+                "t_a",
+                2,
+                true,
+            ),
+            (
+                "SELECT count(*), sum(c) FROM t WHERE a = 99 AND id > 0",
+                "t_a",
+                2,
+                false,
+            ),
+            (
+                "SELECT count(*), sum(c) FROM t WHERE a = 5 AND id > 100000",
+                "t_a",
+                2,
+                false,
+            ),
+            (
+                "SELECT count(*), sum(c) FROM t WHERE a = 5 AND id BETWEEN 300 AND 50",
+                "t_a",
+                2,
+                true,
+            ),
+            (
+                "SELECT max(c) FROM t WHERE id > 1000 AND a = 7",
+                "t_a",
+                2,
+                false,
+            ),
+            // Both key columns pinned: the next field is the rowid here too.
+            (
+                "SELECT sum(id) FROM u WHERE a = 5 AND c = 3 AND id > 100",
+                "u_ac",
+                3,
+                false,
+            ),
+        ];
+        for (sql, index, probe_fields, ceiling) in bounded {
+            assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
+            let ops = explain_ops(&f, sql).await;
+            assert!(
+                opens_index(&f, sql, index).await,
+                "bd-z3a05: `{sql}` must seek {index}, not walk the rowid slice"
+            );
+            assert_eq!(
+                seek_probe_fields(&ops),
+                Some(probe_fields),
+                "bd-z3a05: `{sql}` probe record"
+            );
+            assert_eq!(
+                has_rowid_ceiling(&ops),
+                ceiling,
+                "bd-z3a05: `{sql}` rowid ceiling check"
+            );
+        }
+        // A composite index listed first, which `a = 5` does not fully pin, must
+        // not hide the one-column index that qualifies.
+        for statement in [
+            "CREATE TABLE w (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER)",
+            "CREATE INDEX w_ac ON w(a, c)",
+            "CREATE INDEX w_a ON w(a)",
+            "INSERT INTO w SELECT id, a, c FROM t",
+        ] {
+            f.execute(statement).await.unwrap();
+            r.execute_batch(statement).unwrap();
+        }
+        let shadowed = "SELECT sum(c), group_concat(id) FROM w WHERE a = 5 AND id < 900";
+        assert_eq!(
+            frank_rows(&f, shadowed).await,
+            sqlite_rows(&r, shadowed),
+            "`{shadowed}`"
+        );
+        assert!(
+            opens_index(&f, shadowed, "w_a").await,
+            "`{shadowed}` must seek w_a"
+        );
+        assert!(has_rowid_ceiling(&explain_ops(&f, shadowed).await));
+
+        // Outside the lane, answers must still match. `u`'s `a = 5` entries are
+        // ordered by c, so leaving at the first rowid past 900 would drop rows:
+        // the lane must not claim it. (No group_concat here: this plan visits
+        // in rowid order while stock walks u_ac, so its order differs, on main
+        // as well.)
+        let composite = "SELECT count(*), sum(c), sum(id) FROM u WHERE a = 5 AND id < 900";
+        assert_eq!(
+            frank_rows(&f, composite).await,
+            sqlite_rows(&r, composite),
+            "`{composite}`"
+        );
+        assert!(!has_rowid_ceiling(&explain_ops(&f, composite).await));
+        let other = [
+            "SELECT sum(c) FROM t WHERE a = 5 AND id > 10.5",
+            "SELECT sum(c) FROM t WHERE a = 5 AND id > -5",
+            "SELECT sum(c) FROM t WHERE a = '5' AND id > 100",
+            "SELECT sum(c) FROM t WHERE a IS NULL AND id > 100",
+            "SELECT sum(c) FROM t WHERE (a = 5 OR a = 6) AND id < 900",
+            "SELECT c, sum(id) FROM t WHERE a = 5 AND id < 900 GROUP BY c",
+            "SELECT sum(c) FROM t WHERE a = 5 AND id < 900 HAVING count(*) > 3",
+            "SELECT count(*) FROM t WHERE a = 5 AND id < 900 AND id > 950",
+        ];
+        for sql in other {
+            assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
+        }
+        let param = "SELECT sum(c), count(*) FROM t WHERE a = 5 AND id < ?1";
+        let params = [SqliteValue::Integer(900)];
+        assert_eq!(
+            frank_rows_with(&f, param, &params).await,
+            sqlite_rows_with(&r, param, &params),
+            "`{param}`"
+        );
     });
 }
