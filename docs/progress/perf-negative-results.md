@@ -87,6 +87,54 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: the shell reads a one-line plain statement in one pass and asks the dot-command table only about '.' lines (bd-w4pr1.13.35, lever 2)
+
+- Target: every statement line the shell reads (the scorecard's text rows; measured on
+  `txn_1000x10_rows` and `autocommit_5k_inserts`). Touched: `crates/fsqlite-cli/src/main.rs`
+  (`scan_pending_input`, new `lone_plain_statement_scan`, the state machine renamed
+  `scan_pending_input_by_states`; the read loop's dot-command call).
+- Ledger preflight: the 2026-11-12 bd-5310l WIN entry for this scan set its retry line at "the
+  completeness scan above 3% of a statement shape"; it measured 1,920 instructions of a 38,978
+  in-transaction INSERT (4.9%) after lever 1, about 47 a byte of `INSERT INTO e(w,s)
+  VALUES(7,'p-7-3');`. `try_execute_dot_command` cost 529 for a line that is not a dot command
+  (ten '.'-prefixed name tests in an async fn built and polled for every line).
+- Change: `scan_pending_input` first tries one pass that answers only for: after ASCII whitespace
+  one of the four verbs followed by an ASCII byte, no `"`, backtick or `[` anywhere, no `--` or
+  `/*` anywhere (strings included), balanced single quotes, exactly one semicolon outside strings
+  and it is the last significant byte. That input is exactly what the state scan calls complete
+  and lone (no trigger head can follow the verb, no comment or quoted name can arise, and toggling
+  on every `'` gives the doubled-quote rule's inside/outside answer); everything else goes to the
+  unchanged state scan. The read loop calls `try_execute_dot_command` only for a line starting with
+  '.', every one of its arms tests a '.'-prefixed name.
+- Result (binaries 30b8b968... = lever 1's measured binary, c2b7c9a0... = that tree plus this
+  diff; stock sqlite3 3.46.1 live; every answer equal to stock's): exact per in-transaction INSERT
+  (callgrind, N=2000 minus N=1000) 38,978 -> 37,435 (-1,543): the scan 1,920 -> 898 inclusive and
+  the dot-command dispatch 529 -> 0. perf stat, 7 interleaved reps: `txn_1000x10_rows` 689.0M ->
+  675.6M mean (median 687.6M -> 670.5M; 4.48x -> 4.39x stock 153.9M), CPU best 247.6 -> 241.9 ms
+  (stock 33.1 ms, A/A 1.17); `autocommit_5k_inserts` 1,243.3M -> 1,226.7M mean (10,000 + 2,002
+  lines in the txn row and 5,000 in the autocommit row take the change; the autocommit row's
+  spread is about 2%). Prediction (registered): scan -1.4k to -1.7k, dot dispatch -0.45k to
+  -0.55k; kills: scan under 0.7k, dot under 0.2k, total under 1.2k. The dot dispatch met its
+  prediction; the scan missed it (the one-pass check costs about 22 instructions a byte, not the
+  six to eight estimated) but cleared its kill line; total cleared.
+- Behaviour: shell output byte-identical to the lever-1 binary over 768 runs (`cli_modes_diff2.py`:
+  six modes, headers on and off, sixteen script tails, `:memory:` and a file, separate and merged
+  streams). Test `test_lone_plain_statement_scan_agrees_with_the_state_scan_wherever_it_answers`
+  holds the quick answer to the state scan over every sequence of up to five of sixteen pieces
+  joined by a space and up to four joined by nothing (dashes, slashes, stars, stray and doubled
+  quotes, brackets, a comment, a non-ASCII byte), checks the scorecard lines take the quick path,
+  and lists what a careless quick scan would call lone (`'a--b'`, a second statement, a trailing
+  quote or non-ASCII byte, `selectx`).
+- Gate (rch, lever 1 plus the change): clippy -D warnings on fsqlite-cli `--all-targets` clean
+  (and again on the rebased tree); fsqlite-cli tests 84 pass (79 unit, 3 + 2 integration).
+- Landed as ca047f382 (rebased onto 4b8f3e9cb; clippy reran on 36888e0b3 plus the change, the
+  one later upstream commit is tracker and docs only).
+- Retry condition: for a faster quick scan, the 898-instruction one-pass check above 3% of a
+  statement shape (2.4% of this INSERT now), with a class-table or `memchr`-style search over the
+  same refused set and the same test. Next on this bead: the literal scan's per-parameter `to_string` and string copies
+  (about 0.55k per INSERT), the statement savepoint (about 2.5k), the engine handed over by value
+  (about 2.5k; see the 2026-11-12 REJECTED entry for its retry condition).
+
 ## 2026-11-13 - WIN: a same-size row rewrite parses its cell without the cell-slot cache (bd-w4pr1.13.20, lever Q)
 
 - Target: every UPDATE row rewritten in place at the same size (the scorecard's
