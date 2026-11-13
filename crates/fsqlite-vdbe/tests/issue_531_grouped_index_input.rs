@@ -250,9 +250,16 @@ fn not_indexed_preserves_the_forced_table_scan() {
 fn singleton_rhs_collation_controls_selective_in_admission() {
     let schema = schema('B', &["post_id"]);
     for (predicate, should_seek, fallback_collation) in [
-        ("post_id IN ('a' COLLATE NOCASE)", false, Some("NOCASE")),
-        ("post_id IN (?1 COLLATE NOCASE)", false, Some("NOCASE")),
-        ("post_id IN ('a' COLLATE RTRIM)", false, Some("RTRIM")),
+        // A constant singleton compares as `=`, so a collation inside it
+        // counts (bd-gzjsr keeps this rule for every element that is not
+        // itself a COLLATE).
+        ("post_id IN ('a' COLLATE NOCASE || '')", false, Some("NOCASE")),
+        ("post_id IN (?1 COLLATE RTRIM || '')", false, Some("RTRIM")),
+        // SQLite 3.54 keeps a singleton that is itself a COLLATE as an IN,
+        // which compares with the left side's collation only (bd-gzjsr).
+        ("post_id IN ('a' COLLATE NOCASE)", true, None),
+        ("post_id IN (?1 COLLATE NOCASE)", true, None),
+        ("post_id IN ('a' COLLATE RTRIM)", true, None),
         ("post_id IN ('a' COLLATE BINARY)", true, None),
         ("post_id IN ('a')", true, None),
         // SQLite ignores explicit RHS collations in a multi-element IN list.

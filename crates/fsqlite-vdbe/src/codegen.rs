@@ -2314,8 +2314,7 @@ fn emit_upsert_expr(
                 let r_saw_null = b.alloc_temp();
                 b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
                 let r_val = b.alloc_temp();
-                let in_collation = if values.len() == 1 && singleton_in_rhs_is_constant(&values[0])
-                {
+                let in_collation = if singleton_in_compares_as_equality(values) {
                     upsert_comparison_collation(
                         operand,
                         &values[0],
@@ -19158,9 +19157,12 @@ fn index_const_in_list_target<'t, 'a>(
             if values.is_empty() || !values.iter().all(rowid_in_probe_value_is_constant) {
                 return None;
             }
-            // A singleton constant IN uses binary-comparison collation rules;
-            // a longer list ignores the collations on its RHS expressions.
-            if values.len() == 1 && !is_binary(extract_collation(&values[0])) {
+            // A singleton constant IN uses binary-comparison collation rules
+            // unless it is itself a COLLATE (3.54); a longer list ignores the
+            // collations on its RHS expressions.
+            if singleton_in_compares_as_equality(values)
+                && !is_binary(extract_collation(&values[0]))
+            {
                 return None;
             }
             (column, values.iter().collect())
@@ -40445,9 +40447,9 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 emit_expr(b, operand, r_operand, ctx);
                 // A constant singleton IN-list is comparison-equivalent in
                 // SQLite, so its RHS may supply an explicit/declared collation.
-                // Longer or row-dependent lists use only the LHS collation.
-                let in_collation = if values.len() == 1 && singleton_in_rhs_is_constant(&values[0])
-                {
+                // Longer or row-dependent lists, and a singleton that is itself
+                // a COLLATE (3.54), use only the LHS collation.
+                let in_collation = if singleton_in_compares_as_equality(values) {
                     comparison_collation_ctx(operand, &values[0], ctx)
                 } else {
                     extract_collation(operand)
@@ -40830,12 +40832,28 @@ fn in_list_value_supports_once_materialization(expr: &Expr) -> bool {
     }
 }
 
+/// Whether the IN-list `values` is one element that SQLite's parser rewrites
+/// to an equality (`x IN (e)` -> `x = +e`), so that `e`'s collation takes part
+/// as in a binary comparison. Any other list compares with the left side's
+/// collation only.
+///
+/// SQLite 3.54 skips the rewrite when `e` is itself a COLLATE expression
+/// (`pRHS->op!=TK_COLLATE` in the parser): `'A' IN ('a' COLLATE NOCASE)` stays an
+/// IN and is 0, where 3.53 made it `'A' = 'a' COLLATE NOCASE`, which is 1. A
+/// COLLATE nested inside the element (`'a' COLLATE NOCASE || ''`) still rides
+/// on the rewritten comparison (bd-gzjsr).
+fn singleton_in_compares_as_equality(values: &[Expr]) -> bool {
+    matches!(values, [value] if !matches!(value, Expr::Collate { .. })
+        && singleton_in_rhs_is_constant(value))
+}
+
 /// Whether SQLite may treat a one-element IN-list as an ordinary binary
 /// comparison for collation precedence.  This is narrower than "evaluates to
 /// one value": table columns, scalar subqueries, and non-deterministic calls
 /// remain genuine IN-list terms and therefore cannot donate an RHS collation.
 /// Registry metadata admits both deterministic and SQLite slow-changing scalar
-/// calls, provided every argument is recursively query-constant.
+/// calls, provided every argument is recursively query-constant. A top-level
+/// COLLATE is screened out by [`singleton_in_compares_as_equality`].
 fn singleton_in_rhs_is_constant(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
@@ -43707,7 +43725,7 @@ fn emit_expr_with_fallback(
                     let null_label = b.emit_label();
                     b.emit_jump_to_label(Opcode::IsNull, r_op, 0, null_label, P4::None, 0);
                     let in_collation =
-                        if values.len() == 1 && singleton_in_rhs_is_constant(&values[0]) {
+                        if singleton_in_compares_as_equality(values) {
                             fallback_comparison_collation(operand, &values[0], inner_ctx, outer_ctx)
                         } else {
                             fallback_effective_collation(operand, inner_ctx, outer_ctx)
@@ -57043,9 +57061,13 @@ mod tests {
         let schema = test_schema_with_text_index();
         let ctx = CodegenContext::default();
         for (predicate, should_seek, fallback_collation) in [
-            ("b IN ('a' COLLATE NOCASE)", false, Some("NOCASE")),
-            ("b IN (?1 COLLATE NOCASE)", false, Some("NOCASE")),
-            ("b IN ('a' COLLATE RTRIM)", false, Some("RTRIM")),
+            // A constant singleton compares as `=` unless it is itself a
+            // COLLATE (SQLite 3.54, bd-gzjsr).
+            ("b IN ('a' COLLATE NOCASE || '')", false, Some("NOCASE")),
+            ("b IN (?1 COLLATE RTRIM || '')", false, Some("RTRIM")),
+            ("b IN ('a' COLLATE NOCASE)", true, None),
+            ("b IN (?1 COLLATE NOCASE)", true, None),
+            ("b IN ('a' COLLATE RTRIM)", true, None),
             ("b IN ('a' COLLATE BINARY)", true, None),
             ("b IN ('a')", true, None),
             ("b IN ('a' COLLATE NOCASE, 'b')", true, None),

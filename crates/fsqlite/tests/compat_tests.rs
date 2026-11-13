@@ -2555,6 +2555,36 @@ mod rusqlite_parity {
                  FROM in_rhs",
             )
             .await;
+
+            // bd-gzjsr: SQLite 3.54 rewrites a constant singleton to `=` only
+            // when the element is not itself a COLLATE. A nested COLLATE still
+            // rides on the comparison; a top-level one is ignored like any
+            // multi-item RHS collation, so an unknown name is no error, and
+            // the declared NOCASE of `value` wins over `COLLATE BINARY`.
+            let index_schema = "
+                CREATE TABLE in_rhs_idx (x TEXT);
+                CREATE INDEX in_rhs_idx_nocase ON in_rhs_idx (x COLLATE NOCASE);
+                INSERT INTO in_rhs_idx VALUES ('A'), ('a');
+            ";
+            rconn.execute_batch(index_schema).unwrap();
+            fconn.execute_batch(index_schema).await.unwrap();
+            assert_direct_and_prepared_query_parity(
+                "IN_LIST_SINGLETON_COLLATE_3_54",
+                &rconn,
+                &fconn,
+                "SELECT
+                     'A' IN ('a' COLLATE NOCASE || ''),
+                     'A' IN (('a' || '') COLLATE NOCASE),
+                     'A' IN ('a' COLLATE nosuch),
+                     value IN ('A' COLLATE BINARY),
+                     value IN ('A' COLLATE BINARY, 'x'),
+                     value = ('A' COLLATE BINARY),
+                     (SELECT count(*) FROM in_rhs_idx WHERE x IN ('a' COLLATE NOCASE)),
+                     (SELECT count(*) FROM in_rhs_idx WHERE x = 'a' COLLATE NOCASE),
+                     (SELECT count(*) FROM in_rhs_idx WHERE x IN ('a' COLLATE NOCASE || ''))
+                 FROM in_rhs",
+            )
+            .await;
         });
     }
 

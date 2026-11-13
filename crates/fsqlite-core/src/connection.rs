@@ -93367,7 +93367,7 @@ impl Connection {
                             let singleton_comparison = list.len() == 1 && {
                                 let function_registry = self.func_registry.borrow();
                                 list.first().is_some_and(|list_expr| {
-                                    singleton_in_rhs_is_constant(list_expr, &function_registry)
+                                    singleton_in_compares_as_equality(list_expr, &function_registry)
                                 })
                             };
                             // bd-wwqen.2 B2.3: Use cached pre-computed HashSet for large
@@ -131371,7 +131371,7 @@ fn eval_group_agg_join_expr(
             let singleton_constant = list.len() == 1
                 && list
                     .first()
-                    .is_some_and(current_singleton_in_rhs_is_constant);
+                    .is_some_and(current_singleton_in_compares_as_equality);
             for (list_expr, lv) in list.iter().zip(&list_vals) {
                 if lv.is_null() {
                     saw_null = true;
@@ -139879,7 +139879,7 @@ fn evaluate_having_value(
                     let singleton_constant = exprs.len() == 1
                         && exprs
                             .first()
-                            .is_some_and(current_singleton_in_rhs_is_constant);
+                            .is_some_and(current_singleton_in_compares_as_equality);
                     for e in exprs {
                         let set_val =
                             evaluate_having_value(e, values, columns, group_rows, col_map)?;
@@ -146546,7 +146546,7 @@ fn index_expr_uses_collation_dependency(
                 InSet::List(values) if values.is_empty() => false,
                 InSet::List(values) if values.len() == 1 => {
                     let registry = connection.func_registry.borrow();
-                    if singleton_in_rhs_is_constant(&values[0], &registry) {
+                    if singleton_in_compares_as_equality(&values[0], &registry) {
                         index_comparison_uses_collation(expr, &values[0], table, target)
                     } else {
                         index_expr_effective_collation(expr, table)
@@ -146729,7 +146729,7 @@ fn validate_index_expr_inherited_collation_consumers(
                 && let [value] = values.as_slice()
             {
                 let function_registry = connection.func_registry.borrow();
-                if singleton_in_rhs_is_constant(value, &function_registry) {
+                if singleton_in_compares_as_equality(value, &function_registry) {
                     validate_index_binary_comparison_collation(expr, value, table, registry)?;
                 } else if let Some(collation) = index_expr_effective_collation(expr, table) {
                     validate_registered_collation(collation, registry)?;
@@ -147224,7 +147224,7 @@ fn validate_in_list_membership_collations(
         Ok(())
     } else if let [value] = values {
         let function_registry = connection.func_registry.borrow();
-        if singleton_in_rhs_is_constant(value, &function_registry) {
+        if singleton_in_compares_as_equality(value, &function_registry) {
             validate_binary_comparison_collation(lhs, value, registry)
         } else {
             validate_in_lhs_collations(lhs, registry)
@@ -158968,7 +158968,7 @@ fn emit_in_expr(
     let singleton_constant = list.len() == 1
         && list
             .first()
-            .is_some_and(|element| singleton_in_rhs_is_constant(element, function_registry));
+            .is_some_and(|element| singleton_in_compares_as_equality(element, function_registry));
     let elem_reg = builder.alloc_temp();
     for elem in list {
         emit_expr(builder, elem, elem_reg, bind_state)?;
@@ -163195,11 +163195,23 @@ fn compare_join_in_values(
     })
 }
 
-fn current_singleton_in_rhs_is_constant(expr: &Expr) -> bool {
+/// Whether SQLite's parser rewrites a one-element IN list holding `expr` to an
+/// equality (`x IN (e)` -> `x = +e`), so that `expr`'s collation takes part as
+/// in a binary comparison. Any other list compares with the left side's
+/// collation only. `expr` must be constant ([`singleton_in_rhs_is_constant`])
+/// and, since SQLite 3.54 (`pRHS->op!=TK_COLLATE`), not itself a COLLATE:
+/// `'A' IN ('a' COLLATE NOCASE)` stays an IN and is 0 (bd-gzjsr).
+fn singleton_in_compares_as_equality(expr: &Expr, registry: &FunctionRegistry) -> bool {
+    !matches!(expr, Expr::Collate { .. }) && singleton_in_rhs_is_constant(expr, registry)
+}
+
+fn current_singleton_in_compares_as_equality(expr: &Expr) -> bool {
     with_current_sync_function_registry(|registry| {
-        registry.map(|registry| singleton_in_rhs_is_constant(expr, registry))
+        registry.map(|registry| singleton_in_compares_as_equality(expr, registry))
     })
-    .unwrap_or_else(|| singleton_in_rhs_is_constant(expr, shared_builtin_function_registry()))
+    .unwrap_or_else(|| {
+        singleton_in_compares_as_equality(expr, shared_builtin_function_registry())
+    })
 }
 
 /// Evaluate an expression against a combined join row, producing a value.
@@ -163795,7 +163807,7 @@ pub(crate) fn eval_join_expr(
                 InSet::List(exprs) => {
                     let mut found = false;
                     let singleton_comparison =
-                        exprs.len() == 1 && current_singleton_in_rhs_is_constant(&exprs[0]);
+                        exprs.len() == 1 && current_singleton_in_compares_as_equality(&exprs[0]);
                     for e in exprs {
                         let set_val = eval_join_expr(e, row, col_map)?;
                         if set_val.is_null() {
@@ -173116,8 +173128,12 @@ mod tests {
                      2 COLLATE BINARY)) COLLATE BINARY) OVER () LIMIT 0;",
                     "firstbad",
                 ),
+                // A singleton RHS compares as `=` and its collation is checked;
+                // since SQLite 3.54 only when the element is not itself a
+                // COLLATE (`1 IN (2 COLLATE bad)` stays an IN and is no error,
+                // bd-gzjsr), so the COLLATE is nested here.
                 (
-                    "SELECT sum((1 IN (2 COLLATE singlerhsbad)) \
+                    "SELECT sum((1 IN (2 COLLATE singlerhsbad || '')) \
                      COLLATE BINARY) OVER () LIMIT 0;",
                     "singlerhsbad",
                 ),
@@ -207030,8 +207046,14 @@ mod tests {
                      FROM rhs_collation ORDER BY v LIMIT 1);",
                     SqliteValue::Integer(0),
                 ),
+                // SQLite 3.54 keeps a singleton that is itself a COLLATE as an
+                // IN, compared with the left side's collation (bd-gzjsr).
                 (
                     "SELECT (SELECT 'a') IN ('A' COLLATE NOCASE);",
+                    SqliteValue::Integer(0),
+                ),
+                (
+                    "SELECT (SELECT 'a') IN ('A' COLLATE NOCASE || '');",
                     SqliteValue::Integer(1),
                 ),
                 (
