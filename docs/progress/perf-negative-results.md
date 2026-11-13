@@ -87,6 +87,83 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: a table window SELECT scans into one flat buffer and drops it before output; join projections reserve their width (bd-w4pr1.12)
+
+- Target: peak RSS of the scorecard's `window_row_number` (`SELECT sum(rn) FROM (SELECT
+  row_number() OVER (PARTITION BY a ORDER BY c) rn FROM t)`, 1M rows), 378 MB against stock's
+  16.7 MB. massif of f572c5312 put the heap peak (396 MB, 112 MB of it allocator overhead) at
+  output assembly: 96 MB of scanned values in a million boxed engine rows plus a 24 MB `Vec<Row>`,
+  48 MB `window_results`, 48 MB of one-value output rows plus their 24 MB vector, and the engine's
+  16 MB result array. After the window SELECT returned, the outer `sum()` reached 333 MB: the
+  `execute_join_select` projection grew each row from `Vec::new()`, reserving four values (192
+  bytes) for a one-value row, so it capped RSS once the window phase fell. Touched:
+  `crates/fsqlite-core/src/connection.rs` (`FlatRows`, `TableRowSink`, `WindowScanRows`;
+  `execute_table_program_with_cx` / `execute_table_program_with_db` take a row sink;
+  `execute_window_select`; the `execute_join_select` projection) and
+  `crates/fsqlite-core/src/connection/insert_batch.rs` (one caller passes no sink).
+- Ledger preflight: the step-4 entry below (free the scanned rows before output) was REJECTED
+  because glibc keeps a million freed small blocks, and its retry condition names this lever.
+- Change: (1) the single-table window scan runs its program with a row sink that appends each
+  result row's values to one `Vec<SqliteValue>`, `col_map.len()` values a row (a row of another
+  width is an error); the window code reads row i as a slice of it. Join-sourced window rows keep
+  their moved per-row vectors. The prepared streaming query's handler is the sink's other variant,
+  with the same behaviour. (2) The step-4 early free, retried as its retry condition says: when no
+  plain or wrapped result column and no ORDER BY term outside the result columns reads the scanned
+  rows, the buffer is dropped before the output rows are built; it is one allocation, so its
+  memory leaves the process. (3) `execute_join_select` reserves each projected row at the previous
+  row's width.
+- Result: CLI release-perf, scorecard database, stock sqlite3 3.46.1 live in the same script, 5
+  runs per arm, min user instructions, median CPU and peak RSS (`rss_probe.py`, io_uring refused).
+  Before is main f437189e1 (sha256 ccb2c2f4...), after is the change on it (a31e1538...); it landed
+  rebased on f9f4e3a1d as 5872e70cd. Two runs, at load 15 and 7; the table is the second, and the first agrees
+  within 2.3 MB and 6.1% CPU. Answers equal stock's in every row.
+
+  | statement (summed in an outer SELECT) | stock | before | after |
+  |---|---|---|---|
+  | `row_number() OVER (PARTITION BY a ORDER BY c)` | 8,225.1M, 678.5 ms, 16.7 MB | 9,549.7M, 1,331.2 ms, 380.4 MB | 8,839.7M, 1,106.7 ms, 241.7 MB |
+  | `rank() OVER (ORDER BY b)` | 8,534.8M, 718.8 ms, 16.7 MB | 6,137.8M, 742.9 ms, 402.4 MB | 5,532.5M, 682.9 ms, 263.3 MB |
+  | `sum(c) OVER (PARTITION BY a)` | 6,587.8M, 525.8 ms, 16.7 MB | 7,566.2M, 1,213.8 ms, 380.1 MB | 6,845.9M, 1,035.6 ms, 241.6 MB |
+  | `row_number() OVER (PARTITION BY a % 7 ORDER BY c * 2)` (computed keys) | 8,673.7M, 689.8 ms, 16.6 MB | 12,227.7M, 1,606.8 ms, 380.2 MB | 10,753.2M, 1,398.1 ms, 327.3 MB |
+  | `row_number() OVER (PARTITION BY a ORDER BY c) + a` (reads the rows) | 8,832.3M, 719.4 ms, 16.7 MB | 11,102.9M, 1,482.0 ms, 403.6 MB | 10,412.2M, 1,213.0 ms, 264.4 MB |
+
+  Scorecard (`user_shape_scorecard.py`, 2 reps, wall time, stock at both ends): window_row_number
+  1.298 s and 380 MiB (1.94x) -> 1.144 s and 240 MiB (1.71x); stock 0.670 s and 0.667 s, 14-15
+  MiB. Every other row's answer equals stock's and its wall time moves under 10% at 2 reps (the
+  largest, join_no_index +9.5%, is 2.2 ms). By user instructions the controls are unchanged, the
+  two largest wall-time moves among them: `v1 JOIN v2` 110.4M, `t JOIN u` 4,326.0M, the GROUP BY
+  subquery 3,336.4M in both arms (`rss_probe.py`, 5 runs), the 300k-row DELETE 697.1M -> 697.2M (a
+  fresh database per run, 5 runs). massif of the candidate: heap peak 232 MB, now in the window
+  phase (100.7 MB flat-buffer capacity, 48 MB `func_vals`, 48 MB `window_results`, three index
+  vectors), and allocator overhead 0.07 MB against 112 MB.
+- Prediction (bead comment before code): window_row_number RSS 378 -> 220-270 MB, CPU -8 to
+  -18%, instructions -2 to -6%; rank, sum(c) and computed keys RSS -25 to -40%; the column-reading
+  shape -10 to -25%. Kill: RSS under -30% and CPU under -10% on window_row_number, or another
+  shape worse by over 3% CPU or 5% RSS, or an oracle change. Measured: RSS -36.5%, CPU -16.9%
+  (-13.1% in the first run), instructions -7.4%; rank -34.6%, sum(c) -36.4%; the column-reading
+  shape -34.5%, above its range, since the flat scan alone removes the per-row overhead it pays;
+  computed keys -13.9%, below its range, because its two 48 MB flat key vectors are alive in the
+  window phase, which is its peak. Kill not crossed: kept.
+- Gate on f437189e1 + change (the measured tree): clippy -D warnings clean (fsqlite-core
+  --all-targets); fsqlite-core lib tests filtered on window, for_each, join, flat_rows: 269 pass,
+  among them `test_flat_rows_store_rows_by_stride_and_refuse_other_widths` (rows of another width
+  refused), `test_table_window_select_scans_into_flat_rows_and_drops_them_only_when_unread` (every
+  value class; plain, wrapped and non-result ORDER BY reads after the drop decision) and the
+  updated in-place key test; `test_t6741_left_join_uses_vdbe_storage_cursors` and
+  `test_t6741_simple_inner_join_uses_vdbe_storage_cursors` fail, and fail the same way on clean
+  f437189e1. 54 integration targets that run window SQL, in batches of at most 10: 38 in
+  fsqlite-core (window_function_oracle, conformance_oracle_ext/s55/s74b/s77-s83, the bd_window_*
+  probes, core_sql_rusqlite_conformance and others), 2 in fsqlite, 14 in fsqlite-e2e (the window
+  function, frame, filter and range-offset oracles among them): all pass. Ignored bodies not run:
+  aggregate_window_tvf_divergence_probe and codegen_gap_probe (diagnostic probes),
+  sorter_limit_profile. The landed tree (rebased on f9f4e3a1d, which added a `vtab_instances`
+  parameter beside the sink): clippy clean, the same lib filters pass apart from the same two.
+- Retry / widen: peak RSS now follows the window phase. Next cuts there: evaluate each window
+  function straight into `window_results` (no 48 MB `func_vals`), then the outer phase, where the
+  window SELECT's output rows and the outer projection are still one vector per row. The bead's
+  acceptance (RSS within 2x of stock) still needs a sorter-backed streaming window. Widen the flat
+  sink to the GROUP BY window and join window paths when a measured statement there holds over
+  100 MB of per-row vectors.
+
 ## 2026-11-13 - REJECTED: a writer's close truncates the WAL it fully backfilled, as stock's last close deletes it (bd-w4pr1.13.33)
 
 - Target: every process that opens a database a writer closed. The close ran a PASSIVE checkpoint
