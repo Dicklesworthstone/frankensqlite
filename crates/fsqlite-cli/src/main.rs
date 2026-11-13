@@ -1010,25 +1010,30 @@ where
                 continue;
             }
 
-            match try_execute_dot_command(
-                trimmed,
-                connection,
-                current_db_path,
-                output_options,
-                out,
-                err,
-                shell_options,
-                &mut had_error,
-            )
-            .await
-            {
-                DotCommandResult::NotHandled => {}
-                DotCommandResult::Continue => continue,
-                DotCommandResult::Exit => {
-                    return Some(ShellOutcome {
-                        flow: ShellFlow::Exit,
-                        had_error,
-                    });
+            // Every dot command starts with '.'; for any other line
+            // `try_execute_dot_command` answers NotHandled, so a statement
+            // line does not build and poll its future (bd-w4pr1.13.35).
+            if trimmed.starts_with('.') {
+                match try_execute_dot_command(
+                    trimmed,
+                    connection,
+                    current_db_path,
+                    output_options,
+                    out,
+                    err,
+                    shell_options,
+                    &mut had_error,
+                )
+                .await
+                {
+                    DotCommandResult::NotHandled => {}
+                    DotCommandResult::Continue => continue,
+                    DotCommandResult::Exit => {
+                        return Some(ShellOutcome {
+                            flow: ShellFlow::Exit,
+                            had_error,
+                        });
+                    }
                 }
             }
 
@@ -2976,7 +2981,81 @@ fn statement_complete(buffer: &str) -> bool {
     scan_pending_input(buffer).complete
 }
 
+/// What the shell's pending input is: the one-pass answer for the line it
+/// reads most, else the full state scan.
 fn scan_pending_input(buffer: &str) -> PendingInput {
+    lone_plain_statement_scan(buffer.as_bytes())
+        .unwrap_or_else(|| scan_pending_input_by_states(buffer))
+}
+
+/// The four verbs a lone plain statement starts with.
+const LONE_STATEMENT_VERBS: [&[u8]; 4] = [b"select", b"insert", b"update", b"delete"];
+
+/// [`scan_pending_input`]'s answer for the line the shell reads most: one
+/// INSERT, UPDATE, DELETE or SELECT whose only semicolon outside a string is
+/// its last significant byte, made of plain text and single-quoted strings,
+/// with no `"`, backtick or `[` anywhere and no `--` or `/*` even inside a
+/// string. That input is complete and lone, as
+/// [`scan_pending_input_by_states`] finds; `None` leaves every other input,
+/// complete or not, to that scan (bd-w4pr1.13.35).
+///
+/// With a verb first and nothing significant after the one semicolon, no
+/// trigger head can arise, and without the refused bytes there is no comment
+/// or quoted name to follow. Toggling on every `'` keeps the state scan's
+/// inside/outside answer, since the two halves of a doubled quote have
+/// nothing between them.
+fn lone_plain_statement_scan(bytes: &[u8]) -> Option<PendingInput> {
+    let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let word_end = bytes[start..]
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+        .map_or(bytes.len(), |length| start + length);
+    let verb = &bytes[start..word_end];
+    if !LONE_STATEMENT_VERBS
+        .iter()
+        .any(|candidate| verb.eq_ignore_ascii_case(candidate))
+    {
+        return None;
+    }
+    let rest = &bytes[word_end..];
+    // The lexer's word runs on through a non-ASCII byte.
+    if rest.first().is_some_and(|byte| !byte.is_ascii()) {
+        return None;
+    }
+    let mut in_string = false;
+    let mut semicolons = 0_u32;
+    let mut ends_with_semicolon = false;
+    let mut previous = 0_u8;
+    for &byte in rest {
+        match byte {
+            b'\'' => {
+                if !in_string {
+                    ends_with_semicolon = false;
+                }
+                in_string = !in_string;
+            }
+            b'"' | b'`' | b'[' => return None,
+            b'-' if previous == b'-' => return None,
+            b'*' if previous == b'/' => return None,
+            b';' if !in_string => {
+                semicolons += 1;
+                ends_with_semicolon = true;
+            }
+            _ if in_string || byte.is_ascii_whitespace() => {}
+            _ => ends_with_semicolon = false,
+        }
+        previous = byte;
+    }
+    (!in_string && semicolons == 1 && ends_with_semicolon).then_some(PendingInput {
+        complete: true,
+        lone_plain_statement: true,
+    })
+}
+
+/// The state machine behind [`scan_pending_input`]: completeness as
+/// `sqlite3_complete()` judges it, and whether the input is a lone plain
+/// statement.
+fn scan_pending_input_by_states(buffer: &str) -> PendingInput {
     let bytes = buffer.as_bytes();
     let mut state = StatementScanState::Normal;
     let mut last_significant: Option<u8> = None;
@@ -3246,9 +3325,10 @@ mod tests {
         ShellOptions, StatementScanState, ansi_colors_enabled, bytes_alone_delimit_statements,
         format_row, highlight_sql, is_block_comment_end, is_block_comment_start,
         is_line_comment_start, lone_plain_statement, lone_plain_statement_by_bytes,
-        lone_plain_statement_by_tokens, output_uses_column_names, parse_args, render_display_value,
-        render_prompt, run, run_with_shell_options, scan_pending_input, statement_complete,
-        write_delimited_rows, write_query_plan_tree, write_rows,
+        lone_plain_statement_by_tokens, lone_plain_statement_scan, output_uses_column_names,
+        parse_args, render_display_value, render_prompt, run, run_with_shell_options,
+        scan_pending_input, scan_pending_input_by_states, statement_complete, write_delimited_rows,
+        write_query_plan_tree, write_rows,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -3999,6 +4079,87 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
             "SELECT 'unterminated;",
         ] {
             assert!(!scan_pending_input(other).lone_plain_statement, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn test_lone_plain_statement_scan_agrees_with_the_state_scan_wherever_it_answers() {
+        // Every sequence of up to five of these pieces joined by a space, and
+        // of up to four joined by nothing: verbs and a word, the bytes the
+        // quick scan refuses or must see in pairs (`-`, `/`, `*`, quotes,
+        // brackets), strings holding them, semicolons, a comment and a byte
+        // that is not ASCII.
+        const PIECES: [&str; 16] = [
+            "INSERT", "select", "x1", ";", "'a;b'", "'p-1-2'", "'a--b'", "'a''b'", "-", "/", "*",
+            "'", "\"q\"", "[a]", "-- c\n", "\u{e9}",
+        ];
+        let mut answered = 0_u32;
+        let mut indices = Vec::new();
+        for (joiner, longest) in [(" ", 5), ("", 4)] {
+            for length in 1..=longest {
+                indices.clear();
+                indices.resize(length, 0_usize);
+                loop {
+                    let text = indices
+                        .iter()
+                        .map(|&index| PIECES[index])
+                        .collect::<Vec<_>>()
+                        .join(joiner);
+                    let full = scan_pending_input_by_states(&text);
+                    if let Some(quick) = lone_plain_statement_scan(text.as_bytes()) {
+                        assert_eq!(quick, full, "{text:?}");
+                        answered += 1;
+                    }
+                    assert_eq!(scan_pending_input(&text), full, "{text:?}");
+                    let Some(position) =
+                        indices.iter().rposition(|&index| index + 1 < PIECES.len())
+                    else {
+                        break;
+                    };
+                    indices[position] += 1;
+                    for index in &mut indices[position + 1..] {
+                        *index = 0;
+                    }
+                }
+            }
+        }
+        assert!(answered > 1_000, "{answered}");
+
+        // The lines the scorecard's statement rows feed the shell are read by
+        // the quick scan.
+        for line in [
+            "INSERT INTO e(w,s) VALUES(7,'p-7-3');",
+            "INSERT INTO e(w,s) VALUES(42,'payload-42');",
+            " select * from t where id = -5 / 2 ; \r\n",
+            "UPDATE t SET a = 'x''y;' WHERE id = 1;",
+        ] {
+            assert_eq!(
+                lone_plain_statement_scan(line.as_bytes()),
+                Some(scan_pending_input_by_states(line)),
+                "{line:?}"
+            );
+        }
+        // What a quick scan that read past strings, comments or a second
+        // statement would call lone: each is left to the state scan.
+        for other in [
+            "SELECT 'a--b';",
+            "SELECT '/*';",
+            "SELECT 1 -- c\n;",
+            "SELECT 1; SELECT 2;",
+            "SELECT 1; CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;",
+            "SELECT 'unterminated;",
+            "SELECT 1;'",
+            "SELECT 1; \u{e9}",
+            "SELECT [a];",
+            "selectx 1;",
+            "select\u{e9} 1;",
+            "SELECT 1",
+        ] {
+            assert_eq!(
+                lone_plain_statement_scan(other.as_bytes()),
+                None,
+                "{other:?}"
+            );
         }
     }
 
