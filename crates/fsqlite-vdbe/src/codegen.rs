@@ -19960,6 +19960,8 @@ fn query_conjunct_proves_is_not_null(
 /// [`index_integer_in_list_target`] makes the probe exact, and de-duplicated values keep the runs
 /// disjoint. When `covering`, the aggregates read only the indexed column (or are COUNT(*)/SUM(rowid))
 /// so each entry accumulates straight from the index — no `IdxRowid`/`SeekRowid` and no table cursor.
+/// `rowid_bounds` (bd-z3a05, single-column index and not `covering`) starts each run at its rowid
+/// floor and leaves it past its ceiling: a value's entries are in rowid order.
 #[allow(clippy::too_many_arguments)]
 fn emit_aggregate_index_value_seek(
     b: &mut ProgramBuilder,
@@ -19977,12 +19979,16 @@ fn emit_aggregate_index_value_seek(
     value: i64,
     covering: bool,
     residual_where: Option<&Expr>,
+    rowid_bounds: Option<IndexEqRowidBounds>,
 ) {
     // bd-in-list-composite-prefix-probe: a composite `(a, …)` index is probed with a 1-field PREFIX
     // `[value]` so SeekGE anchors at the first `a=value` entry regardless of the trailing key column
     // (including a NULL trailing column, which sorts before `i64::MIN`). A single-column index keeps
     // the exact 2-field `[value, i64::MIN]` probe (the second field is the rowid floor) — byte-identical.
     let prefix_probe = idx_schema.key_term_count() > 1;
+    // The rowid bounds need the rowid as the next field and the table row read
+    // for each entry; the caller passes them only then.
+    let rowid_bounds = rowid_bounds.filter(|_| !prefix_probe && !covering);
     let n_probe: i32 = if prefix_probe { 1 } else { 2 };
     let probe_key_regs = b.alloc_regs(n_probe);
     b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(value), 0);
@@ -19992,10 +19998,21 @@ fn emit_aggregate_index_value_seek(
             0,
             probe_key_regs + 1,
             0,
-            P4::Int64(i64::MIN),
+            P4::Int64(
+                rowid_bounds
+                    .and_then(|bounds| bounds.lower)
+                    .unwrap_or(i64::MIN),
+            ),
             0,
         );
     }
+    let rowid_ceiling_reg = rowid_bounds
+        .and_then(|bounds| bounds.upper)
+        .map(|ceiling| {
+            let reg = b.alloc_reg();
+            b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(ceiling), 0);
+            reg
+        });
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
@@ -20041,6 +20058,18 @@ fn emit_aggregate_index_value_seek(
         let skip_row = b.emit_label();
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        // bd-z3a05: past the ceiling no later entry of this value's run can
+        // satisfy the WHERE, so the next value is sought.
+        if let Some(ceiling_reg) = rowid_ceiling_reg {
+            b.emit_jump_to_label(
+                Opcode::Gt,
+                ceiling_reg,
+                rowid_reg,
+                next_value,
+                P4::None,
+                0,
+            );
+        }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             table_cursor,
@@ -20687,10 +20716,30 @@ fn codegen_select_aggregate(
         )?;
         Some((idx, prefix, bounds))
     });
-    let rowid_range_seek = rowid_range_seek.filter(|_| index_prefix_rowid_bounded.is_none());
+    // bd-z3a05: the IN-list form, `SUM(c) WHERE a IN (5, 7) AND id < <int>`, the
+    // same way. A one-column index stores each listed value's entries in rowid
+    // order, so each value's seek starts at `(value, floor)` and leaves its run
+    // past the ceiling. index_in_seek already de-duplicates the values, so the
+    // runs stay disjoint, and the residual filter applies the whole WHERE.
+    let index_in_rowid_bounded = rowid_range_seek
+        .as_ref()
+        .filter(|_| index_prefix_rowid_bounded.is_none())
+        .and_then(|(range, _)| {
+            let bounds = IndexEqRowidBounds::from_range(range)?;
+            let (idx, values, has_residual) =
+                index_integer_in_list_residual_target(where_clause, table, table_alias)?;
+            (idx.key_term_count() == 1).then_some((idx, values, has_residual, bounds))
+        });
+    let rowid_range_seek = rowid_range_seek.filter(|_| {
+        index_prefix_rowid_bounded.is_none() && index_in_rowid_bounded.is_none()
+    });
     let index_prefix_residual_seek = match index_prefix_rowid_bounded {
         Some((idx, prefix, bounds)) => Some((idx, prefix, Some(bounds))),
         None => index_prefix_residual_seek.map(|(idx, prefix)| (idx, prefix, None)),
+    };
+    let index_in_seek = match index_in_rowid_bounded {
+        Some((idx, values, has_residual, bounds)) => Some((idx, values, has_residual, Some(bounds))),
+        None => index_in_seek.map(|(idx, values, has_residual)| (idx, values, has_residual, None)),
     };
 
     let finalize_label = b.emit_label();
@@ -21180,13 +21229,16 @@ fn codegen_select_aggregate(
         b.resolve_label(range_skip_label);
         b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
         skip_scan = true;
-    } else if let Some((idx_schema, values, has_residual)) = index_in_seek {
+    } else if let Some((idx_schema, values, has_residual, rowid_bounds)) = index_in_seek {
         // bd-2dgf5 IN-list: open the index (and the table only when not covering), then seek each
         // distinct value's duplicate run and accumulate its rows. INTEGER-affinity + integer-literal
         // values make each probe exact and the runs disjoint, so no scan fallback is needed. Covering
-        // when every aggregate reads only the indexed column or is COUNT(*)/SUM(rowid).
+        // when every aggregate reads only the indexed column or is COUNT(*)/SUM(rowid). A rowid range
+        // (bd-z3a05) is always a residual conjunct, so its walk is never the covering one.
         let idx_cursor = 1_i32;
-        let covering = !has_residual && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
+        let covering = !has_residual
+            && rowid_bounds.is_none()
+            && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
         let residual_where = has_residual.then_some(where_clause).flatten();
         if !covering {
             b.emit_op(
@@ -21221,6 +21273,7 @@ fn codegen_select_aggregate(
                 value,
                 covering,
                 residual_where,
+                rowid_bounds,
             );
         }
         skip_scan = true;

@@ -487,3 +487,102 @@ fn eq_rowid_bounded_aggregates_seek_the_index_and_match_sqlite() {
         );
     });
 }
+
+/// The P4 operands of the program's `Int64` instructions.
+async fn int64_operands(c: &Connection, sql: &str) -> Vec<i64> {
+    c.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|row| {
+            let values = row.values();
+            if !matches!(values.get(1), Some(SqliteValue::Text(op)) if op.to_string() == "Int64") {
+                return None;
+            }
+            match values.get(5)? {
+                SqliteValue::Integer(n) => Some(*n),
+                SqliteValue::Text(text) => {
+                    text.to_string().trim_start_matches("(i64)").parse().ok()
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// bd-z3a05, the IN-list form: `SUM(c) WHERE a IN (5, 7) AND id < 900` walked
+/// the rowid slice. Each listed value's run of a one-column index is in rowid
+/// order, so each seek starts at `(value, floor)` and leaves past the ceiling.
+/// The values are sorted, so group_concat visits 5's rows, then 7's, as stock
+/// does.
+#[test]
+fn eq_rowid_bounded_in_list_aggregates_seek_each_value_and_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        // (query, floor in the probe, ceiling check)
+        let bounded = [
+            (
+                "SELECT sum(c) FROM t WHERE a IN (5, 7) AND id < 900",
+                false,
+                true,
+            ),
+            (
+                "SELECT count(*), sum(c) FROM t WHERE a IN (7, 5, 5) AND id BETWEEN 100 AND 900",
+                true,
+                true,
+            ),
+            (
+                "SELECT group_concat(id) FROM t WHERE a IN (7, 5) AND id > 1300",
+                true,
+                false,
+            ),
+            (
+                "SELECT group_concat(id) FROM t WHERE a IN (5, 7) AND id <= 300",
+                false,
+                true,
+            ),
+            (
+                "SELECT count(*), sum(c) FROM t WHERE a IN (98, 99) AND id > 0",
+                true,
+                false,
+            ),
+            (
+                "SELECT count(*), sum(c) FROM t WHERE a IN (5, 7) AND id > 100000",
+                true,
+                false,
+            ),
+            (
+                "SELECT max(c), min(id) FROM t WHERE a IN (5, 7) AND id > 100 AND id < 700 AND c = 3",
+                true,
+                true,
+            ),
+        ];
+        for (sql, floor, ceiling) in bounded {
+            assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
+            assert!(opens_index(&f, sql, "t_a").await, "`{sql}` must seek t_a");
+            assert_eq!(
+                !int64_operands(&f, sql).await.contains(&i64::MIN),
+                floor,
+                "bd-z3a05: `{sql}` per-value rowid floor"
+            );
+            assert_eq!(
+                has_rowid_ceiling(&explain_ops(&f, sql).await),
+                ceiling,
+                "bd-z3a05: `{sql}` rowid ceiling check"
+            );
+        }
+        // Outside the lane: a composite index's runs are ordered by c, so it
+        // keeps its unbounded prefix probe; non-integer members decline; and
+        // `a = 5 OR (a = 7 AND id < 900)` has no rowid range over the whole WHERE.
+        for sql in [
+            "SELECT count(*), sum(c), sum(id) FROM u WHERE a IN (5, 7) AND id < 900",
+            "SELECT total(c) FROM t WHERE a = 5 OR a = 7 AND id < 900",
+            "SELECT sum(c) FROM t WHERE a IN ('5', 7) AND id < 900",
+            "SELECT sum(c) FROM t WHERE a IN (5, NULL) AND id < 900",
+            "SELECT sum(c) FROM t WHERE a NOT IN (5, 7) AND id < 900",
+        ] {
+            assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
+            assert!(!has_rowid_ceiling(&explain_ops(&f, sql).await), "`{sql}`");
+        }
+    });
+}
