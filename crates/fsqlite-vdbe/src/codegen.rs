@@ -3461,6 +3461,38 @@ pub fn codegen_select(
         .map(|(idx, prefix)| (idx, prefix[0]))
     };
 
+    // bd-z3a05: `<indexed col> = <lit> AND <rowid range>` — keyset pagination
+    // (`WHERE a = 5 AND id > 1000 ORDER BY id LIMIT 20`) — walked the rowid slice
+    // (`rowid_range_residual`, usually most of the table) and filtered on `a`. Seek
+    // the `a = 5` block of a single-column ASC index instead, bounded by the rowid
+    // range: its entries are in rowid order, so the walk costs the smaller of the
+    // two and also serves `ORDER BY <rowid>` ASC or DESC without a sorter, as
+    // stock's `SEARCH ... USING INDEX (a=? AND rowid>?)` does. Same gates as
+    // `eq_residual`, except that a rowid ORDER BY is allowed (`rowid_range_residual`
+    // already declines any other ORDER BY), and only integer-literal rowid bounds.
+    let eq_rowid_bounded: Option<(&IndexSchema, &Expr, IndexEqRowidBounds)> = if from_index_hint
+        .is_some()
+        || time_travel.is_some()
+        || has_window_columns(columns)
+        || table.without_rowid
+        || where_clause
+            .as_deref()
+            .is_some_and(expr_contains_non_numbered_placeholder)
+    {
+        None
+    } else {
+        rowid_range_residual.and_then(|range| {
+            let bounds = IndexEqRowidBounds::from_range(&range)?;
+            let (idx, prefix) = aggregate_index_prefix_literal_residual_target(
+                where_clause.as_deref(),
+                table,
+                table_alias,
+                Some(1),
+            )?;
+            (prefix.len() == 1).then(|| (idx, prefix[0], bounds))
+        })
+    };
+
     // bd-2dgf5: non-aggregate `SELECT ... FROM t WHERE <int col> IN (<int literals>)` seeks
     // the index once per distinct value instead of full-scanning. Same INTEGER-affinity +
     // integer-literal safe subset as the aggregate IN path; declined for ORDER BY (the seek
@@ -4588,6 +4620,7 @@ pub fn codegen_select(
                                                 directive_target_expr,
                                                 false,
                                                 false,
+                                                None,
                                             );
                                         }
                                         Some(_) => Some("index_equality_target_mismatch"),
@@ -4627,6 +4660,7 @@ pub fn codegen_select(
                                         target_expr,
                                         false,
                                         false,
+                                        None,
                                     );
                                 }
                             } else if !directive.index_key_is_expression
@@ -4667,6 +4701,7 @@ pub fn codegen_select(
                                     conjunct_target_expr,
                                     true,
                                     false,
+                                    None,
                                 );
                             } else {
                                 Some("index_equality_target_missing")
@@ -4837,6 +4872,28 @@ pub fn codegen_select(
             None,
             false,
         )
+    } else if let Some((idx_schema, target_expr, bounds)) = eq_rowid_bounded {
+        // bd-z3a05: the bounded `col = lit` block, in rowid order; the residual filter applies the
+        // whole WHERE. Checked before the rowid-slice walk below, which it never costs more than.
+        codegen_select_index_equality_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            target_expr,
+            true,
+            matches!(rowid_order, Some(SortDirection::Desc)),
+            Some(bounds),
+        )
     } else if let Some(rr) = rowid_range_residual {
         // bd-nonagg-rowid-range-residual: the planner SUPPRESSES the directive for an IPK range (returns
         // None) so the VDBE picks its bounded seek here in the heuristic fallback — same path the bare
@@ -4903,6 +4960,7 @@ pub fn codegen_select(
             target_expr,
             false,
             idx_desc,
+            None,
         )
     } else if let Some((idx_schema, target_expr)) = eq_residual {
         // --- Eq-prefix + residual seek (bd-nonagg-eq-residual) ---
@@ -4926,6 +4984,7 @@ pub fn codegen_select(
             target_expr,
             true,
             false,
+            None,
         )
     } else if has_aggregate_columns(columns) && !group_by.is_empty() {
         // --- Aggregate query WITH GROUP BY ---
@@ -5679,6 +5738,41 @@ fn composite_equality_scan_extra_prefix<'e>(
     extra
 }
 
+/// bd-z3a05: integer-literal rowid bounds an index-equality walk applies as
+/// key bounds. A single-column ASC index stores one key value's entries in
+/// rowid order (the key is `(value, rowid)`), so the walk starts at the lower
+/// bound (descending: the upper) and leaves once the rowid passes the other,
+/// as stock does for `SEARCH ... USING INDEX i (a=? AND rowid>?)`. Both bounds
+/// are treated as inclusive here; the residual filter applies the exact
+/// predicate, so an exclusive bound's own rowid is still rejected there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IndexEqRowidBounds {
+    lower: Option<i64>,
+    upper: Option<i64>,
+}
+
+impl IndexEqRowidBounds {
+    fn from_range(range: &RowidRangeTarget<'_>) -> Option<Self> {
+        const fn integer_literal(expr: &Expr) -> Option<i64> {
+            match expr {
+                Expr::Literal(Literal::Integer(value), _) => Some(*value),
+                _ => None,
+            }
+        }
+        let bounds = Self {
+            lower: range
+                .lower
+                .as_ref()
+                .and_then(|bound| integer_literal(bound.expr)),
+            upper: range
+                .upper
+                .as_ref()
+                .and_then(|bound| integer_literal(bound.expr)),
+        };
+        (bounds.lower.is_some() || bounds.upper.is_some()).then_some(bounds)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_index_equality_scan(
     b: &mut ProgramBuilder,
@@ -5707,10 +5801,16 @@ fn codegen_select_index_equality_scan(
     // direction-agnostic, so the value block is detected the same way. `false` is byte-identical to the
     // ascending emission. Gated by the caller to a single-column ASC index. bd-nonagg-index-eq-order-rowid.
     descending: bool,
+    // bd-z3a05: rowid bounds from a `rowid <range>` conjunct of the WHERE (which the residual filter
+    // still applies exactly). Used only by the single-key `(value, rowid)` probe of a rowid table:
+    // the seek starts at the near bound instead of the end of the value's block, and the walk leaves
+    // once the rowid passes the far bound. `None` is byte-identical to the unbounded emission.
+    rowid_bounds: Option<IndexEqRowidBounds>,
 ) -> Result<(), CodegenError> {
     let idx_cursor = 1_i32;
     let full_scan_fallback = b.emit_label();
     let duplicate_run_done = b.emit_label();
+    let rowid_bounds = rowid_bounds.filter(|_| !table.without_rowid);
     let where_placeholder_base = b.current_anon_placeholder();
     // WITHOUT ROWID index entries carry a PK suffix instead of a trailing
     // rowid (bd-rjaff): covering resolution is rowid-table shaped, so route
@@ -5905,17 +6005,38 @@ fn codegen_select_index_equality_scan(
     let saw_index_match_reg = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
 
+    // bd-z3a05: the far rowid bound (ascending: upper; descending: lower), in
+    // a register the walk compares each entry's rowid against.
+    let rowid_far_bound_reg = if composite_prefix_probe {
+        None
+    } else {
+        rowid_bounds
+            .and_then(|bounds| if descending { bounds.lower } else { bounds.upper })
+            .map(|far| {
+                let reg = b.alloc_reg();
+                b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(far), 0);
+                reg
+            })
+    };
     if !composite_prefix_probe {
         let rowid_floor_reg = probe_key_regs + 1;
         // Ascending seeks to `(val, i64::MIN)` (lowest rowid of the value)
         // then walks up; descending seeks to `(val, i64::MAX)` (highest
-        // rowid) then walks down with `Prev`.
+        // rowid) then walks down with `Prev`. A rowid bound moves the start
+        // to that bound (bd-z3a05).
+        let near_bound = rowid_bounds.and_then(|bounds| {
+            if descending {
+                bounds.upper
+            } else {
+                bounds.lower
+            }
+        });
         b.emit_op(
             Opcode::Int64,
             0,
             rowid_floor_reg,
             0,
-            P4::Int64(if descending { i64::MAX } else { i64::MIN }),
+            P4::Int64(near_bound.unwrap_or(if descending { i64::MAX } else { i64::MIN })),
             0,
         );
     }
@@ -6002,6 +6123,19 @@ fn codegen_select_index_equality_scan(
     } else {
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        // bd-z3a05: past the far rowid bound no later entry of this value can
+        // satisfy the WHERE (the block is in rowid order), so the walk ends.
+        // `saw_index_match_reg` is already set, so this is not a seek miss.
+        if let Some(far_reg) = rowid_far_bound_reg {
+            b.emit_jump_to_label(
+                if descending { Opcode::Lt } else { Opcode::Gt },
+                far_reg,
+                rowid_reg,
+                duplicate_run_done,
+                P4::None,
+                0,
+            );
+        }
         if needs_table_lookup {
             b.emit_jump_to_label(
                 Opcode::SeekRowid,
@@ -52428,6 +52562,7 @@ mod tests {
             &placeholder(1),
             false,
             false,
+            None,
         )
         .unwrap();
         b.resolve_label(done_label);
