@@ -87,6 +87,34 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: an indexed equality with a rowid range seeks the index bounded by the range, for keyset pages and aggregates (bd-z3a05)
+
+- Target: `WHERE <indexed col> = v AND <rowid range>`, both keyset pagination
+  (`... ORDER BY id LIMIT n`) and aggregates (`sum(c)`, `count(*)`). The
+  rowid-range lanes came first in the heuristic chains, so these walked the
+  rowid slice (usually most of the table) and filtered on the key. Stock
+  plans `SEARCH t USING INDEX t_i (i=? AND rowid>?)`.
+- Lever: when the equality pins every key column, the index's next record
+  field is the rowid, so the key's entries are in rowid order. The walk seeks
+  `(key, floor)` and leaves the block past the ceiling. Three landings:
+  d089d1da8 (non-aggregate, integer-literal bounds), 824547269 (bound
+  parameters in the ordered index scan's probe, under the rowid's affinity),
+  c2ccccb07 (aggregates, when literal equalities pin every key column:
+  `PrefixIndexShape::FullKey`).
+- Result, stock sqlite3 3.46.1 live in the same run, 200,000 rows, user
+  instructions per query. Keyset page `i = 5 AND id > 100000 ORDER BY id
+  LIMIT 20`: 15,675k -> 509k (stock 151k), ks_ab.py. Aggregates (agg_ab.py,
+  200 rows a key): `sum(c) ... id < 150000` 180,640k -> 2,414k (stock 426k);
+  `count(*) ... id > 100000` 81,544k -> 1,594k (stock 75.7k); BETWEEN
+  12,255k -> 333k (stock 79.7k). Every answer equals stock's.
+- Not done, so retry here first: (a) COUNT(*) is still 21x stock, because
+  stock counts from the index and this walk reads each table row for the
+  residual filter; a covering variant when the residual is only the rowid
+  range. (b) `i IN (5, 7) AND id < N` is still 345x: index_in_seek has no
+  rowid bounds. (c) Parameter bounds in aggregates. The parameter-bound
+  keyset change has plan evidence only, because the CLI arms cannot bind
+  parameters.
+
 ## 2026-11-13 - WIN: a leaf delete trusts the pointer order of the image the previous descending delete wrote (bd-w4pr1.13.20, lever P)
 
 - Target: runs of deletes on one table leaf (a scan DELETE removes about 19 rows per leaf on the
