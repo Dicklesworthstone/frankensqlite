@@ -121,3 +121,53 @@ fn integer_arithmetic_edges_match_rusqlite_oracle() {
         );
     });
 }
+
+/// `%` over operands read from rows, so it runs in the scan loop instead of
+/// being folded: two INTEGER registers take the loop's integer path
+/// (bd-w4pr1.13.20), every other pair `sql_rem`. The rows put each storage
+/// class on both sides, a zero divisor, `i64::MIN % -1`, and result types
+/// that change from row to row in the same result register (INTEGER after
+/// REAL and NULL), compared with their `typeof` against stock.
+#[test]
+fn remainder_over_scanned_rows_matches_rusqlite_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, x, y, s TEXT)",
+            "INSERT INTO p(x, y, s) VALUES \
+             (7, 3, 'a'), (-7, 3, 'b'), (7, -3, 'c'), (-7, -3, 'd'), (5, 0, 'e'), \
+             (0, 5, 'f'), (-9223372036854775808, -1, 'g'), (-9223372036854775808, 7, 'h'), \
+             (9223372036854775807, -2, 'i'), (7.5, 2, 'j'), (8, 3, 'k'), (7, 2.5, 'l'), \
+             (NULL, 3, 'm'), (9, 4, 'n'), ('17', 5, 'o'), (17, '5', 'p'), \
+             (3, NULL, 'r'), (X'3132', 5, 's'), (1e20, 7, 't'), (12, 5, 'u'), (12, 0.0, 'v')",
+        ];
+        for statement in setup {
+            f.execute(statement).await.unwrap();
+            r.execute_batch(statement).unwrap();
+        }
+        let queries = [
+            "SELECT id, x % y, typeof(x % y) FROM p ORDER BY id",
+            "SELECT id, s, x % 3, typeof(x % 3), y % x FROM p ORDER BY id",
+            "SELECT id FROM p WHERE x % y = 1 ORDER BY id",
+            "SELECT id FROM p WHERE x % y = 0 ORDER BY id",
+            "SELECT id FROM p WHERE id % 3 = 0 ORDER BY id",
+            "SELECT count(*), sum(id % 7), sum(rowid % 4), total(x % y) FROM p",
+            "SELECT id, rowid, typeof(rowid), rowid % 5 FROM p ORDER BY id",
+        ];
+        let mut diffs = Vec::new();
+        for q in queries {
+            let fr = fq(&f, q).await;
+            let rr = rq(&r, q);
+            if fr != rr {
+                diffs.push(format!("  `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"));
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} remainder divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

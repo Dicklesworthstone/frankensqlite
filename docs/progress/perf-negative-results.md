@@ -87,6 +87,49 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: the scan loop's Remainder of two integers and its Rowid write their register in place (bd-w4pr1.13.20, lever V)
+
+- Target: every scan that reads a rowid or takes `%` per row: the scorecard's DELETE and UPDATE rows
+  (`WHERE id % 7 = 0`, `WHERE id % 10 = 0`) and any SELECT filtering or projecting a remainder.
+  Touched: `crates/fsqlite-vdbe/src/engine.rs` (the `Remainder` and `Rowid` arms of
+  `try_execute_hot_opcode_sync`).
+- Evidence before (callgrind of `delete_14pct_300k` on the lever-F binary, 300k scanned rows): the
+  scan loop is 261M, 870 per scanned row; `sql_rem` 33.0M (110 per row: `both_integer_numeric_type`
+  and two `to_integer` conversions for two INTEGER registers) and `pool_return_reusable` 10.8M over
+  600k calls: `Rowid` and `Remainder` wrote through `set_reg_fast` (bounds and resize test, NaN
+  normalisation, a whole-value replace and a drop of the old value) where the four other arithmetic
+  opcodes already use `set_reg_arith_result`.
+- Change: `Remainder` with two INTEGER operands computes `sql_rem`'s integer path in place (a zero
+  divisor gives NULL, `i64::MIN % -1` gives 0, the sign follows the dividend) and writes through
+  `set_reg_int`; any other pair keeps `sql_rem` and writes through `set_reg_arith_result`. `Rowid`
+  writes through `set_reg_int`. No bytecode change.
+- Result, stock sqlite3 3.46.1 live in the same run (`sc_mut_probe`, minimum user instructions of
+  7, io_uring refused, load 2.1; binaries a4bbf1cf... base main 09ddffb43, 9c7a4b38... base + this
+  production diff): `delete_14pct_300k` stock 120.7M, base 620.8M (5.14x), lever 568.0M (4.71x):
+  -52.8M, CPU 127.1 -> 120.5 ms (stock 37.9); `update_10pct_300k` stock 273.4M, base 952.6M
+  (3.48x), lever 897.4M (3.28x): -55.2M, CPU 152.8 -> 151.7 ms (stock 49.9). With io_uring allowed:
+  636.1M -> 583.3M and 965.1M -> 908.7M; CPU 159.2 -> 155.0 and 217.9 -> 179.3 ms. Prediction
+  (-30M to -45M each) exceeded; kill (either row under 15M) not met. Read rows on the 1M-row
+  scorecard table (`stable_probe`, ring refused, 5 reps): `SELECT count(*) FROM t WHERE id % 7 = 0`
+  951.8M -> 775.8M (3.22x -> 2.62x stock, CPU 79.8 -> 73.0 ms); `scan_filter_agg` control
+  1,237.8M -> 1,237.9M. Answers equal stock's; stock's `PRAGMA integrity_check` passes on every file
+  the lever wrote.
+- Test: `bd_integer_arithmetic_edges_oracle_probe::remainder_over_scanned_rows_matches_rusqlite_oracle`
+  (`%` over table rows against rusqlite with `typeof`: INTEGER, REAL, TEXT, BLOB and NULL operands
+  on both sides, a zero divisor (a fast path without the zero test answers 0 instead of NULL),
+  `i64::MIN % -1`, result types changing from row to row in one register, `rowid % n`).
+- Found on the way, red on main and not touched here: a non-numeric TEXT operand of `%` or `/`
+  (`'x' % 3`, `'' % 4`) gives REAL 0.0 where stock gives INTEGER 0 (`sql_rem` / `sql_div` treat such
+  text as not integer-typed; stock's numericType reads it as the integer 0). Left out of the new
+  test's rows.
+- Gate, on 09ddffb43 plus the change: clippy -D warnings on fsqlite-vdbe `--all-targets` and on the
+  new test's target clean (again on the rebased tree); fsqlite-vdbe lib 1,243 pass and 2 fail
+  (bd-bhalc pair, red on main); fsqlite-core lib 4,166 pass and 2 fail (t6741 pair, red on main);
+  16 fsqlite-core arithmetic / affinity / DML / rowid targets in two batches, 116 tests pass; 8
+  fsqlite rowid DML oracle targets, 18 pass. Landed as 25a17a1c8 (rebased onto eb6ee587d).
+- Retry condition: none. Next on the scan: the WHERE's per-row `Integer` (the `%` operand literal)
+  and `IsNull` (foldable into the comparison's JUMPIFNULL), a bytecode change.
+
 ## 2026-11-13 - WIN: a leaf delete or same-size row rewrite changes the transaction's staged image of the leaf in place, with no page copy and no page write (bd-w4pr1.13.20, lever F)
 
 - Target: every row a DELETE removes from a table leaf and every same-size row an UPDATE rewrites,
@@ -149,6 +192,71 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   and the WHERE's per-row `Integer` / `IsNull` (about 870 instructions per scanned row against
   stock's whole statement at 400), and the rest of the leaf delete (about 3.6k per row: the
   descending check over the whole pointer array, the pointer-vector copy, the stack entry rebuild).
+
+## 2026-11-13 - WIN: the rowid-floor bump after an insert takes one lock and one lookup (bd-i3csr.4, lever 4.1)
+
+- Target: every insert into a file-backed table (the concurrent rowid allocator is not used in
+  :memory:), measured on the scorecard's `bulk_insert_1M_one_txn`, the 300k-row mutation setup and
+  `txn_1000x10_rows`. Touched: `crates/fsqlite-vdbe/src/engine.rs`
+  (`bump_concurrent_storage_rowid_floor`), `crates/fsqlite-mvcc/src/rowid_alloc.rs`
+  (`ConcurrentRowIdAllocator::current_epoch`).
+- Evidence before (callgrind, main f9f4e3a1d + bd-i3csr.3, the bulk statement file-backed at 100k
+  and 200k rows, per row = difference / 100k): `bump_concurrent_storage_rowid_floor` 634
+  instructions a row: `ensure_table_floor` 302 and `bump_explicit` 253, each a SipHash of the
+  same `AllocatorKey` (184) and a hold of the `tables` mutex, plus the `current_epoch` mutex.
+- Change: the bump no longer calls `bump_explicit(key, rowid)` after
+  `ensure_table_floor(key, Some(visible_max), ..)`: `visible_max >= rowid` already leaves the next
+  rowid at or above `rowid + 1` (or exhausted, which the bump also leaves alone), an
+  AUTOINCREMENT high-water at or above `rowid`, and a missing entry created, so the bump changed
+  nothing (the two calls were two separate lock holds, so dropping the second removes no
+  guarantee under concurrency). `current_epoch` is an `AtomicU64` read once per call and raised
+  with `fetch_max` only by a newer key epoch, instead of a mutex held on every call. Floor values,
+  reservations and rewinds are unchanged (bd-mkon7, the floor that never lowers, neither better
+  nor worse).
+- Result, stock sqlite3 3.46.1 live in the same runs, base main 073296573 (6997232e..., built with
+  only the new cfg(test) tests in the tree; it still links `bump_explicit`, the lever binary
+  2fa5ef04... does not), every answer equal to stock's: the 300k generate_series setup (io_uring
+  refused, 3 runs) 3,252.9M -> 3,171.9M user instructions (-2.5%; 3.07x -> 3.00x stock 1,058.2M);
+  INSERT INTO m2 SELECT * FROM m (300k) 3,707.9M -> 3,626.7M (-2.2%); the 1M bulk row (5 runs)
+  11,942.5M -> 11,666.6M (-2.3%), wall 1,517 -> 1,448 ms (3.52x -> 3.36x stock 431 ms), CPU
+  1,498 -> 1,427 ms; one INSERT inside a 2,000-row transaction (callgrind, (N=2000 - N=1000) /
+  1000) 42,232 -> 41,975 instructions (-0.6%). memory_script_200k 4,820.0M -> 4,820.3M (no
+  allocator in :memory:). Prediction -2% to -3% on the 300k setup: met (-270 a row against the
+  -290 estimate). Kill line under -1.2%: passed.
+- Rows that move within their noise: txn_1000x10_rows 731.0M -> 723.2M (min of 3) and 737.0M ->
+  736.9M (txn_row_probe.py, 5 runs); autocommit_5k_inserts -0.7% and -0.3%; delete_14pct_300k,
+  which never touches the allocator, -1.8%: these file-backed rows carry commit-time wait loops
+  whose instruction counts follow the run's timing, about +/-2%. update_10pct_300k +0.2%,
+  create_index_int_300k +0.1%. Scorecard (2 runs, wall, stock first and last): bulk 1.474 ->
+  1.387 s (3.56x -> 3.35x). Rows that read slower there: window_row_number (+8%) and
+  group_by_1000_groups (+7%) run identical instructions under either binary on either arm's
+  database (3 runs); the window row's CPU reads +3.6% at identical instructions, code placement,
+  since the lever's code does not run in a read. txn_1000x10_rows read +11% wall there, against
+  lower CPU in both probes with more runs (best 290.8 -> 254.1 ms, median 325.8 -> 282.0 ms).
+- Tests: fsqlite-mvcc `a_floor_at_or_above_the_inserted_rowid_leaves_bump_explicit_nothing_to_do`
+  (both modes x absent / committed / committed with a sequence / a peer's reserved tail /
+  exhausted x rowids -5, 0, 1, 7, 100, 10,000, MAX - 1, MAX x a table max at or above the rowid x
+  an AUTOINCREMENT max: 384 cases where bump_explicit after ensure_table_floor as the engine calls
+  it changes neither the next rowid nor the high-water; and the case a floor below the rowid,
+  where it does) and `ensure_table_floor_only_raises_the_current_epoch`.
+- Gate, 073296573 with the change (rch, 2026-11-13): clippy -D warnings with all targets on
+  fsqlite-mvcc, fsqlite-vdbe and fsqlite-core clean; fsqlite-mvcc lib 1,671 pass; fsqlite-vdbe lib
+  1,243 pass and 2 fail (the bd-bhalc pair), goldens 8 pass; 32 fsqlite-core rowid /
+  AUTOINCREMENT / statement and savepoint rewind / concurrent-writer / WAL keepers in 4 batches,
+  277 pass and 3 fail, each red on main with the same message: bd-mkon7's
+  `review_omitted_rowid_alias_ignores_defaults` (102 where stock gives 101) and bd-jlbrk's two
+  `rowid_replace_preflight_*` tests; fsqlite-core lib 4,166 pass and 2 fail (the t6741 pair,
+  bd-nouem).
+- Note: a probe run died on `Disk quota exceeded (os error 122)`: /dev/shm is mounted with
+  usrquota and every agent here writes as the same user, so accumulated probe databases fail
+  later runs of every arm. Remove a probe's work directory once its numbers are read.
+- Retry condition: none. Next on the row: the allocator's remaining lookup still hashes the key
+  with SipHash (184 a row); the per-statement descent to the rightmost leaf in
+  `allocate_concurrent_storage_rowid` (~2.5k per implicit-rowid INSERT statement on a 2,000-row
+  table, more on a deeper one; bd-i3csr.4 lever 4.2); the 4 KiB `PageData` clone per append
+  (~410 a row, lever 4.3). On the txn row (callgrind of one INSERT in a transaction, 42.0k):
+  large by-value moves in `execute_table_program_with_db` / `_with_cx` (~3.2k of memcpy per
+  statement) and `next_internal_savepoint_name`'s `format!` (~0.9k per statement).
 
 ## 2026-11-13 - WIN: a WAL handle answers the frame headers it wrote or validated from memory, so the publication scan and the appended-tail index stop re-reading a peer's new frames (bd-w4pr1.8, M6)
 
