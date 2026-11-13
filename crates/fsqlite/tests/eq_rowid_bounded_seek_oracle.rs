@@ -150,3 +150,157 @@ fn eq_rowid_bounded_seek_matches_sqlite_in_order() {
         }
     });
 }
+
+async fn frank_rows_with(c: &Connection, sql: &str, params: &[SqliteValue]) -> Vec<Vec<String>> {
+    c.query_with_params(sql, params)
+        .await
+        .unwrap_or_else(|e| panic!("frank `{sql}` {params:?}: {e}"))
+        .iter()
+        .map(|row| row.values().iter().map(render).collect())
+        .collect()
+}
+
+fn sqlite_rows_with(
+    c: &rusqlite::Connection,
+    sql: &str,
+    params: &[SqliteValue],
+) -> Vec<Vec<String>> {
+    let values: Vec<rusqlite::types::Value> = params
+        .iter()
+        .map(|value| match value {
+            SqliteValue::Null => rusqlite::types::Value::Null,
+            SqliteValue::Integer(n) => rusqlite::types::Value::Integer(*n),
+            SqliteValue::Float(f) => rusqlite::types::Value::Real(*f),
+            SqliteValue::Text(s) => rusqlite::types::Value::Text(s.to_string()),
+            SqliteValue::Blob(b) => rusqlite::types::Value::Blob(b.to_vec()),
+        })
+        .collect();
+    let mut stmt = c.prepare(sql).unwrap();
+    let n = stmt.column_count();
+    stmt.query_map(rusqlite::params_from_iter(values), |row| {
+        Ok((0..n)
+            .map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
+                rusqlite::types::Value::Null => "NULL".to_owned(),
+                rusqlite::types::Value::Integer(x) => x.to_string(),
+                rusqlite::types::Value::Real(f) => format!("{f:?}"),
+                rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                rusqlite::types::Value::Blob(b) => format!(
+                    "X'{}'",
+                    b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                ),
+            })
+            .collect())
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// Whether the index seek's probe record carries a second field (the rowid
+/// bound): a two-field `MakeRecord` immediately before the `SeekGE`/`SeekLE`.
+async fn seek_probe_has_rowid_field(c: &Connection, sql: &str) -> bool {
+    let rows = c.query(&format!("EXPLAIN {sql}")).await.unwrap();
+    let ops: Vec<(String, i64)> = rows
+        .iter()
+        .map(|row| {
+            let values = row.values();
+            let opcode = match values.get(1) {
+                Some(SqliteValue::Text(op)) => op.to_string(),
+                _ => String::new(),
+            };
+            let p2 = match values.get(3) {
+                Some(SqliteValue::Integer(n)) => *n,
+                _ => -1,
+            };
+            (opcode, p2)
+        })
+        .collect();
+    ops.windows(2).any(|pair| {
+        pair[0].0 == "MakeRecord"
+            && pair[0].1 == 2
+            && (pair[1].0 == "SeekGE" || pair[1].0 == "SeekLE")
+    })
+}
+
+/// bd-z3a05, bound parameters: keyset pagination as applications write it.
+/// The ordered index scan seeks `(key, bound)` instead of the start of the
+/// key's block; the bound takes the rowid's INTEGER affinity, and values that
+/// stay non-numeric sort as SQLite orders them.
+#[test]
+fn eq_rowid_bound_parameters_start_the_seek_and_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        let text = |s: &str| SqliteValue::Text(s.into());
+        let cases: Vec<(&str, Vec<SqliteValue>)> = vec![
+            (
+                "SELECT id, c FROM t WHERE a = ?1 AND id > ?2 ORDER BY id LIMIT 10",
+                vec![SqliteValue::Integer(5), SqliteValue::Integer(100)],
+            ),
+            (
+                "SELECT id, c FROM t WHERE a = ?1 AND id >= ?2 ORDER BY id LIMIT 10",
+                vec![SqliteValue::Integer(5), SqliteValue::Integer(105)],
+            ),
+            (
+                "SELECT id, c FROM t WHERE a = ?1 AND id < ?2 ORDER BY id DESC LIMIT 10",
+                vec![SqliteValue::Integer(5), SqliteValue::Integer(900)],
+            ),
+            (
+                "SELECT id FROM t WHERE a = ?1 AND id > ?2 ORDER BY id LIMIT 5",
+                vec![SqliteValue::Integer(5), text("100")],
+            ),
+            (
+                "SELECT id FROM t WHERE a = ?1 AND id > ?2 ORDER BY id LIMIT 5",
+                vec![SqliteValue::Integer(5), SqliteValue::Float(100.5)],
+            ),
+            (
+                "SELECT id FROM t WHERE a = ?1 AND id > ?2 ORDER BY id LIMIT 5",
+                vec![SqliteValue::Integer(5), SqliteValue::Null],
+            ),
+            (
+                "SELECT id FROM t WHERE a = ?1 AND id > ?2 ORDER BY id LIMIT 5",
+                vec![SqliteValue::Integer(5), text("abc")],
+            ),
+            (
+                "SELECT id FROM t WHERE a = ?1 AND id < ?2 ORDER BY id DESC LIMIT 5",
+                vec![SqliteValue::Integer(5), text("abc")],
+            ),
+            (
+                "SELECT id FROM t WHERE a = ?1 AND id < ?2 ORDER BY id DESC LIMIT 5",
+                vec![SqliteValue::Integer(5), SqliteValue::Null],
+            ),
+            (
+                "SELECT id, x FROM t WHERE x = ?1 AND id > ?2 ORDER BY id LIMIT 7",
+                vec![text("v3"), SqliteValue::Integer(700)],
+            ),
+            (
+                "SELECT id FROM t WHERE a = :a AND id > :after ORDER BY id LIMIT 4",
+                vec![SqliteValue::Integer(9), SqliteValue::Integer(1200)],
+            ),
+            (
+                "SELECT id FROM t WHERE a = ?1 AND id > ?2 ORDER BY id LIMIT 4 OFFSET 2",
+                vec![SqliteValue::Integer(9), SqliteValue::Integer(10)],
+            ),
+        ];
+        for (sql, params) in &cases {
+            assert_eq!(
+                frank_rows_with(&f, sql, params).await,
+                sqlite_rows_with(&r, sql, params),
+                "`{sql}` {params:?}"
+            );
+            assert!(
+                seek_probe_has_rowid_field(&f, sql).await,
+                "bd-z3a05: `{sql}` must seek (key, rowid bound), not the start of the key's block"
+            );
+        }
+        // A composite index's entries are not in rowid order within `a`:
+        // no rowid field is added there, and the rows still match stock.
+        let composite = "SELECT id, c FROM u WHERE a = ?1 AND id > ?2 ORDER BY id LIMIT 10";
+        let params = [SqliteValue::Integer(5), SqliteValue::Integer(100)];
+        assert_eq!(
+            frank_rows_with(&f, composite, &params).await,
+            sqlite_rows_with(&r, composite, &params),
+            "`{composite}`"
+        );
+        assert!(!seek_probe_has_rowid_field(&f, composite).await);
+    });
+}

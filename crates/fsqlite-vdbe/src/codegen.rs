@@ -9955,6 +9955,37 @@ fn emit_covering_output_reads(
     }
 }
 
+/// bd-z3a05: the rowid bound an ordered index scan can start from: a top-level
+/// `rowid > c` / `rowid >= c` conjunct for an ascending scan, `rowid < c` /
+/// `rowid <= c` for a descending one, where `c` is a numbered or named
+/// parameter, a literal, or a constant (`is_rowid_range_constant`). Anonymous
+/// `?` is declined: the probe is emitted before the residual filter, and a
+/// raw AST's anonymous slots would number differently there.
+fn ordered_scan_rowid_start_bound<'e>(
+    where_clause: Option<&'e Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    descending: bool,
+) -> Option<&'e Expr> {
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_clause?, &mut conjuncts);
+    conjuncts.into_iter().find_map(|term| {
+        let Expr::BinaryOp {
+            left, op, right, ..
+        } = term
+        else {
+            return None;
+        };
+        let (slot, bound) = extract_rowid_range_bound(left, *op, right, Some(table), table_alias)?;
+        let near = if descending {
+            matches!(slot, RowidRangeSlot::Upper)
+        } else {
+            matches!(slot, RowidRangeSlot::Lower)
+        };
+        (near && !expr_contains_non_numbered_placeholder(bound.expr)).then_some(bound.expr)
+    })
+}
+
 /// Generate VDBE bytecode for an ORDER BY scan that can stream rows directly
 /// from an index in sorted order (no sorter temp B-tree).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -10013,7 +10044,25 @@ fn codegen_select_index_ordered_scan(
     let loop_start = if use_bounded_prefix_scan {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let prefix_len = index_plan.equality_prefix_len as i32;
-        let probe_key_regs = b.alloc_regs(prefix_len);
+        // bd-z3a05: when the prefix pins every key column of a rowid table's
+        // index, the next record field is the rowid, so a rowid bound in the
+        // WHERE (keyset pagination: `a = ? AND id > ? ORDER BY id`) starts the
+        // seek at `(prefix, bound)` instead of the start of the prefix block.
+        // The block-end check below still compares the prefix fields only, and
+        // the residual filter re-applies the exact predicate.
+        let rowid_start_bound = (!table.without_rowid
+            && index_plan.equality_prefix_len == index_plan.index.key_term_count())
+        .then(|| {
+            ordered_scan_rowid_start_bound(
+                where_clause,
+                table,
+                table_alias,
+                index_plan.descending,
+            )
+        })
+        .flatten();
+        let probe_field_count = prefix_len + i32::from(rowid_start_bound.is_some());
+        let probe_key_regs = b.alloc_regs(probe_field_count);
         for (offset, expr) in equality_prefix_exprs
             .iter()
             .take(index_plan.equality_prefix_len)
@@ -10045,11 +10094,26 @@ fn codegen_select_index_ordered_scan(
                 }
             }
         }
+        if let Some(bound) = rowid_start_bound {
+            // The rowid compares under INTEGER affinity, as SQLite does: '5'
+            // seeks as 5. A value that stays text or blob sorts after every
+            // integer and NULL before, both as `rowid <op> value` evaluates.
+            let bound_reg = probe_key_regs + prefix_len;
+            emit_expr(b, bound, bound_reg, None);
+            b.emit_op(
+                Opcode::Affinity,
+                bound_reg,
+                1,
+                0,
+                P4::Affinity(index_key_affinity('D').to_string()),
+                0,
+            );
+        }
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             probe_key_regs,
-            prefix_len,
+            probe_field_count,
             probe_record_reg,
             P4::None,
             0,
