@@ -109,7 +109,7 @@ pub(super) async fn read_checkpoint_frame_headers<F: VfsFile>(
     let mut previous = if start == 0 {
         header_checksum
     } else {
-        let predecessor = wal.read_frame_header(cx, start - 1).await?;
+        let predecessor = wal.read_frame_header_on_disk(cx, start - 1).await?;
         if predecessor.salts != wal.header().salts || predecessor.page_number == 0 {
             return Err(FrankenError::WalCorrupt {
                 detail: "checkpoint checksum seed belongs to an invalid frame".to_owned(),

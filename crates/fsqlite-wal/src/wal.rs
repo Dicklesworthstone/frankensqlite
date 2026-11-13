@@ -283,6 +283,29 @@ fn push_wal_frame_bytes(
     frame_scratch.extend_from_slice(page_data);
 }
 
+/// A frame header this handle wrote or validated; its salts are the
+/// generation's (bd-w4pr1.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordedFrameHeader {
+    page_number: u32,
+    db_size: u32,
+    checksum: SqliteWalChecksum,
+}
+
+impl From<&WalFrameHeader> for RecordedFrameHeader {
+    fn from(header: &WalFrameHeader) -> Self {
+        Self {
+            page_number: header.page_number,
+            db_size: header.db_size,
+            checksum: header.checksum,
+        }
+    }
+}
+
+/// Default bound on the frame headers one handle remembers: 16 bytes each,
+/// 4 MiB at the bound. Frames past it are read from disk as before.
+pub const DEFAULT_RECORDED_FRAME_HEADER_CAP: usize = 1 << 18;
+
 /// A WAL file backed by a VFS file handle.
 ///
 /// Manages the write-ahead log: creation, sequential frame append with
@@ -308,6 +331,18 @@ pub struct WalFile<F: VfsFile> {
     /// `&mut self`, so reuse stays serialized per handle without reintroducing
     /// any cross-writer coordination.
     frame_scratch: Vec<u8>,
+    /// Headers of frames `0..frame_headers.len()` of the current generation,
+    /// exactly as this handle wrote them or checked them against the
+    /// checksum chain (bd-w4pr1.8). Always a prefix of `frame_count`: it is
+    /// replaced only once a scan or append has succeeded, cut whenever
+    /// `frame_count` is, emptied before a generation change, and never
+    /// extended past a gap. [`Self::read_frame_header`] answers from it, so
+    /// the publication scan and the appended-tail index do not read again
+    /// the headers of frames a refresh already read whole. Page payloads are
+    /// always read from disk.
+    frame_headers: Vec<RecordedFrameHeader>,
+    /// Bound on `frame_headers` ([`DEFAULT_RECORDED_FRAME_HEADER_CAP`]).
+    frame_header_cap: usize,
     /// Frame count covered by the last successful WAL sync.
     /// Used by debug-assertions and FRANKENSQLITE_PARANOID_DURABILITY to
     /// verify the two-phase commit invariant: fsync must complete before
@@ -420,6 +455,10 @@ impl<F: VfsFile> WalFile<F> {
         let mut last_commit_count = last_commit.map_or(0, |(index, _)| index + 1);
         let mut last_commit_checksum =
             last_commit.map_or(disk_header_checksum, |(_, header)| header.checksum);
+        // Headers of the frames validated below extend the remembered prefix
+        // only when it reaches this handle's frame count.
+        let mut validated_headers = Vec::new();
+        let record_headers = self.frame_headers.len() == self.frame_count;
 
         let mut frames = WalFrameReader::new(frame_size, self.frame_count, available_frames);
         for frame_index in self.frame_count..available_frames {
@@ -463,6 +502,9 @@ impl<F: VfsFile> WalFile<F> {
 
             new_running_checksum = expected;
             new_frame_count += 1;
+            if record_headers {
+                validated_headers.push(RecordedFrameHeader::from(&frame_header));
+            }
 
             if frame_header.is_commit() {
                 last_commit_count = new_frame_count;
@@ -487,8 +529,72 @@ impl<F: VfsFile> WalFile<F> {
         self.frame_count = last_commit_count;
         self.running_checksum = last_commit_checksum;
         self.last_commit = last_commit;
+        self.extend_recorded_frame_headers(validated_headers);
+        self.trim_recorded_frame_headers();
 
         Ok(())
+    }
+
+    /// Append `headers`, the frames that follow the remembered prefix, up to
+    /// the bound. A caller passes them only while the prefix reached the
+    /// frame count the frames were appended or validated at.
+    fn extend_recorded_frame_headers(&mut self, headers: Vec<RecordedFrameHeader>) {
+        let room = self
+            .frame_header_cap
+            .saturating_sub(self.frame_headers.len());
+        if headers.len() <= room {
+            if self.frame_headers.is_empty() {
+                self.frame_headers = headers;
+            } else {
+                self.frame_headers.extend(headers);
+            }
+        } else {
+            self.frame_headers.extend(headers.into_iter().take(room));
+        }
+    }
+
+    /// Keep the remembered headers a prefix of the frame count.
+    fn trim_recorded_frame_headers(&mut self) {
+        self.frame_headers.truncate(self.frame_count);
+    }
+
+    /// Remember the headers of the frames just appended at
+    /// `start_frame_index`, when the remembered prefix reached it.
+    fn record_written_frame_headers(
+        &mut self,
+        start_frame_index: usize,
+        headers: Vec<RecordedFrameHeader>,
+    ) {
+        if self.frame_headers.len() == start_frame_index {
+            self.extend_recorded_frame_headers(headers);
+        }
+    }
+
+    /// The frame headers in a prepared batch about to be written at the
+    /// frame count, exactly as they will be on disk; empty when the
+    /// remembered prefix does not reach the frame count.
+    fn prepared_batch_headers(&self, prepared_frame_bytes: &[u8]) -> Vec<RecordedFrameHeader> {
+        if self.frame_headers.len() != self.frame_count || self.frame_count >= self.frame_header_cap
+        {
+            return Vec::new();
+        }
+        let frame_size = self.frame_size();
+        let mut headers = Vec::with_capacity(prepared_frame_bytes.len() / frame_size);
+        for frame in prepared_frame_bytes.chunks_exact(frame_size) {
+            let Ok(header) = WalFrameHeader::from_bytes(&frame[..WAL_FRAME_HEADER_SIZE]) else {
+                break;
+            };
+            headers.push(RecordedFrameHeader::from(&header));
+        }
+        headers
+    }
+
+    /// Bound the frame headers this handle remembers (default
+    /// [`DEFAULT_RECORDED_FRAME_HEADER_CAP`]). Headers past the bound are read
+    /// from disk; `0` reads every header from disk.
+    pub fn set_recorded_frame_header_cap(&mut self, cap: usize) {
+        self.frame_header_cap = cap;
+        self.frame_headers.truncate(cap);
     }
 
     /// Refresh an in-doubt append while preserving its previously accepted prefix.
@@ -547,6 +653,7 @@ impl<F: VfsFile> WalFile<F> {
         let mut accepted_checksum = header_checksum;
         let mut accepted_count = 0;
         let mut last_commit = None;
+        let mut validated_headers = Vec::new();
         let mut frames = WalFrameReader::new(frame_size, 0, available_frames);
         for index in 0..available_frames {
             let Some(frame_buf) = frames.next(cx, &self.file).await? else {
@@ -574,6 +681,9 @@ impl<F: VfsFile> WalFile<F> {
                 break;
             }
             running_checksum = expected;
+            if validated_headers.len() < self.frame_header_cap {
+                validated_headers.push(RecordedFrameHeader::from(&header));
+            }
             let frame_count = index + 1;
             if frame_count == prefix_frame_count && running_checksum != prefix_checksum {
                 return Err(FrankenError::WalCorrupt {
@@ -593,6 +703,8 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum = accepted_checksum;
         self.last_commit = last_commit;
         self.last_fsynced_frame_count = self.last_fsynced_frame_count.min(accepted_count);
+        self.frame_headers = validated_headers;
+        self.trim_recorded_frame_headers();
         Ok(())
     }
 
@@ -608,8 +720,10 @@ impl<F: VfsFile> WalFile<F> {
         // Generation changes, shrink, and explicit native index recovery must
         // fully revalidate this descriptor. Its prior sync watermark cannot
         // authorize frames in the rebuilt view, so clear it
-        // before any fallible I/O and fail closed if rebuilding fails.
+        // before any fallible I/O and fail closed if rebuilding fails. The
+        // remembered headers belong to the prior view as well.
         self.last_fsynced_frame_count = 0;
+        self.frame_headers.clear();
 
         // A torn read of an in-progress header rewrite is retried (bd-mlz2t).
         let Some((header, header_checksum)) =
@@ -648,6 +762,7 @@ impl<F: VfsFile> WalFile<F> {
         )
         .unwrap_or(usize::MAX);
 
+        let mut validated_headers = Vec::new();
         let mut frames = WalFrameReader::new(frame_size, 0, max_frames);
         for frame_index in 0..max_frames {
             let frame_no = frame_index.saturating_add(1);
@@ -689,6 +804,9 @@ impl<F: VfsFile> WalFile<F> {
 
             new_running_checksum = expected;
             new_frame_count += 1;
+            if validated_headers.len() < self.frame_header_cap {
+                validated_headers.push(RecordedFrameHeader::from(&frame_header));
+            }
 
             if frame_header.is_commit() {
                 last_commit_count = new_frame_count;
@@ -703,6 +821,8 @@ impl<F: VfsFile> WalFile<F> {
         self.frame_count = last_commit_count;
         self.running_checksum = last_commit_checksum;
         self.last_commit = last_commit;
+        self.frame_headers = validated_headers;
+        self.trim_recorded_frame_headers();
 
         Ok(())
     }
@@ -793,6 +913,8 @@ impl<F: VfsFile> WalFile<F> {
             frame_count: 0,
             last_commit: None,
             frame_scratch: Vec::new(),
+            frame_headers: Vec::new(),
+            frame_header_cap: DEFAULT_RECORDED_FRAME_HEADER_CAP,
             last_fsynced_frame_count: 0,
             unsynced_after_failed_sync: None,
             headerless_observation: Some(next_headerless_observation()),
@@ -907,6 +1029,8 @@ impl<F: VfsFile> WalFile<F> {
             frame_count: 0,
             last_commit: None,
             frame_scratch: Vec::new(),
+            frame_headers: Vec::new(),
+            frame_header_cap: DEFAULT_RECORDED_FRAME_HEADER_CAP,
             last_fsynced_frame_count: 0,
             unsynced_after_failed_sync: None,
             headerless_observation: None,
@@ -946,6 +1070,7 @@ impl<F: VfsFile> WalFile<F> {
         let mut last_commit_frames = 0_usize;
         let mut last_commit_checksum = header_checksum;
         let mut last_commit = None;
+        let mut validated_headers = Vec::new();
         let mut frames = WalFrameReader::new(frame_size, 0, max_frames);
 
         for frame_index in 0..max_frames {
@@ -996,6 +1121,9 @@ impl<F: VfsFile> WalFile<F> {
 
             running_checksum = expected;
             valid_frames += 1;
+            if validated_headers.len() < DEFAULT_RECORDED_FRAME_HEADER_CAP {
+                validated_headers.push(RecordedFrameHeader::from(&frame_header));
+            }
 
             if frame_header.is_commit() {
                 last_commit_frames = valid_frames;
@@ -1036,6 +1164,11 @@ impl<F: VfsFile> WalFile<F> {
             frame_count: last_commit_frames,
             last_commit,
             frame_scratch: Vec::new(),
+            frame_headers: {
+                validated_headers.truncate(last_commit_frames);
+                validated_headers
+            },
+            frame_header_cap: DEFAULT_RECORDED_FRAME_HEADER_CAP,
             last_fsynced_frame_count: last_commit_frames,
             unsynced_after_failed_sync: None,
             headerless_observation: None,
@@ -1131,17 +1264,19 @@ impl<F: VfsFile> WalFile<F> {
         let new_checksum = append_result?;
 
         self.running_checksum = new_checksum;
+        let frame_index = self.frame_count;
         self.frame_count += 1;
+        let header = WalFrameHeader {
+            page_number,
+            db_size: db_size_if_commit,
+            salts,
+            checksum: new_checksum,
+        };
+        if self.frame_headers.len() == frame_index && frame_index < self.frame_header_cap {
+            self.frame_headers.push(RecordedFrameHeader::from(&header));
+        }
         if db_size_if_commit != 0 {
-            self.last_commit = Some((
-                self.frame_count - 1,
-                WalFrameHeader {
-                    page_number,
-                    db_size: db_size_if_commit,
-                    salts,
-                    checksum: new_checksum,
-                },
-            ));
+            self.last_commit = Some((frame_index, header));
         }
         crate::metrics::GLOBAL_WAL_METRICS
             .set_wal_frames_current(u64::try_from(self.frame_count).unwrap_or(u64::MAX));
@@ -1533,6 +1668,7 @@ impl<F: VfsFile> WalFile<F> {
         // which may extend beyond this marker with uncommitted frames.
         let last_commit =
             self.validated_prepared_commit_header(prepared_frame_bytes, last_commit_offset)?;
+        let written_headers = self.prepared_batch_headers(prepared_frame_bytes);
 
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_crash_at(
@@ -1563,6 +1699,7 @@ impl<F: VfsFile> WalFile<F> {
             frame_count,
             final_running_checksum,
             last_commit,
+            written_headers,
         )
     }
 
@@ -1572,11 +1709,13 @@ impl<F: VfsFile> WalFile<F> {
         frame_count: usize,
         final_running_checksum: SqliteWalChecksum,
         last_commit: Option<(usize, WalFrameHeader)>,
+        written_headers: Vec<RecordedFrameHeader>,
     ) -> Result<()> {
         self.advance_state_after_write(frame_count, final_running_checksum)?;
         if let Some(last_commit) = last_commit {
             self.last_commit = Some(last_commit);
         }
+        self.record_written_frame_headers(start_frame_index, written_headers);
 
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_crash_at(
@@ -1664,6 +1803,7 @@ impl<F: VfsFile> WalFile<F> {
         let offset = self.frame_offset(start_frame_index);
         let last_commit =
             self.validated_prepared_commit_header(prepared_frame_bytes, last_commit_offset)?;
+        let written_headers = self.prepared_batch_headers(prepared_frame_bytes);
 
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_crash_at(
@@ -1684,6 +1824,7 @@ impl<F: VfsFile> WalFile<F> {
         if let Some(last_commit) = last_commit {
             self.last_commit = Some(last_commit);
         }
+        self.record_written_frame_headers(start_frame_index, written_headers);
 
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_crash_at(
@@ -2081,6 +2222,8 @@ impl<F: VfsFile> WalFile<F> {
             let mut running_checksum = self.running_checksum;
             let mut last_commit = None;
             let mut frames_written = 0usize;
+            let record_headers = self.frame_headers.len() == start_frame_index;
+            let mut written_headers = Vec::new();
 
             #[cfg(any(test, feature = "fault-injection"))]
             crate::fault_hooks::maybe_inject_crash_at(
@@ -2106,6 +2249,13 @@ impl<F: VfsFile> WalFile<F> {
                         running_checksum,
                         self.big_endian_checksum,
                     )?;
+                    if record_headers {
+                        written_headers.push(RecordedFrameHeader {
+                            page_number: frame.page_number,
+                            db_size: frame.db_size_if_commit,
+                            checksum: running_checksum,
+                        });
+                    }
                     if frame.db_size_if_commit != 0 {
                         last_commit = Some((
                             start_frame_index + frames_written,
@@ -2137,6 +2287,7 @@ impl<F: VfsFile> WalFile<F> {
                 frame_count,
                 running_checksum,
                 last_commit,
+                written_headers,
             )
         }
         .await;
@@ -2200,7 +2351,34 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     /// Read just the frame header at a given 0-based index.
+    ///
+    /// A frame this handle wrote or checked against the checksum chain in
+    /// the current generation is answered from memory (bd-w4pr1.8); others
+    /// are read from disk. A check of the physical file itself uses
+    /// [`Self::read_frame_header_on_disk`].
     pub async fn read_frame_header(&self, cx: &Cx, frame_index: usize) -> Result<WalFrameHeader> {
+        if let Some(recorded) = self
+            .frame_headers
+            .get(frame_index)
+            .filter(|_| frame_index < self.frame_count)
+        {
+            return Ok(WalFrameHeader {
+                page_number: recorded.page_number,
+                db_size: recorded.db_size,
+                salts: self.header.salts,
+                checksum: recorded.checksum,
+            });
+        }
+        self.read_frame_header_on_disk(cx, frame_index).await
+    }
+
+    /// Read the frame header at a given 0-based index from the file, never
+    /// from the headers this handle remembers.
+    pub async fn read_frame_header_on_disk(
+        &self,
+        cx: &Cx,
+        frame_index: usize,
+    ) -> Result<WalFrameHeader> {
         if frame_index >= self.frame_count {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -2557,6 +2735,9 @@ impl<F: VfsFile> WalFile<F> {
             checksum: SqliteWalChecksum::default(),
         };
         let header_bytes = new_header.to_bytes()?;
+        // The old generation's headers go before its header is overwritten,
+        // whether or not the reset completes.
+        self.frame_headers.clear();
 
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_crash_at(
@@ -5292,6 +5473,178 @@ mod tests {
         assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(4));
 
         reader.close(&cx).expect("close reader");
+    }
+
+    fn test_frame_offset(index: usize) -> u64 {
+        let frame_size = WAL_FRAME_HEADER_SIZE + usize::try_from(PAGE_SIZE).expect("page size");
+        u64::try_from(WAL_HEADER_SIZE + index * frame_size).expect("frame offset fits u64")
+    }
+
+    /// The decoded on-disk header of frame `index`.
+    fn disk_frame_header(vfs: &MemoryVfs, cx: &Cx, index: usize) -> WalFrameHeader {
+        let file = open_wal_file(vfs, cx);
+        let mut bytes = [0_u8; WAL_FRAME_HEADER_SIZE];
+        assert_eq!(
+            file.read(cx, &mut bytes, test_frame_offset(index))
+                .expect("read frame header"),
+            WAL_FRAME_HEADER_SIZE
+        );
+        WalFrameHeader::from_bytes(&bytes).expect("decode frame header")
+    }
+
+    /// Overwrite frame `index`'s page number on disk through a handle of its
+    /// own, which no `WalFile` observes.
+    fn scribble_frame_page_number(vfs: &MemoryVfs, cx: &Cx, index: usize, page_number: u32) {
+        let file = open_wal_file(vfs, cx);
+        file.write(cx, &page_number.to_be_bytes(), test_frame_offset(index))
+            .expect("overwrite page number");
+    }
+
+    #[test]
+    fn test_recorded_frame_headers_match_disk_and_answer_without_reading_it() {
+        // bd-w4pr1.8: a handle answers frame headers it wrote (all three append
+        // paths) or validated (open, refresh) from memory, equal to the disk.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut writer = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        let pages = [
+            sample_page(1),
+            sample_page(2),
+            sample_page(3),
+            sample_page(4),
+        ];
+        writer
+            .append_frame(&cx, 1, &pages[0], 1)
+            .expect("single-frame append");
+        let mut reader = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("open reader");
+        writer
+            .append_frames(
+                &cx,
+                &[frame_ref(2, &pages[1], 0), frame_ref(3, &pages[2], 3)],
+            )
+            .expect("batch append");
+        let mut bytes = Vec::new();
+        let mut transforms = Vec::new();
+        let commit_offset = writer
+            .prepare_frame_bytes_with_transforms_into(
+                1,
+                [frame_ref(4, &pages[3], 4)],
+                &mut bytes,
+                &mut transforms,
+            )
+            .expect("prepare");
+        let checksum = writer
+            .finalize_prepared_frame_bytes(&mut bytes, &transforms)
+            .expect("finalize");
+        writer
+            .append_finalized_prepared_frame_bytes(&cx, &bytes, 1, checksum, commit_offset)
+            .expect("prepared append");
+        reader.refresh(&cx).expect("refresh");
+        assert_eq!(writer.frame_count(), 4);
+        assert_eq!(reader.frame_count(), 4);
+        for index in 0..4 {
+            let disk = disk_frame_header(&vfs, &cx, index);
+            assert_eq!(writer.read_frame_header(&cx, index).expect("writer"), disk);
+            assert_eq!(reader.read_frame_header(&cx, index).expect("reader"), disk);
+        }
+
+        // A write no handle observes changes the disk but not the answer: the
+        // headers come from memory. Bounding the memory brings the disk back.
+        scribble_frame_page_number(&vfs, &cx, 2, 99);
+        assert_eq!(
+            writer
+                .read_frame_header(&cx, 2)
+                .expect("writer")
+                .page_number,
+            3
+        );
+        assert_eq!(
+            reader
+                .read_frame_header(&cx, 2)
+                .expect("reader")
+                .page_number,
+            3
+        );
+        assert_eq!(
+            reader
+                .read_frame_header_on_disk(&cx, 2)
+                .expect("on disk")
+                .page_number,
+            99
+        );
+        writer.set_recorded_frame_header_cap(2);
+        assert_eq!(
+            writer
+                .read_frame_header(&cx, 1)
+                .expect("in bound")
+                .page_number,
+            2
+        );
+        assert_eq!(
+            writer
+                .read_frame_header(&cx, 2)
+                .expect("past bound")
+                .page_number,
+            99
+        );
+        reader.set_recorded_frame_header_cap(0);
+        assert_eq!(
+            reader.read_frame_header(&cx, 2).expect("disk").page_number,
+            99
+        );
+        assert_eq!(
+            reader.read_frame_header(&cx, 0).expect("disk").page_number,
+            1
+        );
+    }
+
+    #[test]
+    fn test_recorded_frame_headers_follow_a_peer_reset_to_the_new_generation() {
+        // bd-w4pr1.8 negative case: a peer resets the WAL and writes other
+        // pages into the same frame slots, at the same file size. The reader's
+        // refresh must answer the new generation's headers; headers kept
+        // across the generation change would still name pages 1 and 2.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut writer = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        writer
+            .append_frame(&cx, 1, &sample_page(1), 0)
+            .expect("append");
+        writer
+            .append_frame(&cx, 2, &sample_page(2), 2)
+            .expect("commit");
+        let mut reader = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("open reader");
+        assert_eq!(
+            reader
+                .read_frame_header(&cx, 0)
+                .expect("header")
+                .page_number,
+            1
+        );
+
+        let new_salts = WalSalts {
+            salt1: 0x1234_5678,
+            salt2: 0x9ABC_DEF0,
+        };
+        writer.reset(&cx, 1, new_salts, false).expect("reset");
+        writer
+            .append_frame(&cx, 7, &sample_page(7), 0)
+            .expect("append");
+        writer
+            .append_frame(&cx, 8, &sample_page(8), 2)
+            .expect("commit");
+
+        reader.refresh(&cx).expect("refresh");
+        for (index, page_number) in [(0, 7), (1, 8)] {
+            let disk = disk_frame_header(&vfs, &cx, index);
+            let header = reader.read_frame_header(&cx, index).expect("reader");
+            assert_eq!(header.page_number, page_number, "frame {index}");
+            assert_eq!(header.salts, new_salts, "frame {index}");
+            assert_eq!(header, disk, "frame {index}");
+            assert_eq!(writer.read_frame_header(&cx, index).expect("writer"), disk);
+        }
     }
 
     #[test]

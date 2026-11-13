@@ -165,7 +165,7 @@ async fn validate_terminal_frame<F: VfsFile>(
     let previous = if index == 0 {
         header_seed
     } else {
-        let predecessor = wal.read_frame_header(cx, index - 1).await?;
+        let predecessor = wal.read_frame_header_on_disk(cx, index - 1).await?;
         if predecessor.page_number == 0 || predecessor.salts != wal.header().salts {
             return Err(corrupt("invalid checkpoint terminal checksum seed"));
         }
@@ -235,7 +235,7 @@ async fn validate_commit_boundary<F: VfsFile>(
     let previous = if index == 0 {
         header_seed
     } else {
-        let predecessor = wal.read_frame_header(cx, index - 1).await?;
+        let predecessor = wal.read_frame_header_on_disk(cx, index - 1).await?;
         if predecessor.page_number == 0 || predecessor.salts != wal.header().salts {
             return Err(corrupt("invalid checkpoint boundary checksum seed"));
         }

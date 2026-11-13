@@ -1393,7 +1393,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         {
             return Err(FrankenError::BusyRecovery);
         }
-        let observed = self.wal.read_frame_header(cx, index).await?;
+        let observed = self.wal.read_frame_header_on_disk(cx, index).await?;
         if observed != committed || observed.salts != self.wal.header().salts {
             return Err(FrankenError::BusyRecovery);
         }
@@ -1771,7 +1771,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 } else {
                     let index = usize::try_from(header.mx_frame - 1)
                         .map_err(|_| FrankenError::DatabaseFull)?;
-                    match self.wal.read_frame_header(cx, index).await {
+                    match self.wal.read_frame_header_on_disk(cx, index).await {
                         Ok(marker) => Some(Some((header.mx_frame, marker))),
                         Err(FrankenError::WalCorrupt { .. }) => None,
                         Err(error) => return Err(error),
@@ -1818,7 +1818,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                     break;
                 }
                 let index = usize::try_from(frame - 1).map_err(|_| FrankenError::DatabaseFull)?;
-                let marker = self.wal.read_frame_header(cx, index).await?;
+                let marker = self.wal.read_frame_header_on_disk(cx, index).await?;
                 if marker.page_number == 0 || marker.salts != wal_header.salts {
                     return Err(FrankenError::WalCorrupt {
                         detail: "validated recovery frame changed under the canonical owner".to_owned(),
@@ -12150,6 +12150,9 @@ mod tests {
                 .expect("open peer reader WAL");
             let mut reader =
                 WalBackendAdapter::new(WalFile::open(&cx, file).expect("open WAL"));
+            // The scan reads its headers from disk only where the handle
+            // remembers none (bd-w4pr1.8); this fault needs that disk read.
+            reader.wal.set_recorded_frame_header_cap(0);
             reader
                 .refresh_published_snapshot(&cx)
                 .expect("publish old prefix");
@@ -12243,6 +12246,70 @@ mod tests {
                 Some(added_page)
             );
         }
+    }
+
+    #[test]
+    fn test_publication_scan_takes_peer_frame_headers_from_the_refresh() {
+        // bd-w4pr1.8: the frames a refresh read whole are scanned for
+        // publication without reading their headers from disk again. With the
+        // handle's memory bounded to zero, the same adoption reads them.
+        let mut header_reads = Vec::new();
+        for cap in [None, Some(0)] {
+            let cx = test_cx();
+            let vfs = CheckpointHandoffFaultVfs::new();
+            let mut writer = make_fault_adapter(&vfs, &cx);
+            writer
+                .append_frame(&cx, 1, &sample_page(0x51), 1)
+                .expect("seed commit");
+            writer.sync(&cx).expect("publish seed commit");
+            let (file, _) = vfs
+                .open(
+                    &cx,
+                    Some(Path::new("test.db-wal")),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+                )
+                .expect("open peer reader WAL");
+            let mut reader =
+                WalBackendAdapter::new(WalFile::open(&cx, file).expect("open WAL"));
+            if let Some(cap) = cap {
+                reader.wal.set_recorded_frame_header_cap(cap);
+            }
+            reader
+                .refresh_published_snapshot(&cx)
+                .expect("publish seed");
+            writer
+                .append_frame(&cx, 2, &sample_page(0x52), 0)
+                .expect("peer frame");
+            writer
+                .append_frame(&cx, 3, &sample_page(0x53), 3)
+                .expect("peer commit");
+            writer.sync(&cx).expect("publish peer commit");
+            // Count the 24-byte header reads of the adoption; never fail one.
+            vfs.fail_wal_frame_header_read_after(usize::MAX);
+            let adopted = reader
+                .refresh_published_snapshot(&cx)
+                .expect("adopt peer commit");
+            assert_eq!(adopted.last_commit_frame, Some(2));
+            assert_eq!(
+                reader.published_snapshot.page_index.as_ref(),
+                &HashMap::from([(1, 0), (2, 1), (3, 2)])
+            );
+            header_reads.push(
+                vfs.faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .wal_header_reads_completed,
+            );
+            assert_eq!(
+                reader.read_page(&cx, 3).expect("peer page"),
+                Some(sample_page(0x53))
+            );
+        }
+        let (remembered, from_disk) = (header_reads[0], header_reads[1]);
+        assert!(
+            remembered + 2 <= from_disk,
+            "the scan must not re-read the two peer headers: {remembered} vs {from_disk}"
+        );
     }
 
     #[test]
