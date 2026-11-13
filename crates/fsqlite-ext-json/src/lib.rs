@@ -439,7 +439,7 @@ pub fn json_valid_blob(input: &[u8], flags: Option<u8>) -> i64 {
 
 /// Convert JSON text into JSONB bytes.
 pub fn jsonb(input: &str) -> Result<Vec<u8>> {
-    let value = parse_json_text(input)?;
+    let value = parse_json_value_lenient(input)?;
     encode_jsonb_root(&value)
 }
 
@@ -818,7 +818,7 @@ fn parse_json_input_blob(input: &[u8]) -> Result<Value> {
     match decode_jsonb_root(input) {
         Ok(value) => Ok(value),
         Err(_) => match std::str::from_utf8(input) {
-            Ok(text) => parse_json_text(text),
+            Ok(text) => parse_json_value_lenient(text),
             Err(_) => Err(malformed_json()),
         },
     }
@@ -1008,7 +1008,7 @@ pub fn json_extract(input: &str, paths: &[&str]) -> Result<SqliteValue> {
 ///
 /// The extracted JSON subtree is always returned as JSONB bytes.
 pub fn jsonb_extract(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     jsonb_extract_value(&root, paths)
 }
 
@@ -1016,7 +1016,7 @@ pub fn jsonb_extract(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
 ///
 /// Missing paths yield SQL NULL.
 pub fn json_arrow(input: &str, path: &str) -> Result<SqliteValue> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     json_arrow_value(&root, path)
 }
 
@@ -1030,16 +1030,22 @@ pub fn json_double_arrow(input: &str, path: &str) -> Result<SqliteValue> {
 /// Matches SQLite JSON1 semantics: a missing path returns SQL NULL, while an
 /// existing non-array target returns 0.
 pub fn json_array_length(input: &str, path: Option<&str>) -> Result<Option<usize>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     json_array_length_value(&root, path)
 }
 
-/// Return 0 for valid JSON, otherwise a 1-based position for first parse error.
+/// Return 0 for valid JSON or JSON5, otherwise a 1-based parse-error position.
 #[must_use]
 pub fn json_error_position(input: &str) -> usize {
     match serde_json::from_str::<Value>(input) {
         Ok(_) => 0,
         Err(error) => {
+            // JSON5 and out-of-range JSON numbers also have valid syntax.
+            // Keep strict parsing first so ordinary JSON is only parsed once.
+            if parse_json_value_lenient(input).is_ok() {
+                return 0;
+            }
+
             let line = error.line();
             let column = error.column();
             if line == 0 || column == 0 {
@@ -1068,7 +1074,7 @@ pub fn json_error_position(input: &str) -> usize {
 
 /// Pretty-print JSON with default 4-space indentation or custom indent token.
 pub fn json_pretty(input: &str, indent: Option<&str>) -> Result<String> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     json_pretty_value(&root, indent)
 }
 
@@ -1334,28 +1340,28 @@ pub fn jsonb_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Vec<
 
 /// Set JSON values at path(s), creating object keys when missing.
 pub fn json_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let edited = edit_json_paths_value(&root, pairs, EditMode::Set)?;
     encode_json_text("json edit encode failed", &edited)
 }
 
 /// JSONB variant of `json_set`.
 pub fn jsonb_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let edited = edit_json_paths_value(&root, pairs, EditMode::Set)?;
     encode_jsonb_root(&edited)
 }
 
 /// Insert JSON values at path(s) only when path does not already exist.
 pub fn json_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let edited = edit_json_paths_value(&root, pairs, EditMode::Insert)?;
     encode_json_text("json edit encode failed", &edited)
 }
 
 /// JSONB variant of `json_insert`.
 pub fn jsonb_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let edited = edit_json_paths_value(&root, pairs, EditMode::Insert)?;
     encode_jsonb_root(&edited)
 }
@@ -1367,7 +1373,7 @@ pub fn jsonb_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8
 /// end is a no-op. Missing object parents may be created when the eventual
 /// target is an array position.
 pub fn json_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let mut edited = root;
     for (path, value) in pairs {
         let segments = parse_path(path)?;
@@ -1378,7 +1384,7 @@ pub fn json_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<S
 
 /// JSONB variant of `json_array_insert`.
 pub fn jsonb_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let mut edited = root;
     for (path, value) in pairs {
         let segments = parse_path(path)?;
@@ -1389,21 +1395,21 @@ pub fn jsonb_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<
 
 /// Replace JSON values at path(s) only when path already exists.
 pub fn json_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let edited = edit_json_paths_value(&root, pairs, EditMode::Replace)?;
     encode_json_text("json edit encode failed", &edited)
 }
 
 /// JSONB variant of `json_replace`.
 pub fn jsonb_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let edited = edit_json_paths_value(&root, pairs, EditMode::Replace)?;
     encode_jsonb_root(&edited)
 }
 
 /// Remove JSON values at path(s). Array removals compact the array.
 pub fn json_remove(input: &str, paths: &[&str]) -> Result<String> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let Some(edited) = json_remove_value(&root, paths)? else {
         return Ok("null".to_owned());
     };
@@ -1412,7 +1418,7 @@ pub fn json_remove(input: &str, paths: &[&str]) -> Result<String> {
 
 /// JSONB variant of `json_remove`.
 pub fn jsonb_remove(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
-    let root = parse_json_text(input)?;
+    let root = parse_json_value_lenient(input)?;
     let Some(edited) = json_remove_value(&root, paths)? else {
         return encode_jsonb_root(&Value::Null);
     };
@@ -1421,16 +1427,16 @@ pub fn jsonb_remove(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
 
 /// Apply RFC 7396 JSON Merge Patch.
 pub fn json_patch(input: &str, patch: &str) -> Result<String> {
-    let root = parse_json_text(input)?;
-    let patch_value = parse_json_text(patch)?;
+    let root = parse_json_value_lenient(input)?;
+    let patch_value = parse_json_value_lenient(patch)?;
     let merged = json_patch_value(&root, &patch_value);
     encode_json_text("json_patch encode failed", &merged)
 }
 
 /// JSONB variant of `json_patch`.
 pub fn jsonb_patch(input: &str, patch: &str) -> Result<Vec<u8>> {
-    let root = parse_json_text(input)?;
-    let patch_value = parse_json_text(patch)?;
+    let root = parse_json_value_lenient(input)?;
+    let patch_value = parse_json_value_lenient(patch)?;
     let merged = json_patch_value(&root, &patch_value);
     encode_jsonb_root(&merged)
 }
@@ -5258,6 +5264,183 @@ mod tests {
         assert_eq!(value["b"], Value::Bool(true));
         assert_eq!(value["n"], Value::Null);
         assert_eq!(value["a"], Value::Array(Vec::new()));
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn json5_public_read_helpers_accept_relaxed_input() {
+        let input = "{a:[1,0x10,],s:'ok',}";
+        assert_eq!(
+            json_from_jsonb(&jsonb(input).unwrap()).unwrap(),
+            r#"{"a":[1,16],"s":"ok"}"#
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb_extract(input, &["$.a"]).unwrap()).unwrap(),
+            "[1,16]"
+        );
+        assert_eq!(
+            json_arrow(input, "$.s").unwrap(),
+            SqliteValue::Text(r#""ok""#.into())
+        );
+        assert_eq!(json_arrow(input, "$.missing").unwrap(), SqliteValue::Null);
+        assert_eq!(json_array_length(input, Some("$.a")).unwrap(), Some(2));
+        assert_eq!(json_array_length(input, Some("$.s")).unwrap(), Some(0));
+        assert_eq!(json_array_length(input, Some("$.missing")).unwrap(), None);
+        assert_eq!(
+            json_pretty("{a:0x10,}", Some("  ")).unwrap(),
+            "{\n  \"a\": 16\n}"
+        );
+        for valid in [input, "9e999", "[9e999]", "{a:Infinity,b:NaN,}"] {
+            assert_eq!(json_error_position(valid), 0, "{valid}");
+            for arg in [
+                SqliteValue::Text(valid.into()),
+                SqliteValue::Blob(Arc::from(valid.as_bytes())),
+            ] {
+                assert_eq!(
+                    JsonErrorPositionFunc.invoke(&[arg]).unwrap(),
+                    SqliteValue::Integer(0),
+                    "{valid}"
+                );
+            }
+        }
+        assert_eq!(json_valid(input, None), 0);
+        assert_eq!(json_valid(input, Some(JSON_VALID_JSON5_FLAG)), 1);
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn json5_public_edit_helpers_accept_documents_and_patches() {
+        let input = "{a:1,b:[2,3,],}";
+        let pairs = [
+            ("$.a", SqliteValue::Integer(9)),
+            ("$.c", SqliteValue::Text("{d:4}".into())),
+        ];
+        let check = |text: Result<String>, binary: Result<Vec<u8>>, expected: &str| {
+            let text = text.unwrap();
+            assert_eq!(text, expected);
+            assert_eq!(json_valid(&text, None), 1);
+            assert_eq!(json_from_jsonb(&binary.unwrap()).unwrap(), expected);
+        };
+        // Value arguments remain literal strings even when they resemble JSON5.
+        check(
+            json_set(input, &pairs),
+            jsonb_set(input, &pairs),
+            r#"{"a":9,"b":[2,3],"c":"{d:4}"}"#,
+        );
+        check(
+            json_insert(input, &pairs),
+            jsonb_insert(input, &pairs),
+            r#"{"a":1,"b":[2,3],"c":"{d:4}"}"#,
+        );
+        check(
+            json_replace(input, &pairs),
+            jsonb_replace(input, &pairs),
+            r#"{"a":9,"b":[2,3]}"#,
+        );
+        let insertion = [("$.b[1]", SqliteValue::Integer(7))];
+        check(
+            json_array_insert(input, &insertion),
+            jsonb_array_insert(input, &insertion),
+            r#"{"a":1,"b":[2,7,3]}"#,
+        );
+        check(
+            json_remove(input, &["$.a"]),
+            jsonb_remove(input, &["$.a"]),
+            r#"{"b":[2,3]}"#,
+        );
+        let patch = "{a:null,b:[0x10,],c:'added',}";
+        check(
+            json_patch(input, patch),
+            jsonb_patch(input, patch),
+            r#"{"b":[16],"c":"added"}"#,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn json5_blob_inputs_support_scalar_and_table_consumers() {
+        let text = |input: &str| SqliteValue::Text(input.into());
+        let blob = |input: &str| SqliteValue::Blob(Arc::from(input.as_bytes()));
+        let input = "{a:[1,0x10,],s:'ok',}";
+        let canonical = r#"{"a":[1,16],"s":"ok"}"#;
+        assert_eq!(JsonFunc.invoke(&[blob(input)]).unwrap(), text(canonical));
+        assert_eq!(
+            JsonbFunc.invoke(&[blob(input)]).unwrap(),
+            SqliteValue::Blob(Arc::from(jsonb(canonical).unwrap()))
+        );
+        assert_eq!(
+            JsonExtractFunc
+                .invoke(&[blob(input), text("$.a[1]")])
+                .unwrap(),
+            SqliteValue::Integer(16)
+        );
+        assert_eq!(
+            JsonArrayLengthFunc
+                .invoke(&[blob(input), text("$.a")])
+                .unwrap(),
+            SqliteValue::Integer(2)
+        );
+        assert_eq!(
+            JsonPatchFunc
+                .invoke(&[blob(input), blob("{s:'updated',}")])
+                .unwrap(),
+            text(r#"{"a":[1,16],"s":"updated"}"#)
+        );
+        assert_eq!(
+            json_each_blob(input.as_bytes(), Some("$.a")).unwrap(),
+            json_each(input, Some("$.a")).unwrap()
+        );
+        assert_eq!(
+            json_tree_blob(input.as_bytes(), None).unwrap(),
+            json_tree(input, None).unwrap()
+        );
+        assert_eq!(json_valid_blob(input.as_bytes(), None), 0);
+        assert_eq!(
+            json_valid_blob(input.as_bytes(), Some(JSON_VALID_JSON5_FLAG)),
+            1
+        );
+        // This is both JSONB integer 456 and UTF-8 JSON text "3456".
+        // JSONB decoding must retain precedence over the text fallback.
+        assert_eq!(
+            JsonExtractFunc
+                .invoke(&[blob("3456"), text("$")])
+                .unwrap(),
+            SqliteValue::Integer(456)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn json5_consumers_preserve_malformed_input_errors() {
+        for input in ["{a:[1,,]}", "{a:'unterminated}", "[0x]", "{a:1} trailing"] {
+            assert!(jsonb(input).is_err(), "{input}");
+            assert!(jsonb_extract(input, &["$"]).is_err(), "{input}");
+            assert!(json_arrow(input, "$").is_err(), "{input}");
+            assert!(json_array_length(input, None).is_err(), "{input}");
+            assert!(json_pretty(input, None).is_err(), "{input}");
+            assert!(json_set(input, &[]).is_err(), "{input}");
+            assert!(jsonb_set(input, &[]).is_err(), "{input}");
+            assert!(json_patch("{}", input).is_err(), "{input}");
+            assert!(jsonb_patch("{}", input).is_err(), "{input}");
+            assert!(json_error_position(input) > 0, "{input}");
+            assert!(
+                JsonFunc
+                    .invoke(&[SqliteValue::Blob(Arc::from(input.as_bytes()))])
+                    .is_err(),
+                "{input}"
+            );
+            assert!(json_each_blob(input.as_bytes(), None).is_err(), "{input}");
+        }
+        let invalid_utf8 = [0xff];
+        assert!(
+            JsonExtractFunc
+                .invoke(&[
+                    SqliteValue::Blob(Arc::from(invalid_utf8.as_slice())),
+                    SqliteValue::Text("$".into()),
+                ])
+                .is_err()
+        );
+        assert!(json_tree_blob(&invalid_utf8, None).is_err());
     }
 
     #[test]
