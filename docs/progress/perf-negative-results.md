@@ -271,6 +271,81 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
 - Retry condition: none. Not done here: the column arms' `IsNull` guards (a column compared with a
   non-literal value), which change nearly every WHERE's bytecode and its goldens.
 
+## 2026-11-13 - WIN: an append to the cached rightmost leaf changes the transaction's staged image of the leaf in place, with no page copy and no page write (bd-i3csr.4, lever 4.2)
+
+- Target: every row appended past the end of a table within one statement after its first (the
+  cursor's cached rightmost leaf): the scorecard's `bulk_insert_1M_one_txn`, the 300k-row
+  mutation setup, `memory_script_200k`'s load, INSERT ... SELECT copies. Touched:
+  `crates/fsqlite-btree/src/cursor.rs` (`try_append_on_cached_rightmost_leaf`,
+  `try_append_in_staged_image_of_cached_leaf`, `StagedLeafAppend`).
+- Evidence before (callgrind, main f9f4e3a1d + bd-i3csr.3, the bulk statement at 100k and 200k
+  rows, per row = difference / 100k): `try_append_table_leaf_payload_in_place_no_overflow` 2,471
+  instructions a row file-backed and 1,829 in :memory:: the append itself 383, the `PageData`
+  clone handed to the pager (an `Arc<[u8]>` built from the cache's owned 4 KiB, ~680 with its
+  allocation), and `write_page_data` 1,421 file-backed / 766 in memory (the engine's tier-0
+  write, whose MVCC prepare returns at once for a page with a staged write, the pager replacing
+  the staged entry and dropping the previous image, `clear_stale_synthetic_pending_commit_surface`).
+- Change: when the transaction's unpublished staged image of the leaf is the image the cache
+  holds (equal `PageData::image_token`), the cache and the stack's top entry give up their
+  references and the row is appended inside the staged image through
+  `PageWriter::try_mutate_staged_page_data`, the contract bd-w4pr1.13.20 lever F (e7996afb0) uses
+  for deletes and same-size rewrites: the engine admits only a page with a staged write that is
+  not freed, the pager takes the savepoint before-image first and refuses a published image or a
+  recovery barrier, and any other holder keeps its bytes through `as_bytes_mut`'s copy-on-write.
+  The cache then shares the staged image; when the row does not fit, the cache and the stack
+  entry share the unchanged image (same bytes, same token) and the existing overflow / split
+  path runs. A store without staged images, or with a different one, takes the old path.
+- Prediction (recorded before code, perf stat terms): -6% to -12% instructions on the 300k
+  setup, the 1M bulk row -6% to -11% instructions and -3% to -10% CPU, memory_script -2% to -5%,
+  txn / autocommit about unchanged. Kill: under -4% on the 300k setup or the 1M row's median CPU
+  not at least 2% lower.
+- Result, stock sqlite3 3.46.1 live in the same runs, base main 661434190 (01fce8...), lever
+  (661434190 + this diff), every answer equal to stock's: the 300k generate_series setup (io_uring
+  refused, 3 runs) 3,131.3M -> 2,556.3M user instructions (-18.4%; 2.96x -> 2.42x stock
+  1,058.2M), CPU 375 -> 298 ms (-20%); INSERT INTO m2 SELECT * FROM m (300k) 3,614.4M ->
+  3,020.8M (-16.4%), CPU 420 -> 338 ms; the 1M bulk row (5 runs) 11,535.6M -> 9,637.2M
+  (-16.5%), CPU 1,391 -> 1,109 ms (-20%), wall 1,410 -> 1,127 ms (3.36x -> 2.68x stock 420 ms);
+  memory_script_200k 4,660.3M -> 4,390.7M (-5.8%), CPU 466 -> 425 ms. Prediction beaten (the
+  callgrind arithmetic, ~1.9k a row file-backed, held under perf stat: the 4 KiB copy here is a
+  vector loop, not rep movsb). Every 1M-row file both binaries wrote passes stock's
+  `PRAGMA integrity_check`, and the table's rows hash the same as stock's.
+- Rows without the path (one row per statement, or no appends): txn_1000x10_rows -0.8%,
+  autocommit_5k_inserts -1.7%, delete_14pct_300k -3.0%, update_10pct_300k and
+  create_index_int_300k flat; read rows identical instructions under either binary on either
+  arm's database (the same 8,187 pages and freelist). multiproc_8x500 (8 processes x 500
+  autocommit INSERTs, mp_probe.py, 15 interleaved runs): median instructions 1,275.9M ->
+  1,271.2M, CPU +0.5%, wall -1.3%; its minimum swings with lock contention (+/-5% between runs
+  of one binary). Scorecard (2 runs, wall, stock first and last): bulk 1.437 -> 1.190 s (3.43x ->
+  2.84x), memory_script 0.507 -> 0.466 s; rows that read slower there (rowid_lookups +5%,
+  order_by +6%, multiproc +5%, create_index +3%) run identical instructions or, for multiproc,
+  equal medians in the probes above.
+- Tests: fsqlite-btree
+  `test_appends_change_the_staged_rightmost_leaf_in_place_only_when_it_is_the_caches` (3,000
+  appends with variable payloads, overflow chains every 257th row and an insert below the end
+  every 500, through a store that keeps its staged images: every page byte-equal to the
+  copy-and-write path, more than 2,000 appends made in place; a store that offers a different
+  staged image, the page before its last write, is never changed in place).
+- Gate, 661434190 with the change (rch, 2026-11-13): clippy -D warnings with all targets on
+  fsqlite-btree, fsqlite-vdbe and fsqlite-core clean; fsqlite-btree lib 553 pass and 1 fail in
+  the gate run (`test_balance_for_delete_defers_until_leaf_empties`, which reads a global
+  balance counter: alone it passes, and the whole lib then passed twice, 554 of 554; the new test
+  holds the same lock); fsqlite-vdbe lib 1,243 pass and 2 fail (the bd-bhalc pair), goldens 8
+  pass; 54 fsqlite-core targets in 8 batches, bd_2jbl5_update_from_triggers_oracle (the
+  bd-w4pr1.13.34 hang keeper) and the staged-leaf, right-edge append and savepoint keepers first,
+  then INSERT, savepoint / rollback, RETURNING, concurrency and rowid keepers: 365 pass and 5 fail,
+  each red on main: bd-jlbrk's two `rowid_replace_preflight_*` tests, bd-mkon7's
+  `review_omitted_rowid_alias_ignores_defaults`, `gh516_returning_conformance::
+  correlated_returning_unbound_parameters_do_not_alias_frozen_assignments` (the red the
+  e7996afb0 entry names), and `bulk_insert_values_memdb_reload_scaling::
+  read_free_insert_values_streak_defers_memdb_reload_and_stays_correct`, flaky on its global
+  reload counter: 1 failure in 5 parallel runs on main's code path and 1 in 5 with the lever,
+  5 of 5 passing alone (bd-8aqha); fsqlite-core lib 4,169 pass and 2 fail (the t6741 pair).
+- Retry condition: none. Next on the row: the per-statement descent to the rightmost leaf in
+  `allocate_concurrent_storage_rowid` for implicit-rowid INSERT statements (bd-i3csr.4 lever 4.3);
+  the stack-entry rebuild per append (a `cell_pointers` Vec clone); on the txn row, by-value moves
+  in `execute_table_program_with_db` / `_with_cx` (~3.2k per statement) and
+  `next_internal_savepoint_name`'s `format!` (~0.9k per statement).
+
 ## 2026-11-13 - WIN: the scan loop's Remainder of two integers and its Rowid write their register in place (bd-w4pr1.13.20, lever V)
 
 - Target: every scan that reads a rowid or takes `%` per row: the scorecard's DELETE and UPDATE rows
