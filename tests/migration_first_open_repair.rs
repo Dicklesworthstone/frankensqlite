@@ -1,0 +1,607 @@
+#![recursion_limit = "512"]
+
+//! bd-zywqc.5: first-open-after-upgrade one-time idempotent repair pass.
+//!
+//! A database created by a version predating this migration logic has no
+//! marker; opening it under the current code runs a bounded, idempotent,
+//! interrupt-safe repair pass and stamps a marker so it never re-runs for the
+//! same `(database, version)`. These tests exercise the acceptance criteria:
+//! runs-once, idempotent, interrupt-safe, backup-preserved, opt-out, message.
+//!
+//! The corruption fixture reuses the deterministic bd-84rh4 freelist-hole (an
+//! in-range page reachable from neither a b-tree nor the durable freelist —
+//! `integrity_check`'s "Page N: never used" class, healed by
+//! `repair_orphaned_pages`). Since the current code stamps a marker at birth,
+//! the fixture deletes that marker to model a genuine pre-fix upgrader.
+
+use std::path::Path;
+
+use fsqlite_core::connection::Connection;
+use fsqlite_core::migration::{
+    CURRENT_MIGRATION_VERSION, migration_marker_path, pre_migration_backup_path,
+    read_migration_marker,
+};
+use fsqlite_types::value::SqliteValue;
+
+/// Build an on-disk database with the bd-84rh4 freelist hole and **no** marker,
+/// modelling a database written by a pre-migration version. Returns
+/// `(db_path, freed_pages)`.
+async fn craft_prefix_corrupt_db(dir: &Path, name: &str) -> (String, u32) {
+    let db = dir.join(name).to_string_lossy().into_owned();
+    {
+        // The first open stamps a birth marker; DELETE journal mode keeps the
+        // crafted image self-contained (no WAL sidecar).
+        let conn = Connection::open(&db).await.expect("open");
+        conn.execute("PRAGMA journal_mode=DELETE;")
+            .await
+            .expect("journal_mode");
+        conn.execute("CREATE TABLE keep(x INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .expect("create keep");
+        conn.execute("CREATE TABLE dropme(x INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .expect("create dropme");
+        for i in 0..64 {
+            conn.execute(&format!("INSERT INTO keep VALUES ({i}, 'k{i}');"))
+                .await
+                .expect("insert keep");
+            conn.execute(&format!("INSERT INTO dropme VALUES ({i}, 'd{i}');"))
+                .await
+                .expect("insert dropme");
+        }
+        conn.execute("DROP TABLE dropme;").await.expect("drop");
+        conn.close().await.expect("close");
+    }
+    // Model a pre-fix database: strip the birth marker.
+    let _ = std::fs::remove_file(migration_marker_path(&db));
+    // Erase the durable freelist header -> the orphan hole.
+    let mut bytes = std::fs::read(&db).expect("read image");
+    let freelist_count = u32::from_be_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]);
+    assert!(freelist_count > 0, "DROP must durably free pages to erase");
+    for b in &mut bytes[32..40] {
+        *b = 0;
+    }
+    std::fs::write(&db, &bytes).expect("write corrupted image");
+    (db, freelist_count)
+}
+
+async fn integrity_lines(conn: &Connection) -> Vec<String> {
+    conn.query("PRAGMA integrity_check;")
+        .await
+        .expect("integrity_check")
+        .iter()
+        .filter_map(|row| match &row.values()[0] {
+            SqliteValue::Text(s) => Some(s.as_ref().to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Stock C SQLite (rusqlite) integrity_check verdict — the oracle.
+fn stock_integrity(db: &str) -> String {
+    let c = rusqlite::Connection::open(db).expect("stock open");
+    c.query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+        .expect("stock integrity_check")
+}
+
+fn run_migration_test<F, Fut>(f: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(f());
+}
+
+/// AC precondition: a database created by the current code is stamped at birth
+/// (so reopens short-circuit) and needs no repair or backup.
+#[test]
+fn clean_database_is_stamped_at_birth_without_repair() {
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("clean.db").to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db).await.expect("open");
+        conn.execute("CREATE TABLE t(a);").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1),(2);").await.unwrap();
+        conn.close().await.unwrap();
+
+        let marker = read_migration_marker(&db).expect("marker stamped at birth");
+        assert_eq!(marker.last_upgrade_version, CURRENT_MIGRATION_VERSION);
+        assert!(
+            marker.repairs_applied.is_empty(),
+            "a born-clean database records no repairs: {marker:?}"
+        );
+        assert!(
+            !pre_migration_backup_path(&db).exists(),
+            "no backup for a clean database"
+        );
+
+        let conn2 = Connection::open(&db)
+            .await
+            .expect("reopen (AlreadyMigrated)");
+        assert_eq!(integrity_lines(&conn2).await, vec!["ok".to_owned()]);
+        conn2.close().await.unwrap();
+    });
+}
+
+/// AC: a pre-fix corrupt database is repaired on first open; the original is
+/// preserved at the backup; stock C SQLite reads the repaired image as `ok`.
+#[test]
+fn prefix_corrupt_database_is_repaired_on_first_open() {
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "prefix.db").await;
+        assert!(
+            read_migration_marker(&db).is_none(),
+            "precondition: a pre-fix database has no marker"
+        );
+
+        // First open under current code triggers the migration/repair pass.
+        let conn = Connection::open(&db)
+            .await
+            .expect("open triggers migration");
+        assert_eq!(
+            integrity_lines(&conn).await,
+            vec!["ok".to_owned()],
+            "migration must heal the freelist hole"
+        );
+        conn.close().await.unwrap();
+
+        let marker = read_migration_marker(&db).expect("marker written after repair");
+        assert_eq!(marker.last_upgrade_version, CURRENT_MIGRATION_VERSION);
+        assert!(
+            !marker.repairs_applied.is_empty(),
+            "repairs_applied records the applied repair: {marker:?}"
+        );
+
+        let backup = pre_migration_backup_path(&db);
+        assert!(
+            backup.exists(),
+            "original preserved at the pre-migration backup"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for private_path in [migration_marker_path(&db), backup.clone()] {
+                let mode = std::fs::metadata(&private_path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "GH#517: migration sidecar/backup must not expose group/other bits ({private_path:?} mode={mode:o})"
+                );
+            }
+        }
+        assert_ne!(
+            std::fs::read(&backup).unwrap(),
+            std::fs::read(&db).unwrap(),
+            "backup holds the pre-repair image, distinct from the repaired database"
+        );
+        assert_eq!(
+            stock_integrity(&db),
+            "ok",
+            "stock oracle: the repaired database is clean"
+        );
+    });
+}
+
+/// AC (1): the migration runs once and only once per (db, version). A second
+/// open sees the marker and does not re-run the repair.
+/// bd-6jf9o review: FrankenSQLite never restamps the header's last-writer
+/// version (offset 96) when it writes a database it did not create, so a
+/// stock-created database that a pre-marker FrankenSQLite build later damaged
+/// still names stock SQLite as its last writer. The pass exists for exactly
+/// that database and must not skip it on the header stamp.
+#[test]
+fn stock_created_database_written_by_frankensqlite_still_gets_the_pass() {
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("stock.db").to_string_lossy().into_owned();
+        {
+            let stock = rusqlite::Connection::open(&db).expect("stock create");
+            stock
+                .execute_batch(
+                    "CREATE TABLE keep(x INTEGER PRIMARY KEY, v TEXT);
+                     CREATE TABLE dropme(x INTEGER PRIMARY KEY, v TEXT);
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64)
+                     INSERT INTO keep SELECT i, 'k' || i FROM n;
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64)
+                     INSERT INTO dropme SELECT i, 'd' || i FROM n;",
+                )
+                .expect("stock seed");
+        }
+        let stock_stamp = std::fs::read(&db).expect("read image")[96..100].to_vec();
+        {
+            // FrankenSQLite writes to the stock database, including the DROP
+            // that frees the pages the damage below orphans.
+            let conn = Connection::open(&db).await.expect("open stock database");
+            // As in craft_prefix_corrupt_db: keep the image self-contained.
+            conn.execute("PRAGMA journal_mode=DELETE;")
+                .await
+                .expect("journal_mode");
+            conn.execute("INSERT INTO keep VALUES (100, 'fsqlite');")
+                .await
+                .expect("fsqlite insert");
+            conn.execute("DROP TABLE dropme;")
+                .await
+                .expect("fsqlite drop");
+            conn.close().await.expect("close");
+        }
+        let mut bytes = std::fs::read(&db).expect("read image");
+        assert_eq!(
+            &bytes[96..100],
+            stock_stamp.as_slice(),
+            "precondition: FrankenSQLite's writes leave stock's last-writer stamp"
+        );
+        assert_ne!(
+            &bytes[96..100],
+            &fsqlite_types::FRANKENSQLITE_SQLITE_VERSION_NUMBER.to_be_bytes(),
+        );
+        // Model a pre-marker FrankenSQLite build: no marker, plus the freelist
+        // hole such builds left behind.
+        let _ = std::fs::remove_file(migration_marker_path(&db));
+        assert!(u32::from_be_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) > 0);
+        for b in &mut bytes[32..40] {
+            *b = 0;
+        }
+        std::fs::write(&db, &bytes).expect("write image");
+        assert_ne!(
+            stock_integrity(&db),
+            "ok",
+            "precondition: stock sees the hole"
+        );
+
+        let conn = Connection::open(&db)
+            .await
+            .expect("open triggers migration");
+        assert_eq!(
+            integrity_lines(&conn).await,
+            vec!["ok".to_owned()],
+            "the pass must heal the hole whatever the last-writer stamp says"
+        );
+        conn.close().await.unwrap();
+
+        let marker = read_migration_marker(&db).expect("marker written after repair");
+        assert_eq!(marker.last_upgrade_version, CURRENT_MIGRATION_VERSION);
+        assert!(!marker.repairs_applied.is_empty(), "{marker:?}");
+        assert!(pre_migration_backup_path(&db).exists());
+        assert_eq!(stock_integrity(&db), "ok");
+    });
+}
+
+#[test]
+fn migration_runs_once_per_version() {
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "once.db").await;
+
+        Connection::open(&db).await.unwrap().close().await.unwrap();
+        let marker1 = read_migration_marker(&db).expect("marker after first open");
+
+        // Remove the backup to observe whether a second open re-runs repair.
+        std::fs::remove_file(pre_migration_backup_path(&db)).unwrap();
+
+        Connection::open(&db).await.unwrap().close().await.unwrap();
+        assert!(
+            !pre_migration_backup_path(&db).exists(),
+            "second open must not re-run the repair (no new backup)"
+        );
+        let marker2 = read_migration_marker(&db).expect("marker after second open");
+        assert_eq!(
+            marker1, marker2,
+            "marker unchanged: migration did not re-run"
+        );
+    });
+}
+
+/// AC (2): forcing a re-run (marker removed) produces identical state — the
+/// repair is idempotent (re-freeing already-free pages is a no-op).
+#[test]
+fn forced_rerun_is_idempotent() {
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "idem.db").await;
+
+        Connection::open(&db).await.unwrap().close().await.unwrap();
+        let repaired = std::fs::read(&db).unwrap();
+
+        // Force a re-run: drop the marker as if opened again by an unmarked path.
+        std::fs::remove_file(migration_marker_path(&db)).unwrap();
+        Connection::open(&db).await.unwrap().close().await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            repaired,
+            "a forced re-run leaves the database byte-identical"
+        );
+        assert_eq!(stock_integrity(&db), "ok");
+        assert!(read_migration_marker(&db).is_some(), "marker re-written");
+    });
+}
+
+/// AC (3): an interruption after the repair but before the marker write leaves
+/// a valid (repaired) database; the next open completes the pass cleanly. This
+/// simulates the interrupt by deleting the marker after a successful pass.
+#[test]
+fn interrupted_before_marker_completes_on_next_open() {
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "interrupt.db").await;
+
+        Connection::open(&db).await.unwrap().close().await.unwrap();
+        // Simulate a kill that repaired the DB but lost the marker write.
+        std::fs::remove_file(migration_marker_path(&db)).unwrap();
+
+        let conn = Connection::open(&db)
+            .await
+            .expect("reopen completes the pass");
+        assert_eq!(
+            integrity_lines(&conn).await,
+            vec!["ok".to_owned()],
+            "post-interrupt state is valid and clean"
+        );
+        conn.close().await.unwrap();
+        assert!(
+            read_migration_marker(&db).is_some(),
+            "marker restored after the interrupted run"
+        );
+    });
+}
+
+/// AC (5): opt-out. Run this test with `FRANKENSQLITE_SKIP_MIGRATION=1` in the
+/// environment; it is a no-op otherwise (so the normal suite is unaffected and
+/// no `unsafe` `set_var` is needed). With opt-out set, a corrupt database is
+/// left untouched — no repair, no marker, no backup.
+#[test]
+fn opt_out_leaves_corrupt_database_untouched() {
+    if std::env::var("FRANKENSQLITE_SKIP_MIGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "opt_out_leaves_corrupt_database_untouched: skipped; \
+             set FRANKENSQLITE_SKIP_MIGRATION=1 to exercise it"
+        );
+        return;
+    }
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "optout.db").await;
+
+        let conn = Connection::open(&db).await.expect("open with opt-out");
+        let lines = integrity_lines(&conn).await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_ascii_lowercase().contains("never used")),
+            "opt-out: the hole must remain (no repair), got {lines:?}"
+        );
+        conn.close().await.unwrap();
+        assert!(
+            read_migration_marker(&db).is_none(),
+            "opt-out: no marker written"
+        );
+        assert!(
+            !pre_migration_backup_path(&db).exists(),
+            "opt-out: no backup written"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// bd-7o1vu (GH#370): reclaim an orphaned `%_content` shadow left on a legacy
+// CONTENTLESS FTS5 table.
+//
+// An OLD build that created a `content=''` FTS5 table ALSO materialized a
+// `%_content` corpus shadow holding the text a second time. At HEAD nothing
+// reads it (contentless binds persisted segments), CREATE no longer makes it,
+// and VACUUM will not remove it — yet the shadow is a well-formed table, so the
+// database stays `integrity_check`-CLEAN (it hits the Ok branch of the
+// first-open migration, not the repair branch). The migration reclaims it after
+// backing up the original; a STORED-content table's legitimate `_content`
+// shadow, and any user table that merely resembles the suffix, are left intact.
+// ---------------------------------------------------------------------------
+
+/// Build a legacy-shaped database with the birth marker still present:
+/// - `t`: a CONTENTLESS fts5 table (`content=''`) PLUS a hand-created,
+///   populated `t_content` table — the orphan an old build would have left.
+/// - `s`: a STORED-content (default) fts5 table that legitimately OWNS its
+///   `s_content` shadow (the negative case: it must NOT be dropped).
+/// - `unrelated_content`: a plain user table that merely resembles a shadow
+///   suffix but is owned by no fts5 vtab (the bonus case: never touched).
+#[cfg(feature = "ext-fts5")]
+async fn craft_legacy_contentless_orphan_db(dir: &Path, name: &str) -> String {
+    let db = dir.join(name).to_string_lossy().into_owned();
+    let conn = Connection::open(&db).await.expect("open");
+    conn.execute("PRAGMA journal_mode=DELETE;")
+        .await
+        .expect("journal_mode");
+    // Contentless FTS5: at HEAD this materializes _data/_idx/_config/_docsize
+    // shadows but NOT a _content corpus shadow.
+    conn.execute("CREATE VIRTUAL TABLE t USING fts5(body, content='');")
+        .await
+        .expect("create contentless fts5");
+    // Simulate the OLD build's orphan: create and populate a `t_content` table
+    // by hand (contentless `t` never owns it at HEAD).
+    conn.execute("CREATE TABLE t_content(id INTEGER PRIMARY KEY, c0);")
+        .await
+        .expect("create orphan t_content");
+    for i in 0..8 {
+        conn.execute(&format!("INSERT INTO t_content VALUES ({i}, 'orphan{i}');"))
+            .await
+            .expect("populate orphan");
+    }
+    // NEGATIVE: a STORED-content (default) fts5 table OWNS its _content shadow.
+    conn.execute("CREATE VIRTUAL TABLE s USING fts5(body);")
+        .await
+        .expect("create default fts5");
+    conn.execute("INSERT INTO s(rowid, body) VALUES (1, 'alpha beta gamma');")
+        .await
+        .expect("insert s");
+    // BONUS: a shadow-suffix-resembling user table owned by no fts5 vtab.
+    conn.execute("CREATE TABLE unrelated_content(x INTEGER PRIMARY KEY, v TEXT);")
+        .await
+        .expect("create unrelated_content");
+    conn.execute("INSERT INTO unrelated_content VALUES (42, 'keep me');")
+        .await
+        .expect("insert unrelated_content");
+    conn.close().await.expect("close");
+    db
+}
+
+#[cfg(feature = "ext-fts5")]
+async fn table_exists(conn: &Connection, name: &str) -> bool {
+    let rows = conn
+        .query(&format!(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='{name}';"
+        ))
+        .await
+        .expect("query sqlite_master");
+    matches!(rows[0].values()[0], SqliteValue::Integer(n) if n > 0)
+}
+
+/// AC: on the first open of a legacy contentless FTS5 archive, the orphaned
+/// `t_content` shadow is DROPped, the original is preserved at the backup, the
+/// marker records `reclaim_orphaned_fts5_content:1`, a subsequent reopen is a
+/// clean no-op, and `integrity_check` is `ok`. The stored-content and unrelated
+/// tables are preserved (negative + bonus).
+#[cfg(feature = "ext-fts5")]
+#[test]
+fn legacy_contentless_fts5_content_shadow_is_reclaimed_on_first_open() {
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = craft_legacy_contentless_orphan_db(dir.path(), "orphan.db").await;
+        // Model a pre-fix upgrader: strip the birth marker.
+        std::fs::remove_file(migration_marker_path(&db)).expect("strip marker");
+        assert!(
+            read_migration_marker(&db).is_none(),
+            "precondition: a pre-fix database has no marker"
+        );
+
+        // First open under current code triggers the reclaim.
+        let conn = Connection::open(&db)
+            .await
+            .expect("open triggers migration");
+        assert!(
+            !table_exists(&conn, "t_content").await,
+            "the orphaned contentless _content shadow is dropped"
+        );
+        // NEGATIVE: a stored-content fts5 table keeps its own _content shadow.
+        assert!(
+            table_exists(&conn, "s_content").await,
+            "a STORED-content FTS5 table keeps its _content shadow"
+        );
+        // BONUS: a user table resembling a shadow suffix is untouched.
+        assert!(
+            table_exists(&conn, "unrelated_content").await,
+            "a user table resembling a shadow suffix is not touched"
+        );
+        // Integrity stays CLEAN: the orphan is gone, so no note either.
+        assert_eq!(
+            integrity_lines(&conn).await,
+            vec!["ok".to_owned()],
+            "reclaimed database is clean with no orphan note"
+        );
+        conn.close().await.unwrap();
+
+        // The marker records exactly one reclaimed shadow.
+        let marker = read_migration_marker(&db).expect("marker written after reclaim");
+        assert_eq!(marker.last_upgrade_version, CURRENT_MIGRATION_VERSION);
+        assert!(
+            marker
+                .repairs_applied
+                .iter()
+                .any(|repair| repair == "reclaim_orphaned_fts5_content:1"),
+            "repairs_applied records the reclaim: {marker:?}"
+        );
+        // The original is preserved before the destructive drop.
+        assert!(
+            pre_migration_backup_path(&db).exists(),
+            "original preserved at the pre-migration backup"
+        );
+
+        // Idempotent: a second open sees the marker (AlreadyMigrated) and does
+        // not re-run the reclaim; the shadow stays dropped, survivors intact.
+        std::fs::remove_file(pre_migration_backup_path(&db)).unwrap();
+        let conn2 = Connection::open(&db)
+            .await
+            .expect("reopen (AlreadyMigrated)");
+        assert!(
+            !table_exists(&conn2, "t_content").await,
+            "shadow stays dropped"
+        );
+        assert!(
+            table_exists(&conn2, "s_content").await,
+            "stored-content shadow intact"
+        );
+        assert!(
+            table_exists(&conn2, "unrelated_content").await,
+            "unrelated table intact"
+        );
+        assert_eq!(integrity_lines(&conn2).await, vec!["ok".to_owned()]);
+        conn2.close().await.unwrap();
+        assert!(
+            !pre_migration_backup_path(&db).exists(),
+            "second open must not re-run the reclaim (no new backup)"
+        );
+
+        // Stock C SQLite (rusqlite) reads the reclaimed image as clean.
+        assert_eq!(
+            stock_integrity(&db),
+            "ok",
+            "stock oracle: the reclaimed database is clean"
+        );
+    });
+}
+
+/// AC (complement, option 1): while an orphan is still present (here because the
+/// birth marker is kept, so the migration does not run), `PRAGMA integrity_check`
+/// keeps the CLEAN `ok` verdict as its first row AND appends an informational
+/// NOTE that names the orphaned contentless `_content` shadow — so the condition
+/// is discoverable. A stored-content shadow is not noted.
+#[cfg(feature = "ext-fts5")]
+#[test]
+fn integrity_check_notes_orphaned_contentless_content_shadow() {
+    run_migration_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Keep the birth marker: the migration is AlreadyMigrated and does NOT
+        // run, so the orphan survives and the note is observable.
+        let db = craft_legacy_contentless_orphan_db(dir.path(), "note.db").await;
+        assert!(
+            read_migration_marker(&db).is_some(),
+            "precondition: birth marker present (migration will not run)"
+        );
+
+        let conn = Connection::open(&db)
+            .await
+            .expect("reopen (AlreadyMigrated)");
+        assert!(
+            table_exists(&conn, "t_content").await,
+            "orphan survives when the migration does not run"
+        );
+
+        let lines = integrity_lines(&conn).await;
+        // Verdict stays CLEAN — the first row is "ok".
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("ok"),
+            "the ok/error verdict is unchanged: {lines:?}"
+        );
+        // An informational NOTE names the orphaned contentless content shadow.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("note:") && line.contains("t_content")),
+            "an informational note names the orphaned contentless content shadow: {lines:?}"
+        );
+        // A stored-content shadow is NOT flagged.
+        assert!(
+            !lines.iter().any(|line| line.contains("s_content")),
+            "a legitimate stored-content shadow is not noted: {lines:?}"
+        );
+        conn.close().await.unwrap();
+    });
+}

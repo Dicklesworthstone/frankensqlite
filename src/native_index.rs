@@ -1,0 +1,3148 @@
+//! Native index lookup, repair, and deterministic segment construction
+//! (§3.6.4-§3.6.7).
+//!
+//! This module implements the read-path lookup algorithm used by Native mode:
+//! cache -> presence filter -> index scan -> fetch+materialize.
+
+/// Existing B-tree algorithms backed by native page transactions.
+pub mod btree;
+
+use std::collections::BTreeMap;
+
+use crate::commit_marker::{
+    CommitMarkerRecord, MarkerError, MarkerSegmentHeader, recover_marker_stream,
+};
+use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::ecs::{BloomFilter, PageVersionIndexSegment, PatchKind, VersionPointer};
+use fsqlite_types::{ObjectId, PageNumber};
+use tracing::{debug, error, info, warn};
+
+const NATIVE_INDEX_BEAD_ID: &str = "bd-1hi.32";
+const NATIVE_INDEX_REPAIR_BEAD_ID: &str = "bd-1hi.33";
+const NATIVE_INDEX_LOGGING_STANDARD: &str = "bd-1fpm";
+const MAX_PATCH_DEPTH: usize = 8;
+const DEFAULT_MAX_REPAIR_SYMBOL_LOSS_RATE: f64 = 0.25;
+
+/// Provider for base-page bytes (step 2 fallback / step 4 materialization).
+pub trait BasePageProvider {
+    /// Load a base page image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O or corruption error when the page cannot be read.
+    fn load_base_page(&self, page: PageNumber) -> Result<Vec<u8>>;
+}
+
+/// Provider for ECS patch object payload bytes.
+pub trait PatchObjectStore {
+    /// Fetch an ECS object payload by `ObjectId`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object is missing/corrupt/unreadable.
+    fn fetch_patch_object(&self, object_id: ObjectId) -> Result<Vec<u8>>;
+}
+
+/// Immutable source identity and visibility bound for a native index read.
+///
+/// `generation` must identify the complete immutable read source, including
+/// the base/checkpoint image and index manifest (for example its trusted root
+/// object ID). A sequence number alone is not such an identity. This token is
+/// supplied by the caller; it does not authenticate or pin storage by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeIndexSnapshot {
+    /// Caller-owned immutable root/checkpoint-and-index identity.
+    pub generation: ObjectId,
+    /// Greatest commit sequence visible to this read.
+    pub high: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeCachedPage {
+    bytes: Box<[u8]>,
+    insertion: u64,
+}
+
+/// Bounded, insertion-ordered cache for materialized native pages.
+///
+/// Defaults to at most 4,096 entries and 16 MiB of boxed page bytes.
+/// Limits bound owned page buffers and entry counts, not allocator overhead or
+/// the caller's returned pages. Oversized pages remain readable but are not
+/// retained. A hit does not refresh insertion order (FIFO, not LRU).
+///
+/// Legacy `insert`/`get` operate in an unscoped namespace; their caller must
+/// keep the source fixed or clear the cache. Prefer
+/// [`lookup_page_version_for_snapshot`] when a cache spans roots/generations.
+/// Switching between scoped and unscoped reads invalidates previous entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePageCache {
+    entries: BTreeMap<(u32, u64), NativeCachedPage>,
+    order: BTreeMap<u64, (u32, u64)>,
+    retained_bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    next_insertion: u64,
+    generation: Option<ObjectId>,
+}
+
+impl Default for NativePageCache {
+    fn default() -> Self {
+        Self::with_limits(4096, 16 * 1024 * 1024)
+    }
+}
+
+impl NativePageCache {
+    /// Configure retained entry and page-buffer limits. Either zero
+    /// disables retention, without disabling page reads.
+    #[must_use]
+    pub const fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            order: BTreeMap::new(),
+            retained_bytes: 0,
+            max_entries,
+            max_bytes,
+            next_insertion: 0,
+            generation: None,
+        }
+    }
+
+    /// Insert into the legacy unscoped namespace. Replacing an entry always
+    /// discards its old bytes, even when the replacement is too large to cache.
+    pub fn insert(&mut self, page: PageNumber, snapshot_high: u64, bytes: Vec<u8>) {
+        self.select_generation(None);
+        self.insert_current(page, snapshot_high, bytes);
+    }
+
+    /// Get an unscoped entry; scoped entries cannot leak through this method.
+    #[must_use]
+    pub fn get(&self, page: PageNumber, snapshot_high: u64) -> Option<&[u8]> {
+        if self.generation.is_some() {
+            return None;
+        }
+        self.get_current(page, snapshot_high)
+    }
+
+    /// Get bytes only if both generation and snapshot match the cache entry.
+    #[must_use]
+    pub fn get_for_snapshot(&self, page: PageNumber, snapshot: NativeIndexSnapshot) -> Option<&[u8]> {
+        if self.generation != Some(snapshot.generation) {
+            return None;
+        }
+        self.get_current(page, snapshot.high)
+    }
+
+    /// Release all retained pages and the generation binding.
+    pub fn clear(&mut self) {
+        self.clear_entries();
+        self.generation = None;
+    }
+
+    /// Number of retained page/snapshot entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this cache retains any pages.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Retained boxed page bytes, excluding map/allocator overhead.
+    #[must_use]
+    pub const fn retained_page_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn get_current(&self, page: PageNumber, snapshot_high: u64) -> Option<&[u8]> {
+        self.entries.get(&(page.get(), snapshot_high)).map(|entry| entry.bytes.as_ref())
+    }
+
+    fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.retained_bytes = 0;
+        self.next_insertion = 0;
+    }
+
+    fn select_generation(&mut self, generation: Option<ObjectId>) {
+        if self.generation != generation {
+            self.clear_entries();
+            self.generation = generation;
+        }
+    }
+
+    fn remove_key(&mut self, key: (u32, u64)) {
+        if let Some(previous) = self.entries.remove(&key) {
+            self.retained_bytes -= previous.bytes.len();
+            self.order.remove(&previous.insertion);
+        }
+    }
+
+    fn insert_current(&mut self, page: PageNumber, snapshot_high: u64, bytes: Vec<u8>) {
+        let key = (page.get(), snapshot_high);
+        self.remove_key(key);
+        let charge = bytes.len();
+        if self.max_entries == 0 || self.max_bytes == 0 || charge > self.max_bytes {
+            return;
+        }
+        // Cache age exhaustion is not database exhaustion. Drop this derived
+        // state rather than wrap an age and collide with a live eviction key.
+        if self.next_insertion == u64::MAX {
+            self.clear_entries();
+        }
+        while self.entries.len() >= self.max_entries
+            || self.retained_bytes > self.max_bytes - charge
+        {
+            let Some((_, oldest)) = self.order.first_key_value() else {
+                return;
+            };
+            let oldest = *oldest;
+            self.remove_key(oldest);
+        }
+        let insertion = self.next_insertion;
+        self.next_insertion += 1;
+        self.order.insert(insertion, key);
+        self.entries.insert(key, NativeCachedPage {
+            bytes: bytes.into_boxed_slice(),
+            insertion,
+        });
+        self.retained_bytes += charge;
+    }
+
+    fn retain_materialized(&mut self, page: PageNumber, snapshot_high: u64, bytes: &[u8]) {
+        // Do not clone a large result merely to discover that it exceeds the
+        // cache budget. Failed optional retention must not fail a valid read.
+        if self.max_entries == 0 || self.max_bytes == 0 || bytes.len() > self.max_bytes {
+            self.remove_key((page.get(), snapshot_high));
+            return;
+        }
+        let mut owned = Vec::new();
+        if owned.try_reserve_exact(bytes.len()).is_err() {
+            self.remove_key((page.get(), snapshot_high));
+            return;
+        }
+        owned.extend_from_slice(bytes);
+        self.insert_current(page, snapshot_high, owned);
+    }
+}
+
+/// Structured debug trace for a single lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookupTrace {
+    /// True when step 1 returned from cache.
+    pub cache_hit: bool,
+    /// True when the presence filter indicated a possible version.
+    pub filter_hit: bool,
+    /// Number of index segments scanned during step 3.
+    pub segment_scans: u64,
+    /// Resolved commit sequence, if any.
+    pub resolved_commit_seq: Option<u64>,
+}
+
+/// Result of native lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupResult {
+    /// Materialized page bytes visible under the snapshot.
+    pub page_bytes: Vec<u8>,
+    /// Resolved version pointer (if lookup found one).
+    pub resolved_pointer: Option<VersionPointer>,
+    /// Structured path telemetry.
+    pub trace: LookupTrace,
+}
+
+/// Deterministic index segment build output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltIndexSegment {
+    /// Built segment payload.
+    pub segment: PageVersionIndexSegment,
+    /// Content-addressed deterministic object id of the segment.
+    pub object_id: ObjectId,
+}
+
+/// Input policy for repair/rebuild aggressiveness (§3.6.7).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoldnessConstraint {
+    /// Permit emergency linear scan when the native index is unavailable.
+    pub allow_emergency_linear_scan: bool,
+    /// Maximum tolerated symbol-loss estimate before aggressive repair is blocked.
+    pub max_repair_symbol_loss_rate: f64,
+}
+
+impl BoldnessConstraint {
+    /// Strict policy used by default: no emergency scans and conservative repair.
+    #[must_use]
+    pub const fn strict() -> Self {
+        Self {
+            allow_emergency_linear_scan: false,
+            max_repair_symbol_loss_rate: DEFAULT_MAX_REPAIR_SYMBOL_LOSS_RATE,
+        }
+    }
+
+    /// Emergency policy enabling linear-scan fallback.
+    #[must_use]
+    pub const fn emergency() -> Self {
+        Self {
+            allow_emergency_linear_scan: true,
+            max_repair_symbol_loss_rate: DEFAULT_MAX_REPAIR_SYMBOL_LOSS_RATE,
+        }
+    }
+
+    #[must_use]
+    fn permits_repair(self, symbol_loss_rate_estimate: f64) -> bool {
+        (0.0..=1.0).contains(&symbol_loss_rate_estimate)
+            && (0.0..=1.0).contains(&self.max_repair_symbol_loss_rate)
+            && symbol_loss_rate_estimate <= self.max_repair_symbol_loss_rate
+    }
+}
+
+impl Default for BoldnessConstraint {
+    fn default() -> Self {
+        Self::strict()
+    }
+}
+
+/// Manifest entry for one native index segment object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeIndexSegmentRef {
+    /// Inclusive start commit sequence covered by the segment.
+    pub start_seq: u64,
+    /// Inclusive end commit sequence covered by the segment.
+    pub end_seq: u64,
+    /// Deterministic ECS object id of the segment payload.
+    pub object_id: ObjectId,
+}
+
+/// Source of persisted index segments.
+pub trait NativeIndexSegmentStore {
+    /// Load one index segment object by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the segment is unavailable or corrupted.
+    fn fetch_index_segment(&self, object_id: ObjectId) -> Result<PageVersionIndexSegment>;
+}
+
+/// Source of per-commit page-version updates recoverable from commit capsules.
+pub trait CommitCapsuleIndexSource {
+    /// Return all page updates encoded by a commit capsule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the capsule cannot be decoded or verified.
+    fn updates_for_commit(
+        &self,
+        commit_seq: u64,
+        capsule_object_id: ObjectId,
+    ) -> Result<Vec<(PageNumber, VersionPointer)>>;
+}
+
+/// Summary of native index repair attempts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRepairReport {
+    /// Repaired segments ordered by `end_seq`.
+    pub segments: Vec<PageVersionIndexSegment>,
+    /// Segments recovered from local symbols.
+    pub repaired_from_local: u64,
+    /// Segments recovered from remote symbols.
+    pub repaired_from_remote: u64,
+}
+
+/// Summary of deterministic full rebuild results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRebuildReport {
+    /// Ordered commit markers used to rebuild the index.
+    pub markers: Vec<CommitMarkerRecord>,
+    /// Built index segments.
+    pub segments: Vec<BuiltIndexSegment>,
+}
+
+/// Trust anchors and decoded-marker budget for native index reconstruction.
+///
+/// Anchors must come from trusted caller state, not from the supplied segments.
+/// Without them, a structurally valid prefix does not prove that no committed
+/// history is missing. Rebuilding an index does not publish a database root.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeIndexRecoveryOptions<'a> {
+    /// Checkpoint marker immediately preceding the supplied history, if known.
+    pub predecessor: Option<&'a CommitMarkerRecord>,
+    /// Exact durable tip that reconstruction must reach, if known.
+    pub expected_tip: Option<&'a CommitMarkerRecord>,
+    /// Maximum decoded markers retained across all segments. This does not
+    /// bound input buffers, capsule payloads, or the rebuilt index itself.
+    pub max_records: usize,
+}
+
+impl Default for NativeIndexRecoveryOptions<'_> {
+    fn default() -> Self {
+        Self {
+            predecessor: None,
+            expected_tip: None,
+            max_records: usize::MAX,
+        }
+    }
+}
+
+/// In-memory deterministic builder for `PageVersionIndexSegment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentBuilder {
+    max_entries: usize,
+    start_seq: Option<u64>,
+    end_seq: Option<u64>,
+    pending: BTreeMap<(u32, u64), VersionPointer>,
+}
+
+impl SegmentBuilder {
+    /// Create a new builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] when `max_entries == 0`.
+    pub fn new(max_entries: usize) -> Result<Self> {
+        if max_entries == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "segment_builder.max_entries".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        Ok(Self {
+            max_entries,
+            start_seq: None,
+            end_seq: None,
+            pending: BTreeMap::new(),
+        })
+    }
+
+    /// Ingest one commit worth of page-version updates.
+    ///
+    /// Returns `Some(segment)` when the builder auto-flushes due to `max_entries`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::TypeMismatch`] if a pointer commit sequence does
+    /// not match `commit_seq`. Conflicting pointers for one `(page, commit_seq)`
+    /// are corruption, including re-admission against pending entries. Identical
+    /// duplicates are idempotent. Invalid updates leave the builder unchanged.
+    pub fn ingest_commit(
+        &mut self,
+        commit_seq: u64,
+        updates: impl IntoIterator<Item = (PageNumber, VersionPointer)>,
+    ) -> Result<Option<BuiltIndexSegment>> {
+        debug!(
+            bead_id = NATIVE_INDEX_BEAD_ID,
+            logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+            commit_seq = commit_seq,
+            "segment builder ingesting commit updates"
+        );
+
+        // Admission must be independent of iterator order. A last-wins insert
+        // would turn two different versions of one page/commit into a plausible
+        // content-addressed segment, hiding corruption from later readers.
+        let mut admitted = BTreeMap::new();
+        for (page, pointer) in updates {
+            if pointer.commit_seq != commit_seq {
+                return Err(FrankenError::TypeMismatch {
+                    expected: format!("pointer.commit_seq == {commit_seq}"),
+                    actual: pointer.commit_seq.to_string(),
+                });
+            }
+            let key = (page.get(), commit_seq);
+            for existing in [admitted.get(&key), self.pending.get(&key)]
+                .into_iter()
+                .flatten()
+            {
+                if *existing != pointer {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "conflicting native index updates for page {} at commit {commit_seq}",
+                            page.get(),
+                        ),
+                    });
+                }
+            }
+            admitted.insert(key, pointer);
+        }
+        self.pending.extend(admitted);
+
+        self.start_seq = Some(match self.start_seq {
+            Some(start) => start.min(commit_seq),
+            None => commit_seq,
+        });
+        self.end_seq = Some(match self.end_seq {
+            Some(end) => end.max(commit_seq),
+            None => commit_seq,
+        });
+
+        if self.pending.len() >= self.max_entries {
+            self.flush()
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Flush pending updates into a deterministic segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns corruption errors when internal state is inconsistent.
+    pub fn flush(&mut self) -> Result<Option<BuiltIndexSegment>> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+
+        let start_seq = self
+            .start_seq
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "segment builder missing start_seq".to_owned(),
+            })?;
+        let end_seq = self.end_seq.ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "segment builder missing end_seq".to_owned(),
+        })?;
+
+        let mut entries = Vec::with_capacity(self.pending.len());
+        for ((page_raw, _commit_seq), pointer) in &self.pending {
+            let page = PageNumber::new(*page_raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("segment builder produced invalid page number {page_raw}"),
+            })?;
+            entries.push((page, *pointer));
+        }
+
+        let segment = PageVersionIndexSegment::new(start_seq, end_seq, entries);
+        let object_id = derive_segment_object_id(&segment);
+
+        info!(
+            bead_id = NATIVE_INDEX_BEAD_ID,
+            logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+            start_seq = start_seq,
+            end_seq = end_seq,
+            segments_built = 1_u8,
+            entry_count = segment.entries.len(),
+            object_id = %object_id,
+            "segment builder flush complete"
+        );
+
+        self.pending.clear();
+        self.start_seq = None;
+        self.end_seq = None;
+
+        Ok(Some(BuiltIndexSegment { segment, object_id }))
+    }
+}
+
+/// Perform native index lookup for one page under `snapshot_high`.
+///
+/// Implements:
+/// 1) cache lookup
+/// 2) presence filter check (fast negative path)
+/// 3) newest visible version across all eligible index segments
+/// 4) patch fetch + materialization.
+///
+/// # Errors
+///
+/// Returns corruption errors for malformed patches and provider errors for I/O.
+pub fn lookup_page_version(
+    page: PageNumber,
+    snapshot_high: u64,
+    segments: &[PageVersionIndexSegment],
+    cache: &mut NativePageCache,
+    base_provider: &impl BasePageProvider,
+    patch_store: &impl PatchObjectStore,
+    symbol_loss_rate_estimate: f64,
+) -> Result<LookupResult> {
+    cache.select_generation(None);
+    lookup_page_version_cached(
+        page, snapshot_high, segments, cache, base_provider, patch_store, symbol_loss_rate_estimate,
+    )
+}
+
+/// Read through a cache bound to one immutable root/checkpoint-and-index view.
+///
+/// A different generation clears all prior cached pages before lookup; a
+/// failed lookup cannot leave entries from the old generation accessible.
+/// Calls with the same generation may reuse entries at different visibility
+/// bounds. Segment and base providers must belong to that immutable generation
+/// and remain pinned by the caller. A label alone does not establish trust,
+/// completeness, or durable storage lifetime.
+///
+/// # Errors
+/// Propagates the same index, patch and I/O failures as [`lookup_page_version`].
+pub fn lookup_page_version_for_snapshot(
+    page: PageNumber,
+    snapshot: NativeIndexSnapshot,
+    segments: &[PageVersionIndexSegment],
+    cache: &mut NativePageCache,
+    base_provider: &impl BasePageProvider,
+    patch_store: &impl PatchObjectStore,
+    symbol_loss_rate_estimate: f64,
+) -> Result<LookupResult> {
+    cache.select_generation(Some(snapshot.generation));
+    lookup_page_version_cached(
+        page, snapshot.high, segments, cache, base_provider, patch_store, symbol_loss_rate_estimate,
+    )
+}
+
+fn lookup_page_version_cached(
+    page: PageNumber,
+    snapshot_high: u64,
+    segments: &[PageVersionIndexSegment],
+    cache: &mut NativePageCache,
+    base_provider: &impl BasePageProvider,
+    patch_store: &impl PatchObjectStore,
+    symbol_loss_rate_estimate: f64,
+) -> Result<LookupResult> {
+    debug!(
+        bead_id = NATIVE_INDEX_BEAD_ID,
+        logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+        page = page.get(),
+        snapshot_high = snapshot_high,
+        "native index lookup started"
+    );
+    let mut deps = LookupDeps {
+        cache,
+        base_provider,
+        patch_store,
+        symbol_loss_rate_estimate,
+    };
+
+    if let Some(cached) = deps.cache.get_current(page, snapshot_high) {
+        log_lookup_path(true, false, 0, None);
+        return Ok(LookupResult {
+            page_bytes: cached.to_vec(),
+            resolved_pointer: None,
+            trace: LookupTrace {
+                cache_hit: true,
+                filter_hit: false,
+                segment_scans: 0,
+                resolved_commit_seq: None,
+            },
+        });
+    }
+
+    let filter_hit = version_maybe_present(page, snapshot_high, segments);
+    if !filter_hit {
+        return base_fallback_result(
+            page,
+            snapshot_high,
+            deps.cache,
+            deps.base_provider,
+            false,
+            0,
+        );
+    }
+
+    let (resolved_pointer, segment_scans) =
+        lookup_pointer_in_segments(page, snapshot_high, segments)?;
+    let Some(pointer) = resolved_pointer else {
+        return base_fallback_result(
+            page,
+            snapshot_high,
+            deps.cache,
+            deps.base_provider,
+            true,
+            segment_scans,
+        );
+    };
+
+    materialized_result(page, snapshot_high, pointer, segment_scans, &mut deps)
+}
+
+struct LookupDeps<'a> {
+    cache: &'a mut NativePageCache,
+    base_provider: &'a dyn BasePageProvider,
+    patch_store: &'a dyn PatchObjectStore,
+    symbol_loss_rate_estimate: f64,
+}
+
+fn base_fallback_result(
+    page: PageNumber,
+    snapshot_high: u64,
+    cache: &mut NativePageCache,
+    base_provider: &(impl BasePageProvider + ?Sized),
+    filter_hit: bool,
+    segment_scans: u64,
+) -> Result<LookupResult> {
+    let base = base_provider.load_base_page(page)?;
+    cache.retain_materialized(page, snapshot_high, &base);
+    log_lookup_path(false, filter_hit, segment_scans, None);
+    Ok(LookupResult {
+        page_bytes: base,
+        resolved_pointer: None,
+        trace: LookupTrace {
+            cache_hit: false,
+            filter_hit,
+            segment_scans,
+            resolved_commit_seq: None,
+        },
+    })
+}
+
+fn materialized_result(
+    page: PageNumber,
+    snapshot_high: u64,
+    pointer: VersionPointer,
+    segment_scans: u64,
+    deps: &mut LookupDeps<'_>,
+) -> Result<LookupResult> {
+    let patch_bytes = deps.patch_store.fetch_patch_object(pointer.patch_object)?;
+    // Full images are self-contained; hinted patches obtain their base from
+    // the object store. Neither path may depend on a possibly absent, newer,
+    // or corrupt compatibility/base page that it will never use.
+    let base_bytes = if pointer.patch_kind != PatchKind::FullImage && pointer.base_hint.is_none() {
+        deps.base_provider.load_base_page(page)?
+    } else {
+        Vec::new()
+    };
+    let page_bytes = materialize_patch(pointer, &patch_bytes, &base_bytes, deps.patch_store, 0)?;
+    if pointer.patch_kind != PatchKind::FullImage {
+        warn!(
+            bead_id = NATIVE_INDEX_BEAD_ID,
+            logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+            object_id = %pointer.patch_object,
+            symbol_loss_rate_estimate = deps.symbol_loss_rate_estimate,
+            "native index lookup used repair/materialization path"
+        );
+    }
+
+    deps.cache.retain_materialized(page, snapshot_high, &page_bytes);
+    log_lookup_path(false, true, segment_scans, Some(pointer.commit_seq));
+    info!(
+        bead_id = NATIVE_INDEX_BEAD_ID,
+        logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+        page = page.get(),
+        snapshot_high = snapshot_high,
+        resolved_commit_seq = pointer.commit_seq,
+        "native index lookup resolved page version"
+    );
+    Ok(LookupResult {
+        page_bytes,
+        resolved_pointer: Some(pointer),
+        trace: LookupTrace {
+            cache_hit: false,
+            filter_hit: true,
+            segment_scans,
+            resolved_commit_seq: Some(pointer.commit_seq),
+        },
+    })
+}
+
+fn log_lookup_path(
+    cache_hit: bool,
+    filter_hit: bool,
+    segment_scans: u64,
+    resolved_commit_seq: Option<u64>,
+) {
+    debug!(
+        bead_id = NATIVE_INDEX_BEAD_ID,
+        logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+        cache_hit = cache_hit,
+        filter_hit = filter_hit,
+        segment_scans = segment_scans,
+        resolved_commit_seq = ?resolved_commit_seq,
+        "lookup path chosen"
+    );
+}
+
+#[must_use]
+fn version_maybe_present(
+    page: PageNumber,
+    snapshot_high: u64,
+    segments: &[PageVersionIndexSegment],
+) -> bool {
+    segments
+        .iter()
+        .any(|segment| segment.start_seq <= snapshot_high && segment.bloom.maybe_contains(page))
+}
+
+fn lookup_pointer_in_segments(
+    page: PageNumber,
+    snapshot_high: u64,
+    segments: &[PageVersionIndexSegment],
+) -> Result<(Option<VersionPointer>, u64)> {
+    // Segment end_seq describes all pages, not this page's newest version.
+    // Overlapping/rebuilt segments cannot be searched by returning the first
+    // hit from the segment with the highest end_seq. Compare actual visible
+    // commit sequences, without allocating and sorting a temporary directory.
+    let mut resolved: Option<VersionPointer> = None;
+    let mut conflicting_latest = false;
+    let mut scans = 0_u64;
+    for segment in segments {
+        if segment.start_seq > snapshot_high {
+            continue;
+        }
+        scans = scans.saturating_add(1);
+        if let Some(pointer) = segment.lookup(page, snapshot_high) {
+            match resolved {
+                Some(current) if pointer.commit_seq < current.commit_seq => {}
+                Some(current) if pointer.commit_seq == current.commit_seq => {
+                    conflicting_latest |= *pointer != current;
+                }
+                _ => {
+                    resolved = Some(*pointer);
+                    conflicting_latest = false;
+                }
+            }
+        }
+    }
+    if conflicting_latest {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "conflicting native index pointers for page {} at snapshot {snapshot_high}",
+                page.get(),
+            ),
+        });
+    }
+    Ok((resolved, scans))
+}
+
+fn materialize_patch(
+    pointer: VersionPointer,
+    patch_bytes: &[u8],
+    base_page: &[u8],
+    patch_store: &(impl PatchObjectStore + ?Sized),
+    depth: usize,
+) -> Result<Vec<u8>> {
+    if depth > MAX_PATCH_DEPTH {
+        error!(
+            bead_id = NATIVE_INDEX_BEAD_ID,
+            logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+            reason_code = "materialize_depth_exceeded",
+            depth = depth,
+            "recursive patch materialization depth exceeded"
+        );
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "patch materialization depth exceeded".to_owned(),
+        });
+    }
+
+    match pointer.patch_kind {
+        PatchKind::FullImage => Ok(patch_bytes.to_vec()),
+        PatchKind::IntentLog => {
+            let mut out = resolve_base_bytes(pointer, base_page, patch_store)?;
+            apply_intent_log_patch(&mut out, patch_bytes)?;
+            Ok(out)
+        }
+        PatchKind::SparseXor => {
+            let mut out = resolve_base_bytes(pointer, base_page, patch_store)?;
+            apply_sparse_xor_patch(&mut out, patch_bytes)?;
+            Ok(out)
+        }
+    }
+}
+
+fn resolve_base_bytes(
+    pointer: VersionPointer,
+    base_page: &[u8],
+    patch_store: &(impl PatchObjectStore + ?Sized),
+) -> Result<Vec<u8>> {
+    if let Some(base_object) = pointer.base_hint {
+        patch_store.fetch_patch_object(base_object)
+    } else {
+        Ok(base_page.to_vec())
+    }
+}
+
+fn apply_intent_log_patch(out: &mut [u8], patch_bytes: &[u8]) -> Result<()> {
+    let mut cursor = 0_usize;
+    let op_count = read_u8(patch_bytes, &mut cursor, "intent.op_count")?;
+    for op_index in 0..op_count {
+        let offset = usize::from(read_u16_le(patch_bytes, &mut cursor, "intent.op.offset")?);
+        let len = usize::from(read_u16_le(patch_bytes, &mut cursor, "intent.op.len")?);
+        let data = read_slice(patch_bytes, &mut cursor, len, "intent.op.data")?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "intent patch offset overflow".to_owned(),
+            })?;
+        if end > out.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "intent patch op {op_index} out of bounds: end={end}, page_len={}",
+                    out.len()
+                ),
+            });
+        }
+        out[offset..end].copy_from_slice(data);
+    }
+    if cursor != patch_bytes.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "intent patch trailing bytes: parsed={cursor}, actual={}",
+                patch_bytes.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn apply_sparse_xor_patch(out: &mut [u8], patch_bytes: &[u8]) -> Result<()> {
+    let mut cursor = 0_usize;
+    let op_count = read_u8(patch_bytes, &mut cursor, "xor.op_count")?;
+    for op_index in 0..op_count {
+        let offset = usize::from(read_u16_le(patch_bytes, &mut cursor, "xor.op.offset")?);
+        let len = usize::from(read_u16_le(patch_bytes, &mut cursor, "xor.op.len")?);
+        let data = read_slice(patch_bytes, &mut cursor, len, "xor.op.data")?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "sparse-xor patch offset overflow".to_owned(),
+            })?;
+        if end > out.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "sparse-xor patch op {op_index} out of bounds: end={end}, page_len={}",
+                    out.len()
+                ),
+            });
+        }
+        for (dst, delta) in out[offset..end].iter_mut().zip(data.iter()) {
+            *dst ^= *delta;
+        }
+    }
+    if cursor != patch_bytes.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sparse-xor patch trailing bytes: parsed={cursor}, actual={}",
+                patch_bytes.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn read_u8(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u8> {
+    let end = cursor
+        .checked_add(1)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("{field} overflow"),
+        })?;
+    if end > bytes.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("{field} out of bounds: end={end}, len={}", bytes.len()),
+        });
+    }
+    let value = bytes[*cursor];
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_u16_le(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u16> {
+    let end = cursor
+        .checked_add(2)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("{field} overflow"),
+        })?;
+    if end > bytes.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("{field} out of bounds: end={end}, len={}", bytes.len()),
+        });
+    }
+    let raw = [bytes[*cursor], bytes[*cursor + 1]];
+    *cursor = end;
+    Ok(u16::from_le_bytes(raw))
+}
+
+fn read_slice<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+    field: &str,
+) -> Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("{field} overflow"),
+        })?;
+    if end > bytes.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("{field} out of bounds: end={end}, len={}", bytes.len()),
+        });
+    }
+    let slice = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(slice)
+}
+
+/// Deterministically derive the ECS object id of an index segment.
+#[must_use]
+pub fn derive_segment_object_id(segment: &PageVersionIndexSegment) -> ObjectId {
+    let canonical = canonical_segment_bytes(segment);
+    ObjectId::derive_from_canonical_bytes(&canonical)
+}
+
+#[must_use]
+fn canonical_segment_bytes(segment: &PageVersionIndexSegment) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&segment.start_seq.to_le_bytes());
+    out.extend_from_slice(&segment.end_seq.to_le_bytes());
+    let count = u64::try_from(segment.entries.len()).unwrap_or(u64::MAX);
+    out.extend_from_slice(&count.to_le_bytes());
+    for (page, pointer) in &segment.entries {
+        out.extend_from_slice(&page.get().to_le_bytes());
+        let vp_bytes = pointer.to_bytes();
+        let vp_len = u64::try_from(vp_bytes.len()).unwrap_or(u64::MAX);
+        out.extend_from_slice(&vp_len.to_le_bytes());
+        out.extend_from_slice(&vp_bytes);
+    }
+    out
+}
+
+/// Critical preflight check before repair/rebuild attempts.
+///
+/// # Errors
+///
+/// Returns [`FrankenError::DatabaseCorrupt`] with
+/// `reason_code=index_unrebuildable_with_markers` when commit markers are
+/// present but neither repair nor rebuild capability is available.
+pub fn preflight_native_index_integrity(
+    marker_segment_blobs: &[Vec<u8>],
+    repair_available: bool,
+    rebuild_available: bool,
+) -> Result<()> {
+    let markers = scan_commit_markers(marker_segment_blobs)?;
+    if !markers.is_empty() && !repair_available && !rebuild_available {
+        error!(
+            bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+            logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+            reason_code = "index_unrebuildable_with_markers",
+            marker_count = markers.len(),
+            repair_available = repair_available,
+            rebuild_available = rebuild_available,
+            "critical integrity failure detected before repair attempt"
+        );
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "reason_code=index_unrebuildable_with_markers marker_count={} repair_available={repair_available} rebuild_available={rebuild_available}",
+                markers.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Repair index segments from surviving symbols without a full rebuild.
+///
+/// The loader first tries local symbols, then remote symbols. Each accepted
+/// segment is checked against its manifest identity, bounds and entry ordering.
+/// Bloom filters are derived accelerators, not part of the canonical identity;
+/// they are rebuilt from verified entries before any lookup can use them.
+/// Resource exhaustion and cancellation are propagated, not disguised as a
+/// missing/corrupt object or retried against a second provider.
+///
+/// # Errors
+///
+/// Returns:
+/// - `reason_code=boldness_violation_blocked_repair` when the boldness policy blocks repair.
+/// - `reason_code=index_repair_incomplete` when one or more segments are irrecoverable.
+pub fn repair_index_segments_from_ecs(
+    segment_refs: &[NativeIndexSegmentRef],
+    local_store: &impl NativeIndexSegmentStore,
+    remote_store: &impl NativeIndexSegmentStore,
+    symbol_loss_rate_estimate: f64,
+    boldness: BoldnessConstraint,
+) -> Result<IndexRepairReport> {
+    if !boldness.permits_repair(symbol_loss_rate_estimate) {
+        warn!(
+            bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+            logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+            reason_code = "boldness_violation_blocked_repair",
+            symbol_loss_rate_estimate = symbol_loss_rate_estimate,
+            max_repair_symbol_loss_rate = boldness.max_repair_symbol_loss_rate,
+            "repair blocked by boldness constraint"
+        );
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "reason_code=boldness_violation_blocked_repair symbol_loss_rate_estimate={symbol_loss_rate_estimate:.6} max_repair_symbol_loss_rate={:.6}",
+                boldness.max_repair_symbol_loss_rate
+            ),
+        });
+    }
+
+    let mut ordered_refs = segment_refs.to_vec();
+    ordered_refs.sort_by_key(|entry| (entry.start_seq, entry.end_seq, *entry.object_id.as_bytes()));
+
+    debug!(
+        bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+        logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+        segment_ref_count = ordered_refs.len(),
+        "starting native index repair from surviving symbols"
+    );
+
+    let mut segments = Vec::with_capacity(ordered_refs.len());
+    let mut repaired_from_local = 0_u64;
+    let mut repaired_from_remote = 0_u64;
+    let mut missing = Vec::new();
+
+    for entry in ordered_refs {
+        match try_fetch_valid_segment(entry, local_store) {
+            Ok(segment) => {
+                repaired_from_local = repaired_from_local.saturating_add(1);
+                segments.push(segment);
+                continue;
+            }
+            Err(error @ (FrankenError::OutOfMemory | FrankenError::TooBig | FrankenError::Abort)) => {
+                return Err(error);
+            }
+            Err(local_error) => {
+                warn!(
+                    bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+                    logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+                    object_id = %entry.object_id,
+                    start_seq = entry.start_seq,
+                    end_seq = entry.end_seq,
+                    error = %local_error,
+                    "local segment fetch failed; trying remote recovery path"
+                );
+            }
+        }
+
+        match try_fetch_valid_segment(entry, remote_store) {
+            Ok(segment) => {
+                repaired_from_remote = repaired_from_remote.saturating_add(1);
+                segments.push(segment);
+            }
+            Err(error @ (FrankenError::OutOfMemory | FrankenError::TooBig | FrankenError::Abort)) => {
+                return Err(error);
+            }
+            Err(remote_error) => {
+                error!(
+                    bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+                    logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+                    object_id = %entry.object_id,
+                    start_seq = entry.start_seq,
+                    end_seq = entry.end_seq,
+                    error = %remote_error,
+                    reason_code = "index_repair_segment_irrecoverable",
+                    "segment irrecoverable from both local and remote symbols"
+                );
+                missing.push(entry.object_id);
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "reason_code=index_repair_incomplete irrecoverable_segments={} first_irrecoverable_object={}",
+                missing.len(),
+                missing
+                    .first()
+                    .map_or_else(|| "none".to_owned(), ToString::to_string)
+            ),
+        });
+    }
+
+    segments.sort_by_key(|segment| segment.end_seq);
+
+    info!(
+        bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+        logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+        repaired_from_local = repaired_from_local,
+        repaired_from_remote = repaired_from_remote,
+        segments_repaired = segments.len(),
+        "native index repair complete"
+    );
+
+    Ok(IndexRepairReport {
+        segments,
+        repaired_from_local,
+        repaired_from_remote,
+    })
+}
+
+/// Rebuild native index segments by replaying the commit marker stream.
+///
+/// Uses unanchored prefix recovery with no explicit marker-count limit. Use
+/// [`rebuild_index_from_marker_stream_with_options`] when the caller knows a
+/// checkpoint/durable tip or needs a decoded-marker budget.
+///
+/// # Errors
+///
+/// Returns [`FrankenError::DatabaseCorrupt`] with
+/// `reason_code=index_unrebuildable_with_markers` when marker replay cannot
+/// reconstruct commit updates.
+pub fn rebuild_index_from_marker_stream(
+    marker_segment_blobs: &[Vec<u8>],
+    capsule_source: &impl CommitCapsuleIndexSource,
+    max_entries: usize,
+) -> Result<IndexRebuildReport> {
+    rebuild_index_from_marker_stream_with_options(
+        marker_segment_blobs,
+        capsule_source,
+        max_entries,
+        NativeIndexRecoveryOptions::default(),
+    )
+}
+
+/// Rebuild only after the entire supplied marker history satisfies its trust
+/// anchors, cross-segment chain invariants, and decoded-marker budget.
+///
+/// Inputs may arrive in any order; only segment references are sorted, not
+/// copied payloads. An incomplete final append is permitted only when it does
+/// not hide `expected_tip`. An incomplete or empty interior segment is always
+/// rejected. No capsule callback runs until all marker validation succeeds.
+/// Checkpoint-covered pages remain the caller's responsibility: only updates
+/// in the supplied suffix are included in the rebuilt index.
+///
+/// # Errors
+///
+/// Returns [`FrankenError::TooBig`] for an exceeded marker budget,
+/// [`FrankenError::OutOfMemory`] for failed marker-buffer reservations,
+/// [`FrankenError::OutOfRange`] for a zero segment-entry threshold, and
+/// corruption errors for invalid history or unrecoverable capsule updates.
+pub fn rebuild_index_from_marker_stream_with_options(
+    marker_segment_blobs: &[Vec<u8>],
+    capsule_source: &impl CommitCapsuleIndexSource,
+    max_entries: usize,
+    options: NativeIndexRecoveryOptions<'_>,
+) -> Result<IndexRebuildReport> {
+    let mut builder = SegmentBuilder::new(max_entries)?;
+    let markers = scan_commit_markers_with_options(marker_segment_blobs, options)?;
+    if markers.is_empty() {
+        return Ok(IndexRebuildReport {
+            markers,
+            segments: Vec::new(),
+        });
+    }
+
+    let start_seq = markers.first().map_or(0_u64, |record| record.commit_seq);
+    let end_seq = markers.last().map_or(0_u64, |record| record.commit_seq);
+    info!(
+        bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+        logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+        start_seq = start_seq,
+        end_seq = end_seq,
+        segments_built = 0_u64,
+        "native index rebuild start"
+    );
+
+    let mut built_segments = Vec::new();
+
+    for marker in &markers {
+        let capsule_id = ObjectId::from_bytes(marker.capsule_object_id);
+        let updates =
+            capsule_source
+                .updates_for_commit(marker.commit_seq, capsule_id)
+                .map_err(|source_error| {
+                    error!(
+                        bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+                        logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+                        reason_code = "index_unrebuildable_with_markers",
+                        commit_seq = marker.commit_seq,
+                        capsule_object_id = %capsule_id,
+                        error = %source_error,
+                        "marker stream exists but commit capsule updates are unrecoverable"
+                    );
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "reason_code=index_unrebuildable_with_markers commit_seq={} capsule_object_id={} source_error={source_error}",
+                            marker.commit_seq, capsule_id
+                        ),
+                    }
+                })?;
+
+        if let Some(segment) = builder.ingest_commit(marker.commit_seq, updates)? {
+            built_segments.push(segment);
+        }
+    }
+
+    if let Some(segment) = builder.flush()? {
+        built_segments.push(segment);
+    }
+
+    info!(
+        bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+        logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+        start_seq = start_seq,
+        end_seq = end_seq,
+        segments_built = built_segments.len(),
+        "native index rebuild complete"
+    );
+
+    Ok(IndexRebuildReport {
+        markers,
+        segments: built_segments,
+    })
+}
+
+/// Emergency linear scan over commit markers when index segments are unavailable.
+///
+/// # Errors
+///
+/// Returns `reason_code=boldness_violation_blocked_linear_scan` if emergency
+/// mode is not explicitly enabled.
+pub fn emergency_linear_scan_lookup(
+    page: PageNumber,
+    snapshot_high: u64,
+    marker_segment_blobs: &[Vec<u8>],
+    capsule_source: &impl CommitCapsuleIndexSource,
+    boldness: BoldnessConstraint,
+    evidence_state: &str,
+) -> Result<Option<VersionPointer>> {
+    if !boldness.allow_emergency_linear_scan {
+        warn!(
+            bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+            logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+            reason_code = "boldness_violation_blocked_linear_scan",
+            attempted_page = page.get(),
+            attempted_snapshot_high = snapshot_high,
+            evidence_state = evidence_state,
+            "boldness violation attempt blocked"
+        );
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "reason_code=boldness_violation_blocked_linear_scan attempted_page={} attempted_snapshot_high={} evidence_state={evidence_state}",
+                page.get(),
+                snapshot_high
+            ),
+        });
+    }
+
+    let markers = scan_commit_markers(marker_segment_blobs)?;
+    for marker in markers.iter().rev() {
+        if marker.commit_seq > snapshot_high {
+            continue;
+        }
+        let capsule_id = ObjectId::from_bytes(marker.capsule_object_id);
+        let updates = capsule_source.updates_for_commit(marker.commit_seq, capsule_id)?;
+        let mut resolved = None;
+        // Validate the whole capsule before returning even its first match.
+        // A pointer at some other visible sequence is not an update belonging
+        // to this marker, and competing target-page updates are ambiguous.
+        for (candidate, pointer) in updates {
+            if pointer.commit_seq != marker.commit_seq {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "capsule update sequence {} does not match marker {}",
+                        pointer.commit_seq, marker.commit_seq,
+                    ),
+                });
+            }
+            if candidate == page {
+                if resolved.is_some_and(|current| current != pointer) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "conflicting capsule updates for page {} at commit {}",
+                            page.get(), marker.commit_seq,
+                        ),
+                    });
+                }
+                resolved = Some(pointer);
+            }
+        }
+        if let Some(pointer) = resolved {
+            info!(
+                bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
+                logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
+                page = page.get(),
+                snapshot_high = snapshot_high,
+                resolved_commit_seq = pointer.commit_seq,
+                "native index emergency linear scan resolved version pointer"
+            );
+            return Ok(Some(pointer));
+        }
+    }
+    Ok(None)
+}
+
+fn scan_commit_markers(marker_segment_blobs: &[Vec<u8>]) -> Result<Vec<CommitMarkerRecord>> {
+    scan_commit_markers_with_options(marker_segment_blobs, NativeIndexRecoveryOptions::default())
+}
+
+fn scan_commit_markers_with_options(
+    marker_segment_blobs: &[Vec<u8>],
+    options: NativeIndexRecoveryOptions<'_>,
+) -> Result<Vec<CommitMarkerRecord>> {
+    let mut ordered_segments = Vec::new();
+    ordered_segments
+        .try_reserve_exact(marker_segment_blobs.len())
+        .map_err(|_| FrankenError::OutOfMemory)?;
+    for bytes in marker_segment_blobs {
+        let header = MarkerSegmentHeader::decode(bytes).map_err(marker_recovery_error)?;
+        ordered_segments.push((header.start_commit_seq, header.segment_id, bytes.as_slice()));
+    }
+
+    // Directory enumeration order is not commit order. Sort borrowed segment
+    // references first, then validate ONE stream, including every segment seam.
+    // Recovering independent prefixes would discard evidence of an interior
+    // torn append and would not bind a later segment to its predecessor hash.
+    ordered_segments.sort_unstable_by_key(|(start, id, _)| (*start, *id));
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(ordered_segments.len())
+        .map_err(|_| FrankenError::OutOfMemory)?;
+    segments.extend(ordered_segments.iter().map(|(_, _, bytes)| *bytes));
+    recover_marker_stream(
+        &segments,
+        options.predecessor,
+        options.expected_tip,
+        options.max_records,
+    )
+    .map_err(marker_recovery_error)
+}
+
+fn marker_recovery_error(error: MarkerError) -> FrankenError {
+    match error {
+        MarkerError::OutOfMemory => FrankenError::OutOfMemory,
+        MarkerError::RecoveryLimitExceeded { .. } => FrankenError::TooBig,
+        other => FrankenError::DatabaseCorrupt {
+            detail: format!("native index marker stream validation failed: {other}"),
+        },
+    }
+}
+
+/// Check canonical entry semantics without consulting the derived Bloom filter.
+/// A matching content hash establishes byte identity, not valid index semantics.
+fn validate_segment_entries(segment: &PageVersionIndexSegment) -> Result<()> {
+    if segment.start_seq > segment.end_seq {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "native index segment has reversed sequence bounds".to_owned(),
+        });
+    }
+    let mut previous: Option<(PageNumber, VersionPointer)> = None;
+    for &(page, pointer) in &segment.entries {
+        if !(segment.start_seq..=segment.end_seq).contains(&pointer.commit_seq) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "native index page {} commit {} is outside segment [{}..={}]",
+                    page.get(), pointer.commit_seq, segment.start_seq, segment.end_seq,
+                ),
+            });
+        }
+        if let Some((previous_page, previous_pointer)) = previous {
+            let previous_key = (previous_page.get(), previous_pointer.commit_seq);
+            let key = (page.get(), pointer.commit_seq);
+            if key < previous_key || (key == previous_key && pointer != previous_pointer) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "native index entries are unordered or conflicting at page {} commit {}",
+                        page.get(), pointer.commit_seq,
+                    ),
+                });
+            }
+        }
+        previous = Some((page, pointer));
+    }
+    Ok(())
+}
+
+fn try_fetch_valid_segment(
+    entry: NativeIndexSegmentRef,
+    store: &impl NativeIndexSegmentStore,
+) -> Result<PageVersionIndexSegment> {
+    if entry.start_seq > entry.end_seq {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "native index manifest has reversed sequence bounds".to_owned(),
+        });
+    }
+    let mut segment = store.fetch_index_segment(entry.object_id)?;
+    if segment.start_seq != entry.start_seq || segment.end_seq != entry.end_seq {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "segment bounds mismatch for object {}: expected [{}..={}], found [{}..={}]",
+                entry.object_id, entry.start_seq, entry.end_seq, segment.start_seq, segment.end_seq
+            ),
+        });
+    }
+    validate_segment_entries(&segment)?;
+    let recomputed = derive_segment_object_id(&segment);
+    if recomputed != entry.object_id {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "segment object id mismatch: expected {}, recomputed {}",
+                entry.object_id, recomputed
+            ),
+        });
+    }
+    // The object ID deliberately excludes the accelerator. Even a valid
+    // canonical payload can arrive with a stale/empty Bloom filter; trusting
+    // it would turn a present page version into an older base-page fallback.
+    let count = u32::try_from(segment.entries.len()).map_err(|_| FrankenError::TooBig)?;
+    let mut bloom = BloomFilter::new(count.max(1), 0.01);
+    for &(page, _) in &segment.entries {
+        bloom.insert(page);
+    }
+    segment.bloom = bloom;
+    Ok(segment)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::commit_marker::{
+        COMMIT_MARKER_RECORD_BYTES, CommitMarkerRecord, MARKER_SEGMENT_HEADER_BYTES,
+        MarkerSegmentHeader,
+    };
+
+    type CapsuleKey = (u64, [u8; 16]);
+    type CapsuleUpdates = Vec<(PageNumber, VersionPointer)>;
+
+    #[derive(Debug, Clone)]
+    struct TestBasePages {
+        pages: BTreeMap<u32, Vec<u8>>,
+        loads: Cell<u64>,
+    }
+
+    impl TestBasePages {
+        fn new(entries: impl IntoIterator<Item = (PageNumber, Vec<u8>)>) -> Self {
+            let mut pages = BTreeMap::new();
+            for (page, bytes) in entries {
+                pages.insert(page.get(), bytes);
+            }
+            Self {
+                pages,
+                loads: Cell::new(0),
+            }
+        }
+
+        fn loads(&self) -> u64 {
+            self.loads.get()
+        }
+    }
+
+    impl BasePageProvider for TestBasePages {
+        fn load_base_page(&self, page: PageNumber) -> Result<Vec<u8>> {
+            self.loads.set(self.loads.get().saturating_add(1));
+            self.pages
+                .get(&page.get())
+                .cloned()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("missing base page {}", page.get()),
+                })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestPatchStore {
+        objects: BTreeMap<[u8; 16], Vec<u8>>,
+        fetches: Cell<u64>,
+    }
+
+    impl TestPatchStore {
+        fn new(entries: impl IntoIterator<Item = (ObjectId, Vec<u8>)>) -> Self {
+            let mut objects = BTreeMap::new();
+            for (oid, payload) in entries {
+                objects.insert(*oid.as_bytes(), payload);
+            }
+            Self {
+                objects,
+                fetches: Cell::new(0),
+            }
+        }
+
+        fn fetches(&self) -> u64 {
+            self.fetches.get()
+        }
+    }
+
+    impl PatchObjectStore for TestPatchStore {
+        fn fetch_patch_object(&self, object_id: ObjectId) -> Result<Vec<u8>> {
+            self.fetches.set(self.fetches.get().saturating_add(1));
+            self.objects
+                .get(object_id.as_bytes())
+                .cloned()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("missing patch object {object_id}"),
+                })
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TestSegmentStore {
+        segments: BTreeMap<[u8; 16], PageVersionIndexSegment>,
+    }
+
+    impl TestSegmentStore {
+        fn new(entries: impl IntoIterator<Item = (ObjectId, PageVersionIndexSegment)>) -> Self {
+            let mut segments = BTreeMap::new();
+            for (id, segment) in entries {
+                segments.insert(*id.as_bytes(), segment);
+            }
+            Self { segments }
+        }
+    }
+
+    impl NativeIndexSegmentStore for TestSegmentStore {
+        fn fetch_index_segment(&self, object_id: ObjectId) -> Result<PageVersionIndexSegment> {
+            self.segments
+                .get(object_id.as_bytes())
+                .cloned()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("missing index segment object {object_id}"),
+                })
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TestCapsuleSource {
+        updates: BTreeMap<CapsuleKey, CapsuleUpdates>,
+    }
+
+    impl TestCapsuleSource {
+        fn with_update(
+            mut self,
+            commit_seq: u64,
+            capsule_seed: u8,
+            updates: Vec<(PageNumber, VersionPointer)>,
+        ) -> Self {
+            self.updates
+                .insert((commit_seq, [capsule_seed; 16]), updates);
+            self
+        }
+    }
+
+    impl CommitCapsuleIndexSource for TestCapsuleSource {
+        fn updates_for_commit(
+            &self,
+            commit_seq: u64,
+            capsule_object_id: ObjectId,
+        ) -> Result<Vec<(PageNumber, VersionPointer)>> {
+            self.updates
+                .get(&(commit_seq, *capsule_object_id.as_bytes()))
+                .cloned()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "missing capsule updates commit_seq={commit_seq} capsule_object_id={capsule_object_id}"
+                    ),
+                })
+        }
+    }
+
+    fn page(n: u32) -> PageNumber {
+        PageNumber::new(n).expect("non-zero page number")
+    }
+
+    fn oid(seed: u8) -> ObjectId {
+        ObjectId::from_bytes([seed; 16])
+    }
+
+    fn pointer(
+        commit_seq: u64,
+        patch_object_seed: u8,
+        patch_kind: PatchKind,
+        base_hint: Option<u8>,
+    ) -> VersionPointer {
+        VersionPointer {
+            commit_seq,
+            patch_object: oid(patch_object_seed),
+            patch_kind,
+            base_hint: base_hint.map(oid),
+        }
+    }
+
+    fn encode_intent_patch(ops: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(u8::try_from(ops.len()).expect("op count fits u8"));
+        for (offset, data) in ops {
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(
+                &u16::try_from(data.len())
+                    .expect("op data len fits u16")
+                    .to_le_bytes(),
+            );
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    fn encode_sparse_xor_patch(ops: &[(u16, &[u8])]) -> Vec<u8> {
+        encode_intent_patch(ops)
+    }
+
+    fn marker_record(
+        commit_seq: u64,
+        capsule_seed: u8,
+        prev_marker: [u8; 16],
+    ) -> CommitMarkerRecord {
+        CommitMarkerRecord::new(
+            commit_seq,
+            1_700_000_000_000_000_000_u64.saturating_add(commit_seq),
+            [capsule_seed; 16],
+            [capsule_seed.wrapping_add(1); 16],
+            prev_marker,
+        )
+    }
+
+    fn marker_segment_blob(start_seq: u64, records: &[CommitMarkerRecord]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let segment_id = start_seq / 1_000_000;
+        let header = MarkerSegmentHeader::new(segment_id, start_seq);
+        out.extend_from_slice(&header.encode());
+        for record in records {
+            out.extend_from_slice(&record.encode());
+        }
+        let expected_len = MARKER_SEGMENT_HEADER_BYTES + COMMIT_MARKER_RECORD_BYTES * records.len();
+        assert_eq!(out.len(), expected_len);
+        out
+    }
+
+    #[derive(Default)]
+    struct CountingCapsuleSource {
+        calls: Cell<usize>,
+    }
+
+    impl CommitCapsuleIndexSource for CountingCapsuleSource {
+        fn updates_for_commit(
+            &self,
+            commit_seq: u64,
+            capsule_object_id: ObjectId,
+        ) -> Result<Vec<(PageNumber, VersionPointer)>> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(vec![(
+                page(7),
+                VersionPointer {
+                    commit_seq,
+                    patch_object: capsule_object_id,
+                    patch_kind: PatchKind::FullImage,
+                    base_hint: None,
+                },
+            )])
+        }
+    }
+
+    #[test]
+    fn native_rebuild_checks_seams_before_capsules() {
+        let first = marker_record(999_999, 0x10, [0; 16]);
+        let last = marker_record(1_000_000, 0x11, first.marker_id);
+        let first_blob = marker_segment_blob(first.commit_seq, std::slice::from_ref(&first));
+        let last_blob = marker_segment_blob(last.commit_seq, std::slice::from_ref(&last));
+        let foreign = marker_record(last.commit_seq, 0x11, [0xFF; 16]);
+        let backwards = CommitMarkerRecord::new(
+            last.commit_seq,
+            first.commit_time_unix_ns - 1,
+            last.capsule_object_id,
+            last.proof_object_id,
+            first.marker_id,
+        );
+        let skipped = marker_record(last.commit_seq + 1, 0x12, first.marker_id);
+        let mut torn_first = first_blob.clone();
+        torn_first.push(0xAA);
+        let mut duplicate_id = last_blob.clone();
+        duplicate_id[..MARKER_SEGMENT_HEADER_BYTES]
+            .copy_from_slice(&MarkerSegmentHeader::new(0, last.commit_seq).encode());
+        let cases = [
+            vec![
+                first_blob.clone(),
+                marker_segment_blob(last.commit_seq, &[foreign]),
+            ],
+            vec![
+                first_blob.clone(),
+                marker_segment_blob(last.commit_seq, &[backwards]),
+            ],
+            vec![
+                first_blob.clone(),
+                marker_segment_blob(skipped.commit_seq, &[skipped]),
+            ],
+            vec![torn_first, last_blob.clone()],
+            vec![marker_segment_blob(first.commit_seq, &[]), last_blob],
+            vec![first_blob, duplicate_id],
+        ];
+        for blobs in cases {
+            let source = CountingCapsuleSource::default();
+            assert!(matches!(
+                rebuild_index_from_marker_stream(&blobs, &source, 1),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert!(preflight_native_index_integrity(&blobs, true, true).is_err());
+            assert!(
+                emergency_linear_scan_lookup(
+                    page(7),
+                    last.commit_seq,
+                    &blobs,
+                    &source,
+                    BoldnessConstraint::emergency(),
+                    "invalid_history",
+                )
+                .is_err()
+            );
+            assert_eq!(
+                source.calls.get(),
+                0,
+                "all consumers must reject before fetch"
+            );
+        }
+    }
+
+    #[test]
+    fn native_rebuild_orders_segments_and_accepts_final_uncommitted_tail() {
+        let first = marker_record(999_999, 0x10, [0; 16]);
+        let last = marker_record(1_000_000, 0x11, first.marker_id);
+        let first_blob = marker_segment_blob(first.commit_seq, std::slice::from_ref(&first));
+        let mut last_blob = marker_segment_blob(last.commit_seq, std::slice::from_ref(&last));
+        last_blob.extend_from_slice(b"incomplete append");
+        let source = CountingCapsuleSource::default();
+        let forward = vec![first_blob.clone(), last_blob.clone()];
+        let reverse = vec![last_blob, first_blob];
+        let expected = rebuild_index_from_marker_stream(&forward, &source, 1).expect("forward");
+        let actual = rebuild_index_from_marker_stream(&reverse, &source, 1).expect("reverse");
+        assert_eq!(actual, expected);
+        assert_eq!(actual.markers, vec![first, last]);
+        assert_eq!(actual.segments.len(), 2);
+        assert_eq!(source.calls.get(), 4);
+        preflight_native_index_integrity(&reverse, true, true).expect("valid prefix");
+    }
+
+    #[test]
+    fn native_rebuild_enforces_checkpoint_tip_and_global_budget() {
+        let checkpoint = marker_record(999_998, 0x09, [0; 16]);
+        let first = marker_record(999_999, 0x10, checkpoint.marker_id);
+        let last = marker_record(1_000_000, 0x11, first.marker_id);
+        let blobs = vec![
+            marker_segment_blob(last.commit_seq, std::slice::from_ref(&last)),
+            marker_segment_blob(first.commit_seq, std::slice::from_ref(&first)),
+        ];
+        let source = CountingCapsuleSource::default();
+        let options = NativeIndexRecoveryOptions {
+            predecessor: Some(&checkpoint),
+            expected_tip: Some(&last),
+            max_records: 2,
+        };
+        for max_records in [0, 1] {
+            assert!(matches!(
+                rebuild_index_from_marker_stream_with_options(
+                    &blobs,
+                    &source,
+                    1,
+                    NativeIndexRecoveryOptions {
+                        max_records,
+                        ..options
+                    },
+                ),
+                Err(FrankenError::TooBig)
+            ));
+            assert_eq!(source.calls.get(), 0);
+        }
+        let foreign_checkpoint = marker_record(checkpoint.commit_seq, 0xF0, [0; 16]);
+        let foreign_tip = marker_record(last.commit_seq, 0xF1, first.marker_id);
+        for invalid in [
+            NativeIndexRecoveryOptions {
+                predecessor: Some(&foreign_checkpoint),
+                ..options
+            },
+            NativeIndexRecoveryOptions {
+                expected_tip: Some(&foreign_tip),
+                ..options
+            },
+        ] {
+            assert!(matches!(
+                rebuild_index_from_marker_stream_with_options(&blobs, &source, 1, invalid),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert_eq!(source.calls.get(), 0);
+        }
+        let report = rebuild_index_from_marker_stream_with_options(&blobs, &source, 1, options)
+            .expect("anchored suffix");
+        assert_eq!(report.markers, vec![first, last]);
+        assert_eq!(report.segments.len(), 2);
+        assert_eq!(source.calls.get(), 2);
+    }
+
+    #[test]
+    fn native_rebuild_checkpoint_only_still_validates_options() {
+        let checkpoint = marker_record(42, 0x10, [0; 16]);
+        let future_tip = marker_record(43, 0x11, checkpoint.marker_id);
+        let source = CountingCapsuleSource::default();
+        let options = NativeIndexRecoveryOptions {
+            predecessor: Some(&checkpoint),
+            expected_tip: Some(&checkpoint),
+            max_records: 0,
+        };
+        let report = rebuild_index_from_marker_stream_with_options(&[], &source, 1, options)
+            .expect("checkpoint already reaches the tip");
+        assert!(report.markers.is_empty());
+        assert!(report.segments.is_empty());
+        assert!(matches!(
+            rebuild_index_from_marker_stream_with_options(&[], &source, 0, options),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            rebuild_index_from_marker_stream_with_options(
+                &[],
+                &source,
+                1,
+                NativeIndexRecoveryOptions {
+                    expected_tip: Some(&future_tip),
+                    ..options
+                },
+            ),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+        assert_eq!(source.calls.get(), 0);
+    }
+
+    #[test]
+    fn native_rebuild_never_hides_a_known_durable_tail() {
+        let first = marker_record(999_999, 0x10, [0; 16]);
+        let last = marker_record(1_000_000, 0x11, first.marker_id);
+        for retained_bytes in 0..COMMIT_MARKER_RECORD_BYTES {
+            let first_blob = marker_segment_blob(first.commit_seq, std::slice::from_ref(&first));
+            let mut last_blob = marker_segment_blob(last.commit_seq, &[]);
+            last_blob.extend_from_slice(&last.encode()[..retained_bytes]);
+            let source = CountingCapsuleSource::default();
+            assert!(matches!(
+                rebuild_index_from_marker_stream_with_options(
+                    &[last_blob, first_blob],
+                    &source,
+                    1,
+                    NativeIndexRecoveryOptions {
+                        expected_tip: Some(&last),
+                        ..NativeIndexRecoveryOptions::default()
+                    },
+                ),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert_eq!(source.calls.get(), 0, "cut at byte {retained_bytes}");
+        }
+    }
+
+    #[test]
+    fn native_marker_scan_rejects_duplicate_maximum_sequence() {
+        let last = marker_record(u64::MAX, 0x10, [0; 16]);
+        let blob = marker_segment_blob(last.commit_seq, std::slice::from_ref(&last));
+        assert_eq!(
+            scan_commit_markers(std::slice::from_ref(&blob)).expect("last"),
+            vec![last]
+        );
+        assert!(scan_commit_markers(&[blob.clone(), blob]).is_err());
+    }
+
+    #[test]
+    fn native_marker_resource_failures_remain_distinct_from_corruption() {
+        assert!(matches!(
+            marker_recovery_error(MarkerError::OutOfMemory),
+            FrankenError::OutOfMemory
+        ));
+        assert!(matches!(
+            marker_recovery_error(MarkerError::RecoveryLimitExceeded { max_records: 0 }),
+            FrankenError::TooBig
+        ));
+        assert!(matches!(
+            marker_recovery_error(MarkerError::SequenceOverflow),
+            FrankenError::DatabaseCorrupt { .. }
+        ));
+    }
+
+    #[test]
+    fn test_lookup_latest_version() {
+        let p = page(7);
+        let vp10 = pointer(10, 0x10, PatchKind::FullImage, None);
+        let vp20 = pointer(20, 0x20, PatchKind::FullImage, None);
+        let seg10 = PageVersionIndexSegment::new(10, 10, vec![(p, vp10)]);
+        let seg20 = PageVersionIndexSegment::new(20, 20, vec![(p, vp20)]);
+        let base = TestBasePages::new([(p, b"base".to_vec())]);
+        let store =
+            TestPatchStore::new([(oid(0x10), b"v10".to_vec()), (oid(0x20), b"v20".to_vec())]);
+
+        let mut cache = NativePageCache::default();
+        let result_high = lookup_page_version(
+            p,
+            25,
+            &[seg10.clone(), seg20.clone()],
+            &mut cache,
+            &base,
+            &store,
+            0.0,
+        )
+        .expect("lookup");
+        assert_eq!(result_high.page_bytes, b"v20".to_vec());
+        assert_eq!(result_high.resolved_pointer, Some(vp20));
+
+        let mut cache2 = NativePageCache::default();
+        let result_mid =
+            lookup_page_version(p, 15, &[seg10, seg20], &mut cache2, &base, &store, 0.0)
+                .expect("lookup");
+        assert_eq!(result_mid.page_bytes, b"v10".to_vec());
+        assert_eq!(result_mid.resolved_pointer, Some(vp10));
+    }
+
+    #[test]
+    fn native_lookup_selects_latest_page_not_latest_segment_end() {
+        let p = page(7);
+        let old = pointer(70, 0x70, PatchKind::FullImage, None);
+        let new = pointer(80, 0x80, PatchKind::FullImage, None);
+        let wide = PageVersionIndexSegment::new(
+            1,
+            100,
+            vec![
+                (p, old),
+                (page(9), pointer(100, 0x90, PatchKind::FullImage, None)),
+            ],
+        );
+        let narrow = PageVersionIndexSegment::new(2, 90, vec![(p, new)]);
+        for segments in [vec![wide.clone(), narrow.clone()], vec![narrow, wide]] {
+            for (snapshot, expected) in [
+                (0, None),
+                (69, None),
+                (70, Some(old)),
+                (79, Some(old)),
+                (80, Some(new)),
+                (100, Some(new)),
+            ] {
+                assert_eq!(
+                    lookup_pointer_in_segments(p, snapshot, &segments)
+                        .expect("lookup")
+                        .0,
+                    expected,
+                    "snapshot {snapshot}"
+                );
+            }
+            let base = TestBasePages::new([]);
+            let store = TestPatchStore::new([
+                (oid(0x70), b"old".to_vec()),
+                (oid(0x80), b"new".to_vec()),
+            ]);
+            let mut cache = NativePageCache::default();
+            let actual = lookup_page_version(p, 85, &segments, &mut cache, &base, &store, 0.0)
+                .expect("latest standalone image");
+            assert_eq!(actual.page_bytes, b"new".to_vec());
+            assert_eq!(actual.resolved_pointer, Some(new));
+            assert_eq!(base.loads(), 0);
+            assert_eq!(store.fetches(), 1);
+        }
+    }
+
+    #[test]
+    fn native_lookup_rejects_ambiguous_latest_versions_in_every_order() {
+        let p = page(7);
+        let first = pointer(20, 0x10, PatchKind::FullImage, None);
+        let conflicting = pointer(20, 0x11, PatchKind::FullImage, None);
+        let latest = pointer(30, 0x12, PatchKind::FullImage, None);
+        let segments = [
+            PageVersionIndexSegment::new(20, 20, vec![(p, first)]),
+            PageVersionIndexSegment::new(20, 20, vec![(p, conflicting)]),
+            PageVersionIndexSegment::new(30, 30, vec![(p, latest)]),
+        ];
+        for order in [
+            [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+        ] {
+            let ordered = order.map(|index| segments[index].clone());
+            let base = TestBasePages::new([]);
+            let store = TestPatchStore::new([]);
+            let mut cache = NativePageCache::default();
+            assert!(matches!(
+                lookup_page_version(p, 20, &ordered, &mut cache, &base, &store, 0.0),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert!(cache.get(p, 20).is_none());
+            assert_eq!(
+                store.fetches(),
+                0,
+                "reject before materializing either candidate"
+            );
+            assert_eq!(base.loads(), 0);
+            assert_eq!(
+                lookup_pointer_in_segments(p, 30, &ordered)
+                    .expect("unambiguous newer version")
+                    .0,
+                Some(latest)
+            );
+        }
+        let repeated = [segments[0].clone(), segments[0].clone()];
+        assert_eq!(
+            lookup_pointer_in_segments(p, 20, &repeated)
+                .expect("identical copies")
+                .0,
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn native_full_image_does_not_require_a_base_page_or_hint_object() {
+        for hint in [None, Some(0xEE)] {
+            let p = page(7);
+            let vp = pointer(40, 0x40, PatchKind::FullImage, hint);
+            let segments = [PageVersionIndexSegment::new(40, 40, vec![(p, vp)])];
+            let base = TestBasePages::new([]);
+            let store = TestPatchStore::new([(oid(0x40), b"complete image".to_vec())]);
+            let mut cache = NativePageCache::default();
+            let actual = lookup_page_version(p, 40, &segments, &mut cache, &base, &store, 0.0)
+                .expect("full image must be self-contained");
+            assert_eq!(actual.page_bytes, b"complete image".to_vec());
+            assert_eq!(base.loads(), 0);
+            assert_eq!(store.fetches(), 1);
+            let cached = lookup_page_version(p, 40, &segments, &mut cache, &base, &store, 0.0)
+                .expect("cached image");
+            assert!(cached.trace.cache_hit);
+            assert_eq!(cached.page_bytes, actual.page_bytes);
+            assert_eq!(store.fetches(), 1);
+        }
+    }
+
+    #[test]
+    fn native_hinted_patches_use_only_their_explicit_base() {
+        let cases = [
+            (
+                PatchKind::IntentLog,
+                encode_intent_patch(&[(1, b"BC")]),
+                b"aBCa".to_vec(),
+            ),
+            (
+                PatchKind::SparseXor,
+                encode_sparse_xor_patch(&[(0, &[1, 2, 3, 4])]),
+                vec![96, 99, 98, 101],
+            ),
+        ];
+        for (kind, patch, expected) in cases {
+            let p = page(7);
+            let vp = pointer(50, 0x50, kind, Some(0x51));
+            let segments = [PageVersionIndexSegment::new(50, 50, vec![(p, vp)])];
+            let base = TestBasePages::new([]);
+            let store = TestPatchStore::new([(oid(0x50), patch), (oid(0x51), b"aaaa".to_vec())]);
+            let mut cache = NativePageCache::default();
+            let actual = lookup_page_version(p, 50, &segments, &mut cache, &base, &store, 0.0)
+                .expect("explicit base materialization");
+            assert_eq!(actual.page_bytes, expected);
+            assert_eq!(base.loads(), 0);
+            assert_eq!(store.fetches(), 2);
+        }
+    }
+
+    #[test]
+    fn native_missing_hint_does_not_fall_back_to_unrelated_base() {
+        let p = page(7);
+        let vp = pointer(50, 0x50, PatchKind::IntentLog, Some(0x51));
+        let segments = [PageVersionIndexSegment::new(50, 50, vec![(p, vp)])];
+        let base = TestBasePages::new([(p, b"newer unrelated page".to_vec())]);
+        let store = TestPatchStore::new([(oid(0x50), encode_intent_patch(&[(0, b"X")]))]);
+        let mut cache = NativePageCache::default();
+        assert!(lookup_page_version(p, 50, &segments, &mut cache, &base, &store, 0.0).is_err());
+        assert_eq!(base.loads(), 0);
+        assert!(cache.get(p, 50).is_none());
+    }
+
+    #[test]
+    fn native_failed_materialization_never_caches_a_partial_page() {
+        let p = page(7);
+        let vp = pointer(50, 0x50, PatchKind::IntentLog, Some(0x51));
+        let segments = [PageVersionIndexSegment::new(50, 50, vec![(p, vp)])];
+        let base = TestBasePages::new([]);
+        let mut store = TestPatchStore::new([
+            (oid(0x50), encode_intent_patch(&[(0, b"X"), (7, b"Y")])),
+            (oid(0x51), b"aaaa".to_vec()),
+        ]);
+        let mut cache = NativePageCache::default();
+        assert!(lookup_page_version(p, 50, &segments, &mut cache, &base, &store, 0.0).is_err());
+        assert!(cache.get(p, 50).is_none());
+        store
+            .objects
+            .insert(*oid(0x50).as_bytes(), encode_intent_patch(&[(1, b"BC")]));
+        let retried = lookup_page_version(p, 50, &segments, &mut cache, &base, &store, 0.0)
+            .expect("retry repaired patch");
+        assert!(!retried.trace.cache_hit);
+        assert_eq!(retried.page_bytes, b"aBCa".to_vec());
+        assert_eq!(base.loads(), 0);
+    }
+
+    #[test]
+    fn native_emergency_lookup_validates_all_updates_before_returning() {
+        let marker = marker_record(100, 0x10, [0; 16]);
+        let blob = marker_segment_blob(100, &[marker]);
+        let good = pointer(100, 0x20, PatchKind::FullImage, None);
+        let cases = [
+            vec![(page(7), pointer(99, 0x21, PatchKind::FullImage, None))],
+            vec![(page(7), pointer(101, 0x21, PatchKind::FullImage, None))],
+            vec![
+                (page(7), good),
+                (page(8), pointer(99, 0x21, PatchKind::FullImage, None)),
+            ],
+            vec![
+                (page(7), good),
+                (page(7), pointer(100, 0x21, PatchKind::FullImage, None)),
+            ],
+        ];
+        for updates in cases {
+            let source = TestCapsuleSource::default().with_update(100, 0x10, updates);
+            assert!(matches!(
+                emergency_linear_scan_lookup(
+                    page(7),
+                    100,
+                    std::slice::from_ref(&blob),
+                    &source,
+                    BoldnessConstraint::emergency(),
+                    "invalid_capsule",
+                ),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+        }
+        let source = TestCapsuleSource::default()
+            .with_update(100, 0x10, vec![(page(7), good), (page(7), good)]);
+        assert_eq!(
+            emergency_linear_scan_lookup(
+                page(7),
+                100,
+                &[blob],
+                &source,
+                BoldnessConstraint::emergency(),
+                "valid_capsule",
+            )
+            .expect("identical updates"),
+            Some(good)
+        );
+    }
+
+    #[test]
+    fn test_filter_negative_path_has_no_false_negatives() {
+        let target = page(5);
+        let other = page(9);
+        let vp = pointer(12, 0x30, PatchKind::FullImage, None);
+        let segment = PageVersionIndexSegment::new(12, 12, vec![(other, vp)]);
+        let base = TestBasePages::new([(target, b"base5".to_vec()), (other, b"base9".to_vec())]);
+        let store = TestPatchStore::new([(oid(0x30), b"other-version".to_vec())]);
+
+        let mut cache = NativePageCache::default();
+        let negative = lookup_page_version(
+            target,
+            20,
+            std::slice::from_ref(&segment),
+            &mut cache,
+            &base,
+            &store,
+            0.0,
+        )
+        .expect("negative path");
+        assert!(!negative.trace.filter_hit);
+        assert_eq!(negative.page_bytes, b"base5".to_vec());
+        assert_eq!(store.fetches(), 0);
+
+        let mut cache2 = NativePageCache::default();
+        let positive = lookup_page_version(other, 20, &[segment], &mut cache2, &base, &store, 0.0)
+            .expect("positive path");
+        assert!(positive.trace.filter_hit);
+        assert_eq!(positive.page_bytes, b"other-version".to_vec());
+    }
+
+    #[test]
+    fn test_materialization_intent_and_sparse_xor() {
+        let p = page(3);
+        let base = TestBasePages::new([(p, b"aaaa".to_vec())]);
+        let intent_ptr = pointer(10, 0x40, PatchKind::IntentLog, None);
+        let xor_ptr = pointer(20, 0x50, PatchKind::SparseXor, None);
+        let seg_intent = PageVersionIndexSegment::new(10, 10, vec![(p, intent_ptr)]);
+        let seg_xor = PageVersionIndexSegment::new(20, 20, vec![(p, xor_ptr)]);
+
+        let intent_patch = encode_intent_patch(&[(1, b"BC")]);
+        let xor_patch = encode_sparse_xor_patch(&[(0, &[0x01, 0x02, 0x03, 0x04])]);
+        let store = TestPatchStore::new([(oid(0x40), intent_patch), (oid(0x50), xor_patch)]);
+
+        let mut cache = NativePageCache::default();
+        let intent = lookup_page_version(
+            p,
+            10,
+            &[seg_intent, seg_xor.clone()],
+            &mut cache,
+            &base,
+            &store,
+            0.0,
+        )
+        .expect("intent materialization");
+        assert_eq!(intent.page_bytes, b"aBCa".to_vec());
+
+        let mut cache2 = NativePageCache::default();
+        let sparse = lookup_page_version(p, 20, &[seg_xor], &mut cache2, &base, &store, 0.0)
+            .expect("xor materialization");
+        assert_eq!(sparse.page_bytes, vec![96, 99, 98, 101]);
+    }
+
+    #[test]
+    fn test_segment_construction_deterministic() {
+        let mut builder_a = SegmentBuilder::new(16).expect("builder");
+        let mut builder_b = SegmentBuilder::new(16).expect("builder");
+
+        let updates_a = vec![
+            (page(7), pointer(100, 0x60, PatchKind::FullImage, None)),
+            (
+                page(2),
+                pointer(100, 0x61, PatchKind::IntentLog, Some(0x62)),
+            ),
+        ];
+        let updates_b = vec![
+            (
+                page(2),
+                pointer(100, 0x61, PatchKind::IntentLog, Some(0x62)),
+            ),
+            (page(7), pointer(100, 0x60, PatchKind::FullImage, None)),
+        ];
+
+        assert!(
+            builder_a
+                .ingest_commit(100, updates_a)
+                .expect("ingest")
+                .is_none()
+        );
+        assert!(
+            builder_b
+                .ingest_commit(100, updates_b)
+                .expect("ingest")
+                .is_none()
+        );
+
+        let built_a = builder_a.flush().expect("flush").expect("segment");
+        let built_b = builder_b.flush().expect("flush").expect("segment");
+        assert_eq!(built_a.segment.entries, built_b.segment.entries);
+        assert_eq!(built_a.object_id, built_b.object_id);
+    }
+
+    #[test]
+    fn invalid_commit_admission_preserves_builder_and_next_segment() {
+        for seeded in [false, true] {
+            let mut builder = SegmentBuilder::new(2).expect("builder");
+            if seeded {
+                builder
+                    .ingest_commit(
+                        10,
+                        [(page(1), pointer(10, 0x10, PatchKind::FullImage, None))],
+                    )
+                    .expect("seed");
+            }
+            let mut control = builder.clone();
+            // The prefix re-admits an existing key in the seeded case; a new
+            // key then reaches the auto-flush threshold before a bad final
+            // sequence rejects the entire commit. Conflicting replacements are
+            // covered separately below.
+            let rejected = [
+                (page(1), pointer(10, 0x10, PatchKind::FullImage, None)),
+                (page(2), pointer(10, 0x21, PatchKind::FullImage, None)),
+                (page(3), pointer(11, 0x22, PatchKind::FullImage, None)),
+            ];
+            assert!(matches!(
+                builder.ingest_commit(10, rejected),
+                Err(FrankenError::TypeMismatch { .. })
+            ));
+            assert_eq!(builder, control, "failed admission must preserve all state");
+            let retry = [
+                (page(1), pointer(20, 0x30, PatchKind::FullImage, None)),
+                (page(2), pointer(20, 0x31, PatchKind::FullImage, None)),
+            ];
+            let actual = builder.ingest_commit(20, retry).expect("retry");
+            let expected = control.ingest_commit(20, retry).expect("control");
+            assert!(actual.is_some(), "valid retry must still auto-flush");
+            assert_eq!(actual, expected, "rejected bytes must not enter the segment");
+            assert_eq!(builder, control);
+            assert!(builder.flush().expect("already flushed").is_none());
+        }
+    }
+
+    fn run_e2e_path_case() {
+        let p = page(11);
+        let base_bytes = vec![0x10, 0x20, 0x30, 0x40];
+        let base = TestBasePages::new([(p, base_bytes.clone())]);
+        let pointer = pointer(30, 0x71, PatchKind::SparseXor, Some(0x70));
+        let segment = PageVersionIndexSegment::new(30, 30, vec![(p, pointer)]);
+        let xor_patch = encode_sparse_xor_patch(&[(2, &[0xFF, 0x0F])]);
+        let store = TestPatchStore::new([(oid(0x70), base_bytes), (oid(0x71), xor_patch)]);
+
+        let mut cache = NativePageCache::default();
+        let first = lookup_page_version(
+            p,
+            30,
+            std::slice::from_ref(&segment),
+            &mut cache,
+            &base,
+            &store,
+            0.02,
+        )
+        .expect("first lookup");
+        assert!(!first.trace.cache_hit);
+        assert!(first.trace.filter_hit);
+        assert_eq!(first.trace.segment_scans, 1);
+        assert_eq!(first.trace.resolved_commit_seq, Some(30));
+        assert_eq!(first.page_bytes, vec![0x10, 0x20, 0xCF, 0x4F]);
+
+        let second = lookup_page_version(p, 30, &[segment], &mut cache, &base, &store, 0.02)
+            .expect("second lookup");
+        assert!(second.trace.cache_hit);
+        assert_eq!(second.page_bytes, first.page_bytes);
+        assert_eq!(store.fetches(), 2);
+        assert_eq!(
+            base.loads(),
+            0,
+            "hinted materialization must not read the base page"
+        );
+    }
+
+    #[test]
+    fn test_e2e_cache_miss_filter_hit_index_scan_fetch_materialize() {
+        run_e2e_path_case();
+    }
+
+    #[test]
+    fn test_bd_1hi_32_unit_compliance_gate() {
+        assert_eq!(NATIVE_INDEX_BEAD_ID, "bd-1hi.32");
+        assert_eq!(NATIVE_INDEX_LOGGING_STANDARD, "bd-1fpm");
+        let store = TestPatchStore::new(std::iter::empty::<(ObjectId, Vec<u8>)>());
+        let err = materialize_patch(
+            pointer(1, 0xAA, PatchKind::FullImage, None),
+            b"",
+            b"",
+            &store,
+            MAX_PATCH_DEPTH + 1,
+        )
+        .expect_err("depth guard");
+        assert!(err.to_string().contains("depth exceeded"));
+    }
+
+    #[test]
+    fn prop_bd_1hi_32_structure_compliance() {
+        for seed in 1_u8..=16 {
+            let mut builder = SegmentBuilder::new(8).expect("builder");
+            let updates = vec![
+                (
+                    page(u32::from(seed)),
+                    pointer(500, seed, PatchKind::FullImage, None),
+                ),
+                (
+                    page(u32::from(seed) + 100),
+                    pointer(500, seed.wrapping_add(1), PatchKind::SparseXor, Some(seed)),
+                ),
+            ];
+            assert!(
+                builder
+                    .ingest_commit(500, updates)
+                    .expect("ingest")
+                    .is_none()
+            );
+            let built = builder.flush().expect("flush").expect("segment");
+            assert!(!built.segment.entries.is_empty());
+            let recomputed = derive_segment_object_id(&built.segment);
+            assert_eq!(built.object_id, recomputed);
+        }
+    }
+
+    #[test]
+    fn test_e2e_bd_1hi_32_compliance() {
+        run_e2e_path_case();
+    }
+
+    #[test]
+    fn test_index_rebuild_from_markers() {
+        let marker_100 = marker_record(100, 0x10, [0_u8; 16]);
+        let marker_101 = marker_record(101, 0x11, marker_100.marker_id);
+        let marker_blob = marker_segment_blob(100, &[marker_100, marker_101]);
+
+        let source = TestCapsuleSource::default()
+            .with_update(
+                100,
+                0x10,
+                vec![(page(3), pointer(100, 0x80, PatchKind::FullImage, None))],
+            )
+            .with_update(
+                101,
+                0x11,
+                vec![
+                    (
+                        page(3),
+                        pointer(101, 0x81, PatchKind::IntentLog, Some(0x82)),
+                    ),
+                    (page(9), pointer(101, 0x83, PatchKind::FullImage, None)),
+                ],
+            );
+
+        let rebuilt_a =
+            rebuild_index_from_marker_stream(std::slice::from_ref(&marker_blob), &source, 2)
+                .expect("rebuild from markers");
+        let rebuilt_b = rebuild_index_from_marker_stream(&[marker_blob], &source, 2)
+            .expect("deterministic rebuild");
+        assert_eq!(rebuilt_a.segments, rebuilt_b.segments);
+
+        let segments: Vec<PageVersionIndexSegment> = rebuilt_a
+            .segments
+            .iter()
+            .map(|segment| segment.segment.clone())
+            .collect();
+        let (resolved, scans) = lookup_pointer_in_segments(page(3), 101, &segments).expect("lookup");
+        assert_eq!(
+            resolved,
+            Some(pointer(101, 0x81, PatchKind::IntentLog, Some(0x82)))
+        );
+        assert!(scans >= 1);
+    }
+
+    #[test]
+    fn test_index_repair_from_ecs() {
+        let p1 = page(4);
+        let p2 = page(8);
+        let seg_local = PageVersionIndexSegment::new(
+            200,
+            200,
+            vec![(p1, pointer(200, 0x90, PatchKind::FullImage, None))],
+        );
+        let seg_remote = PageVersionIndexSegment::new(
+            201,
+            201,
+            vec![(p2, pointer(201, 0x91, PatchKind::SparseXor, Some(0x92)))],
+        );
+        let id_local = derive_segment_object_id(&seg_local);
+        let id_remote = derive_segment_object_id(&seg_remote);
+
+        let refs = vec![
+            NativeIndexSegmentRef {
+                start_seq: 200,
+                end_seq: 200,
+                object_id: id_local,
+            },
+            NativeIndexSegmentRef {
+                start_seq: 201,
+                end_seq: 201,
+                object_id: id_remote,
+            },
+        ];
+
+        let local_store = TestSegmentStore::new([(id_local, seg_local.clone())]);
+        let remote_store = TestSegmentStore::new([(id_local, seg_local), (id_remote, seg_remote)]);
+        let report = repair_index_segments_from_ecs(
+            &refs,
+            &local_store,
+            &remote_store,
+            0.02,
+            BoldnessConstraint::strict(),
+        )
+        .expect("repair from surviving symbols");
+
+        assert_eq!(report.repaired_from_local, 1);
+        assert_eq!(report.repaired_from_remote, 1);
+        assert_eq!(report.segments.len(), 2);
+        let (resolved, _) = lookup_pointer_in_segments(p2, 201, &report.segments).expect("lookup");
+        assert_eq!(
+            resolved,
+            Some(pointer(201, 0x91, PatchKind::SparseXor, Some(0x92)))
+        );
+    }
+
+    #[test]
+    fn test_boldness_constraint() {
+        let marker = marker_record(300, 0x33, [0_u8; 16]);
+        let marker_blob = marker_segment_blob(300, std::slice::from_ref(&marker));
+        let source = TestCapsuleSource::default().with_update(
+            300,
+            0x33,
+            vec![(page(11), pointer(300, 0xA0, PatchKind::FullImage, None))],
+        );
+
+        let blocked = emergency_linear_scan_lookup(
+            page(11),
+            300,
+            std::slice::from_ref(&marker_blob),
+            &source,
+            BoldnessConstraint::strict(),
+            "index_destroyed",
+        )
+        .expect_err("strict boldness must block emergency lookup");
+        assert!(
+            blocked
+                .to_string()
+                .contains("reason_code=boldness_violation_blocked_linear_scan")
+        );
+
+        let resolved = emergency_linear_scan_lookup(
+            page(11),
+            300,
+            &[marker_blob],
+            &source,
+            BoldnessConstraint::emergency(),
+            "index_destroyed",
+        )
+        .expect("emergency lookup")
+        .expect("pointer found");
+        assert_eq!(resolved, pointer(300, 0xA0, PatchKind::FullImage, None));
+    }
+
+    #[test]
+    fn test_critical_integrity_failure_detected_before_repair_attempt() {
+        let marker = marker_record(400, 0x44, [0_u8; 16]);
+        let blob = marker_segment_blob(400, std::slice::from_ref(&marker));
+        let err = preflight_native_index_integrity(std::slice::from_ref(&blob), false, false)
+            .expect_err("markers without recovery paths are critical");
+        assert!(
+            err.to_string()
+                .contains("reason_code=index_unrebuildable_with_markers")
+        );
+
+        preflight_native_index_integrity(&[blob], true, false).expect("repair path available");
+    }
+
+    #[test]
+    fn test_bd_1hi_33_unit_compliance_gate() {
+        assert_eq!(NATIVE_INDEX_REPAIR_BEAD_ID, "bd-1hi.33");
+        assert_eq!(NATIVE_INDEX_LOGGING_STANDARD, "bd-1fpm");
+
+        let marker = marker_record(500, 0x55, [0_u8; 16]);
+        let marker_blob = marker_segment_blob(500, std::slice::from_ref(&marker));
+        let err = preflight_native_index_integrity(&[marker_blob], false, false)
+            .expect_err("critical preflight error");
+        assert!(
+            err.to_string()
+                .contains("reason_code=index_unrebuildable_with_markers")
+        );
+    }
+
+    #[test]
+    fn prop_bd_1hi_33_structure_compliance() {
+        for seed in 1_u8..=12 {
+            let commit_seq = 10_000_u64 + u64::from(seed);
+            let marker = marker_record(commit_seq, seed, [0_u8; 16]);
+            let marker_blob = marker_segment_blob(commit_seq, std::slice::from_ref(&marker));
+            let source = TestCapsuleSource::default().with_update(
+                commit_seq,
+                seed,
+                vec![(
+                    page(u32::from(seed) + 1),
+                    pointer(commit_seq, seed.wrapping_add(1), PatchKind::FullImage, None),
+                )],
+            );
+
+            let rebuilt =
+                rebuild_index_from_marker_stream(std::slice::from_ref(&marker_blob), &source, 1)
+                    .expect("rebuild");
+            assert_eq!(rebuilt.markers.len(), 1);
+            assert!(!rebuilt.segments.is_empty());
+
+            let refs: Vec<NativeIndexSegmentRef> = rebuilt
+                .segments
+                .iter()
+                .map(|segment| NativeIndexSegmentRef {
+                    start_seq: segment.segment.start_seq,
+                    end_seq: segment.segment.end_seq,
+                    object_id: segment.object_id,
+                })
+                .collect();
+            let remote_store = TestSegmentStore::new(
+                rebuilt
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.object_id, segment.segment.clone())),
+            );
+            let local_store = TestSegmentStore::default();
+            let repaired = repair_index_segments_from_ecs(
+                &refs,
+                &local_store,
+                &remote_store,
+                0.05,
+                BoldnessConstraint::strict(),
+            )
+            .expect("repair");
+            assert_eq!(repaired.segments.len(), refs.len());
+
+            let looked_up = emergency_linear_scan_lookup(
+                page(u32::from(seed) + 1),
+                commit_seq,
+                &[marker_blob],
+                &source,
+                BoldnessConstraint::emergency(),
+                "index_destroyed",
+            )
+            .expect("emergency lookup");
+            assert!(looked_up.is_some());
+        }
+    }
+
+    struct Bd1Hi33Fixture {
+        p11: PageNumber,
+        p12: PageNumber,
+        base: TestBasePages,
+        patch_store: TestPatchStore,
+        marker_blob: Vec<u8>,
+        source: TestCapsuleSource,
+    }
+
+    fn build_bd_1hi_33_fixture() -> Bd1Hi33Fixture {
+        let p11 = page(11);
+        let p12 = page(12);
+        let base = TestBasePages::new([(p11, b"base11".to_vec()), (p12, b"base12".to_vec())]);
+        let patch_store = TestPatchStore::new([
+            (oid(0x90), b"v300-p11".to_vec()),
+            (oid(0x91), b"v301-p11".to_vec()),
+            (oid(0x92), b"v301-p12".to_vec()),
+        ]);
+
+        let marker_300 = marker_record(300, 0x30, [0_u8; 16]);
+        let marker_301 = marker_record(301, 0x31, marker_300.marker_id);
+        let marker_blob = marker_segment_blob(300, &[marker_300, marker_301]);
+
+        let source = TestCapsuleSource::default()
+            .with_update(
+                300,
+                0x30,
+                vec![(p11, pointer(300, 0x90, PatchKind::FullImage, None))],
+            )
+            .with_update(
+                301,
+                0x31,
+                vec![
+                    (p11, pointer(301, 0x91, PatchKind::FullImage, None)),
+                    (p12, pointer(301, 0x92, PatchKind::FullImage, None)),
+                ],
+            );
+
+        Bd1Hi33Fixture {
+            p11,
+            p12,
+            base,
+            patch_store,
+            marker_blob,
+            source,
+        }
+    }
+
+    fn assert_repaired_index_lookups(
+        fixture: &Bd1Hi33Fixture,
+        segments: &[PageVersionIndexSegment],
+    ) {
+        let mut cache = NativePageCache::default();
+        let looked_up_p11 = lookup_page_version(
+            fixture.p11,
+            301,
+            segments,
+            &mut cache,
+            &fixture.base,
+            &fixture.patch_store,
+            0.05,
+        )
+        .expect("indexed lookup p11");
+        assert_eq!(looked_up_p11.page_bytes, b"v301-p11".to_vec());
+
+        let mut cache2 = NativePageCache::default();
+        let looked_up_p12 = lookup_page_version(
+            fixture.p12,
+            301,
+            segments,
+            &mut cache2,
+            &fixture.base,
+            &fixture.patch_store,
+            0.05,
+        )
+        .expect("indexed lookup p12");
+        assert_eq!(looked_up_p12.page_bytes, b"v301-p12".to_vec());
+    }
+
+    fn assert_emergency_scan_behavior(fixture: &Bd1Hi33Fixture) {
+        let blocked = emergency_linear_scan_lookup(
+            fixture.p11,
+            301,
+            std::slice::from_ref(&fixture.marker_blob),
+            &fixture.source,
+            BoldnessConstraint::strict(),
+            "index_destroyed",
+        )
+        .expect_err("strict policy blocks emergency scan");
+        assert!(
+            blocked
+                .to_string()
+                .contains("reason_code=boldness_violation_blocked_linear_scan")
+        );
+
+        let fallback_pointer = emergency_linear_scan_lookup(
+            fixture.p11,
+            301,
+            std::slice::from_ref(&fixture.marker_blob),
+            &fixture.source,
+            BoldnessConstraint::emergency(),
+            "index_destroyed",
+        )
+        .expect("emergency linear scan")
+        .expect("pointer");
+        let fallback_patch = fixture
+            .patch_store
+            .fetch_patch_object(fallback_pointer.patch_object)
+            .expect("patch bytes");
+        let fallback_base = fixture.base.load_base_page(fixture.p11).expect("base page");
+        let fallback_bytes = materialize_patch(
+            fallback_pointer,
+            &fallback_patch,
+            &fallback_base,
+            &fixture.patch_store,
+            0,
+        )
+        .expect("materialize from emergency pointer");
+        assert_eq!(fallback_bytes, b"v301-p11".to_vec());
+    }
+
+    #[test]
+    fn test_e2e_bd_1hi_33_compliance() {
+        let fixture = build_bd_1hi_33_fixture();
+
+        let rebuilt_a = rebuild_index_from_marker_stream(
+            std::slice::from_ref(&fixture.marker_blob),
+            &fixture.source,
+            1,
+        )
+        .expect("rebuild");
+        let rebuilt_b = rebuild_index_from_marker_stream(
+            std::slice::from_ref(&fixture.marker_blob),
+            &fixture.source,
+            1,
+        )
+        .expect("rebuild deterministic");
+        let ids_a: Vec<ObjectId> = rebuilt_a
+            .segments
+            .iter()
+            .map(|segment| segment.object_id)
+            .collect();
+        let ids_b: Vec<ObjectId> = rebuilt_b
+            .segments
+            .iter()
+            .map(|segment| segment.object_id)
+            .collect();
+        assert_eq!(ids_a, ids_b);
+
+        let refs: Vec<NativeIndexSegmentRef> = rebuilt_a
+            .segments
+            .iter()
+            .map(|segment| NativeIndexSegmentRef {
+                start_seq: segment.segment.start_seq,
+                end_seq: segment.segment.end_seq,
+                object_id: segment.object_id,
+            })
+            .collect();
+        assert!(refs.len() >= 2);
+
+        let local_store = TestSegmentStore::new([(
+            rebuilt_a.segments[0].object_id,
+            rebuilt_a.segments[0].segment.clone(),
+        )]);
+        let remote_store = TestSegmentStore::new(
+            rebuilt_a
+                .segments
+                .iter()
+                .map(|segment| (segment.object_id, segment.segment.clone())),
+        );
+        let repaired = repair_index_segments_from_ecs(
+            &refs,
+            &local_store,
+            &remote_store,
+            0.05,
+            BoldnessConstraint::strict(),
+        )
+        .expect("repair");
+
+        assert_repaired_index_lookups(&fixture, &repaired.segments);
+        assert_emergency_scan_behavior(&fixture);
+    }
+
+
+    fn ref_for_segment(segment: &PageVersionIndexSegment) -> NativeIndexSegmentRef {
+        NativeIndexSegmentRef {
+            start_seq: segment.start_seq,
+            end_seq: segment.end_seq,
+            object_id: derive_segment_object_id(segment),
+        }
+    }
+
+    #[test]
+    fn repaired_bloom_is_reconstructed_before_page_lookup() {
+        let p = page(7);
+        let vp = pointer(12, 0xA1, PatchKind::FullImage, None);
+        let mut segment = PageVersionIndexSegment::new(10, 20, vec![(p, vp)]);
+        let reference = ref_for_segment(&segment);
+        segment.bloom = BloomFilter::new(1, 0.01);
+        assert!(segment.lookup(p, 20).is_none(), "fixture hides a real version");
+        assert_eq!(derive_segment_object_id(&segment), reference.object_id);
+        let store = TestSegmentStore::new([(reference.object_id, segment)]);
+        let report = repair_index_segments_from_ecs(
+            &[reference], &store, &TestSegmentStore::default(), 0.0,
+            BoldnessConstraint::strict(),
+        ).expect("rebuild the derived filter from canonical entries");
+        assert_eq!(report.repaired_from_local, 1);
+        assert_eq!(report.repaired_from_remote, 0);
+        assert_eq!(report.segments[0].lookup(p, 20), Some(&vp));
+        assert_eq!(derive_segment_object_id(&report.segments[0]), reference.object_id);
+        let result = lookup_page_version(
+            p, 20, &report.segments, &mut NativePageCache::default(),
+            &TestBasePages::new([(p, b"obsolete-base".to_vec())]),
+            &TestPatchStore::new([(vp.patch_object, b"recovered-version".to_vec())]), 0.0,
+        ).expect("repaired version must win over the stale base");
+        assert_eq!(result.page_bytes, b"recovered-version".to_vec());
+    }
+
+    #[test]
+    fn matching_content_id_does_not_admit_invalid_index_semantics() {
+        let first = pointer(10, 0x10, PatchKind::FullImage, None);
+        let second = pointer(20, 0x20, PatchKind::FullImage, None);
+        let valid = PageVersionIndexSegment::new(10, 20, vec![(page(1), first), (page(2), second)]);
+        let mut cases = Vec::new();
+        let mut unordered = valid.clone();
+        unordered.entries.swap(0, 1);
+        cases.push(unordered);
+        let mut reversed = valid.clone();
+        reversed.start_seq = 21;
+        cases.push(reversed);
+        let mut outside = valid.clone();
+        outside.end_seq = 19;
+        cases.push(outside);
+        cases.push(PageVersionIndexSegment::new(10, 20, vec![
+            (page(1), first),
+            (page(1), pointer(10, 0x11, PatchKind::FullImage, None)),
+        ]));
+        for segment in cases {
+            // These references genuinely match the bad canonical payloads.
+            // Checking only the hash would wrongly accept every fixture.
+            let reference = ref_for_segment(&segment);
+            let store = TestSegmentStore::new([(reference.object_id, segment)]);
+            assert!(matches!(try_fetch_valid_segment(reference, &store),
+                Err(FrankenError::DatabaseCorrupt { .. })));
+        }
+    }
+
+    #[test]
+    fn index_repair_uses_verified_remote_when_local_payload_is_wrong() {
+        let good = PageVersionIndexSegment::new(1, 2, vec![
+            (page(2), pointer(2, 0x22, PatchKind::FullImage, None)),
+        ]);
+        let reference = ref_for_segment(&good);
+        let bad = PageVersionIndexSegment::new(1, 2, vec![
+            (page(2), pointer(2, 0x23, PatchKind::FullImage, None)),
+        ]);
+        let local = TestSegmentStore::new([(reference.object_id, bad)]);
+        let mut remote_good = good.clone();
+        remote_good.bloom = BloomFilter::new(1, 0.01);
+        let remote = TestSegmentStore::new([(reference.object_id, remote_good)]);
+        let report = repair_index_segments_from_ecs(
+            &[reference], &local, &remote, 0.0, BoldnessConstraint::strict(),
+        ).expect("valid remote payload repairs the local object");
+        assert_eq!(report.repaired_from_local, 0);
+        assert_eq!(report.repaired_from_remote, 1);
+        assert_eq!(report.segments, vec![good]);
+    }
+
+    #[test]
+    fn index_repair_preserves_resource_and_cancellation_errors() {
+        struct FailingStore { failure: u8, calls: Cell<usize> }
+        impl NativeIndexSegmentStore for FailingStore {
+            fn fetch_index_segment(&self, _id: ObjectId) -> Result<PageVersionIndexSegment> {
+                self.calls.set(self.calls.get() + 1);
+                Err(match self.failure {
+                    0 => FrankenError::OutOfMemory,
+                    1 => FrankenError::TooBig,
+                    2 => FrankenError::Abort,
+                    _ => FrankenError::DatabaseCorrupt { detail: "unavailable".to_owned() },
+                })
+            }
+        }
+        let reference = NativeIndexSegmentRef { start_seq: 1, end_seq: 1, object_id: oid(1) };
+        for failure in 0..3 {
+            for fail_locally in [false, true] {
+                let local = FailingStore { failure: if fail_locally { failure } else { 3 }, calls: Cell::new(0) };
+                let remote = FailingStore { failure, calls: Cell::new(0) };
+                let error = repair_index_segments_from_ecs(
+                    &[reference], &local, &remote, 0.0, BoldnessConstraint::strict(),
+                ).expect_err("operational failure is not repairable corruption");
+                assert!(matches!((failure, error),
+                    (0, FrankenError::OutOfMemory) | (1, FrankenError::TooBig) | (2, FrankenError::Abort)));
+                assert_eq!(local.calls.get(), 1);
+                assert_eq!(remote.calls.get(), usize::from(!fail_locally));
+            }
+        }
+    }
+
+    #[test]
+    fn identical_segment_keys_are_valid_but_conflicting_keys_are_not() {
+        let vp = pointer(10, 0x10, PatchKind::FullImage, None);
+        let good = PageVersionIndexSegment::new(10, 10, vec![(page(3), vp), (page(3), vp)]);
+        let reference = ref_for_segment(&good);
+        let store = TestSegmentStore::new([(reference.object_id, good.clone())]);
+        assert_eq!(try_fetch_valid_segment(reference, &store).unwrap(), good);
+        assert_eq!(good.lookup(page(3), 10), Some(&vp));
+    }
+
+    #[test]
+    fn builder_conflicting_admission_is_atomic_and_order_independent() {
+        let original = pointer(10, 0x10, PatchKind::FullImage, None);
+        let replacement = pointer(10, 0x20, PatchKind::FullImage, None);
+        for seeded in [false, true] {
+            for reverse in [false, true] {
+                let mut builder = SegmentBuilder::new(2).unwrap();
+                if seeded { builder.ingest_commit(10, [(page(1), original)]).unwrap(); }
+                let control = builder.clone();
+                let mut updates = vec![(page(1), original), (page(2), original), (page(1), replacement)];
+                if reverse { updates.reverse(); }
+                assert!(matches!(builder.ingest_commit(10, updates),
+                    Err(FrankenError::DatabaseCorrupt { .. })));
+                assert_eq!(builder, control, "no overwrite, range change, or auto-flush on failure");
+                let result = builder.ingest_commit(10, [(page(1), original), (page(2), original)])
+                    .unwrap().expect("a valid retry can still flush");
+                assert_eq!(result.segment.entries, vec![(page(1), original), (page(2), original)]);
+            }
+        }
+    }
+
+    #[test]
+    fn builder_duplicate_admission_does_not_change_canonical_identity() {
+        let vp = pointer(10, 0x10, PatchKind::FullImage, None);
+        let mut one = SegmentBuilder::new(8).unwrap();
+        let mut duplicates = SegmentBuilder::new(8).unwrap();
+        one.ingest_commit(10, [(page(1), vp)]).unwrap();
+        duplicates.ingest_commit(10, [(page(1), vp), (page(1), vp)]).unwrap();
+        duplicates.ingest_commit(10, [(page(1), vp)]).unwrap();
+        assert_eq!(one.flush().unwrap(), duplicates.flush().unwrap());
+    }
+
+    #[test]
+    fn repair_policy_rejects_invalid_probability_inputs() {
+        let defaults = BoldnessConstraint::strict();
+        for invalid in [-1.0, f64::NEG_INFINITY, f64::INFINITY, f64::NAN, 1.01] {
+            assert!(!defaults.permits_repair(invalid));
+            let policy = BoldnessConstraint { max_repair_symbol_loss_rate: invalid, ..defaults };
+            assert!(!policy.permits_repair(0.0));
+        }
+        assert!(defaults.permits_repair(0.0));
+        assert!(defaults.permits_repair(0.25));
+        assert!(!defaults.permits_repair(0.26));
+    }
+
+
+    fn assert_cache_accounting(cache: &NativePageCache) {
+        assert_eq!(cache.entries.len(), cache.order.len());
+        assert!(cache.entries.len() <= cache.max_entries);
+        assert!(cache.retained_bytes <= cache.max_bytes);
+        assert_eq!(cache.retained_bytes,
+            cache.entries.values().map(|entry| entry.bytes.len()).sum::<usize>());
+        for (key, entry) in &cache.entries {
+            assert_eq!(cache.order.get(&entry.insertion), Some(key));
+        }
+    }
+
+    #[test]
+    fn native_cache_evicts_by_insertion_and_both_limits() {
+        let mut cache = NativePageCache::with_limits(2, 6);
+        cache.insert(page(9), 10, vec![1, 2]);
+        cache.insert(page(2), 10, vec![3, 4]);
+        assert!(cache.get(page(9), 10).is_some()); // FIFO: a hit does not refresh age.
+        cache.insert(page(7), 10, vec![5, 6]);
+        assert!(cache.get(page(9), 10).is_none());
+        assert_eq!(cache.get(page(2), 10), Some([3, 4].as_slice()));
+        cache.insert(page(8), 10, vec![7, 8, 9, 10, 11]);
+        assert_eq!(cache.len(), 1, "byte budget may evict multiple entries");
+        assert_eq!(cache.get(page(8), 10), Some([7, 8, 9, 10, 11].as_slice()));
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_replacements_do_not_accumulate_eviction_metadata() {
+        let mut cache = NativePageCache::with_limits(3, 20);
+        for n in 0..1000 {
+            cache.insert(page(2), 10, vec![0xAA; 1 + n % 10]);
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.order.len(), 1);
+            assert_cache_accounting(&cache);
+        }
+        let mut spare_capacity = Vec::with_capacity(40);
+        spare_capacity.push(1);
+        cache.insert(page(2), 10, spare_capacity);
+        assert_eq!(cache.retained_page_bytes(), 1, "boxing discards spare Vec capacity");
+        assert_cache_accounting(&cache.clone());
+        cache.insert(page(2), 10, vec![1; 40]);
+        assert!(cache.get(page(2), 10).is_none(), "do not retain stale replaced bytes");
+        assert!(cache.is_empty());
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_zero_limits_and_oversized_results_preserve_reads() {
+        for (entries, bytes) in [(0, 100), (100, 0), (1, 3)] {
+            let mut cache = NativePageCache::with_limits(entries, bytes);
+            let base = TestBasePages::new([(page(2), b"uncached result".to_vec())]);
+            let store = TestPatchStore::new([]);
+            for _ in 0..2 {
+                let result = lookup_page_version(page(2), 10, &[], &mut cache, &base, &store, 0.0)
+                    .expect("retention is optional");
+                assert_eq!(result.page_bytes, b"uncached result".to_vec());
+                assert!(!result.trace.cache_hit);
+                assert!(cache.is_empty());
+                assert_cache_accounting(&cache);
+            }
+            assert_eq!(base.loads(), 2);
+        }
+    }
+
+    #[test]
+    fn native_cache_scopes_reused_page_and_sequence_numbers_to_generation() {
+        let p = page(2);
+        let first = NativeIndexSnapshot { generation: oid(1), high: 10 };
+        let second = NativeIndexSnapshot { generation: oid(2), high: 10 };
+        let a = TestBasePages::new([(p, b"root-a".to_vec())]);
+        let b = TestBasePages::new([(p, b"root-b".to_vec())]);
+        let store = TestPatchStore::new([]);
+        let mut cache = NativePageCache::with_limits(8, 100);
+        let first_read = lookup_page_version_for_snapshot(p, first, &[], &mut cache, &a, &store, 0.0).unwrap();
+        let hit = lookup_page_version_for_snapshot(p, first, &[], &mut cache, &a, &store, 0.0).unwrap();
+        assert_eq!(first_read.page_bytes, b"root-a".to_vec());
+        assert!(hit.trace.cache_hit);
+        assert_eq!(a.loads(), 1);
+        assert!(cache.get(p, 10).is_none(), "scoped entries are not unscoped entries");
+        assert!(cache.get_for_snapshot(p, second).is_none());
+        let changed = lookup_page_version_for_snapshot(p, second, &[], &mut cache, &b, &store, 0.0).unwrap();
+        assert!(!changed.trace.cache_hit);
+        assert_eq!(changed.page_bytes, b"root-b".to_vec());
+        assert!(cache.get_for_snapshot(p, first).is_none());
+        assert_eq!(cache.get_for_snapshot(p, second), Some(b"root-b".as_slice()));
+        // Mixing APIs must not smuggle the unscoped cache back into root B.
+        let legacy = lookup_page_version(p, 10, &[], &mut cache, &a, &store, 0.0).unwrap();
+        assert_eq!(legacy.page_bytes, b"root-a".to_vec());
+        assert!(!legacy.trace.cache_hit);
+        assert!(cache.get_for_snapshot(p, second).is_none());
+        let scoped = lookup_page_version_for_snapshot(p, second, &[], &mut cache, &b, &store, 0.0).unwrap();
+        assert_eq!(scoped.page_bytes, b"root-b".to_vec());
+        assert!(!scoped.trace.cache_hit);
+        cache.insert(p, 10, b"manual".to_vec());
+        assert!(cache.get_for_snapshot(p, second).is_none());
+        assert_eq!(cache.get(p, 10), Some(b"manual".as_slice()));
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_keeps_visibility_bounds_separate_within_one_generation() {
+        let p = page(2);
+        let low = pointer(10, 0x10, PatchKind::FullImage, None);
+        let high = pointer(20, 0x20, PatchKind::FullImage, None);
+        let segments = [PageVersionIndexSegment::new(10, 20, vec![(p, low), (p, high)])];
+        let base = TestBasePages::new([]);
+        let store = TestPatchStore::new([(oid(0x10), b"low".to_vec()), (oid(0x20), b"high".to_vec())]);
+        let mut cache = NativePageCache::with_limits(8, 100);
+        for (seq, expected, cached) in [(10, b"low".as_slice(), false), (20, b"high".as_slice(), false), (10, b"low".as_slice(), true)] {
+            let snapshot = NativeIndexSnapshot { generation: oid(1), high: seq };
+            let result = lookup_page_version_for_snapshot(p, snapshot, &segments, &mut cache, &base, &store, 0.0).unwrap();
+            assert_eq!(result.page_bytes.as_slice(), expected);
+            assert_eq!(result.trace.cache_hit, cached);
+        }
+        assert_eq!(store.fetches(), 2);
+        assert_eq!(cache.len(), 2);
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_failed_generation_change_cannot_reuse_old_bytes() {
+        let p = page(2);
+        let a = NativeIndexSnapshot { generation: oid(1), high: 10 };
+        let b = NativeIndexSnapshot { generation: oid(2), high: 10 };
+        let source = TestBasePages::new([(p, b"old".to_vec())]);
+        let missing = TestBasePages::new([]);
+        let store = TestPatchStore::new([]);
+        let mut cache = NativePageCache::default();
+        lookup_page_version_for_snapshot(p, a, &[], &mut cache, &source, &store, 0.0).unwrap();
+        assert!(lookup_page_version_for_snapshot(p, b, &[], &mut cache, &missing, &store, 0.0).is_err());
+        assert!(cache.get_for_snapshot(p, a).is_none());
+        assert!(cache.get_for_snapshot(p, b).is_none());
+        assert!(cache.is_empty());
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_clear_clone_and_age_exhaustion_preserve_accounting() {
+        let mut cache = NativePageCache::with_limits(3, 100);
+        cache.insert(page(2), 10, vec![1, 2, 3]);
+        let mut cloned = cache.clone();
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.retained_page_bytes(), 0);
+        assert_eq!(cloned.get(page(2), 10), Some([1, 2, 3].as_slice()));
+        cloned.next_insertion = u64::MAX;
+        cloned.insert(page(3), 10, vec![4, 5]);
+        assert!(cloned.get(page(2), 10).is_none());
+        assert_eq!(cloned.get(page(3), 10), Some([4, 5].as_slice()));
+        assert_cache_accounting(&cloned);
+        assert_cache_accounting(&cache);
+    }
+
+}

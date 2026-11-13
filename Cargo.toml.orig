@@ -1,0 +1,128 @@
+[package]
+name = "fsqlite-core"
+version = "0.4.14"
+description = "Core engine: connection, prepare, schema, DDL/DML codegen"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+default = ["native", "linux-asupersync-uring", "extensions"]
+bench-internals = []
+# Explicit opt-in for causal WAL adapter fault regressions.
+fault-injection = ["fsqlite-wal/fault-injection"]
+# `native` deliberately does NOT imply `extensions` (fsqlite#356): downstream
+# consumers embedding the engine (e.g. pi_agent_rust session storage) can
+# build `default-features = false, features = ["native"]` without linking
+# every extension vtab. The default feature set still includes `extensions`,
+# so plain `fsqlite-core` builds are unchanged.
+native = [
+    "fsqlite-types/native",
+    "fsqlite-vfs/native",
+    "fsqlite-pager/native",
+    "fsqlite-wal/native",
+    "fsqlite-mvcc/native",
+    "fsqlite-btree/native",
+    "fsqlite-planner/native",
+    "fsqlite-vdbe/native",
+    "diagnostic-pragmas",
+]
+wasm = [
+    "fsqlite-types/wasm",
+    "fsqlite-vfs/wasm",
+    "fsqlite-pager/wasm",
+    "fsqlite-wal/wasm",
+    "fsqlite-mvcc/wasm",
+    "fsqlite-btree/wasm",
+    "fsqlite-planner/wasm",
+    "fsqlite-vdbe/wasm",
+    "wasm-tracing-max-level-error",
+]
+linux-asupersync-uring = ["native", "fsqlite-vfs/linux-asupersync-uring"]
+diagnostic-pragmas = ["dep:serde_json"]
+wasm-tracing-max-level-error = ["tracing/release_max_level_error"]
+wasm-tracing-max-level-warn = ["tracing/release_max_level_warn"]
+extensions = ["ext-json", "ext-fts5", "ext-icu", "ext-misc", "ext-rtree"]
+ext-json = ["dep:fsqlite-ext-json", "fsqlite-func/ext-json"]
+ext-fts5 = ["dep:fsqlite-ext-fts5", "fsqlite-func/ext-fts5"]
+ext-icu = ["dep:fsqlite-ext-icu", "fsqlite-func/ext-icu"]
+ext-misc = ["dep:fsqlite-ext-misc"]
+ext-rtree = [
+    "dep:fsqlite-ext-rtree",
+    "fsqlite-func/ext-geopoly",
+    "fsqlite-func/ext-rtree",
+]
+
+[dependencies]
+fsqlite-types = { workspace = true, default-features = false }
+fsqlite-error = { workspace = true }
+fsqlite-vfs = { workspace = true, default-features = false }
+fsqlite-pager = { workspace = true, default-features = false }
+fsqlite-wal = { workspace = true, default-features = false }
+fsqlite-mvcc = { workspace = true, default-features = false }
+fsqlite-observability = { workspace = true }
+fsqlite-btree = { workspace = true, default-features = false }
+fsqlite-ast = { workspace = true }
+fsqlite-parser = { workspace = true }
+fsqlite-planner = { workspace = true, default-features = false }
+fsqlite-vdbe = { workspace = true, default-features = false }
+fsqlite-func = { workspace = true }
+fsqlite-ext-json = { workspace = true, optional = true }
+fsqlite-ext-fts5 = { workspace = true, optional = true }
+fsqlite-ext-icu = { workspace = true, optional = true }
+fsqlite-ext-misc = { workspace = true, optional = true }
+fsqlite-ext-rtree = { workspace = true, optional = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+itoa = { workspace = true }
+hashbrown = { workspace = true }
+lru = { workspace = true }
+smallvec = { workspace = true }
+lazy_static = "1.5"
+foldhash = "0.2.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+asupersync = { workspace = true }
+# GH#414: remaining-native-stack probe for the trigger/FK recursion caps.
+# Native-only: wasm32 has no queryable thread stack bound, and there the frame
+# caps stand alone exactly as they do today.
+stacker = { workspace = true }
+# Anonymous fixed-residency spools for bounded whole-image validation.
+# Native-only: `bounded_validation` is itself cfg'd off for wasm32.
+tempfile = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The final browser package owns canonical asupersync profile selection.
+asupersync = { workspace = true }
+
+[dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
+criterion = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "symbol_ops"
+harness = false
+
+[[bench]]
+name = "prepared_cache_hot_paths"
+harness = false
+
+[[bench]]
+name = "rowid_eq_aggregate_bench"
+harness = false

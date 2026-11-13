@@ -1,0 +1,249 @@
+#![recursion_limit = "512"]
+
+//! bd-zywqc.14 adversarial corpus — single-bit structural corruption.
+//!
+//! Flip exactly one bit at a structural offset of a committed database file and
+//! verify the engine CATCHES it — `integrity_check` reports corruption, or the
+//! open fails loudly — rather than silently returning wrong data. Every fixture
+//! is cross-checked against stock C SQLite (rusqlite): both engines must catch
+//! the same planted corruption, so the corpus can never certify a fixture that
+//! is secretly still "ok" (the corruption-fixture gotcha).
+//!
+//! Structural fields are targeted deliberately: SQLite's `integrity_check`
+//! validates b-tree structure (page type, cell count, cell pointers), not the
+//! bytes of a payload, so a flip in free space or inside a TEXT value reads
+//! "ok" in both engines and is not a valid corruption fixture.
+//!
+//! The fixtures use `journal_mode=DELETE` so the committed image is
+//! self-contained in the main file — no WAL sidecar where the real data (and
+//! thus the real corruption target) could hide.
+
+use fsqlite_core::connection::Connection;
+use fsqlite_types::value::SqliteValue;
+
+/// Build a clean, self-contained fsqlite database whose page 2 is a populated
+/// table b-tree leaf. Returns `(db_path, page_size)`. Because the current code
+/// stamps a migration marker at birth, reopening this file skips the first-open
+/// repair pass — the corruption verdicts below observe a plain `integrity_check`.
+async fn build_clean_db(dir: &std::path::Path, name: &str) -> (String, usize) {
+    let db = dir.join(name).to_string_lossy().into_owned();
+    {
+        let conn = Connection::open(&db).await.expect("open");
+        conn.execute("PRAGMA journal_mode=DELETE;")
+            .await
+            .expect("journal_mode");
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .expect("create");
+        // Enough rows to densely populate page 2's cell pointer array + content.
+        for i in 0..24 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row-value-{i}');"))
+                .await
+                .expect("insert");
+        }
+        conn.close().await.expect("close");
+    }
+    let bytes = std::fs::read(&db).expect("read header");
+    let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+    let page_size = if raw == 1 { 65_536 } else { raw as usize };
+    (db, page_size)
+}
+
+/// Flip a single bit (`mask`) at `offset` of the file at `db`.
+fn flip_bit(db: &str, offset: usize, mask: u8) {
+    let mut bytes = std::fs::read(db).expect("read image");
+    assert!(
+        offset < bytes.len(),
+        "offset {offset} beyond file len {}",
+        bytes.len()
+    );
+    bytes[offset] ^= mask;
+    std::fs::write(db, &bytes).expect("write corrupted image");
+}
+
+#[test]
+fn real_integrity_metrics_count_clean_and_corrupt_public_checks() {
+    const MODE: &str = "FSQLITE_INTEGRITY_METRICS_TEST_MODE";
+    let Ok(mode) = std::env::var(MODE) else {
+        for mode in ["enabled", "disabled"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "real_integrity_metrics_count_clean_and_corrupt_public_checks",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .env(
+                    "FRANKENSQLITE_METRICS_DISABLE",
+                    if mode == "disabled" { "1" } else { "0" },
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("integrity_metrics mode={mode}\n{stdout}\n{stderr}");
+            assert!(output.status.success(), "isolated {mode} integrity keeper failed");
+            assert!(stderr.contains("event=public_integrity_metrics_verified"));
+        }
+        return;
+    };
+    assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+    let enabled = mode == "enabled";
+    let registry = fsqlite_observability::metrics::global();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, page_size) = build_clean_db(dir.path(), "integrity-metrics.db").await;
+        assert!(matches!(stock_verdict(&db), Verdict::SilentlyAccepted(lines) if lines == ["ok"]));
+        let ok_before = registry.integrity_check_ok_total.get();
+        let fail_before = registry.integrity_check_fail_total.get();
+        let conn = Connection::open(&db).await.unwrap();
+        assert!(conn.is_concurrent_mode_default());
+        for (index, sql) in ["PRAGMA integrity_check;", "PRAGMA quick_check;"].into_iter().enumerate() {
+            let rows = conn.query(sql).await.unwrap();
+            assert_eq!(rows[0].values(), &[SqliteValue::Text("ok".into())]);
+            assert_eq!(registry.integrity_check_ok_total.get() - ok_before, if enabled { u64::try_from(index + 1).unwrap() } else { 0 });
+            assert_eq!(registry.integrity_check_fail_total.get(), fail_before);
+        }
+        conn.close().await.unwrap();
+        flip_bit(&db, page_size, 0x08);
+        assert!(matches!(stock_verdict(&db), Verdict::Caught));
+        let conn = Connection::open(&db).await.expect("fixture reaches the public checker");
+        for (index, sql) in ["PRAGMA integrity_check;", "PRAGMA quick_check;"].into_iter().enumerate() {
+            let rows = conn.query(sql).await.expect("checker returns a corruption verdict");
+            assert!(matches!(&rows[0].values()[0], SqliteValue::Text(text) if text.as_ref() != "ok"));
+            assert_eq!(registry.integrity_check_fail_total.get() - fail_before, if enabled { u64::try_from(index + 1).unwrap() } else { 0 });
+            assert_eq!(registry.integrity_check_ok_total.get() - ok_before, if enabled { 2 } else { 0 });
+        }
+        conn.close().await.unwrap();
+        let exposition = fsqlite_observability::metrics::render_prometheus();
+        if enabled {
+            assert!(exposition.lines().any(|line| line == format!("fsqlite_integrity_check_runs_total{{result=\"ok\"}} {}", registry.integrity_check_ok_total.get())));
+            assert!(exposition.lines().any(|line| line == format!("fsqlite_integrity_check_runs_total{{result=\"fail\"}} {}", registry.integrity_check_fail_total.get())));
+        } else {
+            assert_eq!(registry.integrity_check_ok_total.get(), 0);
+            assert_eq!(registry.integrity_check_fail_total.get(), 0);
+            assert!(exposition.is_empty());
+        }
+        eprintln!("event=public_integrity_metrics_verified mode={mode}");
+    });
+}
+
+/// Whether an engine caught the corruption. `SilentlyAccepted` carries the
+/// rows returned so a failure message can show what leaked through.
+#[derive(Debug)]
+enum Verdict {
+    Caught,
+    SilentlyAccepted(Vec<String>),
+}
+
+/// fsqlite's verdict: an open failure or a non-`ok` `integrity_check` counts as
+/// caught; a clean `ok` on a structurally-corrupt image is a silent accept.
+async fn fsqlite_verdict(db: &str) -> Verdict {
+    let Ok(conn) = Connection::open(db).await else {
+        return Verdict::Caught;
+    };
+    let verdict = match conn.query("PRAGMA integrity_check;").await {
+        Err(_) => Verdict::Caught,
+        Ok(rows) => {
+            let lines: Vec<String> = rows
+                .iter()
+                .filter_map(|r| match &r.values()[0] {
+                    SqliteValue::Text(s) => Some(s.as_ref().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            if lines == vec!["ok".to_owned()] {
+                Verdict::SilentlyAccepted(lines)
+            } else {
+                Verdict::Caught
+            }
+        }
+    };
+    conn.close().await.ok();
+    verdict
+}
+
+/// Stock C SQLite's verdict on the same file — the oracle.
+fn stock_verdict(db: &str) -> Verdict {
+    let Ok(conn) = rusqlite::Connection::open(db) else {
+        return Verdict::Caught;
+    };
+    match conn.query_row("PRAGMA integrity_check;", [], |r| r.get::<_, String>(0)) {
+        Ok(line) if line == "ok" => Verdict::SilentlyAccepted(vec![line]),
+        _ => Verdict::Caught,
+    }
+}
+
+/// The shared scenario body: plant a one-bit structural flip and require BOTH
+/// engines to catch it.
+async fn assert_bit_flip_caught(name: &str, offset_in_page2: usize, mask: u8) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (db, page_size) = build_clean_db(dir.path(), &format!("{name}.db")).await;
+    let offset = page_size + offset_in_page2;
+
+    // Sanity: the pristine image is clean in both engines (fixture is valid).
+    assert!(
+        matches!(stock_verdict(&db), Verdict::SilentlyAccepted(l) if l == vec!["ok".to_owned()]),
+        "{name}: pristine fixture must be clean in stock before the flip"
+    );
+
+    flip_bit(&db, offset, mask);
+
+    let fsq = fsqlite_verdict(&db).await;
+    let stock = stock_verdict(&db);
+    assert!(
+        matches!(stock, Verdict::Caught),
+        "{name}: fixture invalid — stock did not catch the flip at page2+{offset_in_page2} \
+         (mask {mask:#x}); pick a structural offset. Verdict: {stock:?}"
+    );
+    assert!(
+        matches!(fsq, Verdict::Caught),
+        "{name}: fsqlite SILENTLY ACCEPTED a structural corruption stock caught \
+         (page2+{offset_in_page2}, mask {mask:#x}) — integrity_check must not certify a \
+         corrupt image as ok. Verdict: {fsq:?}"
+    );
+}
+
+// Page 2 layout (offsets relative to the page start): byte 0 = b-tree page
+// type; bytes 3..5 = cell count; bytes 8.. = the 2-byte cell pointer array.
+#[test]
+fn bit_flip_page2_btree_page_type() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_type", 0, 0x08).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_cell_count_high() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellcount_hi", 3, 0x01).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_cell_count_low() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellcount_lo", 4, 0x02).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_first_cell_pointer() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellptr0", 8, 0x08).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_second_cell_pointer() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellptr1", 10, 0x08).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_cell_content_area() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellcontent", 5, 0x10).await;
+    });
+}

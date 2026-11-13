@@ -1,0 +1,485 @@
+[
+  {
+    "name": "anonymous_parameter_order_and_residuals",
+    "setup": [
+      "CREATE TABLE kv(a TEXT, b INTEGER, c TEXT, v TEXT, gate INTEGER, PRIMARY KEY(a,b,c))",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,'tenant',7,'one','old',1),(0,'tenant',7,'two','old',0),(7,'tenant',7,'three','old',1),(12,'other',7,'one','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE gate=? AND c=? AND ?=a AND b=? RETURNING rowid,v",
+        "params": [
+          "changed",
+          1,
+          "one",
+          "tenant",
+          7
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE gate=? AND c=? AND a=? AND b=? RETURNING rowid,v",
+        "params": [
+          1,
+          "two",
+          "tenant",
+          7
+        ],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE c=? AND gate=? AND b=? AND a=? RETURNING rowid,v",
+        "params": [
+          "one",
+          1,
+          7,
+          "tenant"
+        ],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "numbered_parameters_and_returning",
+    "setup": [
+      "CREATE TABLE kv(a TEXT, b INTEGER, c TEXT, v TEXT, gate INTEGER, PRIMARY KEY(a,b,c))",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,'tenant',7,'one','old',1),(0,'tenant',7,'two','old',0),(7,'tenant',7,'three','old',1),(12,'other',7,'one','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=?5 WHERE c=?4 AND a=?2 AND b=?3 AND gate=?1 RETURNING ?5,rowid",
+        "params": [
+          1,
+          "tenant",
+          7,
+          "three",
+          "first"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "UPDATE kv SET v=?5 WHERE c=?4 AND a=?2 AND b=?3 AND gate=?1 RETURNING ?5,rowid",
+        "params": [
+          1,
+          "other",
+          7,
+          "one",
+          "second"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=?2 AND c=?4 AND b=?3 AND gate=?1 RETURNING ?5,rowid",
+        "params": [
+          1,
+          "tenant",
+          7,
+          "three",
+          "deleted"
+        ],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "aliases_and_commuted_equalities",
+    "setup": [
+      "CREATE TABLE kv(a TEXT, b INTEGER, c TEXT, v TEXT, gate INTEGER, PRIMARY KEY(a,b,c))",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,'tenant',7,'one','old',1),(0,'tenant',7,'two','old',0),(7,'tenant',7,'three','old',1),(12,'other',7,'one','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv AS target SET v=? WHERE ?=target.c AND target.b=? AND ?=target.a RETURNING rowid,v",
+        "params": [
+          "alias",
+          "one",
+          7,
+          "tenant"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv AS target WHERE ?=target.a AND ?=target.b AND target.c=? RETURNING rowid,v",
+        "params": [
+          "tenant",
+          7,
+          "one"
+        ],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "null_miss_contradiction_and_or",
+    "setup": [
+      "CREATE TABLE kv(a TEXT, b INTEGER, c TEXT, v TEXT, gate INTEGER, PRIMARY KEY(a,b,c))",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,'tenant',7,'one','old',1),(0,'tenant',7,'two','old',0),(7,'tenant',7,'three','old',1),(12,'other',7,'one','old',1)",
+      "INSERT INTO kv VALUES('tenant',7,NULL,'null-key',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "wrong",
+          "tenant",
+          7,
+          null
+        ],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "tenant",
+          7,
+          "missing"
+        ],
+        "changes": 0
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND b=? AND c=? AND a=? RETURNING rowid,v",
+        "params": [
+          "wrong",
+          "tenant",
+          7,
+          "one",
+          "other"
+        ],
+        "changes": 0
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE (a=? AND b=? AND c=?) OR gate=0 RETURNING rowid,v",
+        "params": [
+          "or",
+          "tenant",
+          7,
+          "one"
+        ],
+        "changes": 2
+      }
+    ]
+  },
+  {
+    "name": "builtin_collations_and_numeric_affinity",
+    "setup": [
+      "CREATE TABLE kv(a TEXT COLLATE NOCASE,b NUMERIC,c TEXT COLLATE RTRIM,v TEXT,gate INTEGER,PRIMARY KEY(a,b,c))",
+      "INSERT INTO kv VALUES('Alpha',8,'key   ','old',1),('Alpha',1.5,'fraction','old',1),('Alpha','not-a-number','text','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "coerced",
+          "alpha",
+          "008",
+          "key"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "ALPHA",
+          "1.5",
+          "fraction"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "alpha",
+          "not-a-number",
+          "text"
+        ],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "index_collation_is_narrower_than_predicate",
+    "setup": [
+      "CREATE TABLE kv(a TEXT COLLATE NOCASE,b INTEGER,c TEXT,v TEXT,gate INTEGER,PRIMARY KEY(a COLLATE BINARY,b,c))",
+      "INSERT INTO kv VALUES('Alpha',7,'one','old',1),('alpha',7,'one','old',1),('other',7,'one','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "both",
+          "ALPHA",
+          7,
+          "one"
+        ],
+        "changes": 2
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "alpha",
+          7,
+          "one"
+        ],
+        "changes": 2
+      }
+    ]
+  },
+  {
+    "name": "explicit_collation_is_narrower_than_index",
+    "setup": [
+      "CREATE TABLE kv(a TEXT COLLATE NOCASE,b INTEGER,c TEXT,v TEXT,gate INTEGER,PRIMARY KEY(a,b,c))",
+      "INSERT INTO kv VALUES('Alpha',7,'one','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE a COLLATE BINARY=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "wrong",
+          "alpha",
+          7,
+          "one"
+        ],
+        "changes": 0
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? COLLATE BINARY AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "exact",
+          "Alpha",
+          7,
+          "one"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a COLLATE BINARY=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "alpha",
+          7,
+          "one"
+        ],
+        "changes": 0
+      }
+    ]
+  },
+  {
+    "name": "mixed_descending_key_terms",
+    "setup": [
+      "CREATE TABLE kv(a TEXT,b INTEGER,c TEXT,v TEXT,gate INTEGER,PRIMARY KEY(a DESC,b ASC,c DESC))",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,'tenant',7,'one','old',1),(0,'tenant',7,'two','old',0),(7,'tenant',7,'three','old',1),(12,'other',7,'one','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE c=? AND b=? AND a=? RETURNING rowid,v",
+        "params": [
+          "desc",
+          "three",
+          7,
+          "tenant"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "tenant",
+          7,
+          "one"
+        ],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "nonunique_index_and_key_movement",
+    "setup": [
+      "CREATE TABLE kv(a TEXT,b INTEGER,c TEXT,v TEXT,gate INTEGER)",
+      "CREATE INDEX kv_abc ON kv(a,b,c)",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-2,'tenant',7,'one','old',1),(0,'tenant',7,'one','old',1),(3,'tenant',7,'two','old',1),(9,'other',7,'one','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET c=c||? WHERE a=? AND b=? AND c=? RETURNING rowid,c",
+        "params": [
+          "x",
+          "tenant",
+          7,
+          "one"
+        ],
+        "changes": 2
+      },
+      {
+        "sql": "UPDATE kv SET b=b+1 WHERE a=? AND b=? RETURNING rowid,b",
+        "params": [
+          "tenant",
+          7
+        ],
+        "changes": 3
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=? RETURNING rowid,c",
+        "params": [
+          "tenant",
+          8,
+          "onex"
+        ],
+        "changes": 2
+      }
+    ]
+  },
+  {
+    "name": "blob_affinity_preserves_storage_class",
+    "setup": [
+      "CREATE TABLE kv(a TEXT,b INTEGER,c BLOB,v TEXT,gate INTEGER,PRIMARY KEY(a,b,c))",
+      "INSERT INTO kv VALUES('tenant',7,1,'integer',1),('tenant',7,'1','text',1),('tenant',7,x'00ff','blob',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "text-only",
+          "tenant",
+          7,
+          "1"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "tenant",
+          7,
+          1
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=x'00ff' RETURNING rowid,v",
+        "params": [
+          "tenant",
+          7
+        ],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "unique_key_rewrite_then_probe_new_key",
+    "setup": [
+      "CREATE TABLE kv(a TEXT, b INTEGER, c TEXT, v TEXT, gate INTEGER, PRIMARY KEY(a,b,c))",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,'tenant',7,'one','old',1),(0,'tenant',7,'two','old',0),(7,'tenant',7,'three','old',1),(12,'other',7,'one','old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET a=?,b=?,c=? WHERE a=? AND b=? AND c=? RETURNING rowid,a,b,c",
+        "params": [
+          "moved",
+          9,
+          "new",
+          "tenant",
+          7,
+          "one"
+        ],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND c=? RETURNING rowid,v",
+        "params": [
+          "tenant",
+          7,
+          "one"
+        ],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE c=? AND a=? AND b=? RETURNING rowid,v",
+        "params": [
+          "new",
+          "moved",
+          9
+        ],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "repeated_index_columns_preserve_residuals",
+    "setup": [
+      "CREATE TABLE kv(a INTEGER,b INTEGER,c INTEGER,v TEXT,gate INTEGER)",
+      "CREATE INDEX kv_aa ON kv(a,a)",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,1,2,3,'old',0),(0,1,2,3,'old',1),(7,1,2,3,'old',NULL),(12,2,2,3,'old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND gate=? RETURNING rowid,v,gate",
+        "params": ["gated",1,1],
+        "changes": 1
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND a=? RETURNING rowid,v,gate",
+        "params": ["wrong",1,2],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,null],
+        "changes": 0
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND gate IS NULL RETURNING rowid,v,gate",
+        "params": ["null-gate",1],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,0],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,1],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "repeated_composite_key_terms_preserve_residuals",
+    "setup": [
+      "CREATE TABLE kv(a INTEGER,b INTEGER,c INTEGER,v TEXT,gate INTEGER)",
+      "CREATE INDEX kv_aab ON kv(a,a,b)",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,1,2,3,'old',0),(0,1,2,3,'old',1),(7,1,2,3,'old',NULL),(12,1,9,3,'old',1),(20,2,2,3,'old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE b=? AND gate=? AND a=? RETURNING rowid,v,gate",
+        "params": ["gated",2,1,1],
+        "changes": 1
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE b=? AND a=? AND a=? RETURNING rowid,v,gate",
+        "params": ["wrong",2,1,2],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,2,null],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE b=? AND a=? AND gate IS NULL RETURNING rowid,v,gate",
+        "params": [2,1],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,2,1],
+        "changes": 1
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND b=? RETURNING rowid,v,gate",
+        "params": ["full-key",1,2],
+        "changes": 1
+      }
+    ]
+  }
+]
