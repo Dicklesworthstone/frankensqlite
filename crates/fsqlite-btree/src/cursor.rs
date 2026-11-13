@@ -2528,6 +2528,12 @@ pub struct BtCursor<P> {
     /// repopulated from the live cell pointer array. Eliminates the per-
     /// `remove_cell_from_leaf` allocation (N * 24 bytes for N cells).
     defrag_cells_scratch: Vec<(usize, usize, usize)>,
+    /// The table leaf image (page, `PageData::image_token`) the last compact
+    /// descending leaf delete produced. That image is compact and its pointers
+    /// descend by construction, so a delete on exactly this image skips
+    /// re-checking the pointer order (bd-w4pr1.13.20). Any other image of the
+    /// page carries another token and is checked.
+    descending_leaf_image: Option<(PageNumber, u64)>,
     /// PERF-W5-1: LRU cache of parsed cell slots keyed by page and page-image
     /// mutation signature.
     ///
@@ -3144,6 +3150,7 @@ impl<P: PageReader> BtCursor<P> {
             cell_buf: Vec::new(),
             defrag_ptrs_scratch: Vec::new(),
             defrag_cells_scratch: Vec::new(),
+            descending_leaf_image: None,
             cell_slot_cache: RefCell::new(CellSlotCache::default()),
             current_cell_memo: std::cell::Cell::new(None),
             last_insert_rowid: None,
@@ -9476,6 +9483,8 @@ impl<P: PageWriter> BtCursor<P> {
         let top = &self.stack[depth - 1];
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let mut header = top.header;
+        let known_descending =
+            self.descending_leaf_image == Some((leaf_page_no, top.page_data.image_token()));
         let mut ptrs = take_pooled_cell_pointers();
         ptrs.extend_from_slice(&top.cell_pointers);
         let original_len = ptrs.len();
@@ -9491,9 +9500,11 @@ impl<P: PageWriter> BtCursor<P> {
         }
         // A leaf whose pointers descend keeps its lowest cell last, so the
         // content-offset check reads that one pointer; only a leaf whose
-        // pointer order was disturbed needs the scan for the minimum.
+        // pointer order was disturbed needs the scan for the minimum. The
+        // image the previous compact descending delete wrote is known to
+        // descend and is not scanned again.
         let no_free_gaps = header.first_freeblock == 0 && header.fragmented_free_bytes == 0;
-        let ptrs_descend = no_free_gaps && cell_ptrs_are_descending(&ptrs);
+        let ptrs_descend = no_free_gaps && (known_descending || cell_ptrs_are_descending(&ptrs));
         let lowest_ptr = if ptrs_descend {
             ptrs.last().copied()
         } else {
@@ -9844,6 +9855,12 @@ impl<P: PageWriter> BtCursor<P> {
                 return Err(error);
             }
         }
+        // The descending branch leaves the leaf compact and its pointers still
+        // strictly descending: those before the removed one are unchanged, and
+        // each after it rises by the removed size and so stays below its
+        // predecessor (the cell after the removed one ended where it began).
+        self.descending_leaf_image = (compact_cell_area && ptrs_descend)
+            .then(|| (leaf_page_no, refreshed_page_data.image_token()));
 
         let new_count = header.cell_count;
         let mutation_counter = Self::page_mutation_counter(&refreshed_page_data);
@@ -19629,6 +19646,99 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    /// bd-w4pr1.13.20, lever P: a delete on the very image the previous
+    /// compact descending delete wrote skips re-checking the pointer order;
+    /// once inserts have disturbed that order (same page, a new image) the
+    /// next delete checks it, takes the general branch, and the page ends
+    /// byte for byte as a fresh cursor per operation leaves it. The two
+    /// inserts leave the lowest cell last (the leaf still looks compact from
+    /// its last pointer) with a lower cell's pointer mid-array, so a verdict
+    /// remembered by page number alone takes the descending branch there,
+    /// sizes the removed cell from the wrong neighbour and corrupts the page.
+    #[test]
+    fn test_leaf_delete_reuses_the_pointer_order_only_for_the_image_it_wrote() {
+        enum Step {
+            Insert(i64),
+            Delete(i64),
+        }
+        fn payload(rowid: i64) -> Vec<u8> {
+            let len = usize::try_from(rowid).unwrap() / 10 * 7 + 3;
+            vec![b'a' + u8::try_from(rowid / 10).unwrap(); len]
+        }
+        async fn apply<P: PageWriter>(cursor: &mut BtCursor<P>, cx: &Cx, step: &Step) {
+            match *step {
+                Step::Insert(rowid) => cursor
+                    .table_insert(cx, rowid, &payload(rowid))
+                    .await
+                    .unwrap(),
+                Step::Delete(rowid) => {
+                    assert!(cursor.table_move_to(cx, rowid).await.unwrap().is_found());
+                    cursor.delete(cx).await.unwrap();
+                }
+            }
+        }
+        let steps: Vec<Step> = [10, 20, 30, 40, 60, 70, 80, 90]
+            .into_iter()
+            .map(Step::Insert)
+            .chain([
+                Step::Delete(30),
+                Step::Delete(70),
+                // Its cell lands lowest on the page, its pointer mid-array.
+                Step::Insert(50),
+                // Its cell lands lower still, its pointer last.
+                Step::Insert(95),
+                Step::Delete(50),
+                Step::Delete(20),
+                Step::Delete(90),
+            ])
+            .collect();
+        let empty_leaf = || {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+            store
+        };
+
+        run_async(async {
+            let cx = Cx::new();
+            // Reference: a fresh cursor, with nothing remembered, per step.
+            let mut store = empty_leaf();
+            for step in &steps {
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                apply(&mut cursor, &cx, step).await;
+                store = cursor.pager;
+            }
+            let expected = store.pages.get(&2).unwrap().clone();
+
+            let mut cursor = BtCursor::new(empty_leaf(), pn(2), USABLE, true);
+            let mut remembered_after_delete = Vec::new();
+            for step in &steps {
+                apply(&mut cursor, &cx, step).await;
+                if matches!(step, Step::Delete(_)) {
+                    let shown = cursor.stack.last().map(|top| top.page_data.image_token());
+                    remembered_after_delete.push(cursor.descending_leaf_image.map(
+                        |(page, token)| {
+                            assert_eq!(page, pn(2));
+                            Some(token) == shown
+                        },
+                    ));
+                }
+            }
+            assert_eq!(cursor.pager.pages.get(&2), Some(&expected));
+            // Descending deletes remember the image they wrote (30, 70); the
+            // delete on the disturbed leaf (50) takes the general branch and
+            // remembers nothing; removing 50's pointer restores the order, so
+            // the next deletes (20 after a scan, 90 without one) descend.
+            assert_eq!(
+                remembered_after_delete,
+                vec![Some(true), Some(true), None, Some(true), Some(true)]
+            );
+            let leaf = BtreePageHeader::parse(&expected, 0).unwrap();
+            assert_eq!(leaf.cell_count, 5);
+            let ptrs = cell::read_cell_pointers(&expected, &leaf, 0).unwrap();
+            assert!(cell_ptrs_are_descending(&ptrs));
         });
     }
 
