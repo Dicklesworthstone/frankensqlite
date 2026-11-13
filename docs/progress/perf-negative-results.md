@@ -87,6 +87,96 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-13 - WIN: a window SELECT summed outside stops holding freed rows at its outer phase: values go straight to their slots, and the join projection consumes its source rows (bd-w4pr1.12, steps 6+7)
+
+- Target: peak RSS of the scorecard's `window_row_number`, 242 MB against stock's 16.6 MB after
+  the flat-scan WIN below. A 5 ms VmRSS timeline (`scratchpad/flat/rss_timeline.py` of the
+  coordinator session) of main 23874098c peaks twice: the window phase at about 230 MB and the
+  outer `sum()` at 242 MB. The step-6 entry below cut the window phase alone and did not move
+  RSS. In the outer phase `execute_join_select` built its projected rows while the subquery's
+  million output rows were alive and freed them after the loop, leaving about 64 MB of freed
+  blocks in the middle of the heap that the group-by phase's large (mmapped) allocations never
+  reuse. Touched: `crates/fsqlite-core/src/connection.rs` (`WindowResultSlots` and its use in
+  `execute_window_select`, as in step 6; `execute_join_select`'s projection loop takes its source
+  rows by value, so each is freed once projected and the next projected row of its size reuses
+  the block; the rows are not read after that loop).
+- Ledger preflight: the step-6 entry's retry condition names this pairing; the 2026-11-12
+  early-free REJECT is the same allocator behaviour in another phase.
+- Result: CLI release-perf, scorecard database, stock sqlite3 3.46.1 live in the same script, 5
+  runs, min user instructions, median CPU and peak RSS (`rss_probe.py`, io_uring refused, load
+  1.7). Arms are main 23874098c (sha256 33db2567...), step 6 alone (4aee5b35...), step 7 alone
+  (3297a324...) and both (8b7fd532...; landed rebased on 98dc7de0a as 646e5208c). A second
+  run of base against both, at load 2.8, agrees within 1.2 MB and 8.2% CPU. Answers equal
+  stock's in every row.
+
+  | statement (summed in an outer SELECT) | stock | base | step 6 | step 7 | both |
+  |---|---|---|---|---|---|
+  | `row_number() OVER (PARTITION BY a ORDER BY c)` | 8,225.1M, 674.3 ms, 16.7 MB | 8,839.6M, 1,041.9 ms, 242.2 MB | 241.5 MB | 235.0 MB | 8,504.8M, 954.4 ms, 202.0 MB |
+  | `rank() OVER (ORDER BY b)` | 708.2 ms, 16.6 MB | 644.1 ms, 265.8 MB | 264.0 MB | 242.6 MB | 583.3 ms, 212.0 MB |
+  | `sum(c) OVER (PARTITION BY a)` | 495.2 ms, 16.1 MB | 934.2 ms, 242.2 MB | 241.5 MB | 235.3 MB | 879.5 ms, 201.3 MB |
+  | computed keys (`a % 7`, `c * 2`) | 663.1 ms, 16.6 MB | 1,335.4 ms, 327.7 MB | 273.0 MB | 326.9 MB | 1,279.4 ms, 274.2 MB |
+  | a window plus a column (reads the rows) | 715.0 ms, 16.1 MB | 1,164.2 ms, 265.5 MB | 264.7 MB | 265.7 MB | 1,080.9 ms, 265.1 MB |
+
+  Scorecard (`user_shape_scorecard.py`, 2 reps, wall time, stock at both ends: 0.637 s and
+  0.646 s): window_row_number 0.992 s and 243 MiB -> 1.011 s and 201 MiB. Wall time at 2 reps is
+  inside the drift here; by CPU (above) the row is 6-8% faster. The other rows' answers equal
+  stock's. By user instructions the controls are unchanged: the 300k-row DELETE (the scorecard's
+  largest wall move, +10%) 697.1M -> 697.0M on a fresh database per run, `v1 JOIN v2` 110.4M,
+  `t JOIN u` 4,316.0M, the GROUP BY subquery 3,333.4M -> 3,333.1M, a filtered scan 1,233.8M. The
+  candidate's timeline: window phase about 178 MB, outer phase peaking at 203 MB.
+- Prediction (bead comment before the step-7 code): window_row_number RSS 175-195 MB, CPU -2 to
+  -8%, instructions within 1%; rank and sum(c) -45 to -70 MB; computed keys about 273 MB; the
+  column-reading shape -0 to -15 MB; step 7 alone -5 to -20 MB. Kill: under 30 MB removed on
+  window_row_number, its CPU worse by over 2%, another shape worse by over 3% CPU or 5% RSS, or an
+  oracle change. Measured: -40.2 MB (202.0 MB, above the range: the outer phase still peaks
+  above the window phase), CPU -8.4% (second run -5.8%), instructions -3.8% (outside the range
+  and not explained; step 7 alone carries it, -317M); rank -53.8 MB, sum(c) -40.9 MB
+  (below its range), computed keys 274.2 MB, the column-reading shape -0.4 MB, step 7 alone -7.2
+  MB. Kill not crossed: kept.
+- Gate on 23874098c + both changes: clippy -D warnings clean; fsqlite-core lib filters window,
+  for_each, join, flat_rows 270 pass, and the two t6741 codegen tests fail the same way on clean
+  23874098c; the 54 window integration targets pass (38 fsqlite-core, 2 fsqlite, 14 fsqlite-e2e,
+  batches of at most 10).
+- Retry / widen: the outer group-by phase is the peak again (203 MB against the window phase's
+  178). For an implicit aggregate, `execute_group_by_join_select_inner` still sorts every row into
+  a `(key, row)` vector (48 MB here) and collects a `(value, order keys)` pair per row (72 MB)
+  even when the aggregate has no ORDER BY or DISTINCT. Cut those when an RSS timeline shows that
+  phase above the window phase; below that, the window phase (96 MB flat scan and 48 MB of
+  48-byte results) needs typed result columns or a streaming window.
+
+## 2026-11-13 - REJECTED as a standalone patch: a table window SELECT writes each window value straight into its result slot (bd-w4pr1.12, step 6)
+
+- Target: the heap peak of the scorecard's `window_row_number` after the flat-scan WIN below
+  (massif of that candidate: 232 MB in the window phase, 56 MB of it a `total_rows` vector of
+  values plus a vector of row indices that `execute_window_select` built per window function and
+  scattered into `window_results` afterwards). Touched (not landed as such; patch
+  `scratchpad/flat/winslots-v1.patch` of the coordinator session, diff sha256 33c462cb...):
+  `crates/fsqlite-core/src/connection.rs` (`WindowResultSlots`: values go to the slot of the row at
+  their position in the current partition; a partition with more or fewer values than rows is an
+  error; test `test_window_result_slots_write_partition_values_to_their_rows`).
+- Ledger preflight: only the flat-scan entry's retry note names this lever.
+- Result: CLI release-perf, scorecard database, stock sqlite3 3.46.1 live in the same script, 5
+  runs, min user instructions, median CPU and peak RSS (`rss_probe.py`, io_uring refused, load 2).
+  Before main 23874098c (sha256 33db2567...), after the change on it (4aee5b35...).
+  `window_row_number` 242.5 -> 240.3 MB, 1,037.5 -> 1,010.1 ms, 8,839.6M -> 8,821.8M (stock 16.6
+  MB, 661.0 ms, 8,225.1M); `rank() OVER (ORDER BY b)` 265.5 -> 265.2 MB; `sum(c) OVER (PARTITION BY
+  a)` 241.4 -> 240.4 MB; computed keys (`a % 7`, `c * 2`) 326.3 -> 273.0 MB; a window plus a column
+  265.5 -> 263.8 MB. Answers equal stock's. Prediction: window_row_number 180-200 MB; kill under
+  25 MB removed: crossed.
+- Why: the heap peak fell (232 -> 179 MB in massif), but not the high-water mark of RSS. A 5 ms
+  VmRSS timeline (`scratchpad/flat/rss_timeline.py`) shows the base with two peaks: the window
+  phase at about 230 MB and the outer `sum()` at 242 MB. The change takes the window phase to
+  about 175 MB, and the outer phase still reaches 243 MB. There `execute_join_select` built its
+  projected rows while the subquery's million output rows were alive, then freed those, leaving
+  about 64 MB of freed blocks in the middle of the heap that the group-by phase's large (mmapped)
+  allocations never reuse. `GLIBC_TUNABLES=glibc.malloc.mxfast=0` changes nothing. Only the
+  computed-keys shape, whose peak is its window phase, moved.
+- Gate (green): clippy -D warnings; fsqlite-core lib filters window, for_each, join, flat_rows 270
+  pass (the two t6741 codegen tests fail as on base); the 54 window integration targets pass.
+- Retry condition: not as a standalone patch; together with a change that keeps the outer phase of
+  a window SELECT summed outside below its window phase. It was retried that way: the same code
+  landed with step 7 (entry above), which met its own kill line.
+
 ## 2026-11-13 - REJECTED (correctness, before measurement): a seek-cache hit takes a parked leaf instead of reloading it (bd-w4pr1.13.34)
 
 - Target: lookup joins that probe a small table by rowid (join_1M_to_pk_1000, the memory script's
