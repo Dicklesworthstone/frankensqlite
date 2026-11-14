@@ -1086,6 +1086,23 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN (probe not met): an index-equality scan evaluates a residual that reads only index columns from the index entry (bd-y8zgm)
+
+- Target: `SELECT id FROM t WHERE EXISTS (SELECT 1 FROM p WHERE p.tid = t.id) AND t.a = 5`
+  (11.2x stock): the eq-residual scan looked every `a = 5` entry up (SeekRowid, 200 cold leaves)
+  to evaluate a WHERE that reads only t.id. Touched: crates/fsqlite-vdbe/src/codegen.rs
+  (expr_reads_only_index_columns, exists_reads_only_index_columns,
+  emit_index_entry_where_filter: a RegisterRow image of the index's key columns and rowid,
+  evaluated through emit_expr; codegen_select_index_equality_scan uses it when the projection
+  is covered).
+- Result (16c98f4bd; scratchpad cov_ab.py, plangap fixture with ANALYZE, stock live, answers
+  equal; ELF before 4e0567bc1d63a75d, after 59cc18d57c4c7ced; thinkstation1): 11.2x -> 7.9x;
+  NOT EXISTS 10.0x -> 7.0x; row-reading controls unchanged. Probe (6x) missed: what remains per
+  row is the EXISTS probe's index seek into p.
+- Retry / next: drop the EXISTS index probe's unused per-row OpenRead/Close of p's table
+  cursor; let the eq-residual target prefer an index that covers the residual (t_ab over t_a
+  for `a = 7 AND ... b`); the per-seek cost itself is bd-w4pr1.13.15's.
+
 ## 2026-11-14 - WIN: an OR index union row from an exactly enforced term skips the WHERE, and from a covering index skips the row lookup (bd-0wwov)
 
 - Target: `SELECT id FROM t WHERE a = 5 OR s = 'k77'` (8.2x stock): bd-e9vgj's MULTI-INDEX OR
