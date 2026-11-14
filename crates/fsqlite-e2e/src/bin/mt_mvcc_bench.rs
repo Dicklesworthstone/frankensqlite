@@ -5355,6 +5355,25 @@ fn run(opts: Options) -> Result<(), String> {
                         m.decomposed_holds, val_us, io_us, pub_us, m.io_ns_max, io_frac,
                     );
                 }
+                // bd-i0tn6 S3: commits whose physical write ran without the
+                // guard (their decomposition's io term is then unlocked), the
+                // wait to re-acquire it for publication, and validations that
+                // waited for a peer's pending publication.
+                if m.publish_reacquires_total > 0 || m.publication_waits_total > 0 {
+                    eprintln!(
+                        "registry_lock_split threads={n} unlocked_write_commits={} \
+                         mean_publish_reacquire_wait_us={:.2} publication_waits={} \
+                         mean_publication_wait_us={:.2}",
+                        m.publish_reacquires_total,
+                        m.publish_reacquire_wait_ns_total as f64
+                            / m.publish_reacquires_total.max(1) as f64
+                            / 1_000.0,
+                        m.publication_waits_total,
+                        m.publication_wait_ns_total as f64
+                            / m.publication_waits_total.max(1) as f64
+                            / 1_000.0,
+                    );
+                }
                 let cons = fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.snapshot();
                 let vdbe = fsqlite_vdbe::engine::vdbe_metrics_snapshot();
                 eprintln!(

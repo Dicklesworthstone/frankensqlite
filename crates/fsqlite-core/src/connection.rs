@@ -295,7 +295,8 @@ use fsqlite_mvcc::{
     morsel_parallel_insert::MorselScheduler, prepare_concurrent_commit_fcw_only,
     prepare_concurrent_commit_with_ssi, publication_epoch, record_registry_commit_lock_hold,
     record_registry_commit_lock_hold_decomposed, record_registry_commit_lock_wait,
-    record_registry_publication_wait, ssi_metrics_snapshot, wait_for_publication_epoch_change,
+    record_registry_publication_wait, record_registry_publish_reacquire_wait,
+    ssi_metrics_snapshot, wait_for_publication_epoch_change,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 #[cfg(feature = "diagnostic-pragmas")]
@@ -65662,6 +65663,8 @@ impl Connection {
         // bd-i0tn6: the publication-pending mark of a successful plan, dropped
         // right before publication or on any exit that does not publish.
         let mut publication_lease: Option<PublicationPendingLease> = None;
+        // bd-i0tn6 S3: set when the physical write runs without the guard.
+        let mut unlocked_write: Option<UnlockedCommitWrite> = None;
         // `failed_commit_rollback`: Some(rollback succeeded) when a transaction
         // with pending writes was rolled back instead of committed.
         let (txn_result, committed_write, failed_commit_rollback) = if ok {
@@ -65701,10 +65704,21 @@ impl Connection {
                 };
                 match planned {
                     Ok(plan) => {
-                        // End of the under-lock validate/reserve phase. The
-                        // physical write follows while this guard remains held.
+                        // End of the under-lock validate/reserve phase.
                         if let Some(registry) = commit_registry_guard.as_mut() {
                             registry.mark_validate_done();
+                        }
+                        // bd-i0tn6 S3: a validated concurrent commit that does
+                        // not change the schema writes without the guard and
+                        // re-acquires it to publish (see the explicit COMMIT
+                        // path in `execute_commit_with_cx`).
+                        if plan.is_some()
+                            && is_concurrent_txn
+                            && !schema_change_boundary
+                            && !self.pager.is_memory()
+                            && let Some(registry) = commit_registry_guard.take()
+                        {
+                            unlocked_write = Some(registry.release_after_validation());
                         }
                         plan
                     }
@@ -65990,20 +66004,23 @@ impl Connection {
             };
             match commit_result {
                 Ok(()) => {
-                    // End of the under-lock physical write phase. Publication
-                    // follows while this same guard remains held.
+                    // End of the physical write phase (under the guard, or
+                    // unlocked since bd-i0tn6 S3).
                     if let Some(guard) = commit_registry_guard.as_mut() {
                         guard.mark_io_done();
+                    } else if let Some(unlocked_write) = unlocked_write.as_mut() {
+                        unlocked_write.mark_io_done();
                     }
                     record_hot_path_duration(
                         &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
                         commit_txn_roundtrip_start,
                     );
                     // Issue #115 regression hook: window AFTER physical write,
-                    // BEFORE publish. With the fix the `concurrent_registry`
-                    // guard is still held here.
+                    // BEFORE publish. Since bd-i0tn6 S3 a non-schema concurrent
+                    // commit holds its page locks and publication-pending mark
+                    // here, not the `concurrent_registry` guard.
                     #[cfg(test)]
-                    if commit_registry_guard.is_some() {
+                    if commit_registry_guard.is_some() || unlocked_write.is_some() {
                         fire_concurrent_commit_window_hook();
                     }
                     if txn_has_pending_writes {
@@ -66019,10 +66036,20 @@ impl Connection {
                             } else {
                                 self.sync_filebacked_post_commit_visibility_floor()
                             };
-                            // Issue #115: publish through the SAME held guard.
-                            // `concurrent_plan.is_some()` here implies the guard
-                            // was acquired (both gate on
+                            // Issue #115 / bd-i0tn6: publish under the guard:
+                            // the validation guard when it covered the write,
+                            // otherwise a re-acquisition after the unlocked
+                            // write. `concurrent_plan.is_some()` here implies
+                            // one of the two (both gate on
                             // `ok && is_concurrent_txn && txn_has_pending_writes`).
+                            if commit_registry_guard.is_none()
+                                && let Some(unlocked_write) = unlocked_write.take()
+                            {
+                                commit_registry_guard = Some(lock_registry_for_publication(
+                                    &self.concurrent_registry,
+                                    unlocked_write,
+                                ));
+                            }
                             let registry = commit_registry_guard.as_mut().expect(
                                 "concurrent commit plan present implies the registry guard is held",
                             );
@@ -79648,10 +79675,25 @@ impl Connection {
                     publication_lease =
                         Some(Self::mark_concurrent_commit_publication_pending(registry, plan)?);
                 }
-                // End of the under-lock validate/reserve phase. The physical
-                // write follows while this guard remains held.
+                // End of the under-lock validate/reserve phase.
                 registry.mark_validate_done();
                 plan
+            } else {
+                None
+            };
+            // bd-i0tn6 S3: a validated concurrent commit that does not change
+            // the schema runs its physical write without the registry guard
+            // and re-acquires it only to publish. Its page locks (held until
+            // publication) keep peers off its pages, and its publication-
+            // pending mark holds back any validator it could share an SSI
+            // edge with. A schema change keeps the guard across its write.
+            let write_unlocked = concurrent_commit_plan.is_some()
+                && !validation_is_schema_change
+                && !self.pager.is_memory();
+            let mut unlocked_write = if write_unlocked
+                && let Some(registry) = commit_registry_guard.take()
+            {
+                Some(registry.release_after_validation())
             } else {
                 None
             };
@@ -79765,7 +79807,12 @@ impl Connection {
                             // This re-acquired guard has its own phase clock, so
                             // mark validation again after the retry re-plan.
                             registry.mark_validate_done();
-                            commit_registry_guard = Some(registry);
+                            if write_unlocked && concurrent_commit_plan.is_some() {
+                                unlocked_write = Some(registry.release_after_validation());
+                            } else {
+                                unlocked_write = None;
+                                commit_registry_guard = Some(registry);
+                            }
                         }
                         commit_res = {
                             let mut txn_guard = self.active_txn.borrow_mut();
@@ -79851,10 +79898,12 @@ impl Connection {
             );
             // A successful result means the physical commit reached a durable
             // terminal state, including the in-doubt recovery loop above.
-            if commit_res.is_ok()
-                && let Some(guard) = commit_registry_guard.as_mut()
-            {
-                guard.mark_io_done();
+            if commit_res.is_ok() {
+                if let Some(guard) = commit_registry_guard.as_mut() {
+                    guard.mark_io_done();
+                } else if let Some(unlocked_write) = unlocked_write.as_mut() {
+                    unlocked_write.mark_io_done();
+                }
             }
             if commit_res.is_ok() {
                 self.record_time_travel_commit_delta(time_travel_surface);
@@ -79892,14 +79941,14 @@ impl Connection {
 
             // Issue #115 regression hook: we are now in the precise window
             // AFTER the physical pager write has landed but BEFORE the commit
-            // is published into the shared `CommitIndex`. With the #115 fix the
-            // `concurrent_registry` guard is still held here, so any second
-            // committer is blocked at its own `plan_concurrent_commit_with_registry`
-            // and cannot validate against a stale snapshot. The deterministic
-            // repro test installs a callback here to prove that. The gate is on
-            // the commit PLAN (not the guard) so the window is observable
-            // regardless of whether the critical section is held — that lets the
-            // same hook reproduce the pre-fix TOCTOU when the guard is released.
+            // is published into the shared `CommitIndex`. Since bd-i0tn6 S3 the
+            // `concurrent_registry` guard is NOT held here for a non-schema
+            // concurrent commit: a second committer can validate inside this
+            // window, and what keeps it from claiming this commit's pages
+            // (including fresh EOF pages) is the page locks held until
+            // publication; what keeps it from deciding SSI against this commit
+            // is the publication-pending mark. The deterministic repro tests
+            // install a callback here to drive a peer through the window.
             #[cfg(test)]
             if concurrent_commit_plan.is_some()
                 && matches!(&commit_outcome, PhysicalCommitOutcome::Durable { .. })
@@ -79931,11 +79980,22 @@ impl Connection {
                     } else {
                         self.sync_filebacked_post_commit_visibility_floor()
                     };
-                    // Issue #115: publish through the SAME held registry guard
-                    // (do not re-acquire / release-and-reacquire the lock). The
+                    // Issue #115 / bd-i0tn6: publish under the registry guard:
+                    // the validation guard when it covered the write (schema
+                    // changes), otherwise a re-acquisition after the unlocked
+                    // write. The page locks and the publication-pending mark
+                    // held through the write keep the #115 window closed. The
                     // SSI evidence card is recorded after the guard is dropped
                     // to keep the ledger write off the critical section, matching
                     // the previous `finalize_concurrent_commit` ordering.
+                    if commit_registry_guard.is_none()
+                        && let Some(unlocked_write) = unlocked_write.take()
+                    {
+                        commit_registry_guard = Some(lock_registry_for_publication(
+                            &self.concurrent_registry,
+                            unlocked_write,
+                        ));
+                    }
                     let registry = commit_registry_guard.as_mut().expect(
                         "concurrent commit plan present implies the registry guard is held",
                     );
@@ -127322,6 +127382,10 @@ struct TimedRegistryCommitGuard<'a> {
     acquired_at: Instant,
     validate_done_at: Option<Instant>,
     io_done_at: Option<Instant>,
+    /// bd-i0tn6: for the publication guard of a commit whose physical write
+    /// ran unlocked, the validate hold and the unlocked write time; the drop
+    /// records them with this guard's hold as the publish phase.
+    split_phases: Option<(u64, u64)>,
 }
 
 impl TimedRegistryCommitGuard<'_> {
@@ -127335,6 +127399,42 @@ impl TimedRegistryCommitGuard<'_> {
     #[inline]
     fn mark_io_done(&mut self) {
         self.io_done_at = Some(Instant::now());
+    }
+
+    /// bd-i0tn6: release the validation guard before an unlocked physical
+    /// write; returns the validate hold in ns and the release instant, which
+    /// [`lock_registry_for_publication`] turns into the decomposition.
+    fn release_after_validation(self) -> UnlockedCommitWrite {
+        let validate_ns = u64::try_from(
+            self.validate_done_at
+                .unwrap_or_else(Instant::now)
+                .duration_since(self.acquired_at)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        drop(self);
+        UnlockedCommitWrite {
+            validate_ns,
+            released_at: Instant::now(),
+            io_ns: None,
+        }
+    }
+}
+
+/// bd-i0tn6: timing of a concurrent commit whose physical write runs without
+/// the registry guard, between the validation hold and the publication hold.
+#[derive(Debug, Clone, Copy)]
+struct UnlockedCommitWrite {
+    validate_ns: u64,
+    released_at: Instant,
+    io_ns: Option<u64>,
+}
+
+impl UnlockedCommitWrite {
+    /// Mark the end of the unlocked physical write.
+    fn mark_io_done(&mut self) {
+        self.io_ns =
+            Some(u64::try_from(self.released_at.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
 }
 
@@ -127358,6 +127458,11 @@ impl Drop for TimedRegistryCommitGuard<'_> {
         let hold_ns = u64::try_from(dropped_at.duration_since(self.acquired_at).as_nanos())
             .unwrap_or(u64::MAX);
         record_registry_commit_lock_hold(hold_ns);
+        if let Some((validate_ns, io_ns)) = self.split_phases {
+            // The publication hold of an unlocked-write commit (bd-i0tn6).
+            record_registry_commit_lock_hold_decomposed(validate_ns, io_ns, hold_ns);
+            return;
+        }
         // Error and non-concurrent exits may not reach both marks; they still
         // contribute to the authoritative total-hold counters above.
         if let (Some(validate_done), Some(io_done)) = (self.validate_done_at, self.io_done_at) {
@@ -127385,7 +127490,30 @@ fn lock_registry_for_commit(registry: &Mutex<ConcurrentRegistry>) -> TimedRegist
         acquired_at: Instant::now(),
         validate_done_at: None,
         io_done_at: None,
+        split_phases: None,
     }
+}
+
+/// bd-i0tn6: re-acquire the registry guard to publish a commit whose physical
+/// write ran unlocked. This is a blocking lock with no await, so nothing can
+/// cancel the step between durability and publication; the wait is recorded
+/// separately from validation waits.
+fn lock_registry_for_publication(
+    registry: &Mutex<ConcurrentRegistry>,
+    unlocked_write: UnlockedCommitWrite,
+) -> TimedRegistryCommitGuard<'_> {
+    let wait_started = Instant::now();
+    let mut guard = lock_registry_for_commit(registry);
+    record_registry_publish_reacquire_wait(
+        u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    );
+    guard.split_phases = Some((
+        unlocked_write.validate_ns,
+        unlocked_write.io_ns.unwrap_or_else(|| {
+            u64::try_from(unlocked_write.released_at.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        }),
+    ));
+    guard
 }
 
 fn mvcc_state_path_key(path: &str) -> String {
@@ -313550,6 +313678,307 @@ mod pager_routing_tests {
                  malformed on-disk image (canonical SQLite integrity_check failed)"
                 );
             }
+        });
+    }
+
+    /// bd-i0tn6 S3: connection A, parked in the post-durable / pre-publication
+    /// commit window by the commit-window hook.
+    #[cfg(unix)]
+    struct ParkedUnpublishedCommit {
+        release: std::sync::mpsc::Sender<()>,
+        done: std::sync::mpsc::Receiver<Result<()>>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    /// Clears the process-global commit-window hook when a test ends.
+    #[cfg(unix)]
+    struct I0tn6CommitWindowHookGuard;
+
+    #[cfg(unix)]
+    impl Drop for I0tn6CommitWindowHookGuard {
+        fn drop(&mut self) {
+            super::set_concurrent_commit_window_hook(None);
+        }
+    }
+
+    /// Run `a_sql` and then `COMMIT` on connection A's own thread; A parks in
+    /// the commit window (durable, not yet published) and this returns once
+    /// it is parked.
+    #[cfg(unix)]
+    fn park_commit_before_publication(
+        db_path: &str,
+        a_sql: &'static [&'static str],
+    ) -> ParkedUnpublishedCommit {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (in_window_tx, in_window_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let in_window_tx = Mutex::new(in_window_tx);
+        let release_rx = Mutex::new(release_rx);
+        let armed = Arc::new(AtomicBool::new(true));
+        let target = Arc::new(Mutex::new(None::<std::thread::ThreadId>));
+        let hook_armed = Arc::clone(&armed);
+        let hook_target = Arc::clone(&target);
+        super::set_concurrent_commit_window_hook(Some(Arc::new(move || {
+            let is_target = hook_target
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|thread_id| *thread_id == std::thread::current().id());
+            if is_target && hook_armed.swap(false, Ordering::SeqCst) {
+                let _ = in_window_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+        })));
+        let path = db_path.to_owned();
+        let (done_tx, done_rx) = mpsc::channel::<Result<()>>();
+        let a_target = Arc::clone(&target);
+        let handle = std::thread::spawn(move || {
+            *a_target.lock().unwrap() = Some(std::thread::current().id());
+            let mut res: Result<()> = Ok(());
+            asupersync::test_utils::run_test(|| async {
+                res = async {
+                    let conn = Connection::open(&path).await?;
+                    for sql in a_sql {
+                        conn.execute(sql).await?;
+                    }
+                    conn.execute("COMMIT;").await?;
+                    conn.close_without_checkpoint().await?;
+                    Ok(())
+                }
+                .await;
+            });
+            let _ = done_tx.send(res);
+        });
+        in_window_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("connection A should park between durability and publication");
+        ParkedUnpublishedCommit {
+            release: release_tx,
+            done: done_rx,
+            handle,
+        }
+    }
+
+    /// Run `sql` on a fresh connection on its own thread.
+    #[cfg(unix)]
+    fn run_peer_statements(
+        db_path: &str,
+        sql: &'static [&'static str],
+    ) -> (
+        std::sync::mpsc::Receiver<Result<()>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let path = db_path.to_owned();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<()>>();
+        let handle = std::thread::spawn(move || {
+            let mut res: Result<()> = Ok(());
+            asupersync::test_utils::run_test(|| async {
+                res = async {
+                    let conn = Connection::open(&path).await?;
+                    for statement in sql {
+                        conn.execute(statement).await?;
+                    }
+                    conn.close_without_checkpoint().await?;
+                    Ok(())
+                }
+                .await;
+            });
+            let _ = done_tx.send(res);
+        });
+        (done_rx, handle)
+    }
+
+    /// Two tables with one row each; returns the database path.
+    #[cfg(unix)]
+    async fn i0tn6_two_table_db(dir: &tempfile::TempDir, name: &str) -> String {
+        let db = dir.path().join(name).to_string_lossy().into_owned();
+        let setup = Connection::open(&db).await.unwrap();
+        for sql in [
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);",
+            "INSERT INTO a VALUES (1, 0);",
+            "INSERT INTO b VALUES (1, 0);",
+        ] {
+            setup.execute(sql).await.unwrap();
+        }
+        setup.close().await.unwrap();
+        db
+    }
+
+    #[cfg(unix)]
+    async fn i0tn6_assert_final_state(db: &str, expected_a: i64, expected_b: i64) {
+        let verifier = Connection::open(db).await.unwrap();
+        for (table, expected) in [("a", expected_a), ("b", expected_b)] {
+            let row = verifier
+                .query_row(&format!("SELECT v FROM {table} WHERE id = 1;"))
+                .await
+                .unwrap();
+            assert_eq!(
+                row.get(0),
+                Some(&SqliteValue::Integer(expected)),
+                "table {table} must hold every committed update exactly once"
+            );
+        }
+        verifier.close_without_checkpoint().await.unwrap();
+        let sqlite = rusqlite::Connection::open(db).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    /// bd-i0tn6 S3: the registry guard no longer covers a concurrent commit's
+    /// physical write. While A's durable commit waits to publish, a peer
+    /// writing a disjoint table validates, writes and publishes. On a build
+    /// whose guard spans validate -> write -> publish, B cannot finish until
+    /// A is released and this test fails at the in-window assertion.
+    #[cfg(unix)]
+    #[test]
+    fn i0tn6_disjoint_peer_commits_while_a_durable_commit_is_unpublished() {
+        use std::time::Duration;
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db = i0tn6_two_table_db(&dir, "i0tn6_disjoint.db").await;
+            let hook_guard = I0tn6CommitWindowHookGuard;
+            let parked = park_commit_before_publication(
+                &db,
+                &["BEGIN;", "UPDATE a SET v = v + 1 WHERE id = 1;"],
+            );
+            let (b_done, b_handle) = run_peer_statements(
+                &db,
+                &["BEGIN;", "UPDATE b SET v = v + 1 WHERE id = 1;", "COMMIT;"],
+            );
+            let b_in_window = b_done.recv_timeout(Duration::from_secs(20)).ok();
+            parked.release.send(()).unwrap();
+            let a_res = parked
+                .done
+                .recv_timeout(Duration::from_secs(30))
+                .expect("A should finish after release");
+            parked.handle.join().expect("A thread");
+            let b_res = match b_in_window {
+                Some(res) => res,
+                None => {
+                    let late = b_done.recv_timeout(Duration::from_secs(30));
+                    b_handle.join().expect("B thread");
+                    panic!(
+                        "a disjoint peer must commit while A's durable commit waits to publish; \
+                         B only resolved after A was released ({late:?})"
+                    );
+                }
+            };
+            b_handle.join().expect("B thread");
+            drop(hook_guard);
+            a_res.expect("A's commit must succeed");
+            b_res.expect("B's disjoint commit must succeed inside A's window");
+            i0tn6_assert_final_state(&db, 1, 1).await;
+        });
+    }
+
+    /// bd-i0tn6 S3: a peer that read a page A wrote could form an SSI edge
+    /// with A, whose decision is final but not yet in committed history. It
+    /// must not validate until A publishes. Without the publication-pending
+    /// wait it commits inside A's window (the assertion below), deciding SSI
+    /// against a history that lacks A.
+    #[cfg(unix)]
+    #[test]
+    fn i0tn6_peer_reading_unpublished_writes_waits_for_publication() {
+        use std::time::Duration;
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db = i0tn6_two_table_db(&dir, "i0tn6_reader_waits.db").await;
+            let hook_guard = I0tn6CommitWindowHookGuard;
+            let parked = park_commit_before_publication(
+                &db,
+                &["BEGIN;", "UPDATE a SET v = v + 1 WHERE id = 1;"],
+            );
+            let (b_done, b_handle) = run_peer_statements(
+                &db,
+                &[
+                    "BEGIN;",
+                    "SELECT v FROM a WHERE id = 1;",
+                    "UPDATE b SET v = v + 1 WHERE id = 1;",
+                    "COMMIT;",
+                ],
+            );
+            let b_in_window = b_done.recv_timeout(Duration::from_secs(3)).ok();
+            parked.release.send(()).unwrap();
+            let a_res = parked
+                .done
+                .recv_timeout(Duration::from_secs(30))
+                .expect("A should finish after release");
+            parked.handle.join().expect("A thread");
+            let b_res = match &b_in_window {
+                Some(_) => None,
+                None => Some(
+                    b_done
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("B should resolve once A publishes"),
+                ),
+            };
+            b_handle.join().expect("B thread");
+            drop(hook_guard);
+            a_res.expect("A's commit must succeed");
+            assert!(
+                b_in_window.is_none(),
+                "a peer that read A's unpublished write resolved inside A's window: \
+                 {b_in_window:?}"
+            );
+            b_res
+                .expect("B result")
+                .expect("once A has published, B validates against it and commits");
+            i0tn6_assert_final_state(&db, 1, 1).await;
+        });
+    }
+
+    /// bd-i0tn6 S3: a schema change must not validate while any publication is
+    /// pending: its snapshot could miss rows about to publish (a CREATE INDEX
+    /// built without them). Without the wait the DDL commits inside A's window.
+    #[cfg(unix)]
+    #[test]
+    fn i0tn6_schema_change_waits_for_pending_publication() {
+        use std::time::Duration;
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db = i0tn6_two_table_db(&dir, "i0tn6_schema_waits.db").await;
+            let hook_guard = I0tn6CommitWindowHookGuard;
+            let parked = park_commit_before_publication(
+                &db,
+                &["BEGIN;", "UPDATE a SET v = v + 1 WHERE id = 1;"],
+            );
+            let (b_done, b_handle) =
+                run_peer_statements(&db, &["CREATE INDEX b_v ON b(v);"]);
+            let b_in_window = b_done.recv_timeout(Duration::from_secs(3)).ok();
+            parked.release.send(()).unwrap();
+            let a_res = parked
+                .done
+                .recv_timeout(Duration::from_secs(30))
+                .expect("A should finish after release");
+            parked.handle.join().expect("A thread");
+            let b_res = match &b_in_window {
+                Some(_) => None,
+                None => Some(
+                    b_done
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("the DDL should resolve once A publishes"),
+                ),
+            };
+            b_handle.join().expect("B thread");
+            drop(hook_guard);
+            a_res.expect("A's commit must succeed");
+            assert!(
+                b_in_window.is_none(),
+                "a schema change resolved while A's commit was unpublished: {b_in_window:?}"
+            );
+            b_res
+                .expect("B result")
+                .expect("the DDL commits after A publishes");
+            i0tn6_assert_final_state(&db, 1, 0).await;
         });
     }
 }
