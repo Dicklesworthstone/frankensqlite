@@ -6029,7 +6029,14 @@ async fn lookup_page_in_wal_backend(
         record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendRead);
         let guard = async_rwlock_read_for_page(&backend, cx, "WAL backend").await?;
         if guard.supports_pinned_reads() {
-            WalReadLookup::Ready(guard.read_page_pinned(cx, page_no.get()).await?)
+            // A page the pinned snapshot holds no frame of (the usual answer
+            // on a page-cache miss) is answered without the boxed read
+            // futures; a frame is read through `read_page_pinned`.
+            let data = match guard.read_page_pinned_without_io(page_no.get()) {
+                Some(answer) => answer?,
+                None => guard.read_page_pinned(cx, page_no.get()).await?,
+            };
+            WalReadLookup::Ready(data)
         } else {
             WalReadLookup::NeedsWriteFallback
         }

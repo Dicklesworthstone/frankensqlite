@@ -175,6 +175,15 @@ fn sqlite_database_header_page_size(page_one: &[u8]) -> Option<u32> {
 /// complete per-generation index. `PartialIndexFallback*` outcomes are an
 /// explicit slow-path exception used only when a lowered cap makes the
 /// in-memory index incomplete.
+/// What a pinned read finds before it reads the WAL.
+enum PinnedPageRead<'a> {
+    /// The pinned snapshot holds no frame of the page.
+    NoFrame,
+    /// The page has a frame in this snapshot, or may have one (a partial
+    /// index): resolve and read it.
+    Frame(&'a WalPublishedSnapshot),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalPageLookupResolution {
     AuthoritativeHit { frame_index: usize },
@@ -833,6 +842,29 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         );
 
         Ok(())
+    }
+
+    /// The part of `read_page_pinned` that needs no WAL read: its refusals
+    /// (a pending checkpoint reset, no pinned snapshot), a pinned snapshot
+    /// with no committed frame, and a miss in a complete page index. Both
+    /// `read_page_pinned` and `read_page_pinned_without_io` start here
+    /// (bd-w4pr1.13.18).
+    fn pinned_page_read(&self, page_number: u32) -> Result<PinnedPageRead<'_>> {
+        if self.pending_checkpoint_reset.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let snapshot = self.read_snapshot.as_ref().ok_or_else(|| {
+            FrankenError::internal(
+                "read_page_pinned called without a pinned read snapshot; \
+                 use read_page(&mut self) or call begin_transaction first",
+            )
+        })?;
+        if snapshot.last_commit_frame.is_none()
+            || (!snapshot.index_is_partial && !snapshot.page_index.contains_key(&page_number))
+        {
+            return Ok(PinnedPageRead::NoFrame);
+        }
+        Ok(PinnedPageRead::Frame(snapshot))
     }
 
     /// Resolve the most recent visible frame for `page_number`.
@@ -3119,16 +3151,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         page_number: u32,
     ) -> WalFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
-            if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
-            let snapshot = self.read_snapshot.as_ref().ok_or_else(|| {
-                FrankenError::internal(
-                    "read_page_pinned called without a pinned read snapshot; \
-                     use read_page(&mut self) or call begin_transaction first",
-                )
-            })?;
-            if snapshot.last_commit_frame.is_none() {
-                return Ok(None);
-            }
+            let snapshot = match self.pinned_page_read(page_number)? {
+                PinnedPageRead::NoFrame => return Ok(None),
+                PinnedPageRead::Frame(snapshot) => snapshot,
+            };
 
             let resolution = self
                 .resolve_visible_frame(cx, snapshot, page_number)
@@ -3140,6 +3166,14 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 .await
                 .map(Some)
         })
+    }
+
+    fn read_page_pinned_without_io(&self, page_number: u32) -> Option<Result<Option<Vec<u8>>>> {
+        match self.pinned_page_read(page_number) {
+            Ok(PinnedPageRead::NoFrame) => Some(Ok(None)),
+            Ok(PinnedPageRead::Frame(_)) => None,
+            Err(error) => Some(Err(error)),
+        }
     }
 
     fn supports_pinned_reads(&self) -> bool {
@@ -6867,6 +6901,10 @@ where
         page_number: u32,
     ) -> WalFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move { self.inner.read_page_pinned(cx, page_number).await })
+    }
+
+    fn read_page_pinned_without_io(&self, page_number: u32) -> Option<Result<Option<Vec<u8>>>> {
+        self.inner.read_page_pinned_without_io(page_number)
     }
 
     fn supports_pinned_reads(&self) -> bool {
@@ -11110,6 +11148,67 @@ mod tests {
 
         let result = adapter.read_page(&cx, 99).expect("read missing page");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_adapter_pinned_read_without_io_answers_only_pages_without_a_frame() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        // No pinned snapshot: both refuse, alike.
+        let unpinned = adapter
+            .read_page_pinned_without_io(1)
+            .expect("an unpinned read is refused without I/O")
+            .expect_err("no pinned snapshot");
+        let read_unpinned = adapter
+            .read_page_pinned(&cx, 1)
+            .expect_err("no pinned snapshot");
+        assert_eq!(unpinned.to_string(), read_unpinned.to_string());
+
+        let page1 = sample_page(0x10);
+        adapter.append_frame(&cx, 1, &page1, 1).expect("append commit");
+        adapter.sync(&cx).expect("publish commit");
+        adapter.begin_transaction(&cx).expect("pin snapshot");
+
+        // Page 1 has a frame: only read_page_pinned answers, with its bytes.
+        assert!(adapter.read_page_pinned_without_io(1).is_none());
+        assert_eq!(
+            adapter.read_page_pinned(&cx, 1).expect("frame of page 1"),
+            Some(page1)
+        );
+        // Page 2 has none: answered without I/O, as read_page_pinned answers.
+        assert_eq!(
+            adapter
+                .read_page_pinned_without_io(2)
+                .map(|answer| answer.expect("no refusal")),
+            Some(None)
+        );
+        assert_eq!(
+            adapter.read_page_pinned(&cx, 2).expect("no frame of page 2"),
+            None
+        );
+
+        // A later commit of page 2 is not in the pinned snapshot...
+        let page2 = sample_page(0x20);
+        adapter
+            .append_frame(&cx, 2, &page2, 2)
+            .expect("append later commit");
+        adapter.sync(&cx).expect("publish later commit");
+        assert_eq!(
+            adapter
+                .read_page_pinned_without_io(2)
+                .map(|answer| answer.expect("no refusal")),
+            Some(None),
+            "the pinned snapshot predates page 2's frame"
+        );
+        // ...and is in the next one, where only read_page_pinned answers.
+        adapter.begin_transaction(&cx).expect("pin next snapshot");
+        assert!(adapter.read_page_pinned_without_io(2).is_none());
+        assert_eq!(
+            adapter.read_page_pinned(&cx, 2).expect("frame of page 2"),
+            Some(page2)
+        );
     }
 
     #[test]

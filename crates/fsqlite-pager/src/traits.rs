@@ -772,6 +772,18 @@ pub trait WalBackend: Send + Sync {
         })
     }
 
+    /// [`Self::read_page_pinned`]'s answer when the pinned snapshot gives it
+    /// without reading the WAL: no frame of `page_number` in the snapshot, or
+    /// the refusal `read_page_pinned` raises before it looks. `None` means a
+    /// frame must be read (or a partial index scanned), so only
+    /// `read_page_pinned` can answer. Synchronous: a page-cache miss on a page
+    /// the WAL does not hold skips the boxed read futures (bd-w4pr1.13.18).
+    ///
+    /// The default answers `None` for every page.
+    fn read_page_pinned_without_io(&self, _page_number: u32) -> Option<Result<Option<Vec<u8>>>> {
+        None
+    }
+
     /// Whether this backend supports `read_page_pinned` (shared-lock reads).
     ///
     /// Callers check this before choosing the read vs write lock path.
