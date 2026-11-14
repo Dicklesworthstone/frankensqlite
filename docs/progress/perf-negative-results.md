@@ -421,14 +421,16 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   before cee8e75bbd884ec8, after efbd4b26c0d05cca; thinkstation1): LIMIT 5 462.5x -> 4.7x;
   `GROUP BY b, a LIMIT 5` 5,857.5x -> 1.0x with stock's rows; `a > 900` 15.5x -> 5.6x; ranges,
   equalities and IN inputs 6.9x -> 5.2x, 4.9x -> 4.2x, 3.6x -> 2.7x, 5.2x -> 3.9x.
-- Cost (measured, kept): a whole-table covering GROUP BY without a LIMIT, which now streams over
-  the index, is a little slower than the sorter path: `a, count(*) GROUP BY a` +1.3%,
-  `flag, count(*) GROUP BY flag` +2.3%. The sort is gone, but each row pays a Gosub into the
-  group accumulation and a copy out of its sorter slot. bd-2mrip stays open on that half of its
-  probe.
-- Retry condition: inline the group accumulation in the row body when groups stream (it has one
-  call site) and read keys straight into the current-key registers; or keep the sorter for a
-  whole-index walk with no LIMIT whose keys are ASC in GROUP BY order.
+- Cost as first landed: a whole-table covering GROUP BY without a LIMIT, which streams over the
+  index, was a little slower than the sorter path: `a, count(*) GROUP BY a` +1.3%,
+  `flag, count(*) GROUP BY flag` +2.3%. The sort was gone, but each row paid a Gosub into the
+  group accumulation and a copy out of its sorter slot; that half of bd-2mrip's probe waited for
+  the follow-up below.
+- Follow-up 25cf1befa removed the cost: the row body jumps into the group accumulation (which
+  returns to the index driver) and the keys stay in their slot registers. `a, count(*) GROUP BY
+  a` 676,257.1k -> 580,089.4k (6.5x -> 5.6x, under the sorter path's 667,648.7k), `flag,
+  count(*)` 665,699.0k -> 569,529.9k, and the other streamed shapes cheaper too (LIMIT 5 4.6x
+  -> 4.0x, `a = 5` 2.6x -> 2.0x, IN 3.9x -> 3.3x); bd-2mrip closed.
 - Found on the way: bd-t92q0 (the in-memory mirror prints `a % 7`'s group as 0.0 where stock
   prints 0); GROUP BY codegen oracles must compare :memory: rows as sets (the mirror groups
   there, in key order).
