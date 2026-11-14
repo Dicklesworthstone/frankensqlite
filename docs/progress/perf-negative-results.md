@@ -724,6 +724,23 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN: x IN (SELECT ...) builds its probe set from only the subquery rows its WHERE reaches, and covered outputs read the index (bd-d2jwe)
+
+- Target: `SELECT id FROM t WHERE a IN (SELECT w FROM p WHERE pid < 100)`, the worst ratio left
+  in the 467ea6fe5357bc94 plan-gap sweep (15.4x): the build rewound all of p and filtered
+  `pid < 100` per row. Touched: crates/fsqlite-vdbe/src/codegen.rs
+  (emit_probe_source_walk_start for codegen_select_index_in_subquery_scan and
+  emit_once_materialized_in_probe_source; an index equality-prefix walk of the subquery's table
+  in the scan's build; covering output reads in its probe loop).
+- Result (c352f4093; scratchpad ins_ab.py, stock live; ELF before 467ea6fe5357bc94, after
+  e0de49d03ab6655d; thinkstation1): 15.4x -> 3.8x; BETWEEN 20.0x -> 3.8x; `w = 3 AND pid <
+  1000` 11.8x -> 5.0x; `w = 3` 13.3x -> 7.6x; NOT IN 2.3x -> 2.2x; no-WHERE and
+  indexed-range controls 6.7x -> 6.2x and 14.5x -> 10.9x (covering only).
+- Measured split: the walk alone took the first row to 8.3x; the rest came from the covering
+  read (2,600 outer rows no longer look their table row up).
+- Retry / next: an indexed range in the subquery (`tid < 2000` over p_tid) still scans p; the
+  non-covered IN-subquery output still pays a row lookup per hit.
+
 ## 2026-11-14 - WIN (with statistics): an inner join drives from the table its WHERE pins when sqlite_stat1 says that side is smaller (bd-9uf3l retry)
 
 - Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` drove from all of p
