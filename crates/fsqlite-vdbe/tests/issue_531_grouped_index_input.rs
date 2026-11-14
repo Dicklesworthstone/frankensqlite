@@ -112,6 +112,14 @@ fn assert_indexed_input(program: &VdbeProgram, sql: &str, covering: bool) {
             && program.ops().iter().any(|op| op.opcode == Opcode::AggFinal),
         "indexed input must retain grouped aggregate finalization: {sql}"
     );
+    // A cursor the program reads before it opens it (in program order) makes
+    // the program need the MemDatabase, and the storage substrate then hands
+    // the statement to the in-memory evaluator: the plan above never runs.
+    assert_eq!(
+        program.attached_memdb_requirement_reason(),
+        None,
+        "indexed input must run on storage cursors alone: {sql}"
+    );
     if covering {
         assert_eq!(
             table_cursor(program),

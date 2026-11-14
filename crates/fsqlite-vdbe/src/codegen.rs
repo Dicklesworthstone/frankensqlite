@@ -24911,7 +24911,7 @@ fn codegen_select_group_by_aggregate(
     // Equality-prefix coverage counts distinct WHERE conjuncts, so repeated
     // index keys cannot hide a residual. Richer aggregates keep the ordinary
     // table reader.
-    let covering_count_index = if num_nongrouped == 0
+    let count_only = num_nongrouped == 0
         && agg_columns.iter().all(|agg| {
             agg.name.eq_ignore_ascii_case("count")
                 && agg.num_args == 0
@@ -24924,20 +24924,56 @@ fn codegen_select_group_by_aggregate(
                 && agg.wrapper_expr.is_none()
                 && agg.multi_agg_indices.is_empty()
                 && agg.bare_expr.is_none()
+        });
+    let stores_group_keys = |index: &IndexSchema| {
+        group_by_keys.iter().all(|key| {
+            let GroupByKey::Column(column) = key else {
+                return false;
+            };
+            table.columns[*column].generated_expr.is_none()
+                && matches!(table.columns[*column].affinity, 'B' | 'D')
+                && index_key_position_of(index, table, *column).is_some()
         })
+    };
+    // A range on an index's leading key (`WHERE a < 20`, `created > ?1`)
+    // walks that range instead of the whole table, as stock's `SEARCH t USING
+    // INDEX (a<?)` does. The rows feed the same grouping sorter and the whole
+    // WHERE still filters each one, so the range need only cover every
+    // matching row. An exact range lets a COUNT(*) grouping whose keys the
+    // index stores skip the table, so such an index wins over the others.
+    let index_range_input = if allow_index_seek
+        && !table.without_rowid
+        && index_eq_seek.is_none()
+        && index_in_seek.is_none()
     {
+        let ranges: Vec<(&IndexSchema, KeyRange<'_>)> = table
+            .indexes
+            .iter()
+            .filter(|index| index.supports_direct_column_lookup())
+            .filter_map(|index| {
+                ordered_scan_key_bounds(where_clause, table, table_alias, index, 0)
+                    .map(|range| (index, range))
+            })
+            .collect();
+        ranges
+            .iter()
+            .copied()
+            .find(|(index, range)| range.exact && count_only && stores_group_keys(index))
+            .or_else(|| ranges.first().copied())
+    } else {
+        None
+    };
+    let covering_count_index = if count_only {
         index_eq_seek.as_ref()
             .filter(|target| !target.has_residual)
             .map(|target| target.index)
             .or_else(|| index_in_seek.as_ref()
                 .filter(|target| !target.has_residual)
                 .map(|target| target.index))
-            .filter(|index| group_by_keys.iter().all(|key| {
-                let GroupByKey::Column(column) = key else { return false };
-                table.columns[*column].generated_expr.is_none()
-                    && matches!(table.columns[*column].affinity, 'B' | 'D')
-                    && index_key_position_of(index, table, *column).is_some()
-            }))
+            .or_else(|| index_range_input
+                .filter(|(_, range)| range.exact)
+                .map(|(index, _)| index))
+            .filter(|index| stores_group_keys(index))
     } else {
         None
     };
@@ -24952,7 +24988,27 @@ fn codegen_select_group_by_aggregate(
             0,
         );
     }
-    let indexed_input = index_eq_seek.is_some() || index_in_seek.is_some();
+    // Open the input index here, before the row body: a covering body reads
+    // the index, and the body comes before its driver in the program. A cursor
+    // read before its open in program order makes the program need the
+    // MemDatabase, and the storage substrate then hands the statement to the
+    // in-memory evaluator (every covering GROUP BY input did, GH#531's too).
+    let input_index = index_eq_seek
+        .as_ref()
+        .map(|target| target.index)
+        .or_else(|| index_in_seek.as_ref().map(|target| target.index))
+        .or_else(|| index_range_input.map(|(index, _)| index));
+    if let Some(index) = input_index {
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            index.root_page,
+            0,
+            P4::Index(index.name.clone()),
+            0,
+        );
+    }
+    let indexed_input = input_index.is_some();
     let input_driver = b.emit_label();
     let input_row = b.emit_label();
     let input_return = indexed_input.then(|| b.alloc_reg());
@@ -25145,10 +25201,6 @@ fn codegen_select_group_by_aggregate(
         };
         if let Some(target) = index_eq_seek {
             let index = target.index;
-            b.emit_op(
-                Opcode::OpenRead, idx_cursor, index.root_page, 0,
-                P4::Index(index.name.clone()), 0,
-            );
             let prefix_len = i32::try_from(target.values.len()).map_err(|_| {
                 CodegenError::Unsupported("index equality prefix too wide".to_owned())
             })?;
@@ -25167,15 +25219,49 @@ fn codegen_select_group_by_aggregate(
             }
             emit_index_prefix_rows(b, idx_cursor, index, keys, prefix_len, emit_row);
         } else if let Some(target) = index_in_seek {
-            let index = target.index;
             let probe_cursor = idx_cursor + 1;
-            b.emit_op(
-                Opcode::OpenRead, idx_cursor, index.root_page, 0,
-                P4::Index(index.name.clone()), 0,
-            );
             emit_index_const_list_rows(
                 b, idx_cursor, probe_cursor, &target, where_placeholder_base, emit_row,
             );
+        } else if let Some((index, range)) = index_range_input {
+            let range_done = b.emit_label();
+            let affinity = index
+                .columns
+                .first()
+                .and_then(|name| table.column_index(name))
+                .map_or('A', |column| table.columns[column].affinity);
+            // A NULL bound matches no key; NULL keys match no bound, so a walk
+            // with no lower bound starts past them.
+            let upper = range.upper.map(|bound| {
+                let reg = b.alloc_reg();
+                emit_leading_key_bound(b, bound, affinity, reg);
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, range_done, P4::None, 0);
+                (reg, bound.inclusive)
+            });
+            let probe_reg = b.alloc_reg();
+            let seek = if let Some(bound) = range.lower {
+                emit_leading_key_bound(b, bound, affinity, probe_reg);
+                b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, range_done, P4::None, 0);
+                if bound.inclusive { Opcode::SeekGE } else { Opcode::SeekGT }
+            } else {
+                b.emit_op(Opcode::Null, 0, probe_reg, 0, P4::None, 0);
+                Opcode::SeekGT
+            };
+            let probe_record_reg = b.alloc_reg();
+            b.emit_op(Opcode::MakeRecord, probe_reg, 1, probe_record_reg, P4::None, 0);
+            b.emit_jump_to_label(seek, idx_cursor, probe_record_reg, range_done, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let walk_top = b.current_addr() as i32;
+            if let Some((upper_reg, inclusive)) = upper {
+                emit_key_past_far_bound_exit(
+                    b, idx_cursor, 0, upper_reg, inclusive, false, range_done,
+                );
+            }
+            let skip_row = b.emit_label();
+            emit_row(b, skip_row);
+            b.resolve_label(skip_row);
+            b.emit_op(Opcode::Next, idx_cursor, walk_top, 0, P4::None, 0);
+            b.resolve_label(range_done);
         }
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
         b.set_next_anon_placeholder(after_body_placeholder);
