@@ -348,6 +348,19 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   prints 0); GROUP BY codegen oracles must compare :memory: rows as sets (the mirror groups
   there, in key order).
 
+## 2026-11-14 - WIN (probe missed): an aggregate over exactly `col IS NULL` walks the index's leading NULL keys (bd-z62ru)
+
+- Target: `SELECT count(*) FROM t WHERE n IS NULL` scanned the table (32x stock). Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (aggregate_index_is_null_target; the aggregate range walk's
+  NULL-run mode: Rewind, stop at the first non-NULL key; the COUNT(*) gate yields to it).
+- Result (d164c8759; cin_ab.py, 10% NULL, stock live; ELF before c8b948ada3e04c2f, after
+  72e2e6dd61f83bf7): count 32.0x -> 6.3x, max(id) + sum(c) 4.4x -> 2.6x; IS NOT NULL control
+  unchanged. bd-z62ru's probe asks for at most 5x and stays open: the walk costs about 2.3k
+  instructions per NULL entry against stock's 365 (Column, NotNull, AggStep, Next per entry;
+  per-row cost, bd-w4pr1.11 / bd-w4pr1.13.7).
+- Not covered: IS NULL beside other conjuncts (an equality seek elsewhere is usually better, so
+  it declines), after an equality prefix (`a = 5 AND b IS NULL`), non-aggregate SELECTs.
+
 ## 2026-11-14 - WIN: MIN/MAX of the rowid WHERE a = ? reads one end of a one-key index's run (bd-zgo8b)
 
 - Target: `SELECT max(id) FROM t WHERE a = ?` (latest row per key) walked the a = ? run.
