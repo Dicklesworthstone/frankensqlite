@@ -100,6 +100,18 @@ static REGISTRY_COMMIT_LOCK_IO_NS_MAX: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+// bd-i0tn6: validators that found a pending publication they must observe
+// released the guard and waited for it; these count those waits and their time.
+static REGISTRY_PUBLICATION_WAITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_PUBLICATION_WAIT_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// bd-i0tn6: a commit whose physical write ran unlocked re-acquires the guard
+// to publish; these count those re-acquisitions and their wait.
+static REGISTRY_PUBLISH_REACQUIRES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_PUBLISH_REACQUIRE_WAIT_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn registry_metric_update_max(metric: &std::sync::atomic::AtomicU64, val: u64) {
     use std::sync::atomic::Ordering;
@@ -142,6 +154,18 @@ pub struct RegistryCommitLockMetrics {
     pub io_ns_max: u64,
     /// Total time spent in the under-lock publish phase.
     pub publish_ns_total: u64,
+    /// Validations that waited for a pending publication (bd-i0tn6).
+    pub publication_waits_total: u64,
+    /// Total nanoseconds those validations waited, guard released.
+    pub publication_wait_ns_total: u64,
+    /// Publication re-acquisitions after an unlocked physical write
+    /// (bd-i0tn6). These are also counted in `holds_total`; for such commits
+    /// the decomposition's `io` is the unlocked write, `validate` the first
+    /// hold and `publish` this second hold.
+    pub publish_reacquires_total: u64,
+    /// Total nanoseconds waited for those re-acquisitions (also included in
+    /// `wait_ns_total`).
+    pub publish_reacquire_wait_ns_total: u64,
 }
 
 /// Read the commit-path registry lock counters.
@@ -159,6 +183,11 @@ pub fn registry_commit_lock_metrics() -> RegistryCommitLockMetrics {
         io_ns_total: REGISTRY_COMMIT_LOCK_IO_NS_TOTAL.load(Ordering::Relaxed),
         io_ns_max: REGISTRY_COMMIT_LOCK_IO_NS_MAX.load(Ordering::Relaxed),
         publish_ns_total: REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL.load(Ordering::Relaxed),
+        publication_waits_total: REGISTRY_PUBLICATION_WAITS.load(Ordering::Relaxed),
+        publication_wait_ns_total: REGISTRY_PUBLICATION_WAIT_NS_TOTAL.load(Ordering::Relaxed),
+        publish_reacquires_total: REGISTRY_PUBLISH_REACQUIRES.load(Ordering::Relaxed),
+        publish_reacquire_wait_ns_total: REGISTRY_PUBLISH_REACQUIRE_WAIT_NS_TOTAL
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -175,6 +204,26 @@ pub fn reset_registry_commit_lock_metrics() {
     REGISTRY_COMMIT_LOCK_IO_NS_TOTAL.store(0, Ordering::Relaxed);
     REGISTRY_COMMIT_LOCK_IO_NS_MAX.store(0, Ordering::Relaxed);
     REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL.store(0, Ordering::Relaxed);
+    REGISTRY_PUBLICATION_WAITS.store(0, Ordering::Relaxed);
+    REGISTRY_PUBLICATION_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
+    REGISTRY_PUBLISH_REACQUIRES.store(0, Ordering::Relaxed);
+    REGISTRY_PUBLISH_REACQUIRE_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+/// Record one publication re-acquisition of the registry guard after an
+/// unlocked physical write (bd-i0tn6), and how long it waited.
+pub fn record_registry_publish_reacquire_wait(wait_ns: u64) {
+    use std::sync::atomic::Ordering;
+    REGISTRY_PUBLISH_REACQUIRES.fetch_add(1, Ordering::Relaxed);
+    REGISTRY_PUBLISH_REACQUIRE_WAIT_NS_TOTAL.fetch_add(wait_ns, Ordering::Relaxed);
+}
+
+/// Record one validation that released the registry guard to wait for a
+/// pending publication (bd-i0tn6), and how long it waited.
+pub fn record_registry_publication_wait(wait_ns: u64) {
+    use std::sync::atomic::Ordering;
+    REGISTRY_PUBLICATION_WAITS.fetch_add(1, Ordering::Relaxed);
+    REGISTRY_PUBLICATION_WAIT_NS_TOTAL.fetch_add(wait_ns, Ordering::Relaxed);
 }
 
 /// Record one commit-path registry guard acquisition: how long the committer
@@ -228,6 +277,93 @@ fn witness_is_page(witness: &WitnessKey, page: PageNumber) -> bool {
 
 /// Stable shared handle for one active concurrent transaction.
 pub type SharedConcurrentHandle = Arc<Mutex<ConcurrentHandle>>;
+
+/// bd-i0tn6: owned receipt for a session marked publication-pending by
+/// [`ConcurrentRegistry::mark_publication_pending`].
+///
+/// Dropping it clears the mark unless the session has already published or
+/// aborted (`mark_committed` / `mark_aborted` clear it themselves), so a
+/// commit whose physical write fails, is retried after `Busy`, or whose future
+/// is dropped returns to an ordinary active transaction: exactly the state it
+/// had before the mark existed. The drop takes only the session handle's own
+/// lock, never the registry mutex, so it is safe on every path, including
+/// while the caller holds the registry guard (registry before handle is the
+/// lock order everywhere). The token is compared, so the lease can never
+/// clear a mark another transaction set on the same handle.
+#[must_use = "dropping the lease clears the publication-pending mark"]
+pub struct PublicationPendingLease {
+    handle: SharedConcurrentHandle,
+    txn_token: TxnToken,
+}
+
+impl std::fmt::Debug for PublicationPendingLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicationPendingLease")
+            .field("txn_token", &self.txn_token)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PublicationPendingLease {
+    fn drop(&mut self) {
+        let cleared = {
+            let mut handle = self.handle.lock();
+            let owned =
+                handle.publication_pending && same_txn_identity(handle.txn_token(), self.txn_token);
+            if owned {
+                handle.publication_pending = false;
+            }
+            owned
+        };
+        if cleared {
+            advance_publication_epoch();
+        }
+    }
+}
+
+// bd-i0tn6: process-wide count of publication-pending marks withdrawn
+// (published, aborted, or lease dropped), with a condvar, so a validator
+// waiting for a peer's pending publication sleeps until one is withdrawn
+// instead of polling the registry. A leaf lock: nothing else is acquired while
+// it is held. Waiters capture the epoch before they test the registry, so a
+// withdrawal after that test is never missed; spurious wakeups (another
+// database, an unrelated session) only cost a re-check.
+static PUBLICATION_EPOCH: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+static PUBLICATION_EPOCH_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn advance_publication_epoch() {
+    {
+        let mut epoch = PUBLICATION_EPOCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *epoch = epoch.wrapping_add(1);
+    }
+    PUBLICATION_EPOCH_CHANGED.notify_all();
+}
+
+/// bd-i0tn6: the current publication epoch; capture it before testing
+/// [`ConcurrentRegistry::pending_publication_blocks`] and pass it to
+/// [`wait_for_publication_epoch_change`].
+#[must_use]
+pub fn publication_epoch() -> u64 {
+    *PUBLICATION_EPOCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// bd-i0tn6: block the calling thread until some publication-pending mark is
+/// withdrawn after `observed` was captured, or `timeout` elapses. Returns
+/// whether the epoch moved. Callers hold no other lock.
+#[must_use]
+pub fn wait_for_publication_epoch_change(observed: u64, timeout: std::time::Duration) -> bool {
+    let guard = PUBLICATION_EPOCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (guard, _timed_out) = PUBLICATION_EPOCH_CHANGED
+        .wait_timeout_while(guard, timeout, |epoch| *epoch == observed)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard != observed
+}
 
 /// Result of first-committer-wins validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +436,14 @@ pub struct ConcurrentHandle {
     /// Pages whose `page_states` entry changed since the cache was built.
     /// Only maintained while a cache exists (a full rebuild ignores it).
     savepoint_snapshot_dirty: PageSet,
+    /// bd-i0tn6: this transaction passed commit validation and its physical
+    /// commit may run without the registry guard, so it is neither active
+    /// (its SSI decision is final) nor published (no `CommitIndex` /
+    /// committed-history entry yet). Later validators must not decide against
+    /// it until it publishes or aborts: see
+    /// [`ConcurrentRegistry::pending_publication_blocks`]. Cleared by
+    /// `mark_committed` / `mark_aborted` and on reuse.
+    publication_pending: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -450,6 +594,7 @@ impl ConcurrentHandle {
             marked_for_abort: Cell::new(false),
             savepoint_snapshot_cache: None,
             savepoint_snapshot_dirty: PageSet::default(),
+            publication_pending: false,
         }
     }
 
@@ -484,6 +629,7 @@ impl ConcurrentHandle {
         self.has_in_rw.set(false);
         self.has_out_rw.set(false);
         self.marked_for_abort.set(false);
+        self.publication_pending = false;
     }
 
     /// Returns the read snapshot for this concurrent transaction.
@@ -598,11 +744,26 @@ impl ConcurrentHandle {
     /// Mark the transaction as committed.
     pub fn mark_committed(&mut self) {
         self.state = TransactionState::Committed;
+        self.clear_publication_pending();
     }
 
     /// Mark the transaction as aborted.
     pub fn mark_aborted(&mut self) {
         self.state = TransactionState::Aborted;
+        self.clear_publication_pending();
+    }
+
+    fn clear_publication_pending(&mut self) {
+        if std::mem::take(&mut self.publication_pending) {
+            advance_publication_epoch();
+        }
+    }
+
+    /// Whether this transaction passed commit validation and awaits
+    /// publication (bd-i0tn6).
+    #[must_use]
+    pub const fn is_publication_pending(&self) -> bool {
+        self.publication_pending
     }
 
     /// Record a page read (for SSI rw-antidependency detection).
@@ -1006,6 +1167,11 @@ pub struct ConcurrentRegistry {
     owner_allocation_domain: Option<OwnerAllocationDomain>,
     /// Epoch counter for locally allocated transaction tokens.
     epoch_counter: u32,
+    /// bd-i0tn6: sessions marked by [`Self::mark_publication_pending`]. Entries
+    /// whose handle has since published, aborted or left the registry are
+    /// dropped lazily by [`Self::retain_pending_publications`], so the scan
+    /// is proportional to commits in flight, not to active sessions.
+    pending_publication_sessions: Vec<u64>,
 }
 
 impl ConcurrentRegistry {
@@ -1031,6 +1197,7 @@ impl ConcurrentRegistry {
             last_owner_id: 0,
             owner_allocation_domain: None,
             epoch_counter: 0,
+            pending_publication_sessions: Vec::new(),
         }
     }
 
@@ -1268,14 +1435,7 @@ impl ConcurrentRegistry {
     fn can_use_uncontended_prepare_fast_path(&self, session_id: u64, begin_seq: CommitSeq) -> bool {
         self.active.len() == 1
             && self.active.contains_key(&session_id)
-            && self
-                .committed_readers
-                .last()
-                .is_none_or(|reader| reader.commit_seq <= begin_seq)
-            && self
-                .committed_writers
-                .last()
-                .is_none_or(|writer| writer.commit_seq <= begin_seq)
+            && self.committed_history_is_at_or_before(begin_seq)
     }
 
     fn can_use_uncontended_finalize_fast_path(
@@ -1285,14 +1445,150 @@ impl ConcurrentRegistry {
     ) -> bool {
         (self.active.is_empty()
             || (self.active.len() == 1 && self.active.contains_key(&session_id)))
-            && self
-                .committed_readers
-                .last()
-                .is_none_or(|reader| reader.commit_seq <= begin_seq)
+            && self.committed_history_is_at_or_before(begin_seq)
+    }
+
+    /// Whether every committed-history entry committed at or before
+    /// `begin_seq`.
+    ///
+    /// bd-i0tn6: history is appended in publication order. Once physical
+    /// commits run outside the registry guard, two commits can publish in the
+    /// opposite order of their commit sequences, so the last entry is not
+    /// necessarily the newest and every entry is checked. When this is asked
+    /// (one active session) pruning has already dropped everything at or
+    /// below the horizon, so the scan stops at the first retained entry.
+    fn committed_history_is_at_or_before(&self, begin_seq: CommitSeq) -> bool {
+        self.committed_readers
+            .iter()
+            .all(|reader| reader.commit_seq <= begin_seq)
             && self
                 .committed_writers
-                .last()
-                .is_none_or(|writer| writer.commit_seq <= begin_seq)
+                .iter()
+                .all(|writer| writer.commit_seq <= begin_seq)
+    }
+
+    /// bd-i0tn6: record that `session_id` passed commit validation and that
+    /// its physical commit may now run without the registry guard.
+    ///
+    /// Until the session publishes ([`finalize_prepared_concurrent_commit_with_ssi`])
+    /// or aborts, [`Self::pending_publication_blocks`] holds back any later
+    /// validator whose read or write set could form an SSI rw-antidependency
+    /// with it. Called under the registry guard right after a successful plan.
+    /// Session ids are never reused and owner ids strictly increase, so the
+    /// token check is an exact-identity receipt: a mismatch changes nothing.
+    /// The returned lease clears the mark when dropped (see
+    /// [`PublicationPendingLease`]); the caller drops it right before it
+    /// publishes, or on any path that does not publish.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidState` when the session is missing, no longer active, or owned
+    /// by a different transaction token.
+    pub fn mark_publication_pending(
+        &mut self,
+        session_id: u64,
+        txn_token: TxnToken,
+    ) -> Result<PublicationPendingLease, MvccError> {
+        let handle = self
+            .active
+            .get(&session_id)
+            .map(Arc::clone)
+            .ok_or(MvccError::InvalidState)?;
+        {
+            let mut guard = handle.lock();
+            if !guard.is_active() || !same_txn_identity(guard.txn_token(), txn_token) {
+                return Err(MvccError::InvalidState);
+            }
+            guard.publication_pending = true;
+        }
+        if !self.pending_publication_sessions.contains(&session_id) {
+            self.pending_publication_sessions.push(session_id);
+        }
+        Ok(PublicationPendingLease { handle, txn_token })
+    }
+
+    /// Drop pending-publication entries whose session has published, aborted
+    /// or left the registry.
+    fn retain_pending_publications(&mut self) {
+        if self.pending_publication_sessions.is_empty() {
+            return;
+        }
+        let active = &self.active;
+        self.pending_publication_sessions.retain(|session_id| {
+            active.get(session_id).is_some_and(|handle| {
+                let handle = handle.lock();
+                handle.is_active() && handle.is_publication_pending()
+            })
+        });
+    }
+
+    /// bd-i0tn6: whether any session other than `except` has passed commit
+    /// validation and not yet published or aborted.
+    ///
+    /// A schema change must not validate in that window: its snapshot can
+    /// miss rows the pending commit is about to publish.
+    pub fn has_pending_publication(&mut self, except: Option<u64>) -> bool {
+        self.retain_pending_publications();
+        self.pending_publication_sessions
+            .iter()
+            .any(|&session_id| Some(session_id) != except)
+    }
+
+    /// bd-i0tn6: whether `session_id` must wait for a pending publication
+    /// before it validates.
+    ///
+    /// A session whose commit is pending publication already made its SSI
+    /// decision; it can neither abort nor learn a new edge. A later validator
+    /// that could form an rw-antidependency with it (its writes against the
+    /// pending session's reads, or its reads against the pending session's
+    /// writes) must therefore wait until that session publishes, after which
+    /// the ordinary committed-history checks apply, exactly as when the
+    /// registry guard covered the physical commit. The test is the page-level
+    /// candidate relation SSI edge discovery itself starts from, with no
+    /// commit-sequence window, so it is a superset of every precise edge.
+    /// Write-write overlap cannot arise here: the pending session keeps its
+    /// page locks until it publishes.
+    #[must_use]
+    pub fn pending_publication_blocks(&mut self, session_id: u64) -> bool {
+        self.retain_pending_publications();
+        if self
+            .pending_publication_sessions
+            .iter()
+            .all(|&pending| pending == session_id)
+        {
+            return false;
+        }
+        let pending_views: Vec<HandleView> = self
+            .pending_publication_sessions
+            .iter()
+            .filter(|&&pending| pending != session_id)
+            .filter_map(|pending| {
+                self.active.get(pending).map(|handle| {
+                    let guard = handle.lock();
+                    HandleView::new(&guard)
+                })
+            })
+            .collect();
+        let Some((token, begin_seq, read_summary, write_summary)) =
+            self.get(session_id).map(|handle| {
+                (
+                    handle.token(),
+                    handle.begin_seq(),
+                    summarize_witness_keys(&handle.read_witness_keys()),
+                    summarize_witness_keys(&handle.write_witness_keys()),
+                )
+            })
+        else {
+            return false;
+        };
+        let index = ActiveEdgeDiscoveryIndex::build(&pending_views);
+        let unbounded = CommitSeq::new(u64::MAX);
+        !index
+            .incoming_candidate_refs(&pending_views, token, begin_seq, unbounded, &write_summary)
+            .is_empty()
+            || !index
+                .outgoing_candidate_refs(&pending_views, token, begin_seq, unbounded, &read_summary)
+                .is_empty()
     }
 
     /// Prune committed SSI history that cannot overlap any active transaction.
@@ -6699,6 +6995,285 @@ mod tests {
             !registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)),
             "committed history newer than the begin sequence must disable the fast path"
         );
+    }
+
+    /// bd-i0tn6: once physical commits run outside the registry guard, history
+    /// can be appended out of commit-sequence order. The fast-path predicates
+    /// must not read the last entry as the newest one.
+    #[test]
+    fn test_uncontended_fast_paths_check_every_history_entry_not_only_the_last() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session");
+        let token = registry.get(session_id).expect("handle").txn_token();
+        assert!(registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)));
+
+        // Published out of order: the newer commit (12) first, the older (9) last.
+        for seq in [12, 9] {
+            registry
+                .committed_writers
+                .push(crate::ssi_validation::CommittedWriterInfo {
+                    token,
+                    commit_seq: CommitSeq::new(seq),
+                    had_out_rw: false,
+                    keys: vec![WitnessKey::Page(test_page(7))],
+                });
+        }
+        assert!(
+            !registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)),
+            "a writer committed at 12 > begin 10 must disable the prepare fast path even when \
+             an older entry was appended after it"
+        );
+        assert!(
+            !registry.can_use_uncontended_finalize_fast_path(session_id, CommitSeq::new(10)),
+            "the finalize fast path must apply the same check"
+        );
+        assert!(
+            registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(12)),
+            "with every entry at or below the begin sequence the fast path is allowed"
+        );
+
+        registry.committed_writers.clear();
+        for seq in [13, 8] {
+            registry
+                .committed_readers
+                .push(crate::ssi_validation::CommittedReaderInfo {
+                    token,
+                    begin_seq: CommitSeq::new(1),
+                    commit_seq: CommitSeq::new(seq),
+                    had_in_rw: false,
+                    keys: vec![WitnessKey::Page(test_page(5))],
+                });
+        }
+        assert!(
+            !registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)),
+            "committed reader history gets the same every-entry check"
+        );
+    }
+
+    #[test]
+    fn test_mark_publication_pending_requires_exact_token_and_lease_drop_clears() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session");
+        let token = registry.get(session_id).expect("handle").txn_token();
+        let other = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("other session");
+        let other_token = registry.get(other).expect("other handle").txn_token();
+
+        assert_eq!(
+            registry
+                .mark_publication_pending(session_id, other_token)
+                .map(|_| ())
+                .unwrap_err(),
+            MvccError::InvalidState,
+            "a token that does not own the session must be refused"
+        );
+        assert!(!registry.get(session_id).unwrap().is_publication_pending());
+        assert!(!registry.has_pending_publication(None));
+        assert_eq!(
+            registry
+                .mark_publication_pending(9_999, token)
+                .map(|_| ())
+                .unwrap_err(),
+            MvccError::InvalidState
+        );
+
+        let lease = registry
+            .mark_publication_pending(session_id, token)
+            .expect("owner may mark its own session");
+        assert!(registry.get(session_id).unwrap().is_publication_pending());
+        assert!(registry.has_pending_publication(None));
+        assert!(registry.has_pending_publication(Some(other)));
+        assert!(
+            !registry.has_pending_publication(Some(session_id)),
+            "a session never waits for its own publication"
+        );
+
+        drop(lease);
+        assert!(!registry.get(session_id).unwrap().is_publication_pending());
+        assert!(
+            !registry.has_pending_publication(None),
+            "dropping the lease withdraws the mark and the registry forgets it"
+        );
+
+        let lease = registry
+            .mark_publication_pending(session_id, token)
+            .unwrap();
+        registry.get_mut(session_id).unwrap().mark_committed();
+        assert!(!registry.has_pending_publication(None));
+        drop(lease);
+
+        let aborted = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let aborted_token = registry.get(aborted).unwrap().txn_token();
+        let lease = registry
+            .mark_publication_pending(aborted, aborted_token)
+            .unwrap();
+        registry.get_mut(aborted).unwrap().mark_aborted();
+        assert!(!registry.has_pending_publication(None));
+        assert!(
+            registry
+                .mark_publication_pending(aborted, aborted_token)
+                .is_err(),
+            "an aborted session cannot be marked"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn test_withdrawn_publication_wakes_a_waiter_and_an_unrelated_one_does_not() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let token = registry.get(session_id).unwrap().txn_token();
+        let lease = registry
+            .mark_publication_pending(session_id, token)
+            .unwrap();
+        // The epoch is process-wide and other tests may move it; the check
+        // that matters is that this lease's drop wakes a waiter promptly (a
+        // drop that does not notify leaves it asleep for the full timeout).
+        let observed = super::publication_epoch();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let moved = super::wait_for_publication_epoch_change(
+                observed,
+                std::time::Duration::from_secs(30),
+            );
+            (moved, started.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(lease);
+        let (moved, waited) = waiter.join().unwrap();
+        assert!(
+            moved,
+            "dropping the lease must advance the publication epoch"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the waiter must be woken, not time out ({waited:?})"
+        );
+        let after_drop = super::publication_epoch();
+        // A session committed while pending (finalize without the lease)
+        // advances the epoch too.
+        let other = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let other_token = registry.get(other).unwrap().txn_token();
+        let other_lease = registry
+            .mark_publication_pending(other, other_token)
+            .unwrap();
+        registry.get_mut(other).unwrap().mark_committed();
+        assert_ne!(super::publication_epoch(), after_drop);
+        drop(other_lease);
+    }
+
+    #[test]
+    fn test_publication_lease_drop_never_clears_another_transactions_mark() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let token = registry.get(session_id).unwrap().txn_token();
+        let lease = registry
+            .mark_publication_pending(session_id, token)
+            .unwrap();
+        let handle = registry.handle(session_id).unwrap();
+        {
+            // The handle object now belongs to a different transaction that
+            // has marked itself pending (what reuse would look like).
+            let mut guard = handle.lock();
+            guard.reset_for_new_transaction(test_snapshot(11), test_token(77));
+            guard.publication_pending = true;
+        }
+        drop(lease);
+        assert!(
+            handle.lock().is_publication_pending(),
+            "a stale lease must leave the new owner's mark in place"
+        );
+    }
+
+    #[test]
+    fn test_pending_publication_blocks_only_validators_that_could_share_an_rw_edge() {
+        let mut registry = ConcurrentRegistry::new();
+        let pending = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(pending).unwrap();
+            handle.record_read(test_page(5));
+            handle.record_write_witness(WitnessKey::Page(test_page(7)));
+        }
+        let reads_pending_write = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        registry
+            .get_mut(reads_pending_write)
+            .unwrap()
+            .record_read(test_page(7));
+        let writes_pending_read = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        registry
+            .get_mut(writes_pending_read)
+            .unwrap()
+            .record_write_witness(WitnessKey::Page(test_page(5)));
+        let read_read_only = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(read_read_only).unwrap();
+            handle.record_read(test_page(5));
+            handle.record_write_witness(WitnessKey::Page(test_page(9)));
+        }
+        let disjoint = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(disjoint).unwrap();
+            handle.record_read(test_page(11));
+            handle.record_write_witness(WitnessKey::Page(test_page(12)));
+        }
+
+        let validators = [
+            reads_pending_write,
+            writes_pending_read,
+            read_read_only,
+            disjoint,
+        ];
+        for session in validators {
+            assert!(
+                !registry.pending_publication_blocks(session),
+                "nothing is pending yet"
+            );
+        }
+
+        let token = registry.get(pending).unwrap().txn_token();
+        let lease = registry.mark_publication_pending(pending, token).unwrap();
+        assert!(
+            registry.pending_publication_blocks(reads_pending_write),
+            "reading a page the pending session wrote can form an rw-edge into it"
+        );
+        assert!(
+            registry.pending_publication_blocks(writes_pending_read),
+            "writing a page the pending session read can form an rw-edge out of it"
+        );
+        assert!(
+            !registry.pending_publication_blocks(read_read_only),
+            "a shared read is not an rw-antidependency; must not wait"
+        );
+        assert!(
+            !registry.pending_publication_blocks(disjoint),
+            "a disjoint validator must not wait"
+        );
+        assert!(
+            !registry.pending_publication_blocks(pending),
+            "the pending session never waits for itself"
+        );
+
+        drop(lease);
+        for session in validators {
+            assert!(
+                !registry.pending_publication_blocks(session),
+                "after the mark is withdrawn nobody waits"
+            );
+        }
+
+        let lease = registry.mark_publication_pending(pending, token).unwrap();
+        assert!(registry.pending_publication_blocks(reads_pending_write));
+        registry.get_mut(pending).unwrap().mark_committed();
+        assert!(
+            !registry.pending_publication_blocks(reads_pending_write),
+            "a published session is ordinary committed history"
+        );
+        drop(lease);
     }
 
     #[test]

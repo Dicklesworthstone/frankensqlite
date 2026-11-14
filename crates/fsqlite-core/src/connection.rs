@@ -285,16 +285,17 @@ use fsqlite_mvcc::SsiReadSetSummary;
 use fsqlite_mvcc::{
     CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentRowIdAllocator,
     ConcurrentSavepoint, FcwResult, FlatCombiningMetrics, GcScheduler, GcTickResult, GcTodo,
-    InProcessPageLockTable, MvccError, PreparedConcurrentCommit, RowidAllocSavepointMark,
-    SharedConcurrentHandle, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery,
+    InProcessPageLockTable, MvccError, PreparedConcurrentCommit, PublicationPendingLease,
+    RowidAllocSavepointMark, SharedConcurrentHandle, SsiDecisionCard, SsiDecisionCardDraft,
+    SsiDecisionQuery,
     SsiDecisionType, SsiEProcessConfig, SsiEProcessGate, SsiEProcessSnapshot, SsiEvidenceLedger,
     VersionStore, concurrent_abort, concurrent_clear_page_state, concurrent_commit_read_only,
     concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_track_write_conflict_page,
     finalize_prepared_concurrent_commit_with_ssi, flat_combining_metrics,
     morsel_parallel_insert::MorselScheduler, prepare_concurrent_commit_fcw_only,
-    prepare_concurrent_commit_with_ssi, record_registry_commit_lock_hold,
+    prepare_concurrent_commit_with_ssi, publication_epoch, record_registry_commit_lock_hold,
     record_registry_commit_lock_hold_decomposed, record_registry_commit_lock_wait,
-    ssi_metrics_snapshot,
+    record_registry_publication_wait, ssi_metrics_snapshot, wait_for_publication_epoch_change,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 #[cfg(feature = "diagnostic-pragmas")]
@@ -65630,36 +65631,81 @@ impl Connection {
         // began.
         let serialized_schema_change =
             ok && !is_concurrent_txn && txn_has_pending_writes && schema_change_boundary;
+        // bd-i0tn6: validation first waits out any pending publication it must
+        // observe (see `lock_registry_for_commit_validation`); a cancelled wait
+        // takes the plan-failure path below.
+        let mut registry_validation_error = None;
         let mut commit_registry_guard =
             if (ok && is_concurrent_txn && txn_has_pending_writes) || serialized_schema_change {
-                Some(lock_registry_for_commit(&self.concurrent_registry))
+                let validation_session_id = if is_concurrent_txn {
+                    *self.concurrent_session_id.borrow()
+                } else {
+                    None
+                };
+                match self
+                    .lock_registry_for_commit_validation(
+                        cx,
+                        validation_session_id,
+                        schema_change_boundary,
+                    )
+                    .await
+                {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        registry_validation_error = Some(error);
+                        None
+                    }
+                }
             } else {
                 None
             };
+        // bd-i0tn6: the publication-pending mark of a successful plan, dropped
+        // right before publication or on any exit that does not publish.
+        let mut publication_lease: Option<PublicationPendingLease> = None;
         // `failed_commit_rollback`: Some(rollback succeeded) when a transaction
         // with pending writes was rolled back instead of committed.
         let (txn_result, committed_write, failed_commit_rollback) = if ok {
-            let concurrent_plan = if let Some(registry) = commit_registry_guard.as_mut() {
-                let planned = if is_concurrent_txn {
-                    self.plan_concurrent_commit_with_registry(
-                        registry,
-                        &pending_conflict_pages,
-                        schema_change_boundary,
-                    )
-                } else if self.concurrent_write_generation.load(AtomicOrdering::Acquire)
-                    != self.concurrent_begin_write_generation.get()
+            let concurrent_plan = if commit_registry_guard.is_some()
+                || registry_validation_error.is_some()
+            {
+                let planned = match (commit_registry_guard.as_mut(), registry_validation_error.take())
                 {
-                    Err(FrankenError::BusySnapshot {
-                        conflicting_pages: String::new(),
-                    })
-                } else {
-                    Ok(None)
+                    (_, Some(error)) => Err(error),
+                    (None, None) => Ok(None),
+                    (Some(registry), None) => {
+                        if is_concurrent_txn {
+                            self.plan_concurrent_commit_with_registry(
+                                registry,
+                                &pending_conflict_pages,
+                                schema_change_boundary,
+                            )
+                            .and_then(|plan| {
+                                if let Some(plan) = plan.as_ref() {
+                                    publication_lease =
+                                        Some(Self::mark_concurrent_commit_publication_pending(
+                                            registry, plan,
+                                        )?);
+                                }
+                                Ok(plan)
+                            })
+                        } else if self.concurrent_write_generation.load(AtomicOrdering::Acquire)
+                            != self.concurrent_begin_write_generation.get()
+                        {
+                            Err(FrankenError::BusySnapshot {
+                                conflicting_pages: String::new(),
+                            })
+                        } else {
+                            Ok(None)
+                        }
+                    }
                 };
                 match planned {
                     Ok(plan) => {
                         // End of the under-lock validate/reserve phase. The
                         // physical write follows while this guard remains held.
-                        registry.mark_validate_done();
+                        if let Some(registry) = commit_registry_guard.as_mut() {
+                            registry.mark_validate_done();
+                        }
                         plan
                     }
                     Err(e) => {
@@ -65980,6 +66026,9 @@ impl Connection {
                             let registry = commit_registry_guard.as_mut().expect(
                                 "concurrent commit plan present implies the registry guard is held",
                             );
+                            // bd-i0tn6: withdraw the pending mark under the
+                            // guard, immediately before publication.
+                            drop(publication_lease.take());
                             let commit_card = self.finalize_concurrent_commit_with_registry(
                                 registry,
                                 plan,
@@ -66037,6 +66086,10 @@ impl Connection {
                     // registry, to avoid a self-deadlock on the
                     // physical-write-failure path.
                     drop(commit_registry_guard.take());
+                    // bd-i0tn6: a commit that did not reach durability never
+                    // publishes; withdraw its pending mark and release the
+                    // handle before the session is aborted and recycled.
+                    drop(publication_lease.take());
                     self.txn_metrics_note_rollback();
                     let rollback_result = txn.rollback(cx).await;
                     let rollback_succeeded = rollback_result.is_ok();
@@ -78819,6 +78872,73 @@ impl Connection {
         Ok(())
     }
 
+    /// bd-i0tn6: take the registry guard for commit validation, first waiting
+    /// out every pending publication this commit must observe.
+    ///
+    /// A pending publication is a peer that passed validation and whose
+    /// physical commit may run without the guard (see
+    /// `ConcurrentRegistry::pending_publication_blocks`). A concurrent commit
+    /// (`session_id` set) waits for a pending peer it could form an SSI
+    /// rw-antidependency with; a schema change (`schema_change`) waits for
+    /// every pending peer, because its snapshot can miss rows that peer is
+    /// about to publish. The guard is never held across the wait, which lasts
+    /// until the peer publishes or aborts or this operation is cancelled: the
+    /// same wait a committer had for the guard itself while the guard covered
+    /// the physical write. The thread sleeps on the publication-epoch condvar
+    /// in short slices (a pending write lasts about 0.1-1 ms), so it wakes
+    /// when a mark is withdrawn rather than on a polling timer, and it checks
+    /// cancellation and yields between slices.
+    async fn lock_registry_for_commit_validation(
+        &self,
+        cx: &Cx,
+        session_id: Option<u64>,
+        schema_change: bool,
+    ) -> Result<TimedRegistryCommitGuard<'_>> {
+        const PUBLICATION_WAIT_SLICE: Duration = Duration::from_millis(1);
+        let mut wait_started: Option<Instant> = None;
+        loop {
+            let mut registry = lock_registry_for_commit(&self.concurrent_registry);
+            // Captured before the test: a mark withdrawn after it moves the
+            // epoch, so the wait below cannot miss it.
+            let epoch = publication_epoch();
+            let blocked = if schema_change {
+                registry.has_pending_publication(session_id)
+            } else {
+                session_id.is_some_and(|session_id| registry.pending_publication_blocks(session_id))
+            };
+            if !blocked {
+                if let Some(started) = wait_started {
+                    record_registry_publication_wait(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                }
+                return Ok(registry);
+            }
+            drop(registry);
+            wait_started.get_or_insert_with(Instant::now);
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            if !wait_for_publication_epoch_change(epoch, PUBLICATION_WAIT_SLICE) {
+                asupersync::runtime::yield_now().await;
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            }
+        }
+    }
+
+    /// bd-i0tn6: mark a successfully planned concurrent commit as pending
+    /// publication, under the registry guard that planned it.
+    fn mark_concurrent_commit_publication_pending(
+        registry: &mut ConcurrentRegistry,
+        plan: &PreparedConcurrentCommit,
+    ) -> Result<PublicationPendingLease> {
+        registry
+            .mark_publication_pending(plan.session_id(), plan.txn_token())
+            .map_err(|error| {
+                FrankenError::Internal(format!(
+                    "concurrent commit plan lost its session before publication was reserved: {error}"
+                ))
+            })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn plan_concurrent_commit_with_registry(
         &self,
@@ -79480,12 +79600,29 @@ impl Connection {
             // snapshot that misses the peer's rows.
             let serialized_write = !is_concurrent_txn && txn_has_pending_writes;
             let serialized_schema_change = serialized_write && schema_cookie_to_publish.is_some();
+            // bd-i0tn6: validation waits out any pending publication it must
+            // observe before it holds the guard (see
+            // `lock_registry_for_commit_validation`).
+            let validation_session_id = if is_concurrent_txn {
+                *self.concurrent_session_id.borrow()
+            } else {
+                None
+            };
+            let validation_is_schema_change = schema_cookie_to_publish.is_some();
             let mut commit_registry_guard =
                 if (is_concurrent_txn && txn_has_pending_writes) || serialized_write {
-                    Some(lock_registry_for_commit(&self.concurrent_registry))
+                    Some(
+                        self.lock_registry_for_commit_validation(
+                            cx,
+                            validation_session_id,
+                            validation_is_schema_change,
+                        )
+                        .await?,
+                    )
                 } else {
                     None
                 };
+            let commit_uses_registry = commit_registry_guard.is_some();
             if serialized_schema_change
                 && self.concurrent_write_generation.load(AtomicOrdering::Acquire)
                     != self.concurrent_begin_write_generation.get()
@@ -79494,6 +79631,10 @@ impl Connection {
                     conflicting_pages: String::new(),
                 });
             }
+            // bd-i0tn6: the publication-pending mark of a successful plan,
+            // dropped right before publication or on any exit that does not
+            // publish (failed physical write, Busy retry, dropped future).
+            let mut publication_lease: Option<PublicationPendingLease> = None;
             let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard
                 .as_mut()
                 .filter(|_| is_concurrent_txn)
@@ -79503,6 +79644,10 @@ impl Connection {
                     &pending_conflict_pages,
                     schema_cookie_to_publish.is_some(),
                 )?;
+                if let Some(plan) = plan.as_ref() {
+                    publication_lease =
+                        Some(Self::mark_concurrent_commit_publication_pending(registry, plan)?);
+                }
                 // End of the under-lock validate/reserve phase. The physical
                 // write follows while this guard remains held.
                 registry.mark_validate_done();
@@ -79575,8 +79720,12 @@ impl Connection {
                         // conflicting page during the back-off, the re-plan observes
                         // it via the CommitIndex and aborts first-committer-wins
                         // (which the caller treats as a transient retry).
-                        let reacquire_registry = commit_registry_guard.is_some();
                         drop(commit_registry_guard.take());
+                        // bd-i0tn6: a commit backing off after Busy is not
+                        // about to publish; withdraw its publication-pending
+                        // mark so peers do not wait on it, and re-mark after
+                        // the re-plan below.
+                        drop(publication_lease.take());
                         if let Err(error) = perform_begin_busy_retry_handoff(cx, wait).await {
                             // Preserve the normal physical-outcome decision;
                             // the active transaction remains available for
@@ -79584,14 +79733,27 @@ impl Connection {
                             commit_res = Err(error);
                             break;
                         }
-                        if reacquire_registry {
-                            let mut registry = lock_registry_for_commit(&self.concurrent_registry);
+                        if commit_uses_registry {
+                            let mut registry = self
+                                .lock_registry_for_commit_validation(
+                                    cx,
+                                    validation_session_id,
+                                    validation_is_schema_change,
+                                )
+                                .await?;
                             if is_concurrent_txn {
                                 concurrent_commit_plan = self.plan_concurrent_commit_with_registry(
                                     &mut registry,
                                     &pending_conflict_pages,
                                     schema_cookie_to_publish.is_some(),
                                 )?;
+                                if let Some(plan) = concurrent_commit_plan.as_ref() {
+                                    publication_lease =
+                                        Some(Self::mark_concurrent_commit_publication_pending(
+                                            &mut registry,
+                                            plan,
+                                        )?);
+                                }
                             } else if serialized_schema_change
                                 && self.concurrent_write_generation.load(AtomicOrdering::Acquire)
                                     != self.concurrent_begin_write_generation.get()
@@ -79777,6 +79939,11 @@ impl Connection {
                     let registry = commit_registry_guard.as_mut().expect(
                         "concurrent commit plan present implies the registry guard is held",
                     );
+                    // bd-i0tn6: withdraw the pending mark under the guard,
+                    // immediately before publication; no validator can run in
+                    // between, and the lease must release the handle so the
+                    // finalizer can recycle it.
+                    drop(publication_lease.take());
                     let commit_card = self.finalize_concurrent_commit_with_registry(
                         registry,
                         plan,
