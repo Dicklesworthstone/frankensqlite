@@ -87,6 +87,71 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN (small): concurrent validations share each peer's SSI view parts until the peer changes (bd-i0tn6 scaling lever 2)
+
+- Target: the registry-guard holds of concurrent commits at 8-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`, separate and shared tables). Touched:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (`HandleViewParts`, `ConcurrentHandle::
+  view_parts_cache` / `view_parts` / `invalidate_view_parts`, `HandleView` derefs to shared
+  parts). The bench stage profiler in `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` landed in the
+  same batch.
+- Ledger preflight: lever 1 below (two fewer registry acquisitions, REJECTED: the O(N) holds
+  bind); the HashSet-to-sorted-Vec rewrite of `HandleView` (bd-m4s2c era) made the build cheaper,
+  not rarer. Nothing earlier caches views across validations.
+- Evidence before (bd-i0tn6 bead comment 2026-11-14, hold-split probe on c6f5c57f3): each
+  validation and each publication locked every registered peer and rebuilt its view
+  (`HandleView::new`, about 0.4 us per peer, allocating). That was 20% of the two holds at 16
+  writers, 24% at 32 and 27% at 64. The committed-history index rebuild in prune was 13-23% (38%
+  on the shared table at 32 writers); it is left for the next lever.
+- Change: the witness-derived vectors of a view live in an `Arc<HandleViewParts>` cached on the
+  handle. It is built on the first view after a change and shared until the next one. Identity,
+  flags and rw bits stay fresh per view. Every mutation that can change the parts drops the cache:
+  `record_read`, `record_read_witness`, `record_write_witness`, `ensure_page_state`,
+  `remove_page_state_if_empty`, `concurrent_clear_page_state`, `concurrent_mark_metadata_exempt`,
+  the page-state replacement in `concurrent_rollback_to_savepoint`, `reset_for_new_transaction`.
+- Prediction (bead comment, before code): registry hold at 32w down >= 15%; separate 16w +8% to
+  +20%, 32w and 64w +12% to +25%, 8w +2% to +8%, 1w within 2%; shared 16-32w +3% to +12%. Kill:
+  separate 32w or 64w below 1.05 in either rep, 1w worse than -2%, 8w worse than -3%, 32w hold
+  reduction below 10%, any worker failure, any SSI keeper red.
+- Result (mt-mvcc-bench, stock live in every run, interleaved A B; A = c6f5c57f3 + stage profiler
+  (mtbench-pv3), B = A + this change (mtbench-vc1), sha256 in the run metas; thinkstation1, 64
+  threads, powersave, tmpfs, NORMAL; host load 5-7 from other lanes). B/A with F/C A -> B:
+  - one row per transaction, separate tables, 2 reps: 1w 1.01x (0.088 -> 0.084), 2w 1.01x, 4w
+    1.02x, 8w 1.05x (0.309 -> 0.342), 16w 1.06x (0.304 -> 0.300), 32w 1.10x (0.214 -> 0.194,
+    1.10x in each rep), 64w 1.09x (0.112 -> 0.134; 1.08x and 1.09x).
+  - shared table, 2 reps: 1w 0.92x (the same one-writer workload read 1.01x in the separate runs),
+    2w 1.01x, 4w 1.09x, 8w 1.02x, 16w 1.04x, 32w 0.97x.
+  - one writer, 2,000 rows, 11 rounds, 3 reps: 0.99x (0.076 -> 0.075).
+  - bulk (1,000 rows per transaction): separate 1.03-1.11x at 1-32w; 64w read 0.86x in 2 reps and
+    1.06x (151.5k -> 160.3k) in 3 focused reps. Shared 0.98-1.11x except 2w 0.56x. The 2w
+    bulk-shared round time is bimodal (about 360k or 190k wps) in both arms. Which mode a run lands
+    in follows which writer loses the rightmost-leaf race: the bench retry jitter is (tid * 7 +
+    attempt * 3) % 5 ms, so thread 0's first retry sleeps 4 ms and thread 1's 1 ms. A ran fast in
+    4 of 5 runs and B ran slow in 5 of 5, with the same per-round engine work in both (one page-lock
+    wait of about 2 ms, one retry, equal registry holds). Recorded as a bench mode artifact,
+    not shown to be the engine.
+  - registry hold (validate + publish) per commit, A -> B: 8w 28.6 -> 24.7 us, 16w 45.4 -> 44.4,
+    32w 90.8 -> 80.8 (-11%), 64w 159.9 -> 143.3 (-10%).
+  - worker failures: bulk shared 64w hit the SSI abort storm (60 transactions out of retry budget)
+    in 1 of 6 runs per arm, A and B alike; no other failure.
+  The kill lines are not hit. The gain is below the predicted band at 16-64 writers (+6 / +10 / +9%
+  against +8-20 / +12-25%), because the remaining hold is the prune rebuild, the index builds and
+  the per-peer lock and clone. Tests: the cached parts equal a fresh build after every mutation
+  kind; views share one Arc until a change; a write skew whose operations follow a commit that
+  cached both peers still aborts the first committer as the pivot. All three fail with a cache that
+  is never dropped (checked).
+- Gate (on c6f5c57f3 + this batch, rch): clippy -D warnings mvcc/core/e2e all targets;
+  fsqlite-mvcc lib 1,679 pass; keepers k1-k3 and e1-e3 (the SSI / snapshot-isolation and
+  concurrent-writer targets: ssi_write_skew, ssi_conflict_oracle_e2e,
+  bd_3plop_5_ssi_serialization_correctness, bd_2yqp6_6_1_ssi_serialization_anomaly_differential,
+  correctness_mvcc_isolation, mvcc_edge_case_oracle_e2e and the rest) green; fsqlite-core lib 4,180
+  pass with only the 2 known test_t6741 reds.
+- Retry condition for the residual: the committed-history rebuild in
+  `prune_committed_conflict_history` re-summarizes every retained entry on every commit; it is the
+  next item, then `ActiveEdgeDiscoveryIndex::build`. History lengths feed
+  `evaluate_prepare_t3_dro` (which active pivots finalize marks for abort early), so making
+  pruning lazy changes that input; account for it first.
+
 ## 2026-11-14 - WIN: a leaner column decode in the parallel aggregate kernel, which brings its CPU to stock's on scan_filter_agg (bd-w4pr1.13.11 kernel lever K3)
 
 - Target: the per-row column decode of the parallel ungrouped-aggregate kernel after K2 (above):
