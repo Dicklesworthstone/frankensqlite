@@ -27,7 +27,8 @@ use fsqlite_btree::snapshot_walk::{LeafPage, ParallelWalk, WalkOutcome, split_su
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::{SnapshotPageBuf, SnapshotPageReader};
 use fsqlite_types::record::{
-    ColumnOffset, decode_column_from_offset_with_encoding, decode_scalar_value,
+    ColumnOffset, NumericColumnValue, decode_column_from_offset_with_encoding,
+    decode_numeric_column_from_offset, decode_scalar_value,
 };
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{PageNumber, TextEncoding};
@@ -233,6 +234,30 @@ impl AggState {
     }
 }
 
+/// Where a plan column comes from, resolved once per walk: the rowid (or
+/// the INTEGER PRIMARY KEY column, its alias), or a declared column with
+/// whether the table declares it REAL.
+#[derive(Debug, Clone, Copy)]
+enum ColumnSource {
+    Rowid,
+    Declared { idx: usize, real: bool },
+}
+
+impl ColumnSource {
+    fn resolve(column: ScanColumn, shape: &TableShape) -> Self {
+        match column {
+            ScanColumn::Declared(idx) if shape.ipk_col_idx != Some(idx) => Self::Declared {
+                idx,
+                real: shape
+                    .real_columns
+                    .as_deref()
+                    .is_some_and(|real| real.get(idx).copied().unwrap_or(false)),
+            },
+            _ => Self::Rowid,
+        }
+    }
+}
+
 /// One plan column of the current row, as the serial `Column` opcode would
 /// have decoded it. A NULL, INTEGER or REAL is held in the cell itself, so a
 /// row's cells reset without running any destructor; a TEXT, BLOB or other
@@ -246,11 +271,13 @@ enum ColumnCell {
     Wide,
 }
 
-/// One thread's scratch: the current record's column table, its decoded
-/// plan columns (`cells`, with the TEXT and BLOB values in `wide`), and room
-/// to reassemble a payload that spills onto overflow pages.
+/// One thread's scratch: the current record's column table, where each plan
+/// column comes from, its decoded plan columns (`cells`, with the TEXT and
+/// BLOB values in `wide`), and room to reassemble a payload that spills onto
+/// overflow pages.
 struct RowScratch {
     layout: RecordColumnTable,
+    sources: Vec<ColumnSource>,
     cells: Vec<Option<ColumnCell>>,
     wide: Vec<SqliteValue>,
     includes_rowid_alias: Option<bool>,
@@ -276,10 +303,16 @@ pub fn run_parallel_aggregate(
         workers,
         stop,
     };
+    let sources: Vec<ColumnSource> = plan
+        .columns
+        .iter()
+        .map(|&column| ColumnSource::resolve(column, shape))
+        .collect();
     let outcome = walk.run(
         &split,
         || RowScratch {
             layout: RecordColumnTable::default(),
+            sources: sources.clone(),
             cells: vec![None; plan.columns.len()],
             wide: vec![SqliteValue::Null; plan.columns.len()],
             includes_rowid_alias: None,
@@ -340,6 +373,7 @@ fn scan_leaf(
         })?;
         let RowScratch {
             layout,
+            sources,
             cells,
             wide,
             includes_rowid_alias,
@@ -361,7 +395,7 @@ fn scan_leaf(
         cells.fill(None);
         *includes_rowid_alias = None;
         let mut row = Row {
-            plan,
+            sources,
             shape,
             rowid,
             record,
@@ -493,7 +527,7 @@ fn reassemble_payload(
 
 /// One row being folded: its record and the plan columns decoded so far.
 struct Row<'a> {
-    plan: &'a ParallelAggregatePlan,
+    sources: &'a [ColumnSource],
     shape: &'a TableShape,
     rowid: i64,
     record: &'a [u8],
@@ -505,6 +539,10 @@ struct Row<'a> {
 
 impl Row<'_> {
     /// Plan column `column`, decoded as the serial `Column` opcode decodes it.
+    /// Forced inline so that the cache check runs in each caller: LLVM kept
+    /// it a call under `#[inline]`, which cost a call frame per row.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn cell(&mut self, column: usize) -> Result<ColumnCell> {
         if let Some(cell) = self.cells[column] {
             return Ok(cell);
@@ -540,14 +578,11 @@ impl Row<'_> {
     }
 
     fn decode(&mut self, column: usize) -> Result<ColumnCell> {
-        let idx = match self.plan.columns[column] {
-            ScanColumn::Rowid => return Ok(ColumnCell::Int(self.rowid)),
-            ScanColumn::Declared(idx) => idx,
+        let (idx, real) = match self.sources[column] {
+            ColumnSource::Rowid => return Ok(ColumnCell::Int(self.rowid)),
+            ColumnSource::Declared { idx, real } => (idx, real),
         };
         let shape = self.shape;
-        if shape.ipk_col_idx == Some(idx) {
-            return Ok(ColumnCell::Int(self.rowid));
-        }
         let includes_alias = match shape.ipk_col_idx {
             None => false,
             Some(ipk) => {
@@ -585,21 +620,19 @@ impl Row<'_> {
             let value = shape.defaults.get(idx).cloned().flatten();
             return Ok(self.hold(column, value.unwrap_or(SqliteValue::Null)));
         };
-        let bytes = column_bytes(self.record, &col, self.rowid)?;
-        Ok(match decode_scalar_value(col.serial_type, bytes) {
-            Some(SqliteValue::Integer(stored)) => {
-                if shape
-                    .real_columns
-                    .as_deref()
-                    .is_some_and(|real| real.get(idx).copied().unwrap_or(false))
-                {
-                    ColumnCell::Float(stored as f64)
-                } else {
-                    ColumnCell::Int(stored)
-                }
-            }
-            Some(value) => self.hold(column, value),
+        // NULL, the reserved serial types and a NaN REAL read as NULL here
+        // as in the general decoder; TEXT and BLOB take the general decoder.
+        Ok(match decode_numeric_column_from_offset(self.record, &col) {
+            Some(NumericColumnValue::Integer(stored)) if real => ColumnCell::Float(stored as f64),
+            Some(NumericColumnValue::Integer(stored)) => ColumnCell::Int(stored),
+            Some(NumericColumnValue::Float(v)) => ColumnCell::Float(v),
+            Some(NumericColumnValue::Null) => ColumnCell::Null,
             None => {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("record of row {} is shorter than its header", self.rowid),
+                });
+            }
+            Some(NumericColumnValue::NonNumeric) => {
                 let value = decode_column_from_offset_with_encoding(
                     self.record,
                     &col,

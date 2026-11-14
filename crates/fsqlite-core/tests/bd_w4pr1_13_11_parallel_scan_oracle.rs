@@ -608,6 +608,10 @@ fn parallel_aggregates_read_every_serial_type_as_the_column_opcode_does() {
             "SELECT count(*), min(w), max(w) FROM k WHERE w = '600';",
             "SELECT count(*), min(z) FROM k WHERE z > '5';",
             "SELECT count(*), max(z) FROM k WHERE '5' < z;",
+            // One plan reading the REAL column, an INTEGER column and the
+            // INTEGER PRIMARY KEY: each column keeps its own source and class.
+            "SELECT count(*), min(x), max(z), sum(id) FROM k WHERE x <= 1 AND z <> 0;",
+            "SELECT min(id), max(x), min(z), count(w) FROM k WHERE z > 0 OR x < 1;",
         ] {
             let threads = same_at_every_worker_count(&f, &r, sql).await;
             assert!(took_parallel_path(threads), "`{sql}` did not run in parallel: {threads:?}");
