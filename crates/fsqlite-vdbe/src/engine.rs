@@ -1569,6 +1569,43 @@ type SorterBlob = smallvec::SmallVec<[u8; SORTER_BLOB_INLINE_LEN]>;
 /// A sorter row's decoded sort key. A one-column key stays inside the row.
 type SorterKeyValues = smallvec::SmallVec<[SqliteValue; 1]>;
 
+/// A set of cursor ids, for the few cursors a program holds at once.
+///
+/// It replaces a `HashSet<i32>` whose two hashed probes per deleted row (the
+/// `Delete`'s insert, ~110 instructions, and the next `Next`'s remove) cost
+/// more than a linear scan of a handful of ids (bd-w4pr1.13.20, lever D). The
+/// operations return what `HashSet`'s do.
+#[derive(Debug, Default)]
+struct CursorIdSet(smallvec::SmallVec<[i32; 4]>);
+
+impl CursorIdSet {
+    /// Add `id`; `false` when it was already present.
+    fn insert(&mut self, id: i32) -> bool {
+        if self.0.contains(&id) {
+            return false;
+        }
+        self.0.push(id);
+        true
+    }
+
+    /// Remove `id`; `false` when it was absent.
+    fn remove(&mut self, id: i32) -> bool {
+        let Some(at) = self.0.iter().position(|&held| held == id) else {
+            return false;
+        };
+        self.0.swap_remove(at);
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// Cursor state for sorter opcodes (`SorterOpen`, `SorterInsert`, ...).
 ///
 /// Supports external merge sort: when in-memory rows exceed `spill_threshold`
@@ -7622,7 +7659,7 @@ pub struct VdbeEngine {
     writable_storage_cursor_opened: bool,
     /// Cursors that deleted the current row and should treat the next `Next`
     /// as a no-advance "consume successor" step.
-    pending_next_after_delete: HashSet<i32>,
+    pending_next_after_delete: CursorIdSet,
     /// Whether `OpenRead`/`OpenWrite` should route through storage-backed cursors.
     storage_cursors_enabled: bool,
     /// Whether `OP_Close` should keep storage cursors alive for reusable DML.
@@ -8383,7 +8420,7 @@ impl VdbeEngine {
             storage_cursors: CursorSlots::new(),
             parked_read_cursor_ids: Vec::new(),
             writable_storage_cursor_opened: false,
-            pending_next_after_delete: HashSet::new(),
+            pending_next_after_delete: CursorIdSet::default(),
             storage_cursors_enabled: true,
             retain_storage_cursors_on_close: false,
             txn_page_io: None,
@@ -11936,7 +11973,7 @@ impl VdbeEngine {
                     }
                     let cursor_id = op.p1;
                     let root_page = op.p2;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     if op.p3 == 1 {
                         let has_temp_root = self
                             .db
@@ -11998,7 +12035,7 @@ impl VdbeEngine {
                     }
                     let cursor_id = op.p1;
                     let root_page = op.p2;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     if op.p3 == 1 {
                         let has_temp_root = self
                             .db
@@ -12029,7 +12066,7 @@ impl VdbeEngine {
                 Opcode::OpenEphemeral => {
                     // Ephemeral table: create an in-memory table on-the-fly.
                     let cursor_id = op.p1;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let num_cols = op.p2.max(1);
                     if let Some(db) = self.db.as_mut() {
                         let root_page = db.create_table(num_cols as usize);
@@ -12048,7 +12085,7 @@ impl VdbeEngine {
                     // is_table=false so IdxInsert/IdxGE etc. work correctly.
                     let autoindex_page_size = self.page_size.get();
                     let cursor_id = op.p1;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let root_pgno = if let Some(db) = self.db.as_mut() {
                         let rp = db.allocate_root_page();
                         PageNumber::new(rp as u32)
@@ -12129,7 +12166,7 @@ impl VdbeEngine {
 
                 Opcode::OpenPseudo => {
                     let cursor_id = op.p1;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     self.storage_cursors.remove(&cursor_id);
                     self.cursors.insert(cursor_id, MemCursor::new_pseudo(op.p2));
                     pc += 1;
@@ -12142,7 +12179,7 @@ impl VdbeEngine {
 
                 Opcode::SorterOpen => {
                     let cursor_id = op.p1;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let key_columns = usize::try_from(op.p2.max(1)).unwrap_or(1);
                     let top_n_from_register = (op.p5 & SORTER_OPEN_TOP_N_REGISTER) != 0;
                     let top_n_bound = if top_n_from_register {
@@ -12253,7 +12290,7 @@ impl VdbeEngine {
                     if let Some(cold_state) = self.cold_state_mut() {
                         cold_state.vtab_cursors.remove(&op.p1);
                     }
-                    self.pending_next_after_delete.remove(&op.p1);
+                    self.pending_next_after_delete.remove(op.p1);
                     pc += 1;
                 }
 
@@ -12265,7 +12302,7 @@ impl VdbeEngine {
                     // Position cursor at the first row. Jump to p2 if empty.
                     let cursor_id = op.p1;
                     // Rewind repositions the cursor, so clear any pending delete state.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let is_empty = if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         if matches!(op.opcode, Opcode::Sort | Opcode::SorterSort) {
                             sorter.sort()?;
@@ -12335,7 +12372,7 @@ impl VdbeEngine {
                     // Position cursor at the last row. Jump to p2 if empty.
                     let cursor_id = op.p1;
                     // Last repositions the cursor, so clear any pending delete state.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let is_empty = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         !lean_future(|| cursor.cursor.last(&cursor.cx)).await?
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -12369,7 +12406,7 @@ impl VdbeEngine {
                     // Advance cursor to the next row. Jump to p2 if more rows.
                     let cursor_id = op.p1;
                     let has_next = if !self.pending_next_after_delete.is_empty()
-                        && self.pending_next_after_delete.remove(&cursor_id)
+                        && self.pending_next_after_delete.remove(cursor_id)
                     {
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                             !cursor.cursor.eof()
@@ -12451,7 +12488,7 @@ impl VdbeEngine {
                     // Prev repositions the cursor, so clear any pending
                     // delete/next state before evaluating movement.
                     if !self.pending_next_after_delete.is_empty() {
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                     }
                     let has_prev = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         lean_future(|| cursor.cursor.prev(&cursor.cx)).await?
@@ -12567,7 +12604,7 @@ impl VdbeEngine {
                     // If not found, jump to p2.  NULL key → not found.
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     // Like stock's OP_SeekRowid, a key that is not an integer
                     // takes NUMERIC affinity ('5', '5.0' and 5.0 become 5).
                     // One still not an integer (5.5, 1e300, a blob, NULL)
@@ -12634,7 +12671,7 @@ impl VdbeEngine {
                     // Jump to p2 if no matching row exists.  NULL key → not found.
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
                         pc = op.p2 as usize;
@@ -12852,7 +12889,7 @@ impl VdbeEngine {
                     // state so a following Next advances relative to the new
                     // cursor position.
                     if self.storage_cursors.contains_key(&cursor_id) {
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
@@ -12915,7 +12952,7 @@ impl VdbeEngine {
                     // NULL key → never found (don't jump).
                     let cursor_id = op.p1;
                     if self.storage_cursors.contains_key(&cursor_id) {
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
@@ -12979,7 +13016,7 @@ impl VdbeEngine {
                     // NULL in any key field → always jump (no conflict).
                     let cursor_id = op.p1;
                     if self.storage_cursors.contains_key(&cursor_id) {
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
                     let index_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
@@ -13134,7 +13171,7 @@ impl VdbeEngine {
                         // repositions the cursor. Clear any pending delete/next
                         // state so subsequent Next/Prev behavior is consistent
                         // with the new position.
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                         if concurrent_mode {
                             if let Some(allocator) = concurrent_allocator.as_ref() {
                                 lean_future(|| {
@@ -13734,7 +13771,7 @@ impl VdbeEngine {
                     // br-22iss: Clear pending_next_after_delete since Insert repositions
                     // the cursor. This is critical for UPDATE (Delete+Insert) to avoid
                     // infinite loops when the rowid doesn't change.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     pc += 1;
                 }
 
@@ -13752,7 +13789,13 @@ impl VdbeEngine {
                     // only for legacy Phase 4 cursors.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable && !sc.cursor.eof() {
-                            let current_rowid = lean_future(|| sc.cursor.rowid(&sc.cx)).await?;
+                            // A cursor on a table-leaf cell has the rowid in the
+                            // cell (bd-w4pr1.13.20, lever D, as the Rowid arm);
+                            // any other position takes the async read.
+                            let current_rowid = match sc.cursor.try_table_leaf_rowid()? {
+                                Some(rowid) => rowid,
+                                None => lean_future(|| sc.cursor.rowid(&sc.cx)).await?,
+                            };
                             if is_update {
                                 update_restore = Some(PendingUpdateRestore::Storage {
                                     cursor_id,
@@ -17942,7 +17985,7 @@ impl VdbeEngine {
                             previous_last_insert_rowid_valid,
                             update_restore: None,
                         }));
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                         // CRITICAL FIX: Mark table dirty so MemDB fast paths
                         // know the data is stale and fall back to pager reads.
                         // Without this, subsequent COUNT(*)/LIKE queries via
@@ -18024,7 +18067,7 @@ impl VdbeEngine {
                         previous_last_insert_rowid_valid,
                         update_restore: None,
                     }));
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                 } else {
                     return Err(FrankenError::internal(format!(
                         "FusedAppendInsert: no cursor for id {cursor_id}"
@@ -18083,7 +18126,7 @@ impl VdbeEngine {
     #[inline(always)]
     fn next_hot_step(&mut self, cursor_id: i32) -> Result<Option<bool>> {
         let has_next = if !self.pending_next_after_delete.is_empty()
-            && self.pending_next_after_delete.remove(&cursor_id)
+            && self.pending_next_after_delete.remove(cursor_id)
         {
             if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                 !cursor.cursor.eof()
@@ -18547,7 +18590,7 @@ impl VdbeEngine {
             update_restore: None,
         }));
         self.clear_pending_idx_entries();
-        self.pending_next_after_delete.remove(&template.cursor_id);
+        self.pending_next_after_delete.remove(template.cursor_id);
         self.mark_storage_root_page_dirty(template.root_page);
 
         Ok(ExecOutcome::Done)
@@ -43072,6 +43115,45 @@ mod tests {
                 "{opcode}: each module call is made once"
             );
         }
+    }
+
+    /// `CursorIdSet` answers as the `HashSet<i32>` it replaced
+    /// (bd-w4pr1.13.20, lever D), past its inline capacity too.
+    #[test]
+    fn test_cursor_id_set_matches_hash_set() {
+        let mut set = CursorIdSet::default();
+        let mut model = HashSet::new();
+        let ops: &[(bool, i32)] = &[
+            (true, 3),
+            (true, 3),
+            (true, -1),
+            (false, 7),
+            (true, 0),
+            (true, 9),
+            (true, 12),
+            (true, 40),
+            (false, 3),
+            (false, 3),
+            (true, 3),
+            (false, -1),
+            (false, 40),
+            (true, 41),
+        ];
+        for &(insert, id) in ops {
+            if insert {
+                assert_eq!(set.insert(id), model.insert(id), "insert {id}");
+            } else {
+                assert_eq!(set.remove(id), model.remove(&id), "remove {id}");
+            }
+            assert_eq!(set.is_empty(), model.is_empty());
+            for probe in -2..45 {
+                let held = set.0.contains(&probe);
+                assert_eq!(held, model.contains(&probe), "membership of {probe}");
+            }
+        }
+        set.clear();
+        assert!(set.is_empty());
+        assert!(!set.remove(3));
     }
 
     #[test]
