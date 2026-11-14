@@ -5157,16 +5157,41 @@ pub fn codegen_select(
         // bd-distinct-loose-scan: `SELECT DISTINCT <indexed col>` (no WHERE/GROUP BY/HAVING/LIMIT) is a
         // loose/skip index scan — emit each distinct value once and `SeekGT` past its whole run — instead
         // of scanning every row into a dedup sorter. Work scales with #distinct values, not rows.
-        if where_clause.is_none()
-            && stmt.limit.is_none()
-            && group_by.is_empty()
-            && having.is_none()
-            && let Some(scan) = distinct_loose_scan_plan(columns, table, table_alias)
-        {
+        // A WHERE made only of range bounds on the one DISTINCT column (`DISTINCT a WHERE a < 20`)
+        // narrows the same scan to that range; the scan has no residual filter, so it must be exact.
+        let loose_scan = if stmt.limit.is_none() && group_by.is_empty() && having.is_none() {
+            distinct_loose_scan_plan(columns, table, table_alias)
+        } else {
+            None
+        };
+        let loose_range = match (&loose_scan, where_clause.as_deref()) {
+            (Some(_), None) => Some(None),
+            (Some(scan), Some(_)) if scan.key_col_count == 1 => table
+                .indexes
+                .iter()
+                .find(|idx| idx.name.eq_ignore_ascii_case(&scan.index_name))
+                .and_then(|idx| {
+                    ordered_scan_key_bounds(where_clause.as_deref(), table, table_alias, idx, 0)
+                        .filter(|range| range.exact)
+                        .map(|range| {
+                            let affinity = idx
+                                .columns
+                                .first()
+                                .and_then(|name| table.column_index(name))
+                                .and_then(|position| table.columns.get(position))
+                                .map_or('A', |column| column.affinity);
+                            (range, affinity)
+                        })
+                })
+                .map(Some),
+            _ => None,
+        };
+        if let (Some(scan), Some(range)) = (&loose_scan, loose_range) {
             return codegen_select_distinct_loose_scan(
                 b,
                 cursor,
-                &scan,
+                scan,
+                range,
                 out_regs,
                 out_col_count,
                 done_label,
@@ -9993,6 +10018,16 @@ struct LeadingKeyBound<'e> {
     inclusive: bool,
 }
 
+/// The range [`ordered_scan_key_bounds`] finds on one key column.
+#[derive(Clone, Copy, Debug)]
+struct KeyRange<'e> {
+    lower: Option<LeadingKeyBound<'e>>,
+    upper: Option<LeadingKeyBound<'e>>,
+    /// Every WHERE conjunct is one of these bounds, so the range alone decides
+    /// which keys match.
+    exact: bool,
+}
+
 /// The range an ordered index scan can seek and stop on in key column
 /// `key_pos`, the first column its equality prefix leaves free (0 with no
 /// prefix): top-level `<key> > c`, `>=`, `<`, `<=` and `BETWEEN` conjuncts,
@@ -10011,7 +10046,7 @@ fn ordered_scan_key_bounds<'e>(
     table_alias: Option<&str>,
     index: &IndexSchema,
     key_pos: usize,
-) -> Option<(Option<LeadingKeyBound<'e>>, Option<LeadingKeyBound<'e>>)> {
+) -> Option<KeyRange<'e>> {
     let is_binary = |collation: Option<&str>| {
         collation.is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
     };
@@ -10052,39 +10087,56 @@ fn ordered_scan_key_bounds<'e>(
     };
     let mut conjuncts = Vec::new();
     collect_conjunctive_terms(where_clause?, &mut conjuncts);
-    let mut lower: Option<LeadingKeyBound<'e>> = None;
-    let mut upper: Option<LeadingKeyBound<'e>> = None;
+    let mut range = KeyRange {
+        lower: None,
+        upper: None,
+        exact: true,
+    };
     for term in conjuncts {
         match term {
             Expr::BinaryOp {
                 left, op, right, ..
             } => {
                 // `key op c`, or `c op key` read as `key op' c`.
-                let (bound, op) = if is_key(left) && is_bound(right) {
-                    (right.as_ref(), *op)
+                let flipped = |op: fsqlite_ast::BinaryOp| match op {
+                    fsqlite_ast::BinaryOp::Gt => Some(fsqlite_ast::BinaryOp::Lt),
+                    fsqlite_ast::BinaryOp::Ge => Some(fsqlite_ast::BinaryOp::Le),
+                    fsqlite_ast::BinaryOp::Lt => Some(fsqlite_ast::BinaryOp::Gt),
+                    fsqlite_ast::BinaryOp::Le => Some(fsqlite_ast::BinaryOp::Ge),
+                    _ => None,
+                };
+                let bound = if is_key(left) && is_bound(right) {
+                    Some((right.as_ref(), *op))
                 } else if is_key(right) && is_bound(left) {
-                    let flipped = match op {
-                        fsqlite_ast::BinaryOp::Gt => fsqlite_ast::BinaryOp::Lt,
-                        fsqlite_ast::BinaryOp::Ge => fsqlite_ast::BinaryOp::Le,
-                        fsqlite_ast::BinaryOp::Lt => fsqlite_ast::BinaryOp::Gt,
-                        fsqlite_ast::BinaryOp::Le => fsqlite_ast::BinaryOp::Ge,
-                        _ => continue,
-                    };
-                    (left.as_ref(), flipped)
+                    flipped(*op).map(|op| (left.as_ref(), op))
                 } else {
-                    continue;
+                    None
                 };
-                let (slot, inclusive) = match op {
-                    fsqlite_ast::BinaryOp::Gt => (&mut lower, false),
-                    fsqlite_ast::BinaryOp::Ge => (&mut lower, true),
-                    fsqlite_ast::BinaryOp::Lt => (&mut upper, false),
-                    fsqlite_ast::BinaryOp::Le => (&mut upper, true),
-                    _ => continue,
-                };
-                slot.get_or_insert(LeadingKeyBound {
-                    expr: bound,
-                    inclusive,
+                // (is the lower side, bound)
+                let side_bound = bound.and_then(|(expr, op)| match op {
+                    fsqlite_ast::BinaryOp::Gt => Some((true, false, expr)),
+                    fsqlite_ast::BinaryOp::Ge => Some((true, true, expr)),
+                    fsqlite_ast::BinaryOp::Lt => Some((false, false, expr)),
+                    fsqlite_ast::BinaryOp::Le => Some((false, true, expr)),
+                    _ => None,
                 });
+                match side_bound {
+                    Some((is_lower, inclusive, expr)) => {
+                        let slot = if is_lower {
+                            &mut range.lower
+                        } else {
+                            &mut range.upper
+                        };
+                        if slot.is_none() {
+                            *slot = Some(LeadingKeyBound { expr, inclusive });
+                        } else {
+                            // A second bound on one side: the scan still
+                            // filters, but the range alone is not the WHERE.
+                            range.exact = false;
+                        }
+                    }
+                    None => range.exact = false,
+                }
             }
             Expr::Between {
                 expr,
@@ -10093,19 +10145,22 @@ fn ordered_scan_key_bounds<'e>(
                 not: false,
                 ..
             } if is_key(expr) && is_bound(low) && is_bound(high) => {
-                lower.get_or_insert(LeadingKeyBound {
+                if range.lower.is_some() || range.upper.is_some() {
+                    range.exact = false;
+                }
+                range.lower.get_or_insert(LeadingKeyBound {
                     expr: low,
                     inclusive: true,
                 });
-                upper.get_or_insert(LeadingKeyBound {
+                range.upper.get_or_insert(LeadingKeyBound {
                     expr: high,
                     inclusive: true,
                 });
             }
-            _ => {}
+            _ => range.exact = false,
         }
     }
-    (lower.is_some() || upper.is_some()).then_some((lower, upper))
+    (range.lower.is_some() || range.upper.is_some()).then_some(range)
 }
 
 /// Evaluate an ordered scan's leading-key bound into `reg` under the key
@@ -10258,11 +10313,11 @@ fn codegen_select_index_ordered_scan(
             )
         })
         .flatten()
-        .map(|(lower, upper)| {
+        .map(|range| {
             if index_plan.descending {
-                (upper, lower)
+                (range.upper, range.lower)
             } else {
-                (lower, upper)
+                (range.lower, range.upper)
             }
         });
         let next_key_near = next_key_bounds.and_then(|(near, _)| near);
@@ -10372,7 +10427,7 @@ fn codegen_select_index_ordered_scan(
             );
         }
         loop_start
-    } else if let Some((lower, upper)) = leading_key_bounds {
+    } else if let Some(KeyRange { lower, upper, .. }) = leading_key_bounds {
         // A range on the leading key with no equality prefix (`s > ? ORDER BY s
         // LIMIT n`): seek the near bound instead of walking the index from its
         // start, and leave once the key passes the far bound. Both bounds are
@@ -18468,11 +18523,17 @@ fn distinct_loose_scan_plan(
 /// (`index_seek_with_bias(UpperBound)`) treats a shorter prefix probe as sorting AFTER every equal-prefix
 /// entry (`compare_index_key_values`: `rhs.len() <= lhs.len() => Less`), so one seek clears the whole run.
 /// bd-distinct-loose-scan.
-#[allow(clippy::unnecessary_wraps)]
+///
+/// `range` (one key column only) is a WHERE made entirely of bounds on that
+/// column, with the column's affinity. The scan starts at the lower bound
+/// (`SeekGE`, or `SeekGT` for an exclusive one), or past the NULL keys when
+/// there is none, and ends past the upper bound. A NULL bound matches nothing.
+#[allow(clippy::unnecessary_wraps, clippy::too_many_arguments)]
 fn codegen_select_distinct_loose_scan(
     b: &mut ProgramBuilder,
     idx_cursor: i32,
     scan: &DistinctLooseScan,
+    range: Option<(KeyRange<'_>, char)>,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -18487,8 +18548,54 @@ fn codegen_select_distinct_loose_scan(
         0,
     );
     let finalize_label = b.emit_label();
-    // Empty index → nothing to emit.
-    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+    let upper_bound = match range {
+        // Empty index → nothing to emit.
+        None => {
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+            None
+        }
+        Some((range, affinity)) => {
+            let upper = range.upper.map(|bound| {
+                let reg = b.alloc_reg();
+                emit_leading_key_bound(b, bound, affinity, reg);
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+                (reg, bound.inclusive)
+            });
+            let probe_reg = b.alloc_reg();
+            let seek = if let Some(bound) = range.lower {
+                emit_leading_key_bound(b, bound, affinity, probe_reg);
+                b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, finalize_label, P4::None, 0);
+                if bound.inclusive {
+                    Opcode::SeekGE
+                } else {
+                    Opcode::SeekGT
+                }
+            } else {
+                // No lower bound: start past the NULL keys, which satisfy no
+                // comparison.
+                b.emit_op(Opcode::Null, 0, probe_reg, 0, P4::None, 0);
+                Opcode::SeekGT
+            };
+            let probe_record_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                probe_reg,
+                1,
+                probe_record_reg,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                seek,
+                idx_cursor,
+                probe_record_reg,
+                finalize_label,
+                P4::None,
+                0,
+            );
+            upper
+        }
+    };
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_top = b.current_addr() as i32;
@@ -18501,6 +18608,17 @@ fn codegen_select_distinct_loose_scan(
     // "skip-scan hang" this bead was blocked on).
     for i in 0..n {
         b.emit_op(Opcode::Column, idx_cursor, i, out_regs + i, P4::None, 0);
+    }
+    if let Some((upper_reg, inclusive)) = upper_bound {
+        // Past the upper bound: `key > upper`, or `key >= upper` for an exclusive one.
+        b.emit_jump_to_label(
+            if inclusive { Opcode::Gt } else { Opcode::Ge },
+            upper_reg,
+            out_regs,
+            finalize_label,
+            P4::None,
+            0,
+        );
     }
     let probe_base = b.alloc_regs(n);
     for i in 0..n {

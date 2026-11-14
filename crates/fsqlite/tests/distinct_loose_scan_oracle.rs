@@ -548,3 +548,88 @@ fn distinct_loose_scan_file_backed_matches_rusqlite() {
         assert_same(&f, &r, "SELECT DISTINCT a FROM t ORDER BY a").await;
     });
 }
+
+/// A WHERE made only of range bounds on the DISTINCT column narrows the loose
+/// scan to that range (`SELECT DISTINCT a FROM t WHERE a < 20`), as stock's
+/// covering index range scan does, instead of falling back to a full table scan
+/// into an autoindex. The scan has no residual filter, so every bound must be
+/// applied exactly; any other conjunct, or a second bound on one side, falls
+/// back. Rows come in index order, as stock's.
+#[test]
+fn distinct_loose_scan_range_where_matches_rusqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let mut ins = Vec::new();
+        for i in 1..=3000_i64 {
+            // INTEGER column with NULLs (sort first) and text (sorts after every number).
+            let a = if i % 97 == 0 {
+                "NULL".to_owned()
+            } else if i % 101 == 0 {
+                "'abc'".to_owned()
+            } else {
+                format!("{}", i % 1000)
+            };
+            let s = if i % 89 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("'k{}'", i % 2500)
+            };
+            ins.push(format!(
+                "INSERT INTO t VALUES ({i}, {a}, {s}, {}, '{}{}');",
+                (i % 400) as f64 * 0.5,
+                if i % 2 == 0 { "K" } else { "k" },
+                i % 30
+            ));
+        }
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, s TEXT, c REAL, x TEXT COLLATE NOCASE);",
+                "CREATE INDEX t_a ON t(a);",
+                "CREATE INDEX t_s ON t(s);",
+                "CREATE INDEX t_c ON t(c);",
+                "CREATE INDEX t_x ON t(x);",
+            ],
+            &ins,
+        )
+        .await;
+        for sql in [
+            "SELECT DISTINCT a FROM t WHERE a < 20",
+            "SELECT DISTINCT a FROM t WHERE a <= 20",
+            "SELECT DISTINCT a FROM t WHERE 20 > a",
+            "SELECT DISTINCT a FROM t WHERE a > 990",
+            "SELECT DISTINCT a FROM t WHERE a >= 990",
+            "SELECT DISTINCT a FROM t WHERE a > 995",
+            "SELECT DISTINCT a FROM t WHERE a BETWEEN 100 AND 110",
+            "SELECT DISTINCT a FROM t WHERE a > 5 AND a < 9",
+            "SELECT DISTINCT a FROM t WHERE a >= 5 AND a <= 5",
+            "SELECT DISTINCT a FROM t WHERE a > -1 AND a < 3",
+            "SELECT DISTINCT a FROM t WHERE a < '20'",
+            "SELECT DISTINCT a FROM t WHERE a > 2000",
+            "SELECT DISTINCT a FROM t WHERE a < NULL",
+            "SELECT DISTINCT a FROM t WHERE a > NULL",
+            "SELECT DISTINCT a FROM t WHERE a BETWEEN 10 AND 5",
+            "SELECT DISTINCT s FROM t WHERE s > 'k2490'",
+            "SELECT DISTINCT s FROM t WHERE s < 'k1'",
+            "SELECT DISTINCT s FROM t WHERE s BETWEEN 'k20' AND 'k21'",
+            "SELECT DISTINCT c FROM t WHERE c > 190.0",
+            "SELECT DISTINCT c FROM t WHERE c >= 3 AND c < 4",
+        ] {
+            assert_same(&f, &r, sql).await;
+            assert!(
+                !has_op(&f, sql, "OpenAutoindex").await,
+                "`{sql}` must take the loose scan, not the dedup fallback"
+            );
+        }
+        // Not exact: another conjunct, a second bound on one side, a bound
+        // with an affinity of its own, IS NOT NULL, and a NOCASE key. These
+        // fall back; their sets must still match.
+        for sql in [
+            "SELECT DISTINCT a FROM t WHERE a < 20 AND id > 5",
+            "SELECT DISTINCT a FROM t WHERE a < 20 AND a < 10",
+            "SELECT DISTINCT a FROM t WHERE a < CAST(20 AS TEXT)",
+            "SELECT DISTINCT a FROM t WHERE a IS NOT NULL",
+            "SELECT DISTINCT x FROM t WHERE x > 'K2'",
+        ] {
+            assert_same_set(&f, &r, sql).await;
+        }
+    });
+}
