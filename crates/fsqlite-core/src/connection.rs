@@ -8237,6 +8237,16 @@ struct StorageCountCacheEntry {
     count: i64,
 }
 
+/// bd-prkvt: what `Connection::btree_join_sample` read for a two-table join
+/// without statistics: the written outer table's estimated rows, and the rows
+/// per leading value of each joined-table index whose leading value repeats
+/// across pages (lowercased index name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JoinBtreeSample {
+    outer_rows: u64,
+    index_rows_per_key: Vec<(String, u64)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RetainedAutocommitCountSumInterest {
     root_page: i32,
@@ -67466,6 +67476,204 @@ impl Connection {
         hints
     }
 
+    /// bd-9uf3l / bd-prkvt: row estimates for a join's drive-side choice, or
+    /// `None` for a statement without a join or without any estimate.
+    ///
+    /// `sqlite_stat1`'s rows when ANALYZE wrote them. For a two-table join
+    /// whose written outer table `sqlite_stat1` has no row count for (most
+    /// applications never run ANALYZE), the b-tree is sampled instead
+    /// (`btree_join_sample`): the outer table's rows from one path down its
+    /// b-tree, and for each index of the joined table without statistics,
+    /// whether its leading value repeats across whole pages. The codegen
+    /// weighs the outer rows against the rows the joined table's pinned
+    /// equality matches, so a large unfiltered table written first is not
+    /// read in full, while a small one, or a pin on a repeated value
+    /// (`flag = 1`), keeps the written order.
+    async fn join_row_estimates(
+        &self,
+        select: &SelectStatement,
+        schema: &[TableSchema],
+    ) -> Option<Arc<Stat1RowEstimates>> {
+        fn main_table<'s>(
+            source: &TableOrSubquery,
+            schema: &'s [TableSchema],
+        ) -> Option<&'s TableSchema> {
+            match source {
+                TableOrSubquery::Table {
+                    name,
+                    time_travel: None,
+                    ..
+                } if name
+                    .schema
+                    .as_deref()
+                    .is_none_or(|schema_name| schema_name.eq_ignore_ascii_case("main")) =>
+                {
+                    schema
+                        .iter()
+                        .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+                }
+                _ => None,
+            }
+        }
+        let SelectCore::Select {
+            from: Some(from),
+            where_clause,
+            ..
+        } = &select.body.select
+        else {
+            return None;
+        };
+        if from.joins.is_empty() {
+            return None;
+        }
+        let stat1 = if self.sqlite_stat1_root_page().is_some() {
+            Some(self.sqlite_stat1_hints().await)
+        } else {
+            None
+        };
+        if let [join] = from.joins.as_slice()
+            && let Some(outer) = main_table(&from.source, schema)
+            && let Some(joined) = main_table(&join.table, schema)
+        {
+            let key = outer.name.to_ascii_lowercase();
+            // Only an index led by a column the WHERE or ON names can carry
+            // the pinned equality, so only those are sampled.
+            let mut referenced = HashSet::new();
+            let on = match &join.constraint {
+                Some(fsqlite_ast::JoinConstraint::On(expr)) => Some(expr),
+                _ => None,
+            };
+            for expr in where_clause.as_deref().into_iter().chain(on) {
+                for_each_column_ref_in_expr(expr, &mut |column| {
+                    referenced.insert(column.column.to_ascii_lowercase());
+                });
+            }
+            if stat1
+                .as_ref()
+                .is_none_or(|stat1| !stat1.table_rows.contains_key(&key))
+                && let Some(sample) = self
+                    .btree_join_sample(outer, joined, &referenced, stat1.as_deref())
+                    .await
+            {
+                let mut estimates = stat1.as_deref().cloned().unwrap_or_default();
+                estimates.table_rows.insert(key, sample.outer_rows);
+                for (index, rows_per_key) in sample.index_rows_per_key {
+                    estimates
+                        .index_rows_per_key
+                        .entry(index)
+                        .or_insert_with(|| vec![rows_per_key]);
+                }
+                return Some(Arc::new(estimates));
+            }
+        }
+        stat1.filter(|estimates| !estimates.table_rows.is_empty())
+    }
+
+    /// bd-prkvt: a b-tree sample for a two-table join's drive-side choice when
+    /// `sqlite_stat1` does not cover the written outer table.
+    ///
+    /// `outer`'s rows come from one root-to-leaf path of its b-tree
+    /// (`BtCursor::estimate_entry_count`). Each index of `joined` led by a
+    /// column in `referenced` (the names the WHERE and ON use) that
+    /// `sqlite_stat1` has no row for gets its rows per leading value from one
+    /// page of its leftmost path (`BtCursor::estimate_rows_per_leading_key`);
+    /// an index whose sampled separators mostly differ gets none and is left
+    /// to SQLite's default selectivity in the codegen. With no more outer rows
+    /// than four times that default, an index pin cannot swap at the default
+    /// and the written order is cheap anyway, so no index is sampled.
+    ///
+    /// Reads through the open transaction when there is one, else in a
+    /// read-only snapshot of its own that it rolls back. It returns `None`
+    /// rather than waiting or failing (a busy database, an unreadable page, a
+    /// TEMP table, a `:memory:` database whose cached write transactions it
+    /// does not reconcile), which keeps the written join order.
+    async fn btree_join_sample(
+        &self,
+        outer: &TableSchema,
+        joined: &TableSchema,
+        referenced: &HashSet<String>,
+        stat1: Option<&Stat1RowEstimates>,
+    ) -> Option<JoinBtreeSample> {
+        async fn sample_in_txn(
+            cx: &Cx,
+            txn: &mut TransactionKind,
+            outer_root: PageNumber,
+            outer_is_table: bool,
+            indexes: &[(String, PageNumber)],
+        ) -> Option<JoinBtreeSample> {
+            // The codegen swaps an index pin when its rows per key times 4
+            // are under the outer rows; SQLite's default is 10 per key.
+            const UNSAMPLED_OUTER_ROWS: u64 = 4 * 10;
+            let outer_rows =
+                Connection::new_pager_btree_cursor(cx, txn, outer_root, outer_is_table)
+                    .await
+                    .ok()?
+                    .estimate_entry_count(cx)
+                    .await
+                    .ok()?;
+            let mut index_rows_per_key = Vec::new();
+            let indexes: &[(String, PageNumber)] = if outer_rows <= UNSAMPLED_OUTER_ROWS {
+                &[]
+            } else {
+                indexes
+            };
+            for (name, root) in indexes {
+                let mut cursor = Connection::new_pager_btree_cursor(cx, txn, *root, false)
+                    .await
+                    .ok()?;
+                if let Some(rows_per_key) = cursor.estimate_rows_per_leading_key(cx).await.ok()? {
+                    index_rows_per_key.push((name.clone(), rows_per_key));
+                }
+            }
+            Some(JoinBtreeSample {
+                outer_rows,
+                index_rows_per_key,
+            })
+        }
+        if self.pager.is_memory() || {
+            let temp_tables = self.temp_table_names.borrow();
+            [outer, joined]
+                .iter()
+                .any(|table| temp_tables.contains(&table.name.to_ascii_lowercase()))
+        } {
+            return None;
+        }
+        let page = |root_page: i32| PageNumber::new(u32::try_from(root_page).ok()?);
+        let outer_root = page(outer.root_page)?;
+        let indexes: Vec<(String, PageNumber)> = joined
+            .indexes
+            .iter()
+            .filter(|index| {
+                index
+                    .columns
+                    .first()
+                    .is_some_and(|column| referenced.contains(&column.to_ascii_lowercase()))
+                    && stat1.is_none_or(|stat1| {
+                        !stat1
+                            .index_rows_per_key
+                            .contains_key(&index.name.to_ascii_lowercase())
+                    })
+            })
+            .filter_map(|index| Some((index.name.to_ascii_lowercase(), page(index.root_page)?)))
+            .collect();
+        let cx = self.op_cx_after_background_status();
+        {
+            let mut active_txn = self.active_txn.try_borrow_mut().ok()?;
+            if let Some(txn) = active_txn.as_mut() {
+                return sample_in_txn(&cx, txn, outer_root, !outer.without_rowid, &indexes).await;
+            }
+        }
+        if self.in_transaction.get() {
+            return None;
+        }
+        let mut txn = self.pager.begin(&cx, TransactionMode::ReadOnly).await.ok()?;
+        let sample = sample_in_txn(&cx, &mut txn, outer_root, !outer.without_rowid, &indexes).await;
+        // A read-only snapshot has nothing to undo; its release cannot change
+        // the sample.
+        let _ = txn.rollback(&cx).await;
+        sample
+    }
+
     fn is_autoincrement_table(&self, table_name: &str) -> bool {
         self.autoincrement_tables
             .borrow()
@@ -88952,20 +89160,13 @@ impl Connection {
             planner_collation_is_binary(index.key_term_collation(0))
         });
         record_hot_path_duration(&FSQLITE_COMPILE_PLANNER_NS, t);
-        // bd-9uf3l: a lookup join chooses which table drives from sqlite_stat1's
-        // row estimates; without ANALYZE it keeps the written order. The
-        // reentrant read of sqlite_stat1 happens only when it exists, which is
-        // also when the caller passes an owned schema (see `needs_owned_schema`).
-        let joins = matches!(
-            &canonical_select.body.select,
-            SelectCore::Select { from: Some(from), .. } if !from.joins.is_empty()
-        );
-        let stat1_row_estimates = if joins && self.sqlite_stat1_root_page().is_some() {
-            let estimates = self.sqlite_stat1_hints().await;
-            (!estimates.table_rows.is_empty()).then_some(estimates)
-        } else {
-            None
-        };
+        // bd-9uf3l / bd-prkvt: a lookup join chooses which table drives from
+        // row estimates: sqlite_stat1's, else a b-tree estimate of the written
+        // outer table. The reentrant read of sqlite_stat1 happens only when it
+        // exists, which is also when the caller passes an owned schema (see
+        // `needs_owned_schema`); the b-tree estimate reads pages, never
+        // `self.schema`.
+        let stat1_row_estimates = self.join_row_estimates(canonical_select, schema).await;
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),

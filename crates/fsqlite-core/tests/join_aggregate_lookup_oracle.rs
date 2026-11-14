@@ -2233,76 +2233,79 @@ fn join_lookups_seek_the_outer_table_by_unconsumed_inner_join_terms() {
 
 /// bd-9uf3l: an inner join written with its unfiltered table first (`FROM u
 /// JOIN t ON u.id = t.a WHERE t.b = 'k2'`) drove from u, reading all of it and
-/// looking t up per row (413x stock on 200k rows). With sqlite_stat1 it drives
-/// from t, the table its WHERE pins, and looks u up, as stock does, when the
-/// pinned rows are well under u's rows, nothing seeks u and u has a rowid or
-/// index lookup on the join key. Without statistics, a small written outer
-/// table (5-row q) or an unselective pin (`t.f = 1`, half of t) keeps the
-/// written order, as do a LEFT join, a comma join (stock never reorders CROSS
-/// JOIN, which the parser does not tell from a comma), `*` (cursor-ordered
-/// columns), a written outer table the WHERE already seeks, and a join key with
-/// no lookup on the written outer table. Rows match stock in order either way.
+/// looking t up per row (413x stock on 200k rows). It drives from t, the table
+/// its WHERE pins, and looks u up, as stock does, when the pinned rows are well
+/// under u's rows, nothing seeks u and u has a rowid or index lookup on the
+/// join key. The row counts come from sqlite_stat1, or without it (bd-prkvt,
+/// 257x stock) from b-tree samples: u's rows, and per index of t its rows per
+/// leading value, or SQLite's default of ten when the sampled keys mostly
+/// differ. A small written outer table (5-row q) and an unselective pin
+/// (`t.f = 1`, half of t, whose index repeats each value across its page)
+/// keep the written order either way. So do a LEFT join, a comma join (stock
+/// never reorders CROSS JOIN, which the parser does not tell from a comma),
+/// `*` (cursor-ordered columns), a written outer table the WHERE already
+/// seeks, and a join key with no lookup on the written outer table. Rows match
+/// stock in order either way.
 #[test]
 fn inner_joins_drive_from_the_table_their_where_pins_by_row_estimates() {
-    // (query, whether it reads the outer table in full once ANALYZE has run:
-    // `Some(false)` drives from the pinned table, `Some(true)` keeps the
-    // written outer table as a full scan, `None` checks rows only). Without
-    // statistics every `Some` case keeps the written order.
-    let cases: &[(&str, Option<bool>)] = &[
+    // (query, whether it reads the outer table in full `[without, with]`
+    // ANALYZE: `false` drives from the pinned table, `true` keeps the written
+    // outer table as a full scan; `None` checks rows only).
+    let cases: &[(&str, Option<[bool; 2]>)] = &[
         (
             "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id",
-            Some(false),
+            Some([false, false]),
         ),
         (
             "SELECT count(*), sum(u.r) FROM u JOIN t ON u.id = t.a WHERE t.a = 2",
-            Some(false),
+            Some([false, false]),
         ),
         (
             "SELECT count(*), max(u.r) FROM u JOIN t ON t.a = u.id WHERE t.b = 'k4'",
-            Some(false),
+            Some([false, false]),
         ),
         (
             "SELECT t.id, u.a FROM u INNER JOIN t ON u.id = t.a AND t.b = 'k5' ORDER BY t.id",
-            Some(false),
+            Some([false, false]),
         ),
         (
             "SELECT count(*) FROM u JOIN t ON u.id = t.a WHERE t.id = 9",
-            Some(false),
+            Some([false, false]),
         ),
         // A range on u is no equality seek, so t still drives.
         (
             "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE u.r > 1 AND t.b = 'k2' \
              ORDER BY t.id",
-            Some(false),
+            Some([false, false]),
         ),
         // A pin matching half of t, and a 5-row written outer table.
         (
             "SELECT count(*), sum(u.r) FROM u JOIN t ON u.id = t.a WHERE t.f = 1",
-            Some(true),
+            Some([true, true]),
         ),
         (
             "SELECT count(*) FROM q JOIN t ON t.id = q.id WHERE t.f = 1",
-            Some(true),
+            Some([true, true]),
         ),
         (
             "SELECT count(*) FROM q JOIN t ON t.id = q.id WHERE t.b = 'k14'",
-            Some(true),
+            Some([true, true]),
         ),
         (
             "SELECT t.id, u.r FROM u LEFT JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id",
-            Some(true),
+            Some([true, true]),
         ),
         (
             "SELECT count(*) FROM u, t WHERE u.id = t.a AND t.b = 'k2'",
-            Some(true),
+            Some([true, true]),
         ),
         (
             "SELECT * FROM u JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id, u.id",
-            Some(true),
+            Some([true, true]),
         ),
         (
             "SELECT t.id FROM u JOIN t ON u.a = t.a WHERE t.b = 'k2' ORDER BY t.id",
-            Some(true),
+            Some([true, true]),
         ),
         // The WHERE already seeks u, so u stays outer.
         (
@@ -2351,7 +2354,7 @@ fn inner_joins_drive_from_the_table_their_where_pins_by_row_estimates() {
                     let ops = opcodes(&f, sql).await;
                     assert_eq!(
                         ops.iter().any(|op| op == "Rewind"),
-                        *scans_outer || !analyzed,
+                        scans_outer[usize::from(analyzed)],
                         "`{sql}` full outer scan (analyzed: {analyzed}): {ops:?}"
                     );
                 }

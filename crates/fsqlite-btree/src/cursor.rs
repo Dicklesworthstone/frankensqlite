@@ -3534,6 +3534,140 @@ impl<P: PageReader> BtCursor<P> {
         result
     }
 
+    /// Estimate this B-tree's entry count from its leftmost root-to-leaf path,
+    /// reading depth + 1 pages instead of the whole tree.
+    ///
+    /// The estimate is the product of each interior page's fan-out (its cells
+    /// plus the right child) along the path, times the leaf's cell count, as
+    /// SQLite's `sqlite3BtreeRowCountEst` multiplies along its path. A
+    /// single-page tree is counted exactly; a deeper one is off by how far the
+    /// sampled pages' fill differs from the average, which is enough for a
+    /// planner that needs only the order of magnitude when `sqlite_stat1` has
+    /// no row count (bd-prkvt). The leftmost path, rather than the rightmost,
+    /// avoids the partly filled page that appends leave at the end.
+    pub async fn estimate_entry_count(&mut self, cx: &Cx) -> Result<u64> {
+        let mut page_no = self.root_page;
+        let mut fan_out = 1_u64;
+        for _ in 0..BTREE_MAX_DEPTH {
+            observe_cursor_cancellation(cx)?;
+            let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
+            let page_bytes = cell::usable_prefix(page_data.as_bytes(), self.usable_size);
+            let header = cell::parse_page_header(page_bytes, page_no)?;
+            if header.page_type.is_leaf() {
+                return Ok(fan_out.saturating_mul(u64::from(header.cell_count)));
+            }
+            fan_out = fan_out.saturating_mul(u64::from(header.cell_count) + 1);
+            page_no = if header.cell_count == 0 {
+                header
+                    .right_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior page has no right child in estimate_entry_count"
+                            .to_owned(),
+                    })?
+            } else {
+                let cell_ptr = Self::read_cell_pointer_inline(
+                    page_bytes,
+                    page_no,
+                    usize::from(header.page_type.header_size()),
+                    0,
+                )?;
+                Self::read_child_at_offset(page_bytes, usize::from(cell_ptr))?
+            };
+        }
+        Err(FrankenError::DatabaseCorrupt {
+            detail: format!("B-tree depth exceeds maximum of {BTREE_MAX_DEPTH}"),
+        })
+    }
+
+    /// Estimate how many entries of this index B-tree share one leading key
+    /// value, from the keys of a single page on its leftmost path, for a
+    /// planner without `sqlite_stat1` (bd-prkvt).
+    ///
+    /// The path is followed down to the first page that is a leaf or holds at
+    /// least 16 keys, and its first 64 keys at most are read. They are in
+    /// order, so equal leading values are adjacent and form runs; a single run
+    /// over the whole sample is taken to span the whole page. On a leaf the
+    /// estimate is the spanned entries per run. On an interior page each key
+    /// separates whole subtrees: when the sampled separators fall into runs
+    /// fewer than half of them, a value repeats across pages, and the estimate
+    /// is the entries under the spanned separators per run; when they mostly
+    /// differ, the page cannot tell a selective value from one spanning a
+    /// single subtree, and the result is `None`, as for an empty index or a
+    /// table B-tree. A leading field that does not fit a cell's local payload
+    /// counts as a run of its own.
+    pub async fn estimate_rows_per_leading_key(&mut self, cx: &Cx) -> Result<Option<u64>> {
+        const MIN_SAMPLED_KEYS: u16 = 16;
+        const MAX_SAMPLED_KEYS: u16 = 64;
+        let mut page_no = self.root_page;
+        let mut fan_out_above = 1_u64;
+        for _ in 0..BTREE_MAX_DEPTH {
+            observe_cursor_cancellation(cx)?;
+            let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
+            let page_bytes = cell::usable_prefix(page_data.as_bytes(), self.usable_size);
+            let header = cell::parse_page_header(page_bytes, page_no)?;
+            if header.page_type.is_table() {
+                return Ok(None);
+            }
+            let header_size = usize::from(header.page_type.header_size());
+            let is_leaf = header.page_type.is_leaf();
+            if is_leaf || header.cell_count >= MIN_SAMPLED_KEYS {
+                let sampled = header.cell_count.min(MAX_SAMPLED_KEYS);
+                let mut runs = 0_u16;
+                let mut previous: Option<(u64, &[u8])> = None;
+                for cell_idx in 0..sampled {
+                    let cell_ptr =
+                        Self::read_cell_pointer_inline(page_bytes, page_no, header_size, cell_idx)?;
+                    let cell = CellRef::parse(
+                        page_bytes,
+                        usize::from(cell_ptr),
+                        header.page_type,
+                        self.usable_size,
+                    )?;
+                    let leading = record_leading_field(cell.local_payload(page_bytes));
+                    if leading.is_none() || leading != previous {
+                        runs += 1;
+                    }
+                    previous = leading;
+                }
+                if runs == 0 {
+                    return Ok(None);
+                }
+                // One run over the whole sample may go on past it: take the
+                // whole page as that run, the larger and safer estimate.
+                let span = if runs == 1 {
+                    header.cell_count
+                } else {
+                    sampled
+                };
+                if is_leaf {
+                    return Ok(Some(u64::from(span).div_ceil(u64::from(runs))));
+                }
+                if u32::from(runs) * 2 > u32::from(sampled) {
+                    return Ok(None);
+                }
+                let entries_spanned = self.estimate_entry_count(cx).await? / fan_out_above
+                    * u64::from(span)
+                    / u64::from(header.cell_count);
+                return Ok(Some((entries_spanned / u64::from(runs)).max(1)));
+            }
+            fan_out_above = fan_out_above.saturating_mul(u64::from(header.cell_count) + 1);
+            page_no = if header.cell_count == 0 {
+                header
+                    .right_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior page has no right child in estimate_rows_per_leading_key"
+                            .to_owned(),
+                    })?
+            } else {
+                let cell_ptr = Self::read_cell_pointer_inline(page_bytes, page_no, header_size, 0)?;
+                Self::read_child_at_offset(page_bytes, usize::from(cell_ptr))?
+            };
+        }
+        Err(FrankenError::DatabaseCorrupt {
+            detail: format!("B-tree depth exceeds maximum of {BTREE_MAX_DEPTH}"),
+        })
+    }
+
     /// Count all rows in this table B-tree without decoding cell payloads.
     ///
     /// Walks every leaf page summing `cell_count` values. This avoids key
@@ -6370,6 +6504,20 @@ fn record_leading_integer(record: &[u8]) -> Option<i64> {
         Some(SqliteValue::Integer(value)) => Some(value),
         _ => None,
     }
+}
+
+/// The leading field of `record`: its serial type and value bytes, when both
+/// lie within `record` (a cell's local payload may stop short of them).
+fn record_leading_field(record: &[u8]) -> Option<(u64, &[u8])> {
+    let (header_size, header_varint_len) = read_varint(record)?;
+    let header_size = usize::try_from(header_size).ok()?;
+    if header_size <= header_varint_len || header_size > record.len() {
+        return None;
+    }
+    let (serial_type, _) = read_varint(&record[header_varint_len..header_size])?;
+    let len = usize::try_from(serial_type_len(serial_type)?).ok()?;
+    let body = record.get(header_size..header_size.checked_add(len)?)?;
+    Some((serial_type, body))
 }
 
 impl LeadingIntegerProbe {
@@ -15038,6 +15186,112 @@ mod tests {
                 SeekResult::Found
             );
             assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 200);
+        });
+    }
+
+    /// bd-prkvt: the leftmost-path estimate is exact for an empty or
+    /// single-page tree and, for an appended multi-level tree, lands within 2x
+    /// of the true count, far above what the root page alone holds.
+    #[test]
+    fn test_estimate_entry_count_follows_the_leftmost_path() {
+        run_async(async {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            assert_eq!(cursor.estimate_entry_count(&cx).await.unwrap(), 0);
+
+            let payload = vec![0x5Au8; 24];
+            for rowid in 1..=10_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
+            assert_eq!(cursor.estimate_entry_count(&cx).await.unwrap(), 10);
+
+            let row_count = 30_000_i64;
+            for rowid in 11..=row_count {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
+            assert!(cursor.measure_tree_depth(&cx).await.unwrap() >= 2);
+            let estimate = i64::try_from(cursor.estimate_entry_count(&cx).await.unwrap()).unwrap();
+            assert!(
+                (row_count / 2..=row_count * 2).contains(&estimate),
+                "estimate {estimate} for {row_count} rows"
+            );
+            // The walk leaves the cursor usable.
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), row_count);
+        });
+    }
+
+    /// bd-prkvt: a leaf root gives its entries per run of equal leading values;
+    /// a two-valued key over many pages gives a large estimate, and over a few
+    /// pages one leaf's entries per run; a thousand-valued key over many pages
+    /// gives no estimate (its separators mostly differ), as does a table.
+    #[test]
+    fn test_estimate_rows_per_leading_key_separates_repeated_from_spread_keys() {
+        run_async(async {
+            async fn index_with(
+                cx: &Cx,
+                keys: impl Iterator<Item = (i64, i64)>,
+            ) -> BtCursor<MemPageStore> {
+                let root = pn(2);
+                let store = MemPageStore::with_empty_index(root, USABLE);
+                let mut cursor = BtCursor::new(store, root, USABLE, false);
+                for (value, rowid) in keys {
+                    let key = serialize_record(&[
+                        SqliteValue::Integer(value),
+                        SqliteValue::Integer(rowid),
+                    ]);
+                    cursor.index_insert(cx, &key).await.unwrap();
+                }
+                cursor
+            }
+
+            let cx = Cx::new();
+            let mut leaf = index_with(
+                &cx,
+                [(3, 1), (1, 2), (1, 3), (2, 4), (1, 5), (3, 6)].into_iter(),
+            )
+            .await;
+            assert_eq!(
+                leaf.estimate_rows_per_leading_key(&cx).await.unwrap(),
+                Some(2)
+            );
+
+            let mut flag = index_with(&cx, (1..=20_000_i64).map(|rowid| (rowid % 2, rowid))).await;
+            assert!(flag.measure_tree_depth(&cx).await.unwrap() >= 2);
+            let estimate = flag.estimate_rows_per_leading_key(&cx).await.unwrap();
+            assert!(
+                estimate.is_some_and(|rows| rows >= 2_000),
+                "two-valued key over 20,000 entries: {estimate:?}"
+            );
+
+            let mut small_flag =
+                index_with(&cx, (1..=1_500_i64).map(|rowid| (rowid % 2, rowid))).await;
+            let estimate = small_flag.estimate_rows_per_leading_key(&cx).await.unwrap();
+            assert!(
+                estimate.is_some_and(|rows| rows >= 50),
+                "two-valued key over a few pages: {estimate:?}"
+            );
+
+            let mut spread =
+                index_with(&cx, (1..=20_000_i64).map(|rowid| (rowid % 1000, rowid))).await;
+            assert_eq!(
+                spread.estimate_rows_per_leading_key(&cx).await.unwrap(),
+                None
+            );
+
+            let root = pn(2);
+            let mut table = BtCursor::new(
+                MemPageStore::with_empty_table(root, USABLE),
+                root,
+                USABLE,
+                true,
+            );
+            assert_eq!(
+                table.estimate_rows_per_leading_key(&cx).await.unwrap(),
+                None
+            );
         });
     }
 

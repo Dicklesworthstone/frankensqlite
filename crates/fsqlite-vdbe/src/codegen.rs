@@ -2502,17 +2502,22 @@ pub struct CodegenContext {
     /// (named in that cursor's `VOpen` P4). `None` keeps a table-valued
     /// function source unsupported here.
     pub insert_select_function_columns: Option<Vec<String>>,
-    /// bd-9uf3l: `sqlite_stat1` row estimates, when ANALYZE has written them.
-    /// A lookup join drives from the table its WHERE pins only when these say
-    /// that side has far fewer rows; `None` keeps the written order.
+    /// bd-9uf3l: row estimates for a join's tables, from `sqlite_stat1` when
+    /// ANALYZE has written them and, for a two-table join's written outer
+    /// table it does not cover, from a b-tree estimate (bd-prkvt). A lookup
+    /// join drives from the table its WHERE pins only when these say that
+    /// side has far fewer rows; `None` keeps the written order.
     pub stat1_row_estimates: Option<Arc<Stat1RowEstimates>>,
 }
 
-/// `sqlite_stat1` row estimates, keyed by lowercased table and index name.
+/// Row estimates in `sqlite_stat1`'s shape, keyed by lowercased table and
+/// index name.
 ///
-/// A table's row count is the `stat` column's first integer; per index, the
+/// A table's row count is the `stat` column's first integer, or an estimate
+/// from its b-tree when `sqlite_stat1` has none (bd-prkvt); per index, the
 /// following integers are the average rows an equality on each of its leading
-/// key prefixes matches.
+/// key prefixes matches (without `sqlite_stat1`, a b-tree sample's rows per
+/// leading value, for an index whose sample shows the value repeating).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stat1RowEstimates {
     pub table_rows: std::collections::HashMap<String, u64>,
@@ -13826,15 +13831,19 @@ fn swapped_join_lookup_plan_avoiding_text_walk<'a>(
 /// table and looking each one up. The WHERE and every ON term still filter
 /// each joined row.
 ///
-/// bd-9uf3l: only when `sqlite_stat1` says the pinned side is the smaller one.
-/// Without statistics the sizes are unknown, and the written order is far
-/// cheaper for a small outer table joined to an unselective equality (a
-/// 10-row q JOIN t WHERE t.flag = 1: 305k instructions in the written order,
-/// 1,030,918k swapped), so the swap needs an estimate of both sides: the
-/// written outer table's rows, and the rows the pinned equality matches (one
-/// for a rowid). Each driving row costs about one lookup into the other table
-/// either way, so the side with fewer driving rows wins, by a margin that
-/// keeps near ties in the written order.
+/// bd-9uf3l: only when the estimates say the pinned side is the smaller one.
+/// The written order is far cheaper for a small outer table joined to an
+/// unselective equality (a 10-row q JOIN t WHERE t.flag = 1: 305k
+/// instructions in the written order, 1,030,918k swapped), so the swap needs
+/// an estimate of both sides: the written outer table's rows (from
+/// `sqlite_stat1`, or bd-prkvt's b-tree estimate without it; none keeps the
+/// written order), and the rows the pinned equality matches (one for a rowid;
+/// for an index, the rows per key from `sqlite_stat1` or from the b-tree
+/// sample, else SQLite's default, `default_rows_per_leading_key`; the sample
+/// keeps `t.flag = 1` over half of t from looking selective). Each driving
+/// row costs about one lookup into the other table either way, so the side
+/// with fewer driving rows wins, by a margin that keeps near ties in the
+/// written order.
 #[allow(clippy::too_many_arguments)]
 fn swapped_join_lookup_plan_driving_filtered_side<'a>(
     written: &SingleJoinLookupPlan<'a>,
@@ -13879,12 +13888,25 @@ fn swapped_join_lookup_plan_driving_filtered_side<'a>(
         None,
     )? {
         OuterEqualitySeek::Rowid { .. } => 1,
-        OuterEqualitySeek::Index { index, .. } => *estimates
+        OuterEqualitySeek::Index { index, .. } => estimates
             .index_rows_per_key
-            .get(&index.name.to_ascii_lowercase())?
-            .first()?,
+            .get(&index.name.to_ascii_lowercase())
+            .and_then(|rows_per_key| rows_per_key.first().copied())
+            .unwrap_or_else(|| default_rows_per_leading_key(index)),
     };
     (pinned_rows.saturating_mul(SWAP_MARGIN) < written_outer_rows).then_some(swapped)
+}
+
+/// The rows an equality on `index`'s leading column matches when
+/// `sqlite_stat1` has no row for the index: one for a unique single-column
+/// index, else ten, SQLite's default for a leading column
+/// (`sqlite3DefaultRowEst`).
+fn default_rows_per_leading_key(index: &IndexSchema) -> u64 {
+    if index.is_unique && index.columns.len() == 1 && index.where_clause.is_none() {
+        1
+    } else {
+        10
+    }
 }
 
 /// The affinity SQLite applies to a probe of an index on a column with
