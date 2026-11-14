@@ -22076,6 +22076,18 @@ impl WalPageOneWritePlan {
     }
 }
 
+/// What [`SimpleTransaction::resident_page_lookup`] found in the
+/// transaction's own state.
+enum ResidentPageLookup {
+    /// The staged write, or the image this transaction already read.
+    Page(PageData),
+    /// Allocated after a savepoint that was rolled back: read as zeros.
+    RolledBackAllocation,
+    /// Only a read of shared state (publication plane, cache, WAL, file)
+    /// can answer.
+    NotResident,
+}
+
 impl<V> SimpleTransaction<V>
 where
     V: Vfs,
@@ -22661,6 +22673,90 @@ where
         } else {
             self.txn_read_cache_incomplete.set(true);
         }
+    }
+
+    /// The part of `get_page` that reads only this transaction's own state,
+    /// in `get_page`'s order: the recovery barrier, its freed pages, its write
+    /// set, its rolled-back allocations, its snapshot's size bound and its read
+    /// cache. `get_page` runs it first and `get_resident_page` runs only it,
+    /// so the two cannot disagree (bd-w4pr1.13.18).
+    fn resident_page_lookup(&self, cx: &Cx, page_no: PageNumber) -> Result<ResidentPageLookup> {
+        self.ensure_no_pending_group_commit_attempt()?;
+        if self.contains_freed_page(page_no) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {} was freed earlier in this transaction",
+                    page_no.get()
+                ),
+            });
+        }
+
+        if let Some(staged) = self.write_set.get(&page_no) {
+            return Ok(ResidentPageLookup::Page(staged.published_page()));
+        }
+
+        // Pages that were allocated after a savepoint and then rolled back
+        // should return zeros, not BusySnapshot error.
+        if self.rolled_back_pages.contains(&page_no) {
+            return Ok(ResidentPageLookup::RolledBackAllocation);
+        }
+
+        // MVCC db_size guard: pages beyond the transaction's snapshot db_size
+        // did not exist when this snapshot was taken. A transaction handle is
+        // bound to one coherent snapshot for its lifetime, so a later commit
+        // must never expand this boundary in-place. Callers that need the
+        // latest state must begin a new transaction at the statement boundary.
+        //
+        // Exception: pages allocated by THIS transaction (in allocated_from_eof
+        // or allocated_from_freelist) are allowed even if beyond published_db_size.
+        if page_no.get() > self.published_db_size.get() {
+            let page_allocated_by_this_txn = self.allocated_from_eof.contains(&page_no)
+                || self.allocated_from_freelist.contains(&page_no)
+                || self.page_lease.contains(&page_no);
+            if !page_allocated_by_this_txn {
+                let latest_snapshot = self.published.snapshot();
+                tracing::trace!(
+                    target: "fsqlite.snapshot_publication",
+                    trace_id = cx.trace_id(),
+                    run_id = "pager-publication",
+                    scenario_id = "page_beyond_fixed_snapshot_db_size",
+                    page_no = page_no.get(),
+                    published_db_size = self.published_db_size.get(),
+                    latest_db_size = latest_snapshot.db_size,
+                    published_commit_seq = self.published_visible_commit_seq.get().get(),
+                    latest_commit_seq = latest_snapshot.visible_commit_seq.get(),
+                    "refused to advance a transaction's fixed snapshot"
+                );
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: format!(
+                        "page {} > snapshot db_size {} (latest: {})",
+                        page_no.get(),
+                        self.published_db_size.get(),
+                        latest_snapshot.db_size
+                    ),
+                });
+            }
+        }
+
+        // A transaction that has already observed a page owns that exact
+        // snapshot image for the rest of its lifetime.  Consult the local
+        // cache before every shared publication/cache source; otherwise a
+        // concurrent commit can replace those global latest-image planes and
+        // make a re-read return different bytes even though this handle's
+        // visible commit sequence remains fixed (GH #129).
+        if let Some(cached) = self.txn_read_cache.borrow().get(&page_no) {
+            return Ok(ResidentPageLookup::Page(cached.clone()));
+        }
+        Ok(ResidentPageLookup::NotResident)
+    }
+
+    /// The zeros a page allocated after a rolled-back savepoint reads as.
+    fn rolled_back_allocation_page(&self) -> Result<PageData> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        Ok(PageData::zeroed(inner.page_size))
     }
 
     /// A successful retained commit begins a new logical snapshot. Failed
@@ -27036,86 +27132,30 @@ where
     V: Vfs + Send,
     V::File: Send + Sync + 'static,
 {
-    // bd-h9o9r: a sync mutex guard is held across an await in this
-    // function's body; reachable-deadlock audit and lock-scope repair
-    // belong to the Phase-C pager reconstruction.
-    #[allow(clippy::await_holding_lock)]
     fn get_page<'a>(
         &'a self,
         cx: &'a Cx,
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a {
         async move {
-            self.ensure_no_pending_group_commit_attempt()?;
-            if self.contains_freed_page(page_no) {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "page {} was freed earlier in this transaction",
-                        page_no.get()
-                    ),
-                });
+            match self.resident_page_lookup(cx, page_no)? {
+                ResidentPageLookup::Page(page) => Ok(page),
+                ResidentPageLookup::RolledBackAllocation => self.rolled_back_allocation_page(),
+                ResidentPageLookup::NotResident => self.get_nonresident_page(cx, page_no).await,
             }
+        }
+    }
 
-            if let Some(staged) = self.write_set.get(&page_no) {
-                return Ok(staged.published_page());
-            }
-
-            // Pages that were allocated after a savepoint and then rolled back
-            // should return zeros, not BusySnapshot error.
-            if self.rolled_back_pages.contains(&page_no) {
-                let inner = self
-                    .inner
-                    .lock()
-                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-                return Ok(PageData::zeroed(inner.page_size));
-            }
-
-            // MVCC db_size guard: pages beyond the transaction's snapshot db_size
-            // did not exist when this snapshot was taken. A transaction handle is
-            // bound to one coherent snapshot for its lifetime, so a later commit
-            // must never expand this boundary in-place. Callers that need the
-            // latest state must begin a new transaction at the statement boundary.
-            //
-            // Exception: pages allocated by THIS transaction (in allocated_from_eof
-            // or allocated_from_freelist) are allowed even if beyond published_db_size.
-            if page_no.get() > self.published_db_size.get() {
-                let page_allocated_by_this_txn = self.allocated_from_eof.contains(&page_no)
-                    || self.allocated_from_freelist.contains(&page_no)
-                    || self.page_lease.contains(&page_no);
-                if !page_allocated_by_this_txn {
-                    let latest_snapshot = self.published.snapshot();
-                    tracing::trace!(
-                        target: "fsqlite.snapshot_publication",
-                        trace_id = cx.trace_id(),
-                        run_id = "pager-publication",
-                        scenario_id = "page_beyond_fixed_snapshot_db_size",
-                        page_no = page_no.get(),
-                        published_db_size = self.published_db_size.get(),
-                        latest_db_size = latest_snapshot.db_size,
-                        published_commit_seq = self.published_visible_commit_seq.get().get(),
-                        latest_commit_seq = latest_snapshot.visible_commit_seq.get(),
-                        "refused to advance a transaction's fixed snapshot"
-                    );
-                    return Err(FrankenError::BusySnapshot {
-                        conflicting_pages: format!(
-                            "page {} > snapshot db_size {} (latest: {})",
-                            page_no.get(),
-                            self.published_db_size.get(),
-                            latest_snapshot.db_size
-                        ),
-                    });
-                }
-            }
-
-            // A transaction that has already observed a page owns that exact
-            // snapshot image for the rest of its lifetime.  Consult the local
-            // cache before every shared publication/cache source; otherwise a
-            // concurrent commit can replace those global latest-image planes and
-            // make a re-read return different bytes even though this handle's
-            // visible commit sequence remains fixed (GH #129).
-            if let Some(cached) = self.txn_read_cache.borrow().get(&page_no) {
-                return Ok(cached.clone());
-            }
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
+    fn get_nonresident_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move {
             self.ensure_uncached_snapshot_sequence(
                 page_no,
                 self.published.snapshot().visible_commit_seq,
@@ -27296,6 +27336,15 @@ where
             // Cache the page read from inner.lock() for future reads.
             self.cache_transaction_read_page(page_no, &page);
             Ok(page)
+        }
+    }
+
+    fn get_resident_page(&self, cx: &Cx, page_no: PageNumber) -> Option<Result<PageData>> {
+        match self.resident_page_lookup(cx, page_no) {
+            Ok(ResidentPageLookup::Page(page)) => Some(Ok(page)),
+            Ok(ResidentPageLookup::RolledBackAllocation) => Some(self.rolled_back_allocation_page()),
+            Ok(ResidentPageLookup::NotResident) => None,
+            Err(error) => Some(Err(error)),
         }
     }
 
@@ -66892,6 +66941,135 @@ mod tests {
                 0,
                 "bead_id=bd-db300.3.8.7 case=wal_read_scope_pinned_read_must_not_take_write_lock_fallback"
             );
+        });
+    }
+
+    #[test]
+    fn test_get_resident_page_answers_only_from_the_transactions_own_state() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT.as_usize();
+
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let read_page = seed.allocate_page(&cx).await.unwrap();
+            let unread_page = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, read_page, &vec![0x11; ps])
+                .await
+                .unwrap();
+            seed.write_page(&cx, unread_page, &vec![0x22; ps])
+                .await
+                .unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert!(
+                reader.get_resident_page(&cx, read_page).is_none(),
+                "a page this transaction has not read is left to get_page"
+            );
+            assert_eq!(
+                reader.get_page(&cx, read_page).await.unwrap().as_ref(),
+                vec![0x11; ps].as_slice()
+            );
+
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            writer
+                .write_page(&cx, read_page, &vec![0xEE; ps])
+                .await
+                .unwrap();
+            writer
+                .write_page(&cx, unread_page, &vec![0xDD; ps])
+                .await
+                .unwrap();
+            writer.commit(&cx).await.unwrap();
+
+            let resident = reader
+                .get_resident_page(&cx, read_page)
+                .expect("an image this snapshot read is resident")
+                .unwrap();
+            assert_eq!(
+                resident.as_ref(),
+                vec![0x11; ps].as_slice(),
+                "the snapshot keeps the image it read, not the peer's commit"
+            );
+            assert_eq!(
+                resident.as_ref(),
+                reader.get_page(&cx, read_page).await.unwrap().as_ref()
+            );
+            assert!(
+                reader.get_resident_page(&cx, unread_page).is_none(),
+                "the peer's image in the shared cache is not this snapshot's resident page"
+            );
+            reader.commit(&cx).await.unwrap();
+
+            // After a `None`, the read that skips the prefix is the real read,
+            // and it leaves the page resident.
+            let mut fresh = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert!(fresh.get_resident_page(&cx, unread_page).is_none());
+            assert_eq!(
+                fresh
+                    .get_nonresident_page(&cx, unread_page)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                vec![0xDD; ps].as_slice()
+            );
+            assert_eq!(
+                fresh
+                    .get_resident_page(&cx, unread_page)
+                    .expect("the page read is now resident")
+                    .unwrap()
+                    .as_ref(),
+                vec![0xDD; ps].as_slice()
+            );
+            fresh.commit(&cx).await.unwrap();
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            assert_eq!(
+                txn.get_page(&cx, read_page).await.unwrap().as_ref(),
+                vec![0xEE; ps].as_slice()
+            );
+            txn.write_page(&cx, read_page, &vec![0x33; ps])
+                .await
+                .unwrap();
+            let staged = txn
+                .get_resident_page(&cx, read_page)
+                .expect("a staged write is resident")
+                .unwrap();
+            assert_eq!(
+                staged.as_ref(),
+                vec![0x33; ps].as_slice(),
+                "the transaction's own write, not the image it read before it"
+            );
+
+            txn.savepoint(&cx, "resident").unwrap();
+            let rolled_back = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, rolled_back, &vec![0x44; ps])
+                .await
+                .unwrap();
+            txn.rollback_to_savepoint(&cx, "resident").unwrap();
+            let resident_zeros = txn
+                .get_resident_page(&cx, rolled_back)
+                .expect("a rolled-back allocation reads as zeros without a read")
+                .unwrap();
+            assert!(resident_zeros.as_ref().iter().all(|&byte| byte == 0));
+            assert_eq!(
+                resident_zeros.as_ref(),
+                txn.get_page(&cx, rolled_back).await.unwrap().as_ref()
+            );
+
+            txn.free_page(&cx, unread_page).await.unwrap();
+            let resident_error = txn
+                .get_resident_page(&cx, unread_page)
+                .expect("a freed page is refused from the transaction's own state")
+                .unwrap_err();
+            let read_error = txn.get_page(&cx, unread_page).await.unwrap_err();
+            assert!(matches!(
+                resident_error,
+                FrankenError::DatabaseCorrupt { .. }
+            ));
+            assert_eq!(resident_error.to_string(), read_error.to_string());
+            txn.rollback(&cx).await.unwrap();
         });
     }
 

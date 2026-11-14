@@ -1216,6 +1216,31 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a;
 
+    /// The answer [`Self::get_page`] gives for `page_no` when it needs no
+    /// shared state and no storage read: the transaction's own staged image,
+    /// an image it already read in this transaction, a rolled-back
+    /// allocation's zeros, or the error `get_page` raises from that same state
+    /// (bd-w4pr1.13.18). `None` means only a read of shared state can answer.
+    /// It is synchronous, so a caller holding a resident page skips the read
+    /// future.
+    ///
+    /// The default answers `None` for every page.
+    fn get_resident_page(&self, _cx: &Cx, _page_no: PageNumber) -> Option<Result<PageData>> {
+        None
+    }
+
+    /// [`Self::get_page`] for a caller that [`Self::get_resident_page`] has
+    /// just answered `None` for the same page, with nothing run on this handle
+    /// in between: an implementation may skip the checks that answer already
+    /// made. The default is `get_page` itself.
+    fn get_nonresident_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        self.get_page(cx, page_no)
+    }
+
     /// Hint that `page_no` is likely to be read soon.
     ///
     /// Implementations should keep this best-effort and non-blocking. It is
@@ -2235,6 +2260,20 @@ impl TransactionHandle for TransactionKind {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a {
         async move { dispatch_transaction_kind!(self, txn => txn.get_page(cx, page_no).await) }
+    }
+
+    fn get_resident_page(&self, cx: &Cx, page_no: PageNumber) -> Option<Result<PageData>> {
+        dispatch_transaction_kind!(self, txn => txn.get_resident_page(cx, page_no))
+    }
+
+    fn get_nonresident_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move {
+            dispatch_transaction_kind!(self, txn => txn.get_nonresident_page(cx, page_no).await)
+        }
     }
 
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {

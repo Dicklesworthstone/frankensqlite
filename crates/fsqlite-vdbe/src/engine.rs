@@ -2637,6 +2637,28 @@ impl SharedTxnPageIo {
         self.concurrent.borrow().clone()
     }
 
+    /// The check a B-tree page read makes before it reads the pager
+    /// transaction: a page this concurrent transaction freed is refused.
+    /// Whether or not the page has a staged write, the read is then the pager
+    /// transaction's (its write set answers first).
+    fn refuse_page_freed_in_concurrent_transaction(&self, page_no: PageNumber) -> Result<()> {
+        let concurrent = self.concurrent.borrow();
+        let Some(ctx) = concurrent.as_ref() else {
+            return Ok(());
+        };
+        let handle = ctx.handle.lock();
+        if concurrent_has_page_state(&handle) && concurrent_page_read_status(&handle, page_no).0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {} was freed earlier in concurrent transaction {}",
+                    page_no.get(),
+                    ctx.txn_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn clear_stale_synthetic_pending_commit_surface(
         &self,
         _cx: &Cx,
@@ -3857,37 +3879,36 @@ impl PageReader for SharedTxnPageIo {
         self.txn.borrow().get_page(cx, page_no).await
     }
 
-    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
-    // await in this function's body. The engine executes strictly
-    // sequentially per connection, but the reachable-reentrancy audit and
-    // borrow-scope repair belong to the Phase-C reconstruction.
-    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
+    // bd-h9o9r: a RefCell borrow is held across an await in this function's
+    // body. The engine executes strictly sequentially per connection, but the
+    // reachable-reentrancy audit and borrow-scope repair belong to the Phase-C
+    // reconstruction.
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        if let Some(ctx) = self.concurrent_context() {
-            let has_staged_write = {
-                let handle = ctx.handle.lock();
-                let (is_freed, has_staged_write) = if concurrent_has_page_state(&handle) {
-                    concurrent_page_read_status(&handle, page_no)
-                } else {
-                    (false, false)
-                };
-                if is_freed {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "page {} was freed earlier in concurrent transaction {}",
-                            page_no.get(),
-                            ctx.txn_id
-                        ),
-                    });
-                }
-                has_staged_write
-            };
-
-            if has_staged_write {
-                return self.txn.borrow().get_page(cx, page_no).await;
-            }
-        }
+        self.refuse_page_freed_in_concurrent_transaction(page_no)?;
         self.txn.borrow().get_page(cx, page_no).await
+    }
+
+    fn read_resident_btree_page_data(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+    ) -> Option<Result<PageData>> {
+        if let Err(error) = self.refuse_page_freed_in_concurrent_transaction(page_no) {
+            return Some(Err(error));
+        }
+        self.txn.borrow().get_resident_page(cx, page_no)
+    }
+
+    // The resident answer just made the concurrent-context check; see the
+    // bd-h9o9r note on `read_btree_page_data` for the borrow held here.
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn read_nonresident_btree_page_data(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+    ) -> Result<PageData> {
+        self.txn.borrow().get_nonresident_page(cx, page_no).await
     }
 
     fn record_read_witness(&self, _cx: &Cx, key: WitnessKey) {

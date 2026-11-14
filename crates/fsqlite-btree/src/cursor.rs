@@ -322,6 +322,35 @@ pub trait PageReader {
         async move { self.read_page_data(cx, page_no).await }
     }
 
+    /// [`Self::read_btree_page_data`]'s answer when the reader has it
+    /// without a storage read: a transaction-backed reader answers from the
+    /// transaction's own staged writes and the images it already read
+    /// (bd-w4pr1.13.18). `None` leaves the page to `read_btree_page_data`.
+    /// An implementation returns only what `read_btree_page_data` would return
+    /// at this point, errors included, with the same effects.
+    ///
+    /// The default answers `None` for every page.
+    fn read_resident_btree_page_data(
+        &self,
+        _cx: &Cx,
+        _page_no: PageNumber,
+    ) -> Option<Result<PageData>> {
+        None
+    }
+
+    /// [`Self::read_btree_page_data`] for a caller that
+    /// [`Self::read_resident_btree_page_data`] has just answered `None` for
+    /// the same page, with nothing run on this reader in between: an
+    /// implementation may skip the checks that answer already made. The
+    /// default is `read_btree_page_data` itself.
+    fn read_nonresident_btree_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        self.read_btree_page_data(cx, page_no)
+    }
+
     /// Hint that a page is likely to be needed soon.
     ///
     /// Default implementation is a no-op so platforms without a safe prefetch
@@ -504,6 +533,23 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a {
         self.txn.get_page(cx, page_no)
+    }
+
+    // `read_btree_page_data` is the default one, which reads `get_page`.
+    fn read_resident_btree_page_data(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+    ) -> Option<Result<PageData>> {
+        self.txn.get_resident_page(cx, page_no)
+    }
+
+    fn read_nonresident_btree_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        self.txn.get_nonresident_page(cx, page_no)
     }
 
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -3893,7 +3939,17 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         self.note_page_visit(page_no);
-        let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
+        // A page the transaction already holds (its staged write or an image
+        // it read) comes back without the async read chain (bd-w4pr1.13.18);
+        // any other page is read, past the checks the resident answer made.
+        let page_data = match self.pager.read_resident_btree_page_data(cx, page_no) {
+            Some(resident) => resident?,
+            None => {
+                self.pager
+                    .read_nonresident_btree_page_data(cx, page_no)
+                    .await?
+            }
+        };
         let mutation_counter = Self::page_mutation_counter(&page_data);
         // The same image decodes to the same header and the same checked
         // pointers; see `DecodedPageMemo`.
@@ -13530,6 +13586,11 @@ mod tests {
     struct SeekProbeStore {
         inner: MemPageStore,
         read_pages: Rc<RefCell<Vec<PageNumber>>>,
+        /// Pages `read_resident_btree_page_data` answers; none unless a test
+        /// adds them. `read_pages` records only the async reads.
+        resident: Rc<RefCell<Vec<u32>>>,
+        /// A page whose resident answer is an error.
+        resident_refusal: Rc<RefCell<Option<u32>>>,
     }
 
     impl SeekProbeStore {
@@ -13537,6 +13598,8 @@ mod tests {
             Self {
                 inner,
                 read_pages: Rc::new(RefCell::new(Vec::new())),
+                resident: Rc::new(RefCell::new(Vec::new())),
+                resident_refusal: Rc::new(RefCell::new(None)),
             }
         }
 
@@ -13560,6 +13623,26 @@ mod tests {
                 self.read_pages.borrow_mut().push(page_no);
                 self.inner.read_page(cx, page_no).await
             }
+        }
+
+        fn read_resident_btree_page_data(
+            &self,
+            _cx: &Cx,
+            page_no: PageNumber,
+        ) -> Option<Result<PageData>> {
+            if *self.resident_refusal.borrow() == Some(page_no.get()) {
+                return Some(Err(FrankenError::internal("resident page refused")));
+            }
+            if !self.resident.borrow().contains(&page_no.get()) {
+                return None;
+            }
+            Some(
+                self.inner
+                    .pages
+                    .get(&page_no.get())
+                    .map(|page| PageData::from_vec(page.clone()))
+                    .ok_or_else(|| FrankenError::internal("page not found")),
+            )
         }
 
         fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -15978,6 +16061,73 @@ mod tests {
                     "target {target}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn test_load_page_takes_a_resident_page_without_the_async_read() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_table(
+                    &[
+                        (pn(3), 20),
+                        (pn(4), 40),
+                        (pn(5), 60),
+                        (pn(6), 80),
+                        (pn(7), 100),
+                    ],
+                    pn(8),
+                ),
+            );
+            for (page, first) in [
+                (3_u32, 10_i64),
+                (4, 30),
+                (5, 50),
+                (6, 70),
+                (7, 90),
+                (8, 110),
+            ] {
+                store.pages.insert(
+                    page,
+                    build_leaf_table(&[(first, b"a"), (first + 5, b"b"), (first + 10, b"c")]),
+                );
+            }
+
+            let cx = Cx::new();
+            let probe = SeekProbeStore::new(store);
+            probe.resident.borrow_mut().extend([2_u32, 3, 4]);
+            let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+            // (target, found, async reads). The root and leaves 3 and 4 are
+            // resident; each target below misses the seek cache, so the seek
+            // loads the root and the target's leaf, and only a leaf that is not
+            // resident goes through the async read.
+            for (target, found, reads) in [
+                (10_i64, true, vec![]),
+                (35, true, vec![]),
+                (55, true, vec![pn(5)]),
+                (112, false, vec![pn(8)]),
+            ] {
+                cursor.pager.clear_reads();
+                let result = cursor.table_move_to(&cx, target).await.unwrap();
+                assert_eq!(result.is_found(), found, "target {target}");
+                if found {
+                    assert_eq!(cursor.rowid(&cx).await.unwrap(), target);
+                }
+                assert_eq!(cursor.pager.read_pages(), reads, "target {target}");
+            }
+
+            // A resident refusal is the load's error, not a cue to read the
+            // page again. Leaf 7 is in no seek-cache slot, so the seek starts
+            // at the refused root.
+            *cursor.pager.resident_refusal.borrow_mut() = Some(2);
+            cursor.pager.clear_reads();
+            assert!(cursor.table_move_to(&cx, 90).await.is_err());
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "the refused root is not read through the async path"
+            );
         });
     }
 
