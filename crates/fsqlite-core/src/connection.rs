@@ -40783,9 +40783,10 @@ impl Connection {
             } else {
                 None
             };
-            let mut result = self
-                .execute_statement_once_after_background_status(statement, params)
-                .await;
+            let mut result = lean_future(|| {
+                self.execute_statement_once_after_background_status(statement, params)
+            })
+            .await;
             if !autocommit_retry_entry
                 || !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
                 || self.retained_flush_dropped_pending_writes.get()
@@ -40829,9 +40830,10 @@ impl Connection {
                 self.pending_ddl_source
                     .borrow_mut()
                     .clone_from(&pending_ddl_source);
-                result = self
-                    .execute_statement_once_after_background_status(statement, params)
-                    .await;
+                result = lean_future(|| {
+                    self.execute_statement_once_after_background_status(statement, params)
+                })
+                .await;
                 if !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error))
                     || self.retained_flush_dropped_pending_writes.get()
                 {
@@ -40852,132 +40854,136 @@ impl Connection {
         }))
     }
 
-    fn execute_statement_once_after_background_status<'a>(
-        &'a self,
-        statement: &'a Statement,
-        params: Option<&'a [SqliteValue]>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
-        Box::pin(async move {
-            #[cfg(test)]
-            record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
-            #[cfg(test)]
-            if matches!(statement, Statement::Pragma(_))
-                && let Some(error) = take_pragma_dispatch_error_once()
-            {
-                return Err(error);
+    /// One attempt of a statement. Awaited inline (through `lean_future`) by
+    /// [`Self::execute_statement_after_background_status`], whose box is the
+    /// recursion break for statements that re-enter the dispatcher, so a
+    /// top-level statement keeps this attempt and the dispatch below it in
+    /// that one allocation (bd-w4pr1.13.35, bd-w4pr1.11).
+    async fn execute_statement_once_after_background_status(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        #[cfg(test)]
+        record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
+        #[cfg(test)]
+        if matches!(statement, Statement::Pragma(_))
+            && let Some(error) = take_pragma_dispatch_error_once()
+        {
+            return Err(error);
+        }
+        // bd-zbyi0: inject a one-shot transient at dispatch BEFORE any
+        // retained-batch flush, so the counterkeeper can defer the flush-drop
+        // into a retry iteration and exercise the retry-loop guard.
+        #[cfg(test)]
+        if let Some(error) = take_pre_flush_dispatch_error_once() {
+            return Err(error);
+        }
+        // bd-xl98m (GH #207/#213): route the parenless eponymous no-arg pragma
+        // TVF form (`SELECT * FROM pragma_compile_options`) into the equivalent
+        // call form BEFORE relation validation, so the whole downstream
+        // pipeline (relation/semantics validation and dispatch) serves it
+        // through the already-working table-function path instead of raising
+        // NoSuchTable. Non-pragma statements are returned borrowed unchanged,
+        // so this only pays a cheap FROM-source scan on the common path.
+        let rewritten_statement = self.rewrite_statement_bare_pragma_table_functions(statement);
+        let statement: &Statement = rewritten_statement.as_ref();
+        // bd-cpa8b: `*` leaves out a table-valued function's HIDDEN columns.
+        let star_expanded_statement = expand_statement_hidden_table_function_stars(statement);
+        let statement: &Statement = star_expanded_statement.as_ref().unwrap_or(statement);
+        // bd-l6-view-insert-subquery-numbering-2qtn7: globally number a DML
+        // statement's `?` placeholders (recursing into subqueries) BEFORE the
+        // pre-dispatch non-correlated-subquery fold runs. Otherwise a `(SELECT ?)`
+        // in a VALUES row / SET value / WHERE is folded to a literal by
+        // re-numbering its `?` from 1 (binding param#1), and the enclosing
+        // counter never counts the subquery's slot — diverging from stock's
+        // global `?` numbering (this silently mis-bound UPDATE ... WHERE to
+        // param#1, updating zero rows, and gave DELETE ... RETURNING the wrong
+        // param). The per-DML dispatch arms also canonicalize, but that runs
+        // AFTER the fold; doing it here — idempotent for already-`Numbered`
+        // placeholders — is what makes it precede the fold. A plain
+        // statement has nothing to number and is used as it is.
+        let dml_canonical_statement;
+        let statement: &Statement = match statement {
+            Statement::Insert(insert) if !insert_is_plain(insert) => {
+                dml_canonical_statement =
+                    Statement::Insert(canonicalize_insert_placeholders(insert)?);
+                &dml_canonical_statement
             }
-            // bd-zbyi0: inject a one-shot transient at dispatch BEFORE any
-            // retained-batch flush, so the counterkeeper can defer the flush-drop
-            // into a retry iteration and exercise the retry-loop guard.
-            #[cfg(test)]
-            if let Some(error) = take_pre_flush_dispatch_error_once() {
-                return Err(error);
+            Statement::Update(update) if !update_is_plain(update) => {
+                dml_canonical_statement =
+                    Statement::Update(canonicalize_update_placeholders(update)?);
+                &dml_canonical_statement
             }
-            // bd-xl98m (GH #207/#213): route the parenless eponymous no-arg pragma
-            // TVF form (`SELECT * FROM pragma_compile_options`) into the equivalent
-            // call form BEFORE relation validation, so the whole downstream
-            // pipeline (relation/semantics validation and dispatch) serves it
-            // through the already-working table-function path instead of raising
-            // NoSuchTable. Non-pragma statements are returned borrowed unchanged,
-            // so this only pays a cheap FROM-source scan on the common path.
-            let rewritten_statement = self.rewrite_statement_bare_pragma_table_functions(statement);
-            let statement: &Statement = rewritten_statement.as_ref();
-            // bd-cpa8b: `*` leaves out a table-valued function's HIDDEN columns.
-            let star_expanded_statement = expand_statement_hidden_table_function_stars(statement);
-            let statement: &Statement = star_expanded_statement.as_ref().unwrap_or(statement);
-            // bd-l6-view-insert-subquery-numbering-2qtn7: globally number a DML
-            // statement's `?` placeholders (recursing into subqueries) BEFORE the
-            // pre-dispatch non-correlated-subquery fold runs. Otherwise a `(SELECT ?)`
-            // in a VALUES row / SET value / WHERE is folded to a literal by
-            // re-numbering its `?` from 1 (binding param#1), and the enclosing
-            // counter never counts the subquery's slot — diverging from stock's
-            // global `?` numbering (this silently mis-bound UPDATE ... WHERE to
-            // param#1, updating zero rows, and gave DELETE ... RETURNING the wrong
-            // param). The per-DML dispatch arms also canonicalize, but that runs
-            // AFTER the fold; doing it here — idempotent for already-`Numbered`
-            // placeholders — is what makes it precede the fold. A plain
-            // statement has nothing to number and is used as it is.
-            let dml_canonical_statement;
-            let statement: &Statement = match statement {
-                Statement::Insert(insert) if !insert_is_plain(insert) => {
-                    dml_canonical_statement =
-                        Statement::Insert(canonicalize_insert_placeholders(insert)?);
-                    &dml_canonical_statement
-                }
-                Statement::Update(update) if !update_is_plain(update) => {
-                    dml_canonical_statement =
-                        Statement::Update(canonicalize_update_placeholders(update)?);
-                    &dml_canonical_statement
-                }
-                Statement::Delete(delete) if !delete_is_plain(delete) => {
-                    dml_canonical_statement =
-                        Statement::Delete(canonicalize_delete_placeholders(delete)?);
-                    &dml_canonical_statement
-                }
-                _ => statement,
-            };
-            self.refresh_select_schema_before_relation_validation(statement)
-                .await?;
-            // bd-at0bx: bind `schema.table.column` references to the FROM item
-            // of that database (SQLite's `lookupName` with a `zDb`) before any
-            // validator or executor sees them; they match by table name only.
-            let bound_statement = self.bind_schema_qualified_columns(statement)?;
-            let statement: &Statement = bound_statement.as_ref().unwrap_or(statement);
-            for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
-                let snapshot_generation = self.function_registry_generation();
-                let statement_snapshot = self.freeze_statement_values_snapshot(statement);
-                let froze_deferred_values = matches!(&statement_snapshot, Cow::Owned(_));
+            Statement::Delete(delete) if !delete_is_plain(delete) => {
+                dml_canonical_statement =
+                    Statement::Delete(canonicalize_delete_placeholders(delete)?);
+                &dml_canonical_statement
+            }
+            _ => statement,
+        };
+        self.refresh_select_schema_before_relation_validation(statement)
+            .await?;
+        // bd-at0bx: bind `schema.table.column` references to the FROM item
+        // of that database (SQLite's `lookupName` with a `zDb`) before any
+        // validator or executor sees them; they match by table name only.
+        let bound_statement = self.bind_schema_qualified_columns(statement)?;
+        let statement: &Statement = bound_statement.as_ref().unwrap_or(statement);
+        for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+            let snapshot_generation = self.function_registry_generation();
+            let statement_snapshot = self.freeze_statement_values_snapshot(statement);
+            let froze_deferred_values = matches!(&statement_snapshot, Cow::Owned(_));
 
-                // Virtual-table metadata callbacks are reentrant and may
-                // replace scalar functions while validating a direct
-                // statement. If the statement's VALUES donor was frozen
-                // before that callback, discard it and freeze a fresh snapshot
-                // from the registry-agnostic parsed AST. The implementation is
-                // told that this snapshot has already passed structural
-                // validation so the callback cannot run a second time after
-                // the generation check.
-                let relation_result = self.with_fallback_function_registry(|| {
-                    self.validate_statement_select_relations(statement_snapshot.as_ref())
-                });
-                if self.function_registry_generation() != snapshot_generation {
-                    if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
-                        return Err(FrankenError::SchemaChanged);
-                    }
-                    // A borrowed statement may already contain a VALUES donor
-                    // frozen by an enclosing snapshot. It cannot be
-                    // distinguished from a no-VALUES statement here, so fail
-                    // closed instead of executing potentially mixed-generation
-                    // metadata. The caller may retry from SQL text.
-                    if !froze_deferred_values {
-                        return Err(FrankenError::SchemaChanged);
-                    }
-                    continue;
-                }
-                relation_result?;
-                let semantics_result = self.with_fallback_function_registry(|| {
-                    self.validate_statement_select_semantics(statement_snapshot.as_ref())
-                });
-                if self.function_registry_generation() == snapshot_generation {
-                    semantics_result?;
-                    return self
-                        .execute_statement_impl_after_background_status(
-                            statement_snapshot.as_ref(),
-                            params,
-                            None,
-                            true,
-                        )
-                        .await;
-                }
+            // Virtual-table metadata callbacks are reentrant and may
+            // replace scalar functions while validating a direct
+            // statement. If the statement's VALUES donor was frozen
+            // before that callback, discard it and freeze a fresh snapshot
+            // from the registry-agnostic parsed AST. The implementation is
+            // told that this snapshot has already passed structural
+            // validation so the callback cannot run a second time after
+            // the generation check.
+            let relation_result = self.with_fallback_function_registry(|| {
+                self.validate_statement_select_relations(statement_snapshot.as_ref())
+            });
+            if self.function_registry_generation() != snapshot_generation {
                 if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
                     return Err(FrankenError::SchemaChanged);
                 }
+                // A borrowed statement may already contain a VALUES donor
+                // frozen by an enclosing snapshot. It cannot be
+                // distinguished from a no-VALUES statement here, so fail
+                // closed instead of executing potentially mixed-generation
+                // metadata. The caller may retry from SQL text.
                 if !froze_deferred_values {
                     return Err(FrankenError::SchemaChanged);
                 }
+                continue;
             }
+            relation_result?;
+            let semantics_result = self.with_fallback_function_registry(|| {
+                self.validate_statement_select_semantics(statement_snapshot.as_ref())
+            });
+            if self.function_registry_generation() == snapshot_generation {
+                semantics_result?;
+                return lean_future(|| {
+                    self.execute_statement_impl_body(
+                        statement_snapshot.as_ref(),
+                        params,
+                        None,
+                        true,
+                    )
+                })
+                .await;
+            }
+            if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                return Err(FrankenError::SchemaChanged);
+            }
+            if !froze_deferred_values {
+                return Err(FrankenError::SchemaChanged);
+            }
+        }
 
-            unreachable!("registry-stability loop always returns")
-        })
+        unreachable!("registry-stability loop always returns")
     }
 
     async fn refresh_select_schema_before_relation_validation(
@@ -41257,10 +41263,11 @@ impl Connection {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     // Dispatch re-enters itself (triggers, view INSTEAD OF bodies, subquery
     // materialization, FK cascades), so the future is boxed to break the
-    // recursive type.
+    // recursive type. The top-level path awaits the body inline instead
+    // (`execute_statement_once_after_background_status`), inside the one box
+    // `execute_statement_after_background_status` already holds.
     fn execute_statement_impl_after_background_status<'a>(
         &'a self,
         statement: &'a Statement,
@@ -41268,366 +41275,380 @@ impl Connection {
         precompiled: Option<&'a VdbeProgram>,
         select_structure_validated: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
-        Box::pin(async move {
-            #[cfg(test)]
-            record_trigger_stack_probe(trigger_probe_site::DISPATCH_IMPL);
-            let _record_profile_scope =
-                enter_record_profile_scope(RecordProfileScope::CoreConnection);
-            self.clear_table_program_error_state();
-            self.forget_constraint_failure_action_at_top_level();
-            self.sync_change_tracking_context();
-            // bd-u4hie: raise the dispatch nesting depth AFTER the `'now'` reset
-            // decision above, so any nested subquery / CTE that recurses back
-            // into this dispatch observes depth > 0 and keeps the top-level
-            // statement's captured `'now'`.
-            let _statement_exec_depth_guard = self.enter_statement_exec();
-            // bd-nn29x: the triggers this DML statement fires see its `OR`
-            // clause (see `execute_bound_trigger_statement`).
-            let _dml_conflict_clause_guard =
-                statement_passes_dml_conflict_clause(statement).then(|| {
-                    DmlConflictClauseGuard::new(
-                        &self.dml_conflict_clause,
-                        statement_dml_conflict_clause(statement),
-                    )
-                });
-            if !select_structure_validated {
-                self.with_fallback_function_registry(|| {
-                    self.validate_statement_select_structure(statement)
-                })?;
-            }
-            let statement_kind = match &statement {
-                Statement::Select(_) => "select",
-                Statement::Insert(_) => "insert",
-                Statement::Update(_) => "update",
-                Statement::Delete(_) => "delete",
-                Statement::CreateTable(_) => "create_table",
-                Statement::CreateVirtualTable(_) => "create_virtual_table",
-                Statement::Drop(_) => "drop",
-                Statement::AlterTable(_) => "alter_table",
-                Statement::CreateIndex(_) => "create_index",
-                Statement::Pragma(_) => "pragma",
-                Statement::Begin(_) => "begin",
-                Statement::Commit => "commit",
-                Statement::Rollback(_) => "rollback",
-                Statement::Savepoint(_) => "savepoint",
-                Statement::Release(_) => "release",
-                Statement::CreateView(_) => "create_view",
-                Statement::CreateTrigger(_) => "create_trigger",
-                Statement::Explain { .. } => "explain",
-                _ => "other",
-            };
-            let statement_trace_enabled =
-                tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG);
-            let parse_trace_enabled =
-                tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE);
-            let trace_id = (statement_trace_enabled || parse_trace_enabled)
-                .then(next_trace_id)
-                .unwrap_or(0);
-            let decision_id = statement_trace_enabled.then(next_decision_id).unwrap_or(0);
-            let trace_registration = self.trace_registration.borrow().clone();
-            let compat_trace_stmt_enabled = trace_registration
-                .as_ref()
-                .is_some_and(|trace| trace.mask.contains(TraceMask::STMT));
-            let compat_trace_profile_enabled = trace_registration
-                .as_ref()
-                .is_some_and(|trace| trace.mask.contains(TraceMask::PROFILE));
-            let compat_trace_row_enabled = trace_registration
-                .as_ref()
-                .is_some_and(|trace| trace.mask.contains(TraceMask::ROW));
-            let statement_sql = (compat_trace_stmt_enabled || compat_trace_profile_enabled)
-                .then(|| statement.to_string());
-            let statement_reuse_enabled =
-                tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO);
-            let statement_reuse_sql = statement_reuse_enabled.then(|| {
-                statement_sql
-                    .clone()
-                    .unwrap_or_else(|| statement.to_string())
+        Box::pin(self.execute_statement_impl_body(
+            statement,
+            params,
+            precompiled,
+            select_structure_validated,
+        ))
+    }
+
+    /// The statement dispatch behind
+    /// [`Self::execute_statement_impl_after_background_status`], unboxed so a
+    /// top-level statement does not pay a second large allocation for it
+    /// (bd-w4pr1.13.35, bd-w4pr1.11). Every call from inside the dispatch goes
+    /// through the boxed entry.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_statement_impl_body(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+        precompiled: Option<&VdbeProgram>,
+        select_structure_validated: bool,
+    ) -> Result<Vec<Row>> {
+        #[cfg(test)]
+        record_trigger_stack_probe(trigger_probe_site::DISPATCH_IMPL);
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
+        self.clear_table_program_error_state();
+        self.forget_constraint_failure_action_at_top_level();
+        self.sync_change_tracking_context();
+        // bd-u4hie: raise the dispatch nesting depth AFTER the `'now'` reset
+        // decision above, so any nested subquery / CTE that recurses back
+        // into this dispatch observes depth > 0 and keeps the top-level
+        // statement's captured `'now'`.
+        let _statement_exec_depth_guard = self.enter_statement_exec();
+        // bd-nn29x: the triggers this DML statement fires see its `OR`
+        // clause (see `execute_bound_trigger_statement`).
+        let _dml_conflict_clause_guard =
+            statement_passes_dml_conflict_clause(statement).then(|| {
+                DmlConflictClauseGuard::new(
+                    &self.dml_conflict_clause,
+                    statement_dml_conflict_clause(statement),
+                )
             });
-            let statement_span = statement_trace_enabled.then(|| {
+        if !select_structure_validated {
+            self.with_fallback_function_registry(|| {
+                self.validate_statement_select_structure(statement)
+            })?;
+        }
+        let statement_kind = match &statement {
+            Statement::Select(_) => "select",
+            Statement::Insert(_) => "insert",
+            Statement::Update(_) => "update",
+            Statement::Delete(_) => "delete",
+            Statement::CreateTable(_) => "create_table",
+            Statement::CreateVirtualTable(_) => "create_virtual_table",
+            Statement::Drop(_) => "drop",
+            Statement::AlterTable(_) => "alter_table",
+            Statement::CreateIndex(_) => "create_index",
+            Statement::Pragma(_) => "pragma",
+            Statement::Begin(_) => "begin",
+            Statement::Commit => "commit",
+            Statement::Rollback(_) => "rollback",
+            Statement::Savepoint(_) => "savepoint",
+            Statement::Release(_) => "release",
+            Statement::CreateView(_) => "create_view",
+            Statement::CreateTrigger(_) => "create_trigger",
+            Statement::Explain { .. } => "explain",
+            _ => "other",
+        };
+        let statement_trace_enabled =
+            tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG);
+        let parse_trace_enabled = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE);
+        let trace_id = (statement_trace_enabled || parse_trace_enabled)
+            .then(next_trace_id)
+            .unwrap_or(0);
+        let decision_id = statement_trace_enabled.then(next_decision_id).unwrap_or(0);
+        let trace_registration = self.trace_registration.borrow().clone();
+        let compat_trace_stmt_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::STMT));
+        let compat_trace_profile_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::PROFILE));
+        let compat_trace_row_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::ROW));
+        let statement_sql = (compat_trace_stmt_enabled || compat_trace_profile_enabled)
+            .then(|| statement.to_string());
+        let statement_reuse_enabled =
+            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO);
+        let statement_reuse_sql = statement_reuse_enabled.then(|| {
+            statement_sql
+                .clone()
+                .unwrap_or_else(|| statement.to_string())
+        });
+        let statement_span = statement_trace_enabled.then(|| {
+            let span = tracing::span!(
+                target: "fsqlite.statement",
+                tracing::Level::DEBUG,
+                "statement",
+                trace_id,
+                decision_id,
+                statement_kind
+            );
+            record_trace_span_created();
+            span
+        });
+        let _statement_guard = statement_span.as_ref().map(tracing::Span::enter);
+        if compat_trace_stmt_enabled {
+            emit_compat_trace_event(
+                trace_registration.as_ref(),
+                TraceEvent::Statement {
+                    sql: statement_sql.clone().unwrap_or_default(),
+                },
+            );
+        }
+        let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
+            .then(fsqlite_types::sync_primitives::Instant::now);
+        // bd-7mnz8 Phase 1: box the owned SELECT clone so only a pointer
+        // (not a full `SelectStatement`) lives on this frame across the
+        // recursive trigger-dispatch await below.
+        let derived_storage_log_select: Option<Box<SelectStatement>> = match statement {
+            Statement::Select(select) if flatten_simple_from_subquery_select(select).is_some() => {
+                Some(Box::new(select.clone()))
+            }
+            _ => None,
+        };
+        // bd-7mnz8 Phase 1: keep the (possibly rewritten) statement
+        // heap-indirect for its owned variant so only a pointer — not a full
+        // inline `Statement` — sits on this recursive frame. Borrowed inputs
+        // stay borrowed (no allocation on the common path). `AsRef` (not an
+        // inherent `as_ref`) keeps the ~20 downstream `statement.as_ref()`
+        // call sites unchanged and avoids `clippy::should_implement_trait`.
+        enum RewrittenStatement<'s> {
+            Borrowed(&'s Statement),
+            Owned(Box<Statement>),
+        }
+        impl AsRef<Statement> for RewrittenStatement<'_> {
+            fn as_ref(&self) -> &Statement {
+                match self {
+                    RewrittenStatement::Borrowed(statement) => statement,
+                    RewrittenStatement::Owned(statement) => statement,
+                }
+            }
+        }
+        let statement = {
+            let parse_span = parse_trace_enabled.then(|| {
                 let span = tracing::span!(
-                    target: "fsqlite.statement",
-                    tracing::Level::DEBUG,
-                    "statement",
+                    target: "fsqlite.parse",
+                    tracing::Level::TRACE,
+                    "parse",
                     trace_id,
-                    decision_id,
-                    statement_kind
+                    statement_kind,
+                    phase = "rewrite_subquery"
                 );
                 record_trace_span_created();
                 span
             });
-            let _statement_guard = statement_span.as_ref().map(tracing::Span::enter);
-            if compat_trace_stmt_enabled {
-                emit_compat_trace_event(
-                    trace_registration.as_ref(),
-                    TraceEvent::Statement {
-                        sql: statement_sql.clone().unwrap_or_default(),
-                    },
-                );
+            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
+            match self.rewrite_subquery_statement(statement, params).await? {
+                Cow::Borrowed(borrowed) => RewrittenStatement::Borrowed(borrowed),
+                Cow::Owned(owned) => RewrittenStatement::Owned(Box::new(owned)),
             }
-            let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
-                .then(fsqlite_types::sync_primitives::Instant::now);
-            // bd-7mnz8 Phase 1: box the owned SELECT clone so only a pointer
-            // (not a full `SelectStatement`) lives on this frame across the
-            // recursive trigger-dispatch await below.
-            let derived_storage_log_select: Option<Box<SelectStatement>> = match statement {
-                Statement::Select(select)
-                    if flatten_simple_from_subquery_select(select).is_some() =>
-                {
-                    Some(Box::new(select.clone()))
-                }
-                _ => None,
-            };
-            // bd-7mnz8 Phase 1: keep the (possibly rewritten) statement
-            // heap-indirect for its owned variant so only a pointer — not a full
-            // inline `Statement` — sits on this recursive frame. Borrowed inputs
-            // stay borrowed (no allocation on the common path). `AsRef` (not an
-            // inherent `as_ref`) keeps the ~20 downstream `statement.as_ref()`
-            // call sites unchanged and avoids `clippy::should_implement_trait`.
-            enum RewrittenStatement<'s> {
-                Borrowed(&'s Statement),
-                Owned(Box<Statement>),
-            }
-            impl AsRef<Statement> for RewrittenStatement<'_> {
-                fn as_ref(&self) -> &Statement {
-                    match self {
-                        RewrittenStatement::Borrowed(statement) => statement,
-                        RewrittenStatement::Owned(statement) => statement,
-                    }
+        };
+        // bd-7mnz8 Phase 1: the autocommit/memdb preparation (roughly eight
+        // `.await` points) runs in `plan_statement_execution` so its
+        // resume-state stack lives on a frame that returns before the
+        // recursive trigger-dispatch below descends. Same operations, same
+        // order; `PRAGMA query_only` still rejects writes inside the helper.
+        let StatementExecutionPlan {
+            op_cx,
+            is_write,
+            is_txn_control,
+            capture_time_travel_snapshot,
+            writable_schema_dml,
+            schema_change_boundary,
+            was_auto,
+        } = self.plan_statement_execution(statement.as_ref()).await?;
+        let previous_total_changes = self.total_changes.get();
+        let previous_trigger_step_changes = self.trigger_step_changes.get();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
+        if !is_txn_control {
+            if is_write {
+                self.txn_metrics_note_write();
+            } else if matches!(statement.as_ref(), Statement::Select(_)) {
+                self.txn_metrics_note_read();
+                // bd-m1nte / I2: Track reads during an active retained batch
+                // to detect mixed workloads and lower the flush threshold.
+                if self.retained_autocommit_batch_active() {
+                    self.retained_autocommit_note_read();
                 }
             }
-            let statement = {
-                let parse_span = parse_trace_enabled.then(|| {
-                    let span = tracing::span!(
-                        target: "fsqlite.parse",
-                        tracing::Level::TRACE,
-                        "parse",
-                        trace_id,
-                        statement_kind,
-                        phase = "rewrite_subquery"
-                    );
-                    record_trace_span_created();
-                    span
-                });
-                let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
-                match self.rewrite_subquery_statement(statement, params).await? {
-                    Cow::Borrowed(borrowed) => RewrittenStatement::Borrowed(borrowed),
-                    Cow::Owned(owned) => RewrittenStatement::Owned(Box::new(owned)),
-                }
-            };
-            // bd-7mnz8 Phase 1: the autocommit/memdb preparation (roughly eight
-            // `.await` points) runs in `plan_statement_execution` so its
-            // resume-state stack lives on a frame that returns before the
-            // recursive trigger-dispatch below descends. Same operations, same
-            // order; `PRAGMA query_only` still rejects writes inside the helper.
-            let StatementExecutionPlan {
-                op_cx,
-                is_write,
-                is_txn_control,
-                capture_time_travel_snapshot,
-                writable_schema_dml,
-                schema_change_boundary,
-                was_auto,
-            } = self.plan_statement_execution(statement.as_ref()).await?;
-            let previous_total_changes = self.total_changes.get();
-            let previous_trigger_step_changes = self.trigger_step_changes.get();
-            let previous_last_insert_rowid = self.current_last_insert_rowid();
-            if !is_txn_control {
-                if is_write {
-                    self.txn_metrics_note_write();
-                } else if matches!(statement.as_ref(), Statement::Select(_)) {
-                    self.txn_metrics_note_read();
-                    // bd-m1nte / I2: Track reads during an active retained batch
-                    // to detect mixed workloads and lower the flush threshold.
-                    if self.retained_autocommit_batch_active() {
-                        self.retained_autocommit_note_read();
-                    }
-                }
-            }
-            let use_statement_savepoint = self.should_use_statement_savepoint(was_auto)
-                && matches!(
+        }
+        let use_statement_savepoint = self.should_use_statement_savepoint(was_auto)
+            && matches!(
+                statement.as_ref(),
+                Statement::Insert(_)
+                    | Statement::Update(_)
+                    | Statement::Delete(_)
+                    | Statement::CreateVirtualTable(_)
+                    | Statement::Drop(_)
+                    | Statement::CreateIndex(_)
+                    | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
+                        action: AlterTableAction::DropColumn(_),
+                        ..
+                    })
+                    | Statement::Reindex(_)
+            );
+        let rollback_on_constraint_violation =
+            statement_rolls_back_transaction_on_constraint(statement.as_ref());
+        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
+        let result = if use_statement_savepoint {
+            self.with_internal_statement_savepoint_and_cx(
+                &op_cx,
+                statement_kind,
+                statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                !matches!(
                     statement.as_ref(),
-                    Statement::Insert(_)
-                        | Statement::Update(_)
-                        | Statement::Delete(_)
-                        | Statement::CreateVirtualTable(_)
-                        | Statement::Drop(_)
-                        | Statement::CreateIndex(_)
-                        | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
-                            action: AlterTableAction::DropColumn(_),
-                            ..
-                        })
-                        | Statement::Reindex(_)
-                );
-            let rollback_on_constraint_violation =
-                statement_rolls_back_transaction_on_constraint(statement.as_ref());
-            let execute_body_start = hot_path_profile_enabled().then(Instant::now);
-            let result = if use_statement_savepoint {
-                self.with_internal_statement_savepoint_and_cx(
-                    &op_cx,
-                    statement_kind,
-                    statement_preserves_prior_changes_on_constraint(statement.as_ref()),
-                    !matches!(
+                    Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                ),
+                async || {
+                    self.execute_statement_dispatch_with_fk_scope(
+                        &op_cx,
                         statement.as_ref(),
-                        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-                    ),
-                    async || {
-                        self.execute_statement_dispatch_with_fk_scope(
-                            &op_cx,
-                            statement.as_ref(),
-                            params,
-                            precompiled,
-                            derived_storage_log_select.as_deref(),
-                        )
-                        .await
-                    },
-                )
-                .await
-            } else {
-                self.execute_statement_dispatch_with_fk_scope(
-                    &op_cx,
-                    statement.as_ref(),
-                    params,
-                    precompiled,
-                    derived_storage_log_select.as_deref(),
-                )
-                .await
-            };
-            record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
-            let mut preserved_constraint_failure_rows = false;
-            let result = match result {
-                Ok(rows) => Ok(rows),
-                Err(error) => {
-                    if matches!(
-                        statement.as_ref(),
-                        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-                    ) {
-                        preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
-                            statement_preserves_prior_changes_on_constraint(statement.as_ref()),
-                            &error,
-                            previous_total_changes,
-                            previous_trigger_step_changes,
-                            previous_last_insert_rowid,
-                        );
-                    }
-                    match self
-                        .maybe_rollback_transaction_for_conflict_action(
-                            rollback_on_constraint_violation,
-                            was_auto,
-                            &error,
-                        )
-                        .await
-                    {
-                        Ok(()) => Err(error),
-                        Err(rollback_error) => Err(rollback_error),
-                    }
-                }
-            };
-            let commit_autocommit_on_error = was_auto
-                && (preserved_constraint_failure_rows
-                // RAISE(FAIL) keeps the statement's already-applied rows, so an
-                // autocommit statement must commit them rather than roll back.
-                || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
-            let ok = result.is_ok() || commit_autocommit_on_error;
-            let dirty_table_name = if is_write {
-                Self::extract_written_table_name(statement.as_ref())
-            } else {
-                None
-            };
-            // bd-xvv8f: an autocommit DDL statement applies its connection-local
-            // schema mutation (and bumps `schema_cookie`) eagerly, before the
-            // implicit commit below. If that commit fails — e.g. a concurrent writer
-            // wins the first-committer race on the shared sqlite_master page — the
-            // statement rolls back, but the eager in-memory mutation survives and the
-            // rollback-recovery reload's schema-only fast path can skip repairing it
-            // (its `header_cookie == schema_cookie` guard intermittently matches the
-            // bumped local cookie). Arm a one-shot full-rebuild so the recovery reload
-            // reconstructs the schema from committed state. Scoped to schema-change
-            // boundaries so conflicted INSERT/UPDATE/DELETE rollbacks keep the cheap
-            // fast-path reload. Cleared on the success path (no recovery reload ran,
-            // so nothing consumed it) to avoid forcing an unrelated later reload.
-            let armed_full_schema_reload = was_auto && schema_change_boundary;
-            if armed_full_schema_reload {
-                self.force_full_schema_reload_once.set(true);
-            }
-            let resolve_result = self
-                .resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
-                    was_auto,
-                    ok,
-                    dirty_table_name,
-                    capture_time_travel_snapshot,
-                    schema_change_boundary,
-                    &op_cx,
-                )
-                .await;
-            if armed_full_schema_reload && resolve_result.is_ok() {
-                self.force_full_schema_reload_once.set(false);
-            }
-            if armed_full_schema_reload && !writable_schema_dml {
-                // bd-f5sh5: count consecutive losses to concurrent committers;
-                // any other outcome ends the streak.
-                let lost_race = |outcome: Option<&FrankenError>| {
-                    matches!(
-                        outcome,
-                        Some(FrankenError::Busy | FrankenError::BusySnapshot { .. })
+                        params,
+                        precompiled,
+                        derived_storage_log_select.as_deref(),
                     )
-                };
-                let streak = if lost_race(resolve_result.as_ref().err())
-                    || lost_race(result.as_ref().err())
+                    .await
+                },
+            )
+            .await
+        } else {
+            self.execute_statement_dispatch_with_fk_scope(
+                &op_cx,
+                statement.as_ref(),
+                params,
+                precompiled,
+                derived_storage_log_select.as_deref(),
+            )
+            .await
+        };
+        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+        let mut preserved_constraint_failure_rows = false;
+        let result = match result {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                if matches!(
+                    statement.as_ref(),
+                    Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                ) {
+                    preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
+                        statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                        &error,
+                        previous_total_changes,
+                        previous_trigger_step_changes,
+                        previous_last_insert_rowid,
+                    );
+                }
+                match self
+                    .maybe_rollback_transaction_for_conflict_action(
+                        rollback_on_constraint_violation,
+                        was_auto,
+                        &error,
+                    )
+                    .await
                 {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                }
+            }
+        };
+        let commit_autocommit_on_error = was_auto
+            && (preserved_constraint_failure_rows
+            // RAISE(FAIL) keeps the statement's already-applied rows, so an
+            // autocommit statement must commit them rather than roll back.
+            || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
+        let ok = result.is_ok() || commit_autocommit_on_error;
+        let dirty_table_name = if is_write {
+            Self::extract_written_table_name(statement.as_ref())
+        } else {
+            None
+        };
+        // bd-xvv8f: an autocommit DDL statement applies its connection-local
+        // schema mutation (and bumps `schema_cookie`) eagerly, before the
+        // implicit commit below. If that commit fails — e.g. a concurrent writer
+        // wins the first-committer race on the shared sqlite_master page — the
+        // statement rolls back, but the eager in-memory mutation survives and the
+        // rollback-recovery reload's schema-only fast path can skip repairing it
+        // (its `header_cookie == schema_cookie` guard intermittently matches the
+        // bumped local cookie). Arm a one-shot full-rebuild so the recovery reload
+        // reconstructs the schema from committed state. Scoped to schema-change
+        // boundaries so conflicted INSERT/UPDATE/DELETE rollbacks keep the cheap
+        // fast-path reload. Cleared on the success path (no recovery reload ran,
+        // so nothing consumed it) to avoid forcing an unrelated later reload.
+        let armed_full_schema_reload = was_auto && schema_change_boundary;
+        if armed_full_schema_reload {
+            self.force_full_schema_reload_once.set(true);
+        }
+        let resolve_result = self
+            .resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+                was_auto,
+                ok,
+                dirty_table_name,
+                capture_time_travel_snapshot,
+                schema_change_boundary,
+                &op_cx,
+            )
+            .await;
+        if armed_full_schema_reload && resolve_result.is_ok() {
+            self.force_full_schema_reload_once.set(false);
+        }
+        if armed_full_schema_reload && !writable_schema_dml {
+            // bd-f5sh5: count consecutive losses to concurrent committers;
+            // any other outcome ends the streak.
+            let lost_race = |outcome: Option<&FrankenError>| {
+                matches!(
+                    outcome,
+                    Some(FrankenError::Busy | FrankenError::BusySnapshot { .. })
+                )
+            };
+            let streak =
+                if lost_race(resolve_result.as_ref().err()) || lost_race(result.as_ref().err()) {
                     self.schema_change_conflict_streak.get().saturating_add(1)
                 } else {
                     0
                 };
-                self.schema_change_conflict_streak.set(streak);
+            self.schema_change_conflict_streak.set(streak);
+        }
+        resolve_result?;
+        if ok && writable_schema_dml {
+            let flush_retained = self.retained_autocommit_txn.borrow().is_some();
+            if flush_retained {
+                self.flush_retained_autocommit_txn(&op_cx).await?;
             }
-            resolve_result?;
-            if ok && writable_schema_dml {
-                let flush_retained = self.retained_autocommit_txn.borrow().is_some();
-                if flush_retained {
-                    self.flush_retained_autocommit_txn(&op_cx).await?;
-                }
+        }
+        if statement_reuse_enabled || compat_trace_profile_enabled {
+            let elapsed_ns = execution_started
+                .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            if let Some(statement_reuse_sql) = statement_reuse_sql.as_deref() {
+                let failure_diag = match result.as_ref() {
+                    Ok(_) => Cow::Borrowed("none"),
+                    Err(error) => Cow::Owned(error.to_string()),
+                };
+                self.log_statement_reuse_event(
+                    "execution",
+                    statement_reuse_sql,
+                    precompiled.is_some(),
+                    if ok { "none" } else { "execution_error" },
+                    0,
+                    elapsed_ns,
+                    failure_diag.as_ref(),
+                );
             }
-            if statement_reuse_enabled || compat_trace_profile_enabled {
-                let elapsed_ns = execution_started
-                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
-                if let Some(statement_reuse_sql) = statement_reuse_sql.as_deref() {
-                    let failure_diag = match result.as_ref() {
-                        Ok(_) => Cow::Borrowed("none"),
-                        Err(error) => Cow::Owned(error.to_string()),
-                    };
-                    self.log_statement_reuse_event(
-                        "execution",
-                        statement_reuse_sql,
-                        precompiled.is_some(),
-                        if ok { "none" } else { "execution_error" },
-                        0,
+            if compat_trace_profile_enabled {
+                emit_compat_trace_event(
+                    trace_registration.as_ref(),
+                    TraceEvent::Profile {
+                        sql: statement_sql.unwrap_or_default(),
                         elapsed_ns,
-                        failure_diag.as_ref(),
-                    );
-                }
-                if compat_trace_profile_enabled {
-                    emit_compat_trace_event(
-                        trace_registration.as_ref(),
-                        TraceEvent::Profile {
-                            sql: statement_sql.unwrap_or_default(),
-                            elapsed_ns,
-                        },
-                    );
-                }
+                    },
+                );
             }
-            if compat_trace_row_enabled && let Ok(rows) = result.as_ref() {
-                for row in rows {
-                    emit_compat_trace_event(
-                        trace_registration.as_ref(),
-                        TraceEvent::Row {
-                            values: row.values().to_vec(),
-                        },
-                    );
-                }
+        }
+        if compat_trace_row_enabled && let Ok(rows) = result.as_ref() {
+            for row in rows {
+                emit_compat_trace_event(
+                    trace_registration.as_ref(),
+                    TraceEvent::Row {
+                        values: row.values().to_vec(),
+                    },
+                );
             }
-            result
-        })
+        }
+        result
     }
 
     /// Inner dispatch for `execute_statement` — separated so that
@@ -41756,13 +41777,9 @@ impl Connection {
         // `lean_future`, so an unoptimized build does not reserve every one of
         // them in this frame (bd-w4pr1.28).
         //
-        // An INSERT reaches an attached database only through its table's
-        // schema qualifier (`attached_target_schema` answers None without one),
-        // so an unqualified INSERT does not allocate the delegation future
-        // (bd-w4pr1.13.35).
-        let may_target_attached_schema =
-            !matches!(statement, Statement::Insert(insert) if insert.table.schema.is_none());
-        if may_target_attached_schema
+        // The delegation future is built only for a statement it can act on
+        // (bd-w4pr1.13.35, bd-w4pr1.11).
+        if statement_may_target_attached_schema(statement)
             && let Some(rows) =
                 lean_future(|| self.maybe_execute_attached_target_statement(statement, params))
                     .await
@@ -42763,8 +42780,10 @@ impl Connection {
                     Ok(rows)
                 }
             }
+            // INSERT is a hot statement kind: its dispatch is awaited inline in
+            // release (bd-w4pr1.13.35).
             Statement::Insert(insert) => {
-                boxed_future(|| {
+                lean_future(|| {
                     self.execute_insert_dispatch(cx, statement, insert, params, precompiled, None)
                 })
                 .await
@@ -156034,6 +156053,108 @@ fn sqlite_master_sql_text(row: &[SqliteValue]) -> Result<Option<&str>> {
         Some(other) => Err(FrankenError::DatabaseCorrupt {
             detail: format!("sqlite_master sql column has unexpected value {other:?}"),
         }),
+    }
+}
+
+/// Whether [`Connection::maybe_execute_attached_target_statement`] can act on
+/// `statement`. It handles exactly these statement kinds, an INSERT only
+/// through its table's schema qualifier (`attached_target_schema` answers
+/// None without one, in the WITH pre-check and in the Insert arm), and
+/// answers None at once for every other kind. Keep the two in step: a kind
+/// added there must be added here.
+fn statement_may_target_attached_schema(statement: &Statement) -> bool {
+    match statement {
+        Statement::Insert(insert) => insert.table.schema.is_some(),
+        Statement::CreateTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::CreateView(_)
+        | Statement::CreateTrigger(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Pragma(_)
+        | Statement::Drop(_)
+        | Statement::AlterTable(_) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod attached_target_statement_kind_tests {
+    #[allow(clippy::wildcard_imports)]
+    use super::*;
+
+    /// Every statement the delegation acts on is one the dispatcher still
+    /// builds its future for, and the kinds the dispatcher now skips get None
+    /// from it. A gate keyed on DML alone, or on a qualifier of any kind,
+    /// fails the first list (CREATE / PRAGMA / DROP / ALTER on `aux`).
+    #[test]
+    fn the_attached_target_gate_admits_every_statement_the_delegation_runs() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.expect("open");
+            conn.execute("ATTACH ':memory:' AS aux")
+                .await
+                .expect("attach");
+            conn.execute("CREATE TABLE aux.x(a)")
+                .await
+                .expect("aux table");
+            conn.execute("CREATE TABLE x(a)").await.expect("main table");
+            let delegated = [
+                "CREATE TABLE aux.y(b)",
+                "CREATE INDEX aux.xi ON x(a)",
+                "CREATE VIEW aux.v AS SELECT a FROM x",
+                "CREATE TRIGGER aux.tr AFTER INSERT ON x BEGIN SELECT 1; END",
+                "INSERT INTO aux.x(a) VALUES (1)",
+                "UPDATE aux.x SET a = 2",
+                "DELETE FROM aux.x WHERE a = 2",
+                "PRAGMA aux.user_version = 3",
+                "DROP TABLE aux.y",
+            ];
+            // ALTER TABLE takes its stored text from the top-level statement,
+            // so it is run as an application runs it.
+            let alter = "ALTER TABLE aux.x ADD COLUMN c";
+            assert!(statement_may_target_attached_schema(
+                &parse_single_statement(alter).expect("parse")
+            ));
+            conn.execute(alter).await.expect("ALTER TABLE on aux");
+            conn.query("SELECT c FROM aux.x")
+                .await
+                .expect("the column was added to aux.x");
+            for sql in delegated {
+                let statement = parse_single_statement(sql).expect("parse");
+                let outcome = conn
+                    .maybe_execute_attached_target_statement(&statement, None)
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql}: {error}"));
+                assert!(outcome.is_some(), "the delegation no longer runs {sql}");
+                assert!(
+                    statement_may_target_attached_schema(&statement),
+                    "the gate would skip {sql}"
+                );
+            }
+            let not_delegated = [
+                "SELECT a FROM aux.x",
+                "SELECT a FROM x WHERE a = 1",
+                "INSERT INTO x VALUES (1)",
+                "BEGIN",
+                "COMMIT",
+                "SAVEPOINT s",
+                "RELEASE s",
+                "ANALYZE aux",
+                "EXPLAIN INSERT INTO aux.x VALUES (5)",
+            ];
+            for sql in not_delegated {
+                let statement = parse_single_statement(sql).expect("parse");
+                assert!(
+                    !statement_may_target_attached_schema(&statement),
+                    "the gate still builds the delegation future for {sql}"
+                );
+                let outcome = conn
+                    .maybe_execute_attached_target_statement(&statement, None)
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql}: {error}"));
+                assert!(outcome.is_none(), "the delegation acts on {sql}");
+            }
+        });
     }
 }
 
