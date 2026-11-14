@@ -87,6 +87,44 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN (above its prediction): the parallel aggregate kernel reads a table-leaf cell stored whole on its page from its two varints, which takes its CPU below stock's on scan_filter_agg (bd-w4pr1.13.11 kernel lever K5)
+
+- Target: `CellRef::parse` in the parallel ungrouped-aggregate kernel, 86 Ir/row on scan_filter_agg
+  (two general varint reads ~28, the local-payload-size math, overflow checks and the `CellRef` it
+  builds) for cells that on this table never spill. Touched: `crates/fsqlite-btree/src/cell.rs`
+  (`table_leaf_local_record`, `read_varint_one_byte_first`, a unit test),
+  `crates/fsqlite-vdbe/src/parallel_aggregate.rs` (`scan_leaf`).
+- Ledger preflight: K1-K4 below; the serial cursor's `local_leaf_table_cell_span` already reads
+  the same span for the in-place Column lane, and is not touched (K4 showed what a change in the
+  serial lane's inlining can cost).
+- Pre-registered on the bead (2026-11-14T16:45Z): -30 to -50 Ir/row on the kernel at 8 workers,
+  serial rows unchanged; kill below -15.
+- Change: for a cell whose payload is at most `usable_size - 35` (the table-leaf maximum local
+  size, below which nothing spills), the rowid and record come from the payload-size and rowid
+  varints, each with a one-byte fast path; a cell that spills, or whose varints or record run past
+  the page or the usable size, still goes to `CellRef::parse`, which reads or rejects it as before.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 964c7bc59e0571dc =
+  3f5bed23e, K5 010fc99a6ea55beb = 3f5bed23e + this diff, landed as b18e5553a; stock sqlite3 3.46.1
+  live in the same par_probe run, reps 5; answers equal everywhere): scan_filter_agg at 8 workers
+  534.4M -> 469.4M user instructions (-65.0 Ir/row, above the predicted range), CPU 56.6 -> 52.0 ms
+  against stock's 60.0 in the same run (x0.94 -> x0.87), wall 7.5 ms both (stock 60.3), 7 helper
+  threads in both; callgrind exact 538.10M -> 473.06M, `CellRef::parse` off the hot path (85.9
+  Ir/row -> 0). Serial rows unchanged in instructions: scan_filter_agg 1,261.4M, count_star 63.4M,
+  group_by_1000_groups 3,407.2M, order_by_text_limit10 1,741.8M, window_row_number 8,512.6M (their
+  CPU medians moved by -8% to +9% with identical counts: run-to-run noise on the busy host).
+- Gate: the helper's unit test (held to `CellRef::parse` for payloads 0, 1, 127, 128, max_local-1
+  and max_local with rowids of 1 to 9 varint bytes incl. negatives; the negative cases are a payload
+  one byte over the threshold and one 200 over, which must be declined as spilling, and a local cell
+  crossing the usable size inside the page buffer, declined while the full parse rejects it), the
+  btree cell tests, the oracle file (13/13, incl. its overflow-payload test), the budget test, four
+  aggregate keepers, six fsqlite count / min / max oracles, clippy.
+- Verdict: WIN (MAINTENANCE by the suite's rules, a self-speedup of the default-on parallel path):
+  against stock live, scan_filter_agg at 8 workers is now x0.87 CPU and x0.12 wall. K1-K5 took the
+  kernel from 635 to 469 Ir/row (K2 -63, K3 -38, K5 -65; K1 and K4 rejected). The serial path is
+  untouched by all five (x1.97 stock CPU on the same row).
+- Retry condition: none (kept). What is left per row in the kernel: the record header parse (91,
+  see K4 for what a per-read fill cost), the decode (~105), the comparison and loop.
+
 ## 2026-11-14 - WIN (join prediction missed in sign): a page-cache miss skips the get_page checks its resident answer already made (bd-w4pr1.13.18, join / rowid-seek lever 4)
 
 - Target: the cost lever 1 (the entry three below) put on every page-cache miss. The sync resident
