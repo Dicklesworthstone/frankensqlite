@@ -186,6 +186,85 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   available_parallelism; revisit LEAF_PAGES_PER_THREAD = 32 when a probe at 20k-200k rows shows
   wall above the forced-1 arm.
 
+## 2026-11-14 - WIN: a concurrent commit writes without the registry guard and re-takes it only to publish (bd-i0tn6 S2 + S3)
+
+- Target: concurrent writers committing small transactions (`mt-mvcc-bench
+  --one-row-per-transaction`, shared and separate tables, 1-64 writers). Touched:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (publication-pending mark, `PublicationPendingLease`,
+  `pending_publication_blocks` / `has_pending_publication`, publication-epoch condvar, the
+  every-entry history check in the uncontended fast paths, metrics),
+  `crates/fsqlite-core/src/connection.rs` (`lock_registry_for_commit_validation`, the unlocked
+  physical write in `execute_commit_with_cx` and the autocommit commit path,
+  `TimedRegistryCommitGuard` split phases), `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs`
+  (`registry_lock_split` line).
+- Ledger preflight: the 2026-07-23 bd-6hgad entry (group commit exists, never coalesces at NORMAL)
+  and the 2026-08-25 bd-i0tn6 decomposition. Nothing rejected covers moving the write outside the
+  guard. On main e1ec6bcc5 the guard was busy 87-92% of wall time from 4 writers on, and the
+  physical write was 71-97% of each hold (bead comment 2026-11-13).
+- Change: a validated concurrent commit on a file-backed database that does not change the
+  schema is marked publication-pending under the guard. It releases the guard, runs `txn.commit`
+  (Busy retry and in-doubt settlement included) unlocked, and re-takes the guard with a blocking lock
+  to drop the mark and finalize. Two things guard the window. A later validator that could form an
+  SSI rw-antidependency with a pending session waits for it, guard released, on a process-wide
+  publication-epoch condvar. A schema change waits until nothing is pending. Write-write and the
+  issue #115 fresh-EOF-page hazard stay with the page locks held until finalize. Schema changes,
+  `:memory:` and serialized commits keep the guard across their write. The pager path, the
+  certificate and the commit-sequence source are unchanged. The first build waited with the
+  busy-retry sleep handoff: on the shared table its waits averaged 0.5-3.3 ms and it was flat to
+  -14% at 2-8 writers. The condvar brought the mean wait to 72-267 us at 2-8 writers.
+- Result (binaries: A = main dad20ea6e + the bd-zsnac fix, mt-mvcc-bench sha256 eca32e64...; B =
+  A + this change, b3e03643...; thinkstation1, Threadripper PRO 5975WX, 64 hardware threads,
+  governor powersave, tmpfs, synchronous=NORMAL, 500 rows per writer, 5 rounds per row, stock
+  SQLite live in every run with its C/C null; interleaved A B; observed OS threads at 64 writers:
+  64 writers + main, about 155 runtime workers, about 65 io_uring kernel workers):
+
+  | writers | separate tables B/A (2 reps) | F/C A -> B | shared table B/A (4 reps) | F/C A -> B |
+  |---|---|---|---|---|
+  | 1 | 0.98x | 0.083 -> 0.073 | 1.03x | 0.080 -> 0.076 |
+  | 2 | 0.98x | 0.131 -> 0.147 | 0.98x | 0.112 -> 0.111 |
+  | 4 | 1.52x | 0.138 -> 0.169 | 1.13x | 0.113 -> 0.141 |
+  | 8 | 2.46x | 0.120 -> 0.266 | 1.42x | 0.113 -> 0.180 |
+  | 16 | 2.86x | 0.087 -> 0.254 | 1.62x | 0.109 -> 0.165 |
+  | 32 | 2.21x | 0.093 -> 0.193 | 1.29x | 0.095 -> 0.137 |
+  | 64 | 1.77x (A: one rep) | 0.061 -> 0.109 | not run | |
+
+  Separate tables, F wps: 4w 5,945 -> 9,026; 8w 4,596 -> 11,290; 16w 3,727 -> 10,662; 32w 3,146 ->
+  6,954; 64w 2,483 -> 4,405. One writer, 2,000 rows, 11 rounds, 3 reps: 5,686 -> 5,562 wps
+  (-2.2%; an earlier session measured -0.2%). Bulk (1,000-row transactions): within the spread.
+  Scorecard rows, stock live, all answers equal stock's: `txn_1000x10_rows` 680.4M -> 682.6M
+  instructions (5 reps); `autocommit_5k_inserts` 1,162.3M -> 1,165.4M (5 reps; a 3-rep run read
+  1,159.1M -> 1,179.9M, inside the run-to-run spread of either arm); `multiproc_8x500` wall 961 ->
+  935 ms, instructions median 1,164.2M -> 1,174.6M.
+  Worker failures: none in any B run (4 shared, 2 separate, bulk, one-writer). One A run (separate
+  tables, 64 writers, host load 9.6) lost a worker that ran out of the shared 11 s retry budget at an
+  INSERT (BusySnapshot); that is the guard-held convoy. Before bd-zsnac the B arm lost a worker
+  in 2 of 4 shared runs; that failure was the ROLLBACK flaw it fixes (7fbb850b7).
+- Decomposition with the change (separate tables): validate 1.5-67 us and publish 2.3-105 us under
+  the guard, the physical write (93-406 us) unlocked. Group commit coalesces: waiter_commits
+  667 / 2,294 / 4,950 of 2,000 / 4,000 / 8,000 at 4 / 8 / 16 writers, where it was 0. The convoy
+  moved: the wait to re-take the guard for publication is 161 us at 16w, 765 us at 32w and 2.6 ms at
+  64w, because both short holds grow with the writer count. Shared-table writers wait for each
+  other's publication (publication waits 314-3,862 per round), because SSI witnesses put the table
+  root in every inserter's read and write sets.
+- Predictions (bead comment before code): separate >= 1.5 / 2.0 / 2.5 / 1.8x at 4 / 8 / 16 / 32
+  writers: met (1.52 / 2.46 / 2.86 / 2.21). Shared >= 1.5x at 8-16 writers: missed at 8 (1.42),
+  met at 16 (1.62). No kill line hit (separate 8w at least 1.5x; 1w within 5%; scorecard within noise).
+- Tests: mvcc unit tests for the mark and lease (token-checked; a stale lease leaves a new owner's
+  mark), the wait relation (rw overlap either way waits; a shared read or a disjoint session does
+  not), the epoch wake-up, and the history check with out-of-order entries. Core deterministic tests
+  through the commit-window hook: a disjoint peer commits while a durable commit waits to publish;
+  a peer that read the unpublished write waits; a CREATE INDEX waits. The issue #115 window and
+  EOF-growth stress keepers pass unchanged.
+- Gate (rch, 7fbb850b7 + S2 + S3): clippy -D warnings on fsqlite-mvcc / core / e2e all targets;
+  fsqlite-mvcc lib 1,676 pass; core keepers 194 + 7, fsqlite 8, fsqlite-e2e concurrent-writer
+  batches 55 + 63 + 36 pass; fsqlite-core lib 4,179 pass with the 2 known t6741 reds. Landed as S2
+  d74a04e46 and S3 a56db2ebe (rebased onto 7b1a890d9). On 4c49baa46, after the statement-savepoint
+  change to connection.rs, clippy and 200 focused core tests passed again.
+- Retry condition (for what is left): the 32-64 writer ceiling is now the two short holds (validate
+  39-67 us and publish 56-105 us at 32-64w). Next is bd-15hxt (SSI history windowing) or S4 (publish a
+  coalesced group under one guard acquisition, bd-6a8a5). The single-writer floor (about 5.6k against
+  stock's 70k) is bd-w4pr1.7.
+
 ## 2026-11-14 - WIN: a statement savepoint names itself without format!, takes the cached session handle and skips empty virtual-table levels (bd-w4pr1.13.35 lever 5)
 
 - Target: the internal statement savepoint every statement of an explicit transaction runs in
