@@ -246,6 +246,35 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN: an IN list beside equalities on a composite index probes the whole key prefix (bd-hyoms)
+
+- Target: `a IN (3, 77, 500) AND b = 3` and `a = 5 AND b IN (1, 2, 3)` over INDEX t_ab(a, b)
+  walked the IN column's (or the leading equality's) whole run. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (index_const_in_list_composite_target, IndexConstInList
+  prefix/suffix, emit_index_const_list_rows; the non-aggregate, aggregate and GROUP BY
+  dispatchers prefer it).
+- Result (a2cfca49e; scratchpad cin_ab.py, 200,000-row file database with ANALYZE, fresh
+  process per query, stock live; ELF before c8b948ada3e04c2f, after 72e2e6dd61f83bf7;
+  thinkstation1): 40.6x -> 2.0x, count 15.7x -> 1.2x, rows 15.6x -> 1.7x, sum 25.6x -> 1.6x,
+  GROUP BY 14.8x -> 1.2x; one-field controls within 9k instructions.
+- Measurement note: the fixture's `SELECT 1` baseline varies by up to 74k instructions per
+  process, so sub-10k deltas on point queries are below the subtraction's noise; an A/A of both
+  CLIs on one database (raw per-process counts, sd about 1.5k) put the combined build's extra
+  plan checks at 2-6k instructions per statement.
+- Next: two IN lists on one index (`a IN (..) AND b IN (..)`, 37.4x) need nested probe loops.
+
+## 2026-11-14 - WIN: an OR of indexed equalities seeks one index per term (bd-e9vgj)
+
+- Target: `SELECT id FROM t WHERE a = 5 OR s = 'k77'` scanned the table (614x stock). Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (or_index_union_terms, codegen_select_or_index_union;
+  offered in the planner's FullTableScan branch and before the final full scan).
+- Result (3f6513ce3; scratchpad ab2_extra.py, stock live, same binaries as above): 614.3x ->
+  8.2x with stock's rows in stock's order. Cost: `a = 5 OR flag = 1 LIMIT 10` 1.6x -> 3.3x
+  (the old full scan met its ten rows among the table's first rows; the union opens two indexes
+  and looks each row up, and now returns stock's rows).
+- Retry / next: aggregates over an OR, IN or range terms, ORDER BY; skipping the RowSet insert
+  for the last term (SQLite's MULTI-INDEX OR tests only) is a cheap follow-up.
+
 ## 2026-11-14 - WIN: GROUP BY walks a range on an index's leading key; covering GROUP BY inputs stop needing the MemDatabase (bd-x14us)
 
 - Target: `SELECT a, count(*) FROM t WHERE a < 20 GROUP BY a` scanned the whole table into the
