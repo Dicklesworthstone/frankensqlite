@@ -1253,6 +1253,7 @@ dependencies = [
  "fsqlite-wal",
  "ftui",
  "jsonschema",
+ "nix",
  "rand 0.10.3",
  "rusqlite",
  "serde",

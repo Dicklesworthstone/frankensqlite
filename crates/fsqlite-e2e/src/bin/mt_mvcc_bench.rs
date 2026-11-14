@@ -4259,6 +4259,125 @@ where
     }
 }
 
+/// bd-i0tn6 scaling profile of the one-row FrankenSQLite arm: where each
+/// writer's wall time goes, summed over the writers of one F invocation
+/// (reset before it, printed after it as `fsqlite_stage`). Statement stages are
+/// timed around each await of `run_fsqlite_one_row_transactions`, in wall time
+/// and in the writer thread's CPU time. CPU is read with
+/// `CLOCK_THREAD_CPUTIME_ID`, which brings the scheduler's runtime up to date
+/// when read. `/proc/thread-self/schedstat` lags the running slice (on the
+/// bench host it reported about a tenth of a 0.5 ms busy span), so it
+/// misreads spans this short. The writer's runqueue wait comes from schedstat
+/// over the whole run, where that lag does not matter, so wall time minus CPU
+/// minus runqueue is time the writer spent blocked (locks, condvars, I/O,
+/// sleeps). Diagnostics only: nothing here feeds a verdict.
+mod one_row_stage_profile {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub static BEGIN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static INSERT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ROLLBACK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static RETRY_SLEEP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COMMITS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITER_WALL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITER_ON_CPU_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITER_RUNQUEUE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BEGIN_ON_CPU_NS: AtomicU64 = AtomicU64::new(0);
+    pub static INSERT_ON_CPU_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COMMIT_ON_CPU_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        for counter in [
+            &BEGIN_NS,
+            &INSERT_NS,
+            &COMMIT_NS,
+            &ROLLBACK_NS,
+            &RETRY_SLEEP_NS,
+            &COMMITS,
+            &WRITER_WALL_NS,
+            &WRITER_ON_CPU_NS,
+            &WRITER_RUNQUEUE_NS,
+            &BEGIN_ON_CPU_NS,
+            &INSERT_ON_CPU_NS,
+            &COMMIT_ON_CPU_NS,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// CPU time of the calling thread, in ns.
+    #[cfg(target_os = "linux")]
+    pub fn thread_cpu_ns() -> Option<u64> {
+        clock_ns(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+    }
+
+    /// CPU time of the whole process (all threads, exited ones included), in ns.
+    #[cfg(target_os = "linux")]
+    pub fn process_cpu_ns() -> Option<u64> {
+        clock_ns(nix::time::ClockId::CLOCK_PROCESS_CPUTIME_ID)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clock_ns(clock: nix::time::ClockId) -> Option<u64> {
+        let now = nix::time::clock_gettime(clock).ok()?;
+        let secs = u64::try_from(now.tv_sec()).ok()?;
+        let nanos = u64::try_from(now.tv_nsec()).ok()?;
+        secs.checked_mul(1_000_000_000)?.checked_add(nanos)
+    }
+
+    /// Time the calling thread has spent runnable but waiting for a CPU, in
+    /// ns (schedstat field 2; read at the start and end of a whole run).
+    #[cfg(target_os = "linux")]
+    pub fn thread_runqueue_ns() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+        text.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn thread_cpu_ns() -> Option<u64> {
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn process_cpu_ns() -> Option<u64> {
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn thread_runqueue_ns() -> Option<u64> {
+        None
+    }
+
+    /// `after - before` of two readings, 0 when either is missing.
+    pub fn delta(before: Option<u64>, after: Option<u64>) -> u64 {
+        before
+            .zip(after)
+            .map_or(0, |(before, after)| after.saturating_sub(before))
+    }
+
+    /// Add the thread CPU time since `started` (from [`thread_cpu_ns`]).
+    pub fn add_cpu_since(counter: &AtomicU64, started: Option<u64>) {
+        add(counter, delta(started, thread_cpu_ns()));
+    }
+
+    pub fn add_since(counter: &AtomicU64, started: Instant) {
+        add(
+            counter,
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+
+    pub fn add(counter: &AtomicU64, value: u64) {
+        counter.fetch_add(value, Ordering::Relaxed);
+    }
+
+    pub fn get(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+}
+
 fn run_fsqlite_one_row_transactions(
     conn: &fsqlite::Connection,
     stmt: &fsqlite::PreparedStatement<'_>,
@@ -4267,9 +4386,46 @@ fn run_fsqlite_one_row_transactions(
     rows_per_thread: usize,
     worker_retry_deadline: OneRowWorkerRetryDeadline,
 ) -> Result<(usize, usize, u64), String> {
+    use one_row_stage_profile as profile;
     let mut attempted_writes = 0usize;
     let mut retried_transactions = 0usize;
     let mut statements_executed = 0u64;
+    let profile_wall_started = std::time::Instant::now();
+    let profile_cpu_started = profile::thread_cpu_ns();
+    let profile_runqueue_started = profile::thread_runqueue_ns();
+    let result = run_fsqlite_one_row_transactions_inner(
+        conn,
+        stmt,
+        tid,
+        base,
+        rows_per_thread,
+        worker_retry_deadline,
+        &mut attempted_writes,
+        &mut retried_transactions,
+        &mut statements_executed,
+    );
+    profile::add_since(&profile::WRITER_WALL_NS, profile_wall_started);
+    profile::add_cpu_since(&profile::WRITER_ON_CPU_NS, profile_cpu_started);
+    profile::add(
+        &profile::WRITER_RUNQUEUE_NS,
+        profile::delta(profile_runqueue_started, profile::thread_runqueue_ns()),
+    );
+    result.map(|()| (attempted_writes, retried_transactions, statements_executed))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fsqlite_one_row_transactions_inner(
+    conn: &fsqlite::Connection,
+    stmt: &fsqlite::PreparedStatement<'_>,
+    tid: usize,
+    base: i64,
+    rows_per_thread: usize,
+    worker_retry_deadline: OneRowWorkerRetryDeadline,
+    attempted_writes: &mut usize,
+    retried_transactions: &mut usize,
+    statements_executed: &mut u64,
+) -> Result<(), String> {
+    use one_row_stage_profile as profile;
     for row_index in 0..rows_per_thread {
         let row_index = i64::try_from(row_index)
             .map_err(|_| format!("[fsqlite t{tid}] row index exceeds i64"))?;
@@ -4284,7 +4440,12 @@ fn run_fsqlite_one_row_transactions(
 
         loop {
             let outcome = fsqlite_e2e::block_on(async {
-                if let Err(error) = conn.execute("BEGIN CONCURRENT").await {
+                let begin_started = std::time::Instant::now();
+                let begin_cpu = profile::thread_cpu_ns();
+                let begin_result = conn.execute("BEGIN CONCURRENT").await;
+                profile::add_cpu_since(&profile::BEGIN_ON_CPU_NS, begin_cpu);
+                profile::add_since(&profile::BEGIN_NS, begin_started);
+                if let Err(error) = begin_result {
                     if one_row_failure_disposition(
                         OneRowRetryStage::Begin,
                         fsqlite_error_is_retryable(&error),
@@ -4301,17 +4462,22 @@ fn run_fsqlite_one_row_transactions(
                     ));
                 }
 
-                attempted_writes = attempted_writes
+                *attempted_writes = attempted_writes
                     .checked_add(1)
                     .ok_or_else(|| format!("[fsqlite t{tid}] write-attempt counter overflow"))?;
-                match stmt.execute_with_params(&params).await {
+                let insert_started = std::time::Instant::now();
+                let insert_cpu = profile::thread_cpu_ns();
+                let insert_result = stmt.execute_with_params(&params).await;
+                profile::add_cpu_since(&profile::INSERT_ON_CPU_NS, insert_cpu);
+                profile::add_since(&profile::INSERT_NS, insert_started);
+                match insert_result {
                     Ok(affected) => {
                         // Consume the affected-row result so this INSERT is
                         // proven to have physically executed rather than a
                         // future being constructed and dropped unpolled
                         // (bd-h9pzn/bd-i8pt6).
                         let _affected = affected;
-                        statements_executed =
+                        *statements_executed =
                             statements_executed.checked_add(1).ok_or_else(|| {
                                 format!("[fsqlite t{tid}] executed-statement counter overflow")
                             })?;
@@ -4324,8 +4490,16 @@ fn run_fsqlite_one_row_transactions(
                     }
                 }
 
-                match conn.execute("COMMIT").await {
-                    Ok(_) => Ok(OneRowAttempt::Committed),
+                let commit_started = std::time::Instant::now();
+                let commit_cpu = profile::thread_cpu_ns();
+                let commit_result = conn.execute("COMMIT").await;
+                profile::add_cpu_since(&profile::COMMIT_ON_CPU_NS, commit_cpu);
+                profile::add_since(&profile::COMMIT_NS, commit_started);
+                match commit_result {
+                    Ok(_) => {
+                        profile::add(&profile::COMMITS, 1);
+                        Ok(OneRowAttempt::Committed)
+                    }
                     Err(error) => Ok(OneRowAttempt::RollbackRequired {
                         stage: OneRowRetryStage::Commit,
                         error,
@@ -4337,12 +4511,13 @@ fn run_fsqlite_one_row_transactions(
                 OneRowAttempt::Committed => break,
                 OneRowAttempt::Retry { stage, error } => (stage, error, 0),
                 OneRowAttempt::RollbackRequired { stage, error } => {
-                    let rollback_retries = rollback_fsqlite_one_row_with_retry(
-                        tid,
-                        &mut retry_budget,
-                        || fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map(|_| ()),
-                    )
-                    .map_err(|rollback_error| match stage {
+                    let rollback_started = std::time::Instant::now();
+                    let rollback_outcome =
+                        rollback_fsqlite_one_row_with_retry(tid, &mut retry_budget, || {
+                            fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map(|_| ())
+                        });
+                    profile::add_since(&profile::ROLLBACK_NS, rollback_started);
+                    let rollback_retries = rollback_outcome.map_err(|rollback_error| match stage {
                         OneRowRetryStage::Insert => format!(
                             "[fsqlite t{tid}] one-row INSERT failed for id {id}: {error}; \
                              mandatory rollback also failed: {rollback_error}"
@@ -4381,7 +4556,7 @@ fn run_fsqlite_one_row_transactions(
                     (stage, error, rollback_retries)
                 }
             };
-            retried_transactions = retried_transactions
+            *retried_transactions = retried_transactions
                 .checked_add(rollback_retries)
                 .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
             let Some(wait) = retry_budget.next_wait(tid) else {
@@ -4391,13 +4566,15 @@ fn run_fsqlite_one_row_transactions(
                     retry_budget.attempts()
                 ));
             };
-            retried_transactions = retried_transactions
+            *retried_transactions = retried_transactions
                 .checked_add(1)
                 .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
+            let sleep_started = std::time::Instant::now();
             thread::sleep(wait);
+            profile::add_since(&profile::RETRY_SLEEP_NS, sleep_started);
         }
     }
-    Ok((attempted_writes, retried_transactions, statements_executed))
+    Ok(())
 }
 
 fn run_rusqlite_one_row_transactions(
@@ -5313,6 +5490,8 @@ fn run(opts: Options) -> Result<(), String> {
                 fsqlite_vdbe::engine::set_vdbe_metrics_enabled(true);
                 fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.reset();
                 fsqlite_vdbe::engine::reset_vdbe_metrics();
+                one_row_stage_profile::reset();
+                let process_cpu_before = one_row_stage_profile::process_cpu_ns();
                 let result = run_fsqlite(
                     n,
                     opts.rows_per_thread,
@@ -5394,6 +5573,44 @@ fn run(opts: Options) -> Result<(), String> {
                     vdbe.mvcc_write_path.page_lock_waits_total,
                     vdbe.mvcc_write_path.page_lock_wait_time_ns_total / 1_000,
                 );
+                // bd-i0tn6 scaling profile: every group-commit phase total and
+                // histogram, and where the one-row writers' wall time went.
+                if let Ok(json) = serde_json::to_string(&cons) {
+                    eprintln!("commit_phase_json threads={n} {json}");
+                }
+                {
+                    use one_row_stage_profile as profile;
+                    let process_cpu =
+                        profile::delta(process_cpu_before, profile::process_cpu_ns());
+                    let commits = profile::get(&profile::COMMITS);
+                    if commits > 0 {
+                        let per = |ns: u64| ns as f64 / commits as f64 / 1_000.0;
+                        let wall = profile::get(&profile::WRITER_WALL_NS);
+                        let on_cpu = profile::get(&profile::WRITER_ON_CPU_NS);
+                        let runqueue = profile::get(&profile::WRITER_RUNQUEUE_NS);
+                        eprintln!(
+                            "fsqlite_stage threads={n} commits={commits} \
+                             writer_wall_us={:.1} begin_us={:.1} insert_us={:.1} \
+                             commit_us={:.1} rollback_us={:.1} retry_sleep_us={:.1} \
+                             writer_on_cpu_us={:.1} writer_runqueue_us={:.1} \
+                             writer_blocked_us={:.1} process_cpu_us={:.1} \
+                             begin_cpu_us={:.1} insert_cpu_us={:.1} commit_cpu_us={:.1}",
+                            per(wall),
+                            per(profile::get(&profile::BEGIN_NS)),
+                            per(profile::get(&profile::INSERT_NS)),
+                            per(profile::get(&profile::COMMIT_NS)),
+                            per(profile::get(&profile::ROLLBACK_NS)),
+                            per(profile::get(&profile::RETRY_SLEEP_NS)),
+                            per(on_cpu),
+                            per(runqueue),
+                            per(wall.saturating_sub(on_cpu).saturating_sub(runqueue)),
+                            per(process_cpu),
+                            per(profile::get(&profile::BEGIN_ON_CPU_NS)),
+                            per(profile::get(&profile::INSERT_ON_CPU_NS)),
+                            per(profile::get(&profile::COMMIT_ON_CPU_NS)),
+                        );
+                    }
+                }
                 result
             },
         )?;
@@ -5633,6 +5850,53 @@ fn run(opts: Options) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-i0tn6: the stage profiler's thread CPU clock counts running time,
+    /// not sleeping time, and resolves millisecond spans. A wall-clock reading
+    /// fails the sleep check. A `/proc/thread-self/schedstat` reading fails the
+    /// busy-span check: on the 7.0 kernel of the bench host it reported about
+    /// a tenth of a 0.5 ms busy span.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stage_profile_thread_cpu_counts_running_time_at_millisecond_spans() {
+        use one_row_stage_profile as profile;
+
+        let before_sleep = profile::thread_cpu_ns().expect("thread CPU clock");
+        thread::sleep(Duration::from_millis(80));
+        let after_sleep = profile::thread_cpu_ns().expect("thread CPU clock");
+        assert!(
+            after_sleep.saturating_sub(before_sleep) < 20_000_000,
+            "80 ms asleep must not read as CPU time ({} ns)",
+            after_sleep.saturating_sub(before_sleep)
+        );
+
+        // Busy spans: the median must read at least half its wall time as
+        // CPU (the median tolerates a few spans the host preempts).
+        let mut cpu_share = Vec::new();
+        for span in 0..21 {
+            let wall_started = Instant::now();
+            let cpu_started = profile::thread_cpu_ns();
+            let mut spin = 0_u64;
+            while wall_started.elapsed() < Duration::from_millis(2) {
+                spin = std::hint::black_box(spin.wrapping_add(1));
+            }
+            let cpu = profile::delta(cpu_started, profile::thread_cpu_ns());
+            let wall = u64::try_from(wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            assert!(
+                cpu <= wall + 1_000_000,
+                "busy span {span}: CPU {cpu} ns cannot exceed its wall time {wall} ns"
+            );
+            cpu_share.push(cpu as f64 / wall as f64);
+        }
+        cpu_share.sort_by(f64::total_cmp);
+        assert!(
+            cpu_share[10] >= 0.5,
+            "a busy 2 ms span must read mostly as CPU time (median share {:.2})",
+            cpu_share[10]
+        );
+        assert_eq!(profile::delta(None, Some(5)), 0);
+        assert_eq!(profile::delta(Some(9), Some(5)), 0);
+    }
 
     #[test]
     fn cpuset_capture_follows_inherited_controller_and_prefers_nearest_effective_set() {

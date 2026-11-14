@@ -51,6 +51,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# mt-mvcc-bench's stage profiler reads per-thread and per-process CPU clocks
+# (clock_gettime CLOCK_THREAD_CPUTIME_ID / CLOCK_PROCESS_CPUTIME_ID).
+nix = { workspace = true, features = ["time"] }
+
 [dev-dependencies]
 # Test targets drive the async engine through `asupersync::test_utils::run_test`,
 # which lives behind `test-internals`. The non-dev dependency above stays
