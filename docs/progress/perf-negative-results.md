@@ -87,6 +87,70 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: a begin's refresh signature is the header its reader admission bound (bd-w4pr1.7, lever B)
+
+- Target: every implicit or explicit BEGIN on a file-backed WAL database (the scorecard's
+  `autocommit_5k_inserts`, `txn_1000x10_rows`, `multiproc_8x500`). Touched:
+  `crates/fsqlite-pager/src/pager.rs` (`refresh_runtime_committed_state`,
+  `refresh_committed_state_unless_unchanged`, new `begin_wal_path_identity` and
+  `bound_refresh_signature`, `NativeReaderAttempt::main_wal_lifetime_held`, the premapped-region
+  parameter removed from `acquire_reader_into`, `BeginSignatureObservation` keeps only the `-wal`
+  identity); `crates/fsqlite-core/tests/cache_staleness_cross_txn_regression.rs` (new keeper).
+- Ledger preflight: bd-ih8ak lever 3 (WalRefreshSignature fast path) and its premapped-region
+  follow-up are the closest entries; neither removed the separate observation.
+- Evidence before (callgrind toggle on `refresh_runtime_committed_state`, main 9a372e5ba, N=1000,
+  17.2k per begin; gdb backtraces of every steady-state shm_map): with the header unchanged since
+  this connection's last commit, nothing large is re-derived. The full refresh is skipped, the WAL
+  `NativeReadProof` holds, and the read-mark update and SHARED/read-slot locks are stock's
+  walTryBeginRead protocol. The duplicate was `current_wal_refresh_signature`, which mapped region
+  0 and read and validated the header before admission only to build a "before" signature. The
+  admission then read the same header, locked its slot and revalidated it, and the fast path
+  compared that bound header with the signature.
+- Change: the begin probes only the `-wal` path identity (still once per transaction), and
+  builds its refresh signature from the header the admission bound. It vouches for that header
+  only if the main-file WAL lifetime claim was held at admission, which the attempt records while
+  it holds the file guard, as `observe_vouched_wal_index_header` required. The fast path's
+  test is therefore the admission's own revalidated header. A full refresh stores the bound header,
+  which is exactly the state it adopted. The admission maps region 0 itself, so shm_map/statx
+  counts are unchanged. The standalone refresh (`refresh_published_snapshot`) still observes the
+  header as before.
+- Result, stock sqlite3 3.46.1 live; binaries 1b7cc11a... (main 9a372e5ba) and 9af63344...
+  (9a372e5ba plus this diff); answers equal stock's in every row; stock `integrity_check` ok on all
+  39 candidate files:
+  - Exact (callgrind, N=1000, io_uring refused): `refresh_runtime_committed_state` 17.23k ->
+    14.22k per begin, the implicit begin 28.88k -> 25.79k (-3.1k).
+  - perf stat, stock live: `autocommit_5k_inserts` 944.6M -> 937.7M (7 reps) and 957.0M ->
+    934.9M (9 reps, arms swapped); `auto_scale` 5,000 commits 936.2M -> 918.1M (stock 112.3M).
+    Base itself ranged 936.2M-957.0M across these runs (min-of-reps still carries a time-dependent
+    share of about 2%), so the exact count is the measure. CPU and wall moved within noise (7 reps:
+    565.7 -> 583.1 ms CPU; 9 reps: 579.8 -> 571.2 ms; stock 60-62 ms).
+  - `multiproc_8x500` (7 reps): median 1,083.8M -> 1,054.2M, median CPU 1,149.3 -> 1,114.2 ms,
+    median wall 947.7 -> 971.5 ms (stock 99.0M, 207.0 ms, 164.0 ms).
+  - Prediction (registered on bd-w4pr1.7 before code): -1.5k to -2.5k per commit; exact -3.1k,
+    above the range (the old observation also took the backend read lock and the db-file lock, and
+    the fast path no longer re-reads the bound header through the backend). Kill (< 1.0k) cleared.
+- Test: `autocommit_statements_see_each_peer_commit_and_their_own` (two connections, six rounds:
+  each connection's own autocommit insert and a repeated read take the fast path; the peer's
+  commit between two statements must be seen by the next one, which a begin that skipped the
+  refresh anyway would answer from stale committed state).
+- Gate (rch, 9a372e5ba plus the change): clippy -D warnings on fsqlite-pager and fsqlite-core
+  `--all-targets` clean; fsqlite-pager lib 1,110 passed, 1 failed (`bd_2jpu6_2` poll_quota, red
+  on main); fsqlite-e2e concurrency and group-commit targets 63 + 53 passed, 1 failed (the
+  `bd_3wop3_1_3` `centralized_publication_cost_shrank` timing assertion, which bd-uk9ob records
+  as failing 1 run in 3 on a quiet host and bd-3wop3.1.5 records failing under rch; it failed
+  again alone); fsqlite-core lib 4,175 passed, 2 failed (the t6741 pair, red on main);
+  fsqlite-core WAL, refresh and staleness keepers 14 + 215 + 71 (the new keeper included);
+  fsqlite WAL keepers 16.
+- Landed as 6b7891aeb (rebased onto c2f83a761). On the rebased tree ee5e63f4d (on 7b1a890d9):
+  clippy clean, fsqlite-pager lib 1,110 passed with the same 1 red, and the staleness, path-identity,
+  gh525, gh457 and read-your-own-write keepers 18 passed. The commits after it on main touch
+  neither fsqlite-pager nor fsqlite-vfs.
+- Retry condition: none for this duplicate. What is left in the begin's refresh is the reader
+  admission itself (14.2k): the read-mark update after the connection's own commit (exclusive slot
+  lock, as stock), the read slot, the main-file SHARED snapshot, three header reads/validations
+  and the async lock round trips. Each is under 1.6k; worth a lever only as one redesign of the
+  admission's lock and header round trips, not piecemeal.
+
 ## 2026-11-14 - WIN (default flipped): parallel scans sized by leaf pages under a process-wide helper budget, and fsqlite.parallel_workers defaulting to min(available_parallelism, 8) (bd-w4pr1.13.11)
 
 - Target: the parallel count(*) and ungrouped count/sum/min/max of bd-w4pr1.13.11 steps 1-3
