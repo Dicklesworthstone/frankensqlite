@@ -173,6 +173,22 @@ fn or_of_indexed_equalities_seeks_each_index_and_matches_sqlite() {
             ),
             ("SELECT id FROM t WHERE a = 5 OR s = 'k77' LIMIT 0", vec![]),
             ("SELECT id FROM t WHERE a = 4000 OR s = 'nothing'", vec![]),
+            // bd-0wwov: exact terms whose index holds the output (`id`, `a`
+            // from t_a, `s` from t_s) skip the lookup; a term's index that
+            // lacks an output column, or a residual, reads the row.
+            ("SELECT id, a FROM t WHERE a = 5 OR s = 'k77'", vec![]),
+            (
+                "SELECT s, id FROM t WHERE s = 'k5' OR s = 'k77' OR a = 9",
+                vec![],
+            ),
+            (
+                "SELECT id FROM t WHERE (a = 5 AND c > 100) OR s = 'k77' LIMIT 4 OFFSET 2",
+                vec![],
+            ),
+            (
+                "SELECT id, b FROM t WHERE (a = 5 AND b = 5) OR s = 'k77' LIMIT 9 OFFSET 1",
+                vec![],
+            ),
             (
                 "SELECT id FROM t WHERE a = ?1 OR s = ?2",
                 vec![SqliteValue::Integer(5), text("k77")],
@@ -236,6 +252,28 @@ fn or_of_indexed_equalities_seeks_each_index_and_matches_sqlite() {
                 assert!(
                     !ops.iter().any(|op| op == "RowSetTest"),
                     "`{sql}` must keep its other plan: {ops:?}"
+                );
+            }
+            // bd-0wwov: every term exact and covering: no row lookup at all;
+            // a term that lacks an output column or has a residual looks up.
+            for (sql, looks_up) in [
+                ("SELECT id FROM t WHERE a = 5 OR s = 'k77'", false),
+                (
+                    "SELECT s, id FROM t WHERE s = 'k5' OR s = 'k77' OR a = 9",
+                    true,
+                ),
+                ("SELECT id, a FROM t WHERE a = 5 OR s = 'k77'", true),
+                (
+                    "SELECT id FROM t WHERE (a = 5 AND c > 100) OR s = 'k77'",
+                    true,
+                ),
+                ("SELECT id FROM t WHERE a = ?1 OR s = ?2", false),
+            ] {
+                let ops = opcodes(&f, sql).await;
+                assert_eq!(
+                    ops.iter().any(|op| op == "SeekRowid"),
+                    looks_up,
+                    "`{sql}` row lookups: {ops:?}"
                 );
             }
             // A prepared statement runs twice with fresh rowid sets.

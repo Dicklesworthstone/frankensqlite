@@ -7304,6 +7304,20 @@ fn codegen_select_or_index_union(
     let rowid_reg = b.alloc_reg();
     let row_body = b.emit_label();
     let row_return = b.alloc_reg();
+    // bd-0wwov: a term whose seek enforces it exactly (every conjunct a pinned
+    // key equality) yields only rows that satisfy the OR, so they skip the
+    // WHERE; if its index also holds every output column, the row is read
+    // from the entry and never looked up.
+    let row_exact = b.emit_label();
+    let row_covered = b.emit_label();
+    let covered_outputs: Vec<Option<Vec<CoveringOutputSource>>> = terms
+        .iter()
+        .map(|term| {
+            (!term.has_residual)
+                .then(|| resolve_covering_output_sources(columns, table, table_alias, term.index))
+                .flatten()
+        })
+        .collect();
     let mut index_cursors = Vec::with_capacity(terms.len());
     for (term_pos, term) in terms.iter().enumerate() {
         let index = term.index;
@@ -7355,22 +7369,42 @@ fn codegen_select_or_index_union(
                 P4::None,
                 0,
             );
-            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Gosub, row_return, 0, row_body, P4::None, 0);
+            if let Some(sources) = &covered_outputs[term_pos] {
+                emit_covering_output_reads(b, idx_cursor, rowid_reg, sources, out_regs);
+                b.emit_jump_to_label(Opcode::Gosub, row_return, 0, row_covered, P4::None, 0);
+            } else {
+                b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+                let entry = if term.has_residual { row_body } else { row_exact };
+                b.emit_jump_to_label(Opcode::Gosub, row_return, 0, entry, P4::None, 0);
+            }
         });
     }
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
-    // The row: the whole WHERE, OFFSET, the result columns, LIMIT.
+    // The row: the whole WHERE (`row_body`), OFFSET, the result columns from
+    // the table (`row_exact`) or already read from the index (`row_covered`),
+    // LIMIT.
     b.resolve_label(row_body);
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
         emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
     }
+    b.resolve_label(row_exact);
     if let Some(off_r) = offset_reg {
         b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
     }
     emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    if covered_outputs.iter().any(Option::is_some) {
+        let row_output = b.emit_label();
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, row_output, P4::None, 0);
+        b.resolve_label(row_covered);
+        if let Some(off_r) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+        }
+        b.resolve_label(row_output);
+    } else {
+        b.resolve_label(row_covered);
+    }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     if let Some(lim_r) = limit_reg {
         b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
