@@ -10769,6 +10769,73 @@ impl Drop for StatementSavepointDepthGuard<'_> {
     }
 }
 
+/// The internal statement savepoint name
+/// `__fsqlite_stmt_{purpose}_{trace_id}_{suffix}`, written with `push_str`
+/// and `itoa`: through `format!` it cost about 900 instructions, once per
+/// statement of an explicit transaction (bd-w4pr1.13.35).
+fn internal_savepoint_name(purpose: &str, trace_id: u64, suffix: u64) -> String {
+    const PREFIX: &str = "__fsqlite_stmt_";
+    let mut trace_id_digits = itoa::Buffer::new();
+    let trace_id = trace_id_digits.format(trace_id);
+    let mut suffix_digits = itoa::Buffer::new();
+    let suffix = suffix_digits.format(suffix);
+    let mut name =
+        String::with_capacity(PREFIX.len() + purpose.len() + trace_id.len() + suffix.len() + 2);
+    name.push_str(PREFIX);
+    name.push_str(purpose);
+    name.push('_');
+    name.push_str(trace_id);
+    name.push('_');
+    name.push_str(suffix);
+    name
+}
+
+#[cfg(test)]
+mod internal_savepoint_name_tests {
+    use super::internal_savepoint_name;
+
+    #[test]
+    fn internal_savepoint_name_is_the_format_text() {
+        assert_eq!(
+            internal_savepoint_name("dml", 0, 0),
+            "__fsqlite_stmt_dml_0_0"
+        );
+        assert_eq!(
+            internal_savepoint_name("insert_select", 7, 3),
+            "__fsqlite_stmt_insert_select_7_3"
+        );
+        assert_eq!(
+            internal_savepoint_name("dml", 1_000_000, 12),
+            "__fsqlite_stmt_dml_1000000_12"
+        );
+        assert_eq!(
+            internal_savepoint_name("dml", u64::MAX, u64::MAX),
+            "__fsqlite_stmt_dml_18446744073709551615_18446744073709551615"
+        );
+        assert_eq!(internal_savepoint_name("", 42, 0), "__fsqlite_stmt__42_0");
+        // The trace id comes before the suffix: a builder that swaps them fails.
+        assert_eq!(
+            internal_savepoint_name("dml", 1, 2),
+            "__fsqlite_stmt_dml_1_2"
+        );
+        assert_ne!(
+            internal_savepoint_name("dml", 1, 2),
+            internal_savepoint_name("dml", 2, 1)
+        );
+        // The text the name was written with before: `format!`.
+        for purpose in ["dml", "pending_page_run", "join_hydration", ""] {
+            for trace_id in [0_u64, 9, 10, 99, 100, 12_345_678_901, u64::MAX] {
+                for suffix in [0_u64, 1, 10, u64::MAX] {
+                    assert_eq!(
+                        internal_savepoint_name(purpose, trace_id, suffix),
+                        format!("__fsqlite_stmt_{purpose}_{trace_id}_{suffix}")
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Check if a trigger event matches a DML event.
 ///
 /// For INSERT/DELETE, this is an exact match.
@@ -23068,6 +23135,12 @@ impl Connection {
                     "virtual-table savepoint watermark overflow at level {level}"
                 ))
             })?;
+        // bd-w4pr1.13.35: every statement of an explicit transaction comes
+        // here; with no virtual table in the transaction there is nothing to
+        // collect and sort.
+        if self.live_vtab_transactions.borrow().is_empty() {
+            return Ok(());
+        }
         let names = self.active_live_vtab_names();
         for table_name in names {
             if let Some(watermark) = self
@@ -23097,6 +23170,9 @@ impl Connection {
                 "virtual-table release received negative savepoint level {level}"
             ))
         })?;
+        if self.live_vtab_transactions.borrow().is_empty() {
+            return Ok(());
+        }
         let names = self.active_live_vtab_names();
         let mut errors = Vec::new();
         for table_name in names {
@@ -26199,41 +26275,29 @@ impl Connection {
                     .to_owned(),
             )
         })?;
-        // bd-ifgl7: cache the handle lookup to avoid per-call mutex lock on
-        // concurrent_registry. The handle is stable within a transaction.
-        let handle = {
-            let cached = self.cached_concurrent_handle.borrow();
-            if let Some((cached_sid, ref h)) = *cached {
-                if cached_sid == session_id {
-                    Arc::clone(h)
-                } else {
-                    drop(cached);
-                    let h = lock_unpoisoned(&self.concurrent_registry)
-                        .handle(session_id)
-                        .ok_or_else(|| {
-                            FrankenError::Internal(
-                                "concurrent transaction missing handle during VDBE setup"
-                                    .to_owned(),
-                            )
-                        })?;
-                    *self.cached_concurrent_handle.borrow_mut() =
-                        Some((session_id, Arc::clone(&h)));
-                    h
-                }
-            } else {
-                drop(cached);
-                let h = lock_unpoisoned(&self.concurrent_registry)
-                    .handle(session_id)
-                    .ok_or_else(|| {
-                        FrankenError::Internal(
-                            "concurrent transaction missing handle during VDBE setup".to_owned(),
-                        )
-                    })?;
-                *self.cached_concurrent_handle.borrow_mut() = Some((session_id, Arc::clone(&h)));
-                h
-            }
-        };
+        let handle = self
+            .concurrent_handle_for_session(session_id)
+            .ok_or_else(|| {
+                FrankenError::Internal(
+                    "concurrent transaction missing handle during VDBE setup".to_owned(),
+                )
+            })?;
         Ok(Some((session_id, handle)))
+    }
+
+    /// The registry's handle for `session_id`, through the per-transaction
+    /// cache (bd-ifgl7): the handle is stable within a transaction, so only
+    /// a miss locks `concurrent_registry`. `None` when the registry has no
+    /// such session; the cache is then left as it was.
+    fn concurrent_handle_for_session(&self, session_id: u64) -> Option<SharedConcurrentHandle> {
+        if let Some((cached_session_id, handle)) = self.cached_concurrent_handle.borrow().as_ref()
+            && *cached_session_id == session_id
+        {
+            return Some(Arc::clone(handle));
+        }
+        let handle = lock_unpoisoned(&self.concurrent_registry).handle(session_id)?;
+        *self.cached_concurrent_handle.borrow_mut() = Some((session_id, Arc::clone(&handle)));
+        Some(handle)
     }
 
     fn concurrent_page_io_context(&self) -> Result<Option<ConcurrentPageIoContext>> {
@@ -39760,7 +39824,7 @@ impl Connection {
     fn next_internal_savepoint_name(&self, purpose: &str) -> String {
         let mut suffix = 0_u64;
         loop {
-            let candidate = format!("__fsqlite_stmt_{purpose}_{}_{}", next_trace_id(), suffix);
+            let candidate = internal_savepoint_name(purpose, next_trace_id(), suffix);
             let conflicts = self
                 .savepoints
                 .borrow()
@@ -39860,10 +39924,14 @@ impl Connection {
                         "concurrent transaction active but no session ID".to_owned(),
                     )
                 })?;
-                let registry = lock_unpoisoned(&self.concurrent_registry);
-                let mut handle = registry.get(session_id).ok_or_else(|| {
-                    FrankenError::Internal("concurrent session handle not found".to_owned())
-                })?;
+                // bd-w4pr1.13.35: the transaction's cached handle (bd-ifgl7),
+                // not a registry lock and session lookup per statement.
+                let Some(shared_handle) = self.concurrent_handle_for_session(session_id) else {
+                    return Err(FrankenError::Internal(
+                        "concurrent session handle not found".to_owned(),
+                    ));
+                };
+                let mut handle = shared_handle.lock();
                 let snapshot = concurrent_savepoint(&mut handle, &savepoint_name).map_err(|e| {
                     FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
                 })?;
