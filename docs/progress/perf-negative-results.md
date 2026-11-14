@@ -87,6 +87,85 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: a commit alone on its file skips the group-commit arrival wait (bd-w4pr1.7)
+
+- Target: every WAL commit of a transaction that is the only same-process transaction on its file
+  (the scorecard's `autocommit_5k_inserts`, `txn_1000x10_rows` and each process of
+  `multiproc_8x500`). Touched: `crates/fsqlite-pager/src/pager.rs` (`ArrivalWaitObservation`
+  gains `peers_may_arrive`, `decide_group_commit_arrival_wait` skips with reason
+  `sole_transaction`, `PagerMaintenanceLease::is_sole_transaction`,
+  `SimpleTransaction::group_commit_peers_may_arrive`, a new parameter of
+  `commit_wal_group_commit_with_snapshot`).
+- Ledger preflight: the 2026-09 group-commit entry (line ~26440) found the compat flusher never
+  coalesces under NORMAL sync and that forcing it "would require a deliberate arrival-wait (adds
+  latency to every commit)"; its retry predicate is about adding coalescing, not removing the wait.
+  The 8 us sparse wait came later with bd-1dp9.6.7.9.4 (f4e82a98f). No entry tried skipping it.
+- Evidence before: the attribution posted on bd-w4pr1.7 (2026-11-14) put the arrival wait first at
+  about 36k of 228k user instructions per autocommit commit. The flusher of a batch alone in the
+  queue spun up to `GROUP_COMMIT_SPARSE_ARRIVAL_WAIT` (8 us) on the consolidator lock,
+  `should_flush_now`, `Instant::now`, `cx.checkpoint` and `yield_now` (pager.rs ~24807). The wait is
+  bounded by wall time, so callgrind (190k per statement) under-counts it against perf (228k). An A/B
+  with `FSQLITE_PARALLEL_WAL_MAX_FLUSH_DELAY_MS=0`, which zeroes only this wait's budget, measured
+  225.1k -> 188.8k per commit.
+- Change: the flusher skips the wait when the committing transaction's lease is the only
+  same-process admission on its file's maintenance gate (`active_transactions == 1`, no opener, no
+  maintenance). The gate is identity-bound and shared by every pager of the file in the process,
+  like the group-commit queue, and every writer takes a transaction lease before it can reach the
+  queue, so no batch can arrive. With any other transaction or opener on the gate the policy is
+  unchanged. Durability, publication and batching of multi-writer commits are untouched.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries 0292302f... (main b68522c70) and
+  2626c63d... (b68522c70 plus this diff, diff sha 0b5e60158ba68687); answers equal stock's in every
+  row; stock `integrity_check` ok on every candidate file (6 DML, 10 txn/autocommit, 9 multiproc):
+  - `txn_row_probe`, 5 reps, load 2.2: `autocommit_5k_inserts` 1,151.6M -> 954.2M user
+    instructions (-39.5k per commit, -17.1%; 10.25x -> 8.49x stock 112.3M), CPU best 657.0 ->
+    576.4 ms (stock 62.5, A/A 1.13), wall best 696.1 -> 612.2 ms (6.84x -> 6.01x stock 101.8);
+    `txn_1000x10_rows` 666.8M -> 633.9M (-4.9%; 4.33x -> 4.12x stock 153.9M), CPU 271.4 -> 235.7
+    ms (stock 33.4, A/A 1.16), wall 311.6 -> 274.9 ms (4.40x -> 3.88x stock 70.9).
+  - `auto_scale` (min of 3): 5,000 commits 1,158.3M -> 944.5M; 1,000 commits 241.7M -> 198.0M;
+    the env-knob control on the base binary in an earlier run, 958.4M against the candidate's
+    947.3M, so the change removes the same wait the knob does.
+  - `mp_probe`, 9 reps, load 2.3: `multiproc_8x500` median 1,175.3M -> 1,046.8M (-10.9%; minimum
+    1,120.9M -> 961.9M), median CPU 1,111.0 -> 1,095.1 ms, median wall 947.9 -> 870.7 ms (stock
+    99.0M, 204.2 ms CPU, 166.8 ms wall); 4,000 rows. A 5-rep run before it had median CPU
+    1,091.9 -> 1,144.0 ms with wall flat (947.8 -> 948.3); the 9-rep run did not reproduce it.
+  - rusage, 9 reps, 5,000 commits: user per commit 87.6 -> 76.2 us, sys 37.6 -> 38.7 us, wall 621
+    -> 573 ms (stock 6.5 + 5.7 us). strace: syscalls per commit unchanged (statx 11.01 / 11.04,
+    fcntl 8.00 / 8.01, pread64 4.12 / 4.52, pwrite64 2.13 / 2.17).
+  - `sc_mut_probe`, 3 reps: `delete_14pct_300k` 470.4M / 470.6M, `update_10pct_300k` 811.9M /
+    811.9M (one commit each; unchanged as predicted).
+  - Prediction (registered on bd-w4pr1.7 before code): autocommit -30k to -37k per commit, CPU and
+    wall -3% to -6%; txn -4% to -6%; multiproc -8% to -14%; DML unchanged. txn, multiproc and DML
+    landed inside; autocommit came in above the range (-39.5k, CPU -12.3%, wall -12.1%): the spin's
+    size varies with host timing, and the knob run that sized it measured 36.3k. Kill (autocommit
+    under 25k per commit, CPU best not lower) cleared.
+- Tests (`pager.rs`): `test_commit_service_policy_sole_transaction_skips_the_arrival_wait` (alone:
+  zero wait, reason `sole_transaction`, low-latency mode; the same queue with a possible peer keeps
+  the 8 us sparse wait; a flushable queue keeps `queue_flushable`);
+  `test_maintenance_lease_sole_transaction_counts_every_same_gate_admission` (a second transaction
+  or an opener on the gate makes it not sole, a transaction on another gate does not, an open
+  lease is never a sole transaction). The four existing commit-service policy tests model
+  possible peers and set `peers_may_arrive: true`.
+- Gate (rch, b68522c70 plus the change): clippy -D warnings on fsqlite-pager and fsqlite-core
+  `--all-targets` clean; fsqlite-pager lib 1,107 passed, 1 failed
+  (`bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`, poll_quota 96 vs 97, red on main
+  since asupersync 0.6.2); fsqlite-e2e concurrency and group-commit targets 63 + 54
+  (group_commit_durability, correctness_concurrent_writes, mvcc_concurrent_writers, the
+  concurrent writer and DML oracles, concurrent-mode defaults, multiprocess coordination,
+  parallel WAL staging and publication, swarm writers, concurrent checkpoint, MVCC isolation);
+  fsqlite-core lib 4,173 passed, 3 failed (the t6741 pair, red on main, and the bd-gp7t8
+  load-sensitive `test_wait_for_background_repair_inside_runtime_requeues_instead_of_blocking`,
+  6/6 commit_repair async tests passing alone); fsqlite-core WAL and certificate keepers 14 + 214
+  + 71; fsqlite WAL keepers 16.
+- Landed as b3eceb70a (rebased onto 32af77afe; on the rebased tree, 53763578a on 348c164e3:
+  clippy clean, fsqlite-pager lib 1,110 passed with the same 1 red, the first e2e batch 63 passed;
+  the later upstream commits are vdbe and tracker only).
+- Retry condition: none needed for the single-writer case. For a commit with live peers the wait
+  stays; revisit it only with a measured coalescing gain at the target writer count (the 2026-09
+  retry predicate). Next on bd-w4pr1.7, from the same attribution: the implicit BEGIN's committed-
+  state refresh (28.8k), the INSERT execution (36.9k), group-commit completion (14.9k), and the 18.6
+  syscalls per commit stock does not make (about 27 us of kernel time; the shm_map fstat and the
+  path-identity probes need a decision first).
+
 ## 2026-11-14 - WIN: a top-level statement keeps its statement future in one box (bd-w4pr1.13.35 lever 3, bd-w4pr1.11)
 
 - Target: the per-statement future allocations of every statement through the dispatcher; measured
