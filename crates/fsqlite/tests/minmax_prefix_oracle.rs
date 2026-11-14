@@ -195,3 +195,129 @@ fn minmax_prefix_seek_matches_sqlite() {
         );
     });
 }
+
+/// bd-zgo8b: `SELECT MAX(id) FROM t WHERE a = ?` (the latest row per key) on a one-key index `(a)`,
+/// whose `a = ?` block is in rowid order: one SeekLE (MAX) or SeekGE (MIN) and the entry's rowid,
+/// instead of walking the block. In memory and on a file database in strict mode, against rusqlite.
+#[test]
+fn minmax_rowid_prefix_seek_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("minmax_rowid_prefix.db");
+        let schema = [
+            "CREATE TABLE m (id INTEGER PRIMARY KEY, a INTEGER, s TEXT, c TEXT COLLATE NOCASE, \
+             k INTEGER, v INTEGER);",
+            "CREATE INDEX m_a ON m(a);",
+            "CREATE INDEX m_s ON m(s);",
+            "CREATE INDEX m_c ON m(c);",
+            // k leads only a composite index: its block is in v order, not rowid order.
+            "CREATE INDEX m_kv ON m(k, v);",
+            // A NOCASE column under a BINARY index: `c = 'k1'` matches rows the BINARY block lacks.
+            "CREATE TABLE n (id INTEGER PRIMARY KEY, c TEXT COLLATE NOCASE, v INTEGER);",
+            "CREATE INDEX n_cv ON n(c COLLATE BINARY, v);",
+            "INSERT INTO n VALUES (1, 'k1', 50), (2, 'K1', 3), (3, 'k1', 20), (4, 'k2', 1);",
+            "CREATE TABLE w (k INTEGER, id INTEGER, PRIMARY KEY (k, id)) WITHOUT ROWID;",
+        ];
+        let mut rows = Vec::new();
+        for i in 1..=2000_i64 {
+            let a = if i % 97 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 50)
+            };
+            let c = format!("'{}{}'", if i % 2 == 0 { "K" } else { "k" }, i % 7);
+            rows.push(format!(
+                "INSERT INTO m VALUES ({i}, {a}, 'k{}', {c}, {}, {});",
+                i % 100,
+                i % 30,
+                (i * 37) % 101
+            ));
+            rows.push(format!("INSERT INTO w VALUES ({}, {i});", i % 30));
+        }
+        let queries = [
+            "SELECT MAX(id) FROM m WHERE a = 5",
+            "SELECT MIN(id) FROM m WHERE a = 5",
+            "SELECT MAX(rowid) FROM m WHERE a = 17",
+            "SELECT MIN(rowid) FROM m WHERE 17 = a",
+            "SELECT MAX(id) FROM m WHERE a = 999",
+            "SELECT MIN(id) FROM m WHERE a = NULL",
+            "SELECT MAX(id) FROM m WHERE a = '5'",
+            "SELECT MIN(id) FROM m WHERE a = 5.0",
+            "SELECT MAX(id) FROM m WHERE a = 5.5",
+            "SELECT COALESCE(MAX(id), 0) FROM m WHERE a = 999",
+            "SELECT MAX(id) + 1 FROM m WHERE a = 0",
+            "SELECT MAX(id) FROM m WHERE s = 'k9'",
+            "SELECT MIN(id) FROM m WHERE s = 9",
+            "SELECT MAX(id) FROM m WHERE c = 'K1'",
+            "SELECT MIN(id) FROM m WHERE c = 'k3'",
+            // Declines that must still match: a composite-only key, a residual, the
+            // collation mismatch, WITHOUT ROWID.
+            "SELECT MAX(id) FROM m WHERE k = 3",
+            "SELECT MIN(id) FROM m WHERE k = 3",
+            "SELECT MAX(id) FROM m WHERE a = 5 AND v > 50",
+            "SELECT MIN(v) FROM n WHERE c = 'k1'",
+            "SELECT MAX(v) FROM n WHERE c = 'K1'",
+            "SELECT MAX(id) FROM w WHERE k = 5",
+        ];
+        for path in [":memory:", file.to_str().unwrap()] {
+            let f = Connection::open(path).await.expect("frank");
+            let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+            for stmt in schema
+                .iter()
+                .copied()
+                .chain(rows.iter().map(String::as_str))
+            {
+                f.execute(stmt).await.unwrap();
+                r.execute_batch(stmt).unwrap();
+            }
+            if path != ":memory:" {
+                f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+                    .await
+                    .unwrap();
+            }
+            for sql in queries {
+                assert_eq!(
+                    frank_rows(&f, sql).await,
+                    sqlite_rows(&r, sql),
+                    "diverged: `{sql}` at {path}"
+                );
+            }
+            // Bound parameters take the same seek.
+            for value in [
+                SqliteValue::Integer(5),
+                SqliteValue::Text("5".into()),
+                SqliteValue::Null,
+            ] {
+                let got: Vec<Vec<String>> = f
+                    .query_with_params("SELECT MAX(id) FROM m WHERE a = ?1", &[value.clone()])
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(render).collect())
+                    .collect();
+                let literal = match &value {
+                    SqliteValue::Integer(n) => n.to_string(),
+                    SqliteValue::Text(s) => format!("'{s}'"),
+                    _ => "NULL".to_owned(),
+                };
+                let want = sqlite_rows(&r, &format!("SELECT MAX(id) FROM m WHERE a = {literal}"));
+                assert_eq!(got, want, "MAX(id) WHERE a = ?1 with {value:?} at {path}");
+            }
+            assert_eq!(
+                seek_shape(&f, "SELECT MAX(id) FROM m WHERE a = 5").await,
+                (true, false, false),
+                "MAX(id) WHERE a=? must SeekLE the one-key index, covering"
+            );
+            assert_eq!(
+                seek_shape(&f, "SELECT MIN(id) FROM m WHERE s = 'k9'").await,
+                (false, true, false),
+                "MIN(id) WHERE s=? must SeekGE the one-key index, covering"
+            );
+            assert!(
+                !seek_shape(&f, "SELECT MAX(id) FROM m WHERE k = 3").await.0,
+                "MAX(id) WHERE k=? has no one-key index on k and must not take the prefix seek"
+            );
+            f.close().await.unwrap();
+        }
+    });
+}

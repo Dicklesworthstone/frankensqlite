@@ -262,15 +262,22 @@ fn minmax_rowid_seek_does_not_fire_when_unsafe() {
             rconn.execute_batch(&sql).unwrap();
         }
 
-        // WHERE clause changes the extremum → must NOT use the unconditional seek.
+        // WHERE clause changes the extremum → must NOT use the unconditional seek
+        // (`Last` on the table b-tree). It scans and filters, or (bd-zgo8b) seeks
+        // the end of the `ts = 2` run in the one-key index idx_ts, which holds
+        // that run in rowid order, and reads the entry's rowid.
         let where_dis = fconn
             .prepare("SELECT MAX(id) FROM messages WHERE ts = 2")
             .await
             .unwrap()
             .explain();
+        let seeks_run_end = where_dis.contains("(idx)idx_ts")
+            && where_dis.contains("SeekLE")
+            && where_dis.contains("IdxRowid");
         assert!(
-            where_dis.contains("Next"),
-            "MAX(id) WHERE ... must still scan/filter; got:\n{where_dis}"
+            !where_dis.contains("Last") && (where_dis.contains("Next") || seeks_run_end),
+            "MAX(id) WHERE ... must scan/filter or seek the run's end, never the table's last leaf; \
+             got:\n{where_dis}"
         );
 
         // MAX over a non-rowid column must not use the rowid leaf seek.  It may,

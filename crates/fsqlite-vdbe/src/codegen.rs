@@ -17423,6 +17423,8 @@ struct MinMaxPrefixSeek<'e> {
     /// `true` when key term 1 (`b`) is DESC — then `MAX(b)` is the block's FIRST entry (`SeekGE`),
     /// not the last (`SeekLE`). Only ever set for MAX (a DESC `b` declines MIN).
     b_descending: bool,
+    /// bd-zgo8b: `b` is the rowid of a one-key index's entry (`IdxRowid`, never NULL).
+    b_is_rowid: bool,
     index_name: String,
     index_root: i32,
     /// Affinity to coerce the `a` probe to (`'C'|'D'|'E'|'B'`), or `None` (untyped → no coercion).
@@ -17452,8 +17454,7 @@ fn minmax_prefix_seek_plan<'e>(
     let [agg] = agg_columns else {
         return None;
     };
-    if agg.arg_is_rowid
-        || agg.distinct
+    if agg.distinct
         || agg.filter.is_some()
         || agg.hidden
         || agg.bare_expr.is_some()
@@ -17475,7 +17476,13 @@ fn minmax_prefix_seek_plan<'e>(
         "MAX" => true,
         _ => return None,
     };
-    let b_col_name = table.columns.get(agg.arg_col_index?)?.name.clone();
+    // bd-zgo8b: `MIN(rowid)` / `MAX(rowid)` (or of the INTEGER PRIMARY KEY). A one-key index stores
+    // `(a, rowid)`, so its `a = ?` block is in rowid order and the rowid is the next record field.
+    let b_col_name = if agg.arg_is_rowid {
+        None
+    } else {
+        Some(table.columns.get(agg.arg_col_index?)?.name.clone())
+    };
     // BINARY `b` only: under a non-BINARY collation (e.g. NOCASE) collation-equal values can be
     // byte-different, so the index's tie representative (chosen by rowid) may differ from the scan's
     // MIN/MAX representative — not byte-identical. Such shapes decline to the group scan.
@@ -17487,30 +17494,43 @@ fn minmax_prefix_seek_plan<'e>(
         return None;
     }
     let (a_col_name, a_target) = extract_column_eq_target(where_clause, table, table_alias)?;
-    if a_col_name.eq_ignore_ascii_case(&b_col_name) {
+    if b_col_name
+        .as_deref()
+        .is_some_and(|b_col_name| a_col_name.eq_ignore_ascii_case(b_col_name))
+    {
         return None;
     }
+    let where_expr = where_clause?;
     let idx = table.indexes.iter().find(|idx| {
         idx.supports_direct_column_lookup()
-            && idx.key_term_count() >= 2
             && !idx.key_term_descending(0)
-            // ASC `b`: MIN=first / MAX=last of the block. DESC `b`: MAX is the block's FIRST entry
-            // (SeekGE, O(log n) — no O(block) walk); MIN over a DESC `b` (last non-NULL, SeekLE) is
-            // declined here, so a DESC second term is only accepted for MAX.
-            && (!idx.key_term_descending(1) || is_max)
             && idx
                 .columns
                 .first()
                 .is_some_and(|c| c.eq_ignore_ascii_case(&a_col_name))
-            && idx
-                .columns
-                .get(1)
-                .is_some_and(|c| c.eq_ignore_ascii_case(&b_col_name))
-            && idx
-                .key_term_collation(1)
-                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+            // The block the seek walks is the rows `a = ?` matches only when the comparison uses
+            // key term 0's collation (a NOCASE column under a `COLLATE BINARY` index holds other
+            // case variants elsewhere).
+            && index_equality_term_uses_key_collation(where_expr, table, table_alias, idx, 0)
+            && match b_col_name.as_deref() {
+                None => idx.key_term_count() == 1,
+                // ASC `b`: MIN=first / MAX=last of the block. DESC `b`: MAX is the block's FIRST
+                // entry (SeekGE, O(log n) — no O(block) walk); MIN over a DESC `b` (last non-NULL,
+                // SeekLE) is declined here, so a DESC second term is only accepted for MAX.
+                Some(b_col_name) => {
+                    idx.key_term_count() >= 2
+                        && (!idx.key_term_descending(1) || is_max)
+                        && idx
+                            .columns
+                            .get(1)
+                            .is_some_and(|c| c.eq_ignore_ascii_case(b_col_name))
+                        && idx
+                            .key_term_collation(1)
+                            .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                }
+            }
     })?;
-    let b_descending = idx.key_term_descending(1);
+    let b_descending = b_col_name.is_some() && idx.key_term_descending(1);
     let a_affinity = table
         .column_index(&a_col_name)
         .map(|i| index_key_affinity(table.columns[i].affinity))
@@ -17522,6 +17542,7 @@ fn minmax_prefix_seek_plan<'e>(
     Some(MinMaxPrefixSeek {
         is_max,
         b_descending,
+        b_is_rowid: b_col_name.is_none(),
         index_name: idx.name.clone(),
         index_root: idx.root_page,
         a_affinity,
@@ -19320,6 +19341,13 @@ fn codegen_select_minmax_prefix_seek(
     };
     let cur_a_reg = b.alloc_reg();
     let b_reg = b.alloc_reg();
+    let read_b = |b: &mut ProgramBuilder| {
+        if seek.b_is_rowid {
+            b.emit_op(Opcode::IdxRowid, idx_cursor, b_reg, 0, P4::None, 0);
+        } else {
+            b.emit_op(Opcode::Column, idx_cursor, 1, b_reg, P4::None, 0);
+        }
+    };
     let agg_p4 = agg_func_p4(&agg.name, agg.collation.as_ref());
 
     if seek.is_max {
@@ -19341,7 +19369,7 @@ fn codegen_select_minmax_prefix_seek(
             a_coll(),
             JUMPIFNULL,
         );
-        b.emit_op(Opcode::Column, idx_cursor, 1, b_reg, P4::None, 0);
+        read_b(b);
         // fall through to the shared AggStep with `b_reg` = the max `b`.
     } else {
         // MIN: first entry of the block, then skip leading `b`-NULLs within it.
@@ -19364,7 +19392,7 @@ fn codegen_select_minmax_prefix_seek(
         );
 
         let min_loop = b.current_addr();
-        b.emit_op(Opcode::Column, idx_cursor, 1, b_reg, P4::None, 0);
+        read_b(b);
         let min_found = b.emit_label();
         b.emit_jump_to_label(Opcode::NotNull, b_reg, 0, min_found, P4::None, 0);
         // `b` is NULL: advance; on EOF fall through to finalize.
