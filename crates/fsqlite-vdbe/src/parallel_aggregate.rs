@@ -367,10 +367,6 @@ fn scan_leaf(
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!("cell pointer {idx} of page {} is past the page", leaf.page_no.get()),
             })?;
-        let cell = CellRef::parse(page, offset, BtreePageType::LeafTable, usable_size)?;
-        let rowid = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: "table leaf cell without a rowid".to_owned(),
-        })?;
         let RowScratch {
             layout,
             sources,
@@ -380,13 +376,25 @@ fn scan_leaf(
             payload,
             overflow,
         } = scratch;
-        let record: &[u8] = match cell.overflow_page {
-            None => cell.local_payload(page),
-            Some(first) => {
-                reassemble_payload(reader, usable_size, &cell, page, first, payload, overflow)?;
-                payload.as_slice()
-            }
-        };
+        // A cell stored whole on its page needs only its two varints; one
+        // that spills (or anything the fast read does not take) is parsed
+        // in full.
+        let (rowid, record): (i64, &[u8]) =
+            if let Some(local) = cell::table_leaf_local_record(page, offset, usable_size) {
+                local
+            } else {
+                let cell = CellRef::parse(page, offset, BtreePageType::LeafTable, usable_size)?;
+                let rowid = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "table leaf cell without a rowid".to_owned(),
+                })?;
+                match cell.overflow_page {
+                    None => (rowid, cell.local_payload(page)),
+                    Some(first) => {
+                        reassemble_payload(reader, usable_size, &cell, page, first, payload, overflow)?;
+                        (rowid, payload.as_slice())
+                    }
+                }
+            };
         if !layout.parse(record) {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!("malformed record header in row {rowid}"),

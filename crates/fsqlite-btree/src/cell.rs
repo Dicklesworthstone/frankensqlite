@@ -863,6 +863,50 @@ pub fn read_table_leaf_rowid_at_offset(page: &[u8], cell_offset: usize) -> Optio
     Some(rowid_raw as i64)
 }
 
+/// A varint whose first byte ends it, read inline; any other to
+/// [`read_varint`].
+#[inline]
+fn read_varint_one_byte_first(bytes: &[u8]) -> Option<(u64, usize)> {
+    match bytes.first() {
+        Some(&byte) if byte < 0x80 => Some((u64::from(byte), 1)),
+        _ => read_varint(bytes),
+    }
+}
+
+/// The rowid and record of a table-leaf cell stored whole on its page.
+///
+/// The cell at `cell_offset` is whole on `page` when its payload is at most
+/// `usable_size - 35`, the table-leaf maximum local size: nothing spills onto
+/// overflow pages. `None` for a cell that spills, or whose varints or record run past
+/// `page` or past `usable_size`; [`CellRef::parse`] reads (or rejects)
+/// those. For a cell this
+/// returns, it gives the rowid and the bytes `CellRef::parse` plus
+/// [`CellRef::local_payload`] give, from the two varints alone. Read for every
+/// cell of a leaf by the parallel aggregate scan (bd-w4pr1.13.11).
+#[inline]
+#[must_use]
+pub fn table_leaf_local_record(
+    page: &[u8],
+    cell_offset: usize,
+    usable_size: u32,
+) -> Option<(i64, &[u8])> {
+    let cell = page.get(cell_offset..)?;
+    let (payload_size, payload_varint_len) = read_varint_one_byte_first(cell)?;
+    if payload_size > u64::from(usable_size.saturating_sub(35)) {
+        return None;
+    }
+    let (rowid_raw, rowid_varint_len) =
+        read_varint_one_byte_first(cell.get(payload_varint_len..)?)?;
+    let start = payload_varint_len + rowid_varint_len;
+    let end = start.checked_add(usize::try_from(payload_size).ok()?)?;
+    if cell_offset.checked_add(end)? > usize::try_from(usable_size).ok()? {
+        return None;
+    }
+    let record = cell.get(start..end)?;
+    #[allow(clippy::cast_possible_wrap)]
+    Some((rowid_raw as i64, record))
+}
+
 /// Minimum on-page allocation for any cell, per the SQLite file format
 /// (per SQLite's `cellSizePtr`: "the minimum size of any cell is 4 bytes").
 ///
@@ -1876,6 +1920,66 @@ mod tests {
             CellRef::parse_leaf_table_rowid(&page, 0).unwrap(),
             1_000_000_000
         );
+    }
+
+    #[test]
+    fn test_table_leaf_local_record_matches_cellref_parse_around_the_spill_threshold() {
+        use fsqlite_types::serial_type::write_varint;
+
+        let usable = 512_u32;
+        let usable_len = usize::try_from(usable).unwrap();
+        let max_local = usable - 35;
+        let mut taken = 0_usize;
+        for payload_size in [
+            0_u32,
+            1,
+            127,
+            128,
+            max_local - 1,
+            max_local,
+            max_local + 1,
+            max_local + 200,
+        ] {
+            for rowid in [0_i64, 1, 127, 128, -1, 300, 1 << 40, i64::MIN, i64::MAX] {
+                // Bytes past the usable size stand for the reserved region.
+                let mut page = vec![0xab_u8; usable_len + 64];
+                let off = 3;
+                let n = write_varint(&mut page[off..], u64::from(payload_size));
+                #[allow(clippy::cast_sign_loss)]
+                let m = write_varint(&mut page[off + n..], rowid as u64);
+                for (i, byte) in page[off + n + m..usable_len].iter_mut().enumerate() {
+                    *byte = u8::try_from(i % 251).unwrap();
+                }
+                let fast = table_leaf_local_record(&page, off, usable);
+                let full = CellRef::parse(&page, off, BtreePageType::LeafTable, usable);
+                if payload_size > max_local {
+                    // The negative case: a payload one byte over the
+                    // threshold spills and must not be read as local.
+                    assert_eq!(fast, None, "payload {payload_size} spills");
+                    assert!(full.unwrap().overflow_page.is_some());
+                    continue;
+                }
+                let (fast_rowid, record) = fast.expect("a local cell inside the usable size");
+                let cell = full.unwrap();
+                assert_eq!(cell.overflow_page, None);
+                assert_eq!(Some(fast_rowid), cell.rowid);
+                assert_eq!(record, cell.local_payload(&page));
+                taken += 1;
+            }
+        }
+        assert_eq!(taken, 6 * 9);
+
+        // A local cell that crosses the usable size inside the page buffer:
+        // declined here, rejected by the full parse.
+        let mut page = vec![0_u8; usable_len + 64];
+        let off = usable_len - 10;
+        let n = write_varint(&mut page[off..], 100);
+        let _ = write_varint(&mut page[off + n..], 7);
+        assert_eq!(table_leaf_local_record(&page, off, usable), None);
+        assert!(CellRef::parse(&page, off, BtreePageType::LeafTable, usable).is_err());
+        // Truncated varints and an offset past the page are declined too.
+        assert_eq!(table_leaf_local_record(&[0x81], 0, usable), None);
+        assert_eq!(table_leaf_local_record(&page, page.len(), usable), None);
     }
 
     #[test]
