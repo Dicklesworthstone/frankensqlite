@@ -87,6 +87,49 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - REJECTED: two fewer registry-mutex acquisitions per concurrent transaction (BEGIN seeds the handle cache, lock-free active-session count) (bd-i0tn6 scaling lever 1)
+
+- Target: concurrent writers committing one row per transaction at 8-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`, separate and shared tables). Touched (reverted):
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (`ActiveSessionCount`, an atomic copy of
+  `active.len()` published on every admission and removal), `crates/fsqlite-core/src/connection.rs`
+  (`register_concurrent_session` at the three registration sites seeds `cached_concurrent_handle`
+  under the registration guard; `active_concurrent_txn_count` reads the atomic). Patch:
+  scratchpad `i0_lever1_registry_acquisitions_on_c2f83a761.patch` (session 1f77802a).
+- Ledger preflight: bd-ifgl7 (the per-transaction handle cache this extends) and bd-6hgad (group
+  commit). Nothing earlier removes registry acquisitions.
+- Evidence before (bd-i0tn6 bead comment 2026-11-14, probe build on c2f83a761): five registry
+  acquisitions per transaction (BEGIN registration, the first statement's handle lookup,
+  commit validation, publication, the post-commit auto-checkpoint count). The waits totalled
+  84 us of 635 us per transaction at 8 writers and 752 of 1,438 at 16, about 140 us per
+  acquisition at 16 writers. Holds summed to 35 and 63 us. F wps is flat from 8 to 16 writers.
+- Prediction: separate tables 16w +15% to +30%, 8w +3% to +8%, 1w within 2%, shared 16w +5% to
+  +15%. Kill: 16w separate below 1.08x, 1w or 8w worse than -3%, or a worker failure.
+- Result (mt-mvcc-bench, one row per transaction, 500 rows per writer, 5 rounds, stock live in
+  every run; A = c2f83a761 + bench stage profiler, sha256 2119d428...; B = A + this change,
+  7c5e34e1...; interleaved A B, thinkstation1, 64 threads, powersave, tmpfs, NORMAL). Separate
+  tables, 2 reps, B/A: 1w 1.01x, 2w 0.95x, 4w 1.02x, 8w 1.05x, 16w 1.09x, 32w 0.93x, 64w
+  0.86x. Shared table, 1 rep (the second failed at setup, see below): 4w 1.11x, 8w 0.94x, 16w
+  0.92x, 32w 0.96x. 16w missed the prediction, shared 8w hit the kill line, and 32-64 writers lost
+  in both reps. The first statement stopped queueing (INSERT 728 -> 36 us at 32w, 2,718 -> 124 at
+  64w). But each commit-path hold grew 27-34% (47 -> 59 us at 32w, 81 -> 108 at 64w) and its wait
+  grew from 760 to 1,308 us and from 2,472 to 4,884 us. SSI validation locks every active peer's
+  handle under the registry guard (`HandleView::new` over `iter_active`). With the first-statement
+  wait gone, peers are mid-INSERT on their own handle locks while a validator scans them. The
+  removed waits had been keeping peers off those locks, so taking them out only lengthened the
+  O(N) holds. Worker failures: none.
+- Tests written (in the patch, both pass on B): `test_active_session_count_tracks_admission_and_removal`
+  (mvcc) and `i0tn6_transaction_statements_and_session_count_skip_the_registry_mutex` (core, a
+  statement and the count must finish while another thread holds the registry mutex).
+- Retry condition: after the commit-path validate holds stop locking peer handles or stop scaling
+  with the writer count (bd-15hxt / S4), measured at 32-64 writers; then retry part (b), the
+  lock-free count, on its own first. Not as a standalone patch while validation scans locked peer
+  handles under the guard.
+- Also seen: from 2026-11-14 ~12:25 UTC every tmpfs run failed at stock's first PRAGMA with a
+  disk I/O error, plain sqlite3 included. /dev/shm is mounted `usrquota` and the fleet's uid-1000
+  usage is ~87 GB, so the shared user quota looks exhausted. Runs on /dev/shm are not comparable
+  until it is cleared.
+
 ## 2026-11-14 - WIN: the parallel aggregate kernel keeps INTEGER columns as i64 from decode to comparison, sum and min/max (bd-w4pr1.13.11 kernel lever K2)
 
 - Target: the per-row cost of the parallel ungrouped-aggregate kernel on scan_filter_agg
