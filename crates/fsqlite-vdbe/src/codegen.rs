@@ -9986,6 +9986,173 @@ fn ordered_scan_rowid_start_bound<'e>(
     })
 }
 
+/// One bound on a key column of an ordered index scan.
+#[derive(Clone, Copy, Debug)]
+struct LeadingKeyBound<'e> {
+    expr: &'e Expr,
+    inclusive: bool,
+}
+
+/// The range an ordered index scan can seek and stop on in key column
+/// `key_pos`, the first column its equality prefix leaves free (0 with no
+/// prefix): top-level `<key> > c`, `>=`, `<`, `<=` and `BETWEEN` conjuncts,
+/// either way round, where `c` is a literal (a negative number included) or a
+/// numbered or named parameter. Returns `(lower, upper)`, the first bound found
+/// on each side.
+///
+/// The scan still applies the whole WHERE to each row, so the bounds only
+/// need to cover every matching row. The probe and the stop value take the
+/// column's affinity, as the comparison applies it to the value, and both
+/// the column and the index key must compare with BINARY, the order the index
+/// is in. A DESC key, an expression index and anonymous `?` decline.
+fn ordered_scan_key_bounds<'e>(
+    where_clause: Option<&'e Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+    key_pos: usize,
+) -> Option<(Option<LeadingKeyBound<'e>>, Option<LeadingKeyBound<'e>>)> {
+    let is_binary = |collation: Option<&str>| {
+        collation.is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+    };
+    if key_pos >= index.key_term_count()
+        || index.key_term_descending(key_pos)
+        || index.columns.len() != index.key_term_count()
+        || !is_binary(index.key_term_collation(key_pos))
+    {
+        return None;
+    }
+    let key_column = index.columns.get(key_pos)?;
+    let column = table
+        .column_index(key_column)
+        .and_then(|position| table.columns.get(position))?;
+    if !is_binary(column.collation.as_deref()) {
+        return None;
+    }
+    let is_key = |expr: &Expr| {
+        column_name(expr, table, table_alias)
+            .is_some_and(|name| name.eq_ignore_ascii_case(key_column))
+    };
+    // Only values with no affinity of their own: then the comparison applies
+    // the column's affinity to the value and compares in the column's order,
+    // the index's order. A CAST or a column expression could instead convert
+    // the column (`s > CAST(5 AS INTEGER)` compares s numerically).
+    let is_bound = |expr: &Expr| {
+        matches!(
+            expr,
+            Expr::Literal(..)
+                | Expr::Placeholder(
+                    fsqlite_ast::PlaceholderType::Numbered(_)
+                        | fsqlite_ast::PlaceholderType::ColonNamed(_)
+                        | fsqlite_ast::PlaceholderType::AtNamed(_)
+                        | fsqlite_ast::PlaceholderType::DollarNamed(_),
+                    _
+                )
+        ) || is_numeric_literal_bound(expr)
+    };
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_clause?, &mut conjuncts);
+    let mut lower: Option<LeadingKeyBound<'e>> = None;
+    let mut upper: Option<LeadingKeyBound<'e>> = None;
+    for term in conjuncts {
+        match term {
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                // `key op c`, or `c op key` read as `key op' c`.
+                let (bound, op) = if is_key(left) && is_bound(right) {
+                    (right.as_ref(), *op)
+                } else if is_key(right) && is_bound(left) {
+                    let flipped = match op {
+                        fsqlite_ast::BinaryOp::Gt => fsqlite_ast::BinaryOp::Lt,
+                        fsqlite_ast::BinaryOp::Ge => fsqlite_ast::BinaryOp::Le,
+                        fsqlite_ast::BinaryOp::Lt => fsqlite_ast::BinaryOp::Gt,
+                        fsqlite_ast::BinaryOp::Le => fsqlite_ast::BinaryOp::Ge,
+                        _ => continue,
+                    };
+                    (left.as_ref(), flipped)
+                } else {
+                    continue;
+                };
+                let (slot, inclusive) = match op {
+                    fsqlite_ast::BinaryOp::Gt => (&mut lower, false),
+                    fsqlite_ast::BinaryOp::Ge => (&mut lower, true),
+                    fsqlite_ast::BinaryOp::Lt => (&mut upper, false),
+                    fsqlite_ast::BinaryOp::Le => (&mut upper, true),
+                    _ => continue,
+                };
+                slot.get_or_insert(LeadingKeyBound {
+                    expr: bound,
+                    inclusive,
+                });
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                not: false,
+                ..
+            } if is_key(expr) && is_bound(low) && is_bound(high) => {
+                lower.get_or_insert(LeadingKeyBound {
+                    expr: low,
+                    inclusive: true,
+                });
+                upper.get_or_insert(LeadingKeyBound {
+                    expr: high,
+                    inclusive: true,
+                });
+            }
+            _ => {}
+        }
+    }
+    (lower.is_some() || upper.is_some()).then_some((lower, upper))
+}
+
+/// Evaluate an ordered scan's leading-key bound into `reg` under the key
+/// column's affinity, as the comparison applies it to the constant.
+fn emit_leading_key_bound(
+    b: &mut ProgramBuilder,
+    bound: LeadingKeyBound<'_>,
+    affinity: char,
+    reg: i32,
+) {
+    emit_expr(b, bound.expr, reg, None);
+    b.emit_op(
+        Opcode::Affinity,
+        reg,
+        1,
+        0,
+        P4::Affinity(index_key_affinity(affinity).to_string()),
+        0,
+    );
+}
+
+/// Leave an ordered index walk once key column `key_pos` passes the far bound
+/// in `far_reg`: `key > far` (inclusive) or `key >= far` ascending, `key < far`
+/// or `key <= far` descending. A NULL key or bound compares false, so the walk
+/// goes on and the residual filter decides.
+fn emit_key_past_far_bound_exit(
+    b: &mut ProgramBuilder,
+    index_cursor: i32,
+    key_pos: usize,
+    far_reg: i32,
+    inclusive: bool,
+    descending: bool,
+    done_label: crate::Label,
+) {
+    let key_reg = b.alloc_reg();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let key_column = key_pos as i32;
+    b.emit_op(Opcode::Column, index_cursor, key_column, key_reg, P4::None, 0);
+    let past = match (descending, inclusive) {
+        (false, true) => Opcode::Gt,
+        (false, false) => Opcode::Ge,
+        (true, true) => Opcode::Lt,
+        (true, false) => Opcode::Le,
+    };
+    b.emit_jump_to_label(past, far_reg, key_reg, done_label, P4::None, 0);
+}
+
 /// Generate VDBE bytecode for an ORDER BY scan that can stream rows directly
 /// from an index in sorted order (no sorter temp B-tree).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -10041,6 +10208,21 @@ fn codegen_select_index_ordered_scan(
         0,
     );
 
+    let leading_key_bounds = if use_bounded_prefix_scan {
+        None
+    } else {
+        ordered_scan_key_bounds(where_clause, table, table_alias, &index_plan.index, 0)
+    };
+    // The affinity the comparison applies to a bound on key column `key_pos`.
+    let key_column_affinity = |key_pos: usize| {
+        index_plan
+            .index
+            .columns
+            .get(key_pos)
+            .and_then(|name| table.column_index(name))
+            .and_then(|position| table.columns.get(position))
+            .map_or('A', |column| column.affinity)
+    };
     let loop_start = if use_bounded_prefix_scan {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let prefix_len = index_plan.equality_prefix_len as i32;
@@ -10061,7 +10243,31 @@ fn codegen_select_index_ordered_scan(
             )
         })
         .flatten();
-        let probe_field_count = prefix_len + i32::from(rowid_start_bound.is_some());
+        // A range on the key column after the prefix (`a = ? AND b > ? ORDER BY
+        // b LIMIT n`): the probe takes its near bound as the next field, and the
+        // walk leaves the block once that column passes its far bound.
+        let next_key_bounds = (rowid_start_bound.is_none()
+            && index_plan.equality_prefix_len < index_plan.index.key_term_count())
+        .then(|| {
+            ordered_scan_key_bounds(
+                where_clause,
+                table,
+                table_alias,
+                &index_plan.index,
+                index_plan.equality_prefix_len,
+            )
+        })
+        .flatten()
+        .map(|(lower, upper)| {
+            if index_plan.descending {
+                (upper, lower)
+            } else {
+                (lower, upper)
+            }
+        });
+        let next_key_near = next_key_bounds.and_then(|(near, _)| near);
+        let probe_field_count = prefix_len
+            + i32::from(rowid_start_bound.is_some() || next_key_near.is_some());
         let probe_key_regs = b.alloc_regs(probe_field_count);
         for (offset, expr) in equality_prefix_exprs
             .iter()
@@ -10109,6 +10315,17 @@ fn codegen_select_index_ordered_scan(
                 0,
             );
         }
+        let next_key_affinity = key_column_affinity(index_plan.equality_prefix_len);
+        if let Some(bound) = next_key_near {
+            emit_leading_key_bound(b, bound, next_key_affinity, probe_key_regs + prefix_len);
+        }
+        let next_key_far = next_key_bounds
+            .and_then(|(_, far)| far)
+            .map(|bound| {
+                let reg = b.alloc_reg();
+                emit_leading_key_bound(b, bound, next_key_affinity, reg);
+                (reg, bound.inclusive)
+            });
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
@@ -10143,6 +10360,77 @@ fn codegen_select_index_ordered_scan(
             P4::None,
             index_plan.equality_prefix_len as u16,
         );
+        if let Some((far_reg, inclusive)) = next_key_far {
+            emit_key_past_far_bound_exit(
+                b,
+                index_cursor,
+                index_plan.equality_prefix_len,
+                far_reg,
+                inclusive,
+                index_plan.descending,
+                done_label,
+            );
+        }
+        loop_start
+    } else if let Some((lower, upper)) = leading_key_bounds {
+        // A range on the leading key with no equality prefix (`s > ? ORDER BY s
+        // LIMIT n`): seek the near bound instead of walking the index from its
+        // start, and leave once the key passes the far bound. Both bounds are
+        // applied inclusively here; the residual filter applies the exact
+        // predicate. Index NULLs sort first: an ascending seek skips them and a
+        // descending walk reaches them last, where the filter rejects them.
+        let key_affinity = key_column_affinity(0);
+        let (near, far) = if index_plan.descending {
+            (upper, lower)
+        } else {
+            (lower, upper)
+        };
+        let far_reg = far.map(|bound| {
+            let reg = b.alloc_reg();
+            emit_leading_key_bound(b, bound, key_affinity, reg);
+            (reg, bound.inclusive)
+        });
+        if let Some(bound) = near {
+            let probe_reg = b.alloc_reg();
+            emit_leading_key_bound(b, bound, key_affinity, probe_reg);
+            let probe_record_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                probe_reg,
+                1,
+                probe_record_reg,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                if index_plan.descending {
+                    Opcode::SeekLE
+                } else {
+                    Opcode::SeekGE
+                },
+                index_cursor,
+                probe_record_reg,
+                done_label,
+                P4::None,
+                0,
+            );
+        } else if index_plan.descending {
+            b.emit_jump_to_label(Opcode::Last, index_cursor, 0, done_label, P4::None, 0);
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, index_cursor, 0, done_label, P4::None, 0);
+        }
+        let loop_start = b.current_addr();
+        if let Some((far_reg, inclusive)) = far_reg {
+            emit_key_past_far_bound_exit(
+                b,
+                index_cursor,
+                0,
+                far_reg,
+                inclusive,
+                index_plan.descending,
+                done_label,
+            );
+        }
         loop_start
     } else {
         let loop_start = b.current_addr();
@@ -10153,6 +10441,7 @@ fn codegen_select_index_ordered_scan(
         }
         loop_start
     };
+    let loops_back_to_start = use_bounded_prefix_scan || leading_key_bounds.is_some();
 
     let skip_row = b.emit_label();
     let rowid_reg = b.alloc_reg();
@@ -10214,7 +10503,7 @@ fn codegen_select_index_ordered_scan(
     b.resolve_label(skip_row);
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let loop_body = if use_bounded_prefix_scan {
+    let loop_body = if loops_back_to_start {
         loop_start as i32
     } else {
         (loop_start + 1) as i32
