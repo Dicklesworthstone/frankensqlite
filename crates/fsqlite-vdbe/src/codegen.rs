@@ -17486,10 +17486,13 @@ fn codegen_select_minmax_index_seek(
     Ok(())
 }
 
-/// Emit `SELECT COUNT(DISTINCT col) FROM t` as a single covering index walk: open the single-column
-/// ASC index, skip the leading NULL run (DISTINCT ignores NULLs), and increment the count once per
-/// key-change. No ephemeral dedup B-tree and no table read. Byte-identical to the full-scan DISTINCT
-/// path because the BINARY index groups equal values adjacently. bd-count-distinct-index-walk.
+/// Emit `SELECT COUNT(DISTINCT col) FROM t` as a covering loose scan of the index: start past the
+/// leading NULL run (DISTINCT ignores NULLs), count each key, then skip its duplicate run. A few
+/// cheap `Next` steps go first, so short runs cost what a key-change walk costs, and one `SeekGT`
+/// passes a longer run (a seek-only scan of an all-distinct index measured 11x the walk,
+/// bd-distinct-loose-scan-c8nay). Work scales with the distinct values, not the rows; no dedup
+/// B-tree and no table read. Byte-identical to the full-scan DISTINCT path because the BINARY
+/// index groups equal values adjacently. bd-count-distinct-index-walk.
 #[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
 fn codegen_select_count_distinct_index_walk(
     b: &mut ProgramBuilder,
@@ -17502,12 +17505,11 @@ fn codegen_select_count_distinct_index_walk(
 ) {
     // Count accumulates directly in the output register (COUNT is never NULL; wrappers are declined).
     let count_reg = out_regs;
-    let prev_reg = b.alloc_reg();
-    let have_prev_reg = b.alloc_reg();
     let key_reg = b.alloc_reg();
+    let cur_reg = b.alloc_reg();
+    let probe_record_reg = b.alloc_reg();
 
     b.emit_op(Opcode::Integer, 0, count_reg, 0, P4::None, 0);
-    b.emit_op(Opcode::Integer, 0, have_prev_reg, 0, P4::None, 0);
     b.emit_op(
         Opcode::OpenRead,
         idx_cursor,
@@ -17518,26 +17520,51 @@ fn codegen_select_count_distinct_index_walk(
     );
 
     let finalize_label = b.emit_label();
-    // Empty index → count stays 0.
-    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+    // Start past the NULL keys, which a one-field NULL probe compares equal to. No other key → 0.
+    b.emit_op(Opcode::Null, 0, key_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::MakeRecord, key_reg, 1, probe_record_reg, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SeekGT,
+        idx_cursor,
+        probe_record_reg,
+        finalize_label,
+        P4::None,
+        0,
+    );
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let scan_top = b.current_addr() as i32;
-    let next_label = b.emit_label();
     let count_label = b.emit_label();
+    let next_value = b.emit_label();
+    // The key under the cursor: first after the NULLs, then after each seek past a run.
+    let read_key = b.emit_label();
+    b.resolve_label(read_key);
     b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
-    // DISTINCT ignores NULLs — skip the leading NULL run entirely.
-    b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, next_label, P4::None, 0);
-    // First non-NULL is a new distinct value; otherwise count only when the key differs from the prev.
-    b.emit_jump_to_label(Opcode::IfNot, have_prev_reg, 0, count_label, P4::None, 0);
-    // Eq p1==p3 → jump (skip): key equals the previous distinct value, not new.
-    b.emit_jump_to_label(Opcode::Eq, key_reg, prev_reg, next_label, P4::None, 0);
     b.resolve_label(count_label);
     b.emit_op(Opcode::AddImm, count_reg, 1, 0, P4::None, 0);
-    b.emit_op(Opcode::Copy, key_reg, prev_reg, 0, P4::None, 0);
-    b.emit_op(Opcode::Integer, 1, have_prev_reg, 0, P4::None, 0);
-    b.resolve_label(next_label);
-    b.emit_op(Opcode::Next, idx_cursor, scan_top, 0, P4::None, 0);
+    // A key that differs from the counted one (index order, implicit BINARY) is the next value.
+    for _ in 0..DISTINCT_LOOSE_SCAN_NEXT_PROBES {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let next_addr = b.current_addr() as i32;
+        // Next jumps to p2 when a next entry exists; falls through at EOF.
+        b.emit_op(Opcode::Next, idx_cursor, next_addr + 2, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        b.emit_op(Opcode::Column, idx_cursor, 0, cur_reg, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Ne, key_reg, cur_reg, next_value, P4::None, 0x80);
+    }
+    // Past the rest of the run; no entry beyond it → done.
+    b.emit_op(Opcode::MakeRecord, key_reg, 1, probe_record_reg, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SeekGT,
+        idx_cursor,
+        probe_record_reg,
+        finalize_label,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, read_key, P4::None, 0);
+    // A probe already read the next value: count it without reading it again.
+    b.resolve_label(next_value);
+    b.emit_op(Opcode::Copy, cur_reg, key_reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, count_label, P4::None, 0);
 
     b.resolve_label(finalize_label);
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);

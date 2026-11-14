@@ -290,3 +290,87 @@ fn count_distinct_nocase_declines_but_matches() {
         cmp(&f, &r, "SELECT COUNT(DISTINCT c) FROM t", "nocase").await;
     });
 }
+
+/// The opcodes of the program, in address order.
+async fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| match row.values().get(1) {
+            Some(SqliteValue::Text(op)) => op.to_string(),
+            _ => String::new(),
+        })
+        .collect()
+}
+
+/// The walk is a loose scan: it seeks past the NULL keys, counts a key, steps a
+/// few entries and seeks past the rest of a longer run. Runs of every length
+/// around the step count, a NULL run over several leaf pages, values of every
+/// storage class (an integer and an equal real are one value) and the i64
+/// extremes must count as stock does, on a one-column and a composite index.
+#[test]
+fn count_distinct_loose_scan_runs_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        for (label, index) in [
+            ("one-column", "CREATE INDEX idx_a ON t(a);"),
+            ("composite", "CREATE INDEX idx_a ON t(a, b);"),
+        ] {
+            let (f, r) = setup(&[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a, b INTEGER);",
+                index,
+            ])
+            .await;
+            let sql = "SELECT COUNT(DISTINCT a) FROM t";
+            cmp(&f, &r, sql, &format!("{label} empty")).await;
+            let mut values = Vec::new();
+            for _ in 0..600 {
+                values.push("NULL".to_owned());
+            }
+            for v in 0..70_i64 {
+                // Run lengths 1..=7 cycle, so each length meets the step count.
+                for copy in 0..=(v % 7) {
+                    values.push(if v % 10 == 0 && copy % 2 == 1 {
+                        format!("{v}.0")
+                    } else {
+                        v.to_string()
+                    });
+                }
+                for _ in 0..(v % 5) {
+                    values.push(format!("'s{v}'"));
+                }
+                if v % 9 == 0 {
+                    values.push(format!("x'{v:02x}'"));
+                    values.push(format!("x'{v:02x}'"));
+                }
+            }
+            values.extend(
+                [i64::MIN, i64::MIN, i64::MAX, i64::MAX, i64::MAX]
+                    .iter()
+                    .map(i64::to_string),
+            );
+            values.extend(["2.5", "2.5", "-0.5"].map(str::to_owned));
+            for (i, value) in values.iter().enumerate() {
+                insert_both(
+                    &f,
+                    &r,
+                    &format!("INSERT INTO t VALUES ({}, {value}, {});", i + 1, i % 3),
+                )
+                .await;
+            }
+            cmp(&f, &r, sql, label).await;
+            let ops = opcodes(&f, sql).await;
+            assert!(
+                ops.iter().any(|op| op == "SeekGT") && !ops.iter().any(|op| op == "Rewind"),
+                "[{label}] COUNT(DISTINCT) must seek past runs, not walk every entry: {ops:?}"
+            );
+            assert!(opens(&f, sql, "idx_a").await, "[{label}] must walk idx_a");
+            assert!(
+                !opens(&f, sql, "t").await,
+                "[{label}] must not open the table"
+            );
+            insert_both(&f, &r, "DELETE FROM t WHERE a IS NOT NULL;").await;
+            cmp(&f, &r, sql, &format!("{label} all-null")).await;
+        }
+    });
+}
