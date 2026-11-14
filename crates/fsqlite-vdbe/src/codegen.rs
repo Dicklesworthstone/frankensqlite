@@ -299,10 +299,11 @@ fn effective_rowid_oe(table: &TableSchema, stmt_level: Option<ConflictAction>) -
     )
 }
 
-/// Whether an INSERT ... SELECT row body needs its second `Affinity`, the one
-/// between the CHECK / NOT NULL constraints and `MakeRecord`
-/// (bd-w4pr1.13.21, lever A). The first `Affinity`, before the constraints
-/// (GH #169), already gave every column register its column's affinity.
+/// Whether an INSERT ... SELECT or UPDATE row body needs its second `Affinity`,
+/// the one between the CHECK / NOT NULL constraints and `MakeRecord`
+/// (bd-w4pr1.13.21 lever A, bd-w4pr1.13.20 lever U). The first `Affinity`,
+/// before the constraints (GH #169), already gave every column register its
+/// column's affinity.
 /// Between the two, a NOT NULL column whose effective conflict action is
 /// REPLACE stores its DEFAULT, of any storage class, over a NULL, and a CHECK
 /// expression is compiled over the row registers; a WITHOUT ROWID table's
@@ -29186,6 +29187,20 @@ pub fn codegen_update(
     // rewrite, which re-keys every index).
     let assignment_targets = collect_update_assignment_columns(table, &stmt.assignments)?;
     let update_index_mask = update_index_maintenance_mask(table, &assignment_targets);
+    let rowid_alias_col_idx = ctx
+        .rowid_alias_col_idx
+        .or_else(|| table.columns.iter().position(|col| col.is_ipk));
+    // bd-9ag5r: when neither the hidden rowid nor its INTEGER PRIMARY KEY alias
+    // is assigned, the rowid cannot change, so the engine rewrites the row in
+    // place (stock overwrites the cell) instead of delete + seek + insert.
+    let keeps_rowid = !assignment_targets.assigns_hidden_rowid
+        && !rowid_alias_col_idx.is_some_and(|idx| assignment_targets.columns.contains(&idx));
+    // bd-w4pr1.13.20 lever U: a kept INTEGER PRIMARY KEY alias that the
+    // column preload below reads with `Rowid` holds the row's rowid for the
+    // whole row body, so it is the re-insert's rowid register: no NULL test,
+    // copy or `NewRowid`, and the one-pass scan needs no `Rowid` of its own.
+    let kept_rowid_alias = rowid_alias_col_idx
+        .filter(|&idx| keeps_rowid && table.columns.get(idx).is_some_and(|col| col.is_ipk));
 
     // OpenWrite for table.
     let table_cursor = cursor;
@@ -29383,14 +29398,19 @@ pub fn codegen_update(
                 scan_skip_label,
             );
         }
-        b.emit_op(
-            Opcode::Rowid,
-            table_cursor,
-            matched_rowid_reg,
-            0,
-            P4::None,
-            0,
-        );
+        // With a kept INTEGER PRIMARY KEY alias nothing reads this register:
+        // the CHECK rowid and the re-insert use the alias register, and a
+        // one-pass scan has no RETURNING.
+        if kept_rowid_alias.is_none() {
+            b.emit_op(
+                Opcode::Rowid,
+                table_cursor,
+                matched_rowid_reg,
+                0,
+                P4::None,
+                0,
+            );
+        }
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let scan_body = (scan_start + 1) as i32;
         one_pass_scan = Some((scan_skip_label, scan_body, scan_done_label));
@@ -29635,10 +29655,17 @@ pub fn codegen_update(
         (Some(apply_seek_miss_label), Some(apply_loop))
     };
 
-    // Read ALL existing columns into registers.
+    // Read every existing column the statement does not assign into its
+    // register. An assigned column's register is written by its assignment
+    // before anything reads it (the SET expressions read the old row through
+    // the cursor, never the registers), so its preload was dead
+    // (bd-w4pr1.13.20 lever U).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let col_regs = b.alloc_regs(n_cols as i32);
     for i in 0..n_cols {
+        if assignment_targets.columns.contains(&i) {
+            continue;
+        }
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let target_reg = col_regs + i as i32;
         if table.columns.get(i).is_some_and(|col| col.is_ipk) {
@@ -29780,18 +29807,10 @@ pub fn codegen_update(
 
     // Determine destination rowid for re-insertion.
     let mut rowid_reg = matched_rowid_reg;
-    let rowid_alias_col_idx = ctx
-        .rowid_alias_col_idx
-        .or_else(|| table.columns.iter().position(|col| col.is_ipk));
-    // bd-9ag5r: when neither the hidden rowid nor its INTEGER PRIMARY KEY alias
-    // is assigned, the rowid cannot change, so the engine rewrites the row in
-    // place (stock overwrites the cell) instead of delete + seek + insert.
-    let keeps_rowid_flag = if assignment_targets.assigns_hidden_rowid
-        || rowid_alias_col_idx.is_some_and(|idx| assignment_targets.columns.contains(&idx))
-    {
-        0
-    } else {
+    let keeps_rowid_flag = if keeps_rowid {
         OPFLAG_UPDATE_KEEPS_ROWID
+    } else {
+        0
     };
 
     // UPDATE is delete+insert: remove the current row first, then insert the
@@ -29810,6 +29829,13 @@ pub fn codegen_update(
         // has no INTEGER PRIMARY KEY alias (`resolve_update_target` routes the
         // alias spelling to that column instead), so no payload sync is needed.
         rowid_reg = new_rowid_reg;
+    } else if let Some(ipk_idx) = kept_rowid_alias {
+        // The alias register holds the row's unchanged rowid (preloaded with
+        // `Rowid`, never assigned): the NULL test below could not take its
+        // `NewRowid` branch.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let ipk_reg = col_regs + ipk_idx as i32;
+        rowid_reg = ipk_reg;
     } else if let Some(ipk_idx) = rowid_alias_col_idx {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let ipk_reg = col_regs + ipk_idx as i32;
@@ -29841,19 +29867,25 @@ pub fn codegen_update(
     // STORED generated columns and constraint validation already ran above on
     // the new row image (before the destructive delete), so MakeRecord can use
     // col_regs directly.
-    // Apply column type affinities before packing the record.
+    // Apply column type affinities again before packing the record only when
+    // the constraints between the two passes can change a column register
+    // (bd-w4pr1.13.20 lever U, as lever A for INSERT ... SELECT): a NOT NULL
+    // ... REPLACE column's DEFAULT or a CHECK. The rowid code above writes only
+    // the INTEGER PRIMARY KEY register, an INTEGER under its 'X' affinity.
     let aff_str = table.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let n_cols_i32 = n_cols as i32;
-    b.emit_op(
-        Opcode::Affinity,
-        col_regs,
-        n_cols_i32,
-        0,
-        P4::Affinity(aff_str.clone()),
-        0,
-    );
+    if row_body_needs_affinity_after_constraints(table, stmt.or_conflict) {
+        b.emit_op(
+            Opcode::Affinity,
+            col_regs,
+            n_cols_i32,
+            0,
+            P4::Affinity(aff_str.clone()),
+            0,
+        );
+    }
     emit_table_row_record(b, table, col_regs, rec_reg, &aff_str, || P4::Affinity(aff_str.clone()));
 
     // Moving an INTEGER PRIMARY KEY uses that constraint's own algorithm
@@ -36764,7 +36796,7 @@ fn emit_where_filter_with_ctx(
             let comparison = ResolvedComparisonInfo::new(left, right, scan);
             if let Some(resolved) = comparison.left_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
-                let hoisted = hoisted_where_literal(b, right);
+                let hoisted = hoisted_operand_literal(b, right);
                 let val_reg = hoisted.unwrap_or_else(|| b.alloc_temp());
                 emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
                 if hoisted.is_none() {
@@ -36788,7 +36820,7 @@ fn emit_where_filter_with_ctx(
                 b.free_temp(col_reg);
             } else if let Some(resolved) = comparison.right_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
-                let hoisted = hoisted_where_literal(b, left);
+                let hoisted = hoisted_operand_literal(b, left);
                 let val_reg = hoisted.unwrap_or_else(|| b.alloc_temp());
                 emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
                 if hoisted.is_none() {
@@ -36849,7 +36881,7 @@ fn emit_where_filter_with_ctx(
 
             if let Some(resolved) = comparison.left_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
-                let hoisted = hoisted_where_literal(b, right);
+                let hoisted = hoisted_operand_literal(b, right);
                 let val_reg = hoisted.unwrap_or_else(|| b.alloc_temp());
                 emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
                 if hoisted.is_none() {
@@ -36882,7 +36914,7 @@ fn emit_where_filter_with_ctx(
                     _ => unreachable!(),
                 };
                 let col_reg = b.alloc_temp();
-                let hoisted = hoisted_where_literal(b, left);
+                let hoisted = hoisted_operand_literal(b, left);
                 let val_reg = hoisted.unwrap_or_else(|| b.alloc_temp());
                 emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
                 if hoisted.is_none() {
@@ -36980,15 +37012,17 @@ fn emit_where_comparison_jump(
     let ctx = Some(scan);
     // A literal operand lives in the program prologue (bd-w4pr1.13.31): it is
     // neither reloaded nor NULL-checked per row.
-    let left_hoisted = hoisted_where_literal(b, left);
+    // An arithmetic operand (`id % 7`) reads its own literal from the
+    // prologue too (`emit_binary_op`).
+    let left_hoisted = hoisted_operand_literal(b, left);
     let r_left = left_hoisted.unwrap_or_else(|| b.alloc_temp());
-    let right_hoisted = hoisted_where_literal(b, right);
+    let right_hoisted = hoisted_operand_literal(b, right);
     let r_right = right_hoisted.unwrap_or_else(|| b.alloc_temp());
     if left_hoisted.is_none() {
-        emit_where_comparison_operand(b, left, r_left, ctx);
+        emit_expr(b, left, r_left, ctx);
     }
     if right_hoisted.is_none() {
-        emit_where_comparison_operand(b, right, r_right, ctx);
+        emit_expr(b, right, r_right, ctx);
     }
     let p4 = comparison_collation_ctx(left, right, ctx).map_or(P4::None, P4::Collation);
     // A hoisted literal is never NULL; any other operand may be.
@@ -37006,68 +37040,6 @@ fn emit_where_comparison_jump(
     if left_hoisted.is_none() {
         b.free_temp(r_left);
     }
-}
-
-/// The prologue register of a WHERE comparison operand that is an integer,
-/// real or text literal, loaded once per execution instead of per scanned row
-/// (bd-w4pr1.13.31); such a literal is never NULL, so the caller drops its
-/// NULL check. `None` for any other operand, or a program without a prologue.
-fn hoisted_where_literal(b: &mut ProgramBuilder, expr: &Expr) -> Option<i32> {
-    let literal = match expr {
-        Expr::Literal(Literal::Integer(value), _) => HoistedLiteral::Integer(*value),
-        Expr::Literal(Literal::Float(value), _) => HoistedLiteral::Real(value.to_bits()),
-        Expr::Literal(Literal::String(text), _) => HoistedLiteral::Text(text.clone()),
-        _ => return None,
-    };
-    b.hoisted_literal(literal)
-}
-
-/// Evaluate a WHERE comparison operand into `reg`. An arithmetic operand
-/// whose right side is an integer or real literal (`id % 7`, `a + 1`) reads
-/// that literal from its prologue register (bd-w4pr1.13.20) instead of loading
-/// it per scanned row: the same opcode on the same values, as
-/// [`emit_binary_op`] would emit it, since an arithmetic opcode only reads its
-/// operand registers. Every other operand is [`emit_expr`]'s.
-fn emit_where_comparison_operand(
-    b: &mut ProgramBuilder,
-    expr: &Expr,
-    reg: i32,
-    ctx: Option<&ScanCtx<'_>>,
-) {
-    if let Expr::BinaryOp {
-        left,
-        op:
-            op @ (fsqlite_ast::BinaryOp::Add
-            | fsqlite_ast::BinaryOp::Subtract
-            | fsqlite_ast::BinaryOp::Multiply
-            | fsqlite_ast::BinaryOp::Divide
-            | fsqlite_ast::BinaryOp::Modulo
-            | fsqlite_ast::BinaryOp::BitAnd
-            | fsqlite_ast::BinaryOp::BitOr
-            | fsqlite_ast::BinaryOp::ShiftLeft
-            | fsqlite_ast::BinaryOp::ShiftRight),
-        right,
-        ..
-    } = expr
-        && matches!(
-            right.as_ref(),
-            Expr::Literal(Literal::Integer(_) | Literal::Float(_), _)
-        )
-        && let Some(literal_reg) = hoisted_where_literal(b, right)
-    {
-        emit_expr(b, left, reg, ctx);
-        // VDBE arithmetic: OP p1=rhs, p2=lhs, p3=dest
-        b.emit_op(
-            binary_op_to_opcode(*op),
-            literal_reg,
-            reg,
-            reg,
-            P4::None,
-            0,
-        );
-        return;
-    }
-    emit_expr(b, expr, reg, ctx);
 }
 
 struct ResolvedComparisonInfo {
@@ -47056,14 +47028,94 @@ fn emit_binary_op(
     }
 
     // Arithmetic / logical / bitwise: evaluate left into reg, right into tmp,
-    // then apply the opcode.
-    let tmp = b.alloc_temp();
-    emit_expr(b, left, reg, ctx);
-    emit_expr(b, right, tmp, ctx);
+    // then apply the opcode. VDBE arithmetic: OP p1=rhs, p2=lhs, p3=dest.
     let opcode = binary_op_to_opcode(op);
-    // VDBE arithmetic: OP p1=rhs, p2=lhs, p3=dest
-    b.emit_op(opcode, tmp, reg, reg, P4::None, 0);
-    b.free_temp(tmp);
+    // bd-w4pr1.13.21 lever H: an INTEGER, REAL or TEXT literal operand of an
+    // arithmetic, concatenation or bitwise operator is read from a register
+    // the prologue loads once (bd-w4pr1.13.31), not reloaded every row. These
+    // opcodes read P1 and P2 and write only P3, which stays `reg`, so the
+    // prologue register is never written: a left literal is P2 and the right
+    // operand goes to the scratch register. Lever K: an operand that already
+    // lives in a register of a register row is read from there the same way,
+    // with no Copy. AND / OR keep their loads.
+    let in_place = !matches!(op, fsqlite_ast::BinaryOp::And | fsqlite_ast::BinaryOp::Or);
+    let left_source = if in_place {
+        hoisted_operand_literal(b, left).or_else(|| register_row_operand(left, ctx))
+    } else {
+        None
+    };
+    let right_source = if in_place {
+        hoisted_operand_literal(b, right).or_else(|| register_row_operand(right, ctx))
+    } else {
+        None
+    };
+    match (left_source, right_source) {
+        (None, Some(rhs)) => {
+            emit_expr(b, left, reg, ctx);
+            b.emit_op(opcode, rhs, reg, reg, P4::None, 0);
+        }
+        (Some(lhs), None) => {
+            let tmp = b.alloc_temp();
+            emit_expr(b, right, tmp, ctx);
+            b.emit_op(opcode, tmp, lhs, reg, P4::None, 0);
+            b.free_temp(tmp);
+        }
+        (Some(lhs), Some(rhs)) => {
+            b.emit_op(opcode, rhs, lhs, reg, P4::None, 0);
+        }
+        (None, None) => {
+            let tmp = b.alloc_temp();
+            emit_expr(b, left, reg, ctx);
+            emit_expr(b, right, tmp, ctx);
+            b.emit_op(opcode, tmp, reg, reg, P4::None, 0);
+            b.free_temp(tmp);
+        }
+    }
+}
+
+/// The register an operand already holds when [`emit_expr`] would compile it
+/// to exactly `Copy R reg` (bd-w4pr1.13.21 lever K): a column of the row a
+/// [`RegisterRow`] holds (a table-valued function's row in INSERT ... SELECT,
+/// the row being written to a CHECK or index key), or that row's rowid
+/// register for `rowid` / `_rowid_` / `oid`. A VIRTUAL generated column is
+/// computed, not held, and a reference qualified with another source is not
+/// this row's, so both return `None`, as does every other expression.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn register_row_operand(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> Option<i32> {
+    let Expr::Column(col_ref, _) = expr else {
+        return None;
+    };
+    let sc = ctx?;
+    let RegisterRow {
+        columns: reg_base,
+        rowid,
+    } = sc.register_base?;
+    if let Some(qualifier) = &col_ref.table
+        && !matches_table_or_alias(qualifier, sc.table, sc.table_alias)
+    {
+        return None;
+    }
+    if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
+        return (!sc.table.columns[col_idx].is_virtual_generated())
+            .then_some(reg_base + col_idx as i32);
+    }
+    rowid.filter(|_| sc.table.resolves_to_hidden_rowid(&col_ref.column))
+}
+
+/// The prologue register of an operand that is an integer, real or text
+/// literal, loaded once per execution instead of per row (bd-w4pr1.13.31):
+/// a WHERE comparison's operand, which is then never NULL so its caller drops
+/// the NULL check, or an arithmetic / concatenation / bitwise operand
+/// ([`emit_binary_op`], bd-w4pr1.13.21 lever H). `None` for any other operand,
+/// or a program without a prologue.
+fn hoisted_operand_literal(b: &mut ProgramBuilder, expr: &Expr) -> Option<i32> {
+    let literal = match expr {
+        Expr::Literal(Literal::Integer(value), _) => HoistedLiteral::Integer(*value),
+        Expr::Literal(Literal::Float(value), _) => HoistedLiteral::Real(value.to_bits()),
+        Expr::Literal(Literal::String(text), _) => HoistedLiteral::Text(text.clone()),
+        _ => return None,
+    };
+    b.hoisted_literal(literal)
 }
 
 /// Extract the leftmost explicit COLLATE from an expression operand.
@@ -65934,12 +65986,172 @@ mod tests {
             .iter()
             .find(|op| op.opcode == Opcode::Subtract)
             .unwrap();
+        // bd-w4pr1.13.21 lever H: a left literal is the operation's second
+        // source (P2), loaded once in the prologue; the result goes to its own
+        // destination, so the literal's register is never written.
         assert!(
             ops[start..=end]
                 .iter()
-                .any(|op| op.opcode == Opcode::Integer && op.p1 == 10 && op.p2 == minus.p2),
-            "a left literal is loaded into the destination each row: {ops:?}"
+                .all(|op| !matches!(op.opcode, Opcode::Integer)),
+            "no literal load per row: {ops:?}"
         );
+        let loads: Vec<_> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Integer && op.p2 == minus.p2)
+            .collect();
+        assert_eq!(loads.len(), 1, "one load of the left literal: {ops:?}");
+        assert_eq!(loads[0].p1, 10);
+        assert!(loads.iter().all(|load| {
+            ops.iter()
+                .position(|op| std::ptr::eq(op, *load))
+                .is_some_and(|at| at > end)
+        }));
+        assert_ne!(minus.p3, minus.p2, "the result never lands in the literal");
+        // Results land in P3, loads in P2: only the prologue load writes it.
+        for op in ops {
+            assert_ne!(op.p3, minus.p2, "nothing writes the literal's register: {ops:?}");
+            let loads_p2 = matches!(
+                op.opcode,
+                Opcode::Integer
+                    | Opcode::Int64
+                    | Opcode::Real
+                    | Opcode::String8
+                    | Opcode::Null
+                    | Opcode::Blob
+                    | Opcode::Variable
+            );
+            if loads_p2 && op.p2 == minus.p2 {
+                assert!(
+                    std::ptr::eq(op, loads[0]),
+                    "only the prologue loads the literal's register: {ops:?}"
+                );
+            }
+        }
+    }
+
+    /// bd-w4pr1.13.21 lever H: literal operands of arithmetic and `||` in a
+    /// projection are loaded once, after the program's last instruction, and
+    /// the scan loop reads them; a left literal is the operator's P2. Only its
+    /// prologue load writes a literal's register.
+    #[test]
+    fn test_codegen_projection_literal_operands_are_loaded_once() {
+        let Some((Statement::Select(select), _)) = parse_first_statement_with_tail(
+            "SELECT (a * 7919) % 1000, 'row-' || b, a * 1.5, 4294967296 - a FROM t",
+        )
+        .expect("test SQL should parse") else {
+            panic!("expected a SELECT");
+        };
+        let schema = test_schema();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &select, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+        let start = ops.iter().position(|op| op.opcode == Opcode::Rewind).unwrap();
+        let end = ops.iter().rposition(|op| op.opcode == Opcode::Next).unwrap();
+        let body = &ops[start..=end];
+        assert!(
+            body.iter().all(|op| !matches!(
+                op.opcode,
+                Opcode::Integer | Opcode::Int64 | Opcode::Real | Opcode::String8
+            )),
+            "no literal load in the row loop: {ops:?}"
+        );
+        let load = |matches: &dyn Fn(&VdbeOp) -> bool| {
+            let loads: Vec<(usize, &VdbeOp)> =
+                ops.iter().enumerate().filter(|(_, op)| matches(op)).collect();
+            assert_eq!(loads.len(), 1, "each literal is loaded once: {ops:?}");
+            assert!(loads[0].0 > end, "in the prologue: {ops:?}");
+            loads[0].1.p2
+        };
+        let r7919 = load(&|op| op.opcode == Opcode::Integer && op.p1 == 7919);
+        let r1000 = load(&|op| op.opcode == Opcode::Integer && op.p1 == 1000);
+        let r_row = load(&|op| {
+            op.opcode == Opcode::String8 && matches!(&op.p4, P4::Str(text) if text == "row-")
+        });
+        let r_half = load(&|op| op.opcode == Opcode::Real && op.p4 == P4::Real(1.5));
+        let r_big = load(&|op| op.opcode == Opcode::Int64 && op.p4 == P4::Int64(4_294_967_296));
+        let find = |opcode: Opcode| body.iter().find(|op| op.opcode == opcode).unwrap();
+        assert_eq!(find(Opcode::Remainder).p1, r1000);
+        assert_eq!(find(Opcode::Concat).p2, r_row, "the left literal is P2");
+        assert_eq!(find(Opcode::Subtract).p2, r_big, "the left literal is P2");
+        assert!(
+            body.iter()
+                .any(|op| op.opcode == Opcode::Multiply && op.p1 == r7919)
+        );
+        assert!(
+            body.iter()
+                .any(|op| op.opcode == Opcode::Multiply && op.p1 == r_half)
+        );
+        for reg in [r7919, r1000, r_row, r_half, r_big] {
+            for (at, op) in ops.iter().enumerate() {
+                assert!(
+                    op.p3 != reg || at > end,
+                    "no instruction of the program writes a literal register: {ops:?}"
+                );
+            }
+        }
+    }
+
+    /// bd-w4pr1.13.21 lever K: an operand held in a register row is read from
+    /// its register. `(a * b) + 7 || a` over a row in registers 10.. reads
+    /// registers 10 and 11 as the operators' sources with no Copy, and no
+    /// instruction writes them.
+    #[test]
+    fn test_codegen_register_row_operands_are_read_in_place() {
+        let schema = test_schema();
+        let column = |name: &str| Box::new(Expr::Column(ColumnRef::bare(name), Span::ZERO));
+        let binary = |left: Box<Expr>, op: AstBinaryOp, right: Box<Expr>| {
+            Box::new(Expr::BinaryOp {
+                left,
+                op,
+                right,
+                span: Span::ZERO,
+            })
+        };
+        let expr = binary(
+            binary(
+                binary(column("a"), AstBinaryOp::Multiply, column("b")),
+                AstBinaryOp::Add,
+                Box::new(Expr::Literal(Literal::Integer(7), Span::ZERO)),
+            ),
+            AstBinaryOp::Concat,
+            column("a"),
+        );
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let row = b.alloc_regs(2);
+        let dest = b.alloc_reg();
+        let scan = ScanCtx {
+            cursor: 0,
+            table: &schema[0],
+            table_alias: None,
+            schema: None,
+            register_base: Some(RegisterRow::columns(row)),
+            secondaries: &[],
+        };
+        emit_expr(&mut b, &expr, dest, Some(&scan));
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+        assert!(
+            ops.iter().all(|op| op.opcode != Opcode::Copy),
+            "no operand is copied: {ops:?}"
+        );
+        let find = |opcode: Opcode| ops.iter().find(|op| op.opcode == opcode).unwrap();
+        let multiply = find(Opcode::Multiply);
+        assert_eq!((multiply.p1, multiply.p2, multiply.p3), (row + 1, row, dest));
+        let add = find(Opcode::Add);
+        assert_eq!((add.p2, add.p3), (dest, dest));
+        let concat = find(Opcode::Concat);
+        assert_eq!((concat.p1, concat.p2, concat.p3), (row, dest, dest));
+        for op in ops {
+            assert!(
+                op.p3 != row && op.p3 != row + 1,
+                "nothing writes the row's registers: {ops:?}"
+            );
+        }
     }
 
     #[test]
@@ -66673,17 +66885,21 @@ mod tests {
         let prog = b.finish().unwrap();
 
         // The SET expression should emit Column (reading `a`) + Integer(1) + Add,
-        // NOT Null. Count Column opcodes — there should be at least 3:
-        // 2 from reading all columns, plus 1+ from evaluating `a` in the expression.
-        let column_count = prog
-            .ops()
-            .iter()
-            .filter(|op| op.opcode == Opcode::Column)
-            .count();
-        assert!(
-            column_count >= 3,
-            "expected >= 3 Column ops (2 for reading all cols + 1 for SET expr), got {column_count}"
+        // NOT Null. The row preload reads only the unassigned column `b`
+        // (bd-w4pr1.13.20 lever U: the assignment writes `a`'s register before
+        // anything reads it), so `a` is read once, by the SET expression.
+        let column_reads = |column: i32| {
+            prog.ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::Column && op.p2 == column)
+                .count()
+        };
+        assert_eq!(
+            column_reads(0),
+            1,
+            "`a` is read only by the SET expression `a + 1`"
         );
+        assert_eq!(column_reads(1), 1, "the unassigned `b` is preloaded once");
 
         // There should be an Add opcode for `a + 1`.
         assert!(
@@ -68637,12 +68853,26 @@ mod tests {
 
         // Even with DEFAULT VALUES, stored generated columns should evaluate.
         assert!(
-            ops.contains(&Opcode::Copy),
-            "DEFAULT VALUES with STORED generated column should emit Copy for references"
-        );
-        assert!(
             ops.contains(&Opcode::Add),
             "DEFAULT VALUES with STORED generated column 'a + b' should emit Add"
+        );
+        // bd-w4pr1.13.21 lever K: `a + b` reads the row's `a` and `b` registers
+        // in place (no Copy of either) and writes `c`'s register.
+        let record = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord)
+            .expect("the row is packed");
+        let add = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Add)
+            .expect("a + b");
+        assert_eq!(
+            (add.p2, add.p1, add.p3),
+            (record.p1, record.p1 + 1, record.p1 + 2),
+            "`a + b` reads the row registers of a and b and writes c's: {:?}",
+            prog.ops()
         );
     }
 

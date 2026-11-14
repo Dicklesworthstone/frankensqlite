@@ -476,6 +476,122 @@ const ROW_AFFINITY_CASES: &[Case] = &[
     },
 ];
 
+/// UPDATE row bodies (bd-w4pr1.13.20, lever U): only unassigned columns are
+/// preloaded, a kept INTEGER PRIMARY KEY alias register is the re-insert's
+/// rowid (and the one-pass scan reads no rowid of its own on such a table),
+/// and the second Affinity runs only when a CHECK or a NOT NULL ... REPLACE
+/// column can change a register. `t` has an IPK alias and mixed storage
+/// classes, `u` an implicit rowid, `g` a STORED generated column over an
+/// unassigned column, `r` NOT NULL ... REPLACE columns whose DEFAULT has
+/// another storage class than the column, `k` a CHECK. A body that dropped
+/// an unassigned column's preload stores NULL there (and computes `g.s`
+/// from it); one that read the one-pass rowid from a skipped `Rowid` on `u`
+/// re-inserts at the wrong key; one that skipped the second Affinity on `r`
+/// stores TEXT '7' in the INTEGER column.
+const UPDATE_BODY: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) \
+     INSERT INTO t SELECT i, i % 9, 'b' || i, i * 0.5, \
+     CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN i WHEN 2 THEN 'd' || i ELSE x'0102' END FROM n",
+    "CREATE TABLE u(a INTEGER, b TEXT, c)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) \
+     INSERT INTO u SELECT i % 5, 'u' || i, i * 3 FROM n",
+    "CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, \
+     s INTEGER GENERATED ALWAYS AS (a * 100 + b) STORED)",
+    "INSERT INTO g(id, a, b) SELECT id, a, id FROM t WHERE id <= 60",
+    "CREATE TABLE r(id INTEGER PRIMARY KEY, \
+     a INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT '7', \
+     b TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 3, \
+     c REAL NOT NULL ON CONFLICT REPLACE DEFAULT '2.5', d)",
+    "INSERT INTO r(id, a, b, c, d) SELECT id, a, b, c, d FROM t WHERE id <= 40",
+    "CREATE TABLE k(id INTEGER PRIMARY KEY, a TEXT CHECK (length(a) >= 1 AND a <> 7), b NUMERIC)",
+    "INSERT INTO k(id, a, b) SELECT id, 'k' || id, id FROM t WHERE id <= 40",
+];
+const UPDATE_BODY_STATE: &[&str] = &[
+    "SELECT rowid, id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM t ORDER BY id",
+    "SELECT rowid, a, typeof(a), b, c, typeof(c) FROM u ORDER BY rowid",
+    "SELECT id, a, b, s, typeof(s) FROM g ORDER BY id",
+    "SELECT id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM r ORDER BY id",
+    "SELECT id, a, typeof(a), b, typeof(b) FROM k ORDER BY id",
+    "PRAGMA integrity_check",
+];
+
+const UPDATE_BODY_CASES: &[Case] = &[
+    // Two columns swapped: each SET reads the old row, not a register.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET a = b, b = a WHERE id % 3 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET (c, d) = (d, c) WHERE id % 5 = 1",
+        states: UPDATE_BODY_STATE,
+    },
+    // A SET that reads the column it assigns, a column assigned twice (the
+    // later one wins), and unassigned columns of every storage class kept.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET c = c + 0.25, a = a + 1, a = a * 10 WHERE id % 4 = 2",
+        states: UPDATE_BODY_STATE,
+    },
+    // Affinity of the assigned value: TEXT into INTEGER / REAL, INTEGER into
+    // TEXT, the rowid read through its alias.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET a = '0' || id, b = id, c = '1e1' WHERE id % 7 = 3",
+        states: UPDATE_BODY_STATE,
+    },
+    // RETURNING the rowid and the alias (two passes, the alias register as the
+    // re-insert rowid), on an alias table and on an implicit-rowid table.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET b = 'r' || rowid WHERE id % 50 = 7 RETURNING rowid, id, a, b, d",
+        states: UPDATE_BODY_STATE,
+    },
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE u SET b = b || '-' || rowid WHERE rowid % 60 = 1 RETURNING rowid, a, b, c",
+        states: UPDATE_BODY_STATE,
+    },
+    // One pass on the implicit-rowid table: the scan's own Rowid is the key.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE u SET c = c + rowid, a = a + 1 WHERE rowid % 3 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    // The alias assigned: the row moves to the new key.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET id = id + 1000, a = -a WHERE id % 40 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    // A STORED generated column over an unassigned column.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE g SET a = a + 1 WHERE id % 2 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    // NOT NULL ... REPLACE: the DEFAULT replaces the NULL and the second
+    // Affinity gives it the column's type; and a plain assignment there.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE r SET a = NULL, b = NULL, c = NULL WHERE id % 3 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE r SET a = '12', d = a WHERE id % 3 = 1",
+        states: UPDATE_BODY_STATE,
+    },
+    // A CHECK over the assigned column.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE k SET a = id * 2, b = '5' WHERE id % 4 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+];
+
 fn tag_f(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_owned(),
@@ -663,6 +779,19 @@ fn scan_update_matches_stock_in_one_pass_and_two() {
 fn insert_select_affinity_after_constraints_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         let failures = check_cases(ROW_AFFINITY_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn update_row_body_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(UPDATE_BODY_CASES).await;
         assert!(
             failures.is_empty(),
             "{} differences from SQLite:\n{}",
