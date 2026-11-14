@@ -87,6 +87,68 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: an explicit COMMIT alone in its window advances the memdb mirror to its own commit (bd-w4pr1.7, lever E)
+
+- Target: every explicit write transaction on a file-backed WAL database (the scorecard's
+  `txn_1000x10_rows`; multi-writer explicit transactions). Touched:
+  `crates/fsqlite-core/src/connection.rs` (`execute_commit_with_cx`, the doc comment of
+  `reset_cached_vdbe_engine_for_next_transaction`, and the new test
+  `test_explicit_write_commit_advances_mirror_only_past_its_own_commit`).
+- Ledger preflight: the autocommit tail's advance (5c3f0e9a3, 2026-09-24) is the same rule for
+  autocommit; bd-w4pr1.13.35 lever 6 (2026-11-14) names this lever as its explicit-transaction
+  retry condition. Nothing earlier on the explicit COMMIT.
+- Evidence before (callgrind, the scorecard's txn script, c8b483d42): the coordinator's note put
+  the stale mirror at ~3.5k per explicit BEGIN. That 3.5k is execute_begin's publication bind,
+  which stays. The stale-mirror cost was at the BEGIN statement's boundary. Every concurrent BEGIN
+  sets `memdb_requires_active_txn_reload`, the transaction's INSERTs skip the refresh (bd-33sht),
+  and the COMMIT left `memdb_visible_commit_seq` behind. So `refresh_memdb_from_active_txn_if_dirty`
+  failed its clean-mirror fast path on the sequence check alone, and `reload_memdb_from_pager`
+  began a separate read transaction, reloaded and dropped it: 1,000 calls, 36.4k each.
+- Change: after the file-backed write commit's `sync_filebacked_post_commit_visibility_floor`,
+  the explicit COMMIT advances the mirror sequence under the autocommit tail's rule. The mirror
+  must be at the transaction's begin sequence and the commit must be that sequence + 1. Also
+  required: no schema cookie to publish and an unchanged schema generation, no mirrored rows, no
+  AUTOINCREMENT tables, no live virtual tables, and no deferred mirror upserts. A ROLLBACK TO
+  inside the transaction reloads the mirror from the active transaction (`pragma_state` header
+  fields included), so what the mirror holds at COMMIT is what was committed.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries 5fed0073... (c8b483d42) and
+  8a69be4b... (c8b483d42 plus this diff); answers equal stock's; stock `integrity_check` ok on all
+  35 candidate files:
+  - `txn_1000x10_rows`: 590.5M -> 548.7M user instructions (7 reps) and 595.1M -> 555.5M (9
+    reps, arms swapped); stock 153.9M. CPU best 228.8 -> 223.6 ms and 234.8 -> 198.5 ms; wall
+    best 262.2 -> 262.2 ms and 266.6 -> 239.5 ms (stock 33.4 ms CPU, 67-71 ms wall).
+  - Exact (callgrind): boundary reloads 1,000 -> 0. The pager begin is +1.3k per transaction (the
+    first begin after the commit now does the read-mark update the boundary transaction used to
+    do), so the net is about -35k per transaction.
+  - Syscalls per transaction 36.8 -> 27.2 (statx 14.1 -> 10.1, fcntl 10 -> 8, access 2 -> 1;
+    stock 8.5).
+  - 8 writers on separate tables, 300 explicit transactions each (mw_txn_probe, 5 reps): 380.5k
+    -> 338.7k user instructions per transaction, CPU 414.7 -> 390.1 us (stock 34.5k, 75.5 us).
+    One writer: 281.4k -> 260.5k, 325.3 -> 308.1 us.
+  - `autocommit_5k_inserts` unchanged (924.1M vs 923.8M).
+  - Prediction (registered on bd-w4pr1.7 before code): -25M to -42M on `txn_1000x10_rows`. Kill:
+    under 12M. Cleared.
+- Test: `test_explicit_write_commit_advances_mirror_only_past_its_own_commit`. Three explicit
+  transactions alone in their window each advance the mirror, and the answers stay right. Two
+  negative cases: a peer commit inside the window, and a CREATE TABLE inside the transaction. Both
+  must leave the mirror behind the published sequence, and the next statement must see the peer's
+  row and the new table. An advance on every commit fails both, and main fails the first
+  assertion.
+- Gate (rch, c8b483d42 plus the change): clippy -D warnings on fsqlite-core and fsqlite
+  `--all-targets` clean; fsqlite-core lib 4,181 passed, 2 failed (the t6741 pair, red on main);
+  fsqlite-core keepers for explicit transactions, savepoints and memdb reloads 30, for header
+  pragmas, data_version, AUTOINCREMENT, TEMP/attached schema and prepared staleness 64, for WAL,
+  refresh and concurrency 14 + 204 + 36; fsqlite-e2e concurrency and group-commit targets 63 +
+  26; fsqlite WAL keepers 13.
+- Landed as 06751f418 (rebased onto 7a63c94d8). On the rebased tree ed051dea3 (on 2bee1f1bc):
+  clippy clean, fsqlite-core lib 4,181 passed with the same 2 red. The commits after it on main
+  touch neither `connection.rs` nor fsqlite-pager.
+- Retry condition: none for the single-writer case. With peers committing inside the window the
+  boundary reload stays. That is lever F on bd-w4pr1.7, which reloads inside the BEGIN's own
+  transaction. The fresh VDBE engine per explicit transaction (~1.85k) stays too: COMMIT still
+  discards it at its start and with its compilation caches. Extending the in-place reset there is
+  bd-w4pr1.13.35's retry condition.
+
 ## 2026-11-14 - SMALL WIN (prediction missed, kill line cleared by 0.1M): the Delete arm reads the leaf cell's rowid and keeps its pending-Next cursors in a short vector (bd-w4pr1.13.20, lever D)
 
 - Target: every row a DELETE (or the delete half of an UPDATE that keeps its rowid) removes through a storage
