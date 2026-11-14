@@ -14919,6 +14919,14 @@ pub struct Connection {
     /// subquery in an expression is an error ("sub-select returns N columns -
     /// expected 1"), never a silent NULL.
     scalar_subquery_row_value_context: Cell<bool>,
+    /// bd-j9tg3: while a DML statement with RETURNING replays its rows one at
+    /// a time, the RETURNING columns its first row folded (`Some(None)` until
+    /// that row projects). Stock evaluates a RETURNING subquery that does not
+    /// name the target once, at the first row; later rows reuse its value.
+    returning_first_row_columns: RefCell<ReturningFirstRowColumns>,
+    /// bd-j9tg3: during that first-row fold, the target whose direct re-reads
+    /// (bd-ow713) stay unfolded for every row to evaluate.
+    returning_fold_spared_target: RefCell<Option<String>>,
     /// Connection-local prepared statement template cache keyed by raw SQL.
     /// Avoids rebuilding the prepared wrapper for repeated `prepare()` calls.
     prepared_cache: RefCell<LruCache<u64, Arc<PreparedCacheEntry>>>,
@@ -15740,6 +15748,34 @@ impl<'a> BoolRefCellRestoreGuard<'a> {
 impl Drop for BoolRefCellRestoreGuard<'_> {
     fn drop(&mut self) {
         self.cell.replace(self.previous);
+    }
+}
+
+/// bd-j9tg3: a row-by-row replay's slot for its first row's folded RETURNING
+/// columns: `None` outside a replay, `Some(None)` until the first row folds.
+type ReturningFirstRowColumns = Option<Option<Vec<ResultColumn>>>;
+
+/// Sets a `RefCell` for a scope and puts the previous value back when the
+/// scope ends, including on an error or a cancelled future.
+struct RefCellRestoreGuard<'a, T> {
+    cell: &'a RefCell<T>,
+    previous: Option<T>,
+}
+
+impl<'a, T> RefCellRestoreGuard<'a, T> {
+    fn new(cell: &'a RefCell<T>, value: T) -> Self {
+        Self {
+            cell,
+            previous: Some(cell.replace(value)),
+        }
+    }
+}
+
+impl<T> Drop for RefCellRestoreGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            self.cell.replace(previous);
+        }
     }
 }
 
@@ -16656,6 +16692,8 @@ impl Connection {
             rendered_statements: RefCell::new(RenderedStatements::default()),
             bypass_compiled_cache: Cell::new(false),
             scalar_subquery_row_value_context: Cell::new(false),
+            returning_first_row_columns: RefCell::new(None),
+            returning_fold_spared_target: RefCell::new(None),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             statement_reuse_trace: RefCell::new(StatementReuseTraceState::default()),
             planner_directive_cache: RefCell::new(
@@ -17259,6 +17297,8 @@ impl Connection {
             rendered_statements: RefCell::new(RenderedStatements::default()),
             bypass_compiled_cache: Cell::new(false),
             scalar_subquery_row_value_context: Cell::new(false),
+            returning_first_row_columns: RefCell::new(None),
+            returning_fold_spared_target: RefCell::new(None),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             statement_reuse_trace: RefCell::new(StatementReuseTraceState::default()),
             planner_directive_cache: RefCell::new(
@@ -43044,7 +43084,7 @@ impl Connection {
                     || (computes_new_images
                         && self.returning_has_correlated_subquery(&effective_update.returning))
                     || (effective_update.with.is_none()
-                        && self.returning_rereads_target(
+                        && self.returning_defers_fold(
                             &effective_update.returning,
                             &effective_update.table.name.name,
                         ));
@@ -43538,7 +43578,7 @@ impl Connection {
                             table_name,
                         )
                         || (effective_delete.with.is_none()
-                            && self.returning_rereads_target(
+                            && self.returning_defers_fold(
                                 &effective_delete.returning,
                                 &effective_delete.table.name.name,
                             ))
@@ -47863,6 +47903,7 @@ impl Connection {
         let table_column_count = layout.table_columns.len();
         let insert_sql = self.build_insert_select_replay_sql(insert, &layout, 1);
         let collect_returning = !insert.returning.is_empty();
+        let _first_row_scope = self.returning_first_row_scope(collect_returning);
         let preserve_constraint_failure_rows =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
         let previous_changes = self.last_changes.get();
@@ -56458,36 +56499,108 @@ impl Connection {
         })
     }
 
-    /// bd-ow713: whether a RETURNING expression holds, at any depth, an
-    /// uncorrelated subquery that re-reads the DML target. Stock evaluates
-    /// such a subquery again for every row's RETURNING, so it sees the rows
-    /// changed so far; folding it to its value before the statement runs
-    /// returned the pre-statement answer on every row. Stock evaluates
-    /// every other uncorrelated subquery once, including one that reads the
-    /// target only through a view, a derived table, a CTE or another
-    /// subquery (bd-j9tg3: at the first row, which the fold does not match
-    /// yet). Correlated subqueries are never folded; the existing routing
-    /// predicates cover them.
+    /// bd-ow713, bd-j9tg3: whether a RETURNING expression holds, at any
+    /// depth, an uncorrelated subquery that must not be folded to its value
+    /// before the statement runs. Stock evaluates an uncorrelated RETURNING
+    /// subquery again for every row's RETURNING when the FROM of its last
+    /// SELECT names the target (bd-ow713), and every other one once, when the
+    /// first row's RETURNING reaches it: after that row's change, BEFORE
+    /// triggers and FK actions, before its AFTER triggers (bd-j9tg3). A fold
+    /// before the statement equals that only for a subquery that reads
+    /// nothing the statement can change by then. Correlated subqueries are
+    /// never folded; the existing routing predicates cover them.
     ///
-    /// The prepare-time fold (which skips such a column) and the DML
-    /// dispatch (which routes the statement to the changed-row projection)
-    /// both ask this of the same expressions, so they agree.
-    fn returning_expr_rereads_target(&self, expr: &Expr, table_name: &str) -> bool {
+    /// The prepare-time fold (which skips such a column), the DML dispatch
+    /// (which routes the statement to the changed-row projection) and the
+    /// first-row fold all ask this of the same expressions, and correlation
+    /// is the fold's own verdict (`rewrite_probe_is_correlated`, which reads
+    /// view columns), so they agree.
+    fn returning_expr_defers_fold(&self, expr: &Expr, table_name: &str) -> bool {
         expr_contains_subquery_matching_deep(expr, self, &|subquery, conn| {
             let (SubqueryExprRef::Scalar(inner)
             | SubqueryExprRef::Exists(inner)
             | SubqueryExprRef::In(inner)) = subquery;
-            subquery_final_from_names_table(inner, table_name)
-                && !is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+            !rewrite_probe_is_correlated(conn, inner)
+                && (subquery_final_from_names_table(inner, table_name)
+                    || conn.subquery_reads_dml_write_set(inner, table_name))
         })
     }
 
-    /// bd-ow713: [`Self::returning_expr_rereads_target`] over a RETURNING list.
-    fn returning_rereads_target(&self, returning: &[ResultColumn], table_name: &str) -> bool {
+    /// [`Self::returning_expr_defers_fold`] over a RETURNING list.
+    fn returning_defers_fold(&self, returning: &[ResultColumn], table_name: &str) -> bool {
         returning.iter().any(|column| {
             matches!(column, ResultColumn::Expr { expr, .. }
-                if self.returning_expr_rereads_target(expr, table_name))
+                if self.returning_expr_defers_fold(expr, table_name))
         })
+    }
+
+    /// bd-j9tg3: whether `select` may read a table that a DML statement on
+    /// `table_name` changes before its first row's RETURNING: the target, the
+    /// tables its FK actions cascade into, and every table once the target
+    /// or a cascaded table has a trigger. A view is read through its
+    /// definition. A name it cannot rule out counts as read.
+    fn subquery_reads_dml_write_set(&self, select: &SelectStatement, table_name: &str) -> bool {
+        let mut written = vec![table_name.to_ascii_lowercase()];
+        if self.fk_enforcement_enabled() {
+            let schema = self.schema.borrow();
+            let mut next = 0;
+            while next < written.len() {
+                let parent = written[next].clone();
+                for table in schema.iter() {
+                    let child = table.name.to_ascii_lowercase();
+                    if !written.contains(&child)
+                        && table
+                            .foreign_keys
+                            .iter()
+                            .any(|fk| fk.parent_table.eq_ignore_ascii_case(&parent))
+                    {
+                        written.push(child);
+                    }
+                }
+                next += 1;
+            }
+        }
+        let every_table = {
+            let triggers = self.triggers.borrow();
+            written.iter().any(|table| {
+                triggers
+                    .iter()
+                    .any(|trigger| trigger.table_name.eq_ignore_ascii_case(table))
+            })
+        };
+        let mut pending = Vec::new();
+        let _ = visit_select_qualified_names(select, &mut |name| {
+            pending.push(name.name.to_ascii_lowercase());
+            Ok(())
+        });
+        let views = self.views.borrow();
+        let mut expanded = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if every_table || written.contains(&name) {
+                return true;
+            }
+            if expanded.insert(name.clone()) {
+                for view in views
+                    .iter()
+                    .filter(|view| view.name.eq_ignore_ascii_case(&name))
+                {
+                    let _ = visit_select_qualified_names(&view.query, &mut |inner| {
+                        pending.push(inner.name.to_ascii_lowercase());
+                        Ok(())
+                    });
+                }
+            }
+        }
+        false
+    }
+
+    /// bd-j9tg3: whether the first-row fold now running must leave `select`
+    /// for each row to evaluate: its last SELECT's FROM names the target.
+    fn returning_fold_spares(&self, select: &SelectStatement) -> bool {
+        self.returning_fold_spared_target
+            .borrow()
+            .as_deref()
+            .is_some_and(|target| subquery_final_from_names_table(select, target))
     }
 
     /// An UPDATE's SET list flattened to (target column, value) pairs in order;
@@ -56784,12 +56897,68 @@ impl Connection {
                 alias: None,
             });
         }
+        let first_row_fold = self.returning_defers_fold(returning, &table.name);
         Ok(DmlReturningProjection {
             table,
             select,
             snapshot_columns,
             hidden_rowid,
+            first_row_fold,
         })
+    }
+
+    /// bd-j9tg3: the projection's RETURNING columns with every uncorrelated
+    /// subquery that does not name the target folded to its value now, at
+    /// the first row's RETURNING: after that row's change, BEFORE triggers
+    /// and FK actions, before its AFTER triggers, which is when stock
+    /// evaluates them. A target re-read (bd-ow713) stays for each row. Inside
+    /// a row-by-row replay the first row's columns are kept for later rows.
+    async fn fold_returning_first_row(
+        &self,
+        projection: &DmlReturningProjection,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<ResultColumn>> {
+        let replayed = self
+            .returning_first_row_columns
+            .borrow()
+            .as_ref()
+            .and_then(Clone::clone);
+        if let Some(columns) = replayed {
+            return Ok(columns);
+        }
+        let SelectCore::Select { columns, .. } = &projection.select.body.select else {
+            return Err(FrankenError::Internal(
+                "RETURNING projection is not a SELECT".to_owned(),
+            ));
+        };
+        let target = projection.table.name.clone();
+        let mut columns = columns.clone();
+        {
+            let _spared =
+                RefCellRestoreGuard::new(&self.returning_fold_spared_target, Some(target.clone()));
+            for column in &mut columns {
+                if let ResultColumn::Expr { expr, .. } = column
+                    && self.returning_expr_defers_fold(expr, &target)
+                {
+                    rewrite_in_expr(expr, self, true, params).await?;
+                }
+            }
+        }
+        if let Some(slot) = self.returning_first_row_columns.borrow_mut().as_mut() {
+            *slot = Some(columns.clone());
+        }
+        Ok(columns)
+    }
+
+    /// bd-j9tg3: keep the first row's folded RETURNING columns for the rest
+    /// of a row-by-row replay. Only the outermost replay of a statement
+    /// installs the slot; a row it replays again keeps the same first row.
+    fn returning_first_row_scope(
+        &self,
+        has_returning: bool,
+    ) -> Option<RefCellRestoreGuard<'_, ReturningFirstRowColumns>> {
+        let install = has_returning && self.returning_first_row_columns.borrow().is_none();
+        install.then(|| RefCellRestoreGuard::new(&self.returning_first_row_columns, Some(None)))
     }
 
     async fn project_dml_returning(
@@ -56824,6 +56993,13 @@ impl Connection {
             collations.push(None);
             affinities.push(TypeAffinity::Integer);
         }
+        // bd-j9tg3: fold the subqueries stock evaluates once, at the first
+        // row's RETURNING. No row, no evaluation, as in stock.
+        let first_row_columns = if projection.first_row_fold && !snapshots.is_empty() {
+            Some(self.fold_returning_first_row(projection, params).await?)
+        } else {
+            None
+        };
         let mut output = Vec::with_capacity(snapshots.len());
         for snapshot in snapshots {
             if snapshot.values().len() != col_map.len() {
@@ -56832,6 +57008,14 @@ impl Connection {
                 ));
             }
             let mut select = projection.select.clone();
+            if let Some(columns) = &first_row_columns
+                && let SelectCore::Select {
+                    columns: select_columns,
+                    ..
+                } = &mut select.body.select
+            {
+                select_columns.clone_from(columns);
+            }
             {
                 let schema = self.schema.borrow();
                 let shadowed_main_tables = self.shadowed_main_tables.borrow();
@@ -56969,6 +57153,13 @@ impl Connection {
         } else {
             None
         };
+        let has_returning = match statement {
+            DmlRowReplay::Update(update)
+            | DmlRowReplay::UpdateFrom { update, .. }
+            | DmlRowReplay::UpdateEvaluated { update, .. } => !update.returning.is_empty(),
+            DmlRowReplay::Delete(delete) => !delete.returning.is_empty(),
+        };
+        let _first_row_scope = self.returning_first_row_scope(has_returning);
 
         self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
             let mut row_params = Vec::with_capacity(parameter_base + row_value_count);
@@ -130139,9 +130330,9 @@ async fn rewrite_dml_in_expr(
     rewrite_in_expr(expr, conn, rewrite_in_subqueries, params).await
 }
 
-/// Fold the subqueries of a DML's RETURNING list, except in a column that
-/// re-reads `target` (bd-ow713): stock evaluates that column's subquery for
-/// every row, so it stays for the changed-row projection.
+/// Fold the subqueries of a DML's RETURNING list, except in a column whose
+/// fold must wait (bd-ow713, bd-j9tg3): the changed-row projection evaluates
+/// a target re-read for every row and folds the rest at the first row.
 async fn rewrite_dml_result_columns(
     columns: &mut [ResultColumn],
     target: &str,
@@ -130151,7 +130342,7 @@ async fn rewrite_dml_result_columns(
 ) -> Result<()> {
     for column in columns {
         if let ResultColumn::Expr { expr, .. } = column
-            && !conn.returning_expr_rereads_target(expr, target)
+            && !conn.returning_expr_defers_fold(expr, target)
         {
             rewrite_dml_in_expr(expr, conn, rewrite_in_subqueries, params).await?;
         }
@@ -130724,6 +130915,9 @@ fn rewrite_in_expr<'a>(
                         && conn.in_lhs_column_count(inner) > 1;
                     let should_eager_rewrite = !is_correlated
                         && !lhs_is_vector_subquery
+                        // bd-j9tg3: a first-row RETURNING fold leaves a
+                        // target re-read for each row.
+                        && !conn.returning_fold_spares(sub)
                         && (!vdbe_supported
                             || (rewrite_in_subqueries
                                 && !conn.skip_statement_memdb_refresh.get()))
@@ -130805,7 +130999,8 @@ fn rewrite_in_expr<'a>(
                 // Correlated EXISTS subqueries reference outer table columns and
                 // must be evaluated per-row; skip the eager rewrite so they survive
                 // into the row-level filter evaluation (eval_join_expr).
-                if rewrite_probe_is_correlated(conn, subquery) {
+                if rewrite_probe_is_correlated(conn, subquery) || conn.returning_fold_spares(subquery)
+                {
                     return Ok(());
                 }
                 // frankensim-kl17o: a placeholder-bearing subquery is
@@ -130827,7 +131022,7 @@ fn rewrite_in_expr<'a>(
                 // Correlated scalar subqueries reference outer table columns and
                 // must be evaluated per-row; skip the eager rewrite so they survive
                 // into the VDBE codegen which handles them via emit_scalar_subquery.
-                if rewrite_probe_is_correlated(conn, sub) {
+                if rewrite_probe_is_correlated(conn, sub) || conn.returning_fold_spares(sub) {
                     return Ok(());
                 }
                 // frankensim-kl17o: parameter-dependent subqueries must not be
@@ -162223,6 +162418,9 @@ struct DmlReturningProjection {
     select: SelectStatement,
     snapshot_columns: Vec<ResultColumn>,
     hidden_rowid: Option<&'static str>,
+    /// bd-j9tg3: a RETURNING column holds a subquery the prepare-time fold
+    /// left for the first row to fold (or for each row to evaluate).
+    first_row_fold: bool,
 }
 
 #[derive(Default)]

@@ -484,7 +484,8 @@ fn only_uncompiled_returning_subqueries_run_row_by_row() {
 /// and IN; an alias, a join, a `main.` name, a compound whose last arm reads
 /// the target, a subquery inside an expression, a nested self-read, and
 /// parameters; plus reads of other tables only. (Reads through a view,
-/// derived table or CTE are evaluated once by stock: bd-j9tg3.)
+/// derived table or CTE are evaluated once by stock:
+/// `returning_first_row_subqueries_read_the_first_rows_state`.)
 #[test]
 fn returning_uncorrelated_target_subqueries_see_each_row_change() {
     let statements: &[(&str, &[i64])] = &[
@@ -571,6 +572,91 @@ fn returning_uncorrelated_target_subqueries_see_each_row_change() {
     });
 }
 
+/// bd-j9tg3: stock evaluates every other uncorrelated RETURNING subquery
+/// once, when the first row's RETURNING reaches it: after that row's change,
+/// BEFORE triggers and FK actions, before its AFTER triggers. Folding it
+/// before the statement missed the first row's change when the subquery
+/// reads the target through a view, a derived table, a CTE or a nested
+/// subquery, a table the target's trigger writes (`log`), or a child its FK
+/// action deletes (`uc` with ON DELETE CASCADE). A fix that evaluated such a
+/// subquery for every row would answer 1, 2, 3 where stock answers 1, 1, 1.
+#[test]
+fn returning_first_row_subqueries_read_the_first_rows_state() {
+    let statements: &[(&str, &[i64])] = &[
+        (
+            "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
+             (SELECT count(*) FROM vu WHERE n >= 100)",
+            &[],
+        ),
+        // (A bare `n` over the derived table is judged correlated by the
+        // subquery rewrite and still runs for every row: bd-j9tg3, open.)
+        (
+            "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
+             (SELECT count(*) FROM (SELECT * FROM u) AS d WHERE d.n >= 100), \
+             (WITH c AS (SELECT * FROM u WHERE n >= 100) SELECT count(*) FROM c)",
+            &[],
+        ),
+        (
+            "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
+             (SELECT count(*) FROM k WHERE k.g IN (SELECT g FROM u WHERE n >= 100)), \
+             (SELECT count(*) FROM u WHERE n >= 100 UNION ALL SELECT -1 WHERE 0)",
+            &[],
+        ),
+        // A target re-read (each row) beside a view read (first row only).
+        (
+            "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
+             (SELECT count(*) FROM u WHERE n >= 100) \
+               + (SELECT count(*) FROM vu WHERE n >= 100)",
+            &[],
+        ),
+        (
+            "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
+             (SELECT count(*) FROM log)",
+            &[],
+        ),
+        (
+            "UPDATE u SET n = n + ?1 WHERE id < ?2 RETURNING id, \
+             (SELECT count(*) FROM vu WHERE n >= ?1)",
+            &[100, 5],
+        ),
+        (
+            "DELETE FROM u WHERE id IN (2, 3, 4) RETURNING id, (SELECT count(*) FROM vu)",
+            &[],
+        ),
+        (
+            "DELETE FROM u WHERE id IN (4, 8, 12) RETURNING id, (SELECT count(*) FROM uc)",
+            &[],
+        ),
+        (
+            "INSERT INTO u(id, v, g, n) VALUES (101, 'a', 1, 1), (102, 'b', 2, 2) \
+             RETURNING id, (SELECT count(*) FROM vu)",
+            &[],
+        ),
+        (
+            "INSERT INTO u(id, v, g, n) SELECT id + 100, v, g, n FROM t WHERE id < 4 \
+             RETURNING id, (SELECT count(*) FROM vu)",
+            &[],
+        ),
+        // No row: the subquery is never evaluated.
+        (
+            "UPDATE u SET n = 0 WHERE 0 RETURNING id, (SELECT count(*) FROM vu)",
+            &[],
+        ),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let (mut diffs, mut runs) = compare(false, TARGETS, statements).await;
+        let (file_diffs, file_runs) = compare(true, TARGETS, statements).await;
+        diffs.extend(file_diffs);
+        runs += file_runs;
+        assert!(
+            diffs.is_empty(),
+            "{} divergence(s) over {runs} statement run(s) from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
+
 /// bd-ow713: only an uncorrelated RETURNING subquery whose own FROM names the
 /// target leaves the compiled path. One over other tables (directly or
 /// through a view of another table) still folds, which a fix that never
@@ -589,6 +675,8 @@ fn only_target_rereading_returning_subqueries_skip_the_fold() {
         "DELETE FROM u WHERE id < 4 RETURNING id, EXISTS (SELECT 1 FROM u WHERE id = 2)",
         "INSERT INTO u(id, v, g, n) VALUES (101, 'a', 1, 1) RETURNING id, \
          (SELECT count(*) FROM u)",
+        // bd-j9tg3: a view of the target is read at the first row.
+        "UPDATE u SET n = 0 WHERE id < 4 RETURNING id, (SELECT count(*) FROM vu)",
     ];
     let compiled = [
         "UPDATE u SET n = 0 WHERE id < 4 RETURNING id, (SELECT count(*) FROM k)",
