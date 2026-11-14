@@ -1427,6 +1427,18 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         None
     }
 
+    /// The commit sequence the pager assigned to this handle's own commit,
+    /// once that commit is durable (bd-i0tn6).
+    ///
+    /// This is the commit's identity, not the published visibility horizon:
+    /// a group-commit certificate publishes every member at its high-water
+    /// sequence, and later commits can publish on top before the caller
+    /// reads it. `None` until the commit is durable, and for handles that do
+    /// not number their own commits.
+    fn committed_commit_seq(&self) -> Option<fsqlite_types::CommitSeq> {
+        None
+    }
+
     /// Return the full set of pages this transaction would mutate if it
     /// committed right now, including commit-time metadata synthesis such as
     /// freelist trunk rewrites.
@@ -2372,6 +2384,10 @@ impl TransactionHandle for TransactionKind {
 
     fn published_visible_commit_seq_hint(&self) -> Option<fsqlite_types::CommitSeq> {
         dispatch_transaction_kind!(self, txn => txn.published_visible_commit_seq_hint())
+    }
+
+    fn committed_commit_seq(&self) -> Option<fsqlite_types::CommitSeq> {
+        dispatch_transaction_kind!(self, txn => txn.committed_commit_seq())
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {

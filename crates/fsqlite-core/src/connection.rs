@@ -26752,6 +26752,31 @@ impl Connection {
         committed_seq
     }
 
+    /// bd-i0tn6: the sequence a file-backed concurrent commit publishes its
+    /// `CommitIndex` entries and SSI history under: the one the pager
+    /// assigned to this commit when it became durable (`own_commit_seq`, from
+    /// the pager transaction).
+    ///
+    /// Since S3 the physical write runs outside the registry guard, so the
+    /// pager's published sequence when this connection reaches finalization
+    /// can already be past this commit: a group-commit certificate publishes
+    /// every member at its high-water mark, and later commits can publish on
+    /// top. That sequence still raises the visibility floor, but taken as the
+    /// commit's identity it gave two commits the same sequence. A handle that
+    /// does not number its own commits keeps the published sequence.
+    fn filebacked_concurrent_commit_seq(&self, own_commit_seq: Option<CommitSeq>) -> CommitSeq {
+        let visible_commit_seq = self.sync_filebacked_post_commit_visibility_floor();
+        let Some(own_commit_seq) = own_commit_seq else {
+            return visible_commit_seq;
+        };
+        debug_assert!(
+            own_commit_seq <= visible_commit_seq,
+            "a durable commit's own sequence {own_commit_seq} cannot be past the published \
+             sequence {visible_commit_seq}"
+        );
+        own_commit_seq
+    }
+
     #[inline]
     fn planned_concurrent_commit_seq(&self) -> CommitSeq {
         if self.pager.is_memory() {
@@ -66249,7 +66274,7 @@ impl Connection {
                             let committed_seq = if self.pager.is_memory() {
                                 self.advance_commit_clock()
                             } else {
-                                self.sync_filebacked_post_commit_visibility_floor()
+                                self.filebacked_concurrent_commit_seq(txn.committed_commit_seq())
                             };
                             // Issue #115 / bd-i0tn6: publish under the guard:
                             // the validation guard when it covered the write,
@@ -80443,7 +80468,12 @@ impl Connection {
                     let committed_seq = if self.pager.is_memory() {
                         self.advance_commit_clock()
                     } else {
-                        self.sync_filebacked_post_commit_visibility_floor()
+                        let own_commit_seq = self
+                            .active_txn
+                            .borrow()
+                            .as_ref()
+                            .and_then(TransactionHandle::committed_commit_seq);
+                        self.filebacked_concurrent_commit_seq(own_commit_seq)
                     };
                     // Issue #115 / bd-i0tn6: publish under the registry guard:
                     // the validation guard when it covered the write (schema
@@ -218414,6 +218444,102 @@ mod tests {
                 Some(&SqliteValue::Integer(2))
             );
             conn.close().await.unwrap();
+        });
+    }
+
+    /// bd-i0tn6 (S3 follow-up): a concurrent commit's physical write runs
+    /// outside the registry guard, so a later commit can publish through the
+    /// same pager before this one finalizes. A group-commit certificate does
+    /// exactly that for its members: it publishes all of them at its
+    /// high-water sequence. Finalization must record this commit's own
+    /// sequence in the CommitIndex, not the pager's published sequence at that
+    /// moment, or two commits share one sequence (two writers both finalized
+    /// at 4 in `observed_disjoint_writer_overlap_for_certificate`). The keeper
+    /// commits a peer pager transaction in the window between this commit's
+    /// durable write and its MVCC finalization.
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_i0tn6_concurrent_finalize_records_the_commits_own_sequence() {
+        use fsqlite_pager::{JournalMode, TransactionMode};
+
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("i0tn6_own_commit_seq.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(conn.pager.journal_mode(), JournalMode::Wal);
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
+            let root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("t"))
+                .map(|table| {
+                    PageNumber::new(u32::try_from(table.root_page).expect("root page fits u32"))
+                        .expect("table root page must be nonzero")
+                })
+                .expect("created table must have a root page");
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'own');")
+                .await
+                .unwrap();
+            let own_commit_seq = conn.pager.published_snapshot().visible_commit_seq.next();
+
+            let peer_pager = conn.pager.clone();
+            let page_size = conn.pager.page_size().as_usize();
+            let owner_thread = std::thread::current().id();
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&hook_calls);
+            struct CommitWindowHookGuard;
+            impl Drop for CommitWindowHookGuard {
+                fn drop(&mut self) {
+                    super::set_concurrent_commit_window_hook(None);
+                }
+            }
+            let hook_guard = CommitWindowHookGuard;
+            super::set_concurrent_commit_window_hook(Some(Arc::new(move || {
+                if std::thread::current().id() != owner_thread
+                    || calls.fetch_add(1, AtomicOrdering::SeqCst) != 0
+                {
+                    return;
+                }
+                // The peer commits on its own thread while this commit is
+                // parked between its durable write and its finalization.
+                let peer_pager = peer_pager.clone();
+                std::thread::spawn(move || {
+                    asupersync::test_utils::run_test(|| async {
+                        let cx = Cx::new();
+                        let mut peer = peer_pager
+                            .begin(&cx, TransactionMode::Concurrent)
+                            .await
+                            .unwrap();
+                        let page = peer.allocate_page(&cx).await.unwrap();
+                        peer.write_page(&cx, page, &vec![0x5A; page_size])
+                            .await
+                            .unwrap();
+                        peer.commit(&cx).await.unwrap();
+                    });
+                })
+                .join()
+                .expect("the peer pager commit must succeed");
+            })));
+            conn.execute("COMMIT;").await.unwrap();
+            drop(hook_guard);
+
+            assert_eq!(hook_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(
+                conn.pager.published_snapshot().visible_commit_seq,
+                own_commit_seq.next(),
+                "precondition: the peer published past this commit before it finalized"
+            );
+            assert_eq!(
+                conn.concurrent_commit_index.latest(root_page),
+                Some(own_commit_seq),
+                "the commit's CommitIndex entry must carry its own sequence, not the peer's"
+            );
+            conn.close_without_checkpoint().await.unwrap();
         });
     }
 

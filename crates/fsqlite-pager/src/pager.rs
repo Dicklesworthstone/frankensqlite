@@ -15461,6 +15461,7 @@ where
                     mode,
                     is_writer: eager_writer,
                     committed: false,
+                    own_commit_seq: None,
                     finished: false,
                     cursor_cache_reuse_disabled: false,
                     original_db_size,
@@ -15706,6 +15707,7 @@ where
                 mode,
                 is_writer: eager_writer,
                 committed: false,
+                own_commit_seq: None,
                 finished: false,
                 cursor_cache_reuse_disabled: false,
                 original_db_size,
@@ -21993,6 +21995,12 @@ where
     mode: TransactionMode,
     is_writer: bool,
     committed: bool,
+    /// bd-i0tn6: the sequence this handle's own commit was assigned when it
+    /// became durable: its batch's slot in the group-commit certificate, or
+    /// the pager clock's next value outside group commit. The published
+    /// visible sequence can be past it (a certificate publishes all members
+    /// at its high-water mark), so it is reported separately.
+    own_commit_seq: Option<CommitSeq>,
     finished: bool,
     /// A savepoint rollback can restore a page to clean while live cursors
     /// still cache its discarded image. Keep this fence for the handle's
@@ -26939,13 +26947,15 @@ where
         let attempt = self.pending_group_commit_attempt.clone().ok_or_else(|| {
             FrankenError::internal("cannot finalize a missing authorized group-commit transaction")
         })?;
-        if !matches!(
-            attempt.resolution(),
-            PendingGroupCommitTxnResolution::Authorized(_)
-        ) {
+        let PendingGroupCommitTxnResolution::Authorized(authorization) = attempt.resolution()
+        else {
             return Err(FrankenError::BusyRecovery);
-        }
+        };
         let publication_intent = attempt.publication_intent()?;
+        // bd-i0tn6: this batch's own sequence in the certificate. The intent
+        // publishes the certificate's high-water mark, which a peer member of
+        // the same group shares.
+        self.own_commit_seq = Some(authorization.assigned_commit_seq);
 
         {
             let mut inner = self
@@ -28787,8 +28797,12 @@ where
                     .transpose()?;
                 if let Some(intent) = wal_publication_intent {
                     inner.record_local_wal_commit_at(intent.visible_commit_seq);
+                    self.own_commit_seq = wal_publication_authorization
+                        .as_ref()
+                        .map(|authorization| authorization.assigned_commit_seq);
                 } else {
                     inner.record_local_commit();
+                    self.own_commit_seq = Some(inner.commit_seq);
                 }
                 if self.rollback_commit_finalization_pending {
                     // From this point onward the durable decision and the exact
@@ -29633,8 +29647,12 @@ where
                     .transpose()?;
                 if let Some(intent) = wal_publication_intent {
                     inner.record_local_wal_commit_at(intent.visible_commit_seq);
+                    self.own_commit_seq = wal_publication_authorization
+                        .as_ref()
+                        .map(|authorization| authorization.assigned_commit_seq);
                 } else {
                     inner.record_local_commit();
+                    self.own_commit_seq = Some(inner.commit_seq);
                 }
                 // `commit_and_retain` is restricted to MemoryVfs pagers. Their
                 // committed extent is the monotonic logical page high-water, so
@@ -29802,6 +29820,10 @@ where
             return None;
         }
         Some(self.published_visible_commit_seq.get())
+    }
+
+    fn committed_commit_seq(&self) -> Option<CommitSeq> {
+        self.own_commit_seq
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
@@ -44807,6 +44829,41 @@ mod tests {
             .unwrap();
 
         (pager1, pager2, frames)
+    }
+
+    /// bd-i0tn6: a durable commit reports the sequence the pager assigned to
+    /// it, not the published horizon. Two concurrent transactions on one
+    /// pager both commit before either is finalized above the pager; the
+    /// published sequence is then the second's, and only
+    /// `committed_commit_seq` keeps the first commit's identity.
+    #[test]
+    fn test_committed_commit_seq_is_each_commits_own_after_a_later_commit_publishes() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _frames) = wal_pager().await;
+            let cx = Cx::new();
+            let before = pager.published_snapshot().visible_commit_seq;
+            let mut first = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let mut second = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            for (txn, fill) in [(&mut first, 0x11), (&mut second, 0x22)] {
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(fill)).await.unwrap();
+            }
+            assert_eq!(
+                first.committed_commit_seq(),
+                None,
+                "no commit identity before durability"
+            );
+            first.commit(&cx).await.unwrap();
+            second.commit(&cx).await.unwrap();
+            assert_eq!(first.committed_commit_seq(), Some(before.next()));
+            assert_eq!(second.committed_commit_seq(), Some(before.next().next()));
+            assert_eq!(
+                pager.published_snapshot().visible_commit_seq,
+                before.next().next(),
+                "the published horizon is the later commit's, so reading it after both \
+                 commits would give the first commit the second's sequence"
+            );
+        });
     }
 
     #[test]
