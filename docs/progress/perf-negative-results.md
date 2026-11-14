@@ -87,6 +87,88 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: a WAL commit keeps the main-file size the pager last measured (bd-w4pr1.7, lever C')
+
+- Target: every WAL commit on a file-backed database (the scorecard's `autocommit_5k_inserts`,
+  `txn_1000x10_rows`). Touched: `crates/fsqlite-pager/src/pager.rs`
+  (`finish_authorized_wal_attempt`, and the test
+  `test_named_memory_vfs_wal_commit_records_physical_main_file_size`).
+- Ledger preflight: nothing earlier on this fstat. The other two size/header syscalls on the brief
+  were analysed on bd-w4pr1.7 and left alone. The WAL-length fstat in `WalFile::refresh` is GH#534's
+  unpublished-tail guard, and the WAL-header pread at refresh covers a dead resetter. The
+  wal-index header cannot answer either.
+- Evidence before (strace -f -c, the scorecard's autocommit script at 1,000 and 3,000 commits,
+  difference per commit): 11 statx per commit, stock none. One of them was the main-file fstat
+  `finish_authorized_wal_attempt` made to record `committed_db_file_size_bytes`.
+- Why it can go: a WAL append writes nothing to the main file. Its size changes only with a
+  checkpoint backfill or truncation, or a rollback-mode write, which never reaches this WAL-only
+  path. `committed_db_file_size_bytes` has one reader, the next full refresh's no-change probe
+  (`durable_identity_changed`), and that probe measures the file again. A stale value can only
+  make the probe clear the page cache once more. The published snapshot's `db_file_size_bytes`
+  has no reader outside a test. The commit now keeps the size last measured. The private
+  `:memory:` image keeps its synthetic size, which moves with the commit.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries a1a5cc9e... (06662b1f9) and
+  500be53f... (06662b1f9 plus this diff); answers equal stock's; stock `integrity_check` ok on all
+  14 candidate files:
+  - strace, three runs: statx per commit 11.01 -> 10.06, 11.06 -> 10.04, 11.04 -> 10.06; the
+    other syscalls within run-to-run noise.
+  - perf stat: `/dev/shm` had hit the user tmpfs quota (errno 122), so these runs used
+    disk-backed work directories. `autocommit_5k_inserts` 921.6M -> 919.7M user instructions
+    (stock 112.5M), CPU best 627.4 -> 610.3 ms, wall best 811.9 -> 782.4 ms (stock 258.5 ms);
+    `txn_1000x10_rows` 582.3M -> 572.9M, CPU best 238.3 -> 228.4 ms (stock 153.9M).
+  - rusage: system time 44.3 -> 42.5 us per commit (stock 12.9 us); user time moved within
+    noise (77.5 -> 80.6 us).
+  - Prediction (registered on bd-w4pr1.7 before code): statx 11 -> 10 per commit, -0.2k to -0.6k
+    user instructions and about -1 us system time per commit. Kill: syscalls per commit not down
+    by 0.9. Cleared (-0.95 to -1.02).
+- Test: `test_named_memory_vfs_wal_commit_records_physical_main_file_size` gains a negative half.
+  After the commit the main file grows (as a checkpoint backfill grows it), and the recorded size
+  must stay the one last measured. The next full refresh (a read-only begin) must then record the
+  grown size, which a pager that never re-measured would fail.
+- Gate (rch, 06662b1f9 plus the change): clippy -D warnings on fsqlite-pager and fsqlite-core
+  `--all-targets` clean; fsqlite-pager lib 1,110 passed, 1 failed (`bd_2jpu6_2` poll_quota, red
+  on main); fsqlite-e2e concurrency and group-commit targets 63 + 53 passed, 1 failed (the
+  `bd_3wop3_1_3` timing assertion, bd-uk9ob); fsqlite-core lib 4,180 passed, 2 failed (the t6741
+  pair, red on main); fsqlite-core WAL, refresh and staleness keepers 14 + 214 + 71; fsqlite WAL
+  keepers 16.
+- Landed as 8f971d9e5 (rebased onto c6f5c57f3). On the rebased tree 3ca3c40a7 (on a3b4ef8d6):
+  clippy clean, fsqlite-pager lib 1,110 passed with the same 1 red. The commits after it on main
+  touch neither fsqlite-pager nor fsqlite-vfs.
+- Retry condition: none for this fstat. The analysis on bd-w4pr1.7 covers the other size and
+  header syscalls: the GH#534 WAL-length check, the dead-resetter header pread, and the path
+  identity probes, which are owner-contract items.
+
+## 2026-11-14 - NOT TAKEN: skipping the per-begin rollback-journal probe in WAL mode (bd-w4pr1.7, lever D)
+
+- Target: the `access(-journal)` call every begin makes in `refresh_runtime_committed_state`
+  (one syscall, about 0.2k user instructions and ~1 us of kernel time per commit on
+  `autocommit_5k_inserts`; stock makes none). Nothing was changed.
+- Stock (SQLite 3.54.1 source): `sqlite3PagerSharedLock` probes for a hot journal and calls
+  `pagerOpenWalIfPresent` only in its `!pagerUseWal(pPager) && eState==PAGER_OPEN` branch; a WAL
+  pager goes straight to `pagerBeginReadTransaction`. That is sound because a WAL-mode connection
+  keeps its main-file SHARED lock between transactions (`pager_unlock` in WAL mode only ends the
+  read transaction). Leaving WAL needs `sqlite3WalClose` to take EXCLUSIVE on the database file
+  (`sqlite3PagerCloseWal` -> `pagerExclusiveLock`), which fails while any other WAL connection is
+  open, in this process too, since stock's inode lock table counts its SHARED. So under an open WAL
+  connection no peer can switch the file out of WAL, no rollback-mode writer exists, and no hot
+  journal can appear.
+- fsqlite: the WAL lifetime claim keeps the kernel SHARED lock, so another process cannot take
+  EXCLUSIVE (the unix.rs wal-lifetime test shows a foreign EXCLUSIVE refused). Within the process
+  it does not: the in-process EXCLUSIVE check refuses only on `n_shared > 1 || n_exclusive > 0`,
+  and an idle attachment counts in `n_wal_lifetime`, not `n_shared` (same test: "idle attachments
+  are not transactions"). `set_journal_mode(Delete)` needs only the in-process maintenance gate's
+  sole-owner upgrade, which an idle connection does not block. It then takes the maintenance fence
+  (EXCLUSIVE), rewrites page 1 to version 1 and retires the WAL. So a same-process peer can leave
+  WAL between this connection's transactions, and its rollback-mode writes can leave a journal
+  behind. The probe runs before the header and path checks that notice the switch; without it, the
+  begin that discovers the switch has no guarantee the journal is looked at before pages are read.
+- Verdict: not taken. The argument holds across processes, not within one.
+- Retry condition: the in-process EXCLUSIVE (or `set_journal_mode` out of WAL) refuses while
+  another handle holds a WAL lifetime claim, as stock does. That would also make an in-process
+  `PRAGMA journal_mode=DELETE` under an open WAL connection busy, as it is in stock, and it is a
+  behaviour decision of its own. After it, the probe is redundant while the begin's handle holds
+  its lifetime claim: about 1 syscall and 0.2k instructions per begin.
+
 ## 2026-11-14 - REJECTED: two fewer registry-mutex acquisitions per concurrent transaction (BEGIN seeds the handle cache, lock-free active-session count) (bd-i0tn6 scaling lever 1)
 
 - Target: concurrent writers committing one row per transaction at 8-64 writers (`mt-mvcc-bench
