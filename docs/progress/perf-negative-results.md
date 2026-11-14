@@ -137,6 +137,52 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   pays there is unmeasured, and moving that reload needs the prepare to see the refreshed schema
   first, which is a separate design.
 
+## 2026-11-14 - WIN: an INSERT ... SELECT row applies its second Affinity only when a constraint can change a register (bd-w4pr1.13.21, lever A)
+
+- Target: every INSERT ... SELECT row into a rowid table without a CHECK constraint or a NOT NULL ... REPLACE column:
+  the scorecard's `bulk_insert_1M_one_txn`, the 300k-row mutation setup, INSERT ... SELECT copies. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`row_body_needs_affinity_after_constraints`, `codegen_insert_select`,
+  `codegen_insert_select_without_from`).
+- Evidence before (callgrind of the bulk statement on main ffb7385aa): the row ran Affinity twice over its 4 column
+  registers, once before CHECK / NOT NULL (GH #169) and once before MakeRecord, ~480 instructions a row for the two
+  plus two exits from the synchronous lane.
+- Ledger preflight: 2026-05-24 "VDBE `Opcode::Affinity` hot-dispatch promotion" (rejected) changed the arm's
+  dispatch; this lever removes an opcode from the program and leaves the arm alone. bd-i3csr.3 (2026-11-13) made the
+  no-op case cheaper.
+- Change: the second Affinity is emitted only when code between the two can leave a column register without its
+  column's affinity: a NOT NULL column whose effective conflict action is REPLACE (it stores its DEFAULT, of any
+  storage class, over a NULL), a CHECK expression (compiled over the row registers), or a WITHOUT ROWID table
+  (implicitly NOT NULL key columns). INSERT VALUES, UPSERT and UPDATE keep both passes in this step.
+- Prediction (recorded before code, scope amended before code to INSERT ... SELECT only): bulk -180M to -300M user
+  instructions, CPU -2% to -3%; DML rows unchanged. Kill: bulk down by less than 100M.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave), binaries main
+  b3a835a48 (0e921354...) and main + this diff (15515e76...), answers equal stock's: `bulk_insert_1M_one_txn`
+  (bulk_cpu_probe.py, 5 runs, io_uring allowed) 8,691.8M -> 8,177.6M (-514.2M, -5.9%; 2.08x -> 1.96x stock
+  4,177.5M), CPU 1,056.2 -> 1,028.0 ms (-2.7%), wall 1,054.7 -> 1,032.6 ms (2.52x -> 2.47x stock 417.8 ms); the
+  statement alone (io_uring refused, 5 interleaved runs, databases on disk scratch) 7,683.0M -> 7,165.9M (-517.1M),
+  CPU 902.0 -> 879.1 ms (stock 3,665.3M / 388.4 ms); `update_10pct_300k` 641.1M -> 641.1M, `delete_14pct_300k`
+  421.5M -> 421.5M. A first statement-only pass on /dev/shm failed part of its runs with EDQUOT (the per-user tmpfs
+  quota) and was discarded. Prediction exceeded (the removed pass cost ~517 a row against the ~325 estimate); kill
+  line not met. Stock's `PRAGMA integrity_check` is ok on all 5 files the lever wrote, and the 1M rows hash the same
+  as stock's.
+- Test: fsqlite-core `one_pass_delete_oracle::insert_select_affinity_after_constraints_matches_stock` (NOT NULL ...
+  ON CONFLICT REPLACE columns whose DEFAULT has another storage class, statement-level OR REPLACE, a CHECK over a row
+  column and a table with no constraint, typeof and values against rusqlite in `:memory:` and a file, direct and
+  prepared; a version that dropped the second Affinity unconditionally would store TEXT '7' in the INTEGER column,
+  which the typeof comparison rejects; not run as a mutation).
+- Gate, on b3a835a48 plus the change (rch, 2026-11-14): clippy -D warnings with all targets on fsqlite-vdbe and on
+  the touched fsqlite-core test target clean; fsqlite-vdbe lib 1,249 pass and 1 fail (the codegen IN-list test red on
+  main, see the lever C entry), goldens 8 pass unchanged (no golden holds an INSERT ... SELECT); 16 fsqlite-core
+  keeper targets (the new oracle, INSERT ... SELECT one-program and batched replay, NOT NULL conflict, CHECK depth,
+  generated columns, STRICT, RETURNING, conflict-clause review and atomicity, UPSERT, triggers, FK, affinity,
+  CHECK rowid alias) pass except the reds known on main: bd-jlbrk's two `rowid_replace_preflight_*` tests, bd-mkon7's
+  `review_omitted_rowid_alias_ignores_defaults` and bd-d8s37's two `fk_insert_conflict_oracle` upsert tests.
+  After the clean rebase onto 67fd99d10 (upstream bd-y8zgm changed other codegen functions), the fsqlite INSERT
+  targets (insert_test, insert_select_column_reorder, compat_tests) ran on the landing tree: 92 pass (the next
+  upstream commit, a ledger entry, followed before the push). Landed as 076eff697.
+- Retry / widen: INSERT VALUES (the txn / autocommit rows) and UPDATE run the same double pass; widening needs the
+  hand-updated `upsert_on_conflict_*` and `update_with_where_predicate` goldens.
+
 ## 2026-11-14 - WIN (small): concurrent validations share each peer's SSI view parts until the peer changes (bd-i0tn6 scaling lever 2)
 
 - Target: the registry-guard holds of concurrent commits at 8-64 writers (`mt-mvcc-bench
