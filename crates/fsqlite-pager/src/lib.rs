@@ -84,7 +84,7 @@ pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,
     S3FifoEvent, S3FifoRolloutGate,
 };
-pub use snapshot_reader::{SnapshotPageBuf, SnapshotPageReader, WalSnapshotFrames};
+pub use snapshot_reader::{SnapshotPageBuf, SnapshotPageReader, WalPageIndex, WalSnapshotFrames};
 pub use submodular_prefetch::{Candidate as PrefetchCandidate, expected_gain, greedy_select};
 pub use thompson_partitioner::{BetaArm, RESAMPLE_INTERVAL, ThompsonPartitioner};
 pub use traits::{

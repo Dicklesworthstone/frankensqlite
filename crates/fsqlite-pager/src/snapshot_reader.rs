@@ -29,6 +29,13 @@ const WAL_HEADER_BYTES: u64 = 32;
 /// Bytes of the header that precede a page image in a WAL frame.
 const WAL_FRAME_HEADER_BYTES: usize = 24;
 
+/// A WAL page index, keyed with foldhash (bd-w4pr1.13.18).
+///
+/// For each page, its latest frame (0-based) at or below a snapshot's last
+/// commit frame. Every page-cache miss in WAL mode looks a page up in one,
+/// hence foldhash, as the page cache's own maps use.
+pub type WalPageIndex = HashMap<u32, usize, foldhash::fast::FixedState>;
+
 /// The WAL frames one pinned read snapshot sees.
 #[derive(Debug, Clone)]
 pub struct WalSnapshotFrames {
@@ -38,7 +45,7 @@ pub struct WalSnapshotFrames {
     pub file: Arc<File>,
     /// For each page the snapshot finds in the WAL, its latest frame
     /// (0-based) at or below the snapshot's last commit frame.
-    pub page_index: Arc<HashMap<u32, usize>>,
+    pub page_index: Arc<WalPageIndex>,
 }
 
 /// Pages of one committed snapshot of a WAL-mode database. Cloning shares it.
@@ -252,7 +259,7 @@ mod tests {
         let frames = WalSnapshotFrames {
             publication: publication(Some(1)),
             file: wal,
-            page_index: Arc::new(HashMap::from([(2_u32, 1_usize)])),
+            page_index: Arc::new(std::iter::once((2_u32, 1_usize)).collect::<WalPageIndex>()),
         };
         let reader = SnapshotPageReader::new(temp_file(&db), Some(frames), 16, 4);
         let mut buf = reader.new_buffer();
@@ -280,7 +287,7 @@ mod tests {
         let wrong_page = WalSnapshotFrames {
             publication: publication(Some(1)),
             file: Arc::clone(&wal),
-            page_index: Arc::new(HashMap::from([(2_u32, 0_usize)])),
+            page_index: Arc::new(std::iter::once((2_u32, 0_usize)).collect::<WalPageIndex>()),
         };
         let reader = SnapshotPageReader::new(temp_file(&db), Some(wrong_page), 16, 2);
         let mut buf = reader.new_buffer();
@@ -289,7 +296,7 @@ mod tests {
         let past_commit = WalSnapshotFrames {
             publication: publication(Some(0)),
             file: wal,
-            page_index: Arc::new(HashMap::from([(2_u32, 1_usize)])),
+            page_index: Arc::new(std::iter::once((2_u32, 1_usize)).collect::<WalPageIndex>()),
         };
         let reader = SnapshotPageReader::new(temp_file(&db), Some(past_commit), 16, 2);
         assert!(reader.read_page(PageNumber::new(2).unwrap(), &mut buf).is_err());
@@ -297,7 +304,7 @@ mod tests {
         let empty = WalSnapshotFrames {
             publication: publication(None),
             file: wal_file(&[(2, 20)]),
-            page_index: Arc::new(HashMap::from([(2_u32, 0_usize)])),
+            page_index: Arc::new(std::iter::once((2_u32, 0_usize)).collect::<WalPageIndex>()),
         };
         let reader = SnapshotPageReader::new(temp_file(&db), Some(empty), 16, 2);
         assert_eq!(

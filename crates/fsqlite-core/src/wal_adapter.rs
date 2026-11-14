@@ -20,7 +20,7 @@ use fsqlite_pager::traits::{
 };
 use fsqlite_pager::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, ParallelWalCommitReconciliation,
-    WalBackend, WalIndexShmSource, WalPublicationSnapshot,
+    WalBackend, WalIndexShmSource, WalPageIndex, WalPublicationSnapshot,
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -234,7 +234,7 @@ struct WalPublishedSnapshot {
     generation: WalGenerationIdentity,
     last_commit_frame: Option<usize>,
     commit_count: u64,
-    page_index: Arc<HashMap<u32, usize>>,
+    page_index: Arc<WalPageIndex>,
     index_is_partial: bool,
 }
 
@@ -246,7 +246,7 @@ impl WalPublishedSnapshot {
             generation,
             last_commit_frame: None,
             commit_count: 0,
-            page_index: Arc::new(HashMap::new()),
+            page_index: Arc::new(WalPageIndex::default()),
             index_is_partial: false,
         }
     }
@@ -294,7 +294,7 @@ struct PendingWalAppendAttempt {
 /// No published lookup state changes until the entire scan succeeds.
 #[derive(Debug, Default)]
 struct WalPublicationDelta {
-    page_index_updates: HashMap<u32, usize>,
+    page_index_updates: WalPageIndex,
     commit_count: u64,
     index_is_partial: bool,
 }
@@ -798,7 +798,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let page_index = if extend_previous {
             let mut page_index = std::mem::replace(
                 &mut self.published_snapshot.page_index,
-                Arc::new(HashMap::new()),
+                Arc::new(WalPageIndex::default()),
             );
             if !delta.page_index_updates.is_empty() {
                 Arc::make_mut(&mut page_index).extend(delta.page_index_updates);
@@ -2173,10 +2173,10 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let mut page_index = if can_extend_previous {
             std::mem::replace(
                 &mut self.published_snapshot.page_index,
-                Arc::new(HashMap::new()),
+                Arc::new(WalPageIndex::default()),
             )
         } else {
-            Arc::new(HashMap::new())
+            Arc::new(WalPageIndex::default())
         };
         let mut index_is_partial = if can_extend_previous {
             self.published_snapshot.index_is_partial
@@ -12307,7 +12307,10 @@ mod tests {
             let before_next_sequence = reader.next_publication_seq;
             assert_eq!(before.last_commit_frame, Some(0));
             assert_eq!(before.commit_count, 1);
-            assert_eq!(before_map, HashMap::from([(1, 0)]));
+            assert_eq!(
+                before_map,
+                std::iter::once((1, 0)).collect::<WalPageIndex>()
+            );
 
             writer
                 .append_frame(&cx, 1, &updated_page, 0)
@@ -12369,7 +12372,7 @@ mod tests {
             assert_eq!(reader.next_publication_seq, before_next_sequence + 1);
             assert_eq!(
                 reader.published_snapshot.page_index.as_ref(),
-                &HashMap::from([(1, 1), (2, 2)])
+                &[(1, 1), (2, 2)].into_iter().collect::<WalPageIndex>()
             );
             if pin_reader {
                 assert_eq!(
@@ -12434,7 +12437,9 @@ mod tests {
             assert_eq!(adopted.last_commit_frame, Some(2));
             assert_eq!(
                 reader.published_snapshot.page_index.as_ref(),
-                &HashMap::from([(1, 0), (2, 1), (3, 2)])
+                &[(1, 0), (2, 1), (3, 2)]
+                    .into_iter()
+                    .collect::<WalPageIndex>()
             );
             header_reads.push(
                 vfs.faults
@@ -12482,7 +12487,7 @@ mod tests {
             let refreshed = reader
                 .refresh_published_snapshot(&cx)
                 .expect("scan peer commits");
-            let mut expected_index = HashMap::new();
+            let mut expected_index = WalPageIndex::default();
             if cap >= 1 {
                 expected_index.insert(1, 4);
             }

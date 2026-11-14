@@ -3579,12 +3579,13 @@ impl InFlightReadLeader<'_> {
             return;
         }
 
+        // One probe: the page's entry goes only if it is still this flight.
         let mut in_flight = self.cache.in_flight_reads.lock();
-        if in_flight
-            .get(&self.page_no)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+        if let std::collections::hash_map::Entry::Occupied(current) =
+            in_flight.entry(self.page_no)
+            && Arc::ptr_eq(current.get(), &self.flight)
         {
-            in_flight.remove(&self.page_no);
+            current.remove();
         }
         drop(in_flight);
 
@@ -3660,8 +3661,10 @@ pub struct ShardedPageCache {
     reconstructed_victim_scan_calls: AtomicU64,
     /// Per-page miss flights. The first task for a missing page owns the VFS
     /// read; later tasks await the same completion notification and retry the
-    /// cache instead of amplifying disk I/O.
-    in_flight_reads: Mutex<HashMap<PageNumber, Arc<InFlightPageRead>>>,
+    /// cache instead of amplifying disk I/O. Keyed with foldhash like the
+    /// shards: every page miss inserts and removes its flight (bd-w4pr1.13.18).
+    in_flight_reads:
+        Mutex<HashMap<PageNumber, Arc<InFlightPageRead>, foldhash::fast::FixedState>>,
     /// Bayesian-mixture e-value evictor (IMPL-19 / AAC-P5).
     ///
     /// Present only when the `evalue-eviction` cargo feature is enabled.
@@ -3816,7 +3819,9 @@ impl ShardedPageCache {
             diagnostic_snapshot_calls: AtomicU64::new(0),
             #[cfg(test)]
             reconstructed_victim_scan_calls: AtomicU64::new(0),
-            in_flight_reads: Mutex::new(HashMap::new()),
+            in_flight_reads: Mutex::new(HashMap::with_hasher(
+                foldhash::fast::FixedState::default(),
+            )),
             #[cfg(feature = "evalue-eviction")]
             evalue_evictor: crate::evalue_eviction::EValueEvictor::new(),
             #[cfg(feature = "evalue-eviction")]
@@ -7935,6 +7940,43 @@ mod tests {
         assert_eq!(file.read_calls(), 1);
         assert_eq!(cache.budget_resident_pages(), 0);
         assert!(cache.in_flight_reads.lock().is_empty());
+    }
+
+    /// bd-w4pr1.13.18: a finishing read leader removes the page's in-flight
+    /// entry only while it is its own flight. A newer flight registered for the
+    /// same page stays for its followers; removing the entry by page number
+    /// alone would strand them behind a second read.
+    #[test]
+    fn test_in_flight_finish_removes_only_its_own_flight() {
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let page_no = PageNumber::new(7).unwrap();
+        let InFlightReadRole::Leader(mut leader) = cache.claim_in_flight_read(page_no) else {
+            panic!("the first claim of a page leads its read");
+        };
+        let newer = Arc::new(InFlightPageRead::new());
+        cache
+            .in_flight_reads
+            .lock()
+            .insert(page_no, Arc::clone(&newer));
+        leader.finish();
+        assert!(
+            cache
+                .in_flight_reads
+                .lock()
+                .get(&page_no)
+                .is_some_and(|current| Arc::ptr_eq(current, &newer)),
+            "the newer flight stays registered"
+        );
+        drop(leader);
+        assert_eq!(cache.in_flight_reads.lock().len(), 1);
+
+        let other = PageNumber::new(8).unwrap();
+        let InFlightReadRole::Leader(mut leader) = cache.claim_in_flight_read(other) else {
+            panic!("the first claim of a page leads its read");
+        };
+        leader.finish();
+        assert!(!cache.in_flight_reads.lock().contains_key(&other));
+        assert!(cache.in_flight_reads.lock().contains_key(&page_no));
     }
 
     #[test]
