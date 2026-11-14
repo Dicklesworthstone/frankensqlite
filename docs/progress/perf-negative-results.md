@@ -325,6 +325,41 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN (with a measured cost): GROUP BY streams groups in index order and stops at its LIMIT (bd-2mrip; bd-gazf2's file part)
+
+- Target: `SELECT a, max(b) FROM t GROUP BY a ORDER BY a LIMIT 5` sorted every row before its
+  first group (462.5x stock). Touched: crates/fsqlite-vdbe/src/codegen.rs
+  (codegen_select_group_by_aggregate: groups_in_index_order, index_walk_input, the group_row
+  subroutine, covering reads of plain-column aggregate arguments; DESC and permuted keys past
+  the ORDER BY prefix, IN inputs).
+- Result (a2939d952 + 336c3ae9b; scratchpad gb_ab.py, stock live, fresh process per query; ELF
+  before cee8e75bbd884ec8, after efbd4b26c0d05cca; thinkstation1): LIMIT 5 462.5x -> 4.7x;
+  `GROUP BY b, a LIMIT 5` 5,857.5x -> 1.0x with stock's rows; `a > 900` 15.5x -> 5.6x; ranges,
+  equalities and IN inputs 6.9x -> 5.2x, 4.9x -> 4.2x, 3.6x -> 2.7x, 5.2x -> 3.9x.
+- Cost (measured, kept): a whole-table covering GROUP BY without a LIMIT, which now streams over
+  the index, is a little slower than the sorter path: `a, count(*) GROUP BY a` +1.3%,
+  `flag, count(*) GROUP BY flag` +2.3%. The sort is gone, but each row pays a Gosub into the
+  group accumulation and a copy out of its sorter slot. bd-2mrip stays open on that half of its
+  probe.
+- Retry condition: inline the group accumulation in the row body when groups stream (it has one
+  call site) and read keys straight into the current-key registers; or keep the sorter for a
+  whole-index walk with no LIMIT whose keys are ASC in GROUP BY order.
+- Found on the way: bd-t92q0 (the in-memory mirror prints `a % 7`'s group as 0.0 where stock
+  prints 0); GROUP BY codegen oracles must compare :memory: rows as sets (the mirror groups
+  there, in key order).
+
+## 2026-11-14 - WIN: MIN/MAX of the rowid WHERE a = ? reads one end of a one-key index's run (bd-zgo8b)
+
+- Target: `SELECT max(id) FROM t WHERE a = ?` (latest row per key) walked the a = ? run.
+  Touched: crates/fsqlite-vdbe/src/codegen.rs (minmax_prefix_seek_plan, codegen_select_minmax_
+  prefix_seek: IdxRowid for a rowid argument over a one-key index).
+- Result (acde6723a; cin_ab.py, stock live; ELF before c8b948ada3e04c2f, after
+  72e2e6dd61f83bf7): min(id) WHERE a = 5 4.2x -> 0.8x, max(id) WHERE s = 'k9' 1.6x -> 0.7x,
+  max(id) WHERE a = 500 4.2x -> 0.7x.
+- Correctness found on the way (fixed in the same commit): the plan never checked that `a = ?`
+  compares under the index key's collation; a NOCASE column under a `COLLATE BINARY` index gave
+  min(v) 20 where stock gives 3.
+
 ## 2026-11-14 - WIN: an IN list beside equalities on a composite index probes the whole key prefix (bd-hyoms)
 
 - Target: `a IN (3, 77, 500) AND b = 3` and `a = 5 AND b IN (1, 2, 3)` over INDEX t_ab(a, b)
