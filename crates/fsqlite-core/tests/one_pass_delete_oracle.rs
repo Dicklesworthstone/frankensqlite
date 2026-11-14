@@ -425,6 +425,57 @@ const ROWID_CASES: &[Case] = &[
     },
 ];
 
+/// INSERT ... SELECT row bodies whose second Affinity (after CHECK and NOT
+/// NULL) still matters (bd-w4pr1.13.21, lever A): a NOT NULL ... ON CONFLICT
+/// REPLACE column stores its DEFAULT over a NULL, and each DEFAULT here has
+/// another storage class than its column (TEXT '7' into INTEGER, 3 into TEXT,
+/// '2.5' into REAL), so only the second Affinity gives the stored value the
+/// column's type; `d` has no constraint. `k` carries a CHECK over a row column,
+/// and `p` none of them (its second Affinity is skipped).
+const ROW_AFFINITY: &[&str] = &[
+    "CREATE TABLE r(id INTEGER PRIMARY KEY, \
+     a INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT '7', \
+     b TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 3, \
+     c REAL NOT NULL ON CONFLICT REPLACE DEFAULT '2.5', d)",
+    "CREATE TABLE k(id INTEGER PRIMARY KEY, a TEXT CHECK (length(a) >= 1 AND a <> 7), b NUMERIC)",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d NUMERIC)",
+    "CREATE TABLE src(x, y)",
+    "INSERT INTO src VALUES (NULL, NULL), (1, 'q'), (NULL, 'z'), ('8', NULL), (9, 10), ('3.0', '4.5')",
+];
+const ROW_AFFINITY_STATE: &[&str] = &[
+    "SELECT id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM r ORDER BY id",
+    "SELECT id, a, typeof(a), b, typeof(b) FROM k ORDER BY id",
+    "SELECT id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM p ORDER BY id",
+];
+
+const ROW_AFFINITY_CASES: &[Case] = &[
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT INTO r(a, b, c, d) SELECT x, y, x, y FROM src",
+        states: ROW_AFFINITY_STATE,
+    },
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT INTO r(a, b, c, d) SELECT NULL, NULL, NULL, x FROM src",
+        states: ROW_AFFINITY_STATE,
+    },
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT OR REPLACE INTO r(a, b, c, d) SELECT y, x, y, x FROM src",
+        states: ROW_AFFINITY_STATE,
+    },
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT INTO k(a, b) SELECT y, x FROM src WHERE y IS NOT NULL AND x IS NOT NULL",
+        states: ROW_AFFINITY_STATE,
+    },
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT INTO p(a, b, c, d) SELECT x, x, y, y FROM src",
+        states: ROW_AFFINITY_STATE,
+    },
+];
+
 fn tag_f(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_owned(),
@@ -599,6 +650,19 @@ fn scan_delete_matches_stock_in_one_pass_and_two() {
 fn scan_update_matches_stock_in_one_pass_and_two() {
     asupersync::test_utils::run_test(|| async {
         let failures = check_cases(UPDATE_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn insert_select_affinity_after_constraints_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(ROW_AFFINITY_CASES).await;
         assert!(
             failures.is_empty(),
             "{} differences from SQLite:\n{}",

@@ -299,6 +299,28 @@ fn effective_rowid_oe(table: &TableSchema, stmt_level: Option<ConflictAction>) -
     )
 }
 
+/// Whether an INSERT ... SELECT row body needs its second `Affinity`, the one
+/// between the CHECK / NOT NULL constraints and `MakeRecord`
+/// (bd-w4pr1.13.21, lever A). The first `Affinity`, before the constraints
+/// (GH #169), already gave every column register its column's affinity.
+/// Between the two, a NOT NULL column whose effective conflict action is
+/// REPLACE stores its DEFAULT, of any storage class, over a NULL, and a CHECK
+/// expression is compiled over the row registers; a WITHOUT ROWID table's
+/// PRIMARY KEY columns are NOT NULL without the declaration. Any of those keeps
+/// the second pass; otherwise nothing writes a column register in between.
+fn row_body_needs_affinity_after_constraints(
+    table: &TableSchema,
+    stmt_level: Option<ConflictAction>,
+) -> bool {
+    table.without_rowid
+        || !table.check_constraints.is_empty()
+        || table.columns.iter().any(|column| {
+            column.notnull
+                && !column.is_ipk
+                && effective_oe(stmt_level, column.conflict_action) == OE_REPLACE
+        })
+}
+
 /// bd-nn29x: the `OE_*` algorithm a failing constraint `Halt` carries in P2,
 /// which tells the statement boundary to keep the statement's rows (FAIL),
 /// undo them (ABORT) or end the transaction (ROLLBACK), as stock's
@@ -28451,14 +28473,16 @@ fn codegen_insert_select(
     let pk_oe = effective_rowid_oe(target_table, stmt_level);
 
     let aff_str = target_table.affinity_string();
-    b.emit_op(
-        Opcode::Affinity,
-        final_regs,
-        final_n_cols,
-        0,
-        P4::Affinity(aff_str.clone()),
-        0,
-    );
+    if row_body_needs_affinity_after_constraints(target_table, stmt_level) {
+        b.emit_op(
+            Opcode::Affinity,
+            final_regs,
+            final_n_cols,
+            0,
+            P4::Affinity(aff_str.clone()),
+            0,
+        );
+    }
 
     let prechecked_records = emit_unique_checks_before_rowid_replace(
         b,
@@ -28743,16 +28767,19 @@ fn codegen_insert_select_without_from(
     );
     emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
 
-    // Apply column type affinities before packing the record.
+    // Apply column type affinities before packing the record, again only when
+    // the constraints could have changed a register (bd-w4pr1.13.21, lever A).
     let aff_str = target_table.affinity_string();
-    b.emit_op(
-        Opcode::Affinity,
-        final_regs,
-        final_n_cols,
-        0,
-        P4::Affinity(aff_str.clone()),
-        0,
-    );
+    if row_body_needs_affinity_after_constraints(target_table, stmt_level) {
+        b.emit_op(
+            Opcode::Affinity,
+            final_regs,
+            final_n_cols,
+            0,
+            P4::Affinity(aff_str.clone()),
+            0,
+        );
+    }
 
     let prechecked_records = emit_unique_checks_before_rowid_replace(
         b,
