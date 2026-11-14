@@ -18,9 +18,9 @@
 //! "cannot rollback - no transaction is active", the next `BEGIN` works, and
 //! the transaction's rows are gone.
 //!
-//! The negative case: a retryable `Busy` at COMMIT (a stock writer holds the
-//! WAL write lock in another process) keeps the transaction open, and a second
-//! COMMIT succeeds once the holder is done.
+//! The negative case: a retryable `Busy` at COMMIT (another fsqlite process
+//! holds the write lock with BEGIN IMMEDIATE) keeps the transaction open, and a
+//! second COMMIT succeeds once the holder is done.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -289,12 +289,14 @@ fn busy_snapshot_commit_rolls_the_transaction_back_like_a_stock_automatic_rollba
     assert_eq!(stock_integrity(&db), "ok");
 }
 
-/// The holder process for the negative case: stock opens `db`, takes the WAL
-/// write lock with `BEGIN IMMEDIATE` plus an UPDATE of a row on an existing
-/// page of table `h`, reports `held`, waits for `release`, commits, reports
-/// `released`, and keeps its connection open until `done`. Closing it right
-/// after the COMMIT would also run stock's close-time checkpoint while the
-/// fsqlite transaction is still open, a different interaction from the
+/// The holder process for the negative case: an fsqlite connection takes the
+/// write lock with `BEGIN IMMEDIATE` (an explicit opt-out of the concurrent
+/// promotion) plus an UPDATE of a row on an existing page of table `h`,
+/// reports `held`, waits for `release`, commits, reports `released`, and
+/// closes once the parent reports `done`. A stock holder does not fit here: an
+/// fsqlite transaction open across a stock process's commit gets "recovery in
+/// progress" from every later COMMIT on main as well (reported on
+/// bd-reality-check-1022-llk6g.5), which is a different defect from the
 /// retryable Busy this case pins.
 #[test]
 fn refused_commit_holder_child() {
@@ -302,23 +304,34 @@ fn refused_commit_holder_child() {
         return;
     };
     let (db, dir) = spec.split_once('|').expect("holder spec");
-    let (db, dir) = (PathBuf::from(db), PathBuf::from(dir));
-    let stock = rusqlite::Connection::open(&db).expect("holder open");
-    stock
-        .execute_batch("BEGIN IMMEDIATE; UPDATE h SET v = v + 1 WHERE id = 1;")
-        .expect("holder BEGIN IMMEDIATE");
-    std::fs::write(dir.join("held"), b"").expect("held");
-    assert!(
-        wait_for(&dir.join("release"), Duration::from_secs(120)),
-        "holder never released"
-    );
-    stock.execute_batch("COMMIT").expect("holder COMMIT");
-    std::fs::write(dir.join("released"), b"").expect("released");
-    assert!(
-        wait_for(&dir.join("done"), Duration::from_secs(120)),
-        "parent never finished"
-    );
-    drop(stock);
+    let (db, dir) = (db.to_owned(), PathBuf::from(dir));
+    asupersync::test_utils::run_test(|| async move {
+        let holder = Connection::open(&db).await.expect("holder open");
+        holder
+            .execute("BEGIN IMMEDIATE")
+            .await
+            .expect("holder BEGIN IMMEDIATE");
+        assert!(
+            !holder.is_concurrent_transaction(),
+            "BEGIN IMMEDIATE is not promoted"
+        );
+        holder
+            .execute("UPDATE h SET v = v + 1 WHERE id = 1")
+            .await
+            .expect("holder UPDATE");
+        std::fs::write(dir.join("held"), b"").expect("held");
+        assert!(
+            wait_for(&dir.join("release"), Duration::from_secs(120)),
+            "holder never released"
+        );
+        holder.execute("COMMIT").await.expect("holder COMMIT");
+        std::fs::write(dir.join("released"), b"").expect("released");
+        assert!(
+            wait_for(&dir.join("done"), Duration::from_secs(120)),
+            "parent never finished"
+        );
+        holder.close().await.expect("holder close");
+    });
 }
 
 fn spawn_holder(db: &Path, dir: &Path) -> Child {
@@ -362,8 +375,8 @@ fn retryable_busy_at_commit_keeps_the_transaction_open() {
     let mut holder = None;
     let (holder_slot, holder_db) = (&mut holder, db.clone());
     asupersync::test_utils::run_test(|| async move {
-        // Open before the holder takes the write lock: opening a WAL database
-        // whose write lock another process holds is refused with Busy.
+        // Open before the holder takes the write lock, so the open is not
+        // part of what this case measures.
         let conn = Connection::open(&path).await.expect("open");
         conn.execute("PRAGMA busy_timeout=200")
             .await
