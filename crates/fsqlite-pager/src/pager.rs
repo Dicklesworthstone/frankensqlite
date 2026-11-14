@@ -26781,32 +26781,18 @@ where
         }
         let publication_intent = attempt.publication_intent()?;
 
-        let (db_file, memory_file_size) = {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            (
-                Arc::clone(&inner.db_file),
-                self.memory_db_bump_alloc
-                    .then(|| u64::from(inner.db_size) * u64::from(inner.page_size.get())),
-            )
-        };
-        let committed_file_size = if let Some(file_size) = memory_file_size {
-            Some(file_size)
-        } else {
-            match shared_db_file_read(&db_file, cx).await {
-                Ok(db_file) => db_file.file_size(cx).ok(),
-                Err(_) => None,
-            }
-        };
         {
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            if let Some(file_size) = committed_file_size {
-                inner.committed_db_file_size_bytes = file_size;
+            // A WAL append writes nothing to the main database file, so its
+            // size stays the one the pager last measured (bd-w4pr1.7); the next
+            // full refresh's probe measures it again. Only the private
+            // `:memory:` image's synthetic size moves with the commit.
+            if self.memory_db_bump_alloc {
+                inner.committed_db_file_size_bytes =
+                    u64::from(inner.db_size) * u64::from(inner.page_size.get());
             }
             self.publish_committed_snapshot_from_inner(&inner);
         }
@@ -63315,6 +63301,32 @@ mod tests {
                 reader.get_page(&cx, page).await.unwrap().as_ref()[0],
                 0x6D,
                 "commit must keep its WAL-published page visible after finalization"
+            );
+            drop(reader);
+
+            // bd-w4pr1.7: a WAL commit keeps the size the pager last measured
+            // instead of statting the file; the next full refresh measures it
+            // again, so a main file that grew meanwhile (as a checkpoint grows
+            // it) is seen there.
+            {
+                let file = shared_db_file_write(&db_file, &cx).await.unwrap();
+                file.write(&cx, &vec![0x5A; ps], physical_main_file_size)
+                    .await
+                    .unwrap();
+            }
+            let grown_main_file_size =
+                physical_main_file_size + u64::from(PageSize::DEFAULT.get());
+            assert_eq!(
+                pager.inner.lock().unwrap().committed_db_file_size_bytes,
+                physical_main_file_size,
+                "nothing has measured the grown file yet"
+            );
+            let reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            drop(reader);
+            assert_eq!(
+                pager.inner.lock().unwrap().committed_db_file_size_bytes,
+                grown_main_file_size,
+                "the next full refresh must measure the grown main file"
             );
         });
     }
