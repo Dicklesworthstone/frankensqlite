@@ -2230,3 +2230,143 @@ fn join_lookups_seek_the_outer_table_by_unconsumed_inner_join_terms() {
         });
     }
 }
+
+/// bd-9uf3l: an inner join written with its unfiltered table first (`FROM u
+/// JOIN t ON u.id = t.a WHERE t.b = 'k2'`) drove from u, reading all of it and
+/// looking t up per row (413x stock on 200k rows). With sqlite_stat1 it drives
+/// from t, the table its WHERE pins, and looks u up, as stock does, when the
+/// pinned rows are well under u's rows, nothing seeks u and u has a rowid or
+/// index lookup on the join key. Without statistics, a small written outer
+/// table (5-row q) or an unselective pin (`t.f = 1`, half of t) keeps the
+/// written order, as do a LEFT join, a comma join (stock never reorders CROSS
+/// JOIN, which the parser does not tell from a comma), `*` (cursor-ordered
+/// columns), a written outer table the WHERE already seeks, and a join key with
+/// no lookup on the written outer table. Rows match stock in order either way.
+#[test]
+fn inner_joins_drive_from_the_table_their_where_pins_by_row_estimates() {
+    // (query, whether it reads the outer table in full once ANALYZE has run:
+    // `Some(false)` drives from the pinned table, `Some(true)` keeps the
+    // written outer table as a full scan, `None` checks rows only). Without
+    // statistics every `Some` case keeps the written order.
+    let cases: &[(&str, Option<bool>)] = &[
+        (
+            "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id",
+            Some(false),
+        ),
+        (
+            "SELECT count(*), sum(u.r) FROM u JOIN t ON u.id = t.a WHERE t.a = 2",
+            Some(false),
+        ),
+        (
+            "SELECT count(*), max(u.r) FROM u JOIN t ON t.a = u.id WHERE t.b = 'k4'",
+            Some(false),
+        ),
+        (
+            "SELECT t.id, u.a FROM u INNER JOIN t ON u.id = t.a AND t.b = 'k5' ORDER BY t.id",
+            Some(false),
+        ),
+        (
+            "SELECT count(*) FROM u JOIN t ON u.id = t.a WHERE t.id = 9",
+            Some(false),
+        ),
+        // A range on u is no equality seek, so t still drives.
+        (
+            "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE u.r > 1 AND t.b = 'k2' \
+             ORDER BY t.id",
+            Some(false),
+        ),
+        // A pin matching half of t, and a 5-row written outer table.
+        (
+            "SELECT count(*), sum(u.r) FROM u JOIN t ON u.id = t.a WHERE t.f = 1",
+            Some(true),
+        ),
+        (
+            "SELECT count(*) FROM q JOIN t ON t.id = q.id WHERE t.f = 1",
+            Some(true),
+        ),
+        (
+            "SELECT count(*) FROM q JOIN t ON t.id = q.id WHERE t.b = 'k14'",
+            Some(true),
+        ),
+        (
+            "SELECT t.id, u.r FROM u LEFT JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id",
+            Some(true),
+        ),
+        (
+            "SELECT count(*) FROM u, t WHERE u.id = t.a AND t.b = 'k2'",
+            Some(true),
+        ),
+        (
+            "SELECT * FROM u JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id, u.id",
+            Some(true),
+        ),
+        (
+            "SELECT t.id FROM u JOIN t ON u.a = t.a WHERE t.b = 'k2' ORDER BY t.id",
+            Some(true),
+        ),
+        // The WHERE already seeks u, so u stays outer.
+        (
+            "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE u.id = 2 AND t.b = 'k2' \
+             ORDER BY t.id",
+            None,
+        ),
+    ];
+    let mut setup = vec![
+        "CREATE TABLE u(id INTEGER PRIMARY KEY, a INTEGER, r REAL)".to_owned(),
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, f INTEGER)".to_owned(),
+        "CREATE TABLE q(id INTEGER PRIMARY KEY, w INTEGER)".to_owned(),
+        "CREATE INDEX t_a ON t(a)".to_owned(),
+        "CREATE INDEX t_b ON t(b)".to_owned(),
+        "CREATE INDEX t_f ON t(f)".to_owned(),
+    ];
+    for i in 1..=400_i64 {
+        setup.push(format!("INSERT INTO u VALUES ({i}, {}, {}.5)", i % 9, i % 13));
+        setup.push(format!(
+            "INSERT INTO t VALUES ({i}, {i}, 'k{}', {})",
+            i % 100,
+            i % 2
+        ));
+    }
+    for i in 1..=5_i64 {
+        setup.push(format!("INSERT INTO q VALUES ({}, {i})", i * 7));
+    }
+    for analyzed in [false, true] {
+        let setup = setup.clone();
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_drives_pinned_table.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in &setup {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            if analyzed {
+                f.execute("ANALYZE").await.unwrap();
+                r.execute_batch("ANALYZE").unwrap();
+            }
+            for (sql, scans_outer) in cases {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                if let Some(scans_outer) = scans_outer {
+                    let ops = opcodes(&f, sql).await;
+                    assert_eq!(
+                        ops.iter().any(|op| op == "Rewind"),
+                        *scans_outer || !analyzed,
+                        "`{sql}` full outer scan (analyzed: {analyzed}): {ops:?}"
+                    );
+                }
+            }
+            for value in [2_i64, 6, 999] {
+                assert_agree(
+                    &f,
+                    &r,
+                    "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE t.a = ?1 ORDER BY t.id",
+                    &[SqliteValue::Integer(value)],
+                    &[&value],
+                )
+                .await;
+            }
+            f.close().await.unwrap();
+        });
+    }
+}

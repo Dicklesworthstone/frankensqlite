@@ -242,7 +242,8 @@ use fsqlite_types::{
 use fsqlite_vdbe::codegen::{
     CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
-    SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
+    SelectPlannerDirective, Stat1RowEstimates, TableSchema, bind_explicit_index, codegen_delete,
+    codegen_insert,
     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
     emit_scan_filter, join_select_seeks_outer_table, join_select_uses_lookup,
     without_rowid_index_appended_pk, without_rowid_pk_indices,
@@ -13107,15 +13108,6 @@ struct PlannerDirectiveCacheEntry {
     directive: Option<SelectPlannerDirective>,
 }
 
-/// Planner inputs from `sqlite_stat1`, keyed by lowercased name.
-#[derive(Debug, Default)]
-struct Stat1Hints {
-    /// Table row count (the first `stat` integer).
-    table_rows: HashMap<String, u64>,
-    /// Per index: average rows matching an equality on each leading prefix.
-    index_rows_per_key: HashMap<String, Vec<u64>>,
-}
-
 /// Schema-scoped execution metadata reused by table-backed VDBE runs.
 ///
 /// This caches only data derived from the schema graph. Values that are
@@ -14856,7 +14848,7 @@ pub struct Connection {
     planner_directive_cache: RefCell<LruCache<u64, Arc<PlannerDirectiveCacheEntry>>>,
     /// `sqlite_stat1` as loaded at a mirror commit sequence. Cleared with the
     /// planner-directive cache, so both see the same ANALYZE.
-    stat1_hints_cache: RefCell<Option<(CommitSeq, Rc<Stat1Hints>)>>,
+    stat1_hints_cache: RefCell<Option<(CommitSeq, Arc<Stat1RowEstimates>)>>,
     /// Version-scoped prepared equality caches for safe in-memory secondary-index
     /// lookup fast paths.
     prepared_indexed_equality_cache:
@@ -67033,14 +67025,14 @@ impl Connection {
     /// Without the guard, running `query()` on `sqlite_stat1` would itself
     /// compile through `planner_select_directive_with_cache`, which calls
     /// back into this function and overflows the stack.
-    async fn sqlite_stat1_hints(&self) -> Rc<Stat1Hints> {
+    async fn sqlite_stat1_hints(&self) -> Arc<Stat1RowEstimates> {
         thread_local! {
             static STAT1_LOAD_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
         if self.sqlite_stat1_root_page().is_none()
             || STAT1_LOAD_IN_PROGRESS.with(std::cell::Cell::get)
         {
-            return Rc::default();
+            return Arc::default();
         }
         let visible_seq = *self.memdb_visible_commit_seq.borrow();
         let cacheable = !self.in_transaction.get();
@@ -67048,7 +67040,7 @@ impl Connection {
             && let Some((seq, hints)) = self.stat1_hints_cache.borrow().as_ref()
             && *seq == visible_seq
         {
-            return Rc::clone(hints);
+            return Arc::clone(hints);
         }
         STAT1_LOAD_IN_PROGRESS.with(|c| c.set(true));
         // RAII guard so we clear the flag even if `query` panics (unlikely,
@@ -67063,9 +67055,9 @@ impl Connection {
 
         let sql = "SELECT tbl, idx, stat FROM sqlite_stat1";
         let Ok(rows) = self.query(sql).await else {
-            return Rc::default();
+            return Arc::default();
         };
-        let mut out = Stat1Hints::default();
+        let mut out = Stat1RowEstimates::default();
         for row in &rows {
             let values = row.values();
             let Some(SqliteValue::Text(table)) = values.first() else {
@@ -67097,11 +67089,11 @@ impl Connection {
                 }
             }
         }
-        let hints = Rc::new(out);
+        let hints = Arc::new(out);
         if cacheable {
             // The read may have refreshed the mirror; key by what it read.
             let seq = *self.memdb_visible_commit_seq.borrow();
-            *self.stat1_hints_cache.borrow_mut() = Some((seq, Rc::clone(&hints)));
+            *self.stat1_hints_cache.borrow_mut() = Some((seq, Arc::clone(&hints)));
         }
         hints
     }
@@ -87413,7 +87405,7 @@ impl Connection {
     fn planner_select_directive_with_stats(
         select: &SelectStatement,
         schema: &[TableSchema],
-        stat1: Option<&Stat1Hints>,
+        stat1: Option<&Stat1RowEstimates>,
     ) -> Option<SelectPlannerDirective> {
         const PLANNER_SURFACE: &str = "single_table_access_path_v1";
         const PLAN_GENERATION: u64 = 1;
@@ -88425,11 +88417,26 @@ impl Connection {
             planner_collation_is_binary(index.key_term_collation(0))
         });
         record_hot_path_duration(&FSQLITE_COMPILE_PLANNER_NS, t);
+        // bd-9uf3l: a lookup join chooses which table drives from sqlite_stat1's
+        // row estimates; without ANALYZE it keeps the written order. The
+        // reentrant read of sqlite_stat1 happens only when it exists, which is
+        // also when the caller passes an owned schema (see `needs_owned_schema`).
+        let joins = matches!(
+            &canonical_select.body.select,
+            SelectCore::Select { from: Some(from), .. } if !from.joins.is_empty()
+        );
+        let stat1_row_estimates = if joins && self.sqlite_stat1_root_page().is_some() {
+            let estimates = self.sqlite_stat1_hints().await;
+            (!estimates.table_rows.is_empty()).then_some(estimates)
+        } else {
+            None
+        };
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
             index_ordered_scan_reliable: true,
+            stat1_row_estimates,
             wr_binary_ascending_roots: self
                 .table_execution_metadata()
                 .wr_binary_ascending_roots
@@ -264479,7 +264486,7 @@ mod pager_routing_tests {
             conn.execute("COMMIT;").await.unwrap();
             let select = parse_select_statement("SELECT c FROM sel_stats WHERE a = 1 AND b = 7");
 
-            let directive = |hints: Option<&Stat1Hints>| {
+            let directive = |hints: Option<&Stat1RowEstimates>| {
                 Connection::planner_select_directive_with_stats(
                     &select,
                     &conn.schema.borrow(),

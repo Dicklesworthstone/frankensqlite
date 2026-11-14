@@ -2480,6 +2480,21 @@ pub struct CodegenContext {
     /// (named in that cursor's `VOpen` P4). `None` keeps a table-valued
     /// function source unsupported here.
     pub insert_select_function_columns: Option<Vec<String>>,
+    /// bd-9uf3l: `sqlite_stat1` row estimates, when ANALYZE has written them.
+    /// A lookup join drives from the table its WHERE pins only when these say
+    /// that side has far fewer rows; `None` keeps the written order.
+    pub stat1_row_estimates: Option<Arc<Stat1RowEstimates>>,
+}
+
+/// `sqlite_stat1` row estimates, keyed by lowercased table and index name.
+///
+/// A table's row count is the `stat` column's first integer; per index, the
+/// following integers are the average rows an equality on each of its leading
+/// key prefixes matches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stat1RowEstimates {
+    pub table_rows: std::collections::HashMap<String, u64>,
+    pub index_rows_per_key: std::collections::HashMap<String, Vec<u64>>,
 }
 
 /// Errors during code generation.
@@ -13033,6 +13048,32 @@ fn codegen_join_aggregate_select(
                 aggregates,
             );
         }
+        if !keeps_written_order
+            && let Some(swapped) = swapped_join_lookup_plan_driving_filtered_side(
+                &plan,
+                where_clause,
+                left_table,
+                left_alias,
+                right_table,
+                right_alias,
+                on_expr,
+                ctx.stat1_row_estimates.as_deref(),
+            )
+        {
+            return codegen_single_join_lookup_select(
+                b,
+                stmt,
+                columns,
+                where_clause,
+                right_table,
+                right_alias,
+                left_table,
+                left_alias,
+                &swapped,
+                ctx,
+                aggregates,
+            );
+        }
         return codegen_single_join_lookup_select(
             b,
             stmt,
@@ -13540,6 +13581,76 @@ fn swapped_join_lookup_plan_avoiding_text_walk<'a>(
         on_expr,
     )
     .filter(|swapped| !swapped.numeric_text_walk)
+}
+
+/// An inner join written with its unfiltered table first (`FROM p JOIN t ON
+/// t.id = p.tid WHERE t.a = 5`) drives from the table its WHERE pins, as
+/// SQLite does: when no equality seeks the written outer table, one seeks the
+/// other, and the written outer table has a rowid or index lookup on the join
+/// key (not an automatic index). It then reads only the pinned rows and seeks
+/// the other table for each, instead of reading every row of the unfiltered
+/// table and looking each one up. The WHERE and every ON term still filter
+/// each joined row.
+///
+/// bd-9uf3l: only when `sqlite_stat1` says the pinned side is the smaller one.
+/// Without statistics the sizes are unknown, and the written order is far
+/// cheaper for a small outer table joined to an unselective equality (a
+/// 10-row q JOIN t WHERE t.flag = 1: 305k instructions in the written order,
+/// 1,030,918k swapped), so the swap needs an estimate of both sides: the
+/// written outer table's rows, and the rows the pinned equality matches (one
+/// for a rowid). Each driving row costs about one lookup into the other table
+/// either way, so the side with fewer driving rows wins, by a margin that
+/// keeps near ties in the written order.
+#[allow(clippy::too_many_arguments)]
+fn swapped_join_lookup_plan_driving_filtered_side<'a>(
+    written: &SingleJoinLookupPlan<'a>,
+    where_clause: Option<&'a Expr>,
+    left_table: &'a TableSchema,
+    left_alias: Option<&'a str>,
+    right_table: &'a TableSchema,
+    right_alias: Option<&'a str>,
+    on_expr: &'a Expr,
+    estimates: Option<&Stat1RowEstimates>,
+) -> Option<SingleJoinLookupPlan<'a>> {
+    const SWAP_MARGIN: u64 = 4;
+    let estimates = estimates?;
+    let written_outer_rows = *estimates
+        .table_rows
+        .get(&left_table.name.to_ascii_lowercase())?;
+    if written.join_kind != fsqlite_ast::JoinKind::Inner
+        || resolve_outer_equality_seek_terms(
+            join_outer_filter_terms(where_clause, written),
+            left_table,
+            left_alias,
+            Some((right_table, right_alias)),
+            None,
+        )
+        .is_some()
+    {
+        return None;
+    }
+    let swapped = resolve_single_join_lookup_plan(
+        right_table,
+        right_alias,
+        left_table,
+        left_alias,
+        written.join_kind,
+        Some(on_expr),
+    )?;
+    let pinned_rows = match resolve_outer_equality_seek_terms(
+        join_outer_filter_terms(where_clause, &swapped),
+        right_table,
+        right_alias,
+        Some((left_table, left_alias)),
+        None,
+    )? {
+        OuterEqualitySeek::Rowid { .. } => 1,
+        OuterEqualitySeek::Index { index, .. } => *estimates
+            .index_rows_per_key
+            .get(&index.name.to_ascii_lowercase())?
+            .first()?,
+    };
+    (pinned_rows.saturating_mul(SWAP_MARGIN) < written_outer_rows).then_some(swapped)
 }
 
 /// The affinity SQLite applies to a probe of an index on a column with
@@ -15946,6 +16057,33 @@ fn codegen_join_select(
                 right_table,
                 right_alias.as_deref(),
                 *on_expr,
+            )
+        {
+            return codegen_single_join_lookup_select(
+                b,
+                stmt,
+                columns,
+                where_clause,
+                right_table,
+                right_alias.as_deref(),
+                left_table,
+                left_alias,
+                &swapped,
+                ctx,
+                &[],
+            );
+        }
+        if !columns.iter().any(|column| matches!(column, ResultColumn::Star))
+            && let Some(on_expr) = *on_expr
+            && let Some(swapped) = swapped_join_lookup_plan_driving_filtered_side(
+                &plan,
+                where_clause,
+                left_table,
+                left_alias,
+                right_table,
+                right_alias.as_deref(),
+                on_expr,
+                ctx.stat1_row_estimates.as_deref(),
             )
         {
             return codegen_single_join_lookup_select(
