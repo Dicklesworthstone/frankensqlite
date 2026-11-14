@@ -416,6 +416,11 @@ struct ArrivalWaitObservation {
     pending_batch_count: usize,
     should_flush_now: bool,
     fill_age: Duration,
+    /// False when the flushing transaction is the only same-process
+    /// transaction on its file, so no batch can arrive during a wait: every
+    /// writer takes a transaction lease on the file's maintenance gate before
+    /// it can reach the group-commit queue (bd-w4pr1.7).
+    peers_may_arrive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,6 +637,24 @@ fn decide_group_commit_arrival_wait(
                     fairness_budget,
                     max_wait,
                     mode,
+                    false,
+                );
+            }
+
+            // A wait can only gain members a peer could submit. With no other
+            // transaction on the file it is pure latency: the flusher spun on
+            // the consolidator, the clock and the scheduler for the whole
+            // sparse budget, about 36k user instructions of a 228k autocommit
+            // commit (bd-w4pr1.7).
+            if !observation.peers_may_arrive {
+                return ArrivalWaitDecision::skip(
+                    control_epoch,
+                    "sole_transaction",
+                    observation.fill_age,
+                    queue_age_p95,
+                    fairness_budget,
+                    max_wait,
+                    CommitServiceMode::LowLatency,
                     false,
                 );
             }
@@ -7046,6 +7069,20 @@ impl PagerMaintenanceGate {
 }
 
 impl PagerMaintenanceLease {
+    /// Whether this is a transaction lease and the only same-process
+    /// admission on its file: no other transaction, no opener and no
+    /// maintenance. The gate is shared by every pager of the file in this
+    /// process, so no other transaction of this process can be writing it.
+    fn is_sole_transaction(&self) -> bool {
+        matches!(self.kind, PagerMaintenanceLeaseKind::Transaction)
+            && self
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_sole_owner(PagerMaintenanceLeaseKind::Transaction)
+    }
+
     /// Temporarily turn this lease into the sole same-process maintenance
     /// owner. Recovery callers use this only after releasing every VFS lock,
     /// so the backend starts cross-process acquisition from an unambiguous
@@ -23413,6 +23450,17 @@ where
             .collect()
     }
 
+    /// Whether another same-process transaction on this file could join a
+    /// group commit this transaction flushes. False only when this
+    /// transaction's lease is the file's sole admission; without a lease the
+    /// answer stays the conservative `true`.
+    fn group_commit_peers_may_arrive(&self) -> bool {
+        !self
+            .maintenance_lease
+            .as_ref()
+            .is_some_and(PagerMaintenanceLease::is_sole_transaction)
+    }
+
     fn publish_committed_state(&self, cx: &Cx, update: PublishedPagerUpdate) {
         // D1-CRITICAL Change 3: Use sharded publish_commit.
         self.published.publish_commit(cx, update, &self.write_set);
@@ -24418,6 +24466,7 @@ where
             queue,
             &mut publication_authorization,
             None,
+            true,
         )
         .await
     }
@@ -24456,6 +24505,10 @@ where
         queue: &GroupCommitQueueRef,
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
         txn_attempt: Option<&Arc<PendingGroupCommitTxnAttempt<V::File>>>,
+        // False when this transaction is alone on its file in this process
+        // (see `ArrivalWaitObservation::peers_may_arrive`): a flush it runs
+        // then skips the arrival wait.
+        peers_may_arrive: bool,
     ) -> Result<()> {
         let operation_cx = pager_busy_wait_cx(cx, inner_arc)?;
         let cx = &operation_cx;
@@ -24781,6 +24834,7 @@ where
                                 pending_batch_count: consolidator.pending_batch_count(),
                                 should_flush_now: consolidator.should_flush_now(),
                                 fill_age: consolidator.fill_age(),
+                                peers_may_arrive,
                             })
                         } else {
                             None
@@ -28450,6 +28504,7 @@ where
                     &self.group_commit_queue,
                     &mut wal_publication_authorization,
                     wal_attempt.as_ref(),
+                    self.group_commit_peers_may_arrive(),
                 )
                 .await;
                 record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
@@ -29328,6 +29383,7 @@ where
                         &self.group_commit_queue,
                         &mut wal_publication_authorization,
                         wal_attempt.as_ref(),
+                        self.group_commit_peers_may_arrive(),
                     )
                     .await;
                     inner = match inner_arc
@@ -54594,6 +54650,7 @@ mod tests {
                 pending_batch_count: 1,
                 should_flush_now: false,
                 fill_age,
+                peers_may_arrive: true,
             }),
             max_wait,
             fairness_budget,
@@ -54621,6 +54678,93 @@ mod tests {
         );
     }
 
+    /// bd-w4pr1.7: a flusher whose transaction is alone on its file skips the
+    /// arrival wait; the same queue with a possible peer still waits, and a
+    /// flushable queue keeps its own reason.
+    #[test]
+    fn test_commit_service_policy_sole_transaction_skips_the_arrival_wait() {
+        let max_wait = Duration::from_micros(250);
+        let fill_age = Duration::from_micros(3);
+        let fairness_budget = default_commit_service_fairness_budget(max_wait);
+        let decide = |peers_may_arrive: bool, should_flush_now: bool| {
+            decide_group_commit_arrival_wait(
+                Some(ArrivalWaitObservation {
+                    pending_batch_count: 1,
+                    should_flush_now,
+                    fill_age,
+                    peers_may_arrive,
+                }),
+                max_wait,
+                fairness_budget,
+                fill_age,
+                CommitServiceMode::Balanced,
+                5,
+            )
+        };
+
+        let alone = decide(false, false);
+        assert_eq!(alone.wait_budget, Duration::ZERO);
+        assert_eq!(alone.reason, "sole_transaction");
+        assert_eq!(alone.mode, CommitServiceMode::LowLatency);
+        assert!(!alone.starvation_prevented);
+        assert_eq!(alone.control_epoch, 5);
+        assert_eq!(alone.max_wait, max_wait);
+
+        let with_peer = decide(true, false);
+        assert_eq!(
+            with_peer.wait_budget, GROUP_COMMIT_SPARSE_ARRIVAL_WAIT,
+            "a queue a peer can still join keeps the sparse wait"
+        );
+        assert_eq!(with_peer.reason, "sparse_queue");
+
+        let flushable = decide(false, true);
+        assert_eq!(flushable.wait_budget, Duration::ZERO);
+        assert_eq!(
+            flushable.reason, "queue_flushable",
+            "a flushable queue reports why it flushes, alone or not"
+        );
+    }
+
+    /// bd-w4pr1.7: only a transaction lease with no other transaction, opener
+    /// or maintenance on its gate is the sole transaction; another gate's
+    /// leases do not count.
+    #[test]
+    fn test_maintenance_lease_sole_transaction_counts_every_same_gate_admission() {
+        let gate = Arc::new(PagerMaintenanceGate::default());
+        let other_gate = Arc::new(PagerMaintenanceGate::default());
+        let txn = gate.enter_transaction().unwrap();
+        assert!(txn.is_sole_transaction());
+
+        let other_file_txn = other_gate.enter_transaction().unwrap();
+        assert!(
+            txn.is_sole_transaction(),
+            "a transaction on another file is not a peer"
+        );
+        assert!(other_file_txn.is_sole_transaction());
+
+        let peer = gate.enter_transaction().unwrap();
+        assert!(!txn.is_sole_transaction(), "a second transaction can commit");
+        assert!(!peer.is_sole_transaction());
+        drop(peer);
+        assert!(txn.is_sole_transaction());
+
+        let opener = gate.enter_open().unwrap();
+        assert!(
+            !txn.is_sole_transaction(),
+            "an opener can begin a transaction"
+        );
+        assert!(!opener.is_sole_transaction(), "an open lease is not a transaction");
+        drop(opener);
+        assert!(txn.is_sole_transaction());
+
+        drop(txn);
+        let opener = gate.enter_open().unwrap();
+        assert!(
+            !opener.is_sole_transaction(),
+            "an open lease alone is not a sole transaction"
+        );
+    }
+
     #[test]
     fn test_commit_service_policy_throughput_hysteresis_stays_enabled_for_bursty_backlog() {
         let max_wait = Duration::from_micros(250);
@@ -54632,6 +54776,7 @@ mod tests {
                 pending_batch_count: 3,
                 should_flush_now: false,
                 fill_age,
+                peers_may_arrive: true,
             }),
             max_wait,
             fairness_budget,
@@ -54669,6 +54814,7 @@ mod tests {
                 pending_batch_count: 2,
                 should_flush_now: false,
                 fill_age,
+                peers_may_arrive: true,
             }),
             max_wait,
             fairness_budget,
@@ -54736,6 +54882,7 @@ mod tests {
                 pending_batch_count: 1,
                 should_flush_now: false,
                 fill_age,
+                peers_may_arrive: true,
             }),
             max_wait,
             fairness_budget,
