@@ -87,6 +87,61 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - LOSS: an inner join driving from the table its WHERE pins, without row estimates (bd-9uf3l, not landed)
+
+- Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` drives from p (all 50,000
+  rows, a t lookup each) where stock drives from the 200 rows of t with a = 5 (413.7x).
+- Lever (fsq-jsw tree, crates/fsqlite-vdbe/src/codegen.rs, not landed):
+  swapped_join_lookup_plan_driving_filtered_side. For an inner ON join whose written outer table
+  no equality seeks, swap the order when one seeks the other table and the written outer table
+  has a rowid or index lookup on the join key. It was used in codegen_join_select,
+  codegen_join_aggregate_select and join_select_seeks_outer_table.
+- Result, stock sqlite3 3.46.1 live in the same run (ab2_extra.py, joinorder.py; binary
+  4792edea6142761c vs 0802cab15a251861, thinkstation1): the target 203,057k -> 7,056k (14.4x,
+  equal to its t-first spelling). Control: a 10-row q joined to the 200,000-row t,
+  `SELECT count(*) FROM q JOIN t ON t.id = q.tid WHERE t.flag = 1`, 305k (3.0x) -> 1,030,918k
+  (10,095x), and `... WHERE t.a = 5` 302k (3.2x) -> 4,374k (46.3x). The database had ANALYZE
+  statistics, and stock kept q outer.
+- Why: the swap ignores table sizes. Stock's choice without statistics matches the lever's (an
+  indexed equality is assumed selective, and tables equal-sized), but with sqlite_stat1 it
+  knows q has 10 rows.
+- Retry condition: row-count estimates reach the join codegen (sqlite_stat1 when present, and
+  stock's defaults when absent). Swap only when the pinned side's estimate is below the written
+  outer table's, and re-run both controls above.
+
+## 2026-11-14 - WIN: three plan-gap levers from one sweep: ordered-scan key ranges (bd-dduz1), DISTINCT over a key range (bd-kzfcf), comma joins seek their outer table (bd-61nf7)
+
+- Source: a plan-gap sweep of 40 common single-table and join shapes (scratchpad plangap.py,
+  joinorder.py), 200,000-row file database, stock sqlite3 3.46.1 live in the same run, user
+  instructions per query (perf stat). Engine overhead alone is 2-5x on this host, so a row far
+  above that points at a wrong access path. Answers were compared on every row.
+- bd-dduz1 (a121f252e, crates/fsqlite-vdbe/src/codegen.rs codegen_select_index_ordered_scan,
+  ordered_scan_key_bounds): an ORDER BY served by an index scan ignored a range on the ordered key
+  and walked the index from its start, or the whole equality-prefix block. It now seeks the near
+  bound and leaves past the far bound. `s > 'k4999' ORDER BY s LIMIT 3` 1,829,221k -> 692.5k
+  (stock 59.8k); `a = 77 AND b > 50 ORDER BY b LIMIT 10` 1,848.7k -> 367.9k (stock 78.9k).
+- bd-kzfcf (e2133fe72, distinct_loose_scan_plan's range): `SELECT DISTINCT a ... WHERE a < 20`
+  took the dedup path over a full scan, and its rows came out of stock's order. An exact range
+  on the loose scan's key now bounds the loose scan. 192,038.8k -> 653.8k (stock 116.5k), with
+  rows equal to stock's in order.
+- bd-61nf7 (056a46b60, join_outer_filter_terms): `FROM t, p WHERE t.id = p.tid AND t.a = 5`
+  handed its whole WHERE to the lookup as the join condition, so `t.a = 5` never seeked the
+  outer table. 215,556.6k -> 7,050.4k (stock 490.2k), equal to its ON form (7,058.3k).
+- Binaries: before 0802cab15a251861 (5081a25cf), after a3282e14591c74ef (b68522c70 plus these
+  levers and bd-ti5c9); host thinkstation1.
+- Retry / next: (a) bd-dduz1's first row was still 11.6x after a121f252e: the exclusive bound's
+  40 equal keys were each looked up in the table. The follow-up seeks past them (SeekGT) and past
+  NULL keys, and ends the walk on a NULL bound: 692.5k -> 173.1k (2.9x), and the next-key row
+  367.9k -> 338.5k (4.3x), on the combined binary 4792edea6142761c. The ordered walk is still
+  never covering, where stock reads `s` from the index. (b) Lookup joins cost
+  about 10x stock per outer row whatever the access path (7.8M for 200 outer rows against 730k).
+  Look there before any further join-plan lever (bd-w4pr1.11). (c) Not yet landed from the same
+  sweep: GROUP BY over a range (bd-x14us, 67x), join ORDER BY + LIMIT on the materializing
+  executor (bd-ti5c9, 8,165x), count(DISTINCT) (bd-fk2wa, 196x), GROUP BY in index order
+  (bd-2mrip, 550x). Still open with no lever: OR of two indexed terms (615x), a join driving its
+  unfiltered side (`FROM p JOIN t ... WHERE t.a = 5`, 413x), composite IN plus equality (98x and
+  37x), and IS NULL on an indexed column (33x; no IS NULL index seek exists).
+
 ## 2026-11-14 - WIN: new WAL commit certificates carry an XXH3-128 frame digest as record version 5 (bd-w4pr1.7.2)
 
 - Target: every WAL commit and every open that authorizes a certificate (each frame a certificate
