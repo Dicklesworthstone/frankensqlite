@@ -31,6 +31,14 @@ pub(super) struct CompiledInsertReplayOutcome {
     pub(super) returning_rows: Vec<Row>,
 }
 
+/// The row image returned by the write program is the source of FK values.
+/// Candidate INSERT values and interpreted SET expressions can differ from
+/// the row actually written by the DO UPDATE arm.
+struct UpsertForeignKeySnapshot {
+    columns: Vec<ResultColumn>,
+    updated_keys: Vec<usize>,
+}
+
 /// Admission only: expressions are still evaluated by the ordinary INSERT
 /// program for each written row. In particular, do not evaluate RETURNING
 /// against stored rows after AFTER triggers have changed them.
@@ -96,6 +104,75 @@ fn reusable_insert_returning(columns: &[fsqlite_ast::ResultColumn]) -> bool {
 }
 
 impl Connection {
+    /// Capture actual child FK values for a rowid UPSERT with one update arm.
+    ///
+    /// A rowid program reports whether this execution inserted a row through
+    /// its last-insert receipt; UPDATE deliberately leaves that receipt empty.
+    ///
+    /// With one DO UPDATE arm, that also identifies exactly which child keys
+    /// the update assigns without evaluating its SET expressions a second time.
+    ///
+    /// WITHOUT ROWID and multiple DO UPDATE arms need a richer program receipt
+    /// to identify the action and taken arm. Keep their existing enforcement
+    /// path until that information is available.
+    fn upsert_foreign_key_snapshot(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Option<UpsertForeignKeySnapshot> {
+        if !self.fk_enforcement_enabled()
+            || !self.temp_storage_roots().is_empty()
+            || self.targets_shadowed_main(&insert.table)
+            || insert
+                .table
+                .schema
+                .as_deref()
+                .is_some_and(|schema| !schema.eq_ignore_ascii_case("main"))
+        {
+            return None;
+        }
+        let mut updates = insert.upsert.iter().filter_map(|clause| match &clause.action {
+            fsqlite_ast::UpsertAction::Update { assignments, .. } => Some(assignments.as_slice()),
+            fsqlite_ast::UpsertAction::Nothing => None,
+        });
+        let assignments = updates.next()?;
+        if updates.next().is_some() {
+            return None;
+        }
+        let columns = {
+            let schema = self.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))?;
+            if table.without_rowid || table.foreign_keys.is_empty() {
+                return None;
+            }
+            // Generated child keys need dependency-aware SET-column tracking;
+            // the existing helper tracks directly assigned columns only.
+            if table.foreign_keys.iter().any(|fk| {
+                fk.child_columns.iter().any(|&column| {
+                    table
+                        .columns
+                        .get(column)
+                        .is_none_or(|column| column.generated_expr.is_some())
+                })
+            }) {
+                return None;
+            }
+            table
+                .columns
+                .iter()
+                .map(|column| ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::bare(column.name.clone()), Span::ZERO),
+                    alias: None,
+                })
+                .collect()
+        };
+        Some(UpsertForeignKeySnapshot {
+            columns,
+            updated_keys: self.fk_keys_modified_by_update(&insert.table.name, assignments),
+        })
+    }
+
     pub(super) fn insert_replay_identity(&self) -> InsertReplayIdentity {
         InsertReplayIdentity {
             schema_cookie: self.schema_cookie(),
@@ -1132,11 +1209,20 @@ impl Connection {
         // candidate values when defaults, affinity or generated columns have
         // changed them. Multi-row inputs were replayed above so this snapshot
         // is evaluated before the next row and before AFTER triggers.
-        let snapshot_statement = returning_projection.as_ref().map(|projection| {
+        let fk_snapshot = self.upsert_foreign_key_snapshot(insert);
+        let snapshot_statement = (returning_projection.is_some() || fk_snapshot.is_some()).then(|| {
             let mut snapshot_insert = insert.clone();
-            snapshot_insert
-                .returning
-                .clone_from(&projection.snapshot_columns);
+            if let Some(projection) = &returning_projection {
+                snapshot_insert
+                    .returning
+                    .clone_from(&projection.snapshot_columns);
+            } else if let Some(snapshot) = &fk_snapshot {
+                // Keep the caller's RETURNING prefix and evaluation point.
+                // The trailing FK image must not evaluate SET expressions again.
+                snapshot_insert
+                    .returning
+                    .extend(snapshot.columns.iter().cloned());
+            }
             Statement::Insert(snapshot_insert)
         });
         let compiled_statement = snapshot_statement.as_ref().unwrap_or(statement);
@@ -1148,7 +1234,7 @@ impl Connection {
         // A BEFORE trigger can invalidate code compiled at batch entry.
         // Check again here, after BEFORE and immediately before the write.
         let program: &VdbeProgram = if let Some(p) = precompiled.filter(|_| {
-            returning_projection.is_none()
+            snapshot_statement.is_none()
                 && replay_identity.is_none_or(|identity| self.insert_replay_identity() == identity)
         }) {
             p
@@ -1167,7 +1253,7 @@ impl Connection {
             // A RETURNING snapshot also changes the compiled shape independently
             // of any original SQL text retained by the dispatcher.
             let _insert_cache_bypass = (insert_values_have_subquery(insert)
-                || returning_projection.is_some())
+                || snapshot_statement.is_some())
             .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
             arc_prog = self
                 .compile_with_cache(sql_key, &sql_text, async |conn| {
@@ -1178,7 +1264,7 @@ impl Connection {
         };
         let runtime_requirements = self.insert_runtime_requirements(insert)?;
         let vtab_instances = self.insert_program_vtab_instances(insert, program)?;
-        let (rows, affected, last_insert_rowid) = self
+        let (mut rows, affected, last_insert_rowid) = self
             .execute_table_program_with_cx(
                 program,
                 params,
@@ -1199,11 +1285,38 @@ impl Connection {
             Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
         }
 
-        // bd-thqgm: FK constraint checking on INSERT.
-        // Skip FK enforcement when no row was written (e.g. an OR IGNORE
-        // PK conflict, affected == 0): SQLite does not FK-check a row it
-        // never inserted (#111).
-        if affected > 0 && self.fk_enforcement_enabled() {
+        // bd-d8s37: an UPSERT checks the row the write program produced.
+        // A real insert checks every child key; DO UPDATE checks only keys
+        // assigned by its single update arm. No-op arms produce no snapshot.
+        if let Some(snapshot) = &fk_snapshot {
+            if rows.len() != affected {
+                return Err(FrankenError::internal(
+                    "UPSERT foreign-key snapshot count does not match changed rows",
+                ));
+            }
+            for row in &mut rows {
+                let width = snapshot.columns.len();
+                let start = if returning_projection.is_some() {
+                    0
+                } else {
+                    row.values.len().checked_sub(width).ok_or_else(|| {
+                        FrankenError::internal("UPSERT foreign-key snapshot is incomplete")
+                    })?
+                };
+                let written = row.values.get(start..start + width).ok_or_else(|| {
+                    FrankenError::internal("UPSERT foreign-key snapshot is incomplete")
+                })?;
+                let keys = last_insert_rowid
+                    .is_none()
+                    .then_some(snapshot.updated_keys.as_slice());
+                Box::pin(self.check_fk_parent_exists_for_keys(table_name, written, keys)).await?;
+                if returning_projection.is_none() {
+                    row.values.truncate(start);
+                }
+            }
+        } else if affected > 0 && self.fk_enforcement_enabled() {
+            // Ordinary INSERT and UPSERT shapes without a precise receipt keep
+            // their established enforcement. Never check a skipped row.
             Box::pin(self.enforce_fk_on_insert(insert, table_name, params)).await?;
         }
 

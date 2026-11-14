@@ -445,3 +445,45 @@ fn bd_axr5h_or_rollback_controls_match_stock() {
     ));
     assert_matches_stock("OR ROLLBACK controls", &cases);
 }
+
+/// A DO UPDATE FK failure aborts the entire INSERT, including earlier input
+/// rows and BEFORE-trigger effects, regardless of its outer conflict clause.
+#[test]
+fn bd_d8s37_upsert_fk_violation_aborts_the_entire_statement() {
+    let mut cases = Vec::new();
+    for mode in MODES {
+        for explicit_transaction in [false, true] {
+            let mut setup = fk_schema(false);
+            setup.extend([
+                "CREATE TABLE audit(phase TEXT, id INTEGER, pid INTEGER)".to_owned(),
+                "CREATE TRIGGER c_bi BEFORE INSERT ON c BEGIN \
+                 INSERT INTO audit VALUES ('before', NEW.id, NEW.pid); END"
+                    .to_owned(),
+                "CREATE TRIGGER c_au AFTER UPDATE ON c BEGIN \
+                 INSERT INTO audit VALUES ('after', NEW.id, NEW.pid); END"
+                    .to_owned(),
+            ]);
+            let mut steps = Vec::new();
+            if explicit_transaction {
+                steps.push("BEGIN".to_owned());
+            }
+            steps.extend([
+                "INSERT INTO c VALUES (10, 1)".to_owned(),
+                format!(
+                    "INSERT {mode} INTO c VALUES (11, 1), (10, 1), (12, 2) \
+                     ON CONFLICT(id) DO UPDATE SET pid = 99"
+                ),
+                "INSERT INTO c VALUES (14, 2)".to_owned(),
+            ]);
+            let mut queries = fk_queries();
+            queries.push("SELECT phase, id, pid FROM audit ORDER BY rowid".to_owned());
+            cases.push(case(
+                format!("UPSERT FK, explicit={explicit_transaction}, {mode}"),
+                setup,
+                &steps,
+                queries,
+            ));
+        }
+    }
+    assert_matches_stock("UPSERT FK failure must abort the whole statement", &cases);
+}
