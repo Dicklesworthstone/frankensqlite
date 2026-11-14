@@ -87,6 +87,46 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - REJECTED: a record header table filled on demand for the in-place Column lane and the parallel kernel (bd-w4pr1.13.11 kernel lever K4)
+
+- Target: `RecordColumnTable::parse`, 91 Ir/row both in the serial in-place Column lane
+  (`try_read_column_in_place`, 7.2% of serial scan_filter_agg) and in the parallel aggregate
+  kernel: every row's header was parsed for all four columns of t(id, a, b, c) although
+  scan_filter_agg and group_by_1000_groups read only `a`. Touched (reverted):
+  `crates/fsqlite-vdbe/src/engine.rs` (`RecordColumnTable`, `try_read_column_in_place`, the
+  column-table tests), `crates/fsqlite-vdbe/src/parallel_aggregate.rs` (`Row::decode`).
+- Ledger preflight: K1-K3 below; no earlier entry on this header parse.
+- Pre-registered on the bead (2026-11-14T15:14Z): -18 to -30 Ir/row on serial scan_filter_agg, on
+  serial group_by_1000_groups and on the kernel at 8 workers; count_star unchanged; kill below -9 on
+  serial scan_filter_agg, or a read-every-column row (order_by_text_limit10, window_row_number) up
+  by more than 0.5%.
+- Change: for a one-byte header (checked by an OR over the header bytes) `parse` only counted the
+  columns and `column_offset_in(record, idx)` filled offsets up to the column asked for; other
+  headers were filled whole; a short record was filled whole before the rowid-alias verdict. The
+  batch one-byte loop was gone; the decode-scratch equivalence test filled on demand, middle column
+  first, plus a test that a table reused from a longer record exposes no stale column.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 25b7602be3be6612 =
+  2f8f1b542, K4 da5d30fb591918a6 = 2f8f1b542 + diff 795e8d307bf40910; stock sqlite3 3.46.1 live in
+  the same par_probe run, reps 5; answers equal everywhere): user instructions went UP on every row
+  that reads a column: serial scan_filter_agg 1,261.3M -> 1,300.9M (+39.6 Ir/row), kernel at 8
+  workers 534.4M -> 577.4M (+43.0; CPU 58.1 -> 60.4 ms, stock 53.7), group_by_1000_groups 3,407.2M
+  -> 3,447.2M (+40), order_by_text_limit10 1,740.9M -> 1,796.8M (+56), window_row_number 8,512.6M
+  -> 8,610.4M (+98); count_star 63.4M both. Callgrind exact (serial): the parse itself did get
+  cheaper, 91.0 -> 63.0 Ir/row, and the short-record fill never ran (zero cost at that line); the
+  rest of the cost moved into the fill inlined into the lane and the interpreter's hot loop
+  (`try_read_column_in_place` became a 21 Ir/row self entry, and `run_hot_opcodes_sync`'s
+  inlining changed), more than the parse saved. The vdbe lib (1,250 passed; the one failure,
+  `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, is bd-bhalc's,
+  already red on main), the oracle file (13/13), the budget test, six aggregate / view keepers and
+  clippy passed on the candidate: it was correct, only slower.
+- Verdict: REJECTED on its own kill rule (+39.6 Ir/row on serial scan_filter_agg against a
+  required -9), reverted.
+- Retry condition: not as a per-read fill in the lane. Worth retrying only as a header prefix
+  bounded once per cursor (the highest column the program reads from that cursor, known when the
+  program is prepared), parsed by the same batch loop up to that bound, with the instruction count
+  of `run_hot_opcodes_sync` and its callees compared before and after; or when a scorecard table
+  has many more columns than its scans read, where the saving per row grows with the unread tail.
+
 ## 2026-11-14 - REJECTED on its kill line: a concurrent BEGIN reloads a stale memdb mirror inside its own pager transaction (bd-w4pr1.7, lever F)
 
 - Target: explicit transactions with peer writers committing (8 or 4 processes on separate tables,
