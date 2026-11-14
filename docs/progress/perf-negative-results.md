@@ -151,6 +151,39 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   and the async lock round trips. Each is under 1.6k; worth a lever only as one redesign of the
   admission's lock and header round trips, not piecemeal.
 
+## 2026-11-14 - REJECTED: Copy column cells in the parallel aggregate kernel (bd-w4pr1.13.11 kernel lever K1)
+
+- Target: the per-row column decode of the parallel ungrouped-aggregate kernel
+  (`crates/fsqlite-vdbe/src/parallel_aggregate.rs`, `Row::value` / `scan_leaf`), measured on
+  scan_filter_agg (`SELECT count(*), sum(a) FROM t WHERE a > 500;`, 1M rows) at 8 workers, where it
+  is x1.15-1.23 stock CPU. Touched (reverted): `RowScratch`, `Row`, `scan_leaf`, `Row::eval`.
+- Ledger preflight: the default-flip entry below (its kernel profile: 635 Ir/row), the steps 1-3
+  entry. No earlier entry on this kernel's decode.
+- Pre-registered on the bead (2026-11-14T09:37Z) before the change. Line-level callgrind of the
+  2-worker kernel put the rowid-alias verdict and payload-index lines at ~18 Ir/row, so the plan's
+  L1 (cache them per record shape) could not reach its own kill floor and was dropped; K1 aimed at
+  what the lines did show: the per-row `values.fill(None)` over `Vec<Option<SqliteValue>>` with its
+  drop glue (~29 Ir/row), Option handling (~15), SqliteValue construction (~29). Prediction -35 to
+  -60 Ir/row; kill below -18.
+- Change: each plan column of a row cached as a Copy cell (Null / Int / Float / Wide), TEXT and
+  BLOB values in a per-column slot written only when read; comparisons and min/max built the
+  scalar's SqliteValue on the stack and called the same compare_for_where / cmp_binary_in.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 37650fb1d2d7211d =
+  7b1a890d9, K1 68a3018b1485bbbf = 7b1a890d9 + diff ee0c572f1605eb83; stock sqlite3 3.46.1 live
+  in the same par_probe run, reps 5; answers equal everywhere): scan_filter_agg at 8 workers
+  635.4M -> 622.9M user instructions (-12.5 Ir/row), CPU 65.4 -> 65.8 ms (stock 56.8), wall 8.3 ->
+  9.2 ms (stock 56.7), 7 helper threads in both; callgrind exact 635.05M -> 622.55M. Serial rows
+  unchanged as predicted (scan_filter_agg 1,234.9M, count_star 63.4M, group_by_1000_groups
+  3,334.0M user instructions in both arms). Where it went: the fill and drop glue did disappear
+  (-29), but the stack-built SqliteValue temporaries brought their own `drop_in_place` calls
+  (~10-19 Ir/row) and the comparison closure in `Row::eval` added ~8.
+- Verdict: REJECTED at -12.5 Ir/row against a kill floor of -18; reverted. The new oracle test
+  for serial types 8 and 9 (0 and 1 stored without body bytes) stays, since the shipped kernel's
+  oracle did not cover them.
+- Retry condition: not as a standalone patch. Worth retrying only together with a comparison and
+  min/max path that never builds a SqliteValue for an INTEGER or REAL (lever K2's integer compare),
+  where the temporaries' drop glue disappears too; the kill floor then applies to the pair.
+
 ## 2026-11-14 - WIN (default flipped): parallel scans sized by leaf pages under a process-wide helper budget, and fsqlite.parallel_workers defaulting to min(available_parallelism, 8) (bd-w4pr1.13.11)
 
 - Target: the parallel count(*) and ungrouped count/sum/min/max of bd-w4pr1.13.11 steps 1-3
