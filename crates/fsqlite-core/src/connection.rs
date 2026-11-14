@@ -9808,7 +9808,7 @@ impl PreparedStatement<'_> {
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
         let replace_victims = engine_back
-            .as_mut()
+            .as_deref_mut()
             .map(VdbeEngine::take_replace_victims)
             .unwrap_or_default();
         *self.conn.cached_vdbe_engine.borrow_mut() = engine_back;
@@ -13958,7 +13958,11 @@ pub struct Connection {
     /// every statement, we park the engine here after execution and `reset()`
     /// it on the next call.  `clear()` on Vecs/HashMaps retains heap capacity,
     /// making reuse essentially free.
-    cached_vdbe_engine: RefCell<Option<VdbeEngine>>,
+    ///
+    /// Boxed: the engine is taken out for every program run and put back after
+    /// it, through the executor's future; the struct is about 2.9 KB, the box
+    /// one pointer (bd-w4pr1.13.35).
+    cached_vdbe_engine: RefCell<Option<Box<VdbeEngine>>>,
     /// Caller-owned parser token/error scratch for statement-cache misses.
     ///
     /// The parser still allocates AST nodes normally, but cache-miss token and
@@ -75127,7 +75131,7 @@ impl Connection {
         let victims = self
             .cached_vdbe_engine
             .borrow_mut()
-            .as_mut()
+            .as_deref_mut()
             .map(VdbeEngine::take_replace_victims)
             .unwrap_or_default();
         if victims.is_empty() {
@@ -105875,7 +105879,7 @@ impl Connection {
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
         let replace_victims = engine_back
-            .as_mut()
+            .as_deref_mut()
             .map(VdbeEngine::take_replace_victims)
             .unwrap_or_default();
         // Park the engine for reuse by the next statement.
@@ -145104,10 +145108,10 @@ async fn execute_table_program_with_db(
     mut row_sink: Option<TableRowSink<'_, '_>>,
     allow_retained_cursor_reuse: bool,
     prepared_engine_reuse_profile: bool,
-    cached_engine: Option<VdbeEngine>,
+    cached_engine: Option<Box<VdbeEngine>>,
     vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
     parallel_workers: usize,
-) -> (TableProgramExecOutcome, Option<VdbeEngine>) {
+) -> (TableProgramExecOutcome, Option<Box<VdbeEngine>>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
     // Main-schema statements are atomic because they run inside the pager's
@@ -145155,7 +145159,11 @@ async fn execute_table_program_with_db(
         );
         cached
     } else {
-        VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size)
+        Box::new(VdbeEngine::new_with_execution_cx(
+            program.register_count(),
+            execution_cx,
+            page_size,
+        ))
     };
     engine.set_retain_storage_cursors_on_close(allow_retained_cursor_reuse);
     engine.set_parallel_workers(parallel_workers);
@@ -145391,8 +145399,8 @@ async fn execute_table_program_exactly_one_row_with_db(
     text_encoding: TextEncoding,
     max_collected_result_rows: usize,
     prepared_engine_reuse_profile: bool,
-    cached_engine: Option<VdbeEngine>,
-) -> (TableProgramSingleRowExecOutcome, Option<VdbeEngine>) {
+    cached_engine: Option<Box<VdbeEngine>>,
+) -> (TableProgramSingleRowExecOutcome, Option<Box<VdbeEngine>>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
     // Main-schema statements are atomic because they run inside the pager's
@@ -145431,7 +145439,11 @@ async fn execute_table_program_exactly_one_row_with_db(
         );
         cached
     } else {
-        VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size)
+        Box::new(VdbeEngine::new_with_execution_cx(
+            program.register_count(),
+            execution_cx,
+            page_size,
+        ))
     };
     if let Some(params) = params
         && let Err(e) = validate_bound_parameters(program, params)

@@ -169,3 +169,7 @@ path = "src/bin/bridge_overhead_bench.rs"
 [[bin]]
 name = "mt-oltp-bench"
 path = "src/bin/mt_oltp_bench.rs"
+
+[[bin]]
+name = "prepared-dml-probe"
+path = "src/bin/prepared_dml_probe.rs"
