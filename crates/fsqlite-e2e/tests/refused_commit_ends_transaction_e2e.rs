@@ -32,6 +32,30 @@ use fsqlite_error::FrankenError;
 const SQLITE_BUSY: i32 = 5;
 const SQLITE_BUSY_SNAPSHOT: i32 = 517;
 const HOLDER_ENV: &str = "FSQLITE_REFUSED_COMMIT_HOLDER";
+const STOCK_HOLDER_ENV: &str = "FSQLITE_REFUSED_COMMIT_STOCK_HOLDER";
+
+struct HolderGuard(Option<Child>);
+
+impl HolderGuard {
+    fn finish(mut self) -> std::process::Output {
+        self.0
+            .take()
+            .expect("holder spawned")
+            .wait_with_output()
+            .expect("holder output")
+    }
+}
+
+impl Drop for HolderGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            // A failing parent assertion must not leave a writer holding the
+            // database until the child's handshake timeout expires.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 fn wait_for(path: &Path, limit: Duration) -> bool {
     let started = Instant::now();
@@ -293,11 +317,8 @@ fn busy_snapshot_commit_rolls_the_transaction_back_like_a_stock_automatic_rollba
 /// write lock with `BEGIN IMMEDIATE` (an explicit opt-out of the concurrent
 /// promotion) plus an UPDATE of a row on an existing page of table `h`,
 /// reports `held`, waits for `release`, commits, reports `released`, and
-/// closes once the parent reports `done`. A stock holder does not fit here: an
-/// fsqlite transaction open across a stock process's commit gets "recovery in
-/// progress" from every later COMMIT on main as well (reported on
-/// bd-reality-check-1022-llk6g.5), which is a different defect from the
-/// retryable Busy this case pins.
+/// closes once the parent reports `done`. The stock variant exercises the
+/// same lock lifecycle with an independently implemented WAL writer.
 #[test]
 fn refused_commit_holder_child() {
     let Ok(spec) = std::env::var(HOLDER_ENV) else {
@@ -305,6 +326,24 @@ fn refused_commit_holder_child() {
     };
     let (db, dir) = spec.split_once('|').expect("holder spec");
     let (db, dir) = (db.to_owned(), PathBuf::from(dir));
+    if std::env::var(STOCK_HOLDER_ENV).as_deref() == Ok("1") {
+        let holder = rusqlite::Connection::open(&db).expect("stock holder open");
+        holder
+            .execute_batch("BEGIN IMMEDIATE; UPDATE h SET v = v + 1 WHERE id = 1;")
+            .expect("stock holder takes WRITE and updates h");
+        std::fs::write(dir.join("held"), b"").expect("held");
+        assert!(
+            wait_for(&dir.join("release"), Duration::from_secs(120)),
+            "stock holder never released"
+        );
+        holder.execute_batch("COMMIT").expect("stock holder COMMIT");
+        std::fs::write(dir.join("released"), b"").expect("released");
+        assert!(
+            wait_for(&dir.join("done"), Duration::from_secs(120)),
+            "stock holder parent never finished"
+        );
+        return;
+    }
     asupersync::test_utils::run_test(|| async move {
         let holder = Connection::open(&db).await.expect("holder open");
         holder
@@ -334,8 +373,8 @@ fn refused_commit_holder_child() {
     });
 }
 
-fn spawn_holder(db: &Path, dir: &Path) -> Child {
-    Command::new(std::env::current_exe().expect("test binary path"))
+fn spawn_holder(db: &Path, dir: &Path, stock: bool) -> HolderGuard {
+    let child = Command::new(std::env::current_exe().expect("test binary path"))
         .args([
             "--exact",
             "refused_commit_holder_child",
@@ -343,10 +382,12 @@ fn spawn_holder(db: &Path, dir: &Path) -> Child {
             "--test-threads=1",
         ])
         .env(HOLDER_ENV, format!("{}|{}", db.display(), dir.display()))
+        .env(STOCK_HOLDER_ENV, if stock { "1" } else { "0" })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn holder")
+        .expect("spawn holder");
+    HolderGuard(Some(child))
 }
 
 /// Negative case: a COMMIT that gets a retryable `Busy` (another process holds
@@ -381,7 +422,7 @@ fn retryable_busy_at_commit_keeps_the_transaction_open() {
         conn.execute("PRAGMA busy_timeout=200")
             .await
             .expect("busy_timeout");
-        *holder_slot = Some(spawn_holder(&holder_db, &work));
+        *holder_slot = Some(spawn_holder(&holder_db, &work, false));
         assert!(
             wait_for(&work.join("held"), Duration::from_secs(120)),
             "holder never took the write lock"
@@ -416,10 +457,7 @@ fn retryable_busy_at_commit_keeps_the_transaction_open() {
         conn.close().await.expect("close");
         std::fs::write(work.join("done"), b"").expect("done");
     });
-    let output = holder
-        .expect("holder spawned")
-        .wait_with_output()
-        .expect("holder output");
+    let output = holder.expect("holder spawned").finish();
     assert!(
         output.status.success(),
         "holder failed: {}\n{}",
@@ -435,5 +473,87 @@ fn retryable_busy_at_commit_keeps_the_transaction_open() {
         .query_row("SELECT v FROM h WHERE id = 1", [], |row| row.get(0))
         .expect("holder row");
     assert_eq!(h, 1, "the holder's commit is durable");
+    assert_eq!(stock_integrity(&db), "ok");
+}
+
+/// bd-reality-check-1022-llk6g.5.5: a stock writer can restart an empty,
+/// fully checkpointed WAL while a concurrent transaction pins only the main
+/// database. That transaction must either commit safely or receive a terminal
+/// snapshot refusal. Retrying recovery against its obsolete generation can
+/// never make progress.
+#[test]
+fn stock_peer_commit_does_not_leave_a_retryable_recovery_loop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("stock-peer.db");
+    rusqlite::Connection::open(&db)
+        .expect("seed open")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, w INTEGER NOT NULL, s TEXT NOT NULL);
+             CREATE TABLE h(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+             INSERT INTO t VALUES (1, 0, 'seed');
+             INSERT INTO h VALUES (1, 0);",
+        )
+        .expect("seed");
+    let path = db.to_str().expect("utf8 path").to_owned();
+    let work = dir.path().to_path_buf();
+    let peer_db = db.clone();
+    asupersync::test_utils::run_test(|| async move {
+        let conn = Connection::open(&path).await.expect("open");
+        conn.execute("PRAGMA busy_timeout=100")
+            .await
+            .expect("busy_timeout");
+        conn.execute("BEGIN").await.expect("BEGIN");
+        assert!(conn.is_concurrent_transaction());
+        conn.execute("INSERT INTO t VALUES (2, 1, 'retried')")
+            .await
+            .expect("stage concurrent INSERT before stock writes");
+
+        let holder = spawn_holder(&peer_db, &work, true);
+        assert!(
+            wait_for(&work.join("held"), Duration::from_secs(20)),
+            "stock holder never took WRITE"
+        );
+        let blocked = conn.execute("COMMIT").await.expect_err("WRITE is held");
+        assert!(matches!(blocked, FrankenError::Busy), "{blocked:?}");
+        assert!(conn.in_transaction(), "lock contention remains retryable");
+        std::fs::write(work.join("release"), b"").expect("release stock");
+        assert!(
+            wait_for(&work.join("released"), Duration::from_secs(20)),
+            "stock holder never committed"
+        );
+
+        let started = Instant::now();
+        match conn.execute("COMMIT").await {
+            Ok(_) => assert!(!conn.in_transaction()),
+            Err(error @ FrankenError::BusySnapshot { .. }) => {
+                assert_eq!(error.extended_error_code(), SQLITE_BUSY_SNAPSHOT);
+                assert!(!conn.in_transaction(), "obsolete transaction must end");
+                assert_eq!(fsqlite_ids(&conn).await, vec![1]);
+                conn.execute("BEGIN").await.expect("fresh BEGIN");
+                conn.execute("INSERT INTO t VALUES (2, 1, 'retried')")
+                    .await
+                    .expect("retry INSERT on a fresh snapshot");
+                conn.execute("COMMIT").await.expect("fresh COMMIT");
+            }
+            Err(error) => panic!("stock committed; recovery must not loop forever: {error:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fsqlite_ids(&conn).await, vec![1, 2]);
+        assert_eq!(scalar(&conn, "SELECT v FROM h WHERE id = 1").await, 1);
+        conn.close().await.expect("close");
+        std::fs::write(work.join("done"), b"").expect("done");
+        let output = holder.finish();
+        assert!(
+            output.status.success(),
+            "stock holder failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+    assert_eq!(
+        stock_rows(&db),
+        vec![(1, "seed".to_owned()), (2, "retried".to_owned())]
+    );
     assert_eq!(stock_integrity(&db), "ok");
 }

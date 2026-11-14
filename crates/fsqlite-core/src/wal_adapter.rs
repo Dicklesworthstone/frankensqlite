@@ -4709,6 +4709,26 @@ where
         self.inner.append_baseline_proven_under_gate = false;
     }
 
+    /// An active reader cannot rebind its WAL generation in place. If its
+    /// unpublished transaction tries to append after a peer replaced that
+    /// generation, retrying recovery with the same pin will never progress.
+    /// Refuse that snapshot so the connection can retire the pin and retry
+    /// from fresh read admission. An unresolved physical publication still
+    /// owns its original generation and must retain its recovery obligation.
+    fn native_wal_path_mismatch(&self, for_append: bool) -> FrankenError {
+        if for_append
+            && self.inner.native_read_binding.is_some()
+            && !self.inner.has_pending_publication()
+            && self.inner.native_recovery_requested.is_none()
+        {
+            FrankenError::BusySnapshot {
+                conflicting_pages: "WAL generation changed".to_owned(),
+            }
+        } else {
+            FrankenError::BusyRecovery
+        }
+    }
+
     async fn validate_current_native_wal_path_uncached(
         &mut self,
         cx: &Cx,
@@ -4738,7 +4758,7 @@ where
         // documents as unsupported, not cover for an interop defect.
         match self.current_handle_names_wal_path(cx, false, None).await? {
             Some(true) => return Ok(()),
-            Some(false) => return Err(FrankenError::BusyRecovery),
+            Some(false) => return Err(self.native_wal_path_mismatch(for_append)),
             None => {}
         }
         if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
@@ -4767,7 +4787,7 @@ where
         let close = file.close(&cleanup_cx);
         match (validation, close) {
             (Ok(true), Ok(())) => Ok(()),
-            (Ok(false), Ok(())) => Err(FrankenError::BusyRecovery),
+            (Ok(false), Ok(())) => Err(self.native_wal_path_mismatch(for_append)),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(validation), Err(close)) => Err(FrankenError::internal(format!(
                 "native WAL path validation and close failed: validation={validation}; close={close}"
