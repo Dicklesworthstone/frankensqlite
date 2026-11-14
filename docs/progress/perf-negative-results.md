@@ -155,6 +155,97 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   future (structural pinning), worth one more large allocation per statement and the remaining
   musl group mapping.
 
+## 2026-11-14 - WIN: ungrouped count / sum / min / max over a filtered rowid-table scan run on several threads with mergeable accumulators; `scan_filter_agg` at 8 workers is 0.18x stock's statement wall (bd-w4pr1.13.11, step 3)
+
+- Target: `scan_filter_agg` (`SELECT count(*), sum(a) FROM t WHERE a > 500`, 1M file-backed rows)
+  and every ungrouped full rowid-order scan whose result columns are plain `count(*)`, `count`,
+  `sum`, `min`, `max` of a column or the rowid and whose WHERE is an AND / OR of BINARY
+  column-versus-literal comparisons and `IS [NOT] NULL` (also `SELECT count(*) ... WHERE`), with
+  `PRAGMA fsqlite.parallel_workers = N` > 1 in autocommit. Touched: `crates/fsqlite-vdbe/src/
+  parallel_aggregate.rs` (new: plan types, per-run accumulators, leaf scan, rowid-order merge),
+  `codegen.rs` (`parallel_aggregate_plan`, `parallel_scan_plan`, `parallel_scan_predicate`,
+  attached in `codegen_select_aggregate`'s full-scan branch and `codegen_select_count_star`'s
+  scan; bytecode and EXPLAIN unchanged), `lib.rs` (plan carried by the builder and the
+  program), `engine.rs` (hook after the plan's `OpenRead`: on success write the `ResultRow`
+  registers and jump there; `compare_for_where`; the in-place lane's alias / slot helpers shared
+  as `pub(crate)`).
+- Exactness: an integer sum carries its total and the highest and lowest running total per run;
+  the merge raises `IntegerOverflow` exactly when a rowid-order running total leaves i64; a sum
+  input that is not a stored integer (REAL, or TEXT / BLOB that sum() coerces) declines the plan
+  and the serial loop runs; min / max keep the first row of a tie (strict improvement, runs merged
+  in rowid order); column reads use the in-place lane's rules (rowid alias and short-record alias
+  verdict, record slot map, REAL affinity, ALTER ADD COLUMN defaults) and reassemble overflow
+  payloads per thread; any read or decode failure, a non-UTF-8 database, an application function
+  in the registry or an overridden built-in collation declines; cancellation stops every thread.
+- Result, stock sqlite3 3.46.1 live in the same run (scratchpad `par_probe.py`, ring refused, 5
+  reps, 64 CPUs, powersave; base main 924bf4d62 sha256 3371e8aa, candidate sha256 39beb9d3,
+  same database bytes; threads = clone3 under strace): workers 1: 1,234.9M instr (base 1,237.9M),
+  wall 101.5 ms. Workers 2 / 4 / 8 / 16: wall 28.4 / 16.6 / 9.9 / 5.5 ms against stock 52.4 /
+  52.6 / 54.9 / 54.4; CPU 51.6 / 57.2 / 66.1 / 70.1 ms against serial ~100 and stock ~54;
+  threads +1 / +3 / +7 / +15; user instructions 635M at every count above 1 (stock 499M).
+  `SELECT count(*) FROM t WHERE a > 500`: 9.1 ms at 8 workers against stock 47.0 (serial 81.8).
+  Full scorecard (`user_shape_scorecard.py` with `PRAGMA parallel_workers=8` before every
+  statement, stock first and last, whole-process wall): scan_filter_agg 0.021 s against stock
+  0.059 (base 0.112), count_star 0.014 against 0.020 (base 0.040); every other row within the
+  run's noise of base. At the default (1) the full scorecard is unchanged within noise.
+- Prediction: 8 workers at most 1/5 of stock's wall (met: 0.18x), 2 -> 8 at least 2.5x (met:
+  2.9x), serial within 0.5% (met: -0.24%), CPU-seconds at most stock's (missed: 1.21x stock,
+  0.66x serial fsqlite; the per-row kernel is 635 instructions against stock's 499). Kill (under
+  3x serial at 8 workers, 2 -> 8 under 2x) not met.
+- Found on the way: sharing `payload_rowid_alias_header_verdict` with a second caller made LLVM
+  stop inlining it into the in-place `Column` lane: +9.0M instructions (+0.73%) on serial
+  scan_filter_agg, +12.0M on the count-with-WHERE row. `#[inline(always)]` restored it (verified
+  by the symbol disappearing from the binary and the instruction counts above).
+- Landed: bbd81503d (steps 1, 2 and 3 in one commit; the default stays 1).
+- Tests: `crates/fsqlite-core/tests/bd_w4pr1_13_11_parallel_scan_oracle.rs` (stock-oracle at
+  1/2/4/8 workers: the scorecard shape, mixed storage classes and affinity coercion, an integer
+  sum that overflows only in rowid order (stock raises; summing runs or checking the total would
+  answer MAX) and one that only rowid order keeps in range, rowid alias, ALTER-added short rows,
+  overflow payloads, WITHOUT ROWID / explicit transaction / application function decline, EXPLAIN
+  identical at 1 and 8, a writer committing during 60 parallel aggregates); codegen unit test
+  `bd_w4pr1_13_11_parallel_aggregate_plan_only_for_admitted_shapes`.
+- Retry condition (for wider use): GROUP BY waits for bd-w4pr1.13.8's hash aggregation; REAL
+  sum / avg / total / group_concat stay serial until an order-independent exact result is proven;
+  negated literals, IN lists, parameters and expressions in the WHERE need the predicate
+  evaluator to grow (each with its own oracle cases); the per-row kernel (635 instr) is the next
+  lever for CPU-seconds.
+
+## 2026-11-13 - WIN: `count(*)` reads its committed snapshot on several threads through a Send snapshot page reader and a b-tree split into disjoint subtrees (bd-w4pr1.13.11, steps 1 and 2)
+
+- Target: `count_star` (`SELECT count(*) FROM t`, 1M-row file-backed table held in the WAL),
+  with `PRAGMA fsqlite.parallel_workers = N` (new; default 1). Touched:
+  `crates/fsqlite-vfs` (`VfsFile::positional_reader`), `crates/fsqlite-pager/src/snapshot_reader.rs`
+  (new: `SnapshotPageReader`, `WalSnapshotFrames`), `TransactionHandle::snapshot_page_reader`
+  (`SimpleTransaction`: read-only WAL transaction with nothing written, authoritative page index,
+  backend still pinning the captured snapshot), `WalBackend::pinned_snapshot_frames`
+  (`crates/fsqlite-core/src/wal_adapter.rs`), `crates/fsqlite-btree/src/snapshot_walk.rs` (new:
+  `split_subtrees`, `ParallelWalk`, `count_entries_parallel`), the `Count` opcode
+  (`crates/fsqlite-vdbe/src/engine.rs`), the pragma and the per-statement worker count
+  (`crates/fsqlite-core/src/connection.rs`; 1 inside an explicit transaction).
+- Ledger preflight: 2026-11-10 ASSESSED (dormant vectorized kernels; retry only with a Send snapshot
+  reader and rowid-range splitting, which this is) and 2026-08-17 bd-8euyp (no allocation per page:
+  each thread reads into one reused frame-sized buffer; the WAL page index is the adapter's
+  copy-on-write `Arc`, captured without copying).
+- Result, stock sqlite3 3.46.1 live in the same run (scratchpad `par_probe.py`, ring refused, 5
+  reps, 64 CPUs, powersave; base main 924bf4d62 sha256 3371e8aa, candidate sha256 1fdbada6, same
+  database bytes): workers 1: 63.4M instr for both, wall 27.0 ms (stock 12.5). Workers 2 / 4 / 8 /
+  16: wall 7.7 / 4.1 / 2.3 / 2.2 ms against stock 14.1 / 13.1 / 13.2 / 13.3; CPU 14.6 / 16.0 /
+  17.4 / 22.0 ms against serial 26.2; threads observed (clone3 under strace) +1 / +3 / +7 / +15.
+  `scan_filter_agg` 1,237.9M instr for base and candidate at every worker count (control).
+  Prediction (>= 4x at 8 workers, CPU within 1.3x of serial) met; kill (serial +2% or under 3x)
+  not met.
+- Landed: bbd81503d, together with step 3 (entry above).
+- Tests: `crates/fsqlite-core/tests/bd_w4pr1_13_11_parallel_scan_oracle.rs` (counts equal stock's
+  on a multi-level table, an index whose interior cells are entries, one-leaf and empty tables at
+  1/2/4/8 workers; workers=1 records no walk; an explicit transaction stays serial and sees its
+  own deletes; a writer committing 500-row batches during 60 parallel counts: every answer is a
+  whole number of batches and never goes back; the reader and the walk on a stock-written file,
+  stopping when asked, and a page past the snapshot is an error), pager unit tests for frame
+  resolution, uncommitted frames and wrong-page frames.
+- Retry condition (for wider use): the reader serves only read-only WAL transactions; rollback-
+  journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
+  for the statement (rollback journal) or the memory pager's page images.
+
 ## 2026-11-14 - LOSS: an inner join driving from the table its WHERE pins, without row estimates (bd-9uf3l, not landed)
 
 - Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` drives from p (all 50,000
