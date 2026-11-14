@@ -1608,6 +1608,30 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN (without statistics): a two-table inner join samples its b-trees to choose the driving table (bd-prkvt)
+
+- Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` without ANALYZE drove
+  from all of p (256.8x stock): bd-9uf3l's swap needs row estimates and kept the written order
+  without sqlite_stat1. Touched: crates/fsqlite-btree/src/cursor.rs (estimate_entry_count,
+  estimate_rows_per_leading_key), crates/fsqlite-core/src/connection.rs (join_row_estimates,
+  btree_join_sample), crates/fsqlite-vdbe/src/codegen.rs (default_rows_per_leading_key).
+- Round 1 LOSS (not landed): the written outer table's b-tree estimate against SQLite's
+  default 10 rows per indexed equality alone, as stock decides without statistics. It swapped
+  `p JOIN t ... WHERE t.flag = 1` (half of t) into 100k index seeks of p: 192,911k ->
+  2,058,207k instructions (1.1x -> 11.2x stock; jss_ab.py, ELF 005d8502801f49f1). Our per-seek
+  cost turns stock's mis-swap into a 10x one.
+- Round 2 COST (not landed): sampling every index of the joined table, every key of the page,
+  fixed the flag row but cost +80..170k instructions on the 10-row q joins.
+- Round 3 (dd4331a1d): sample only indexes led by a column the WHERE/ON names, at most 64 keys
+  of one leftmost-path page (one run over the sample spans the page), and none when the outer
+  table has <= 40 rows. Result (jss_ab.py, stock live, same-base symbolized arm; ELF
+  73344b8ed1cdf333; thinkstation1): 256.8x -> 10.5x (= its t-first spelling), rows 164.7x ->
+  7.5x, rowid pin 786.1x -> 0.5x, flag row unchanged (1.1x), every row unchanged with ANALYZE;
+  q joins within per-process noise (prk_small.py, 11 interleaved rounds).
+- Retry / next: the swap trusts a leftmost-path sample; a key whose leftmost range is dense but
+  whose rest is sparse (or the reverse) is misjudged. Sampling a second path, or the page the
+  bound lands on, is the next step if a real workload shows it.
+
 ## 2026-11-14 - WIN (probe not met): an index-equality scan evaluates a residual that reads only index columns from the index entry (bd-y8zgm)
 
 - Target: `SELECT id FROM t WHERE EXISTS (SELECT 1 FROM p WHERE p.tid = t.id) AND t.a = 5`
