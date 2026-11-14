@@ -914,6 +914,20 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN: an OR index union row from an exactly enforced term skips the WHERE, and from a covering index skips the row lookup (bd-0wwov)
+
+- Target: `SELECT id FROM t WHERE a = 5 OR s = 'k77'` (8.2x stock): bd-e9vgj's MULTI-INDEX OR
+  looked every row up (SeekRowid) and re-applied the whole WHERE in one shared body. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (codegen_select_or_index_union: `row_exact` past the WHERE
+  for a term with no residual, `row_covered` with resolve_covering_output_sources /
+  emit_covering_output_reads when the term's index holds every output column).
+- Result (a77326088; scratchpad ab2_extra.py, fresh CLI per query, median of 3, stock live in
+  the same run, answers equal; ELF before 467ea6fe5357bc94, after 4e0567bc1d63a75d;
+  thinkstation1): 8.2x -> 3.3x; `count(*) FROM (... a = 5 OR flag = 1)` 2.6x -> 1.9x;
+  `a = 5 OR flag = 1 LIMIT 10` 3.1x -> 1.9x.
+- Retry / next: a term with a residual keeps the lookup and the WHERE; the rowid set still
+  takes an insert for the last term's rows, which no later term can repeat.
+
 ## 2026-11-14 - WIN: x IN (SELECT ...) builds its probe set from only the subquery rows its WHERE reaches, and covered outputs read the index (bd-d2jwe)
 
 - Target: `SELECT id FROM t WHERE a IN (SELECT w FROM p WHERE pid < 100)`, the worst ratio left
