@@ -87,6 +87,72 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN (CPU prediction missed by 20 ms): a window whose keys are numbers sorts them as packed (cells, row number) rows, which takes window_row_number below stock's CPU (bd-w4pr1.12, lever W1)
+
+- Target: the row-index sort in `execute_window_select` on the serial scorecard row
+  `window_row_number` (`row_number() OVER (PARTITION BY a ORDER BY c)`, 1M rows): a stable
+  `sort_by` through `cmp_sqlite_values` that was 4,520M Ir inclusive (53% of the statement, 29.9M
+  comparator calls) and ~55% of its cycles, every comparison reading both rows' keys from the
+  scanned rows at random. Touched: `crates/fsqlite-core/src/connection.rs`
+  (`PackedWindowSortKeys`, `packed_partition_runs`, the sort and partition split in
+  `execute_window_select`, three unit tests), `crates/fsqlite-core/tests/window_function_oracle.rs`
+  (`numeric_window_keys_match_stock`).
+- Ledger preflight: 2026-11-11 "REJECTED: numeric window sort keys, in two forms" -- form 2 (packed
+  u64 keys sorted unstable with the row number) was -11% CPU against a 15% kill on a 3,924 ms row,
+  its ~450 ms then hidden behind a duplicate output sort and the 1.2 GB materialization since
+  removed. Its retry condition ("on the tree without the duplicate sort, a call-graph profile that
+  puts the first window's sort at 15% or more of window_row_number's CPU") held at ~55%.
+- Pre-registered on bd-w4pr1.12 (2026-11-14T19:00Z): Ir 8,511M -> 4,000-4,700M, CPU 973 -> 430-600
+  ms; sum(c) OVER (PARTITION BY a) and the computed-key shape -25..-50% CPU; rank() OVER (ORDER BY
+  b) within 1%. Kill: CPU above 730 ms or Ir above 6,000M, rank() worse by more than 3%, or an
+  oracle change.
+- Change: when every PARTITION BY and ORDER BY value is INTEGER, non-NaN REAL or NULL and no key
+  column holds both INTEGER and REAL, each row's keys become u64 cells in the comparator's order
+  (integer with the sign bit flipped; real by the sign transform, -0.0 folded into 0.0; a DESC
+  ORDER BY term complemented; for a column holding a NULL a class cell first: NULL first for a
+  partition key as `cmp_sqlite_values` ranks it, the term's NULLS FIRST / LAST or default for an
+  ORDER BY key, not reversed by DESC, as `cmp_in_aggregate_order_keys` places it). One to four
+  cells a row sort as `([u64; K], row)` with `sort_unstable` (the unique row number last makes it
+  the stable order); more cells sort an index over the flat cells. Partitions are the runs of
+  equal partition cells. Form 2 refused NULL keys; this packs them. TEXT, BLOB, NaN and a mixed
+  INTEGER/REAL column keep the general comparator.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused, serial `parallel_workers=1`;
+  base main 687feb125 sha256 3ce3002aea0e019b, W1 a662dc71d199cc17 = 687feb125 + this diff; stock
+  sqlite3 3.46.1 live in the same par_probe run, reps 5, two runs at load 11.5 and 4.6; answers
+  equal everywhere): window_row_number 8,511.2M -> 4,740.7M Ir (stock 8,223.9M), CPU 971.9 ->
+  619.5 ms and 1,012.0 -> 655.1 ms (x1.46 -> x0.93 and x1.48 -> x0.96 stock); sum(c) OVER
+  (PARTITION BY a) 6,511M -> 5,155M Ir, CPU 866 -> 659 / 913 -> 704 ms (x1.77 -> x1.35); PARTITION
+  BY a % 7 ORDER BY c * 2: 10,463M -> 6,267M, 1,251 -> 842 / 1,310 -> 887 ms (x1.86 -> x1.25);
+  the window plus a column: 10,079M -> 6,309M, 1,090 -> 741 / 1,237 -> 774 ms (x1.53 -> x1.03);
+  rank() OVER (ORDER BY b), a TEXT key: 5,201.3M -> 5,200.3M, 586 -> 582 / 601 -> 603 ms.
+  scan_filter_agg, group_by_1000_groups, order_by_text_limit10 and count_star identical in Ir.
+  Prediction: Ir missed high by 41M (4,741M against 4,000-4,700M), CPU missed high by 20-55 ms
+  (620 / 655 against 430-600); the computed-key shape inside its range, sum(c) OVER (PARTITION BY
+  a) just below it (-24% against -25..-50%). Kill lines not crossed. After W1 the sort is ~10% of
+  window_row_number's cycles; the largest items are the interpreter (15%), memmove (11.6%, the
+  scanned rows' and result vectors' growth) and the outer GROUP BY/join select (~10%).
+- Gate (on 687feb125 + this diff): clippy -D warnings fsqlite-core --all-targets clean; fsqlite-core
+  lib 4,185 passed, 2 failed (the t6741 pair, bd-nouem, red on main); the three new unit tests
+  (every pair of rows over integer and real columns with NULL, values beyond 2^53, signed zeros,
+  infinities, under nine direction / NULLS terms; one to seven cells a row against the general
+  stable sort and partition split; refusals of TEXT, BLOB, NaN, 1 beside 1.0, one row); the 41
+  window-using fsqlite-core integration targets plus the parallel scan oracle and budget (44
+  binaries, 2,143 passed; incl. the new 18-query oracle: -0.0 / 0.0 as one partition and peers,
+  2^53 and 2^53 + 1 as two partitions, NULL partitions, NULLS FIRST / LAST under DESC, +-inf,
+  mixed and TEXT controls; memory and file, direct and prepared), 13 fsqlite-e2e window targets
+  (92 passed), fsqlite distinct_loose_scan and the six count / min / max oracles (12 passed).
+  One failure, not this lever's: bd_json_scalar_oracle_probe `reserved_number_tag_strings_match_stock`
+  (`json(jsonb_group_object(k, v))` over keys that collide after the nonfinite tag: stock keeps
+  four members, fsqlite two; no window in the statement, and the main and W1 CLIs print the same
+  bytes for it). After rebasing onto origin/main (upstream touched no window code): clippy
+  -D warnings fsqlite-core --lib --tests clean.
+- Verdict: WIN against stock live: window_row_number x1.47 -> x0.93-0.96 CPU. Landed as 32084d5c0
+  (rebased over acf1fb0e3, a codegen-only commit).
+- Retry condition: none (kept). Widen to TEXT keys under BINARY on a UTF-8 database (cells from a
+  prefix with a tie-break on the full bytes) when a scorecard window row orders by a TEXT key
+  and its sort is 15% or more of that row's CPU; a column mixing INTEGER and REAL needs an exact
+  int/real cell (the comparator is exact past 2^53).
+
 ## 2026-11-14 - WIN (above its prediction): the parallel aggregate kernel reads a table-leaf cell stored whole on its page from its two varints, which takes its CPU below stock's on scan_filter_agg (bd-w4pr1.13.11 kernel lever K5)
 
 - Target: `CellRef::parse` in the parallel ungrouped-aggregate kernel, 86 Ir/row on scan_filter_agg
