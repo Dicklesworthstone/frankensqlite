@@ -373,6 +373,58 @@ const UPDATE_CASES: &[Case] = &[
     },
 ];
 
+/// Rowid reads beside column reads of the same rows (bd-w4pr1.13.20, lever R:
+/// the scan's Rowid reads the leaf cell without the row-decode cache). The
+/// INTEGER PRIMARY KEY column `id` fills the cache's rowid for a row, so a
+/// Rowid that trusted the cache without checking the cursor's position would
+/// return the previous row's rowid after Next; Column reads after a Rowid on a
+/// moved, rewritten or regrown row must still see that row. `u` has an
+/// implicit rowid and rows that grow past their cell when rewritten.
+const ROWID_MIX: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1500) \
+     INSERT INTO t SELECT i * 3, i % 11, printf('%040d', i) FROM n",
+    "CREATE TABLE u(a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1500) \
+     INSERT INTO u SELECT i % 7, 'u' || i FROM n",
+];
+const ROWID_MIX_STATE: &[&str] = &[
+    "SELECT rowid, a, rowid, id, b, rowid FROM t WHERE rowid % 9 = 0 ORDER BY rowid",
+    "SELECT count(*), sum(rowid), sum(a * rowid), sum(id - rowid) FROM t WHERE a % 2 = rowid % 2",
+    "SELECT id, rowid, a, rowid FROM t WHERE id % 7 = 1 ORDER BY id",
+    "SELECT rowid, a, rowid, b FROM u WHERE rowid % 13 = 1 ORDER BY rowid",
+    "SELECT count(*), sum(rowid), sum(a + rowid), max(length(b)) FROM u WHERE a = rowid % 5",
+    "PRAGMA integrity_check",
+];
+
+const ROWID_CASES: &[Case] = &[
+    Case {
+        setup: ROWID_MIX,
+        statement: "UPDATE t SET a = a + rowid % 5 WHERE id % 4 = 0",
+        states: ROWID_MIX_STATE,
+    },
+    Case {
+        setup: ROWID_MIX,
+        statement: "UPDATE t SET b = b || rowid WHERE rowid % 6 = 0",
+        states: ROWID_MIX_STATE,
+    },
+    Case {
+        setup: ROWID_MIX,
+        statement: "DELETE FROM t WHERE rowid % 6 = 3",
+        states: ROWID_MIX_STATE,
+    },
+    Case {
+        setup: ROWID_MIX,
+        statement: "UPDATE u SET b = b || rowid || rowid WHERE rowid % 3 = 0",
+        states: ROWID_MIX_STATE,
+    },
+    Case {
+        setup: ROWID_MIX,
+        statement: "DELETE FROM u WHERE a = rowid % 7",
+        states: ROWID_MIX_STATE,
+    },
+];
+
 fn tag_f(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_owned(),
@@ -547,6 +599,19 @@ fn scan_delete_matches_stock_in_one_pass_and_two() {
 fn scan_update_matches_stock_in_one_pass_and_two() {
     asupersync::test_utils::run_test(|| async {
         let failures = check_cases(UPDATE_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn rowid_reads_beside_column_reads_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(ROWID_CASES).await;
         assert!(
             failures.is_empty(),
             "{} differences from SQLite:\n{}",

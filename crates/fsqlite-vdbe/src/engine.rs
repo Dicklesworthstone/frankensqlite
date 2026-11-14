@@ -17603,8 +17603,14 @@ impl VdbeEngine {
             // The rowid of a storage cursor on a table leaf is in the cell the
             // cursor stands on. Everything else `Rowid` serves (an index
             // cursor, a virtual table, an in-memory cursor, a cursor at EOF)
-            // keeps its arm in `try_execute_hot_opcode_async`. A decline
-            // follows at most the stale-row refresh that arm starts with.
+            // keeps its arm in `try_execute_hot_opcode_async`.
+            //
+            // The cell is read directly; the row-decode cache is neither
+            // consulted nor filled (bd-w4pr1.13.20, lever R). Each of its
+            // readers compares the cursor's position stamp itself before
+            // trusting it, and keeping it coherent here (the stamp compare and
+            // the invalidation of a moved row) cost more than the two varints
+            // of the read on every scanned row.
             Opcode::Rowid => {
                 let Some(cursor) = self.storage_cursors.get_mut(&op.p1) else {
                     return Ok(false);
@@ -17612,7 +17618,7 @@ impl VdbeEngine {
                 if cursor.cursor.eof() {
                     return Ok(false);
                 }
-                let Some(rowid) = try_storage_cursor_cached_rowid_local(cursor)? else {
+                let Some(rowid) = cursor.cursor.try_table_leaf_rowid()? else {
                     return Ok(false);
                 };
                 self.set_reg_int(op.p2, rowid);
