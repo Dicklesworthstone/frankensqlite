@@ -4520,6 +4520,37 @@ pub fn codegen_select(
                             None,
                         );
                     }
+                    // The planner models no OR across indexes, so it plans a
+                    // full scan for `a = 5 OR s = 'k77'`; seek each term instead.
+                    if from_index_hint.is_none()
+                        && time_travel.is_none()
+                        && stmt.order_by.is_empty()
+                        && !ctx.reverse_unordered_selects
+                        && let Some(terms) =
+                            or_index_union_terms(where_clause.as_deref(), table, table_alias)
+                    {
+                        log_planner_select_directive_outcome(
+                            directive,
+                            "bypassed",
+                            "or_index_union",
+                            "or_index_union",
+                        );
+                        return codegen_select_or_index_union(
+                            b,
+                            cursor,
+                            table,
+                            table_alias,
+                            schema,
+                            columns,
+                            where_clause.as_deref(),
+                            stmt.limit.as_ref(),
+                            out_regs,
+                            out_col_count,
+                            done_label,
+                            end_label,
+                            &terms,
+                        );
+                    }
                     log_planner_select_directive_outcome(
                         directive,
                         "honored",
@@ -5260,6 +5291,28 @@ pub fn codegen_select(
             end_label,
             &plan,
             None,
+        )
+    } else if from_index_hint.is_none()
+        && time_travel.is_none()
+        && stmt.order_by.is_empty()
+        && !ctx.reverse_unordered_selects
+        && let Some(terms) = or_index_union_terms(where_clause.as_deref(), table, table_alias)
+    {
+        // --- MULTI-INDEX OR: one index seek per OR term ---
+        codegen_select_or_index_union(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            &terms,
         )
     } else {
         // --- Full table scan ---
@@ -7059,6 +7112,171 @@ fn codegen_select_full_scan(
     // End target for Init jump.
     b.resolve_label(end_label);
 
+    Ok(())
+}
+
+/// Split `expr` into its top-level OR terms, in written order.
+fn collect_disjunctive_terms<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    let mut pending = vec![expr];
+    while let Some(term) = pending.pop() {
+        if let Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Or,
+            right,
+            ..
+        } = term
+        {
+            pending.push(right);
+            pending.push(left);
+        } else {
+            out.push(term);
+        }
+    }
+}
+
+/// The index seek of each OR term of a WHERE whose every term pins an
+/// index's equality prefix (`a = 5 OR s = 'k77'`, `email = ?1 OR name = ?2`,
+/// `(a = 1 AND b = 2) OR c = 3`), as stock's MULTI-INDEX OR seeks them. A term
+/// with no such prefix means a full scan, so the whole OR declines. Anonymous
+/// `?` declines: the seeks emit their values before the WHERE does, and only
+/// numbered slots keep their numbers when reordered (the connection numbers
+/// every placeholder before code generation).
+fn or_index_union_terms<'t, 'e>(
+    where_clause: Option<&'e Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<Vec<IndexEqualityPrefix<'t, 'e>>> {
+    let where_expr = where_clause?;
+    if table.without_rowid || expr_contains_non_numbered_placeholder(where_expr) {
+        return None;
+    }
+    let mut terms = Vec::new();
+    collect_disjunctive_terms(where_expr, &mut terms);
+    if terms.len() < 2 {
+        return None;
+    }
+    terms
+        .into_iter()
+        .map(|term| index_equality_prefix_target(Some(term), table, table_alias))
+        .collect()
+}
+
+/// `SELECT ... WHERE <term> OR <term> ...` (no ORDER BY) as one index seek
+/// per term, in written order, each walking its equality block. A rowid set
+/// drops a row an earlier term already produced, then the row is looked up,
+/// filtered by the whole WHERE and emitted, as stock's MULTI-INDEX OR does:
+/// rows come out term by term, each term's in its index order, and a LIMIT
+/// ends the walk.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_or_index_union(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    terms: &[IndexEqualityPrefix<'_, '_>],
+) -> Result<(), CodegenError> {
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    let rowset_reg = b.alloc_reg();
+    let rowid_reg = b.alloc_reg();
+    let row_body = b.emit_label();
+    let row_return = b.alloc_reg();
+    let mut index_cursors = Vec::with_capacity(terms.len());
+    for (term_pos, term) in terms.iter().enumerate() {
+        let index = term.index;
+        let idx_cursor = cursor
+            + 1
+            + i32::try_from(term_pos)
+                .map_err(|_| CodegenError::Unsupported("too many OR terms".to_owned()))?;
+        index_cursors.push(idx_cursor);
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            index.root_page,
+            0,
+            P4::Index(index.name.clone()),
+            0,
+        );
+        let prefix_len = i32::try_from(term.values.len())
+            .map_err(|_| CodegenError::Unsupported("index equality prefix too wide".to_owned()))?;
+        let keys = b.alloc_regs(prefix_len);
+        for (offset, expr) in term.values.iter().enumerate() {
+            let key = keys + i32::try_from(offset).expect("prefix width checked");
+            emit_expr(b, expr, key, None);
+            // The probe takes the comparison affinity `col = value` applies.
+            if let Some(affinity) = index
+                .columns
+                .get(offset)
+                .and_then(|name| table.column_index(name))
+                .map(|column| table.columns[column].affinity)
+                .filter(|affinity| matches!(affinity, 'B' | 'C' | 'D' | 'E'))
+            {
+                b.emit_op(
+                    Opcode::Affinity,
+                    key,
+                    1,
+                    0,
+                    P4::Affinity(affinity.to_string()),
+                    0,
+                );
+            }
+        }
+        emit_index_prefix_rows(b, idx_cursor, index, keys, prefix_len, |b, skip_row| {
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            // Jumps when an earlier term produced the row; otherwise records it.
+            b.emit_jump_to_label(
+                Opcode::RowSetTest,
+                rowset_reg,
+                rowid_reg,
+                skip_row,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Gosub, row_return, 0, row_body, P4::None, 0);
+        });
+    }
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    // The row: the whole WHERE, OFFSET, the result columns, LIMIT.
+    b.resolve_label(row_body);
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+    }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+    b.resolve_label(skip_label);
+    b.emit_op(Opcode::Return, row_return, 0, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    for idx_cursor in index_cursors {
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
     Ok(())
 }
 
@@ -49473,7 +49691,6 @@ mod tests {
         for sql in [
             "SELECT id FROM t WHERE k = 2 OR v = 3",
             "SELECT id FROM t WHERE k = 2 OR k > 5",
-            "SELECT id FROM t WHERE k = 2 OR k = 3 AND id < 5",
             "SELECT id FROM t WHERE k = 2 OR k = 3 ORDER BY id",
             "SELECT id FROM t NOT INDEXED WHERE k = 2 OR k = 3",
         ] {
@@ -49484,6 +49701,15 @@ mod tests {
                 "`{sql}` must decline OR normalization and scan (Rewind present)"
             );
         }
+        // Not one column's equalities, so no IN normalization; but each OR term
+        // pins `k`, so the MULTI-INDEX OR seeks both (the second with `id < 5`
+        // left to the WHERE filter) instead of scanning (bd-e9vgj).
+        let union = bd_2dgf5_program("SELECT id FROM t WHERE k = 2 OR k = 3 AND id < 5");
+        assert!(
+            union.iter().any(|op| op.opcode == Opcode::RowSetTest)
+                && !union.iter().any(|op| op.opcode == Opcode::Rewind),
+            "k = 2 OR (k = 3 AND id < 5) must seek each OR term: {union:?}"
+        );
     }
 
     /// bd-2dgf5: a covering aggregate seek must read the index entry and nothing
