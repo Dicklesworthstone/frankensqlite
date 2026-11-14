@@ -1646,6 +1646,24 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN: COUNT(*) over an index range, IS NULL or IS NOT NULL counts whole leaves from the b-tree (bd-2fb53)
+
+- Target: `count(*) WHERE n IS NOT NULL` (read every row, 7.3x stock), `n IS NULL` and `a BETWEEN
+  10 AND 20` (an index walk at ~2.3k instructions per entry, 6x). Stock steps every entry with
+  Next as well. Touched: crates/fsqlite-btree/src/cursor.rs (count_entries_before: a leaf whose
+  last key orders before the bound is added from its cell count, the boundary leaf
+  binary-searched, separators tested one by one, leaves reached via advance_next),
+  crates/fsqlite-types/src/opcode.rs + crates/fsqlite-vdbe/src/engine.rs (Opcode::IdxCountBefore),
+  crates/fsqlite-vdbe/src/codegen.rs (codegen_select_count_star_index_range for a lone COUNT(*)
+  over an exact range, IS NULL or IS NOT NULL).
+- Result (6e66dfd70; scratchpad cnt_ab.py, 200k-row t, stock live, answers equal; ELF before
+  59cc18d57c4c7ced, after 631b8c89affe8939; thinkstation1): IS NOT NULL 7.27x -> 0.20x, IS NULL
+  6.42x -> 0.07x, BETWEEN 6.01x -> 0.21x, `a > 500` 18.85x -> 0.17x, `a < 500` 6.30x -> 0.06x,
+  BINARY text range 6.18x -> 0.07x, REAL range 19.77x -> 0.24x; `a = 5` unchanged (4.98x).
+- Retry / next: an equality or equality prefix (`a = c`, `a = 1 AND b = 2`) as the inclusive
+  range [c, c] where index_range_fast_path_is_safe holds; a NOCASE text range (declined by the
+  range target today); a composite index's leading range with no residual.
+
 ## 2026-11-14 - WIN (without statistics): a two-table inner join samples its b-trees to choose the driving table (bd-prkvt)
 
 - Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` without ANALYZE drove
