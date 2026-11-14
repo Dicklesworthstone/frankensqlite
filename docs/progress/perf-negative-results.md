@@ -87,6 +87,74 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: a top-level statement keeps its statement future in one box (bd-w4pr1.13.35 lever 3, bd-w4pr1.11)
+
+- Target: the per-statement future allocations of every statement through the dispatcher; measured
+  on an in-transaction literal INSERT, an autocommit point SELECT by rowid (bd-w4pr1.11's shape),
+  `txn_1000x10_rows` and `autocommit_5k_inserts`. Touched: `crates/fsqlite-core/src/connection.rs`
+  (`execute_statement_after_background_status`, `execute_statement_once_after_background_status`,
+  `execute_statement_impl_after_background_status` and the new `execute_statement_impl_body`, the
+  dispatcher's INSERT arm, the new `statement_may_target_attached_schema`).
+- Ledger preflight: bd-uzq54 (2026-08-11) rejected boxing cold branches of the prepared-statement
+  futures; this removes boxes instead. bd-w4pr1.28's `lean_future` keeps boxing in debug builds,
+  where inline futures blow up stack frames.
+- Evidence before (gdb `break malloc if size >= 4096`, symbolized glibc release-perf CLI of main
+  d41ec59eb, per statement = (200 - 100 statements) / 100): an in-transaction INSERT allocated
+  32,320 B (the impl's `Box::pin`), 11,744 B (`once`'s `Box::pin`), 21,640 B (the INSERT arm's
+  `boxed_future`) and a 4,112 B page `Arc`; a point SELECT the same 32,320 + 11,744 B, 13,968 B
+  (the attached-target delegation's `Box::pin`, which answers None for any SELECT) and two 4,096 B
+  buffers. On the shipped musl CLI these sizes are mallocng groups mapped and unmapped per
+  statement (bd-w4pr1.11's diagnosis).
+- Change: `once` is an async fn and the impl's body the async fn `execute_statement_impl_body`;
+  the top-level path awaits both through `lean_future`, inside the `FallbackStatementFuture` box
+  that `execute_statement_after_background_status` already holds and that stays the recursion
+  break. `execute_statement_impl_after_background_status` stays the boxed dyn entry for the calls
+  from inside the dispatch (row replay, triggers, views), so every recursion still passes a dyn box
+  (an unboxed cycle does not compile in release). The INSERT arm awaits its dispatch through
+  `lean_future`. The delegation future is built only for the statement kinds the delegation acts
+  on (CREATE TABLE / INDEX / VIEW / TRIGGER, a schema-qualified INSERT, UPDATE, DELETE, PRAGMA,
+  DROP, ALTER TABLE).
+- Result (binaries 20fd8a8a... = main d41ec59eb; f436fb47... = d41ec59eb plus this diff with the
+  body written as `fn -> impl Future { async move }`, and 0a8d713d... = the landed `async fn`
+  form, which clippy's `manual_async_fn` required; stock sqlite3 3.46.1 live; every answer and the
+  shell output over 768 runs equal): allocations of 4 KiB or more per statement, in-transaction
+  INSERT 4 -> 2 (one 40,288 B future box and the page `Arc`), point SELECT 5 -> 3 (one 40,288 B box
+  and the two buffers), the same in both lever binaries; `strace -c` brk / mmap / munmap counts
+  unchanged and independent of the statement count. Callgrind exact: in-transaction INSERT 37,847
+  -> 36,924 and 36,929 (-0.92k); point SELECT, whose autocommit runs vary about 0.5k for one
+  binary, base 81,691 / 81,325 / 81,891 against the lever 80,776 / 80,480 (-0.9k to -1.4k). perf
+  stat per point SELECT (sel_probe.py, 5 reps): 82.8k -> 81.3k user instructions (3.42x -> 3.36x
+  stock 24.2k). `txn_1000x10_rows`, two runs of 7 interleaved reps: 682.5M -> 679.5M and 687.8M ->
+  676.8M mean (medians -7.9M, -10.4M; 4.45x -> 4.41x stock 153.9M), inside the row's spread;
+  `autocommit_5k_inserts` 1,244.4M -> 1,230.7M and 1,243.3M -> 1,234.4M. Prediction (registered):
+  future boxes 3 -> 1 (met); callgrind -1.0k to -1.6k per INSERT (missed at -0.92k), -0.9k to -1.5k
+  per SELECT (met at the low end); txn row -10M to -16M (not resolved: -7M over 14 reps). Kill lines
+  (under 0.6k per INSERT, boxes not down to one, more mapping syscalls, an answer differing) not
+  met.
+- Tests: `the_attached_target_gate_admits_every_statement_the_delegation_runs` (unit, against an
+  attached database): every statement kind the delegation acts on is admitted by the gate and
+  delegated, and nine kinds the gate now skips (SELECT on aux and main, an unqualified INSERT,
+  BEGIN, COMMIT, SAVEPOINT, RELEASE, ANALYZE aux, EXPLAIN of an aux INSERT) get None from the
+  delegation. The release CLI's trigger recursion up to the depth cap and an FK cascade answer as
+  the base CLI does.
+- Gate (rch, d41ec59eb plus the change): clippy -D warnings on fsqlite-core `--all-targets` clean
+  (and again on the rebased tree); fsqlite-core lib 4,175 pass and 2 fail (the t6741 pair); 40
+  fsqlite-core targets in five batches (view-chain and small-stack, busy-retry, attach, trigger /
+  INSTEAD OF / recursive CTE, savepoint / conflict / RETURNING / literal parameterization, FK /
+  FTS5 / CHECK depth) 205 pass and 3 fail, each red on main: bd-vy10l `gh516_returning_conformance`
+  and `bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack` twice (its stock side:
+  the bundled SQLite refuses `SELECT * FROM v999` with "VIEWs and/or subqueries nested too deep"
+  before fsqlite runs); 8 fsqlite targets 121 pass. The tests run with debug assertions, where
+  `lean_future` still boxes, so the release shape is checked by the release CLI: shell output over
+  768 runs, the scorecard rows' answers, and trigger recursion to the depth cap and an FK cascade,
+  all equal to the base CLI.
+- Landed as af3dabe00 (rebased onto 1fa98375c; clippy reran on bbd81503d plus the change, and the
+  two later upstream commits touch fsqlite-vdbe codegen, a fsqlite test and the tracker).
+- Retry condition: none for this. Left: the `FallbackStatementFuture` box itself (40 KB, one per
+  top-level statement); removing it needs the statement attribution it carries to wrap an inline
+  future (structural pinning), worth one more large allocation per statement and the remaining
+  musl group mapping.
+
 ## 2026-11-14 - LOSS: an inner join driving from the table its WHERE pins, without row estimates (bd-9uf3l, not landed)
 
 - Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` drives from p (all 50,000
