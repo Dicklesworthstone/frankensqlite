@@ -87,6 +87,49 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: a leaner column decode in the parallel aggregate kernel, which brings its CPU to stock's on scan_filter_agg (bd-w4pr1.13.11 kernel lever K3)
+
+- Target: the per-row column decode of the parallel ungrouped-aggregate kernel after K2 (above):
+  `Row::cell` 152.7 Ir/row on scan_filter_agg's filter path (call frame and cache check ~43, a
+  `drop_in_place` of `decode_scalar_value`'s `Option<SqliteValue>` ~10, the per-row REAL-column
+  lookup through `shape.real_columns`). Touched: `crates/fsqlite-vdbe/src/parallel_aggregate.rs`
+  (`ColumnSource`, `RowScratch::sources`, `Row::cell` / `Row::decode`), the oracle file.
+- Ledger preflight: K1 and K2 below. No earlier entry on this decode.
+- Pre-registered on the bead (2026-11-14T12:21Z): (a) decode through
+  `decode_numeric_column_from_offset` (Copy result, one bounds check, no drop glue; TEXT / BLOB to
+  the general decoder; NULL, serial types 10-11 and a NaN REAL read as NULL in both decoders), (b)
+  the cache check of `cell()` inlined into its callers, (c) each plan column's source (rowid or
+  alias, or declared index with its REAL flag) resolved once per walk. Prediction -30 to -55 Ir/row
+  at every worker count, CPU at 8 workers -2 to -5 ms; kill below -15.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 6607bdb8bb30d2de =
+  ac486d7f0; stock sqlite3 3.46.1 live in the same par_probe run, reps 5; answers equal
+  everywhere): with (b) as an `#[inline]` hint, which LLVM did not take (`cell` stayed a call),
+  K3 d1373ffdf495b4f9: scan_filter_agg at 8 workers 572.4M -> 546.4M user instructions (-26.0
+  Ir/row, below the predicted range, above the kill floor), CPU 60.9 -> 58.3 ms (stock 55.2; x1.10
+  -> x1.06), wall 7.7 -> 8.1 ms (stock 55.7), 7 helper threads in both; callgrind exact 572.06M ->
+  546.04M, `Row::cell` 166.7 -> 138.7, the `Option<SqliteValue>` drop gone (10 -> 0).
+  With (b) forced (`#[inline(always)]` under `#[allow(clippy::inline_always)]`, as engine.rs does
+  for measured hot paths), K3b 25f24cab81ffe4eb against the same base: 572.4M -> 534.4M (-38.0
+  Ir/row, inside the prediction), CPU 59.4 -> 56.8 ms against stock's 56.9 in the same run (x1.04
+  -> x1.00), wall 8.1 -> 7.7 ms (stock 56.8); callgrind exact 576.08M -> 538.11M, the decode now
+  an out-of-line `Row::decode` of 104.7 Ir/row behind an inline cache check. K3b is what
+  landed, as 61fe0d627.
+  Serial rows unchanged in every arm: scan_filter_agg 1,234.9M, count_star 63.4M,
+  group_by_1000_groups 3,334.0M user instructions (the serial engine is not touched).
+- Gate: the oracle file (13 tests; the serial-type test gains a plan reading the REAL column, an
+  INTEGER column and the INTEGER PRIMARY KEY together, whose sources a mix-up would swap), the
+  budget test, four aggregate keepers, six fsqlite count / min / max oracles, clippy. A first draft
+  of that new query filtered on `id > 100`, which the planner answers with a rowid range seek, so
+  it never reached the parallel plan; the landed query filters on `z <> 0`.
+- Verdict: WIN, kept as K3b (MAINTENANCE by the suite's rules, a self-speedup of the default-on
+  parallel path). Against stock live in the same run, scan_filter_agg at 8 workers is now x1.00
+  CPU and x0.14 wall; K1 + K2 + K3 together took the kernel from 635 to 534 Ir/row. The serial
+  path (x1.87-1.94 stock CPU on the same row) is untouched by all three.
+- Retry condition: none (kept). The decode after K3 is ~139 Ir/row; what is left in it is the
+  rowid-alias verdict and payload index (~18), the cache bookkeeping and the general bounds of
+  `column_offset`; the next kernel levers are the record header parse (91 Ir/row, shared with
+  the serial in-place Column lane) and the leaf cell parse (86 Ir/row).
+
 ## 2026-11-14 - WIN: an explicit COMMIT alone in its window advances the memdb mirror to its own commit (bd-w4pr1.7, lever E)
 
 - Target: every explicit write transaction on a file-backed WAL database (the scorecard's
@@ -466,8 +509,9 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   and max compare and store an INTEGER against an INTEGER best in place. Every other pair builds
   the SqliteValue and calls compare_for_where / cmp_binary_in as before.
 - Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 930fd4dc423904a4 =
-  6ae747d6d, K2 88c0dbbbc7c2b1fc = 6ae747d6d + this diff, landed as cb70f9126; stock sqlite3 3.46.1 live in the same
-  par_probe run, reps 5; answers equal everywhere): scan_filter_agg at 8 workers 635.4M -> 572.4M
+  6ae747d6d, K2 88c0dbbbc7c2b1fc = 6ae747d6d + this diff, landed as cb70f9126; stock sqlite3
+  3.46.1 live in the same par_probe run, reps 5; answers equal everywhere): scan_filter_agg at 8
+  workers 635.4M -> 572.4M
   user instructions (-63.0 Ir/row), CPU 68.0 -> 63.6 ms (stock 53.6; x1.27 -> x1.19), wall 10.7 ->
   9.1 ms (stock 53.6), 7 helper threads in both. Callgrind exact (2 workers) 635.05M -> 572.04M:
   compare_for_where off the hot path (51 Ir/row -> 0), Row::eval 268.7 -> 226.7. Serial rows
