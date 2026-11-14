@@ -549,3 +549,77 @@ fn stale_prepared_statement_reprepares_after_schema_change_from_other_connection
     });
     outcome
 }
+
+async fn row_count_and_sum(conn: &Connection) -> TestResult<(i64, i64)> {
+    let rows = conn.query("SELECT count(*), coalesce(sum(pk), 0) FROM t").await?;
+    match rows[0].values() {
+        [SqliteValue::Integer(count), SqliteValue::Integer(sum)] => Ok((*count, *sum)),
+        other => Err(format!("expected two integers, got {other:?}").into()),
+    }
+}
+
+/// bd-w4pr1.7: a begin skips re-deriving committed state only when the WAL-index
+/// header its reader admission bound is the one this connection's last refresh
+/// or own commit left behind. Its own autocommit inserts and a repeated read
+/// take that path; a peer's commit between two statements moves the header, so
+/// the next statement must see the peer's row (a begin that skipped anyway would
+/// answer from its stale committed state and page cache).
+#[test]
+fn autocommit_statements_see_each_peer_commit_and_their_own() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let db_path = dir.path().join("begin-signature.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+
+            let conn_a = open_wal_db(&db_path).await?;
+            setup_table(&conn_a).await?;
+            let conn_b = open_wal_db(&db_path).await?;
+            let mut expected = (0_i64, 0_i64);
+            for round in 0..6_i64 {
+                let own = round * 2;
+                conn_a
+                    .execute_with_params(
+                        "INSERT INTO t(pk, v) VALUES(?1, 'a')",
+                        &[SqliteValue::Integer(own)],
+                    )
+                    .await?;
+                expected = (expected.0 + 1, expected.1 + own);
+                assert_eq!(
+                    row_count_and_sum(&conn_a).await?,
+                    expected,
+                    "own commit, round {round}"
+                );
+                assert_eq!(
+                    row_count_and_sum(&conn_a).await?,
+                    expected,
+                    "an unchanged header keeps the answer, round {round}"
+                );
+
+                let peer = own + 1;
+                conn_b
+                    .execute_with_params(
+                        "INSERT INTO t(pk, v) VALUES(?1, 'b')",
+                        &[SqliteValue::Integer(peer)],
+                    )
+                    .await?;
+                expected = (expected.0 + 1, expected.1 + peer);
+                assert_eq!(
+                    row_count_and_sum(&conn_a).await?,
+                    expected,
+                    "the peer's commit is seen by the next statement, round {round}"
+                );
+                assert_eq!(
+                    row_count_and_sum(&conn_b).await?,
+                    expected,
+                    "peer view, round {round}"
+                );
+            }
+            assert_eq!(expected, (12, 66));
+            Ok(())
+        }
+        .await;
+    });
+    outcome
+}
