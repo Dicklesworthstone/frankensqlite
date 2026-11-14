@@ -1407,11 +1407,12 @@ impl SqliteValue {
         }
     }
 
-    /// Mirrors C SQLite's `numericType()` (SQLite VDBE:496): returns true if this
-    /// value should be treated as an integer for arithmetic purposes.
+    /// Whether this value has an integer numeric prefix: an Integer, or
+    /// Text/Blob whose SQLite numeric prefix parses as an `i64`. Float, Null and
+    /// text with no numeric prefix are not.
     ///
-    /// Integer values are obviously integer-typed. Text/Blob values that parse
-    /// as i64 are also integer-typed. Float and Null are not.
+    /// This is not arithmetic's operand type: there non-numeric text counts as
+    /// integer 0 (see [`Self::is_float_numeric_type`]).
     #[inline]
     pub fn is_integer_numeric_type(&self) -> bool {
         fn text_is_integer_numeric_type(s: &str) -> bool {
@@ -1428,12 +1429,14 @@ impl SqliteValue {
         }
     }
 
-    /// Returns true for REAL syntax or a numeric prefix outside the `i64` range.
-    /// Non-numeric text/blob is NOT float: it coerces to integer 0 in
-    /// SQLite's OP_Add/Sub/Mul. Arithmetic must promote overflowing integer
-    /// text to REAL instead of using the saturating INTEGER conversion.
+    /// Arithmetic's operand type, as C SQLite's `numericType()` decides it:
+    /// true (REAL) for a Float, or Text/Blob whose numeric prefix is REAL
+    /// syntax or lies outside the `i64` range; false (INTEGER) otherwise.
+    /// Non-numeric text/blob is NOT float: it coerces to integer 0 in every
+    /// arithmetic opcode (`+ - * / %`). Arithmetic must promote overflowing
+    /// integer text to REAL instead of using the saturating INTEGER conversion.
     #[inline]
-    fn is_float_numeric_type(&self) -> bool {
+    pub fn is_float_numeric_type(&self) -> bool {
         fn text_is_float(s: &str) -> bool {
             let trimmed = trim_sqlite_ascii_whitespace(s);
             let end = scan_numeric_prefix(trimmed.as_bytes());
@@ -1532,6 +1535,59 @@ impl SqliteValue {
                 }
             }
             _ => Self::float_result_or_null(self.to_float() * other.to_float()),
+        }
+    }
+
+    /// Divide following SQLite's `OP_Divide`: NULL if either operand is NULL
+    /// or the divisor is zero. When both operands are integer-typed by
+    /// [`Self::is_float_numeric_type`] (text with no numeric prefix counts as
+    /// integer 0, bd-5lrpw), the division truncates toward zero and
+    /// `i64::MIN / -1` is promoted to REAL; otherwise it is REAL division. A
+    /// NaN result is NULL.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn sql_div(&self, divisor: &Self) -> Self {
+        if self.is_null() || divisor.is_null() {
+            return Self::Null;
+        }
+        if !self.is_float_numeric_type() && !divisor.is_float_numeric_type() {
+            let a = self.to_integer();
+            let b = divisor.to_integer();
+            if b == 0 {
+                return Self::Null;
+            }
+            return match a.checked_div(b) {
+                Some(result) => Self::Integer(result),
+                None => Self::float_result_or_null(a as f64 / b as f64),
+            };
+        }
+        let b = divisor.to_float();
+        if b == 0.0 {
+            return Self::Null;
+        }
+        Self::float_result_or_null(self.to_float() / b)
+    }
+
+    /// Remainder following SQLite's `OP_Remainder`: NULL if either operand is
+    /// NULL or the integer divisor is zero. Both operands are converted to
+    /// integers; the result is INTEGER when both are integer-typed (the rule of
+    /// [`Self::sql_div`]) and REAL otherwise. `i64::MIN % -1` is 0.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn sql_rem(&self, divisor: &Self) -> Self {
+        if self.is_null() || divisor.is_null() {
+            return Self::Null;
+        }
+        let a = self.to_integer();
+        let b = divisor.to_integer();
+        if b == 0 {
+            return Self::Null;
+        }
+        let result = a.checked_rem(b).unwrap_or_default();
+        if !self.is_float_numeric_type() && !divisor.is_float_numeric_type() {
+            Self::Integer(result)
+        } else {
+            Self::Float(result as f64)
         }
     }
 
@@ -3696,6 +3752,56 @@ mod tests {
         assert!(SqliteValue::Blob(Arc::from(b"123a".as_slice())).is_integer_numeric_type());
         assert!(!SqliteValue::Text(SmallText::new("1.5e2abc")).is_integer_numeric_type());
         assert!(!SqliteValue::Text(SmallText::new("abc")).is_integer_numeric_type());
+    }
+
+    #[test]
+    fn sql_div_and_sql_rem_take_arithmetic_operand_types() {
+        // `SqliteValue` equality is numeric (INTEGER 0 == REAL 0.0), so the
+        // storage class is checked through the derived `Debug` text.
+        fn class(v: &SqliteValue) -> String {
+            format!("{v:?}")
+        }
+        let text = |s: &str| SqliteValue::Text(SmallText::new(s));
+        let int = SqliteValue::Integer;
+        let cases = [
+            // bd-5lrpw: text with no numeric prefix is INTEGER 0, not REAL 0.0.
+            (text("x").sql_div(&int(3)), "Integer(0)"),
+            (text("x").sql_rem(&int(3)), "Integer(0)"),
+            (
+                SqliteValue::Blob(Arc::from(b"A".as_slice())).sql_rem(&int(3)),
+                "Integer(0)",
+            ),
+            (text("").sql_div(&text("2")), "Integer(0)"),
+            // Numeric text divides as an integer.
+            (text("17").sql_div(&int(5)), "Integer(3)"),
+            (text("12abc").sql_rem(&int(5)), "Integer(2)"),
+            // A REAL-looking or out-of-range prefix stays REAL, even for `%`.
+            (text("2.5").sql_rem(&int(2)), "Float(0.0)"),
+            (
+                text("9223372036854775808").sql_div(&int(2)),
+                "Float(4.611686018427388e18)",
+            ),
+            // Overflow promotes; zero divisors, NULL and NaN give NULL.
+            (
+                int(i64::MIN).sql_div(&int(-1)),
+                "Float(9.223372036854776e18)",
+            ),
+            (int(i64::MIN).sql_rem(&int(-1)), "Integer(0)"),
+            (int(5).sql_div(&int(0)), "Null"),
+            (int(5).sql_rem(&text("x")), "Null"),
+            (
+                SqliteValue::Float(1.0).sql_div(&SqliteValue::Float(0.0)),
+                "Null",
+            ),
+            (SqliteValue::Null.sql_div(&int(1)), "Null"),
+            (
+                SqliteValue::Float(f64::INFINITY).sql_div(&SqliteValue::Float(f64::INFINITY)),
+                "Null",
+            ),
+        ];
+        for (index, (value, expected)) in cases.iter().enumerate() {
+            assert_eq!(class(value), *expected, "case {index}");
+        }
     }
 
     #[test]

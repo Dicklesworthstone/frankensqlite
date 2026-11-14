@@ -140589,8 +140589,8 @@ fn evaluate_having_value(
                 fsqlite_ast::BinaryOp::Add => lv.sql_add(&rv),
                 fsqlite_ast::BinaryOp::Subtract => lv.sql_sub(&rv),
                 fsqlite_ast::BinaryOp::Multiply => lv.sql_mul(&rv),
-                fsqlite_ast::BinaryOp::Divide => numeric_div(&lv, &rv),
-                fsqlite_ast::BinaryOp::Modulo => numeric_mod(&lv, &rv),
+                fsqlite_ast::BinaryOp::Divide => lv.sql_div(&rv),
+                fsqlite_ast::BinaryOp::Modulo => lv.sql_rem(&rv),
                 fsqlite_ast::BinaryOp::Concat => lv.sql_concat(&rv),
                 fsqlite_ast::BinaryOp::BitAnd => {
                     if is_null_op {
@@ -140999,76 +140999,6 @@ fn evaluate_having_value(
         }
 
         _ => Ok(SqliteValue::Null),
-    }
-}
-
-/// SQL division with NULL propagation, division-by-zero → NULL, and overflow
-/// promotion to REAL (matching VDBE `sql_div` semantics).
-#[allow(clippy::cast_precision_loss)]
-fn numeric_div(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    if a.is_null() || b.is_null() {
-        return SqliteValue::Null;
-    }
-    if let (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) = (a, b) {
-        if *bi == 0 {
-            SqliteValue::Null
-        } else {
-            match ai.checked_div(*bi) {
-                Some(result) => SqliteValue::Integer(result),
-                // i64::MIN / -1 overflows; C SQLite promotes to the floating
-                // point arithmetic path.
-                #[allow(clippy::cast_precision_loss)]
-                None => {
-                    let result = *ai as f64 / *bi as f64;
-                    if result.is_nan() {
-                        SqliteValue::Null
-                    } else {
-                        SqliteValue::Float(result)
-                    }
-                }
-            }
-        }
-    } else {
-        let bf = b.to_float();
-        if bf == 0.0 {
-            SqliteValue::Null
-        } else {
-            let result = a.to_float() / bf;
-            if result.is_nan() {
-                SqliteValue::Null
-            } else {
-                SqliteValue::Float(result)
-            }
-        }
-    }
-}
-
-/// SQL remainder with NULL propagation and division-by-zero → NULL.
-///
-/// C SQLite: both-integer → Integer result; otherwise converts both to integer
-/// and computes `iB % iA`, storing as Float.
-#[allow(clippy::cast_precision_loss)]
-fn numeric_mod(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    if a.is_null() || b.is_null() {
-        return SqliteValue::Null;
-    }
-    // C SQLite converts both operands to integer for OP_Remainder in ALL
-    // paths: iA = intValue(pIn1), iB = intValue(pIn2).
-    // Both-integer → Integer result; mixed/float → Float result.
-    let both_int = matches!((a, b), (SqliteValue::Integer(_), SqliteValue::Integer(_)));
-    let ai = a.to_integer();
-    let bi = b.to_integer();
-    if bi == 0 {
-        return SqliteValue::Null;
-    }
-    let rem = ai.checked_rem(bi).unwrap_or(0);
-    if both_int {
-        SqliteValue::Integer(rem)
-    } else {
-        #[allow(clippy::cast_precision_loss)]
-        {
-            SqliteValue::Float(rem as f64)
-        }
     }
 }
 
@@ -165436,8 +165366,8 @@ fn eval_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) -> Sqli
         BinaryOp::Add => left.sql_add(right),
         BinaryOp::Subtract => left.sql_sub(right),
         BinaryOp::Multiply => left.sql_mul(right),
-        BinaryOp::Divide => numeric_div(left, right),
-        BinaryOp::Modulo => numeric_mod(left, right),
+        BinaryOp::Divide => left.sql_div(right),
+        BinaryOp::Modulo => left.sql_rem(right),
         BinaryOp::Concat => left.sql_concat(right),
         BinaryOp::Is => {
             let eq = match (left.is_null(), right.is_null()) {

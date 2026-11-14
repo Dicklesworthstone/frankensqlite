@@ -171,3 +171,107 @@ fn remainder_over_scanned_rows_matches_rusqlite_oracle() {
         );
     });
 }
+
+/// bd-5lrpw: arithmetic decides INTEGER or REAL per operand as stock's
+/// `numericType()` does. Text or blob with no numeric prefix counts as INTEGER
+/// 0 in every operator, so `'x' / 3` and `x'41' % 3` are INTEGER 0 (they were
+/// REAL 0.0 in `/` and `%`); a REAL-looking or out-of-range prefix stays REAL
+/// (`'2.5' % 2` is REAL 0.0, `'9223372036854775808' / 3` REAL), which a fix
+/// treating all text as integer would get wrong. Each operand class is tried
+/// on both sides, as literals and as values read from scanned rows.
+#[test]
+fn text_and_blob_operands_take_stock_numeric_type_in_every_operator() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let operands = [
+            "'x'",
+            "''",
+            "' '",
+            "'abc1'",
+            "x'41'",
+            "x''",
+            "'12abc'",
+            "' 7 '",
+            "'7'",
+            "'-3'",
+            "'2.5'",
+            "'1e3'",
+            "'1.0'",
+            "'9223372036854775807'",
+            "'9223372036854775808'",
+            "char(11) || '42'",
+            "char(160) || '1.5'",
+            "3",
+            "2.5",
+            "0",
+        ];
+        let setup = [
+            "CREATE TABLE v(id INTEGER PRIMARY KEY, a)".to_owned(),
+            format!(
+                "INSERT INTO v(a) VALUES {}",
+                operands
+                    .iter()
+                    .map(|o| format!("({o})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ];
+        for statement in &setup {
+            f.execute(statement).await.unwrap();
+            r.execute_batch(statement).unwrap();
+        }
+        let mut queries = Vec::new();
+        for op in ["/", "%", "+", "-", "*"] {
+            queries.push(format!(
+                "SELECT l.id, r.id, l.a {op} r.a, typeof(l.a {op} r.a) \
+                 FROM v AS l, v AS r ORDER BY l.id, r.id"
+            ));
+            for operand in operands {
+                queries.push(format!(
+                    "SELECT {operand} {op} 3, typeof({operand} {op} 3), \
+                     7 {op} {operand}, typeof(7 {op} {operand})"
+                ));
+            }
+        }
+        // HAVING is evaluated outside the VDBE for grouped scans and grouped
+        // joins; before the fix it gave REAL for every `/` and `%` there
+        // ('17' / 5 = 3.4), so these kept only the INTEGER operand row.
+        f.execute("CREATE TABLE w(id INTEGER PRIMARY KEY, b)")
+            .await
+            .unwrap();
+        r.execute_batch("CREATE TABLE w(id INTEGER PRIMARY KEY, b)")
+            .unwrap();
+        f.execute("INSERT INTO w(b) VALUES (1), (2)").await.unwrap();
+        r.execute_batch("INSERT INTO w(b) VALUES (1), (2)").unwrap();
+        for op in ["/", "%"] {
+            queries.push(format!(
+                "SELECT id, count(*) FROM v GROUP BY id \
+                 HAVING typeof(a {op} 3) = 'integer' ORDER BY id"
+            ));
+            queries.push(format!(
+                "SELECT l.id, count(*) FROM v AS l, w AS r GROUP BY l.id \
+                 HAVING typeof(l.a {op} 3) = 'integer' ORDER BY l.id"
+            ));
+        }
+        queries.push(
+            "SELECT l.id, count(*) FROM v AS l, w AS r GROUP BY l.id \
+             HAVING l.a / 5 = 3 ORDER BY l.id"
+                .to_owned(),
+        );
+        let mut diffs = Vec::new();
+        for q in &queries {
+            let fr = fq(&f, q).await;
+            let rr = rq(&r, q);
+            if fr != rr {
+                diffs.push(format!("  `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"));
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} arithmetic operand-type divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

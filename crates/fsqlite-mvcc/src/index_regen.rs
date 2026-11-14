@@ -329,8 +329,10 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::Add => left.sql_add(&right),
         RebaseBinaryOp::Subtract => left.sql_sub(&right),
         RebaseBinaryOp::Multiply => left.sql_mul(&right),
-        RebaseBinaryOp::Divide => numeric_div(&left, &right),
-        RebaseBinaryOp::Remainder => numeric_rem(&left, &right),
+        // The engine's own rules, so a regenerated index key equals the one the
+        // statement computed (bd-5lrpw).
+        RebaseBinaryOp::Divide => left.sql_div(&right),
+        RebaseBinaryOp::Remainder => left.sql_rem(&right),
         RebaseBinaryOp::BitwiseAnd => integer_bitop(&left, &right, |a, b| a & b),
         RebaseBinaryOp::BitwiseOr => integer_bitop(&left, &right, |a, b| a | b),
         #[allow(clippy::cast_sign_loss)]
@@ -355,44 +357,6 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
                 a >> shift
             }
         }),
-    }
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn numeric_div(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        if *b == 0 {
-            return SqliteValue::Null;
-        }
-        match a.checked_div(*b) {
-            Some(result) => SqliteValue::Integer(result),
-            None => SqliteValue::from(*a as f64 / *b as f64),
-        }
-    } else {
-        let fb = r.to_float();
-        if fb == 0.0 {
-            return SqliteValue::Null;
-        }
-        SqliteValue::from(l.to_float() / fb)
-    }
-}
-
-fn numeric_rem(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        if *b == 0 {
-            return SqliteValue::Null;
-        }
-        SqliteValue::Integer(a.wrapping_rem(*b))
-    } else {
-        // C SQLite: OP_Remainder always converts to integers even for float
-        // operands, performs integer %, then returns result as Float.
-        let ia = l.to_integer();
-        let ib = r.to_integer();
-        if ib == 0 {
-            return SqliteValue::Null;
-        }
-        let result = ia.checked_rem(ib).unwrap_or_default();
-        SqliteValue::Float(result as f64)
     }
 }
 
