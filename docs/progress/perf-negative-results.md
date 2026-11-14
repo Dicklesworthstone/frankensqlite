@@ -1646,6 +1646,22 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN (probe not met): an aggregate over an index range with a residual a composite index holds walks only that index (bd-k96op)
+
+- Target: `count(*) WHERE a > 500 AND b = 3` with t_a and t_ab (201x stock): the residual branch
+  of aggregate_index_range_seek_target took only single-column indexes, so it walked t_a and
+  looked every row up for `b = 3`. Touched: crates/fsqlite-vdbe/src/codegen.rs (the residual
+  branch tries indexes covering the WHERE first when it has residual terms; the range walk
+  applies such a residual from the entry with emit_index_entry_where_filter and stays
+  covering; a wider index is sought with the bound alone).
+- Result (80a94ab35; scratchpad cnt_ab.py, stock live, answers equal; ELF before
+  59cc18d57c4c7ced, after 40e54cbe1be33311; thinkstation1): 201.1x -> 105.3x; sum(c) over a
+  range 4.09x -> 3.94x; other rows unchanged. The 2x probe is missed by the per-entry cost:
+  ~6.2k instructions per index entry against stock's ~59.
+- Retry / next: fill the row image with only the columns the residual names (each index
+  Column ~1.4k) and skip IdxRowid when unused; the rest is per-opcode / per-Column engine
+  cost (bd-w4pr1.13.7, bd-w4pr1.13.4).
+
 ## 2026-11-14 - WIN: COUNT(*) over an index range, IS NULL or IS NOT NULL counts whole leaves from the b-tree (bd-2fb53)
 
 - Target: `count(*) WHERE n IS NOT NULL` (read every row, 7.3x stock), `n IS NULL` and `a BETWEEN
