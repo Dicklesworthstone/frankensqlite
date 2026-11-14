@@ -7791,6 +7791,10 @@ pub struct VdbeEngine {
     /// MemDB data. This eliminates the 0.10 µs/row sync overhead for fast-path
     /// storage-cursor-backed workloads.
     dirty_root_pages: HashSet<i32>,
+    /// Set by `reset_for_next_transaction`, cleared by every reuse reset
+    /// (which precedes any binding or run): an engine parked across several
+    /// commits without being used is reset once, not at every commit.
+    transaction_state_clear: bool,
 }
 
 type ResultRowCallback<'a> = dyn FnMut(smallvec::SmallVec<[SqliteValue; 16]>) -> Result<()> + 'a;
@@ -8425,6 +8429,7 @@ impl VdbeEngine {
             statement_state_clean: true,
             statement_cold_state: StatementColdState::empty(),
             dirty_root_pages: HashSet::new(),
+            transaction_state_clear: false,
         }
     }
 
@@ -8695,6 +8700,7 @@ impl VdbeEngine {
             self.max_collected_result_rows = None;
         }
         self.statement_state_clean = true;
+        self.transaction_state_clear = false;
     }
 
     /// Reset the engine for reuse, clearing per-statement state but keeping
@@ -8762,6 +8768,26 @@ impl VdbeEngine {
 
     pub fn reset_for_reuse(&mut self, register_count: i32, execution_cx: &Cx, page_size: PageSize) {
         self.reset_for_reuse_ex(register_count, execution_cx, page_size, false);
+    }
+
+    /// Park the engine across a write commit (bd-w4pr1.13.35): the next
+    /// statement gets what a fresh engine would bring it, without dropping and
+    /// rebuilding the engine. Everything bound to the finished transaction
+    /// (storage cursors, the lent transaction's page I/O, the database, vtab
+    /// and time-travel state) and the runtime setup it ran with goes, as in
+    /// `reset_for_reuse`; so do the two caches only a fresh engine starts
+    /// without, which the reuse resets keep. Heap capacity stays. The next
+    /// execution resets and binds the engine as for any reuse. An engine
+    /// nothing has reset for reuse since its last call is left as it is.
+    pub fn reset_for_next_transaction(&mut self) {
+        if self.transaction_state_clear {
+            return;
+        }
+        let execution_cx = self.execution_cx.clone();
+        self.reset_for_reuse_impl(0, &execution_cx, self.page_size, false, false);
+        self.builtin_collations_overridden_cache = None;
+        self.dirty_root_pages.clear();
+        self.transaction_state_clear = true;
     }
 
     /// Control whether `OP_Close` preserves storage cursors for reusable DML.
@@ -27956,6 +27982,71 @@ mod tests {
             fourth_outcome.function_cache_cleared,
             "legacy reset_for_reuse clears caches, so next apply should clear them again"
         );
+    }
+
+    #[test]
+    fn test_reset_for_next_transaction_leaves_what_a_fresh_engine_brings() {
+        let state = ReusableTableExecutionState {
+            func_registry: Arc::new(FunctionRegistry::new()),
+            collation_registry: Arc::new(std::sync::Mutex::new(CollationRegistry::new())),
+            schema_cookie: 7,
+            autoincrement_seq_by_root_page: HashMap::new(),
+            rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
+            table_column_count_by_root_page: Arc::new(HashMap::new()),
+            first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
+            ipk_label_by_root_page: Arc::new(HashMap::new()),
+            column_defaults_by_root_page: Arc::new(HashMap::new()),
+            index_desc_flags_by_root_page: Arc::new(HashMap::new()),
+            index_collations_by_root_page: Arc::new(HashMap::new()),
+            reject_mem_fallback: false,
+            memdb_rows_loaded: true,
+            storage_cursor_memdb_count_shortcuts_safe: true,
+            version_store: None,
+            collect_result_rows: true,
+            max_collected_result_rows: None,
+            text_encoding: TextEncoding::Utf8,
+        };
+        let mut engine = VdbeEngine::new(4);
+        engine.apply_reusable_table_execution_state(state.clone());
+        engine.builtin_collations_overridden();
+        engine.mark_root_page_dirty(3);
+        engine.cursor_root_pages.insert(1, 3);
+        assert_eq!(engine.schema_cookie(), 7);
+        assert!(engine.builtin_collations_overridden_cache.is_some());
+
+        engine.reset_for_next_transaction();
+        // The runtime setup and the cursor state go, as on a fresh engine; a
+        // reset that kept either (the reuse resets) fails here.
+        assert_eq!(engine.schema_cookie(), 0);
+        assert!(engine.func_registry.is_none());
+        assert!(!engine.memdb_rows_loaded);
+        assert!(engine.cursor_root_pages.is_empty());
+        assert!(!engine.has_txn_page_io());
+        // The caches only a fresh engine starts without.
+        assert!(engine.builtin_collations_overridden_cache.is_none());
+        assert!(!engine.has_dirty_root_pages());
+
+        // The next statement binds it as it would bind a fresh engine.
+        let reset_cx = Cx::new();
+        engine.reset_for_reuse_preserving_runtime_setup(4, &reset_cx, PageSize::DEFAULT, false);
+        let reused = engine.apply_reusable_table_execution_state(state.clone());
+        let mut fresh = VdbeEngine::new(4);
+        let fresh_outcome = fresh.apply_reusable_table_execution_state(state);
+        assert!(reused.function_cache_cleared);
+        assert_eq!(
+            reused.function_cache_cleared,
+            fresh_outcome.function_cache_cleared
+        );
+        assert_eq!(engine.schema_cookie(), fresh.schema_cookie());
+        assert_eq!(engine.memdb_rows_loaded, fresh.memdb_rows_loaded);
+
+        // Reused and bound again, the engine is reset again at the next
+        // commit: the reuse reset re-arms it.
+        engine.mark_root_page_dirty(4);
+        engine.reset_for_next_transaction();
+        assert_eq!(engine.schema_cookie(), 0);
+        assert!(engine.func_registry.is_none());
+        assert!(!engine.has_dirty_root_pages());
     }
 
     #[test]

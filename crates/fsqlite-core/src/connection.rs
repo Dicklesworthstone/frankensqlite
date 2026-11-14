@@ -39436,6 +39436,19 @@ impl Connection {
         let _ = self.cached_vdbe_engine.borrow_mut().take();
     }
 
+    /// At an autocommit write commit the parked engine must not carry the
+    /// finished transaction or its runtime setup into the next statement
+    /// (issue #70 discarded it here). Resetting it in place gives the next
+    /// statement what a fresh engine would, without the drop and the
+    /// rebuild: about 4k instructions per autocommit write statement
+    /// (bd-w4pr1.13.35). An explicit COMMIT still discards it, since the
+    /// next BEGIN's memdb reload discards the engine anyway.
+    fn reset_cached_vdbe_engine_for_next_transaction(&self) {
+        if let Some(engine) = self.cached_vdbe_engine.borrow_mut().as_deref_mut() {
+            engine.reset_for_next_transaction();
+        }
+    }
+
     /// Clear all prepared-statement / compiled-program / planner-directive
     /// caches on this connection and reset statement lookaside scratch buffers.
     ///
@@ -66444,7 +66457,7 @@ impl Connection {
         self.cleanup_committed_dropped_live_vtabs(cx, committed_dropped_live_vtabs);
 
         if committed_write {
-            self.discard_cached_vdbe_engine();
+            self.reset_cached_vdbe_engine_for_next_transaction();
             let commit_post_write_maintenance_start = hot_path_profile_enabled().then(Instant::now);
             let last_local_commit_seq = *self.last_local_commit_seq.borrow();
             if let Some(committed_seq) = last_local_commit_seq {
