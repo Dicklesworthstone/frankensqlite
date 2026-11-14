@@ -6720,20 +6720,6 @@ fn codegen_select_index_in_subquery_scan(
     let r_value = b.alloc_temp();
     let r_key = b.alloc_temp();
     let build_done = b.emit_label();
-    let build_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, build_done, P4::None, 0);
-    let skip_source_row = probe_source.where_clause.map(|_| b.emit_label());
-    if let (Some(where_expr), Some(skip_label)) = (probe_source.where_clause, skip_source_row) {
-        emit_where_filter(
-            b,
-            where_expr,
-            source_cursor,
-            probe_source.table,
-            probe_source.table_alias,
-            schema,
-            skip_label,
-        );
-    }
     let probe_scan = ScanCtx {
         cursor: source_cursor,
         table: probe_source.table,
@@ -6742,21 +6728,109 @@ fn codegen_select_index_in_subquery_scan(
         register_base: None,
         secondaries: &[],
     };
-    emit_in_probe_value(b, source_cursor, probe_source, r_value, &probe_scan);
-    let skip_insert = b.emit_label();
-    let next_source = b.emit_label();
-    b.emit_jump_to_label(Opcode::IsNull, r_value, 0, next_source, P4::None, 0);
-    b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
-    b.emit_jump_to_label(Opcode::Found, probe_cursor, r_key, skip_insert, P4::None, 0);
-    b.emit_op(Opcode::IdxInsert, probe_cursor, r_key, 0, P4::None, 0);
-    b.resolve_label(skip_insert);
-    b.resolve_label(next_source);
-    if let Some(skip_label) = skip_source_row {
-        b.resolve_label(skip_label);
+    // One source row: the subquery's WHERE, then its member into the probe set
+    // (NULL and duplicate members are skipped).
+    let emit_build_row = |b: &mut ProgramBuilder, skip_row: crate::Label| {
+        if let Some(where_expr) = probe_source.where_clause {
+            emit_where_filter(
+                b,
+                where_expr,
+                source_cursor,
+                probe_source.table,
+                probe_source.table_alias,
+                schema,
+                skip_row,
+            );
+        }
+        emit_in_probe_value(b, source_cursor, probe_source, r_value, &probe_scan);
+        b.emit_jump_to_label(Opcode::IsNull, r_value, 0, skip_row, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Found, probe_cursor, r_key, skip_row, P4::None, 0);
+        b.emit_op(Opcode::IdxInsert, probe_cursor, r_key, 0, P4::None, 0);
+    };
+    // bd-d2jwe: an equality prefix of an index on the subquery's table
+    // (`IN (SELECT id FROM users WHERE org_id = ?1)`) walks only that block,
+    // looking each entry's row up; a rowid range walks only the range.
+    let source_index_seek = probe_source_where_is_reemittable(probe_source)
+        .then(|| {
+            index_equality_prefix_target(
+                probe_source.where_clause,
+                probe_source.table,
+                probe_source.table_alias,
+            )
+        })
+        .flatten();
+    if let Some(target) = source_index_seek {
+        let source_index_cursor = cursor + 4;
+        b.emit_op(
+            Opcode::OpenRead,
+            source_index_cursor,
+            target.index.root_page,
+            0,
+            P4::Index(target.index.name.clone()),
+            0,
+        );
+        let prefix_len = i32::try_from(target.values.len())
+            .map_err(|_| CodegenError::Unsupported("index equality prefix too wide".to_owned()))?;
+        let keys = b.alloc_regs(prefix_len);
+        for (offset, expr) in target.values.iter().enumerate() {
+            let key = keys + i32::try_from(offset).expect("prefix width checked");
+            emit_expr(b, expr, key, None);
+            // The probe takes the comparison affinity `col = value` applies.
+            if let Some(affinity) = target
+                .index
+                .columns
+                .get(offset)
+                .and_then(|name| probe_source.table.column_index(name))
+                .map(|column| probe_source.table.columns[column].affinity)
+                .filter(|affinity| matches!(affinity, 'B' | 'C' | 'D' | 'E'))
+            {
+                b.emit_op(
+                    Opcode::Affinity,
+                    key,
+                    1,
+                    0,
+                    P4::Affinity(affinity.to_string()),
+                    0,
+                );
+            }
+        }
+        let rowid_reg = b.alloc_reg();
+        emit_index_prefix_rows(
+            b,
+            source_index_cursor,
+            target.index,
+            keys,
+            prefix_len,
+            |b, skip_row| {
+                b.emit_op(
+                    Opcode::IdxRowid,
+                    source_index_cursor,
+                    rowid_reg,
+                    0,
+                    P4::None,
+                    0,
+                );
+                b.emit_jump_to_label(
+                    Opcode::SeekRowid,
+                    source_cursor,
+                    rowid_reg,
+                    skip_row,
+                    P4::None,
+                    0,
+                );
+                emit_build_row(b, skip_row);
+            },
+        );
+        b.emit_op(Opcode::Close, source_index_cursor, 0, 0, P4::None, 0);
+    } else {
+        let build_loop_body =
+            emit_probe_source_walk_start(b, source_cursor, probe_source, schema, build_done);
+        let next_source = b.emit_label();
+        emit_build_row(b, next_source);
+        b.resolve_label(next_source);
+        b.emit_op(Opcode::Next, source_cursor, build_loop_body, 0, P4::None, 0);
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let build_loop_body = (build_start + 1) as i32;
-    b.emit_op(Opcode::Next, source_cursor, build_loop_body, 0, P4::None, 0);
     b.resolve_label(build_done);
     b.emit_op(Opcode::Close, source_cursor, 0, 0, P4::None, 0);
     b.free_temp(r_key);
@@ -6804,15 +6878,23 @@ fn codegen_select_index_in_subquery_scan(
     );
     let skip_output = b.emit_label();
     b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-    b.emit_jump_to_label(
-        Opcode::SeekRowid,
-        cursor,
-        rowid_reg,
-        skip_output,
-        P4::None,
-        0,
-    );
-    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    // bd-d2jwe: an index that holds every output column (`SELECT id FROM t
+    // WHERE a IN (SELECT ...)` over t_a) gives the row from its entry, as
+    // stock's `SEARCH t USING COVERING INDEX t_a (a=?)` does.
+    if let Some(sources) = resolve_covering_output_sources(columns, table, table_alias, idx_schema)
+    {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, &sources, out_regs);
+    } else {
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            skip_output,
+            P4::None,
+            0,
+        );
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     b.resolve_label(skip_output);
     b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
@@ -10157,6 +10239,78 @@ fn extract_safe_probe_source_rowid_range<'a>(
         probe_source.table_alias,
     )?;
     rowid_range_fast_path_is_safe(range).then_some(range)
+}
+
+/// Whether an IN probe source's WHERE may be emitted twice, once as seek keys
+/// or bounds and once as the per-row filter: numbered parameters keep their
+/// slots, an anonymous or named one would take the next.
+fn probe_source_where_is_reemittable(probe_source: &InProbeSource<'_>) -> bool {
+    probe_source
+        .where_clause
+        .is_none_or(|where_expr| !expr_contains_non_numbered_placeholder(where_expr))
+}
+
+/// bd-d2jwe: start the walk of an IN probe source's table at a safe rowid
+/// range's lower bound (`IN (SELECT w FROM p WHERE pid < 100)`: stock's
+/// `SEARCH p USING INTEGER PRIMARY KEY (rowid<?)`), or at its first row, and
+/// at the top of each row leave past the range's upper bound. The caller's
+/// WHERE filter still checks every row, so the bounds only narrow the walk.
+/// Returns the loop top, where the caller's `Next` jumps back to.
+fn emit_probe_source_walk_start(
+    b: &mut ProgramBuilder,
+    source_cursor: i32,
+    probe_source: &InProbeSource<'_>,
+    schema: &[TableSchema],
+    done: crate::Label,
+) -> i32 {
+    let range = probe_source_where_is_reemittable(probe_source)
+        .then(|| extract_safe_probe_source_rowid_range(probe_source))
+        .flatten();
+    let upper = range.and_then(|range| range.upper).map(|bound| {
+        let reg = b.alloc_reg();
+        emit_expr(b, bound.expr, reg, None);
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done, P4::None, 0);
+        (reg, bound)
+    });
+    if let Some(bound) = range.and_then(|range| range.lower) {
+        let reg = b.alloc_reg();
+        emit_expr(b, bound.expr, reg, None);
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done, P4::None, 0);
+        let seek = if bound.inclusive {
+            Opcode::SeekGE
+        } else {
+            Opcode::SeekGT
+        };
+        b.emit_jump_to_label(seek, source_cursor, reg, done, P4::None, 0);
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, done, P4::None, 0);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_top = b.current_addr() as i32;
+    if let Some((upper_reg, bound)) = upper {
+        let comparison = resolved_rowid_range_comparison(
+            probe_source.table,
+            probe_source.table_alias,
+            schema,
+            bound,
+        );
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::Rowid, source_cursor, rowid_reg, 0, P4::None, 0);
+        let stop = if bound.inclusive {
+            Opcode::Gt
+        } else {
+            Opcode::Ge
+        };
+        b.emit_jump_to_label(
+            stop,
+            upper_reg,
+            rowid_reg,
+            done,
+            comparison.collation_p4,
+            comparison.cmp_p5,
+        );
+    }
+    loop_top
 }
 
 fn count_exists_semijoin_merge_is_safe(
@@ -43820,15 +43974,8 @@ fn emit_once_materialized_in_probe_source(
     );
 
     let build_scan_done = b.emit_label();
-    let build_scan_start = b.current_addr();
-    b.emit_jump_to_label(
-        Opcode::Rewind,
-        source_cursor,
-        0,
-        build_scan_done,
-        P4::None,
-        0,
-    );
+    let loop_body =
+        emit_probe_source_walk_start(b, source_cursor, probe_source, schema, build_scan_done);
 
     let skip_label = probe_source.where_clause.map(|_| b.emit_label());
     if let (Some(where_expr), Some(skip)) = (probe_source.where_clause, skip_label) {
@@ -43882,7 +44029,6 @@ fn emit_once_materialized_in_probe_source(
     if let Some(skip) = skip_label {
         b.resolve_label(skip);
     }
-    let loop_body = (build_scan_start + 1) as i32;
     b.emit_op(Opcode::Next, source_cursor, loop_body, 0, P4::None, 0);
     b.resolve_label(build_scan_done);
     b.emit_op(Opcode::Close, source_cursor, 0, 0, P4::None, 0);
@@ -59773,13 +59919,28 @@ mod tests {
             not: false,
             span: Span::ZERO,
         };
-        let stmt = simple_select(&["b"], "t", Some(Box::new(where_expr)));
+        let stmt = simple_select(&["b"], "t", Some(Box::new(where_expr.clone())));
 
         let schema = test_schema_with_index_and_subquery_source();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
+
+        // bd-d2jwe: a column idx_t_b does not hold (`a`) is read from the
+        // table row each index hit looks up.
+        let lookup_stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+        let mut lookup_builder = ProgramBuilder::new();
+        codegen_select(&mut lookup_builder, &lookup_stmt, &schema, &ctx).unwrap();
+        let lookup_prog = lookup_builder.finish().unwrap();
+        assert!(
+            lookup_prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid)
+                && lookup_prog
+                    .ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::SeekRowid),
+            "an index hit whose output idx_t_b lacks looks the row up in the base table"
+        );
 
         assert!(
             prog.ops().iter().any(|op| matches!(&op.p4, P4::Index(name) if op.opcode == Opcode::OpenRead && name == "idx_t_b")),
@@ -59800,10 +59961,12 @@ mod tests {
             prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
             "indexed IN-subquery should seek into the outer index per probe value"
         );
+        // `SELECT b` is all in idx_t_b: each hit gives its row from the index
+        // entry, as stock's `USING COVERING INDEX` does (bd-d2jwe).
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid)
-                && prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
-            "each index hit should look the row up in the base table"
+                && !prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "a covered output reads the index entry, with no table lookup"
         );
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::ResultRow),
@@ -59813,7 +59976,7 @@ mod tests {
         // scanned: every Rewind belongs to the probe/source cursors.
         assert!(
             prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
-            "the base table stays open for SeekRowid lookups"
+            "the base table cursor is opened for the lookups an uncovered output needs"
         );
         assert!(
             !prog
