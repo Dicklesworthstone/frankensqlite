@@ -157,6 +157,129 @@ fn scalar_subquery_empty_and_multi() {
     });
 }
 
+/// The same comparison on a file-backed database, whose subqueries run
+/// through the VDBE rather than the in-memory evaluator.
+async fn agree_file_backed(setup: &[&str], sql: &str, msg: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oracle.db");
+    let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+    let r = rusqlite::Connection::open_in_memory().unwrap();
+    for s in setup {
+        let _ = f.execute(s).await;
+        let _ = r.execute_batch(s);
+    }
+    let fr = fq(&f, sql).await;
+    let rr = rq(&r, sql);
+    assert_eq!(
+        fr, rr,
+        "{msg} (file-backed)\n  sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}"
+    );
+}
+
+/// u(id,n) is read through a FROM-clause subquery inside a scalar subquery
+/// that runs once per row of t(id,a).
+const DERIVED: &[&str] = &[
+    "CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER)",
+    "INSERT INTO u VALUES (1,10),(2,20),(3,30),(4,40)",
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)",
+    "INSERT INTO t VALUES (1,15),(2,25),(3,35)",
+];
+
+/// bd-j9tg3: a bare outer column under a derived table resolves outward, the
+/// derived table's own columns resolve inward, and correlation inside the
+/// derived table binds the outer row. Every derived table used to be an
+/// opaque scope, and each of these failed with "no such column: a".
+#[test]
+fn bare_outer_reference_under_a_derived_table() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT n FROM u) WHERE n > a) FROM t ORDER BY id",
+            "derived-table column beside a bare outer column",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT n AS m FROM u) WHERE m > a) FROM t ORDER BY id",
+            "aliased derived-table column",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT * FROM u) WHERE n > a) FROM t ORDER BY id",
+            "derived table over *",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT u.* FROM u) WHERE n > a) FROM t ORDER BY id",
+            "derived table over u.*",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (VALUES (10),(20),(30)) WHERE column1 > a) FROM t ORDER BY id",
+            "derived VALUES table",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT n, n + 1 FROM u) WHERE n > a) FROM t ORDER BY id",
+            "derived table with an unaliased expression column",
+        ),
+        (
+            "SELECT a, (SELECT sum(c) FROM (SELECT n, count(*) AS c FROM u GROUP BY n) WHERE n > a) FROM t ORDER BY id",
+            "grouped derived table",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT n FROM u UNION ALL SELECT n FROM u) WHERE n > a) FROM t ORDER BY id",
+            "compound derived table (names from its first arm)",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT n FROM u) AS d JOIN u AS e ON e.n = d.n WHERE d.n > a) FROM t ORDER BY id",
+            "derived table joined to a base table",
+        ),
+        (
+            "SELECT a, EXISTS (SELECT 1 FROM (SELECT id, n FROM u) WHERE n = a + 5) FROM t ORDER BY id",
+            "EXISTS over a derived table",
+        ),
+        // Negative: the derived table's `id` shadows t.id, so the subquery is
+        // the same for every row (stock 2, 2, 2). An inventory that missed
+        // `id` would bind t.id instead.
+        (
+            "SELECT id, (SELECT count(*) FROM (SELECT id FROM u) WHERE id > 2) FROM t ORDER BY id",
+            "derived-table column shadows the outer column of the same name",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT n FROM u WHERE n > a)) FROM t ORDER BY id",
+            "correlation inside the derived table",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (SELECT n FROM u WHERE n > a) WHERE n < a + 20) FROM t ORDER BY id",
+            "correlation inside the derived table and in the scope that reads it",
+        ),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for (sql, msg) in cases {
+            agree(DERIVED, sql, msg).await;
+            agree_file_backed(DERIVED, sql, msg).await;
+        }
+    });
+}
+
+/// bd-j9tg3: stock resolves `rowid` inside a derived table's scope locally
+/// (the derived table's own NULL rowid), not to t's rowid. fsqlite has no
+/// derived-table rowid yet and refuses with "no such column", which is the
+/// fail-closed answer. Binding t.rowid would give 0, 4, 4.
+#[test]
+fn rowid_under_a_derived_table_never_binds_the_outer_rowid() {
+    asupersync::test_utils::run_test(|| async {
+        let sql = "SELECT a, (SELECT count(*) FROM (SELECT * FROM u) WHERE rowid > 1) FROM t ORDER BY id";
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in DERIVED {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        let fr = fq(&f, sql).await;
+        let rr = rq(&r, sql);
+        let refused = fr.len() == 1 && fr[0].len() == 1 && fr[0][0].starts_with("<ERR");
+        assert!(
+            fr == rr || refused,
+            "rowid under a derived table must resolve locally or refuse\n  frank ={fr:?}\n  sqlite={rr:?}"
+        );
+    });
+}
+
 #[test]
 fn correlated_having_and_nested() {
     asupersync::test_utils::run_test(|| async {

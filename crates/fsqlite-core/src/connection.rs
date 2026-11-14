@@ -129592,9 +129592,10 @@ struct OuterReferenceLookup<'a> {
 ///
 /// This is deliberately fail-closed. Base tables present in the connection
 /// schema have a complete column inventory, so an unqualified name absent from
-/// all of them may continue resolving through outer scopes. Sources whose
-/// output cannot be established from that inventory (CTEs, views, derived
-/// tables, table functions, attached/unknown relations) return `None`.
+/// all of them may continue resolving through outer scopes. A derived table's
+/// inventory comes from its own projection (`collect_derived_table_columns`).
+/// Sources whose output cannot be established (CTEs, views, table functions,
+/// attached/unknown relations) return `None`.
 /// Runtime substitution then leaves every unqualified reference untouched
 /// rather than accidentally capturing a local column as an outer value. The
 /// correlation-analysis probe still marks such a surviving reference as
@@ -129688,8 +129689,78 @@ fn collect_known_source_columns(
             }
             Some(())
         }
-        TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => None,
+        TableOrSubquery::Subquery { query, .. } => {
+            collect_derived_table_columns(query, lookup, opaque_cte_names, out)
+        }
+        TableOrSubquery::TableFunction { .. } => None,
     }
+}
+
+/// bd-j9tg3: the unqualified names a FROM-clause subquery exposes to the
+/// scope that reads it.
+///
+/// They are the first arm's result names, as for a view: an alias, a
+/// column's own name, `column1..columnN` for VALUES. A `*` or `t.*` adds
+/// every column of the arm's own sources, a superset for `t.*`. Extra names
+/// are safe because a protected name is left to local resolution, which fails
+/// with "no such column" rather than binding an outer value. A missing name
+/// would bind an outer value in its place. An unaliased expression is named
+/// by its source text, which only a quoted identifier can spell, so it adds
+/// nothing. Stock resolves `rowid`, `_rowid_` and `oid` inside a derived
+/// table's scope locally (`(SELECT * FROM u) WHERE rowid > 1` reads the
+/// derived table's own NULL rowid), so those stay protected too.
+///
+/// Before this, every derived table was opaque. A bare outer reference
+/// under one, `(SELECT count(*) FROM (SELECT n FROM u) WHERE n > a)`, then
+/// failed with "no such column: a" at runtime. The RETURNING fold probe also
+/// judged such a subquery correlated.
+fn collect_derived_table_columns(
+    query: &SelectStatement,
+    lookup: &OuterReferenceLookup<'_>,
+    opaque_cte_names: &HashSet<String>,
+    out: &mut HashSet<String>,
+) -> Option<()> {
+    let mut query_cte_names;
+    let cte_names = if let Some(with) = &query.with {
+        query_cte_names = opaque_cte_names.clone();
+        query_cte_names.extend(with.ctes.iter().map(|cte| cte.name.to_ascii_lowercase()));
+        &query_cte_names
+    } else {
+        opaque_cte_names
+    };
+    match &query.body.select {
+        SelectCore::Values(rows) => {
+            let width = rows.first().map_or(0, Vec::len);
+            out.extend((1..=width).map(|index| format!("column{index}")));
+        }
+        SelectCore::Select { columns, from, .. } => {
+            for column in columns {
+                match column {
+                    ResultColumn::Expr {
+                        alias: Some(alias), ..
+                    } => {
+                        out.insert(alias.to_ascii_lowercase());
+                    }
+                    ResultColumn::Expr {
+                        expr: Expr::Column(column_ref, _),
+                        ..
+                    } => {
+                        out.insert(column_ref.column.to_ascii_lowercase());
+                    }
+                    ResultColumn::Expr { .. } => {}
+                    ResultColumn::Star | ResultColumn::TableStar(_) => {
+                        let from = from.as_ref()?;
+                        collect_known_source_columns(&from.source, lookup, cte_names, out)?;
+                        for join in &from.joins {
+                            collect_known_source_columns(&join.table, lookup, cte_names, out)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.extend(["rowid", "_rowid_", "oid"].map(str::to_owned));
+    Some(())
 }
 
 struct ResolvedOuterColumn {

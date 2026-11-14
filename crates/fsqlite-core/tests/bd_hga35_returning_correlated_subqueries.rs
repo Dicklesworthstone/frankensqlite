@@ -588,12 +588,20 @@ fn returning_first_row_subqueries_read_the_first_rows_state() {
              (SELECT count(*) FROM vu WHERE n >= 100)",
             &[],
         ),
-        // (A bare `n` over the derived table is judged correlated by the
-        // subquery rewrite and still runs for every row: bd-j9tg3, open.)
         (
             "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
              (SELECT count(*) FROM (SELECT * FROM u) AS d WHERE d.n >= 100), \
              (WITH c AS (SELECT * FROM u WHERE n >= 100) SELECT count(*) FROM c)",
+            &[],
+        ),
+        // A bare `n` over a derived table names the derived table's column,
+        // so the subquery is uncorrelated and reads the first row's state
+        // (bd-j9tg3). This held only qualified until derived tables had an
+        // output inventory.
+        (
+            "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
+             (SELECT count(*) FROM (SELECT n FROM u) WHERE n >= 100), \
+             (SELECT count(*) FROM (SELECT * FROM u) WHERE n >= 100)",
             &[],
         ),
         (
