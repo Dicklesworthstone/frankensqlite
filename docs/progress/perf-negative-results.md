@@ -87,6 +87,221 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN (join prediction missed in sign): a page-cache miss skips the get_page checks its resident answer already made (bd-w4pr1.13.18, join / rowid-seek lever 4)
+
+- Target: the cost lever 1 (the entry three below) put on every page-cache miss. The sync resident
+  attempt ran `get_page`'s prefix, and the async read then ran it again: about 185 per miss on
+  rowid_lookups_200k and about 400 per leaf miss on full scans. group_by_1000_groups was +0.09%
+  against base and order_by_text_limit10 +0.18%. Touched (it lands in the same commit as lever 1):
+  - `crates/fsqlite-pager/src/traits.rs`: `TransactionHandle::get_nonresident_page`, defaulting
+    to `get_page`, with its `TransactionKind` dispatch;
+  - `crates/fsqlite-pager/src/pager.rs`: `get_page` is now the prefix plus `get_nonresident_page`;
+    `get_resident_page` also answers the rolled-back zero-fill (`rolled_back_allocation_page`), so
+    its `None` means only that shared state must be read;
+  - `crates/fsqlite-btree/src/cursor.rs`: `PageReader::read_nonresident_btree_page_data`,
+    defaulting to `read_btree_page_data`; `TransactionPageIo` forwards it; `load_page` calls it only
+    after a `None`;
+  - `crates/fsqlite-vdbe/src/engine.rs`: `SharedTxnPageIo` skips the freed-page check the resident
+    attempt has just made.
+- Result: same method as levers 1 and 2 (load 4.0, io_uring refused, 5 reps; stock sqlite3 3.46.1
+  live). Binaries: base a3b4ef8d6 2699110b30fb374c, l2 45b5f01fa9fb1522, l4 = l2 + this diff
+  9108d5e06ad654a2. Answers equal stock's.
+
+  | statement | stock | base | l2 | l4 |
+  |---|---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,955.6M | 2,871.8M | 2,831.5M (5.11x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,847.8M | 4,738.3M | 4,748.1M (2.76x) |
+  | group_by_1000_groups | 2,876.2M | 3,335.8M | 3,338.9M | 3,333.8M |
+  | order_by_text_limit10 | 777.1M | 1,715.5M | 1,718.6M | 1,713.5M |
+  | scan_filter_agg | 498.7M | 573.5M | 573.5M | 573.5M |
+  | count(*) | 4.7M | 3.7M | 3.7M | 3.7M |
+
+- Prediction (bead, before code) and result:
+  - rowid -25M to -45M; measured -40.3M, inside;
+  - the two scan rows back to within 0.05% of base; measured a little below base;
+  - the join -1M to -3M; measured +9.8M (+0.2%), wrong in sign.
+  Callgrind of l4 puts the join's extra cost on the hit path: `get_resident_page` went from 125 to
+  133 per call. Its new arm (the rolled-back zero-fill behind the inner mutex) changed the call's
+  code generation. No kill line covered the join. The kill lines that did exist (rowid under -15M;
+  a scan row more than 0.1% above base; an answer change) were not crossed: kept.
+- Write rows, the landed tree (levers 1, 2 and 4) against base. Each arm built its own fresh
+  database; 3 reps; io_uring refused; stock live; answers equal.
+  - create_index_int_300k 928.7M -> 929.1M (+0.04%);
+  - update_10pct_300k 667.8M -> 668.8M (+0.15%);
+  - delete_14pct_300k 453.6M -> 454.6M (+0.22%);
+  - txn_1000x10_rows 563.0M -> 560.4M (-0.46%).
+  The wall-time scorecard (2 reps, load about 4, stock A/A drift up to 14%) shows no row outside
+  that drift.
+- Keepers: the pager test of lever 1 checks three more things here. A rolled-back allocation is
+  answered as zeros, equal to `get_page`'s. After a `None`, `get_nonresident_page` returns the
+  committed image. That read leaves the page resident.
+- Gate (gate g10, on the tree of levers 1, 2 and 4, rch). clippy -D warnings on pager, btree, vdbe
+  and core was clean, before the rebase onto main and again after it.
+  - --lib suites: btree 556/0; pager 1,111/1 (bd_2jpu6_2, red on main); core 4,181/2 (the t6741
+    pair, bd-nouem); vdbe 1,247/1 (bd-bhalc's codegen test).
+  - The join, seek, savepoint, trigger, snapshot and pager-touch keepers, the fsqlite rowid
+    keepers and nine fsqlite-e2e concurrent-writer / isolation / checkpoint targets all pass, apart
+    from two reds that are also red on main:
+    - bd_8c68u's compile-count test (bd-f8m1v);
+    - `concurrent_writer_mvcc_oracle_e2e::observed_disjoint_writer_overlap_for_certificate`, which
+      also fails on clean a3b4ef8d6 (both writers finalize at the same commit_seq; analysis on
+      bd-i0tn6).
+- Landed in 01d40bb9d, together with lever 1.
+- Retry / widen: get the 8 per hit back by keeping the zero-fill out of `get_resident_page`. The
+  non-resident read would then check `rolled_back_pages` itself. Measure it on the join and on a
+  savepoint keeper.
+
+## 2026-11-14 - REJECTED on its kill line: a table rowid search reads its rowids from page bytes taken once, and the seek cache records a landing in place (bd-w4pr1.13.18, join / rowid-seek lever 3)
+
+- Target: the rowid seek's own body. On rowid_lookups_200k that is the interior binary search
+  (2.59M `table_interior_rowid_at` calls, 78 each, 6.8% of the row). On join_1M_to_pk_1000 it is
+  the leaf search (240 per probe, 2.99M `table_leaf_rowid_at` calls at 51) and
+  `remember_table_landing` (259 per descent). Touched (reverted, never committed):
+  `crates/fsqlite-btree/src/cursor.rs`:
+  - `table_interior_rowid_in`, `read_stack_entry_cell_pointer_in` and `table_leaf_rowid_in`: the
+    old functions on a page slice that the search takes once;
+  - `binary_search_table_interior`, `search_integer_key_table_leaf` and `table_leaf_rowid_bounds`
+    use them;
+  - `remember_table_seek` rotates the landing's slot (or the first empty one, or the last) to the
+    front instead of rebuilding the array through a flatten iterator;
+  - a model test of that rotation against the rebuild.
+- Ledger preflight: the 2026-05-20 cell-parse family ("4-6 ns per cell, no lever"), whose retry
+  condition is whole-workload attribution. The shares above are that attribution.
+- Result: same run method as levers 1 and 2 (thinkstation1, governor powersave, load 3.4,
+  io_uring refused, 5 reps; stock sqlite3 3.46.1 live). Binaries l2 45b5f01fa9fb1522, l3 =
+  l2 + this diff 1abcddbbaa1c4a3b. Answers equal stock's.
+  - join_1M_to_pk_1000: 4,738.3M -> 4,706.3M (-32.0M);
+  - rowid_lookups_200k: 2,871.8M -> 2,836.8M (-35.0M);
+  - scan_filter_agg 573.5M and count(*) 3.7M unchanged.
+- Prediction (bead, before code): join -90M to -160M, rowid -70M to -130M. Kill: join under -45M or
+  rowid under -35M. The join kill line is crossed; the rowid result lands exactly on its line.
+  REJECTED and reverted.
+- Why short (callgrind of the l3 binary against main 70a46a0f3):
+  - the interior read went from 78 to 63 per probe;
+  - the leaf search from 240 to 231 per probe;
+  - `remember_table_landing` from 259 to 229 per descent.
+  Each part came in at about a third of its prediction. The release build (fat LTO, one codegen
+  unit) already inlines `usable_bytes` and most of the call frames this removed by hand. What is
+  left is the varint decode, the bounds checks and `observe_cursor_cancellation` per probe.
+- Retry condition: not this shape. A search that stops decoding per probe is a different lever:
+  routing keys decoded once per page image (kept with the decoded-page memo, bd-w4pr1.13.26), so a
+  probe compares two i64s. Retry that with a profile that still puts the interior or leaf search
+  above 5% of a row.
+
+## 2026-11-14 - WIN: a WAL lookup the pinned snapshot answers without reading a frame skips the boxed read futures (bd-w4pr1.13.18, join / rowid-seek lever 2)
+
+- Target: the WAL lookup made on every page-cache miss in WAL mode; measured on rowid_lookups_200k
+  (188.6k lookups, nearly all of them pages with no frame in the pinned snapshot). Touched:
+  `crates/fsqlite-pager/src/traits.rs` (`WalBackend::read_page_pinned_without_io`, default
+  `None`), `crates/fsqlite-pager/src/pager.rs` (`lookup_page_in_wal_backend` asks it before
+  awaiting `read_page_pinned`), `crates/fsqlite-core/src/wal_adapter.rs` (`PinnedPageRead`,
+  `WalBackendAdapter::pinned_page_read`, the prefix `read_page_pinned` and the new method share;
+  `PathRefreshingWalBackend` forwards).
+- Ledger preflight: the 2026-11-12 bd-w4pr1.13.18 WIN (a miss asks the pinned snapshot once, not
+  twice) removed the second lookup; this makes the remaining one cheaper. Not near the
+  eviction-trace rejections.
+- Evidence before (callgrind, main 70a46a0f3): `lookup_page_in_wal_backend` was 821 per lookup.
+  - The work was about 194: `resolve_visible_frame`, a HashMap get in the pinned page index.
+  - The rest was two `Box::pin` futures (`PathRefreshingWalBackend::read_page_pinned` around
+    `WalBackendAdapter::read_page_pinned`), a malloc and a free each, and their polling and drop,
+    about 330 together;
+  - plus the function's own code 215, the registry handle 34 and `attached_native_cx` 48.
+- Change: the refusals (pending checkpoint reset, no pinned snapshot), a snapshot with no
+  committed frame, and a miss in a complete page index are answered synchronously. A frame read or
+  a partial-index scan still goes through `read_page_pinned`, which starts from the same prefix.
+  Locking, the admission rule of the read lock and the frames read are unchanged.
+- Result: same method and run as lever 1 (thinkstation1, governor powersave, load 1.9, io_uring
+  refused, 5 reps; stock sqlite3 3.46.1 live; binaries l1 79397ad4cc80e79e, l2 45b5f01fa9fb1522 =
+  l1 + this diff). Answers equal stock's.
+  - rowid_lookups_200k: 2,936.1M -> 2,871.8M (-341 per lookup; 5.30x -> 5.18x stock's 554.4M);
+    the JOIN..ON spelling 2,936.5M -> 2,872.2M.
+  - join_1M_to_pk_1000: 4,740.9M -> 4,738.3M (7.6k lookups).
+  - scan_filter_agg 573.5M and count(*) 3.7M unchanged.
+  CPU moved inside the run-to-run noise: rowid 677 -> 684 ms refused and 658 -> 654 ms with the
+  ring (stock 342-362).
+- Prediction (bead, before code): -300 to -450 per lookup, rowid -57M to -85M. Measured -341 and
+  -64.3M, inside both. Kill (rowid under -30M) not crossed.
+- Keeper: `test_adapter_pinned_read_without_io_answers_only_pages_without_a_frame` (fsqlite-core).
+  Unpinned, both methods refuse with the same error. A page with a frame is left to
+  `read_page_pinned`, which reads its bytes. A page without one is answered as no frame. A later
+  commit of that page stays out of the pinned snapshot and is read in the next one.
+- Gate: gate g10 (the entry two above). Landed as fce23ccdf.
+- Retry / widen: a miss's WAL lookup is now about 480 (821 - 341): the registry handle, the
+  read-lock helper with `attached_native_cx`, the async frame of `lookup_page_in_wal_backend`
+  itself and the SipHash lookup in the page index. Widen only with a profile that puts that
+  remainder above 2% of a row.
+
+## 2026-11-14 - WIN (prediction missed low): a page load served by the transaction's own state skips the async read chain (bd-w4pr1.13.18, join / rowid-seek lever 1)
+
+- Target: every B-tree page load that the transaction read cache or write set answers. Measured on
+  join_1M_to_pk_1000 (810k such loads) and rowid_lookups_200k (412k such loads, plus 188k misses).
+  Touched: `crates/fsqlite-pager/src/traits.rs` (`TransactionHandle::get_resident_page`, default
+  `None`, and its `TransactionKind` dispatch), `crates/fsqlite-pager/src/pager.rs`
+  (`ResidentPageLookup`, `SimpleTransaction::resident_page_lookup`, the prefix `get_page` and
+  `get_resident_page` share), `crates/fsqlite-btree/src/cursor.rs`
+  (`PageReader::read_resident_btree_page_data`, default `None`; `TransactionPageIo` forwards;
+  `BtCursor::load_page` takes it first), `crates/fsqlite-vdbe/src/engine.rs` (`SharedTxnPageIo`:
+  the concurrent-context freed-page check in one sync helper, used by `read_btree_page_data` and
+  the new method).
+- Ledger preflight: the two bd-w4pr1.13.34 entries (a parked-leaf pool in front of the load,
+  rejected twice; the retry entry says to attack the load itself). Fresh attribution on main
+  70a46a0f3 also showed why that pool had nothing to serve. All 810k join loads come from descents
+  from the root (405k descents, root plus leaf). The seek cache never served a probe on a leaf other
+  than the current one, because u has 5 leaves in the fsqlite-built file and the probe keys step by
+  -81 (t.a = 7919*i mod 1000): a cyclic walk one larger than the 4-slot LRU. bd-w4pr1.13.26 (the
+  decoded-page memo) and bd-w4pr1.13.14 (page-read locks) are on this path and unchanged.
+- Evidence before (callgrind, main 70a46a0f3): a load on a transaction-cache hit cost about 590.
+  About 215 of that was future construction, polling and drop across `SharedTxnPageIo::
+  read_btree_page_data`, the `TransactionKind::get_page` dispatch and `SimpleTransaction::get_page`.
+- Change: `get_page`'s prefix (recovery barrier, freed pages, write set, rolled-back allocations,
+  snapshot size bound, transaction read cache) is one sync function. `get_page` runs it first;
+  `get_resident_page` runs only it and answers its page or its error, or `None` (for a rolled-back
+  allocation as well, which `get_page` still zero-fills). The cursor awaits the old path only on
+  `None`. The answers are the same images and errors, read from the same transaction-private state,
+  so MVCC visibility does not change. The time-travel reader and every test store keep the default
+  `None`.
+- Result: thinkstation1, governor powersave, load 1.8. io_uring refused, 5 reps repeating to 0.6M.
+  Stock sqlite3 3.46.1 live in the same invocation; each fsqlite arm on its own copy of one
+  fsqlite-built database. Base main a3b4ef8d6 (sha256 2699110b30fb374c), candidate a3b4ef8d6 + this
+  diff (79397ad4cc80e79e). Answers equal stock's everywhere.
+  - join_1M_to_pk_1000: 4,847.8M -> 4,740.9M user instructions (2.82x -> 2.75x stock's 1,721.4M);
+    CPU 476 -> 465 ms (2.45x -> 2.39x). With the ring allowed: 478 -> 455 ms (stock 192).
+  - rowid_lookups_200k: 2,955.6M -> 2,936.1M (5.33x -> 5.30x stock's 554.4M); CPU within noise
+    (661 -> 667 ms refused, 654 -> 686 ms with the ring; the JOIN..ON spelling 660 -> 659 ms).
+  - scan_filter_agg 573.5M and count(*) 3.7M unchanged to the instruction.
+- Other read shapes, levers 1 and 2 together (base against l2 45b5f01fa9fb1522, 3 reps, stock
+  live):
+  - correlated EXISTS over p: 3,116.7M -> 3,032.9M (4.81x -> 4.68x);
+  - scalar subquery per row: 2,930.4M -> 2,846.7M (4.40x -> 4.28x);
+  - the join restricted to t.id <= 100000: 478.8M -> 467.4M;
+  - join_no_index_5k_x_5k: unchanged.
+  The cost of this lever: group_by_1000_groups +3.1M (+0.09%) and order_by_text_limit10 +3.1M
+  (+0.18%), about 400 per page-cache miss on their 7.6k leaf loads. A miss runs the prefix twice,
+  in the sync attempt and again in the async read.
+- Prediction (bead, before code):
+  - per hit load -180 to -280; measured -132;
+  - join -146M to -227M, measured -106.9M (kill: under -100M, not crossed);
+  - rowid -55M to -104M, measured -19.5M (kill: not below base, not crossed). A miss runs the prefix
+    twice, and that cost about 185 per miss, not the predicted 60 to 100.
+- After (callgrind, candidate, join): a hit load is about 415.
+  - `DecodedPageMemo::lookup` 112 (it copies the cell pointers);
+  - `get_resident_page` 125 (hash 32, PageData clone 21);
+  - the concurrent-context check 23;
+  - `load_page`'s own code about 150.
+  The previous `StackEntry`'s drop is still 45 per probe.
+- Keepers: `test_get_resident_page_answers_only_from_the_transactions_own_state` (pager). A page
+  read before a peer's commit keeps its image. A page never read gives `None` even with the peer's
+  newer image in the shared cache. A staged write gives the staged image. A rolled-back allocation
+  gives `None` while `get_page` zero-fills it; with lever 4, which landed in the same commit, the
+  resident answer is those zeros and the test checks that instead. A freed page gives
+  `get_page`'s own error.
+  `test_load_page_takes_a_resident_page_without_the_async_read` (btree): resident pages skip the
+  async read, others take it, and a resident refusal is the load's error, not retried.
+- Landed together with lever 4 (the entry three above), which removes the prefix's second run on a
+  miss, in one commit: 01d40bb9d. Gate: gate g10, in that entry.
+- Retry / widen: the memo's pointer copy (112 per hit load) is the next item on the hit path. Share
+  the decoded pointers instead of copying them.
+
 ## 2026-11-14 - REJECTED: a record header table filled on demand for the in-place Column lane and the parallel kernel (bd-w4pr1.13.11 kernel lever K4)
 
 - Target: `RecordColumnTable::parse`, 91 Ir/row both in the serial in-place Column lane
