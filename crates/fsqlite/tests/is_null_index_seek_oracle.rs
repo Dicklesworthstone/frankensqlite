@@ -168,9 +168,17 @@ fn aggregate_over_is_null_walks_the_leading_null_keys_and_matches_sqlite() {
                 let walks_index = ops
                     .iter()
                     .any(|(op, p4)| op == "OpenRead" && (p4.contains("_n") || p4.contains("t_ab")));
+                // A lone count(*) counts the NULL keys from the index's pages up to a
+                // `[NULL]` bound (bd-2fb53); other aggregates step them and stop at the
+                // first non-NULL key.
+                let stop = if sql.starts_with("SELECT count(*) FROM") {
+                    "IdxCountBefore"
+                } else {
+                    "NotNull"
+                };
                 assert!(
-                    walks_index && ops.iter().any(|(op, _)| op == "NotNull"),
-                    "`{sql}` must walk the index's NULL keys: {ops:?}"
+                    walks_index && ops.iter().any(|(op, _)| op == stop),
+                    "`{sql}` must walk the index's NULL keys ({stop}): {ops:?}"
                 );
             }
             // Covering: the count reads no table row; a column the index lacks does.

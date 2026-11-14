@@ -1264,6 +1264,7 @@ fn compute_attached_memdb_requirement_reason(ops: &[VdbeOp]) -> Option<&'static 
             | Opcode::IdxGE
             | Opcode::SetSnapshot
             | Opcode::CountIndexEqRun
+            | Opcode::IdxCountBefore
             | Opcode::FusedAppendInsert
             | Opcode::IdxBulkLoad
                 if !storage_cursor_ids.contains(&op.p1) && !sorter_cursor_ids.contains(&op.p1) =>

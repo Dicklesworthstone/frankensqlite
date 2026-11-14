@@ -6112,6 +6112,125 @@ impl<P: PageReader> BtCursor<P> {
         self.advance_next_impl(cx, true).await
     }
 
+    /// Count this index B-tree's entries from the cursor's position onward
+    /// that order before `bound`, a key record compared as an index seek
+    /// compares one: with `inclusive`, an entry whose leading fields equal the
+    /// bound's counts (`key <= bound`); without it, it does not (`key <
+    /// bound`). `None` counts to the end of the index. A `[NULL]` bound with
+    /// `inclusive` counts the leading NULL keys.
+    ///
+    /// A leaf whose last entry orders before the bound is counted whole from
+    /// its cell count, so only the leaf the bound falls in is searched
+    /// (bd-2fb53). Interior separators are entries of their own and are
+    /// tested one by one. Moving from leaf to leaf goes through
+    /// `advance_next`, which records each page as a `Next` walk does. The
+    /// cursor is left on the first entry not counted, or at EOF.
+    pub async fn count_entries_before(
+        &mut self,
+        cx: &Cx,
+        bound: Option<&[u8]>,
+        inclusive: bool,
+    ) -> Result<u64> {
+        let bias = if inclusive {
+            IndexSeekBias::UpperBound
+        } else {
+            IndexSeekBias::LowerBound
+        };
+        let parsed_bound = bound.and_then(|key| {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            self.decode_index_key_for_compare(key)
+        });
+        let mut count = 0_u64;
+        loop {
+            observe_cursor_cancellation(cx)?;
+            if self.at_eof {
+                return Ok(count);
+            }
+            let Some(top) = self.stack.last() else {
+                return Ok(count);
+            };
+            let (cell_idx, cell_count) = (top.cell_idx, top.header.cell_count);
+            if !top.header.page_type.is_leaf() {
+                // An interior separator: an entry of an index B-tree.
+                if !self
+                    .top_cell_orders_before(cx, cell_idx, bound, parsed_bound.as_deref(), bias)
+                    .await?
+                {
+                    return Ok(count);
+                }
+                count += 1;
+                if !self.advance_next(cx).await? {
+                    return Ok(count);
+                }
+                continue;
+            }
+            if cell_idx >= cell_count {
+                if !self.advance_next(cx).await? {
+                    return Ok(count);
+                }
+                continue;
+            }
+            let last = cell_count - 1;
+            if self
+                .top_cell_orders_before(cx, last, bound, parsed_bound.as_deref(), bias)
+                .await?
+            {
+                count += u64::from(cell_count - cell_idx);
+                if let Some(top) = self.stack.last_mut() {
+                    top.cell_idx = last;
+                }
+                if !self.advance_next(cx).await? {
+                    return Ok(count);
+                }
+                continue;
+            }
+            // The bound falls in this leaf: cells before `low` order before
+            // it, the cell at `high` does not.
+            let (mut low, mut high) = (cell_idx, last);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if self
+                    .top_cell_orders_before(cx, mid, bound, parsed_bound.as_deref(), bias)
+                    .await?
+                {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            count += u64::from(low - cell_idx);
+            if let Some(top) = self.stack.last_mut() {
+                top.cell_idx = low;
+            }
+            return Ok(count);
+        }
+    }
+
+    /// Whether the cell at `idx` of the page on top of the stack orders
+    /// before `bound` under `bias` (always, without a bound).
+    async fn top_cell_orders_before(
+        &self,
+        cx: &Cx,
+        idx: u16,
+        bound: Option<&[u8]>,
+        parsed_bound: Option<&[SqliteValue]>,
+        bias: IndexSeekBias,
+    ) -> Result<bool> {
+        let Some(bound) = bound else {
+            return Ok(true);
+        };
+        let entry = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("count_entries_before: empty cursor stack"))?;
+        let cell = self.parse_cell_ref_at(entry, idx)?;
+        let payload = self.read_cell_payload(cx, entry, &cell).await?;
+        Ok(
+            self.compare_index_key_bytes_with_bias(&payload, bound, parsed_bound, bias)
+                == std::cmp::Ordering::Less,
+        )
+    }
+
     /// Synchronous fast path of [`BtreeCursorOps::next`]: step to the next
     /// cell when it lives on the current leaf page.
     ///
@@ -15292,6 +15411,106 @@ mod tests {
                 table.estimate_rows_per_leading_key(&cx).await.unwrap(),
                 None
             );
+        });
+    }
+
+    /// bd-2fb53: counting from a position up to a bound agrees with the
+    /// entries' own order, for bounds inside one leaf, across leaves and
+    /// interior separators, at both ends, past the end, and the leading NULL
+    /// keys, whatever seek placed the cursor.
+    #[test]
+    fn test_count_entries_before_matches_the_key_order() {
+        // A key edge: the leading value (None = NULL) and whether it is passed
+        // over (a start) or included (a bound).
+        type Edge = Option<(Option<i64>, bool)>;
+        // Index order of a leading key: NULL first, then integers.
+        fn rank(value: Option<i64>) -> (u8, i64) {
+            value.map_or((0, 0), |v| (1, v))
+        }
+        fn record(value: Option<i64>) -> Vec<u8> {
+            serialize_record(&[value.map_or(SqliteValue::Null, SqliteValue::Integer)])
+        }
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+            let mut values = Vec::new();
+            for rowid in 1..=6_000_i64 {
+                let value = (rowid % 11 != 0).then_some((rowid * 37) % 500);
+                values.push(value);
+                let key = serialize_record(&[
+                    value.map_or(SqliteValue::Null, SqliteValue::Integer),
+                    SqliteValue::Integer(rowid),
+                ]);
+                cursor.index_insert(&cx, &key).await.unwrap();
+            }
+            assert!(cursor.measure_tree_depth(&cx).await.unwrap() >= 2);
+
+            // (start: None = the first entry, Some((key, past)) = a seek to the first
+            // key >= it, or > it when `past`), (bound, inclusive).
+            let cases: &[(Edge, Edge)] = &[
+                (None, Some((None, true))),
+                (Some((None, true)), None),
+                (Some((Some(100), false)), Some((Some(200), true))),
+                (Some((Some(100), true)), Some((Some(200), false))),
+                (Some((Some(250), false)), Some((Some(250), true))),
+                (Some((Some(250), false)), Some((Some(250), false))),
+                (Some((Some(0), false)), Some((Some(499), true))),
+                (Some((Some(499), false)), None),
+                (Some((Some(600), false)), None),
+                (None, None),
+                (Some((None, true)), Some((Some(0), false))),
+                (Some((Some(-5), false)), Some((Some(3), true))),
+            ];
+            for &(start, bound) in cases {
+                match start {
+                    None => {
+                        cursor.first(&cx).await.unwrap();
+                    }
+                    Some((key, false)) => {
+                        cursor.index_move_to(&cx, &record(key)).await.unwrap();
+                    }
+                    Some((key, true)) => {
+                        cursor
+                            .index_move_to_upper_bound(&cx, &record(key))
+                            .await
+                            .unwrap();
+                    }
+                }
+                let bound_record = bound.map(|(key, _)| record(key));
+                let counted = cursor
+                    .count_entries_before(
+                        &cx,
+                        bound_record.as_deref(),
+                        bound.is_some_and(|(_, inclusive)| inclusive),
+                    )
+                    .await
+                    .unwrap();
+                let expected = values
+                    .iter()
+                    .filter(|&&value| {
+                        start.is_none_or(|(key, past)| {
+                            if past {
+                                rank(value) > rank(key)
+                            } else {
+                                rank(value) >= rank(key)
+                            }
+                        }) && bound.is_none_or(|(key, inclusive)| {
+                            if inclusive {
+                                rank(value) <= rank(key)
+                            } else {
+                                rank(value) < rank(key)
+                            }
+                        })
+                    })
+                    .count();
+                assert_eq!(
+                    counted,
+                    u64::try_from(expected).unwrap(),
+                    "start {start:?}, bound {bound:?}"
+                );
+            }
         });
     }
 

@@ -3309,6 +3309,14 @@ pub fn codegen_select(
                 .is_some()
                 || aggregate_index_is_null_target(where_clause.as_deref(), table, table_alias)
                     .is_some()
+                // bd-2fb53: and `col IS NOT NULL`, counted from the index's pages.
+                || count_star_index_range_target(
+                    where_clause.as_deref(),
+                    table,
+                    table_alias,
+                    schema,
+                )
+                .is_some()
                 || composite_index_prefix_range_target(
                     where_clause.as_deref(),
                     table,
@@ -5090,6 +5098,21 @@ pub fn codegen_select(
             aggregate_index_eq_seek_allowed(from_index_hint),
             stmt.order_by.len(),
         )
+    } else if is_simple_count_star(columns)
+        && stmt.limit.is_none()
+        && stmt.order_by.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && from_clause.joins.is_empty()
+        && time_travel.is_none()
+        && aggregate_index_eq_seek_allowed(from_index_hint)
+        && let Some((index, range)) =
+            count_star_index_range_target(where_clause.as_deref(), table, table_alias, schema)
+    {
+        // --- bd-2fb53: COUNT(*) over an index range, IS NULL or IS NOT NULL ---
+        codegen_select_count_star_index_range(b, table, index, &range, out_regs, done_label, end_label);
+        Ok(())
     } else if has_aggregate_columns(columns) {
         // --- Aggregate query (single-group, no GROUP BY) ---
         let limit_anon_placeholder_base = stmt.limit.as_ref().map(|limit_clause| {
@@ -20859,6 +20882,169 @@ fn aggregate_index_is_null_target<'t>(
         .iter()
         .filter(leads)
         .min_by_key(|idx| idx.key_term_count())
+}
+
+/// The rows a lone `COUNT(*)` counts from an index without reading them
+/// (bd-2fb53): a range its WHERE states exactly, the leading NULL keys, or
+/// every key after them.
+enum CountIndexRange<'e> {
+    Range(ColumnRangeTarget<'e>),
+    Nulls,
+    NotNulls,
+}
+
+/// bd-2fb53: the index and the key range a `COUNT(*)` whose WHERE is exactly
+/// a range on one column (the residual-free
+/// [`aggregate_index_range_seek_target`]), `col IS NULL`
+/// ([`aggregate_index_is_null_target`]) or `col IS NOT NULL` on an ascending
+/// index's leading column counts, so the count can come from the index's
+/// pages (`Opcode::IdxCountBefore`).
+fn count_star_index_range_target<'t, 'e>(
+    where_clause: Option<&'e Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+) -> Option<(&'t IndexSchema, CountIndexRange<'e>)> {
+    if let Some((index, range, false)) =
+        aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
+    {
+        return Some((index, CountIndexRange::Range(range)));
+    }
+    if let Some(index) = aggregate_index_is_null_target(where_clause, table, table_alias) {
+        return Some((index, CountIndexRange::Nulls));
+    }
+    let Some(Expr::IsNull {
+        expr, not: true, ..
+    }) = where_clause
+    else {
+        return None;
+    };
+    if table.without_rowid {
+        return None;
+    }
+    let col_name = column_name(expr, table, table_alias)?;
+    table
+        .indexes
+        .iter()
+        .filter(|idx| {
+            idx.supports_direct_column_lookup()
+                && !idx.key_term_descending(0)
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+        })
+        .min_by_key(|idx| idx.key_term_count())
+        .map(|index| (index, CountIndexRange::NotNulls))
+}
+
+/// bd-2fb53: `SELECT count(*) FROM t WHERE <range | col IS NULL | col IS NOT
+/// NULL>` over `index`, counted from its pages: the cursor is placed on the
+/// first counted key (`SeekGE`/`SeekGT` on a one-field key record, `SeekGT`
+/// past the leading NULL keys, or `Rewind` for the NULL keys themselves) and
+/// `IdxCountBefore` counts up to the upper bound (`[NULL]` for the NULL keys,
+/// none to the end), adding whole leaves without reading their rows, where
+/// stock steps through every entry. A NULL bound counts nothing, as the
+/// range then matches no row. The bounds get the index key's affinity, as in
+/// the aggregate range walk this replaces.
+fn codegen_select_count_star_index_range(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    index: &IndexSchema,
+    range: &CountIndexRange<'_>,
+    out_reg: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) {
+    let idx_cursor = 1_i32;
+    let bound_affinity = index
+        .columns
+        .first()
+        .and_then(|name| table.column_index(name))
+        .map(|i| index_key_affinity(table.columns[i].affinity))
+        .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
+    b.emit_op(Opcode::Integer, 0, out_reg, 0, P4::None, 0);
+    let key_record = |b: &mut ProgramBuilder, expr: Option<&Expr>| -> i32 {
+        let value = b.alloc_reg();
+        match expr {
+            Some(expr) => {
+                emit_expr(b, expr, value, None);
+                if let Some(aff) = bound_affinity
+                    && !bound_matches_affinity(aff, expr)
+                {
+                    b.emit_op(
+                        Opcode::Affinity,
+                        value,
+                        1,
+                        0,
+                        P4::Affinity(aff.to_string()),
+                        0,
+                    );
+                }
+                b.emit_jump_to_label(Opcode::IsNull, value, 0, done_label, P4::None, 0);
+            }
+            None => {
+                b.emit_op(Opcode::Null, 0, value, 0, P4::None, 0);
+            }
+        }
+        let record = b.alloc_reg();
+        b.emit_op(Opcode::MakeRecord, value, 1, record, P4::None, 0);
+        record
+    };
+    // (start key record and seek, or `None` to Rewind) and (upper bound record, inclusive).
+    let (start, upper) = match range {
+        CountIndexRange::Range(range) => {
+            let start = match range.lower.as_ref() {
+                Some(bound) => (
+                    key_record(b, Some(bound.expr())),
+                    if bound.inclusive {
+                        Opcode::SeekGE
+                    } else {
+                        Opcode::SeekGT
+                    },
+                ),
+                // A NULL key satisfies no range bound: start past them.
+                None => (key_record(b, None), Opcode::SeekGT),
+            };
+            let upper = range
+                .upper
+                .as_ref()
+                .map(|bound| (key_record(b, Some(bound.expr())), bound.inclusive));
+            (Some(start), upper)
+        }
+        CountIndexRange::Nulls => (None, Some((key_record(b, None), true))),
+        CountIndexRange::NotNulls => (Some((key_record(b, None), Opcode::SeekGT)), None),
+    };
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        index.root_page,
+        0,
+        P4::Index(index.name.clone()),
+        0,
+    );
+    match start {
+        Some((record, seek)) => {
+            b.emit_jump_to_label(seek, idx_cursor, record, done_label, P4::None, 0);
+        }
+        None => {
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
+        }
+    }
+    let (upper_record, upper_inclusive) = upper.unwrap_or((0, false));
+    b.emit_op(
+        Opcode::IdxCountBefore,
+        idx_cursor,
+        out_reg,
+        upper_record,
+        P4::None,
+        u16::from(upper_inclusive),
+    );
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::ResultRow, out_reg, 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
 }
 
 /// Returns `(index, range, has_residual)`. `has_residual == false` is the residual-free case above.

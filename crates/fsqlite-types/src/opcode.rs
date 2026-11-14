@@ -625,14 +625,27 @@ pub enum Opcode {
     /// where the program inserts the rows with `IdxInsert`
     /// (bd-reality-check-1022-llk6g.8).
     IdxBulkLoad = 200,
+
+    /// Count index entries from the cursor's position up to a bound.
+    ///
+    /// P1 = index cursor, positioned on the first entry to count (or at EOF),
+    /// P2 = output register, set to the count, P3 = register holding the
+    /// bound as a key record, or 0 to count to the end of the index, P5 = 1
+    /// to count entries whose leading fields equal the bound's (`key <=
+    /// bound`), 0 to stop at them (`key < bound`).
+    ///
+    /// Leaves wholly before the bound are counted from their cell counts, so
+    /// the work is per leaf rather than per entry (bd-2fb53). The cursor is
+    /// left on the first entry not counted.
+    IdxCountBefore = 201,
 }
 
 impl Opcode {
     /// Exclusive upper bound on valid opcode discriminants.
     ///
-    /// Discriminants run `1..=200` (there is no zero opcode), so valid bytes
+    /// Discriminants run `1..=201` (there is no zero opcode), so valid bytes
     /// are exactly `1..COUNT` and the number of opcodes defined is `COUNT - 1`.
-    pub const COUNT: usize = 201;
+    pub const COUNT: usize = 202;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -838,6 +851,7 @@ impl Opcode {
             Self::ColumnOctetLength => "ColumnOctetLength",
             Self::IfConflictSkip => "IfConflictSkip",
             Self::IdxBulkLoad => "IdxBulkLoad",
+            Self::IdxCountBefore => "IdxCountBefore",
         }
     }
 
@@ -1053,6 +1067,7 @@ impl Opcode {
             198 => Some(Self::ColumnOctetLength),
             199 => Some(Self::IfConflictSkip),
             200 => Some(Self::IdxBulkLoad),
+            201 => Some(Self::IdxCountBefore),
             _ => None,
         }
     }
@@ -1663,8 +1678,8 @@ mod tests {
     fn opcode_count() {
         // COUNT is the exclusive upper bound on discriminants (1..COUNT), so the
         // number of opcodes actually defined is COUNT - 1.
-        assert_eq!(Opcode::COUNT, 201);
-        assert_eq!(Opcode::COUNT - 1, 200);
+        assert_eq!(Opcode::COUNT, 202);
+        assert_eq!(Opcode::COUNT - 1, 201);
     }
 
     #[test]
@@ -1691,7 +1706,8 @@ mod tests {
         assert_eq!(Opcode::from_byte(198), Some(Opcode::ColumnOctetLength));
         assert_eq!(Opcode::from_byte(199), Some(Opcode::IfConflictSkip));
         assert_eq!(Opcode::from_byte(200), Some(Opcode::IdxBulkLoad));
-        assert_eq!(Opcode::from_byte(201), None);
+        assert_eq!(Opcode::from_byte(201), Some(Opcode::IdxCountBefore));
+        assert_eq!(Opcode::from_byte(202), None);
         assert_eq!(Opcode::from_byte(255), None);
     }
 

@@ -4,7 +4,9 @@
 //! HARD GATE: byte-identical to C SQLite (rusqlite) across `>`/`>=`/`<`/`<=`/`BETWEEN`, reversed
 //! operand order, NULLs (excluded by the predicate), empty ranges (→ COUNT=0 / SUM=NULL), the COALESCE
 //! wrapper, mixed storage classes in the indexed column, and a residual-predicate DECLINE
-//! (`a > c AND x = k` must not drop `x = k`). Opcode gate: a lower-bounded range SeekGEs the index.
+//! (`a > c AND x = k` must not drop `x = k`). Opcode gate: a lower-bounded range seeks the index;
+//! a lone COUNT(*) over an exact range counts it from the index's pages (`IdxCountBefore`,
+//! bd-2fb53).
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -183,10 +185,13 @@ fn agg_index_range_matches_sqlite() {
             "range + residual is non-covering (SeekRowid to read the residual column)"
         );
 
-        // Opcode gate: a lower-bounded range seeks the index for both aggregates.
+        // Opcode gate: a lower-bounded range seeks the index for both aggregates. COUNT(*)
+        // seeks past the bound's own keys and counts the range from the index's pages
+        // (bd-2fb53).
         assert!(
-            has_op(&f, "SELECT COUNT(*) FROM t WHERE a > 100", "SeekGE").await,
-            "COUNT(*) WHERE a>c must seek the index"
+            has_op(&f, "SELECT COUNT(*) FROM t WHERE a > 100", "SeekGT").await
+                && has_op(&f, "SELECT COUNT(*) FROM t WHERE a > 100", "IdxCountBefore").await,
+            "COUNT(*) WHERE a>c must seek the index and count from it"
         );
         assert!(
             has_op(&f, "SELECT SUM(x) FROM t WHERE a > 100", "SeekGE").await,
@@ -590,5 +595,146 @@ fn grouped_desc_index_keys_stream_in_index_order() {
             }
             f.close().await.unwrap();
         }
+    });
+}
+
+/// bd-2fb53: a lone COUNT(*) whose WHERE is exactly a range on an index's key,
+/// `IS NULL` or `IS NOT NULL` counts from the index's pages (`IdxCountBefore`,
+/// whole leaves at a time) and matches stock: on a file database with indexes
+/// of many leaves and interior levels, inclusive and exclusive bounds, ranges
+/// starting and ending inside one leaf, across leaves and at both ends,
+/// empty ranges, NULL bounds, reals and text in the INTEGER column, bound
+/// parameters, BINARY text ranges over mixed-case keys with an integer and a
+/// blob at the ends, a composite index's leading NULLs, and an empty table. A
+/// residual, a DESC index, a NOCASE text range (which the range lane declines)
+/// and a non-COUNT aggregate keep their programs.
+#[test]
+fn count_star_over_an_exact_index_range_counts_leaves_and_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("count_index_range.db");
+        let f = Connection::open(file.to_str().unwrap()).await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for stmt in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, s TEXT COLLATE NOCASE, x INTEGER, \
+             d INTEGER, w TEXT);",
+            "CREATE INDEX idx_a ON t(a);",
+            "CREATE INDEX idx_s ON t(s);",
+            "CREATE INDEX idx_w ON t(w);",
+            "CREATE INDEX idx_xa ON t(x, a);",
+            "CREATE INDEX idx_d ON t(d DESC);",
+            "CREATE TABLE empty (id INTEGER PRIMARY KEY, a INTEGER);",
+            "CREATE INDEX idx_empty ON empty(a);",
+        ] {
+            f.execute(stmt).await.unwrap();
+            r.execute_batch(stmt).unwrap();
+        }
+        let mut batch = String::from("BEGIN;");
+        for i in 1..=12_000_i64 {
+            // Every 9th row has a NULL key; the rest repeat each value about 12 times.
+            let a = if i % 9 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", (i * 37) % 1000 - 300)
+            };
+            let x = if i % 5 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 3)
+            };
+            let s = if i % 4 == 0 { "K" } else { "k" };
+            batch.push_str(&format!(
+                "INSERT INTO t VALUES ({i}, {a}, '{s}{}', {x}, {}, '{s}{}');",
+                i % 50,
+                i % 70,
+                i % 60
+            ));
+        }
+        batch.push_str(
+            "INSERT INTO t VALUES (90001, 7.5, NULL, 1, 1, NULL), (90002, 'apple', NULL, 1, 1, 7), \
+             (90003, 'zzz', NULL, 1, 1, X'01'); COMMIT;",
+        );
+        f.execute_batch(&batch).await.unwrap();
+        r.execute_batch(&batch).unwrap();
+        f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .await
+            .unwrap();
+
+        let counted: &[(&str, &[i64])] = &[
+            ("SELECT count(*) FROM t WHERE a > 100", &[]),
+            ("SELECT count(*) FROM t WHERE a >= 100", &[]),
+            ("SELECT count(*) FROM t WHERE a < 100", &[]),
+            ("SELECT count(*) FROM t WHERE a <= 100", &[]),
+            ("SELECT count(*) FROM t WHERE a BETWEEN -50 AND 50", &[]),
+            ("SELECT count(*) FROM t WHERE a > -300 AND a < 699", &[]),
+            ("SELECT count(*) FROM t WHERE a BETWEEN 10 AND 10", &[]),
+            ("SELECT count(*) FROM t WHERE a > 10 AND a < 11", &[]),
+            ("SELECT count(*) FROM t WHERE a >= 698", &[]),
+            ("SELECT count(*) FROM t WHERE a <= -300", &[]),
+            ("SELECT count(*) FROM t WHERE a > 100000", &[]),
+            ("SELECT count(*) FROM t WHERE a < -100000", &[]),
+            ("SELECT count(*) FROM t WHERE a > 249", &[]),
+            ("SELECT count(*) FROM t WHERE 100 < a", &[]),
+            ("SELECT count(*) FROM t WHERE a IS NULL", &[]),
+            ("SELECT count(*) FROM t WHERE a IS NOT NULL", &[]),
+            ("SELECT count(*) FROM t WHERE x IS NULL", &[]),
+            ("SELECT count(*) FROM t WHERE x IS NOT NULL", &[]),
+            (
+                "SELECT count(*) AS n FROM t WHERE a BETWEEN ?1 AND ?2",
+                &[-20, 400],
+            ),
+            ("SELECT count(*) FROM t WHERE a > ?1", &[650]),
+            // BINARY text keys: 'K…' sort before 'k…'; an integer and a blob sit at the ends.
+            ("SELECT count(*) FROM t WHERE w >= 'k1' AND w < 'k2'", &[]),
+            ("SELECT count(*) FROM t WHERE w > 'K30'", &[]),
+            ("SELECT count(*) FROM t WHERE w IS NOT NULL", &[]),
+            ("SELECT count(*) FROM empty WHERE a > 0", &[]),
+            ("SELECT count(*) FROM empty WHERE a IS NULL", &[]),
+        ];
+        for (sql, params) in counted {
+            assert_eq!(
+                frank_rows(&f, sql, params).await,
+                sqlite_rows(&r, sql, params),
+                "diverged: `{sql}` {params:?}"
+            );
+            assert!(
+                has_op(&f, sql, "IdxCountBefore").await,
+                "an exact index range counts from the index's pages: `{sql}`"
+            );
+        }
+        // A NULL bound matches no row.
+        for sql in [
+            "SELECT count(*) FROM t WHERE a > NULL",
+            "SELECT count(*) FROM t WHERE a BETWEEN NULL AND 5",
+        ] {
+            assert_eq!(
+                frank_rows(&f, sql, &[]).await,
+                sqlite_rows(&r, sql, &[]),
+                "diverged: `{sql}`"
+            );
+        }
+
+        let walked = [
+            "SELECT count(*) FROM t WHERE a > 100 AND x = 1",
+            "SELECT count(*) FROM t WHERE d > 30",
+            // A NOCASE text range is not an exact range for this lane (the range target declines
+            // it); its answer must still be stock's.
+            "SELECT count(*) FROM t WHERE s >= 'k1' AND s < 'k2'",
+            "SELECT count(*) FROM t WHERE s > 'K30'",
+            "SELECT sum(a) FROM t WHERE a > 100",
+            "SELECT count(a) FROM t WHERE a > 100",
+        ];
+        for sql in walked {
+            assert_eq!(
+                frank_rows(&f, sql, &[]).await,
+                sqlite_rows(&r, sql, &[]),
+                "diverged: `{sql}`"
+            );
+            assert!(
+                !has_op(&f, sql, "IdxCountBefore").await,
+                "not an exact lone COUNT(*) range: `{sql}`"
+            );
+        }
+        f.close().await.unwrap();
     });
 }

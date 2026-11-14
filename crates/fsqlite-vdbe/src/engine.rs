@@ -4590,6 +4590,20 @@ impl CursorBackend {
         }
     }
 
+    /// bd-2fb53: [`BtCursor::count_entries_before`].
+    async fn count_entries_before(
+        &mut self,
+        cx: &Cx,
+        bound: Option<&[u8]>,
+        inclusive: bool,
+    ) -> Result<u64> {
+        match self {
+            Self::Mem(c) => c.count_entries_before(cx, bound, inclusive).await,
+            Self::Txn(c) => c.count_entries_before(cx, bound, inclusive).await,
+            Self::TimeTravel(c) => c.count_entries_before(cx, bound, inclusive).await,
+        }
+    }
+
     async fn prev(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.prev(cx).await,
@@ -14772,6 +14786,37 @@ impl VdbeEngine {
                     };
                     let next_count = self.get_reg(op.p2).to_integer().wrapping_add(matched);
                     self.set_reg_int(op.p2, next_count);
+                    pc += 1;
+                }
+
+                Opcode::IdxCountBefore => {
+                    // bd-2fb53: count the index entries from the cursor's
+                    // position that order before the bound record in P3 (to
+                    // the end when P3 is 0), whole leaves at a time.
+                    let bound = (op.p3 > 0).then(|| self.clone_reg_materialized(op.p3));
+                    let collect_vdbe_metrics = self.collect_vdbe_metrics;
+                    let cursor = self.storage_cursors.get_mut(&op.p1).ok_or_else(|| {
+                        FrankenError::internal("IdxCountBefore requires an open storage cursor")
+                    })?;
+                    if cursor.cursor.is_table_btree() {
+                        return Err(FrankenError::internal(
+                            "IdxCountBefore requires an index cursor",
+                        ));
+                    }
+                    let bound_bytes = bound.as_ref().map(record_blob_bytes);
+                    let inclusive = (op.p5 & 1) != 0;
+                    let counted = lean_future(|| {
+                        cursor
+                            .cursor
+                            .count_entries_before(&cursor.cx, bound_bytes, inclusive)
+                    })
+                    .await?;
+                    invalidate_storage_cursor_row_cache_with_reason(
+                        cursor,
+                        collect_vdbe_metrics,
+                        DecodeCacheInvalidationReason::PositionChange,
+                    );
+                    self.set_reg_int(op.p2, i64::try_from(counted).unwrap_or(i64::MAX));
                     pc += 1;
                 }
 
