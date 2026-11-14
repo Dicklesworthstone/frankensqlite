@@ -325,6 +325,23 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN (with statistics): an inner join drives from the table its WHERE pins when sqlite_stat1 says that side is smaller (bd-9uf3l retry)
+
+- Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` drove from all of p
+  (246x stock). The unconditional swap was the LOSS entry below. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (swapped_join_lookup_plan_driving_filtered_side takes
+  Stat1RowEstimates; CodegenContext::stat1_row_estimates), crates/fsqlite-core/src/connection.rs
+  (Stat1Hints replaced by Stat1RowEstimates in an Arc; a join statement's compile passes it).
+- Rule: swap only when stat1's rows per key for the pinned index (one for a rowid) times 4 is
+  under the written outer table's row count; no statistics, no swap.
+- Result (b73d7ba83; scratchpad jss_ab.py, the same fixture without and with ANALYZE, stock live;
+  ELF before c8b948ada3e04c2f, after a02f39873c03c37a; thinkstation1): with ANALYZE 246.4x ->
+  10.4x (equal to the t-first spelling), rows 161.8x -> 7.5x, rowid pin 672.6x -> 0.9x; the
+  10-row outer and the unselective-pin controls keep the written order (1.1x-1.3x). Without
+  ANALYZE every row is unchanged.
+- Retry / next: without statistics the target stays at 257x; it needs a table-size estimate
+  from the b-tree (bd-9uf3l's follow-up bead), not stock's equal-size default.
+
 ## 2026-11-14 - WIN (with a measured cost): GROUP BY streams groups in index order and stops at its LIMIT (bd-2mrip; bd-gazf2's file part)
 
 - Target: `SELECT a, max(b) FROM t GROUP BY a ORDER BY a LIMIT 5` sorted every row before its
