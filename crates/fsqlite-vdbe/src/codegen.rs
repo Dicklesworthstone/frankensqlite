@@ -3265,6 +3265,8 @@ pub fn codegen_select(
                     schema,
                 )
                 .is_some()
+                || aggregate_index_is_null_target(where_clause.as_deref(), table, table_alias)
+                    .is_some()
                 || composite_index_prefix_range_target(
                     where_clause.as_deref(),
                     table,
@@ -20429,6 +20431,42 @@ fn index_integer_in_list_residual_target<'t>(
 /// column, so a residual `c = 5` or a second column declines), so the seek — which applies no
 /// residual filter — is byte-exact. Rowid tables only; the trailing sentinel in the probe is the
 /// rowid.
+/// bd-z62ru: a WHERE that is exactly `col IS NULL`, on an index whose ascending first key term is
+/// `col`. NULLs sort first, so the rows it matches are the index's leading entries up to the
+/// first non-NULL key: the walk starts at `Rewind` and stops there, as stock's
+/// `SEARCH t USING COVERING INDEX i (col=?)` does. A one-key index is preferred and a partial
+/// index never qualifies. Beside other conjuncts it declines: an equality seek on another
+/// column (`a = 5 AND n IS NULL`) usually visits far fewer rows than every NULL key.
+fn aggregate_index_is_null_target<'t>(
+    where_clause: Option<&Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<&'t IndexSchema> {
+    let Some(Expr::IsNull {
+        expr, not: false, ..
+    }) = where_clause
+    else {
+        return None;
+    };
+    if table.without_rowid {
+        return None;
+    }
+    let col_name = column_name(expr, table, table_alias)?;
+    let leads = |idx: &&IndexSchema| {
+        idx.supports_direct_column_lookup()
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    };
+    table
+        .indexes
+        .iter()
+        .filter(leads)
+        .min_by_key(|idx| idx.key_term_count())
+}
+
 /// Returns `(index, range, has_residual)`. `has_residual == false` is the residual-free case above.
 /// `has_residual == true` additionally allows a range on an INTEGER-affinity single-column index that
 /// coexists with OTHER (placeholder-free) predicates the seek cannot enforce: the integer-literal
@@ -21752,6 +21790,8 @@ fn codegen_select_aggregate(
     // `BETWEEN`) instead of a full scan. Reuses the residual-safe `aggregate_index_range_seek_target`
     // detection; mirrors the non-aggregate `codegen_select_index_range_scan`, only the per-row action
     // changes (accumulate vs `ResultRow`).
+    // bd-z62ru: `col IS NULL` walks the same way, over the index's leading NULL keys
+    // (the last tuple field).
     let index_range_seek = if allow_index_seek
         && having.is_none()
         && index_eq_seek.is_none()
@@ -21761,6 +21801,16 @@ fn codegen_select_aggregate(
         && index_const_in_seek.is_none()
     {
         aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
+            .map(|(index, range, has_residual)| (index, range, has_residual, false))
+            .or_else(|| {
+                aggregate_index_is_null_target(where_clause, table, table_alias).map(|index| {
+                    let nulls = ColumnRangeTarget {
+                        lower: None,
+                        upper: None,
+                    };
+                    (index, nulls, false, true)
+                })
+            })
     } else {
         None
     };
@@ -22484,7 +22534,7 @@ fn codegen_select_aggregate(
         );
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
         skip_scan = true;
-    } else if let Some((idx_schema, index_range, has_residual)) = index_range_seek {
+    } else if let Some((idx_schema, index_range, has_residual, nulls_only)) = index_range_seek {
         // Single-column index range: position at the lower bound (or `Rewind` when unbounded below),
         // walk while the key stays within the range, accumulate. Mirrors the ascending half of
         // `codegen_select_index_range_scan`; a NULL bound / empty range jumps to finalize (still-Null
@@ -22539,8 +22589,10 @@ fn codegen_select_aggregate(
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
             (reg, bound.inclusive)
         });
-        // A register holding the current key, needed to test an exclusive lower bound or any upper bound.
-        let current_key_reg = (upper_reg.is_some()
+        // A register holding the current key, needed to test an exclusive lower bound, any upper
+        // bound, or the end of the leading NULL keys.
+        let current_key_reg = (nulls_only
+            || upper_reg.is_some()
             || lower_probe
                 .as_ref()
                 .is_some_and(|(_, inclusive)| !inclusive))
@@ -22593,8 +22645,11 @@ fn codegen_select_aggregate(
         if let Some(key_reg) = current_key_reg {
             b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
             // With no lower probe (`Rewind` start) the leading NULLs of the index must be skipped —
-            // a NULL key satisfies no range bound.
-            if lower_probe.is_none() {
+            // a NULL key satisfies no range bound. `IS NULL` takes exactly those leading NULLs and
+            // stops at the first non-NULL key.
+            if nulls_only {
+                b.emit_jump_to_label(Opcode::NotNull, key_reg, 0, finalize_label, P4::None, 0);
+            } else if lower_probe.is_none() {
                 b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, skip_label, P4::None, 0);
             }
         }
