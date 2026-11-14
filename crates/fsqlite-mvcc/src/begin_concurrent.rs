@@ -444,6 +444,13 @@ pub struct ConcurrentHandle {
     /// [`ConcurrentRegistry::pending_publication_blocks`]. Cleared by
     /// `mark_committed` / `mark_aborted` and on reuse.
     publication_pending: bool,
+    /// bd-i0tn6: the witness-derived part of this handle's SSI view, built on
+    /// the first validation that needs it after a change and shared, by `Arc`,
+    /// with every later one until the next change. Every mutation that can
+    /// alter it (a read or write witness, a page-state transition, a savepoint
+    /// rollback, reuse) drops it through
+    /// [`ConcurrentHandle::invalidate_view_parts`].
+    view_parts_cache: Option<Arc<HandleViewParts>>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -595,6 +602,7 @@ impl ConcurrentHandle {
             savepoint_snapshot_cache: None,
             savepoint_snapshot_dirty: PageSet::default(),
             publication_pending: false,
+            view_parts_cache: None,
         }
     }
 
@@ -617,6 +625,7 @@ impl ConcurrentHandle {
         self.snapshot = snapshot;
         self.serializable = serializable;
         self.page_states.clear();
+        self.invalidate_view_parts();
         self.savepoint_snapshot_cache = None;
         self.savepoint_snapshot_dirty.clear();
         self.state = TransactionState::Active;
@@ -773,6 +782,7 @@ impl ConcurrentHandle {
                 .entry(page)
                 .or_default()
                 .push(WitnessKey::Page(page));
+            self.invalidate_view_parts();
         }
     }
 
@@ -803,6 +813,7 @@ impl ConcurrentHandle {
         } else {
             self.global_read_witnesses.push(key);
         }
+        self.invalidate_view_parts();
     }
 
     /// Record a granular write witness for fine-grained SSI.
@@ -811,6 +822,7 @@ impl ConcurrentHandle {
             let witnesses = self.write_index.entry(p).or_default();
             if !witnesses.iter().any(|existing| existing == &key) {
                 witnesses.push(key);
+                self.invalidate_view_parts();
             }
         } else if !self
             .global_write_witnesses
@@ -818,7 +830,26 @@ impl ConcurrentHandle {
             .any(|existing| existing == &key)
         {
             self.global_write_witnesses.push(key);
+            self.invalidate_view_parts();
         }
+    }
+
+    /// bd-i0tn6: drop the cached view parts; the next validation that views
+    /// this handle rebuilds them from the current witnesses and page states.
+    fn invalidate_view_parts(&mut self) {
+        self.view_parts_cache = None;
+    }
+
+    /// The witness-derived part of this handle's SSI view: the cached copy
+    /// when nothing changed since it was built, otherwise a fresh build that
+    /// later validations share.
+    fn view_parts(&mut self) -> Arc<HandleViewParts> {
+        if let Some(parts) = &self.view_parts_cache {
+            return Arc::clone(parts);
+        }
+        let parts = Arc::new(HandleViewParts::build(self));
+        self.view_parts_cache = Some(Arc::clone(&parts));
+        parts
     }
 
     /// Returns the set of pages that were read.
@@ -901,8 +932,10 @@ impl ConcurrentHandle {
 
     fn ensure_page_state(&mut self, page: PageNumber) -> &mut PageTxnState {
         // The returned &mut is how every state transition happens, so the
-        // page must be assumed dirtied (bd-5310l savepoint snapshot cache).
+        // page must be assumed dirtied (bd-5310l savepoint snapshot cache)
+        // and the tracked write-conflict set in the view parts stale.
         self.note_savepoint_state_dirty(page);
+        self.invalidate_view_parts();
         self.page_states.entry(page).or_default()
     }
 
@@ -913,6 +946,7 @@ impl ConcurrentHandle {
             .is_some_and(PageTxnState::is_empty)
         {
             self.note_savepoint_state_dirty(page);
+            self.invalidate_view_parts();
             self.page_states.remove(&page);
         }
     }
@@ -1564,8 +1598,8 @@ impl ConcurrentRegistry {
             .filter(|&&pending| pending != session_id)
             .filter_map(|pending| {
                 self.active.get(pending).map(|handle| {
-                    let guard = handle.lock();
-                    HandleView::new(&guard)
+                    let mut guard = handle.lock();
+                    HandleView::new(&mut guard)
                 })
             })
             .collect();
@@ -2150,6 +2184,7 @@ pub fn concurrent_clear_page_state(
     }
 
     handle.note_savepoint_state_dirty(page);
+    handle.invalidate_view_parts();
     handle.page_states.remove(&page);
     Ok(())
 }
@@ -2333,6 +2368,8 @@ pub fn concurrent_has_page_state(handle: &ConcurrentHandle) -> bool {
 /// - Structural B-tree metadata that can be merged safely
 pub fn concurrent_mark_metadata_exempt(handle: &mut ConcurrentHandle, page: PageNumber) {
     handle.note_savepoint_state_dirty(page);
+    // An exempt page leaves the tracked write-conflict set.
+    handle.invalidate_view_parts();
     if let Some(state) = handle.page_states.get_mut(&page) {
         state.metadata_exempt = true;
     }
@@ -2703,10 +2740,23 @@ impl ExactCellWitness {
     }
 }
 
+/// One validation's view of an active handle: identity, flags and rw bits read
+/// fresh, plus the witness-derived page sets shared through the handle's
+/// cache (bd-i0tn6). Field access goes through `Deref` to the parts.
 struct HandleView {
     token: TxnToken,
     begin_seq: CommitSeq,
     flags: HandleViewFlags,
+    parts: Arc<HandleViewParts>,
+    has_in_rw: Cell<bool>,
+    has_out_rw: Cell<bool>,
+}
+
+/// The witness-derived page sets of a [`HandleView`]: a pure function of the
+/// handle's read/write witnesses and tracked write-conflict pages, so one
+/// build serves every validation until one of those changes.
+#[derive(Debug, PartialEq, Eq)]
+struct HandleViewParts {
     // Sorted, dedup'd page sets queried via `binary_search`. Storing these
     // as `HashSet<PageNumber>` (default `RandomState` hasher) cost
     // SipHash13 on every insert + every overlap probe — `HandleView::new`
@@ -2720,12 +2770,53 @@ struct HandleView {
     write_pages: Vec<PageNumber>,
     write_page_witness_pages: Vec<PageNumber>,
     write_exact_cells: Vec<(PageNumber, u64)>,
-    has_in_rw: Cell<bool>,
-    has_out_rw: Cell<bool>,
+}
+
+impl std::ops::Deref for HandleView {
+    type Target = HandleViewParts;
+
+    fn deref(&self) -> &HandleViewParts {
+        &self.parts
+    }
 }
 
 impl HandleView {
-    fn new(handle: &ConcurrentHandle) -> Self {
+    /// The view validation and publication take of `handle`, sharing the
+    /// handle's cached parts when nothing changed since they were built.
+    fn new(handle: &mut ConcurrentHandle) -> Self {
+        Self {
+            token: handle.token(),
+            begin_seq: handle.begin_seq(),
+            flags: HandleViewFlags::from_handle(handle),
+            parts: handle.view_parts(),
+            has_in_rw: Cell::new(handle.has_in_rw()),
+            has_out_rw: Cell::new(handle.has_out_rw()),
+        }
+    }
+
+    const fn is_currently_active(&self) -> bool {
+        self.flags.is_active()
+    }
+
+    fn has_read_witnesses(&self) -> bool {
+        !self.read_pages.is_empty() || self.has_global_read_witnesses()
+    }
+
+    fn has_write_witnesses(&self) -> bool {
+        !self.write_pages.is_empty() || self.has_global_write_witnesses()
+    }
+
+    const fn has_global_read_witnesses(&self) -> bool {
+        self.flags.has_global_read_witnesses()
+    }
+
+    const fn has_global_write_witnesses(&self) -> bool {
+        self.flags.has_global_write_witnesses()
+    }
+}
+
+impl HandleViewParts {
+    fn build(handle: &ConcurrentHandle) -> Self {
         let read_summary = summarize_witness_keys(&handle.read_witness_keys());
         let write_summary = summarize_witness_keys(&handle.write_witness_keys());
 
@@ -2758,38 +2849,13 @@ impl HandleView {
         write_exact_cells.dedup();
 
         Self {
-            token: handle.token(),
-            begin_seq: handle.begin_seq(),
-            flags: HandleViewFlags::from_handle(handle),
             read_pages: read_summary.pages,
             read_page_witness_pages: read_summary.page_witness_pages,
             read_exact_cells,
             write_pages,
             write_page_witness_pages: write_summary.page_witness_pages,
             write_exact_cells,
-            has_in_rw: Cell::new(handle.has_in_rw()),
-            has_out_rw: Cell::new(handle.has_out_rw()),
         }
-    }
-
-    const fn is_currently_active(&self) -> bool {
-        self.flags.is_active()
-    }
-
-    fn has_read_witnesses(&self) -> bool {
-        !self.read_pages.is_empty() || self.has_global_read_witnesses()
-    }
-
-    fn has_write_witnesses(&self) -> bool {
-        !self.write_pages.is_empty() || self.has_global_write_witnesses()
-    }
-
-    const fn has_global_read_witnesses(&self) -> bool {
-        self.flags.has_global_read_witnesses()
-    }
-
-    const fn has_global_write_witnesses(&self) -> bool {
-        self.flags.has_global_write_witnesses()
     }
 }
 
@@ -3606,8 +3672,8 @@ pub fn prepare_concurrent_commit_with_ssi(
         let views = registry
             .iter_active()
             .filter_map(|(_, handle)| {
-                let guard = handle.lock();
-                guard.is_active().then_some(HandleView::new(&guard))
+                let mut guard = handle.lock();
+                guard.is_active().then(|| HandleView::new(&mut guard))
             })
             .collect::<Vec<_>>();
         let active_index = ActiveEdgeDiscoveryIndex::build(&views);
@@ -3721,8 +3787,8 @@ pub fn prepare_concurrent_commit_with_ssi(
     let views = registry
         .iter_active()
         .filter_map(|(_, handle)| {
-            let guard = handle.lock();
-            guard.is_active().then_some(HandleView::new(&guard))
+            let mut guard = handle.lock();
+            guard.is_active().then(|| HandleView::new(&mut guard))
         })
         .collect::<Vec<_>>();
     let active_index = ActiveEdgeDiscoveryIndex::build(&views);
@@ -4089,8 +4155,8 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             .active
             .values()
             .map(|handle| {
-                let guard = handle.lock();
-                HandleView::new(&guard)
+                let mut guard = handle.lock();
+                HandleView::new(&mut guard)
             })
             .collect();
         let active_index = ActiveEdgeDiscoveryIndex::build(&active_views);
@@ -4138,8 +4204,8 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         .active
         .values()
         .map(|handle| {
-            let guard = handle.lock();
-            HandleView::new(&guard)
+            let mut guard = handle.lock();
+            HandleView::new(&mut guard)
         })
         .collect();
     let active_index = ActiveEdgeDiscoveryIndex::build(&active_views);
@@ -4493,6 +4559,8 @@ pub fn concurrent_rollback_to_savepoint(
     // Wholesale replacement above invalidates the incremental savepoint
     // snapshot cache; the next savepoint rebuilds it in full (bd-5310l).
     handle.invalidate_savepoint_snapshot_cache();
+    // ...and the tracked write-conflict pages of the SSI view parts.
+    handle.invalidate_view_parts();
     Ok(())
 }
 
@@ -4529,7 +4597,8 @@ mod tests {
 
     use super::{
         ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
-        ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, OwnerAllocationDomain,
+        ConcurrentRegistry, FcwResult, HandleView, HandleViewParts, MAX_CONCURRENT_WRITERS,
+        OwnerAllocationDomain,
         concurrent_abort, concurrent_clear_page_state, concurrent_commit,
         concurrent_commit_read_only, concurrent_commit_with_ssi, concurrent_free_page,
         concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt, concurrent_page_is_freed,
@@ -7868,7 +7937,7 @@ mod tests {
             namespace: 4,
             bytes: b"write-global".to_vec(),
         });
-        let view = HandleView::new(&handle);
+        let view = HandleView::new(&mut handle);
 
         assert!(view.check_read_overlap(&WitnessKey::Custom {
             namespace: 5,
@@ -7888,7 +7957,7 @@ mod tests {
 
         let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(3011));
         handle.record_read_witness(WitnessKey::for_cell_read(root, leaf_a, b"key-a"));
-        let view = HandleView::new(&handle);
+        let view = HandleView::new(&mut handle);
 
         assert!(view.check_read_overlap(&WitnessKey::for_cell_read(root, leaf_a, b"key-a")));
         assert!(
@@ -7930,9 +7999,9 @@ mod tests {
         unrelated_writer.record_write_witness(WitnessKey::Page(test_page(9)));
 
         let views = vec![
-            HandleView::new(&page_writer),
-            HandleView::new(&global_writer),
-            HandleView::new(&unrelated_writer),
+            HandleView::new(&mut page_writer),
+            HandleView::new(&mut global_writer),
+            HandleView::new(&mut unrelated_writer),
         ];
         let index = ActiveEdgeDiscoveryIndex::build(&views);
         let read_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
@@ -7962,7 +8031,7 @@ mod tests {
         assert!(tracked_writer.tracks_write_conflict_page(test_page(11)));
         assert!(tracked_writer.write_index.is_empty());
 
-        let views = vec![HandleView::new(&tracked_writer)];
+        let views = vec![HandleView::new(&mut tracked_writer)];
         let index = ActiveEdgeDiscoveryIndex::build(&views);
         let read_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(11))]);
 
@@ -7995,7 +8064,7 @@ mod tests {
         writer.record_write_witness(write_cell.clone());
         writer.record_write_witness(write_page.clone());
 
-        let views = vec![HandleView::new(&reader), HandleView::new(&writer)];
+        let views = vec![HandleView::new(&mut reader), HandleView::new(&mut writer)];
         let index = ActiveEdgeDiscoveryIndex::build(&views);
         let write_summary = summarize_witness_keys(&[write_cell.clone(), write_page.clone()]);
         let read_summary =
@@ -8043,9 +8112,9 @@ mod tests {
         unrelated_reader.record_read(test_page(9));
 
         let views = vec![
-            HandleView::new(&page_reader),
-            HandleView::new(&global_reader),
-            HandleView::new(&unrelated_reader),
+            HandleView::new(&mut page_reader),
+            HandleView::new(&mut global_reader),
+            HandleView::new(&mut unrelated_reader),
         ];
         let index = ActiveEdgeDiscoveryIndex::build(&views);
         let write_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
@@ -8653,6 +8722,122 @@ mod tests {
             CommitSeq::new(11),
         );
         assert!(result2.is_ok(), "T2 should commit after T1 aborted");
+    }
+
+    /// bd-i0tn6: the cached view parts equal a fresh build after every kind of
+    /// mutation that feeds them. Each check leaves the cache filled, so a
+    /// mutation point that forgets to drop it fails at that step.
+    #[test]
+    fn test_view_parts_cache_matches_a_fresh_build_after_every_mutation() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(9101));
+        let check = |handle: &mut ConcurrentHandle, step: &str| {
+            let cached = handle.view_parts();
+            assert_eq!(
+                *cached,
+                HandleViewParts::build(handle),
+                "cached view parts are stale after {step}"
+            );
+        };
+        check(&mut handle, "creation");
+        handle.record_read(test_page(3));
+        check(&mut handle, "record_read");
+        handle.record_read_witness(WitnessKey::for_cell_read(test_page(40), test_page(41), b"k"));
+        check(&mut handle, "record_read_witness");
+        handle.record_read_witness(WitnessKey::Custom {
+            namespace: 2,
+            bytes: b"global-read".to_vec(),
+        });
+        check(&mut handle, "a global read witness");
+        handle.record_write_witness(WitnessKey::Page(test_page(6)));
+        check(&mut handle, "record_write_witness");
+        concurrent_write_page(&mut handle, &lock_table, test_page(7), test_data()).unwrap();
+        check(&mut handle, "concurrent_write_page");
+        let savepoint = concurrent_savepoint(&mut handle, "sp").unwrap();
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, test_page(8)).unwrap();
+        check(&mut handle, "concurrent_track_write_conflict_page");
+        concurrent_free_page(&mut handle, &lock_table, test_page(9)).unwrap();
+        check(&mut handle, "concurrent_free_page");
+        concurrent_mark_metadata_exempt(&mut handle, test_page(7));
+        check(&mut handle, "concurrent_mark_metadata_exempt");
+        concurrent_rollback_to_savepoint(&mut handle, &lock_table, &savepoint).unwrap();
+        check(&mut handle, "concurrent_rollback_to_savepoint");
+        concurrent_clear_page_state(&mut handle, &lock_table, test_page(7)).unwrap();
+        check(&mut handle, "concurrent_clear_page_state");
+        handle.reset_for_new_transaction(test_snapshot(20), test_token(9102));
+        check(&mut handle, "reset_for_new_transaction");
+        assert!(HandleViewParts::build(&handle).write_pages.is_empty());
+    }
+
+    /// bd-i0tn6: validations with no change in between share one build; the
+    /// next change makes the following view a new build. A handle without the
+    /// cache builds every time and fails the first assertion.
+    #[test]
+    fn test_view_parts_are_shared_until_the_handle_changes() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(9103));
+        handle.record_read(test_page(4));
+        concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
+        let first = HandleView::new(&mut handle);
+        let second = HandleView::new(&mut handle);
+        assert!(Arc::ptr_eq(&first.parts, &second.parts));
+        handle.record_read(test_page(12));
+        let third = HandleView::new(&mut handle);
+        assert!(!Arc::ptr_eq(&second.parts, &third.parts));
+        assert!(third.read_pages.binary_search(&test_page(12)).is_ok());
+        assert!(second.read_pages.binary_search(&test_page(12)).is_err());
+    }
+
+    /// bd-i0tn6: a classic write skew whose reads and writes happen after an
+    /// unrelated commit already viewed both peers (filling their view-parts
+    /// caches). As on the uncached path, the first committer is the pivot and
+    /// aborts, and the other then commits. A cache that is not dropped on new
+    /// witnesses or page writes lets T1 commit and aborts T2 instead.
+    #[test]
+    fn test_ssi_write_skew_after_peer_views_were_cached_still_aborts_the_pivot() {
+        use super::concurrent_commit_with_ssi;
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        // An unrelated reader-writer commits first: its validation and
+        // publication view T1 and T2 while both are still empty.
+        {
+            let mut h3 = registry.get_mut(s3).unwrap();
+            h3.record_read(test_page(91));
+            concurrent_write_page(&mut h3, &lock_table, test_page(90), test_data()).unwrap();
+        }
+        concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s3, CommitSeq::new(11))
+            .expect("the unrelated writer commits");
+        for session in [s1, s2] {
+            assert!(
+                registry.get(session).unwrap().view_parts_cache.is_some(),
+                "the unrelated commit cached the peer's view parts"
+            );
+        }
+
+        // T1 reads A (5) and writes B (10); T2 reads B and writes A.
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(5));
+            concurrent_write_page(&mut h1, &lock_table, test_page(10), test_data()).unwrap();
+        }
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(10));
+            concurrent_write_page(&mut h2, &lock_table, test_page(5), test_data()).unwrap();
+        }
+
+        let result1 =
+            concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s1, CommitSeq::new(12));
+        let (err, _) = result1.expect_err("T1 has both rw edges with active T2 and must abort");
+        assert_eq!(err, MvccError::BusySnapshot);
+        concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s2, CommitSeq::new(12))
+            .expect("T2 commits once the pivot T1 has aborted");
     }
 
     // Test 16: SSI - transaction marked for abort fails.
@@ -9413,7 +9598,7 @@ mod tests {
         use std::cell::Cell;
         use std::time::Instant;
 
-        use super::{ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags};
+        use super::{ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, HandleViewParts};
 
         fn make_view(token_id: u64, page_base: u32, pages_per_view: u32) -> HandleView {
             let mut read_pages: Vec<PageNumber> = (0..pages_per_view)
@@ -9428,12 +9613,14 @@ mod tests {
                 token: test_token(token_id),
                 begin_seq: CommitSeq::new(1),
                 flags: HandleViewFlags(HandleViewFlags::ACTIVE),
-                read_pages: read_pages.clone(),
-                read_page_witness_pages: read_pages,
-                read_exact_cells: Vec::new(),
-                write_pages: write_pages.clone(),
-                write_page_witness_pages: write_pages,
-                write_exact_cells: Vec::new(),
+                parts: std::sync::Arc::new(HandleViewParts {
+                    read_pages: read_pages.clone(),
+                    read_page_witness_pages: read_pages,
+                    read_exact_cells: Vec::new(),
+                    write_pages: write_pages.clone(),
+                    write_page_witness_pages: write_pages,
+                    write_exact_cells: Vec::new(),
+                }),
                 has_in_rw: Cell::new(false),
                 has_out_rw: Cell::new(false),
             }
@@ -9581,7 +9768,8 @@ mod tests {
         use std::time::Instant;
 
         use super::{
-            ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, summarize_witness_keys,
+            ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, HandleViewParts,
+            summarize_witness_keys,
         };
 
         fn make_writer_view(token_id: u64, pages: &[u32]) -> HandleView {
@@ -9593,12 +9781,14 @@ mod tests {
                 flags: HandleViewFlags(HandleViewFlags::ACTIVE),
                 // Read side intentionally empty — all_readers stays empty
                 // so the short-circuit fires.
-                read_pages: Vec::new(),
-                read_page_witness_pages: Vec::new(),
-                read_exact_cells: Vec::new(),
-                write_pages: write_pages.clone(),
-                write_page_witness_pages: write_pages,
-                write_exact_cells: Vec::new(),
+                parts: std::sync::Arc::new(HandleViewParts {
+                    read_pages: Vec::new(),
+                    read_page_witness_pages: Vec::new(),
+                    read_exact_cells: Vec::new(),
+                    write_pages: write_pages.clone(),
+                    write_page_witness_pages: write_pages,
+                    write_exact_cells: Vec::new(),
+                }),
                 has_in_rw: Cell::new(false),
                 has_out_rw: Cell::new(false),
             }
@@ -9665,7 +9855,9 @@ mod tests {
         );
     }
 
-    /// Microbench for `HandleView::new` on the typical MT writer shape:
+    /// Microbench for the view-parts build (`HandleViewParts::build`, which
+    /// `HandleView::new` paid on every call until bd-i0tn6 cached it per
+    /// handle) on the typical MT writer shape:
     /// 10 read-witness pages + 10 staged write pages (which feed both the
     /// `tracked_write_conflict_pages_iter` chain and the write-witness
     /// summary). Six set-shaped fields are built per call; switching the
@@ -9682,7 +9874,7 @@ mod tests {
     fn bench_handle_view_new_typical() {
         use std::time::Instant;
 
-        use super::HandleView;
+        use super::HandleViewParts;
 
         const READ_PAGES: u32 = 10;
         const WRITE_PAGES: u32 = 10;
@@ -9712,14 +9904,14 @@ mod tests {
 
         // Warm-up.
         for _ in 0..BUILDS_PER_TRIAL {
-            std::hint::black_box(HandleView::new(&handle));
+            std::hint::black_box(HandleViewParts::build(&handle));
         }
 
         let mut samples = Vec::with_capacity(TRIALS);
         for _ in 0..TRIALS {
             let start = Instant::now();
             for _ in 0..BUILDS_PER_TRIAL {
-                std::hint::black_box(HandleView::new(&handle));
+                std::hint::black_box(HandleViewParts::build(&handle));
             }
             let elapsed = start.elapsed();
             let ns_per_build = elapsed.as_nanos() as f64 / f64::from(BUILDS_PER_TRIAL);
