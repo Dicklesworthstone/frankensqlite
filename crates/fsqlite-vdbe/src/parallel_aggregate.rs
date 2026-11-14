@@ -33,8 +33,8 @@ use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{PageNumber, TextEncoding};
 
 use crate::engine::{
-    RecordColumnTable, RecordColumns, column_payload_end, compare_for_where,
-    payload_rowid_alias_header_verdict, storage_payload_column_index,
+    RecordColumnTable, RecordColumns, SQLITE_AFF_MASK, SQLITE_AFF_TEXT, column_payload_end,
+    compare_for_where, payload_rowid_alias_header_verdict, storage_payload_column_index,
 };
 
 /// A column a plan reads from each row.
@@ -233,12 +233,26 @@ impl AggState {
     }
 }
 
+/// One plan column of the current row, as the serial `Column` opcode would
+/// have decoded it. A NULL, INTEGER or REAL is held in the cell itself, so a
+/// row's cells reset without running any destructor; a TEXT, BLOB or other
+/// value sits in the row's wide slot for that column.
+#[derive(Debug, Clone, Copy)]
+enum ColumnCell {
+    Null,
+    Int(i64),
+    Float(f64),
+    /// The value is in the column's wide slot.
+    Wide,
+}
+
 /// One thread's scratch: the current record's column table, its decoded
-/// plan columns, and room to reassemble a payload that spills onto overflow
-/// pages.
+/// plan columns (`cells`, with the TEXT and BLOB values in `wide`), and room
+/// to reassemble a payload that spills onto overflow pages.
 struct RowScratch {
     layout: RecordColumnTable,
-    values: Vec<Option<SqliteValue>>,
+    cells: Vec<Option<ColumnCell>>,
+    wide: Vec<SqliteValue>,
     includes_rowid_alias: Option<bool>,
     payload: Vec<u8>,
     overflow: SnapshotPageBuf,
@@ -266,7 +280,8 @@ pub fn run_parallel_aggregate(
         &split,
         || RowScratch {
             layout: RecordColumnTable::default(),
-            values: vec![None; plan.columns.len()],
+            cells: vec![None; plan.columns.len()],
+            wide: vec![SqliteValue::Null; plan.columns.len()],
             includes_rowid_alias: None,
             payload: Vec::new(),
             overflow: reader.new_buffer(),
@@ -325,7 +340,8 @@ fn scan_leaf(
         })?;
         let RowScratch {
             layout,
-            values,
+            cells,
+            wide,
             includes_rowid_alias,
             payload,
             overflow,
@@ -342,7 +358,7 @@ fn scan_leaf(
                 detail: format!("malformed record header in row {rowid}"),
             });
         }
-        values.fill(None);
+        cells.fill(None);
         *includes_rowid_alias = None;
         let mut row = Row {
             plan,
@@ -350,7 +366,8 @@ fn scan_leaf(
             rowid,
             record,
             layout,
-            values,
+            cells,
+            wide,
             includes_rowid_alias,
         };
         if let Some(filter) = &plan.filter
@@ -362,7 +379,7 @@ fn scan_leaf(
             match (state, *agg) {
                 (AggState::Count(n), ParallelAggregate::CountStar) => *n += 1,
                 (AggState::Count(n), ParallelAggregate::Count(column)) => {
-                    if !row.value(column)?.is_null() {
+                    if !matches!(row.cell(column)?, ColumnCell::Null) {
                         *n += 1;
                     }
                 }
@@ -374,9 +391,9 @@ fn scan_leaf(
                         low,
                     },
                     ParallelAggregate::Sum(column),
-                ) => match *row.value(column)? {
-                    SqliteValue::Null => {}
-                    SqliteValue::Integer(v) => {
+                ) => match row.cell(column)? {
+                    ColumnCell::Null => {}
+                    ColumnCell::Int(v) => {
                         *seen = true;
                         *total += i128::from(v);
                         *high = (*high).max(*total);
@@ -384,28 +401,43 @@ fn scan_leaf(
                     }
                     // A REAL, or a TEXT or BLOB that sum() coerces: the
                     // serial sum depends on the order of its additions.
-                    SqliteValue::Float(_) | SqliteValue::Text(_) | SqliteValue::Blob(_) => {
-                        return Ok(false);
-                    }
+                    ColumnCell::Float(_) | ColumnCell::Wide => return Ok(false),
                 },
                 (AggState::Min(best), ParallelAggregate::Min(column)) => {
-                    let value = row.value(column)?;
-                    if !value.is_null()
-                        && best.as_ref().is_none_or(|b| {
-                            value.cmp_binary_in(b, TextEncoding::Utf8) == Ordering::Less
-                        })
+                    let cell = row.cell(column)?;
+                    // Two integers order as cmp_binary_in orders them.
+                    if let ColumnCell::Int(v) = cell
+                        && let Some(SqliteValue::Integer(b)) = best
                     {
-                        *best = Some(value.clone());
+                        if v < *b {
+                            *b = v;
+                        }
+                    } else if !matches!(cell, ColumnCell::Null) {
+                        row.with_value(column, cell, |value| {
+                            if best.as_ref().is_none_or(|b| {
+                                value.cmp_binary_in(b, TextEncoding::Utf8) == Ordering::Less
+                            }) {
+                                *best = Some(value.clone());
+                            }
+                        });
                     }
                 }
                 (AggState::Max(best), ParallelAggregate::Max(column)) => {
-                    let value = row.value(column)?;
-                    if !value.is_null()
-                        && best.as_ref().is_none_or(|b| {
-                            value.cmp_binary_in(b, TextEncoding::Utf8) == Ordering::Greater
-                        })
+                    let cell = row.cell(column)?;
+                    if let ColumnCell::Int(v) = cell
+                        && let Some(SqliteValue::Integer(b)) = best
                     {
-                        *best = Some(value.clone());
+                        if v > *b {
+                            *b = v;
+                        }
+                    } else if !matches!(cell, ColumnCell::Null) {
+                        row.with_value(column, cell, |value| {
+                            if best.as_ref().is_none_or(|b| {
+                                value.cmp_binary_in(b, TextEncoding::Utf8) == Ordering::Greater
+                            }) {
+                                *best = Some(value.clone());
+                            }
+                        });
                     }
                 }
                 _ => unreachable!("states follow the plan's aggregates"),
@@ -466,28 +498,55 @@ struct Row<'a> {
     rowid: i64,
     record: &'a [u8],
     layout: &'a RecordColumnTable,
-    values: &'a mut Vec<Option<SqliteValue>>,
+    cells: &'a mut [Option<ColumnCell>],
+    wide: &'a mut [SqliteValue],
     includes_rowid_alias: &'a mut Option<bool>,
 }
 
 impl Row<'_> {
     /// Plan column `column`, decoded as the serial `Column` opcode decodes it.
-    fn value(&mut self, column: usize) -> Result<&SqliteValue> {
-        if self.values[column].is_none() {
-            let value = self.decode(self.plan.columns[column])?;
-            self.values[column] = Some(value);
+    fn cell(&mut self, column: usize) -> Result<ColumnCell> {
+        if let Some(cell) = self.cells[column] {
+            return Ok(cell);
         }
-        Ok(self.values[column].get_or_insert(SqliteValue::Null))
+        let cell = self.decode(column)?;
+        self.cells[column] = Some(cell);
+        Ok(cell)
     }
 
-    fn decode(&mut self, column: ScanColumn) -> Result<SqliteValue> {
-        let idx = match column {
-            ScanColumn::Rowid => return Ok(SqliteValue::Integer(self.rowid)),
+    /// `f` of plan column `column`'s value, `cell` being its cell: a scalar's
+    /// value is built here, a wide one's is borrowed from its slot.
+    fn with_value<R>(&self, column: usize, cell: ColumnCell, f: impl FnOnce(&SqliteValue) -> R) -> R {
+        match cell {
+            ColumnCell::Null => f(&SqliteValue::Null),
+            ColumnCell::Int(v) => f(&SqliteValue::Integer(v)),
+            ColumnCell::Float(v) => f(&SqliteValue::Float(v)),
+            ColumnCell::Wide => f(&self.wide[column]),
+        }
+    }
+
+    /// The cell of `value` for plan column `column`; a TEXT or BLOB goes to
+    /// the column's wide slot.
+    fn hold(&mut self, column: usize, value: SqliteValue) -> ColumnCell {
+        match value {
+            SqliteValue::Null => ColumnCell::Null,
+            SqliteValue::Integer(v) => ColumnCell::Int(v),
+            SqliteValue::Float(v) => ColumnCell::Float(v),
+            wide => {
+                self.wide[column] = wide;
+                ColumnCell::Wide
+            }
+        }
+    }
+
+    fn decode(&mut self, column: usize) -> Result<ColumnCell> {
+        let idx = match self.plan.columns[column] {
+            ScanColumn::Rowid => return Ok(ColumnCell::Int(self.rowid)),
             ScanColumn::Declared(idx) => idx,
         };
         let shape = self.shape;
         if shape.ipk_col_idx == Some(idx) {
-            return Ok(SqliteValue::Integer(self.rowid));
+            return Ok(ColumnCell::Int(self.rowid));
         }
         let includes_alias = match shape.ipk_col_idx {
             None => false,
@@ -523,36 +582,35 @@ impl Row<'_> {
         );
         let Some(col) = self.layout.column_offset(payload_idx).copied() else {
             // Past the record's end: the value ALTER TABLE ADD COLUMN gave it.
-            return Ok(shape
-                .defaults
-                .get(idx)
-                .cloned()
-                .flatten()
-                .unwrap_or(SqliteValue::Null));
+            let value = shape.defaults.get(idx).cloned().flatten();
+            return Ok(self.hold(column, value.unwrap_or(SqliteValue::Null)));
         };
         let bytes = column_bytes(self.record, &col, self.rowid)?;
-        let value = match decode_scalar_value(col.serial_type, bytes) {
-            Some(value) => value,
-            None => decode_column_from_offset_with_encoding(
-                self.record,
-                &col,
-                TextEncoding::Utf8,
-                false,
-            )
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: format!("failed to decode column {payload_idx} of row {}", self.rowid),
-            })?,
-        };
-        Ok(match value {
-            SqliteValue::Integer(stored)
+        Ok(match decode_scalar_value(col.serial_type, bytes) {
+            Some(SqliteValue::Integer(stored)) => {
                 if shape
                     .real_columns
                     .as_deref()
-                    .is_some_and(|real| real.get(idx).copied().unwrap_or(false)) =>
-            {
-                SqliteValue::Float(stored as f64)
+                    .is_some_and(|real| real.get(idx).copied().unwrap_or(false))
+                {
+                    ColumnCell::Float(stored as f64)
+                } else {
+                    ColumnCell::Int(stored)
+                }
             }
-            value => value,
+            Some(value) => self.hold(column, value),
+            None => {
+                let value = decode_column_from_offset_with_encoding(
+                    self.record,
+                    &col,
+                    TextEncoding::Utf8,
+                    false,
+                )
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("failed to decode column {payload_idx} of row {}", self.rowid),
+                })?;
+                self.hold(column, value)
+            }
         })
     }
 
@@ -566,20 +624,28 @@ impl Row<'_> {
                 literal_left,
                 p5,
             } => {
-                let value = self.value(*column)?;
-                if value.is_null() || literal.is_null() {
-                    None
-                } else {
-                    let ord = if *literal_left {
-                        compare_for_where(literal, value, *p5, TextEncoding::Utf8)
-                    } else {
-                        compare_for_where(value, literal, *p5, TextEncoding::Utf8)
-                    };
-                    ord.map(|ord| op.holds(ord))
+                let cell = self.cell(*column)?;
+                match (cell, literal) {
+                    (ColumnCell::Null, _) | (_, SqliteValue::Null) => None,
+                    // Two integers, as compare_for_where orders them unless
+                    // the comparison's affinity is TEXT.
+                    (ColumnCell::Int(v), SqliteValue::Integer(l))
+                        if *p5 & SQLITE_AFF_MASK != SQLITE_AFF_TEXT =>
+                    {
+                        Some(op.holds(if *literal_left { l.cmp(&v) } else { v.cmp(l) }))
+                    }
+                    _ => self.with_value(*column, cell, |value| {
+                        let ord = if *literal_left {
+                            compare_for_where(literal, value, *p5, TextEncoding::Utf8)
+                        } else {
+                            compare_for_where(value, literal, *p5, TextEncoding::Utf8)
+                        };
+                        ord.map(|ord| op.holds(ord))
+                    }),
                 }
             }
             ScanPredicate::IsNull { column, negated } => {
-                Some(self.value(*column)?.is_null() != *negated)
+                Some(matches!(self.cell(*column)?, ColumnCell::Null) != *negated)
             }
             ScanPredicate::And(left, right) => match self.eval(left)? {
                 Some(false) => Some(false),

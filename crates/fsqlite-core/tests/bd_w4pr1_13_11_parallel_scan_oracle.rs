@@ -602,6 +602,12 @@ fn parallel_aggregates_read_every_serial_type_as_the_column_opcode_does() {
             "SELECT sum(z), count(z) FROM k WHERE z < 2;",
             "SELECT count(*), min(x), max(x) FROM k WHERE x <= 1;",
             "SELECT count(*), sum(id) FROM k WHERE z IS NOT NULL AND w IS NULL;",
+            // An integer against a TEXT literal is not an integer comparison:
+            // `w` (no affinity) matches only the TEXT '600', `z` (INTEGER)
+            // compares '5' as the number 5.
+            "SELECT count(*), min(w), max(w) FROM k WHERE w = '600';",
+            "SELECT count(*), min(z) FROM k WHERE z > '5';",
+            "SELECT count(*), max(z) FROM k WHERE '5' < z;",
         ] {
             let threads = same_at_every_worker_count(&f, &r, sql).await;
             assert!(took_parallel_path(threads), "`{sql}` did not run in parallel: {threads:?}");

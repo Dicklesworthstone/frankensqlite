@@ -21013,8 +21013,8 @@ impl VdbeEngine {
 
 /// SQLite affinity constants (from §3.2 of datatype3.html).
 /// Encoded in the lower bits of comparison opcode p5 (masked by 0x47).
-const SQLITE_AFF_MASK: u16 = 0x47;
-const SQLITE_AFF_TEXT: u16 = 0x42; // 'B'
+pub(crate) const SQLITE_AFF_MASK: u16 = 0x47;
+pub(crate) const SQLITE_AFF_TEXT: u16 = 0x42; // 'B'
 const SQLITE_AFF_NUMERIC: u16 = 0x43; // 'C'
 
 /// C SQLite OP_If/OP_IfNot truthiness: uses `sqlite3VdbeRealValue() != 0.0`,
