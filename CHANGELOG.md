@@ -58,6 +58,28 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- WAL commit certificates in `app.db-wal-cert` are written as record version 5, whose digest of
+  the certificate's frames is XXH3-128 instead of BLAKE3. Version 4 records are still read and
+  verified with BLAKE3, so a database last written by an earlier release opens normally, and its
+  sidecar then holds both versions. Hashing a 4 KiB frame now takes about 3.4k user instructions
+  where it took 11.2k, at commit and again when another process authorizes the certificate.
+  Against stock `sqlite3` 3.46.1 in the same runs: deleting 14% of a 300k-row table takes 470.5M
+  instructions where it took 506.0M (stock 120.7M), 5,000 autocommit `INSERT`s 1,161.5M where they
+  took 1,226.6M (stock 112.3M), and 8 processes of 500 autocommit `INSERT`s 1,149.2M where they took
+  1,272.2M (medians; stock 99.0M) (bd-w4pr1.7.2; the 2026-11-14 entry of
+  `docs/progress/perf-negative-results.md` has the runs and binaries).
+- A release before this change refuses to open a database whose `-wal-cert` or `-wal-cert-head`
+  holds a version 5 record, with `WAL file is corrupt: parallel WAL certificate newest record is
+  invalid: unsupported durable certificate record version 5`; stock `sqlite3` reads the database.
+  In one check, an earlier release opened a copy of such a database made without those two files,
+  with all of its rows.
+
+---
+
 ## [0.5.0] -- 2026-11-12 (tag; no GitHub Release)
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.13...v0.5.0>

@@ -41,9 +41,9 @@ use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget,
     PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC, PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE,
     ParallelWalCommitCertificate, ParallelWalDurableCertificateRecord,
-    ParallelWalFramePayloadDigestBuilder, TransactionConflictPageBaseline,
-    TransactionConflictSnapshot, WAL_HEADER_SIZE, WalFile, WalGenerationIdentity, WalHeader,
-    WalSalts, durable_certificate_record_version_is_legacy, execute_checkpoint,
+    TransactionConflictPageBaseline, TransactionConflictSnapshot, WAL_HEADER_SIZE, WalFile,
+    WalGenerationIdentity, WalHeader, WalSalts, durable_certificate_record_version_is_honored,
+    durable_certificate_record_version_is_legacy, execute_checkpoint,
     validate_wal_header_checksum,
 };
 use tracing::debug;
@@ -3709,7 +3709,7 @@ fn validate_incomplete_certificate_suffix(bytes: &[u8], anchored: bool) -> Resul
         );
         return Ok(());
     }
-    if version != fsqlite_wal::PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION {
+    if !durable_certificate_record_version_is_honored(version) {
         return Err(FrankenError::WalCorrupt {
             detail: format!(
                 "parallel WAL certificate suffix has unsupported record version {version}"
@@ -5743,12 +5743,14 @@ where
         }
     }
 
+    /// Recompute, with `record`'s digest algorithm, the frame-payload digest
+    /// of `record`'s frame interval as the WAL now holds it.
     async fn wal_frame_payload_digest(
         &self,
         cx: &Cx,
-        wal_frame_start: u64,
-        wal_frame_end: u64,
+        record: &ParallelWalDurableCertificateRecord,
     ) -> Result<[u8; 32]> {
+        let (wal_frame_start, wal_frame_end) = (record.wal_frame_start, record.wal_frame_end);
         if wal_frame_start == 0 || wal_frame_end < wal_frame_start {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -5757,7 +5759,7 @@ where
             });
         }
 
-        let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+        let mut digest = record.frame_payload_digest_builder();
         for frame_number in wal_frame_start..=wal_frame_end {
             let frame_index = usize::try_from(frame_number.saturating_sub(1)).map_err(|_| {
                 FrankenError::WalCorrupt {
@@ -6099,10 +6101,7 @@ where
                 0
             };
             let actual_wal_frame_payload_digest = if commit_marker_frame == record.wal_frame_end {
-                Some(
-                    self.wal_frame_payload_digest(cx, record.wal_frame_start, record.wal_frame_end)
-                        .await?,
-                )
+                Some(self.wal_frame_payload_digest(cx, &record).await?)
             } else {
                 None
             };
@@ -6709,7 +6708,7 @@ where
                     });
                 }
                 let actual_wal_frame_payload_digest = self
-                    .wal_frame_payload_digest(cx, wal_frame_start, wal_frame_end)
+                    .wal_frame_payload_digest(cx, &expected_record)
                     .await?;
                 if !expected_record.authorizes_wal_boundary(
                     wal_generation,
@@ -7223,6 +7222,7 @@ mod tests {
     use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::MemoryVfs;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
+    use fsqlite_wal::ParallelWalFramePayloadDigestBuilder;
     use fsqlite_wal::checksum::WalSalts;
 
     use super::*;

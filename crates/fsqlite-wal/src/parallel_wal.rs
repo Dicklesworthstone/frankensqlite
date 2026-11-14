@@ -187,7 +187,19 @@ pub const PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION: u16 = 2;
 /// creating database's 16-byte creation-stable identity (`db_file_id`). A v3
 /// (identity-less) record decodes to an error, which recovery treats as an
 /// absent certificate rather than a fatal failure.
-pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 4;
+///
+/// Bumped 4 -> 5 for bd-w4pr1.7.2: a v5 record's frame-payload digest is
+/// XXH3-128 instead of BLAKE3 (see [`ParallelWalFramePayloadDigestAlgorithm`]).
+/// The envelope layout is unchanged, and v4 records keep decoding and
+/// verifying with BLAKE3, so a sidecar written before the upgrade still
+/// authorizes its commits.
+pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 5;
+/// Oldest durable-certificate envelope version this build verifies.
+///
+/// That is v4, the BLAKE3 digest. Versions from
+/// [`PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION`] up to (not
+/// including) this one are legacy.
+pub const PARALLEL_WAL_DURABLE_CERTIFICATE_OLDEST_HONORED_RECORD_VERSION: u16 = 4;
 /// First durable-certificate envelope version that ever reached a `-wal-cert`
 /// sidecar. The parallel-WAL durability work shipped its on-disk record at v2;
 /// no v1 record was ever written.
@@ -205,7 +217,7 @@ pub const PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION: u16 = 2;
 /// Legacy = written by an older release and recognized but not honored by
 /// this build: every version in the half-open range from
 /// [`PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION`] up to (but not
-/// including) [`PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION`].
+/// including) [`PARALLEL_WAL_DURABLE_CERTIFICATE_OLDEST_HONORED_RECORD_VERSION`].
 ///
 /// Strictly newer versions and never-shipped values (0, 1) are NOT legacy:
 /// they still fail strict decoding, so a corrupted version field keeps
@@ -213,12 +225,65 @@ pub const PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION: u16 = 2;
 #[must_use]
 pub const fn durable_certificate_record_version_is_legacy(version: u16) -> bool {
     version >= PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION
-        && version < PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION
+        && version < PARALLEL_WAL_DURABLE_CERTIFICATE_OLDEST_HONORED_RECORD_VERSION
+}
+
+/// True when this build decodes and verifies a durable-certificate envelope
+/// of `version`: v4 (BLAKE3 frame-payload digest) and v5 (XXH3-128).
+#[must_use]
+pub const fn durable_certificate_record_version_is_honored(version: u16) -> bool {
+    ParallelWalFramePayloadDigestAlgorithm::for_record_version(version).is_some()
 }
 /// Magic prefix for one record in the `-wal-cert` sidecar.
 pub const PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC: [u8; 8] = *b"FSQLCERT";
+/// BLAKE3 derive-key context of the v4 frame-payload digest.
 const PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN: &str =
     "FrankenSQLite parallel WAL ordered frame payload digest v1";
+/// Prefix of the v5 (XXH3-128) frame-payload digest stream: it separates this
+/// digest from every other XXH3 use (the checkpoint's frame checks hash bare
+/// frames).
+const PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_XXH3_DOMAIN: &[u8] =
+    b"FrankenSQLite parallel WAL ordered frame payload digest v2 (XXH3-128)\0";
+
+/// The algorithm a durable certificate record's frame-payload digest uses,
+/// chosen by its record version.
+///
+/// The digest binds a certificate to its exact ordered frames against torn,
+/// stale or replaced bytes. It is not a keyed MAC: v4's BLAKE3 ran in
+/// derive-key mode with a public context, so anyone able to write frames could
+/// recompute it, and v5 uses the much cheaper XXH3-128 for the same job
+/// (bd-w4pr1.7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelWalFramePayloadDigestAlgorithm {
+    /// Record version 4: BLAKE3 in derive-key mode, 32-byte digest.
+    Blake3DeriveKey,
+    /// Record version 5: XXH3-128 over the stream behind a domain prefix; the
+    /// 16-byte digest little-endian, then 16 zero bytes in the record's
+    /// 32-byte field.
+    Xxh3_128,
+}
+
+impl ParallelWalFramePayloadDigestAlgorithm {
+    /// The algorithm of a record version this build verifies, if any.
+    #[must_use]
+    pub const fn for_record_version(version: u16) -> Option<Self> {
+        match version {
+            4 => Some(Self::Blake3DeriveKey),
+            5 => Some(Self::Xxh3_128),
+            _ => None,
+        }
+    }
+
+    /// The durable-certificate envelope version whose records carry this
+    /// algorithm's digest.
+    #[must_use]
+    pub const fn record_version(self) -> u16 {
+        match self {
+            Self::Blake3DeriveKey => 4,
+            Self::Xxh3_128 => 5,
+        }
+    }
+}
 const PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_SIZE: usize = 32;
 /// Lane ids and commit-certificate lane counts are stored as `u16`, so keep
 /// both the count and every generated id representable.
@@ -236,20 +301,40 @@ pub const PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE: usize =
 ///
 /// Each [`Self::update`] hashes a zero-based `u64` frame ordinal, the `u32`
 /// page number, the `u32` commit database size, the `u64` payload length, and
-/// the payload bytes, all in little-endian field order. BLAKE3 derive-key mode
-/// domain-separates this digest from every other hash protocol.
+/// the payload bytes, all in little-endian field order. The algorithm is the
+/// record version's (see [`ParallelWalFramePayloadDigestAlgorithm`]); either
+/// one is domain-separated from every other hash protocol, BLAKE3 by its
+/// derive-key context and XXH3-128 by a prefix hashed before the first frame.
 ///
 /// The digest is a function of that byte stream alone, not of how it is cut
-/// into hasher calls. The builder hands the stream to BLAKE3 in whole
+/// into hasher calls. The BLAKE3 builder hands the stream to BLAKE3 in whole
 /// [`FRAME_PAYLOAD_DIGEST_BLOCK`]s (bd-w4pr1.13.17): BLAKE3 hashes 1 KiB
 /// chunks and takes its multi-chunk SIMD path only for a call that starts on
 /// a chunk boundary, and the 24 bytes of fields before every page otherwise
 /// leave a partial chunk that the page's first bytes finish one 64-byte
-/// block at a time.
-#[derive(Debug, Clone)]
+/// block at a time. XXH3's streaming state buffers on its own.
+#[derive(Clone)]
 pub struct ParallelWalFramePayloadDigestBuilder {
-    hasher: blake3::Hasher,
+    state: FramePayloadDigestState,
     next_ordinal: u64,
+}
+
+#[derive(Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the inline XXH3 state is the variant every commit builds; boxing it would add an \
+              allocation per commit"
+)]
+enum FramePayloadDigestState {
+    /// Boxed: v4 digests are only recomputed to verify records an older
+    /// release wrote, and the BLAKE3 hasher is several times the XXH3 state.
+    Blake3(Box<Blake3FramePayloadDigest>),
+    Xxh3_128(xxhash_rust::xxh3::Xxh3Default),
+}
+
+#[derive(Clone)]
+struct Blake3FramePayloadDigest {
+    hasher: blake3::Hasher,
     /// Stream bytes not yet handed to the hasher: always less than one
     /// block, so the hasher has always received a whole number of blocks.
     pending: Vec<u8>,
@@ -263,12 +348,47 @@ const FRAME_PAYLOAD_DIGEST_BLOCK: usize = 16 * 1024;
 const FRAME_PAYLOAD_DIGEST_FIELD_BYTES: usize = 8 + 4 + 4 + 8;
 
 impl ParallelWalFramePayloadDigestBuilder {
+    /// A builder for the digest new certificate records carry.
     #[must_use]
     pub fn new() -> Self {
+        Self::for_algorithm(ParallelWalFramePayloadDigestAlgorithm::Xxh3_128)
+    }
+
+    /// A builder for `algorithm`, to verify a record of that algorithm's
+    /// version.
+    #[must_use]
+    pub fn for_algorithm(algorithm: ParallelWalFramePayloadDigestAlgorithm) -> Self {
+        let state = match algorithm {
+            ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey => {
+                FramePayloadDigestState::Blake3(Box::new(Blake3FramePayloadDigest {
+                    hasher: blake3::Hasher::new_derive_key(
+                        PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN,
+                    ),
+                    pending: Vec::new(),
+                }))
+            }
+            ParallelWalFramePayloadDigestAlgorithm::Xxh3_128 => {
+                let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+                hasher.update(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_XXH3_DOMAIN);
+                FramePayloadDigestState::Xxh3_128(hasher)
+            }
+        };
         Self {
-            hasher: blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN),
+            state,
             next_ordinal: 0,
-            pending: Vec::new(),
+        }
+    }
+
+    /// The algorithm this builder computes.
+    #[must_use]
+    pub const fn algorithm(&self) -> ParallelWalFramePayloadDigestAlgorithm {
+        match self.state {
+            FramePayloadDigestState::Blake3(_) => {
+                ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey
+            }
+            FramePayloadDigestState::Xxh3_128(_) => {
+                ParallelWalFramePayloadDigestAlgorithm::Xxh3_128
+            }
         }
     }
 
@@ -287,14 +407,49 @@ impl ParallelWalFramePayloadDigestBuilder {
         fields[12..16].copy_from_slice(&db_size_if_commit.to_le_bytes());
         fields[16..].copy_from_slice(&payload_len.to_le_bytes());
 
-        // Room for this frame, up to the one block the buffer ever holds.
-        let room = FRAME_PAYLOAD_DIGEST_BLOCK - self.pending.len();
-        self.pending
-            .reserve(room.min(fields.len().saturating_add(payload.len())));
-        self.absorb(&fields);
-        self.absorb(payload);
+        match &mut self.state {
+            FramePayloadDigestState::Blake3(blake3) => {
+                // Room for this frame, up to the one block the buffer ever holds.
+                let room = FRAME_PAYLOAD_DIGEST_BLOCK - blake3.pending.len();
+                blake3
+                    .pending
+                    .reserve(room.min(fields.len().saturating_add(payload.len())));
+                blake3.absorb(&fields);
+                blake3.absorb(payload);
+            }
+            FramePayloadDigestState::Xxh3_128(hasher) => {
+                hasher.update(&fields);
+                hasher.update(payload);
+            }
+        }
     }
 
+    /// Finish the ordered-frame digest, consuming the builder so a completed
+    /// certificate cannot accidentally be extended with later frames.
+    ///
+    /// The XXH3-128 digest fills the first 16 bytes little-endian; the last
+    /// 16 are zero.
+    #[must_use]
+    pub fn finalize(self) -> [u8; 32] {
+        match self.state {
+            FramePayloadDigestState::Blake3(blake3) => {
+                let Blake3FramePayloadDigest {
+                    mut hasher,
+                    pending,
+                } = *blake3;
+                hasher.update(&pending);
+                *hasher.finalize().as_bytes()
+            }
+            FramePayloadDigestState::Xxh3_128(hasher) => {
+                let mut digest = [0_u8; PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_SIZE];
+                digest[..16].copy_from_slice(&hasher.digest128().to_le_bytes());
+                digest
+            }
+        }
+    }
+}
+
+impl Blake3FramePayloadDigest {
     /// Append `bytes` to the hashed stream, handing the hasher every whole
     /// block as soon as it is complete.
     fn absorb(&mut self, mut bytes: &[u8]) {
@@ -315,19 +470,20 @@ impl ParallelWalFramePayloadDigestBuilder {
             }
         }
     }
-
-    /// Finish the ordered-frame digest, consuming the builder so a completed
-    /// certificate cannot accidentally be extended with later frames.
-    #[must_use]
-    pub fn finalize(mut self) -> [u8; 32] {
-        self.hasher.update(&self.pending);
-        *self.hasher.finalize().as_bytes()
-    }
 }
 
 impl Default for ParallelWalFramePayloadDigestBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for ParallelWalFramePayloadDigestBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParallelWalFramePayloadDigestBuilder")
+            .field("algorithm", &self.algorithm())
+            .field("next_ordinal", &self.next_ordinal)
+            .finish_non_exhaustive()
     }
 }
 
@@ -769,6 +925,11 @@ pub struct ParallelWalDurableCertificateRecord {
     /// [`ParallelWalCommitCertificate`] payload and its checksum are unchanged.
     pub db_file_id: [u8; 16],
     pub certificate: ParallelWalCommitCertificate,
+    /// Algorithm of `certificate.wal_frame_payload_digest`, which also fixes
+    /// the envelope version [`Self::to_bytes`] writes: XXH3-128 (v5) for a
+    /// record built by [`Self::new`], or whatever version
+    /// [`Self::from_bytes`] decoded.
+    frame_payload_digest_algorithm: ParallelWalFramePayloadDigestAlgorithm,
 }
 
 impl ParallelWalDurableCertificateRecord {
@@ -812,7 +973,35 @@ impl ParallelWalDurableCertificateRecord {
             wal_frame_end,
             db_file_id,
             certificate,
+            frame_payload_digest_algorithm: ParallelWalFramePayloadDigestAlgorithm::Xxh3_128,
         })
+    }
+
+    /// The same record with its digest declared as `algorithm`'s, so it
+    /// encodes as that algorithm's envelope version. The certificate's digest
+    /// bytes are not recomputed: the caller supplies a certificate whose digest
+    /// was built with `algorithm`. Recovery code never needs this; it exists to
+    /// write the v4 records an older release wrote.
+    #[must_use]
+    pub const fn with_frame_payload_digest_algorithm(
+        mut self,
+        algorithm: ParallelWalFramePayloadDigestAlgorithm,
+    ) -> Self {
+        self.frame_payload_digest_algorithm = algorithm;
+        self
+    }
+
+    /// The algorithm a verifier must recompute this record's frame-payload
+    /// digest with.
+    #[must_use]
+    pub const fn frame_payload_digest_algorithm(&self) -> ParallelWalFramePayloadDigestAlgorithm {
+        self.frame_payload_digest_algorithm
+    }
+
+    /// The envelope version this record encodes as.
+    #[must_use]
+    pub const fn record_version(&self) -> u16 {
+        self.frame_payload_digest_algorithm.record_version()
     }
 
     /// Decide whether this proof record may authorize a reconstructed WAL
@@ -844,7 +1033,7 @@ impl ParallelWalDurableCertificateRecord {
             .saturating_add(Self::LENGTH_FOOTER_SIZE);
         let mut bytes = Vec::with_capacity(total_len);
         bytes.extend_from_slice(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC);
-        bytes.extend_from_slice(&PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.record_version().to_le_bytes());
         bytes.extend_from_slice(&u32::try_from(total_len).unwrap_or(u32::MAX).to_le_bytes());
         bytes.extend_from_slice(&self.wal_generation.checkpoint_seq.to_le_bytes());
         bytes.extend_from_slice(&self.wal_generation.salts.salt1.to_le_bytes());
@@ -883,11 +1072,13 @@ impl ParallelWalDurableCertificateRecord {
         }
         let version_bytes = read_record_bytes(bytes, &mut offset, 2, "record version")?;
         let version = u16::from_le_bytes([version_bytes[0], version_bytes[1]]);
-        if version != PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION {
+        let Some(frame_payload_digest_algorithm) =
+            ParallelWalFramePayloadDigestAlgorithm::for_record_version(version)
+        else {
             return Err(format!(
                 "unsupported durable certificate record version {version}"
             ));
-        }
+        };
         let declared_len =
             usize::try_from(read_record_u32(bytes, &mut offset, "record length")?)
                 .map_err(|_| "durable certificate record length exceeds usize".to_owned())?;
@@ -1042,6 +1233,14 @@ impl ParallelWalDurableCertificateRecord {
             db_file_id,
             certificate,
         )
+        .map(|record| record.with_frame_payload_digest_algorithm(frame_payload_digest_algorithm))
+    }
+
+    /// A builder for this record's frame-payload digest, for recomputing it
+    /// from the frames the record covers.
+    #[must_use]
+    pub fn frame_payload_digest_builder(&self) -> ParallelWalFramePayloadDigestBuilder {
+        ParallelWalFramePayloadDigestBuilder::for_algorithm(self.frame_payload_digest_algorithm)
     }
 }
 
@@ -5471,7 +5670,15 @@ mod tests {
     }
 
     fn frame_payload_digest(frames: &[(u32, u32, &[u8])]) -> [u8; 32] {
-        let mut builder = ParallelWalFramePayloadDigestBuilder::new();
+        frame_payload_digest_with(ParallelWalFramePayloadDigestAlgorithm::Xxh3_128, frames)
+    }
+
+    fn frame_payload_digest_with(
+        algorithm: ParallelWalFramePayloadDigestAlgorithm,
+        frames: &[(u32, u32, &[u8])],
+    ) -> [u8; 32] {
+        let mut builder = ParallelWalFramePayloadDigestBuilder::for_algorithm(algorithm);
+        assert_eq!(builder.algorithm(), algorithm);
         for &(page_number, db_size_if_commit, payload) in frames {
             builder.update(
                 PageNumber::new(page_number).expect("test page number should be valid"),
@@ -5492,10 +5699,37 @@ mod tests {
         ])
     }
 
+    /// The documented field stream of `frames`, without any domain prefix.
+    fn frame_payload_digest_stream(frames: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        for (ordinal, &(page_number, db_size_if_commit, payload)) in frames.iter().enumerate() {
+            stream.extend_from_slice(&u64::try_from(ordinal).unwrap().to_le_bytes());
+            stream.extend_from_slice(&page_number.to_le_bytes());
+            stream.extend_from_slice(&db_size_if_commit.to_le_bytes());
+            stream.extend_from_slice(&u64::try_from(payload.len()).unwrap().to_le_bytes());
+            stream.extend_from_slice(payload);
+        }
+        stream
+    }
+
+    /// The v5 digest computed one-shot: XXH3-128 of the domain prefix and the
+    /// stream, little-endian in the first 16 bytes, the rest zero.
+    fn xxh3_frame_payload_digest_reference(stream: &[u8]) -> [u8; 32] {
+        let mut prefixed = PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_XXH3_DOMAIN.to_vec();
+        prefixed.extend_from_slice(stream);
+        let mut digest = [0_u8; 32];
+        digest[..16].copy_from_slice(&xxhash_rust::xxh3::xxh3_128(&prefixed).to_le_bytes());
+        digest
+    }
+
     #[test]
     fn frame_payload_digest_builder_binds_ordered_metadata_length_and_bytes() {
-        let baseline = frame_payload_digest(&[(2, 0, b"abc"), (3, 17, b"defg")]);
+        let frames: [(u32, u32, &[u8]); 2] = [(2, 0, b"abc"), (3, 17, b"defg")];
+        let stream = frame_payload_digest_stream(&frames);
 
+        // v4: BLAKE3 derive-key over the stream.
+        let blake3 = ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey;
+        let blake3_baseline = frame_payload_digest_with(blake3, &frames);
         let mut expected = blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN);
         expected.update(&0_u64.to_le_bytes());
         expected.update(&2_u32.to_le_bytes());
@@ -5507,50 +5741,77 @@ mod tests {
         expected.update(&17_u32.to_le_bytes());
         expected.update(&4_u64.to_le_bytes());
         expected.update(b"defg");
-        assert_eq!(baseline, *expected.finalize().as_bytes());
-
-        let mut unkeyed = blake3::Hasher::new();
-        unkeyed.update(&0_u64.to_le_bytes());
-        unkeyed.update(&2_u32.to_le_bytes());
-        unkeyed.update(&0_u32.to_le_bytes());
-        unkeyed.update(&3_u64.to_le_bytes());
-        unkeyed.update(b"abc");
-        unkeyed.update(&1_u64.to_le_bytes());
-        unkeyed.update(&3_u32.to_le_bytes());
-        unkeyed.update(&17_u32.to_le_bytes());
-        unkeyed.update(&4_u64.to_le_bytes());
-        unkeyed.update(b"defg");
+        assert_eq!(blake3_baseline, *expected.finalize().as_bytes());
         assert_ne!(
-            baseline,
-            *unkeyed.finalize().as_bytes(),
+            blake3_baseline,
+            *blake3::hash(&stream).as_bytes(),
             "derive-key domain separation must affect the digest"
         );
 
+        // v5: XXH3-128 over the domain prefix and the stream.
+        let xxh3 = ParallelWalFramePayloadDigestAlgorithm::Xxh3_128;
+        let xxh3_baseline = frame_payload_digest_with(xxh3, &frames);
+        assert_eq!(xxh3_baseline, frame_payload_digest(&frames));
+        assert_eq!(xxh3_baseline, xxh3_frame_payload_digest_reference(&stream));
+        assert_eq!(xxh3_baseline[16..], [0_u8; 16]);
         assert_ne!(
-            baseline,
-            frame_payload_digest(&[(3, 17, b"defg"), (2, 0, b"abc")]),
-            "ordered frame position must affect the digest"
+            xxh3_baseline[..16],
+            xxhash_rust::xxh3::xxh3_128(&stream).to_le_bytes(),
+            "the domain prefix must affect the digest"
         );
         assert_ne!(
-            baseline,
-            frame_payload_digest(&[(4, 0, b"abc"), (3, 17, b"defg")]),
-            "page number must affect the digest"
+            u64::from_le_bytes(xxh3_baseline[..8].try_into().unwrap()),
+            xxhash_rust::xxh3::xxh3_64(&{
+                let mut prefixed = PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_XXH3_DOMAIN.to_vec();
+                prefixed.extend_from_slice(&stream);
+                prefixed
+            }),
+            "the digest is XXH3-128, not XXH3-64"
         );
-        assert_ne!(
-            baseline,
-            frame_payload_digest(&[(2, 0, b"abc"), (3, 18, b"defg")]),
-            "commit database size must affect the digest"
-        );
-        assert_ne!(
-            baseline,
-            frame_payload_digest(&[(2, 0, b"abc"), (3, 17, b"defh")]),
-            "payload bytes must affect the digest"
-        );
-        assert_ne!(
-            baseline,
-            frame_payload_digest(&[(2, 0, b"abc"), (3, 17, b"defg\0")]),
-            "payload length must affect the digest"
-        );
+        assert_ne!(blake3_baseline, xxh3_baseline);
+
+        for algorithm in [blake3, xxh3] {
+            let baseline = frame_payload_digest_with(algorithm, &frames);
+            assert_ne!(
+                baseline,
+                frame_payload_digest_with(algorithm, &[(3, 17, b"defg"), (2, 0, b"abc")]),
+                "{algorithm:?}: ordered frame position must affect the digest"
+            );
+            assert_ne!(
+                baseline,
+                frame_payload_digest_with(algorithm, &[(4, 0, b"abc"), (3, 17, b"defg")]),
+                "{algorithm:?}: page number must affect the digest"
+            );
+            assert_ne!(
+                baseline,
+                frame_payload_digest_with(algorithm, &[(2, 0, b"abc"), (3, 18, b"defg")]),
+                "{algorithm:?}: commit database size must affect the digest"
+            );
+            assert_ne!(
+                baseline,
+                frame_payload_digest_with(algorithm, &[(2, 0, b"abc"), (3, 17, b"defh")]),
+                "{algorithm:?}: payload bytes must affect the digest"
+            );
+            assert_ne!(
+                baseline,
+                frame_payload_digest_with(algorithm, &[(2, 0, b"abc"), (3, 17, b"defg\0")]),
+                "{algorithm:?}: payload length must affect the digest"
+            );
+            // Moving a byte across the frame boundary keeps the concatenated
+            // payload bytes but changes both length fields.
+            assert_ne!(
+                baseline,
+                frame_payload_digest_with(algorithm, &[(2, 0, b"abcd"), (3, 17, b"efg")]),
+                "{algorithm:?}: the frame boundary must affect the digest"
+            );
+        }
+    }
+
+    fn blake3_pending_len(builder: &ParallelWalFramePayloadDigestBuilder) -> usize {
+        match &builder.state {
+            FramePayloadDigestState::Blake3(blake3) => blake3.pending.len(),
+            FramePayloadDigestState::Xxh3_128(_) => panic!("not a BLAKE3 builder"),
+        }
     }
 
     /// bd-w4pr1.13.17: the builder hands BLAKE3 whole blocks, and the digest
@@ -5558,6 +5819,9 @@ mod tests {
     /// field, which is what every certificate on disk holds. Payload sizes
     /// sit at, below and above the block size and the chunk size; frame
     /// counts leave the buffer empty, part full and exactly full at finalize.
+    /// bd-w4pr1.7.2: the streaming XXH3 builder must equal one-shot XXH3-128
+    /// over the prefixed stream at the same sizes, which cross its 256-byte
+    /// buffer and 1 KiB stripe block at every alignment the fields leave.
     #[test]
     fn frame_payload_digest_builder_matches_the_piecewise_stream() {
         let block = FRAME_PAYLOAD_DIGEST_BLOCK;
@@ -5580,9 +5844,13 @@ mod tests {
         let mut exact_fills = 0_usize;
         for payload_len in payload_lens {
             for frame_count in [1_usize, 2, 3, 4, 5, 17, 40] {
-                let mut builder = ParallelWalFramePayloadDigestBuilder::new();
+                let mut builder = ParallelWalFramePayloadDigestBuilder::for_algorithm(
+                    ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey,
+                );
+                let mut xxh3_builder = ParallelWalFramePayloadDigestBuilder::new();
                 let mut piecewise =
                     blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN);
+                let mut stream = Vec::new();
                 for frame in 0..frame_count {
                     let page_number = u32::try_from(frame + 2).unwrap();
                     let db_size_if_commit = if frame + 1 == frame_count { 99 } else { 0 };
@@ -5596,20 +5864,36 @@ mod tests {
                         db_size_if_commit,
                         &payload,
                     );
+                    xxh3_builder.update(
+                        PageNumber::new(page_number).unwrap(),
+                        db_size_if_commit,
+                        &payload,
+                    );
                     piecewise.update(&u64::try_from(frame).unwrap().to_le_bytes());
                     piecewise.update(&page_number.to_le_bytes());
                     piecewise.update(&db_size_if_commit.to_le_bytes());
                     piecewise.update(&u64::try_from(payload_len).unwrap().to_le_bytes());
                     piecewise.update(&payload);
-                    assert!(builder.pending.len() < block);
+                    stream.extend_from_slice(&u64::try_from(frame).unwrap().to_le_bytes());
+                    stream.extend_from_slice(&page_number.to_le_bytes());
+                    stream.extend_from_slice(&db_size_if_commit.to_le_bytes());
+                    stream.extend_from_slice(&u64::try_from(payload_len).unwrap().to_le_bytes());
+                    stream.extend_from_slice(&payload);
+                    assert!(blake3_pending_len(&builder) < block);
                 }
                 exact_fills += usize::from(
-                    builder.pending.is_empty() && (fields + payload_len) * frame_count >= block,
+                    blake3_pending_len(&builder) == 0
+                        && (fields + payload_len) * frame_count >= block,
                 );
                 assert_eq!(
                     builder.finalize(),
                     *piecewise.finalize().as_bytes(),
                     "{frame_count} frames of {payload_len} payload bytes"
+                );
+                assert_eq!(
+                    xxh3_builder.finalize(),
+                    xxh3_frame_payload_digest_reference(&stream),
+                    "XXH3: {frame_count} frames of {payload_len} payload bytes"
                 );
             }
         }
@@ -5619,10 +5903,17 @@ mod tests {
         );
         // No frames: the digest of the empty stream.
         assert_eq!(
-            ParallelWalFramePayloadDigestBuilder::new().finalize(),
+            ParallelWalFramePayloadDigestBuilder::for_algorithm(
+                ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey
+            )
+            .finalize(),
             *blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN)
                 .finalize()
                 .as_bytes()
+        );
+        assert_eq!(
+            ParallelWalFramePayloadDigestBuilder::new().finalize(),
+            xxh3_frame_payload_digest_reference(&[])
         );
     }
 
@@ -5874,6 +6165,53 @@ mod tests {
             PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION + 1
         ));
         assert!(!durable_certificate_record_version_is_legacy(u16::MAX));
+        // bd-w4pr1.7.2: v4 (BLAKE3) is superseded by v5 but still honored, so
+        // it is not legacy either.
+        assert_eq!(
+            PARALLEL_WAL_DURABLE_CERTIFICATE_OLDEST_HONORED_RECORD_VERSION,
+            4
+        );
+        assert!(!durable_certificate_record_version_is_legacy(4));
+    }
+
+    #[test]
+    fn durable_certificate_honored_versions_are_v4_and_v5() {
+        // bd-w4pr1.7.2: exactly the BLAKE3 (v4) and XXH3-128 (v5) envelopes
+        // decode and verify; legacy, never-shipped and future versions do not.
+        assert_eq!(PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION, 5);
+        for version in 0..=8_u16 {
+            let honored = durable_certificate_record_version_is_honored(version);
+            assert_eq!(honored, matches!(version, 4 | 5), "version {version}");
+            assert!(
+                !(honored && durable_certificate_record_version_is_legacy(version)),
+                "version {version} cannot be both honored and legacy"
+            );
+        }
+        assert!(!durable_certificate_record_version_is_honored(u16::MAX));
+        assert_eq!(
+            ParallelWalFramePayloadDigestAlgorithm::for_record_version(4),
+            Some(ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey)
+        );
+        assert_eq!(
+            ParallelWalFramePayloadDigestAlgorithm::for_record_version(5),
+            Some(ParallelWalFramePayloadDigestAlgorithm::Xxh3_128)
+        );
+        for algorithm in [
+            ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey,
+            ParallelWalFramePayloadDigestAlgorithm::Xxh3_128,
+        ] {
+            assert_eq!(
+                ParallelWalFramePayloadDigestAlgorithm::for_record_version(
+                    algorithm.record_version()
+                ),
+                Some(algorithm)
+            );
+        }
+        assert_eq!(
+            ParallelWalFramePayloadDigestBuilder::new().algorithm(),
+            ParallelWalFramePayloadDigestAlgorithm::Xxh3_128,
+            "new certificates carry the current version's digest"
+        );
     }
 
     #[test]
@@ -5907,17 +6245,30 @@ mod tests {
         .expect("v4 record validates");
 
         let encoded = record.to_bytes();
-        // v4 marker in the little-endian version slot immediately after magic.
+        // Current-version marker in the little-endian version slot immediately
+        // after magic: v5 since bd-w4pr1.7.2, whose envelope is v4's.
         assert_eq!(
             u16::from_le_bytes([encoded[8], encoded[9]]),
             PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION
         );
-        assert_eq!(PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION, 4);
+        assert_eq!(PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION, 5);
 
         let decoded =
-            ParallelWalDurableCertificateRecord::from_bytes(&encoded).expect("v4 record decodes");
+            ParallelWalDurableCertificateRecord::from_bytes(&encoded).expect("v5 record decodes");
         assert_eq!(decoded.db_file_id, identity);
         assert_eq!(decoded, record);
+
+        // The same record as v4 carries the identity identically.
+        let v4 = record.clone().with_frame_payload_digest_algorithm(
+            ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey,
+        );
+        let v4_encoded = v4.to_bytes();
+        assert_eq!(u16::from_le_bytes([v4_encoded[8], v4_encoded[9]]), 4);
+        let v4_decoded = ParallelWalDurableCertificateRecord::from_bytes(&v4_encoded)
+            .expect("v4 record decodes");
+        assert_eq!(v4_decoded.db_file_id, identity);
+        assert_eq!(v4_decoded, v4);
+        assert_ne!(v4_decoded, record, "the version is part of the record");
 
         // Roll the version marker back to v3 (identity-less). `from_bytes`
         // rejects the unknown version outright; crucially it returns an Err the
@@ -5959,6 +6310,225 @@ mod tests {
         let mut wrong_frame_payload_digest = actual_frame_payload_digest;
         wrong_frame_payload_digest[0] ^= 1;
         assert!(!record.authorizes_wal_boundary(wal_generation, 5, 5, wrong_frame_payload_digest));
+    }
+
+    /// Five 4 KiB frames, the last a commit marker, as the digest sees them.
+    fn digest_test_pages() -> Vec<(u32, u32, Vec<u8>)> {
+        (0..5_u32)
+            .map(|frame| {
+                let payload = (0..4_096_u32)
+                    .map(|byte| u8::try_from((byte * 13 + frame * 29) % 251).unwrap())
+                    .collect();
+                (frame + 2, if frame == 4 { 17 } else { 0 }, payload)
+            })
+            .collect()
+    }
+
+    fn digest_of_pages(
+        mut builder: ParallelWalFramePayloadDigestBuilder,
+        pages: &[(u32, u32, Vec<u8>)],
+    ) -> [u8; 32] {
+        for (page_number, db_size_if_commit, payload) in pages {
+            builder.update(
+                PageNumber::new(*page_number).unwrap(),
+                *db_size_if_commit,
+                payload,
+            );
+        }
+        builder.finalize()
+    }
+
+    const fn digest_test_generation() -> WalGenerationIdentity {
+        WalGenerationIdentity {
+            checkpoint_seq: 9,
+            salts: crate::checksum::WalSalts {
+                salt1: 0x1122_3344,
+                salt2: 0x5566_7788,
+            },
+        }
+    }
+
+    fn certificate_with_frame_payload_digest(digest: [u8; 32]) -> ParallelWalCommitCertificate {
+        let mut request = durability_request(ParallelWalOperatingMode::Auto);
+        request.wal_frame_payload_digest = digest;
+        ParallelWalDurabilityCombiner::default()
+            .certify_and_publish(request, |_| Ok(()))
+            .expect("certificate should publish")
+            .certificate
+    }
+
+    /// A v4 record exactly as the release before bd-w4pr1.7.2 encoded it,
+    /// written out field by field instead of through `to_bytes`.
+    fn encode_v4_record_as_released(
+        generation: WalGenerationIdentity,
+        wal_frame_start: u64,
+        wal_frame_end: u64,
+        db_file_id: [u8; 16],
+        certificate: &ParallelWalCommitCertificate,
+    ) -> Vec<u8> {
+        let certificate_bytes = certificate.canonical_bytes();
+        let total_len = 8 + 2 + 4 + 4 + 4 + 4 + 8 + 8 + 16 + certificate_bytes.len() + 4 + 4 + 4;
+        let mut bytes = Vec::with_capacity(total_len);
+        bytes.extend_from_slice(b"FSQLCERT");
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(total_len).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&generation.checkpoint_seq.to_le_bytes());
+        bytes.extend_from_slice(&generation.salts.salt1.to_le_bytes());
+        bytes.extend_from_slice(&generation.salts.salt2.to_le_bytes());
+        bytes.extend_from_slice(&wal_frame_start.to_le_bytes());
+        bytes.extend_from_slice(&wal_frame_end.to_le_bytes());
+        bytes.extend_from_slice(&db_file_id);
+        bytes.extend_from_slice(&certificate_bytes);
+        bytes.extend_from_slice(&certificate.certificate_crc32c.to_le_bytes());
+        let envelope_crc32c = crc32c::crc32c(&bytes);
+        bytes.extend_from_slice(&envelope_crc32c.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(total_len).unwrap().to_le_bytes());
+        assert_eq!(bytes.len(), total_len);
+        bytes
+    }
+
+    /// `encoded` with its version field set to `version` and the envelope
+    /// checksum recomputed, so only the version differs.
+    fn relabel_record_version(encoded: &[u8], version: u16) -> Vec<u8> {
+        let mut bytes = encoded.to_vec();
+        bytes[8..10].copy_from_slice(&version.to_le_bytes());
+        let crc_offset = bytes.len() - 8;
+        let envelope_crc32c = crc32c::crc32c(&bytes[..crc_offset]);
+        bytes[crc_offset..crc_offset + 4].copy_from_slice(&envelope_crc32c.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn durable_certificate_record_v5_round_trips_and_authorizes_its_xxh3_digest() {
+        // bd-w4pr1.7.2: a new record is v5, survives encode/decode unchanged,
+        // and the decoded record's own builder reproduces its XXH3 digest.
+        let pages = digest_test_pages();
+        let generation = digest_test_generation();
+        let digest = digest_of_pages(ParallelWalFramePayloadDigestBuilder::new(), &pages);
+        let record = ParallelWalDurableCertificateRecord::new(
+            generation,
+            1,
+            5,
+            [0x5A; 16],
+            certificate_with_frame_payload_digest(digest),
+        )
+        .expect("v5 record validates");
+        assert_eq!(record.record_version(), 5);
+        assert_eq!(
+            record.frame_payload_digest_algorithm(),
+            ParallelWalFramePayloadDigestAlgorithm::Xxh3_128
+        );
+
+        let encoded = record.to_bytes();
+        assert_eq!(u16::from_le_bytes([encoded[8], encoded[9]]), 5);
+        let decoded =
+            ParallelWalDurableCertificateRecord::from_bytes(&encoded).expect("v5 record decodes");
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.to_bytes(), encoded);
+
+        let recomputed = digest_of_pages(decoded.frame_payload_digest_builder(), &pages);
+        assert_eq!(recomputed, digest);
+        assert!(decoded.authorizes_wal_boundary(generation, 5, 5, recomputed));
+    }
+
+    #[test]
+    fn durable_certificate_v4_record_from_the_blake3_encoder_still_authorizes() {
+        // bd-w4pr1.7.2: a sidecar written before the v5 switch holds v4
+        // records with BLAKE3 digests; they must keep authorizing their commits.
+        let pages = digest_test_pages();
+        let generation = digest_test_generation();
+        let identity = [0xC4; 16];
+        let blake3_digest = digest_of_pages(
+            ParallelWalFramePayloadDigestBuilder::for_algorithm(
+                ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey,
+            ),
+            &pages,
+        );
+        let certificate = certificate_with_frame_payload_digest(blake3_digest);
+        let encoded = encode_v4_record_as_released(generation, 1, 5, identity, &certificate);
+
+        let decoded =
+            ParallelWalDurableCertificateRecord::from_bytes(&encoded).expect("a v4 record decodes");
+        assert_eq!(decoded.record_version(), 4);
+        assert_eq!(
+            decoded.frame_payload_digest_algorithm(),
+            ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey
+        );
+        assert_eq!(decoded.db_file_id, identity);
+        assert_eq!(
+            decoded.to_bytes(),
+            encoded,
+            "re-encoding a v4 record reproduces the released v4 bytes"
+        );
+        let recomputed = digest_of_pages(decoded.frame_payload_digest_builder(), &pages);
+        assert_eq!(recomputed, blake3_digest);
+        assert!(decoded.authorizes_wal_boundary(generation, 5, 5, recomputed));
+    }
+
+    #[test]
+    fn durable_certificate_digest_rejects_a_flipped_frame_byte_and_the_other_algorithm() {
+        // bd-w4pr1.7.2 negative cases, for both honored versions: one flipped
+        // payload byte, the right frames hashed with the other version's
+        // algorithm, and a record relabeled to the other version (envelope
+        // checksum fixed up) must all fail to authorize.
+        let pages = digest_test_pages();
+        let generation = digest_test_generation();
+        let blake3 = ParallelWalFramePayloadDigestAlgorithm::Blake3DeriveKey;
+        let xxh3 = ParallelWalFramePayloadDigestAlgorithm::Xxh3_128;
+        for (algorithm, other) in [(xxh3, blake3), (blake3, xxh3)] {
+            let digest = digest_of_pages(
+                ParallelWalFramePayloadDigestBuilder::for_algorithm(algorithm),
+                &pages,
+            );
+            let record = ParallelWalDurableCertificateRecord::new(
+                generation,
+                1,
+                5,
+                [0x77; 16],
+                certificate_with_frame_payload_digest(digest),
+            )
+            .expect("record validates")
+            .with_frame_payload_digest_algorithm(algorithm);
+            let decoded = ParallelWalDurableCertificateRecord::from_bytes(&record.to_bytes())
+                .expect("record decodes");
+            assert_eq!(decoded.frame_payload_digest_algorithm(), algorithm);
+            let intact = digest_of_pages(decoded.frame_payload_digest_builder(), &pages);
+            assert!(
+                decoded.authorizes_wal_boundary(generation, 5, 5, intact),
+                "{algorithm:?}: the intact frames authorize"
+            );
+
+            for (frame, offset) in [(0_usize, 0_usize), (2, 2_048), (4, 4_095)] {
+                let mut flipped = pages.clone();
+                flipped[frame].2[offset] ^= 0x01;
+                let actual = digest_of_pages(decoded.frame_payload_digest_builder(), &flipped);
+                assert!(
+                    !decoded.authorizes_wal_boundary(generation, 5, 5, actual),
+                    "{algorithm:?}: frame {frame} byte {offset} flipped must not authorize"
+                );
+            }
+
+            let other_digest = digest_of_pages(
+                ParallelWalFramePayloadDigestBuilder::for_algorithm(other),
+                &pages,
+            );
+            assert!(
+                !decoded.authorizes_wal_boundary(generation, 5, 5, other_digest),
+                "{algorithm:?} record verified with {other:?} must not authorize"
+            );
+
+            let relabeled = ParallelWalDurableCertificateRecord::from_bytes(
+                &relabel_record_version(&record.to_bytes(), other.record_version()),
+            )
+            .expect("a relabeled record still has a valid envelope");
+            assert_eq!(relabeled.frame_payload_digest_algorithm(), other);
+            let relabeled_actual =
+                digest_of_pages(relabeled.frame_payload_digest_builder(), &pages);
+            assert!(
+                !relabeled.authorizes_wal_boundary(generation, 5, 5, relabeled_actual),
+                "{algorithm:?} digest relabeled as {other:?} must not authorize"
+            );
+        }
     }
 
     #[test]

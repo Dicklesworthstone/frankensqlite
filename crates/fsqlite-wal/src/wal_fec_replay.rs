@@ -26,7 +26,6 @@ use crate::checksum::{
 };
 use crate::parallel_wal::{
     PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE, ParallelWalDurableCertificateRecord,
-    ParallelWalFramePayloadDigestBuilder,
 };
 use crate::wal::WalGenerationIdentity;
 
@@ -781,7 +780,7 @@ fn match_replay_certificate(
             return None;
         }
     }
-    let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+    let mut digest = record.frame_payload_digest_builder();
     let mut terminal = None;
     for frame in image.get(start..end)?.chunks_exact(frame_size) {
         let header = WalFrameHeader::from_bytes(frame).ok()?;
@@ -1935,7 +1934,7 @@ mod tests {
     ) -> ParallelWalDurableCertificateRecord {
         use crate::parallel_wal::{
             PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION, ParallelWalCommitCertificate,
-            ParallelWalOrderedResidue,
+            ParallelWalFramePayloadDigestBuilder, ParallelWalOrderedResidue,
         };
         use fsqlite_types::CommitSeq;
 
