@@ -19,11 +19,21 @@
 //! alias, rows ALTER TABLE left short, payloads on overflow pages, and the
 //! shapes that must stay serial.
 
-use fsqlite_btree::snapshot_walk::take_last_parallel_walk_threads;
+use fsqlite_btree::snapshot_walk::{SerialReason, WalkRecord, take_last_parallel_walk};
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
 const WORKERS: [usize; 4] = [1, 2, 4, 8];
+
+/// Whether the statement took the parallel path: it walked, or found the
+/// process's helper budget used up by the other tests in this binary and
+/// ran serially for that reason only.
+fn took_parallel_path(record: Option<WalkRecord>) -> bool {
+    matches!(
+        record,
+        Some(WalkRecord::Ran { .. } | WalkRecord::Serial(SerialReason::BudgetExhausted))
+    )
+}
 
 fn render(v: &SqliteValue) -> String {
     match v {
@@ -112,25 +122,30 @@ fn parallel_count_star_matches_stock_on_table_and_index_btrees() {
             set_workers(&f, workers).await;
             // `big` is a multi-level table b-tree; `ix` counts through its
             // index, whose interior cells are entries too (a count of leaf
-            // cells alone would be short); `tiny` and `empty` are one leaf.
+            // cells alone would be short); `tiny` and `empty` are one leaf,
+            // too small for a second thread.
             for (sql, multi_level) in [
                 ("SELECT count(*) FROM big;", true),
                 ("SELECT count(*) FROM ix;", true),
                 ("SELECT count(*) FROM tiny;", false),
                 ("SELECT count(*) FROM empty;", false),
             ] {
-                let _ = take_last_parallel_walk_threads();
+                let _ = take_last_parallel_walk();
                 assert_eq!(frank(&f, sql).await, stock(&r, sql), "workers={workers} `{sql}`");
-                let threads = take_last_parallel_walk_threads();
+                let record = take_last_parallel_walk();
                 if workers == 1 {
-                    assert_eq!(threads, None, "workers=1 must stay serial: `{sql}`");
+                    assert_eq!(record, None, "workers=1 must stay serial: `{sql}`");
                 } else if multi_level {
                     assert!(
-                        threads.is_some(),
-                        "workers={workers} `{sql}`: walk used {threads:?} threads"
+                        took_parallel_path(record),
+                        "workers={workers} `{sql}`: walk {record:?}"
                     );
                 } else {
-                    assert_eq!(threads, Some(1), "workers={workers} `{sql}`");
+                    assert_eq!(
+                        record,
+                        Some(WalkRecord::Serial(SerialReason::SmallTree)),
+                        "workers={workers} `{sql}`"
+                    );
                 }
             }
         }
@@ -150,13 +165,13 @@ fn parallel_count_stays_serial_inside_a_transaction_and_sees_own_writes() {
         set_workers(&f, 8).await;
         both(&f, &r, "BEGIN;").await;
         both(&f, &r, "DELETE FROM t WHERE id % 3 = 0;").await;
-        let _ = take_last_parallel_walk_threads();
+        let _ = take_last_parallel_walk();
         let sql = "SELECT count(*) FROM t;";
         assert_eq!(frank(&f, sql).await, stock(&r, sql));
-        assert_eq!(take_last_parallel_walk_threads(), None, "explicit transaction ran parallel");
+        assert_eq!(take_last_parallel_walk(), None, "explicit transaction ran parallel");
         both(&f, &r, "COMMIT;").await;
         assert_eq!(frank(&f, sql).await, stock(&r, sql));
-        assert!(take_last_parallel_walk_threads().is_some());
+        assert!(took_parallel_path(take_last_parallel_walk()));
     });
 }
 
@@ -218,7 +233,7 @@ fn parallel_count_reads_one_committed_snapshot_while_a_writer_commits() {
                 assert!(count >= previous, "count went back from {previous} to {count}");
                 assert!(count <= BASE + BATCH * BATCHES);
                 previous = count;
-                if take_last_parallel_walk_threads().is_some() {
+                if matches!(take_last_parallel_walk(), Some(WalkRecord::Ran { .. })) {
                     parallel_runs += 1;
                 }
             }
@@ -264,17 +279,34 @@ fn snapshot_walk_counts_a_stock_written_file_and_stops_when_asked() {
     let reader = SnapshotPageReader::new(Arc::new(file), None, 4096, pages);
     let never = || false;
 
-    // A multi-level split covers the tree with more than one subtree.
+    // A multi-level split covers the tree with more than one subtree and
+    // counts enough leaves for 8 threads; one worker is the serial path.
     let split = split_subtrees(&reader, table_root, 4096, 32).unwrap();
     assert!(split.subtrees.len() >= 32, "split {:?}", split.subtrees.len());
+    // 50,000 rows of about 20 bytes: some 250 leaves, one thread per 32.
+    assert!((200..400).contains(&split.leaf_pages), "leaf pages {}", split.leaf_pages);
+    let by_size = usize::try_from(split.leaf_pages / 32).unwrap();
+    assert_eq!(
+        (split.threads_for(1), split.threads_for(4), split.threads_for(64)),
+        (1, 4, by_size)
+    );
     for workers in [1, 2, 4, 8] {
         for root in [table_root, index_root] {
-            assert_eq!(
-                count_entries_parallel(&reader, root, 4096, workers, &never).unwrap(),
-                Some(rows),
-                "workers={workers} root={}",
-                root.get()
-            );
+            let counted = count_entries_parallel(&reader, root, 4096, workers, &never).unwrap();
+            let record = take_last_parallel_walk();
+            let at = format!("workers={workers} root={}", root.get());
+            match counted {
+                Some(n) => assert_eq!(n, rows, "{at}"),
+                None if workers == 1 => assert!(
+                    matches!(record, Some(WalkRecord::Serial(_))),
+                    "{at}: {record:?}"
+                ),
+                None => assert_eq!(
+                    record,
+                    Some(WalkRecord::Serial(SerialReason::BudgetExhausted)),
+                    "{at}"
+                ),
+            }
         }
     }
     // Asked to stop before the first page: no answer.
@@ -290,28 +322,123 @@ fn snapshot_walk_counts_a_stock_written_file_and_stops_when_asked() {
         4096,
         pages / 2,
     );
-    assert!(count_entries_parallel(&short, table_root, 4096, 4, &never).is_err());
+    match count_entries_parallel(&short, table_root, 4096, 4, &never) {
+        Err(_) => {}
+        Ok(None) => assert_eq!(
+            take_last_parallel_walk(),
+            Some(WalkRecord::Serial(SerialReason::BudgetExhausted))
+        ),
+        Ok(Some(count)) => panic!("counted {count} rows of a truncated snapshot"),
+    }
+}
+
+/// bd-w4pr1.13.11 sizing: a tree of one interior level over a few leaves
+/// (2,000 rows) is not worth a second thread, so even with 8 workers asked
+/// for, count(*) and the filtered aggregate take the serial path; a tree a
+/// few times larger gets threads in proportion to its leaves.
+#[test]
+fn small_trees_stay_serial_and_larger_ones_get_threads_by_leaf_pages() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sizes.db");
+        let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+        f.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE small(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);",
+            "CREATE TABLE medium(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);",
+        ] {
+            both(&f, &r, sql).await;
+        }
+        both(&f, &r, &fill("small", 2_000)).await;
+        both(&f, &r, &fill("medium", 20_000)).await;
+        set_workers(&f, 8).await;
+        for sql in [
+            "SELECT count(*) FROM small;",
+            "SELECT count(*), sum(a) FROM small WHERE a > 500;",
+        ] {
+            let _ = take_last_parallel_walk();
+            assert_eq!(frank(&f, sql).await, stock(&r, sql), "`{sql}`");
+            assert_eq!(
+                take_last_parallel_walk(),
+                Some(WalkRecord::Serial(SerialReason::SmallTree)),
+                "`{sql}`"
+            );
+        }
+        for sql in [
+            "SELECT count(*) FROM medium;",
+            "SELECT count(*), sum(a) FROM medium WHERE a > 500;",
+        ] {
+            let _ = take_last_parallel_walk();
+            assert_eq!(frank(&f, sql).await, stock(&r, sql), "`{sql}`");
+            let record = take_last_parallel_walk();
+            // About 150 leaves: more than one thread, fewer than 8.
+            assert!(
+                matches!(record, Some(WalkRecord::Ran { workers, .. }) if (2..8).contains(&workers))
+                    || record == Some(WalkRecord::Serial(SerialReason::BudgetExhausted)),
+                "`{sql}`: {record:?}"
+            );
+        }
+    });
+}
+
+/// bd-w4pr1.13.11 default: without the pragma a connection allows
+/// min(available parallelism, 8) workers, and an explicit transaction still
+/// reads serially (and sees its own writes).
+#[test]
+fn the_default_worker_count_and_explicit_transactions() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("default.db");
+        let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+        f.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let expected = std::thread::available_parallelism().map_or(1, usize::from).min(8);
+        assert_eq!(
+            frank(&f, "PRAGMA fsqlite.parallel_workers;").await,
+            vec![vec![expected.to_string()]]
+        );
+        both(&f, &r, "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);").await;
+        both(&f, &r, &fill("t", 30_000)).await;
+        let sql = "SELECT count(*), sum(a) FROM t WHERE a > 500;";
+        let _ = take_last_parallel_walk();
+        assert_eq!(frank(&f, sql).await, stock(&r, sql));
+        let record = take_last_parallel_walk();
+        if expected > 1 {
+            assert!(took_parallel_path(record), "{record:?}");
+        } else {
+            assert_eq!(record, None);
+        }
+        both(&f, &r, "BEGIN;").await;
+        both(&f, &r, "DELETE FROM t WHERE id % 4 = 0;").await;
+        for sql in [sql, "SELECT count(*) FROM t;"] {
+            let _ = take_last_parallel_walk();
+            assert_eq!(frank(&f, sql).await, stock(&r, sql), "`{sql}`");
+            assert_eq!(take_last_parallel_walk(), None, "transaction ran `{sql}` in parallel");
+        }
+        both(&f, &r, "COMMIT;").await;
+    });
 }
 
 /// Run `sql` on fsqlite at every worker count and on stock; the answers
-/// must be equal. Returns the threads the last parallel run's walk used.
+/// must be equal. Returns what the last parallel run's walk did.
 async fn same_at_every_worker_count(
     f: &Connection,
     r: &rusqlite::Connection,
     sql: &str,
-) -> Option<usize> {
+) -> Option<WalkRecord> {
     let expected = stock_result(r, sql);
-    let mut threads = None;
+    let mut record = None;
     for workers in WORKERS {
         set_workers(f, workers).await;
-        let _ = take_last_parallel_walk_threads();
+        let _ = take_last_parallel_walk();
         assert_eq!(frank_result(f, sql).await, expected, "workers={workers} `{sql}`");
-        threads = take_last_parallel_walk_threads();
+        record = take_last_parallel_walk();
         if workers == 1 {
-            assert_eq!(threads, None, "workers=1 must stay serial: `{sql}`");
+            assert_eq!(record, None, "workers=1 must stay serial: `{sql}`");
         }
     }
-    threads
+    record
 }
 
 /// An answer or the error message, so a raised error compares as well.
@@ -377,7 +504,7 @@ fn parallel_aggregates_match_stock_on_the_scorecard_shape() {
             "SELECT count(a) FROM t WHERE b IS NOT NULL AND 500 < a;",
         ] {
             let threads = same_at_every_worker_count(&f, &r, sql).await;
-            assert!(threads.is_some(), "`{sql}` did not run in parallel: {threads:?}");
+            assert!(took_parallel_path(threads), "`{sql}` did not run in parallel: {threads:?}");
         }
         // A REAL sum depends on addition order: its walk declines at the
         // first row and the serial loop answers.
@@ -432,7 +559,7 @@ fn parallel_aggregates_follow_sqlite_type_and_comparison_rules() {
             "SELECT sum(id), count(*) FROM m WHERE v = 3.0 OR n = 3;",
         ] {
             let threads = same_at_every_worker_count(&f, &r, sql).await;
-            assert!(threads.is_some(), "`{sql}` did not run in parallel: {threads:?}");
+            assert!(took_parallel_path(threads), "`{sql}` did not run in parallel: {threads:?}");
         }
         // sum() over mixed classes coerces TEXT and adds REALs: declined.
         for sql in ["SELECT sum(v) FROM m;", "SELECT sum(n) FROM m WHERE n > 0;", "SELECT sum(x) FROM m;"] {
@@ -477,7 +604,7 @@ fn parallel_sum_raises_integer_overflow_exactly_when_the_serial_sum_does() {
             "SELECT sum(v) FROM o WHERE z = 0;",
         ] {
             let threads = same_at_every_worker_count(&f, &r, sql).await;
-            assert!(threads.is_some(), "`{sql}` did not run in parallel: {threads:?}");
+            assert!(took_parallel_path(threads), "`{sql}` did not run in parallel: {threads:?}");
         }
         // The negative case itself: stock raises, so must every worker count.
         assert!(stock_result(&r, "SELECT sum(v) FROM o;").is_err());
@@ -527,7 +654,7 @@ fn parallel_aggregates_read_aliases_short_rows_and_overflow_payloads() {
             "SELECT sum(z), count(z), min(z), max(z) FROM p;",
         ] {
             let threads = same_at_every_worker_count(&f, &r, sql).await;
-            assert!(threads.is_some(), "`{sql}` did not run in parallel: {threads:?}");
+            assert!(took_parallel_path(threads), "`{sql}` did not run in parallel: {threads:?}");
         }
     });
 }
@@ -558,11 +685,11 @@ fn parallel_aggregates_decline_without_rowid_user_functions_and_transactions() {
         both(&f, &r, "BEGIN;").await;
         both(&f, &r, "UPDATE t SET a = a + 1 WHERE id % 2 = 0;").await;
         let sql = "SELECT count(*), sum(a) FROM t WHERE a > 5;";
-        let _ = take_last_parallel_walk_threads();
+        let _ = take_last_parallel_walk();
         assert_eq!(frank_result(&f, sql).await, stock_result(&r, sql));
-        assert_eq!(take_last_parallel_walk_threads(), None);
+        assert_eq!(take_last_parallel_walk(), None);
         both(&f, &r, "COMMIT;").await;
-        assert!(same_at_every_worker_count(&f, &r, sql).await.is_some());
+        assert!(took_parallel_path(same_at_every_worker_count(&f, &r, sql).await));
         // EXPLAIN is the serial program whatever the worker count.
         set_workers(&f, 1).await;
         let serial = frank(&f, "EXPLAIN SELECT count(*), sum(a) FROM t WHERE a > 5;").await;
@@ -579,7 +706,7 @@ fn parallel_aggregates_decline_without_rowid_user_functions_and_transactions() {
                 frank_result(&f, "SELECT count(*) FROM t WHERE twice(a) > 5;").await,
                 stock_result(&r, "SELECT count(*) FROM t WHERE a * 2 > 5;"),
             );
-            assert_eq!(take_last_parallel_walk_threads(), None);
+            assert_eq!(take_last_parallel_walk(), None);
         }
     });
 }
@@ -667,7 +794,7 @@ fn parallel_aggregate_reads_one_committed_snapshot_while_a_writer_commits() {
                     SqliteValue::Integer(count * 1001)
                 };
                 assert_eq!(*sum, expected);
-                if take_last_parallel_walk_threads().is_some() {
+                if matches!(take_last_parallel_walk(), Some(WalkRecord::Ran { .. })) {
                     parallel_runs += 1;
                 }
             }

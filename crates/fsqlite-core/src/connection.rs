@@ -772,6 +772,16 @@ const FUNCTION_REGISTRY_STABILITY_ATTEMPTS: usize = 4;
 /// Upper bound of `PRAGMA fsqlite.parallel_workers` (bd-w4pr1.13.11).
 const MAX_PARALLEL_WORKERS: usize = 64;
 
+/// `PRAGMA fsqlite.parallel_workers` of a new connection (bd-w4pr1.13.11):
+/// the machine's available parallelism, at most 8. A scan still uses only the
+/// threads its tree is worth (one per 32 leaf pages) that the process-wide
+/// helper budget grants, so small tables stay on the connection's thread.
+fn default_parallel_workers() -> usize {
+    // Read once: available_parallelism consults cgroup files on Linux.
+    static DEFAULT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEFAULT.get_or_init(|| crate::available_parallelism_or_one().min(8))
+}
+
 /// Maximum aggregate depth of active trigger and FK-action programs.
 ///
 /// SQLite charges trigger bodies and recursive foreign-key actions against one
@@ -14342,8 +14352,9 @@ pub struct Connection {
     /// byte-exact parity with the stock CLI; a follow-up PRAGMA flips it.
     dqs_enabled: Cell<bool>,
     /// bd-w4pr1.13.11: threads one scan of an autocommit read may use, the
-    /// connection's own included. 1 (default) keeps every scan on the
-    /// connection's thread. Controlled by `PRAGMA fsqlite.parallel_workers`.
+    /// connection's own included ([`default_parallel_workers`] by default; 1
+    /// keeps every scan on the connection's thread). Controlled by
+    /// `PRAGMA fsqlite.parallel_workers`.
     parallel_workers: Cell<usize>,
     /// Commit-path safety regime. `Safe` (default) always runs the full
     /// SSI validation. `LabUnsafe` enables the `ssi_e_process_gate` skip
@@ -16499,7 +16510,7 @@ impl Connection {
             pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
             dqs_enabled: Cell::new(true),
-            parallel_workers: Cell::new(1),
+            parallel_workers: Cell::new(default_parallel_workers()),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -17084,7 +17095,7 @@ impl Connection {
             pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
             dqs_enabled: Cell::new(true),
-            parallel_workers: Cell::new(1),
+            parallel_workers: Cell::new(default_parallel_workers()),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
