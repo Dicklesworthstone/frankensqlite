@@ -199,22 +199,27 @@ fn in_twenty_grouped_count_uses_covering_index_input_and_original_slots() {
     let program = compile(sql, &schema);
     assert_indexed_input(&program, sql, true);
     assert_eq!(bind_slots(&program), (1..=20).collect());
+    // The probes run in ascending key order, each over its block, so the
+    // groups stream (bd-gazf2): the only sorter orders the bind-time probe
+    // keys.
     assert_eq!(
         program
             .ops()
             .iter()
             .filter(|op| op.opcode == Opcode::SorterOpen)
             .count(),
-        2,
-        "group rows and bind-time probe keys use separate sorters"
+        1,
+        "only the bind-time probe keys use a sorter"
     );
+    // One call into the row body, which all probe keys share, and one from
+    // it into the group accumulation.
     assert_eq!(
         program
             .ops()
             .iter()
             .filter(|op| op.opcode == Opcode::Gosub)
             .count(),
-        1,
+        2,
         "all probe keys share one compiled row body"
     );
 }

@@ -5043,6 +5043,7 @@ pub fn codegen_select(
             done_label,
             end_label,
             aggregate_index_eq_seek_allowed(from_index_hint),
+            stmt.order_by.len(),
         )
     } else if has_aggregate_columns(columns) {
         // --- Aggregate query (single-group, no GROUP BY) ---
@@ -25178,6 +25179,10 @@ fn codegen_select_group_by_aggregate(
     done_label: crate::Label,
     end_label: crate::Label,
     allow_index_seek: bool,
+    // The ORDER BY's length. It is an ASC prefix of the GROUP BY keys (the
+    // only shape routed here), so the keys past it may come out in any order:
+    // they may stream in a DESC index key's order, as stock emits them.
+    order_by_len: usize,
 ) -> Result<(), CodegenError> {
     // Resolve SELECT-list aliases referenced from HAVING (e.g.
     // `SELECT product_id, SUM(qty) AS total_qty ... HAVING total_qty >= 10`).
@@ -25348,36 +25353,56 @@ fn codegen_select_group_by_aggregate(
     };
     // Whether rows read in `index`'s order arrive grouped, past an equality
     // prefix of `prefix_len` key columns: each GROUP BY key is a plain BINARY
-    // column, either pinned by the prefix or the index's next ASC BINARY key,
-    // in GROUP BY order. Groups then form as rows arrive, in the order the
-    // sorter would emit them.
+    // column pinned by the prefix or one of the index's next BINARY keys. The
+    // keys the ORDER BY names come first, in order, on ASC index keys; the
+    // rest fill the following index positions in any order and direction.
+    // Groups then form as rows arrive, in index order, which is the order
+    // stock emits them in when it walks that index (bd-gazf2): `GROUP BY x, a`
+    // over `(a, x)` comes out in `(a, x)` order, and a DESC key descending.
     let groups_in_index_order = |index: &IndexSchema, prefix_len: usize| {
         let is_binary = |collation: Option<&str>| {
             collation.is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
         };
+        if !index.has_plain_column_key() {
+            return false;
+        }
         let mut next_key = prefix_len;
-        index.has_plain_column_key()
-            && group_by_keys.iter().all(|key| {
-                let GroupByKey::Column(column) = key else {
-                    return false;
-                };
-                let Some(position) = index_key_position_of(index, table, *column)
-                    .and_then(|position| usize::try_from(position).ok())
-                else {
-                    return false;
-                };
-                if !is_binary(table.columns[*column].collation.as_deref()) {
+        let mut free_positions = Vec::new();
+        for (key_pos, key) in group_by_keys.iter().enumerate() {
+            let GroupByKey::Column(column) = key else {
+                return false;
+            };
+            let Some(position) = index_key_position_of(index, table, *column)
+                .and_then(|position| usize::try_from(position).ok())
+            else {
+                return false;
+            };
+            if !is_binary(table.columns[*column].collation.as_deref()) {
+                return false;
+            }
+            if position < prefix_len {
+                continue;
+            }
+            if !is_binary(index.key_term_collation(position)) {
+                return false;
+            }
+            if key_pos < order_by_len {
+                if position != next_key || index.key_term_descending(position) {
                     return false;
                 }
-                if position < prefix_len {
-                    return true;
-                }
-                let next = position == next_key
-                    && !index.key_term_descending(position)
-                    && is_binary(index.key_term_collation(position));
                 next_key += 1;
-                next
-            })
+            } else {
+                free_positions.push(position);
+            }
+        }
+        // The keys past the ORDER BY fill the next index positions in any
+        // order: rows equal on all of them are still adjacent.
+        free_positions.sort_unstable();
+        free_positions.dedup();
+        free_positions
+            .iter()
+            .enumerate()
+            .all(|(offset, &position)| position == next_key + offset)
     };
     // A range on an index's leading key (`WHERE a < 20`, `created > ?1`)
     // walks that range instead of the whole table, as stock's `SEARCH t USING
@@ -25447,10 +25472,14 @@ fn codegen_select_group_by_aggregate(
         .filter(|index| covers_grouping(index));
     // Rows that arrive grouped skip the sorter: each one goes straight to the
     // group accumulation below, and a LIMIT ends the walk after its last
-    // group. IN probes arrive in list order, so they keep the sorter.
+    // group. IN probes run once per distinct value in ascending order, each
+    // over its block in index order, and their index's first key is ASC.
     let streams_groups = index_eq_seek
         .as_ref()
         .is_some_and(|target| groups_in_index_order(target.index, target.values.len()))
+        || index_in_seek
+            .as_ref()
+            .is_some_and(|target| groups_in_index_order(target.index, 0))
         || index_range_input.is_some_and(|(index, _)| groups_in_index_order(index, 0))
         || index_walk_input.is_some();
     if !streams_groups {
