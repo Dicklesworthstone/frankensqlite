@@ -698,6 +698,14 @@ thread_local! {
     static FSQLITE_ROLLBACK_BUSY_ONCE: Cell<bool> = const { Cell::new(false) };
 }
 
+// bd-zsnac: number of times the mirror reload that follows a terminal pager
+// rollback returns BusyRecovery instead of running (a peer's group-commit
+// finalization holding the read install). Scoped to the executing test thread.
+#[cfg(test)]
+thread_local! {
+    static FSQLITE_ROLLBACK_RELOAD_BUSY: Cell<u32> = const { Cell::new(0) };
+}
+
 // Test-only one-shot fault injection for the retained-autocommit flush commit
 // (bd-irmuw). Forces `flush_retained_autocommit_txn`'s `txn.commit` to return the
 // armed error exactly once, so the counterkeeper can prove a flush-commit failure
@@ -80355,7 +80363,41 @@ impl Connection {
             // active-transaction marker first because the active_txn has
             // already been taken and is no longer available for reload.
             self.memdb_requires_active_txn_reload.set(false);
-            let reload_result = self.reload_memdb_from_pager(cx).await;
+            #[cfg(test)]
+            let injected_reload_busy = FSQLITE_ROLLBACK_RELOAD_BUSY.with(|remaining| {
+                let armed = remaining.get();
+                remaining.set(armed.saturating_sub(1));
+                armed > 0
+            });
+            #[cfg(not(test))]
+            let injected_reload_busy = false;
+            let reload_result = if injected_reload_busy {
+                Err(FrankenError::BusyRecovery)
+            } else {
+                self.reload_memdb_from_pager(cx).await
+            };
+            // bd-zsnac: the pager rollback above is terminal and the MVCC
+            // session is released, so this ROLLBACK has happened whatever the
+            // reload reports. A transient refusal (a peer's group-commit
+            // finalization holding the read install) must not come back as a
+            // retryable ROLLBACK error: a caller that retries finds no
+            // transaction and cannot tell whether its transaction ended. On a
+            // file-backed connection the reload is owed to the next read
+            // boundary instead: `refresh_memdb_from_active_txn_if_dirty` runs it
+            // once no transaction is open (or rebuilds from the next
+            // transaction's view inside one), and the forced full schema
+            // rebuild keeps its cookie-match exit from skipping it, exactly as
+            // for the rollback-recovery reload.
+            let reload_result = match reload_result {
+                Err(FrankenError::Busy | FrankenError::BusyRecovery)
+                    if rollback_result.is_ok() && !self.pager.is_memory() =>
+                {
+                    self.memdb_requires_active_txn_reload.set(true);
+                    self.force_full_schema_reload_once.set(true);
+                    Ok(())
+                }
+                other => other,
+            };
 
             // Clear transaction state.
             // bd-do0d6: a terminal full rollback discards any postponed
@@ -216423,6 +216465,134 @@ mod tests {
                 conn.query_row("SELECT id FROM t").await.unwrap().get(0),
                 Some(&SqliteValue::Integer(2))
             );
+            conn.close().await.unwrap();
+        });
+    }
+
+    /// bd-zsnac: once a full ROLLBACK's teardown is terminal (pager rolled back,
+    /// MVCC session released, transaction state cleared), a Busy/BusyRecovery
+    /// from the mirror reload that follows must not come back as a retryable
+    /// ROLLBACK error: a caller that retries it would get "no transaction is
+    /// active" and cannot tell whether its transaction ended. The reload is
+    /// owed to the next read boundary instead, which must then see a peer's
+    /// committed schema and rows. Before the fix this ROLLBACK returned
+    /// `Err(BusyRecovery)` with the transaction already gone.
+    #[test]
+    fn test_rollback_reload_busy_after_terminal_teardown_completes_the_rollback() {
+        struct ResetReloadBusy;
+        impl Drop for ResetReloadBusy {
+            fn drop(&mut self) {
+                super::FSQLITE_ROLLBACK_RELOAD_BUSY.with(|remaining| remaining.set(0));
+            }
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let _reset = ResetReloadBusy;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bd_zsnac_rollback_reload_busy.db");
+            let path = path.to_str().unwrap();
+            let conn = Connection::open(path).await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'committed')")
+                .await
+                .unwrap();
+            conn.execute("BEGIN CONCURRENT").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 'rolled back')")
+                .await
+                .unwrap();
+
+            // A peer commits a schema change and a row while this transaction
+            // is open (on another table: this transaction holds the page lock
+            // on t's leaf): the reload the ROLLBACK owes must bring both in.
+            let peer = Connection::open(path).await.unwrap();
+            peer.execute("CREATE TABLE t2(x INTEGER)").await.unwrap();
+            peer.execute("INSERT INTO t2 VALUES (42)").await.unwrap();
+
+            super::FSQLITE_ROLLBACK_RELOAD_BUSY.with(|remaining| remaining.set(1));
+            let first = conn.execute("ROLLBACK").await;
+            assert_eq!(
+                super::FSQLITE_ROLLBACK_RELOAD_BUSY.with(|remaining| remaining.get()),
+                0,
+                "the probe must reach the post-rollback mirror reload"
+            );
+            assert!(
+                first.is_ok(),
+                "a ROLLBACK whose teardown is terminal must not report a retryable \
+                 error: {first:?}"
+            );
+            assert!(
+                !conn.in_transaction()
+                    && !conn.is_concurrent_transaction()
+                    && conn.active_txn.borrow().is_none()
+                    && !conn.has_concurrent_session(),
+                "the rollback must have ended the transaction exactly once"
+            );
+            let second = conn.execute("ROLLBACK").await;
+            assert!(
+                matches!(&second, Err(error) if error.to_string().contains("no transaction is active")),
+                "a second ROLLBACK must find no transaction: {second:?}"
+            );
+
+            // The next statements read the peer's commit through the owed reload.
+            assert_eq!(
+                conn.query_row("SELECT x FROM t2").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(42)),
+                "the owed reload must load the peer's committed schema"
+            );
+            let ids: Vec<_> = conn
+                .query("SELECT id FROM t ORDER BY id")
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0).cloned())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![Some(SqliteValue::Integer(1))],
+                "t holds the committed row, never the rolled-back one"
+            );
+            // The peer can now write the page this transaction had locked.
+            peer.execute("INSERT INTO t VALUES (3, 'peer')").await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT v FROM t WHERE id = 3")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("peer".into()))
+            );
+            conn.execute("INSERT INTO t VALUES (4, 'after')").await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT v FROM t WHERE id = 4")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("after".into()))
+            );
+
+            // Second round: the statement after the ROLLBACK opens a
+            // transaction, and that transaction must see the peer's schema.
+            conn.execute("BEGIN CONCURRENT").await.unwrap();
+            conn.execute("INSERT INTO t2 VALUES (7)").await.unwrap();
+            peer.execute("CREATE TABLE t3(y INTEGER)").await.unwrap();
+            peer.execute("INSERT INTO t3 VALUES (9)").await.unwrap();
+            super::FSQLITE_ROLLBACK_RELOAD_BUSY.with(|remaining| remaining.set(1));
+            let rolled_back = conn.execute("ROLLBACK").await;
+            assert!(rolled_back.is_ok(), "{rolled_back:?}");
+            conn.execute("BEGIN CONCURRENT").await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT y FROM t3").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(9)),
+                "a transaction opened after the owed reload sees the peer's schema"
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM t2").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(1)),
+                "the rolled-back INSERT INTO t2 must not survive"
+            );
+            conn.execute("COMMIT").await.unwrap();
+            peer.close().await.unwrap();
             conn.close().await.unwrap();
         });
     }
