@@ -170,6 +170,32 @@ fn value_preserves_reusable_heap_storage(value: &SqliteValue) -> bool {
 /// with common cache line fractions and matches Arc<str>'s pointer size.
 const SMALL_TEXT_INLINE_CAP: usize = 23;
 
+/// Length of the longest `i64` in decimal, `i64::MIN` with its sign.
+const I64_DECIMAL_MAX_LEN: usize = 20;
+
+/// `value` in decimal, with a leading `-` when negative: the bytes
+/// `i64::to_string` produces, written at the end of `digits`.
+fn write_i64_decimal(value: i64, digits: &mut [u8; I64_DECIMAL_MAX_LEN]) -> &[u8] {
+    let mut rest = value.unsigned_abs();
+    let mut start = I64_DECIMAL_MAX_LEN;
+    loop {
+        start -= 1;
+        // `rest % 10` is a single digit.
+        #[allow(clippy::cast_possible_truncation)]
+        let digit = (rest % 10) as u8;
+        digits[start] = b'0' + digit;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        start -= 1;
+        digits[start] = b'-';
+    }
+    &digits[start..]
+}
+
 #[cfg(feature = "bench-internals")]
 static SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -305,6 +331,28 @@ impl SmallText {
                 },
             }
         }
+    }
+
+    /// `left` followed by `right` in the inline representation, or `None` when
+    /// the two do not fit in [`Self::INLINE_CAPACITY`] bytes.
+    ///
+    /// Each part must be valid UTF-8 on its own (whole code points), which
+    /// makes the result valid UTF-8, the inline representation's invariant.
+    fn inline_concat_utf8(left: &[u8], right: &[u8]) -> Option<Self> {
+        let len = left.len() + right.len();
+        if len > SMALL_TEXT_INLINE_CAP {
+            return None;
+        }
+        let mut buf = [0u8; SMALL_TEXT_INLINE_CAP];
+        buf[..left.len()].copy_from_slice(left);
+        buf[left.len()..len].copy_from_slice(right);
+        debug_assert!(simdutf8::basic::from_utf8(&buf[..len]).is_ok());
+        Some(Self {
+            repr: SmallTextRepr::Inline {
+                len: u8::try_from(len).ok()?,
+                buf,
+            },
+        })
     }
 
     /// Create from an `Arc<str>`, avoiding re-allocation if already heap.
@@ -1309,7 +1357,21 @@ impl SqliteValue {
             bytes.extend_from_slice(&right);
             return Self::Text(SmallText::from_bytes(&bytes));
         }
-        // Both operands render as valid UTF-8: concatenate as `str`.
+        // Both operands render as valid UTF-8. A TEXT or INTEGER pair whose
+        // result fits inline is built in place: no String for the integer's
+        // digits or for the result, and no UTF-8 check of a part that is
+        // already known to be valid (`'row-' || id` cost ~600 instructions a
+        // row through the String path below).
+        let mut left_digits = [0_u8; I64_DECIMAL_MAX_LEN];
+        let mut right_digits = [0_u8; I64_DECIMAL_MAX_LEN];
+        if let (Some(left), Some(right)) = (
+            self.concat_operand_utf8(&mut left_digits),
+            rhs.concat_operand_utf8(&mut right_digits),
+        ) && let Some(text) = SmallText::inline_concat_utf8(left, right)
+        {
+            return Self::Text(text);
+        }
+        // Concatenate as `str`.
         match (self, rhs) {
             (Self::Text(l), Self::Text(r)) => {
                 let mut s = String::with_capacity(l.len() + r.len());
@@ -1334,6 +1396,20 @@ impl SqliteValue {
                 s.push_str(&r.to_text());
                 Self::Text(s.into())
             }
+        }
+    }
+
+    /// The UTF-8 bytes `||` takes from a valid-UTF-8 TEXT (its stored bytes)
+    /// or an INTEGER (its decimal digits, written into `digits`). `None` for
+    /// every other value.
+    fn concat_operand_utf8<'a>(
+        &'a self,
+        digits: &'a mut [u8; I64_DECIMAL_MAX_LEN],
+    ) -> Option<&'a [u8]> {
+        match self {
+            Self::Text(text) if text.is_valid_utf8() => Some(text.as_bytes_direct()),
+            Self::Integer(value) => Some(write_i64_decimal(*value, digits)),
+            _ => None,
         }
     }
 
@@ -3470,6 +3546,104 @@ mod tests {
             panic!("text || text must be TEXT");
         };
         assert_eq!(out.as_bytes_direct(), &[0x80, 0x81, b'z']);
+    }
+
+    #[test]
+    fn test_write_i64_decimal_matches_to_string() {
+        let mut values = vec![
+            0,
+            1,
+            -1,
+            9,
+            -9,
+            10,
+            -10,
+            99,
+            100,
+            i64::MAX,
+            i64::MIN,
+            i64::MAX - 1,
+            i64::MIN + 1,
+        ];
+        let mut power = 1_i64;
+        while let Some(next) = power.checked_mul(10) {
+            values.extend([power - 1, power, power + 1, -power + 1, -power, -power - 1]);
+            power = next;
+        }
+        values.extend((-2_000..2_000).map(|i| i * 7_919));
+        for value in values {
+            let mut digits = [0_u8; I64_DECIMAL_MAX_LEN];
+            assert_eq!(
+                write_i64_decimal(value, &mut digits),
+                value.to_string().as_bytes(),
+                "decimal digits of {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sql_concat_inline_path_matches_rendered_bytes() {
+        let t = |s: &str| SqliteValue::Text(s.into());
+        let operands = vec![
+            t(""),
+            t("row-"),
+            t("üé€"),
+            t("abcdefghijklmnopqrstu"),
+            t("abcdefghijklmnopqrstuv"),
+            t("abcdefghijklmnopqrstuvw"),
+            t("abcdefghijklmnopqrstuvwx"),
+            SqliteValue::Text(SmallText::from_bytes(&[0x80, b'q'])),
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(7),
+            SqliteValue::Integer(-7),
+            SqliteValue::Integer(12),
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Integer(i64::MIN),
+            SqliteValue::Float(1.5),
+            SqliteValue::Float(-0.25),
+            SqliteValue::Blob(vec![0x61, 0x62].into()),
+            SqliteValue::Blob(vec![0x00, 0xFF].into()),
+            SqliteValue::Null,
+        ];
+        // The bytes SQLite's `||` produces, built without sql_concat.
+        let rendered = |v: &SqliteValue| -> Vec<u8> {
+            match v {
+                SqliteValue::Integer(i) => i.to_string().into_bytes(),
+                SqliteValue::Float(f) => format_sqlite_float(*f).into_bytes(),
+                SqliteValue::Text(s) => s.as_bytes_direct().to_vec(),
+                SqliteValue::Blob(b) => b.to_vec(),
+                SqliteValue::Null => Vec::new(),
+            }
+        };
+        for left in &operands {
+            for right in &operands {
+                let joined = left.sql_concat(right);
+                if left.is_null() || right.is_null() {
+                    assert_eq!(joined, SqliteValue::Null, "{left:?} || {right:?}");
+                    continue;
+                }
+                let SqliteValue::Text(text) = &joined else {
+                    panic!("{left:?} || {right:?} must be TEXT, got {joined:?}");
+                };
+                let mut expected = rendered(left);
+                expected.extend(rendered(right));
+                assert_eq!(
+                    text.as_bytes_direct(),
+                    expected.as_slice(),
+                    "{left:?} || {right:?}"
+                );
+                let valid = std::str::from_utf8(&expected).is_ok();
+                assert_eq!(text.is_valid_utf8(), valid, "{left:?} || {right:?}");
+                if valid {
+                    assert_eq!(
+                        text.is_inline(),
+                        expected.len() <= SmallText::INLINE_CAPACITY,
+                        "{left:?} || {right:?} storage"
+                    );
+                    assert_eq!(text.as_str().as_bytes(), expected.as_slice());
+                }
+            }
+        }
     }
 
     #[test]
