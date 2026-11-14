@@ -87,6 +87,105 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN (default flipped): parallel scans sized by leaf pages under a process-wide helper budget, and fsqlite.parallel_workers defaulting to min(available_parallelism, 8) (bd-w4pr1.13.11)
+
+- Target: the parallel count(*) and ungrouped count/sum/min/max of bd-w4pr1.13.11 steps 1-3
+  (bbd81503d), which only ran under `PRAGMA fsqlite.parallel_workers = N`; this decides whether a
+  user gets them by default. Touched: `crates/fsqlite-btree/src/snapshot_walk.rs`
+  (`LEAF_PAGES_PER_THREAD`, `BtreeSplit::leaf_pages` / `threads_for`, `HelperGrant`,
+  `parallel_helper_budget`, `parallel_helpers_high_water`, `WalkRecord`, `SerialReason`,
+  `take_last_parallel_walk`), `crates/fsqlite-core/src/connection.rs` (`default_parallel_workers`),
+  the oracle file `bd_w4pr1_13_11_parallel_scan_oracle.rs` and the new
+  `bd_w4pr1_13_11_parallel_budget.rs`.
+- Ledger preflight: the steps 1-3 entry below (52df35c25) and its missed prediction (scan_filter_agg
+  at 8 workers costs 1.21x stock CPU). No earlier entry sizes or budgets threads.
+- Change: the split counts the leaves below its frontier (exact when the frontier is leaves,
+  frontier x fanout of the last expanded level otherwise). A statement wants
+  min(parallel_workers, leaf pages / 32) threads, at least 1; wanting 1 runs the serial path, so a
+  one-level tree (up to 63 leaves, e.g. 2,000 rows) starts nothing. The threads beyond the
+  statement's own come from one process-wide budget of available_parallelism helpers, granted by a
+  CAS that never waits: a statement takes what is left, and with nothing left it runs the serial
+  path. The grant is returned when the walk's scope ends. Explicit and concurrent transactions stay
+  serial (unchanged from steps 1-3).
+- Pre-registered on the bead (2026-11-14T04:05Z) before any run: flip only if (a) 2,000-row tables
+  start 0 threads under strace at the new default, (b) every scorecard row without a parallel
+  statement stays within +2% wall of the forced-1 arm with CPU reported for every row, (c) the
+  read / aggregate / snapshot / EXPLAIN / concurrency keepers pass with the default flipped in code,
+  (d) explicit transactions stay serial, (e) 8 connections asking for 64 workers each stay within
+  the budget.
+- Results (host thinkstation1, 64 CPUs online and in affinity, governor powersave, io_uring
+  refused; binary 5f3251ab4c2210dd = 52df35c25 plus this diff, landed as 5f3006612; stock sqlite3
+  3.46.1 live in the same runs):
+  - (a) strace -f clone/clone3 at the default vs forced 1, same database: 2,000 rows 0 helpers for
+    count(*) and for `count(*), sum(a) ... WHERE a > 500`; 20,000 rows 3 helpers (4 threads, as
+    predicted); 1M rows 7 helpers. Default readback 8.
+  - Sizing, 1M rows at 8 workers (perf stat, 5 reps): scan_filter_agg 635.9M instructions, unchanged
+    from steps 1-3; 2,000 rows now serial, CPU 0.6 ms (stock 0.2 ms) where steps 1-3 started 7
+    threads for it.
+  - (b) Rows that start no helper thread (strace classification of every scorecard statement at
+    the default vs forced 1): bulk_insert_1M_one_txn, group_by_1000_groups, rowid_lookups_200k,
+    join_1M_to_pk_1000, order_by_text_limit10, window_row_number, join_no_index_5k_x_5k,
+    autocommit_5k_inserts, txn_1000x10_rows, memory_script_200k, multiproc_8x500. The early passes
+    were noisier than the band: the full scorecard at reps 5 (A/B/A) had multiproc_8x500 at +7.3%,
+    an interleaved ABBA pass at reps 10 had txn_1000x10_rows at +5.5% (A/A +3.1%), a reps-20 pass
+    of two rows had autocommit_5k_inserts at +3.4%, and none of the three reproduced in the next
+    pass. User instructions for the two flagged write rows (perf stat, ABBA, 8 reps): txn
+    +0.08% min / -0.00% median, autocommit -0.44% / -0.12%. The decision used one more pass whose
+    rule was written down before it ran: interleaved ABBA, reps 30, all eleven rows, a row fails
+    when its median wall B/A exceeds +2%. B/A wall (CPU; paired median and its bootstrap 95% CI):
+    autocommit_5k_inserts +0.8% (+0.4%; -0.2% [-1.5, +0.8]), txn_1000x10_rows -1.4% (-1.9%; -0.9%
+    [-3.3, +0.6]), join_1M_to_pk_1000 +0.1% (+0.0%; +0.9% [-1.1, +1.8]), window_row_number +0.7%
+    (+0.6%; +1.0% [-0.2, +1.7]), memory_script_200k -0.7% (-0.6%; -0.3% [-2.1, +0.5]),
+    bulk_insert_1M_one_txn -2.2% (-0.6%; -2.1% [-3.0, -1.4]), group_by_1000_groups -1.0% (-1.0%;
+    -0.6% [-2.2, +2.0]), rowid_lookups_200k -1.9% (-2.0%; -1.1% [-2.7, +0.8]),
+    order_by_text_limit10 -0.3% (-0.3%; -0.4% [-2.1, +0.4]), join_no_index_5k_x_5k +1.1% (+1.0%;
+    +1.8% [-2.3, +4.5], a 22 ms row), multiproc_8x500 +0.3% (-1.9%; -0.6% [-3.7, +1.4]). All
+    answers equal. Rows that go parallel (reps 10, B/A wall / CPU): scan_filter_agg -82.9% /
+    -36.3% (8 threads' kernel spends less CPU than the serial VDBE loop, still x1.23 stock CPU);
+    count_star -65.2% / -26.6%; create_index_int_300k +1.1% / +0.9%, update_10pct_300k -14.7% /
+    -5.5%, delete_14pct_300k +1.0% / +6.4% (each parallel only in its trailing count(*) or sum
+    over 300,000 rows).
+  - (c) with the default flipped in code and no pragma anywhere (pre-rebase tree, 52df35c25 plus
+    this diff): 53 integration targets (aggregate and bare-column oracles, view reads, prepared
+    pragma dispatch, GROUP BY depth, the gh525 / gh457 / gh338 / gh430 / gh409 snapshot and
+    read-your-own-write keepers, live capture, read-only opens, time-travel snapshots, the memory
+    mirror differential, WAL reset with a foreign reader, INDEXED BY, fast-path separation, view
+    flattening, join aggregates, one-pass DELETE, IN-list seeks,
+    agent_swarm_explain_concurrency_contract, concurrent_update_differential_stress,
+    rowid_statement_rewind_concurrent_stress, the fsqlite count / min / max / range oracles,
+    concurrent freelist churn, gh519), fsqlite-core --lib and the vdbe golden_bytecode_snapshots
+    pass apart from four failures already red on main
+    (test_t6741_left_join / simple_inner_join_uses_vdbe_storage_cursors,
+    indexed_group_by_predicates_match_sqlite_without_table_scans, gh19 in
+    wal_reset_with_foreign_reader). After the rebase onto 4c49baa46: clippy, the two
+    bd-w4pr1.13.11 files and the aggregate / EXPLAIN tests that landed meanwhile
+    (join_aggregate_lookup_oracle, conformance_oracle_minmax_rowid_seek, agg_index_range_oracle,
+    in_list_composite_probe_oracle, is_null_index_seek_oracle, minmax_prefix_oracle,
+    or_index_union_oracle, golden_bytecode_snapshots, issue_531_grouped_index_input) all pass,
+    and clippy again after a second rebase onto c5a9af7ae.
+  - (d) `the_default_worker_count_and_explicit_transactions`, no pragma: on a 30,000-row table the
+    aggregate takes the parallel path in autocommit (the negative case), and inside BEGIN, after a
+    DELETE, neither it nor count(*) records a parallel walk; answers equal rusqlite.
+  - (e) `bd_w4pr1_13_11_parallel_budget`: 8 threads, each its own Connection asking for 64 workers,
+    6 rounds of count(*) and the scan_filter_agg shape over 300,000 rows behind a barrier: every
+    answer equals rusqlite, helper high-water <= budget (the rch worker's available_parallelism),
+    and since eight scans of about 50 threads each ask for more than the budget, at least one ran
+    with fewer than 40 workers or serially (the negative case: an unbudgeted walk fails it).
+- Scorecard at the new default (full scorecard, reps 5, stock first and last; wall / CPU,
+  candidate default vs stock): scan_filter_agg 0.020 s / 0.074 s vs 0.061 / 0.060 (x0.33 wall,
+  x1.23 CPU); count_star 0.014 / 0.031 vs 0.019 / 0.018 (x0.73 wall, x1.7 CPU); the mutation rows
+  go parallel only in their trailing count(*) or sum.
+- Verdict: all five held, so the default is min(available_parallelism, 8) and a user gets the
+  parallel count(*) and ungrouped aggregates without a pragma. Wall WIN vs stock on the two read
+  rows that go parallel (scan_filter_agg x0.33, count_star x0.73), still a CPU loss vs stock (x1.23
+  and x1.7); the next lever is the per-row kernel (635 Ir per row, profile on the bead), not more
+  threads.
+- Retry condition: back to a default of 1 if a scorecard row without a parallel statement moves
+  past +2% wall at the default in an interleaved ABBA pass of 30 or more reps, if a keeper shows a
+  parallel walk inside an explicit transaction, or if the helper high-water ever exceeds
+  available_parallelism; revisit LEAF_PAGES_PER_THREAD = 32 when a probe at 20k-200k rows shows
+  wall above the forced-1 arm.
+
 ## 2026-11-14 - WIN: a statement savepoint names itself without format!, takes the cached session handle and skips empty virtual-table levels (bd-w4pr1.13.35 lever 5)
 
 - Target: the internal statement savepoint every statement of an explicit transaction runs in
