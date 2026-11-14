@@ -798,8 +798,12 @@ impl Connection {
         // bd-d8fxs: INSERT needs the same changed-row projection boundary as
         // UPDATE/DELETE. In particular, a nested WITH or derived table must
         // not reach emit_scalar_subquery, which cannot preserve that scope.
+        // bd-ow713: nor may a subquery that re-reads the target, which stock
+        // evaluates again after each row is inserted (the subquery fold left
+        // it in place for this).
         let returning_projection = if !is_live_vtab
-            && self.returning_has_uncompiled_subquery(&insert.returning)
+            && (self.returning_has_uncompiled_subquery(&insert.returning)
+                || self.returning_rereads_target(&insert.returning, table_name))
         {
             self.log_mem_execution_fallback("insert", "insert_row_by_row_returning_fallback")?;
             Some(self.prepare_dml_returning_projection(

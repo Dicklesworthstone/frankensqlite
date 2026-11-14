@@ -42957,7 +42957,12 @@ impl Connection {
                 let returning_needs_select_path = self
                     .returning_has_uncompiled_correlated_subquery(&effective_update.returning)
                     || (computes_new_images
-                        && self.returning_has_correlated_subquery(&effective_update.returning));
+                        && self.returning_has_correlated_subquery(&effective_update.returning))
+                    || (effective_update.with.is_none()
+                        && self.returning_rereads_target(
+                            &effective_update.returning,
+                            &effective_update.table.name.name,
+                        ));
                 let returning_projection = if returning_needs_select_path {
                     Some(self.prepare_dml_returning_projection(
                         &effective_update.table,
@@ -43447,6 +43452,11 @@ impl Connection {
                             &effective_delete.returning,
                             table_name,
                         )
+                        || (effective_delete.with.is_none()
+                            && self.returning_rereads_target(
+                                &effective_delete.returning,
+                                &effective_delete.table.name.name,
+                            ))
                         || ((has_before_delete
                             || has_after_delete
                             || self.fk_cascade_propagation_enabled())
@@ -44179,11 +44189,14 @@ impl Connection {
                         }
                     }
                 }
-                for column in &mut insert.returning {
-                    if let ResultColumn::Expr { expr, .. } = column {
-                        rewrite_dml_in_expr(expr, self, eager_in_subqueries, params).await?;
-                    }
-                }
+                rewrite_dml_result_columns(
+                    &mut insert.returning,
+                    &insert.table.name,
+                    self,
+                    eager_in_subqueries,
+                    params,
+                )
+                .await?;
                 Ok(Cow::Owned(Statement::Insert(insert)))
             }
             Statement::Update(update) if update.with.is_some() => Ok(Cow::Borrowed(statement)),
@@ -44260,6 +44273,7 @@ impl Connection {
                 }
                 rewrite_dml_result_columns(
                     &mut update.returning,
+                    &update.table.name.name,
                     self,
                     eager_in_subqueries,
                     params,
@@ -44288,6 +44302,7 @@ impl Connection {
                 }
                 rewrite_dml_result_columns(
                     &mut delete.returning,
+                    &delete.table.name.name,
                     self,
                     eager_in_subqueries,
                     params,
@@ -56355,6 +56370,38 @@ impl Connection {
                 subquery_references_table(inner, table_name)
                     && is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
             })
+        })
+    }
+
+    /// bd-ow713: whether a RETURNING expression holds, at any depth, an
+    /// uncorrelated subquery that re-reads the DML target. Stock evaluates
+    /// such a subquery again for every row's RETURNING, so it sees the rows
+    /// changed so far; folding it to its value before the statement runs
+    /// returned the pre-statement answer on every row. Stock evaluates
+    /// every other uncorrelated subquery once, including one that reads the
+    /// target only through a view, a derived table, a CTE or another
+    /// subquery (bd-j9tg3: at the first row, which the fold does not match
+    /// yet). Correlated subqueries are never folded; the existing routing
+    /// predicates cover them.
+    ///
+    /// The prepare-time fold (which skips such a column) and the DML
+    /// dispatch (which routes the statement to the changed-row projection)
+    /// both ask this of the same expressions, so they agree.
+    fn returning_expr_rereads_target(&self, expr: &Expr, table_name: &str) -> bool {
+        expr_contains_subquery_matching_deep(expr, self, &|subquery, conn| {
+            let (SubqueryExprRef::Scalar(inner)
+            | SubqueryExprRef::Exists(inner)
+            | SubqueryExprRef::In(inner)) = subquery;
+            subquery_final_from_names_table(inner, table_name)
+                && !is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+        })
+    }
+
+    /// bd-ow713: [`Self::returning_expr_rereads_target`] over a RETURNING list.
+    fn returning_rereads_target(&self, returning: &[ResultColumn], table_name: &str) -> bool {
+        returning.iter().any(|column| {
+            matches!(column, ResultColumn::Expr { expr, .. }
+                if self.returning_expr_rereads_target(expr, table_name))
         })
     }
 
@@ -128469,6 +128516,44 @@ fn expr_has_self_referencing_scalar_subquery(
     }
 }
 
+/// bd-ow713: whether the FROM of `select`'s last SELECT names `table_name`
+/// as a table, in any schema and through parenthesized joins, but not
+/// through a derived table, CTE or view. Stock re-evaluates a RETURNING
+/// subquery per row exactly when this holds; for a compound it decides by
+/// the last arm alone (`SELECT ... UNION ALL SELECT count(*) FROM t` is
+/// re-evaluated, `SELECT count(*) FROM t UNION ALL SELECT -1` is not).
+fn subquery_final_from_names_table(select: &SelectStatement, table_name: &str) -> bool {
+    fn names_table(table: &TableOrSubquery, table_name: &str) -> bool {
+        match table {
+            TableOrSubquery::Table { name, .. } => name.name.eq_ignore_ascii_case(table_name),
+            TableOrSubquery::ParenJoin(from) => {
+                names_table(&from.source, table_name)
+                    || from
+                        .joins
+                        .iter()
+                        .any(|join| names_table(&join.table, table_name))
+            }
+            TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => false,
+        }
+    }
+    let last = select
+        .body
+        .compounds
+        .last()
+        .map_or(&select.body.select, |(_, core)| core);
+    let SelectCore::Select {
+        from: Some(from), ..
+    } = last
+    else {
+        return false;
+    };
+    names_table(&from.source, table_name)
+        || from
+            .joins
+            .iter()
+            .any(|join| names_table(&join.table, table_name))
+}
+
 /// Check if a subquery references `table_name` in its FROM clause.
 fn subquery_references_table(subquery: &SelectStatement, table_name: &str) -> bool {
     if let SelectCore::Select {
@@ -129627,14 +129712,20 @@ async fn rewrite_dml_in_expr(
     rewrite_in_expr(expr, conn, rewrite_in_subqueries, params).await
 }
 
+/// Fold the subqueries of a DML's RETURNING list, except in a column that
+/// re-reads `target` (bd-ow713): stock evaluates that column's subquery for
+/// every row, so it stays for the changed-row projection.
 async fn rewrite_dml_result_columns(
     columns: &mut [ResultColumn],
+    target: &str,
     conn: &Connection,
     rewrite_in_subqueries: bool,
     params: Option<&[SqliteValue]>,
 ) -> Result<()> {
     for column in columns {
-        if let ResultColumn::Expr { expr, .. } = column {
+        if let ResultColumn::Expr { expr, .. } = column
+            && !conn.returning_expr_rereads_target(expr, target)
+        {
             rewrite_dml_in_expr(expr, conn, rewrite_in_subqueries, params).await?;
         }
     }
