@@ -6514,9 +6514,11 @@ impl InListProbe {
 /// INTEGER-affinity column, or string literals on a BINARY TEXT column (bd-5qu8n).
 ///
 /// bd-2dgf5. Seeks the index once per distinct value (ascending, matching C SQLite's
-/// value-then-rowid output order), does the table lookup, and emits `ResultRow`. Non-covering
-/// (always looks the row up). No scan fallback: the INTEGER-affinity + integer-literal +
-/// de-duplicated gate in [`index_integer_in_list_target`] makes each probe exact and the runs
+/// value-then-rowid output order), does the table lookup, and emits `ResultRow`. bd-mids0: when
+/// the index holds every output and the residual (if any) reads only its columns and the rowid,
+/// the entry answers the row and the table is never opened. No scan fallback: the
+/// INTEGER-affinity + integer-literal + de-duplicated gate in [`index_integer_in_list_target`]
+/// makes each probe exact and the runs
 /// disjoint. The caller gates out ORDER BY / LIMIT / DISTINCT / WITHOUT ROWID.
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_index_in_scan(
@@ -6535,8 +6537,8 @@ fn codegen_select_index_in_scan(
     where_clause: Option<&Expr>,
     // When true, the full `where_clause` is applied as a per-row residual filter after positioning on
     // each IN-list run — for `col IN (ints) AND <residual>`. The seek visits a SUPERSET (the IN runs)
-    // and the residual narrows to the exact matches; the table is always open here (SeekRowid below), so
-    // the residual can read any column. `false` for the exact-IN caller → byte-identical. Placeholder
+    // and the residual narrows to the exact matches; the table is open for it (SeekRowid below) unless
+    // the residual and outputs read only the index (bd-mids0). `false` for the exact-IN caller. Placeholder
     // numbering is reset before each run's filter so a `?` in the residual numbers the same on every
     // run. bd-nonagg-in-list-residual.
     residual_filter: bool,
@@ -6545,14 +6547,27 @@ fn codegen_select_index_in_scan(
     // Captured before any placeholder-emitting op (IN values are integer literals) so each residual
     // filter can reset to it and number a `?` in the residual identically across runs.
     let where_placeholder_base = b.current_anon_placeholder();
-    b.emit_op(
-        Opcode::OpenRead,
-        cursor,
-        table.root_page,
-        0,
-        P4::Table(table.name.clone()),
-        0,
-    );
+    // bd-mids0: when the index holds every output and the residual reads only its columns and the
+    // rowid, each entry is answered from the index and the table is never opened.
+    let covering_output = if table.without_rowid
+        || (residual_filter
+            && !where_clause.is_some_and(|where_expr| {
+                expr_reads_only_index_columns(where_expr, table, table_alias, idx_schema, false)
+            })) {
+        None
+    } else {
+        resolve_covering_output_sources(columns, table, table_alias, idx_schema)
+    };
+    if covering_output.is_none() {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
     b.emit_op(
         Opcode::OpenRead,
         idx_cursor,
@@ -6616,13 +6631,32 @@ fn codegen_select_index_in_scan(
         let skip_row = b.emit_label();
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
-        // bd-nonagg-in-list-residual: narrow the IN run to the exact matches with the full WHERE.
-        if residual_filter && let Some(where_expr) = where_clause {
-            b.set_next_anon_placeholder(where_placeholder_base);
-            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
+        if let Some(sources) = covering_output.as_ref() {
+            if residual_filter && let Some(where_expr) = where_clause {
+                b.set_next_anon_placeholder(where_placeholder_base);
+                emit_index_entry_where_filter(
+                    b,
+                    where_expr,
+                    idx_cursor,
+                    rowid_reg,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    idx_schema,
+                    skip_row,
+                );
+            }
+            emit_covering_output_reads(b, idx_cursor, rowid_reg, sources, out_regs);
+        } else {
+            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+            // bd-nonagg-in-list-residual: narrow the IN run to the exact matches with the full WHERE.
+            if residual_filter && let Some(where_expr) = where_clause {
+                b.set_next_anon_placeholder(where_placeholder_base);
+                emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
+            }
+            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
         }
-        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
         b.resolve_label(skip_row);
         b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
@@ -6631,7 +6665,9 @@ fn codegen_select_index_in_scan(
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
-    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    if covering_output.is_none() {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())

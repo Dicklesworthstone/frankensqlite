@@ -1,8 +1,9 @@
 //! bd-nonagg-in-list-residual: `SELECT ... FROM t WHERE <int-indexed col> IN (<ints>) AND <residual>`
 //! seeks each IN-list value's run and filters the residual per row, instead of full-scanning. The IN
-//! emitter always opens the table, so the residual reads any column and ALL outputs (covering too) work;
-//! IN is not a single-eq prefix, so no composite-prefix-range interaction. Exact IN (no residual) still
-//! seeks byte-identically. Byte-set-identical to C SQLite.
+//! emitter opens the table unless the index holds every output and the residual reads only its
+//! columns (bd-mids0), so the residual reads any column and ALL outputs work; IN is not a single-eq
+//! prefix, so no composite-prefix-range interaction. Exact IN (no residual) still seeks.
+//! Byte-set-identical to C SQLite.
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 fn render(v: &SqliteValue) -> String {
@@ -151,5 +152,75 @@ fn nonagg_in_residual_matches_sqlite() {
             ],
         )
         .await;
+    });
+}
+
+async fn has_op(c: &Connection, sql: &str, want: &str) -> bool {
+    c.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.as_str() == want))
+}
+
+/// bd-mids0: an IN-list scan whose outputs the index holds, with a residual
+/// (if any) that reads only its columns and the rowid, answers each entry
+/// from the index and never looks the row up; NULL second keys of a
+/// composite index stay in their runs. An output or residual the index lacks
+/// keeps the lookup. Answers match stock.
+#[test]
+fn in_list_scan_reads_only_the_index_when_it_holds_the_output() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
+            "CREATE INDEX idx_ab ON t(a, b);",
+        ])
+        .await;
+        for i in 1..=600_i64 {
+            let b = if i % 7 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 9)
+            };
+            ins(
+                &f,
+                &r,
+                &format!("INSERT INTO t VALUES ({i}, {}, {b}, {});", i % 20, i % 5),
+            )
+            .await;
+        }
+        for sql in [
+            "SELECT id FROM t WHERE a IN (1,3,5)",
+            "SELECT id, a, b FROM t WHERE a IN (2,4)",
+            "SELECT id FROM t WHERE a IN (1,2,3) AND b > 4",
+            "SELECT b, id FROM t WHERE a IN (6,7) AND b IS NULL",
+            "SELECT id FROM t WHERE a IN (999) AND b > 1",
+        ] {
+            cmp(&f, &r, sql, "covered").await;
+            assert!(has_seek(&f, sql).await, "must seek: `{sql}`");
+            assert!(
+                !has_op(&f, sql, "SeekRowid").await,
+                "the index holds every column read: `{sql}`"
+            );
+        }
+        // `a IN (..) AND b = 4` is a composite probe of (a, b) (bd-hyoms), another emitter: its
+        // answers only.
+        cmp(
+            &f,
+            &r,
+            "SELECT id FROM t WHERE a IN (1,2,3) AND b = 4",
+            "composite-probe",
+        )
+        .await;
+        for sql in [
+            "SELECT c FROM t WHERE a IN (1,3,5)",
+            "SELECT id FROM t WHERE a IN (1,3,5) AND c = 2",
+        ] {
+            cmp(&f, &r, sql, "looked-up").await;
+            assert!(
+                has_op(&f, sql, "SeekRowid").await,
+                "a column the index lacks needs the row: `{sql}`"
+            );
+        }
     });
 }
