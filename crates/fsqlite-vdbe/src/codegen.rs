@@ -3546,7 +3546,15 @@ pub fn codegen_select(
     // table, so the residual reads any column and no covering gate is needed; IN is not a single-eq
     // prefix, so it does not collide with the composite-prefix-range path.
     // bd-5qu8n (GH#497): a TEXT column's string-literal IN list seeks the same way.
-    let index_in = if in_list_seek_allowed && rowid_in.is_none() && rowid_in_const.is_none() {
+    // bd-hyoms: a probe that also pins a neighbouring key term (`a IN (3, 77)
+    // AND b = 3` on `(a, b)`) is the constant-list seek's below.
+    let index_in = if in_list_seek_allowed
+        && rowid_in.is_none()
+        && rowid_in_const.is_none()
+        && (time_travel.is_some()
+            || index_const_in_list_composite_target(where_clause.as_deref(), table, table_alias)
+                .is_none())
+    {
         index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
             .map(|(idx, ints, has_residual)| {
                 (
@@ -20080,6 +20088,12 @@ struct IndexConstInList<'t, 'a> {
     /// Anonymous `?` placeholders in the conjuncts before the membership test (see
     /// [`RowidConstInList::anon_offset`]).
     anon_offset: u32,
+    /// bd-hyoms: `col = constant` values pinning the key terms before the
+    /// member's (`prefix`) and right after it (`suffix`), each with the
+    /// affinity its comparison applies, so a member seeks the run of
+    /// `(prefix.., member, suffix..)`. Both empty for a one-field probe.
+    prefix: Vec<(&'a Expr, char)>,
+    suffix: Vec<(&'a Expr, char)>,
 }
 
 /// The index, members and affinity of `<col> IN (<bind-time constants>)` for
@@ -20096,6 +20110,35 @@ fn index_const_in_list_target<'t, 'a>(
     if table.without_rowid {
         return None;
     }
+    let is_binary = |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+    let (col_name, values, affinity) = const_in_list_members(term, table, table_alias)?;
+    let usable = |idx: &&IndexSchema| {
+        idx.supports_direct_column_lookup()
+            && !idx.key_term_descending(0)
+            && is_binary(idx.key_term_collation(0))
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    };
+    let idx = table
+        .indexes
+        .iter()
+        .filter(usable)
+        .find(|idx| idx.key_term_count() == 1)
+        .or_else(|| table.indexes.iter().filter(usable).find(|idx| idx.key_term_count() > 1))?;
+    Some((idx, values, affinity))
+}
+
+/// The column, members and comparison affinity of `<col> IN (<bind-time constants>)`, or of
+/// an OR chain of `<col> = <constant>`, for [`index_const_in_list_target`] and
+/// [`index_const_in_list_composite_target`]: `col` is a table column with BINARY collation
+/// whose members, converted to the returned affinity, compare as a BINARY index orders them.
+fn const_in_list_members<'a>(
+    term: &'a Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(String, Vec<&'a Expr>, char)> {
     let is_binary = |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
     let (column, values): (&Expr, Vec<&Expr>) = match term {
         Expr::In {
@@ -20156,30 +20199,134 @@ fn index_const_in_list_target<'t, 'a>(
     {
         return None;
     }
-    let usable = |idx: &&IndexSchema| {
-        idx.supports_direct_column_lookup()
-            && !idx.key_term_descending(0)
-            && is_binary(idx.key_term_collation(0))
-            && idx
-                .columns
-                .first()
-                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
-    };
-    let idx = table
-        .indexes
-        .iter()
-        .filter(usable)
-        .find(|idx| idx.key_term_count() == 1)
-        .or_else(|| table.indexes.iter().filter(usable).find(|idx| idx.key_term_count() > 1))?;
-    Some((idx, values, index_key_affinity(column_info.affinity)))
+    Some((col_name, values, index_key_affinity(column_info.affinity)))
 }
 
+/// bd-hyoms: an IN conjunct on key term `k` of an index whose terms `0..k` are each pinned by a
+/// `col = constant` conjunct compared under that term's collation, taking the pinned terms after
+/// `k` too, so each member seeks the run of `(prefix.., member, suffix..)` (stock's
+/// `SEARCH t USING INDEX t_ab (a=? AND b=?)`) instead of the IN column's whole run, or the leading
+/// equality's run with the IN evaluated per row. `None` unless the probe pins two or more key
+/// terms. The widest probe wins, then one that enforces the whole WHERE, then the shorter index.
+/// The constants take the column's affinity, as `col = constant` applies it, and the residual
+/// filter still applies every conjunct but the IN, so the probe only has to reach every row the
+/// WHERE accepts.
+fn index_const_in_list_composite_target<'t, 'a>(
+    where_clause: Option<&'a Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<IndexConstInList<'t, 'a>> {
+    let where_expr = where_clause?;
+    // The probe emits the equalities before the IN members, so an anonymous
+    // or named parameter would take another slot than in the WHERE.
+    if table.without_rowid || expr_contains_non_numbered_placeholder(where_expr) {
+        return None;
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    let is_binary = |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+    let key_affinity = |column: &str| {
+        table
+            .column_index(column)
+            .and_then(|position| table.columns.get(position))
+            .map_or('A', |info| index_key_affinity(info.affinity))
+    };
+    let mut best: Option<IndexConstInList<'t, 'a>> = None;
+    for (in_term_pos, &term) in conjuncts.iter().enumerate() {
+        let Some((col_name, values, affinity)) = const_in_list_members(term, table, table_alias)
+        else {
+            continue;
+        };
+        for index in &table.indexes {
+            if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+                continue;
+            }
+            let key_terms = index.key_term_count().min(index.columns.len());
+            let Some(in_pos) = index.columns[..key_terms]
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(&col_name))
+            else {
+                continue;
+            };
+            if !is_binary(index.key_term_collation(in_pos)) {
+                continue;
+            }
+            let pinned = |key_pos: usize| {
+                let column = &index.columns[key_pos];
+                conjuncts.iter().enumerate().find_map(|(term_pos, candidate)| {
+                    let value =
+                        extract_index_column_equality_expr(candidate, table, table_alias, column)?;
+                    index_equality_term_uses_key_collation(
+                        candidate, table, table_alias, index, key_pos,
+                    )
+                    .then(|| (term_pos, (value, key_affinity(column))))
+                })
+            };
+            let mut consumed = vec![in_term_pos];
+            let Some(prefix) = (0..in_pos)
+                .map(|key_pos| {
+                    pinned(key_pos).map(|(term_pos, value)| {
+                        consumed.push(term_pos);
+                        value
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let suffix: Vec<_> = (in_pos + 1..key_terms)
+                .map_while(|key_pos| {
+                    pinned(key_pos).map(|(term_pos, value)| {
+                        consumed.push(term_pos);
+                        value
+                    })
+                })
+                .collect();
+            let width = prefix.len() + 1 + suffix.len();
+            if width < 2 {
+                continue;
+            }
+            consumed.sort_unstable();
+            consumed.dedup();
+            let has_residual = consumed.len() < conjuncts.len();
+            let rank = |target: &IndexConstInList<'_, '_>| {
+                (
+                    target.prefix.len() + 1 + target.suffix.len(),
+                    !target.has_residual,
+                    std::cmp::Reverse(target.index.key_term_count()),
+                )
+            };
+            let candidate = IndexConstInList {
+                index,
+                values: values.clone(),
+                predicate: term,
+                affinity,
+                has_residual,
+                anon_offset: 0,
+                prefix,
+                suffix,
+            };
+            if best.as_ref().is_none_or(|previous| rank(&candidate) > rank(previous)) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+/// [`index_const_in_list_composite_target`] when it pins two or more key terms, else
 /// [`index_const_in_list_target`] for the whole WHERE, else for one conjunct of it.
 fn index_const_in_list_residual_target<'t, 'a>(
     where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
 ) -> Option<IndexConstInList<'t, 'a>> {
+    if let Some(target) = index_const_in_list_composite_target(where_clause, table, table_alias) {
+        return Some(target);
+    }
     let where_expr = where_clause?;
     if let Some((index, values, affinity)) =
         index_const_in_list_target(where_expr, table, table_alias)
@@ -20191,6 +20338,8 @@ fn index_const_in_list_residual_target<'t, 'a>(
             affinity,
             has_residual: false,
             anon_offset: 0,
+            prefix: Vec::new(),
+            suffix: Vec::new(),
         });
     }
     let mut conjuncts = Vec::new();
@@ -20209,6 +20358,8 @@ fn index_const_in_list_residual_target<'t, 'a>(
                 affinity,
                 has_residual: true,
                 anon_offset,
+                prefix: Vec::new(),
+                suffix: Vec::new(),
             });
         }
         anon_offset += count_anon_placeholders(term);
@@ -20929,7 +21080,19 @@ fn emit_index_const_list_rows<R>(
     emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label) -> R,
 ) -> R {
     b.emit_op(Opcode::SorterOpen, probe_cursor, 1, 0, P4::Str("+".to_owned()), 0);
-    let key = b.alloc_reg();
+    // bd-hyoms: the probe is `(prefix.., member, suffix..)`; the constants
+    // around the member are computed once and take their key term's affinity.
+    let prefix_len = i32::try_from(target.prefix.len() + 1 + target.suffix.len())
+        .expect("an index has fewer than i32::MAX key terms");
+    let probe = b.alloc_regs(prefix_len);
+    let key = probe + i32::try_from(target.prefix.len()).expect("checked above");
+    for (reg, (value, affinity)) in (probe..key)
+        .chain(key + 1..probe + prefix_len)
+        .zip(target.prefix.iter().chain(&target.suffix))
+    {
+        emit_expr(b, value, reg, None);
+        b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(affinity.to_string()), 0);
+    }
     let record = b.alloc_reg();
     let previous_key = b.alloc_reg();
     let has_previous = b.alloc_reg();
@@ -20957,7 +21120,7 @@ fn emit_index_const_list_rows<R>(
     b.resolve_label(first_key);
     b.emit_op(Opcode::Copy, key, previous_key, 0, P4::None, 0);
     b.emit_op(Opcode::Integer, 1, has_previous, 0, P4::None, 0);
-    let result = emit_index_prefix_rows(b, idx_cursor, target.index, key, 1, emit_row);
+    let result = emit_index_prefix_rows(b, idx_cursor, target.index, probe, prefix_len, emit_row);
     b.resolve_label(next_probe);
     b.emit_op(Opcode::SorterNext, probe_cursor, probe_loop, 0, P4::None, 0);
     b.resolve_label(probes_done);
@@ -21527,11 +21690,14 @@ fn codegen_select_aggregate(
     // bd-2dgf5: seek an INTEGER-affinity index once per distinct value of a
     // `WHERE col IN (<int literals>)` instead of full-scanning. Narrowly gated so no
     // per-value scan fallback is needed (see `index_integer_in_list_target`).
+    // bd-hyoms: a probe that also pins a neighbouring key term (`a IN (3, 77)
+    // AND b = 3` on `(a, b)`) is the constant-list seek's below.
     let index_in_seek = if allow_index_seek
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
         && rowid_range_seek.is_none()
+        && index_const_in_list_composite_target(where_clause, table, table_alias).is_none()
     {
         index_integer_in_list_residual_target(where_clause, table, table_alias)
     } else {
@@ -25115,9 +25281,16 @@ fn codegen_select_group_by_aggregate(
     // GROUP BY changes the consumer of rows, not the validity of an indexed
     // WHERE. Feed the existing grouping sorter from equality-prefix and
     // bind-time IN seeks instead of unrelated table rows (GH#531).
+    // bd-hyoms: an IN probe pinning at least as many key terms (`a = 5 AND
+    // b IN (1, 2)` on `(a, b)`) visits fewer rows than the equality prefix.
+    let composite_in_width = allow_index_seek
+        .then(|| index_const_in_list_composite_target(where_clause, table, table_alias))
+        .flatten()
+        .map_or(0, |target| target.prefix.len() + 1 + target.suffix.len());
     let index_eq_seek = allow_index_seek
         .then(|| index_equality_prefix_target(where_clause, table, table_alias))
-        .flatten();
+        .flatten()
+        .filter(|target| target.values.len() > composite_in_width);
     let index_in_seek = if allow_index_seek && !table.without_rowid && index_eq_seek.is_none() {
         index_const_in_list_residual_target(where_clause, table, table_alias)
     } else {
