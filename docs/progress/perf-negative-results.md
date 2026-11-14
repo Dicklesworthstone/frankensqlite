@@ -126,6 +126,32 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
 - Retry condition: none needed (kept). Extend to REAL cells (Float against a REAL literal) when a
   scorecard row filters or aggregates a REAL column on the parallel path.
 
+## 2026-11-14 - REJECTED on its kill lines: the parked-leaf seek pool, limited to programs that write no storage (bd-w4pr1.13.34 retry)
+
+- Target: rowid probes of a small table in join_1M_to_pk_1000. Fresh evidence (callgrind, main
+  70a46a0f3): BtCursor::table_move_to is 1,714 Ir per probe; load_page 441 of it, from 810k loads
+  in 1M probes. Touched (not landed; branch `reject-seekpool-readonly-d2c2b785e` of the
+  frankensqlite-perf5-shm clone): `crates/fsqlite-btree/src/cursor.rs` (the 2026-11-13 pool
+  patch, plus a `park_displaced_leaves` flag, off by default) and `crates/fsqlite-vdbe/src/lib.rs`,
+  `engine.rs` (`VdbeProgram::writes_storage`; the engine allows parking only on read cursors of a
+  program with no write opcode). This was the retry condition of the 2026-11-13 correctness
+  rejection.
+- Prediction: join -300 to -400 per probe; rowid_lookups_200k within +-0.5%. Kill: join drop
+  under 250 per probe, or rowid_lookups_200k +1% or more.
+- Result (perf stat user instructions, io_uring refused, 5 reps repeating to 0.1M, stock sqlite3
+  3.46.1 live, each arm on the database it built, answers equal):
+  - join_1M_to_pk_1000 4,847.8M -> 4,953.9M (+106 per probe);
+  - rowid_lookups_200k 2,956.0M -> 2,999.0M (+1.5%);
+  - scan_filter_agg 636.5M unchanged.
+  Both kill lines are hit. The gate was stopped before its bd_2jbl5 job finished, so this says
+  nothing about the earlier hang.
+- Not attributed: whether the pool rarely hits, or its park / take bookkeeping on every seek costs
+  more than the reload it saves. The decoded-page memo (bd-w4pr1.13.26) already makes a reload
+  cheaper than when the pool was first proposed.
+- Retry condition: a callgrind split on join_1M showing seek-cache hits on a non-current leaf above
+  70% of probes, and park plus take under 100 Ir per seek. Otherwise attack the load itself
+  (get_page on a transaction-cache hit, about 545 per load), not a pool in front of it.
+
 ## 2026-11-14 - WIN: an autocommit write commit resets the parked VDBE engine in place instead of dropping it for a fresh one (bd-w4pr1.13.35 lever 6)
 
 - Target: the connection's parked VDBE engine across an autocommit write commit; measured on an
