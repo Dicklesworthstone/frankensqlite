@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use foldhash::fast::FixedState;
 use fsqlite_types::sync_primitives::Mutex;
 use fsqlite_types::{RowId, RowIdMode, SchemaEpoch, TableId};
 use tracing::{debug, error, info, warn};
@@ -241,15 +242,18 @@ pub struct ConcurrentRowIdAllocator {
     /// file-backed table reads it, and only a newer epoch writes it
     /// (bd-i3csr.4).
     current_epoch: AtomicU64,
-    /// Per-table allocator states.
-    tables: Mutex<HashMap<AllocatorKey, TableAllocatorState>>,
+    /// Per-table allocator states. Both maps hash with foldhash, not std's
+    /// SipHash: every insert into a file-backed table looks its key up, and
+    /// the keys are the engine's own (schema epoch, root page), so flooding
+    /// resistance buys nothing here (bd-i3csr.4 lever F2).
+    tables: Mutex<HashMap<AllocatorKey, TableAllocatorState, FixedState>>,
     /// bd-gh-147 (GH #147): per-`(session, table)` count of rowids this session
     /// has reserved-and-not-yet-rolled-back. Enables a provably-safe savepoint
     /// rewind: on `ROLLBACK TO`, the shared allocator's `next_rowid` is rewound
     /// only when this session reserved the entire contiguous tail since the
     /// savepoint (so no other writer's committed id is ever reissued). A
     /// concurrent writer that intervened leaves the gap intact (§5.10.1.1).
-    session_reservations: Mutex<HashMap<(u64, AllocatorKey), SessionReservations>>,
+    session_reservations: Mutex<HashMap<(u64, AllocatorKey), SessionReservations, FixedState>>,
 }
 
 /// One session's reservations on one table (bd-gh-147, bd-8a8pr).
@@ -331,8 +335,8 @@ impl ConcurrentRowIdAllocator {
     pub fn new(current_epoch: SchemaEpoch) -> Self {
         Self {
             current_epoch: AtomicU64::new(current_epoch.get()),
-            tables: Mutex::new(HashMap::new()),
-            session_reservations: Mutex::new(HashMap::new()),
+            tables: Mutex::new(HashMap::with_hasher(FixedState::default())),
+            session_reservations: Mutex::new(HashMap::with_hasher(FixedState::default())),
         }
     }
 
