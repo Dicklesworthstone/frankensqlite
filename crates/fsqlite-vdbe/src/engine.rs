@@ -8151,6 +8151,11 @@ struct ColdVdbeState {
     /// Each entry is a fixed-size bit array used for early rejection
     /// during index lookups.
     bloom_filters: HashMap<i32, Vec<u64>>,
+    /// A virtual-table module's error from a `VColumn` / `VNext` the
+    /// synchronous lane ran, for the main loop's arm of the same opcode to
+    /// report as it always has (bd-w4pr1.13.21, lever S). The lane hands that
+    /// opcode back at once, so the arm runs next and takes it.
+    vtab_lane_error: Option<FrankenError>,
 }
 
 impl ColdVdbeState {
@@ -8170,6 +8175,7 @@ impl ColdVdbeState {
             register_subtypes: HashMap::new(),
             has_subtypes: false,
             bloom_filters: HashMap::new(),
+            vtab_lane_error: None,
         }
     }
 }
@@ -8510,6 +8516,92 @@ impl VdbeEngine {
                 .pending_update_restore = Some(restore);
         } else if let Some(cold_state) = self.cold_state_mut() {
             cold_state.pending_update_restore = None;
+        }
+    }
+
+    #[inline]
+    fn take_vtab_lane_error(&mut self) -> Option<FrankenError> {
+        self.cold_state_mut()
+            .and_then(|cold_state| cold_state.vtab_lane_error.take())
+    }
+
+    /// `VColumn` on the synchronous lane, with the main arm's semantics: NULL
+    /// for a cursor that is missing, on a NULL row or at EOF; otherwise the
+    /// module's value between the same two requested-cancellation loads. A
+    /// module error is kept for the main arm (`Ok(false)`, `pc` unchanged).
+    fn execute_vcolumn_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<bool> {
+        let column = match self
+            .cold_state
+            .as_deref()
+            .and_then(|cold_state| cold_state.vtab_cursors.get(&op.p1))
+        {
+            Some(state) if !state.null_row && !state.cursor.eof() => {
+                observe_requested_execution_cancellation(&self.execution_cx)?;
+                let mut ctx = ColumnContext::new();
+                match state.cursor.column(&mut ctx, op.p2) {
+                    Ok(()) => {
+                        observe_requested_execution_cancellation(&self.execution_cx)?;
+                        Ok(ctx.take_value().unwrap_or(SqliteValue::Null))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => Ok(SqliteValue::Null),
+        };
+        match column {
+            Ok(value) => {
+                self.set_reg(op.p3, value);
+                *pc += 1;
+                Ok(true)
+            }
+            Err(error) => {
+                self.ensure_cold_state().vtab_lane_error = Some(error);
+                Ok(false)
+            }
+        }
+    }
+
+    /// `VNext` on the synchronous lane, with the main arm's semantics: fall
+    /// through for a missing cursor, a NULL row or the last row; otherwise
+    /// jump to P2. The module steps between the same two
+    /// requested-cancellation loads, with the execution context the main arm
+    /// clones. A module error is kept for the main arm (`Ok(false)`, `pc`
+    /// unchanged, the cursor where the failed step left it).
+    fn execute_vnext_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<bool> {
+        let cx = &self.execution_cx;
+        let step = match self
+            .cold_state
+            .as_deref_mut()
+            .and_then(|cold_state| cold_state.vtab_cursors.get_mut(&op.p1))
+        {
+            Some(state) if !state.null_row => {
+                observe_requested_execution_cancellation(cx)?;
+                match state.cursor.next(cx) {
+                    Ok(()) => {
+                        observe_requested_execution_cancellation(cx)?;
+                        Ok(!state.cursor.eof())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => Ok(false),
+        };
+        match step {
+            Ok(true) => {
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    *pc = op.p2 as usize;
+                }
+                Ok(true)
+            }
+            Ok(false) => {
+                *pc += 1;
+                Ok(true)
+            }
+            Err(error) => {
+                self.ensure_cold_state().vtab_lane_error = Some(error);
+                Ok(false)
+            }
         }
     }
 
@@ -16111,6 +16203,11 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let col = op.p2;
                     let dest = op.p3;
+                    // The synchronous lane ran this VColumn and kept the
+                    // module's error for this arm to report.
+                    if let Some(error) = self.take_vtab_lane_error() {
+                        break vtab_exec_outcome("VColumn", error)?;
+                    }
 
                     let column_value = if let Some(state) = self
                         .cold_state()
@@ -16140,6 +16237,11 @@ impl VdbeEngine {
                     // P2 = jump address to loop body (go back if not eof)
                     let cursor_id = op.p1;
                     let jump_if_more = op.p2;
+                    // The synchronous lane ran this VNext and kept the
+                    // module's error for this arm to report.
+                    if let Some(error) = self.take_vtab_lane_error() {
+                        break vtab_exec_outcome("VNext", error)?;
+                    }
                     let cx = self.derive_execution_cx();
 
                     if let Some(state) = self
@@ -17622,6 +17724,24 @@ impl VdbeEngine {
                     return Ok(false);
                 };
                 self.set_reg_int(op.p2, rowid);
+                *pc += 1;
+                Ok(true)
+            }
+            // A virtual-table cursor's column read and step are synchronous
+            // calls into the module (bd-w4pr1.13.21, lever S): leaving this
+            // lane for them cost an INSERT ... SELECT from a table-valued
+            // function ~85 instructions each per row. A module error goes to
+            // the main loop's arm, which reports it as before.
+            Opcode::VColumn => self.execute_vcolumn_hot(op, pc),
+            Opcode::VNext => self.execute_vnext_hot(op, pc),
+            // An INTEGER is already an integer key: MustBeInt converts nothing
+            // and does not jump; of the main arm's take and write only the
+            // subtype clear remains. Every other value takes that arm.
+            Opcode::MustBeInt => {
+                if !matches!(self.get_reg(op.p1), SqliteValue::Integer(_)) {
+                    return Ok(false);
+                }
+                self.clear_register_subtype(op.p1);
                 *pc += 1;
                 Ok(true)
             }
@@ -42329,6 +42449,16 @@ mod tests {
         cancel_on_filter: bool,
         interrupt_on_filter: bool,
         cancel_on_column: Option<Cx>,
+        faults: Option<MockVtabFaults>,
+    }
+
+    /// Module errors a [`MockVtabCursor`] raises, and a count of its column
+    /// and next calls.
+    #[derive(Clone)]
+    struct MockVtabFaults {
+        column_fails_on_row: Option<usize>,
+        next_fails_on_row: Option<usize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockVtabCursor {
@@ -42341,6 +42471,14 @@ mod tests {
                 cancel_on_filter: false,
                 interrupt_on_filter: false,
                 cancel_on_column: None,
+                faults: None,
+            }
+        }
+
+        fn with_faults(rows: Vec<Vec<SqliteValue>>, faults: MockVtabFaults) -> Self {
+            Self {
+                faults: Some(faults),
+                ..Self::new(rows)
             }
         }
 
@@ -42356,6 +42494,7 @@ mod tests {
                 cancel_on_filter: false,
                 interrupt_on_filter: false,
                 cancel_on_column: None,
+                faults: None,
             }
         }
 
@@ -42368,6 +42507,7 @@ mod tests {
                 cancel_on_filter: true,
                 interrupt_on_filter: false,
                 cancel_on_column: None,
+                faults: None,
             }
         }
 
@@ -42380,6 +42520,7 @@ mod tests {
                 cancel_on_filter: false,
                 interrupt_on_filter: true,
                 cancel_on_column: None,
+                faults: None,
             }
         }
 
@@ -42392,6 +42533,7 @@ mod tests {
                 cancel_on_filter: false,
                 interrupt_on_filter: false,
                 cancel_on_column: Some(cancel_cx),
+                faults: None,
             }
         }
     }
@@ -42423,6 +42565,14 @@ mod tests {
             Ok(())
         }
         fn next(&mut self, _cx: &Cx) -> Result<()> {
+            if let Some(faults) = &self.faults {
+                faults
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if faults.next_fails_on_row == Some(self.pos) {
+                    return Err(FrankenError::internal("mock next failed"));
+                }
+            }
             self.pos += 1;
             Ok(())
         }
@@ -42432,6 +42582,14 @@ mod tests {
         fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
             if let Some(cancel_cx) = &self.cancel_on_column {
                 cancel_cx.cancel();
+            }
+            if let Some(faults) = &self.faults {
+                faults
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if faults.column_fails_on_row == Some(self.pos) {
+                    return Err(FrankenError::internal("mock column failed"));
+                }
             }
             #[allow(clippy::cast_sign_loss)]
             let val = self
@@ -42857,6 +43015,63 @@ mod tests {
                 vec![SqliteValue::Integer(20), SqliteValue::Text("b".into())],
             ]
         );
+    }
+
+    /// A module error from a `VColumn` or `VNext` the synchronous lane runs
+    /// (bd-w4pr1.13.21, lever S) ends the program with the main arm's outcome
+    /// and text, after the rows before it, and the failing call is made once.
+    #[test]
+    fn test_vcolumn_vnext_module_errors_report_once_from_the_main_arm() {
+        let rows_in = vec![
+            vec![SqliteValue::Integer(10)],
+            vec![SqliteValue::Integer(20)],
+            vec![SqliteValue::Integer(30)],
+        ];
+        let scan = |b: &mut ProgramBuilder| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let done_label = b.emit_label();
+            let loop_label = b.emit_label();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+            emit_vfilter_noargs(b, 0, done_label);
+            b.resolve_label(loop_label);
+            b.emit_op(Opcode::VColumn, 0, 0, r1, P4::None, 0);
+            b.emit_op(Opcode::MustBeInt, r1, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::VNext, 0, 0, loop_label, P4::None, 0);
+            b.resolve_label(done_label);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        };
+        for (column_fails_on_row, next_fails_on_row, opcode, message, rows_out, calls) in [
+            (Some(1), None, "VColumn", "mock column failed", 1, 3),
+            (None, Some(1), "VNext", "mock next failed", 2, 4),
+            (None, None, "", "", 3, 6),
+        ] {
+            let faults = MockVtabFaults {
+                column_fails_on_row,
+                next_fails_on_row,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            };
+            let cursor = MockVtabCursor::with_faults(rows_in.clone(), faults.clone());
+            let (rows, outcome) = run_vtab_program(0, cursor, scan);
+            assert_eq!(rows, rows_in[..rows_out].to_vec(), "{opcode} rows");
+            let expected = if opcode.is_empty() {
+                ExecOutcome::Done
+            } else {
+                ExecOutcome::Error {
+                    code: 1,
+                    message: format!("{opcode} error: {}", FrankenError::internal(message)),
+                }
+            };
+            assert_eq!(outcome, expected, "{opcode} outcome");
+            assert_eq!(
+                faults.calls.load(std::sync::atomic::Ordering::Relaxed),
+                calls,
+                "{opcode}: each module call is made once"
+            );
+        }
     }
 
     #[test]
