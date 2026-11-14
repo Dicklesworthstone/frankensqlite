@@ -8558,11 +8558,18 @@ fn execute_fsqlite_concurrent_transaction(
             match conn.execute("COMMIT").await {
                 Ok(_) => Ok(ConcurrentTxnAttempt::Committed),
                 Err(error) if error.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                    conn.execute("ROLLBACK").await.map_err(|rollback_error| {
-                        format!(
-                            "FrankenSQLite worker {worker_index} rollback after COMMIT retry failed: {rollback_error}"
-                        )
-                    })?;
+                    // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+                    // BusySnapshot has already rolled its transaction back.
+                    let rolled_back_by_commit =
+                        matches!(error, fsqlite::FrankenError::BusySnapshot { .. })
+                            && !conn.in_transaction();
+                    if !rolled_back_by_commit {
+                        conn.execute("ROLLBACK").await.map_err(|rollback_error| {
+                            format!(
+                                "FrankenSQLite worker {worker_index} rollback after COMMIT retry failed: {rollback_error}"
+                            )
+                        })?;
+                    }
                     Ok(ConcurrentTxnAttempt::Retry)
                 }
                 Err(error) => {

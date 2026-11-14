@@ -594,7 +594,7 @@ fn transaction_execute_params_compat() {
 }
 
 #[test]
-fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
+fn transaction_failed_commit_leaves_the_transaction_as_the_engine_left_it() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("compat_failed_commit_keeps_tx_open.db");
@@ -627,17 +627,23 @@ fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
             .await
             .unwrap();
 
-        let loser_err = match tx_b.execute("UPDATE t SET v = v + 1 WHERE id = 1;").await {
+        let (loser_err, refused_at_commit) = match tx_b
+            .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+            .await
+        {
             Ok(changes) => {
                 assert_eq!(changes, 1);
                 tx_a.commit().await.unwrap();
-                tx_b.commit().await.expect_err(
-                "second compat transaction should fail transiently once the stale snapshot resolves",
-            )
+                (
+                        tx_b.commit().await.expect_err(
+                            "second compat transaction should fail transiently once the stale snapshot resolves",
+                        ),
+                        true,
+                    )
             }
             Err(err) => {
                 tx_a.commit().await.unwrap();
-                err
+                (err, false)
             }
         };
 
@@ -645,16 +651,32 @@ fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
             loser_err.is_transient(),
             "losing compat transaction should fail transiently, got {loser_err:?}"
         );
-        assert!(
-            conn_b.in_transaction(),
-            "failed compat commit must leave the underlying transaction open for caller-directed recovery"
-        );
-
-        tx_b.rollback().await.unwrap();
-        assert!(
-            !conn_b.in_transaction(),
-            "explicit rollback should close the failed compat transaction"
-        );
+        if refused_at_commit && matches!(loser_err, FrankenError::BusySnapshot { .. }) {
+            // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+            // BusySnapshot can never commit, so the engine rolls it back and
+            // the compat handle is finalized.
+            assert!(
+                !conn_b.in_transaction(),
+                "a COMMIT refused with BusySnapshot ends the underlying transaction"
+            );
+            assert!(
+                matches!(
+                    tx_b.rollback().await,
+                    Err(FrankenError::NoActiveTransaction)
+                ),
+                "the finalized compat handle has nothing left to roll back"
+            );
+        } else {
+            assert!(
+                conn_b.in_transaction(),
+                "a statement-level conflict leaves the underlying transaction open for caller-directed recovery"
+            );
+            tx_b.rollback().await.unwrap();
+            assert!(
+                !conn_b.in_transaction(),
+                "explicit rollback should close the failed compat transaction"
+            );
+        }
 
         let row = conn_a
             .query_row("SELECT v FROM t WHERE id = 1")

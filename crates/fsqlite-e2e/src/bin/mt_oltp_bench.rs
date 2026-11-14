@@ -1285,6 +1285,14 @@ fn query_rusqlite_database_state(conn: &rusqlite::Connection) -> Result<Database
     .map_err(|error| format!("C SQLite postflight query failed: {error}"))
 }
 
+/// bd-reality-check-1022-llk6g.5.1: a COMMIT refused with BusySnapshot rolls
+/// its transaction back itself; a ROLLBACK after it would report "no
+/// transaction is active". Every other COMMIT failure keeps the mandatory
+/// ROLLBACK.
+fn commit_refusal_rolled_back(conn: &fsqlite::Connection, error: &fsqlite::FrankenError) -> bool {
+    matches!(error, fsqlite::FrankenError::BusySnapshot { .. }) && !conn.in_transaction()
+}
+
 async fn rollback_fsqlite(conn: &fsqlite::Connection, context: &str) -> Result<(), String> {
     conn.execute("ROLLBACK")
         .await
@@ -1362,15 +1370,20 @@ fn execute_fsqlite_write(
             match conn.execute("COMMIT").await {
                 Ok(_) => Ok(WriteAttempt::Committed),
                 Err(error) if error.is_transient() && attempt < MAX_RETRIES => {
-                    rollback_fsqlite(
-                        conn,
-                        &format!("transient commit failure for row {id}: {error}"),
-                    )
-                    .await?;
+                    if !commit_refusal_rolled_back(conn, &error) {
+                        rollback_fsqlite(
+                            conn,
+                            &format!("transient commit failure for row {id}: {error}"),
+                        )
+                        .await?;
+                    }
                     Ok(WriteAttempt::Retry)
                 }
                 Err(error) => {
-                    rollback_fsqlite(conn, &format!("commit failed for row {id}: {error}")).await?;
+                    if !commit_refusal_rolled_back(conn, &error) {
+                        rollback_fsqlite(conn, &format!("commit failed for row {id}: {error}"))
+                            .await?;
+                    }
                     Err(format!(
                         "commit failed for row {id} after {attempt} attempt(s): {error}"
                     ))

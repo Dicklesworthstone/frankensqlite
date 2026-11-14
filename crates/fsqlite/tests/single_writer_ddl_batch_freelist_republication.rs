@@ -268,7 +268,24 @@ fn mixed_engine_ddl_rejects_intervening_data_commit() {
             )),
             "must reject because of intervening data commit: {events:?}"
         );
-        ddl.execute("ROLLBACK").await.expect("rollback stale DDL");
+        // bd-reality-check-1022-llk6g.5.1: the refused COMMIT rolled the stale
+        // DDL back itself.
+        assert!(
+            !ddl.in_transaction(),
+            "a COMMIT refused with BusySnapshot ends its transaction"
+        );
+        let rollback = ddl
+            .execute("ROLLBACK")
+            .await
+            .expect_err("nothing is left to roll back");
+        assert_eq!(
+            rollback.to_string(),
+            "cannot rollback - no transaction is active"
+        );
+        assert!(
+            ddl.query("SELECT 1 FROM base_0").await.is_ok(),
+            "the refused RENAME did not apply"
+        );
         writer.close().await.expect("close writer");
         ddl.close().await.expect("close DDL connection");
     });

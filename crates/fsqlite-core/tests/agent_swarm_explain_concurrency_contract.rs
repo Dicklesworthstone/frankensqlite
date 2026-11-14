@@ -737,7 +737,9 @@ fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
             assert!(matches!(first.execute("COMMIT;").await, Err(fsqlite_error::FrankenError::BusySnapshot { .. })));
             assert_eq!(busy.get() - busy_before, u64::from(enabled));
             delta(before, 0);
-            first.execute("ROLLBACK;").await?;
+            // bd-reality-check-1022-llk6g.5.1: the refused COMMIT rolled the
+            // write skew's pivot back itself.
+            assert!(!first.in_transaction(), "a COMMIT refused with BusySnapshot ends its transaction");
             second.execute("COMMIT;").await?;
             delta(before, 1);
             assert_eq!(busy.get() - busy_before, u64::from(enabled), "rollback and survivor must not recount the rejection");
@@ -988,7 +990,9 @@ fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> Tes
                     assert!(stats.iter().any(|row| matches!(row.values(), [SqliteValue::Text(name), SqliteValue::Integer(value)] if name.as_ref() == key && *value == expected)), "incorrect {key} stats: {stats:?}");
                 }
                 assert_eq!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.len(), 1, "shared conflict diagnostics are independent of connection-local SSI evidence capture");
-                first.execute("ROLLBACK;").await?;
+                // bd-reality-check-1022-llk6g.5.1: the refused COMMIT rolled
+                // the pivot back itself.
+                assert!(!first.in_transaction(), "a COMMIT refused with BusySnapshot ends its transaction");
                 second.execute("COMMIT;").await?;
                 assert_eq!(monitor.query("SELECT value FROM a WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(10)]);
                 assert_eq!(monitor.query("SELECT value FROM b WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(21 + i64::try_from(round)?) ]);
@@ -1061,7 +1065,9 @@ fn real_ssi_early_abort_reports_unmeasured_edges() -> TestResult {
             for (table, expected) in [("a", 11), ("c", 10), ("d", 11), ("e", 10)] {
                 assert_eq!(monitor.query(&format!("SELECT value FROM {table} WHERE id=1;")).await?[0].values(), &[SqliteValue::Integer(expected)]);
             }
-            pivot.execute("ROLLBACK;").await?;
+            // bd-reality-check-1022-llk6g.5.1: the refused COMMIT rolled the
+            // pivot back itself.
+            assert!(!pivot.in_transaction(), "a COMMIT refused with BusySnapshot ends its transaction");
             for connection in overlapping {
                 connection.execute("ROLLBACK;").await?;
                 connection.close().await?;

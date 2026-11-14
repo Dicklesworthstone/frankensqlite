@@ -4512,10 +4512,22 @@ fn run_fsqlite_one_row_transactions_inner(
                 OneRowAttempt::Retry { stage, error } => (stage, error, 0),
                 OneRowAttempt::RollbackRequired { stage, error } => {
                     let rollback_started = std::time::Instant::now();
-                    let rollback_outcome =
+                    // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+                    // BusySnapshot rolls its transaction back itself, so the
+                    // connection is out of it and there is nothing to roll
+                    // back. Any other failure that leaves a transaction (or
+                    // leaves none after another error) keeps the mandatory,
+                    // fail-closed ROLLBACK.
+                    let rolled_back_by_commit = stage == OneRowRetryStage::Commit
+                        && matches!(error, fsqlite::FrankenError::BusySnapshot { .. })
+                        && !conn.in_transaction();
+                    let rollback_outcome = if rolled_back_by_commit {
+                        Ok(0)
+                    } else {
                         rollback_fsqlite_one_row_with_retry(tid, &mut retry_budget, || {
                             fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map(|_| ())
-                        });
+                        })
+                    };
                     profile::add_since(&profile::ROLLBACK_NS, rollback_started);
                     let rollback_retries = rollback_outcome.map_err(|rollback_error| match stage {
                         OneRowRetryStage::Insert => format!(
@@ -5580,8 +5592,7 @@ fn run(opts: Options) -> Result<(), String> {
                 }
                 {
                     use one_row_stage_profile as profile;
-                    let process_cpu =
-                        profile::delta(process_cpu_before, profile::process_cpu_ns());
+                    let process_cpu = profile::delta(process_cpu_before, profile::process_cpu_ns());
                     let commits = profile::get(&profile::COMMITS);
                     if commits > 0 {
                         let per = |ns: u64| ns as f64 / commits as f64 / 1_000.0;

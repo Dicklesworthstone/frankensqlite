@@ -30,26 +30,59 @@ const CHILD_ENV: &str = "FSQLITE_MP_BUSY_CHILD";
 #[derive(Debug)]
 struct ChildReport {
     committed: usize,
+    /// `seq` of every row whose transaction reported success (explicit shapes).
+    committed_seqs: Vec<usize>,
     errors: Vec<String>,
 }
 
 #[derive(Debug)]
 struct ShapeResult {
     committed: usize,
+    /// `(worker, seq)` of every reported commit (explicit shapes).
+    committed_rows: Vec<(i64, i64)>,
     errors: Vec<String>,
     elapsed: Duration,
     final_rows: i64,
+    /// `(worker, seq)` of every durable row, read by stock.
+    durable_rows: Vec<(i64, i64)>,
     integrity: String,
+    /// Writer stderr lines where the pager certified the durable db_size floor
+    /// for a non-growing commit (`VNXJD FLOOR-CERTIFIED`, traced with
+    /// `DW8OE_TRACE` in the own-table fsqlite shape).
+    floor_certified: usize,
 }
 
-fn seed(db: &Path) {
+const FLOOR_CERTIFIED_MARKER: &str = "VNXJD FLOOR-CERTIFIED";
+
+/// A `-own` backend gives every writer its own table `t<worker>`; `t` is then a
+/// view over all of them, so the shape's counts and durable-row reads are the
+/// same queries.
+fn own_tables(backend: &str) -> bool {
+    backend.ends_with("-own")
+}
+
+fn seed(db: &Path, backend: &str, workers: usize) {
     let stock = rusqlite::Connection::open(db).expect("seed open");
-    stock
-        .execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE t(id INTEGER PRIMARY KEY, worker INTEGER NOT NULL, seq INTEGER NOT NULL);",
-        )
-        .expect("seed schema");
+    let schema = if own_tables(backend) {
+        let tables: String = (0..workers)
+            .map(|worker| {
+                format!(
+                    "CREATE TABLE t{worker}(id INTEGER PRIMARY KEY, worker INTEGER NOT NULL, \
+                     seq INTEGER NOT NULL);"
+                )
+            })
+            .collect();
+        let union = (0..workers)
+            .map(|worker| format!("SELECT worker, seq FROM t{worker}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        format!("PRAGMA journal_mode=WAL; {tables} CREATE VIEW t AS {union};")
+    } else {
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE t(id INTEGER PRIMARY KEY, worker INTEGER NOT NULL, seq INTEGER NOT NULL);"
+            .to_owned()
+    };
+    stock.execute_batch(&schema).expect("seed schema");
 }
 
 fn wait_for(path: &Path, limit: Duration) -> bool {
@@ -78,21 +111,29 @@ fn parse_report(stdout: &str) -> Option<ChildReport> {
         .find_map(|field| field.strip_prefix("committed="))?
         .parse()
         .ok()?;
+    let committed_seqs = events(stdout, "event=mp_busy_committed_seq ")
+        .map(|seq| seq.trim().parse().expect("committed seq"))
+        .collect();
     let errors = events(stdout, "event=mp_busy_error ")
         .map(str::to_owned)
         .collect();
-    Some(ChildReport { committed, errors })
+    Some(ChildReport {
+        committed,
+        committed_seqs,
+        errors,
+    })
 }
 
 fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -> ShapeResult {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("mp.db");
-    seed(&db);
+    seed(&db, backend, workers);
     let go = dir.path().join("go");
     let exe = std::env::current_exe().expect("test binary path");
     let children: Vec<(usize, Child)> = (0..workers)
         .map(|worker| {
-            let child = Command::new(&exe)
+            let mut command = Command::new(&exe);
+            command
                 .args([
                     "--exact",
                     "mp_busy_writer_child",
@@ -108,10 +149,11 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
                     ),
                 )
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn writer");
-            (worker, child)
+                .stderr(Stdio::piped());
+            if backend == "fsqlite-explicit-own" {
+                command.env("DW8OE_TRACE", "1");
+            }
+            (worker, command.spawn().expect("spawn writer"))
         })
         .collect();
     for worker in 0..workers {
@@ -130,10 +172,16 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
         .map(|(worker, child)| (worker, std::thread::spawn(|| child.wait_with_output())))
         .collect();
     let mut committed = 0;
+    let mut committed_rows = Vec::new();
     let mut errors = Vec::new();
+    let mut floor_certified = 0;
     for (worker, drain) in draining {
         let output = drain.join().expect("drain thread").expect("writer output");
         let stdout = String::from_utf8_lossy(&output.stdout);
+        floor_certified += String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| line.contains(FLOOR_CERTIFIED_MARKER))
+            .count();
         let report = parse_report(&stdout).unwrap_or_else(|| {
             panic!(
                 "{backend}: writer {worker} produced no report (status {:?}):\n{stdout}\n{}",
@@ -142,31 +190,50 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
             )
         });
         committed += report.committed;
+        let worker = i64::try_from(worker).expect("worker");
+        committed_rows.extend(
+            report
+                .committed_seqs
+                .iter()
+                .map(|&seq| (worker, i64::try_from(seq).expect("seq"))),
+        );
         errors.extend(report.errors);
     }
+    committed_rows.sort_unstable();
     let elapsed = started.elapsed();
     let stock = rusqlite::Connection::open(&db).expect("verify open");
     let final_rows: i64 = stock
         .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
         .expect("count");
+    let durable_rows = stock
+        .prepare("SELECT worker, seq FROM t ORDER BY worker, seq")
+        .expect("prepare")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("durable rows");
     let integrity: String = stock
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("integrity_check");
     let result = ShapeResult {
         committed,
+        committed_rows,
         errors,
         elapsed,
         final_rows,
+        durable_rows,
         integrity,
+        floor_certified,
     };
     eprintln!(
         "event=mp_busy_shape backend={backend} workers={workers} rows={rows} busy_timeout_ms={busy_timeout_ms} \
-         committed={} errors={} elapsed_ms={} final_rows={} integrity={} sample_errors={:?}",
+         committed={} errors={} elapsed_ms={} final_rows={} integrity={} floor_certified={} sample_errors={:?}",
         result.committed,
         result.errors.len(),
         result.elapsed.as_millis(),
         result.final_rows,
         result.integrity,
+        result.floor_certified,
         result.errors.iter().take(5).collect::<Vec<_>>()
     );
     result
@@ -178,6 +245,15 @@ fn ready_path(dir: &Path, worker: usize) -> PathBuf {
 
 fn insert_sql(worker: usize, seq: usize) -> String {
     format!("INSERT INTO t(worker, seq) VALUES ({worker}, {seq})")
+}
+
+/// The explicit shapes' INSERT: into `t`, or into the writer's own table.
+fn explicit_insert_sql(backend: &str, worker: usize, seq: usize) -> String {
+    if own_tables(backend) {
+        format!("INSERT INTO t{worker}(worker, seq) VALUES ({worker}, {seq})")
+    } else {
+        insert_sql(worker, seq)
+    }
 }
 
 /// The writer process body; a no-op unless the parent set `CHILD_ENV`.
@@ -195,8 +271,80 @@ fn mp_busy_writer_child() {
     let rows: usize = rows.parse().expect("rows");
     let busy_timeout_ms: u64 = busy_timeout_ms.parse().expect("busy_timeout_ms");
     let mut committed = 0;
+    let mut committed_seqs = Vec::new();
     let mut errors = Vec::new();
     match backend {
+        // bd-reality-check-1022-llk6g.5.1: `BEGIN; INSERT; COMMIT` per row,
+        // the way a CLI script runs it: every statement runs, an error is
+        // recorded, and nothing rolls back. The row counts as committed only
+        // when both its INSERT and its COMMIT succeeded.
+        "stock-explicit" | "stock-explicit-own" => {
+            let conn = rusqlite::Connection::open(&db).expect("stock open");
+            conn.busy_timeout(Duration::from_millis(busy_timeout_ms))
+                .expect("stock busy_timeout");
+            std::fs::write(ready_path(&dir, worker), b"").expect("ready");
+            assert!(wait_for(&dir.join("go"), Duration::from_secs(120)), "no go");
+            for seq in 0..rows {
+                let begin = conn.execute_batch("BEGIN");
+                let insert = conn.execute(&explicit_insert_sql(backend, worker, seq), []);
+                let commit = conn.execute_batch("COMMIT");
+                if let Err(error) = &begin {
+                    errors.push(format!("begin: {error}"));
+                }
+                if let Err(error) = &insert {
+                    errors.push(format!("insert: {error}"));
+                }
+                if let Err(error) = &commit {
+                    errors.push(format!(
+                        "commit autocommit_after={}: {error}",
+                        conn.is_autocommit()
+                    ));
+                }
+                if insert.is_ok() && commit.is_ok() {
+                    committed += 1;
+                    committed_seqs.push(seq);
+                }
+            }
+        }
+        "fsqlite-explicit" | "fsqlite-explicit-own" => {
+            let (committed, committed_seqs, errors) =
+                (&mut committed, &mut committed_seqs, &mut errors);
+            asupersync::test_utils::run_test(|| async move {
+                let conn = Connection::open(db.to_str().expect("utf8 path"))
+                    .await
+                    .expect("fsqlite open");
+                conn.execute(&format!("PRAGMA busy_timeout={busy_timeout_ms}"))
+                    .await
+                    .expect("fsqlite busy_timeout");
+                std::fs::write(ready_path(&dir, worker), b"").expect("ready");
+                assert!(wait_for(&dir.join("go"), Duration::from_secs(120)), "no go");
+                for seq in 0..rows {
+                    let begin = conn.execute("BEGIN").await;
+                    let insert = conn
+                        .execute(&explicit_insert_sql(backend, worker, seq))
+                        .await;
+                    let commit = conn.execute("COMMIT").await;
+                    if let Err(error) = &begin {
+                        errors.push(format!("begin: {error}"));
+                    }
+                    if let Err(error) = &insert {
+                        errors.push(format!("insert: {error}"));
+                    }
+                    if let Err(error) = &commit {
+                        errors.push(format!(
+                            "commit code={} autocommit_after={}: {error}",
+                            error.extended_error_code(),
+                            !conn.in_transaction()
+                        ));
+                    }
+                    if insert.is_ok() && commit.is_ok() {
+                        *committed += 1;
+                        committed_seqs.push(seq);
+                    }
+                }
+                let _ = conn.close().await;
+            });
+        }
         "stock" => {
             let conn = rusqlite::Connection::open(&db).expect("stock open");
             conn.busy_timeout(Duration::from_millis(busy_timeout_ms))
@@ -268,6 +416,9 @@ fn mp_busy_writer_child() {
     for error in &errors {
         println!("event=mp_busy_error {error}");
     }
+    for seq in &committed_seqs {
+        println!("event=mp_busy_committed_seq {seq}");
+    }
     println!(
         "event=mp_busy_child backend={backend} worker={worker} committed={committed} errors={}",
         errors.len()
@@ -326,6 +477,63 @@ fn cross_process_fresh_connection_writers_honor_busy_timeout() {
     assert_all_committed("4x100 stock oracle", &stock, 400);
     let frank = run_shape("fsqlite-fresh", 4, 100, 5000);
     assert_all_committed("4x100 fsqlite-fresh", &frank, 400);
+}
+
+/// The error text of a COMMIT refused with BusySnapshot (517) after which the
+/// connection was back in autocommit mode.
+const REFUSED_COMMIT_ENDED: &str = "commit code=517 autocommit_after=true: ";
+
+/// bd-reality-check-1022-llk6g.5.1: processes running explicit `BEGIN; INSERT;
+/// COMMIT` transactions on ONE table, CLI-style (no ROLLBACK after an error).
+/// Stock commits every row: a write-first transaction waits for the write
+/// lock at its INSERT. fsqlite's page MVCC refuses the second committer of a
+/// leaf page with BusySnapshot (first-committer-wins, the owner's design), and
+/// that refusal must end its transaction, so it costs exactly its own row. On
+/// main 714e81184 the refused transaction stayed open: the next BEGIN failed
+/// "within a transaction", the next INSERTs landed in the doomed transaction,
+/// and 8 CLI writers x 300 committed 300-312 of 2400 rows.
+#[test]
+fn cross_process_explicit_writers_on_one_table_lose_only_refused_transactions() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    let (workers, rows) = (4, 100);
+    let stock = run_shape("stock-explicit", workers, rows, 5000);
+    assert_all_committed("4x100 explicit stock oracle", &stock, workers * rows);
+    assert!(stock.errors.is_empty(), "stock: {:?}", stock.errors);
+    assert_eq!(
+        stock.durable_rows, stock.committed_rows,
+        "stock: durable rows"
+    );
+
+    let frank = run_shape("fsqlite-explicit", workers, rows, 5000);
+    assert_eq!(frank.integrity, "ok", "fsqlite-explicit: integrity_check");
+    assert_eq!(
+        frank.durable_rows, frank.committed_rows,
+        "fsqlite-explicit: the durable rows are exactly the transactions whose COMMIT \
+         succeeded (no refused row became durable, no later row was lost)"
+    );
+    let (refused, other): (Vec<&String>, Vec<&String>) = frank
+        .errors
+        .iter()
+        .partition(|error| error.starts_with(REFUSED_COMMIT_ENDED));
+    assert!(
+        other.is_empty(),
+        "fsqlite-explicit: the only error may be a BusySnapshot COMMIT refusal that ended its \
+         transaction; got {} others, e.g. {:?}",
+        other.len(),
+        other.iter().take(5).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        frank.committed + refused.len(),
+        workers * rows,
+        "fsqlite-explicit: each refused transaction costs exactly its own row"
+    );
+    assert!(
+        !refused.is_empty(),
+        "non-vacuity: {workers} writers on one leaf page produced no COMMIT refusal, so this \
+         run did not exercise the refused-COMMIT path"
+    );
 }
 
 const IMMEDIATE_CHILD_ENV: &str = "FSQLITE_MP_IMMEDIATE_CHILD";
@@ -432,7 +640,7 @@ fn parse_immediate(stdout: &str) -> Option<(bool, Duration, String)> {
 fn run_immediate(backend: &str) -> [(bool, Duration, String); 2] {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("imm.db");
-    seed(&db);
+    seed(&db, backend, 2);
     let exe = std::env::current_exe().expect("test binary path");
     let children: Vec<Child> = ["a", "b"]
         .iter()

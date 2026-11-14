@@ -1147,7 +1147,16 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             {
                                                 conflicts.fetch_add(1, Ordering::Relaxed);
                                                 let rollback_start = Instant::now();
-                                                rollback_fsqlite(&conn, "COMMIT conflict");
+                                                // bd-reality-check-1022-llk6g.5.1: a
+                                                // COMMIT refused with BusySnapshot
+                                                // has rolled its transaction back.
+                                                if !matches!(
+                                                    e,
+                                                    FrankenError::BusySnapshot { .. }
+                                                ) || conn.in_transaction()
+                                                {
+                                                    rollback_fsqlite(&conn, "COMMIT conflict");
+                                                }
                                                 operation_timing.rollback_cleanup +=
                                                     rollback_start.elapsed();
                                                 retry_count += 1;

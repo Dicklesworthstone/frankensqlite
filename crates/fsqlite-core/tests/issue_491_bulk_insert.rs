@@ -336,9 +336,12 @@ fn wal_savepoint_rollback_keeps_real_same_page_write_conflicts() {
             other => panic!("unexpected SQLite conflict error: {other}"),
         }
         // FrankenSQLite may validate at statement execution or at COMMIT.
-        let error = match db.execute(update).await {
-            Err(error) => error,
-            Ok(_) => db.execute("COMMIT").await.expect_err("stale writer must not commit"),
+        let (error, refused_at_commit) = match db.execute(update).await {
+            Err(error) => (error, false),
+            Ok(_) => (
+                db.execute("COMMIT").await.expect_err("stale writer must not commit"),
+                true,
+            ),
         };
         assert!(
             matches!(
@@ -348,7 +351,15 @@ fn wal_savepoint_rollback_keeps_real_same_page_write_conflicts() {
             ),
             "expected a real snapshot/serialization conflict, got {error}",
         );
-        execute_both(&db, &stock, "ROLLBACK").await;
+        // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with BusySnapshot
+        // has rolled its transaction back; a statement-level refusal (stock's
+        // shape) leaves it open for the ROLLBACK.
+        if refused_at_commit && matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }) {
+            assert!(!db.in_transaction(), "a COMMIT refused with BusySnapshot ends its transaction");
+            stock.execute_batch("ROLLBACK").unwrap();
+        } else {
+            execute_both(&db, &stock, "ROLLBACK").await;
+        }
         assert_rows(&db, &stock, read).await;
         execute_both(&db, &stock, update).await;
         assert_rows(&db, &stock, read).await;

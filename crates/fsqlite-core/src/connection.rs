@@ -79852,11 +79852,63 @@ impl Connection {
     /// through here: `COMMIT`, `commit_transaction()`, and `RELEASE` of the
     /// savepoint that implicitly began the transaction. Committing main alone
     /// left an enrolled child's transaction open, so its writes vanished at the
-    /// next ROLLBACK. On a main-commit error the children stay mid-transaction,
-    /// as the error leaves main.
+    /// next ROLLBACK. On a retryable main-commit error the children stay
+    /// mid-transaction, as the error leaves main; a refused snapshot ends both
+    /// (see `end_transaction_after_refused_commit`).
     async fn execute_commit_with_attached_participants(&self, cx: &Cx) -> Result<()> {
-        Box::pin(self.execute_commit_with_cx(cx)).await?;
+        if let Err(error) = Box::pin(self.execute_commit_with_cx(cx)).await {
+            return Err(Box::pin(self.end_transaction_after_refused_commit(cx, error)).await);
+        }
         Box::pin(self.commit_attached_participants(cx)).await
+    }
+
+    /// bd-reality-check-1022-llk6g.5.1: a COMMIT refused with `BusySnapshot`
+    /// ends its transaction. The snapshot is stale against a peer's durable
+    /// commit, so the same transaction cannot commit: the pager never retries
+    /// a BusySnapshot flush, and an in-process FCW/SSI refusal has already
+    /// aborted the MVCC session. Left open, every later statement of the
+    /// connection landed in it: the next `BEGIN` failed "cannot start a
+    /// transaction within a transaction" and later rows were lost with it, or
+    /// a later COMMIT made rows durable whose COMMIT had been reported failed.
+    /// Stock documents that an error may roll a transaction back, with
+    /// autocommit on afterwards; this runs the full ROLLBACK teardown and
+    /// returns the refusal unchanged (SQLITE_BUSY_SNAPSHOT).
+    ///
+    /// Every other COMMIT error leaves the transaction as the error left it:
+    /// `Busy`/`BusyRecovery` are retryable (the peer may finish), as in stock,
+    /// and a deferred foreign-key violation keeps the transaction open for the
+    /// application to resolve. A teardown that is itself refused retryably
+    /// restores the transaction, so the caller's own ROLLBACK still works.
+    async fn end_transaction_after_refused_commit(
+        &self,
+        cx: &Cx,
+        error: FrankenError,
+    ) -> FrankenError {
+        let refused_uncommitted = matches!(error, FrankenError::BusySnapshot { .. })
+            && self.in_transaction.get()
+            && self
+                .active_txn
+                .borrow()
+                .as_ref()
+                .is_none_or(|txn| txn.pager_commit_state() == PagerCommitState::NotCommitted);
+        if !refused_uncommitted {
+            return error;
+        }
+        let full_rollback = fsqlite_ast::RollbackStatement { to_savepoint: None };
+        match Box::pin(self.execute_rollback_with_cx(cx, &full_rollback)).await {
+            Ok(()) => error,
+            Err(rollback_error) if self.in_transaction.get() => {
+                tracing::debug!(
+                    %error,
+                    %rollback_error,
+                    "refused COMMIT left its transaction open: the teardown was refused retryably"
+                );
+                error
+            }
+            Err(rollback_error) => FrankenError::Internal(format!(
+                "COMMIT refused: {error}; ending the transaction failed: {rollback_error}"
+            )),
+        }
     }
 
     async fn execute_commit_with_cx(&self, cx: &Cx) -> Result<()> {
@@ -192218,20 +192270,31 @@ mod tests {
                         "second writer should affect one row before stale conflict resolves"
                     );
                     conn1.execute("COMMIT;").await.unwrap();
-                    conn2.execute("COMMIT;").await.unwrap_err()
+                    (conn2.execute("COMMIT;").await.unwrap_err(), true)
                 }
                 Err(err) => {
                     conn1.execute("COMMIT;").await.unwrap();
-                    err
+                    (err, false)
                 }
             };
+            let (loser_err, refused_at_commit) = loser_err;
 
             assert!(
                 loser_err.is_transient(),
                 "same-row Beads rewrite should fail transiently, got {loser_err:?}"
             );
 
-            conn2.execute("ROLLBACK;").await.unwrap();
+            // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+            // BusySnapshot has rolled the loser back itself; a statement-level
+            // refusal leaves it open for the ROLLBACK.
+            if refused_at_commit && matches!(loser_err, FrankenError::BusySnapshot { .. }) {
+                assert!(
+                    !conn2.in_transaction(),
+                    "a COMMIT refused with BusySnapshot ends its transaction"
+                );
+            } else {
+                conn2.execute("ROLLBACK;").await.unwrap();
+            }
 
             let visible = conn1
                 .query_row(
@@ -192355,19 +192418,29 @@ mod tests {
                 Ok(changes) => {
                     assert_eq!(changes, 1);
                     conn1.execute("COMMIT;").await.unwrap();
-                    conn2.execute("COMMIT;").await.unwrap_err()
+                    (conn2.execute("COMMIT;").await.unwrap_err(), true)
                 }
                 Err(err) => {
                     conn1.execute("COMMIT;").await.unwrap();
-                    err
+                    (err, false)
                 }
             };
+            let (loser_err, refused_at_commit) = loser_err;
             assert!(
                 loser_err.is_transient(),
                 "losing writer should fail transiently, got {loser_err:?}"
             );
 
-            conn2.execute("ROLLBACK;").await.unwrap();
+            // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+            // BusySnapshot has rolled the loser back itself.
+            if refused_at_commit && matches!(loser_err, FrankenError::BusySnapshot { .. }) {
+                assert!(
+                    !conn2.in_transaction(),
+                    "a COMMIT refused with BusySnapshot ends its transaction"
+                );
+            } else {
+                conn2.execute("ROLLBACK;").await.unwrap();
+            }
             assert_eq!(
                 conn2
                     .query_row("SELECT content_hash FROM issues WHERE id = 'bd-040';")
@@ -217049,24 +217122,37 @@ mod tests {
                     conn_a.execute("COMMIT;").await.unwrap_or_else(|err| {
                         panic!("first writer COMMIT failed unexpectedly: {err:?}")
                     });
-                    conn_b.execute("COMMIT;").await.expect_err(
+                    (conn_b.execute("COMMIT;").await.expect_err(
                     "second writer should fail transiently once the stale-snapshot conflict resolves",
-                )
+                ), true)
                 }
                 Err(err) => {
                     conn_a.execute("COMMIT;").await.unwrap_or_else(|commit_err| {
                     panic!("first writer COMMIT after loser UPDATE conflict failed unexpectedly: {commit_err:?}")
                 });
-                    err
+                    (err, false)
                 }
             };
+            let (loser_err, refused_at_commit) = loser_err;
             assert!(
                 loser_err.is_transient(),
                 "same-row concurrent writer must fail transiently, got {loser_err:?}"
             );
-            conn_b.execute("ROLLBACK;").await.unwrap_or_else(|err| {
-                panic!("losing writer ROLLBACK after transient stale-write failure failed: {err:?}")
-            });
+            // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+            // BusySnapshot has rolled the loser back itself (the teardown this
+            // test's ROLLBACK ran); a statement-level refusal leaves it open.
+            if refused_at_commit && matches!(loser_err, FrankenError::BusySnapshot { .. }) {
+                assert!(
+                    !conn_b.in_transaction(),
+                    "a COMMIT refused with BusySnapshot ends its transaction"
+                );
+            } else {
+                conn_b.execute("ROLLBACK;").await.unwrap_or_else(|err| {
+                    panic!(
+                        "losing writer ROLLBACK after transient stale-write failure failed: {err:?}"
+                    )
+                });
+            }
 
             conn_a
                 .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
@@ -232007,9 +232093,14 @@ mod autocommit_txn_tests {
                 // locks, so their close checkpointed and unlinked the WAL
                 // companions mid-transaction. The commit refuses rather than
                 // land in an unlinked inode and vanish (bd-7zs8a); as with
-                // SQLITE_BUSY_SNAPSHOT, the caller rolls back and redoes it.
+                // SQLITE_BUSY_SNAPSHOT, the caller redoes it. The refused COMMIT
+                // has already rolled the transaction back
+                // (bd-reality-check-1022-llk6g.5.1).
                 Err(FrankenError::BusySnapshot { .. }) => {
-                    conn.execute("ROLLBACK;").await.unwrap();
+                    assert!(
+                        !conn.in_transaction(),
+                        "a COMMIT refused with BusySnapshot ends its transaction"
+                    );
                     conn.execute("BEGIN;").await.unwrap();
                     conn.execute("INSERT INTO begin_flush VALUES (2, 'explicit');")
                         .await
@@ -245327,13 +245418,14 @@ mod pager_routing_tests {
                         loser_commit.is_err(),
                         "losing writer must fail transiently instead of silently overwriting"
                     );
-                    loser_commit.unwrap_err()
+                    (loser_commit.unwrap_err(), true)
                 }
                 Err(err) => {
                     conn1.execute("COMMIT;").await.unwrap();
-                    err
+                    (err, false)
                 }
             };
+            let (loser_err, refused_at_commit) = loser_err;
             let winner_commit_seq = conn1
                 .concurrent_commit_index
                 .latest(table_root_pgno)
@@ -245343,7 +245435,16 @@ mod pager_routing_tests {
                 "losing writer should surface as transient retryable error: {loser_err}"
             );
 
-            conn2.execute("ROLLBACK;").await.unwrap();
+            // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+            // BusySnapshot has rolled the loser back itself.
+            if refused_at_commit && matches!(loser_err, FrankenError::BusySnapshot { .. }) {
+                assert!(
+                    !conn2.in_transaction(),
+                    "a COMMIT refused with BusySnapshot ends its transaction"
+                );
+            } else {
+                conn2.execute("ROLLBACK;").await.unwrap();
+            }
 
             let visible_after_rollback = conn2
                 .query_row("SELECT v FROM t WHERE id = 1;")
@@ -245628,21 +245729,33 @@ mod pager_routing_tests {
             let stale_write = conn_c
                 .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 50;")
                 .await;
-            let stale_error = match stale_write {
-                Err(error) => error,
+            let (stale_error, refused_at_commit) = match stale_write {
+                Err(error) => (error, false),
                 Ok(changes) => {
                     assert_eq!(changes, 1);
-                    conn_c
-                        .execute("COMMIT;")
-                        .await
-                        .expect_err("FCW must reject writer C's stale page image")
+                    (
+                        conn_c
+                            .execute("COMMIT;")
+                            .await
+                            .expect_err("FCW must reject writer C's stale page image"),
+                        true,
+                    )
                 }
             };
             assert!(
                 stale_error.is_transient(),
                 "the stale writer must fail with a retryable conflict: {stale_error}"
             );
-            conn_c.execute("ROLLBACK;").await.unwrap();
+            // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+            // BusySnapshot has rolled writer C back itself.
+            if refused_at_commit && matches!(stale_error, FrankenError::BusySnapshot { .. }) {
+                assert!(
+                    !conn_c.in_transaction(),
+                    "a COMMIT refused with BusySnapshot ends its transaction"
+                );
+            } else {
+                conn_c.execute("ROLLBACK;").await.unwrap();
+            }
 
             let balance = conn_a
                 .query_row("SELECT balance FROM accounts WHERE id = 50;")

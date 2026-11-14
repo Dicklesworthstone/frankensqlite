@@ -146,7 +146,9 @@ impl<'a> Transaction<'a> {
     /// Commit the transaction.
     ///
     /// If `COMMIT` fails, the transaction remains active so the caller can
-    /// inspect the error and choose whether to retry or roll back.
+    /// inspect the error and choose whether to retry or roll back. The
+    /// exception is a `BusySnapshot` refusal: that transaction can never
+    /// commit, so the engine rolls it back and this handle is finalized.
     pub async fn commit(&mut self) -> Result<(), FrankenError> {
         self.ensure_active()?;
         let result = self.conn.commit_transaction().await;

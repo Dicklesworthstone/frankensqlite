@@ -2175,7 +2175,9 @@ impl<'conn> Transaction<'conn> {
     pub fn commit(mut self) -> Result<()> {
         // A failed COMMIT (for example, a deferred foreign-key violation)
         // leaves the SQL transaction open. Keep its drop policy armed until
-        // the engine accepts the commit, as rusqlite does.
+        // the engine accepts the commit, as rusqlite does. A BusySnapshot
+        // refusal rolls the transaction back instead; the drop then sees
+        // autocommit and does nothing.
         self.conn.execute_batch("COMMIT")?;
         self.finished = true;
         Ok(())

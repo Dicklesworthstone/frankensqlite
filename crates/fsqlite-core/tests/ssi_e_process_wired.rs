@@ -248,7 +248,17 @@ fn lab_unsafe_same_page_conflict_does_not_train_gate() {
         assert_eq!(after.clean_streak, before.clean_streak);
         assert_eq!(after.e_value.to_bits(), before.e_value.to_bits());
         assert_eq!(after.skip_grants, before.skip_grants);
-        second.execute("ROLLBACK;").await.unwrap();
+        // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with BusySnapshot
+        // has rolled its transaction back; a write-phase refusal leaves it
+        // open for the ROLLBACK.
+        if phase == "commit" && matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }) {
+            assert!(
+                !second.in_transaction(),
+                "a COMMIT refused with BusySnapshot ends its transaction"
+            );
+        } else {
+            second.execute("ROLLBACK;").await.unwrap();
+        }
         first.close().await.unwrap();
         second.close().await.unwrap();
         let reopened = Connection::open(path).await.unwrap();
