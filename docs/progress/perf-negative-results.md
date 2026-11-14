@@ -153,6 +153,21 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   and its sort is 15% or more of that row's CPU; a column mixing INTEGER and REAL needs an exact
   int/real cell (the comparator is exact past 2^53).
 
+## 2026-11-14 - WIN: an indexed IN-list scan answers covered outputs from the index entry (bd-mids0)
+
+- Target: `SELECT id FROM t WHERE a IN (3, 77, 500)` (10.0x stock): codegen_select_index_in_scan
+  did IdxRowid + SeekRowid into t for every entry of every run, though `id` is the entry's rowid.
+  Touched: crates/fsqlite-vdbe/src/codegen.rs (when resolve_covering_output_sources covers the
+  outputs and the residual reads only index columns, the entry answers the row through
+  emit_index_entry_where_filter / emit_covering_output_reads and the table is never opened).
+- Result (acf1fb0e3; scratchpad cin_ab.py, 200k-row t with ANALYZE, stock live, answers equal
+  and in stock's row order; ELF before 40e54cbe1be33311, after 3e69d86d23a4a99c; thinkstation1):
+  9.7x -> 3.3x stock (a second run 3.1x); `... AND c > 1000` (c not in the index) unchanged at
+  4.0x. The rest is ~6k instructions per entry in the seek/Next/ResultRow loop.
+- Retry / next: per-seek and per-opcode engine cost (bd-w4pr1.13.15, bd-w4pr1.13.7). And
+  a separate plan gap: `a IN (3, 77) AND b > 50` returns stock's rows in another order (stock
+  range-seeks t_ab per member; we walk t_a and filter), before and after this change.
+
 ## 2026-11-14 - WIN (above its prediction): the parallel aggregate kernel reads a table-leaf cell stored whole on its page from its two varints, which takes its CPU below stock's on scan_filter_agg (bd-w4pr1.13.11 kernel lever K5)
 
 - Target: `CellRef::parse` in the parallel ungrouped-aggregate kernel, 86 Ir/row on scan_filter_agg
