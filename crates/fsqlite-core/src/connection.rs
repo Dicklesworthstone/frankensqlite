@@ -25747,6 +25747,7 @@ impl Connection {
             columns,
             from: Some(from),
             group_by,
+            having,
             windows,
             ..
         } = &select.body.select
@@ -25754,7 +25755,16 @@ impl Connection {
             return false;
         };
 
+        // bd-23kpa / bd-w4pr1.13.32: the substrate drops every group when a
+        // HAVING's aggregate sits inside an expression (`count(*) * 2 > 3`)
+        // and keeps failing groups when it is not a result column. Ad hoc
+        // dispatch sends every HAVING to the in-memory path; a prepared
+        // statement, which asks this check at prepare time, ran the substrate
+        // for those shapes too and returned the wrong groups (bd-ro43z).
         if group_by.is_empty()
+            || having
+                .as_deref()
+                .is_some_and(|having| !having_is_substrate_safe(having, columns))
             || !windows.is_empty()
             || !from.joins.is_empty()
             || !Self::select_order_by_matches_group_by_prefix(select, group_by)
@@ -111578,6 +111588,84 @@ fn expr_has_ordered_aggregate(expr: &Expr) -> bool {
         | Expr::Column(_, _)
         | Expr::Raise { .. }
         | Expr::Placeholder(_, _) => false,
+    }
+}
+
+/// bd-ro43z: the HAVING shapes the GROUP BY storage substrate answers like
+/// stock. It drops every group when an aggregate sits inside an expression
+/// (`count(*) * 2 > 3`) and keeps failing groups when an aggregate is not a
+/// result column (`SELECT max(id) ... HAVING count(*) > 1`, bd-23kpa). Safe:
+/// AND, OR and NOT over comparisons whose every operand is either free of
+/// aggregates or exactly a result column's aggregate, or its alias.
+fn having_is_substrate_safe(having: &Expr, columns: &[ResultColumn]) -> bool {
+    // A result column's aggregate, or a bare reference to its alias.
+    let is_result_aggregate = |expr: &Expr| {
+        columns.iter().any(|column| {
+            let ResultColumn::Expr {
+                expr: result,
+                alias,
+            } = column
+            else {
+                return false;
+            };
+            expr_has_aggregate(result)
+                && (result == expr
+                    || matches!(
+                        (expr, alias),
+                        (Expr::Column(col_ref, _), Some(alias))
+                            if col_ref.table.is_none()
+                                && col_ref.column.eq_ignore_ascii_case(alias)
+                    ))
+        })
+    };
+    // No aggregate, and no alias of one either (`total * 2` is one inside an
+    // expression).
+    let free_of_aggregates = |expr: &Expr| {
+        if expr_has_aggregate(expr) {
+            return false;
+        }
+        let mut mentions_alias = false;
+        let _ = visit_expr_column_refs(expr, &mut |col_ref| {
+            if col_ref.table.is_none()
+                && columns.iter().any(|column| {
+                    matches!(column, ResultColumn::Expr { expr: result, alias: Some(alias) }
+                        if expr_has_aggregate(result) && col_ref.column.eq_ignore_ascii_case(alias))
+                })
+            {
+                mentions_alias = true;
+            }
+            Ok(())
+        });
+        !mentions_alias
+    };
+    let operand = |expr: &Expr| is_result_aggregate(expr) || free_of_aggregates(expr);
+    match having {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And | BinaryOp::Or,
+            right,
+            ..
+        } => having_is_substrate_safe(left, columns) && having_is_substrate_safe(right, columns),
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            expr,
+            ..
+        } => having_is_substrate_safe(expr, columns),
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::Is
+                | BinaryOp::IsNot,
+            right,
+            ..
+        } => operand(left) && operand(right),
+        other => free_of_aggregates(other),
     }
 }
 
@@ -209461,15 +209549,32 @@ mod tests {
             .collect()
         }
 
+        // Ad hoc, and prepared (which decides at prepare time whether the
+        // substrate runs the statement), with and without bound parameters.
         async fn check(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
-            let rows: Vec<String> = conn
+            let want = oracle_rows(oracle, sql);
+            let rendered = |rows: Vec<Row>| -> Vec<String> {
+                rows.iter().map(|row| render(row.values())).collect()
+            };
+            let ad_hoc = conn
                 .query(sql)
                 .await
-                .unwrap_or_else(|error| panic!("`{sql}`: {error}"))
-                .iter()
-                .map(|row| render(row.values()))
-                .collect();
-            assert_eq!(rows, oracle_rows(oracle, sql), "`{sql}`");
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"));
+            assert_eq!(rendered(ad_hoc), want, "ad hoc `{sql}`");
+            let prepared = conn
+                .prepare(sql)
+                .await
+                .unwrap_or_else(|error| panic!("prepare `{sql}`: {error}"));
+            let rows = prepared
+                .query()
+                .await
+                .unwrap_or_else(|error| panic!("prepared `{sql}`: {error}"));
+            assert_eq!(rendered(rows), want, "prepared `{sql}`");
+            let with_params = conn
+                .query_with_params(sql, &[])
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}` with params: {error}"));
+            assert_eq!(rendered(with_params), want, "query_with_params `{sql}`");
         }
 
         async fn both(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
@@ -209491,6 +209596,27 @@ mod tests {
                 "INSERT INTO hav1 VALUES (1,'a',10),(2,'a',20),(3,'a',30),(4,'b',40),(5,'b',50)",
             ] {
                 both(&conn, &oracle, sql).await;
+            }
+            // The substrate's shape check refuses the HAVING shapes it answers
+            // wrongly, so a prepared statement takes the in-memory path for
+            // them, as the ad hoc dispatch does, and keeps the substrate for
+            // comparisons of result-column aggregates.
+            let eligible = |sql: &str| {
+                let Statement::Select(select) = parse_single_statement(sql).unwrap() else {
+                    panic!("expected SELECT: {sql}");
+                };
+                conn.select_group_by_storage_substrate_is_vdbe_eligible(&select)
+            };
+            for (sql, substrate) in [
+                ("SELECT grp, count(*) FROM hav1 GROUP BY grp", true),
+                ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING count(*) > 1", true),
+                ("SELECT grp, count(*) c FROM hav1 GROUP BY grp HAVING c >= 2 AND grp <> 'z'", true),
+                ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING sum(val) > 50", false),
+                ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING count(*) * 2 > 3", false),
+                ("SELECT grp, count(*) c FROM hav1 GROUP BY grp HAVING c + 0 > 1", false),
+                ("SELECT max(id) FROM hav1 GROUP BY grp HAVING count(*) > 1", false),
+            ] {
+                assert_eq!(eligible(sql), substrate, "substrate eligibility of `{sql}`");
             }
             let havings = [
                 "count(*) > 1",
