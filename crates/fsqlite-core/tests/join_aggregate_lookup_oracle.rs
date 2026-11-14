@@ -2169,3 +2169,64 @@ mod table_function_visibility_registration {
         });
     }
 }
+
+/// A join written without a constraint (`FROM t, u WHERE u.id = t.a AND t.a = 2`)
+/// is joined by its whole WHERE, so the outer-table equality was never offered
+/// to the outer seek and the outer table was scanned (440x stock on 200k rows).
+/// An inner join's ON terms that the lookup does not consume filter the outer
+/// row as WHERE terms do, so they now seek it too. A LEFT JOIN's ON term does
+/// not filter the outer row (it still comes out, null-extended) and must not
+/// seek; nor may a term under OR.
+#[test]
+fn join_lookups_seek_the_outer_table_by_unconsumed_inner_join_terms() {
+    // (query, must seek the outer index)
+    let cases: &[(&str, bool)] = &[
+        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = 2 ORDER BY t.id", true),
+        ("SELECT t.id, u.r FROM t, u WHERE u.id = t.a AND t.b = '2' ORDER BY t.id", true),
+        ("SELECT count(*), sum(u.r) FROM t, u WHERE u.id = t.a AND t.a = 2", true),
+        ("SELECT t.id, u.id FROM t, u WHERE t.a = 4 AND u.id = t.a ORDER BY t.id", true),
+        ("SELECT t.id, u.id FROM t JOIN u ON u.id = t.a AND t.a = 2 ORDER BY t.id", true),
+        ("SELECT t.id, u.id FROM t CROSS JOIN u WHERE u.id = t.a AND t.a = 2 ORDER BY t.id", true),
+        ("SELECT t.id, u.id FROM t LEFT JOIN u ON u.id = t.a AND t.a = 2 ORDER BY t.id", false),
+        (
+            "SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND (t.a = 2 OR t.a = 4) ORDER BY t.id",
+            false,
+        ),
+        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = '2' ORDER BY t.id", false),
+        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = 9 ORDER BY t.id", true),
+    ];
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_outer_seek_by_on_terms.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for (sql, seeks) in cases {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                if indexed {
+                    let ops = opcodes(&f, sql).await;
+                    assert_eq!(
+                        ops.iter().any(|op| op == "SeekGE"),
+                        *seeks,
+                        "`{sql}` outer index seek: {ops:?}"
+                    );
+                }
+            }
+            for value in [2_i64, 7] {
+                assert_agree(
+                    &f,
+                    &r,
+                    "SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = ?1 ORDER BY t.id",
+                    &[SqliteValue::Integer(value)],
+                    &[&value],
+                )
+                .await;
+            }
+        });
+    }
+}

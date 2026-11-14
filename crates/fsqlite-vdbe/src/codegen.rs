@@ -13874,9 +13874,17 @@ pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSche
         return false;
     };
     // A join joined by its WHERE clause hands that clause to the lookup as
-    // the join condition and scans its outer table.
+    // the join condition, keeps its written table order, and seeks the outer
+    // table by the terms the lookup leaves (`t.a = 5`), as codegen does.
     if joined_by_where {
-        return false;
+        return resolve_outer_equality_seek_terms(
+            join_outer_filter_terms(None, &plan),
+            left_table,
+            left_alias,
+            Some((right_table, right_alias)),
+            None,
+        )
+        .is_some();
     }
     let where_clause = where_clause.as_deref();
     // Mirror codegen_join_select's choice of the driving table.
@@ -13902,8 +13910,8 @@ pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSche
         )
         .is_some();
     }
-    resolve_outer_equality_seek(
-        where_clause,
+    resolve_outer_equality_seek_terms(
+        join_outer_filter_terms(where_clause, &plan),
         left_table,
         left_alias,
         Some((right_table, right_alias)),
@@ -13924,11 +13932,46 @@ fn resolve_outer_equality_seek<'a>(
     other_table: Option<(&TableSchema, Option<&str>)>,
     required_index: Option<&str>,
 ) -> Option<OuterEqualitySeek<'a>> {
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_clause?, &mut conjuncts);
+    resolve_outer_equality_seek_terms(
+        conjuncts,
+        left_table,
+        left_alias,
+        other_table,
+        required_index,
+    )
+}
+
+/// The conjuncts that filter a single-join lookup's outer row: the WHERE's,
+/// and for an inner join the ON terms the lookup does not consume.
+fn join_outer_filter_terms<'a>(
+    where_clause: Option<&'a Expr>,
+    plan: &SingleJoinLookupPlan<'a>,
+) -> Vec<&'a Expr> {
+    let mut conjuncts = Vec::new();
+    if let Some(where_expr) = where_clause {
+        collect_conjunctive_terms(where_expr, &mut conjuncts);
+    }
+    if matches!(plan.join_kind, fsqlite_ast::JoinKind::Inner) {
+        conjuncts.extend(plan.on_residual.iter().copied());
+    }
+    conjuncts
+}
+
+/// [`resolve_outer_equality_seek`] over terms already split into conjuncts:
+/// the WHERE's, and for an inner join also the ON terms its lookup does not
+/// consume, which filter the outer row the same way.
+fn resolve_outer_equality_seek_terms<'a>(
+    conjuncts: Vec<&'a Expr>,
+    left_table: &'a TableSchema,
+    left_alias: Option<&str>,
+    other_table: Option<(&TableSchema, Option<&str>)>,
+    required_index: Option<&str>,
+) -> Option<OuterEqualitySeek<'a>> {
     if left_table.without_rowid {
         return None;
     }
-    let mut conjuncts = Vec::new();
-    collect_conjunctive_terms(where_clause?, &mut conjuncts);
     let mut index_seek = None;
     for term in conjuncts {
         let Expr::BinaryOp {
@@ -14465,8 +14508,12 @@ fn codegen_single_join_lookup_select(
     };
 
     let next_left_label = b.emit_label();
-    let outer_seek = resolve_outer_equality_seek(
-        where_clause,
+    // An inner join's ON terms the lookup does not consume filter the outer
+    // row as WHERE terms do, so they can seek it too. That covers a join
+    // written as `FROM t, u WHERE u.k = t.id AND t.a = 5`, whose whole WHERE
+    // is its join condition.
+    let outer_seek = resolve_outer_equality_seek_terms(
+        join_outer_filter_terms(where_clause, plan),
         left_table,
         left_alias,
         Some((right_table, right_alias)),
