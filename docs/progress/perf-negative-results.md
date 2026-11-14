@@ -87,6 +87,74 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: a statement savepoint names itself without format!, takes the cached session handle and skips empty virtual-table levels (bd-w4pr1.13.35 lever 5)
+
+- Target: the internal statement savepoint every statement of an explicit transaction runs in
+  (`with_internal_statement_savepoint_and_cx`); measured on an in-transaction literal INSERT and
+  `txn_1000x10_rows`. Touched: `crates/fsqlite-core/src/connection.rs` (the new
+  `internal_savepoint_name` and `concurrent_handle_for_session`, `next_internal_savepoint_name`,
+  `concurrent_session_handle`, `live_vtab_savepoint_all`, `live_vtab_release_all`).
+- Ledger preflight: skipping the statement savepoint inside a concurrent transaction is not an
+  option (a page lock is taken per page mid-statement, so a Busy mid-split needs the statement
+  rollback; bd-w4pr1.13.35's proof). This cuts what the savepoint costs instead.
+- Evidence before (callgrind, symbolized release-perf CLI of main 52df35c25 plus lever 4, per
+  in-transaction INSERT): `next_internal_savepoint_name` 940 (format! with two u64 Display);
+  the concurrent savepoint 381 in `concurrent_savepoint` plus a registry mutex and SipHash session
+  lookup; pager savepoint 155 and release 351; `statement_snapshot` 179;
+  `live_vtab_savepoint_all` 71 and `live_vtab_release_all` 85 with no virtual table in the
+  transaction. An autocommit literal INSERT and the prepared INSERT lane take no statement
+  savepoint.
+- Change: the name `__fsqlite_stmt_{purpose}_{trace_id}_{suffix}` is written with push_str and
+  itoa (same text; next_trace_id still drawn once per attempt); concurrent_savepoint takes the
+  handle through the per-transaction cache bd-ifgl7 already keeps for VDBE setup and page I/O (a
+  miss still asks the registry; error texts unchanged); the two virtual-table functions return
+  after their level checks when no virtual table has joined the transaction. The pager round-trip
+  is left as it is: its cost is the drop of the journalled before-image and the name String, and
+  cutting those means changing the pager's savepoint API.
+- Result (binaries a4392a27... = lever 4, ab53c7e7... = lever 4 plus this diff; stock sqlite3
+  3.46.1 live, answers equal): callgrind in-transaction INSERT 34,060 -> 33,111 (name 940 -> 243,
+  virtual-table levels 156 -> 53, concurrent savepoint about -100); perf stat user instructions,
+  5 reps interleaved, `txn_1000x10_rows` 630.6M -> 616.5M (stock 153.9M; 4.10x -> 4.01x).
+  Autocommit literal INSERT 183,057 -> 183,493 and prepared txn INSERT 25,514 -> 25,529 (no
+  statement savepoint; within run noise). The prediction was -0.9k to -1.3k per statement with a
+  kill line under 0.6k. A unit test pins the name text against literal strings and the format! it
+  replaces.
+- Gate (this lever and lever 4 below on one tree, rch): clippy -D warnings on fsqlite-core all
+  targets and the prepared-dml-probe bin; fsqlite-core --lib 4178 passed, 2 failed (the
+  test_t6741 join tests, red on main as bd-nouem); 56 keeper targets (prepared reuse, REPLACE /
+  UPSERT, savepoint and statement-rollback, busy and concurrent-writer, trigger and FK, FTS5 /
+  R-tree, fsqlite API) pass except fk_insert_conflict_oracle's two bd-d8s37 tests, red on main.
+- Retry condition: the remaining savepoint cost (pager round-trip about 500, concurrent_savepoint
+  381, snapshot 179 per statement) is worth another pass only together with a pager savepoint API
+  that does not own a name String per savepoint, or when a profile shows the statement savepoint
+  above 5% of an in-transaction statement again.
+
+## 2026-11-14 - WIN: the cached VDBE engine handed over in a Box (bd-w4pr1.13.35 lever 4; retry of the 2026-11-12 rejection)
+
+- Target: every program run through `execute_table_program_with_db` or its exactly-one-row twin in
+  `crates/fsqlite-core/src/connection.rs`. Change: `Connection::cached_vdbe_engine` holds
+  `Option<Box<VdbeEngine>>`, both executors take and return the box, and a fresh engine is boxed
+  once where it is created; the same change as aeaae6a83.
+- Ledger preflight: the 2026-11-12 entry rejected this on a prepared insert_autocommit wall-time
+  reading the bench could not resolve to 1%; its retry condition, an instruction-count A/B of a
+  prepared autocommit INSERT, is met here with `prepared-dml-probe` (new fsqlite-e2e bin: N
+  prepared single-row INSERTs through `fsqlite::blocking` on a WAL file database, the shape of
+  blocking_vs_rusqlite_bench's insert_autocommit / insert_txn rows; cost per execution =
+  (Ir(N_hi) - Ir(N_lo)) / dN).
+- Result (main 52df35c25 against 52df35c25 plus this diff; release-perf with line tables;
+  binaries fsqlite aeb9ea53... / a4392a27..., probe 2053e3ad... / 060260c9...; stock sqlite3
+  3.46.1 live, answers equal): prepared autocommit INSERT (N=800 vs 400), three runs per arm,
+  base 159,500 / 160,733 / 160,069 (mean 160,101), lever 160,704 / 158,412 / 159,214 (mean
+  159,443), so -0.4%, inside the base runs' own 1.2k spread; the prepared INSERT takes the direct
+  lane, which does not use the engine. Prepared txn INSERT 25,828 -> 25,514. Callgrind
+  in-transaction literal INSERT 36,961 -> 34,060, autocommit point SELECT 80,258 -> 77,557. perf
+  stat user instructions, 5 reps interleaved: `txn_1000x10_rows` 648.4M -> 621.9M (stock 153.9M;
+  4.21x -> 4.04x), `autocommit_5k_inserts` 1,138.1M -> 1,134.9M (stock 112.3M). The prediction
+  was -2.0k to -3.0k per in-transaction INSERT, prepared autocommit between -1.5% and +0.5%, with
+  a kill line at +1% on the prepared autocommit INSERT. Gate: with lever 5, above.
+- Retry condition: none needed; a later change that moves the engine by value again should show
+  up as memcpy in the two executor layers on the same callgrind shape.
+
 ## 2026-11-14 - WIN: a commit alone on its file skips the group-commit arrival wait (bd-w4pr1.7)
 
 - Target: every WAL commit of a transaction that is the only same-process transaction on its file
