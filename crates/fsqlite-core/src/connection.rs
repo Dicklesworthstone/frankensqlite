@@ -99189,66 +99189,80 @@ impl Connection {
                     width: ob.len(),
                 },
             };
-            let mut sorted_indices: Vec<usize> = (0..total_rows).collect();
-            sorted_indices.sort_by(|&a, &b| {
-                for (k, (va, vb)) in partition_keys
-                    .key(a)
-                    .iter()
-                    .zip(partition_keys.key(b))
-                    .enumerate()
-                {
-                    let coll = pb_coll.get(k).and_then(|c| c.as_deref());
-                    let ord =
-                        cmp_sqlite_values_collated_snapshot(va, vb, coll, &collation_registry_snap);
-                    if ord != std::cmp::Ordering::Equal {
-                        return ord;
-                    }
-                }
-                let order = cmp_in_aggregate_order_keys(
-                    ob,
-                    ob_coll,
-                    order_keys.key(a),
-                    order_keys.key(b),
-                    &collation_registry_snap,
-                );
-                if order != std::cmp::Ordering::Equal {
-                    return order;
-                }
-                std::cmp::Ordering::Equal
-            });
-
-            // Build partitions for this window function.
-            // s79i: partition-key equality must be collation-aware so that
-            // PARTITION BY on a `COLLATE NOCASE` column groups 'Alice' with
-            // 'alice'. Reuse the per-window PARTITION BY collation snapshot.
-            let partitions: Vec<Vec<usize>> = if sorted_indices.is_empty() {
-                Vec::new()
-            } else if pb.is_empty() {
-                vec![sorted_indices.clone()]
+            // Numeric keys sort as packed rows of order-preserving cells and
+            // give their partitions as the runs of equal partition cells
+            // (bd-w4pr1.12, lever W1); any other key takes the comparator.
+            let packed_keys =
+                PackedWindowSortKeys::new(&partition_keys, pb.len(), &order_keys, ob, total_rows);
+            let (sorted_indices, partitions) = if let Some(packed_keys) = packed_keys {
+                packed_keys.sorted_rows_and_partitions()
             } else {
-                // bd-w4pr1.12: the rows were just sorted by the PARTITION BY
-                // keys under the comparison that defines a partition, so the
-                // rows of one partition are consecutive and a row starts a new
-                // partition exactly when its keys differ from the first row of
-                // the current one. Searching every earlier partition for each
-                // row cost rows x partitions comparisons and a key clone.
-                let mut parts: Vec<Vec<usize>> = Vec::new();
-                for &ri in &sorted_indices {
-                    match parts.last_mut() {
-                        Some(part)
-                            if group_keys_equal_collated(
-                                partition_keys.key(part[0]),
-                                partition_keys.key(ri),
-                                pb_coll,
-                                &collation_registry_snap,
-                            ) =>
-                        {
-                            part.push(ri);
+                let mut sorted_indices: Vec<usize> = (0..total_rows).collect();
+                sorted_indices.sort_by(|&a, &b| {
+                    for (k, (va, vb)) in partition_keys
+                        .key(a)
+                        .iter()
+                        .zip(partition_keys.key(b))
+                        .enumerate()
+                    {
+                        let coll = pb_coll.get(k).and_then(|c| c.as_deref());
+                        let ord = cmp_sqlite_values_collated_snapshot(
+                            va,
+                            vb,
+                            coll,
+                            &collation_registry_snap,
+                        );
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
                         }
-                        _ => parts.push(vec![ri]),
                     }
-                }
-                parts
+                    let order = cmp_in_aggregate_order_keys(
+                        ob,
+                        ob_coll,
+                        order_keys.key(a),
+                        order_keys.key(b),
+                        &collation_registry_snap,
+                    );
+                    if order != std::cmp::Ordering::Equal {
+                        return order;
+                    }
+                    std::cmp::Ordering::Equal
+                });
+
+                // Build partitions for this window function.
+                // s79i: partition-key equality must be collation-aware so that
+                // PARTITION BY on a `COLLATE NOCASE` column groups 'Alice' with
+                // 'alice'. Reuse the per-window PARTITION BY collation snapshot.
+                let partitions: Vec<Vec<usize>> = if sorted_indices.is_empty() {
+                    Vec::new()
+                } else if pb.is_empty() {
+                    vec![sorted_indices.clone()]
+                } else {
+                    // bd-w4pr1.12: the rows were just sorted by the PARTITION BY
+                    // keys under the comparison that defines a partition, so the
+                    // rows of one partition are consecutive and a row starts a new
+                    // partition exactly when its keys differ from the first row of
+                    // the current one. Searching every earlier partition for each
+                    // row cost rows x partitions comparisons and a key clone.
+                    let mut parts: Vec<Vec<usize>> = Vec::new();
+                    for &ri in &sorted_indices {
+                        match parts.last_mut() {
+                            Some(part)
+                                if group_keys_equal_collated(
+                                    partition_keys.key(part[0]),
+                                    partition_keys.key(ri),
+                                    pb_coll,
+                                    &collation_registry_snap,
+                                ) =>
+                            {
+                                part.push(ri);
+                            }
+                            _ => parts.push(vec![ri]),
+                        }
+                    }
+                    parts
+                };
+                (sorted_indices, partitions)
             };
             let row_passes_filter = |row_index: usize| filter_matches[row_index];
             let partition_count = u64::try_from(partitions.len()).unwrap_or(u64::MAX);
@@ -139832,6 +139846,508 @@ impl WindowKeyRows for WindowKeys<'_> {
             Self::RowColumn { rows, column } => std::slice::from_ref(&rows.row(row)[*column]),
             Self::Flat { values, width } => &values[row * width..(row + 1) * width],
         }
+    }
+}
+
+/// The PARTITION BY and ORDER BY keys of a window's rows as order-preserving
+/// numbers, for the sort that orders the rows (bd-w4pr1.12, lever W1).
+///
+/// Built when every key value is an INTEGER, a REAL that is not NaN, or NULL,
+/// and no key column holds both INTEGER and REAL values. For such keys the
+/// window sort's comparator reduces, column by column, to an integer or a
+/// real comparison, reversed for a DESC ORDER BY term, with NULL placed by its
+/// own rule; collations do not apply to numbers. Each row's keys become
+/// `stride` `u64` cells whose unsigned lexicographic order is that
+/// comparator's order, so the rows sort as one array of (cells, row number)
+/// instead of through an index whose every comparison reads two rows' keys at
+/// random from the scanned rows.
+struct PackedWindowSortKeys {
+    /// Cells per row: the PARTITION BY columns' cells, then the ORDER BY ones.
+    stride: usize,
+    /// The leading cells of a row that hold its PARTITION BY keys.
+    partition_cells: usize,
+    /// `stride` cells per row, row after row.
+    cells: Vec<u64>,
+}
+
+/// The bit that separates negative from non-negative in both cell encodings.
+const PACKED_SORT_KEY_SIGN: u64 = 1 << 63;
+
+/// A `u64` whose unsigned order is the order of `value` among integers.
+const fn packed_integer_sort_key(value: i64) -> u64 {
+    value.cast_unsigned() ^ PACKED_SORT_KEY_SIGN
+}
+
+/// A `u64` whose unsigned order is the order of `value` among reals as
+/// [`cmp_sqlite_values`] orders them, `-0.0` and `0.0` sharing one cell.
+/// `None` for NaN, which that comparator does not order.
+fn packed_real_sort_key(value: f64) -> Option<u64> {
+    if value.is_nan() {
+        return None;
+    }
+    let bits = value.to_bits();
+    // `-0.0` is the sign bit alone.
+    let bits = if bits == PACKED_SORT_KEY_SIGN {
+        0
+    } else {
+        bits
+    };
+    Some(if bits & PACKED_SORT_KEY_SIGN == 0 {
+        bits | PACKED_SORT_KEY_SIGN
+    } else {
+        // Negative: a larger magnitude is a smaller value.
+        !bits
+    })
+}
+
+/// What a key column of [`PackedWindowSortKeys`] holds besides NULL.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackedKeyClass {
+    NullOnly,
+    Integer,
+    Real,
+}
+
+/// One key column of [`PackedWindowSortKeys`] and how its cells are written.
+struct PackedKeyColumn {
+    class: PackedKeyClass,
+    /// The column holds a NULL, so each row gets a class cell before its
+    /// value cell: 1 for a value, 0 or 2 for NULL.
+    has_null: bool,
+    /// A DESC ORDER BY term: value cells are complemented.
+    descending: bool,
+    /// NULL orders before every value: always for a PARTITION BY key (as
+    /// `cmp_sqlite_values` ranks NULL lowest), and for an ORDER BY term by its
+    /// NULLS FIRST / LAST or that clause's default, which DESC does not
+    /// reverse (as `cmp_in_aggregate_order_keys` places NULL).
+    nulls_first: bool,
+}
+
+impl PackedWindowSortKeys {
+    /// The cells of `rows` rows, or `None` when some key is not one these
+    /// cells can order: TEXT, BLOB, NaN, a column holding both INTEGER and
+    /// REAL values, a row whose key width differs, or fewer than two rows.
+    fn new(
+        partition_keys: &impl WindowKeyRows,
+        partition_width: usize,
+        order_keys: &impl WindowKeyRows,
+        order_by: &[OrderingTerm],
+        rows: usize,
+    ) -> Option<Self> {
+        if rows < 2 || partition_width + order_by.len() == 0 {
+            return None;
+        }
+        let mut columns: Vec<PackedKeyColumn> = (0..partition_width)
+            .map(|_| PackedKeyColumn {
+                class: PackedKeyClass::NullOnly,
+                has_null: false,
+                descending: false,
+                nulls_first: true,
+            })
+            .chain(order_by.iter().map(|term| {
+                PackedKeyColumn {
+                    class: PackedKeyClass::NullOnly,
+                    has_null: false,
+                    descending: term.direction == Some(SortDirection::Desc),
+                    nulls_first: term
+                        .nulls
+                        .unwrap_or_else(|| default_nulls_order(term.direction))
+                        == NullsOrder::First,
+                }
+            }))
+            .collect();
+        for row in 0..rows {
+            let (partition, order) = (partition_keys.key(row), order_keys.key(row));
+            if partition.len() != partition_width || order.len() != order_by.len() {
+                return None;
+            }
+            for (column, value) in columns.iter_mut().zip(partition.iter().chain(order)) {
+                let class = match value {
+                    SqliteValue::Null => {
+                        column.has_null = true;
+                        continue;
+                    }
+                    SqliteValue::Integer(_) => PackedKeyClass::Integer,
+                    SqliteValue::Float(real) if !real.is_nan() => PackedKeyClass::Real,
+                    _ => return None,
+                };
+                if column.class == PackedKeyClass::NullOnly {
+                    column.class = class;
+                } else if column.class != class {
+                    return None;
+                }
+            }
+        }
+        let cells_of = |column: &PackedKeyColumn| 1 + usize::from(column.has_null);
+        let partition_cells = columns[..partition_width].iter().map(cells_of).sum();
+        let stride: usize = columns.iter().map(cells_of).sum();
+        let mut cells = Vec::with_capacity(rows.checked_mul(stride)?);
+        for row in 0..rows {
+            let values = partition_keys.key(row).iter().chain(order_keys.key(row));
+            for (column, value) in columns.iter().zip(values) {
+                let key = match value {
+                    SqliteValue::Null => None,
+                    SqliteValue::Integer(integer) => Some(packed_integer_sort_key(*integer)),
+                    SqliteValue::Float(real) => Some(packed_real_sort_key(*real)?),
+                    SqliteValue::Text(_) | SqliteValue::Blob(_) => return None,
+                };
+                if column.has_null {
+                    cells.push(match key {
+                        Some(_) => 1,
+                        None if column.nulls_first => 0,
+                        None => 2,
+                    });
+                }
+                let key = key.unwrap_or(0);
+                cells.push(if column.descending { !key } else { key });
+            }
+        }
+        Some(Self {
+            stride,
+            partition_cells,
+            cells,
+        })
+    }
+
+    /// The row numbers in sorted order (equal keys in row order, which is
+    /// how the comparator's stable sort leaves them) and the partitions:
+    /// the runs of sorted rows whose partition cells are equal.
+    fn sorted_rows_and_partitions(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
+        match self.stride {
+            1 => self.sorted_packed_rows::<1>(),
+            2 => self.sorted_packed_rows::<2>(),
+            3 => self.sorted_packed_rows::<3>(),
+            4 => self.sorted_packed_rows::<4>(),
+            _ => {
+                let row_cells = |row: usize| &self.cells[row * self.stride..][..self.stride];
+                let mut rows: Vec<usize> = (0..self.cells.len() / self.stride).collect();
+                rows.sort_by(|&a, &b| row_cells(a).cmp(row_cells(b)));
+                packed_partition_runs(
+                    rows.iter().map(|&row| (row_cells(row), row)),
+                    self.partition_cells,
+                    rows.len(),
+                )
+            }
+        }
+    }
+
+    /// [`Self::sorted_rows_and_partitions`] for `K` cells a row: each row's
+    /// cells and its row number sort as one value, so the sort reads memory
+    /// in order and no comparison leaves the array. The row number is unique
+    /// and last, so the unstable sort gives the stable order.
+    fn sorted_packed_rows<const K: usize>(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let (keyed_rows, _) = self.cells.as_chunks::<K>();
+        let mut keyed: Vec<([u64; K], usize)> = keyed_rows.iter().copied().zip(0..).collect();
+        keyed.sort_unstable();
+        packed_partition_runs(
+            keyed.iter().map(|(cells, row)| (cells.as_slice(), *row)),
+            self.partition_cells,
+            keyed.len(),
+        )
+    }
+}
+
+/// The rows of `sorted` in order, and its runs of rows whose first
+/// `partition_cells` cells are equal (one run when that is zero).
+fn packed_partition_runs<'c>(
+    sorted: impl Iterator<Item = (&'c [u64], usize)>,
+    partition_cells: usize,
+    rows: usize,
+) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let mut order = Vec::with_capacity(rows);
+    let mut partitions: Vec<Vec<usize>> = Vec::new();
+    let mut current: &[u64] = &[];
+    for (cells, row) in sorted {
+        let key = &cells[..partition_cells];
+        match partitions.last_mut() {
+            Some(partition) if current == key => partition.push(row),
+            _ => {
+                partitions.push(vec![row]);
+                current = key;
+            }
+        }
+        order.push(row);
+    }
+    (order, partitions)
+}
+
+#[cfg(test)]
+mod packed_window_sort_key_tests {
+    use super::{
+        CollationRegistry, PackedWindowSortKeys, cmp_in_aggregate_order_keys,
+        cmp_sqlite_values_collated_snapshot, group_keys_equal_collated,
+    };
+    use fsqlite_ast::{Expr, Literal, NullsOrder, OrderingTerm, SortDirection, Span};
+    use fsqlite_types::SqliteValue;
+    use std::cmp::Ordering;
+
+    fn term(direction: Option<SortDirection>, nulls: Option<NullsOrder>) -> OrderingTerm {
+        OrderingTerm {
+            expr: Expr::Literal(Literal::Null, Span::ZERO),
+            direction,
+            nulls,
+        }
+    }
+
+    /// The comparator `execute_window_select` sorts with when the keys are
+    /// not packed.
+    fn general(
+        partition_keys: &[Vec<SqliteValue>],
+        order_keys: &[Vec<SqliteValue>],
+        order_by: &[OrderingTerm],
+        a: usize,
+        b: usize,
+    ) -> Ordering {
+        let registry = CollationRegistry::default();
+        for (left, right) in partition_keys[a].iter().zip(&partition_keys[b]) {
+            let ordering = cmp_sqlite_values_collated_snapshot(left, right, None, &registry);
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        cmp_in_aggregate_order_keys(order_by, &[], &order_keys[a], &order_keys[b], &registry)
+    }
+
+    /// The general path's result: a stable sort by [`general`], then runs of
+    /// rows whose partition keys are equal.
+    fn general_sort(
+        partition_keys: &[Vec<SqliteValue>],
+        order_keys: &[Vec<SqliteValue>],
+        order_by: &[OrderingTerm],
+    ) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let registry = CollationRegistry::default();
+        let mut sorted: Vec<usize> = (0..partition_keys.len()).collect();
+        sorted.sort_by(|&a, &b| general(partition_keys, order_keys, order_by, a, b));
+        let mut partitions: Vec<Vec<usize>> = Vec::new();
+        for &row in &sorted {
+            match partitions.last_mut() {
+                Some(partition)
+                    if group_keys_equal_collated(
+                        &partition_keys[partition[0]],
+                        &partition_keys[row],
+                        &[],
+                        &registry,
+                    ) =>
+                {
+                    partition.push(row);
+                }
+                _ => partitions.push(vec![row]),
+            }
+        }
+        (sorted, partitions)
+    }
+
+    fn cells(keys: &PackedWindowSortKeys, row: usize) -> &[u64] {
+        &keys.cells[row * keys.stride..][..keys.stride]
+    }
+
+    fn integers() -> Vec<SqliteValue> {
+        [
+            i64::MIN,
+            -9_007_199_254_740_993,
+            -3,
+            -1,
+            0,
+            1,
+            2,
+            2,
+            9_007_199_254_740_993,
+            i64::MAX,
+        ]
+        .into_iter()
+        .map(SqliteValue::Integer)
+        .chain([SqliteValue::Null])
+        .collect()
+    }
+
+    fn reals() -> Vec<SqliteValue> {
+        [
+            f64::NEG_INFINITY,
+            -2.5,
+            -1.0e-300,
+            -0.0,
+            0.0,
+            1.0e-300,
+            2.5,
+            2.5,
+            9_007_199_254_740_992.0,
+            f64::INFINITY,
+        ]
+        .into_iter()
+        .map(SqliteValue::Float)
+        .chain([SqliteValue::Null])
+        .collect()
+    }
+
+    fn order_terms() -> Vec<OrderingTerm> {
+        let mut terms = Vec::new();
+        for direction in [None, Some(SortDirection::Asc), Some(SortDirection::Desc)] {
+            for nulls in [None, Some(NullsOrder::First), Some(NullsOrder::Last)] {
+                terms.push(term(direction, nulls));
+            }
+        }
+        terms
+    }
+
+    /// Every pair of rows compares by its cells as the general comparator
+    /// compares it: an integer and a real column each with NULL, extreme
+    /// integers beyond 2^53, signed zeros, infinities, equal values, every
+    /// direction and NULLS placement, as a PARTITION BY and an ORDER BY key.
+    #[test]
+    fn packed_cells_order_rows_as_the_general_comparator_does() {
+        for column in [integers(), reals()] {
+            for order_term in order_terms() {
+                let mut partition_keys = Vec::new();
+                let mut order_keys = Vec::new();
+                for partition in &column {
+                    for order in &column {
+                        partition_keys.push(vec![partition.clone()]);
+                        order_keys.push(vec![order.clone()]);
+                    }
+                }
+                let order_by = std::slice::from_ref(&order_term);
+                let rows = partition_keys.len();
+                let keys =
+                    PackedWindowSortKeys::new(&partition_keys, 1, &order_keys, order_by, rows)
+                        .expect("numeric keys with NULL are packed");
+                for a in 0..rows {
+                    for b in 0..rows {
+                        assert_eq!(
+                            cells(&keys, a).cmp(cells(&keys, b)),
+                            general(&partition_keys, &order_keys, order_by, a, b),
+                            "rows {a} {b}: {:?} {:?} / {:?} {:?} under {:?} {:?}",
+                            partition_keys[a],
+                            order_keys[a],
+                            partition_keys[b],
+                            order_keys[b],
+                            order_term.direction,
+                            order_term.nulls,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The packed sort returns the general path's row order and partitions
+    /// for one to six cells a row (the in-place sort for up to four, the
+    /// index sort past that), with and without PARTITION BY, NULL keys in
+    /// either clause, and ties on every key so the row-order tie break shows.
+    #[test]
+    fn packed_sort_returns_the_general_sort_and_partitions() {
+        let integer = |value: i64| SqliteValue::Integer(value);
+        let real = |value: f64| SqliteValue::Float(value);
+        let rows = 97_usize;
+        let shapes: &[(usize, usize, bool)] = &[
+            // (PARTITION BY columns, ORDER BY columns, NULLs present)
+            (1, 0, false),
+            (0, 1, false),
+            (1, 1, false),
+            (1, 1, true),
+            (2, 1, false),
+            (1, 2, true),
+            (2, 2, true),
+            (0, 3, true),
+        ];
+        for &(partition_width, order_width, nulls) in shapes {
+            for directions in [
+                [None, None, None],
+                [Some(SortDirection::Desc), None, Some(SortDirection::Desc)],
+                [None, Some(SortDirection::Desc), Some(SortDirection::Asc)],
+            ] {
+                let order_by: Vec<OrderingTerm> = (0..order_width)
+                    .map(|i| {
+                        let nulls_order = match i {
+                            0 => Some(NullsOrder::Last),
+                            1 => Some(NullsOrder::First),
+                            _ => None,
+                        };
+                        term(directions[i], nulls_order)
+                    })
+                    .collect();
+                let mut partition_keys = Vec::new();
+                let mut order_keys = Vec::new();
+                for row in 0..rows {
+                    let r = i64::try_from(row).unwrap();
+                    let value = |column: i64, modulus: i64| -> SqliteValue {
+                        let v = (r * (7 + 2 * column) + column) % modulus;
+                        if nulls && v == 0 {
+                            SqliteValue::Null
+                        } else if column % 2 == 1 {
+                            real(match v {
+                                1 => -0.0,
+                                2 => 0.0,
+                                _ => v as f64 / 2.0 - 3.0,
+                            })
+                        } else {
+                            integer(v - 4)
+                        }
+                    };
+                    partition_keys.push(
+                        (0..partition_width)
+                            .map(|c| value(i64::try_from(c).unwrap() * 2, 5))
+                            .collect::<Vec<_>>(),
+                    );
+                    order_keys.push(
+                        (0..order_width)
+                            .map(|c| value(i64::try_from(c).unwrap() + 1, 6))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                let keys = PackedWindowSortKeys::new(
+                    &partition_keys,
+                    partition_width,
+                    &order_keys,
+                    &order_by,
+                    rows,
+                )
+                .expect("numeric keys are packed");
+                assert_eq!(
+                    keys.sorted_rows_and_partitions(),
+                    general_sort(&partition_keys, &order_keys, &order_by),
+                    "shape {partition_width}x{order_width} nulls={nulls} stride={}",
+                    keys.stride,
+                );
+            }
+        }
+    }
+
+    /// Keys the cells cannot order take the general comparator: TEXT, BLOB,
+    /// NaN, a column holding both 1 and 1.0, and fewer than two rows.
+    #[test]
+    fn other_keys_are_not_packed() {
+        let order_by = [term(None, None)];
+        let refused = |partition: Vec<SqliteValue>, order: Vec<SqliteValue>| {
+            let partition_keys: Vec<Vec<SqliteValue>> =
+                partition.into_iter().map(|value| vec![value]).collect();
+            let order_keys: Vec<Vec<SqliteValue>> =
+                order.into_iter().map(|value| vec![value]).collect();
+            let rows = partition_keys.len();
+            PackedWindowSortKeys::new(&partition_keys, 1, &order_keys, &order_by, rows).is_none()
+        };
+        let integer = SqliteValue::Integer;
+        assert!(refused(
+            vec![integer(1), integer(2)],
+            vec![SqliteValue::Text("a".into()), integer(1)]
+        ));
+        assert!(refused(
+            vec![SqliteValue::Blob(vec![1].into()), integer(2)],
+            vec![integer(1), integer(1)]
+        ));
+        assert!(refused(
+            vec![integer(1), integer(2)],
+            vec![SqliteValue::Float(f64::NAN), SqliteValue::Float(1.0)]
+        ));
+        assert!(refused(
+            vec![integer(1), SqliteValue::Float(1.0)],
+            vec![integer(1), integer(1)]
+        ));
+        assert!(refused(vec![integer(1)], vec![integer(1)]));
+        // The control: the same shapes with numeric keys are packed.
+        assert!(!refused(
+            vec![integer(1), SqliteValue::Null],
+            vec![SqliteValue::Float(1.0), SqliteValue::Null]
+        ));
     }
 }
 

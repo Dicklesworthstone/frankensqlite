@@ -119,6 +119,12 @@ fn ranking_functions() {
 }
 
 async fn row_number_queries_match_stock(queries: &[&str]) {
+    queries_match_stock(SETUP, queries).await;
+}
+
+/// Each query gives stock's rows on `setup`'s tables, in memory and in a
+/// file, run directly and prepared.
+async fn queries_match_stock(setup: &[&str], queries: &[&str]) {
     let mut differences = Vec::new();
     for file_backed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -135,7 +141,7 @@ async fn row_number_queries_match_stock(queries: &[&str]) {
                 rusqlite::Connection::open_in_memory().unwrap(),
             )
         };
-        for sql in SETUP {
+        for sql in setup {
             f.execute(sql).await.unwrap();
             r.execute_batch(sql).unwrap();
         }
@@ -163,6 +169,62 @@ async fn row_number_queries_match_stock(queries: &[&str]) {
         f.close().await.unwrap();
     }
     assert!(differences.is_empty(), "{}", differences.join("\n"));
+}
+
+const NUMERIC_KEY_SETUP: &[&str] = &[
+    "CREATE TABLE w(id INTEGER PRIMARY KEY, g INT, x REAL, n INT, m, t TEXT)",
+    "INSERT INTO w VALUES \
+     (1, 1, 2.5, 10, 1, 'b'), \
+     (2, NULL, -0.0, 9007199254740993, 1.0, 'a'), \
+     (3, 1, NULL, 9007199254740992, 2, NULL), \
+     (4, -5, 0.0, -3, 1, 'c'), \
+     (5, NULL, NULL, 10, 2.5, 'a'), \
+     (6, 1, -2.5, NULL, 1.0, 'b'), \
+     (7, 9007199254740993, 2.5, 7, 3, 'd'), \
+     (8, 9007199254740992, 9e999, 7, 1, 'a'), \
+     (9, -5, -9e999, -3, NULL, 'e'), \
+     (10, 1, 2.5, 10, 2, 'b'), \
+     (11, NULL, 0.0, 0, 1, NULL), \
+     (12, -5, -0.0, 9007199254740993, 1.0, 'c'), \
+     (13, 9007199254740992, -2.5, NULL, 2, 'a')",
+];
+
+/// bd-w4pr1.12 lever W1: window keys that are INTEGER, REAL or NULL sort as
+/// packed numeric cells. Each query's result is fixed by its keys (ties are
+/// broken by `id` or the function treats peers alike), so it must equal
+/// stock's whatever the tie order. Negative cases a naive packing fails:
+/// -0.0 and 0.0 are one partition and peers; 2^53 and 2^53 + 1 are two
+/// partitions; NULL partition keys form one partition that sorts first;
+/// NULLS FIRST / LAST hold under DESC; +-inf order at the ends. Controls:
+/// a column holding 1 and 1.0 and a TEXT key take the general comparator.
+#[test]
+fn numeric_window_keys_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        queries_match_stock(
+            NUMERIC_KEY_SETUP,
+            &[
+                "SELECT id, row_number() OVER (PARTITION BY g ORDER BY x, id) FROM w ORDER BY id",
+                "SELECT id, rank() OVER (PARTITION BY g ORDER BY x DESC NULLS FIRST) FROM w ORDER BY id",
+                "SELECT id, rank() OVER (PARTITION BY g ORDER BY x DESC) FROM w ORDER BY id",
+                "SELECT id, dense_rank() OVER (ORDER BY x NULLS LAST) FROM w ORDER BY id",
+                "SELECT id, dense_rank() OVER (ORDER BY x ASC NULLS LAST, n DESC NULLS FIRST) FROM w ORDER BY id",
+                "SELECT id, rank() OVER (ORDER BY g DESC, x) FROM w ORDER BY id",
+                "SELECT id, count(*) OVER (PARTITION BY x) FROM w ORDER BY id",
+                "SELECT id, count(*) OVER (PARTITION BY n), count(*) OVER (PARTITION BY g) FROM w ORDER BY id",
+                "SELECT id, sum(id) OVER (PARTITION BY g) FROM w ORDER BY id",
+                "SELECT id, sum(id) OVER (PARTITION BY g, n ORDER BY x, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w ORDER BY id",
+                "SELECT id, sum(id) OVER (ORDER BY x RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM w ORDER BY id",
+                "SELECT id, lag(id) OVER (PARTITION BY g ORDER BY x DESC, id), lead(id) OVER (PARTITION BY g ORDER BY x DESC, id) FROM w ORDER BY id",
+                "SELECT id, row_number() OVER (PARTITION BY g % 3 ORDER BY x * 2, n, id) FROM w ORDER BY id",
+                "SELECT id, row_number() OVER (PARTITION BY g, n ORDER BY x DESC NULLS LAST, id DESC) FROM w ORDER BY id",
+                "SELECT id, rank() OVER (ORDER BY m) FROM w ORDER BY id",
+                "SELECT id, rank() OVER (PARTITION BY m ORDER BY x) FROM w ORDER BY id",
+                "SELECT id, rank() OVER (PARTITION BY g ORDER BY t) FROM w ORDER BY id",
+                "SELECT sum(rn) FROM (SELECT row_number() OVER (PARTITION BY g ORDER BY x, id) rn FROM w)",
+            ],
+        )
+        .await;
+    });
 }
 
 #[test]
