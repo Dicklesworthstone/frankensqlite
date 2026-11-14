@@ -87,6 +87,202 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN (prediction missed, beyond its range): an UPDATE row body preloads only unassigned columns, re-inserts under its kept INTEGER PRIMARY KEY register and applies its second Affinity only when a constraint can change a register (bd-w4pr1.13.20, lever U)
+
+- Target: every UPDATE row of a rowid table through `codegen_update` (not UPDATE ... FROM, not WITHOUT ROWID):
+  the scorecard's `update_10pct_300k` (30,000 rewritten rows). Touched: `crates/fsqlite-vdbe/src/codegen.rs`
+  (`codegen_update`; `row_body_needs_affinity_after_constraints` now serves UPDATE too).
+- Evidence before: `EXPLAIN UPDATE m SET a = a + 1 WHERE id % 10 = 0` on main ran 16 opcodes per updated row: a
+  Rowid of the one-pass scan nobody read on an alias table, a dead `Column` preload of the assigned column, the
+  `IsNull` / `Copy` / `Goto` of an INTEGER PRIMARY KEY that is never assigned (its `NewRowid` branch cannot run),
+  and a second `Affinity` with no constraint between the two passes. Stock runs 11.
+- Ledger preflight: bd-9ag5r (in-place rewrite) and levers F / Q (2026-11-13) changed the b-tree rewrite; lever A
+  (2026-11-14) skipped the same second Affinity for INSERT ... SELECT. No entry on the UPDATE row body's opcodes.
+- Change: (1) the preload skips assigned columns (each assignment form writes its target register before anything
+  reads it; the SET expressions read the old row through the cursor); (2) a kept, preloaded INTEGER PRIMARY KEY
+  register is the re-insert's rowid register; (3) the one-pass scan emits no Rowid of its own on such a table; (4)
+  the second Affinity follows `row_body_needs_affinity_after_constraints` (CHECK, NOT NULL ... REPLACE). The row now
+  runs 10 opcodes.
+- Prediction (on bd-w4pr1.13.20 before code, amended twice before code): `update_10pct_300k` -10M to -20M user
+  instructions; DELETE and bulk unchanged. Kill: under 5M.
+- Result, stock sqlite3 3.46.1 live in the same runs (r2_mut_probe, 7 interleaved reps, io_uring refused, databases
+  on disk scratch), host thinkstation1 (governor powersave), binaries main 4fb410a8d (52ac94f0...) and main + this
+  diff (587e1f77...): `update_10pct_300k` 633.5M -> 598.3M (-35.2M, -5.6%; 2.32x -> 2.19x stock 273.3M), CPU 136.0 ->
+  133.6 ms (stock 58.6); the statement alone 6,907 -> 5,733 instructions per updated row; `delete_14pct_300k` 421.5M
+  -> 421.5M; `bulk_insert_1M_one_txn` 8,187.6M -> 8,163.4M (arms in sequence; main's own min was 8,176.3M an hour
+  earlier). Prediction missed beyond its range (the six opcodes cost ~1,170 a row, not ~700); kill line not met.
+  Answers equal stock's; stock `PRAGMA integrity_check` ok on every file written.
+- Test: fsqlite-core `one_pass_delete_oracle::update_row_body_matches_stock` (12 UPDATEs on 5 tables against
+  rusqlite, `:memory:` and file, direct and prepared: column swaps, a column assigned twice and one read while
+  assigned, assigned-value affinity, RETURNING rowid + alias on an alias and an implicit-rowid table, one pass on
+  the implicit-rowid table, the alias assigned, a STORED generated column over an unassigned column, NOT NULL ...
+  REPLACE with DEFAULTs of another storage class, a CHECK; a body that dropped an unassigned preload stores NULL
+  there, one that skipped the second Affinity on `r` stores TEXT '7' in an INTEGER column; not run as a mutation).
+  The vdbe unit test `test_codegen_update_set_column_self_ref` pinned the dead preload (">= 3 Column ops"); it now
+  asserts one read of the assigned column and one preload of the other.
+- Gate (one gate for levers U, H, K and F2, rch, 2026-11-14, on main 4fb410a8d plus the four changes): clippy -D
+  warnings with all targets on fsqlite-vdbe and fsqlite-mvcc, and on the two touched fsqlite-core test targets,
+  clean (re-run after test-only fixes); fsqlite-vdbe lib 1,251 pass and 1 fail
+  (`test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, bd-bhalc, red on main), goldens 8
+  pass with the hand-edited `update_with_where_predicate` (GOLDEN-CHANGE note in the commit); fsqlite-mvcc lib 1,679
+  pass; 80 fsqlite-core keeper and EXPLAIN-reading targets (DML, triggers, FK, RETURNING, UPSERT, conflict clauses,
+  rowid / AUTOINCREMENT / rewinds, concurrent-writer stress, INSERT ... SELECT one-program and batched replay, every
+  EXPLAIN-reading core target) 578 pass and 10 fail: nine red on main (the gh516 trio, bd-d8s37's two
+  `fk_insert_conflict_oracle` upsert tests, bd-mkon7's `review_omitted_rowid_alias_ignores_defaults`, bd-jlbrk's two
+  `rowid_replace_preflight_*` tests, `bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans`)
+  and the first version of lever K's oracle, which read generate_series on rusqlite (its bundled SQLite has none)
+  and then compared a CREATE TABLE's change count (stock reports the last DML's); both test bugs fixed, the target
+  re-run: 5 pass. 71 fsqlite DML and EXPLAIN-reading targets 223 pass. `bd_2jbl5_update_from_triggers_oracle` alone
+  3 pass in 48 s (hz3). fsqlite-core --lib was not run. After the clean rebase onto 8fb2902ee (upstream had changed
+  other codegen functions and several EXPLAIN-reading tests): fsqlite-vdbe lib 1,251 pass and the same 1 fail,
+  goldens 8 pass, clippy -D warnings on fsqlite-vdbe / fsqlite-mvcc all targets clean; the EXPLAIN-reading tests
+  upstream changed (agg_composite_prefix_range_oracle, agg_index_range_oracle, is_null_index_seek_oracle,
+  nonagg_in_residual_oracle, compat_tests, join_aggregate_lookup_oracle, agent_swarm_explain_concurrency_contract,
+  issue_491_bulk_insert, window_function_oracle) were not re-run on the rebased tree (their new assertions are
+  index-seek opcode gates and value oracles). Landed as da18bbdfc (levers U, H, K) and 0798067f9 (lever F2).
+- Retry / widen: `codegen_update_from` and the WITHOUT ROWID UPDATE still preload every column. Next on the UPDATE
+  row: the Delete arm's update-restore copy of the old payload (300 a rewritten row, `CursorBackend::payload`), which
+  nothing reads when the in-place rewrite cannot conflict (no UNIQUE index); see the bd-w4pr1.13.20 handoff.
+
+## 2026-11-14 - WIN (prediction missed, beyond its range): a literal operand of arithmetic, `||` or a bitwise operator is loaded once in the prologue, and a left literal is the operator's second source (bd-w4pr1.13.21, lever H)
+
+- Target: every expression row loop with `x op literal` or `literal op x` for + - * / % || & | << >>: the
+  scorecard's `bulk_insert_1M_one_txn` (`(value*7919)%1000`, `'row-'||value`, `value*1.5`), the 300k mutation
+  setup, `memory_script_200k`, UPDATE SET `a + 1`, projections and aggregates over such expressions. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`emit_binary_op`, `hoisted_operand_literal`; lever G's
+  `emit_where_comparison_operand` and `hoisted_where_literal` folded into them).
+- Evidence before (main 4fb410a8d): the bulk INSERT ran 23 opcodes a row, 4 of them per-row loads of `Integer 7919`,
+  `Integer 1000`, `String8 'row-'`, `Real 1.5` into scratch registers (stock loads all four once); callgrind of the
+  statement alone: 6,919 instructions a row, `write_text_to_reg` for the String8 98, the synchronous lane's
+  dispatch ~25-30 an opcode.
+- Ledger preflight: c1076d876 (bd-w4pr1.13.31, WIN) built the prologue for comparison literals; lever G
+  (08b5fa96b, WIN) read a right arithmetic literal from it inside WHERE comparisons only and kept a left literal as
+  the destination's per-row load. No entry rejects hoisting operands.
+- Change: an INTEGER, REAL or TEXT literal operand of those operators reads a prologue register
+  (`ProgramBuilder::hoisted_literal`; a program without a leading Init keeps the load). A right literal is P1; a left
+  literal is P2 and the right operand goes to the scratch register, the result to the destination, so nothing after
+  the prologue writes a literal register (the arithmetic, Concat and bitwise arms read P1 / P2 and write only P3).
+  AND / OR, comparisons, NULL / BLOB / CURRENT_* literals unchanged. The bulk row now runs 19 opcodes.
+- Prediction (on bd-w4pr1.13.21 before code): bulk -200M to -300M user instructions, CPU -1% to -3%; update -0.5M
+  to -2M; delete unchanged. Kill: bulk under 120M.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave, load average 7-9 from
+  other lanes), binaries main + U (587e1f77...) and main + U + H (623ce6bc...): `bulk_insert_1M_one_txn`
+  (r2_bulk_probe, arms interleaved, 7 reps, io_uring allowed, disk scratch) 8,178.4M -> 7,794.8M (-383.6M, -4.7%;
+  1.96x -> 1.87x stock 4,177.5M), CPU 1,022.0 -> 987.7 ms (-3.4%), wall 1,156.9 -> 1,126.2 ms (2.09x -> 2.04x
+  stock 553.3 ms); callgrind of the statement alone 6,919 -> 6,540 a row; `update_10pct_300k` 598.4M -> 596.6M;
+  `delete_14pct_300k` 421.5M -> 421.5M. The bulk prediction was missed beyond its range (four loads and their
+  dispatch ~380 a row); the others met; kill line not met. Answers equal stock's; stock integrity_check ok.
+- Tests: fsqlite-vdbe `test_codegen_projection_literal_operands_are_loaded_once`; lever G's codegen test pinned the
+  left literal's per-row load and now asserts its prologue load, P2 role and that only the prologue loads its
+  register; fsqlite-core
+  `bd_integer_arithmetic_edges_oracle_probe::literal_operands_over_scanned_rows_match_rusqlite_oracle` (10 operators
+  x 7 literals on both sides over 2,000 mixed-type rows, an aggregate, a WHERE, two UPDATEs, an INSERT ... SELECT,
+  each query twice per connection, `:memory:` and file; a version that wrote a result into the literal's register
+  gives every later row a different operand; not run as a mutation). Its 153 statements give byte-identical CLI
+  output on main and on the landing tree.
+- Gate: one gate with lever U (its entry). Landed as da18bbdfc.
+- Retry / widen: none for literal operands; NULL / BLOB / CURRENT_* literals and AND / OR keep their loads.
+
+## 2026-11-14 - WIN (prediction missed, beyond its range): an operand held in a register row is read from its register, with no Copy (bd-w4pr1.13.21, lever K)
+
+- Target: arithmetic, `||` and bitwise operands that are columns of a row held in registers: a table-valued
+  function's row in INSERT ... SELECT (the scorecard's `bulk_insert_1M_one_txn` and the 300k mutation setup read
+  `value` three times a row), and the row a CHECK, generated column or index key is evaluated over. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`emit_binary_op`, new `register_row_operand`).
+- Evidence before (EXPLAIN of the bulk INSERT on main + U + H): every read of `value` was `Copy 7 X` followed by the
+  one opcode that reads X (`Copy 7 3; Multiply 16 3 3`, `Copy 7 18; Concat 18 17 4`, `Copy 7 5; Multiply 19 5 5`).
+- Ledger preflight: the integer-write vein (set_reg_int for Copy / SCopy / Variable, WIN) made the Copy cheaper; no
+  entry on eliding it.
+- Change: an operand that `emit_expr` would compile to exactly `Copy R reg` (a stored column of a `RegisterRow`, or
+  its rowid register) is the opcode's P2 (left) or P1 (right) directly; the destination stays P3, so R is never
+  written. VIRTUAL generated columns, cursor columns and references qualified with another source keep `emit_expr`.
+  The bulk row now runs 16 opcodes (main 23).
+- Prediction (on bd-w4pr1.13.21 before code): bulk -100M to -200M user instructions, CPU -0.5% to -2%; DML rows
+  unchanged. Kill: bulk under 60M.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1: no binary of exactly main + U + H + F2
+  was built, so K is measured two ways. perf stat (r2_bulk_probe, interleaved, 7 reps): main + U + H + V2 + F2
+  (d14acf95...) -> the landing tree main + U + H + F2 + K (53e3a846...) 7,582.3M -> 7,204.9M (-377.4M by min,
+  -391.4M by median), CPU 982.3 -> 921.9 ms (-6.1%); that step also drops the rejected V2 (-17.7M on its own), so K
+  is about -395M. Callgrind of the statement: U + H 6,540 a row, U + H + V2 + F2 6,317 (F2 -192), landing 5,947, so
+  K = -401 a row. `update_10pct_300k` 596.6M -> 596.5M, `delete_14pct_300k` 421.6M -> 421.5M. Prediction missed
+  beyond its range (each elided Copy cost ~130: dispatch, the MakeRecord-sideband check, the read and the integer
+  store); kill line not met. Answers equal stock's; stock integrity_check ok.
+- Tests: fsqlite-vdbe `test_codegen_register_row_operands_are_read_in_place` (`(a * b) + 7 || a` over a register
+  row: no Copy, the row's registers as P1 / P2, nothing writes them); fsqlite-core
+  `bd_integer_arithmetic_edges_oracle_probe::register_operands_over_function_rows_match_rusqlite_oracle` (the
+  source column on both sides and twice over generate_series and json_each rows, a CHECK over two columns of the
+  row being written with OR IGNORE, `:memory:` and file, against rusqlite, whose side reads a recursive CTE for
+  generate_series; not run as a mutation). The vdbe unit test `test_codegen_insert_default_values_stored_generated`
+  pinned a Copy for the STORED column's `a + b`; it now asserts the Add reads the a and b registers and writes c's.
+- Gate: one gate with lever U (its entry). Landed as da18bbdfc.
+- Lane total, one run on the landing tree (main 4fb410a8d vs U + H + F2 + K, stock live): `bulk_insert_1M_one_txn`
+  8,164.4M (1.95x) -> 7,197.0M (1.72x stock 4,177.5M), CPU 1,010.2 -> 946.0 ms (2.21x -> 2.07x), wall 1,133.3 ->
+  1,060.5 ms (2.04x -> 1.91x stock 554.6); `update_10pct_300k` 633.4M (2.32x) -> 596.5M (2.18x);
+  `delete_14pct_300k` 421.5M (3.49x) unchanged; `memory_script_200k` 3,983.4M (2.08x) -> 3,802.1M (1.99x stock
+  1,914.0M).
+- Retry / widen: INSERT ... SELECT's INTEGER PRIMARY KEY routing still copies the alias register into a separate
+  rowid register every row (`IsNull` / `MustBeInt` / `Copy` / `Goto`); with the alias register as the Insert's rowid
+  register (as lever U does for UPDATE) that Copy goes too, about -100M to -150M on the bulk row (bd-w4pr1.13.21
+  handoff, not started).
+
+## 2026-11-14 - WIN (prediction missed, beyond its range): the rowid allocator's maps hash their (schema epoch, root page) keys with foldhash instead of SipHash (bd-i3csr.4, lever F2)
+
+- Target: every insert into a file-backed table (the rowid-floor bump after each row, reservations of implicit
+  rowids): the scorecard's `bulk_insert_1M_one_txn`, the 300k mutation setup, the txn and autocommit insert rows.
+  Touched: `crates/fsqlite-mvcc/src/rowid_alloc.rs` (`ConcurrentRowIdAllocator::tables` and
+  `session_reservations` use `foldhash::fast::FixedState`), `crates/fsqlite-mvcc/Cargo.toml` and `Cargo.lock`
+  (foldhash 0.2.0, already used by fsqlite-pager / btree / core).
+- Evidence before (callgrind of main 4fb410a8d, the bulk INSERT alone, 100k / 200k rows):
+  `bump_concurrent_storage_rowid_floor` 364 a row inclusive, `ensure_table_floor` 293, of which 197 the std
+  `HashMap` lookup (SipHash-1-3 of the key and the probe). bd-i3csr.4 lever 4.1's retry condition named this
+  exactly ("a profile where the allocator's cost is the hash itself").
+- Ledger preflight: the 2026-11-13 lever 4.1 entry (one lock and one lookup per row, WIN) and its retry condition;
+  the 2026-07-16 note that March foldhash swaps rested on stale profiles (this one rests on a current profile).
+- Change: the two maps' hasher only; no floor, reservation, rewind or epoch logic changes. The keys are the
+  engine's own, so SipHash's flooding resistance buys nothing.
+- Prediction (on bd-i3csr.4 before code): bulk -110M to -170M user instructions; txn / autocommit down slightly.
+  Kill: bulk under 70M; any allocator / rowid / rewind / concurrent-writer keeper changing outcome.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (load 6-7). Both arms carried the
+  rejected lever V2 (the F2 build was started before V2's numbers came back; V2 is in another function and is
+  reverted from the landing tree): binaries d943dda7... and d14acf95.... `bulk_insert_1M_one_txn` (r2_bulk_probe,
+  interleaved, 7 reps) 7,754.4M -> 7,563.0M by min (-191.4M, -2.5%), -178.0M by median; CPU and wall unchanged
+  within noise (1,001.9 -> 1,000.1 ms). `txn_1000x10_rows` / `autocommit_5k_inserts` (txn_row_probe): a 3-rep run
+  read +1.6% / +3.7%, a 5-rep rerun with the arms swapped -1.8% / -0.5%; pooled mins -8.7M / -4.3M; the lever's own
+  autocommit min moved 37.7M between the runs, so neither reading is resolvable. Bulk prediction missed beyond its
+  range; kill line not met. Answers equal stock's; stock integrity_check ok.
+- Test: no new test; the maps' behaviour does not change, and the allocator, rewind and concurrent-writer keepers
+  in the gate cover it.
+- Gate: one gate with lever U (its entry), including fsqlite-mvcc lib and the allocator / rewind / concurrent
+  keepers (`rowid_statement_rewind_concurrent_stress`, `concurrent_update_differential_stress`,
+  `bulk_import_upsert_text_pk_phantom_pk`, `issue_491_bulk_insert`, the bd_ih8ak pair, gh385, gh457, the rowid /
+  AUTOINCREMENT / statement-rollback oracles). Landed as 0798067f9.
+- Retry condition: none.
+
+## 2026-11-14 - REJECTED on its kill line: the append's stack-entry rebuild reuses the old entry's cell-pointer buffer (bd-i3csr.4, lever V2)
+
+- Target: every row appended to the cached rightmost leaf (`bulk_insert_1M_one_txn`, the 300k mutation setup).
+  Touched, not kept: `crates/fsqlite-btree/src/cursor.rs` (a `refill_top_cell_pointers` helper used by the two
+  stack rebuilds in `try_append_on_cached_rightmost_leaf`, and a unit test).
+- Evidence before (callgrind of main 4fb410a8d, the bulk INSERT alone, 100k / 200k rows): after each append the
+  stack entry is rebuilt with `cached.cell_pointers.clone()` (malloc 30 a row, 198,509 calls at 200k rows) and the
+  old entry's drop frees its buffer (the thread-local pool is full: free 34 a row, 201,454 calls; the recycle 53
+  inclusive). Attributed ~130 a row.
+- Ledger preflight: 2026-05-05 "Quick-balance one-cell pointer Vec pooling" and 2026-05-09 "Same-leaf direct DELETE
+  run in-place cell-pointer mutation" (both rejected) are other sites; the 2026-11-13 lever 4.2 entry named this
+  rebuild as a next lever.
+- Change: the rebuilt entry takes the old top entry's buffer (`mem::take`), clears it and refills it from the
+  cache's pointers.
+- Prediction (on bd-i3csr.4 before code): bulk -70M to -120M user instructions. Kill: under 50M.
+- Result, stock sqlite3 3.46.1 live, host thinkstation1 (load ~7), binaries main + U + H (623ce6bc...) and the
+  same + this diff (d943dda7...): bulk (r2_bulk_probe, interleaved, 7 reps) 7,786.4M -> 7,768.7M by min (-17.7M),
+  -24.1M by median; callgrind of the statement 6,540 -> 6,509 a row. The malloc and the free are gone (0 and 2,945
+  calls at 200k rows), ~70 a row; the refill (take, clear, extend_from_slice, the old entry's drop still entering
+  recycle for an empty buffer) gives ~40 back. Prediction missed; kill line met; reverted (its btree test, which
+  passed with it, went with it).
+- Retry condition: only with a change that removes the per-append stack rebuild itself (a stack entry sharing the
+  rightmost-leaf cache's pointers, or a cursor that defers the rebuild until a read needs the stack), measured on
+  `bulk_insert_1M_one_txn`; not as a standalone buffer reuse.
+
 ## 2026-11-14 - WIN (CPU prediction missed by 20 ms): a window whose keys are numbers sorts them as packed (cells, row number) rows, which takes window_row_number below stock's CPU (bd-w4pr1.12, lever W1)
 
 - Target: the row-index sort in `execute_window_select` on the serial scorecard row
