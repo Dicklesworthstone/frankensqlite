@@ -87,6 +87,85 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: new WAL commit certificates carry an XXH3-128 frame digest as record version 5 (bd-w4pr1.7.2)
+
+- Target: every WAL commit and every open that authorizes a certificate (each frame a certificate
+  covers is hashed at commit and again by the next process that authorizes it). Measured on
+  `delete_14pct_300k`, `update_10pct_300k`, `txn_1000x10_rows`, `autocommit_5k_inserts` and
+  `multiproc_8x500`. Touched: `crates/fsqlite-wal/src/parallel_wal.rs` (record version 5,
+  `ParallelWalFramePayloadDigestAlgorithm`, the builder's BLAKE3 / XXH3 states, the record's
+  algorithm), `crates/fsqlite-wal/src/lib.rs`, `crates/fsqlite-wal/src/wal_fec_replay.rs`,
+  `crates/fsqlite-core/src/wal_adapter.rs` (suffix check accepts v4 and v5; the digest is
+  recomputed with the record's algorithm), `README.md` file table.
+- Ledger preflight: no earlier entry changed the digest algorithm; the 2026-11-12 bd-w4pr1.13.17
+  entry made BLAKE3 take whole 16 KiB blocks and recorded BLAKE3 as the remaining cost. The
+  2026-11-13 callgrind attribution of `delete_14pct_300k` (posted on bd-w4pr1.13.20 and
+  bd-w4pr1.7.1) put the BLAKE3 digest at 11.2k instructions per 4 KiB frame (25.4M over the commit's
+  2,260 frames), and the open's authorization of the setup process's 2,262 frames, frame reads
+  included, at 40.6M; the checkpoint's XXH3-128 of a 4,120-byte frame costs 2.84k on the same
+  baseline x86-64 build (SSE2 path).
+- Change: a new record is version 5; its digest is XXH3-128 (streaming `Xxh3Default`) over a
+  domain prefix and the same ordered field stream as v4 (ordinal, page, commit size, payload
+  length, payload), the 16-byte digest little-endian in the record's 32-byte field and 16 zero
+  bytes after it. A v4 record keeps decoding, and every verifier (open-time authorization, the
+  in-doubt reconciliation, WAL-FEC replay) recomputes with the decoded record's algorithm; v2/v3
+  stay legacy (absent). Envelope layout, commit-certificate payload and where the digest is
+  computed are unchanged; the record remembers its version, so a v4 record re-encodes to its v4
+  bytes.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries 390b9c97... (main 65003d294) and
+  db786817... (65003d294 plus this diff, diff sha 7b21c2e915ef12cc); answers equal stock's in every
+  row; stock `integrity_check` ok on all 10 candidate DML files:
+  - `sc_mut_probe`, minimum of 5, io_uring refused, load 3.0: `delete_14pct_300k` 506.0M ->
+    470.5M user instructions (-35.5M; 4.19x -> 3.90x stock 120.7M), CPU 119.9 -> 113.5 ms (stock
+    36.0); `update_10pct_300k` 847.3M -> 811.9M (-35.4M; 3.10x -> 2.97x stock 273.3M), CPU 145.0
+    -> 136.3 ms (stock 49.7). 4,522 frames hashed per DELETE run: -7.85k per frame.
+  - `txn_row_probe`, 5 reps, load 4.3: `txn_1000x10_rows` 693.8M -> 678.9M (-2.1%; 4.51x ->
+    4.41x stock 153.9M), CPU best 258.7 -> 241.1 ms (stock 33.0, A/A 1.21);
+    `autocommit_5k_inserts` 1,226.6M -> 1,161.5M (-5.3%, -13.0k per commit; 10.92x -> 10.34x
+    stock 112.3M), CPU best 652.9 -> 624.1 ms (stock 64.2, A/A 1.12).
+  - `mp_probe`, 5 reps, load 4.4: `multiproc_8x500` median 1,272.2M -> 1,149.2M (-9.7%; minimum
+    1,198.2M -> 1,116.3M), median CPU 1,202.2 -> 1,105.6 ms (stock 99.0M, 208.8 ms); 4,000 rows.
+  - Prediction (registered on the bead before code): DELETE and UPDATE -32M to -42M, autocommit
+    -5% to -7%, txn -2% to -4%, multiproc -5% to -12%; all five landed inside. Kills: DELETE
+    under 35M or autocommit under 4%. Autocommit cleared by 1.3 points; DELETE cleared by 0.5M,
+    which is narrow: the per-frame saving came in at 7.85k against the 8.2k estimate.
+- Compatibility, checked with both binaries (`x72_updown.py`, `x72_downgrade_copy.py`): a database
+  whose sidecar the old build wrote (202 v4 records) opens with the new build, which appends v5
+  records after them; answers equal stock's and stock `integrity_check` is ok. The old build
+  refuses a database whose sidecar holds v5 records: `WAL file is corrupt: parallel WAL
+  certificate newest record is invalid: unsupported durable certificate record version 5`. Stock
+  reads that database. A copy of it without `-wal-cert` and `-wal-cert-head` (WAL still holding
+  all 300 rows) opened in the old build with every row, and stock's `integrity_check` was ok
+  after the old build wrote to it.
+- Tests (`parallel_wal.rs`): the stream test now checks both algorithms against a reference
+  (BLAKE3 derive-key, and one-shot `xxh3_128` over prefix plus stream) for 91 size and count cases,
+  and fails a digest without the prefix, an XXH3-64 digest, and a moved frame boundary; v5 round
+  trip and authorization; a v4 record assembled field by field the way the old encoder wrote it
+  decodes as v4, re-encodes to the same bytes and authorizes; a flipped payload byte (three
+  positions), the other algorithm's digest, and a record relabeled to the other version with its
+  envelope checksum fixed up all fail to authorize, for both versions; only 4 and 5 are honored.
+- Gate (rch, 65003d294 plus the change): clippy -D warnings on fsqlite-wal, fsqlite-pager and
+  fsqlite-core `--all-targets` clean; fsqlite-wal lib 1,174 passed; fsqlite-wal integration with
+  fault-injection 55 and without 74; fsqlite-pager lib `wal` 102 and
+  `self_alloc_extension_not_conflict` 3; fsqlite-core lib 4,171 passed, 2 failed (the known
+  t6741 pair, red on main); fsqlite-core WAL/certificate keepers 14 + 214 + 70 (bd_ih8ak_*,
+  gh416, gh385, gh384, gh534, wal_cert_sidecar_compaction, wal_fec_commit_pipeline,
+  bulk_import_upsert_text_pk_phantom_pk, readonly_close_no_checkpoint_mutation and the rest of
+  the M6 list) and 8 DML oracle targets 27; fsqlite WAL keepers 16, plus
+  `async_drop_skips_detached_checkpoint` 1 with `async-api`.
+- Landed as d22b2577c (rebased onto 2cd267023; clippy -D warnings on the three crates reran clean
+  on the rebased tree; the upstream commits from 65003d294 to 2cd267023 touch none of the changed
+  files). README file table and CHANGELOG [Unreleased] updated in the same commit.
+- Per commit (callgrind of 2,000 autocommit INSERTs, the digest functions' inclusive counts; the
+  process totals are spin-loop artefacts): about 19.2k before (BLAKE3 update 16.6k, finalize 1.1k,
+  builder 1.5k), about 3.7k after (builder update 3.35k per frame at 1.01 frames per commit,
+  finalize 0.33k).
+- Retry condition: the digest is now about 3.35k per frame. A wider XXH3 loop (AVX2 chosen at run
+  time; the release build is baseline x86-64) is worth trying when the digest is above 3% of
+  `autocommit_5k_inserts` again (about 1.6% now). Moving the digest off the commit's critical
+  path is bd-w4pr1.7.1, which now has about 3.7k per autocommit to move, not 17.6k; its
+  re-measurement is on that bead.
+
 ## 2026-11-13 - WIN: the shell reads a one-line plain statement in one pass and asks the dot-command table only about '.' lines (bd-w4pr1.13.35, lever 2)
 
 - Target: every statement line the shell reads (the scorecard's text rows; measured on
