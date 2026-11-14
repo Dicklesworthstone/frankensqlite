@@ -87,6 +87,45 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: the parallel aggregate kernel keeps INTEGER columns as i64 from decode to comparison, sum and min/max (bd-w4pr1.13.11 kernel lever K2)
+
+- Target: the per-row cost of the parallel ungrouped-aggregate kernel on scan_filter_agg
+  (`SELECT count(*), sum(a) FROM t WHERE a > 500;`, 1M rows), where it was x1.15-1.27 stock CPU at
+  8 workers. Touched: `crates/fsqlite-vdbe/src/parallel_aggregate.rs` (`ColumnCell`, `RowScratch`,
+  `Row::cell` / `with_value` / `hold` / `decode`, `Row::eval`, the min/max arms of `scan_leaf`),
+  `crates/fsqlite-vdbe/src/engine.rs` (`SQLITE_AFF_MASK` / `SQLITE_AFF_TEXT` pub(crate)), the
+  oracle file.
+- Ledger preflight: K1 below (the copy cells alone, REJECTED at -12.5 Ir/row) names this as its
+  retry condition; the default-flip entry's kernel profile (evaluating `a > 500` ~269 Ir/row:
+  decode 163, Row::eval 47, compare_for_where 51).
+- Pre-registered on the bead (2026-11-14T10:46Z): -60 to -95 Ir/row at every worker count, CPU at
+  8 workers -4 to -8 ms, serial rows unchanged within 0.2%; kill below -30.
+- Change: K1's Copy cells (NULL / INTEGER / REAL / wide, TEXT and BLOB in a per-column slot), and
+  an INTEGER cell against an INTEGER literal compares the i64 directly when the comparison's
+  affinity is not TEXT (the case `fast_compare_same_storage_class` answers with `a.cmp(b)`; the
+  test is a per-row mask compare of `p5`, not decided once per predicate as the plan said); min
+  and max compare and store an INTEGER against an INTEGER best in place. Every other pair builds
+  the SqliteValue and calls compare_for_where / cmp_binary_in as before.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 930fd4dc423904a4 =
+  6ae747d6d, K2 88c0dbbbc7c2b1fc = 6ae747d6d + this diff, landed as cb70f9126; stock sqlite3 3.46.1 live in the same
+  par_probe run, reps 5; answers equal everywhere): scan_filter_agg at 8 workers 635.4M -> 572.4M
+  user instructions (-63.0 Ir/row), CPU 68.0 -> 63.6 ms (stock 53.6; x1.27 -> x1.19), wall 10.7 ->
+  9.1 ms (stock 53.6), 7 helper threads in both. Callgrind exact (2 workers) 635.05M -> 572.04M:
+  compare_for_where off the hot path (51 Ir/row -> 0), Row::eval 268.7 -> 226.7. Serial rows
+  unchanged: scan_filter_agg 1,234.9M, count_star 63.4M, group_by_1000_groups 3,334.0M user
+  instructions in both arms (the serial engine is not touched; their CPU medians moved by up to
+  +-15% with identical instruction counts, run-to-run noise on the busy host).
+- Gate: the oracle file (13 tests; the serial-type test gains the integer-against-TEXT-literal
+  cases `w = '600'`, `z > '5'`, `'5' < z`), the budget test, aggregate_edge_oracle,
+  bd_aggregate_null_and_groupconcat_oracle_probe, implicit_agg_bare_column_gh226_oracle,
+  bd_xmpma_aggregate_absorbing_where, the fsqlite count / min / max oracles, clippy.
+- Verdict: WIN as a self-speedup of the default-on parallel path (MAINTENANCE by the suite's
+  rules; the vs-stock ratio it moves is x1.27 -> x1.19 CPU and x0.20 -> x0.17 wall at 8 workers).
+  The decode itself is now the largest item: Row::cell 152.7 Ir/row on the filter path (call
+  frame and cache check ~43, a drop of decode_scalar_value's Option<SqliteValue> ~10).
+- Retry condition: none needed (kept). Extend to REAL cells (Float against a REAL literal) when a
+  scorecard row filters or aggregates a REAL column on the parallel path.
+
 ## 2026-11-14 - WIN: an autocommit write commit resets the parked VDBE engine in place instead of dropping it for a fresh one (bd-w4pr1.13.35 lever 6)
 
 - Target: the connection's parked VDBE engine across an autocommit write commit; measured on an
