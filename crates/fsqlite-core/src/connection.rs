@@ -39441,8 +39441,9 @@ impl Connection {
     /// (issue #70 discarded it here). Resetting it in place gives the next
     /// statement what a fresh engine would, without the drop and the
     /// rebuild: about 4k instructions per autocommit write statement
-    /// (bd-w4pr1.13.35). An explicit COMMIT still discards it, since the
-    /// next BEGIN's memdb reload discards the engine anyway.
+    /// (bd-w4pr1.13.35). An explicit COMMIT still discards it, at its start
+    /// and with its compilation caches; extending the reset there is that
+    /// bead's retry condition.
     fn reset_cached_vdbe_engine_for_next_transaction(&self) {
         if let Some(engine) = self.cached_vdbe_engine.borrow_mut().as_deref_mut() {
             engine.reset_for_next_transaction();
@@ -80277,7 +80278,27 @@ impl Connection {
         let committed_dropped_live_vtabs = self.take_committed_dropped_live_vtabs();
         self.txn_metrics_mark_finished();
         if committed_write && !self.pager.is_memory() {
-            self.sync_filebacked_post_commit_visibility_floor();
+            let committed_seq = self.sync_filebacked_post_commit_visibility_floor();
+            // As at the autocommit tail: when no other commit landed between
+            // this transaction's snapshot and its own commit, the mirror's
+            // schema and header metadata are what this transaction wrote and
+            // only the sequence lags. Advance it, so the next statement
+            // boundary (the next BEGIN) takes the clean-mirror fast path
+            // instead of beginning a whole read transaction to re-derive them
+            // (bd-w4pr1.7). DDL, mirrored rows, AUTOINCREMENT counters, live
+            // virtual tables and deferred mirror upserts keep that reload.
+            let mirror_seq = *self.memdb_visible_commit_seq.borrow();
+            if schema_cookie_to_publish.is_none()
+                && txn_begin_schema_generation == Some(self.schema_generation())
+                && !self.memdb_rows_loaded.get()
+                && self.pending_memdb_direct_upserts.borrow().is_empty()
+                && self.autoincrement_tables.borrow().is_empty()
+                && self.vtab_instances.borrow().is_empty()
+                && txn_begin_visible_commit_seq
+                    .is_some_and(|begin| begin == mirror_seq && begin.next() == committed_seq)
+            {
+                *self.memdb_visible_commit_seq.borrow_mut() = committed_seq;
+            }
         }
         if committed_write {
             self.arm_pending_local_live_vtab_preservation(
@@ -243761,6 +243782,94 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             assert_eq!(rows2.len(), 2, "stale detection must trigger memdb refresh");
+        });
+    }
+
+    /// bd-w4pr1.7 lever E: an explicit write COMMIT moves the mirror's
+    /// visibility to its own commit only when nothing else committed since the
+    /// transaction's snapshot and the transaction changed no schema, so the
+    /// next BEGIN's statement boundary begins no read transaction. A peer
+    /// commit inside the window, or DDL in the transaction, must leave the
+    /// mirror behind for the boundary reload, and every answer stays current.
+    #[test]
+    fn test_explicit_write_commit_advances_mirror_only_past_its_own_commit() {
+        async fn count_and_sum(conn: &Connection, table: &str) -> (i64, i64) {
+            let rows = conn
+                .query(&format!("SELECT count(*), coalesce(sum(v), 0) FROM {table};"))
+                .await
+                .unwrap();
+            match rows[0].values() {
+                [SqliteValue::Integer(count), SqliteValue::Integer(sum)] => (*count, *sum),
+                other => panic!("expected two integers, got {other:?}"),
+            }
+        }
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("explicit_commit_mirror.db");
+            let path_str = db_path.to_str().unwrap();
+            let conn = Connection::open(path_str).await.unwrap();
+            let peer = Connection::open(path_str).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);")
+                .await
+                .unwrap();
+            peer.execute("INSERT INTO p(v) VALUES (100);").await.unwrap();
+            let published = |c: &Connection| c.pager.published_snapshot().visible_commit_seq;
+            let mirror = |c: &Connection| *c.memdb_visible_commit_seq.borrow();
+
+            // Alone in its window: the mirror follows each commit, and the next
+            // transaction and reads still see every row.
+            for round in 1..=3_i64 {
+                conn.execute("BEGIN;").await.unwrap();
+                conn.execute(&format!("INSERT INTO t(v) VALUES ({round});"))
+                    .await
+                    .unwrap();
+                conn.execute(&format!("INSERT INTO t(v) VALUES ({});", round * 10))
+                    .await
+                    .unwrap();
+                conn.execute("COMMIT;").await.unwrap();
+                assert_eq!(
+                    mirror(&conn),
+                    published(&conn),
+                    "round {round}: a commit alone in its window must advance the mirror"
+                );
+            }
+            assert_eq!(count_and_sum(&conn, "t").await, (6, 66));
+
+            // A peer commits while the transaction is open: the mirror must stay
+            // behind, and the next statement reloads and sees the peer's row.
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO t(v) VALUES (1000);").await.unwrap();
+            peer.execute("INSERT INTO p(v) VALUES (200);").await.unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            assert!(
+                mirror(&conn) < published(&conn),
+                "a peer commit inside the window must keep the boundary reload: \
+                 mirror {:?}, published {:?}",
+                mirror(&conn),
+                published(&conn)
+            );
+            assert_eq!(count_and_sum(&conn, "p").await, (2, 300));
+            assert_eq!(count_and_sum(&conn, "t").await, (7, 1066));
+            assert_eq!(mirror(&conn), published(&conn));
+
+            // DDL inside the transaction keeps the boundary reload too.
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO u(v) VALUES (7);").await.unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            assert!(
+                mirror(&conn) < published(&conn),
+                "DDL in the transaction must keep the boundary reload: mirror {:?}, published {:?}",
+                mirror(&conn),
+                published(&conn)
+            );
+            assert_eq!(count_and_sum(&conn, "u").await, (1, 7));
+            assert_eq!(count_and_sum(&peer, "t").await, (7, 1066));
         });
     }
 
