@@ -211,15 +211,16 @@ fn in_twenty_grouped_count_uses_covering_index_input_and_original_slots() {
         1,
         "only the bind-time probe keys use a sorter"
     );
-    // One call into the row body, which all probe keys share, and one from
-    // it into the group accumulation.
+    // One call into the row body, which all probe keys share; the body jumps
+    // into the group accumulation, which returns to the probe loop
+    // (bd-2mrip).
     assert_eq!(
         program
             .ops()
             .iter()
             .filter(|op| op.opcode == Opcode::Gosub)
             .count(),
-        2,
+        1,
         "all probe keys share one compiled row body"
     );
 }

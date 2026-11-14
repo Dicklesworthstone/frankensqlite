@@ -25730,9 +25730,16 @@ fn codegen_select_group_by_aggregate(
     // non-grouped column values, with first_flag = 1 and the accumulators
     // Null. Set up before pass 1 when groups stream (pass 1 accumulates
     // them), after it otherwise.
+    // bd-2mrip: a streamed row's group keys stay in its sorter-slot registers
+    // (`keys_in_slots`), which the group accumulation reads as the current
+    // keys, so it allocates no current-key registers and copies none.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let alloc_group_state = |b: &mut ProgramBuilder| {
-        let cur_key_base = b.alloc_regs(num_group_keys as i32);
+    let alloc_group_state = |b: &mut ProgramBuilder, keys_in_slots: bool| {
+        let cur_key_base = if keys_in_slots {
+            0
+        } else {
+            b.alloc_regs(num_group_keys as i32)
+        };
         let prev_key_base = b.alloc_regs(num_group_keys as i32);
         let accum_base = b.alloc_regs(num_aggs as i32);
         let prev_nongrouped_base = b.alloc_regs(num_nongrouped.max(1) as i32);
@@ -25749,10 +25756,14 @@ fn codegen_select_group_by_aggregate(
             first_flag,
         )
     };
-    let streamed_group_state = streams_groups.then(|| alloc_group_state(b));
-    // Streaming calls the group accumulation once per row.
+    let streamed_group_state = streams_groups.then(|| alloc_group_state(b, true));
+    // Streaming runs the group accumulation once per row. Its rows come from
+    // an index driver that calls the row body as a subroutine, so the body
+    // jumps into the accumulation and the accumulation returns to the driver
+    // through the body's own return register: one call per row, not two.
     let group_row = b.emit_label();
-    let group_row_return = streams_groups.then(|| b.alloc_reg());
+    let group_row_return =
+        streams_groups.then(|| input_return.unwrap_or_else(|| b.alloc_reg()));
 
     // === Pass 1: Feed qualifying rows into the sorter, or to the groups ===
     let scan_start = b.current_addr();
@@ -25908,7 +25919,11 @@ fn codegen_select_group_by_aggregate(
 
     if let Some(return_reg) = group_row_return {
         // The row's values in `sorter_base` go straight to its group.
-        b.emit_jump_to_label(Opcode::Gosub, return_reg, 0, group_row, P4::None, 0);
+        if input_return == Some(return_reg) {
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, group_row, P4::None, 0);
+        } else {
+            b.emit_jump_to_label(Opcode::Gosub, return_reg, 0, group_row, P4::None, 0);
+        }
     } else {
         // MakeRecord + SorterInsert.
         let record_reg = b.alloc_reg();
@@ -26046,8 +26061,15 @@ fn codegen_select_group_by_aggregate(
     // slots from the registers it filled; what remains is the last group.
     let (cur_key_base, prev_key_base, accum_base, prev_nongrouped_base, first_flag) =
         match streamed_group_state {
-            Some(state) => state,
-            None => alloc_group_state(b),
+            // The keys are the first sorter slots (`keys_in_slots`).
+            Some((_, prev_key_base, accum_base, prev_nongrouped_base, first_flag)) => (
+                sorter_base,
+                prev_key_base,
+                accum_base,
+                prev_nongrouped_base,
+                first_flag,
+            ),
+            None => alloc_group_state(b, false),
         };
     let final_group = b.emit_label();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -26086,10 +26108,13 @@ fn codegen_select_group_by_aggregate(
         Some(sort_loop_body)
     };
 
-    // Read the row's group keys into cur_key registers.
+    // Read the row's group keys into cur_key registers (a streamed row's keys
+    // already are its first slots).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for i in 0..num_group_keys {
-        read_slot(b, i, cur_key_base + i as i32);
+    if !streams_groups {
+        for i in 0..num_group_keys {
+            read_slot(b, i, cur_key_base + i as i32);
+        }
     }
 
     // If first row, skip group-change comparison.
