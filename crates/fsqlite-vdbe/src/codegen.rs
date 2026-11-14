@@ -10182,10 +10182,23 @@ fn emit_leading_key_bound(
     );
 }
 
+/// The seek that starts an ordered index walk at its probe: at the first key at
+/// or past it (`SeekGE`, or `SeekLE` descending), or with `past_probe` at the
+/// first key past every key equal to it (`SeekGT`, `SeekLT`).
+const fn ordered_scan_seek_opcode(descending: bool, past_probe: bool) -> Opcode {
+    match (descending, past_probe) {
+        (false, false) => Opcode::SeekGE,
+        (false, true) => Opcode::SeekGT,
+        (true, false) => Opcode::SeekLE,
+        (true, true) => Opcode::SeekLT,
+    }
+}
+
 /// Leave an ordered index walk once key column `key_pos` passes the far bound
-/// in `far_reg`: `key > far` (inclusive) or `key >= far` ascending, `key < far`
-/// or `key <= far` descending. A NULL key or bound compares false, so the walk
-/// goes on and the residual filter decides.
+/// in `far_reg`, which the caller has checked is not NULL: `key > far`
+/// (inclusive) or `key >= far` ascending, `key < far` or `key <= far`
+/// descending. NULL keys sort first and match no bound, so a descending walk
+/// that reaches one is past every match. An ascending walk starts past them.
 fn emit_key_past_far_bound_exit(
     b: &mut ProgramBuilder,
     index_cursor: i32,
@@ -10199,6 +10212,9 @@ fn emit_key_past_far_bound_exit(
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let key_column = key_pos as i32;
     b.emit_op(Opcode::Column, index_cursor, key_column, key_reg, P4::None, 0);
+    if descending {
+        b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, done_label, P4::None, 0);
+    }
     let past = match (descending, inclusive) {
         (false, true) => Opcode::Gt,
         (false, false) => Opcode::Ge,
@@ -10321,8 +10337,15 @@ fn codegen_select_index_ordered_scan(
             }
         });
         let next_key_near = next_key_bounds.and_then(|(near, _)| near);
+        let next_key_far = next_key_bounds.and_then(|(_, far)| far);
+        // The block's NULL keys come first and match no bound, so an ascending
+        // walk bounded only above starts past them.
+        let skip_next_key_nulls =
+            !index_plan.descending && next_key_near.is_none() && next_key_far.is_some();
         let probe_field_count = prefix_len
-            + i32::from(rowid_start_bound.is_some() || next_key_near.is_some());
+            + i32::from(
+                rowid_start_bound.is_some() || next_key_near.is_some() || skip_next_key_nulls,
+            );
         let probe_key_regs = b.alloc_regs(probe_field_count);
         for (offset, expr) in equality_prefix_exprs
             .iter()
@@ -10370,17 +10393,21 @@ fn codegen_select_index_ordered_scan(
                 0,
             );
         }
+        // A NULL bound matches no row, so the walk ends before it starts.
         let next_key_affinity = key_column_affinity(index_plan.equality_prefix_len);
         if let Some(bound) = next_key_near {
-            emit_leading_key_bound(b, bound, next_key_affinity, probe_key_regs + prefix_len);
+            let reg = probe_key_regs + prefix_len;
+            emit_leading_key_bound(b, bound, next_key_affinity, reg);
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        } else if skip_next_key_nulls {
+            b.emit_op(Opcode::Null, 0, probe_key_regs + prefix_len, 0, P4::None, 0);
         }
-        let next_key_far = next_key_bounds
-            .and_then(|(_, far)| far)
-            .map(|bound| {
-                let reg = b.alloc_reg();
-                emit_leading_key_bound(b, bound, next_key_affinity, reg);
-                (reg, bound.inclusive)
-            });
+        let next_key_far = next_key_far.map(|bound| {
+            let reg = b.alloc_reg();
+            emit_leading_key_bound(b, bound, next_key_affinity, reg);
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+            (reg, bound.inclusive)
+        });
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
@@ -10390,12 +10417,12 @@ fn codegen_select_index_ordered_scan(
             P4::None,
             0,
         );
+        // Seek past the probe's keys when its last field is an exclusive near
+        // bound or the NULL before the block's first key.
+        let seek_past_probe =
+            skip_next_key_nulls || next_key_near.is_some_and(|bound| !bound.inclusive);
         b.emit_jump_to_label(
-            if index_plan.descending {
-                Opcode::SeekLE
-            } else {
-                Opcode::SeekGE
-            },
+            ordered_scan_seek_opcode(index_plan.descending, seek_past_probe),
             index_cursor,
             probe_record_reg,
             done_label,
@@ -10429,11 +10456,11 @@ fn codegen_select_index_ordered_scan(
         loop_start
     } else if let Some(KeyRange { lower, upper, .. }) = leading_key_bounds {
         // A range on the leading key with no equality prefix (`s > ? ORDER BY s
-        // LIMIT n`): seek the near bound instead of walking the index from its
-        // start, and leave once the key passes the far bound. Both bounds are
-        // applied inclusively here; the residual filter applies the exact
-        // predicate. Index NULLs sort first: an ascending seek skips them and a
-        // descending walk reaches them last, where the filter rejects them.
+        // LIMIT n`): seek past the near bound instead of walking the index from
+        // its start, and leave once the key passes the far bound; the residual
+        // filter still applies the whole WHERE. A NULL bound matches no row.
+        // Index NULLs sort first and match no bound: an ascending walk starts
+        // past them, and a descending one leaves when it reaches them.
         let key_affinity = key_column_affinity(0);
         let (near, far) = if index_plan.descending {
             (upper, lower)
@@ -10443,11 +10470,21 @@ fn codegen_select_index_ordered_scan(
         let far_reg = far.map(|bound| {
             let reg = b.alloc_reg();
             emit_leading_key_bound(b, bound, key_affinity, reg);
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
             (reg, bound.inclusive)
         });
-        if let Some(bound) = near {
-            let probe_reg = b.alloc_reg();
+        let probe_reg = b.alloc_reg();
+        let seek = if let Some(bound) = near {
             emit_leading_key_bound(b, bound, key_affinity, probe_reg);
+            b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, done_label, P4::None, 0);
+            Some(ordered_scan_seek_opcode(index_plan.descending, !bound.inclusive))
+        } else if !index_plan.descending {
+            b.emit_op(Opcode::Null, 0, probe_reg, 0, P4::None, 0);
+            Some(Opcode::SeekGT)
+        } else {
+            None
+        };
+        if let Some(seek) = seek {
             let probe_record_reg = b.alloc_reg();
             b.emit_op(
                 Opcode::MakeRecord,
@@ -10457,22 +10494,10 @@ fn codegen_select_index_ordered_scan(
                 P4::None,
                 0,
             );
-            b.emit_jump_to_label(
-                if index_plan.descending {
-                    Opcode::SeekLE
-                } else {
-                    Opcode::SeekGE
-                },
-                index_cursor,
-                probe_record_reg,
-                done_label,
-                P4::None,
-                0,
-            );
-        } else if index_plan.descending {
-            b.emit_jump_to_label(Opcode::Last, index_cursor, 0, done_label, P4::None, 0);
+            b.emit_jump_to_label(seek, index_cursor, probe_record_reg, done_label, P4::None, 0);
         } else {
-            b.emit_jump_to_label(Opcode::Rewind, index_cursor, 0, done_label, P4::None, 0);
+            // Descending with no upper bound.
+            b.emit_jump_to_label(Opcode::Last, index_cursor, 0, done_label, P4::None, 0);
         }
         let loop_start = b.current_addr();
         if let Some((far_reg, inclusive)) = far_reg {
