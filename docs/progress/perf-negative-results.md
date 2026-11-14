@@ -87,6 +87,62 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: an autocommit write commit resets the parked VDBE engine in place instead of dropping it for a fresh one (bd-w4pr1.13.35 lever 6)
+
+- Target: the connection's parked VDBE engine across an autocommit write commit; measured on an
+  autocommit literal INSERT, a prepared autocommit INSERT and `autocommit_5k_inserts`. Touched:
+  `crates/fsqlite-vdbe/src/engine.rs` (`VdbeEngine::reset_for_next_transaction`, the
+  `transaction_state_clear` flag) and `crates/fsqlite-core/src/connection.rs`
+  (`reset_cached_vdbe_engine_for_next_transaction`, the committed-write tail of
+  `resolve_autocommit_txn_with_dirty_table_and_capture_and_cx`).
+- Ledger preflight: no entry on this site. The 2026-07-10 NON-CANDIDATE on caching
+  `opcode_trace_enabled()` concerned the reuse path, where that read never runs; here it ran once
+  per autocommit write, inside every fresh engine.
+- Evidence before (callgrind, symbolized release-perf CLI, autocommit literal INSERT, about 181k Ir
+  per statement): `discard_cached_vdbe_engine` 2,485 (the engine's drop) and the next statement's
+  `VdbeEngine::new_with_execution_cx` 1,846, 418 of it in the opcode-trace env read.
+- Change: the committed-write tail resets the parked engine instead of dropping it. The reset is the
+  existing one without retained cursors or preserved runtime setup, plus the two caches only a fresh
+  engine starts without (`builtin_collations_overridden_cache`, `dirty_root_pages`). Both
+  executors bind a reused engine's runtime state from the connection before any run, so the next
+  statement sees what a fresh engine would bring. A flag, re-armed by every reuse reset, skips the
+  reset for an engine parked across commits that never use it.
+- Two findings on the way, both measured. First, without the flag the prepared direct-insert lane,
+  which parks an engine from setup statements and never runs it, paid a reset at every commit
+  (prepared autocommit INSERT mean +2.3k over three runs; the dropped engine's None had cost
+  nothing). Second, an explicit COMMIT's own discards were changed at first too. There the next
+  BEGIN's memdb reload (`reload_memdb_from_txn_with_mode`, once per explicit transaction) discards
+  the engine anyway, so the reset only added work: callgrind on `txn_1000x10_rows` showed the same
+  1,000 fresh engines plus 1.43M of resets. The landed change leaves the explicit COMMIT's discards
+  as they were.
+- Result (main 4c49baa46 against this commit; binaries fsqlite 1e400a20... / a74aa89f..., probe
+  ed071997... / f21985da...; stock sqlite3 3.46.1 live, answers equal):
+  - callgrind autocommit literal INSERT, three runs per arm: 180,559 / 179,908 / 180,958 ->
+    177,772 / 176,680 / 177,305 (-3.2k);
+  - prepared autocommit INSERT: 159,134 / 160,765 / 159,263 -> 158,541 / 158,809 / 159,435
+    (unchanged);
+  - in-transaction literal INSERT unchanged.
+  - perf stat user instructions, 15 reps interleaved, whose spread is now wide (about 920M to 990M
+    for the base): `autocommit_5k_inserts` min 920.4M -> 903.8M, p25 931.5M -> 917.0M, mean
+    946.9M -> 932.9M (stock 112.3M; 8.43x -> 8.30x). `txn_1000x10_rows` is unchanged (p25
+    578.5M -> 577.6M).
+  - The prediction was -2.0k to -3.5k per autocommit statement and -10M to -17M on the row, with a
+    kill line under 1.5k.
+- Gate (rch, this commit before its rebase onto 6ae747d6d): clippy -D warnings on fsqlite-vdbe
+  and fsqlite-core all targets; --lib of both 5425 passed, 3 failed. The three are red on main:
+  bd-nouem's two test_t6741 join tests and bd-bhalc's
+  test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion. 48 keeper targets
+  pass (565 tests): prepared reuse and cross-connection staleness (issue #70's
+  cache_staleness_cross_txn_regression among them), track_w_gate, AUTOINCREMENT, collation, time
+  travel, TEMP schema, savepoint / rollback atomicity, busy and concurrent writers, trigger / FK,
+  FTS5 / R-tree, and the fsqlite API batch. The unit test
+  `test_reset_for_next_transaction_leaves_what_a_fresh_engine_brings` checks the reset against a
+  fresh engine and that a reuse re-arms it.
+- Retry condition: the explicit-transaction half waits for the memdb reload at BEGIN. When an
+  explicit COMMIT stops leaving the memdb stale, as the autocommit tail already avoids by advancing
+  `memdb_visible_commit_seq`, extend the reset to `execute_commit_with_cx`'s discards and measure
+  `txn_1000x10_rows`.
+
 ## 2026-11-14 - WIN: a begin's refresh signature is the header its reader admission bound (bd-w4pr1.7, lever B)
 
 - Target: every implicit or explicit BEGIN on a file-backed WAL database (the scorecard's
