@@ -2698,6 +2698,13 @@ fn gh399_checkpoint_peer_reader_case(read_only: bool) {
             (1, 0),
             "TRUNCATE is busy with nothing checkpointed while an fsqlite peer pins a snapshot: {truncate:?}"
         );
+        // bd-s4lco: RESTART reports the same stock busy row, never an error.
+        let restart = gh399_checkpoint(&conn, "RESTART").await;
+        assert_eq!(
+            (restart[0], restart[2]),
+            (1, 0),
+            "RESTART is busy with nothing checkpointed while an fsqlite peer pins a snapshot: {restart:?}"
+        );
         assert_eq!(
             gh399_wal_generation(&wal_path),
             generation_v2,
