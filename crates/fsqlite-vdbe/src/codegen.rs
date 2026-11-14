@@ -21063,8 +21063,10 @@ fn aggregate_index_range_seek_target<'t, 'e>(
         return None;
     }
     let where_expr = where_clause?;
+    let whole_where_range = extract_column_range_target(where_clause, table, table_alias);
+    let has_residual_terms = whole_where_range.is_none();
     // Residual-free: the WHOLE WHERE is a range on one column.
-    if let Some((col_name, range)) = extract_column_range_target(where_clause, table, table_alias) {
+    if let Some((col_name, range)) = whole_where_range {
         // Search ALL indexes for a single-column ascending index on `col_name`. `index_for_column`
         // returns the FIRST leading-column match, which may be a COMPOSITE `(col, …)` index that
         // shadows a usable single-column one declared after it; filtering that result with `?` would
@@ -21084,14 +21086,30 @@ fn aggregate_index_range_seek_target<'t, 'e>(
                 .then_some((idx, range, false));
         }
     }
-    // Residual: a range on a single-column index plus other predicates. The `bounds_ok` check below
+    // Residual: a range on an index's leading key plus other predicates. The `bounds_ok` check below
     // requires LITERAL bounds, so the probe emits no placeholders and a `?` can appear only in the
     // residual, where the filter numbers it identically to the scan path (bd-agg-param-residual).
-    for index in &table.indexes {
-        if index.key_term_count() != 1
-            || index.key_term_descending(0)
-            || !index.supports_direct_column_lookup()
-        {
+    // bd-k96op: when the WHERE has terms beyond the range, an index whose keys and rowid hold
+    // every column it reads comes first, of any width (the walk then applies the residual from the
+    // index entry); otherwise a single-column index, whose walk looks each row up for the
+    // residual. A range-only WHERE keeps the single-column rule, leaving a composite index to
+    // the composite range walk.
+    let covers_where = |index: &IndexSchema| {
+        has_residual_terms
+            && expr_reads_only_index_columns(where_expr, table, table_alias, index, false)
+    };
+    let candidates = table
+        .indexes
+        .iter()
+        .filter(|index| covers_where(index))
+        .chain(
+            table
+                .indexes
+                .iter()
+                .filter(|index| index.key_term_count() == 1 && !covers_where(index)),
+        );
+    for index in candidates {
+        if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
             continue;
         }
         let col_name = &index.columns[0];
@@ -23121,10 +23139,17 @@ fn codegen_select_aggregate(
         // accumulators → COUNT=0 / SUM=NULL). No ORDER BY / LIMIT to satisfy here. When every aggregate
         // reads only the indexed column (or is COUNT(*)/SUM(rowid)) the walk is COVERING — the table
         // cursor is never opened and no `SeekRowid` is emitted (SQLite's "USING COVERING INDEX" plan).
-        // With a residual predicate the walk is a SUPERSET, so it is forced non-covering and the whole
-        // (placeholder-free) WHERE is re-applied per row.
+        // With a residual predicate the walk is a SUPERSET and the whole (placeholder-free) WHERE is
+        // re-applied per row: from the index entry when it reads only the index's columns and the rowid
+        // (bd-k96op), which keeps the walk covering; otherwise from the table row.
         let idx_cursor = 1_i32;
-        let covering = !has_residual && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
+        let residual_from_index = has_residual
+            && where_clause.is_some_and(|where_expr| {
+                expr_reads_only_index_columns(where_expr, table, table_alias, idx_schema, false)
+            });
+        let covering = (!has_residual || residual_from_index)
+            && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
+        let probe_fields = if idx_schema.key_term_count() == 1 { 2 } else { 1 };
         let bound_affinity = idx_schema
             .columns
             .first()
@@ -23148,7 +23173,11 @@ fn codegen_select_aggregate(
                 );
             }
             b.emit_jump_to_label(Opcode::IsNull, base, 0, finalize_label, P4::None, 0);
-            b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
+            // A single-column key's second field is the rowid; a wider index's is its next key
+            // column, whose NULLs would sort before `i64::MIN`, so its probe is the bound alone.
+            if probe_fields == 2 {
+                b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
+            }
             (base, bound.inclusive)
         });
         let upper_reg = index_range.upper.as_ref().map(|bound| {
@@ -23202,7 +23231,7 @@ fn codegen_select_aggregate(
             b.emit_op(
                 Opcode::MakeRecord,
                 *lower_reg,
-                2,
+                probe_fields,
                 probe_record_reg,
                 P4::None,
                 0,
@@ -23257,6 +23286,29 @@ fn codegen_select_aggregate(
             );
         }
 
+        // bd-k96op: a residual that reads only the index's columns and the rowid is applied from the
+        // entry, before any row is looked up.
+        let rowid_reg = (residual_from_index || !covering).then(|| {
+            let reg = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, reg, 0, P4::None, 0);
+            reg
+        });
+        if residual_from_index
+            && let (Some(where_expr), Some(rowid_reg)) = (where_clause, rowid_reg)
+        {
+            emit_index_entry_where_filter(
+                b,
+                where_expr,
+                idx_cursor,
+                rowid_reg,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                idx_schema,
+                skip_label,
+            );
+        }
         if covering {
             emit_aggregate_accumulate_body_covering(
                 b,
@@ -23266,9 +23318,7 @@ fn codegen_select_aggregate(
                 &agg_columns,
                 accum_base,
             );
-        } else {
-            let rowid_reg = b.alloc_reg();
-            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        } else if let Some(rowid_reg) = rowid_reg {
             b.emit_jump_to_label(
                 Opcode::SeekRowid,
                 cursor,
@@ -23278,7 +23328,10 @@ fn codegen_select_aggregate(
                 0,
             );
             // Residual: re-apply the whole (placeholder-free) WHERE; the range is a superset.
-            if has_residual && let Some(where_expr) = where_clause {
+            if has_residual
+                && !residual_from_index
+                && let Some(where_expr) = where_clause
+            {
                 emit_where_filter(
                     b,
                     where_expr,

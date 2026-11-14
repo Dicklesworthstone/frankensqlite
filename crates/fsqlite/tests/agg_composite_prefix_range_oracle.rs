@@ -259,3 +259,115 @@ fn agg_composite_pure_leading_range_matches_sqlite() {
         );
     });
 }
+
+/// The tables and indexes the program opens with `OpenRead`, by their P4 names.
+async fn index_opened(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .filter(|row| {
+            matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.as_str() == "OpenRead")
+        })
+        .filter_map(|row| match row.values().get(5) {
+            Some(SqliteValue::Text(p4)) => Some(p4.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// bd-k96op: an aggregate over a range on an index's leading key with a residual that a
+/// composite index holds (`a > 5 AND b = 3` over `idx_ab(a, b)`) walks that index, preferred over
+/// the single-column `idx_a`, and applies the residual from the entry: no row is looked up unless
+/// an aggregate reads a column the index lacks. A NULL second key at an inclusive lower bound is
+/// counted (the seek probe is the bound alone). A residual the index lacks (`c = 1`) keeps the
+/// single-column walk and its lookups. Answers match stock in memory and on a file database in
+/// strict mode.
+#[test]
+fn agg_leading_range_with_a_residual_the_index_holds_reads_only_the_index() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("agg_range_covered_residual.db");
+        for path in [":memory:", file.to_str().unwrap()] {
+            let f = Connection::open(path).await.expect("frank");
+            let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+            for stmt in [
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
+                "CREATE INDEX idx_a ON t(a);",
+                "CREATE INDEX idx_ab ON t(a, b);",
+            ] {
+                f.execute(stmt).await.unwrap();
+                r.execute_batch(stmt).unwrap();
+            }
+            for i in 1..=3000_i64 {
+                let a = if i % 47 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    format!("{}", i % 12)
+                };
+                let b = if i % 9 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    format!("{}", i % 25)
+                };
+                let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {});", i % 5);
+                f.execute(&stmt).await.unwrap();
+                r.execute_batch(&stmt).unwrap();
+            }
+            if path != ":memory:" {
+                f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+                    .await
+                    .unwrap();
+            }
+            let covered = [
+                "SELECT COUNT(*) FROM t WHERE a > 5 AND b = 3",
+                "SELECT COUNT(*) FROM t WHERE a >= 5 AND b IS NULL",
+                "SELECT COUNT(*) FROM t WHERE a BETWEEN 2 AND 8 AND b < 10",
+                "SELECT SUM(b) FROM t WHERE a < 5 AND b > 3",
+                "SELECT MIN(b), MAX(b) FROM t WHERE a > 3 AND b <> 7",
+                "SELECT COUNT(*) FROM t WHERE a > 5 AND (b = 1 OR b = 2)",
+                "SELECT COUNT(*) FROM t WHERE a > 100 AND b = 1",
+            ];
+            for sql in covered {
+                assert_eq!(
+                    frank_rows(&f, sql).await,
+                    sqlite_rows(&r, sql),
+                    "diverged: `{sql}` at {path}"
+                );
+                assert_eq!(
+                    index_opened(&f, sql).await,
+                    ["idx_ab"],
+                    "`{sql}` must read only idx_ab at {path}"
+                );
+                assert!(
+                    !has_op(&f, sql, "SeekRowid").await,
+                    "`{sql}` must not look rows up at {path}"
+                );
+            }
+            // The residual still comes from the entry; the uncovered aggregate reads the row.
+            let sum_c = "SELECT SUM(c) FROM t WHERE a > 5 AND b = 3";
+            assert_eq!(
+                frank_rows(&f, sum_c).await,
+                sqlite_rows(&r, sum_c),
+                "{path}"
+            );
+            assert!(
+                index_opened(&f, sum_c).await.contains(&"idx_ab".to_owned())
+                    && has_op(&f, sum_c, "SeekRowid").await,
+                "`{sum_c}` filters on idx_ab and reads c from the row at {path}"
+            );
+            // A residual the index lacks keeps the single-column walk and its lookups.
+            let uncovered = "SELECT COUNT(*) FROM t WHERE a > 5 AND c = 1";
+            assert_eq!(
+                frank_rows(&f, uncovered).await,
+                sqlite_rows(&r, uncovered),
+                "{path}"
+            );
+            assert!(
+                has_op(&f, uncovered, "SeekRowid").await,
+                "`{uncovered}` must read c from the row at {path}"
+            );
+            f.close().await.unwrap();
+        }
+    });
+}
