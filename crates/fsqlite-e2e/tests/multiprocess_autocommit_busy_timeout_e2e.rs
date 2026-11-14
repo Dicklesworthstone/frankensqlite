@@ -68,7 +68,7 @@ fn seed(db: &Path, backend: &str, workers: usize) {
             .map(|worker| {
                 format!(
                     "CREATE TABLE t{worker}(id INTEGER PRIMARY KEY, worker INTEGER NOT NULL, \
-                     seq INTEGER NOT NULL);"
+                     seq INTEGER NOT NULL, pad TEXT NOT NULL);"
                 )
             })
             .collect();
@@ -247,10 +247,15 @@ fn insert_sql(worker: usize, seq: usize) -> String {
     format!("INSERT INTO t(worker, seq) VALUES ({worker}, {seq})")
 }
 
-/// The explicit shapes' INSERT: into `t`, or into the writer's own table.
+/// The explicit shapes' INSERT: into `t`, or into the writer's own table. An
+/// own-table row carries a 200-byte pad, so each table spans many pages and the
+/// writers keep growing the file while others commit into existing pages.
 fn explicit_insert_sql(backend: &str, worker: usize, seq: usize) -> String {
     if own_tables(backend) {
-        format!("INSERT INTO t{worker}(worker, seq) VALUES ({worker}, {seq})")
+        format!(
+            "INSERT INTO t{worker}(worker, seq, pad) VALUES ({worker}, {seq}, '{}')",
+            "p".repeat(200)
+        )
     } else {
         insert_sql(worker, seq)
     }
@@ -533,6 +538,73 @@ fn cross_process_explicit_writers_on_one_table_lose_only_refused_transactions() 
         !refused.is_empty(),
         "non-vacuity: {workers} writers on one leaf page produced no COMMIT refusal, so this \
          run did not exercise the refused-COMMIT path"
+    );
+}
+
+/// bd-reality-check-1022-llk6g.5.2: processes running explicit transactions on
+/// their OWN tables, CLI-style. A commit that does not grow the file, flushing
+/// after a peer published growth between its prep and its append gate, was
+/// refused "snapshot conflict on pages: 1" by the bd-vnxjd db_size floor gate
+/// (130 per 6 x 2400 transactions once .5.1 ended refused transactions). It now
+/// certifies the durable floor. Two writers growing in the same window still
+/// alias their EOF pages and the second is refused
+/// (bd-reality-check-1022-llk6g.5.3), which with .5.1 costs exactly its own
+/// row. Non-vacuity: the pager traces each floor certification under
+/// `DW8OE_TRACE`, and the run must have made at least one.
+#[test]
+fn cross_process_explicit_writers_on_own_tables_certify_the_durable_floor() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    let (workers, rows) = (8, 300);
+    let stock = run_shape("stock-explicit-own", workers, rows, 5000);
+    assert_all_committed("8x300 own-table stock oracle", &stock, workers * rows);
+    assert!(stock.errors.is_empty(), "stock: {:?}", stock.errors);
+    assert_eq!(
+        stock.durable_rows, stock.committed_rows,
+        "stock: durable rows"
+    );
+
+    let frank = run_shape("fsqlite-explicit-own", workers, rows, 5000);
+    assert_eq!(
+        frank.integrity, "ok",
+        "fsqlite-explicit-own: integrity_check"
+    );
+    assert_eq!(
+        frank.durable_rows, frank.committed_rows,
+        "fsqlite-explicit-own: the durable rows are exactly the transactions whose COMMIT succeeded"
+    );
+    let floor_refusals: Vec<&String> = frank
+        .errors
+        .iter()
+        .filter(|error| error.contains("(snapshot conflict on pages: 1)"))
+        .collect();
+    assert!(
+        floor_refusals.is_empty(),
+        "fsqlite-explicit-own: {} commits refused on the db_size floor; a non-growing commit must \
+         certify the durable floor instead: {:?}",
+        floor_refusals.len(),
+        floor_refusals.iter().take(5).collect::<Vec<_>>()
+    );
+    let (refused, other): (Vec<&String>, Vec<&String>) = frank
+        .errors
+        .iter()
+        .partition(|error| error.starts_with(REFUSED_COMMIT_ENDED));
+    assert!(
+        other.is_empty(),
+        "fsqlite-explicit-own: the only error may be a BusySnapshot COMMIT refusal that ended its \
+         transaction; got {:?}",
+        other.iter().take(5).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        frank.committed + refused.len(),
+        workers * rows,
+        "fsqlite-explicit-own: each refused transaction costs exactly its own row"
+    );
+    assert!(
+        frank.floor_certified > 0,
+        "non-vacuity: no commit certified the durable floor, so this run did not reach the \
+         prep-to-gate race the fix covers"
     );
 }
 

@@ -12403,6 +12403,22 @@ fn flatten_group_commit_batches<'a>(
     (frame_refs, final_db_size)
 }
 
+/// The payload digest a group commit's certificate carries over its flattened
+/// frames, commit db_size included.
+fn group_commit_frame_payload_digest(frame_refs: &[traits::WalFrameRef<'_>]) -> Result<[u8; 32]> {
+    let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+    for frame in frame_refs {
+        let page_number = PageNumber::new(frame.page_number).ok_or_else(|| {
+            FrankenError::internal(format!(
+                "group commit contains invalid WAL page number {}",
+                frame.page_number
+            ))
+        })?;
+        digest.update(page_number, frame.db_size_if_commit, frame.page_data);
+    }
+    Ok(digest.finalize())
+}
+
 fn group_commit_batch_frame_refs(batch: &TransactionFrameBatch) -> Vec<traits::WalFrameRef<'_>> {
     batch
         .frames
@@ -25302,23 +25318,13 @@ where
                     }
                 }
                 let batches: Arc<[TransactionFrameBatch]> = Arc::from(batches);
-                let (frame_refs, final_db_size) =
+                // Mutable only for the bd-vnxjd floor certification under the
+                // append gate, which rebuilds all three from `batches`.
+                let (mut frame_refs, mut final_db_size) =
                     flatten_group_commit_batches(flush_base_db_size, &batches);
                 debug_assert_eq!(final_db_size, consolidated_db_size);
                 let frame_count = frame_refs.len();
-                let wal_frame_payload_digest = {
-                    let mut digest = ParallelWalFramePayloadDigestBuilder::new();
-                    for frame in &frame_refs {
-                        let page_number = PageNumber::new(frame.page_number).ok_or_else(|| {
-                            FrankenError::internal(format!(
-                                "group commit contains invalid WAL page number {}",
-                                frame.page_number
-                            ))
-                        })?;
-                        digest.update(page_number, frame.db_size_if_commit, frame.page_data);
-                    }
-                    digest.finalize()
-                };
+                let mut wal_frame_payload_digest = group_commit_frame_payload_digest(&frame_refs)?;
                 let mut fallback_reason = if matches!(
                     parallel_wal_control.mode,
                     ParallelWalOperatingMode::Conservative
@@ -25790,21 +25796,78 @@ where
                                 // flush's prep-time floor read and this append
                                 // gate; certifying a smaller db_size would let
                                 // the checkpoint truncate that committed
-                                // growth away. Fail closed pre-durability —
-                                // the statement retry re-preps against the
-                                // fresh durable floor.
+                                // growth away.
+                                //
+                                // bd-reality-check-1022-llk6g.5.2: that is a
+                                // prep-to-gate race, not a stale snapshot. The
+                                // anti-alias gate above refused every frame in
+                                // (flush_snapshot_db_size, floor], and every
+                                // frame is <= final_db_size < floor, so this
+                                // group writes only pages that existed at its
+                                // snapshot and peers own every page in
+                                // (final_db_size, floor]. Certify the floor, as
+                                // the prep would have had it read the floor
+                                // here: rebuild the frame refs, the payload
+                                // digest and any prepared batch from
+                                // `batches`. The commit db_size rides in the
+                                // commit frame and its checksum chain, so
+                                // nothing prepared is patched in place. A
+                                // page-1 frame carries header db_size and
+                                // freelist bytes the prep promoted, so a group
+                                // with one still fails closed.
                                 if let Some(durable_db_size_floor) = durable_db_size_floor
                                     && durable_db_size_floor > final_db_size
                                 {
-                                    tracing::warn!(
+                                    let carries_page_one = batches
+                                        .iter()
+                                        .flat_map(|batch| batch.frames.iter())
+                                        .any(|frame| frame.page_number == 1);
+                                    if carries_page_one {
+                                        tracing::warn!(
+                                            target: "fsqlite.pager.commit",
+                                            certified_db_size = final_db_size,
+                                            durable_db_size = durable_db_size_floor,
+                                            "commit refused: batch rewrites page 1 and would regress durable db_size (bd-vnxjd)"
+                                        );
+                                        return Err(FrankenError::BusySnapshot {
+                                            conflicting_pages: "1".to_owned(),
+                                        });
+                                    }
+                                    let (rebuilt_frame_refs, rebuilt_db_size) =
+                                        flatten_group_commit_batches(
+                                            durable_db_size_floor,
+                                            &batches,
+                                        );
+                                    debug_assert_eq!(rebuilt_db_size, durable_db_size_floor);
+                                    wal_frame_payload_digest =
+                                        group_commit_frame_payload_digest(&rebuilt_frame_refs)?;
+                                    if prepared_batch.is_some() {
+                                        // The raw-fallback preparation, run
+                                        // under the gate.
+                                        let mut prepared =
+                                            wal.prepare_append_frames(&rebuilt_frame_refs)?;
+                                        if let Some(prepared) = prepared.as_mut() {
+                                            wal.finalize_prepared_frames(cx, prepared)?;
+                                        }
+                                        prepared_batch = prepared;
+                                        fallback_reason = Some(
+                                            ParallelWalFallbackReason::ControllerEvidenceLost,
+                                        );
+                                    }
+                                    tracing::debug!(
                                         target: "fsqlite.pager.commit",
-                                        certified_db_size = final_db_size,
-                                        durable_db_size = durable_db_size_floor,
-                                        "commit refused: batch would regress durable db_size (bd-vnxjd)"
+                                        prepared_db_size = final_db_size,
+                                        certified_db_size = rebuilt_db_size,
+                                        "non-growing group certified the durable db_size floor a peer published after its prep (bd-vnxjd)"
                                     );
-                                    return Err(FrankenError::BusySnapshot {
-                                        conflicting_pages: "1".to_owned(),
-                                    });
+                                    if dw8oe_trace_enabled() {
+                                        eprintln!(
+                                            "VNXJD FLOOR-CERTIFIED prepared={final_db_size} certified={rebuilt_db_size} frames={}",
+                                            rebuilt_frame_refs.len()
+                                        );
+                                    }
+                                    frame_refs = rebuilt_frame_refs;
+                                    final_db_size = rebuilt_db_size;
                                 }
                                 frames_written_start = u64::try_from(wal.frame_count())
                                     .unwrap_or(u64::MAX)
