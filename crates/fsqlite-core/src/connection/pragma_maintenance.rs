@@ -287,7 +287,10 @@ impl Connection {
         if self.wal_checkpoint_blocked_by_active_concurrent_txns() {
             let log_frames =
                 i64::try_from(self.pager.wal_frame_count(&cx).await).unwrap_or(i64::MAX);
-            return Ok([1, log_frames, 0]);
+            // bd-s4lco: an open transaction pins frames the way a stock
+            // reader does. A PASSIVE checkpoint stopped by readers is not
+            // busy in stock (`0|log|done`); FULL, RESTART and TRUNCATE are.
+            return Ok([i64::from(mode != CheckpointMode::Passive), log_frames, 0]);
         }
 
         self.invalidate_cached_write_txn(&cx).await;
