@@ -377,3 +377,110 @@ fn join_limit_stops_after_its_last_row() {
         }
     });
 }
+
+/// ORDER BY + LIMIT on a lookup join runs in the VDBE: the join's rows are
+/// sorted, then the LIMIT/OFFSET applies (it cost 1.5G instructions in the
+/// materializing executor for `t JOIN p ON p.tid = t.id WHERE t.a = 5 ORDER BY
+/// t.id LIMIT 5`, against 8M here). Every ORDER BY is a total order, so stock's
+/// rows are the only answer. A nested-loop join and a statement the GH#386
+/// keyset lane may take keep the materializing executor; their rows must still
+/// match.
+const ORDERED_SHAPES: &[&str] = &[
+    "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g ORDER BY t.id DESC",
+    "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g ORDER BY k.label, t.id",
+    "SELECT t.id, u.w FROM t LEFT JOIN u ON u.tid = t.id ORDER BY t.id DESC, u.id",
+    "SELECT t.id, u.w FROM t JOIN u ON u.tid = t.id ORDER BY u.w",
+    "SELECT t.id, p.note FROM t JOIN p ON p.code = t.v ORDER BY p.note DESC, t.id",
+    "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g WHERE t.n > 1 AND k.label <> 'k3' \
+     ORDER BY t.n, t.id DESC",
+    "SELECT a.id AS x, b.label FROM t AS a LEFT JOIN k AS b ON b.g = a.g WHERE a.n <> 2 \
+     ORDER BY x DESC",
+    "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g ORDER BY 1 DESC",
+    "SELECT t.id, k.label FROM t, k WHERE t.g = k.g ORDER BY t.id DESC",
+    // No index on q.x: the VDBE builds an automatic one and looks it up.
+    "SELECT t.id, q.y FROM t JOIN q ON q.x = t.n ORDER BY t.id, q.y",
+    // No lookup at all: keeps the materializing executor.
+    "SELECT t.id, q.y FROM t JOIN q ON q.x < t.n ORDER BY t.id, q.y",
+    // A GH#386 keyset candidate: keeps the materializing executor.
+    "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g WHERE t.id > 10 ORDER BY t.id",
+];
+
+#[test]
+fn join_order_by_limit_matches_stock_in_order() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        let mut statements = 0usize;
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            for shape in ORDERED_SHAPES {
+                for limit in LIMITS {
+                    let sql = format!("{shape} {limit}");
+                    statements += 1;
+                    let fr = f
+                        .query(&sql)
+                        .await
+                        .map(|rows| tag_rows(&rows))
+                        .map_err(|e| e.to_string());
+                    let rr = rq(&r, &sql, &[]);
+                    if fr != rr {
+                        diffs.push(format!(
+                            "  [file={file_backed}] `{sql}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                        ));
+                    }
+                }
+            }
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} of {statements} statement(s) diverge from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
+
+/// Strict parity-cert mode refuses the materializing executor, so a lookup
+/// join with ORDER BY + LIMIT must now run in the VDBE, while a join with no
+/// lookup and a GH#386 keyset candidate (both still the executor's) are
+/// refused: the check tells the routes apart. In memory, because a file
+/// database may run the executor's join on the real backend without asking
+/// strict mode.
+#[test]
+fn join_order_by_limit_runs_in_the_vdbe() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let (f, _r) = open_pair(false, &dir).await;
+        f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .await
+            .unwrap();
+        for sql in [
+            "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g ORDER BY t.id DESC LIMIT 3",
+            "SELECT t.id, u.w FROM t LEFT JOIN u ON u.tid = t.id ORDER BY t.id DESC, u.id \
+             LIMIT 3 OFFSET 4",
+            "SELECT t.id, k.label FROM t, k WHERE t.g = k.g ORDER BY t.id DESC LIMIT 2",
+            "SELECT t.id, q.y FROM t JOIN q ON q.x = t.n ORDER BY t.id, q.y LIMIT 3",
+        ] {
+            let rows = f.query(sql).await;
+            assert!(
+                rows.is_ok(),
+                "`{sql}` must run in the VDBE: {:?}",
+                rows.err()
+            );
+        }
+        for sql in [
+            "SELECT t.id, q.y FROM t JOIN q ON q.x < t.n ORDER BY t.id, q.y LIMIT 3",
+            "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g WHERE t.id > 10 ORDER BY t.id \
+             LIMIT 3",
+        ] {
+            assert!(
+                f.query(sql).await.is_err(),
+                "`{sql}` keeps the materializing executor, which strict mode refuses"
+            );
+        }
+        f.close().await.unwrap();
+    });
+}

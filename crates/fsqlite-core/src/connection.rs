@@ -114652,15 +114652,22 @@ fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
     select.limit.is_none() && select_join_shape_is_vdbe_eligible(select)
 }
 
-/// bd-9gl3w: a join with a LIMIT and no ORDER BY that the VDBE can stop early.
+/// bd-9gl3w: a join with a LIMIT that the VDBE runs.
 ///
 /// The join codegen compiles LIMIT/OFFSET where it emits each row, so a
 /// lookup join (a rowid or index seek per outer row) ends after its last row.
 /// A nested-loop join would rescan the inner table per outer row until then,
 /// so it keeps the materializing executor, which hashes the inner table once.
-/// ORDER BY + LIMIT keeps that executor and its GH#386 keyset lane too.
+///
+/// With an ORDER BY the LIMIT is applied to the sorted rows, so nothing stops
+/// early, but a lookup join is still cheaper than the materializing executor,
+/// which builds every joined row before sorting: `t JOIN p ON p.tid = t.id
+/// WHERE t.a = 5 ORDER BY t.id LIMIT 5` cost 1.5G instructions there against
+/// 8M for the same join with no LIMIT here. A statement that may take the
+/// executor's GH#386 keyset lane once its parameters are bound, which does
+/// stop early, keeps the executor.
 fn select_limited_join_is_vdbe_eligible(select: &SelectStatement, schema: &[TableSchema]) -> bool {
-    select.order_by.is_empty()
+    (select.order_by.is_empty() || !join_keyset_limit_pushdown_candidate(select))
         && select.limit.as_ref().is_some_and(|clause| {
             !expr_has_any_subquery(&clause.limit)
                 && clause
@@ -114676,19 +114683,56 @@ fn select_join_shape_is_vdbe_eligible(select: &SelectStatement) -> bool {
     select_join_shape_is_vdbe_eligible_as(select, false)
 }
 
+/// Whether a join's ORDER BY + LIMIT may take the GH#386 keyset lane of the
+/// materializing executor ([`join_keyset_limit_pushdown_shape`]) once its
+/// parameters are bound: one ascending column ORDER BY with no NULLS order, a
+/// literal or parameter LIMIT with no OFFSET, and a WHERE that is a single
+/// comparison. A superset of the lane's shape, so no statement that could
+/// stream there is moved to the VDBE.
+fn join_keyset_limit_pushdown_candidate(select: &SelectStatement) -> bool {
+    let Some(limit) = select.limit.as_ref() else {
+        return false;
+    };
+    let [order_term] = select.order_by.as_slice() else {
+        return false;
+    };
+    let SelectCore::Select {
+        where_clause: Some(where_clause),
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    limit.offset.is_none()
+        && matches!(
+            limit.limit,
+            Expr::Literal(Literal::Integer(_), _) | Expr::Placeholder(..)
+        )
+        && order_term.direction != Some(SortDirection::Desc)
+        && order_term.nulls.is_none()
+        && matches!(order_term.expr, Expr::Column(..))
+        && matches!(
+            where_clause.as_ref(),
+            Expr::BinaryOp {
+                op: BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Lt | BinaryOp::Le,
+                ..
+            }
+        )
+}
+
 /// bd-w4pr1.13.16: a two-table inner or cross join written without a
 /// constraint (`FROM t, u WHERE u.a = t.a`, `t CROSS JOIN u WHERE ...`) whose
 /// WHERE clause gives the VDBE join codegen a lookup into the second table.
 /// The WHERE is then the join condition of the same lookup loop an ON clause
 /// gets. Without a lookup the join keeps the materializing executor, which
 /// hashes the inner table once where a nested loop would rescan it. A LIMIT
-/// is taken as for an ON join (bd-9gl3w): only without ORDER BY.
+/// is taken as for an ON join (bd-9gl3w).
 fn select_where_joined_lookup_is_vdbe_eligible(
     select: &SelectStatement,
     schema: &[TableSchema],
 ) -> bool {
     select.limit.as_ref().is_none_or(|clause| {
-        select.order_by.is_empty()
+        (select.order_by.is_empty() || !join_keyset_limit_pushdown_candidate(select))
             && !expr_has_any_subquery(&clause.limit)
             && clause
                 .offset
@@ -313415,9 +313459,30 @@ mod join_keyset_stream_tests {
                     stock_rows(&stock, Q2_PARAMS, rusqlite::params![500, 20])
                 );
                 let visited = visited_outer() - visited_before;
+                // bd-9gl3w: a join with ORDER BY + LIMIT that the lane cannot
+                // take now runs in the VDBE, outside the generic route. Check
+                // that, then run the generic route on the same statement as its
+                // dispatch does (LIMIT applied to the joined, sorted rows), so
+                // the contrast below still measures it.
+                let generic_sql = q2_generic(500, 20);
+                let vdbe = conn.query(&generic_sql).await.unwrap();
+                assert_eq!(
+                    conn.join_materialization_profile.borrow().generic_route_hits,
+                    0
+                );
+                assert_eq!(values_of(&vdbe), values_of(&fast));
+                let super::Statement::Select(mut generic_select) =
+                    super::parse_single_statement(generic_sql.trim_end_matches(';')).unwrap()
+                else {
+                    panic!("expected SELECT");
+                };
+                let generic_limit = generic_select.limit.take().expect("Q2 has a LIMIT");
+                conn.join_materialization_profile.replace(Default::default());
                 let rss = RssSampler::start();
                 let started = std::time::Instant::now();
-                let generic = conn.query(&q2_generic(500, 20)).await.unwrap();
+                let mut generic = conn.execute_join_select(&generic_select, None).await.unwrap();
+                conn.apply_limit_clause(&mut generic, &generic_limit, None)
+                    .unwrap();
                 let generic_elapsed = started.elapsed();
                 let generic_rss = rss.finish();
                 let generic_profile = *conn.join_materialization_profile.borrow();
