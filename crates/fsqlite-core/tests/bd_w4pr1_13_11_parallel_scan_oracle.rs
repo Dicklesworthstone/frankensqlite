@@ -569,6 +569,47 @@ fn parallel_aggregates_follow_sqlite_type_and_comparison_rules() {
 }
 
 #[test]
+fn parallel_aggregates_read_every_serial_type_as_the_column_opcode_does() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (f, r) = file_pair(&dir, "serial_types.db").await;
+        // The integers 0 and 1 are stored as serial types 8 and 9, with no
+        // body bytes; `w` (no affinity) also holds 600, the REAL 600.0, the
+        // TEXT '600', 500.5, a BLOB, NULL and integers up to 6 bytes; `z` is
+        // INTEGER with 0, 1, negatives and 6-byte values; `x` is REAL, whose
+        // integral values are stored as integers and read back as REALs. A
+        // cell decoded as the wrong storage class changes one of these answers.
+        both(&f, &r, "CREATE TABLE k(id INTEGER PRIMARY KEY, w, z INTEGER, x REAL);").await;
+        both(
+            &f,
+            &r,
+            "WITH RECURSIVE q(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM q WHERE i < 30000) \
+             INSERT INTO k SELECT i, \
+               CASE i % 9 WHEN 0 THEN 0 WHEN 1 THEN 1 WHEN 2 THEN 600 WHEN 3 THEN 600.0 \
+                 WHEN 4 THEN '600' WHEN 5 THEN 500.5 WHEN 6 THEN x'01' WHEN 7 THEN NULL \
+                 ELSE i * 100003 END, \
+               CASE i % 4 WHEN 0 THEN 0 WHEN 1 THEN 1 WHEN 2 THEN -i ELSE i * 4294967311 END, \
+               CASE i % 3 WHEN 0 THEN 0 WHEN 1 THEN 1 ELSE i END \
+             FROM q;",
+        )
+        .await;
+        for sql in [
+            "SELECT count(*), count(w), min(w), max(w) FROM k;",
+            "SELECT count(*), min(w), max(w) FROM k WHERE w > 500;",
+            "SELECT count(*), min(w), max(w) FROM k WHERE w = 600;",
+            "SELECT count(*), count(w) FROM k WHERE w = 1 OR w = 0;",
+            "SELECT count(*), sum(z), min(z), max(z) FROM k;",
+            "SELECT sum(z), count(z) FROM k WHERE z < 2;",
+            "SELECT count(*), min(x), max(x) FROM k WHERE x <= 1;",
+            "SELECT count(*), sum(id) FROM k WHERE z IS NOT NULL AND w IS NULL;",
+        ] {
+            let threads = same_at_every_worker_count(&f, &r, sql).await;
+            assert!(took_parallel_path(threads), "`{sql}` did not run in parallel: {threads:?}");
+        }
+    });
+}
+
+#[test]
 fn parallel_sum_raises_integer_overflow_exactly_when_the_serial_sum_does() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
