@@ -87,6 +87,56 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - REJECTED on its kill line: a concurrent BEGIN reloads a stale memdb mirror inside its own pager transaction (bd-w4pr1.7, lever F)
+
+- Target: explicit transactions with peer writers committing (8 or 4 processes on separate tables,
+  BEGIN; one INSERT; COMMIT; the concurrency lane's shape on bd-i0tn6). Touched, not kept:
+  `crates/fsqlite-core/src/connection.rs`. The changes were:
+  - a new `concurrent_begin_reloads_mirror_in_its_own_txn`;
+  - the dispatcher's boundary refresh skips the mirror reload for a concurrent BEGIN;
+  - `execute_begin`'s prebound step only binds the publication;
+  - `refresh_concurrent_begin_from_open_txn` gains a `mirror_reload_deferred` parameter. With it,
+    the reload takes the dirty-mirror schema-only path and publishes the committed schema cookie.
+    The snapshot's schema epoch is re-keyed when the reload changed the cookie;
+  - a new test, `test_concurrent_begin_after_peer_commit_reloads_mirror_in_its_own_txn`.
+- Ledger preflight: lever E (the entry below) removed the own-commit case of the same boundary
+  reload. Nothing earlier on the peer case.
+- Evidence before (exact, 4 writers each under callgrind, 200 transactions each, lever E binary):
+  at 144-183 of 200 BEGINs per contended writer, the boundary refresh began a separate read
+  transaction to reload the mirror. That cost 71.9k: the publication bind with its full refresh
+  after the peers' commits 30.2k, the read transaction's begin 23.6k, its drop 11.3k, and the
+  reload 5.8k. execute_begin's prebound refresh did the same another 20-31 times per writer.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries 71f9e8a9... (96821c8bf) and
+  3def2450... (96821c8bf plus the change):
+  - Exact (same 4-writer callgrind): separate-transaction reloads at BEGIN went to 0 (149-183 per
+    contended writer now reload inside the BEGIN's transaction, 4.4k each). The boundary refresh
+    plus execute_begin per contended transaction went from 99-115k to 63-70k; the uncontended
+    writer is unchanged (34.5k vs 34.2k).
+  - Native, 8 writers, 300 transactions each, user instructions per transaction (stock 34.4k):
+    7 reps 335.4k -> 325.7k by min and -14.0k by median; 11 reps with the arms swapped 344.3k ->
+    328.8k by min and -12.5k by median. Pooled min over the 18 reps per arm: 335.4k -> 325.7k
+    (-9.7k).
+  - CPU per transaction (median): 365.5 -> 367.0 us and 372.8 -> 359.9 us (stock 74.5-76.2 us).
+  - 4 writers (7 reps): -1.6k by min, -6.8k by median, CPU 312.0 -> 310.4 us.
+  - Errors (8 writers, 12 reps per arm): 809 error lines and 156 rows lost in 5 runs on the base,
+    689 and 116 in 3 runs on the candidate; not higher, as the kill line required.
+  - Prediction (registered on bd-w4pr1.7 before code): -25k to -40k per transaction at 8 writers,
+    CPU down 10-25 us. Kill: under 12k. The pooled min (-9.7k) is under it, the medians sit at it,
+    and CPU moved within noise. Not kept, not pushed.
+- Why the miss: callgrind slows every writer about 50x. That serializes them, so most BEGINs follow
+  a peer's commit, and the exact count promised ~35k per contended BEGIN. Natively, the share of
+  BEGINs after a peer commit since the connection's own commit is low enough that the separate
+  reload averages only ~10-14k per transaction. Lever E already removed the own-commit case.
+- Retry condition: the patch is correct as far as it went (clippy clean; its test, lever E's and
+  the stale-detection test pass; the full gate was not run). It is worth retrying when a
+  multi-writer explicit-transaction shape shows the BEGIN boundary reload above ~25k per
+  transaction natively, measured with perf on the peer-commit path rather than inferred from
+  callgrind. Higher commit rates per peer, or many more writers, are the shapes to check. Or retry
+  it together with the autocommit statement boundary, which reloads a stale mirror the same way
+  (`refresh_memdb_if_stale_with_publication("autocommit_begin")`). How much `multiproc_8x500`
+  pays there is unmeasured, and moving that reload needs the prepare to see the refreshed schema
+  first, which is a separate design.
+
 ## 2026-11-14 - WIN (small): concurrent validations share each peer's SSI view parts until the peer changes (bd-i0tn6 scaling lever 2)
 
 - Target: the registry-guard holds of concurrent commits at 8-64 writers (`mt-mvcc-bench
