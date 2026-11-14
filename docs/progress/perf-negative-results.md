@@ -87,6 +87,178 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - SMALL WIN (prediction missed, kill line cleared by 0.1M): the Delete arm reads the leaf cell's rowid and keeps its pending-Next cursors in a short vector (bd-w4pr1.13.20, lever D)
+
+- Target: every row a DELETE (or the delete half of an UPDATE that keeps its rowid) removes through a storage
+  cursor: the scorecard's `delete_14pct_300k` (42,857 deletes) and `update_10pct_300k` (30,000 in-place rewrites).
+  Touched: `crates/fsqlite-vdbe/src/engine.rs` (the `Opcode::Delete` arm, `CursorIdSet`,
+  `pending_next_after_delete`).
+- Evidence before (callgrind of the DELETE on main ffb7385aa, per deleted row 2,734): the arm read the rowid
+  through the async `CursorBackend::rowid` (132 a row) although the cursor stands on a table-leaf cell, and
+  `pending_next_after_delete`, a hashbrown `HashSet<i32>`, took the cursor id (insert ~110) for the next `Next` to
+  remove again.
+- Ledger preflight: no entry on the Delete arm's rowid read or on the set's type.
+- Change: the arm takes the rowid from the cell (`CursorBackend::try_table_leaf_rowid`, as lever R's Rowid arm) and
+  keeps the async read for any other position; `pending_next_after_delete` is a `CursorIdSet`, a `SmallVec<[i32;
+  4]>` with the four operations its 29 call sites use, returning what `HashSet`'s do (`remove` takes the id by
+  value, clippy's `trivially_copy_pass_by_ref`; the measured binary had the by-reference form, the only difference).
+- Prediction (recorded before code): DELETE -8M to -13M, UPDATE -2M to -5M. Kill: DELETE down by less than 6M.
+- Result, stock sqlite3 3.46.1 live in the same runs (sc_mut_probe, min of 7, io_uring refused; base main + C + R
+  + S as first built (f0cede81...), lever = base + this diff (cdfe52f9...)): `delete_14pct_300k` 427.6M -> 421.5M
+  (-6.1M, -1.4%; stock 120.7M) in two runs, CPU 114.9 -> 113.0 and 114.4 -> 119.3 ms (no CPU change resolvable);
+  `update_10pct_300k` 651.9M -> 650.3M (-1.6M); the statement-only variants `id % 7` 426.6M -> 420.5M and `id % 14`
+  367.6M -> 365.2M, about 170 a deleted row. Prediction missed low (-6.1M against -8M to -13M); the kill line (under
+  6M) is cleared by 0.1M. Kept as a small, simple change; its share is within the noise of any row's CPU.
+- Test: fsqlite-vdbe `test_cursor_id_set_matches_hash_set` (inserts, repeated inserts, removes of present and
+  absent ids past the inline capacity, membership after each step, against `HashSet`); the DML oracles' consecutive
+  deletes (one_pass_delete_oracle) catch a Next that loses its cursor id.
+- Gate: one gate for levers C, R, S and D, in the lever C entry below. Landed as 899b4c917.
+- Retry / widen: none.
+
+## 2026-11-14 - WIN: VColumn, VNext and an INTEGER MustBeInt run on the synchronous lane (bd-w4pr1.13.21, lever S)
+
+- Target: every row of a virtual-table scan run by bytecode (INSERT ... SELECT from a table-valued function: the
+  scorecard's `bulk_insert_1M_one_txn` and the 300k-row mutation setup), and every `MustBeInt` of an INTEGER (the
+  INTEGER PRIMARY KEY of an INSERT row). Touched: `crates/fsqlite-vdbe/src/engine.rs` (`execute_vcolumn_hot`,
+  `execute_vnext_hot`, the `MustBeInt` / `VColumn` / `VNext` arms of `try_execute_hot_opcode_sync`, the
+  `vtab_lane_error` hand-off read by the main loop's `VColumn` / `VNext` arms).
+- Evidence before (callgrind of the bulk statement on main ffb7385aa): 7 of the 23 opcodes of the row leave the
+  synchronous lane (VColumn, Concat, MustBeInt, Affinity x2, Insert, VNext); each exit returns from
+  `run_hot_opcodes_sync`, takes the main loop's checks, the async-lane test and the big match and re-enters the
+  lane (~85 instructions on the line profile) before the arm's own work; VNext also clones the execution `Cx`.
+- Ledger preflight: no VColumn, VNext or MustBeInt entry in the 2026-05-23..25 hot-dispatch series. The 2026-05-24
+  Concat and Affinity promotions were rejected with a retry condition this lever does not claim, so both stay off
+  the lane.
+- Change: the three arms run on the lane with the main arms' semantics (NULL for a missing / NULL-row / EOF cursor,
+  the same two requested-cancellation loads around each module call, VNext's jump; MustBeInt of an INTEGER only
+  clears the register subtype, every other value takes the main arm). A module error is not reported from the
+  lane: it is stored on the engine and the lane hands the opcode back, so the main arm, which runs next, reports
+  it with the same `vtab_exec_outcome` text and the module call is made once.
+- Prediction (recorded before code): bulk -200M to -320M user instructions, CPU -2% to -4%; the DML rows unchanged
+  within 2M. Kill: bulk down by less than 120M or its median CPU not lower.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave), answers equal
+  stock's; base main + C + R (4b73060e...), lever = base + this diff (f0cede81...): `bulk_insert_1M_one_txn`
+  (bulk_cpu_probe.py, 7 runs, io_uring allowed) 9,149.0M -> 8,670.9M user instructions (-478.1M, -5.2%; 2.19x ->
+  2.08x stock 4,177.5M), CPU 1,113.9 -> 1,057.9 ms (-5.0%), wall 1,112.8 -> 1,062.5 ms (2.71x -> 2.58x stock 411.2
+  ms); the statement alone (INSERT ... SELECT and COMMIT, io_uring refused, 5 interleaved runs) 8,125.7M -> 7,670.1M
+  (-455.6M), CPU 920.3 -> 892.7 ms (stock 3,665.3M, 356.6 ms). The prediction (-200M to -320M) was exceeded: the
+  main loop's VColumn / VNext arms cost more than the ~85-instruction exit estimate. The DML rows moved the other
+  way: `update_10pct_300k` 644.5M -> 652.1M (+7.6M), `delete_14pct_300k` 421.9M -> 427.6M (+5.7M), against the
+  predicted "unchanged within 2M" (missed). Callgrind of the scan-only DELETE puts it in the lane's loop: +19
+  instructions a scanned row (`index_mut` of the register file, which the larger loop no longer inlines, +12; the
+  loop's own code +7). Marking the two module-call helpers `#[inline(never)]` did not remove it (DELETE 421.5M ->
+  422.4M, UPDATE 650.1M -> 650.2M) and cost the bulk statement +20M, so the helpers stay as written. The kill line
+  (bulk under 120M or CPU not lower) was not met; the DML cost is recorded here and is net of lever D in the lane
+  total.
+- Test: fsqlite-vdbe `test_vcolumn_vnext_module_errors_report_once_from_the_main_arm` (a mock module whose
+  column() or next() fails on the second row: the rows before it, the main arm's `ExecOutcome::Error` text, and
+  one call per module operation counted; a lane that reported the error itself or repeated the call fails it; a
+  `MustBeInt` on every scanned INTEGER).
+- Gate: one gate for levers C, R, S and D, in the lever C entry below. Landed as a29756059.
+- Retry condition: none for these arms. The +19 instructions a scanned row the larger lane loop costs a DML scan is
+  worth retrying only with a change that shrinks the loop and is measured on `delete_14pct_300k`'s scan-only
+  variant. Concat and Affinity on the lane stay governed by their 2026-05-24 entries.
+
+## 2026-11-14 - WIN: the scan loop's Rowid reads the leaf cell without the row-decode cache (bd-w4pr1.13.20, lever R)
+
+- Target: every `Rowid` of a storage cursor standing on a table-leaf cell, in the synchronous lane: the scan of
+  `delete_14pct_300k` and `update_10pct_300k` (300k rows each, plus two Rowids per updated row), and any read whose
+  WHERE or projection reads the rowid. Touched: `crates/fsqlite-vdbe/src/engine.rs` (the `Opcode::Rowid` arm of
+  `try_execute_hot_opcode_sync`).
+- Evidence before (callgrind, main ffb7385aa, the DELETE's scan): the arm cost ~194 instructions a scanned row, the
+  largest piece of the 685-a-row scan: `refresh_storage_cursor_first_key_state` ~85 (the position stamp, its
+  compare, `row_decode.invalidate()`, `payload_buf.clear()`, field stores) and the `cached_rowid` store, kept only to
+  keep the row-decode cache coherent for a later reader, around the two varints of the cell (~90).
+- Ledger preflight: 2026-05-25 "`Opcode::Rowid` hot-dispatch removal" (rejected) removed the arm; lever V
+  (2026-11-13) changed its register write. No entry on its cache bookkeeping.
+- Change: the arm reads `CursorBackend::try_table_leaf_rowid` directly and neither consults nor fills the cache.
+  Every reader of the cache (the Column lanes, the INTEGER PRIMARY KEY column, `payload_includes_rowid_alias`,
+  `storage_cursor_cached_rowid`) checks the cursor's position stamp itself first, so none relied on the arm's
+  refresh. A cursor that is not on a table-leaf cell (index, virtual table, in-memory, EOF) still takes the async
+  arm.
+- Prediction (recorded before code): DELETE and UPDATE each -18M to -30M user instructions, the scan-only DELETE -20M
+  to -30M, bulk unchanged. Kill: either row down by less than 12M.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave), binaries main + lever
+  C (1328c6f9..., the base) and main + C + R (4b73060e...), answers equal stock's (sc_mut_probe, min of 7, io_uring
+  refused): `delete_14pct_300k` 453.6M -> 421.9M (-31.7M, -7.0%; 3.76x -> 3.50x stock 120.7M), CPU 122.8 -> 114.0
+  ms (stock 37.8); `update_10pct_300k` 676.8M -> 644.5M (-32.3M, -4.8%; 2.48x -> 2.36x stock 273.4M), CPU 133.5 ->
+  131.6 ms; the scan-only `DELETE FROM m WHERE id % 7 = 7` 222.1M -> 189.7M (-32.4M). io_uring allowed (5 runs):
+  DELETE 467.5M -> 435.8M, CPU 144.7 -> 139.7 ms, wall 184.8 -> 186.4 ms; UPDATE 686.9M -> 656.3M, CPU 169.7 -> 176.3
+  ms, wall 220.9 -> 207.8 ms (ring CPU varies with the ring's worker threads; refused-ring CPU is the repeatable
+  one). Prediction range exceeded by ~2M on each row; the kill line was not met. Stock's `PRAGMA integrity_check` is
+  ok on all 19 files the lever wrote. The bulk row, which runs no Rowid, read +10.9M on the statement alone (8,114.8M
+  -> 8,125.7M, io_uring refused, 5 runs; +0.13%, attributed to the lane loop's code placement, not verified) and
+  +23.6M on the scorecard row (min of 7; main's own minimum ranged 9,450.1M to 9,461.3M over today's four runs).
+  Both are against the "bulk unchanged" prediction.
+- Test: fsqlite-core `one_pass_delete_oracle::rowid_reads_beside_column_reads_match_stock` (Rowid, the INTEGER
+  PRIMARY KEY column and other columns alternating on the same rows, after Next, after in-place and growing
+  rewrites and after deletes, on an IPK table and an implicit-rowid table, `:memory:` and file, direct and
+  prepared, against rusqlite; a Rowid that trusted the cache's rowid without the stamp check returns the previous
+  row's id after Next and fails it).
+- Gate: one gate for levers C, R, S and D, in the lever C entry below. Landed as d5e954e3c.
+- Retry condition: none.
+
+## 2026-11-14 - WIN: `||` of TEXT and INTEGER builds an inline result in place (bd-w4pr1.13.21, lever C)
+
+- Target: every `||` whose operands are valid-UTF-8 TEXT or INTEGER and whose result fits the 23-byte inline
+  `SmallText`; on the scorecard the `'row-' || value` of `bulk_insert_1M_one_txn` and `memory_script_200k`.
+  Touched: `crates/fsqlite-types/src/value.rs` (`SqliteValue::sql_concat`, `concat_operand_utf8`,
+  `SmallText::inline_concat_utf8`, `write_i64_decimal`). Callers: the VDBE `Concat` opcode and the two
+  interpreted evaluators in `connection.rs`, all through `sql_concat`.
+- Evidence before (callgrind of the bulk statement on main ffb7385aa, toggle-collect on the statements,
+  (300k - 200k) / 100k rows): `sql_concat` 603 instructions a row: `Integer::to_string` into a `String`
+  (`spec_to_string` 90 + malloc), a second `String` for the result, `push_str` through `SmallText::as_str`, which
+  re-validates the inline `'row-'` on every call (`from_utf8` 69), `SmallText::from_string` copying the result
+  inline, two frees.
+- Ledger preflight: 2026-05-24 "VDBE `Opcode::Concat` hot-dispatch promotion" (rejected) moved the opcode's
+  dispatch; this lever changes `sql_concat`'s body only. 2026-11-12 bd-w4pr1.13.28 (`length()` on stored bytes) is
+  the same `as_str` re-validation pattern.
+- Change: after the NULL and byte-exact (BLOB / invalid-UTF-8 TEXT) cases, a pair of valid-UTF-8 TEXT (its stored
+  bytes, not re-validated) and INTEGER (its decimal digits written into a 20-byte stack buffer, the bytes
+  `i64::to_string` writes, `i64::MIN` included) whose result is at most `SmallText::INLINE_CAPACITY` bytes is built
+  directly as the inline representation; valid parts concatenate to valid UTF-8 (debug-asserted). REAL operands
+  and longer results keep the `String` path.
+- Prediction (recorded before code): bulk -350M to -500M user instructions, CPU -3% to -5%; DML rows unchanged.
+  Kill: bulk down by less than 200M or its median CPU not lower.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave), binaries main
+  ffb7385aa (sha256 2f75107d...) and main + this diff (1328c6f9...), answers equal stock's:
+  `bulk_insert_1M_one_txn` (bulk_cpu_probe.py, 7 runs, io_uring allowed) 9,450.1M -> 9,119.7M user instructions
+  (-330.4M, -3.5%; 2.26x -> 2.18x stock 4,177.5M), CPU 1,176.5 -> 1,144.8 ms (-2.7%), wall 1,180.2 -> 1,145.2 ms
+  (2.87x -> 2.78x stock 411.5 ms); `memory_script_200k` (11 interleaved runs, :memory:) 4,313.3M -> 4,242.9M
+  (-1.6%), CPU 430.7 -> 428.8 ms (a 5-run pass first read +2.3% CPU at the same instruction drop; the 11-run rerun
+  did not reproduce it); `update_10pct_300k` 676.9M -> 676.8M, `delete_14pct_300k` 453.6M -> 453.6M. The
+  prediction's range was missed low by 20M (-330M against -350M to -500M); the kill line (200M, CPU) was not met.
+  Stock's `PRAGMA integrity_check` is ok on all 7 files the lever wrote, and the 1M rows (id, a, b, typeof(b), c)
+  hash the same on files written by stock, main and the lever.
+- Tests: fsqlite-types `test_write_i64_decimal_matches_to_string` (every power-of-ten edge, both signs, `i64::MIN`
+  / `MAX`, a stride sweep) and `test_sql_concat_inline_path_matches_rendered_bytes` (every pair of TEXT of 0 / 4 /
+  7-multibyte / 21 / 22 / 23 / 24 bytes and invalid UTF-8, INTEGER 0 / 7 / -7 / 12 / MAX / MIN, REAL, BLOB, NULL
+  against bytes rendered without `sql_concat`, and inline storage exactly up to 23 bytes: a version that drops
+  `i64::MIN`'s sign, formats unsigned, swaps the operands or admits 24 bytes inline fails it); fsqlite-core
+  `bd_string_scalar_oracle_probe::concat_over_scanned_rows_matches_rusqlite_oracle` (table columns in `:memory:`
+  and a file: quote / typeof / length / hex of t||n, n||t, n||n, t||t, t||r, r||n, b||n, n||b, an INSERT ... SELECT
+  into a NUMERIC column and an UPDATE s = s || id, against rusqlite).
+- Gate (one gate for levers C, R, S and D together, on ffb7385aa plus the four commits, tree identical to the
+  measured binaries' apart from `CursorIdSet::remove` taking its id by value; rch, 2026-11-14): clippy -D warnings
+  with all targets on fsqlite-types and fsqlite-vdbe clean (the first run found `trivially_copy_pass_by_ref` on
+  `CursorIdSet::remove`, fixed by passing the id by value at its 22 call sites), and on the two touched fsqlite-core
+  test targets clean; fsqlite-types lib 591 pass; fsqlite-vdbe lib 1,248 pass and 1 fail
+  (`codegen::tests::test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, a codegen-only
+  test: red on clean main a3fec6ea6 and in every lane's vdbe lib run since 2026-11-11; not re-run on ffb7385aa
+  itself), goldens 8 pass; fsqlite-core lib 4,180 pass and 2 fail (the t6741 pair); 48 fsqlite-core keeper targets
+  (string / concat / cast / affinity oracles, INSERT ... SELECT one-program, triggers, FK, RETURNING, UPSERT,
+  conflict atomicity, UPDATE / DELETE one-pass, savepoints, rowid / AUTOINCREMENT, generate_series / json_each /
+  pragma table-valued functions, FTS5 / R-tree) pass except the reds known on main: bd-jlbrk's two `bd_i3csr_1`
+  `rowid_replace_preflight_*` tests, bd-d8s37's two `fk_insert_conflict_oracle` upsert tests and the gh516 trio; 8
+  fsqlite targets 97 pass. `bd_2jbl5_update_from_triggers_oracle`'s 972-case test hung in the first run (no output
+  for 15 minutes on vmi1227854 against a usual 47-137 s; cancelled; the same test hung for 90 minutes in another
+  lane's gate today on vmi1293453 and passed on retry there); run alone on the same tree it passed, 3 of 3 in 47.4 s
+  on hz4. After the rebase onto 2bee1f1bc (clean, no conflict) clippy on fsqlite-types / fsqlite-vdbe and the vdbe lib
+  + goldens were run again on the landing tree: clippy clean, fsqlite-vdbe lib 1,249 pass and the same 1 fail, goldens
+  8 pass. Landed as 1fe7bdee3.
+- Retry / widen: none for this step. The bulk row's String8 `'row-'` per row (write_text_to_reg ~98) and the
+  per-row literal loads are the constant-hoisting lever.
+
 ## 2026-11-14 - WIN: a WAL commit keeps the main-file size the pager last measured (bd-w4pr1.7, lever C')
 
 - Target: every WAL commit on a file-backed database (the scorecard's `autocommit_5k_inserts`,
