@@ -87,6 +87,239 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - REJECTED on its point-SELECT kill line: an interior table image the cursor's memo serves again keeps all its routing keys, and the descent searches them as a slice (bd-w4pr1.13.18, join / rowid-seek round 2, lever 4)
+
+- Target: the interior binary search's routing-rowid decode (rowid_lookups_200k: 2.59M reads at
+  78, 7.3%; join_1M_to_pk_1000: 972k at 70). This is the narrowed retry of lever 2 (two entries
+  below): keys only, no per-read closure, no bit set.
+- Touched (reverted, never committed; patch `scratchpad/jr2_l4_v1_only.patch` of the coordinator
+  session): `crates/fsqlite-btree/src/cursor.rs`.
+  - `DecodedPageMemo::routing_keys`: 32 direct-mapped `(page, token, Vec<i64>)` entries, empty
+    until used. An entry is never handed to another page.
+  - `load_page` decodes and keeps all keys on a memo hit of an interior table image.
+  - `table_seek_for_insert` searches them with `binary_search_routing_keys`: the same loop, the
+    same cancellation check per probe.
+  - Keepers: equality with `binary_search_table_interior` over 95k targets; keys never route a
+    changed image; a colliding page does not take another's keys. clippy clean.
+- Result. thinkstation1, governor powersave, load 8.5, io_uring refused, 5 reps, stock sqlite3
+  3.46.1 live. Binaries l3 cf68d8835f195223 (the lever-3 WIN below) and l34 = l3 + this diff
+  8c946da5a372b1da. Answers equal stock's.
+
+  | statement | stock | l3 | l34 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,681.4M (4.84x) | 2,521.3M (4.55x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,478.1M (2.60x) | 4,444.9M (2.58x) |
+  | 2,000 autocommit point SELECTs | 42.7M | 167.8M | 169.3M |
+
+  group_by_1000_groups +0.4M, order_by_text_limit10 +1.4M; scan_filter_agg and count(*)
+  unchanged.
+- Prediction (bead, before code):
+  - rowid -120M to -175M; measured -160.1M, inside;
+  - join -30M to -55M; measured -33.2M, inside;
+  - the point-SELECT control within +0.2M; measured +1.5M.
+  Kill: that control worse by 0.4M or more. Crossed: REJECTED and reverted.
+- Why the control moved (callgrind of the control, +604 per statement). No statement kept keys:
+  each fresh cursor loads each page once. Two costs:
+  - `load_page` +139 (+46 per load): the served-again test and the StackEntry move the keep
+    needs;
+  - `_int_malloc` +313 and `unlink_chunk` +95, from the same 6,306 reallocs now leaving their
+    chunk more often. Those are the String/PathBuf growth in `journal_path`,
+    `refresh_runtime_committed_state` and `begin_wal_path_identity`, not this lever's code: a heap
+    layout effect, deterministic per binary.
+- Retry condition: the same keys with the served-again test folded into `DecodedPageMemo::lookup`,
+  so `load_page` gains no branch or move. Judge the point-SELECT control on process-level
+  instructions, and list the realloc sites separately when they move. The rowid and join gains
+  above are what such a retry has to keep.
+
+## 2026-11-14 - WIN: SipHash leaves the page-miss path: the in-flight read map and the WAL page index hash page numbers with foldhash (bd-w4pr1.13.18, join / rowid-seek round 2, lever 3)
+
+- Target: `RandomState::hash_one` on every page-cache miss. Callgrind on main a527f8a1f: 89.2M of
+  rowid_lookups_200k (3.2%), 753k hashes at 118 each:
+  - `InFlightReadLeader::finish`, 376k (a get, then a remove of the same page);
+  - `claim_in_flight_read`, 188k (the insert);
+  - the pinned WAL snapshot's page_index lookup, 189k.
+- Touched:
+  - `crates/fsqlite-pager/src/page_cache.rs`: `in_flight_reads` with `foldhash::fast::FixedState`;
+    `finish` removes the page's flight through one `entry()` probe, only while it is still this
+    leader's flight.
+  - `crates/fsqlite-pager/src/snapshot_reader.rs` and `lib.rs`: `pub type WalPageIndex =
+    HashMap<u32, usize, FixedState>`, the type of `WalSnapshotFrames::page_index` (the parallel
+    scan's snapshot reader shares the published index's Arc).
+  - `crates/fsqlite-core/src/wal_adapter.rs`: the published `page_index` and the publication
+    delta use it.
+- Ledger preflight: no entry covers these hashers. The page cache's shards already key
+  `PageNumber` maps with `FixedState`. Round 1's lever-2 retry note named the page-index SipHash
+  as part of a miss's remaining WAL-lookup cost.
+- Result. thinkstation1, governor powersave, load 4.3, io_uring refused, 5 reps, stock sqlite3
+  3.46.1 live. Binaries main b45c84151634c54f and l3 = main + this diff cf68d8835f195223 (the
+  landed commit differs from it only in test code and doc comments). One fsqlite-built database.
+  Answers equal stock's.
+
+  | statement | stock | main | l3 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,777.8M (5.01x) | 2,681.4M (4.84x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,482.7M (2.60x) | 4,478.1M (2.60x) |
+  | group_by_1000_groups | 2,876.2M | 3,407.0M | 3,403.1M |
+  | order_by_text_limit10 | 777.1M | 1,740.5M | 1,736.7M |
+  | 2,000 autocommit point SELECTs | 42.7M | 169.2M | 167.9M |
+  | 1,000 autocommit INSERTs (fresh file) | 23.61M | 183.07M | 182.87M |
+  | 100 transactions of 10 INSERTs (fresh file) | 16.49M | 57.01M | 56.97M |
+
+  Open plus `SELECT 1`: 5.32M -> 5.07M; the WAL index built at open hashes faster. rowid CPU, 8
+  interleaved pairs: user cycles 1,704M -> 1,670M (-2.0%), task-clock 692 -> 680 ms.
+- Prediction (bead, before code):
+  - rowid -60M to -90M; measured -96.4M, a little past the range;
+  - the three scan rows -1M to -4M; measured -3.8M to -4.6M;
+  - the point-SELECT control within 0.2M; measured -1.3M (open);
+  - write rows not worse; measured inside 0.1%.
+  Kill (rowid under 45M, a control 0.3% worse, an answer change): not crossed.
+- Measurement trap: a write probe that reused one growing database per arm showed this lever
+  about 1% worse on the transaction row. The arms' schemas differed (the table names carried the
+  arm label), and the per-statement schema scans account for the gap. Compare write rows on fresh,
+  identical files.
+- Gate (r2g3, on the landed tree before its rebase). clippy -D warnings on pager, btree, vdbe and
+  core, all targets: clean.
+  - --lib: btree 556/0; pager 1,112/1 (bd_2jpu6_2, red on main); core 4,182/2 (the t6741 pair,
+    bd-nouem); vdbe 1,249/1 (bd-bhalc).
+  - Keepers: the 10 join and seek targets, with one red, bd_8c68u's compile-count test
+    (bd-f8m1v); the 7 seek-key targets 13/0; the 9 savepoint, trigger, peer and staleness
+    targets 65/0.
+  - 24 targets on hz3: the pager-touch keepers (bulk_import_upsert_text_pk_phantom_pk, gh534,
+    gh525, gh457, gh338, bd_2jbl5), the fsqlite rowid keepers and the fsqlite-e2e
+    concurrent-writer batch. One red: `observed_disjoint_writer_overlap_for_certificate`, the
+    known duplicate commit_seq at finalize (bd-i0tn6).
+  - bd_2jbl5 first stalled past 7 minutes on vmi1156319 (bd-w4pr1.37), then passed in 47 s on
+    hz3.
+  - Post-rebase clippy on pager and core: clean.
+- Keepers: a finishing leader leaves a newer flight for its page in place
+  (`test_in_flight_finish_removes_only_its_own_flight`; removing by page number alone would strand
+  that flight's followers). The existing in-flight, snapshot-reader and WAL page-index tests, with
+  their expected maps built as `WalPageIndex`.
+- After (callgrind of l3, rowid):
+  - the WAL lookup on a miss is 353 (main 480);
+  - `claim_in_flight_read` 137 (main 249);
+  - `finish` 2,411 per miss (main 2,681). Most of it is still the eviction trim and its tracker
+    `forget` (1,587).
+- Landed in 091d26b0d.
+- Retry / widen: the WAL lookup's remainder is the registry handle, the read-lock helper and the
+  async frame. Widen only with a profile that puts it above 2% of a row.
+
+## 2026-11-14 - REJECTED on two kill lines: the decoded-page memo keeps the rowids a table search reads, and interior pages get memo slots leaves cannot take (bd-w4pr1.13.18, join / rowid-seek round 2, lever 2)
+
+- Target, from callgrind on main a527f8a1f:
+  - rowid_lookups_200k: the interior binary search read 2.59M routing rowids at 78 each (201.8M,
+    7.3%). 333k of 600k page loads missed the 8-slot memo and decoded their pointer array (355
+    each), because random leaves of t took the slots of its 18 interior pages.
+  - join_1M_to_pk_1000: the leaf search was 240 per probe (2.985M leaf rowid reads at 51), and
+    remember_table_landing re-read the leaf's first and last rowid.
+  This is the retry the 2026-11-14 lever-3 rejection named (routing keys decoded once per image,
+  kept with the memo).
+- Touched (reverted, never committed; patch `scratchpad/jr2_l2_v1.patch` of the coordinator
+  session): `crates/fsqlite-btree/src/cursor.rs`.
+  - `DecodedRowids` holds a `Vec<i64>` and a bit per cell. It is turned on when the memo serves
+    an image again, and a search's first read of a cell stores its rowid.
+  - The leaf search, the interior search and the leaf bounds take their rowid reader as a
+    parameter (`memo_rowid_reader`).
+  - An interior page displaced from the 8 inline slots moves to 32 interior slots, allocated at
+    the first displacement.
+  - Keepers: the memoized searches equal the plain ones over 24k targets on dense, gapped and
+    interior pages; stored rowids never answer for a changed image; leaf loads do not drop an
+    interior page. fsqlite-btree --lib 559 pass.
+- Result. thinkstation1, governor powersave, load 1.1, io_uring refused, 5 reps, stock sqlite3
+  3.46.1 live. Binaries main b45c84151634c54f and l2 = main + this diff 7f06046ea7bb8556. Answers
+  equal stock's.
+
+  | statement | stock | main | l2 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,777.7M (5.01x) | 2,631.9M (4.75x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,482.5M (2.60x) | 4,425.0M (2.57x) |
+  | 2,000 autocommit point SELECTs | 42.7M | 169.2M | 171.2M |
+
+  group_by_1000_groups +0.2M, order_by_text_limit10 +1.1M; scan_filter_agg and count(*)
+  unchanged. CPU on rowid did not move (658 ms both).
+- Prediction (bead, before code):
+  - rowid -130M to -230M; measured -145.8M, inside;
+  - join -200M to -300M; measured -57.5M;
+  - all-hits control within +0.3M; measured +2.0M.
+  Kill lines crossed: the join drop under 130M, and the all-hits control +0.8M or more. REJECTED
+  and reverted.
+- Why (callgrind of l2):
+  - The memo hit where it was aimed: on rowid, interior rowid decodes fell from 2.59M to 226k
+    and pointer decodes from 333k to 216k.
+  - A stored rowid costs about 28 per read against 51 to decode: the Option match, the
+    covered-cell test, the bit test and two bounds-checked slices. The prediction priced it at 8.
+    On the join, decoding fell by 250 per row, while the reader added 140 and the memo lookups in
+    the seek 36.
+  - Fresh cursors (the all-hits control) paid about 840 per statement:
+    - the interior table allocated on most point SELECTs, since t's descent loads two interior
+      pages and a leaf (about 230 in malloc and free);
+    - larger memo moves (+120 memcpy);
+    - the reader on images that never store (about 150);
+    - the memo lookups (about 140).
+- Retry condition: not this shape. Two separate retries:
+  1. Interior routing keys only: a complete `&[i64]` per interior image, searched as a plain slice
+     with no per-read closure and no bit set, and interior slots that cost a fresh cursor nothing
+     (no allocation, no larger inline memo). Gate it on the all-hits point-SELECT control within
+     0.2M. Tried the same day as lever 4 (two entries above) and rejected on that control; its
+     entry carries the next retry condition.
+  2. The join's leaf search (240 per probe), with a stored-rowid read at or under 10
+     instructions.
+
+## 2026-11-14 - REJECTED on its kill line: the eviction tracker forgets a page by lazy deletion through a page-to-slot HashMap (bd-w4pr1.13.18, join / rowid-seek round 2, lever 1)
+
+- Target: `S3FifoEvictionTracker::forget`, run on every page-cache eviction. Fresh callgrind on main
+  a527f8a1f: 1,587 per eviction, 297.5M of rowid_lookups_200k (10.8%; 187.5k evictions).
+  - This is the third try. The retry condition of the 2026-11-11 and 2026-11-12 rejections below
+    is lazy deletion with bookkeeping per admission under 100 instructions.
+  - Touched (reverted, never committed; patch `scratchpad/jr2_l1_v1.patch` of the coordinator
+    session): `crates/fsqlite-pager/src/page_cache.rs`. The S3-FIFO and ARC trackers share a new
+    `AccessTrace`:
+    - entries of (slot, generation);
+    - a slot per page with live entries, and a `HashMap<PageNumber, u32>` (foldhash) from page to
+      slot;
+    - `forget` frees the slot and advances its generation;
+    - a full history skips dead entries at the front when it drops its oldest live one;
+    - `VecDeque::retain` sweeps the ring at twice the bound;
+    - a back-to-back record of the same page reuses the last slot.
+  - Its keepers passed: a model test against the eager VecDeque over 100k random operations, a
+    negative case (a forget makes room in a full history), and S3-FIFO victim and snapshot
+    equality with a replay of the eager history.
+- Result. thinkstation1, governor powersave, load 5.6, io_uring refused, 5 reps, stock sqlite3
+  3.46.1 live. Binaries main b45c84151634c54f and l1 = main + this diff 4655a3e241c19adb. One
+  fsqlite-built database. Answers equal stock's.
+
+  | statement | stock | main | l1 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,777.7M (5.01x) | 2,533.4M (4.57x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,482.7M | 4,473.1M |
+  | group_by_1000_groups | 2,876.2M | 3,406.9M | 3,397.9M |
+  | order_by_text_limit10 | 777.1M | 1,740.5M | 1,732.4M |
+  | 2,000 autocommit point SELECTs (all page-cache hits) | 42.7M | 169.2M | 169.9M |
+
+  rowid CPU, 8 interleaved pairs: user cycles 1,712M -> 1,615M (-5.7%), task-clock 684 -> 663 ms
+  (-3%). scan_filter_agg and count(*) are unchanged.
+- Prediction (bead, before code):
+  - rowid -230M to -290M; measured -244.3M, inside;
+  - three scan rows -8M to -11M each; measured inside;
+  - the all-hits control +0.1M to +0.4M; measured +0.7M, above the range and under its 1.0M kill
+    line.
+  - Kill: tracker work per miss (record_admit + record_access + forget + the sweep) at or above
+    170, i.e. more than 100 above today's two trace pushes. Measured about 354: the old tracker's
+    310.7M less the row's 244.4M drop, over 187.5k misses. REJECTED and reverted.
+- Why it missed (callgrind of l1). The two records of a miss (admission, then the read) cost 249:
+  - VecDeque push and the retain sweep 51; the retain is about 20 per swept entry;
+  - the hashbrown insert about 45 with its SSE2 group and tag code;
+  - bounds checks 23;
+  - the function's own code 77.
+  `forget` costs 79, plus about 30 of inlined hashbrown removal. The prediction priced the hash
+  map at a third of that and did not price the retain per entry.
+- Retry condition: one tracker per miss under 170 by callgrind, from a purpose-built
+  open-addressing table keyed by page number in place of the HashMap, and dead entries popped at
+  the front on each record in place of the retain sweep. Under round-robin flat-slot eviction the
+  oldest entries die first. Estimated at 190 to 240 per miss before writing it, so measure the
+  table alone first. Also measure user cycles with interleaved pairs: a 5-rep task-clock showed
+  nothing here while cycles moved 5.7%.
+
 ## 2026-11-14 - WIN (prediction missed, beyond its range): an UPDATE row body preloads only unassigned columns, re-inserts under its kept INTEGER PRIMARY KEY register and applies its second Affinity only when a constraint can change a register (bd-w4pr1.13.20, lever U)
 
 - Target: every UPDATE row of a rowid table through `codegen_update` (not UPDATE ... FROM, not WITHOUT ROWID):
