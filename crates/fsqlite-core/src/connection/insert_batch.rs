@@ -847,18 +847,31 @@ impl Connection {
             // must first be resolved against the ORIGINAL statement's
             // globally numbered/named slots (as INSERT SELECT does).
             let resolved_insert;
-            let replay_insert = match params {
-                Some(params) if !insert.upsert.is_empty() || !insert.returning.is_empty() => {
-                    let mut cloned = insert.clone();
-                    bind_placeholders_in_insert_statement(
-                        &mut cloned,
-                        &mut BindParamState::default(),
-                        params,
-                    )?;
-                    resolved_insert = cloned;
-                    &resolved_insert
-                }
-                _ => insert,
+            let replay_insert = if !insert.upsert.is_empty() || !insert.returning.is_empty() {
+                // These are caller bindings, before replay assigns ?1..?N to
+                // source values. Omitted bindings mean NULL, whereas an
+                // explicitly supplied short slice must still be rejected.
+                let mut bind_state = BindParamState::default();
+                let mut cloned =
+                    canonicalize_insert_placeholders_with_state(insert, &mut bind_state)?;
+                let unbound_params;
+                let original_params = if let Some(params) = params {
+                    params
+                } else {
+                    let parameter_slots =
+                        usize::try_from(bind_state.next_index.saturating_sub(1)).unwrap_or(0);
+                    unbound_params = vec![SqliteValue::Null; parameter_slots];
+                    &unbound_params
+                };
+                bind_placeholders_in_insert_statement(
+                    &mut cloned,
+                    &mut BindParamState::default(),
+                    original_params,
+                )?;
+                resolved_insert = cloned;
+                &resolved_insert
+            } else {
+                insert
             };
             let outcome = self
                 .execute_insert_select_materialized_rows_outcome(replay_insert, &source_rows)

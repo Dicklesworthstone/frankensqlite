@@ -533,3 +533,121 @@ fn correlated_returning_external_probe_with_all_rowid_aliases_shadowed() {
         .await;
     });
 }
+
+#[test]
+fn insert_replay_unbound_returning_parameters_do_not_alias_source_values() {
+    asupersync::test_utils::run_test(|| async {
+        for timing in ["BEFORE", "AFTER"] {
+            let setup = format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT);\
+                 CREATE TABLE ids(id INTEGER);\
+                 INSERT INTO ids VALUES(1),(2);\
+                 CREATE VIEW id_view AS SELECT id FROM ids;\
+                 CREATE TABLE audit(id INTEGER,v TEXT);\
+                 CREATE TRIGGER tr {timing} INSERT ON t BEGIN \
+                   INSERT INTO audit VALUES(NEW.id,NEW.v); END;"
+            );
+            for projection in [
+                "id,v,?1,?2",
+                "id,v,?1,?4,?,:marker,:marker",
+                "id,v,?1,?4,(SELECT count(*) FROM id_view WHERE id_view.id=t.id)",
+            ] {
+                let sql = format!(
+                    "INSERT INTO t VALUES(1,'first'),(2,'second') RETURNING {projection}"
+                );
+                compare_correlated_dml_returning(
+                    &format!("{timing} INSERT preserves unbound caller slots: {projection}"),
+                    &setup,
+                    &sql,
+                    true,
+                    &[
+                        "SELECT changes()",
+                        "SELECT * FROM t ORDER BY id",
+                        "SELECT * FROM audit ORDER BY rowid",
+                    ],
+                )
+                .await;
+            }
+        }
+    });
+}
+
+#[test]
+fn insert_replay_unbound_upsert_assignments_remain_null() {
+    asupersync::test_utils::run_test(|| async {
+        for returning in ["", " RETURNING id,v,?1,?4,?"] {
+            let sql = format!(
+                "INSERT INTO t VALUES(1,'first'),(2,'second') \
+                 ON CONFLICT(id) DO UPDATE SET v=?2{returning}"
+            );
+            compare_correlated_dml_returning(
+                &format!("UPSERT preserves unbound caller slots: {returning}"),
+                "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT);\
+                 INSERT INTO t VALUES(1,'old-first'),(2,'old-second');\
+                 CREATE TABLE audit(id INTEGER,v TEXT);\
+                 CREATE TRIGGER au AFTER UPDATE ON t BEGIN \
+                   INSERT INTO audit VALUES(NEW.id,NEW.v); END;",
+                &sql,
+                true,
+                &[
+                    "SELECT changes()",
+                    "SELECT * FROM t ORDER BY id",
+                    "SELECT * FROM audit ORDER BY rowid",
+                ],
+            )
+            .await;
+        }
+    });
+}
+
+#[test]
+fn insert_replay_explicit_short_bindings_are_rejected_before_writes() {
+    asupersync::test_utils::run_test(|| async {
+        for prepared in [false, true] {
+            let native = Connection::open(":memory:").await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let setup = "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT);\
+                         CREATE TABLE audit(id INTEGER);\
+                         CREATE TRIGGER ai AFTER INSERT ON t BEGIN \
+                           INSERT INTO audit VALUES(NEW.id); END;";
+            native.execute_batch(setup).await.unwrap();
+            stock.execute_batch(setup).unwrap();
+            let sql = "INSERT INTO t VALUES(1,'first'),(2,'second') RETURNING id,v,?2";
+            for parameter_count in [0, 1] {
+                let parameters = vec![SqliteValue::Integer(99); parameter_count];
+                let actual = if prepared {
+                    native
+                        .prepare(sql)
+                        .await
+                        .unwrap()
+                        .query_with_params(&parameters)
+                        .await
+                } else {
+                    native.query_with_params(sql, &parameters).await
+                };
+                let mut reference = stock.prepare(sql).unwrap();
+                let stock_parameters = vec![99_i64; parameter_count];
+                assert!(
+                    reference
+                        .query(rusqlite::params_from_iter(stock_parameters))
+                        .is_err(),
+                    "stock must reject an explicit short parameter slice"
+                );
+                assert!(
+                    actual.is_err(),
+                    "prepared={prepared}, parameter_count={parameter_count}: {actual:?}"
+                );
+                for check in ["SELECT count(*) FROM t", "SELECT count(*) FROM audit"] {
+                    let actual = native.query(check).await.unwrap();
+                    let expected = stock_rows(&stock, check).unwrap();
+                    assert_rows(
+                        &actual,
+                        &expected,
+                        "a binding error cannot write or fire triggers",
+                    );
+                }
+            }
+            native.close().await.unwrap();
+        }
+    });
+}
