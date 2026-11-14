@@ -246,6 +246,44 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
   for the statement (rollback journal) or the memory pager's page images.
 
+## 2026-11-14 - WIN: GROUP BY walks a range on an index's leading key; covering GROUP BY inputs stop needing the MemDatabase (bd-x14us)
+
+- Target: `SELECT a, count(*) FROM t WHERE a < 20 GROUP BY a` scanned the whole table into the
+  grouping sorter (62.6x stock). Touched: crates/fsqlite-vdbe/src/codegen.rs
+  (codegen_select_group_by_aggregate: index_range_input from ordered_scan_key_bounds,
+  covering_count_index for exact ranges, the input index opened before pass 1).
+- Result (1b7e343ed; scratchpad gb_ab.py, 200,000-row file database, each query in a fresh
+  process, stock sqlite3 3.46.1 live in the same run, user instructions, median of 5; ELF
+  before a3282e14591c74ef, after cee8e75bbd884ec8; thinkstation1): `a < 20 GROUP BY a` count
+  192,824.5k -> 21,275.4k (stock 3,080.1k: 62.6x -> 6.9x); sum(c) 198,764.6k -> 58,446.0k
+  (16.7x -> 4.9x); `GROUP BY b` over the range 24.3x -> 3.0x; GH#531's `a = 5` covering count
+  4.4x -> 3.6x; whole-table GROUP BY unchanged. Answers equal.
+- Finding on the way: every covering GROUP BY input program read the index before its OpenRead
+  in program order, so compute_attached_memdb_requirement_reason flagged it and the substrate
+  handed the statement to the in-memory evaluator (GH#531's covering eq/IN count never ran on a
+  file database). An EXPLAIN-only test cannot see this; issue_531_grouped_index_input now asserts
+  attached_memdb_requirement_reason() == None. A :memory: GROUP BY test cannot see the program
+  either (the mirror groups there): oracles for GROUP BY codegen run file-backed in strict mode
+  with a refused-HAVING control.
+- Retry / next: the remaining 6.9x is per-row cost (bd-w4pr1.11); streaming groups in index
+  order is bd-2mrip.
+
+## 2026-11-14 - WIN: count(DISTINCT col) loose-scans its index (bd-fk2wa)
+
+- Target: `SELECT count(DISTINCT a) FROM t` over an index on a walked every entry and counted
+  key changes (196.5x stock, 200,000 rows, 1,000 values). Touched: crates/fsqlite-vdbe/src/
+  codegen.rs codegen_select_count_distinct_index_walk.
+- Lever (37d1381d6): seek past the NULL keys, count a key, try
+  DISTINCT_LOOSE_SCAN_NEXT_PROBES (3) Next steps, then SeekGT past the rest of the run, as the
+  DISTINCT loose scan does. A key a probe step already read is copied, not read again: the first
+  version read it twice and made the all-distinct column 8% slower (5.4x -> 5.8x).
+- Result (scratchpad cdx_ab.py, stock live, ELF before a3282e14591c74ef, after
+  6a91f74ba4190e9b; thinkstation1): 1,000 values 446,992.4k -> 24,325.6k (stock 2,274.9k: 196.5x
+  -> 10.7x); 5,000 values 30.2x -> 7.7x; all distinct 5.4x -> 5.0x; a third NULL 4.3x -> 3.0x.
+- Retry / next: the first row is about one index seek per distinct value (24k instructions
+  against stock's 2.3k), the per-seek cost of bd-w4pr1.11. bd-fk2wa stays open: its probe asks
+  for at most 10x on that row.
+
 ## 2026-11-14 - LOSS: an inner join driving from the table its WHERE pins, without row estimates (bd-9uf3l, not landed)
 
 - Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` drives from p (all 50,000
@@ -264,9 +302,15 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
 - Why: the swap ignores table sizes. Stock's choice without statistics matches the lever's (an
   indexed equality is assumed selective, and tables equal-sized), but with sqlite_stat1 it
   knows q has 10 rows.
-- Retry condition: row-count estimates reach the join codegen (sqlite_stat1 when present, and
-  stock's defaults when absent). Swap only when the pinned side's estimate is below the written
-  outer table's, and re-run both controls above.
+- Without statistics (same fixture, no ANALYZE, measured 2026-11-14): stock drives t through
+  t_flag on the control too and costs 72,115k there (730k on the target). The written order
+  runs that control in 305k, 236x under stock, so stock's no-statistics defaults would make the
+  swap fire there and give that margin away.
+- Retry condition: row-count estimates reach the join codegen: sqlite_stat1 when present
+  (Stat1Hints in connection.rs already carries table rows and rows per index key), and when
+  absent an estimate of the table's size from its b-tree (page count or root fan-out), not
+  stock's equal-size default. Swap only when the pinned side's estimate is well below the
+  written outer table's, and re-run both controls above with and without ANALYZE.
 
 ## 2026-11-14 - WIN: three plan-gap levers from one sweep: ordered-scan key ranges (bd-dduz1), DISTINCT over a key range (bd-kzfcf), comma joins seek their outer table (bd-61nf7)
 
