@@ -25294,18 +25294,6 @@ fn codegen_select_group_by_aggregate(
     // Sorter cursor.
     let sorter_cursor = cursor + 1;
 
-    // Open sorter: p2 = number of key columns (for sorting by group keys).
-    let sort_order: String = std::iter::repeat_n('+', num_group_keys).collect();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    b.emit_op(
-        Opcode::SorterOpen,
-        sorter_cursor,
-        num_group_keys as i32,
-        0,
-        P4::Str(sort_order),
-        0,
-    );
-
     // GROUP BY changes the consumer of rows, not the validity of an indexed
     // WHERE. Feed the existing grouping sorter from equality-prefix and
     // bind-time IN seeks instead of unrelated table rows (GH#531).
@@ -25324,42 +25312,79 @@ fn codegen_select_group_by_aggregate(
     } else {
         None
     };
-    // The reported COUNT(*) shape needs only the grouping keys from each
-    // index entry. Omit the table cursor only when the row source enforces
-    // the complete WHERE and every payload value is stored in the index.
-    // Equality-prefix coverage counts distinct WHERE conjuncts, so repeated
-    // index keys cannot hide a residual. Richer aggregates keep the ordinary
-    // table reader.
-    let count_only = num_nongrouped == 0
+    // A grouping whose every input value an index entry stores can read the
+    // index alone: plain-column group keys, and COUNT(*) or plain-column
+    // aggregate arguments. Omit the table cursor only when the row source
+    // also enforces the complete WHERE. Equality-prefix coverage counts
+    // distinct WHERE conjuncts, so repeated index keys cannot hide a
+    // residual. TEXT and INTEGER columns only: their index values read back
+    // as the table's do.
+    let index_fed_aggregates = num_nongrouped == 0
         && agg_columns.iter().all(|agg| {
-            agg.name.eq_ignore_ascii_case("count")
+            let count_star = agg.name.eq_ignore_ascii_case("count")
                 && agg.num_args == 0
-                && agg.arg_col_index.is_none()
+                && agg.arg_col_index.is_none();
+            (count_star || agg.arg_col_index.is_some())
                 && !agg.arg_is_rowid
-                && !agg.distinct
                 && agg.arg_expr.is_none()
-                && agg.extra_args.is_empty()
                 && agg.filter.is_none()
                 && agg.wrapper_expr.is_none()
                 && agg.multi_agg_indices.is_empty()
                 && agg.bare_expr.is_none()
         });
-    let stores_group_keys = |index: &IndexSchema| {
-        group_by_keys.iter().all(|key| {
-            let GroupByKey::Column(column) = key else {
-                return false;
-            };
-            table.columns[*column].generated_expr.is_none()
-                && matches!(table.columns[*column].affinity, 'B' | 'D')
-                && index_key_position_of(index, table, *column).is_some()
-        })
+    let index_stores_column = |index: &IndexSchema, column: usize| {
+        table.columns[column].generated_expr.is_none()
+            && matches!(table.columns[column].affinity, 'B' | 'D')
+            && index_key_position_of(index, table, column).is_some()
+    };
+    let covers_grouping = |index: &IndexSchema| {
+        index_fed_aggregates
+            && group_by_keys.iter().all(|key| {
+                matches!(key, GroupByKey::Column(column) if index_stores_column(index, *column))
+            })
+            && agg_arg_table_cols
+                .iter()
+                .all(|&column| index_stores_column(index, column))
+    };
+    // Whether rows read in `index`'s order arrive grouped, past an equality
+    // prefix of `prefix_len` key columns: each GROUP BY key is a plain BINARY
+    // column, either pinned by the prefix or the index's next ASC BINARY key,
+    // in GROUP BY order. Groups then form as rows arrive, in the order the
+    // sorter would emit them.
+    let groups_in_index_order = |index: &IndexSchema, prefix_len: usize| {
+        let is_binary = |collation: Option<&str>| {
+            collation.is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+        };
+        let mut next_key = prefix_len;
+        index.has_plain_column_key()
+            && group_by_keys.iter().all(|key| {
+                let GroupByKey::Column(column) = key else {
+                    return false;
+                };
+                let Some(position) = index_key_position_of(index, table, *column)
+                    .and_then(|position| usize::try_from(position).ok())
+                else {
+                    return false;
+                };
+                if !is_binary(table.columns[*column].collation.as_deref()) {
+                    return false;
+                }
+                if position < prefix_len {
+                    return true;
+                }
+                let next = position == next_key
+                    && !index.key_term_descending(position)
+                    && is_binary(index.key_term_collation(position));
+                next_key += 1;
+                next
+            })
     };
     // A range on an index's leading key (`WHERE a < 20`, `created > ?1`)
     // walks that range instead of the whole table, as stock's `SEARCH t USING
     // INDEX (a<?)` does. The rows feed the same grouping sorter and the whole
     // WHERE still filters each one, so the range need only cover every
-    // matching row. An exact range lets a COUNT(*) grouping whose keys the
-    // index stores skip the table, so such an index wins over the others.
+    // matching row. An exact range lets a grouping the index covers skip the
+    // table, so such an index wins over the others.
     let index_range_input = if allow_index_seek
         && !table.without_rowid
         && index_eq_seek.is_none()
@@ -25377,27 +25402,72 @@ fn codegen_select_group_by_aggregate(
         ranges
             .iter()
             .copied()
-            .find(|(index, range)| range.exact && count_only && stores_group_keys(index))
+            .find(|(index, range)| range.exact && covers_grouping(index))
             .or_else(|| ranges.first().copied())
     } else {
         None
     };
-    let covering_count_index = if count_only {
-        index_eq_seek.as_ref()
-            .filter(|target| !target.has_residual)
-            .map(|target| target.index)
-            .or_else(|| index_in_seek.as_ref()
-                .filter(|target| !target.has_residual)
-                .map(|target| target.index))
-            .or_else(|| index_range_input
-                .filter(|(_, range)| range.exact)
-                .map(|(index, _)| index))
-            .filter(|index| stores_group_keys(index))
+    // With no seek, an index whose order groups the keys can still feed the
+    // grouping, read whole in order: it pays when the index covers the query
+    // (no table read at all) or a LIMIT ends the walk after its last group.
+    // The whole WHERE filters each row.
+    let index_walk_input = if allow_index_seek
+        && !table.without_rowid
+        && index_eq_seek.is_none()
+        && index_in_seek.is_none()
+        && index_range_input.is_none()
+    {
+        let walkable = || {
+            table.indexes.iter().filter(|index| {
+                index.supports_direct_column_lookup() && groups_in_index_order(index, 0)
+            })
+        };
+        walkable()
+            .find(|index| where_clause.is_none() && covers_grouping(index))
+            .or_else(|| limit_clause.and_then(|_| walkable().next()))
     } else {
         None
     };
+    let covering_index = index_eq_seek
+        .as_ref()
+        .filter(|target| !target.has_residual)
+        .map(|target| target.index)
+        .or_else(|| {
+            index_in_seek
+                .as_ref()
+                .filter(|target| !target.has_residual)
+                .map(|target| target.index)
+        })
+        .or_else(|| {
+            index_range_input
+                .filter(|(_, range)| range.exact)
+                .map(|(index, _)| index)
+        })
+        .or_else(|| index_walk_input.filter(|_| where_clause.is_none()))
+        .filter(|index| covers_grouping(index));
+    // Rows that arrive grouped skip the sorter: each one goes straight to the
+    // group accumulation below, and a LIMIT ends the walk after its last
+    // group. IN probes arrive in list order, so they keep the sorter.
+    let streams_groups = index_eq_seek
+        .as_ref()
+        .is_some_and(|target| groups_in_index_order(target.index, target.values.len()))
+        || index_range_input.is_some_and(|(index, _)| groups_in_index_order(index, 0))
+        || index_walk_input.is_some();
+    if !streams_groups {
+        // Open sorter: p2 = number of key columns (for sorting by group keys).
+        let sort_order: String = std::iter::repeat_n('+', num_group_keys).collect();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::SorterOpen,
+            sorter_cursor,
+            num_group_keys as i32,
+            0,
+            P4::Str(sort_order),
+            0,
+        );
+    }
     let idx_cursor = sorter_cursor + 1;
-    if covering_count_index.is_none() {
+    if covering_index.is_none() {
         b.emit_op(
             Opcode::OpenRead,
             cursor,
@@ -25416,7 +25486,8 @@ fn codegen_select_group_by_aggregate(
         .as_ref()
         .map(|target| target.index)
         .or_else(|| index_in_seek.as_ref().map(|target| target.index))
-        .or_else(|| index_range_input.map(|(index, _)| index));
+        .or_else(|| index_range_input.map(|(index, _)| index))
+        .or(index_walk_input);
     if let Some(index) = input_index {
         b.emit_op(
             Opcode::OpenRead,
@@ -25433,7 +25504,35 @@ fn codegen_select_group_by_aggregate(
     let input_return = indexed_input.then(|| b.alloc_reg());
     let where_placeholder_base = b.current_anon_placeholder();
 
-    // === Pass 1: Feed qualifying rows into the sorter ===
+    // Group state: current and previous group keys, accumulators, and
+    // non-grouped column values, with first_flag = 1 and the accumulators
+    // Null. Set up before pass 1 when groups stream (pass 1 accumulates
+    // them), after it otherwise.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let alloc_group_state = |b: &mut ProgramBuilder| {
+        let cur_key_base = b.alloc_regs(num_group_keys as i32);
+        let prev_key_base = b.alloc_regs(num_group_keys as i32);
+        let accum_base = b.alloc_regs(num_aggs as i32);
+        let prev_nongrouped_base = b.alloc_regs(num_nongrouped.max(1) as i32);
+        let first_flag = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 1, first_flag, 0, P4::None, 0);
+        for i in 0..num_aggs as i32 {
+            b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
+        }
+        (
+            cur_key_base,
+            prev_key_base,
+            accum_base,
+            prev_nongrouped_base,
+            first_flag,
+        )
+    };
+    let streamed_group_state = streams_groups.then(|| alloc_group_state(b));
+    // Streaming calls the group accumulation once per row.
+    let group_row = b.emit_label();
+    let group_row_return = streams_groups.then(|| b.alloc_reg());
+
+    // === Pass 1: Feed qualifying rows into the sorter, or to the groups ===
     let scan_start = b.current_addr();
     let scan_done = b.emit_label();
     if indexed_input {
@@ -25447,7 +25546,7 @@ fn codegen_select_group_by_aggregate(
     // build a second membership index for a long list and disqualify
     // storage-only execution. Retain every residual and its bind position.
     let skip_label = b.emit_label();
-    if covering_count_index.is_some() {
+    if covering_index.is_some() {
         b.set_next_anon_placeholder(where_placeholder_base
             + where_clause.map_or(0, count_anon_placeholders));
     } else if let Some(target) = index_in_seek.as_ref() {
@@ -25499,9 +25598,9 @@ fn codegen_select_group_by_aggregate(
                     // the NULL placeholder. Route it through the canonical reader
                     // so the generating expression is computed on read, exactly
                     // as single-table projection / emit_join_expr do.
-                    if let Some(index) = covering_count_index {
+                    if let Some(index) = covering_index {
                         let key_position = index_key_position_of(index, table, *col_idx)
-                            .expect("covering grouped count must store every group key");
+                            .expect("a covering index stores every group key");
                         b.emit_op(Opcode::Column, idx_cursor, key_position, reg, P4::None, 0);
                     } else if virtual_generated_column_expr(&table.columns[*col_idx]).is_some() {
                         emit_table_column_read(
@@ -25527,7 +25626,11 @@ fn codegen_select_group_by_aggregate(
         for &col_idx in &agg_arg_table_cols {
             // bd-hx3zu (GH#227 sibling): compute a VIRTUAL generated column used
             // as an aggregate argument instead of reading its NULL placeholder.
-            if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
+            if let Some(index) = covering_index {
+                let key_position = index_key_position_of(index, table, col_idx)
+                    .expect("a covering index stores every aggregate argument");
+                b.emit_op(Opcode::Column, idx_cursor, key_position, reg, P4::None, 0);
+            } else if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
                 emit_table_column_read(b, cursor, table, table_alias, Some(schema), col_idx, reg);
             } else {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -25581,25 +25684,30 @@ fn codegen_select_group_by_aggregate(
         }
     }
 
-    // MakeRecord + SorterInsert.
-    let record_reg = b.alloc_reg();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    b.emit_op(
-        Opcode::MakeRecord,
-        sorter_base,
-        total_sorter_cols as i32,
-        record_reg,
-        P4::None,
-        0,
-    );
-    b.emit_op(
-        Opcode::SorterInsert,
-        sorter_cursor,
-        record_reg,
-        0,
-        P4::None,
-        0,
-    );
+    if let Some(return_reg) = group_row_return {
+        // The row's values in `sorter_base` go straight to its group.
+        b.emit_jump_to_label(Opcode::Gosub, return_reg, 0, group_row, P4::None, 0);
+    } else {
+        // MakeRecord + SorterInsert.
+        let record_reg = b.alloc_reg();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::MakeRecord,
+            sorter_base,
+            total_sorter_cols as i32,
+            record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::SorterInsert,
+            sorter_cursor,
+            record_reg,
+            0,
+            P4::None,
+            0,
+        );
+    }
 
     // Skip label (for WHERE-filtered rows).
     b.resolve_label(skip_label);
@@ -25612,7 +25720,7 @@ fn codegen_select_group_by_aggregate(
         let after_body_placeholder = b.current_anon_placeholder();
         let rowid_reg = b.alloc_reg();
         let emit_row = |b: &mut ProgramBuilder, skip_row| {
-            if covering_count_index.is_none() {
+            if covering_index.is_none() {
                 b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
                 b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
             }
@@ -25681,6 +25789,18 @@ fn codegen_select_group_by_aggregate(
             b.resolve_label(skip_row);
             b.emit_op(Opcode::Next, idx_cursor, walk_top, 0, P4::None, 0);
             b.resolve_label(range_done);
+        } else if index_walk_input.is_some() {
+            // The whole index in key order, NULL keys (a group of their own)
+            // first.
+            let walk_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, walk_done, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let walk_top = b.current_addr() as i32;
+            let skip_row = b.emit_label();
+            emit_row(b, skip_row);
+            b.resolve_label(skip_row);
+            b.emit_op(Opcode::Next, idx_cursor, walk_top, 0, P4::None, 0);
+            b.resolve_label(walk_done);
         }
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
         b.set_next_anon_placeholder(after_body_placeholder);
@@ -25693,65 +25813,61 @@ fn codegen_select_group_by_aggregate(
 
     // End of pass 1.
     b.resolve_label(scan_done);
-    if covering_count_index.is_none() {
+    if covering_index.is_none() {
         b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     }
 
-    // === Pass 2: Iterate sorted rows, accumulate per-group ===
-
-    // Allocate registers for current group keys, previous group keys, accumulators,
-    // and non-grouped column values.
+    // === Pass 2: accumulate each row into its group ===
+    //
+    // Sorted: iterate the sorter, reading each row's slots from it. Streamed:
+    // pass 1 called the same code once per row (`group_row`), reading the
+    // slots from the registers it filled; what remains is the last group.
+    let (cur_key_base, prev_key_base, accum_base, prev_nongrouped_base, first_flag) =
+        match streamed_group_state {
+            Some(state) => state,
+            None => alloc_group_state(b),
+        };
+    let final_group = b.emit_label();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let cur_key_base = b.alloc_regs(num_group_keys as i32);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let prev_key_base = b.alloc_regs(num_group_keys as i32);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let accum_base = b.alloc_regs(num_aggs as i32);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let prev_nongrouped_base = b.alloc_regs(num_nongrouped.max(1) as i32);
-    let first_flag = b.alloc_reg();
-
-    // Initialize: first_flag = 1, accumulators = Null.
-    b.emit_op(Opcode::Integer, 1, first_flag, 0, P4::None, 0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for i in 0..num_aggs as i32 {
-        b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
-    }
-
-    // SorterSort: sort and position at first row; jump to done if empty.
-    b.emit_jump_to_label(
-        Opcode::SorterSort,
-        sorter_cursor,
-        0,
-        done_label,
-        P4::None,
-        0,
-    );
-
-    let sort_loop_body = b.current_addr();
-
-    // SorterData: decode current sorted row.
-    let sorted_reg = b.alloc_reg();
-    b.emit_op(
-        Opcode::SorterData,
-        sorter_cursor,
-        sorted_reg,
-        0,
-        P4::None,
-        0,
-    );
-
-    // Read group-key columns from sorter into cur_key registers.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for i in 0..num_group_keys {
-        b.emit_op(
-            Opcode::Column,
+    let read_slot = |b: &mut ProgramBuilder, slot: usize, dst: i32| {
+        if streams_groups {
+            b.emit_op(Opcode::Copy, sorter_base + slot as i32, dst, 0, P4::None, 0);
+        } else {
+            b.emit_op(Opcode::Column, sorter_cursor, slot as i32, dst, P4::None, 0);
+        }
+    };
+    let sort_loop_body = if streams_groups {
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, final_group, P4::None, 0);
+        b.resolve_label(group_row);
+        None
+    } else {
+        // SorterSort: sort and position at first row; jump to done if empty.
+        b.emit_jump_to_label(
+            Opcode::SorterSort,
             sorter_cursor,
-            i as i32,
-            cur_key_base + i as i32,
+            0,
+            done_label,
             P4::None,
             0,
         );
+        let sort_loop_body = b.current_addr();
+        // SorterData: decode current sorted row.
+        let sorted_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::SorterData,
+            sorter_cursor,
+            sorted_reg,
+            0,
+            P4::None,
+            0,
+        );
+        Some(sort_loop_body)
+    };
+
+    // Read the row's group keys into cur_key registers.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for i in 0..num_group_keys {
+        read_slot(b, i, cur_key_base + i as i32);
     }
 
     // If first row, skip group-change comparison.
@@ -25881,21 +25997,13 @@ fn codegen_select_group_by_aggregate(
         );
     }
 
-    // Copy non-grouped columns from sorter to prev_nongrouped registers.
+    // Copy non-grouped columns from the row to prev_nongrouped registers.
     // These hold the latest (arbitrary) value for each non-grouped column.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     {
         let mut ng_idx = 0i32;
         for col in &output_cols {
             if let GroupByOutputCol::NonGroupedColumn { sorter_col, .. } = col {
-                b.emit_op(
-                    Opcode::Column,
-                    sorter_cursor,
-                    *sorter_col as i32,
-                    prev_nongrouped_base + ng_idx,
-                    P4::None,
-                    0,
-                );
+                read_slot(b, *sorter_col, prev_nongrouped_base + ng_idx);
                 ng_idx += 1;
             }
         }
@@ -25906,19 +26014,11 @@ fn codegen_select_group_by_aggregate(
     for (i, agg) in agg_columns.iter().enumerate() {
         let accum_reg = accum_base + i as i32;
 
-        // FILTER clause: read boolean from sorter and skip AggStep if false/NULL.
+        // FILTER clause: read the row's boolean and skip AggStep if false/NULL.
         let filter_skip_label = if let Some(filt_col) = filter_sorter_col[i] {
             let skip_lbl = b.emit_label();
             let filt_reg = b.alloc_temp();
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(
-                Opcode::Column,
-                sorter_cursor,
-                filt_col as i32,
-                filt_reg,
-                P4::None,
-                0,
-            );
+            read_slot(b, filt_col, filt_reg);
             // p3=1: treat NULL as false (skip AggStep).
             b.emit_jump_to_label(Opcode::IfNot, filt_reg, 1, skip_lbl, P4::None, 0);
             b.free_temp(filt_reg);
@@ -25946,15 +26046,7 @@ fn codegen_select_group_by_aggregate(
                     "internal: non-zero-arg aggregate missing sorter column".to_owned(),
                 ));
             };
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(
-                Opcode::Column,
-                sorter_cursor,
-                sorter_col as i32,
-                arg_base,
-                P4::None,
-                0,
-            );
+            read_slot(b, sorter_col, arg_base);
             // Extra arguments (e.g. separator for group_concat):
             // re-evaluate inline since they are typically constant expressions.
             for (j, extra_expr) in agg.extra_args.iter().enumerate() {
@@ -25984,19 +26076,25 @@ fn codegen_select_group_by_aggregate(
         }
     }
 
-    // SorterNext: advance to next sorted row.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    b.emit_op(
-        Opcode::SorterNext,
-        sorter_cursor,
-        sort_loop_body as i32,
-        0,
-        P4::None,
-        0,
-    );
+    if let Some(return_reg) = group_row_return {
+        // Back to pass 1 for the next row.
+        b.emit_op(Opcode::Return, return_reg, 0, 0, P4::None, 0);
+    } else if let Some(sort_loop_body) = sort_loop_body {
+        // SorterNext: advance to next sorted row.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::SorterNext,
+            sorter_cursor,
+            sort_loop_body as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
 
     // After loop: output final group (if any rows were processed).
     // If first_flag is still > 0, table was empty — skip final output.
+    b.resolve_label(final_group);
     b.emit_jump_to_label(Opcode::IfPos, first_flag, 0, done_label, P4::None, 0);
 
     // Finalize last group.
@@ -26074,9 +26172,12 @@ fn codegen_select_group_by_aggregate(
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     b.resolve_label(final_skip);
 
-    // Done: Close sorter + Halt.
+    // Done: Close sorter + Halt. A LIMIT that ends a streamed walk leaves its
+    // cursors to Halt.
     b.resolve_label(done_label);
-    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    if !streams_groups {
+        b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End target for Init jump.

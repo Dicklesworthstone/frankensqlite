@@ -312,15 +312,139 @@ fn grouped_index_range_matches_sqlite() {
                 !has_op(&f, other_key, "SeekRowid").await,
                 "`{other_key}` must use idx_ax"
             );
-            // Other aggregates and residual conjuncts read the row.
-            for sql in [
-                "SELECT x, count(*), sum(a) FROM t WHERE a BETWEEN 0 AND 200 GROUP BY x",
-                "SELECT a, count(*) FROM t WHERE a < 100 AND x = 5 GROUP BY a",
+            // idx_ax stores x and a, so a plain-column aggregate reads the index
+            // too; a residual conjunct reads the row.
+            for (sql, reads_row) in [
+                (
+                    "SELECT x, count(*), sum(a) FROM t WHERE a BETWEEN 0 AND 200 GROUP BY x",
+                    false,
+                ),
+                (
+                    "SELECT a, count(*) FROM t WHERE a < 100 AND x = 5 GROUP BY a",
+                    true,
+                ),
             ] {
                 assert!(
                     !has_op(&f, sql, "Rewind").await,
                     "`{sql}` must walk the range"
                 );
+                assert_eq!(
+                    has_op(&f, sql, "SeekRowid").await,
+                    reads_row,
+                    "`{sql}` row lookup"
+                );
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+/// GROUP BY whose keys an index orders forms its groups as the index's rows
+/// arrive, with no sorter, and a LIMIT ends the walk: a whole-index walk when
+/// the index covers the query or there is a LIMIT, a range on the leading key,
+/// and an equality prefix with the keys next in the index. Rows match stock in
+/// order, in memory and on a file database in strict mode (where the program
+/// under test must produce them). Keys no index orders, expression keys and
+/// arguments, IN lists and keys out of index order keep the sorter.
+#[test]
+fn grouped_index_order_streams_and_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("grouped_index_order.db");
+        let streamed: &[(&str, &[i64])] = &[
+            ("SELECT a, count(*) FROM t GROUP BY a", &[]),
+            (
+                "SELECT a, max(x), min(x), count(x), sum(x), total(x), avg(x) FROM t GROUP BY a",
+                &[],
+            ),
+            ("SELECT a, max(x) FROM t GROUP BY a ORDER BY a LIMIT 5", &[]),
+            ("SELECT a, count(*) FROM t GROUP BY a LIMIT 3 OFFSET 2", &[]),
+            ("SELECT a, count(*) FROM t GROUP BY a LIMIT ?1", &[4]),
+            ("SELECT a, sum(id) FROM t GROUP BY a LIMIT 4", &[]),
+            ("SELECT a, count(DISTINCT x) FROM t GROUP BY a", &[]),
+            (
+                "SELECT a, count(*) FROM t WHERE x > 50 GROUP BY a LIMIT 5",
+                &[],
+            ),
+            ("SELECT a, count(*) FROM t WHERE a < 100 GROUP BY a", &[]),
+            (
+                "SELECT a, max(x) FROM t WHERE a BETWEEN 0 AND 300 GROUP BY a",
+                &[],
+            ),
+            ("SELECT a, count(*) FROM t WHERE a = 5 GROUP BY a", &[]),
+            ("SELECT a, x, count(*) FROM t GROUP BY a, x LIMIT 7", &[]),
+            ("SELECT a, sum(x) FROM t GROUP BY a ORDER BY a", &[]),
+            ("SELECT a, count(*) FROM t GROUP BY a LIMIT 0", &[]),
+        ];
+        // The equality prefix takes the first index that pins it (idx_a), whose
+        // order does not group x: either way the rows must match.
+        let either = "SELECT x, count(*) FROM t WHERE a = 5 GROUP BY x";
+        let sorted: &[&str] = &[
+            "SELECT x, count(*) FROM t GROUP BY x",
+            // (CAST: `a % 7` puts 7.5's 0.0 in the integer 0 group, whose
+            // output value the in-memory mirror takes from another row than
+            // stock, bd-t92q0.)
+            "SELECT CAST(a AS INTEGER) % 7, count(*) FROM t GROUP BY CAST(a AS INTEGER) % 7",
+            "SELECT a, sum(id * 2) FROM t GROUP BY a",
+            "SELECT a, count(*) FROM t WHERE a IN (5, 3, 9) GROUP BY a",
+            "SELECT x, a, count(*) FROM t GROUP BY x, a ORDER BY x, a LIMIT 5",
+        ];
+        for path in [":memory:", file.to_str().unwrap()] {
+            let (f, r) = seeded(path, &["CREATE INDEX idx_ax ON t(a, x);"]).await;
+            if path != ":memory:" {
+                f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+                    .await
+                    .unwrap();
+                let having = "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1";
+                assert!(
+                    f.query(having).await.is_err(),
+                    "strict mode must refuse the grouped evaluator, which a HAVING still takes \
+                     (bd-w4pr1.13.32); otherwise the rows below need not come from the program"
+                );
+            }
+            for &(sql, params) in streamed {
+                assert_eq!(
+                    frank_rows(&f, sql, params).await,
+                    sqlite_rows(&r, sql, params),
+                    "diverged: `{sql}` {params:?} at {path}"
+                );
+                assert!(
+                    !has_op(&f, sql, "SorterOpen").await,
+                    "`{sql}` must form its groups in index order, without a sorter"
+                );
+            }
+            assert_eq!(
+                frank_rows(&f, either, &[]).await,
+                sqlite_rows(&r, either, &[]),
+                "diverged: `{either}` at {path}"
+            );
+            for &sql in sorted {
+                assert_eq!(
+                    frank_rows(&f, sql, &[]).await,
+                    sqlite_rows(&r, sql, &[]),
+                    "diverged: `{sql}` at {path}"
+                );
+                assert!(
+                    has_op(&f, sql, "SorterOpen").await,
+                    "`{sql}` must keep the sorter"
+                );
+            }
+            // An index that stores every input value is read alone.
+            for sql in [
+                "SELECT a, count(*) FROM t GROUP BY a",
+                "SELECT a, max(x), min(x), count(x), sum(x), total(x), avg(x) FROM t GROUP BY a",
+                "SELECT a, x, count(*) FROM t GROUP BY a, x LIMIT 7",
+            ] {
+                assert!(
+                    !has_op(&f, sql, "SeekRowid").await,
+                    "`{sql}` must read only the index"
+                );
+            }
+            // A residual or a rowid argument reads the row.
+            for sql in [
+                "SELECT a, count(*) FROM t WHERE x > 50 GROUP BY a LIMIT 5",
+                "SELECT a, sum(id) FROM t GROUP BY a LIMIT 4",
+            ] {
                 assert!(
                     has_op(&f, sql, "SeekRowid").await,
                     "`{sql}` must read the row"
