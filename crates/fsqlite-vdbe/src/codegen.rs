@@ -3438,9 +3438,10 @@ pub fn codegen_select(
     // filtering the FULL WHERE per row (`codegen_select_index_equality_scan` with `residual_filter =
     // true`, so its fast path narrows to the exact matches). Dispatched as a heuristic fallback (AFTER
     // rowid/range/index_eq, before the full scan) so strictly-better rowid/range paths still win. Single
-    // eq column only. The residual-aware emitter always opens the table even when the projection itself
-    // is index-covering, because the residual may read any table column. The `col=lit` rows come back in
-    // rowid order — the full scan's order within that block — so byte-identical.
+    // eq column only. The residual-aware emitter looks each row up unless the projection is
+    // index-covering and the residual reads only the rowid and index key columns (bd-y8zgm). The
+    // `col=lit` rows come back in rowid order — the full scan's order within that block — so
+    // byte-identical.
     let eq_residual: Option<(&IndexSchema, &Expr)> = if is_aggregate
         || from_index_hint.is_some()
         || time_travel.is_some()
@@ -5924,11 +5925,20 @@ fn codegen_select_index_equality_scan(
     } else {
         None
     };
-    let covering_output = if wr_pk_indices.is_some() || residual_filter {
-        None
-    } else {
-        resolve_covering_output_sources(columns, table, table_alias, idx_schema)
-    };
+    // bd-y8zgm: a residual that reads only the rowid and the index's key
+    // columns is evaluated from the index entry, so with a covered projection
+    // the fast path never looks the row up.
+    let residual_reads_index_only = residual_filter
+        && wr_pk_indices.is_none()
+        && where_clause.is_some_and(|where_expr| {
+            expr_reads_only_index_columns(where_expr, table, table_alias, idx_schema, false)
+        });
+    let covering_output =
+        if wr_pk_indices.is_some() || (residual_filter && !residual_reads_index_only) {
+            None
+        } else {
+            resolve_covering_output_sources(columns, table, table_alias, idx_schema)
+        };
     let needs_table_lookup = covering_output.is_none();
     let fast_path_done_label = if needs_table_lookup {
         done_label
@@ -6254,21 +6264,35 @@ fn codegen_select_index_equality_scan(
     };
     // bd-nonagg-eq-residual: apply the full WHERE as a per-row residual filter on the fast seek path
     // when the caller has a residual beyond the eq prefix. The seek already pins `col = lit` (so that
-    // conjunct is redundant here) and the row is positioned (table cursor for the non-covering caller
-    // this flag is gated to), so the residual (e.g. `c = 7`) narrows the eq block to the exact matches.
-    // The placeholder base is reset exactly as the fallback below does, so a `?` in the residual numbers
-    // identically on both runtime paths.
+    // conjunct is redundant here) and the row is positioned (the table cursor, or for a WHERE that
+    // reads only index columns the index entry, bd-y8zgm), so the residual (e.g. `c = 7`) narrows the
+    // eq block to the exact matches. The placeholder base is reset exactly as the fallback below
+    // does, so a `?` in the residual numbers identically on both runtime paths.
     if residual_filter && let Some(where_expr) = where_clause {
         b.set_next_anon_placeholder(where_placeholder_base);
-        emit_where_filter(
-            b,
-            where_expr,
-            cursor,
-            table,
-            table_alias,
-            schema,
-            idx_skip_label,
-        );
+        match covering_rowid_reg {
+            Some(rowid_reg) if !needs_table_lookup => emit_index_entry_where_filter(
+                b,
+                where_expr,
+                idx_cursor,
+                rowid_reg,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                idx_schema,
+                idx_skip_label,
+            ),
+            _ => emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                idx_skip_label,
+            ),
+        }
     }
     // OFFSET applies to rows that satisfy WHERE, and projection expressions must
     // not run for filtered-out candidates. Keep both after the residual filter.
@@ -38244,6 +38268,200 @@ fn resolve_covering_output_sources(
     }
 
     Some(output)
+}
+
+/// bd-y8zgm: whether every reference `expr` makes to the scanned `table` reads
+/// its rowid or one of `index`'s key columns, so that the expression can be
+/// evaluated from the index entry (`emit_index_entry_where_filter`) without
+/// the table row.
+///
+/// Literals, parameters and bound outer values read nothing. An EXISTS over one
+/// plain table is walked too (`in_exists`): SQLite binds its names to that
+/// table first, but a name that could also bind to `table` must be covered
+/// either way, so an inner column that shadows an outer one never hides an
+/// uncovered read. A REAL-affinity or virtual generated column, any other
+/// subquery, and an EXISTS inside an EXISTS fail closed.
+fn expr_reads_only_index_columns(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+    in_exists: bool,
+) -> bool {
+    let walk = |inner: &Expr| expr_reads_only_index_columns(inner, table, table_alias, index, in_exists);
+    match expr {
+        Expr::Column(_, _) => match resolve_column_ref(expr, table, table_alias) {
+            Some(SortKeySource::Rowid) => true,
+            Some(SortKeySource::Column(col_idx)) => table.columns.get(col_idx).is_some_and(|column| {
+                !column.affinity.eq_ignore_ascii_case(&'E')
+                    && virtual_generated_column_expr(column).is_none()
+                    && index_column_position(index, &column.name).is_some()
+            }),
+            Some(SortKeySource::Expression(_)) => false,
+            // Inside the EXISTS a name that is not `table`'s binds to the
+            // subquery's own table; outside it, nothing this can place.
+            None => in_exists,
+        },
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::BoundOuterValue { .. } => true,
+        Expr::BinaryOp { left, right, .. } => walk(left) && walk(right),
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => walk(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => walk(inner) && walk(low) && walk(high),
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            walk(inner)
+                && match set {
+                    fsqlite_ast::InSet::List(items) => items.iter().all(walk),
+                    fsqlite_ast::InSet::Table(_) => true,
+                    fsqlite_ast::InSet::Subquery(_) => false,
+                }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            order_by.is_empty()
+                && filter.is_none()
+                && over.is_none()
+                && match args {
+                    FunctionArgs::Star => true,
+                    FunctionArgs::List(items) => items.iter().all(walk),
+                }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_none_or(walk)
+                && whens
+                    .iter()
+                    .all(|(condition, result)| walk(condition) && walk(result))
+                && else_expr.as_deref().is_none_or(walk)
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => walk(inner) && walk(pattern) && escape.as_deref().is_none_or(walk),
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => walk(inner) && walk(path),
+        Expr::RowValue(items, _) => items.iter().all(walk),
+        Expr::Exists { subquery, .. } => {
+            !in_exists && exists_reads_only_index_columns(subquery, table, table_alias, index)
+        }
+        Expr::Subquery(_, _) | Expr::Raise { .. } => false,
+    }
+}
+
+/// [`expr_reads_only_index_columns`] for `EXISTS (subquery)`: a SELECT over one
+/// plain table with no WITH, compound, join, GROUP BY, HAVING or window, whose
+/// every expression reads `table` only through the rowid or `index`'s key
+/// columns.
+fn exists_reads_only_index_columns(
+    subquery: &SelectStatement,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+) -> bool {
+    let SelectCore::Select {
+        columns,
+        from: Some(from),
+        where_clause,
+        group_by,
+        having,
+        windows,
+        ..
+    } = &subquery.body.select
+    else {
+        return false;
+    };
+    let walk = |inner: &Expr| expr_reads_only_index_columns(inner, table, table_alias, index, true);
+    subquery.with.is_none()
+        && subquery.body.compounds.is_empty()
+        && from.joins.is_empty()
+        && matches!(from.source, TableOrSubquery::Table { .. })
+        && group_by.is_empty()
+        && having.is_none()
+        && windows.is_empty()
+        && columns.iter().all(|column| match column {
+            ResultColumn::Expr { expr, .. } => walk(expr),
+            ResultColumn::Star | ResultColumn::TableStar(_) => true,
+        })
+        && where_clause.as_deref().is_none_or(walk)
+        && subquery.order_by.iter().all(|term| walk(&term.expr))
+        && subquery.limit.as_ref().is_none_or(|clause| {
+            walk(&clause.limit) && clause.offset.as_ref().is_none_or(walk)
+        })
+}
+
+/// bd-y8zgm: skip to `skip_label` unless `where_expr` holds for the index entry
+/// under `idx_cursor`, whose rowid is in `rowid_reg`, without the table row.
+///
+/// The index's key columns and the rowid (also in the INTEGER PRIMARY KEY's
+/// slot) are copied into a row image of `table`, and the expression is
+/// evaluated against it through `ScanCtx::register_base` with the general
+/// expression emitter, whose column reads honor the image. Only for an
+/// expression [`expr_reads_only_index_columns`] accepts, so the image's other
+/// columns, left NULL, are never read.
+#[allow(clippy::too_many_arguments)]
+fn emit_index_entry_where_filter(
+    b: &mut ProgramBuilder,
+    where_expr: &Expr,
+    idx_cursor: i32,
+    rowid_reg: i32,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    index: &IndexSchema,
+    skip_label: crate::Label,
+) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let image = b.alloc_regs(table.columns.len() as i32);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (position, name) in index.columns.iter().enumerate() {
+        if let Some(col_idx) = table.column_index(name) {
+            b.emit_op(
+                Opcode::Column,
+                idx_cursor,
+                position as i32,
+                image + col_idx as i32,
+                P4::None,
+                0,
+            );
+        }
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    if let Some(ipk) = table.columns.iter().position(|column| column.is_ipk) {
+        b.emit_op(Opcode::Copy, rowid_reg, image + ipk as i32, 0, P4::None, 0);
+    }
+    let scan = ScanCtx {
+        cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: Some(RegisterRow::with_rowid(image, rowid_reg)),
+        secondaries: &[],
+    };
+    let condition = b.alloc_temp();
+    emit_expr(b, where_expr, condition, Some(&scan));
+    b.emit_jump_to_label(Opcode::IfNot, condition, 1, skip_label, P4::None, 0);
+    b.free_temp(condition);
 }
 
 fn resolve_order_by_rowid_direction(

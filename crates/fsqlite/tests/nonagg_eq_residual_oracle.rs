@@ -3,8 +3,9 @@
 //! fallback, after rowid/range/index_eq) via codegen_select_index_equality_scan with residual_filter=true,
 //! instead of full-scanning. Composite indexes can emit the equality block in trailing-key order,
 //! so unordered pagination checks cardinality and membership against stock SQLite. Ordered
-//! comparisons also check row identity and order. The residual-aware emitter opens the table
-//! even when the projection is index-covering, because the residual may read any table column.
+//! comparisons also check row identity and order. The residual-aware emitter looks each row up
+//! unless the projection is index-covering and the residual reads only the rowid and the index's
+//! key columns (bd-y8zgm), which it then evaluates from the index entry.
 use fsqlite::Connection;
 use fsqlite_func::ScalarFunction;
 use fsqlite_types::SqliteValue;
@@ -1984,5 +1985,115 @@ fn nonagg_eq_residual_rejects_binary_index_for_nocase_column() {
             "a BINARY index cannot serve a bare equality whose NOCASE column semantics \
              also match differently-cased keys"
         );
+    });
+}
+
+/// Whether the plan positions the scanned table's cursor (0) on a row.
+async fn looks_table_row_up(c: &Connection, sql: &str) -> bool {
+    c.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(|row| {
+            matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.as_str() == "SeekRowid")
+                && row.values().get(2) == Some(&SqliteValue::Integer(0))
+        })
+}
+
+/// bd-y8zgm: when the projection and the whole WHERE read only the rowid and the
+/// index's key columns, the residual (a correlated EXISTS included) is evaluated
+/// from the index entry and no row is looked up. A name inside the EXISTS binds
+/// to the subquery's table first (`b` below is p.b, not t.b); an outer read of a
+/// column the index lacks (`t.c`), a residual on it, or an uncovered output keeps
+/// the lookup. Answers match stock either way.
+#[test]
+fn eq_residual_reading_only_index_columns_skips_the_row_lookup() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, s TEXT);",
+            "CREATE INDEX t_ab ON t(a, b);",
+            "CREATE TABLE p (pid INTEGER PRIMARY KEY, tid INTEGER, w INTEGER, b INTEGER, c INTEGER);",
+            "CREATE INDEX p_tid ON p(tid);",
+        ])
+        .await;
+        for i in 1..=300_i64 {
+            ins(
+                &f,
+                &r,
+                &format!(
+                    "INSERT INTO t VALUES ({i}, {}, {}, {}, 's{}');",
+                    i % 10,
+                    i % 7,
+                    i % 5,
+                    i % 11
+                ),
+            )
+            .await;
+        }
+        for i in 1..=200_i64 {
+            ins(
+                &f,
+                &r,
+                &format!(
+                    "INSERT INTO p VALUES ({}, {}, {}, {}, {});",
+                    i * 2,
+                    (i * 3) % 300 + 1,
+                    i % 5,
+                    i % 4 + 100,
+                    i % 3
+                ),
+            )
+            .await;
+        }
+        let covered = [
+            "SELECT id FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE p.tid = t.id)",
+            "SELECT id, a FROM t WHERE a = 5 AND NOT EXISTS (SELECT 1 FROM p WHERE p.tid = t.id)",
+            "SELECT id, b FROM t WHERE a = 4 AND EXISTS (SELECT 1 FROM p WHERE p.pid = t.id)",
+            // `id` is not a column of p, so it binds to t.
+            "SELECT id FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE tid = id)",
+            // `b` binds to p.b (100-103), never to t.b (0-6).
+            "SELECT id FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE p.tid = t.id AND b = 101)",
+            "SELECT id FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE p.tid = t.id AND p.w = t.b)",
+            "SELECT id FROM t WHERE a = 3 AND (id > 100 OR b = 2)",
+        ];
+        for sql in covered {
+            cmp(&f, &r, sql, "index-only-residual").await;
+            assert!(has_seek(&f, sql).await, "must seek: `{sql}`");
+            assert!(
+                !looks_table_row_up(&f, sql).await,
+                "the residual reads only index columns: `{sql}`"
+            );
+        }
+        let looked_up = [
+            // t.c is not in t_ab: reading it from the index entry would see NULL.
+            "SELECT id FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE p.tid = t.id AND p.w = t.c)",
+            "SELECT id FROM t WHERE a = 5 AND c > 2",
+            "SELECT id, s FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE p.tid = t.id)",
+        ];
+        for sql in looked_up {
+            cmp(&f, &r, sql, "row-reading-residual").await;
+            assert!(has_seek(&f, sql).await, "must seek: `{sql}`");
+            assert!(
+                looks_table_row_up(&f, sql).await,
+                "the residual or output needs the row: `{sql}`"
+            );
+        }
+        // `c` binds to p.c; the plan may look t up (t.c is a possible binding
+        // the index lacks), and the answer must be p.c's either way.
+        cmp(
+            &f,
+            &r,
+            "SELECT id FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE p.tid = t.id AND c = 2)",
+            "shadowed-uncovered-name",
+        )
+        .await;
+        let unpaged =
+            "SELECT id FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE p.tid = t.id)";
+        let eligible = sqlite_rows(&r, unpaged);
+        assert!(eligible.len() > 4, "fixture needs several qualifying rows");
+        for offset in [1, eligible.len() - 1] {
+            let sql = format!("{unpaged} LIMIT 3 OFFSET {offset}");
+            assert_unordered_page(&frank_rows(&f, &sql).await, &eligible, 3, offset, "paged");
+        }
     });
 }
