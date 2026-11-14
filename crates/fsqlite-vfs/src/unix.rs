@@ -3953,6 +3953,13 @@ impl VfsFile for UnixFile {
         Ok(Some(live))
     }
 
+    fn positional_reader(&self) -> Option<Arc<File>> {
+        if self.closed {
+            return None;
+        }
+        self.file.as_ref().map(Arc::clone)
+    }
+
     async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
         checked_io_range(offset, buf.len(), "read")?;

@@ -218,6 +218,7 @@ use crate::{
         InsertValueSource, RowidLookupSelectTemplate, SimpleInsertTemplate, try_compile_program,
     },
     opcode_register_spans,
+    parallel_aggregate::{ParallelAggregatePlan, TableShape, run_parallel_aggregate},
 };
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
@@ -5225,7 +5226,7 @@ struct PageRowView {
 }
 
 /// What the rowid-alias rules read from a record header.
-trait RecordColumns {
+pub(crate) trait RecordColumns {
     /// Number of columns the record stores.
     fn column_count(&self) -> usize;
     /// Serial type and byte range of stored column `idx`.
@@ -5251,7 +5252,7 @@ impl RecordColumns for RowDecodeScratch {
 /// slots; on a scan their upkeep and the general varint reader were most of
 /// what a header parse cost.
 #[derive(Debug, Default)]
-struct RecordColumnTable {
+pub(crate) struct RecordColumnTable {
     /// `columns[..count]` describes the current record; the rest is spare
     /// room kept from earlier records.
     columns: Vec<ColumnOffset>,
@@ -5299,7 +5300,7 @@ impl RecordColumnTable {
     /// loop state on that function's stack, a parse cost about as much as
     /// the decode scratch's.
     #[inline(never)]
-    fn parse(&mut self, record: &[u8]) -> bool {
+    pub(crate) fn parse(&mut self, record: &[u8]) -> bool {
         self.count = 0;
         let Some(&size_byte) = record.first() else {
             return false;
@@ -7594,6 +7595,12 @@ pub struct VdbeEngine {
     trace_opcodes: bool,
     /// Execute-scoped metrics flag latched once per statement.
     collect_vdbe_metrics: bool,
+    /// Threads one scan of this statement may use, the engine's own included
+    /// (bd-w4pr1.13.11). 1 runs every scan on this thread alone, as before;
+    /// a larger value lets a scan read the transaction's snapshot through a
+    /// [`fsqlite_pager::SnapshotPageReader`] on that many threads when the
+    /// transaction offers one. Set per statement by the connection.
+    parallel_workers: usize,
     /// Result rows accumulated during execution.
     results: ResultRowStorage,
     /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
@@ -8359,6 +8366,7 @@ impl VdbeEngine {
             text_encoding_authoritative: false,
             trace_opcodes: opcode_trace_enabled(),
             collect_vdbe_metrics: false,
+            parallel_workers: 1,
             results: Vec::with_capacity(64),
             cursors: CursorSlots::new(),
             sorters: CursorSlots::new(),
@@ -8759,6 +8767,100 @@ impl VdbeEngine {
     /// Control whether `OP_Close` preserves storage cursors for reusable DML.
     pub fn set_retain_storage_cursors_on_close(&mut self, retain: bool) {
         self.retain_storage_cursors_on_close = retain;
+    }
+
+    /// Threads one scan of the next execution may use, this one included
+    /// (bd-w4pr1.13.11). 0 and 1 keep every scan on this thread.
+    pub fn set_parallel_workers(&mut self, workers: usize) {
+        self.parallel_workers = workers.max(1);
+    }
+
+    /// A reader of the lent transaction's committed snapshot for threads
+    /// outside this engine, when parallel scans are allowed and the
+    /// transaction offers one. A transaction with an MVCC concurrent context
+    /// records page reads for conflict detection and never offers one.
+    fn parallel_snapshot_reader(&self) -> Option<fsqlite_pager::SnapshotPageReader> {
+        if self.parallel_workers <= 1 {
+            return None;
+        }
+        let io = self.txn_page_io.as_ref()?;
+        if io.concurrent.borrow().is_some() {
+            return None;
+        }
+        io.txn.borrow().snapshot_page_reader()
+    }
+
+    /// bd-w4pr1.13.11: run `plan`, the program's parallel aggregate, for the
+    /// table cursor `cursor_id` its `OpenRead` just opened, on the lent
+    /// transaction's committed snapshot. `Ok(Some(values))` holds the values
+    /// of the plan's `ResultRow`. `Ok(None)` leaves the serial loop to run:
+    /// the plan does not fit this program, the transaction offers no snapshot
+    /// reader, user code could change an aggregate or a comparison, the walk
+    /// was stopped, a sum met a value it does not add exactly, or a page or
+    /// record failed to read (which the serial loop then reports itself).
+    fn try_parallel_aggregate(
+        &mut self,
+        program: &VdbeProgram,
+        plan: &ParallelAggregatePlan,
+        cursor_id: i32,
+    ) -> Result<Option<Vec<SqliteValue>>> {
+        let fits = program.ops().get(plan.result_addr).is_some_and(|op| {
+            op.opcode == Opcode::ResultRow
+                && op.p1 == plan.out_reg
+                && usize::try_from(op.p2).is_ok_and(|n| n == plan.aggregates.len())
+        });
+        if !fits
+            || self.text_encoding != TextEncoding::Utf8
+            || self
+                .func_registry
+                .as_ref()
+                .is_some_and(|registry| registry.has_application_functions())
+            || self.builtin_collations_overridden()
+        {
+            return Ok(None);
+        }
+        let Some(reader) = self.parallel_snapshot_reader() else {
+            return Ok(None);
+        };
+        let defaults = self
+            .column_defaults_by_root_page
+            .get(&plan.root_page)
+            .cloned()
+            .unwrap_or_default();
+        let workers = self.parallel_workers;
+        let Some(sc) = self.storage_cursors.get(&cursor_id) else {
+            return Ok(None);
+        };
+        if !sc.cursor.is_table_btree() {
+            return Ok(None);
+        }
+        let CursorBackend::Txn(btree) = &sc.cursor else {
+            return Ok(None);
+        };
+        let shape = TableShape {
+            ipk_col_idx: sc.ipk_col_idx,
+            table_column_count: sc.table_column_count,
+            first_not_null_non_ipk_col: sc.first_not_null_non_ipk_col,
+            record_slots: sc.record_slots.clone(),
+            real_columns: sc.real_columns.clone(),
+            defaults,
+        };
+        let cx = &sc.cx;
+        match run_parallel_aggregate(
+            plan,
+            &shape,
+            &reader,
+            btree.root_page(),
+            btree.usable_size(),
+            workers,
+            &|| cx.is_cancel_requested(),
+        ) {
+            Ok(values) => Ok(values),
+            // Raised only once every row was folded, as the serial AggFinal
+            // raises it for the same rows.
+            Err(FrankenError::IntegerOverflow) => Err(FrankenError::IntegerOverflow),
+            Err(_) => Ok(None),
+        }
     }
 
     fn clear_storage_cursor_statement_state(sc: &mut StorageCursor) {
@@ -11741,6 +11843,23 @@ impl VdbeEngine {
                     }
                     self.cursor_root_pages.insert(cursor_id, root_page);
                     self.cursors.remove(&cursor_id);
+                    // bd-w4pr1.13.11: the aggregate loop this OpenRead starts
+                    // may run on several threads instead; on success the
+                    // program continues at its ResultRow with the same values.
+                    if self.parallel_workers > 1
+                        && let Some(plan) = program.parallel_aggregate()
+                        && plan.open_addr == pc
+                        && plan.cursor == cursor_id
+                        && plan.root_page == root_page
+                        && let Some(values) =
+                            self.try_parallel_aggregate(program, plan, cursor_id)?
+                    {
+                        for (reg, value) in (plan.out_reg..).zip(values) {
+                            self.set_reg(reg, value);
+                        }
+                        pc = plan.result_addr;
+                        continue;
+                    }
                     pc += 1;
                 }
                 Opcode::OpenWrite => {
@@ -14403,12 +14522,41 @@ impl VdbeEngine {
                         } else {
                             0
                         }
-                    } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                    } else if self.storage_cursors.get(&cursor_id).is_some() {
+                        // bd-w4pr1.13.11: with parallel workers allowed and a
+                        // snapshot reader offered, count the cursor's b-tree on
+                        // several threads. Any failure or stop falls back to the
+                        // serial count, which reports errors and cancellation as
+                        // it always has.
+                        let reader = self.parallel_snapshot_reader();
+                        let workers = self.parallel_workers;
+                        let sc = self
+                            .storage_cursors
+                            .get_mut(&cursor_id)
+                            .ok_or_else(|| FrankenError::internal("Count cursor vanished"))?;
+                        let parallel = match (&reader, &sc.cursor) {
+                            (Some(reader), CursorBackend::Txn(btree)) => {
+                                let cx = &sc.cx;
+                                fsqlite_btree::snapshot_walk::count_entries_parallel(
+                                    reader,
+                                    btree.root_page(),
+                                    btree.usable_size(),
+                                    workers,
+                                    &|| cx.is_cancel_requested(),
+                                )
+                                .ok()
+                                .flatten()
+                            }
+                            _ => None,
+                        };
                         // bd-wwqen.3: storage-cursor COUNT must report the
                         // cursor's own storage view, not a connection-local
                         // MemDatabase mirror that may lag retained same-connection
                         // writes.
-                        lean_future(|| sc.cursor.count_all_rows(&sc.cx)).await?
+                        match parallel {
+                            Some(count) => count,
+                            None => lean_future(|| sc.cursor.count_all_rows(&sc.cx)).await?,
+                        }
                     } else {
                         0
                     };
@@ -20916,6 +21064,23 @@ fn coerce_for_comparison<'a>(
     (Cow::Borrowed(lhs), Cow::Borrowed(rhs))
 }
 
+/// How a comparison opcode with no collation in P4, affinity flags `p5` and
+/// no built-in collation overridden orders `lhs` against `rhs` (P3 against
+/// P1), for code that evaluates a WHERE outside the dispatch loop
+/// (bd-w4pr1.13.11). `None` is an indeterminate comparison.
+pub(crate) fn compare_for_where(
+    lhs: &SqliteValue,
+    rhs: &SqliteValue,
+    p5: u16,
+    enc: TextEncoding,
+) -> Option<Ordering> {
+    if let Some(ord) = fast_compare_same_storage_class(lhs, rhs, &P4::None, p5, enc) {
+        return ord;
+    }
+    let (lhs, rhs) = coerce_for_comparison(lhs, rhs, p5);
+    lhs.partial_cmp(&rhs)
+}
+
 fn values_equal_without_collation(lhs: &SqliteValue, rhs: &SqliteValue) -> bool {
     if lhs.is_null() || rhs.is_null() {
         return false;
@@ -21694,7 +21859,13 @@ fn try_storage_cursor_payload_includes_rowid_alias_local(
 /// Returns the header-only verdict and, when that verdict is "absent" on a
 /// short payload whose slot holds an integer, the slot to compare with the
 /// row's rowid.
-fn payload_rowid_alias_header_verdict<C: RecordColumns>(
+///
+/// Inlined at every call: the in-place `Column` lane calls it once per row,
+/// and a second caller (the parallel aggregate scan, bd-w4pr1.13.11) was
+/// enough for LLVM to stop inlining it there (+9M instructions on a 1M-row
+/// filtered aggregate).
+#[inline(always)]
+pub(crate) fn payload_rowid_alias_header_verdict<C: RecordColumns>(
     row_decode: &C,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
@@ -22544,7 +22715,7 @@ fn payload_includes_rowid_alias_without_rowid<C: RecordColumns>(
     matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null)
 }
 
-fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
+pub(crate) fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
     let start = usize::try_from(col.body_offset).ok()?;
     let len = usize::try_from(col.value_len).ok()?;
     start.checked_add(len)
@@ -22559,7 +22730,7 @@ fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
 /// marks a column the record leaves out, which reads past the record end.
 /// Such a record always stores the alias slot, as stock's does. Otherwise
 /// columns after the alias sit one slot earlier when the payload omits it.
-fn storage_payload_column_index(
+pub(crate) fn storage_payload_column_index(
     col_idx: usize,
     ipk_col_idx: Option<usize>,
     payload_includes_rowid_alias: bool,

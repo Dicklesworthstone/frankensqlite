@@ -14,6 +14,7 @@ pub mod learned_rowid;
 pub mod overflow;
 pub mod payload;
 pub mod quotient_filter;
+pub mod snapshot_walk;
 pub mod swiss_index;
 pub mod swizzle;
 pub mod traits;

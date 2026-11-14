@@ -36,6 +36,7 @@ pub mod page_cache;
 pub mod pager;
 pub mod persistent_page_map;
 pub mod s3_fifo;
+pub mod snapshot_reader;
 pub mod submodular_prefetch;
 pub mod thompson_partitioner;
 pub mod traits;
@@ -83,6 +84,7 @@ pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,
     S3FifoEvent, S3FifoRolloutGate,
 };
+pub use snapshot_reader::{SnapshotPageBuf, SnapshotPageReader, WalSnapshotFrames};
 pub use submodular_prefetch::{Candidate as PrefetchCandidate, expected_gain, greedy_select};
 pub use thompson_partitioner::{BetaArm, RESAMPLE_INTERVAL, ThompsonPartitioner};
 pub use traits::{

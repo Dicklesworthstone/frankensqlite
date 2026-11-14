@@ -29589,6 +29589,48 @@ where
             || (self.is_writer && self.freelist_metadata_dirty())
     }
 
+    /// bd-w4pr1.13.11: offered for a WAL-mode read transaction that has
+    /// written, freed and allocated nothing, whose captured snapshot has an
+    /// authoritative page index, and whose backend still pins exactly that
+    /// snapshot. Every lock is tried, never waited for: contention declines.
+    fn snapshot_page_reader(&self) -> Option<crate::snapshot_reader::SnapshotPageReader> {
+        if self.journal_mode != JournalMode::Wal
+            || self.mode != TransactionMode::ReadOnly
+            || self.is_writer
+            || self.writes_observed
+            || self.finished
+            || self.committed
+            || self.has_pending_writes()
+            || self.has_pending_recovery_barrier()
+            || !self.freed_pages.is_empty()
+            || !self.rolled_back_pages.is_empty()
+            || !self.allocated_from_eof.is_empty()
+            || !self.allocated_from_freelist.is_empty()
+            || !self.page_lease.is_empty()
+        {
+            return None;
+        }
+        let captured = self.wal_conflict_snapshot?;
+        if captured.index_is_partial {
+            return None;
+        }
+        let frames = {
+            let backend = wal_backend_handle(&self.wal_backend).ok()?;
+            let guard = backend.try_read().ok()?;
+            guard.pinned_snapshot_frames()?
+        };
+        if frames.publication != captured {
+            return None;
+        }
+        let db_file = self.db_file.try_read().ok()?.positional_reader()?;
+        Some(crate::snapshot_reader::SnapshotPageReader::new(
+            db_file,
+            Some(frames),
+            self.pool.page_size(),
+            self.published_db_size.get(),
+        ))
+    }
+
     fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> {
         if self.has_pending_recovery_barrier() {
             return None;

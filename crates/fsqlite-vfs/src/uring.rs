@@ -1443,6 +1443,10 @@ impl VfsFile for IoUringFile {
         self.read_data_path(cx, buf, offset)
     }
 
+    fn positional_reader(&self) -> Option<Arc<std::fs::File>> {
+        self.inner.positional_reader()
+    }
+
     fn write<'a>(
         &'a self,
         cx: &'a Cx,

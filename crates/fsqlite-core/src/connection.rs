@@ -760,6 +760,9 @@ pub const MAX_TRIGGER_DEPTH: usize = 8;
 /// changes the scalar-function registry while a statement snapshot is formed.
 const FUNCTION_REGISTRY_STABILITY_ATTEMPTS: usize = 4;
 
+/// Upper bound of `PRAGMA fsqlite.parallel_workers` (bd-w4pr1.13.11).
+const MAX_PARALLEL_WORKERS: usize = 64;
+
 /// Maximum aggregate depth of active trigger and FK-action programs.
 ///
 /// SQLite charges trigger bodies and recursive foreign-key actions against one
@@ -6440,6 +6443,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     if full_name_is("fsqlite.dqs") || full_name_is("dqs") {
         return &["dqs"];
     }
+    if full_name_is("fsqlite.parallel_workers") || full_name_is("parallel_workers") {
+        return &["parallel_workers"];
+    }
     if full_name_is("fsqlite.concurrency")
         || full_name_is("concurrency")
         || full_name_is("fsqlite_concurrency")
@@ -9786,6 +9792,7 @@ impl PreparedStatement<'_> {
             true,
             cached,
             Vec::new(),
+            self.conn.statement_parallel_workers(),
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10160,6 +10167,7 @@ impl PreparedStatement<'_> {
                 true,
                 cached,
                 Vec::new(),
+                self.conn.statement_parallel_workers(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10219,6 +10227,7 @@ impl PreparedStatement<'_> {
                 true,
                 cached,
                 Vec::new(),
+                self.conn.statement_parallel_workers(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -14261,6 +14270,10 @@ pub struct Connection {
     /// column/table falls back to a string literal. Default `true` for
     /// byte-exact parity with the stock CLI; a follow-up PRAGMA flips it.
     dqs_enabled: Cell<bool>,
+    /// bd-w4pr1.13.11: threads one scan of an autocommit read may use, the
+    /// connection's own included. 1 (default) keeps every scan on the
+    /// connection's thread. Controlled by `PRAGMA fsqlite.parallel_workers`.
+    parallel_workers: Cell<usize>,
     /// Commit-path safety regime. `Safe` (default) always runs the full
     /// SSI validation. `LabUnsafe` enables the `ssi_e_process_gate` skip
     /// path. Controlled by `PRAGMA fsqlite.write_merge`.
@@ -16415,6 +16428,7 @@ impl Connection {
             pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
             dqs_enabled: Cell::new(true),
+            parallel_workers: Cell::new(1),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -16999,6 +17013,7 @@ impl Connection {
             pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
             dqs_enabled: Cell::new(true),
+            parallel_workers: Cell::new(1),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -26278,6 +26293,18 @@ impl Connection {
 
     fn clear_cached_concurrent_handle(&self) {
         self.cached_concurrent_handle.borrow_mut().take();
+    }
+
+    /// Threads a scan of the statement about to run may use (bd-w4pr1.13.11):
+    /// `PRAGMA fsqlite.parallel_workers` for an autocommit statement, 1 inside
+    /// an explicit transaction, whose reads may need conflict tracking and
+    /// whose own writes a snapshot reader would not see.
+    fn statement_parallel_workers(&self) -> usize {
+        if self.in_transaction.get() || self.concurrent_txn.get() {
+            1
+        } else {
+            self.parallel_workers.get()
+        }
     }
 
     fn concurrent_exec_context(&self) -> Result<Option<ConcurrentExecContext>> {
@@ -83906,6 +83933,23 @@ impl Connection {
                     }])
                 }
             }
+            // bd-w4pr1.13.11: threads one scan of an autocommit read may use,
+            // this connection's own included; 0 and 1 keep every scan serial,
+            // larger values are capped at MAX_PARALLEL_WORKERS. Echoes the
+            // effective value. `PRAGMA threads` keeps stock's meaning (sorter
+            // helper threads, capped at 8, GH#279).
+            "fsqlite.parallel_workers" | "parallel_workers" => {
+                if let Some(ref val) = pragma.value {
+                    let raw = parse_pragma_nonnegative_usize(val, "fsqlite.parallel_workers")?;
+                    self.parallel_workers
+                        .set(raw.clamp(1, MAX_PARALLEL_WORKERS));
+                }
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(
+                        i64::try_from(self.parallel_workers.get()).unwrap_or(i64::MAX),
+                    )],
+                }])
+            }
             // Read-only introspection of the active write-concurrency model
             // (bd-nao48). Makes the `journal_mode = 'wal'` -> page-level MVCC
             // divergence explicit so callers do not silently assume SQLite's
@@ -105699,6 +105743,7 @@ impl Connection {
             false,
             cached_engine,
             vtab_instances,
+            self.statement_parallel_workers(),
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -144814,6 +144859,7 @@ async fn execute_table_program_with_db(
     prepared_engine_reuse_profile: bool,
     cached_engine: Option<VdbeEngine>,
     vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
+    parallel_workers: usize,
 ) -> (TableProgramExecOutcome, Option<VdbeEngine>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
@@ -144865,6 +144911,7 @@ async fn execute_table_program_with_db(
         VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size)
     };
     engine.set_retain_storage_cursors_on_close(allow_retained_cursor_reuse);
+    engine.set_parallel_workers(parallel_workers);
     // bd-i3csr.2: the table-valued-function instances the program's VOpen
     // cursors scan.
     for (cursor_id, instance) in vtab_instances {

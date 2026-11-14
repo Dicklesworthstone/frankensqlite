@@ -8829,6 +8829,23 @@ fn codegen_select_count_star(
     }
 
     // Non-COUNT path: open table cursor as before.
+    // bd-w4pr1.13.11: a full scan counting the rows its WHERE keeps may run
+    // on several threads.
+    let parallel_plan = if rowid_range.is_none() && index_hint.is_none() {
+        parallel_scan_plan(
+            cursor,
+            table,
+            table_alias,
+            schema,
+            where_clause,
+            b.current_addr(),
+            out_regs,
+            Vec::new(),
+            vec![crate::parallel_aggregate::ParallelAggregate::CountStar],
+        )
+    } else {
+        None
+    };
     b.emit_op(
         Opcode::OpenRead,
         cursor,
@@ -8920,7 +8937,12 @@ fn codegen_select_count_star(
     b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
 
     b.resolve_label(done_label);
+    let result_addr = b.current_addr();
     b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+    if let Some(mut plan) = parallel_plan {
+        plan.result_addr = result_addr;
+        b.set_parallel_aggregate(plan);
+    }
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
@@ -20698,6 +20720,222 @@ fn emit_index_const_list_rows<R>(
     result
 }
 
+/// bd-w4pr1.13.11: the parallel plan of an ungrouped aggregate whose full
+/// rowid-order scan of `table` opens at the `OpenRead` at `open_addr`: every
+/// result column a plain `count(*)`, `count`, `sum`, `min` or `max` of a
+/// column (or the rowid) of this rowid table without generated columns, and
+/// the WHERE an AND / OR of BINARY comparisons of such a column with a
+/// literal and `IS [NOT] NULL` tests of one. `None` for anything else. The
+/// plan's `result_addr` is set once the `ResultRow` is emitted.
+#[allow(clippy::too_many_arguments)]
+fn parallel_aggregate_plan(
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    agg_columns: &[AggColumn],
+    where_clause: Option<&Expr>,
+    open_addr: usize,
+    out_regs: i32,
+) -> Option<crate::parallel_aggregate::ParallelAggregatePlan> {
+    use crate::parallel_aggregate::{ParallelAggregate, ScanColumn};
+
+    let mut columns: Vec<ScanColumn> = Vec::new();
+    let mut slot = |column: ScanColumn| -> usize {
+        columns.iter().position(|c| *c == column).unwrap_or_else(|| {
+            columns.push(column);
+            columns.len() - 1
+        })
+    };
+    let mut aggregates = Vec::with_capacity(agg_columns.len());
+    for agg in agg_columns {
+        if agg.hidden
+            || agg.distinct
+            || agg.wrapper_expr.is_some()
+            || agg.bare_expr.is_some()
+            || agg.arg_expr.is_some()
+            || agg.filter.is_some()
+            || agg.collation.is_some()
+            || !agg.multi_agg_indices.is_empty()
+            || !agg.extra_args.is_empty()
+            || !builtin_aggregate_semantics_available(&agg.name, agg.num_args)
+        {
+            return None;
+        }
+        let column = match agg.num_args {
+            0 => None,
+            1 if agg.arg_is_rowid => Some(slot(ScanColumn::Rowid)),
+            1 => {
+                let idx = agg.arg_col_index?;
+                if table.columns.get(idx)?.is_ipk {
+                    Some(slot(ScanColumn::Rowid))
+                } else {
+                    Some(slot(ScanColumn::Declared(idx)))
+                }
+            }
+            _ => return None,
+        };
+        // `parse_aggregate_columns` keeps names upper-cased.
+        aggregates.push(match (agg.name.to_ascii_uppercase().as_str(), column) {
+            ("COUNT", None) => ParallelAggregate::CountStar,
+            ("COUNT", Some(c)) => ParallelAggregate::Count(c),
+            ("SUM", Some(c)) => ParallelAggregate::Sum(c),
+            ("MIN", Some(c)) => ParallelAggregate::Min(c),
+            ("MAX", Some(c)) => ParallelAggregate::Max(c),
+            _ => return None,
+        });
+    }
+    if aggregates.is_empty() {
+        return None;
+    }
+    parallel_scan_plan(
+        cursor,
+        table,
+        table_alias,
+        schema,
+        where_clause,
+        open_addr,
+        out_regs,
+        columns,
+        aggregates,
+    )
+}
+
+/// [`parallel_aggregate_plan`] once its result columns are known, also
+/// used by `SELECT count(*) ... WHERE`'s scan: `columns` are the plan
+/// columns the aggregates read; the WHERE adds its own.
+#[allow(clippy::too_many_arguments)]
+fn parallel_scan_plan(
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    where_clause: Option<&Expr>,
+    open_addr: usize,
+    out_regs: i32,
+    mut columns: Vec<crate::parallel_aggregate::ScanColumn>,
+    aggregates: Vec<crate::parallel_aggregate::ParallelAggregate>,
+) -> Option<crate::parallel_aggregate::ParallelAggregatePlan> {
+    if table.without_rowid || table.columns.iter().any(|col| col.generated_expr.is_some()) {
+        return None;
+    }
+    let scan = ScanCtx {
+        cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
+    let mut slot = |column| {
+        columns.iter().position(|c| *c == column).unwrap_or_else(|| {
+            columns.push(column);
+            columns.len() - 1
+        })
+    };
+    let filter = match where_clause {
+        None => None,
+        Some(expr) => Some(parallel_scan_predicate(expr, &scan, &mut slot)?),
+    };
+    Some(crate::parallel_aggregate::ParallelAggregatePlan {
+        cursor,
+        root_page: table.root_page,
+        open_addr,
+        result_addr: usize::MAX,
+        out_reg: out_regs,
+        columns,
+        aggregates,
+        filter,
+    })
+}
+
+/// The WHERE of [`parallel_aggregate_plan`], or `None` when it holds a term
+/// the parallel scan does not evaluate.
+fn parallel_scan_predicate(
+    expr: &Expr,
+    scan: &ScanCtx<'_>,
+    slot: &mut dyn FnMut(crate::parallel_aggregate::ScanColumn) -> usize,
+) -> Option<crate::parallel_aggregate::ScanPredicate> {
+    use crate::parallel_aggregate::{CompareOp, ScanColumn, ScanPredicate};
+
+    let column_of = |resolved: &SortKeySource| match resolved {
+        SortKeySource::Rowid => Some(ScanColumn::Rowid),
+        SortKeySource::Column(idx) => Some(ScanColumn::Declared(*idx)),
+        SortKeySource::Expression(_) => None,
+    };
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } => Some(ScanPredicate::And(
+            Box::new(parallel_scan_predicate(left, scan, slot)?),
+            Box::new(parallel_scan_predicate(right, scan, slot)?),
+        )),
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Or,
+            right,
+            ..
+        } => Some(ScanPredicate::Or(
+            Box::new(parallel_scan_predicate(left, scan, slot)?),
+            Box::new(parallel_scan_predicate(right, scan, slot)?),
+        )),
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            let op = match op {
+                fsqlite_ast::BinaryOp::Eq => CompareOp::Eq,
+                fsqlite_ast::BinaryOp::Ne => CompareOp::Ne,
+                fsqlite_ast::BinaryOp::Lt => CompareOp::Lt,
+                fsqlite_ast::BinaryOp::Le => CompareOp::Le,
+                fsqlite_ast::BinaryOp::Gt => CompareOp::Gt,
+                fsqlite_ast::BinaryOp::Ge => CompareOp::Ge,
+                _ => return None,
+            };
+            let comparison = ResolvedComparisonInfo::new(left, right, scan);
+            if !matches!(comparison.collation_p4, P4::None) {
+                return None;
+            }
+            let (column, literal, literal_left) = match (
+                comparison.left_resolved.as_ref(),
+                comparison.right_resolved.as_ref(),
+            ) {
+                (Some(column), None) => (column, right.as_ref(), false),
+                (None, Some(column)) => (column, left.as_ref(), true),
+                _ => return None,
+            };
+            let literal = match literal {
+                Expr::Literal(Literal::Integer(value), _) => SqliteValue::Integer(*value),
+                Expr::Literal(Literal::Float(value), _) => SqliteValue::Float(*value),
+                Expr::Literal(Literal::String(text), _) => {
+                    SqliteValue::Text(SmallText::new(text.as_str()))
+                }
+                _ => return None,
+            };
+            Some(ScanPredicate::Compare {
+                column: slot(column_of(column)?),
+                op,
+                literal,
+                literal_left,
+                p5: comparison.cmp_p5,
+            })
+        }
+        Expr::IsNull { expr, not, .. } => {
+            if matches!(expr.as_ref(), Expr::Collate { .. }) {
+                return None;
+            }
+            let resolved = resolve_column_ref(expr, scan.table, scan.table_alias)?;
+            Some(ScanPredicate::IsNull {
+                column: slot(column_of(&resolved)?),
+                negated: *not,
+            })
+        }
+        _ => None,
+    }
+}
+
 // Takes the same cursor / table / schema / label bundle as every other
 // `codegen_select_*` row-source emitter. Bundling those into a struct here alone
 // would fork the signature shape it shares with the scan emitter it falls back to.
@@ -22462,7 +22700,21 @@ fn codegen_select_aggregate(
         skip_scan = true;
     }
 
+    // bd-w4pr1.13.11: the full scan below may run on several threads.
+    let mut parallel_plan = None;
     if !skip_scan {
+        if having.is_none() && limit_clause.is_none() && from_index_hint.is_none() {
+            parallel_plan = parallel_aggregate_plan(
+                cursor,
+                table,
+                table_alias,
+                schema,
+                &agg_columns,
+                where_clause,
+                b.current_addr(),
+                out_regs,
+            );
+        }
         // Open table for reading.
         b.emit_op(
             Opcode::OpenRead,
@@ -22661,7 +22913,14 @@ fn codegen_select_aggregate(
     }
 
     // ResultRow (reached when HAVING passes or when there is no HAVING).
+    let result_addr = b.current_addr();
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(mut plan) = parallel_plan
+        && usize::try_from(out_col_count).is_ok_and(|n| n == plan.aggregates.len())
+    {
+        plan.result_addr = result_addr;
+        b.set_parallel_aggregate(plan);
+    }
     if let Some(limit_reg) = limit_reg {
         b.emit_jump_to_label(Opcode::DecrJumpZero, limit_reg, 0, done_label, P4::None, 0);
     }
@@ -58260,6 +58519,67 @@ mod tests {
                 .any(|op| op.opcode == Opcode::OpenAutoindex),
             "correlated IN subqueries must not materialize once because they depend on outer-row values"
         );
+    }
+
+    /// bd-w4pr1.13.11: codegen attaches a parallel aggregate plan, leaving
+    /// the bytecode as it is, to the ungrouped full scans whose aggregates and
+    /// WHERE the parallel scan reproduces, and to nothing else.
+    #[test]
+    fn bd_w4pr1_13_11_parallel_aggregate_plan_only_for_admitted_shapes() {
+        let schema = test_schema();
+        let program = |sql: &str| {
+            let stmt = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+            b.finish().unwrap()
+        };
+        for sql in [
+            "SELECT count(*), sum(a) FROM t WHERE a > 500",
+            "SELECT min(b), max(a), count(b) FROM t WHERE b >= 'x' OR a IS NULL",
+            "SELECT sum(rowid), min(rowid), count(*) FROM t WHERE 7 <= a AND a < 9.5",
+            "SELECT max(a) FROM t WHERE b IS NOT NULL",
+            "SELECT count(*) FROM t WHERE a > 5 OR b IS NULL",
+        ] {
+            let prog = program(sql);
+            let plan = prog
+                .parallel_aggregate()
+                .unwrap_or_else(|| panic!("no parallel plan for `{sql}`"));
+            let open = &prog.ops()[plan.open_addr];
+            assert_eq!(open.opcode, Opcode::OpenRead, "`{sql}`");
+            assert_eq!((open.p1, open.p2), (plan.cursor, plan.root_page), "`{sql}`");
+            let result = &prog.ops()[plan.result_addr];
+            assert_eq!(result.opcode, Opcode::ResultRow, "`{sql}`");
+            assert_eq!(result.p1, plan.out_reg, "`{sql}`");
+        }
+        for sql in [
+            // Order-dependent or unsupported aggregates and arguments.
+            "SELECT avg(a) FROM t WHERE a > 1",
+            "SELECT total(a) FROM t WHERE a > 1",
+            "SELECT group_concat(b) FROM t WHERE a > 1",
+            "SELECT sum(a + 1) FROM t WHERE a > 1",
+            "SELECT count(DISTINCT a) FROM t WHERE a > 1",
+            "SELECT count(*) FILTER (WHERE a > 1) FROM t WHERE a > 0",
+            "SELECT coalesce(max(a), 0) FROM t WHERE a > 1",
+            "SELECT max(a), b FROM t WHERE a > 1",
+            // Terms the parallel scan does not evaluate.
+            "SELECT sum(a) FROM t WHERE a + 1 > 5",
+            "SELECT sum(a) FROM t WHERE a > 5 AND length(b) = 3",
+            "SELECT sum(a) FROM t WHERE b > 'x' COLLATE NOCASE",
+            "SELECT sum(a) FROM t WHERE a IN (1, 2)",
+            "SELECT sum(a) FROM t WHERE a > ?",
+            // A rowid range seeks instead of scanning.
+            "SELECT sum(a) FROM t WHERE rowid > 5",
+            "SELECT count(*) FROM t WHERE rowid > 5 AND a > 1",
+            // Grouping, limits and output filters.
+            "SELECT sum(a) FROM t WHERE a > 1 GROUP BY b",
+            "SELECT sum(a) FROM t WHERE a > 1 LIMIT 1",
+            "SELECT sum(a) FROM t WHERE a > 1 HAVING sum(a) > 3",
+        ] {
+            assert!(
+                program(sql).parallel_aggregate().is_none(),
+                "`{sql}` must not get a parallel plan"
+            );
+        }
     }
 
     #[test]

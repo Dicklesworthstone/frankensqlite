@@ -1302,6 +1302,18 @@ pub trait VfsFile: Send + Sync {
         offset: u64,
     ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a;
 
+    /// The descriptor this handle reads through, for positional reads by
+    /// threads outside the connection while the handle stays open: readers
+    /// of one committed snapshot of the file (bd-w4pr1.13.11).
+    ///
+    /// Such a reader gets the bytes a `pread` returns and nothing else: no
+    /// locking, cancellation or metrics. `None`, the default, for a backend
+    /// without such a descriptor or one whose [`Self::read`] returns other
+    /// bytes than the descriptor holds.
+    fn positional_reader(&self) -> Option<Arc<std::fs::File>> {
+        None
+    }
+
     /// Write `buf` starting at byte offset `offset`.
     fn write<'a>(
         &'a self,

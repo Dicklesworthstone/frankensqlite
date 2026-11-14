@@ -425,6 +425,17 @@ pub trait WalBackend: Send + Sync {
         None
     }
 
+    /// The frames of the pinned read snapshot and the WAL file's descriptor,
+    /// for a [`crate::SnapshotPageReader`] of that snapshot (bd-w4pr1.13.11).
+    ///
+    /// `publication` must equal [`Self::pinned_read_snapshot`]. `None`, the
+    /// default, for a backend that pins no snapshot, whose page index is
+    /// partial, or whose WAL file has no positional descriptor.
+    #[must_use]
+    fn pinned_snapshot_frames(&self) -> Option<crate::snapshot_reader::WalSnapshotFrames> {
+        None
+    }
+
     /// Return an authorized logical horizon for the currently pinned reader
     /// snapshot, if the backend can prove one.
     ///
@@ -1359,6 +1370,17 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// writes, even if the transaction had previously upgraded to writer mode.
     fn has_pending_writes(&self) -> bool;
 
+    /// A reader of this transaction's committed snapshot that other threads
+    /// can share while the transaction lives (bd-w4pr1.13.11).
+    ///
+    /// Offered only for a read-only transaction that has written nothing and
+    /// whose every page read resolves through one immutable committed
+    /// snapshot; `None`, the default, otherwise. Every thread using the reader
+    /// must be joined before the transaction ends.
+    fn snapshot_page_reader(&self) -> Option<crate::snapshot_reader::SnapshotPageReader> {
+        None
+    }
+
     /// Visible commit sequence bound to this transaction's current snapshot.
     ///
     /// Pager-backed transactions can expose this so upper layers reuse the
@@ -2291,6 +2313,10 @@ impl TransactionHandle for TransactionKind {
 
     fn has_pending_writes(&self) -> bool {
         dispatch_transaction_kind!(self, txn => txn.has_pending_writes())
+    }
+
+    fn snapshot_page_reader(&self) -> Option<crate::snapshot_reader::SnapshotPageReader> {
+        dispatch_transaction_kind!(self, txn => txn.snapshot_page_reader())
     }
 
     fn published_visible_commit_seq_hint(&self) -> Option<fsqlite_types::CommitSeq> {

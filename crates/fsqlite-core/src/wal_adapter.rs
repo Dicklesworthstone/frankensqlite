@@ -2517,6 +2517,25 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         Self::pinned_read_snapshot(self)
     }
 
+    /// bd-w4pr1.13.11: the pinned snapshot's page index is shared, not
+    /// copied; publication replaces it copy-on-write, so the `Arc` handed
+    /// out never changes. Declined where `read_page_pinned` would not answer
+    /// from the index alone.
+    fn pinned_snapshot_frames(&self) -> Option<fsqlite_pager::WalSnapshotFrames> {
+        if self.pending_checkpoint_reset.is_some() {
+            return None;
+        }
+        let snapshot = self.read_snapshot.as_ref()?;
+        if snapshot.index_is_partial {
+            return None;
+        }
+        Some(fsqlite_pager::WalSnapshotFrames {
+            publication: wal_publication_snapshot_from_published(snapshot),
+            file: self.wal.file().positional_reader()?,
+            page_index: Arc::clone(&snapshot.page_index),
+        })
+    }
+
     fn refresh_published_snapshot<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -6391,6 +6410,10 @@ where
 
     fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
         self.inner.pinned_read_snapshot()
+    }
+
+    fn pinned_snapshot_frames(&self) -> Option<fsqlite_pager::WalSnapshotFrames> {
+        WalBackend::pinned_snapshot_frames(&self.inner)
     }
 
     fn pinned_logical_read_snapshot<'a>(

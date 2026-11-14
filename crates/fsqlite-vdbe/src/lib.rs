@@ -27,6 +27,7 @@ pub mod frame;
 pub mod jit;
 #[cfg(test)]
 mod make_record_simd;
+mod parallel_aggregate;
 #[cfg(test)]
 mod repro_delete_skip;
 pub mod vectorized;
@@ -592,6 +593,9 @@ pub struct ProgramBuilder {
     /// bd-w4pr1.13.31: literals loaded once, in the prologue `Init` jumps to,
     /// with the register each one lives in (see [`Self::hoisted_literal`]).
     hoisted_literals: Vec<(HoistedLiteral, i32)>,
+    /// bd-w4pr1.13.11: the aggregate loop the engine may run on several
+    /// threads instead (see [`Self::set_parallel_aggregate`]).
+    parallel_aggregate: Option<parallel_aggregate::ParallelAggregatePlan>,
 }
 
 /// A literal a program loads once, before its first instruction after
@@ -619,7 +623,18 @@ impl ProgramBuilder {
             preserves_rows_on_constraint: false,
             materialized_virtual_generated_roots: Vec::new(),
             hoisted_literals: Vec::new(),
+            parallel_aggregate: None,
         }
+    }
+
+    /// bd-w4pr1.13.11: record that the aggregate loop starting at `plan`'s
+    /// `OpenRead` may instead run on several threads and continue at its
+    /// `ResultRow`. The program's instructions do not change.
+    pub(crate) fn set_parallel_aggregate(
+        &mut self,
+        plan: parallel_aggregate::ParallelAggregatePlan,
+    ) {
+        self.parallel_aggregate = Some(plan);
     }
 
     /// A register holding `literal` for the whole run of the program, loaded
@@ -1017,6 +1032,7 @@ impl ProgramBuilder {
             } else {
                 ConstraintFailureRows::Discard
             },
+            parallel_aggregate: self.parallel_aggregate.map(Arc::new),
         };
         program.verify_control_flow_targets()?;
         Ok(program)
@@ -1343,6 +1359,9 @@ pub struct VdbeProgram {
     /// bd-5bq6u: `OR FAIL` keeps rows already written when a later row
     /// violates a constraint; ABORT discards them.
     constraint_failure_rows: ConstraintFailureRows,
+    /// bd-w4pr1.13.11: an aggregate loop the engine may run on several
+    /// threads instead, continuing at its `ResultRow`.
+    parallel_aggregate: Option<Arc<parallel_aggregate::ParallelAggregatePlan>>,
 }
 
 impl VdbeProgram {
@@ -1582,6 +1601,12 @@ impl VdbeProgram {
     /// Returns `true` when this program can read historical page versions.
     pub fn requires_version_store(&self) -> bool {
         self.requires_version_store
+    }
+
+    /// bd-w4pr1.13.11: the aggregate loop the engine may run on several
+    /// threads instead, if codegen proved one.
+    pub(crate) fn parallel_aggregate(&self) -> Option<&parallel_aggregate::ParallelAggregatePlan> {
+        self.parallel_aggregate.as_deref()
     }
 
     /// Disassemble the program to a human-readable string.
