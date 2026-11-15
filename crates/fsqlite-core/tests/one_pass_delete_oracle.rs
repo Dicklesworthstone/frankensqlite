@@ -237,6 +237,159 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// Lever SD (bd-w4pr1.13.20): a plain DELETE's row on a leaf the transaction
+/// already holds staged is deleted on the synchronous lane. MANY's rows with
+/// a partial and an expression index, so each deleted row also loses its
+/// index entries.
+const SD_INDEXED: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) \
+     INSERT INTO t SELECT i, (i * 7919) % 1000, printf('%0100d', i) FROM n",
+    "CREATE INDEX t_p ON t(a) WHERE a > 500",
+    "CREATE INDEX t_e ON t(a + length(b))",
+];
+const SD_INDEXED_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT count(*), sum(id), sum(a) FROM t",
+    "SELECT count(*), sum(id) FROM t INDEXED BY t_p WHERE a > 500",
+    "SELECT count(*), sum(id) FROM t INDEXED BY t_e WHERE a + length(b) > 0",
+    "PRAGMA integrity_check",
+];
+const SD_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT count(*), sum(id), sum(a), min(id), max(id) FROM t",
+    "SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY id LIMIT 40)",
+    "PRAGMA integrity_check",
+];
+/// The DELETE inside a transaction, under a savepoint the states roll back
+/// to: the rows removed in place come back, and a second DELETE commits.
+const SD_SAVEPOINT: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) \
+     INSERT INTO t SELECT i, (i * 7919) % 1000, printf('%0100d', i) FROM n",
+    "BEGIN",
+    "SAVEPOINT s1",
+];
+const SD_SAVEPOINT_STATE: &[&str] = &[
+    "SELECT changes(), total_changes(), count(*), sum(id) FROM t",
+    "ROLLBACK TO s1",
+    "SELECT count(*), sum(id) FROM t",
+    "DELETE FROM t WHERE id % 11 = 0",
+    "COMMIT",
+    "SELECT total_changes(), count(*), sum(id), sum(a) FROM t",
+    "PRAGMA integrity_check",
+];
+/// A WHERE with a correlated subquery over another table.
+const SD_CORRELATED: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) \
+     INSERT INTO t SELECT i, (i * 7919) % 1000, printf('%0100d', i) FROM n",
+    "CREATE TABLE u(k INTEGER PRIMARY KEY, m INTEGER)",
+    "INSERT INTO u VALUES (0, 900), (1, 100), (2, 500), (3, 0), (4, 999)",
+];
+
+const SD_CASES: &[Case] = &[
+    // Every third row stays: two deletes in a row on one leaf, with the
+    // cursor on the successor between them (a lane that forgot the pending
+    // Next would skip the second).
+    Case {
+        setup: MANY,
+        statement: "DELETE FROM t WHERE id % 3 <> 1",
+        states: SD_STATE,
+    },
+    // The scorecard's shape, with index entries to remove.
+    Case {
+        setup: SD_INDEXED,
+        statement: "DELETE FROM t WHERE id % 7 = 0",
+        states: SD_INDEXED_STATE,
+    },
+    Case {
+        setup: SD_SAVEPOINT,
+        statement: "DELETE FROM t WHERE id % 5 = 0",
+        states: SD_SAVEPOINT_STATE,
+    },
+    // Two passes: the second pass's SeekRowid + Delete take the lane.
+    Case {
+        setup: SD_CORRELATED,
+        statement: "DELETE FROM t WHERE a > (SELECT m FROM u WHERE u.k = t.id % 5)",
+        states: MANY_STATE,
+    },
+    Case {
+        setup: MANY,
+        statement: "DELETE FROM t WHERE id % 9 = 4 RETURNING id, a",
+        states: MANY_STATE,
+    },
+];
+
+/// Lever UR (bd-w4pr1.13.20): an UPDATE that keeps its rowid on a table
+/// without a UNIQUE index cannot conflict, and its Delete keeps no copy of the
+/// old row. The twin tables: `t` with a plain index only (the flag set), `u`
+/// with a UNIQUE index on a column the UPDATEs below may or may not touch (the
+/// flag absent; a conflict restores the old row).
+const UR_TWINS: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "CREATE INDEX t_a ON t(a)",
+    "CREATE TABLE u(id INTEGER PRIMARY KEY, a INTEGER, b TEXT UNIQUE)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
+     INSERT INTO t SELECT i, i % 13, 'k' || i FROM n",
+    "INSERT INTO u SELECT * FROM t",
+];
+const UR_STATE: &[&str] = &[
+    "SELECT count(*), sum(id), sum(a), sum(length(b)) FROM t",
+    "SELECT a, count(*) FROM t INDEXED BY t_a WHERE a >= 0 GROUP BY a ORDER BY a",
+    "SELECT count(*), sum(id), sum(a), sum(length(b)) FROM u",
+    "SELECT group_concat(b) FROM (SELECT b FROM u WHERE id % 97 = 0 ORDER BY id)",
+    "PRAGMA integrity_check",
+];
+
+const UR_CASES: &[Case] = &[
+    // The flag set: same-size rewrites, rows that grow (the deferred delete
+    // is materialized), and conflict clauses with nothing to conflict on.
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE t SET a = a + 1 WHERE id % 10 = 0",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE t SET b = b || printf('%0200d', id) WHERE id % 7 = 0",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE OR IGNORE t SET b = 'k1' WHERE id % 13 = 5",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE OR REPLACE t SET a = NULL, b = 'k7' WHERE id % 13 = 5",
+        states: UR_STATE,
+    },
+    // The flag absent: a UNIQUE conflict under IGNORE keeps each old row,
+    // under REPLACE removes the victims, under ABORT fails mid-scan and rolls
+    // the statement back; an UPDATE of another column on that table.
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE OR IGNORE u SET b = 'k1' WHERE id % 13 = 5",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE OR REPLACE u SET b = 'k7' WHERE id % 13 = 5",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE u SET b = 'k5' WHERE id > 3",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE u SET a = a * 2 WHERE id % 3 = 0",
+        states: UR_STATE,
+    },
+];
+
 /// 600 short rows: an UPDATE that widens every third row to 300 bytes
 /// splits leaves while the scan is still walking them.
 const GROW: &[&str] = &[
@@ -446,6 +599,92 @@ const ROW_AFFINITY_STATE: &[&str] = &[
     "SELECT id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM r ORDER BY id",
     "SELECT id, a, typeof(a), b, typeof(b) FROM k ORDER BY id",
     "SELECT id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM p ORDER BY id",
+];
+
+/// Lever I (bd-w4pr1.13.21): an INSERT ... SELECT into a table with an
+/// INTEGER PRIMARY KEY uses the alias register as the rowid register. The
+/// sources give the alias NULL, an INTEGER, TEXT '7', REAL 8.0, a negative and
+/// a value the table holds already; CHECKs read the alias and the rowid, and a
+/// partial index covers the alias.
+const IPK_SETUP: &[&str] = &[
+    "CREATE TABLE s(k, v)",
+    "INSERT INTO s VALUES (NULL, 'n1'), (5, 'i5'), ('7', 't7'), (8.0, 'r8'), (-3, 'neg'), \
+     (NULL, 'n2'), (12, 'i12')",
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT CHECK (id <> 99), \
+     w INTEGER DEFAULT 1 CHECK (rowid <> 98))",
+    "CREATE INDEX t_part ON t(id) WHERE id > 6",
+    "INSERT INTO t(id, v) VALUES (12, 'old12')",
+    "CREATE TABLE ta(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+];
+const IPK_STATE: &[&str] = &[
+    "SELECT rowid, id, typeof(id), v, w FROM t ORDER BY rowid",
+    "SELECT count(*), sum(id) FROM t INDEXED BY t_part WHERE id > 6",
+    "SELECT rowid, id, v FROM ta ORDER BY rowid",
+    "SELECT seq FROM sqlite_sequence WHERE name = 'ta'",
+    "PRAGMA integrity_check",
+];
+
+const IPK_CASES: &[Case] = &[
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k, v FROM s WHERE k IS NOT 12",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT OR IGNORE INTO t(id, v) SELECT k, v FROM s",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT OR REPLACE INTO t(id, v) SELECT k, v FROM s",
+        states: IPK_STATE,
+    },
+    // The duplicate 12 aborts the statement; 5.5 is not an integer key; the
+    // CHECKs on the alias and on the rowid.
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k, v FROM s",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k + 0.5, v FROM s WHERE k = 5",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k + 94, v FROM s WHERE k = 5",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k + 93, v FROM s WHERE k = 5",
+        states: IPK_STATE,
+    },
+    // The alias left out (every key generated), AUTOINCREMENT, RETURNING.
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(v) SELECT v FROM s",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO ta(id, v) SELECT k, v FROM s",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k, v FROM s WHERE k IS NOT 12 RETURNING rowid, id, v",
+        states: IPK_STATE,
+    },
+    // Many rows from a recursive CTE, as the bulk row's generator.
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v, w) WITH RECURSIVE n(i) AS (SELECT 20 UNION ALL \
+                    SELECT i + 1 FROM n WHERE i < 3000) SELECT i, 'g' || i, i % 7 FROM n",
+        states: IPK_STATE,
+    },
 ];
 
 const ROW_AFFINITY_CASES: &[Case] = &[
@@ -753,6 +992,109 @@ async fn check_cases(cases: &[Case]) -> Vec<String> {
 fn scan_delete_matches_stock_in_one_pass_and_two() {
     asupersync::test_utils::run_test(|| async {
         let failures = check_cases(CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn staged_leaf_delete_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(SD_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+/// Lever SD: a second connection's open snapshot keeps the rows another
+/// connection's transaction deletes in place, before and after that commits,
+/// and its next transaction sees the deletes; the deleting connection sees
+/// its own. Compared step by step with stock on the same steps in WAL mode.
+#[test]
+fn staged_leaf_delete_is_invisible_to_an_open_snapshot_as_in_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let frank_path = dir
+            .path()
+            .join("frank.db")
+            .to_str()
+            .expect("utf-8 path")
+            .to_owned();
+        let stock_path = dir.path().join("stock.db");
+        let f1 = Connection::open(&frank_path).await.expect("open");
+        let s1 = rusqlite::Connection::open(&stock_path).expect("stock open");
+        f1.query("PRAGMA journal_mode=WAL").await.expect("frank wal");
+        stock_rows(&s1, "PRAGMA journal_mode=WAL").expect("stock wal");
+        for setup in MANY {
+            f1.execute(setup).await.expect("frank setup");
+            s1.execute_batch(setup).expect("stock setup");
+        }
+        let f2 = Connection::open(&frank_path).await.expect("open second");
+        let s2 = rusqlite::Connection::open(&stock_path).expect("stock open second");
+        let steps: &[(u8, &str)] = &[
+            (2, "BEGIN"),
+            (2, "SELECT count(*), sum(id) FROM t"),
+            (1, "BEGIN"),
+            (1, "DELETE FROM t WHERE id % 7 = 0"),
+            (1, "SELECT count(*), sum(id) FROM t"),
+            (2, "SELECT count(*), sum(id) FROM t"),
+            (1, "DELETE FROM t WHERE id % 3 = 0"),
+            (1, "COMMIT"),
+            (2, "SELECT count(*), sum(id) FROM t"),
+            (2, "COMMIT"),
+            (2, "SELECT count(*), sum(id) FROM t"),
+            (1, "PRAGMA integrity_check"),
+        ];
+        let mut failures = Vec::new();
+        for &(which, sql) in steps {
+            let (f, s) = if which == 1 { (&f1, &s1) } else { (&f2, &s2) };
+            let fv = match f.query(sql).await {
+                Ok(rows) => Ok(frank_rows(&rows)),
+                Err(e) => Err(e.to_string()),
+            };
+            let sv = stock_rows(s, sql);
+            if fv != sv {
+                failures.push(format!(
+                    "connection {which}, `{sql}`: frank {fv:?} vs stock {sv:?}"
+                ));
+            }
+        }
+        f2.close().await.expect("close second");
+        f1.close().await.expect("close");
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn insert_select_alias_rowid_register_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(IPK_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn update_without_restore_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(UR_CASES).await;
         assert!(
             failures.is_empty(),
             "{} differences from SQLite:\n{}",

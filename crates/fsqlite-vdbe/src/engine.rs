@@ -293,6 +293,11 @@ const OPFLAG_STAGED_BUILD: u16 = 0x02;
 /// when the new record has the same size (stock `btreeOverwriteCell`) instead
 /// of a delete, a re-seek and an insert per row.
 const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
+/// Beside `OPFLAG_UPDATE_KEEPS_ROWID` on an UPDATE's `Delete`: the table has no
+/// UNIQUE index, so the rewrite cannot meet a conflict and nothing will
+/// restore the old row; the `Delete` keeps no copy of its payload
+/// (bd-w4pr1.13.20, lever UR).
+const OPFLAG_UPDATE_NO_RESTORE: u16 = 0x200;
 /// Marks a `Halt(SQLITE_CONSTRAINT)` emitted after a non-mutating UNIQUE
 /// preflight. P4 contains the constraint's column label.
 const OPFLAG_HALT_UNIQUE: u16 = 0x01;
@@ -4636,6 +4641,18 @@ impl CursorBackend {
             Self::Mem(c) => c.try_table_leaf_rowid(),
             Self::Txn(c) => c.try_table_leaf_rowid(),
             Self::TimeTravel(c) => c.try_table_leaf_rowid(),
+        }
+    }
+
+    /// [`Self::delete`] without waiting, for a table-leaf cell the b-tree
+    /// removes from a leaf the transaction holds staged; `false` changes
+    /// nothing. A time-travel cursor never deletes.
+    #[inline]
+    fn try_delete_table_leaf_cell_in_staged_image(&mut self) -> bool {
+        match self {
+            Self::Mem(c) => c.try_delete_table_leaf_cell_in_staged_image(),
+            Self::Txn(c) => c.try_delete_table_leaf_cell_in_staged_image(),
+            Self::TimeTravel(_) => false,
         }
     }
 
@@ -13831,7 +13848,10 @@ impl VdbeEngine {
                                 Some(rowid) => rowid,
                                 None => lean_future(|| sc.cursor.rowid(&sc.cx)).await?,
                             };
-                            if is_update {
+                            // An in-place rewrite that cannot conflict
+                            // (OPFLAG_UPDATE_NO_RESTORE, lever UR) is never
+                            // restored, so it keeps no copy of the row.
+                            if is_update && (op.p5 & OPFLAG_UPDATE_NO_RESTORE) == 0 {
                                 update_restore = Some(PendingUpdateRestore::Storage {
                                     cursor_id,
                                     rowid: current_rowid,
@@ -17880,8 +17900,58 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // A plain DELETE's row on a table leaf the transaction holds
+            // staged is removed here (bd-w4pr1.13.20, lever SD): that b-tree
+            // delete never waits, and leaving this lane for it cost ~260
+            // instructions a deleted row. An UPDATE's Delete and every delete
+            // the b-tree declines (a leaf's last or only row, an overflowing
+            // row, the first write of a leaf) take the main loop's arm.
+            Opcode::Delete => self.execute_plain_delete_hot(op, pc),
             _ => Ok(false),
         }
+    }
+
+    /// The main loop's `Delete` arm for a plain DELETE (no `OPFLAG_ISUPDATE`)
+    /// whose row the b-tree removes without waiting. `Ok(false)` changes
+    /// nothing and leaves the opcode to that arm.
+    ///
+    /// Kept out of line so the synchronous lane's scan loop stays as small as
+    /// it was.
+    #[inline(never)]
+    fn execute_plain_delete_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<bool> {
+        if op.p5 & OPFLAG_ISUPDATE != 0 {
+            return Ok(false);
+        }
+        let cursor_id = op.p1;
+        let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let Some(sc) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(false);
+        };
+        if !sc.writable || sc.cursor.eof() {
+            return Ok(false);
+        }
+        let Some(rowid) = sc.cursor.try_table_leaf_rowid()? else {
+            return Ok(false);
+        };
+        if !sc.cursor.try_delete_table_leaf_cell_in_staged_image() {
+            return Ok(false);
+        }
+        invalidate_storage_cursor_row_cache_with_reason(
+            sc,
+            collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::WriteMutation,
+        );
+        // The rest of the main arm after a storage delete, for a plain DELETE:
+        // no update restore, no deferred rewrite.
+        self.sync_storage_table_delete_into_memdb_mirror(cursor_id, rowid);
+        drop(self.take_pending_update_idx_deletes());
+        self.set_pending_update_restore(None);
+        if op.p5 & 1 != 0 {
+            self.changes += 1;
+        }
+        self.pending_next_after_delete.insert(cursor_id);
+        *pc += 1;
+        Ok(true)
     }
 
     /// Whether [`Self::try_execute_hot_opcode_async`] has an arm for `opcode`.

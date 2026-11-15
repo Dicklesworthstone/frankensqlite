@@ -252,6 +252,11 @@ const OPFLAG_STAGED_BUILD: u16 = 0x02;
 /// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change; the
 /// engine then rewrites the row in place instead of deleting and re-inserting.
 const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
+/// Beside `OPFLAG_UPDATE_KEEPS_ROWID` on an UPDATE's `Delete`: the table has no
+/// UNIQUE index, so the in-place rewrite cannot meet a conflict and nothing
+/// will restore the old row; the engine keeps no copy of it (bd-w4pr1.13.20,
+/// lever UR).
+const OPFLAG_UPDATE_NO_RESTORE: u16 = 0x200;
 /// Marks a non-mutating UNIQUE constraint halt. P4 carries the column label.
 const OPFLAG_HALT_UNIQUE: u16 = 0x01;
 /// As [`OPFLAG_HALT_UNIQUE`], for a conflict in a PRIMARY KEY: the engine
@@ -28678,6 +28683,21 @@ fn codegen_insert_select(
         (val_regs, n_cols)
     };
 
+    // bd-w4pr1.13.21 lever I: without an explicit hidden-rowid source, an
+    // INTEGER PRIMARY KEY alias register is the rowid register. It holds the
+    // key from the routing below on (nothing after it writes the alias:
+    // its affinity changes no integer, no NOT NULL default applies to it, a
+    // generated column cannot be the alias, and the record stores the alias
+    // as NULL), so the CHECK row, the unique prechecks, the Insert, the index
+    // inserts and RETURNING read it there; copying it into a register of its
+    // own cost ~130 instructions a row.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let alias_rowid_reg = ctx
+        .rowid_alias_col_idx
+        .filter(|_| explicit_rowid_source_pos.is_none())
+        .map(|ipk_idx| final_regs + ipk_idx as i32);
+    let rowid_reg = alias_rowid_reg.unwrap_or(rowid_reg);
+
     // Rowid determination: explicit hidden rowid takes precedence over IPK.
     if let Some(source_pos) = explicit_rowid_source_pos {
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -28711,21 +28731,21 @@ fn codegen_insert_select(
         }
 
         b.resolve_label(done_rowid);
-    } else if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
-        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        let ipk_reg = final_regs + ipk_idx as i32;
+    } else if ctx.rowid_alias_col_idx.is_some() {
+        // `rowid_reg` is the INTEGER PRIMARY KEY alias register here (see
+        // `alias_rowid_reg` above): the key is coerced or generated where the
+        // alias holds it, with no copy either way.
         let auto_label = b.emit_label();
         let done_rowid = b.emit_label();
 
-        b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IsNull, rowid_reg, 0, auto_label, P4::None, 0);
 
         // Non-NULL: coerce the selected value to an integer key and use it
         // as rowid.
-        emit_rowid_must_be_int(b, ipk_reg);
-        b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
+        emit_rowid_must_be_int(b, rowid_reg);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, done_rowid, P4::None, 0);
 
-        // NULL: auto-generate and sync back.
+        // NULL: auto-generate it into the alias register.
         b.resolve_label(auto_label);
         b.emit_op(
             Opcode::NewRowid,
@@ -28735,7 +28755,6 @@ fn codegen_insert_select(
             P4::None,
             0,
         );
-        b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
 
         b.resolve_label(done_rowid);
     } else {
@@ -29826,10 +29845,15 @@ pub fn codegen_update(
 
     // Determine destination rowid for re-insertion.
     let mut rowid_reg = matched_rowid_reg;
-    let keeps_rowid_flag = if keeps_rowid {
+    // bd-w4pr1.13.20 lever UR: with the rowid kept, only a UNIQUE index can
+    // make the rewrite conflict (CHECK and NOT NULL ran above), and only a
+    // conflict reads the old row back; without one the engine keeps no copy.
+    let keeps_rowid_flag = if !keeps_rowid {
+        0
+    } else if table.indexes.iter().any(|index| index.is_unique) {
         OPFLAG_UPDATE_KEEPS_ROWID
     } else {
-        0
+        OPFLAG_UPDATE_KEEPS_ROWID | OPFLAG_UPDATE_NO_RESTORE
     };
 
     // UPDATE is delete+insert: remove the current row first, then insert the

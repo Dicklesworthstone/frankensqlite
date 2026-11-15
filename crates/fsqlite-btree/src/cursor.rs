@@ -9790,6 +9790,133 @@ impl<P: PageWriter> BtCursor<P> {
         None
     }
 
+    /// The plain delete of a table-leaf cell, without waiting
+    /// (bd-w4pr1.13.20, lever SD).
+    ///
+    /// Runs when the cursor stands on a cell of a table leaf it reached from
+    /// the root, the leaf is compact with descending pointers, the cell is
+    /// neither the leaf's only nor its last one and has no overflow chain,
+    /// b-tree tracing is off, and the store holds the leaf staged as the very
+    /// image the cursor shows. The leaf then ends byte for byte as the compact
+    /// descending branch of [`Self::remove_table_cell_from_leaf_deferred`]
+    /// leaves it (only the pointers from the removed index on are written; the
+    /// others are the same there too), and the cursor stands on the removed
+    /// cell's successor, as [`BtreeCursorOps::delete`] leaves it.
+    ///
+    /// Returns `false`, having changed nothing, in every other case. Those
+    /// take the ordinary delete, which balances a drained leaf, repairs the
+    /// separator of a removed maximum, steps to the next leaf, frees overflow
+    /// chains, writes a leaf the transaction has not staged yet and reports a
+    /// malformed page.
+    pub fn try_delete_table_leaf_cell_in_staged_image(&mut self) -> bool {
+        if !self.is_table || self.at_eof || tracing::enabled!(target: "fsqlite.btree", Level::DEBUG)
+        {
+            return false;
+        }
+        let depth = self.stack.len();
+        if depth == 0 || self.stack[0].page_no != self.root_page {
+            return false;
+        }
+        let top = &self.stack[depth - 1];
+        let header = top.header;
+        let delete_idx = usize::from(top.cell_idx);
+        let cell_count = top.cell_pointers.len();
+        if header.page_type != cell::BtreePageType::LeafTable
+            || header.first_freeblock != 0
+            || header.fragmented_free_bytes != 0
+            || cell_count != usize::from(header.cell_count)
+            || delete_idx + 1 >= cell_count
+        {
+            return false;
+        }
+        let leaf_page_no = top.page_no;
+        let content_offset = header.content_offset(self.usable_size);
+        let known_descending =
+            self.descending_leaf_image == Some((leaf_page_no, top.page_data.image_token()));
+        if usize::from(top.cell_pointers[cell_count - 1]) != content_offset
+            || !(known_descending || cell_ptrs_are_descending(&top.cell_pointers))
+        {
+            return false;
+        }
+        match self.parse_cell_at_uncached(top, top.cell_idx) {
+            Ok(cell_ref) if cell_ref.overflow_page.is_none() => {}
+            _ => return false,
+        }
+        let deleted_ptr = usize::from(top.cell_pointers[delete_idx]);
+        let deleted_upper = if delete_idx == 0 {
+            self.usable_size as usize
+        } else {
+            usize::from(top.cell_pointers[delete_idx - 1])
+        };
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let ptr_array_start = header_offset + usize::from(header.page_type.header_size());
+        let new_ptr_array_end = ptr_array_start + (cell_count - 1) * 2;
+        // The checks the compact branch makes before it changes a byte; a page
+        // that fails one is the ordinary delete's to report.
+        if deleted_ptr >= deleted_upper || content_offset > deleted_ptr {
+            return false;
+        }
+        let deleted_size = deleted_upper - deleted_ptr;
+        let new_content_offset = content_offset + deleted_size;
+        if new_content_offset > self.usable_size as usize || new_content_offset < new_ptr_array_end
+        {
+            return false;
+        }
+        let (Ok(pointer_shift), Ok(cell_content_offset)) = (
+            u16::try_from(deleted_size),
+            u32::try_from(new_content_offset),
+        ) else {
+            return false;
+        };
+        let mut new_header = header;
+        new_header.cell_count -= 1;
+        new_header.cell_content_offset = cell_content_offset;
+
+        // The cells below the removed one move up by its size. Their pointers
+        // follow it in the array (the order descends), so each moves one slot
+        // down and rises by that size; nothing before the removed pointer
+        // changes. Each raised pointer stays below the removed cell's upper
+        // bound, so none leaves the u16 range.
+        let mut ptrs = std::mem::take(&mut self.stack[depth - 1].cell_pointers);
+        let mut rewrite = |page: &mut [u8]| {
+            if content_offset < deleted_ptr {
+                page.copy_within(content_offset..deleted_ptr, new_content_offset);
+            }
+            new_header.write(page, header_offset);
+            let moved = &mut page[ptr_array_start + delete_idx * 2..new_ptr_array_end];
+            let (slots, _) = moved.as_chunks_mut::<2>();
+            for (slot, &ptr) in slots.iter_mut().zip(&ptrs[delete_idx + 1..]) {
+                *slot = (ptr + pointer_shift).to_be_bytes();
+            }
+        };
+        let Some(image) =
+            self.try_rewrite_top_page_in_staged_image(depth, leaf_page_no, &mut rewrite)
+        else {
+            self.stack[depth - 1].cell_pointers = ptrs;
+            return false;
+        };
+        ptrs.remove(delete_idx);
+        for ptr in &mut ptrs[delete_idx..] {
+            *ptr += pointer_shift;
+        }
+        let image_token = image.image_token();
+        let top = &mut self.stack[depth - 1];
+        top.cell_pointers = ptrs;
+        top.header = new_header;
+        top.mutation_counter = Self::page_mutation_counter(&image);
+        top.page_data = image;
+        self.descending_leaf_image = Some((leaf_page_no, image_token));
+
+        // What `with_btree_op` and `delete` do around the ordinary delete.
+        instrumentation::record_operation(BtreeOpType::Delete);
+        self.clear_rightmost_leaf_cache();
+        self.clear_seek_cache();
+        self.last_known_depth = Some(depth);
+        instrumentation::set_depth_gauge(depth);
+        self.bump_row_image_epoch();
+        true
+    }
+
     async fn remove_table_cell_from_leaf_deferred(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
@@ -10515,6 +10642,31 @@ impl<P: PageWriter> BtCursor<P> {
         let varint_len = write_varint(&mut new_cell[4..], new_rowid as u64);
         let new_cell = &new_cell[..4 + varint_len];
 
+        // bd-w4pr1.13.20, lever J: a new rowid whose varint is exactly as long
+        // as the stored one is written over it. The cell keeps its size and
+        // its place, so no other cell and no pointer moves; the rewrite below
+        // (sizing, sorting and moving every cell of the page) cost ~50k
+        // instructions per repaired leaf maximum. A varint of another length
+        // still takes that rewrite.
+        let rowid_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(
+            &entry,
+            separator_idx,
+        )?) + 4;
+        let stored_varint_len = entry
+            .page_data
+            .as_bytes()
+            .get(rowid_offset..self.usable_size as usize)
+            .and_then(read_varint)
+            .map(|(_, len)| len);
+        if stored_varint_len == Some(varint_len) {
+            let mut page_data = entry.page_data.clone();
+            drop(entry);
+            page_data.as_bytes_mut()[rowid_offset..rowid_offset + varint_len]
+                .copy_from_slice(&new_cell[4..]);
+            self.pager.write_page_data(cx, page_no, page_data).await?;
+            return self.refresh_stack_entries_showing(cx, page_no).await;
+        }
+
         let page_no = entry.page_no;
         let header_offset = cell::header_offset_for_page(page_no);
         let mut page_data = self.pager.read_btree_page_data(cx, page_no).await?;
@@ -10615,7 +10767,12 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         self.pager.write_page_data(cx, page_no, page_data).await?;
+        self.refresh_stack_entries_showing(cx, page_no).await
+    }
 
+    /// Reload `page_no` and put its fresh image into every stack entry that
+    /// shows it, each keeping its cell index.
+    async fn refresh_stack_entries_showing(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         let refreshed = self.reload_page_fresh(cx, page_no).await?;
         for stack_entry in &mut self.stack {
             if stack_entry.page_no == page_no {
@@ -19766,6 +19923,116 @@ mod tests {
         });
     }
 
+    /// Lever J (bd-w4pr1.13.20): deleting a leaf's maximum writes the new
+    /// separator's varint over the old one when both have one length, and
+    /// rewrites the page only when the length changes (128 -> 127).
+    #[test]
+    fn test_separator_repair_writes_a_same_length_varint_in_place() {
+        /// (cell offset, rowid) of every separator of the root page 2.
+        async fn root_separators(
+            cursor: &mut BtCursor<PrefetchProbeStore>,
+            cx: &Cx,
+        ) -> Vec<(usize, i64)> {
+            let root = cursor.load_page(cx, pn(2)).await.unwrap();
+            assert_eq!(root.header.page_type, cell::BtreePageType::InteriorTable);
+            (0..root.header.cell_count)
+                .map(|idx| {
+                    let offset =
+                        BtCursor::<PrefetchProbeStore>::read_stack_entry_cell_pointer_inline(
+                            &root, idx,
+                        )
+                        .unwrap();
+                    let rowid = cursor.parse_cell_at(&root, idx).unwrap().rowid.unwrap();
+                    (usize::from(offset), rowid)
+                })
+                .collect()
+        }
+
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            // 60-byte rows: several dozen to a leaf under one interior root.
+            for rowid in 1..=400_i64 {
+                cursor.table_insert(&cx, rowid, &[b'r'; 60]).await.unwrap();
+            }
+            assert_eq!(measure_tree_depth(&cursor.pager, pn(2), USABLE).await, 2);
+
+            // The leaf holding 128; its rows from its maximum down to 128 are
+            // deleted, each one the leaf's maximum when it goes, and 127 stays
+            // on the leaf.
+            assert!(cursor.table_move_to(&cx, 128).await.unwrap().is_found());
+            let (leaf_min, leaf_max) = {
+                let top = cursor.stack.last().unwrap();
+                let last = top.header.cell_count - 1;
+                (
+                    cursor.parse_cell_at(top, 0).unwrap().rowid.unwrap(),
+                    cursor.parse_cell_at(top, last).unwrap().rowid.unwrap(),
+                )
+            };
+            assert!(leaf_min < 127, "the leaf must hold 127 and a row below it");
+            assert!(leaf_max > 130, "the leaf must hold rows above 128");
+
+            for removed in (128..=leaf_max).rev() {
+                let before_bytes = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                let before = root_separators(&mut cursor, &cx).await;
+                let slot = before
+                    .iter()
+                    .position(|&(_, rowid)| rowid == removed)
+                    .expect("the leaf's maximum is a root separator");
+
+                assert!(cursor.table_move_to(&cx, removed).await.unwrap().is_found());
+                cursor.delete(&cx).await.unwrap();
+
+                let after_bytes = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                let after = root_separators(&mut cursor, &cx).await;
+                assert_eq!(after.len(), before.len(), "row {removed}");
+                assert_eq!(after[slot].1, removed - 1, "row {removed}: the new maximum");
+                #[allow(clippy::cast_sign_loss)]
+                let (old_len, new_len) =
+                    (varint_len(removed as u64), varint_len((removed - 1) as u64));
+                if old_len == new_len {
+                    // Only the varint after the cell's 4-byte child changed.
+                    let varint_at = before[slot].0 + 4;
+                    let varint_end = varint_at + old_len;
+                    assert_eq!(after, {
+                        let mut expected = before.clone();
+                        expected[slot].1 = removed - 1;
+                        expected
+                    });
+                    for (at, (old, new)) in before_bytes.iter().zip(&after_bytes).enumerate() {
+                        assert!(
+                            old == new || (varint_at..varint_end).contains(&at),
+                            "row {removed}: root byte {at} changed outside the separator's varint"
+                        );
+                    }
+                } else {
+                    assert_eq!(removed, 128, "only 128 -> 127 shortens the varint here");
+                    assert_ne!(after[slot].0, before[slot].0, "the page was rewritten");
+                }
+                for entry in cursor.stack.iter().filter(|entry| entry.page_no == pn(2)) {
+                    assert_eq!(
+                        entry.page_data.as_bytes(),
+                        after_bytes.as_slice(),
+                        "row {removed}: the cursor shows the repaired root"
+                    );
+                }
+                validate_table_tree_invariants(&cursor.pager, pn(2), USABLE)
+                    .await
+                    .expect("table invariants hold after the separator repair");
+            }
+
+            for rowid in 1..=400_i64 {
+                assert_eq!(
+                    cursor.table_move_to(&cx, rowid).await.unwrap().is_found(),
+                    !(128..=leaf_max).contains(&rowid),
+                    "row {rowid}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn test_table_delete_all_from_left_leaf_preserves_right_subtree() {
         run_async(async {
@@ -20372,6 +20639,143 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    /// bd-w4pr1.13.20, lever SD: the synchronous delete of a cell on a
+    /// staged compact leaf leaves every page and the cursor exactly as the
+    /// ordinary delete does (the reference store holds no staged images, so
+    /// it never takes the synchronous path), and refuses, changing nothing, a
+    /// leaf's last cell, a leaf's only cell, a cell with an overflow chain and
+    /// a leaf whose pointers do not descend. A delete that rewrote each moved
+    /// pointer's value but not its slot, or left the cursor anywhere but on
+    /// the successor, makes the pages or the visited rows differ.
+    #[test]
+    fn test_synchronous_leaf_delete_matches_the_ordinary_delete_and_refuses_the_rest() {
+        async fn refused<P: PageWriter>(cursor: &mut BtCursor<P>, cx: &Cx, rowid: i64, what: &str) {
+            assert!(
+                cursor.table_move_to(cx, rowid).await.unwrap().is_found(),
+                "{what}"
+            );
+            let top = cursor.stack.last().unwrap();
+            let shown = (top.page_no, top.page_data.image_token(), top.cell_idx);
+            let before = cursor.pager.read_page(cx, shown.0).await.unwrap();
+            assert!(
+                !cursor.try_delete_table_leaf_cell_in_staged_image(),
+                "{what}: refused"
+            );
+            let top = cursor.stack.last().unwrap();
+            assert_eq!(
+                (top.page_no, top.page_data.image_token(), top.cell_idx),
+                shown,
+                "{what}: the cursor is unchanged"
+            );
+            assert_eq!(
+                cursor.pager.read_page(cx, shown.0).await.unwrap(),
+                before,
+                "{what}: the page is unchanged"
+            );
+            assert_eq!(cursor.rowid(cx).await.unwrap(), rowid, "{what}");
+        }
+
+        let _leaf_cursor_guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        run_async(async {
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(
+                MemPageStore::with_empty_table(pn(2), USABLE),
+                pn(2),
+                USABLE,
+                true,
+            );
+            let mut cursor = BtCursor::new(
+                ImageKeepingStore::new(MemPageStore::with_empty_table(pn(2), USABLE), false),
+                pn(2),
+                USABLE,
+                true,
+            );
+            for rowid in 1..=1_200 {
+                let payload = payload_for_rowid(rowid);
+                reference.table_insert(&cx, rowid, &payload).await.unwrap();
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
+
+            // A one-pass DELETE's scan: delete where the cursor stands (it
+            // then stands on the successor), otherwise step.
+            assert!(reference.first(&cx).await.unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            let mut synchronous = 0;
+            while !reference.eof() {
+                assert!(!cursor.eof());
+                let rowid = reference.rowid(&cx).await.unwrap();
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), rowid);
+                if rowid % 3 == 1 {
+                    let more = reference.next(&cx).await.unwrap();
+                    assert_eq!(cursor.next(&cx).await.unwrap(), more, "row {rowid}");
+                    continue;
+                }
+                assert!(
+                    !reference.try_delete_table_leaf_cell_in_staged_image(),
+                    "a store without staged images never takes the synchronous delete"
+                );
+                reference.delete(&cx).await.unwrap();
+                if cursor.try_delete_table_leaf_cell_in_staged_image() {
+                    synchronous += 1;
+                } else {
+                    cursor.delete(&cx).await.unwrap();
+                }
+            }
+            assert!(cursor.eof());
+            assert!(
+                synchronous > 600,
+                "most of the 800 deletes run synchronously: {synchronous}"
+            );
+            let reference_pages: BTreeMap<u32, Vec<u8>> = reference
+                .pager
+                .pages_iter()
+                .map(|(page_no, bytes)| (*page_no, bytes.to_vec()))
+                .collect();
+            for (page_no, bytes) in &reference_pages {
+                assert_eq!(
+                    cursor.pager.page_bytes(*page_no).as_ref(),
+                    Some(bytes),
+                    "page {page_no} differs from the ordinary delete's"
+                );
+            }
+            assert_eq!(
+                scan_table_rows(&mut cursor).await,
+                scan_table_rows(&mut reference).await
+            );
+
+            // A leaf's last cell, on the staged store.
+            assert!(cursor.table_move_to(&cx, 601).await.unwrap().is_found());
+            let last = {
+                let top = cursor.stack.last().unwrap();
+                cursor
+                    .parse_cell_at(top, top.header.cell_count - 1)
+                    .unwrap()
+                    .rowid
+                    .unwrap()
+            };
+            refused(&mut cursor, &cx, last, "a leaf's last cell").await;
+
+            // A root leaf: its only cell, a cell with an overflow chain, and
+            // a leaf whose pointers no longer descend.
+            let mut small = BtCursor::new(
+                ImageKeepingStore::new(MemPageStore::with_empty_table(pn(2), USABLE), false),
+                pn(2),
+                USABLE,
+                true,
+            );
+            small.table_insert(&cx, 10, b"only").await.unwrap();
+            refused(&mut small, &cx, 10, "a leaf's only cell").await;
+            small.table_insert(&cx, 20, &[b'o'; 6_000]).await.unwrap();
+            small.table_insert(&cx, 30, b"after").await.unwrap();
+            refused(&mut small, &cx, 20, "a cell with an overflow chain").await;
+            small.table_insert(&cx, 15, b"late").await.unwrap();
+            refused(&mut small, &cx, 15, "a leaf whose pointers do not descend").await;
+            refused(&mut small, &cx, 10, "a leaf whose pointers do not descend").await;
         });
     }
 

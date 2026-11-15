@@ -405,20 +405,33 @@ fn explain_marks_only_rowid_preserving_updates_for_in_place_rewrite() {
     asupersync::test_utils::run_test(|| async {
         const KEEPS_ROWID: i64 = 0x10 | 0x80;
         const MOVES_ROWID: i64 = 0x10;
+        // bd-w4pr1.13.20 lever UR: a kept rowid on a table without a UNIQUE
+        // index cannot conflict, and its Delete keeps no copy of the row.
+        const KEEPS_ROWID_NO_RESTORE: i64 = KEEPS_ROWID | 0x200;
         let frank = Connection::open(":memory:").await.unwrap();
         frank
-            .execute_batch("CREATE TABLE p(id INTEGER PRIMARY KEY, v, w); CREATE TABLE h(v)")
+            .execute_batch(
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, v, w); CREATE TABLE h(v); \
+                 CREATE TABLE u(id INTEGER PRIMARY KEY, v UNIQUE, w); \
+                 CREATE TABLE n(id INTEGER PRIMARY KEY, v, w); CREATE INDEX n_v ON n(v)",
+            )
             .await
             .unwrap();
         for (sql, expected) in [
-            ("UPDATE p SET v = v + 1", KEEPS_ROWID),
-            ("UPDATE p SET v = 1, w = 2 WHERE id = 7", KEEPS_ROWID),
+            ("UPDATE p SET v = v + 1", KEEPS_ROWID_NO_RESTORE),
+            ("UPDATE p SET v = 1, w = 2 WHERE id = 7", KEEPS_ROWID_NO_RESTORE),
             ("UPDATE p SET id = id + 1", MOVES_ROWID),
             ("UPDATE p SET v = 1, id = 5 WHERE id = 7", MOVES_ROWID),
             ("UPDATE p SET rowid = 5 WHERE id = 7", MOVES_ROWID),
-            ("UPDATE h SET v = v * 2", KEEPS_ROWID),
+            ("UPDATE h SET v = v * 2", KEEPS_ROWID_NO_RESTORE),
             ("UPDATE h SET rowid = rowid + 1", MOVES_ROWID),
             ("UPDATE h SET _rowid_ = 9 WHERE v = 1", MOVES_ROWID),
+            // A UNIQUE index, even on a column the UPDATE leaves alone, keeps
+            // the restore; a plain index does not need it.
+            ("UPDATE u SET v = v + 1", KEEPS_ROWID),
+            ("UPDATE u SET w = 1", KEEPS_ROWID),
+            ("UPDATE u SET id = 5 WHERE id = 7", MOVES_ROWID),
+            ("UPDATE n SET v = v + 1", KEEPS_ROWID_NO_RESTORE),
         ] {
             let rows = frank_rows(&frank, &format!("EXPLAIN {sql}")).await;
             let deletes: Vec<i64> = rows
