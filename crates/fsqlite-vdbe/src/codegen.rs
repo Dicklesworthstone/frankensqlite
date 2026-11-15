@@ -26650,18 +26650,11 @@ fn codegen_select_group_by_aggregate(
             P4::None,
             0,
         );
-        let sort_loop_body = b.current_addr();
-        // SorterData: decode current sorted row.
-        let sorted_reg = b.alloc_reg();
-        b.emit_op(
-            Opcode::SorterData,
-            sorter_cursor,
-            sorted_reg,
-            0,
-            P4::None,
-            0,
-        );
-        Some(sort_loop_body)
+        // The loop reads its keys and aggregate arguments with `Column` on the
+        // sorter cursor itself, so no register takes the sorter record: the
+        // `SorterData` that did copied every record into a register no opcode
+        // read (bd-w4pr1.13.8, lever G4).
+        Some(b.current_addr())
     };
 
     // Read the row's group keys into cur_key registers (a streamed row's keys
