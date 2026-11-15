@@ -5798,6 +5798,20 @@ where
     if let Some(wal) = open_valid_wal_for_install(&vfs, cx, wal_path).await? {
         return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
     }
+    // bd-reality-check-1022-llk6g.5.6: in a database that is already in WAL
+    // mode, a WAL shorter than its header beside a `-shm` has no frames, as
+    // stock reads it, and its next writer writes the header under the append
+    // gate. Initializing it here takes EXCLUSIVE on the main file, which any
+    // peer's open transaction blocks (a stock reader included), so the open
+    // waited out the bootstrap retry (~35 s). A database entering WAL mode is
+    // changing its file format, which is whole-image maintenance anyway; the
+    // zero-byte WAL an earlier exit from WAL mode left is initialized as before.
+    if pager.journal_mode() == JournalMode::Wal
+        && let Some(wal) =
+            open_headerless_wal_for_install(&vfs, cx, wal_path, pager.page_size().get())?
+    {
+        return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
+    }
     let mut state = (vfs, wal_path.to_path_buf(), pager.page_size().get());
     let wal = pager
         .with_wal_initialization(cx, &mut state, |cx, (vfs, path, page_size)| {
@@ -5916,6 +5930,35 @@ where
         install_opened_wal_backend(pager, cx, vfs, wal_path, wal, false)?;
     }
     Ok(true)
+}
+
+/// bd-reality-check-1022-llk6g.5.6: bind an existing WAL that is shorter than
+/// its header, without writing one, when a `-shm` is present to read it
+/// through. A stock connection leaves such a WAL whenever it creates one (it
+/// writes the header with its first frame) or runs `wal_checkpoint(TRUNCATE)`.
+/// `None` for a missing WAL, a WAL with no `-shm` (no WAL-mode peer can be
+/// live; initialization repeats its inspection under the fence), a WAL that
+/// has a header, and every VFS without a shared WAL index.
+fn open_headerless_wal_for_install<V: Vfs>(
+    vfs: &V,
+    cx: &Cx,
+    wal_path: &Path,
+    page_size: u32,
+) -> Result<Option<WalFile<V::File>>> {
+    if !cfg!(all(feature = "native", unix))
+        || vfs.is_memory()
+        || !vfs.access(cx, wal_path, AccessFlags::EXISTS)?
+        || headerless_wal_lacks_wal_index(vfs, cx, wal_path)?
+    {
+        return Ok(None);
+    }
+    let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+    let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
+    if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+        let _ = file.close(cx);
+        return Ok(None);
+    }
+    Ok(Some(WalFile::open_headerless(file, page_size)))
 }
 
 /// GH#515: whether a read-only open of a header-less WAL finds no `-shm` to

@@ -1462,6 +1462,50 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         Err(unpublished_wal_tail_conflict())
     }
 
+    /// bd-reality-check-1022-llk6g.5.6: give a header-less WAL the header its
+    /// first frame needs, as stock's first writer does (`walFrames` with
+    /// `iFrame == 0`). The caller holds the append gate, so WAL_WRITE is
+    /// held and no peer can append, write a header, or checkpoint meanwhile.
+    ///
+    /// A header a peer wrote since this handle looked binds instead. Otherwise
+    /// the shared index must publish no frame. The salts are the index's own
+    /// when it carries a generation: stock's `walRestartHdr` stores the next
+    /// salts there, and the publication of the first frame is validated
+    /// against them. Stock's unindexed empty header carries none, so fresh
+    /// salts are drawn and the first publication binds them (GH#443). A page
+    /// size or checksum byte order that differs from the index's refuses.
+    async fn bind_header_for_first_append(&mut self, cx: &Cx) -> Result<()> {
+        self.wal.refresh(cx).await?;
+        if !self.wal.is_headerless() {
+            return Ok(());
+        }
+        if self.has_pending_publication() || self.native_recovery_requested.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let source = self.wal_index_shm_source.clone().ok_or(FrankenError::Unsupported)?;
+        let region = source.map_region(cx, 0, false).await?;
+        let baseline = read_shared_wal_index_header(&region)?.ok_or(FrankenError::BusyRecovery)?;
+        if baseline.mx_frame != 0 {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let salts = if baseline.is_unindexed_empty() {
+            WalSalts::generate()
+        } else {
+            let wal_header = self.wal.header();
+            if baseline.page_size()? != wal_header.page_size
+                || baseline.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+            {
+                return Err(FrankenError::BusyRecovery);
+            }
+            WalSalts {
+                salt1: baseline.a_salt[0],
+                salt2: baseline.a_salt[1],
+            }
+        };
+        let checkpoint_seq = self.wal.header().checkpoint_seq.wrapping_add(1);
+        self.wal.reset(cx, checkpoint_seq, salts, false).await
+    }
+
     /// Inspect the live native prefix before conflict checks or candidate staging.
     async fn native_append_baseline(&mut self, cx: &Cx) -> Result<fsqlite_wal::wal_index::WalIndexHdr> {
         if self.has_pending_publication() {
@@ -1477,6 +1521,13 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let region = source.map_region(cx, 0, false).await?;
         let baseline = read_shared_wal_index_header(&region)?.ok_or(FrankenError::BusyRecovery)?;
         self.wal.refresh(cx).await?;
+        // bd-reality-check-1022-llk6g.5.6: a header-less WAL gets its header
+        // only from `bind_header_for_first_append`, under the append gate. A
+        // preflight outside the gate (the advisory db_size floor) refuses
+        // here and never writes one.
+        if self.wal.is_headerless() {
+            return Err(FrankenError::BusyRecovery);
+        }
         let start = u32::try_from(self.wal.frame_count()).map_err(|_| FrankenError::DatabaseFull)?;
         if baseline.mx_frame > start { return Err(FrankenError::BusyRecovery); }
         let terminal = if baseline.mx_frame == 0 {
@@ -4310,15 +4361,21 @@ where
         cx: &Cx,
         path_file: &V::File,
     ) -> Result<bool> {
-        if let (Some(path_identity), Some(current_identity)) = (
-            path_file.file_identity()?, self.inner.wal.file().file_identity()?,
-        ) && path_identity != current_identity {
+        let identities = (path_file.file_identity()?, self.inner.wal.file().file_identity()?);
+        if let (Some(path_identity), Some(current_identity)) = identities
+            && path_identity != current_identity
+        {
             return Ok(false);
         }
         let mut header_buf = [0_u8; WAL_HEADER_SIZE];
         let bytes_read = path_file.read(cx, &mut header_buf, 0).await?;
         if bytes_read < WAL_HEADER_SIZE {
-            return Ok(false);
+            // bd-reality-check-1022-llk6g.5.6: a header-less handle names a
+            // path that still has no header, when both are the same known
+            // file. Its next writer binds a header under the append gate.
+            let same_known_file =
+                matches!(identities, (Some(path), Some(current)) if path == current);
+            return Ok(self.inner.wal.is_headerless() && same_known_file);
         }
 
         let path_header = WalHeader::from_bytes(&header_buf)?;
@@ -4694,8 +4751,17 @@ where
             Err(error) => { let _ = file.close(cx); return Err(error); }
         };
         if size < u64::try_from(WAL_HEADER_SIZE).expect("WAL header size fits u64") {
-            file.close(cx)?;
-            return Ok(WalNativeReadOutcome::RecoveryRequired(WalNativeRecoveryReason::WalGenerationMismatch));
+            // bd-reality-check-1022-llk6g.5.6: a WAL shorter than its header
+            // has no frames, as stock reads it (a stock `wal_checkpoint(TRUNCATE)`
+            // leaves one behind). Bind it header-less: the inner admission
+            // then accepts only an index that publishes no frame and sends any
+            // other to recovery. Answering RecoveryRequired here instead failed
+            // every statement of an open connection with BusyRecovery while
+            // any stock connection stayed open. A header-less handle known to
+            // be on this same file returned Ready above; any other handle is
+            // replaced, as for a new header.
+            self.replace_inner(cx, WalFile::open_headerless(file, self.page_size))?;
+            return Ok(WalNativeReadOutcome::Ready);
         }
         let same = self.path_header_matches_current_handle(cx, &file).await;
         match same {
@@ -6437,6 +6503,10 @@ where
                 return Ok(());
             }
             self.validate_current_native_wal_path(cx, true).await?;
+            if self.append_gate_proof.is_some() && self.inner.wal.is_headerless() {
+                // bd-reality-check-1022-llk6g.5.6: only under the append gate.
+                self.inner.bind_header_for_first_append(cx).await?;
+            }
             self.inner.preflight_native_append(cx).await?;
             if let Some(proof) = &mut self.append_gate_proof {
                 proof.baseline = true;
