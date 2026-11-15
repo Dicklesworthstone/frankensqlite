@@ -3304,8 +3304,13 @@ pub fn codegen_select(
             && (aggregate_index_eq_seek_target(where_clause.as_deref(), table, table_alias).is_some()
                 || index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
                     .is_some()
-                || index_const_in_list_residual_target(where_clause.as_deref(), table, table_alias)
-                    .is_some()
+                || index_const_in_list_residual_target(
+                    where_clause.as_deref(),
+                    table,
+                    table_alias,
+                    schema,
+                )
+                .is_some()
                 || aggregate_index_range_seek_target(
                     where_clause.as_deref(),
                     table,
@@ -3612,8 +3617,13 @@ pub fn codegen_select(
         && rowid_in.is_none()
         && rowid_in_const.is_none()
         && (time_travel.is_some()
-            || index_const_in_list_composite_target(where_clause.as_deref(), table, table_alias)
-                .is_none())
+            || index_const_in_list_composite_target(
+                where_clause.as_deref(),
+                table,
+                table_alias,
+                schema,
+            )
+            .is_none())
     {
         index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
             .map(|(idx, ints, has_residual)| {
@@ -3638,7 +3648,7 @@ pub fn codegen_select(
         && rowid_in_const.is_none()
         && index_in.is_none()
     {
-        index_const_in_list_residual_target(where_clause.as_deref(), table, table_alias)
+        index_const_in_list_residual_target(where_clause.as_deref(), table, table_alias, schema)
     } else {
         None
     };
@@ -6718,14 +6728,31 @@ fn codegen_select_index_in_const_scan(
     // As in the rowid sibling: the members number their anonymous `?`s from where the WHERE
     // places them, and whatever follows the WHERE sees the counter past all of it.
     let where_placeholder_base = b.current_anon_placeholder();
-    b.emit_op(
-        Opcode::OpenRead,
-        cursor,
-        table.root_page,
-        0,
-        P4::Table(table.name.clone()),
-        0,
-    );
+    let mut terms = Vec::new();
+    if let Some(where_expr) = where_clause {
+        collect_conjunctive_terms(where_expr, &mut terms);
+    }
+    // bd-5i6zm: when the index holds every output and each conjunct the probes leave to the
+    // filter reads only its columns and the rowid, the entry answers the row (as bd-mids0's
+    // one-field IN scan does) and the table is never opened.
+    let covering_output = terms
+        .iter()
+        .all(|term| {
+            std::ptr::eq(*term, target.predicate)
+                || expr_reads_only_index_columns(term, table, table_alias, idx_schema, false)
+        })
+        .then(|| resolve_covering_output_sources(columns, table, table_alias, idx_schema))
+        .flatten();
+    if covering_output.is_none() {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
     b.emit_op(
         Opcode::OpenRead,
         idx_cursor,
@@ -6740,23 +6767,32 @@ fn codegen_select_index_in_const_scan(
         |b, skip_row| {
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
-            let mut terms = Vec::new();
-            if let Some(where_expr) = where_clause {
-                collect_conjunctive_terms(where_expr, &mut terms);
+            if covering_output.is_none() {
+                b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
             }
             let mut anon_offset = 0;
-            for term in terms {
+            for &term in &terms {
                 b.set_next_anon_placeholder(where_placeholder_base + anon_offset);
                 if !std::ptr::eq(term, target.predicate) {
-                    emit_where_filter(b, term, cursor, table, table_alias, schema, skip_row);
+                    if covering_output.is_some() {
+                        emit_index_entry_where_filter(
+                            b, term, idx_cursor, rowid_reg, cursor, table, table_alias, schema,
+                            idx_schema, skip_row,
+                        );
+                    } else {
+                        emit_where_filter(b, term, cursor, table, table_alias, schema, skip_row);
+                    }
                 }
                 anon_offset += count_anon_placeholders(term);
             }
             b.set_next_anon_placeholder(
                 where_placeholder_base + where_clause.map_or(0, count_anon_placeholders),
             );
-            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+            if let Some(sources) = covering_output.as_ref() {
+                emit_covering_output_reads(b, idx_cursor, rowid_reg, sources, out_regs);
+            } else {
+                emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+            }
             b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
             Ok::<(), CodegenError>(())
         },
@@ -6764,7 +6800,9 @@ fn codegen_select_index_in_const_scan(
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
-    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    if covering_output.is_none() {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())
@@ -6928,6 +6966,7 @@ fn codegen_select_index_in_subquery_scan(
             target.index,
             keys,
             prefix_len,
+            None,
             |b, skip_row| {
                 b.emit_op(
                     Opcode::IdxRowid,
@@ -7484,7 +7523,7 @@ fn codegen_select_or_index_union(
                 );
             }
         }
-        emit_index_prefix_rows(b, idx_cursor, index, keys, prefix_len, |b, skip_row| {
+        emit_index_prefix_rows(b, idx_cursor, index, keys, prefix_len, None, |b, skip_row| {
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
             // Jumps when an earlier term produced the row; otherwise records it.
             b.emit_jump_to_label(
@@ -20588,13 +20627,43 @@ struct IndexConstInList<'t, 'a> {
     /// Anonymous `?` placeholders in the conjuncts before the membership test (see
     /// [`RowidConstInList::anon_offset`]).
     anon_offset: u32,
-    /// bd-hyoms: `col = constant` values pinning the key terms before the
-    /// member's (`prefix`) and right after it (`suffix`), each with the
-    /// affinity its comparison applies, so a member seeks the run of
-    /// `(prefix.., member, suffix..)`. Both empty for a one-field probe.
-    prefix: Vec<(&'a Expr, char)>,
-    suffix: Vec<(&'a Expr, char)>,
+    /// bd-hyoms: the key terms pinned before the member's (`prefix`) and right
+    /// after it (`suffix`), each with the affinity its comparison applies, so a
+    /// member seeks the run of `(prefix.., member, suffix..)`. Both empty for a
+    /// one-field probe.
+    prefix: Vec<KeyPin<'a>>,
+    suffix: Vec<KeyPin<'a>>,
+    /// bd-5i6zm: a range on the key term after the pinned ones, which bounds
+    /// each probe's run exactly (`a IN (3, 77) AND b > 50` on `(a, b)`).
+    range: Option<ProbeRange<'a>>,
 }
+
+impl IndexConstInList<'_, '_> {
+    /// The key terms the probe constrains, its range term included.
+    fn width(&self) -> usize {
+        self.prefix.len() + 1 + self.suffix.len() + usize::from(self.range.is_some())
+    }
+}
+
+/// A key term of an [`IndexConstInList`] probe pinned beside its member:
+/// `col = constant` (one value) or, since bd-5i6zm, another constant IN list,
+/// whose members multiply the probe set (the cross product of the lists).
+enum KeyPin<'a> {
+    Eq(&'a Expr, char),
+    In(Vec<&'a Expr>, char),
+}
+
+/// The range an [`IndexConstInList`] probe applies to the key term after its
+/// pinned ones: each bound is seek-safe (`index_range_bound_is_seek_safe`)
+/// and takes `affinity` (the key's, when it coerces) before it is compared.
+struct ProbeRange<'a> {
+    bounds: ColumnRangeTarget<'a>,
+    affinity: Option<char>,
+}
+
+/// bd-5i6zm: the most member combinations a composite probe with several IN
+/// lists enumerates; a larger cross product leaves the extra list a residual.
+const MAX_COMPOSITE_IN_PROBES: usize = 64;
 
 /// The index, members and affinity of `<col> IN (<bind-time constants>)` for
 /// [`IndexConstInList`]: `col` is a table column with BINARY collation, and an index
@@ -20706,15 +20775,20 @@ fn const_in_list_members<'a>(
 /// `col = constant` conjunct compared under that term's collation, taking the pinned terms after
 /// `k` too, so each member seeks the run of `(prefix.., member, suffix..)` (stock's
 /// `SEARCH t USING INDEX t_ab (a=? AND b=?)`) instead of the IN column's whole run, or the leading
-/// equality's run with the IN evaluated per row. `None` unless the probe pins two or more key
-/// terms. The widest probe wins, then one that enforces the whole WHERE, then the shorter index.
-/// The constants take the column's affinity, as `col = constant` applies it, and the residual
-/// filter still applies every conjunct but the IN, so the probe only has to reach every row the
-/// WHERE accepts.
+/// equality's run with the IN evaluated per row. bd-5i6zm: a pinned term may also be another
+/// constant IN list on a BINARY key term, and the probe set is then the cross product of the
+/// lists (at most [`MAX_COMPOSITE_IN_PROBES`] combinations; a larger one leaves the extra list a
+/// residual); the key term after the pinned ones may carry a seek-safe range on an ascending
+/// BINARY key term, which bounds each probe's run (stock's `(a=? AND b>?)`). `None` unless the
+/// probe constrains two or more key terms. The widest pinned probe wins, then one with a range,
+/// then one that enforces the whole WHERE, then the shorter index. The constants take the
+/// column's affinity, as `col = constant` applies it, and the residual filter still applies
+/// every conjunct but the IN, so the probe only has to reach every row the WHERE accepts.
 fn index_const_in_list_composite_target<'t, 'a>(
     where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
 ) -> Option<IndexConstInList<'t, 'a>> {
     let where_expr = where_clause?;
     // The probe emits the equalities before the IN members, so an anonymous
@@ -20756,37 +20830,104 @@ fn index_const_in_list_composite_target<'t, 'a>(
             }
             let pinned = |key_pos: usize| {
                 let column = &index.columns[key_pos];
-                conjuncts.iter().enumerate().find_map(|(term_pos, candidate)| {
-                    let value =
-                        extract_index_column_equality_expr(candidate, table, table_alias, column)?;
-                    index_equality_term_uses_key_collation(
-                        candidate, table, table_alias, index, key_pos,
-                    )
-                    .then(|| (term_pos, (value, key_affinity(column))))
-                })
+                conjuncts
+                    .iter()
+                    .enumerate()
+                    .find_map(|(term_pos, candidate)| {
+                        let value = extract_index_column_equality_expr(
+                            candidate,
+                            table,
+                            table_alias,
+                            column,
+                        )?;
+                        index_equality_term_uses_key_collation(
+                            candidate, table, table_alias, index, key_pos,
+                        )
+                        .then(|| (term_pos, KeyPin::Eq(value, key_affinity(column))))
+                    })
+                    .or_else(|| {
+                        if !is_binary(index.key_term_collation(key_pos)) {
+                            return None;
+                        }
+                        conjuncts
+                            .iter()
+                            .enumerate()
+                            .find_map(|(term_pos, candidate)| {
+                                let (name, members, member_affinity) =
+                                    const_in_list_members(candidate, table, table_alias)?;
+                                (term_pos != in_term_pos && name.eq_ignore_ascii_case(column))
+                                    .then_some((term_pos, KeyPin::In(members, member_affinity)))
+                            })
+                    })
+            };
+            // A pinned IN list multiplies the probe set; past the cap it stays a residual.
+            let mut probes = values.len();
+            let mut admit = |pin: &KeyPin<'_>| match pin {
+                KeyPin::Eq(..) => true,
+                KeyPin::In(members, _) => match probes.checked_mul(members.len()) {
+                    Some(total) if total <= MAX_COMPOSITE_IN_PROBES => {
+                        probes = total;
+                        true
+                    }
+                    _ => false,
+                },
             };
             let mut consumed = vec![in_term_pos];
-            let Some(prefix) = (0..in_pos)
-                .map(|key_pos| {
-                    pinned(key_pos).map(|(term_pos, value)| {
+            let mut prefix = Vec::with_capacity(in_pos);
+            for key_pos in 0..in_pos {
+                match pinned(key_pos) {
+                    Some((term_pos, pin)) if admit(&pin) => {
                         consumed.push(term_pos);
-                        value
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-            else {
+                        prefix.push(pin);
+                    }
+                    _ => break,
+                }
+            }
+            if prefix.len() < in_pos {
                 continue;
-            };
-            let suffix: Vec<_> = (in_pos + 1..key_terms)
-                .map_while(|key_pos| {
-                    pinned(key_pos).map(|(term_pos, value)| {
+            }
+            let mut suffix = Vec::new();
+            for key_pos in in_pos + 1..key_terms {
+                match pinned(key_pos) {
+                    Some((term_pos, pin)) if admit(&pin) => {
                         consumed.push(term_pos);
-                        value
+                        suffix.push(pin);
+                    }
+                    _ => break,
+                }
+            }
+            let range_pos = in_pos + 1 + suffix.len();
+            let range = if range_pos < key_terms
+                && !index.key_term_descending(range_pos)
+                && is_binary(index.key_term_collation(range_pos))
+            {
+                let column = &index.columns[range_pos];
+                extract_named_column_range(where_expr, table, table_alias, column)
+                    .filter(|bounds| {
+                        index_range_fast_path_is_safe(table, table_alias, schema, column, bounds)
                     })
-                })
-                .collect();
-            let width = prefix.len() + 1 + suffix.len();
-            if width < 2 {
+                    .map(|bounds| {
+                        consumed.extend(conjuncts.iter().enumerate().filter_map(
+                            |(term_pos, candidate)| {
+                                conjunct_is_range_bound_on_column(
+                                    candidate,
+                                    column,
+                                    table,
+                                    table_alias,
+                                )
+                                .then_some(term_pos)
+                            },
+                        ));
+                        ProbeRange {
+                            bounds,
+                            affinity: Some(key_affinity(column))
+                                .filter(|aff| matches!(aff, 'C' | 'D' | 'E' | 'B')),
+                        }
+                    })
+            } else {
+                None
+            };
+            if prefix.len() + 1 + suffix.len() + usize::from(range.is_some()) < 2 {
                 continue;
             }
             consumed.sort_unstable();
@@ -20795,6 +20936,7 @@ fn index_const_in_list_composite_target<'t, 'a>(
             let rank = |target: &IndexConstInList<'_, '_>| {
                 (
                     target.prefix.len() + 1 + target.suffix.len(),
+                    target.range.is_some(),
                     !target.has_residual,
                     std::cmp::Reverse(target.index.key_term_count()),
                 )
@@ -20808,6 +20950,7 @@ fn index_const_in_list_composite_target<'t, 'a>(
                 anon_offset: 0,
                 prefix,
                 suffix,
+                range,
             };
             if best.as_ref().is_none_or(|previous| rank(&candidate) > rank(previous)) {
                 best = Some(candidate);
@@ -20823,8 +20966,11 @@ fn index_const_in_list_residual_target<'t, 'a>(
     where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
 ) -> Option<IndexConstInList<'t, 'a>> {
-    if let Some(target) = index_const_in_list_composite_target(where_clause, table, table_alias) {
+    if let Some(target) =
+        index_const_in_list_composite_target(where_clause, table, table_alias, schema)
+    {
         return Some(target);
     }
     let where_expr = where_clause?;
@@ -20840,6 +20986,7 @@ fn index_const_in_list_residual_target<'t, 'a>(
             anon_offset: 0,
             prefix: Vec::new(),
             suffix: Vec::new(),
+            range: None,
         });
     }
     let mut conjuncts = Vec::new();
@@ -20860,6 +21007,7 @@ fn index_const_in_list_residual_target<'t, 'a>(
                 anon_offset,
                 prefix: Vec::new(),
                 suffix: Vec::new(),
+                range: None,
             });
         }
         anon_offset += count_anon_placeholders(term);
@@ -21800,15 +21948,28 @@ fn emit_aggregate_index_value_seek(
     b.resolve_label(next_value);
 }
 
+/// The registers of a [`ProbeRange`] for [`emit_index_prefix_rows`]: a lower
+/// bound sits right after the prefix keys (it ends the seek record), an upper
+/// bound in its own register; both already carry the key's affinity.
+struct ProbeRangeRegs {
+    lower_inclusive: Option<bool>,
+    upper: Option<(i32, bool)>,
+}
+
 /// Visit an equality-prefix run of an already-open index. The caller supplies
 /// affinity-coerced key registers and the action for each matching entry.
 /// A partial record is the lower bound of the run, including NULL/DESC suffixes.
+/// bd-5i6zm: with `range`, the run is also bounded on the key term after the
+/// prefix (ascending, BINARY): the seek starts at the lower bound, an entry at
+/// an exclusive lower bound or with a NULL key (no lower bound) is skipped, and
+/// the first entry past the upper bound ends the run.
 fn emit_index_prefix_rows<R>(
     b: &mut ProgramBuilder,
     idx_cursor: i32,
     idx_schema: &IndexSchema,
     probe_key_regs: i32,
     prefix_len: i32,
+    range: Option<&ProbeRangeRegs>,
     emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label) -> R,
 ) -> R {
     let next_value = b.emit_label();
@@ -21822,11 +21983,25 @@ fn emit_index_prefix_rows<R>(
             0,
         );
     }
+    // A NULL bound makes the comparison NULL for every row.
+    let lower_reg = probe_key_regs + prefix_len;
+    let seek_fields = match range {
+        Some(range) => {
+            if range.lower_inclusive.is_some() {
+                b.emit_jump_to_label(Opcode::IsNull, lower_reg, 0, next_value, P4::None, 0);
+            }
+            if let Some((upper_reg, _)) = range.upper {
+                b.emit_jump_to_label(Opcode::IsNull, upper_reg, 0, next_value, P4::None, 0);
+            }
+            prefix_len + i32::from(range.lower_inclusive.is_some())
+        }
+        None => prefix_len,
+    };
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         probe_key_regs,
-        prefix_len,
+        seek_fields,
         probe_record_reg,
         P4::None,
         0,
@@ -21858,6 +22033,23 @@ fn emit_index_prefix_rows<R>(
         );
     }
     let skip_row = b.emit_label();
+    if let Some(range) = range {
+        let range_key_reg = b.alloc_reg();
+        b.emit_op(Opcode::Column, idx_cursor, prefix_len, range_key_reg, P4::None, 0);
+        match range.lower_inclusive {
+            None => {
+                b.emit_jump_to_label(Opcode::IsNull, range_key_reg, 0, skip_row, P4::None, 0);
+            }
+            Some(false) => {
+                b.emit_jump_to_label(Opcode::Le, lower_reg, range_key_reg, skip_row, P4::None, 0);
+            }
+            Some(true) => {}
+        }
+        if let Some((upper_reg, inclusive)) = range.upper {
+            let past = if inclusive { Opcode::Gt } else { Opcode::Ge };
+            b.emit_jump_to_label(past, upper_reg, range_key_reg, next_value, P4::None, 0);
+        }
+    }
     let result = emit_row(b, skip_row);
     b.resolve_label(skip_row);
     b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
@@ -21869,6 +22061,10 @@ fn emit_index_prefix_rows<R>(
 /// before sorting and deduplicating makes `1`, `1.0` and `'1'` one probe for
 /// NUMERIC affinity, while a TEXT index keeps `'1'` and `'1.0'` separate.
 /// A statement-local sorter avoids requiring a MemDatabase for the probe set.
+/// bd-5i6zm: with several IN lists the sorter holds one record per member
+/// combination (a NULL member drops its combinations), sorted in the key
+/// terms' order and directions, and a run of equal records is sought once.
+#[allow(clippy::too_many_lines)]
 fn emit_index_const_list_rows<R>(
     b: &mut ProgramBuilder,
     idx_cursor: i32,
@@ -21877,48 +22073,157 @@ fn emit_index_const_list_rows<R>(
     anon_placeholder_base: u32,
     emit_row: impl FnOnce(&mut ProgramBuilder, crate::Label) -> R,
 ) -> R {
-    b.emit_op(Opcode::SorterOpen, probe_cursor, 1, 0, P4::Str("+".to_owned()), 0);
-    // bd-hyoms: the probe is `(prefix.., member, suffix..)`; the constants
-    // around the member are computed once and take their key term's affinity.
-    let prefix_len = i32::try_from(target.prefix.len() + 1 + target.suffix.len())
-        .expect("an index has fewer than i32::MAX key terms");
-    let probe = b.alloc_regs(prefix_len);
-    let key = probe + i32::try_from(target.prefix.len()).expect("checked above");
-    for (reg, (value, affinity)) in (probe..key)
-        .chain(key + 1..probe + prefix_len)
-        .zip(target.prefix.iter().chain(&target.suffix))
-    {
+    // bd-hyoms: the probe is `(prefix.., member, suffix..)`; an equality
+    // around the member is computed once and takes its key term's affinity.
+    let pins = target.prefix.len() + 1 + target.suffix.len();
+    let prefix_len = i32::try_from(pins).expect("an index has fewer than i32::MAX key terms");
+    let probe = b.alloc_regs(
+        prefix_len
+            + i32::from(
+                target
+                    .range
+                    .as_ref()
+                    .is_some_and(|range| range.bounds.lower.is_some()),
+            ),
+    );
+    // The key position, register, members and affinity of each IN list, in key
+    // order, and the register, value and affinity of each pinned equality.
+    let mut lists: Vec<(usize, i32, &[&Expr], char)> = Vec::new();
+    let mut equalities: Vec<(i32, &Expr, char)> = Vec::new();
+    for (pos, reg) in (probe..probe + prefix_len).enumerate() {
+        let pin = match pos.cmp(&target.prefix.len()) {
+            std::cmp::Ordering::Less => &target.prefix[pos],
+            std::cmp::Ordering::Equal => {
+                lists.push((pos, reg, target.values.as_slice(), target.affinity));
+                continue;
+            }
+            std::cmp::Ordering::Greater => &target.suffix[pos - target.prefix.len() - 1],
+        };
+        match pin {
+            KeyPin::Eq(value, affinity) => equalities.push((reg, value, *affinity)),
+            KeyPin::In(members, affinity) => lists.push((pos, reg, members.as_slice(), *affinity)),
+        }
+    }
+    let width = i32::try_from(lists.len()).expect("fewer IN lists than key terms");
+    // Probes are visited in index order, as stock walks its IN lists.
+    let orders: String = lists
+        .iter()
+        .map(|&(pos, ..)| if target.index.key_term_descending(pos) { '-' } else { '+' })
+        .collect();
+    b.emit_op(Opcode::SorterOpen, probe_cursor, width, 0, P4::Str(orders), 0);
+    for (reg, value, affinity) in equalities {
         emit_expr(b, value, reg, None);
         b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(affinity.to_string()), 0);
     }
+    let range_regs = target.range.as_ref().map(|range| {
+        let emit_bound = |b: &mut ProgramBuilder, bound: &ColumnRangeBound<'_>, reg: i32| {
+            emit_expr(b, bound.expr(), reg, None);
+            if let Some(aff) = range.affinity
+                && !bound_matches_affinity(aff, bound.expr())
+            {
+                b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+            }
+        };
+        let lower_inclusive = range.bounds.lower.as_ref().map(|lower| {
+            emit_bound(b, lower, probe + prefix_len);
+            lower.inclusive
+        });
+        let upper = range.bounds.upper.as_ref().map(|upper| {
+            let reg = b.alloc_reg();
+            emit_bound(b, upper, reg);
+            (reg, upper.inclusive)
+        });
+        ProbeRangeRegs {
+            lower_inclusive,
+            upper,
+        }
+    });
     let record = b.alloc_reg();
-    let previous_key = b.alloc_reg();
+    let previous = b.alloc_regs(width);
     let has_previous = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, has_previous, 0, P4::None, 0);
     b.set_next_anon_placeholder(anon_placeholder_base + target.anon_offset);
-    for value in &target.values {
-        let skip_value = b.emit_label();
-        emit_expr(b, value, key, None);
-        b.emit_jump_to_label(Opcode::IsNull, key, 0, skip_value, P4::None, 0);
-        b.emit_op(Opcode::Affinity, key, 1, 0, P4::Affinity(target.affinity.to_string()), 0);
-        b.emit_op(Opcode::MakeRecord, key, 1, record, P4::None, 0);
-        b.emit_op(Opcode::SorterInsert, probe_cursor, record, 0, P4::None, 0);
-        b.resolve_label(skip_value);
+    if let [(_, key, values, affinity)] = lists[..] {
+        for value in values {
+            let skip_value = b.emit_label();
+            emit_expr(b, value, key, None);
+            b.emit_jump_to_label(Opcode::IsNull, key, 0, skip_value, P4::None, 0);
+            b.emit_op(Opcode::Affinity, key, 1, 0, P4::Affinity(affinity.to_string()), 0);
+            b.emit_op(Opcode::MakeRecord, key, 1, record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, probe_cursor, record, 0, P4::None, 0);
+            b.resolve_label(skip_value);
+        }
+    } else {
+        // Every member once, then each combination copied into one record.
+        let members: Vec<Vec<i32>> = lists
+            .iter()
+            .map(|&(_, _, values, affinity)| {
+                values
+                    .iter()
+                    .map(|value| {
+                        let reg = b.alloc_reg();
+                        emit_expr(b, value, reg, None);
+                        b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(affinity.to_string()), 0);
+                        reg
+                    })
+                    .collect()
+            })
+            .collect();
+        let combination = b.alloc_regs(width);
+        let mut choice = vec![0_usize; lists.len()];
+        'combinations: loop {
+            let skip_combination = b.emit_label();
+            for ((list, &pick), field) in members.iter().zip(&choice).zip(combination..) {
+                b.emit_jump_to_label(Opcode::IsNull, list[pick], 0, skip_combination, P4::None, 0);
+                b.emit_op(Opcode::Copy, list[pick], field, 0, P4::None, 0);
+            }
+            b.emit_op(Opcode::MakeRecord, combination, width, record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, probe_cursor, record, 0, P4::None, 0);
+            b.resolve_label(skip_combination);
+            for (slot, list) in choice.iter_mut().zip(&members).rev() {
+                *slot += 1;
+                if *slot < list.len() {
+                    continue 'combinations;
+                }
+                *slot = 0;
+            }
+            break;
+        }
     }
     let probes_done = b.emit_label();
     b.emit_jump_to_label(Opcode::SorterSort, probe_cursor, 0, probes_done, P4::None, 0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let probe_loop = b.current_addr() as i32;
     b.emit_op(Opcode::SorterData, probe_cursor, record, 0, P4::None, 0);
-    b.emit_op(Opcode::Column, probe_cursor, 0, key, P4::None, 0);
+    for (field, &(_, reg, ..)) in (0..width).zip(&lists) {
+        b.emit_op(Opcode::Column, probe_cursor, field, reg, P4::None, 0);
+    }
     let first_key = b.emit_label();
     let next_probe = b.emit_label();
     b.emit_jump_to_label(Opcode::IfNot, has_previous, 0, first_key, P4::None, 0);
-    b.emit_jump_to_label(Opcode::Eq, previous_key, key, next_probe, P4::None, 0);
+    if let [(_, key, ..)] = lists[..] {
+        b.emit_jump_to_label(Opcode::Eq, previous, key, next_probe, P4::None, 0);
+    } else {
+        // A record equal to the previous one field by field was sought already.
+        for (prior, &(_, reg, ..)) in (previous..).zip(&lists) {
+            b.emit_jump_to_label(Opcode::Ne, prior, reg, first_key, P4::None, 0);
+        }
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, next_probe, P4::None, 0);
+    }
     b.resolve_label(first_key);
-    b.emit_op(Opcode::Copy, key, previous_key, 0, P4::None, 0);
+    for (prior, &(_, reg, ..)) in (previous..).zip(&lists) {
+        b.emit_op(Opcode::Copy, reg, prior, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Integer, 1, has_previous, 0, P4::None, 0);
-    let result = emit_index_prefix_rows(b, idx_cursor, target.index, probe, prefix_len, emit_row);
+    let result = emit_index_prefix_rows(
+        b,
+        idx_cursor,
+        target.index,
+        probe,
+        prefix_len,
+        range_regs.as_ref(),
+        emit_row,
+    );
     b.resolve_label(next_probe);
     b.emit_op(Opcode::SorterNext, probe_cursor, probe_loop, 0, P4::None, 0);
     b.resolve_label(probes_done);
@@ -22495,7 +22800,7 @@ fn codegen_select_aggregate(
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
         && rowid_range_seek.is_none()
-        && index_const_in_list_composite_target(where_clause, table, table_alias).is_none()
+        && index_const_in_list_composite_target(where_clause, table, table_alias, schema).is_none()
     {
         index_integer_in_list_residual_target(where_clause, table, table_alias)
     } else {
@@ -22512,7 +22817,7 @@ fn codegen_select_aggregate(
         && rowid_range_seek.is_none()
         && index_in_seek.is_none()
     {
-        index_const_in_list_residual_target(where_clause, table, table_alias)
+        index_const_in_list_residual_target(where_clause, table, table_alias, schema)
     } else {
         None
     };
@@ -26135,15 +26440,15 @@ fn codegen_select_group_by_aggregate(
     // bd-hyoms: an IN probe pinning at least as many key terms (`a = 5 AND
     // b IN (1, 2)` on `(a, b)`) visits fewer rows than the equality prefix.
     let composite_in_width = allow_index_seek
-        .then(|| index_const_in_list_composite_target(where_clause, table, table_alias))
+        .then(|| index_const_in_list_composite_target(where_clause, table, table_alias, schema))
         .flatten()
-        .map_or(0, |target| target.prefix.len() + 1 + target.suffix.len());
+        .map_or(0, |target| target.width());
     let index_eq_seek = allow_index_seek
         .then(|| index_equality_prefix_target(where_clause, table, table_alias))
         .flatten()
         .filter(|target| target.values.len() > composite_in_width);
     let index_in_seek = if allow_index_seek && !table.without_rowid && index_eq_seek.is_none() {
-        index_const_in_list_residual_target(where_clause, table, table_alias)
+        index_const_in_list_residual_target(where_clause, table, table_alias, schema)
     } else {
         None
     };
@@ -26618,7 +26923,7 @@ fn codegen_select_group_by_aggregate(
                     b.emit_op(Opcode::Affinity, key, 1, 0, P4::Affinity(affinity.to_string()), 0);
                 }
             }
-            emit_index_prefix_rows(b, idx_cursor, index, keys, prefix_len, emit_row);
+            emit_index_prefix_rows(b, idx_cursor, index, keys, prefix_len, None, emit_row);
         } else if let Some(target) = index_in_seek {
             let probe_cursor = idx_cursor + 1;
             emit_index_const_list_rows(

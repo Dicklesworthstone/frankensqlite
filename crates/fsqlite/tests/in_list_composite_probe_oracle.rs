@@ -32,43 +32,57 @@ fn to_rusqlite(value: &SqliteValue) -> rusqlite::types::Value {
 }
 
 async fn frank_rows(c: &Connection, sql: &str, params: &[SqliteValue]) -> Vec<Vec<String>> {
-    let mut rows: Vec<Vec<String>> = c
-        .query_with_params(sql, params)
-        .await
-        .unwrap_or_else(|e| panic!("frank `{sql}` {params:?}: {e}"))
-        .iter()
-        .map(|row| row.values().iter().map(render).collect())
-        .collect();
+    let mut rows = frank_rows_in_order(c, sql, params).await;
     rows.sort();
     rows
 }
 
+async fn frank_rows_in_order(
+    c: &Connection,
+    sql: &str,
+    params: &[SqliteValue],
+) -> Vec<Vec<String>> {
+    c.query_with_params(sql, params)
+        .await
+        .unwrap_or_else(|e| panic!("frank `{sql}` {params:?}: {e}"))
+        .iter()
+        .map(|row| row.values().iter().map(render).collect())
+        .collect()
+}
+
 fn sqlite_rows(c: &rusqlite::Connection, sql: &str, params: &[SqliteValue]) -> Vec<Vec<String>> {
-    let mut stmt = c.prepare(sql).unwrap();
-    let n = stmt.column_count();
-    let mut rows: Vec<Vec<String>> = stmt
-        .query_map(
-            rusqlite::params_from_iter(params.iter().map(to_rusqlite)),
-            |row| {
-                Ok((0..n)
-                    .map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
-                        rusqlite::types::Value::Null => "NULL".to_owned(),
-                        rusqlite::types::Value::Integer(x) => x.to_string(),
-                        rusqlite::types::Value::Real(f) => format!("{f:?}"),
-                        rusqlite::types::Value::Text(s) => format!("'{s}'"),
-                        rusqlite::types::Value::Blob(b) => format!(
-                            "X'{}'",
-                            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
-                        ),
-                    })
-                    .collect())
-            },
-        )
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let mut rows = sqlite_rows_in_order(c, sql, params);
     rows.sort();
     rows
+}
+
+fn sqlite_rows_in_order(
+    c: &rusqlite::Connection,
+    sql: &str,
+    params: &[SqliteValue],
+) -> Vec<Vec<String>> {
+    let mut stmt = c.prepare(sql).unwrap();
+    let n = stmt.column_count();
+    stmt.query_map(
+        rusqlite::params_from_iter(params.iter().map(to_rusqlite)),
+        |row| {
+            Ok((0..n)
+                .map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
+                    rusqlite::types::Value::Null => "NULL".to_owned(),
+                    rusqlite::types::Value::Integer(x) => x.to_string(),
+                    rusqlite::types::Value::Real(f) => format!("{f:?}"),
+                    rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                    rusqlite::types::Value::Blob(b) => format!(
+                        "X'{}'",
+                        b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                    ),
+                })
+                .collect())
+        },
+    )
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
 }
 
 /// EXPLAIN rows as (opcode, p1, p2, p3).
@@ -298,12 +312,12 @@ fn in_list_with_key_equalities_probes_the_composite_prefix_and_matches_sqlite() 
         ];
         // The probe cannot pin a second term: the IN column has a NOCASE
         // collation, the equality compares under another collation than the
-        // key term's, or a key term between them is not pinned.
+        // key term's, or a key term between them is not pinned. (A range on
+        // the next key term is a probe since bd-5i6zm, checked below.)
         let one_field: Vec<&str> = vec![
             "SELECT id, x FROM t WHERE a = 5 AND x IN ('K1', 'k2')",
             "SELECT id, x FROM t WHERE a IN (5, 7) AND x = 'K0' COLLATE BINARY",
             "SELECT id FROM t WHERE u IN (3, 4) AND c = 9",
-            "SELECT id FROM t WHERE a IN (5, 7) AND b > 3",
         ];
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("in_list_composite_probe.db");
@@ -375,6 +389,308 @@ fn in_list_with_key_equalities_probes_the_composite_prefix_and_matches_sqlite() 
             let sql = "SELECT id FROM t WHERE a = ?1 AND b IN (?2, ?3)";
             let stmt = f.prepare(sql).await.unwrap();
             for params in [[int(5), int(1), int(3)], [int(7), int(2), int(2)]] {
+                let mut got: Vec<Vec<String>> = stmt
+                    .query_with_params(&params)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(render).collect())
+                    .collect();
+                got.sort();
+                assert_eq!(
+                    got,
+                    sqlite_rows(&r, sql, &params),
+                    "prepared {params:?} at {path}"
+                );
+            }
+            drop(stmt);
+            f.close().await.unwrap();
+        }
+    });
+}
+
+/// bd-5i6zm: a second IN list on a pinned key term multiplies the probe set
+/// (one seek per member combination, at most 64), and a range on the key term
+/// after the pinned ones bounds each probe's run, as stock's
+/// `SEARCH t USING COVERING INDEX t_ab (a=? AND b=?)` / `(a=? AND b>?)` do.
+/// Covered outputs are answered from the index entry. Rows match rusqlite's,
+/// in its order where both walk the same index.
+#[test]
+fn second_in_list_or_range_on_the_next_key_term_extends_the_composite_probe() {
+    asupersync::test_utils::run_test(|| async {
+        let int = SqliteValue::Integer;
+        let text = |s: &str| SqliteValue::Text(s.into());
+        // (sql, params, probe width the seek must reach, outputs and filter covered by the index)
+        let probes: Vec<(&str, Vec<SqliteValue>, i64, bool)> = vec![
+            // Two IN lists: duplicates, equal-after-affinity, NULL, text and
+            // absent members, an OR chain, and three key terms.
+            (
+                "SELECT id FROM t WHERE a IN (3, 17, 39) AND b IN (3, 4)",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id, c FROM t WHERE a IN (5, 7) AND b IN (1, 2, 3)",
+                vec![],
+                2,
+                false,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (5, 5.0, '5', NULL, 7) AND b IN (1, '1', NULL, 2)",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id, a FROM t WHERE a IN ('abc', 5) AND b IN (1, 5)",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (100, 200) AND b IN (1, 2)",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (5, 7) AND (b = 1 OR b = 4)",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id, s FROM t WHERE a IN (5, 7) AND s IN ('k5', 'k45', 'k7')",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE u IN (3, 4) AND b IN (2, 3) AND c IN (6, 9)",
+                vec![],
+                3,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE u IN (3, 4) AND b = 2 AND c IN (6, 9)",
+                vec![],
+                3,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (5, 7) AND b IN (1, 2) AND c > 4",
+                vec![],
+                2,
+                false,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (?1, ?2) AND b IN (?3, ?4)",
+                vec![int(5), text("7"), int(1), SqliteValue::Null],
+                2,
+                true,
+            ),
+            // A range on the next key term: exclusive and inclusive bounds,
+            // BETWEEN, an empty range, REAL keys, parameters, and a NULL bound.
+            (
+                "SELECT id, a FROM t WHERE a IN (3, 17) AND b > 4",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id, b FROM t WHERE a IN (17, 3) AND b BETWEEN 2 AND 4",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (3, 17) AND b >= 2 AND b < 5",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (3, 17) AND b > 100",
+                vec![],
+                2,
+                true,
+            ),
+            // A REAL filter column is not read from the entry (fails closed).
+            (
+                "SELECT id, r FROM t WHERE a IN (4, 5) AND r > 1.5",
+                vec![],
+                2,
+                false,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (?1, ?2) AND b > ?3",
+                vec![int(3), int(17), int(4)],
+                2,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (?1, ?2) AND b > ?3",
+                vec![int(3), int(17), SqliteValue::Null],
+                2,
+                true,
+            ),
+            (
+                "SELECT id, c FROM t WHERE a IN (3, 17) AND b > 2 AND c < 5",
+                vec![],
+                2,
+                false,
+            ),
+            // Pinned terms then a range: three key terms.
+            (
+                "SELECT id FROM t WHERE u IN (3, 4) AND b = 2 AND c > 5",
+                vec![],
+                3,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE u IN (3, 4) AND b IN (2, 3) AND c BETWEEN 2 AND 8",
+                vec![],
+                3,
+                true,
+            ),
+            // No lower bound: the seek is the pinned prefix, NULL keys are
+            // skipped and the upper bound ends each run.
+            (
+                "SELECT id FROM t WHERE a IN (3, 17) AND b < 3",
+                vec![],
+                1,
+                true,
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (3, 17) AND b <= 3",
+                vec![],
+                1,
+                true,
+            ),
+            // Aggregates the probe answers alone, and one with a residual.
+            (
+                "SELECT count(*) FROM t WHERE a IN (3, 17, 39) AND b IN (3, 4)",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE a IN (3, 17, 39) AND b BETWEEN 2 AND 4",
+                vec![],
+                2,
+                true,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE a IN (3, 17) AND b < 3",
+                vec![],
+                1,
+                true,
+            ),
+            (
+                "SELECT sum(c) FROM t WHERE a IN (3, 17) AND b > 2",
+                vec![],
+                2,
+                false,
+            ),
+        ];
+        // Not extended: a cross product past 64 combinations, a text bound on
+        // the INTEGER column, a DESC or NOCASE range term.
+        let unchanged: Vec<&str> = vec![
+            "SELECT id FROM t WHERE a IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, \
+             17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32) AND b IN (1, 2)",
+            "SELECT id FROM t WHERE a IN (3, 17) AND b > '4'",
+            "SELECT id, s FROM t WHERE a IN (5, 7) AND s > 'k4'",
+            "SELECT id, x FROM t WHERE a IN (5, 7) AND x > 'k2'",
+        ];
+        // Stock walks the same index: same rows, in the same order.
+        let ordered = [
+            "SELECT id FROM t WHERE a IN (3, 17, 39) AND b IN (3, 4)",
+            "SELECT id, a FROM t WHERE a IN (3, 17) AND b > 4",
+            "SELECT id, b FROM t WHERE a IN (17, 3) AND b BETWEEN 2 AND 4",
+            "SELECT id, s FROM t WHERE a IN (5, 7) AND s IN ('k5', 'k45', 'k7')",
+            "SELECT id FROM t WHERE u IN (3, 4) AND b IN (2, 3) AND c BETWEEN 2 AND 8",
+            "SELECT id FROM t WHERE a IN (3, 17) AND b < 3",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("in_list_composite_cross.db");
+        for path in [":memory:", file.to_str().unwrap()] {
+            let (f, r) = setup(path).await;
+            f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+                .await
+                .unwrap();
+            for (sql, params, width, covered) in &probes {
+                assert_eq!(
+                    frank_rows(&f, sql, params).await,
+                    sqlite_rows(&r, sql, params),
+                    "`{sql}` {params:?} at {path}"
+                );
+                let ops = program(&f, sql).await;
+                assert_eq!(
+                    widest_probe(&ops),
+                    *width,
+                    "`{sql}` must probe {width} key terms: {ops:?}"
+                );
+                assert!(
+                    !ops.iter().any(|(op, ..)| op == "Rewind"),
+                    "`{sql}` must not scan: {ops:?}"
+                );
+                assert_eq!(
+                    !ops.iter().any(|(op, ..)| op == "SeekRowid"),
+                    *covered,
+                    "`{sql}`: the index {} every column read: {ops:?}",
+                    if *covered { "holds" } else { "lacks" }
+                );
+                // Without a lower bound the seek key is the pinned prefix; the
+                // composite probe set serves it, not the integer IN walk that
+                // filters every entry of each member's run.
+                if *width == 1 {
+                    assert!(
+                        ops.iter().any(|(op, ..)| op == "SorterOpen"),
+                        "`{sql}` must take the composite probe: {ops:?}"
+                    );
+                }
+            }
+            for sql in &unchanged {
+                assert_eq!(
+                    frank_rows(&f, sql, &[]).await,
+                    sqlite_rows(&r, sql, &[]),
+                    "`{sql}` at {path}"
+                );
+                let ops = program(&f, sql).await;
+                assert!(
+                    widest_probe(&ops) < 2,
+                    "`{sql}` must keep its one-field probe: {ops:?}"
+                );
+            }
+            for sql in ordered {
+                assert_eq!(
+                    frank_rows_in_order(&f, sql, &[]).await,
+                    sqlite_rows_in_order(&r, sql, &[]),
+                    "`{sql}` rows in stock's order at {path}"
+                );
+            }
+            // GROUP BY over a cross product and over a range (rows only in
+            // memory, where the mirror groups).
+            for sql in [
+                "SELECT a, b, count(*) FROM t WHERE a IN (5, 7) AND b IN (1, 2) GROUP BY a, b",
+                "SELECT a, sum(c) FROM t WHERE a IN (3, 17, 39) AND b > 3 GROUP BY a",
+            ] {
+                assert_eq!(
+                    frank_rows(&f, sql, &[]).await,
+                    sqlite_rows(&r, sql, &[]),
+                    "`{sql}` at {path}"
+                );
+                assert_eq!(
+                    widest_probe(&program(&f, sql).await),
+                    2,
+                    "`{sql}` must probe two key terms"
+                );
+            }
+            // A prepared statement runs again with other members and bound.
+            let sql = "SELECT id FROM t WHERE a IN (?1, ?2) AND b > ?3";
+            let stmt = f.prepare(sql).await.unwrap();
+            for params in [[int(3), int(17), int(4)], [int(17), int(17), int(0)]] {
                 let mut got: Vec<Vec<String>> = stmt
                     .query_with_params(&params)
                     .await
