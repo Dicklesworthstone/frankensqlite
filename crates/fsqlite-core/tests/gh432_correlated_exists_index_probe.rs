@@ -223,3 +223,92 @@ fn correlated_scalar_subquery_seeks_an_index_on_the_probed_column() {
         conn.close().await.unwrap();
     });
 }
+
+/// The `OpenRead`s of the table whose root page is `root` in `sql`'s program.
+async fn table_opens(conn: &Connection, sql: &str, root: i64) -> usize {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap_or_else(|error| panic!("EXPLAIN {sql}: {error}"))
+        .iter()
+        .filter(|row| {
+            let values = row.values();
+            matches!(&values[1], SqliteValue::Text(op) if op.as_str() == "OpenRead")
+                && values[3] == SqliteValue::Integer(root)
+        })
+        .count()
+}
+
+/// bd-tx55u: an EXISTS opens its subquery table only on the paths that read
+/// a row of it, since every open costs each outer row: not for an index
+/// probe without residual terms, nor besides the uncorrelated subquery's one
+/// materialization. A residual, a rowid probe and a scan read the table.
+#[test]
+fn correlated_exists_opens_its_table_only_where_it_reads_a_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bd_tx55u.db");
+    let path = path.to_str().unwrap().to_owned();
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(&path).await.unwrap();
+        conn.execute_batch(SETUP).await.unwrap();
+        conn.close().await.unwrap();
+        let conn = Connection::open(&path).await.unwrap();
+        let root = match conn
+            .query("SELECT rootpage FROM sqlite_master WHERE name = 'repos3'")
+            .await
+            .unwrap()[0]
+            .values()[0]
+        {
+            SqliteValue::Integer(root) => root,
+            ref other => panic!("repos3 root page: {other:?}"),
+        };
+        conn.set_reject_mem_fallback(true);
+        conn.set_strict_mem_fallback_rejection(true);
+        // (sql, ids, OpenReads of repos3's table b-tree)
+        for (sql, expected, opens) in [
+            (
+                "SELECT id FROM evidence WHERE EXISTS \
+                 (SELECT 1 FROM repos3 WHERE repos3.path = evidence.repo)",
+                vec![1, 2],
+                0,
+            ),
+            (
+                "SELECT id FROM evidence WHERE NOT EXISTS \
+                 (SELECT 1 FROM repos3 WHERE repos3.path = evidence.repo)",
+                vec![3, 4, 5],
+                0,
+            ),
+            (
+                "SELECT id FROM evidence WHERE EXISTS \
+                 (SELECT 1 FROM repos3 WHERE repos3.path = evidence.repo AND repos3.n > 1)",
+                vec![1, 2],
+                1,
+            ),
+            (
+                "SELECT id FROM evidence WHERE EXISTS \
+                 (SELECT 1 FROM repos3 WHERE repos3.rowid = evidence.n)",
+                vec![1, 3, 4, 5],
+                1,
+            ),
+            (
+                "SELECT id FROM evidence WHERE EXISTS (SELECT 1 FROM repos3 WHERE n > 2)",
+                vec![1, 2, 3, 4, 5],
+                1,
+            ),
+        ] {
+            assert_eq!(ids(&conn, sql).await, expected, "{sql}");
+            assert_eq!(
+                table_opens(&conn, sql, root).await,
+                opens,
+                "repos3's table opens in `{sql}`"
+            );
+        }
+        conn.set_strict_mem_fallback_rejection(false);
+        conn.set_reject_mem_fallback(false);
+        // A correlated probe of an unindexed column runs the correlated-EXISTS
+        // fallback; its answer is unchanged.
+        let sql = "SELECT id FROM evidence WHERE EXISTS \
+                   (SELECT 1 FROM repos3 WHERE repos3.n = evidence.n)";
+        assert_eq!(ids(&conn, sql).await, vec![1, 3, 4, 5], "{sql}");
+        conn.close().await.unwrap();
+    });
+}

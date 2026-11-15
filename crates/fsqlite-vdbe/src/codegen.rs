@@ -45744,16 +45744,20 @@ fn emit_exists_subquery(
     let default_val = i32::from(not);
     b.emit_op(Opcode::Integer, default_val, reg, 0, P4::None, 0);
 
-    // Open a read cursor on the subquery table.
+    // A read cursor on the subquery table, opened by the paths below that read
+    // a table row (bd-tx55u): an index probe without residual terms, and the
+    // once-materialized probe, never do, and each open costs every outer row.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    b.emit_op(
-        Opcode::OpenRead,
-        sub_cursor,
-        table.root_page as i32,
-        0,
-        P4::Int(table.columns.len() as i32),
-        0,
-    );
+    let open_table = |b: &mut ProgramBuilder| {
+        b.emit_op(
+            Opcode::OpenRead,
+            sub_cursor,
+            table.root_page as i32,
+            0,
+            P4::Int(table.columns.len() as i32),
+            0,
+        );
+    };
 
     let sub_ctx = ScanCtx {
         cursor: sub_cursor,
@@ -45802,6 +45806,7 @@ fn emit_exists_subquery(
         && let Some((probe_expr, residual_terms)) =
             extract_exists_rowid_probe(where_expr, table, sub_alias)
     {
+        open_table(b);
         let probe_reg = b.alloc_temp();
         emit_expr_with_fallback(b, probe_expr, probe_reg, &sub_ctx, Some(outer_ctx));
         b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, done_label, P4::None, 0);
@@ -45837,6 +45842,10 @@ fn emit_exists_subquery(
         && let Some(index_probe) =
             extract_exists_index_probe(where_expr, table, sub_alias, outer_ctx)
     {
+        let reads_table = !index_probe.residual_terms.is_empty();
+        if reads_table {
+            open_table(b);
+        }
         let idx_cursor = sub_cursor + 1;
         let close_label = b.emit_label();
         let probe_regs = b.alloc_regs(2);
@@ -45903,10 +45912,13 @@ fn emit_exists_subquery(
         b.resolve_label(close_label);
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
         b.resolve_label(done_label);
-        b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+        if reads_table {
+            b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+        }
         return;
     }
 
+    open_table(b);
     let rewind_addr = b.current_addr();
     b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
