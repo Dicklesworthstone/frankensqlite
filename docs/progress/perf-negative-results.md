@@ -89,6 +89,21 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN (probe partly met): an indexed equality seeks with a folded uncorrelated scalar subquery's value (bd-wp9s1 part 1)
+
+- Target: `SELECT id FROM t WHERE a = (SELECT w FROM p WHERE pid > 10 LIMIT 1)` (606x stock):
+  the fold leaves a BoundOuterValue with the result column's affinity, and is_simple_constant
+  refuses every BoundOuterValue as a seek key, so the outer equality scanned. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (is_exact_equality_seek_value: the value is an exact key when
+  the comparison converts only it; the equality walk reads its storage class like a literal's).
+- Result (c1c715a48; scratchpad wp_ab.py, stock live, answers equal; ELF before
+  ea1aec8d7519ec2a, after 3ae0fcb4a04033b8; thinkstation1): 606x -> 3.8x, its count 1653x ->
+  2.8x, TEXT 2563x -> 5.3x; the no-LIMIT row 2656x -> 568x (its fold still runs the whole
+  subquery).
+- Retry condition: part 2 gives the scalar fold LIMIT 1 (fsq-sfl); a TEXT value on a numeric
+  column and a NULL value stay on the exact zero-match scan fallback until the equality walk
+  coerces its probe.
+
 ## 2026-11-15 - MEASURED WIN, NOT LANDED (gate incomplete): a window function's arguments are read from their slots in the scanned row (bd-w4pr1.12, lever W5)
 
 - Target: `SELECT sum(s) FROM (SELECT sum(c) OVER (PARTITION BY a) s FROM t)` (x1.02-1.05 stock
