@@ -89,6 +89,48 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - MEASURED WIN, NOT LANDED (gate incomplete): a window function's arguments are read from their slots in the scanned row (bd-w4pr1.12, lever W5)
+
+- Target: `SELECT sum(s) FROM (SELECT sum(c) OVER (PARTITION BY a) s FROM t)` (x1.02-1.05 stock
+  CPU). Round 3's callgrind of the landed tree (4,046.7M Ir): build_window_args 436.0M over 1M
+  calls (eval_join_expr 320.0M, find_col_in_map per row) and one Vec per row for the arguments
+  (malloc 181.7M over 1,000,001 calls, plus the frees). Touched (not landed):
+  crates/fsqlite-core/src/connection.rs (execute_window_select's step sites, a `WindowArgValues`
+  alias beside build_window_args).
+- Ledger preflight: W1 (one-column window keys read through window_key_row_column; kept), W2, W3,
+  A1 (kept). No entry on window arguments.
+- Pre-registered on bd-w4pr1.12 (19:38Z, before the code): sum(c) OVER Ir -300 to -550M, CPU -20 to
+  -60 ms; the other window rows and the non-window rows within 0.3% Ir. Kill: Ir down by less than
+  250M or CPU not lower in each of two runs, another read row up more than 0.3% Ir, or a window /
+  derived / join oracle change.
+- Change: per window function, its arguments resolve once through window_key_row_column (the
+  resolver W1 uses: an unqualified USING column's coalesced projection left to the evaluator, every
+  row holding the column); when all resolve, a row's arguments are its slots' values in a two-value
+  inline vector, otherwise build_window_args as before. The eight step sites use it; the sites that
+  store arguments (application functions' rows, nth_value's frame rows) keep build_window_args.
+- Result (thinkstation1, powersave, io_uring refused, serial on every arm, stock 3.46.1 live; base
+  origin/main fd6bf353e sha256 b43aac3d8a4419fa, W5 = fd6bf353e + this diff 8595e26351945d04; two
+  par_probe runs, reps 5, load ~3, answers equal; 10 interleaved pairs): sum(c) OVER 4,049.4M ->
+  3,684.4M Ir (-365M), CPU 510.2 -> 491.1 and 533.3 -> 520.6 ms (x1.02 -> x0.98, x1.05 -> x1.02
+  stock), cycles:u 1,400.4M -> 1,318.5M (pairs median 0.939), task-clock 530.4 -> 510.5 ms;
+  row_number +4.0M (+0.11%), the a % 7 window +2.0M (+0.04%, pairs 1.0095), rank() +4.0M (+0.10%,
+  pairs 1.0029); every non-window row identical in Ir. Prediction: Ir inside (-365M in
+  -300..-550M), CPU at the low end and just under it (-13 to -19 ms against -20..-60 ms). Kill
+  lines not crossed.
+- Gate (rch, on the measured tree): clippy -D warnings fsqlite-core --lib clean; eight window /
+  derived targets (window_function_oracle, bd_window_fn_oracle_probe,
+  bd_window_range_frames_oracle_probe, bd_named_window_exclude_oracle_probe,
+  bd_derived_table_column_alias_oracle_probe, bd_ffwsd_json_window_aggregates,
+  window_multi_scalar_bkc4f_oracle, window_order_nulls_gh248_oracle) 30 passed, 0 failed. Not run:
+  fsqlite-core lib, W1's other window-using targets, the GROUP BY / join keeper batches, the
+  fsqlite crate suite, the fsqlite-e2e targets.
+- Verdict: MEASURED WIN against stock live (sum(c) OVER x1.02-1.05 -> x0.98-1.02 CPU), NOT LANDED:
+  the round ended before the gate. The diff is kept in the round-4 lane scratchpad
+  (`rl4/w5_v1_full.patch`; local branch `rl4-w5-wip` in clone perf2-wt2).
+- Retry condition: land it after the full gate (the runs listed as not run above) on a tree rebased
+  onto current main, with the two-run A/B repeated there; no new prediction is needed unless the
+  code changes.
+
 ## 2026-11-15 - WIN: on Linux every file sync is fdatasync, as stock SQLite's, and a WAL the open creates syncs its directory (bd-w4pr1.7, lever S)
 
 - Target: every synchronous=FULL commit on Linux, and every checkpoint's file syncs at any level.
