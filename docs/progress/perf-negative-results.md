@@ -98,7 +98,10 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   ea1aec8d7519ec2a, after 4b3b5f58113e4925; thinkstation1): 201.4x -> 21.4x; other rows
   unchanged. The 3x probe is missed by the folded `a = 5 AND 1`: the constant conjunct counts as a
   residual and moves the COUNT(*) off its index (2,803k against 130k for `a = 5`).
-- Retry condition: drop constant TRUE conjuncts after the fold (follow-up on bd-b887p).
+- Retry condition: drop constant TRUE conjuncts after the fold (follow-up on bd-b887p). Done in
+  19c186739: rewrite_subqueries drops non-zero integer literal WHERE conjuncts after folding;
+  the row went 21.3x -> 2.6x stock (ELF 4b3b5f58113e4925 -> 6b73b23b3b8c6892, exo_ab.py, stock
+  live), meeting the probe; bd-b887p closed.
 
 ## 2026-11-15 - SMALL WIN (prediction missed, cost model refuted): an EXISTS opens its subquery table only where it reads a row (bd-tx55u)
 
