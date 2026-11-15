@@ -263,6 +263,42 @@ fn exists_stops_at_its_first_row() {
     });
 }
 
+/// bd-b887p: a folded true EXISTS leaves a TRUE literal conjunct, dropped so
+/// the rest of the WHERE keeps its access path; a false one keeps the WHERE
+/// false. Alone, beside other conjuncts, and in a compound arm.
+#[test]
+fn folded_exists_conjuncts_keep_their_answers() {
+    asupersync::test_utils::run_test(|| async {
+        for (sql, expected) in [
+            (
+                "SELECT count(*) FROM oc WHERE z > 1 AND EXISTS (SELECT 1 FROM kx WHERE x = 5)",
+                "2",
+            ),
+            (
+                "SELECT count(*) FROM oc WHERE EXISTS (SELECT 1 FROM kx WHERE x = 5)",
+                "4",
+            ),
+            (
+                "SELECT count(*) FROM oc WHERE z > 1 AND NOT EXISTS (SELECT 1 FROM kx WHERE x = 5)",
+                "0",
+            ),
+            (
+                "SELECT count(*) FROM oc WHERE EXISTS (SELECT 1 FROM kx) AND z IS NULL",
+                "1",
+            ),
+        ] {
+            assert_matches_sqlite(sql, &[&[expected]]).await;
+        }
+        assert_matches_sqlite(
+            "SELECT z FROM oc WHERE EXISTS (SELECT 1 FROM kx) AND z < 3 \
+             UNION ALL SELECT x FROM kx WHERE 1 AND EXISTS (SELECT 1 FROM oc WHERE z = 3) \
+             ORDER BY 1",
+            &[&["1"], &["1"], &["2"], &["2"], &["5"]],
+        )
+        .await;
+    });
+}
+
 /// GH#427: a correlated EXISTS in the result list over an aggregate subquery
 /// is true for every outer row, like the WHERE-clause form above.
 #[test]

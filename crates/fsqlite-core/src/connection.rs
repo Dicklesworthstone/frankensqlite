@@ -103274,9 +103274,11 @@ impl Connection {
         // make the remaining outer expression read the wrong parameter.
         let mut result = canonicalize_select_placeholders(select)?;
         rewrite_in_select_core(&mut result.body.select, self, false, params).await?;
+        drop_true_literal_conjuncts(&mut result.body.select);
         // Also rewrite any compound arms.
         for (_op, core) in &mut result.body.compounds {
             rewrite_in_select_core(core, self, false, params).await?;
+            drop_true_literal_conjuncts(core);
         }
         // bd-rwaxp / bd-2fong regression (31243f227): a top-level ORDER BY scalar
         // subquery is eagerly folded here by *executing* it. If that fold errors
@@ -121804,6 +121806,40 @@ fn table_function_source_dependencies<C: AsRef<[String]>>(
 // ---------------------------------------------------------------------------
 // Subquery rewriting helpers (IN, EXISTS, scalar subqueries)
 // ---------------------------------------------------------------------------
+
+/// bd-b887p: drop the WHERE conjuncts that are a non-zero integer literal,
+/// which is what a folded true EXISTS (or any `AND 1`) leaves behind. `x AND
+/// 1` is `x` in a WHERE, NULL included, but the access-path targets count
+/// the literal as a residual: `a = 5 AND 1` lost its index count. A WHERE of
+/// TRUE literals alone goes away.
+fn drop_true_literal_conjuncts(core: &mut SelectCore) {
+    fn keep(expr: Expr) -> Option<Expr> {
+        match expr {
+            Expr::Literal(Literal::Integer(value), _) if value != 0 => None,
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And,
+                right,
+                span,
+            } => match (keep(*left), keep(*right)) {
+                (Some(left), Some(right)) => Some(Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOp::And,
+                    right: Box::new(right),
+                    span,
+                }),
+                (Some(kept), None) | (None, Some(kept)) => Some(kept),
+                (None, None) => None,
+            },
+            other => Some(other),
+        }
+    }
+    if let SelectCore::Select { where_clause, .. } = core
+        && let Some(where_expr) = where_clause.take()
+    {
+        *where_clause = keep(*where_expr).map(Box::new);
+    }
+}
 
 /// Walk a `SelectCore` and rewrite subquery expressions found in its
 /// result columns, WHERE clause, or HAVING clause.
