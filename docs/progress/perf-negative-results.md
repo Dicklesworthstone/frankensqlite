@@ -87,6 +87,20 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN (probe not met): COUNT(*) WHERE col IN (<integer literals>) counts each member's run from the b-tree (bd-qyd3s)
+
+- Target: `SELECT count(*) FROM t WHERE a IN (3, 77, 500)` (3.2x stock): the aggregate integer IN
+  seek stepped every entry of each member's run with an AggStep. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (CountIndexRange::Members from index_integer_in_list_target;
+  codegen_select_count_star_index_range counts a list of runs, SeekGE + IdxCountBefore + Add per
+  member; one run emits the old program).
+- Result (65377e134; scratchpad cin_ab.py, stock live, answers equal; ELF before
+  ea1aec8d7519ec2a, after a8b8daf523a61f74; thinkstation1, two runs): 3.5x / 3.2x -> 0.5x / 0.4x
+  stock. The 0.3x probe is missed by the statement's fixed cost. Every other row moved by one
+  constant per run, the difference of the two arms' SELECT 1 baselines (+-100k per process here).
+- Retry condition: none for counting; the rest is per-statement cost. EQP for this count needed
+  explain::aggregate_index_seek_facts to accept IdxCountBefore (bd-zgbhb follow-up).
+
 ## 2026-11-15 - WIN (CPU beyond its range, Ir missed low): an aggregate with no GROUP BY over a derived table or a join keeps its rows as one group instead of sorting them by an empty key (bd-w4pr1.12, lever A1)
 
 - Target: execute_group_by_join_select_inner (the outer SELECT of every window scorecard row, and
