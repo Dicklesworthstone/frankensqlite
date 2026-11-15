@@ -87,6 +87,21 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN: a composite IN probe takes a second IN list or a range on the next key term (bd-5i6zm)
+
+- Target: `a IN (3, 77, 500) AND b IN (3, 4)` (36.6x stock) and `a IN (..) AND b BETWEEN ..`
+  (37.0x) fell from bd-hyoms's composite probe (one IN term) to the one-field IN walk over t_a with
+  a row lookup per entry; `a IN (3, 77) AND b > 50` (11.0x) also returned another row order.
+  Touched: crates/fsqlite-vdbe/src/codegen.rs (KeyPin::In cross product capped at 64 combinations,
+  a k-field probe sorter in key order and direction with field-wise dedup; ProbeRange bounding each
+  run in emit_index_prefix_rows; covered outputs in codegen_select_index_in_const_scan).
+- Result (241704b25; scratchpad inr_ab.py, stock live, rows compared in order; ELF before
+  ea1aec8d7519ec2a, after 54681a63331e9f21; thinkstation1): 35.6x -> 1.8x, 37.2x -> 1.7x,
+  36.1x -> 2.0x, 10.8x -> 3.1x, with stock's row order; bd-hyoms rows 2.0x -> 1.5x and 1.8x ->
+  1.3x (answered from the index), the rest unchanged.
+- Retry condition: none (kept). Not taken here: a range on a DESC or non-BINARY key term, and a
+  cross product past 64 combinations, which keep the one-field probe.
+
 ## 2026-11-15 - WIN (probe not met): COUNT(*) WHERE col IN (<integer literals>) counts each member's run from the b-tree (bd-qyd3s)
 
 - Target: `SELECT count(*) FROM t WHERE a IN (3, 77, 500)` (3.2x stock): the aggregate integer IN
