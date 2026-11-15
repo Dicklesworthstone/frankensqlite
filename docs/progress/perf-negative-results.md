@@ -87,6 +87,150 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN (prediction missed, beyond its range): a literal SELECT keyed on any column of a rowid table without a partial index runs parameterized (bd-w4pr1.13.18, read/seek round 4, lever L2)
+
+- Target: the non-prepared point lookup by a secondary key, point_sec_key_2000 of the read sweep
+  (`SELECT id, name FROM s WHERE k = <int>`, 2,000 distinct literals, each its own autocommit
+  statement through the CLI): main 458M user instructions against stock's 67.4M (6.8x), 207 ms CPU
+  against 29.9 ms. Round 3's callgrind put compile_with_cache at 64.4k of 229k a statement and the
+  parse at about 27k. bd-5310l's literal parameterization already gave the rowid twin
+  (point_rowid_2000) one parse and one compiled program for every literal, but
+  `literal_statement_may_run_parameterized` admitted a keyed statement only when the key was the
+  rowid alias.
+- Touched: `crates/fsqlite-core/src/connection/literal_params.rs` (`LiteralStatementKind`, recorded
+  on `ParameterizedLiteralStatement`), `crates/fsqlite-core/src/connection.rs`
+  (`literal_statement_may_run_parameterized`), the keeper in
+  `crates/fsqlite-core/tests/bd_5310l_literal_parameterization_oracle.rs`.
+- Rule: a SELECT may also key on another column of the table when the table is a rowid table and
+  none of its indexes is partial. The planner reads a literal's value only to prove a partial
+  index's predicate (`k = 13` implies `k > 10`; `expr_implies_partial_predicate`); there is no
+  stat4 sampling. The recognizer takes only integer literals, which like a bound integer have no
+  affinity, so the column's affinity and collation apply alike. UPDATE and DELETE keep the
+  rowid-alias rule. Text the parse cache already holds keeps the text path, as before.
+- Ledger preflight: bd-5310l's entries (the literal parameterization and its rowid-only rule); no
+  entry on widening the rule.
+- Result. thinkstation1, governor powersave, load about 18, io_uring refused, 3 reps interleaved;
+  stock sqlite3 3.46.1 live (5a910e452929c124); each fsqlite arm on its own database built by its
+  own CLI; answers equal stock's on every row. A/B on the base this was measured on: p1v4 =
+  fd57be379 + the P1 v4 fetch change (CLI b7f9020c980ce794; P1 was then rejected, the entry below),
+  l2 = p1v4 + this change (CLI afdbc1ae72984355). L2 touches no fetch code.
+
+  | statement | stock | p1v4 | l2 |
+  |---|---|---|---|
+  | point_sec_key_2000, instructions | 67.4M | 449.1M (6.67x) | 256.6M (3.81x), 128k a statement |
+  | point_sec_key_2000, user cycles | 49.2M | 695.9M (14.1x) | 373.2M (7.6x) |
+  | point_sec_key_2000, CPU | 29.5 ms | 210.0 ms (7.1x) | 126.8 ms (4.3x) |
+  | point_rowid_2000 (control) | 44.0M | 173.1M | 173.2M (+0.06%) |
+  | orderby_page_500x20 (control) | 60.7M | 298.9M | 298.6M |
+  | multicol_eq_1000 (control) | 60.1M | 386.1M | 385.7M |
+  | count_star_t_1M (control) | 4.7M | 2.8M | 2.8M |
+
+  Against main fd57be379 (CLI 810f41242c6c347c) in another run, the tree with P1 v5 and this change
+  gave point_sec_key_2000 461.0M -> 256.2M (6.84x -> 3.80x). The landed tree is origin/main
+  ba8d3f295 (rebased to 593e3aca1) plus this change, without P1; it was not rebuilt as a release
+  binary for a third A/B.
+- Prediction (bd-w4pr1.13.18, before code): point_sec_key_2000 458M -> 270M to 320M (missed beyond
+  its range: -192.5M; parse plus compile cost more than the 91k a statement estimated from round 3's
+  profile), CPU 120 ms to 165 ms (inside), controls within 0.3% (inside). Kill (under -40M, a
+  control worse than 0.3%, an answer differing, a keeper failing): not crossed.
+- Keeper: `literal_statements_run_identically_parameterized_as_text_and_on_stock` gains a table
+  with an indexed column of every affinity (INTEGER, TEXT, REAL, NUMERIC, BLOB, none), a NOCASE TEXT
+  column, an unindexed INTEGER and a VIRTUAL generated column, holding integers, integer-looking
+  text ('13', ' 13'), reals (13.0, 13.5), a blob, NULL and text, several rows per key; 63 keyed
+  SELECTs (signed, zero, absent keys), a star projection and `k = NULL` (stays text), each run
+  parameterized, on the `main.`-qualified text path and on stock, compared exactly; unknown columns
+  compared by outcome. Engagement on the parse-cache counters: 60 distinct secondary-key SELECTs
+  parse at most 4 times; a table with a partial index and a WITHOUT ROWID table keep the text path
+  (60 parses each); adding a partial index to the admitted table turns the shape away, dropping it
+  admits it again. A rule that skipped the partial-index check, or admitted WITHOUT ROWID, fails
+  the counters; one whose bound key missed an affinity conversion fails the answers.
+- Gate (rch). On origin/main ba8d3f295 plus this change, the tree that lands: clippy -D warnings on
+  fsqlite-core, all targets: clean; fsqlite-core --lib together with the savepoint / trigger / peer /
+  staleness batch and the prepared-statement / schema-change / literal-parameterization keepers (20
+  targets, bd_5310l's included): 4,324 passed and 2 failed, the t6741 pair (bd-nouem). On
+  78e67b4f6 plus this change (and the wal_adapter clippy fix main then took as ba8d3f295; the rebase
+  pulled other lanes' connection.rs work, hence the rerun above): the core join / seek and seek-key
+  batches, 18 targets, 46 passed and 1 failed, bd_8c68u's
+  `scalar_subquery_when_guards_compile_once_and_match_stock` (92 compilations against its limit 60,
+  the known red bd-f8m1v, same count); 21 fsqlite aggregate / composite / range / count oracle
+  targets, 34 passed. Not run: btree / pager / vdbe --lib (only fsqlite-core is touched), the
+  fsqlite min/max / range oracle batch (stopped for time), the cross-process battery and the
+  fsqlite-e2e concurrent-writer set (no pager, WAL or transaction-begin change).
+- Landed in 6e2943d21 (rebased onto 593e3aca1, which touched none of its files).
+- Retry / widen: multicol_eq_1000 (`SELECT count(*), sum(val) FROM s WHERE g = ? AND h = ?`, 6.4x)
+  is not recognized (aggregate projection, two equalities); the same rule (no partial index) would
+  admit it once the recognizer reads those spellings (measure the plan on stock first).
+  orderby_page_500x20 (`k > N ORDER BY k LIMIT 20`) is a range shape the recognizer does not take.
+
+## 2026-11-15 - REJECTED on its kill line (four versions): a page fetch shares the image its cache holds instead of copying it twice (bd-05xlf, read/seek round 4, lever P1)
+
+- Target: every first read of a page in a transaction (a non-resident fetch). Measured on the
+  prepared secondary-key lookup of bd-05xlf (`SELECT id FROM t WHERE a = ?1`, fsqlite-e2e
+  prepared-dml-probe select-index, 100k-row table), which makes four fetches per execution: callgrind
+  on main e53dcdff1 put them at 13.3k of 92.9k Ir, about 3.3k each. Each copied the page twice and
+  allocated twice: `WalFramePageCache::get` returned `bytes.to_vec()` and the transaction read
+  cache's `page.clone()` materialized an `Arc::from(&[u8])` of that Owned page; on a checkpointed
+  file `get_copy` and the same Arc copy. A frame-cache hit also went through two boxed futures.
+- Touched (never committed; patches in the coordinator scratchpad `rs4/p1_v1.patch` (v2),
+  `p1_v3.patch`, `p1_v4.patch`, `p1v5_l2.patch`): `crates/fsqlite-pager/src/traits.rs`
+  (`WalBackend::read_page_pinned` / `read_page_pinned_without_io` answer `PageData`),
+  `crates/fsqlite-pager/src/pager.rs` (`WalPageLookup` carries `PageData`; `get_nonresident_page`
+  keeps the shared image; the pinned-miss read takes `cache.get_shared`),
+  `crates/fsqlite-core/src/wal_adapter.rs` (the frame cache hands out its `Arc<[u8]>`;
+  `read_page_pinned_without_io` answers a committed frame the cache holds), five test doubles, and
+  keepers (adapter without-I/O answer shared and frame-exact; frame cache keyed by generation, frame
+  and page; reads, peer commits and a rolled-back write through shared images against stock on a WAL
+  file and a checkpointed one).
+- Ledger preflight: the 2026-07-11 bd-5310l decomposition named the per-page 4 KB copy "a broad
+  pager zero-copy refactor, not a micro-lever"; `PageData` has since gained a shared representation
+  with copy on write and the page cache `get_shared` (used by the rollback-journal read path), so
+  this tried the fetch without a refactor.
+- Result. thinkstation1, governor powersave, load 17 to 20, io_uring refused; every arm on main
+  fd57be379 (which carries 250db23d7), each on its own database file built by its own binary; stock
+  live in the same runs (sqlite3 3.46.1 for the CLI sweep, a 3.54.1 amalgamation driver of the same
+  prepared loop, `scratchpad/rs4/stock_lookup.c`, for the probe); answers equal everywhere. main CLI
+  810f41242c6c347c / probe fb30f459a359a8db.
+
+  | row | stock | main | P1 (v4 / v5) |
+  |---|---|---|---|
+  | prepared select-index, instructions per execution | 5,058 | 77,431 (15.3x) | 68,996 / 68,847 (13.6x) |
+  | prepared select-index, checkpointed | 5,058 | 75,521 | 69,036 / 69,007 |
+  | select-rowid (memdb fast path, control) | 4,725 | 8,139 | 8,129 / 8,129 |
+  | autocommit INSERT (control) | - | 145,088 | 144,888 / 145,089 |
+  | point_rowid_2000 (CLI) | 44.0M | 181.3M | 173.3M / 173.2M (-4.5%) |
+  | orderby_page_500x20 / multicol_eq_1000 | 60.7M / 60.1M | 305.5M / 398.0M | 298.8M / 385.5M |
+  | rowid_lookups_200k | 554.4M | 2,684.6M | 2,695.6M / 2,695.3M (+0.40%) |
+  | range_noncovering_200k | 637.6M | 3,357.9M | 3,368.9M / 3,368.3M (+0.31%) |
+
+  User cycles at that load moved within run-to-run noise in the last runs (select-index -5.8% to
+  -11.5% in three runs, -6.6% in the fourth; checkpointed -3.2% to -8.9%, +3.3% in the fourth).
+- Prediction (bd-05xlf, before code): select-index 68.5k to 71.5k (met), checkpointed 68.5k to
+  70.5k (met), point_rowid_2000 164M to 174M (met), controls unchanged (met). v2 measured
+  rowid_lookups_200k +1.4% and range_noncovering_200k +1.0% (the main cache asked twice on a miss);
+  the comment reporting v2 added the kill line "those two rows not worse than 0.2%" (posted while v3
+  was building, before it was measured), and v5's comment, posted before its code, declared it the
+  last try. v3 +0.41% / +0.32%; v4 (foldhash for the frame cache, built under v3's kill line
+  without a comment of its own; it did not move them, their pages come from the main file) +0.41% /
+  +0.33%; v5 (the miss path without the async layer) +0.40% / +0.31%. REJECTED.
+- Why the miss rows lose (callgrind of rowid_lookups_200k, main against v4, 188,562 main-cache
+  misses): `get_nonresident_page`'s own code grows from 335 to 406 Ir per call, because a fetch now
+  carries a `PageData` (the Owned/Shared enum and its image token, more than twice the size of the
+  `Option<Vec<u8>>` it replaced) through the WAL lookup's answer and the cache probe; the cheaper
+  probe (get_shared's miss 91 Ir, get_copy's 119) does not pay for it when nearly every fetch misses.
+  Also observed: an entry read through `get_shared` keeps its shared snapshot until changed or
+  evicted, so a read-hot cache can hold a second 4 KB per entry (peak RSS of the two miss rows 32.6
+  to 32.9 MB on main, 33.8 to 34.7 MB with v2).
+- Measurement trap: under callgrind the blocking facade's move of the statement future shows as
+  17.5k Ir of memcpy per call, because glibc picks `rep movsb` on valgrind's CPU model (callgrind
+  counts one Ir per byte); natively it takes the AVX loop (perf annotate put memmove's samples on its
+  vmovdqu lines, none on rep movsb), about 140 iterations. Its native share of the lookup's cycles
+  was not separated from the page copies. Read memcpy in callgrind with perf stat beside it.
+- Retry condition: share the cached image on a hit without widening what a miss moves before the
+  file read (the WAL lookup and the cache probe answering a small hit/miss value, the image taken
+  only on a hit), or a smaller `PageData`. Judge it on rowid_lookups_200k and range_noncovering_200k
+  (not worse than 0.2%) as well as the prepared lookup; the hit-path gains above are what it has to
+  keep. A frame-cache-only variant is untested and widens the WAL lookup's answer the same way.
+
 ## 2026-11-15 - MEASURED WIN (small), NOT LANDED (gate incomplete): a repeat dirty mark of the root a statement marked last skips the hash insert (bd-w4pr1.13.20, lever M)
 
 - Target: every row a storage-cursor INSERT, DELETE or UPDATE writes: the engine marks the table's root dirty for
