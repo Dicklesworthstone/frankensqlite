@@ -41991,6 +41991,9 @@ impl Connection {
         if let Some(error) = returning_aggregate_window_misuse(statement) {
             return Err(error);
         }
+        // bd-k66zh: nor may a subquery of an UPDATE or DELETE hold an
+        // aggregate call that reads only the statement's own columns.
+        self.reject_dml_owned_subquery_aggregate(statement)?;
         // ATTACH/DETACH register or release a *separate* side connection and do
         // not write to the main database file, so a read-only / schema-only main
         // connection must still be allowed to run them — this matches SQLite,
@@ -42135,6 +42138,9 @@ impl Connection {
                 // in a recursive-CTE recursive term, matching SQLite's "misuse"
                 // errors (frank was too permissive).
                 self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
+                // bd-k66zh: aggregate calls its subqueries hold for this core,
+                // with stock's misuse errors for the positions it rejects.
+                let owned_subquery_aggregates = self.select_owned_subquery_aggregates(select)?;
                 // bd-1zc9p: a constant LIMIT/OFFSET that is not losslessly
                 // convertible to an integer (a fractional real, non-numeric
                 // text, NULL, or a blob) is a "datatype mismatch" in SQLite.
@@ -42327,6 +42333,29 @@ impl Connection {
                     return self
                         .execute_expression_only_with_subqueries(select, params)
                         .await;
+                }
+                // bd-k66zh: a core that owns an aggregate call of its subqueries
+                // is an aggregate the compiled lanes would read as a plain scan,
+                // evaluating the call per outer row. The grouped fallback
+                // computes the call over the core's groups instead.
+                if owned_subquery_aggregates.any() {
+                    self.admit_select_mem_fallback(cx, "correlated_scalar_subquery_fallback")
+                        .await?;
+                    let rewritten =
+                        lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                    let limit_clause = bound.limit.take();
+                    let mut rows =
+                        boxed_future(|| self.execute_group_by_join_select(cx, &bound, None))
+                            .await?;
+                    if distinct {
+                        dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
+                    }
+                    if let Some(limit) = limit_clause {
+                        self.apply_limit_clause(&mut rows, &limit, None)?;
+                    }
+                    return Ok(rows);
                 }
                 if !custom_implicit_aggregate
                     && let Some(rows) = self.try_execute_plain_live_vtab_count_star(select)?
@@ -52405,8 +52434,15 @@ impl Connection {
         let prefer_memdb_hash_grouped_join_dispatch =
             self.prefer_memdb_hash_grouped_join_dispatch(select);
 
+        // bd-k66zh: a core that owns an aggregate call of its subqueries runs
+        // on the grouped fallback, and a misuse of one errors there.
+        let has_owned_subquery_aggregate = self
+            .select_owned_subquery_aggregates(select)
+            .map_or(true, OwnedSubqueryAggregates::any);
+
         prefer_memdb_hash_join_dispatch
             || prefer_memdb_hash_grouped_join_dispatch
+            || has_owned_subquery_aggregate
             || has_dispatch_only_subquery
             || has_semantic_in_operand
             || has_dynamic_expression_only_limit
@@ -54021,6 +54057,9 @@ impl Connection {
     fn validate_statement_select_semantics(&self, statement: &Statement) -> Result<()> {
         match statement {
             Statement::Select(select) => {
+                // bd-k66zh: stock rejects an owned subquery aggregate call in
+                // some positions while preparing.
+                self.select_owned_subquery_aggregates(select)?;
                 let column_reference_preflight =
                     select_requires_column_reference_preflight(select, self);
                 if column_reference_preflight {
@@ -90139,7 +90178,67 @@ impl Connection {
         // group's first row (plain columns, aggregates nested in an expression,
         // correlated subqueries, HAVING, ORDER BY), so move that row to the
         // front. The lone min()/max() does not depend on row order.
-        if let Some(tracking) = self.select_uses_builtin_minmax_bare_tracking(select) {
+        //
+        // bd-k66zh: aggregate calls this core's subqueries hold for it are
+        // computed over each group below. A moved min()/max() takes part in
+        // the bare-column row choice where stock's aggregate walk meets it.
+        let result_owned_plans: Vec<Vec<Vec<bool>>> = result_descriptors
+            .iter()
+            .map(|desc| match desc {
+                GroupByColumn::Plain(expr) => {
+                    self.plan_owned_subquery_aggregates(expr, &col_map, using_skip)
+                }
+                GroupByColumn::Agg { .. } => Vec::new(),
+            })
+            .collect();
+        let having_owned_plan = having_expr.map_or_else(Vec::new, |having| {
+            self.plan_owned_subquery_aggregates(having, &col_map, using_skip)
+        });
+        let order_owned_plans: Vec<Vec<Vec<bool>>> = select
+            .order_by
+            .iter()
+            .map(|term| self.plan_owned_subquery_aggregates(&term.expr, &col_map, using_skip))
+            .collect();
+        let owns_subquery_aggregates = result_owned_plans
+            .iter()
+            .chain(std::iter::once(&having_owned_plan))
+            .chain(&order_owned_plans)
+            .any(|plan| !plan.is_empty());
+        let tracking_select;
+        let tracking_source = if owns_subquery_aggregates {
+            let mut exposed = select.clone();
+            if let SelectCore::Select {
+                columns, having, ..
+            } = &mut exposed.body.select
+            {
+                *columns = expanded_columns
+                    .iter()
+                    .zip(&result_owned_plans)
+                    .map(|(column, plan)| match column {
+                        ResultColumn::Expr { expr, alias } if !plan.is_empty() => {
+                            ResultColumn::Expr {
+                                expr: Self::expose_owned_subquery_aggregates(expr, plan),
+                                alias: alias.clone(),
+                            }
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
+                if let Some(having) = having.as_mut().filter(|_| !having_owned_plan.is_empty()) {
+                    **having = Self::expose_owned_subquery_aggregates(having, &having_owned_plan);
+                }
+            }
+            for (term, plan) in exposed.order_by.iter_mut().zip(&order_owned_plans) {
+                if !plan.is_empty() {
+                    term.expr = Self::expose_owned_subquery_aggregates(&term.expr, plan);
+                }
+            }
+            tracking_select = exposed;
+            &tracking_select
+        } else {
+            select
+        };
+        if let Some(tracking) = self.select_uses_builtin_minmax_bare_tracking(tracking_source) {
             for (_key, group_rows) in &mut groups {
                 if let Some(index) = self
                     .join_minmax_bare_extremum_index(
@@ -90158,10 +90257,27 @@ impl Connection {
         let mut result_group_indices = Vec::with_capacity(groups.len());
         for (group_index, (_key, group_rows)) in groups.iter().enumerate() {
             let representative_row = group_rows.first().unwrap_or(&empty_group_row);
+            let owned_group_rows: Vec<&Vec<SqliteValue>> = if owns_subquery_aggregates {
+                group_rows.iter().collect()
+            } else {
+                Vec::new()
+            };
             let mut values = Vec::with_capacity(result_descriptors.len());
-            for desc in &result_descriptors {
+            for (desc, owned_plan) in result_descriptors.iter().zip(&result_owned_plans) {
                 match desc {
                     GroupByColumn::Plain(expr) => {
+                        let owned_bound;
+                        let expr: &Expr = if owned_plan.is_empty() {
+                            expr
+                        } else {
+                            owned_bound = self.bind_owned_subquery_aggregates(
+                                expr,
+                                owned_plan,
+                                &owned_group_rows,
+                                &col_map,
+                            )?;
+                            &owned_bound
+                        };
                         let val = if self.expr_contains_aggregate_with_registry(expr) {
                             // If the expression also has subqueries, inline
                             // them first so `eval_group_agg_join_expr` sees
@@ -90483,6 +90599,18 @@ impl Connection {
                 }
             }
             if let Some(having) = having_expr {
+                let owned_having;
+                let having = if having_owned_plan.is_empty() {
+                    having
+                } else {
+                    owned_having = self.bind_owned_subquery_aggregates(
+                        having,
+                        &having_owned_plan,
+                        &owned_group_rows,
+                        &col_map,
+                    )?;
+                    &owned_having
+                };
                 let resolved_having;
                 let effective_having = if expr_has_any_subquery(having) {
                     resolved_having = self
@@ -90546,7 +90674,17 @@ impl Connection {
                     let group_rows = &groups[group_index].1;
                     let representative_row = group_rows.first().unwrap_or(&empty_group_row);
                     let mut extra_values = Vec::with_capacity(extra_order_terms.len());
-                    for (_term_idx, expr) in &extra_order_terms {
+                    for (term_idx, expr) in &extra_order_terms {
+                        let owned_bound;
+                        let expr: &Expr = match order_owned_plans.get(*term_idx) {
+                            Some(plan) if !plan.is_empty() => {
+                                let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                                owned_bound =
+                                    self.bind_owned_subquery_aggregates(expr, plan, &refs, &col_map)?;
+                                &owned_bound
+                            }
+                            _ => expr,
+                        };
                         let val = if self.expr_contains_aggregate_with_registry(expr) {
                             let inlined_expr;
                             let effective: &Expr = if expr_has_any_subquery(expr) {
@@ -123704,6 +123842,1083 @@ fn select_has_unsupported_correlated_exists_subquery(
     })
 }
 
+// bd-k66zh: an aggregate call inside a subquery can belong to an enclosing
+// query. SQLite (resolve.c, TK_AGG_FUNCTION) gives the call to the innermost
+// query whose FROM one of its column references names, walking outward from
+// the call. A call that names no column stays where it is written. The owner
+// becomes an aggregate and computes the call over its rows or groups, and the
+// subquery reads the value. The classifier probes a subquery with the owner's
+// columns replaced by markers, through the same outer-reference walker that
+// correlated execution substitutes with, so both agree on every scope.
+
+/// The clause of a SELECT core an expression sits in, for SQLite's rules on
+/// where an aggregate call may appear (`resolveSelectStep`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AggregateClause {
+    /// The result list.
+    Result,
+    /// WHERE, a join's ON, or a table-valued function's arguments. An
+    /// aggregate call there is legal only in an aggregate query.
+    Filter,
+    GroupBy,
+    Having,
+    OrderBy,
+    /// LIMIT/OFFSET and window definitions.
+    Other,
+}
+
+/// Where [`walk_select_exprs_mut`] found an expression.
+#[derive(Clone, Copy, Debug)]
+struct AggregateWalkSite {
+    clause: AggregateClause,
+    /// Whether the core holding the expression is an aggregate by its own
+    /// result list, GROUP BY or HAVING.
+    core_is_aggregate: bool,
+}
+
+/// The site of an expression walked on its own, outside any core.
+const UNPLACED_AGGREGATE_WALK_SITE: AggregateWalkSite = AggregateWalkSite {
+    clause: AggregateClause::Other,
+    core_is_aggregate: false,
+};
+
+type ExprWalkVisit<'v> = dyn FnMut(&mut Expr, AggregateWalkSite) -> bool + 'v;
+
+/// Visit every expression of `select` in one fixed pre-order: the WITH
+/// queries, each core (result list, FROM, WHERE, GROUP BY, HAVING, windows),
+/// then ORDER BY and LIMIT, entering nested subqueries. `visit` sees a node
+/// before its children and returns whether to walk them.
+fn walk_select_exprs_mut(select: &mut SelectStatement, visit: &mut ExprWalkVisit<'_>) {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            walk_select_exprs_mut(&mut cte.query, visit);
+        }
+    }
+    let primary_is_aggregate = select_core_is_aggregate(&select.body.select);
+    walk_core_exprs_mut(&mut select.body.select, visit);
+    for (_, core) in &mut select.body.compounds {
+        walk_core_exprs_mut(core, visit);
+    }
+    let order_by = AggregateWalkSite {
+        clause: AggregateClause::OrderBy,
+        core_is_aggregate: primary_is_aggregate,
+    };
+    for term in &mut select.order_by {
+        walk_expr_mut(&mut term.expr, order_by, true, visit);
+    }
+    if let Some(limit) = &mut select.limit {
+        let site = AggregateWalkSite {
+            clause: AggregateClause::Other,
+            core_is_aggregate: primary_is_aggregate,
+        };
+        walk_expr_mut(&mut limit.limit, site, true, visit);
+        if let Some(offset) = &mut limit.offset {
+            walk_expr_mut(offset, site, true, visit);
+        }
+    }
+}
+
+fn walk_core_exprs_mut(core: &mut SelectCore, visit: &mut ExprWalkVisit<'_>) {
+    let core_is_aggregate = select_core_is_aggregate(core);
+    let site = |clause| AggregateWalkSite {
+        clause,
+        core_is_aggregate,
+    };
+    match core {
+        SelectCore::Values(rows) => {
+            for expr in rows.iter_mut().flatten() {
+                walk_expr_mut(expr, site(AggregateClause::Result), true, visit);
+            }
+        }
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    walk_expr_mut(expr, site(AggregateClause::Result), true, visit);
+                }
+            }
+            if let Some(from) = from {
+                walk_from_exprs_mut(from, site(AggregateClause::Filter), visit);
+            }
+            if let Some(expr) = where_clause {
+                walk_expr_mut(expr, site(AggregateClause::Filter), true, visit);
+            }
+            for expr in group_by {
+                walk_expr_mut(expr, site(AggregateClause::GroupBy), true, visit);
+            }
+            if let Some(expr) = having {
+                walk_expr_mut(expr, site(AggregateClause::Having), true, visit);
+            }
+            for window in windows {
+                walk_window_spec_exprs_mut(
+                    &mut window.spec,
+                    site(AggregateClause::Other),
+                    true,
+                    visit,
+                );
+            }
+        }
+    }
+}
+
+fn walk_from_exprs_mut(
+    from: &mut FromClause,
+    site: AggregateWalkSite,
+    visit: &mut ExprWalkVisit<'_>,
+) {
+    walk_source_exprs_mut(&mut from.source, site, visit);
+    for join in &mut from.joins {
+        walk_source_exprs_mut(&mut join.table, site, visit);
+        if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+            walk_expr_mut(expr, site, true, visit);
+        }
+    }
+}
+
+fn walk_source_exprs_mut(
+    source: &mut TableOrSubquery,
+    site: AggregateWalkSite,
+    visit: &mut ExprWalkVisit<'_>,
+) {
+    match source {
+        TableOrSubquery::Table { .. } => {}
+        TableOrSubquery::Subquery { query, .. } => walk_select_exprs_mut(query, visit),
+        TableOrSubquery::TableFunction { args, .. } => {
+            for expr in args {
+                walk_expr_mut(expr, site, true, visit);
+            }
+        }
+        TableOrSubquery::ParenJoin(from) => walk_from_exprs_mut(from, site, visit),
+    }
+}
+
+/// Visit `expr` and its sub-expressions in pre-order. With `into_subqueries`
+/// false the expressions of a nested SELECT are not walked; the subquery node
+/// itself, and an IN operand, still are.
+fn walk_expr_mut(
+    expr: &mut Expr,
+    site: AggregateWalkSite,
+    into_subqueries: bool,
+    visit: &mut ExprWalkVisit<'_>,
+) {
+    if !visit(expr, site) {
+        return;
+    }
+    match expr {
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            walk_expr_mut(left, site, into_subqueries, visit);
+            walk_expr_mut(right, site, into_subqueries, visit);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => walk_expr_mut(expr, site, into_subqueries, visit),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk_expr_mut(expr, site, into_subqueries, visit);
+            walk_expr_mut(low, site, into_subqueries, visit);
+            walk_expr_mut(high, site, into_subqueries, visit);
+        }
+        Expr::In { expr, set, .. } => {
+            walk_expr_mut(expr, site, into_subqueries, visit);
+            match set {
+                InSet::List(items) => {
+                    for item in items {
+                        walk_expr_mut(item, site, into_subqueries, visit);
+                    }
+                }
+                InSet::Subquery(subquery) => {
+                    if into_subqueries {
+                        walk_select_exprs_mut(subquery, visit);
+                    }
+                }
+                InSet::Table(_) => {}
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            walk_expr_mut(expr, site, into_subqueries, visit);
+            walk_expr_mut(pattern, site, into_subqueries, visit);
+            if let Some(escape) = escape {
+                walk_expr_mut(escape, site, into_subqueries, visit);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                walk_expr_mut(operand, site, into_subqueries, visit);
+            }
+            for (when_expr, then_expr) in whens {
+                walk_expr_mut(when_expr, site, into_subqueries, visit);
+                walk_expr_mut(then_expr, site, into_subqueries, visit);
+            }
+            if let Some(else_expr) = else_expr {
+                walk_expr_mut(else_expr, site, into_subqueries, visit);
+            }
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            if into_subqueries {
+                walk_select_exprs_mut(subquery, visit);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(args) = args {
+                for arg in args {
+                    walk_expr_mut(arg, site, into_subqueries, visit);
+                }
+            }
+            for term in order_by {
+                walk_expr_mut(&mut term.expr, site, into_subqueries, visit);
+            }
+            if let Some(filter) = filter {
+                walk_expr_mut(filter, site, into_subqueries, visit);
+            }
+            if let Some(window) = over {
+                walk_window_spec_exprs_mut(window, site, into_subqueries, visit);
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            walk_expr_mut(expr, site, into_subqueries, visit);
+            walk_expr_mut(path, site, into_subqueries, visit);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                walk_expr_mut(value, site, into_subqueries, visit);
+            }
+        }
+    }
+}
+
+fn walk_window_spec_exprs_mut(
+    window: &mut WindowSpec,
+    site: AggregateWalkSite,
+    into_subqueries: bool,
+    visit: &mut ExprWalkVisit<'_>,
+) {
+    for expr in &mut window.partition_by {
+        walk_expr_mut(expr, site, into_subqueries, visit);
+    }
+    for term in &mut window.order_by {
+        walk_expr_mut(&mut term.expr, site, into_subqueries, visit);
+    }
+    if let Some(frame) = &mut window.frame {
+        for bound in std::iter::once(&mut frame.start).chain(frame.end.as_mut()) {
+            if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
+                walk_expr_mut(expr, site, into_subqueries, visit);
+            }
+        }
+    }
+}
+
+/// The SELECT of a scalar, EXISTS or IN subquery node.
+fn direct_subquery_mut(expr: &mut Expr) -> Option<&mut SelectStatement> {
+    match expr {
+        Expr::Subquery(subquery, _)
+        | Expr::Exists { subquery, .. }
+        | Expr::In {
+            set: InSet::Subquery(subquery),
+            ..
+        } => Some(subquery.as_mut()),
+        _ => None,
+    }
+}
+
+/// Whether `expr` is a call some query owns as an aggregate: a non-window call
+/// of an aggregate function (two-argument max()/min() are scalar).
+fn is_owned_aggregate_candidate(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::FunctionCall { name, args, over: None, .. }
+            if is_current_aggregate_fn(name, args) && !is_scalar_max_min(name, args)
+    )
+}
+
+/// The parameter name that stands for an owner's column in a probe. The
+/// tokenizer never yields a parameter name holding NUL.
+const OWNED_AGGREGATE_PROBE_MARKER: &str = "\u{0}bd-k66zh owner column";
+
+fn owned_aggregate_probe_marker() -> Expr {
+    Expr::Placeholder(
+        PlaceholderType::ColonNamed(OWNED_AGGREGATE_PROBE_MARKER.to_owned()),
+        Span::ZERO,
+    )
+}
+
+fn is_owned_aggregate_probe_marker(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Placeholder(PlaceholderType::ColonNamed(name), _)
+            if name == OWNED_AGGREGATE_PROBE_MARKER
+    )
+}
+
+fn select_holds_owned_aggregate_probe_marker(select: &mut SelectStatement) -> bool {
+    let mut found = false;
+    walk_select_exprs_mut(select, &mut |node, _| {
+        found |= is_owned_aggregate_probe_marker(node);
+        !found
+    });
+    found
+}
+
+/// Whether the probed call `call` belongs to the probe's owner: it reads one
+/// of the owner's columns (a marker) and nothing of a query in between (a
+/// column left in place, or a nested subquery that still reads outside
+/// itself). A call that reads nothing at all stays where it is written.
+fn probed_call_belongs_to_owner(call: &mut Expr, schema: &[TableSchema]) -> bool {
+    let mut reads_owner = false;
+    let mut reads_between = false;
+    walk_expr_mut(call, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |node, _| {
+        if is_owned_aggregate_probe_marker(node) {
+            reads_owner = true;
+        } else if matches!(node, Expr::Column(..)) {
+            reads_between = true;
+        } else if let Some(subquery) = direct_subquery_mut(node) {
+            reads_owner |= select_holds_owned_aggregate_probe_marker(subquery);
+            reads_between |= is_correlated_subquery_with_schema(subquery, schema);
+        }
+        !reads_between
+    });
+    reads_owner && !reads_between
+}
+
+/// One aggregate call of a probed subquery, in [`walk_select_exprs_mut`]
+/// order.
+struct ProbedAggregateCall {
+    /// Whether the call belongs to the core the subquery is written in.
+    owned: bool,
+    /// Where the call is written.
+    site: AggregateWalkSite,
+    /// The function name as written, for stock's misuse messages.
+    name: String,
+}
+
+/// Classify every aggregate call of `probe`, a subquery whose owner columns are
+/// markers, in walk order. An owned call's arguments are not walked: a call in
+/// them is a nested aggregate of the same query.
+fn probe_aggregate_calls(
+    probe: &mut SelectStatement,
+    schema: &[TableSchema],
+) -> Vec<ProbedAggregateCall> {
+    let mut calls = Vec::new();
+    walk_select_exprs_mut(probe, &mut |node, site| {
+        if !is_owned_aggregate_candidate(node) {
+            return true;
+        }
+        let name = match node {
+            Expr::FunctionCall { name, .. } => name.clone(),
+            _ => String::new(),
+        };
+        let owned = probed_call_belongs_to_owner(node, schema);
+        calls.push(ProbedAggregateCall { owned, site, name });
+        !owned
+    });
+    calls
+}
+
+/// bd-k66zh: where a core's subqueries hold calls the core owns.
+#[derive(Clone, Copy, Default)]
+struct OwnedSubqueryAggregates {
+    /// An owned call sits in the result list, which makes the core an
+    /// aggregate.
+    in_result: bool,
+    /// One sits in HAVING or ORDER BY, legal in an aggregate core.
+    in_having_or_order_by: bool,
+}
+
+impl OwnedSubqueryAggregates {
+    const fn any(self) -> bool {
+        self.in_result || self.in_having_or_order_by
+    }
+}
+
+/// The owned calls one clause of a core holds through its subqueries.
+struct ClauseOwnedAggregateProbe {
+    clause: AggregateClause,
+    /// Whether the subquery sits inside one of the core's own aggregate or
+    /// window calls.
+    inside_call: bool,
+    calls: Vec<ProbedAggregateCall>,
+}
+
+impl Connection {
+    /// bd-k66zh: the aggregate calls of `subquery`, written in a core whose
+    /// FROM columns are `col_map`, each marked with whether that core owns it.
+    fn probe_subquery_aggregate_calls(
+        &self,
+        subquery: &SelectStatement,
+        col_map: &[(String, String, bool)],
+        using_skip: Option<&HashSet<usize>>,
+    ) -> Vec<ProbedAggregateCall> {
+        let mut probe = subquery.clone();
+        let markers = vec![owned_aggregate_probe_marker(); col_map.len()];
+        let schema = self.schema.borrow();
+        let shadowed_main_tables = self.shadowed_main_tables.borrow();
+        let temp_table_names = self.temp_table_names.borrow();
+        let lookup = OuterReferenceLookup {
+            row: &[],
+            col_map,
+            using_skip,
+            replacement_exprs: Some(&markers),
+            column_collations: None,
+            column_affinities: None,
+            declared_blob_columns: None,
+            schema: schema.as_slice(),
+            shadowed_main_tables: Some(&*shadowed_main_tables),
+            temp_table_names: Some(&*temp_table_names),
+            probe_unqualified_external_ref: false,
+        };
+        substitute_outer_refs_in_select_scoped(
+            &mut probe,
+            &lookup,
+            &[],
+            Some(&HashSet::new()),
+            &CteScopes::new(),
+        );
+        self.with_fallback_function_registry(|| probe_aggregate_calls(&mut probe, &schema))
+    }
+
+    /// bd-k66zh: for `expr`, an expression of the core whose FROM columns are
+    /// `col_map`, the owned flags of the calls of each subquery `expr` holds
+    /// directly, in walk order. Empty when no subquery holds a call that core
+    /// owns.
+    fn plan_owned_subquery_aggregates(
+        &self,
+        expr: &Expr,
+        col_map: &[(String, String, bool)],
+        using_skip: Option<&HashSet<usize>>,
+    ) -> Vec<Vec<bool>> {
+        let screened = self.with_fallback_function_registry(|| {
+            expr_contains_subquery_match(expr, &mut |subquery| {
+                let (SubqueryExprRef::Scalar(inner)
+                | SubqueryExprRef::Exists(inner)
+                | SubqueryExprRef::In(inner)) = subquery;
+                select_holds_aggregate_call(inner)
+            })
+        });
+        if !screened {
+            return Vec::new();
+        }
+        let mut walked = expr.clone();
+        let mut plan = Vec::new();
+        walk_expr_mut(
+            &mut walked,
+            UNPLACED_AGGREGATE_WALK_SITE,
+            false,
+            &mut |node, _| {
+                if let Some(subquery) = direct_subquery_mut(node) {
+                    plan.push(
+                        self.probe_subquery_aggregate_calls(subquery, col_map, using_skip)
+                            .into_iter()
+                            .map(|call| call.owned)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                true
+            },
+        );
+        if plan.iter().flatten().any(|owned| *owned) {
+            plan
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// bd-k66zh: `expr` with each owned call of `plan` replaced by its value
+    /// over `group_rows`, the rows of one group of the owning core.
+    fn bind_owned_subquery_aggregates(
+        &self,
+        expr: &Expr,
+        plan: &[Vec<bool>],
+        group_rows: &[&Vec<SqliteValue>],
+        col_map: &[(String, String, bool)],
+    ) -> Result<Expr> {
+        let mut bound = expr.clone();
+        let mut subqueries = plan.iter();
+        let mut failure = None;
+        walk_expr_mut(
+            &mut bound,
+            UNPLACED_AGGREGATE_WALK_SITE,
+            false,
+            &mut |node, _| {
+                if failure.is_some() {
+                    return false;
+                }
+                let Some(subquery) = direct_subquery_mut(node) else {
+                    return true;
+                };
+                let Some(owned) = subqueries.next() else {
+                    return true;
+                };
+                let mut owned = owned.iter();
+                walk_select_exprs_mut(subquery, &mut |call, _| {
+                    if failure.is_some() {
+                        return false;
+                    }
+                    if !is_owned_aggregate_candidate(call) {
+                        return true;
+                    }
+                    if !owned.next().copied().unwrap_or(false) {
+                        return true;
+                    }
+                    match self.eval_owned_subquery_aggregate(call, group_rows, col_map) {
+                        Ok(value) => *call = value,
+                        Err(error) => failure = Some(error),
+                    }
+                    false
+                });
+                true
+            },
+        );
+        failure.map_or(Ok(bound), Err)
+    }
+
+    /// bd-k66zh: the value of `call`, an aggregate of the grouped core, over
+    /// one group's rows, as the literal its subquery reads.
+    fn eval_owned_subquery_aggregate(
+        &self,
+        call: &Expr,
+        group_rows: &[&Vec<SqliteValue>],
+        col_map: &[(String, String, bool)],
+    ) -> Result<Expr> {
+        if expr_has_any_subquery(call) {
+            return Err(FrankenError::NotImplemented(
+                "an aggregate of an enclosing query whose arguments hold a subquery (bd-k66zh)"
+                    .to_owned(),
+            ));
+        }
+        let value = self.with_fallback_function_registry(|| {
+            eval_group_agg_join_expr(call, group_rows, col_map)
+        })?;
+        let span = match call {
+            Expr::FunctionCall { span, .. } => *span,
+            _ => Span::ZERO,
+        };
+        // A bound value, not a literal: an integer literal in the
+        // subquery's GROUP BY or ORDER BY would read as a column ordinal. An
+        // aggregate's result has no affinity and donates no collation.
+        Ok(Expr::BoundOuterValue {
+            value,
+            collation: BoundCollation::Unspecified,
+            affinity: None,
+            span,
+        })
+    }
+
+    /// bd-k66zh: an UPDATE or DELETE is no aggregate, so an aggregate call that
+    /// a subquery of its SET values or WHERE holds for it (a call that reads
+    /// only columns of the target or of UPDATE FROM) is stock's "misuse of
+    /// aggregate: f()", or "misuse of aggregate function f()" when written in a
+    /// non-aggregate subquery's WHERE. Evaluated per row, `DELETE FROM t WHERE
+    /// id = (SELECT max(id))` compared each row with itself and deleted every
+    /// row. RETURNING is left alone: stock evaluates its subqueries per
+    /// returned row.
+    fn reject_dml_owned_subquery_aggregate(&self, statement: &Statement) -> Result<()> {
+        let (table, from, exprs): (
+            &fsqlite_ast::QualifiedTableRef,
+            Option<&FromClause>,
+            Vec<&Expr>,
+        ) =
+            match statement {
+                Statement::Update(update) => (
+                    &update.table,
+                    update.from.as_ref(),
+                    update
+                        .assignments
+                        .iter()
+                        .map(|assignment| &assignment.value)
+                        .chain(update.where_clause.as_ref())
+                        .collect(),
+                ),
+                Statement::Delete(delete) => {
+                    (&delete.table, None, delete.where_clause.iter().collect())
+                }
+                _ => return Ok(()),
+            };
+        let screened = self.with_fallback_function_registry(|| {
+            exprs.iter().any(|expr| {
+                expr_contains_subquery_match(expr, &mut |subquery| {
+                    let (SubqueryExprRef::Scalar(inner)
+                    | SubqueryExprRef::Exists(inner)
+                    | SubqueryExprRef::In(inner)) = subquery;
+                    select_holds_aggregate_call(inner)
+                })
+            })
+        });
+        if !screened {
+            return Ok(());
+        }
+        let scope = |from: FromClause| SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from),
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    windows: Vec::new(),
+                },
+                compounds: Vec::new(),
+            },
+            order_by: Vec::new(),
+            limit: None,
+        };
+        let mut col_map = self.build_join_col_map(&scope(FromClause {
+            source: TableOrSubquery::Table {
+                name: table.name.clone(),
+                alias: table.alias.clone(),
+                index_hint: None,
+                time_travel: None,
+            },
+            joins: Vec::new(),
+        }));
+        if let Some(from) = from {
+            col_map.extend(self.build_join_col_map(&scope(from.clone())));
+        }
+        for expr in exprs {
+            let mut walked = expr.clone();
+            let mut misuse = None;
+            walk_expr_mut(
+                &mut walked,
+                UNPLACED_AGGREGATE_WALK_SITE,
+                false,
+                &mut |node, _| {
+                    if misuse.is_some() {
+                        return false;
+                    }
+                    if let Some(subquery) = direct_subquery_mut(node) {
+                        misuse = self
+                            .probe_subquery_aggregate_calls(subquery, &col_map, None)
+                            .into_iter()
+                            .find(|call| call.owned)
+                            .map(|call| {
+                                if call.site.clause == AggregateClause::Filter
+                                    && !call.site.core_is_aggregate
+                                {
+                                    format!("misuse of aggregate function {}()", call.name)
+                                } else {
+                                    format!("misuse of aggregate: {}()", call.name)
+                                }
+                            });
+                    }
+                    true
+                },
+            );
+            if let Some(message) = misuse {
+                return Err(FrankenError::FunctionError(message));
+            }
+        }
+        Ok(())
+    }
+
+    /// bd-k66zh: whether `expr`, an ORDER BY term of a subquery core whose FROM
+    /// columns are `col_map` and result aliases `output_aliases`, holds an
+    /// aggregate call of that core: one that reads one of its columns or
+    /// aliases, or no column at all. A call that reads only an enclosing
+    /// query's columns belongs to that query, so it is no misuse here.
+    fn order_term_holds_core_aggregate(
+        &self,
+        expr: &Expr,
+        col_map: &[(String, String, bool)],
+        using_skip: Option<&HashSet<usize>>,
+        output_aliases: &HashSet<String>,
+    ) -> bool {
+        let mut probe = expr.clone();
+        let markers = vec![owned_aggregate_probe_marker(); col_map.len()];
+        let schema = self.schema.borrow();
+        let shadowed_main_tables = self.shadowed_main_tables.borrow();
+        let temp_table_names = self.temp_table_names.borrow();
+        let lookup = OuterReferenceLookup {
+            row: &[],
+            col_map,
+            using_skip,
+            replacement_exprs: Some(&markers),
+            column_collations: None,
+            column_affinities: None,
+            declared_blob_columns: None,
+            schema: schema.as_slice(),
+            shadowed_main_tables: Some(&*shadowed_main_tables),
+            temp_table_names: Some(&*temp_table_names),
+            probe_unqualified_external_ref: false,
+        };
+        substitute_outer_refs_in_expr_mut(
+            &mut probe,
+            &lookup,
+            &[],
+            Some(&HashSet::new()),
+            &HashSet::new(),
+            &CteScopes::new(),
+        );
+        let mut holds = false;
+        self.with_fallback_function_registry(|| {
+            walk_expr_mut(
+                &mut probe,
+                UNPLACED_AGGREGATE_WALK_SITE,
+                false,
+                &mut |node, _| {
+                    if holds {
+                        return false;
+                    }
+                    if !is_owned_aggregate_candidate(node) {
+                        return true;
+                    }
+                    let mut reads_core = false;
+                    let mut reads_outside = false;
+                    walk_expr_mut(
+                        node,
+                        UNPLACED_AGGREGATE_WALK_SITE,
+                        false,
+                        &mut |inner, _| {
+                            if is_owned_aggregate_probe_marker(inner) {
+                                reads_core = true;
+                            } else if let Expr::Column(column, _) = inner {
+                                if column.table.is_none()
+                                    && output_aliases.contains(&column.column.to_ascii_lowercase())
+                                {
+                                    reads_core = true;
+                                } else {
+                                    reads_outside = true;
+                                }
+                            } else if let Some(subquery) = direct_subquery_mut(inner) {
+                                reads_core |= select_holds_owned_aggregate_probe_marker(subquery);
+                                reads_outside |=
+                                    is_correlated_subquery_with_schema(subquery, &schema);
+                            }
+                            true
+                        },
+                    );
+                    holds = reads_core || !reads_outside;
+                    false
+                },
+            );
+        });
+        holds
+    }
+
+    /// bd-k66zh: `expr` with each subquery that holds owned calls followed by
+    /// those calls, as `coalesce(subquery, call, ...)`. The bare-column row
+    /// choice (`select_minmax_bare_tracking_walk`) then meets a moved
+    /// min()/max() where stock's aggregate walk meets it. Only that walk reads
+    /// the result.
+    fn expose_owned_subquery_aggregates(expr: &Expr, plan: &[Vec<bool>]) -> Expr {
+        let mut exposed = expr.clone();
+        let mut subqueries = plan.iter();
+        walk_expr_mut(
+            &mut exposed,
+            UNPLACED_AGGREGATE_WALK_SITE,
+            false,
+            &mut |node, _| {
+                let Some(subquery) = direct_subquery_mut(node) else {
+                    return true;
+                };
+                let Some(owned) = subqueries.next() else {
+                    return true;
+                };
+                if !owned.iter().any(|owned| *owned) {
+                    return true;
+                }
+                let mut owned = owned.iter();
+                let mut calls = Vec::new();
+                walk_select_exprs_mut(&mut subquery.clone(), &mut |call, _| {
+                    if !is_owned_aggregate_candidate(call) {
+                        return true;
+                    }
+                    if !owned.next().copied().unwrap_or(false) {
+                        return true;
+                    }
+                    calls.push(call.clone());
+                    false
+                });
+                let span = node.span();
+                let mut args = vec![node.clone()];
+                args.extend(calls);
+                *node = Expr::FunctionCall {
+                    name: "coalesce".to_owned(),
+                    args: FunctionArgs::List(args),
+                    distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                    over: None,
+                    span,
+                };
+                false
+            },
+        );
+        exposed
+    }
+
+    /// bd-k66zh: find the calls that `select`'s subqueries hold for its primary
+    /// core, and reject the positions stock rejects: "misuse of aggregate
+    /// function f()" for a call written in the WHERE, ON or table-function
+    /// arguments of a subquery that is no aggregate; "aggregate functions are
+    /// not allowed in the GROUP BY clause"; "HAVING clause on a non-aggregate
+    /// query"; and "misuse of aggregate: f()" for a call that reaches the
+    /// core's WHERE, ON or window definitions, one of its aggregate or window
+    /// calls, the ORDER BY of a core that is no aggregate, or a core with a
+    /// window function.
+    fn select_owned_subquery_aggregates(
+        &self,
+        select: &SelectStatement,
+    ) -> Result<OwnedSubqueryAggregates> {
+        let SelectCore::Select { from: Some(_), .. } = &select.body.select else {
+            return Ok(OwnedSubqueryAggregates::default());
+        };
+        let screened = self.with_fallback_function_registry(|| {
+            select_contains_subquery_matching(select, self, &|subquery, _| {
+                let (SubqueryExprRef::Scalar(inner)
+                | SubqueryExprRef::Exists(inner)
+                | SubqueryExprRef::In(inner)) = subquery;
+                select_holds_aggregate_call(inner)
+            })
+        });
+        if !screened {
+            return Ok(OwnedSubqueryAggregates::default());
+        }
+        let col_map = self.build_join_col_map(select);
+        let using_skip_indices = self.build_join_using_skip_indices(select);
+        let using_skip = (!using_skip_indices.is_empty()).then_some(&using_skip_indices);
+        let mut probe = select.clone();
+        let mut probed = Vec::new();
+        let mut has_window = false;
+        let (core_has_group_by, core_has_aggregate) = match &probe.body.select {
+            SelectCore::Select {
+                columns, group_by, ..
+            } => (
+                !group_by.is_empty(),
+                self.with_fallback_function_registry(|| {
+                    columns.iter().any(|column| {
+                        matches!(column, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr))
+                    })
+                }),
+            ),
+            SelectCore::Values(_) => (false, false),
+        };
+        let mut probe_clause = |expr: &mut Expr, clause: AggregateClause| {
+            self.probe_core_clause_owned_aggregates(
+                expr,
+                clause,
+                &col_map,
+                using_skip,
+                &mut probed,
+                &mut has_window,
+            );
+        };
+        let core_has_having;
+        if let SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } = &mut probe.body.select
+        {
+            core_has_having = having.is_some();
+            // Stock's resolution order: result list, HAVING, WHERE, the
+            // table-function arguments and ON terms, ORDER BY, GROUP BY.
+            for column in columns.iter_mut() {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    probe_clause(expr, AggregateClause::Result);
+                }
+            }
+            if let Some(expr) = having {
+                probe_clause(expr, AggregateClause::Having);
+            }
+            if let Some(expr) = where_clause {
+                probe_clause(expr, AggregateClause::Filter);
+            }
+            if let Some(from) = from {
+                let sources = std::iter::once(&mut from.source)
+                    .chain(from.joins.iter_mut().map(|join| &mut join.table));
+                for source in sources {
+                    if let TableOrSubquery::TableFunction { args, .. } = source {
+                        for arg in args {
+                            probe_clause(arg, AggregateClause::Filter);
+                        }
+                    }
+                }
+                for join in &mut from.joins {
+                    if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                        probe_clause(expr, AggregateClause::Filter);
+                    }
+                }
+            }
+            for term in &mut probe.order_by {
+                probe_clause(&mut term.expr, AggregateClause::OrderBy);
+            }
+            for expr in group_by {
+                probe_clause(expr, AggregateClause::GroupBy);
+            }
+            for window in windows {
+                let mut walked = Expr::FunctionCall {
+                    name: String::new(),
+                    args: FunctionArgs::List(Vec::new()),
+                    distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                    over: Some(window.spec.clone()),
+                    span: Span::ZERO,
+                };
+                probe_clause(&mut walked, AggregateClause::Other);
+            }
+        } else {
+            return Ok(OwnedSubqueryAggregates::default());
+        }
+        let mut found = OwnedSubqueryAggregates::default();
+        let mut resolve_error: Option<String> = None;
+        let mut codegen_error: Option<String> = None;
+        let mut in_order_by: Option<String> = None;
+        let mut in_having = false;
+        let mut first_owned: Option<String> = None;
+        for clause_probe in &probed {
+            for call in clause_probe.calls.iter().filter(|call| call.owned) {
+                let name = &call.name;
+                first_owned.get_or_insert_with(|| name.clone());
+                if call.site.clause == AggregateClause::Filter && !call.site.core_is_aggregate {
+                    resolve_error.get_or_insert_with(|| {
+                        format!("misuse of aggregate function {name}()")
+                    });
+                }
+                if clause_probe.inside_call {
+                    codegen_error.get_or_insert_with(|| format!("misuse of aggregate: {name}()"));
+                    continue;
+                }
+                match clause_probe.clause {
+                    AggregateClause::Result => found.in_result = true,
+                    AggregateClause::Having => {
+                        found.in_having_or_order_by = true;
+                        in_having = true;
+                    }
+                    AggregateClause::OrderBy => {
+                        found.in_having_or_order_by = true;
+                        in_order_by.get_or_insert_with(|| name.clone());
+                    }
+                    AggregateClause::GroupBy => {
+                        resolve_error.get_or_insert_with(|| {
+                            "aggregate functions are not allowed in the GROUP BY clause".to_owned()
+                        });
+                    }
+                    AggregateClause::Filter | AggregateClause::Other => {
+                        codegen_error
+                            .get_or_insert_with(|| format!("misuse of aggregate: {name}()"));
+                    }
+                }
+            }
+        }
+        let Some(first_owned) = first_owned else {
+            return Ok(OwnedSubqueryAggregates::default());
+        };
+        let core_is_aggregate = core_has_group_by || core_has_aggregate || found.in_result;
+        if in_having && !core_is_aggregate && core_has_having {
+            resolve_error.get_or_insert_with(|| "HAVING clause on a non-aggregate query".to_owned());
+        }
+        if let Some(error) = resolve_error {
+            return Err(FrankenError::FunctionError(error));
+        }
+        if let Some(name) = in_order_by.filter(|_| !core_is_aggregate) {
+            codegen_error.get_or_insert_with(|| format!("misuse of aggregate: {name}()"));
+        }
+        if has_window {
+            codegen_error.get_or_insert_with(|| format!("misuse of aggregate: {first_owned}()"));
+        }
+        if let Some(error) = codegen_error {
+            return Err(FrankenError::FunctionError(error));
+        }
+        Ok(found)
+    }
+
+    /// bd-k66zh: probe each subquery `expr`, one clause of a core, holds
+    /// directly, noting whether it sits inside one of the core's own aggregate
+    /// or window calls and whether the clause holds a window call.
+    fn probe_core_clause_owned_aggregates(
+        &self,
+        expr: &mut Expr,
+        clause: AggregateClause,
+        col_map: &[(String, String, bool)],
+        using_skip: Option<&HashSet<usize>>,
+        probed: &mut Vec<ClauseOwnedAggregateProbe>,
+        has_window: &mut bool,
+    ) {
+        walk_expr_mut(
+            expr,
+            UNPLACED_AGGREGATE_WALK_SITE,
+            false,
+            &mut |node, _| {
+                let window = matches!(node, Expr::FunctionCall { over: Some(_), .. });
+                *has_window |= window;
+                if window || self.with_fallback_function_registry(|| is_owned_aggregate_candidate(node))
+                {
+                    let mut inner = Vec::new();
+                    walk_expr_mut(
+                        node,
+                        UNPLACED_AGGREGATE_WALK_SITE,
+                        false,
+                        &mut |inner_node, _| {
+                            if let Some(subquery) = direct_subquery_mut(inner_node) {
+                                inner.push(self.probe_subquery_aggregate_calls(
+                                    subquery, col_map, using_skip,
+                                ));
+                            }
+                            true
+                        },
+                    );
+                    probed.extend(inner.into_iter().map(|calls| ClauseOwnedAggregateProbe {
+                        clause,
+                        inside_call: true,
+                        calls,
+                    }));
+                    return false;
+                }
+                if let Some(subquery) = direct_subquery_mut(node) {
+                    probed.push(ClauseOwnedAggregateProbe {
+                        clause,
+                        inside_call: false,
+                        calls: self.probe_subquery_aggregate_calls(subquery, col_map, using_skip),
+                    });
+                }
+                true
+            },
+        );
+    }
+}
+
+/// Whether `select` holds a call of an aggregate function anywhere.
+fn select_holds_aggregate_call(select: &SelectStatement) -> bool {
+    any_function_call_in_select(select, &mut |name, args| {
+        is_current_aggregate_fn(name, args) && !is_scalar_max_min(name, args)
+    })
+}
+
 /// Whether `emit_exists_subquery`'s scan answers `sub`. It looks for one row
 /// of one main-schema base table that passes the WHERE: it ignores joins,
 /// compounds, CTEs and HAVING, reads a view, derived table or table function
@@ -154070,9 +155285,18 @@ impl<'a> SelectStructureResolver<'a> {
         };
         if !is_aggregate_query {
             for term in &select.order_by {
+                // bd-k66zh: in a subquery, a call that reads only an
+                // enclosing query's columns is that query's aggregate.
                 if self
                     .connection
                     .expr_contains_aggregate_with_registry(&term.expr)
+                    && (self.enclosing_selects.len() < 2
+                        || self.connection.order_term_holds_core_aggregate(
+                            &term.expr,
+                            &col_map,
+                            using_skip,
+                            &output_aliases,
+                        ))
                 {
                     // Stock names the offending aggregate: "misuse of aggregate:
                     // sum()" (the rightmost bare aggregate in the term).
