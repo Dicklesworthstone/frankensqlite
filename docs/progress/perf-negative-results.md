@@ -79,13 +79,112 @@ written; this is where their scope is recorded.
 valgrind changes the I/O path (2026-11-10); a remote build can return a stale binary (2026-07-13,
 2026-08-02 bd-8wumh); the old concurrent section ran C at `FULL` against fsqlite at `NORMAL`
 (2026-07-23); VDBE metrics are process-global (2026-07-10); counters can be observer-dominated
-(2026-08-02 bd-he3ua); `ResultRow` drains its source registers (2026-07-22).
+(2026-08-02 bd-he3ua); `ResultRow` drains its source registers (2026-07-22); an arm added to or
+reshaped in `try_execute_hot_opcode_sync` moves other statements' cycles (2026-11-15 W3) and their
+instruction counts by up to 1.3% (2026-11-15 H1) without running any of the change.
 
 ### New entries
 
 Every entry from here on ends with a retry condition a later agent can grep and test: a profile
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
+
+## 2026-11-15 - REJECTED on its kill lines (four versions): a GROUP BY over a table scan aggregates each row into its group through a hash table and sorts the groups, not the rows (bd-w4pr1.13.8, lever H1)
+
+- Target: the GROUP BY rows that sort every input row. `GROUP BY a` with sum(c) (x1.55-1.62 stock
+  CPU) and `GROUP BY id % 100000` (x1.80-1.86) have distinct records, which G3 declines;
+  group_by_1000_groups and GROUP BY a % 10 collect G3 runs (x0.88-0.97). Callgrind of the first
+  (serial): 3,876.2M Ir, SorterCursor::sort 422.7M (the pair quicksort 338.3M), pass 2's sorter
+  Column reads 490.0M inclusive, SorterInsert 125.0M self plus its record decode; perf (round 3):
+  the permutation 30.5% and its quicksort 5.5-7.6% of the cycles; peak RSS ~140 MB against
+  stock's 8.4 MB. Touched (not landed): crates/fsqlite-types/src/opcode.rs (HashAggOpen /
+  HashAggGroup / HashAggSort / HashAggNext / HashAggAdopt, 202-206),
+  crates/fsqlite-func/src/{aggregate.rs,agg_builtins.rs} (`AggregateFunction::step_is_pure`, true
+  for the built-in count, sum, total, avg, min, max), crates/fsqlite-vdbe/src/{lib.rs,engine.rs,
+  codegen.rs} (HashGroupTable, codegen_select_group_by_aggregate), and a stock-oracle keeper in
+  crates/fsqlite-core/tests/bd_w4pr1_13_1_sync_lane_boundary_oracle.rs.
+- Ledger preflight: INDEX "Narrow aggregate lanes" (names hash aggregation as a different
+  change); G3 and G4 (kept); S1 (REJECTED; its retry condition names this lever); 2026-11-10
+  bd-w4pr1.13.3 (pair sort; kept). No entry on hash grouping.
+- Design common to all versions: for a plain table scan with no HAVING, no bare column, and only
+  those six aggregates (one argument, DISTINCT allowed, no FILTER), HashAggGroup runs after the
+  WHERE and the key / argument registers. It finds or creates the row's group (keys hashed so that
+  1 = 1.0 and -0.0 = 0.0 hash alike, equal as the sorter's comparator finds them) and swaps that
+  group's accumulator contexts into the AggStep slots, so the unchanged AggStep steps them in scan
+  order. HashAggSort orders the groups with compare_sorter_rows and the existing AggFinal / Copy /
+  OFFSET / ResultRow / LIMIT code emits them. A REAL key keeps its group's latest row's spelling,
+  as the sorted plan's previous-key registers do. HashAggOpen hashes only when every resolved
+  aggregate's step is pure: steps run during the scan instead of after the sort, and sum reports
+  its overflow at finalize, in output order. The sorted plan stays in the program as the fallback.
+- Pre-registered on bd-w4pr1.13.8 before each version's code (15:59Z, 18:03Z, 18:28Z, 19:03Z), each
+  version with its own kill lines; all versions: GROUP BY a with sum(c) CPU at least 100 ms lower
+  in each of two runs, group_by_1000_groups (v2 on) at least 30 ms lower, a unique-key guard
+  (GROUP BY id) and GROUP BY id % 100000 within a few percent, other read rows within 0.3% Ir.
+- Method: thinkstation1, 64 CPUs, governor powersave, io_uring refused, serial parallel_workers=1
+  on every arm, stock sqlite3 3.46.1 live in the same par_probe run, reps 5, answers equal
+  everywhere. v1 and v2 against base feac15bd3 (5bbc8a36c34eebfb); v3 and v4 against origin/main
+  72b5ee69e (7a8fee4aaab39f19), both arms built there.
+- v1 (sha256 0c29361d3deacd08): past the sorter's 100 MiB budget the table froze (kept its groups,
+  sent new keys to the sorter, inserted its groups as records at the end). Repeating-group rows
+  x0.58-0.61 stock; GROUP BY id % 100000 2,852.0M -> 1,640.8M Ir but cache-bound (perf: the index
+  probe's key compare 22.6% and the context swap 9.4% of the cycles); GROUP BY id (1M distinct keys)
+  5,292.0M -> 7,315.4M Ir (+38%), 1,049.6 -> 1,441.9 ms, ~325 MB RSS: the frozen groups entered
+  the sorter after every later row, turning the integer-key permutation, the identity for
+  rowid-ordered input, into a rotation (22% of the cycles). Killed on the guard.
+- v2: a check at 4,096 rows and every doubling (groups * 2 > rows stops the table); a stop hands
+  every group to the sorter as a record before any later row, every later row of any key follows,
+  and pass 2 adopts a group's contexts at its first row (the sort is stable, so the record comes
+  first); AggregateContext's DISTINCT set behind a Box (72 -> 32 bytes). Repeating-group rows
+  x0.56-0.61; GROUP BY id % 100000 +11.9% Ir, GROUP BY id +16.6%: the sorted fallback paid per row
+  for the record's extra NULL group column (MakeRecord, the sorter insert, pass 2's sorter Column
+  decode 69M -> 109M), a Null and HashAggGroup's test (+341M on id % 100000 under callgrind).
+- v3: rows' records at their own width (pass 2 reads the group column, NULL past a shorter record);
+  the first 4,096 rows go to the sorter as well (HashAggSkip), so a stop at that check drops the
+  groups instead of handing them over; a hand-off register makes pass 2's group-start check one
+  test. Repeating-group rows x0.57-0.60; id % 100000 +3.96%, GROUP BY id +3.27%; scan_filter_agg,
+  which runs no H1 code, 1,271.2M -> 1,276.7M (+0.43%). Killed on the other-rows line.
+- v4 (sha256 268dbc5466a43a84): v3 with the first rows' records inserted by HashAggGroup itself (no
+  HashAggSkip arm). group_by_1000_groups 2,454.3M -> 1,401.9M Ir, CPU 200.3 -> 118.2 ms (x0.96 ->
+  x0.57 stock); GROUP BY a with sum(c) 3,872.9M -> 1,777.0M, 406.9 -> 153.8 ms (x1.55 -> x0.59);
+  GROUP BY a % 10 2,559.1M -> 1,513.2M, 208.0 -> 119.4 ms (x0.97 -> x0.56); GROUP BY id % 100000
+  2,852.1M -> 2,973.7M (+4.26%); GROUP BY id 5,292.0M -> 5,466.8M (+3.30%); scan_filter_agg
+  -0.39%; order_by_text_limit10 1,649.2M -> 1,671.2M (+1.33%); window rows -0.2 to -0.3%. Killed
+  on id % 100000 (+4.26% against 4%) and on order_by_text_limit10 (+1.33% against 0.3%).
+- Measurement trap (an addition to W3's): adding or reshaping one arm of
+  try_execute_hot_opcode_sync moved the instruction counts of read rows that run none of the
+  change by -0.4% to +1.3% across these versions (v1: one arm, scan_filter_agg +0.08%; v3: two
+  arms, +0.43%; v4: one arm with a different callee signature, scan_filter_agg -0.39% and
+  order_by_text_limit10 +1.33%). A 0.3% other-rows Ir line cannot be met by a lever that touches
+  that match without measuring a no-op arm first.
+- Correctness evidence (rch): clippy -D warnings fsqlite-types / func / vdbe --all-targets clean on
+  v1 and v4 (v3 needed an allow on the boxed DISTINCT set, box_collection); fsqlite-vdbe lib
+  1,256 passed / 1 failed on v1 (bd-bhalc's known red), goldens 8/8 unchanged (their GROUP BYs have
+  a HAVING or stream from an index); fsqlite-func lib 534/0, fsqlite-types lib 592/0; the keeper
+  file 4/4 on v1 with `hash_grouped_aggregates_match_sqlite_on_a_strict_file_database` (30,000
+  rows on a strict file database, 17 statements against stock: output order with no ORDER BY,
+  REAL / TEXT / BLOB / mixed-type / NULL keys, REAL sums and avg in scan order, DISTINCT, LIMIT /
+  OFFSET, an empty input, collated min / max, an integer sum that overflows in one group failing
+  as stock does and a LIMIT before that group returning its rows; 8 shapes on other routes compared
+  with strict off); the vdbe unit tests of each version (the hash plan against the sorted plan
+  under test-only memory budgets and first-check sizes, a hand-off after the first rows with keys
+  spelled 3 / 3.0 on both sides, a stop at the first check, an application aggregate named sum
+  that must decline) passed on v2 and v3. The full gate was not run on any version.
+- Found on the way (pre-existing, not filed): the VDBE sorted GROUP BY prints the latest row's
+  spelling of a key whose group mixes 3 and 3.0 (or 0 / -0.0, 5.0 / 5); stock 3.46.1 prints the
+  first row's (VALUES (3),(3.0) -> stock 3, fsqlite 3.0). The connection's grouped evaluator
+  matches stock. H1 kept the sorted plan's behaviour.
+- Verdict: REJECTED, all four versions, on their kill lines; nothing landed. The few-group gain is
+  large and measured (x0.56-0.60 stock CPU from x0.94-1.58, -41 to -54% Ir, RSS ~140 -> ~32 MB on
+  GROUP BY a with sum(c)); what killed it is the per-row cost of the sorted fallback for unique and
+  many-group keys (3-4% from v3 on) and the synchronous lane's layout on other rows.
+- Retry condition: a version whose fallback costs nothing per row: the hash plan and the sorted plan
+  as two program regions, HashAggGroup leaving the hash region for the sorted one with one jump
+  when the table stops instead of a test on every later row, or a plan chosen before the scan from
+  a distinct-count statistic; with its other-rows Ir and cycles line set after measuring a no-op
+  arm in try_execute_hot_opcode_sync. The v4 diff is kept in the round-4 lane scratchpad
+  (`rl4/h1_v4_full.patch`; local branch `rl4-h1-wip` in clone perf2-wt2). For many-group keys
+  (id % 100000: v1 took 42% of its instructions but kept most of its cycles), the table also needs
+  INTEGER keys inside the index entry and contexts stepped in place rather than swapped.
 
 ## 2026-11-15 - WIN (probe not met; also a correctness fix): an EXISTS probe without a LIMIT stops at its first row (bd-b887p)
 
