@@ -1574,6 +1574,130 @@ type SorterBlob = smallvec::SmallVec<[u8; SORTER_BLOB_INLINE_LEN]>;
 /// A sorter row's decoded sort key. A one-column key stays inside the row.
 type SorterKeyValues = smallvec::SmallVec<[SqliteValue; 1]>;
 
+/// The records a sorter holds before it looks for repeated ones
+/// (bd-w4pr1.13.8, lever G3). A smaller sorter never pays for the search.
+const SORTER_RUNS_FIRST_CHECK: usize = 4096;
+
+/// How a sorter's rows stand for the records inserted into it (bd-w4pr1.13.8,
+/// lever G3).
+///
+/// A GROUP BY whose aggregates read only its keys inserts records that are
+/// exactly their keys: a million-row table grouped into a thousand groups
+/// sorted a million copies of a thousand records. While `Collecting`, a row
+/// stands for `counts[i]` records that are byte for byte `rows[i]`. That gives
+/// the sort's answer as long as two records with equal keys are always the
+/// same bytes: copies of one record cannot be told apart, so every arrangement
+/// of the inserted records sorts to the same sequence of bytes, the distinct
+/// rows in key order with each emitted `counts[i]` times. Keys are equal here
+/// only as the comparator finds them equal: NULL, INTEGER by value, TEXT and
+/// BLOB by bytes, with no collation on any key. A REAL key (1 = 1.0 and
+/// -0.0 = 0.0 compare equal in different bytes) or equal keys in different
+/// bytes turn the runs back into rows ([`SorterCursor::expand_runs`]).
+#[derive(Clone)]
+enum SorterRuns {
+    /// One row per record; at [`SORTER_RUNS_FIRST_CHECK`] records the sorter
+    /// decides whether to collect runs.
+    Undecided,
+    /// One row per record until `ResetSorter`.
+    Off,
+    /// `rows[i]` stands for `counts[i]` identical records, and no two rows have
+    /// equal keys. `index` holds `(hash of the key, row)` for every row; the
+    /// hash starts from `seed`, drawn from `hasher`'s random state.
+    Collecting {
+        index: hashbrown::HashTable<(u64, usize)>,
+        seed: u64,
+        hasher: hashbrown::DefaultHashBuilder,
+        counts: Vec<u64>,
+        /// Records inserted while collecting, counted from the first check.
+        records: u64,
+        /// The record count at which compression is checked next.
+        next_check: u64,
+    },
+    /// Sorted: `rows[i]` stands for `counts[i]` identical records.
+    Sorted { counts: Vec<u64> },
+}
+
+/// What [`SorterCursor::collect_record`] did with a record.
+enum RunInsert {
+    /// The record joined a run or started one.
+    Taken,
+    /// As `Taken`, and the runs no longer compress the records 2x.
+    TakenBelowCompression,
+    /// The record cannot join runs; it is handed back to be inserted as a row.
+    Declined(SorterKeyValues, SorterBlob),
+}
+
+/// One step of [`sorter_run_key_hash`]: `state` and `word` folded through a
+/// 64x64 -> 128-bit multiply, whose two halves mix every input bit into both
+/// the high bits (the table's tags) and the low bits (its buckets).
+#[inline(always)]
+#[allow(clippy::cast_possible_truncation)]
+fn sorter_run_hash_mix(state: u64, word: u64) -> u64 {
+    let product = u128::from(state ^ word) * u128::from(0x9E37_79B9_7F4A_7C15_u64);
+    (product as u64) ^ ((product >> 64) as u64)
+}
+
+/// The hash of a sort key for [`SorterRuns::Collecting`], or `None` for a key
+/// that cannot be collected (one holding a REAL). `seed` is the sorter's own
+/// random start; TEXT and BLOB bytes go through `hasher`. A one-INTEGER key,
+/// the common GROUP BY key, costs one multiply.
+#[inline(always)]
+fn sorter_run_key_hash(
+    seed: u64,
+    hasher: &hashbrown::DefaultHashBuilder,
+    values: &[SqliteValue],
+) -> Option<u64> {
+    use std::hash::BuildHasher;
+    if let [SqliteValue::Integer(n)] = values {
+        return Some(sorter_run_hash_mix(seed ^ 1, u64::from_ne_bytes(n.to_ne_bytes())));
+    }
+    let mut state = seed;
+    for value in values {
+        state = match value {
+            SqliteValue::Null => sorter_run_hash_mix(state, 0x6E75_6C6C),
+            SqliteValue::Integer(n) => {
+                sorter_run_hash_mix(state ^ 1, u64::from_ne_bytes(n.to_ne_bytes()))
+            }
+            SqliteValue::Text(text) => {
+                sorter_run_hash_mix(state ^ 2, hasher.hash_one(text.as_bytes_direct()))
+            }
+            SqliteValue::Blob(bytes) => sorter_run_hash_mix(state ^ 3, hasher.hash_one(&**bytes)),
+            SqliteValue::Float(_) => return None,
+        };
+    }
+    Some(state)
+}
+
+/// Whether two collectable sort keys are equal as the sorter's comparator
+/// finds them with no collation: NULL with NULL, INTEGER by value, TEXT and
+/// BLOB by bytes, and the same number of key values.
+#[inline(always)]
+fn sorter_run_keys_equal(lhs: &[SqliteValue], rhs: &[SqliteValue]) -> bool {
+    if let ([SqliteValue::Integer(lhs)], [SqliteValue::Integer(rhs)]) = (lhs, rhs) {
+        return lhs == rhs;
+    }
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs).all(|pair| match pair {
+            (SqliteValue::Null, SqliteValue::Null) => true,
+            (SqliteValue::Integer(lhs), SqliteValue::Integer(rhs)) => lhs == rhs,
+            (SqliteValue::Text(lhs), SqliteValue::Text(rhs)) => {
+                lhs.as_bytes_direct() == rhs.as_bytes_direct()
+            }
+            (SqliteValue::Blob(lhs), SqliteValue::Blob(rhs)) => lhs == rhs,
+            _ => false,
+        })
+}
+
+/// Whether `ops` can position sorter `cursor_id` without sorting it: an
+/// unsorted `Rewind` reads the records in insertion order, which runs do not
+/// keep. `Last` and `Prev` are counted too, though they do not move a sorter
+/// today.
+fn program_reads_sorter_unsorted(ops: &[VdbeOp], cursor_id: i32) -> bool {
+    ops.iter().any(|op| {
+        op.p1 == cursor_id && matches!(op.opcode, Opcode::Rewind | Opcode::Last | Opcode::Prev)
+    })
+}
+
 /// A set of cursor ids, for the few cursors a program holds at once.
 ///
 /// It replaces a `HashSet<i32>` whose two hashed probes per deleted row (the
@@ -1631,10 +1755,20 @@ struct SorterCursor {
     /// encoding (UTF-16 code-unit order on a UTF-16 database) — bd-bld9w.4.
     /// `Utf8` (the default) keeps the previous canonical-UTF-8 byte order.
     text_encoding: TextEncoding,
-    /// Inserted records.
+    /// Inserted records, or runs of identical records (see `runs`).
     rows: Vec<SorterRow>,
+    /// Whether `rows` stand for one record each or for runs of them
+    /// (bd-w4pr1.13.8, lever G3).
+    runs: SorterRuns,
+    /// Whether this sorter may collect runs at all: no top-N bound and no
+    /// collation on any key. `ResetSorter` starts it `Undecided` again.
+    runs_allowed: bool,
     /// Current position after `SorterSort`/`SorterNext`.
     position: Option<usize>,
+    /// How many more times the row at `position` is emitted before the next
+    /// row: its run's count less the copies already emitted. Always 0 unless
+    /// `runs` is `Sorted`.
+    copies_left: u64,
     /// Position for which the lazy output decode cache is currently valid.
     cached_row_position: Option<usize>,
     /// Sorter-owned decode/materialization scratch for the current output row.
@@ -1785,6 +1919,7 @@ impl SorterCursor {
             sort_key_orders.resize(key_columns, SortKeyOrder::Asc);
         }
         sort_key_orders.truncate(key_columns);
+        let runs_allowed = top_n_limit.is_none() && collations.iter().all(Option::is_none);
         Self {
             key_columns,
             sort_key_orders,
@@ -1792,7 +1927,14 @@ impl SorterCursor {
             collation_registry,
             text_encoding,
             rows: Vec::new(),
+            runs: if runs_allowed {
+                SorterRuns::Undecided
+            } else {
+                SorterRuns::Off
+            },
+            runs_allowed,
             position: None,
+            copies_left: 0,
             cached_row_position: None,
             cached_row_decode: RowDecodeScratch::default(),
             memory_used: 0,
@@ -1938,6 +2080,9 @@ impl SorterCursor {
         if self.top_n_limit == Some(0) {
             return Ok(());
         }
+        if !self.rows_are_records() {
+            return self.insert_record_with_runs(values, blob);
+        }
 
         let new_row_size = Self::estimate_row_size(&values, &blob);
         if let Some(limit) = self.top_n_limit {
@@ -1987,7 +2132,18 @@ impl SorterCursor {
             }
         }
 
-        self.memory_used += new_row_size;
+        self.push_record(values, blob, new_row_size)
+    }
+
+    /// Append a record as one row and spill if memory exceeds the threshold.
+    #[inline(always)]
+    fn push_record(
+        &mut self,
+        values: SorterKeyValues,
+        blob: SorterBlob,
+        row_size: usize,
+    ) -> Result<()> {
+        self.memory_used += row_size;
         self.rows.push(SorterRow {
             values,
             blob,
@@ -2001,6 +2157,328 @@ impl SorterCursor {
         Ok(())
     }
 
+    /// [`Self::insert_record`] for a sorter whose rows stand for runs
+    /// (bd-w4pr1.13.8, lever G3). Kept out of line so the insert of a sorter
+    /// with one row per record pays one test for it. A sorter with runs has
+    /// no top-N bound, so a record that does not join them is a plain append.
+    #[inline(never)]
+    fn insert_record_with_runs(&mut self, values: SorterKeyValues, blob: SorterBlob) -> Result<()> {
+        if matches!(self.runs, SorterRuns::Collecting { .. }) {
+            match self.collect_record(values, blob) {
+                RunInsert::Taken => {}
+                RunInsert::TakenBelowCompression => self.expand_runs(),
+                RunInsert::Declined(values, blob) => {
+                    self.expand_runs();
+                    let row_size = Self::estimate_row_size(&values, &blob);
+                    return self.push_record(values, blob, row_size);
+                }
+            }
+            if self.memory_used >= self.spill_threshold {
+                self.spill_to_disk()?;
+            }
+            return Ok(());
+        }
+        // An insert after the sort: rows go back to one per record, in the
+        // order the sort gave them, as a sorter without runs holds them.
+        self.expand_runs();
+        let row_size = Self::estimate_row_size(&values, &blob);
+        self.push_record(values, blob, row_size)
+    }
+
+    /// Insert a record from a `SorterInsert` of `ops`, the program that owns
+    /// sorter `cursor_id`; at [`SORTER_RUNS_FIRST_CHECK`] records an
+    /// `Undecided` sorter decides whether it collects runs
+    /// ([`Self::start_runs`]).
+    fn insert_program_record(
+        &mut self,
+        values: SorterKeyValues,
+        blob: SorterBlob,
+        ops: &[VdbeOp],
+        cursor_id: i32,
+    ) -> Result<()> {
+        self.insert_record(values, blob)?;
+        if matches!(self.runs, SorterRuns::Undecided) && self.rows.len() >= SORTER_RUNS_FIRST_CHECK
+        {
+            self.start_runs(!program_reads_sorter_unsorted(ops, cursor_id));
+        }
+        Ok(())
+    }
+
+    /// Decide, once, whether an `Undecided` sorter collects runs: it does when
+    /// `program_allows` (no unsorted read of this sorter in its program), it
+    /// has neither spilled nor been positioned, no record so far has a REAL
+    /// key, any two with equal keys are the same bytes, and they hold at most
+    /// half as many distinct records as records. The first record of each
+    /// key keeps its place, its later copies become its count. Otherwise the
+    /// sorter keeps one row per record, unchanged.
+    fn start_runs(&mut self, program_allows: bool) {
+        self.runs = SorterRuns::Off;
+        if !program_allows || !self.spill_runs.is_empty() || self.position.is_some() {
+            return;
+        }
+        let hasher = hashbrown::DefaultHashBuilder::default();
+        let seed = {
+            use std::hash::BuildHasher;
+            hasher.hash_one(SORTER_RUNS_FIRST_CHECK)
+        };
+        let rows = &self.rows;
+        let mut index: hashbrown::HashTable<(u64, usize)> = hashbrown::HashTable::new();
+        // The row each row repeats: itself for the first record of a key.
+        let mut first_of: Vec<usize> = Vec::with_capacity(rows.len());
+        for (at, row) in rows.iter().enumerate() {
+            let Some(hash) = sorter_run_key_hash(seed, &hasher, &row.values) else {
+                return;
+            };
+            let found = index
+                .find(hash, |&(entry_hash, first)| {
+                    entry_hash == hash && sorter_run_keys_equal(&rows[first].values, &row.values)
+                })
+                .map(|&(_, first)| first);
+            let first = match found {
+                Some(first) if rows[first].blob == row.blob => first,
+                Some(_) => return,
+                None => {
+                    index.insert_unique(hash, (hash, at), |&(entry_hash, _)| entry_hash);
+                    at
+                }
+            };
+            first_of.push(first);
+        }
+        let records = rows.len();
+        if index.len().saturating_mul(2) > records {
+            return;
+        }
+        // Keep each first record; its copies become its count. `slot_of` maps
+        // a first record's place in `rows` to its place in `kept`.
+        let mut slot_of: Vec<usize> = vec![usize::MAX; records];
+        let mut kept: Vec<SorterRow> = Vec::with_capacity(index.len());
+        let mut counts: Vec<u64> = Vec::with_capacity(index.len());
+        for (at, row) in std::mem::take(&mut self.rows).into_iter().enumerate() {
+            let first = first_of[at];
+            if first == at {
+                slot_of[at] = kept.len();
+                kept.push(row);
+                counts.push(1);
+            } else {
+                counts[slot_of[first]] += 1;
+                self.memory_used = self
+                    .memory_used
+                    .saturating_sub(Self::estimate_row_size(&row.values, &row.blob));
+            }
+        }
+        for entry in index.iter_mut() {
+            entry.1 = slot_of[entry.1];
+        }
+        self.rows = kept;
+        let records = records as u64;
+        self.runs = SorterRuns::Collecting {
+            index,
+            seed,
+            hasher,
+            counts,
+            records,
+            next_check: records.saturating_mul(2),
+        };
+        self.invalidate_output_row_cache();
+    }
+
+    /// Add one record to a `Collecting` sorter: to the run of its key when it
+    /// is that run's bytes, as a new run when its key has none. A REAL key, or
+    /// a key whose run holds other bytes, is handed back without changing
+    /// anything. At each doubling of the record count the runs must still
+    /// compress the records 2x.
+    fn collect_record(&mut self, values: SorterKeyValues, blob: SorterBlob) -> RunInsert {
+        let SorterRuns::Collecting {
+            index,
+            seed,
+            hasher,
+            counts,
+            records,
+            next_check,
+        } = &mut self.runs
+        else {
+            return RunInsert::Declined(values, blob);
+        };
+        let Some(hash) = sorter_run_key_hash(*seed, hasher, &values) else {
+            return RunInsert::Declined(values, blob);
+        };
+        let rows = &mut self.rows;
+        let found = index
+            .find(hash, |&(entry_hash, slot)| {
+                entry_hash == hash && sorter_run_keys_equal(&rows[slot].values, &values)
+            })
+            .map(|&(_, slot)| slot);
+        match found {
+            Some(slot) => {
+                if rows[slot].blob != blob {
+                    return RunInsert::Declined(values, blob);
+                }
+                counts[slot] += 1;
+            }
+            None => {
+                let slot = rows.len();
+                self.memory_used += Self::estimate_row_size(&values, &blob);
+                rows.push(SorterRow {
+                    values,
+                    blob,
+                    source_sequence: 0,
+                });
+                index.insert_unique(hash, (hash, slot), |&(entry_hash, _)| entry_hash);
+                counts.push(1);
+            }
+        }
+        *records += 1;
+        if *records < *next_check {
+            return RunInsert::Taken;
+        }
+        *next_check = next_check.saturating_mul(2);
+        if (rows.len() as u64).saturating_mul(2) > *records {
+            RunInsert::TakenBelowCompression
+        } else {
+            RunInsert::Taken
+        }
+    }
+
+    /// Turn runs back into one row per record, each run's copies beside it
+    /// (any arrangement of identical records sorts the same), and keep one
+    /// row per record until `ResetSorter`. A sorted sorter keeps its place:
+    /// the row it is on, at the copy it has reached.
+    fn expand_runs(&mut self) {
+        let counts = match std::mem::replace(&mut self.runs, SorterRuns::Off) {
+            SorterRuns::Collecting { counts, .. } | SorterRuns::Sorted { counts } => counts,
+            other => {
+                self.runs = other;
+                return;
+            }
+        };
+        let position = self.position.map(|pos| {
+            let before: u64 = counts[..pos].iter().sum();
+            before + (counts[pos] - 1 - self.copies_left)
+        });
+        self.copies_left = 0;
+        let records: u64 = counts.iter().sum();
+        if records != self.rows.len() as u64 {
+            let mut expanded: Vec<SorterRow> =
+                Vec::with_capacity(usize::try_from(records).unwrap_or(self.rows.len()));
+            for (row, count) in std::mem::take(&mut self.rows).into_iter().zip(counts) {
+                if count > 1 {
+                    let size = Self::estimate_row_size(&row.values, &row.blob);
+                    for _ in 1..count {
+                        self.memory_used = self.memory_used.saturating_add(size);
+                        expanded.push(row.clone());
+                    }
+                }
+                expanded.push(row);
+            }
+            self.rows = expanded;
+        }
+        self.position = position.and_then(|pos| usize::try_from(pos).ok());
+        self.invalidate_output_row_cache();
+    }
+
+    /// Sort runs of distinct keys with their counts. Keys are distinct, so
+    /// the order is the same under any sort; one INTEGER key sorts by the
+    /// key (a DESC key as its complement), anything else by the comparator.
+    fn sort_runs(
+        key_columns: usize,
+        sort_key_orders: &[SortKeyOrder],
+        collations: &[Option<String>],
+        collation_registry: &CollationRegistry,
+        text_encoding: TextEncoding,
+        rows: &mut Vec<SorterRow>,
+        counts: Vec<u64>,
+    ) -> Vec<u64> {
+        let descending = matches!(
+            sort_key_orders.first(),
+            Some(SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst)
+        );
+        let integer_key = |row: &SorterRow| match row.values.first() {
+            Some(SqliteValue::Integer(key)) if key_columns == 1 => {
+                Some(if descending { !*key } else { *key })
+            }
+            _ => None,
+        };
+        let mut runs: Vec<(SorterRow, u64)> = std::mem::take(rows).into_iter().zip(counts).collect();
+        if runs.iter().all(|(row, _)| integer_key(row).is_some()) {
+            runs.sort_unstable_by_key(|(row, _)| integer_key(row));
+        } else {
+            runs.sort_by(|(lhs, _), (rhs, _)| {
+                compare_sorter_rows(
+                    &lhs.values,
+                    &rhs.values,
+                    key_columns,
+                    sort_key_orders,
+                    collations,
+                    collation_registry,
+                    text_encoding,
+                )
+            });
+        }
+        let (sorted, counts): (Vec<SorterRow>, Vec<u64>) = runs.into_iter().unzip();
+        *rows = sorted;
+        counts
+    }
+
+    /// The runs' counts, leaving `runs` `Off`; `None` when rows are records.
+    fn take_run_counts(&mut self) -> Option<Vec<u64>> {
+        match std::mem::replace(&mut self.runs, SorterRuns::Off) {
+            SorterRuns::Collecting { counts, .. } | SorterRuns::Sorted { counts } => Some(counts),
+            other => {
+                self.runs = other;
+                None
+            }
+        }
+    }
+
+    /// Whether every row is one record (no runs), as code that reads `rows`
+    /// directly, such as the index bulk load, needs.
+    const fn rows_are_records(&self) -> bool {
+        matches!(self.runs, SorterRuns::Undecided | SorterRuns::Off)
+    }
+
+    /// Copies of the row at `at` emitted after its first: its run's count
+    /// less one.
+    fn copies_after(&self, at: usize) -> u64 {
+        match &self.runs {
+            SorterRuns::Sorted { counts } => counts.get(at).map_or(0, |count| count - 1),
+            _ => 0,
+        }
+    }
+
+    /// Position at the first record; `false` when there is none.
+    fn position_at_first(&mut self) -> bool {
+        if self.rows.is_empty() {
+            self.position = None;
+            self.copies_left = 0;
+            false
+        } else {
+            self.position = Some(0);
+            self.copies_left = self.copies_after(0);
+            true
+        }
+    }
+
+    /// Advance to the next record: another copy of the current row while its
+    /// run has copies left, else the next row; `false` past the last.
+    fn advance(&mut self) -> bool {
+        let Some(pos) = self.position else {
+            return false;
+        };
+        if self.copies_left > 0 {
+            self.copies_left -= 1;
+            return true;
+        }
+        let next = pos + 1;
+        if next < self.rows.len() {
+            self.position = Some(next);
+            self.copies_left = self.copies_after(next);
+            true
+        } else {
+            self.position = None;
+            false
+        }
+    }
+
     /// Sort the in-memory rows, write them to a temp file, and clear them.
     #[cfg(not(target_arch = "wasm32"))]
     fn spill_to_disk(&mut self) -> Result<()> {
@@ -2009,6 +2487,10 @@ impl SorterCursor {
         if self.rows.is_empty() {
             return Ok(());
         }
+
+        // A sorter collecting runs writes each run's record its count times
+        // and keeps one row per record from here on.
+        let run_counts = self.take_run_counts();
 
         // Sort current batch — lock collation registry once for entire sort.
         // A run is sorted the way an in-memory sort is: a single INTEGER key
@@ -2022,19 +2504,32 @@ impl SorterCursor {
             .collation_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows) {
-            self.rows.sort_by(|lhs, rhs| {
-                compare_sorter_rows(
-                    &lhs.values,
-                    &rhs.values,
-                    key_columns,
-                    &orders,
-                    &colls,
-                    &coll_guard,
-                    text_encoding,
-                )
-            });
-        }
+        let run_counts = if let Some(counts) = run_counts {
+            Some(Self::sort_runs(
+                key_columns,
+                &orders,
+                &colls,
+                &coll_guard,
+                text_encoding,
+                &mut self.rows,
+                counts,
+            ))
+        } else {
+            if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows) {
+                self.rows.sort_by(|lhs, rhs| {
+                    compare_sorter_rows(
+                        &lhs.values,
+                        &rhs.values,
+                        key_columns,
+                        &orders,
+                        &colls,
+                        &coll_guard,
+                        text_encoding,
+                    )
+                });
+            }
+            None
+        };
         drop(coll_guard);
 
         // Write to temp file.  We use `keep()` to detach the auto-delete
@@ -2047,22 +2542,26 @@ impl SorterCursor {
             .map_err(|e| FrankenError::internal(format!("sorter spill keep: {e}")))?;
         let mut writer = std::io::BufWriter::new(file);
 
-        let record_count = self.rows.len() as u64;
+        let mut record_count: u64 = 0;
         let mut bytes_written: u64 = 0;
-        for row in &self.rows {
+        for (at, row) in self.rows.iter().enumerate() {
             // Write the raw blob directly instead of re-serializing from
             // decoded values.  The blob is the original record bytes from
             // MakeRecord and is identical to what serialize_record would
             // produce (but without the decode→re-encode round-trip).
             #[allow(clippy::cast_possible_truncation)]
             let len_bytes = (row.blob.len() as u32).to_le_bytes();
-            writer
-                .write_all(&len_bytes)
-                .map_err(|e| FrankenError::internal(format!("sorter spill write len: {e}")))?;
-            writer
-                .write_all(&row.blob)
-                .map_err(|e| FrankenError::internal(format!("sorter spill write data: {e}")))?;
-            bytes_written += 4 + row.blob.len() as u64;
+            let copies = run_counts.as_ref().map_or(1, |counts| counts[at]);
+            for _ in 0..copies {
+                writer
+                    .write_all(&len_bytes)
+                    .map_err(|e| FrankenError::internal(format!("sorter spill write len: {e}")))?;
+                writer.write_all(&row.blob).map_err(|e| {
+                    FrankenError::internal(format!("sorter spill write data: {e}"))
+                })?;
+                bytes_written += 4 + row.blob.len() as u64;
+            }
+            record_count += copies;
         }
         writer
             .flush()
@@ -2177,6 +2676,30 @@ impl SorterCursor {
             .collation_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+
+        // Runs sort as (row, count) pairs and stay runs for the output
+        // (a sorter collecting runs has never spilled); a sorter still
+        // `Undecided` keeps one row per record from here on.
+        match std::mem::replace(&mut self.runs, SorterRuns::Off) {
+            SorterRuns::Collecting { counts, .. } | SorterRuns::Sorted { counts } => {
+                debug_assert!(self.spill_runs.is_empty());
+                let counts = Self::sort_runs(
+                    self.key_columns,
+                    &self.sort_key_orders,
+                    &self.collations,
+                    &coll_guard,
+                    self.text_encoding,
+                    &mut self.rows,
+                    counts,
+                );
+                drop(coll_guard);
+                self.rows_sorted_total += counts.iter().sum::<u64>();
+                self.runs = SorterRuns::Sorted { counts };
+                self.invalidate_output_row_cache();
+                return Ok(());
+            }
+            SorterRuns::Undecided | SorterRuns::Off => {}
+        }
 
         if self.spill_runs.is_empty() {
             if self.top_n_limit.is_some() {
@@ -2330,7 +2853,13 @@ impl SorterCursor {
     /// Clear all rows and spill state (for `ResetSorter`).
     fn reset(&mut self) {
         self.rows.clear();
+        self.runs = if self.runs_allowed {
+            SorterRuns::Undecided
+        } else {
+            SorterRuns::Off
+        };
         self.position = None;
+        self.copies_left = 0;
         self.invalidate_output_row_cache();
         self.memory_used = 0;
         self.next_source_sequence = 0;
@@ -9589,7 +10118,10 @@ impl VdbeEngine {
             return Ok(false);
         };
         let key_columns = sorter.key_columns;
+        // A row standing for a run of records would be stored once; the
+        // per-row path emits each record (bd-w4pr1.13.8, lever G3).
         if !sc.writable
+            || !sorter.rows_are_records()
             || sorter.rows.is_empty()
             || unique_key_columns > key_columns
             || !sc.cursor.index_root_is_empty_leaf(&sc.cx).await?
@@ -12395,13 +12927,11 @@ impl VdbeEngine {
                                 "sort completed"
                             );
                         }
-                        if sorter.rows.is_empty() {
-                            sorter.position = None;
-                            true
-                        } else {
-                            sorter.position = Some(0);
-                            false
-                        }
+                        // An unsorted Rewind reads insertion order, which a
+                        // sorter collecting runs does not keep: one whose
+                        // program has a Rewind on it never collects.
+                        debug_assert!(!matches!(sorter.runs, SorterRuns::Collecting { .. }));
+                        !sorter.position_at_first()
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if cursor.is_pseudo {
                             cursor.pseudo_row.is_none()
@@ -12500,18 +13030,7 @@ impl VdbeEngine {
                     } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         lean_future(|| cursor.cursor.next(&cursor.cx)).await?
                     } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        if let Some(pos) = sorter.position {
-                            let next = pos + 1;
-                            if next < sorter.rows.len() {
-                                sorter.position = Some(next);
-                                true
-                            } else {
-                                sorter.position = None;
-                                false
-                            }
-                        } else {
-                            false
-                        }
+                        sorter.advance()
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if cursor.is_pseudo {
                             false
@@ -14502,7 +15021,7 @@ impl VdbeEngine {
                 // The hot lane runs the three sorter opcodes below; these arms
                 // keep the statement loop's match complete.
                 Opcode::SorterInsert => {
-                    self.execute_sorter_insert(op)?;
+                    self.execute_sorter_insert(ops, op)?;
                     pc += 1;
                 }
 
@@ -16729,8 +17248,10 @@ impl VdbeEngine {
         self.get_reg(r).clone()
     }
 
-    /// `SorterInsert`: hand the record in register `p2` to sorter `p1`.
-    fn execute_sorter_insert(&mut self, op: &VdbeOp) -> Result<()> {
+    /// `SorterInsert`: hand the record in register `p2` to sorter `p1`. `ops`
+    /// is the program `op` belongs to, read once per sorter fill when the
+    /// sorter decides whether it collects runs.
+    fn execute_sorter_insert(&mut self, ops: &[VdbeOp], op: &VdbeOp) -> Result<()> {
         // Lazy key decode: only decode the first `key_columns`
         // values (the sort key) instead of all columns.  The
         // raw blob is retained for output via `SorterData`.
@@ -16797,7 +17318,7 @@ impl VdbeEngine {
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "malformed record in SorterInsert".to_owned(),
             })?;
-            sorter.insert_record(key_values, blob)?;
+            sorter.insert_program_record(key_values, blob, ops, cursor_id)?;
         }
         Ok(())
     }
@@ -17898,7 +18419,7 @@ impl VdbeEngine {
             // either: one of them per row is what ended the run in ORDER BY
             // and GROUP BY loops.
             Opcode::SorterInsert => {
-                self.execute_sorter_insert(op)?;
+                self.execute_sorter_insert(ops, op)?;
                 *pc += 1;
                 Ok(true)
             }
@@ -18309,18 +18830,7 @@ impl VdbeEngine {
                 None => return Ok(None),
             }
         } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-            if let Some(pos) = sorter.position {
-                let next = pos + 1;
-                if next < sorter.rows.len() {
-                    sorter.position = Some(next);
-                    true
-                } else {
-                    sorter.position = None;
-                    false
-                }
-            } else {
-                false
-            }
+            sorter.advance()
         } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
             if cursor.is_pseudo {
                 false
@@ -40677,6 +41187,332 @@ mod tests {
             .map(|r| r.values[0].to_integer())
             .collect();
         assert_eq!(sorted, vec![5, 4, 3]);
+    }
+
+    /// The record of `values` as `SorterInsert` hands it to a sorter: its
+    /// first `key_columns` values decoded, and its bytes.
+    fn sorter_runs_record(
+        values: &[SqliteValue],
+        key_columns: usize,
+    ) -> (SorterKeyValues, SorterBlob) {
+        let record = serialize_record(values);
+        (
+            values.iter().take(key_columns).cloned().collect(),
+            SorterBlob::from_slice(&record),
+        )
+    }
+
+    /// Every record a sorter emits from its first, as bytes, through the
+    /// positioning and advance `SorterSort` / `SorterNext` use.
+    fn sorter_runs_emitted(sorter: &mut SorterCursor) -> Vec<Vec<u8>> {
+        let mut emitted = Vec::new();
+        if sorter.position_at_first() {
+            loop {
+                let at = sorter.position.expect("positioned");
+                emitted.push(sorter.rows[at].blob.to_vec());
+                if !sorter.advance() {
+                    break;
+                }
+            }
+        }
+        emitted
+    }
+
+    fn sorter_runs_state(sorter: &SorterCursor) -> &'static str {
+        match sorter.runs {
+            SorterRuns::Undecided => "undecided",
+            SorterRuns::Off => "off",
+            SorterRuns::Collecting { .. } => "collecting",
+            SorterRuns::Sorted { .. } => "sorted",
+        }
+    }
+
+    /// Insert `records` into a sorter that may collect runs (as `SorterInsert`
+    /// does, under `ops`) and into one that keeps a row per record, sort both
+    /// and require the same records, in the same order, and the same sorted
+    /// count. Returns the state the first one sorted in.
+    fn sorter_runs_against_plain(
+        label: &str,
+        records: &[Vec<SqliteValue>],
+        key_columns: usize,
+        orders: &[SortKeyOrder],
+        ops: &[VdbeOp],
+    ) -> &'static str {
+        let mut runs = SorterCursor::new(key_columns, orders.to_vec(), Vec::new());
+        let mut plain = SorterCursor::new(key_columns, orders.to_vec(), Vec::new());
+        for values in records {
+            let (keys, blob) = sorter_runs_record(values, key_columns);
+            runs.insert_program_record(keys.clone(), blob.clone(), ops, 1)
+                .expect("insert");
+            plain.insert_record(keys, blob).expect("insert");
+        }
+        runs.sort().expect("sort");
+        plain.sort().expect("sort");
+        assert_eq!(runs.rows_sorted_total, plain.rows_sorted_total, "{label}");
+        let (emitted, expected) = (
+            sorter_runs_emitted(&mut runs),
+            sorter_runs_emitted(&mut plain),
+        );
+        assert_eq!(emitted.len(), records.len(), "{label}");
+        assert_same_records(label, &emitted, &expected);
+        sorter_runs_state(&runs)
+    }
+
+    /// The same records in the same order; reports the first that differs.
+    fn assert_same_records(label: &str, emitted: &[Vec<u8>], expected: &[Vec<u8>]) {
+        assert_eq!(emitted.len(), expected.len(), "{label}: record count");
+        let first_difference = emitted.iter().zip(expected).position(|(lhs, rhs)| lhs != rhs);
+        assert_eq!(first_difference, None, "{label}: first record that differs");
+    }
+
+    /// bd-w4pr1.13.8 lever G3: a sorter collecting runs emits what a sorter
+    /// holding one row per record emits, in every case that keeps runs and in
+    /// every case that has to give them up. Each case states the state it
+    /// ends in, so none passes without exercising its path.
+    #[test]
+    fn test_sorter_runs_emit_what_one_row_per_record_emits() {
+        let int = SqliteValue::Integer;
+        let text = |s: String| SqliteValue::Text(s.as_str().into());
+        let asc = [SortKeyOrder::Asc];
+        let no_ops: [VdbeOp; 0] = [];
+        let n = 20_000_i64;
+
+        // An INTEGER key repeated in 37 groups: collected and sorted as runs.
+        let groups: Vec<_> = (0..n).map(|i| vec![int(i % 37)]).collect();
+        assert_eq!(
+            sorter_runs_against_plain("groups", &groups, 1, &asc, &no_ops),
+            "sorted"
+        );
+        let desc = [SortKeyOrder::Desc];
+        assert_eq!(
+            sorter_runs_against_plain("groups desc", &groups, 1, &desc, &no_ops),
+            "sorted"
+        );
+
+        // The key turns REAL after the runs started: 3.0 equals 3 in other
+        // bytes, so the runs give way and 3.0 sorts between the 3s it came
+        // between. A collapse by value would move it.
+        let real_after: Vec<_> = (0..n)
+            .map(|i| {
+                if i == 6_000 {
+                    vec![SqliteValue::Float(3.0)]
+                } else {
+                    vec![int(i % 5)]
+                }
+            })
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("real after start", &real_after, 1, &asc, &no_ops),
+            "off"
+        );
+        // -0.0 and 0.0 beside 0, after the start.
+        let zeros: Vec<_> = (0..n)
+            .map(|i| match i {
+                7_000 => vec![SqliteValue::Float(-0.0)],
+                7_001 => vec![SqliteValue::Float(0.0)],
+                _ => vec![int(i % 3)],
+            })
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("signed zeros", &zeros, 1, &asc, &no_ops),
+            "off"
+        );
+        // A REAL key before the first check: never collects.
+        let reals: Vec<_> = (0..n)
+            .map(|i| vec![SqliteValue::Float(f64::from(u32::try_from(i % 9).unwrap()))])
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("real keys", &reals, 1, &asc, &no_ops),
+            "off"
+        );
+
+        // A record wider than its key whose payload is a function of the key
+        // for 6,000 records and then varies: equal keys in other bytes end the
+        // runs, and the payloads of one key keep their insertion order. A
+        // collapse by key alone would reorder them.
+        let payload: Vec<_> = (0..n)
+            .map(|i| {
+                let p = if i < 6_000 { (i % 37) * 10 } else { i };
+                vec![int(i % 37), int(p)]
+            })
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("payload changes", &payload, 1, &asc, &no_ops),
+            "off"
+        );
+        // A payload that always follows the key collects.
+        let same_payload: Vec<_> = (0..n)
+            .map(|i| vec![int(i % 37), text(format!("p{}", i % 37))])
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("payload follows key", &same_payload, 1, &asc, &no_ops),
+            "sorted"
+        );
+
+        // Ten keys for 8,000 records, then every key new: below 2x at the
+        // 16,384 check, the runs turn back into rows there.
+        let thinning: Vec<_> = (0..n)
+            .map(|i| vec![int(if i < 8_000 { i % 10 } else { i })])
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("thinning", &thinning, 1, &asc, &no_ops),
+            "off"
+        );
+        // Unique keys: declined at the first check.
+        let unique: Vec<_> = (0..n).map(|i| vec![int(n - i)]).collect();
+        assert_eq!(
+            sorter_runs_against_plain("unique", &unique, 1, &asc, &no_ops),
+            "off"
+        );
+        // Under 4,096 records nothing is decided.
+        assert_eq!(
+            sorter_runs_against_plain("small", &groups[..4_000], 1, &asc, &no_ops),
+            "off"
+        );
+
+        // NULL, INTEGER, TEXT and BLOB keys of two columns, every direction.
+        let mixed: Vec<_> = (0..n)
+            .map(|i| {
+                let first = match i % 4 {
+                    0 => SqliteValue::Null,
+                    1 => int(i % 7),
+                    2 => text(format!("t{}", i % 5)),
+                    _ => SqliteValue::Blob(Arc::from(vec![u8::try_from(i % 3).unwrap(); 2])),
+                };
+                vec![first, int(i % 2)]
+            })
+            .collect();
+        for orders in [
+            [SortKeyOrder::Asc, SortKeyOrder::Desc],
+            [SortKeyOrder::Desc, SortKeyOrder::Asc],
+            [SortKeyOrder::AscNullsLast, SortKeyOrder::DescNullsFirst],
+        ] {
+            assert_eq!(
+                sorter_runs_against_plain("mixed", &mixed, 2, &orders, &no_ops),
+                "sorted",
+                "{orders:?}"
+            );
+        }
+        // A record shorter than its key (one value under two key columns).
+        let short: Vec<_> = (0..n).map(|i| vec![int(i % 4)]).collect();
+        assert_eq!(
+            sorter_runs_against_plain("short record", &short, 2, &asc, &no_ops),
+            "sorted"
+        );
+
+        // A program that rewinds the sorter without sorting it reads
+        // insertion order: it never collects.
+        let rewinds = [VdbeOp {
+            opcode: Opcode::Rewind,
+            p1: 1,
+            p2: 0,
+            p3: 0,
+            p4: P4::None,
+            p5: 0,
+        }];
+        assert_eq!(
+            sorter_runs_against_plain("rewound", &groups, 1, &asc, &rewinds),
+            "off"
+        );
+        let other_cursor = [VdbeOp {
+            p1: 0,
+            ..rewinds[0].clone()
+        }];
+        assert_eq!(
+            sorter_runs_against_plain("other cursor rewound", &groups, 1, &asc, &other_cursor),
+            "sorted"
+        );
+    }
+
+    /// A sorter collecting runs that spills writes each run's record its
+    /// count times, then keeps one row per record; an insert after the sort
+    /// turns the runs back into rows at the record it was on; ResetSorter
+    /// lets the next fill collect again; the index bulk load sees runs as not
+    /// one row per record.
+    #[test]
+    fn test_sorter_runs_spill_insert_after_sort_and_reset() {
+        let int = SqliteValue::Integer;
+        let no_ops: [VdbeOp; 0] = [];
+        let new_sorter = || SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
+        let insert_both = |runs: &mut SorterCursor, plain: &mut SorterCursor, key: i64| {
+            let (keys, blob) = sorter_runs_record(&[int(key)], 1);
+            runs.insert_program_record(keys.clone(), blob.clone(), &no_ops, 1)
+                .expect("insert");
+            plain.insert_record(keys, blob).expect("insert");
+        };
+
+        // 1,000 keys for 10,000 records, then a new key each: the runs grow
+        // past the threshold and spill while collecting.
+        let row_size = SorterCursor::estimate_row_size(&[int(1)], &serialize_record(&[int(1)]));
+        let (mut runs, mut plain) = (new_sorter(), new_sorter());
+        runs.spill_threshold = row_size * 5_000;
+        plain.spill_threshold = row_size * 5_000;
+        let mut spilled_while_collecting = false;
+        for i in 0..30_000_i64 {
+            let collecting = matches!(runs.runs, SorterRuns::Collecting { .. });
+            insert_both(&mut runs, &mut plain, if i < 10_000 { i % 1_000 } else { i });
+            spilled_while_collecting |= collecting && !runs.spill_runs.is_empty();
+        }
+        assert!(spilled_while_collecting, "the spill must come while collecting");
+        assert_eq!(sorter_runs_state(&runs), "off");
+        runs.sort().expect("sort");
+        plain.sort().expect("sort");
+        assert_eq!(runs.rows_sorted_total, plain.rows_sorted_total);
+        assert_same_records(
+            "spill",
+            &sorter_runs_emitted(&mut runs),
+            &sorter_runs_emitted(&mut plain),
+        );
+
+        // Insert after the sort, three records into a run of 20.
+        let (mut runs, mut plain) = (new_sorter(), new_sorter());
+        for i in 0..20_000_i64 {
+            insert_both(&mut runs, &mut plain, (i * 7) % 1_000);
+        }
+        runs.sort().expect("sort");
+        plain.sort().expect("sort");
+        assert_eq!(sorter_runs_state(&runs), "sorted");
+        assert!(!runs.rows_are_records(), "the bulk load must decline runs");
+        assert!(runs.position_at_first() && plain.position_at_first());
+        for _ in 0..25 {
+            assert!(runs.advance() && plain.advance());
+        }
+        let current = |sorter: &SorterCursor| sorter.rows[sorter.position.unwrap()].blob.to_vec();
+        assert_eq!(current(&runs), current(&plain));
+        for key in [5, 999, -1] {
+            insert_both(&mut runs, &mut plain, key);
+        }
+        assert_eq!(sorter_runs_state(&runs), "off");
+        assert!(runs.rows_are_records());
+        assert_eq!(runs.position, plain.position, "the expanded place");
+        assert_eq!(current(&runs), current(&plain));
+        let rest = |sorter: &mut SorterCursor| {
+            let mut out = Vec::new();
+            while sorter.advance() {
+                out.push(sorter.rows[sorter.position.unwrap()].blob.to_vec());
+            }
+            out
+        };
+        assert_same_records("after insert", &rest(&mut runs), &rest(&mut plain));
+        runs.sort().expect("sort");
+        plain.sort().expect("sort");
+        assert_same_records(
+            "sorted again",
+            &sorter_runs_emitted(&mut runs),
+            &sorter_runs_emitted(&mut plain),
+        );
+
+        // ResetSorter: the next fill collects again.
+        runs.reset();
+        assert_eq!(sorter_runs_state(&runs), "undecided");
+        assert_eq!(runs.copies_left, 0);
+        for i in 0..5_000_i64 {
+            let (keys, blob) = sorter_runs_record(&[int(i % 3)], 1);
+            runs.insert_program_record(keys, blob, &no_ops, 1)
+                .expect("insert");
+        }
+        assert_eq!(sorter_runs_state(&runs), "collecting");
+        assert_eq!(runs.rows.len(), 3);
     }
 
     #[test]
