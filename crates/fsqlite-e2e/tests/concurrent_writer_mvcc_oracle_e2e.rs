@@ -1913,7 +1913,6 @@ fn concurrent_implicit_rowid_append_with_autocheckpoint_and_large_rows_bd_ujp0h_
     });
 }
 
-
 const STRUCTURAL_SPLIT_CASE_DIR: &str = "FSQLITE_STRUCTURAL_SPLIT_CASE_DIR";
 
 struct StructuralSplitPeer(Option<std::process::Child>);
@@ -2108,7 +2107,9 @@ fn cross_process_right_edge_split_conflicts_with_old_leaf_append_bd_73pfl() {
                     .expect("allow small appender commit");
                 peer.wait_for(&dir.path().join("small-result"));
             }
-            split_verdict = Some(structural_split_commit_verdict(conn.execute("COMMIT").await));
+            split_verdict = Some(structural_split_commit_verdict(
+                conn.execute("COMMIT").await,
+            ));
             assert!(
                 !conn.in_transaction(),
                 "either COMMIT verdict ends the transaction"
@@ -2123,8 +2124,7 @@ fn cross_process_right_edge_split_conflicts_with_old_leaf_append_bd_73pfl() {
         let split_verdict = split_verdict.expect("splitter commit ran");
         let small_verdict = std::fs::read_to_string(dir.path().join("small-result"))
             .expect("small appender verdict");
-        std::fs::write(dir.path().join("finish-small"), b"finish")
-            .expect("release small appender");
+        std::fs::write(dir.path().join("finish-small"), b"finish").expect("release small appender");
         peer.finish();
 
         let stock = rusqlite::Connection::open(&path).expect("stock reopen");
