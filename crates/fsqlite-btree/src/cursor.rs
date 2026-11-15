@@ -452,6 +452,11 @@ pub trait PageWriter: PageReader {
     ///
     /// Returns `Ok(false)` when this writer keeps no such set; the caller then
     /// restages the page's current bytes instead, which conflicts the same way.
+    /// A successful claim must be visible to every competing writer, including
+    /// writers in other processes. A process-local commit index alone cannot
+    /// satisfy this contract for a file-backed WAL database: the unchanged
+    /// page must also be published in the WAL, so those writers discover the
+    /// structural change during first-committer-wins validation (bd-73pfl).
     fn claim_write_conflict_page<'a>(
         &'a mut self,
         _cx: &'a Cx,

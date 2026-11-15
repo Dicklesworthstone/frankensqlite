@@ -4460,9 +4460,10 @@ where
             return Vec::new();
         }
 
-        // Images are compared byte for byte: this is the only place a
-        // baseline is consulted, so nothing is hashed on the commits that
-        // never get here.
+        // Main-file images are compared byte for byte: this is the only
+        // place a baseline is consulted, so nothing is hashed on the
+        // commits that never get here. Current-generation WAL frames are
+        // newer writes even when their payload equals the baseline.
         let mut baselines = HashMap::<u32, &[u8]>::new();
         let mut ambiguous_baselines = HashSet::<u32>::new();
         for baseline in page_baselines {
@@ -4532,6 +4533,25 @@ where
 
         let mut conflicts = Vec::new();
         for &page_number in &candidates {
+            // The caller observed a different WAL generation after this
+            // transaction's snapshot. Every committed frame in the refreshed
+            // generation therefore postdates that snapshot. An unchanged
+            // image may be a structural claim: a B-tree split can move the
+            // right edge off a leaf without changing that leaf's bytes
+            // (bd-73pfl). Reject its frame exactly as the same-generation
+            // scan rejects a post-snapshot frame; byte equality cannot erase
+            // the write. Check this before the fresh-allocation exception so
+            // a peer's new page cannot be mistaken for our own allocation.
+            // The appended tail deliberately bypasses the still-pinned read
+            // snapshot (bd-reality-check-1022-llk6g.5.5).
+            match self.inner.read_page_at_appended_tail(cx, page_number).await {
+                Ok(None) => {}
+                Ok(Some(_)) | Err(_) => {
+                    conflicts.push(page_number);
+                    continue;
+                }
+            }
+
             let Some(expected_image) = baselines.get(&page_number).copied() else {
                 if committed_page_count > 0 && page_number > committed_page_count {
                     continue;
@@ -4544,35 +4564,19 @@ where
                 continue;
             }
 
-            // The newest committed image, read from the appended tail: this
-            // runs under the append gate, after the preflight refreshed the
-            // handle. `read_page` would resolve through the transaction's
-            // pinned snapshot, which is still pinned at COMMIT, and so would
-            // return the very image the baseline holds and miss the peer's
-            // newer commit of the page (bd-reality-check-1022-llk6g.5.5).
-            let current_page = match self
-                .inner
-                .read_page_at_appended_tail(cx, page_number)
-                .await
-            {
-                Ok(Some(page)) if page.len() == page_size => page,
-                Ok(Some(_)) | Err(_) => {
+            // A checkpoint-only reset can leave the main-file page identical
+            // to our snapshot. Preserve that valid case instead of treating
+            // every generation change as a conflict.
+            let mut current_page = vec![0_u8; page_size];
+            let page_offset = u64::from(page_number.saturating_sub(1))
+                .saturating_mul(u64::from(self.page_size));
+            match db_file.read(cx, &mut current_page, page_offset).await {
+                Ok(bytes_read) if bytes_read == page_size => {}
+                Ok(_) | Err(_) => {
                     conflicts.push(page_number);
                     continue;
                 }
-                Ok(None) => {
-                    let mut page = vec![0_u8; page_size];
-                    let page_offset = u64::from(page_number.saturating_sub(1))
-                        .saturating_mul(u64::from(self.page_size));
-                    match db_file.read(cx, &mut page, page_offset).await {
-                        Ok(bytes_read) if bytes_read == page_size => page,
-                        Ok(_) | Err(_) => {
-                            conflicts.push(page_number);
-                            continue;
-                        }
-                    }
-                }
-            };
+            }
             if current_page.as_slice() != expected_image {
                 conflicts.push(page_number);
             }
@@ -11852,6 +11856,49 @@ mod tests {
             .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
             .expect("replacement WAL page must take precedence over identical main page");
         assert_eq!(conflicts, vec![2]);
+    }
+
+    #[test]
+    fn test_generation_change_rejects_identical_candidate_from_replacement_wal_bd_73pfl() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        append_replacement_wal_page(&vfs, &cx, 2, &page_two, 2);
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(
+                &cx,
+                snapshot,
+                &[2],
+                &[conflict_baseline(2, &page_two)],
+            )
+            .expect("validate a byte-identical structural claim in the new WAL generation");
+        assert_eq!(
+            conflicts,
+            vec![2],
+            "a post-snapshot WAL frame is a write even when its bytes are unchanged"
+        );
+    }
+
+    #[test]
+    fn test_generation_change_allows_unchanged_main_page_with_unrelated_wal_frame() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        append_replacement_wal_page(&vfs, &cx, 3, &sample_page(0x55), 3);
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(
+                &cx,
+                snapshot,
+                &[2],
+                &[conflict_baseline(2, &page_two)],
+            )
+            .expect("validate unchanged main-file page after an unrelated peer write");
+        assert!(
+            conflicts.is_empty(),
+            "only candidates written in the new WAL conflict; identical main-file pages remain valid"
+        );
     }
 
     #[test]
