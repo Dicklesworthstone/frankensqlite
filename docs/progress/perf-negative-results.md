@@ -87,6 +87,146 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN (prediction missed, beyond its range): a separator repair whose new rowid has the stored one's varint length writes it in place (bd-w4pr1.13.20, lever J)
+
+- Target: every table delete that removes a leaf's last cell, whose ancestor separator the b-tree then lowers to
+  the leaf's new maximum (stock never repairs a table separator). The scorecard's `delete_14pct_300k` removes 310
+  leaf maxima. Touched: `crates/fsqlite-btree/src/cursor.rs` (`replace_table_interior_separator_rowid`, the new
+  `refresh_stack_entries_showing`).
+- Evidence before (callgrind of the DELETE on main 51d16b5d3, toggle on run_statement): each repair re-read the
+  interior page, sized all ~268 of its cells (`cell_on_page_size_fast`, 83,088 calls), sorted them (ipnsort 9.1M),
+  moved them, rewrote every pointer and reloaded the page twice; attribution on bd-w4pr1.13.20 (2026-11-14
+  round 3).
+- Ledger preflight: 2026-05-10 "Direct DELETE parent-separator admission" was a prepared direct-lane lever; no
+  entry on the bytecode row loop's separator repair.
+- Change: when the new rowid's varint is exactly as long as the stored one (a removed maximum and its predecessor
+  almost always are), the varint is written over the old one and the stack entries showing the page are
+  refreshed; any other length keeps the rewrite. Same separator value and cell bytes; no cell or pointer moves.
+- Prediction (on bd-w4pr1.13.20 before code): `delete_14pct_300k` -10M to -15M user instructions. Kill: under 7M.
+- Result, stock sqlite3 3.46.1 live (r3_mut_probe, 3 reps, io_uring refused; binaries 933a1a2f... main 51d16b5d3,
+  920a6f97... main + this diff), host thinkstation1 (governor powersave, load 5.2): `delete_14pct_300k` 422.9M ->
+  397.8M (-25.1M; 3.50x -> 3.30x stock 120.7M), CPU 122.4 -> 113.2 ms (noise at this load); `delete_id14_stmt`
+  -23.5M; `update_10pct_300k` unchanged (578.6M / 578.7M, a later run). Prediction missed beyond its range: ~81k
+  a repair, not ~50k (the attribution left out the interior page's own copy-on-write and full pointer rewrite).
+  Answers equal stock's; stock `integrity_check` ok on every file written.
+- Test: fsqlite-btree `test_separator_repair_writes_a_same_length_varint_in_place` (the leaf holding 128 loses its
+  rows from its maximum down to 128 under a one-level root: each same-length repair changes no root byte but the
+  varint's, 128 -> 127 takes the rewrite, the cursor's stack shows the repaired root, the tree invariants hold,
+  every other row is found).
+- Gate: one gate for levers J, SD, UR and I; see the lever I entry below.
+- Retry / widen: a varint of another length (a removed maximum at a power-of-128 boundary) still rewrites the page;
+  worth doing only if a profile shows those rewrites above 1% of a DML row.
+
+## 2026-11-15 - WIN (prediction missed low, kill line cleared by 0.4M): a plain DELETE of a row on a staged compact leaf runs on the synchronous lane (bd-w4pr1.13.20, lever SD)
+
+- Target: every row a plain DELETE (no OPFLAG_ISUPDATE) removes from a table leaf the transaction already holds
+  staged, compact with descending pointers, the cell neither the leaf's only nor its last, without overflow: ~40k
+  of the 42,857 deletes of `delete_14pct_300k` (the first delete of each leaf, the leaf maxima and overflow rows
+  keep the ordinary path). Touched: `crates/fsqlite-btree/src/cursor.rs` (new
+  `BtCursor::try_delete_table_leaf_cell_in_staged_image`), `crates/fsqlite-vdbe/src/engine.rs` (its
+  `CursorBackend` wrapper, an `Opcode::Delete` arm in `try_execute_hot_opcode_sync`, `execute_plain_delete_hot`).
+- Evidence before (same attribution): 2,513 of the 2,590-a-row marginal cost was the Delete arm and the cursor's
+  delete: the async-arm exit and re-entry 264, the async wrappers and postlude ~220, the pointer-vector copy and
+  StackEntry rebuild ~215, every pointer of the leaf rewritten, the inlined body ~680.
+- Ledger preflight: levers F, P (2026-11-13) and D (2026-11-14) built the staged in-place delete this reuses;
+  lever S (2026-11-14) moved VColumn / VNext / MustBeInt into the synchronous lane; the May 2026 direct-lane
+  delete levers are scoped to prepared direct lanes (INDEX).
+- Change: the new b-tree function makes exactly the page bytes the compact descending branch of
+  `remove_table_cell_from_leaf_deferred` makes (only the pointers from the removed index on are written), updates
+  the stack entry's pointer vector in place, and does the ordinary path's bookkeeping (row-image epoch, seek and
+  rightmost caches, depth gauge, descending-image record); it returns false having changed nothing in every other
+  case. The engine's synchronous arm does the main arm's bookkeeping for a plain DELETE (row-cache invalidation,
+  memdb dirty mark, changes, pending Next) and otherwise leaves the opcode to the main arm. `BtCursor::delete`
+  does not call it (a first-write leaf would be tried twice).
+- Prediction (on bd-w4pr1.13.20 before code, measured on main + J): `delete_14pct_300k` -50M to -65M user
+  instructions, CPU -8% to -14%. Kill: under 30M.
+- Result, stock live (r3_mut_probe, 5 reps, io_uring refused, load 6.6; J 920a6f97..., J + SD + UR + I
+  5ca507b1...; the DELETE runs neither UR nor I): `delete_14pct_300k` 397.7M -> 367.3M (-30.4M; 3.30x -> 3.04x
+  stock 120.7M), CPU 115.7 -> 111.9 ms (stock 46.8; noise). Prediction missed low (~710 a delete, not ~1,500);
+  kill line cleared by 0.4M. Callgrind of the new binary: the marginal deleted row is 1,618 (main 2,590); the
+  synchronous path still pays the pager's staged-mutate dispatch ~245 and try_rewrite's wrapper ~80, the cell move
+  and tail pointers ~370, CellRef::parse 85, the b-tree checks and bookkeeping ~450, and the engine's ~250 (the
+  memdb dirty mark's HashMap insert 80 a row). Answers equal stock's; stock `integrity_check` ok.
+- Tests: fsqlite-btree `test_synchronous_leaf_delete_matches_the_ordinary_delete_and_refuses_the_rest` (a one-pass
+  scan deleting two rows in three on a staged store, against the same deletes on a store without staged images:
+  every page byte-equal, the same rows visited; refusals of a leaf's last cell, an only cell, an overflow cell and a
+  disturbed leaf change nothing); fsqlite-core `one_pass_delete_oracle::staged_leaf_delete_matches_stock` (changes()
+  and total_changes(), a partial and an expression index, ROLLBACK TO a savepoint after in-place deletes, a
+  correlated subquery, RETURNING; `:memory:` and file, direct and prepared) and
+  `staged_leaf_delete_is_invisible_to_an_open_snapshot_as_in_stock` (a second connection's open snapshot, step by
+  step against stock in WAL mode).
+- Gate: see the lever I entry below.
+- Retry / widen: the engine's per-row memdb dirty mark (a HashMap insert of the same root page each row, ~80) and
+  the pager's staged-mutate dispatch (~245, pager-side; its owner first) are the next pieces; the cell move itself
+  is the b-tree's compact-on-delete design (see the comment in `remove_table_cell_from_leaf_deferred`: a freeblock
+  chain left 1-3 byte gaps stock reports as corruption), whose retry is a freeblock delete with its own integrity
+  oracle, not this path.
+
+## 2026-11-15 - WIN: an UPDATE that keeps its rowid on a table without a UNIQUE index keeps no copy of the old row (bd-w4pr1.13.20, lever UR)
+
+- Target: every row an UPDATE rewrites in place (OPFLAG_UPDATE_KEEPS_ROWID) on a table with no UNIQUE index: the
+  scorecard's `update_10pct_300k` (30,000 rows). Touched: `crates/fsqlite-vdbe/src/codegen.rs` (`codegen_update`
+  sets the new Delete P5 bit OPFLAG_UPDATE_NO_RESTORE, 0x200), `crates/fsqlite-vdbe/src/engine.rs` (the Delete arm
+  skips the restore capture under it); GOLDEN-CHANGE `update_with_where_predicate` (Delete p5 144 -> 656) and
+  fsqlite-core `bd_9ag5r_update_in_place_oracle`'s EXPLAIN p5 table (kept-rowid deletes on tables without a UNIQUE
+  index now carry the bit; a UNIQUE-index table is added whose deletes must not).
+- Evidence before (callgrind on main 51d16b5d3, UPDATE ... id % 10 against id % 20): 5,682 per updated row, of it
+  the Delete arm's `CursorBackend::payload` copy into PendingUpdateRestore 300 and its drop ~60; the restore is read
+  only after a conflict, and with the rowid kept only a UNIQUE index can conflict (CHECK and NOT NULL run first).
+- Ledger preflight: lever U (2026-11-14) named this lever; bd-9ag5r and bd-c1vth define the restore.
+- Prediction (on bd-w4pr1.13.20 before code): `update_10pct_300k` -7M to -11M. Kill: under 4M.
+- Result, stock live (same run as lever SD): `update_10pct_300k` 578.7M -> 568.7M (-10.0M; 2.12x -> 2.08x stock
+  273.3M), CPU noise. Prediction met. Answers equal stock's; `integrity_check` ok.
+- Test: fsqlite-core `one_pass_delete_oracle::update_without_restore_matches_stock` (twin tables, a plain index
+  and a UNIQUE one: same-size and growing rewrites, OR IGNORE / OR REPLACE with nothing to conflict on, a UNIQUE
+  conflict under IGNORE, REPLACE and ABORT, an UPDATE of another column of the UNIQUE table).
+- Gate: see the lever I entry below.
+- Retry / widen: `codegen_update_from` still captures; a table with a UNIQUE index still copies every row's payload
+  although only conflicting rows need it (a restore built on conflict would need the old payload kept elsewhere).
+
+## 2026-11-15 - WIN: INSERT ... SELECT uses the INTEGER PRIMARY KEY alias register as its rowid register (bd-w4pr1.13.21, lever I)
+
+- Target: every row of an INSERT ... SELECT into a table with an INTEGER PRIMARY KEY and no explicit hidden-rowid
+  source: the scorecard's `bulk_insert_1M_one_txn`. Touched: `crates/fsqlite-vdbe/src/codegen.rs`
+  (`codegen_insert_select`'s rowid routing).
+- Evidence before: the row ran IsNull / MustBeInt / Copy alias -> rowid / Goto (round 2's callgrind on the landing
+  tree); lever K measured an elided integer Copy at ~130 a row.
+- Ledger preflight: lever U (2026-11-14) did the same for UPDATE; no entry on INSERT ... SELECT's routing.
+- Change: the alias register is the rowid register: IsNull alias -> auto; MustBeInt alias; Goto; auto: NewRowid
+  into the alias. Both Copies go; the CHECK row, unique prechecks, Insert, index inserts and RETURNING read the alias
+  register. `codegen_insert_values` and its goldens are unchanged.
+- Prediction (on bd-w4pr1.13.21 before code): bulk -100M to -150M, memory_script_200k -20M to -30M. Kill: bulk under
+  60M.
+- Result, stock live (r2_bulk_probe, 3 reps interleaved, load 4.4; main 933a1a2f..., main + J + SD + UR + I
+  5ca507b1..., the bulk row runs none of the other three): `bulk_insert_1M_one_txn` 7,227.1M -> 7,091.7M (-135.4M;
+  1.73x -> 1.70x stock 4,177.5M), CPU 969.3 -> 877.2 ms (stock 436.7; the -9.5% is noise at this load); answers
+  equal, `integrity_check` ok. `memory_script_200k` 3,800.2M (J) -> 3,762.1M with SD, UR and I together (1.97x
+  stock 1,914.0M; not split). Prediction met.
+- Test: fsqlite-core `one_pass_delete_oracle::insert_select_alias_rowid_register_matches_stock` (11 statements
+  against rusqlite: alias sources NULL / INTEGER / TEXT '7' / REAL 8.0 / negative / present, plain / OR IGNORE / OR
+  REPLACE, 5.5 as a key, CHECKs on the alias and the rowid, the alias left out, AUTOINCREMENT, RETURNING, 2,981 CTE
+  rows, a partial index over the alias).
+- Gate: one gate for levers J, SD, UR and I (rch, 2026-11-15, on origin/main ae505a097 plus the change; the
+  measured binaries were built on 51d16b5d3 plus the same diff, which applied unchanged): clippy -D warnings with
+  all targets on fsqlite-btree and fsqlite-vdbe, and on the two touched fsqlite-core test targets, clean;
+  fsqlite-btree lib 562 pass; fsqlite-vdbe lib 1,250 pass and 2 fail: bd-bhalc's
+  `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion` (red on main) and
+  `test_shared_txn_page_io_short_owned_write_tracks_in_place_zero_extend_metrics`, the process-global counter flake of
+  bd-p3963 (it passed in the same stage on the 51d16b5d3 base, 1,251 / 1, and no changed code writes pages);
+  goldens 8 pass with `update_with_where_predicate` hand-edited (GOLDEN-CHANGE in the commit); the 80 fsqlite-core
+  keeper and EXPLAIN-reading targets 582 pass and 9 fail, all red on main with the assertions and values of round
+  2's runs (the gh516 trio, bd-d8s37's two `fk_insert_conflict_oracle` upsert tests, bd-mkon7, bd-jlbrk's two
+  `rowid_replace_preflight_*` tests, `bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans`);
+  the 71 fsqlite DML and EXPLAIN-reading targets 226 pass; fsqlite-core --lib 4,186 pass and 2 fail (the t6741 pair,
+  bd-nouem, red on main). Not run: fsqlite-e2e `golden_bytecode_shapes_oracle_e2e` and
+  `bd_2jbl5_update_from_triggers_oracle` (time; the fleet took 25-60 minutes a job), the e2e concurrent-writer batch
+  (no MVCC or commit code changed). Moved onto 0dea37f2d before landing: of the changed files upstream had touched
+  only codegen.rs (SELECT range routing, a WITHOUT ROWID upsert probe), so fsqlite-vdbe lib + goldens and the two
+  touched fsqlite-core targets were re-run on that tree: vdbe lib 1,251 pass and 1 fail (bd-bhalc; the counter test
+  passed), goldens 8 pass, the two targets 19 pass. The commits between 0dea37f2d and the landing base 9d7e6e249
+  touch none of the changed files. Landed as 908c771bc.
+- Retry / widen: `codegen_insert_values` has the same routing (one row per statement; its upsert goldens pin it).
+
 ## 2026-11-15 - WIN: committed SSI history keeps its page indexes entry by entry instead of rebuilding them at every commit, +44% at 64 separate-table writers and +59% at 32 shared-table writers (bd-i0tn6 scaling lever 3)
 
 - Target: the registry-guard holds of concurrent commits at 16-64 writers (`mt-mvcc-bench
