@@ -6,15 +6,16 @@
 //! so beads_rust (`br`), which reads through such an open first, could no
 //! longer use its own tracker.
 //!
-//! Expected, matching stock SQLite:
-//! - a plain read-only open rebuilds an existing, uninitialized index (a
+//! Recovery remains available through the explicit WAL-index recovery API:
+//! - an explicitly recovering read-only open rebuilds an uninitialized index (a
 //!   `-shm` shorter than one region, or a primary header copy that was never
 //!   initialized) under every WAL recovery lock, reads every committed row,
 //!   and leaves the WAL byte-identical;
 //! - while another process holds one of those locks it fails with a retryable
 //!   busy error and changes nothing, then succeeds once the lock is released,
 //!   even with that process still attached;
-//! - it never rewrites an initialized index, and never creates a `-shm`;
+//! - a plain read-only open refuses recovery and leaves the entire file family
+//!   byte-identical (GH#535), including a never-initialized `-shm`;
 //! - stock SQLite reads the result, including a stock connection that stayed
 //!   attached through the rebuild.
 //!
@@ -25,6 +26,7 @@
 // The async engine futures nest deeply; match the other integration suites.
 #![recursion_limit = "512"]
 
+use std::collections::BTreeMap;
 use std::io::{BufRead as _, Write as _};
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
@@ -79,12 +81,56 @@ async fn read_rows(conn: &Connection) -> Result<Vec<(i64, String)>, FrankenError
         .collect())
 }
 
-/// A plain read-only open, the way `br`'s read-only probe reads.
+/// A plain read-only open must observe without repairing any file.
 async fn plain_read_only_rows(db: &Path) -> Result<Vec<(i64, String)>, FrankenError> {
     let conn = Connection::open_schema_only(db.to_str().expect("utf-8 path")).await?;
     let rows = read_rows(&conn).await;
-    drop(conn);
+    conn.close_without_checkpoint().await?;
     rows
+}
+
+async fn recovering_read_only_rows(db: &Path) -> Result<Vec<(i64, String)>, FrankenError> {
+    let conn = Connection::open_schema_only_with_wal_index_recovery(
+        db.to_str().expect("utf-8 path"),
+    )
+    .await?;
+    let rows = read_rows(&conn).await;
+    conn.close_without_checkpoint().await?;
+    rows
+}
+
+/// Include sidecar creation and removal as well as changes to existing bytes.
+fn file_family_bytes(db: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let name = db.file_name().expect("file name").to_str().expect("utf-8");
+    let prefix = format!("{name}-");
+    std::fs::read_dir(db.parent().expect("parent"))
+        .expect("read database directory")
+        .map(|entry| entry.expect("directory entry").path())
+        .filter(|path| {
+            let filename = path.file_name().expect("file name").to_str().expect("utf-8");
+            filename == name || filename.starts_with(&prefix)
+        })
+        .map(|path| {
+            let bytes = std::fs::read(&path).expect("read file-family member");
+            (path, bytes)
+        })
+        .collect()
+}
+
+async fn assert_plain_read_only_refuses_recovery(db: &Path, context: &str) {
+    let before = file_family_bytes(db);
+    let error = plain_read_only_rows(db)
+        .await
+        .expect_err("a plain read-only open cannot rebuild an index");
+    assert!(
+        matches!(error, FrankenError::BusyRecovery),
+        "{context}: expected a recovery refusal, got {error:?}"
+    );
+    assert_eq!(
+        file_family_bytes(db),
+        before,
+        "{context}: read-only refusal must leave the whole file family unchanged"
+    );
 }
 
 async fn write_rows(db: &Path, settle: bool) {
@@ -198,11 +244,11 @@ fn stock_rows(db: &Path) -> Vec<(i64, String)> {
 
 /// The whole recovery: rows, an untouched WAL, an accepted index that a
 /// second plain read-only open leaves byte-identical, and stock agreement.
-async fn assert_read_only_recovers(db: &Path, wal: &[u8], context: &str) {
+async fn assert_explicit_read_only_recovers(db: &Path, wal: &[u8], context: &str) {
     let started = Instant::now();
-    let rows = plain_read_only_rows(db)
+    let rows = recovering_read_only_rows(db)
         .await
-        .unwrap_or_else(|error| panic!("{context}: plain read-only open failed: {error:?}"));
+        .unwrap_or_else(|error| panic!("{context}: explicit read-only recovery failed: {error:?}"));
     assert_eq!(rows, expected_rows(), "{context}");
     assert!(
         started.elapsed() < Duration::from_secs(10),
@@ -215,21 +261,21 @@ async fn assert_read_only_recovers(db: &Path, wal: &[u8], context: &str) {
         "{context}: the WAL is untouched"
     );
     assert_rebuilt_index(db, wal, context);
-    let rebuilt = read_shm(db);
+    let rebuilt = file_family_bytes(db);
     assert_eq!(
         plain_read_only_rows(db).await.expect("second read"),
         expected_rows()
     );
     assert_eq!(
-        read_shm(db),
+        file_family_bytes(db),
         rebuilt,
-        "{context}: a valid index is never rewritten"
+        "{context}: a successful plain read-only open changes no file-family bytes"
     );
     assert_eq!(stock_rows(db), expected_rows(), "{context}: stock agrees");
 }
 
 #[test]
-fn plain_read_only_open_rebuilds_a_truncated_shm_beside_wal_frames() {
+fn plain_read_only_refuses_a_truncated_shm_and_explicit_recovery_preserves_wal() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         for len in [3, 0, 100, SEGMENT - 1] {
@@ -243,13 +289,15 @@ fn plain_read_only_open_rebuilds_a_truncated_shm_beside_wal_frames() {
                     "stock's marker"
                 );
             }
-            assert_read_only_recovers(&db, &wal, &format!("{len}-byte -shm")).await;
+            let context = format!("{len}-byte -shm");
+            assert_plain_read_only_refuses_recovery(&db, &context).await;
+            assert_explicit_read_only_recovers(&db, &wal, &context).await;
         }
     });
 }
 
 #[test]
-fn plain_read_only_open_rebuilds_a_truncated_shm_beside_a_frameless_wal() {
+fn explicit_read_only_recovery_handles_a_truncated_shm_beside_a_frameless_wal() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         for shape in ["header-only", "empty"] {
@@ -275,9 +323,18 @@ fn plain_read_only_open_rebuilds_a_truncated_shm_beside_a_frameless_wal() {
             };
             std::fs::write(sidecar(&db, "-wal"), &wal).expect("shape the WAL");
             truncate_shm(&db, 3);
-            let rows = plain_read_only_rows(&db)
+            if shape == "header-only" {
+                assert_plain_read_only_refuses_recovery(&db, shape).await;
+            } else {
+                // A header-less WAL has no committed frames to recover.
+                // It can already be read without touching its short index.
+                let before = file_family_bytes(&db);
+                assert_eq!(plain_read_only_rows(&db).await.expect("empty WAL"), expected_rows());
+                assert_eq!(file_family_bytes(&db), before, "empty WAL is byte-neutral");
+            }
+            let rows = recovering_read_only_rows(&db)
                 .await
-                .unwrap_or_else(|error| panic!("{shape}: plain read-only open failed: {error:?}"));
+                .unwrap_or_else(|error| panic!("{shape}: explicit read-only recovery failed: {error:?}"));
             assert_eq!(rows, expected_rows(), "{shape}");
             assert_eq!(
                 std::fs::read(sidecar(&db, "-wal")).expect("WAL"),
@@ -342,12 +399,12 @@ fn reopen_with_a_live_cached_mapping_survives_shm_truncation() {
             wal,
             "recovering the index must not alter committed WAL bytes"
         );
-        assert_read_only_recovers(&db, &wal, "cached mapping after truncation").await;
+        assert_explicit_read_only_recovers(&db, &wal, "cached mapping after truncation").await;
     });
 }
 
 #[test]
-fn plain_read_only_open_rebuilds_an_interrupted_reconstruction() {
+fn plain_read_only_refuses_an_interrupted_reconstruction_until_explicit_recovery() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         for shape in [
@@ -385,7 +442,8 @@ fn plain_read_only_open_rebuilds_an_interrupted_reconstruction() {
                 parse_shm_header(&read_shm(&db)).expect("parse").is_none(),
                 "{shape}"
             );
-            assert_read_only_recovers(&db, &wal, shape).await;
+            assert_plain_read_only_refuses_recovery(&db, shape).await;
+            assert_explicit_read_only_recovers(&db, &wal, shape).await;
         }
     });
 }
@@ -414,7 +472,10 @@ fn plain_read_only_open_never_rewrites_an_initialized_index_or_creates_shm() {
                 .await
                 .expect("the explicit recovery mode still rebuilds it");
         assert_eq!(read_rows(&recovering).await.expect("rows"), expected_rows());
-        drop(recovering);
+        recovering
+            .close_without_checkpoint()
+            .await
+            .expect("close explicit recovery connection");
         assert_rebuilt_index(&db, &wal, "explicit recovery");
 
         // Missing: read-only opens create no sidecar, and never read wrong rows.
@@ -432,7 +493,7 @@ fn plain_read_only_open_never_rewrites_an_initialized_index_or_creates_shm() {
 }
 
 #[test]
-fn read_only_rebuild_waits_for_a_stock_reader_and_serves_it_afterwards() {
+fn explicit_read_only_rebuild_waits_for_a_stock_reader_and_serves_it_afterwards() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("live-stock-peer.db");
@@ -452,7 +513,7 @@ fn read_only_rebuild_waits_for_a_stock_reader_and_serves_it_afterwards() {
 
         // Exclusive recovery authority is unavailable: fail retryably and
         // change nothing.
-        let error = plain_read_only_rows(&db)
+        let error = recovering_read_only_rows(&db)
             .await
             .expect_err("a pinned reader blocks the rebuild");
         assert!(
@@ -471,7 +532,7 @@ fn read_only_rebuild_waits_for_a_stock_reader_and_serves_it_afterwards() {
         stock.signal("release");
         stock.witness("released");
         assert_eq!(
-            plain_read_only_rows(&db).await.expect("read after release"),
+            recovering_read_only_rows(&db).await.expect("read after release"),
             expected_rows()
         );
         assert_rebuilt_index(&db, &wal, "rebuilt beside a live stock peer");
@@ -487,7 +548,7 @@ fn read_only_rebuild_waits_for_a_stock_reader_and_serves_it_afterwards() {
 }
 
 #[test]
-fn read_only_open_recovers_after_a_killed_stock_first_attacher() {
+fn read_only_refuses_a_killed_stock_first_attacher_until_explicit_recovery() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("killed-stock.db");
@@ -513,12 +574,13 @@ fn read_only_open_recovers_after_a_killed_stock_first_attacher() {
             "stock's marker"
         );
 
-        assert_read_only_recovers(&db, &wal, "killed stock first attacher").await;
+        assert_plain_read_only_refuses_recovery(&db, "killed stock first attacher").await;
+        assert_explicit_read_only_recovers(&db, &wal, "killed stock first attacher").await;
     });
 }
 
 #[test]
-fn concurrent_read_only_attachers_all_read_the_rebuilt_index() {
+fn concurrent_explicit_recovery_attachers_all_read_the_rebuilt_index() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -578,13 +640,13 @@ fn concurrent_read_only_attachers_all_read_the_rebuilt_index() {
 async fn read_with_busy_retry(db: &Path) -> Vec<(i64, String)> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match plain_read_only_rows(db).await {
+        match recovering_read_only_rows(db).await {
             Ok(rows) => return rows,
             Err(error) if error.is_transient() && Instant::now() < deadline => {
                 asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2))
                     .await;
             }
-            Err(error) => panic!("plain read-only open failed: {error:?}"),
+            Err(error) => panic!("explicit read-only recovery failed: {error:?}"),
         }
     }
 }

@@ -6694,7 +6694,7 @@ struct PagerMaintenanceState {
     /// remains armed; once every pre-existing transaction/opener drains, one
     /// surviving pager may adopt this receipt and run canonical recovery.
     orphaned_rollback_recovery: Option<OrphanedRollbackRecovery>,
-    /// GH#528: a read-only pager holds a [`WalIndexRebuildDrain`] and waits
+    /// GH#528: an explicitly recovering read-only pager holds a [`WalIndexRebuildDrain`] and waits
     /// to become the sole owner; new same-process admissions answer `Busy`.
     wal_index_rebuild_draining: bool,
 }
@@ -6715,8 +6715,8 @@ impl PagerMaintenanceState {
     }
 }
 
-/// Bound on how long a read-only pager drains same-process admissions before
-/// it rebuilds an uninitialized WAL index (GH#528). Counted openers fail fast
+/// Bound on how long an explicitly recovering read-only pager drains
+/// same-process admissions before it rebuilds a WAL index (GH#528). Counted openers fail fast
 /// once the drain is armed, so they leave within one admission attempt.
 const WAL_INDEX_REBUILD_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
@@ -6929,8 +6929,8 @@ impl PagerMaintenanceGate {
         })
     }
 
-    /// GH#528: arm the drain for one read-only rebuild of an uninitialized
-    /// WAL index. A drain or exclusive maintenance already in progress may
+    /// GH#528: arm the drain for one explicitly authorized read-only rebuild
+    /// of a WAL index. A drain or exclusive maintenance already in progress may
     /// publish that index itself, so a second claimant answers at once.
     fn begin_wal_index_rebuild_drain(self: &Arc<Self>) -> Result<WalIndexRebuildDrain> {
         let mut state = self
@@ -19150,48 +19150,6 @@ where
         Ok(outcome)
     }
 
-    /// Whether this pager's `-shm` exists; read-only opens never create it.
-    fn wal_index_shm_exists(&self, cx: &Cx) -> Result<bool> {
-        let mut shm_path = self.db_path.as_os_str().to_owned();
-        shm_path.push("-shm");
-        self.vfs.access(cx, Path::new(&shm_path), AccessFlags::EXISTS)
-    }
-
-    /// GH#528: classify the shared index for a pager that may rebuild only an
-    /// uninitialized one. The answer is authoritative only while the caller
-    /// holds every recovery fence, so no peer can publish, truncate, or read
-    /// through the index meanwhile. `false` means a peer published a valid
-    /// header first. An initialized header that fails validation stays
-    /// fail-closed.
-    async fn wal_index_is_uninitialized(
-        &self,
-        cx: &Cx,
-        inner: &PagerInner<V::File>,
-    ) -> Result<bool> {
-        use fsqlite_wal::wal_index::{
-            read_shared_wal_index_header, shared_wal_index_header_is_uninitialized,
-        };
-        let source = WalIndexShmSource {
-            db_file: Arc::clone(&inner.db_file),
-            cleanup_queue: Arc::downgrade(&self.group_commit_queue),
-            can_publish_reader_marks: false,
-        };
-        let region = match source.map_region(cx, 0, false).await {
-            Ok(region) => region,
-            // Shorter than one region, like stock's 3-byte first-attacher
-            // marker: nothing was ever published there.
-            Err(FrankenError::CannotOpen { .. }) => return Ok(true),
-            Err(error) => return Err(error),
-        };
-        if read_shared_wal_index_header(&region)?.is_some() {
-            return Ok(false);
-        }
-        if shared_wal_index_header_is_uninitialized(&region)? {
-            return Ok(true);
-        }
-        Err(FrankenError::BusyRecovery)
-    }
-
     /// Retire the whole reader attempt before a separately classified recovery.
     /// `observed` (bd-ih8ak) is offered to the first binding attempt only; one
     /// after a recovery states the `-wal` path itself.
@@ -19230,37 +19188,20 @@ where
             if read_only && reason == traits::WalNativeRecoveryReason::StaleReaderMarks {
                 return Err(FrankenError::ReadOnly);
             }
-            // GH#528: a stock first attacher truncates `-shm` to 3 bytes and
-            // rebuilds it later, so one that dies in between leaves an index
-            // nobody initialized, which a pager that may not rebuild it can
-            // never read. A plain read-only pager therefore rebuilds an
-            // existing index found uninitialized under every recovery fence,
-            // as stock does from any connection that can write `-shm`. It
-            // never creates a missing `-shm` or rewrites an initialized index.
-            let uninitialized_only = read_only
-                && matches!(
-                    reason,
-                    traits::WalNativeRecoveryReason::SharedIndexUnavailable
-                        | traits::WalNativeRecoveryReason::SharedHeaderInvalid
-                );
-            if recovered_once || (read_only && !uninitialized_only) {
+            // GH#535: a truncated or uninitialized index is still a write
+            // to the database's file family. A plain read-only connection
+            // must refuse it before acquiring recovery authority; only the
+            // explicit WAL-index recovery mode may rebuild that sidecar.
+            if recovered_once || read_only {
                 return Err(FrankenError::BusyRecovery);
-            }
-            if uninitialized_only {
-                if !self.wal_index_shm_exists(cx)? {
-                    return Err(FrankenError::BusyRecovery);
-                }
-                // Unlocked, this only turns an initialized index that fails
-                // validation away before peers are drained; the fenced check
-                // below settles the classification.
-                self.wal_index_is_uninitialized(cx, inner).await?;
             }
             external_lock.restore().await?;
             // Recovery needs sole same-process ownership, which openers that
-            // each wait for it while counted never reach. A read-only rebuild
-            // drains instead: new admissions answer `Busy`, counted peers fail
-            // their own attempts, and the drain ends after the downgrade.
-            let rebuild_drain = if uninitialized_only {
+            // each wait for it while counted never reach. An explicitly
+            // authorized read-only rebuild drains instead: new admissions
+            // answer `Busy`, counted peers fail their own attempts, and the
+            // drain ends after the downgrade.
+            let rebuild_drain = if inner.access_mode == PagerAccessMode::ReadOnlyWithWalIndexRecovery {
                 let drain = maintenance_lease.gate.begin_wal_index_rebuild_drain()?;
                 maintenance_lease.wait_until_sole_owner(cx).await?;
                 Some(drain)
@@ -19269,18 +19210,10 @@ where
             };
             let recovery_guard = self.recovery_fence.acquire_for_recovery()?;
             let prior_kind = maintenance_lease.upgrade_to_exclusive(inner.rollback_journal_recovery_owner)?;
-            let acquisition = external_lock.acquire_wal_recovery(cx).await;
-            let rebuild = match acquisition {
-                Ok(()) if uninitialized_only => self.wal_index_is_uninitialized(cx, inner).await,
-                Ok(()) => Ok(true),
-                Err(error) => Err(error),
-            };
-            let recovery_result = match rebuild {
-                Ok(true) => with_wal_backend(&self.wal_backend, cx, |wal, cx| {
+            let recovery_result = match external_lock.acquire_wal_recovery(cx).await {
+                Ok(()) => with_wal_backend(&self.wal_backend, cx, |wal, cx| {
                     Box::pin(async move { wal.recover_native_read_state(cx, reason).await })
                 }).await,
-                // A peer published a valid index first; rebind to it.
-                Ok(false) => Ok(()),
                 Err(error) => Err(error),
             };
             if let Err(restore_error) = external_lock.restore().await {
