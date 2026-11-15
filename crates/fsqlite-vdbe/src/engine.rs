@@ -17295,12 +17295,14 @@ impl VdbeEngine {
             Opcode::Column => {
                 // A row whose payload is on the cursor's leaf page is read
                 // here, from the page when the value needs no heap and
-                // through the copying lane otherwise; anything else is left
-                // for `execute_column_hot`.
+                // through the copying lane otherwise, and so is the current
+                // row of a sorter; anything else is left for
+                // `execute_column_hot`.
                 #[allow(clippy::cast_sign_loss)]
                 let col_idx = op.p2 as usize;
                 if self.try_column_to_reg_in_place(op.p1, col_idx, op.p3)?
                     || self.try_column_to_reg_direct_local(op.p1, col_idx, op.p3)?
+                    || self.try_sorter_column_to_reg(op.p1, col_idx, op.p3)?
                 {
                     *pc += 1;
                     Ok(true)
@@ -20399,72 +20401,38 @@ impl VdbeEngine {
 
         // Sorter cursor: read column directly from the sorted row.
         if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-            if let Some(pos) = sorter.position {
-                if let Some(value) = sorter
-                    .rows
-                    .get(pos)
-                    .and_then(|row| row.values.get(col_idx))
-                    .cloned()
-                {
-                    note_decode_cache_hit(collect_vdbe_metrics);
-                    if collect_vdbe_metrics {
-                        record_decoded_value_metrics(&value);
-                    }
-                    return Ok(value);
-                }
-                let refresh_state = ensure_sorter_row_cache(sorter, collect_vdbe_metrics, pos)?;
-                let rows = &sorter.rows;
-                let cached_row_decode = &mut sorter.cached_row_decode;
-                let row = rows.get(pos).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!("missing sorter row at position {pos}"),
-                })?;
-                let value = if col_idx < cached_row_decode.column_count() {
-                    let cached_value_ready = cached_row_decode.cached_value_ready(col_idx);
-                    if cached_value_ready {
-                        if refresh_state.refreshed && refresh_state.eager_values_ready {
-                            note_decode_cache_miss(collect_vdbe_metrics);
-                        } else {
-                            note_decode_cache_hit(collect_vdbe_metrics);
-                        }
-                        cached_row_decode
-                            .cached_value(col_idx)
-                            .cloned()
-                            .unwrap_or(SqliteValue::Null)
-                    } else if let Some(value) =
-                        fsqlite_types::record::decode_column_from_offset_with_encoding(
-                            &row.blob,
-                            cached_row_decode
-                                .column_offset(col_idx)
-                                .expect("col_idx checked against column_count"),
-                            // bd-0s9bv: a sorter row blob is the raw source-table
-                            // record (ORDER BY pushes it through unchanged), so TEXT
-                            // must be decoded in the DB's storage encoding. Utf8-only
-                            // decode returned raw UTF-16 bytes for a UTF-16 database.
-                            text_encoding,
-                            collect_vdbe_metrics,
-                        )
-                    {
-                        note_decode_cache_miss(collect_vdbe_metrics);
-                        cached_row_decode.cache_decoded(col_idx, value.clone());
-                        value
-                    } else {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "malformed sorter record while reading column {col_idx}"
-                            ),
-                        });
-                    }
-                } else {
-                    SqliteValue::Null
-                };
-                if collect_vdbe_metrics {
-                    record_decoded_value_metrics(&value);
-                }
-                return Ok(value);
-            }
+            return sorter_current_row_column(sorter, col_idx, text_encoding, collect_vdbe_metrics);
         }
 
         Ok(SqliteValue::Null)
+    }
+
+    /// `Column` on a sorter cursor, on the synchronous lane (bd-w4pr1.13.8,
+    /// lever G2): reads and stores what the async lane's `execute_column_hot`
+    /// would, through the same [`sorter_current_row_column`], so the output
+    /// loop of a sorted GROUP BY no longer leaves the lane once per row.
+    ///
+    /// Returns `Ok(false)`, having changed nothing, for a cursor id that is a
+    /// storage or memory cursor (which [`Self::cursor_column`] reads before
+    /// any sorter) or that is not a sorter.
+    fn try_sorter_column_to_reg(
+        &mut self,
+        cursor_id: i32,
+        col_idx: usize,
+        target: i32,
+    ) -> Result<bool> {
+        if self.storage_cursors.get(&cursor_id).is_some() || self.cursors.get(&cursor_id).is_some()
+        {
+            return Ok(false);
+        }
+        let (text_encoding, collect_vdbe_metrics) = (self.text_encoding, self.collect_vdbe_metrics);
+        let Some(sorter) = self.sorters.get_mut(&cursor_id) else {
+            return Ok(false);
+        };
+        let value =
+            sorter_current_row_column(sorter, col_idx, text_encoding, collect_vdbe_metrics)?;
+        self.set_reg_fast(target, value);
+        Ok(true)
     }
 
     /// Get the rowid from the cursor's current row.
@@ -23374,6 +23342,79 @@ fn finish_storage_cursor_row_layout(
         refreshed,
         eager_values_ready,
     }))
+}
+
+/// Column `col_idx` of the sorter's current row, as `Column` reads it: a
+/// column of the decoded sort-key prefix from the row, any other through the
+/// sorter's row-decode cache, NULL past the record's end or with no current
+/// row. Shared by [`VdbeEngine::cursor_column`] and the synchronous lane's
+/// `Column` (bd-w4pr1.13.8, lever G2).
+fn sorter_current_row_column(
+    sorter: &mut SorterCursor,
+    col_idx: usize,
+    text_encoding: TextEncoding,
+    collect_vdbe_metrics: bool,
+) -> Result<SqliteValue> {
+    let Some(pos) = sorter.position else {
+        return Ok(SqliteValue::Null);
+    };
+    if let Some(value) = sorter
+        .rows
+        .get(pos)
+        .and_then(|row| row.values.get(col_idx))
+        .cloned()
+    {
+        note_decode_cache_hit(collect_vdbe_metrics);
+        if collect_vdbe_metrics {
+            record_decoded_value_metrics(&value);
+        }
+        return Ok(value);
+    }
+    let refresh_state = ensure_sorter_row_cache(sorter, collect_vdbe_metrics, pos)?;
+    let rows = &sorter.rows;
+    let cached_row_decode = &mut sorter.cached_row_decode;
+    let row = rows.get(pos).ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!("missing sorter row at position {pos}"),
+    })?;
+    let value = if col_idx < cached_row_decode.column_count() {
+        let cached_value_ready = cached_row_decode.cached_value_ready(col_idx);
+        if cached_value_ready {
+            if refresh_state.refreshed && refresh_state.eager_values_ready {
+                note_decode_cache_miss(collect_vdbe_metrics);
+            } else {
+                note_decode_cache_hit(collect_vdbe_metrics);
+            }
+            cached_row_decode
+                .cached_value(col_idx)
+                .cloned()
+                .unwrap_or(SqliteValue::Null)
+        } else if let Some(value) = fsqlite_types::record::decode_column_from_offset_with_encoding(
+            &row.blob,
+            cached_row_decode
+                .column_offset(col_idx)
+                .expect("col_idx checked against column_count"),
+            // bd-0s9bv: a sorter row blob is the raw source-table record (ORDER
+            // BY pushes it through unchanged), so TEXT must be decoded in the
+            // DB's storage encoding. Utf8-only decode returned raw UTF-16 bytes
+            // for a UTF-16 database.
+            text_encoding,
+            collect_vdbe_metrics,
+        ) {
+            note_decode_cache_miss(collect_vdbe_metrics);
+            cached_row_decode.cache_decoded(col_idx, value.clone());
+            value
+        } else {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("malformed sorter record while reading column {col_idx}"),
+            });
+        }
+    } else {
+        SqliteValue::Null
+    };
+    if collect_vdbe_metrics {
+        record_decoded_value_metrics(&value);
+    }
+    Ok(value)
 }
 
 fn ensure_sorter_row_cache(

@@ -467,3 +467,131 @@ fn scans_and_column_reads_match_sqlite_on_both_sides_of_every_sync_lane_boundary
         );
     });
 }
+
+/// bd-w4pr1.13.8 lever G2: `Column` on a sorter cursor runs on the
+/// synchronous lane. On a file database under strict mode each GROUP BY below
+/// runs its sorter program (strict mode refuses the grouped evaluator there,
+/// which a HAVING still takes, bd-w4pr1.13.32: that refusal is the control
+/// that the rows come from the program). The queries read sorter key and
+/// non-key columns over NULL, INTEGER, REAL, TEXT and BLOB keys and several
+/// key columns, on rows that change from one sorter row to the next (a lane
+/// that kept a previous row's decoded column, or read a non-key column from
+/// the key prefix, fails here).
+const SORTER_COLUMN_QUERIES: [&str; 8] = [
+    "SELECT k, count(*), sum(n), min(r), max(r) FROM g GROUP BY k ORDER BY k",
+    "SELECT k, n, count(*) FROM g GROUP BY k, n ORDER BY k, n",
+    "SELECT b, count(*), sum(n) FROM g GROUP BY b ORDER BY b",
+    "SELECT r, count(*) FROM g GROUP BY r ORDER BY r",
+    "SELECT k, count(*) FROM g WHERE n > 40 GROUP BY k ORDER BY k",
+    "SELECT k, n, count(*), sum(r), max(b), min(id) FROM g GROUP BY k, n ORDER BY k, n",
+    "SELECT b, k, min(n), max(r), count(r) FROM g GROUP BY b, k ORDER BY b, k",
+    "SELECT n, min(k), max(k), total(r) FROM g GROUP BY n ORDER BY n",
+];
+
+/// GROUP BY shapes that strict mode refuses on the same file (an expression
+/// key with DISTINCT aggregates, `typeof(k)`, a descending ORDER BY over the
+/// key with `max(s)`, a grouped derived table): they do not run the sorter
+/// program, so they are compared with strict mode off, as plain answers.
+/// (`GROUP BY s` over the NOCASE column is left out: on main it prints the
+/// first row's spelling of a group where stock prints the last row's, a
+/// divergence of the grouped evaluator reported on bd-w4pr1.13.8.)
+const SORTER_REFUSED_IN_STRICT_QUERIES: [&str; 5] = [
+    "SELECT n % 7, count(DISTINCT k), sum(DISTINCT n), avg(r) FROM g GROUP BY n % 7 ORDER BY 1",
+    "SELECT typeof(k), count(*), min(k), max(k) FROM g GROUP BY typeof(k) ORDER BY 1",
+    "SELECT n, count(*), sum(length(s)), max(s) FROM g GROUP BY n ORDER BY n DESC",
+    "SELECT count(*), sum(c) FROM (SELECT n, count(*) c FROM g GROUP BY n)",
+    "SELECT count(*), sum(c) FROM (SELECT k, s, count(*) c FROM g GROUP BY k, s)",
+];
+
+fn sorter_column_setup() -> String {
+    let mut rows = Vec::new();
+    for i in 0..1500_i64 {
+        let k = match i % 9 {
+            0 => "NULL".to_owned(),
+            1 => format!("{}", i % 13),
+            2 => format!("{}.5", i % 11),
+            3 => format!("'{}'", i % 13),
+            4 => format!("x'{:02x}'", i % 7),
+            5 => format!("{}", -(i % 5)),
+            6 => "9223372036854775807".to_owned(),
+            _ => format!("'k-{}'", i % 17),
+        };
+        let s = match i % 4 {
+            0 => format!("'Name-{}'", i % 23),
+            1 => format!("'name-{}'", i % 23),
+            2 => "NULL".to_owned(),
+            _ => format!("'NAME-{}'", i % 19),
+        };
+        let r = if i % 6 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("{}.25", i % 31)
+        };
+        let b = if i % 5 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("x'{:04x}'", i % 29)
+        };
+        rows.push(format!("({i}, {k}, {}, {r}, {s}, {b})", i % 61));
+    }
+    format!(
+        "CREATE TABLE g(id INTEGER PRIMARY KEY, k, n INTEGER, r REAL, s TEXT COLLATE NOCASE, b BLOB);
+         INSERT INTO g VALUES {};",
+        rows.join(", ")
+    )
+}
+
+#[test]
+fn sorter_column_reads_match_sqlite_on_a_strict_file_database() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sorter.db");
+        let frank = Connection::open(path.to_str().expect("utf-8 path"))
+            .await
+            .expect("open");
+        let stock = rusqlite::Connection::open_in_memory().expect("stock open");
+        let setup = sorter_column_setup();
+        frank.execute_batch(&setup).await.expect("frank setup");
+        stock.execute_batch(&setup).expect("stock setup");
+        frank
+            .execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .await
+            .expect("strict");
+        assert!(
+            frank
+                .query("SELECT k, count(*) FROM g GROUP BY k HAVING count(*) > 1")
+                .await
+                .is_err(),
+            "strict mode must refuse the grouped evaluator, which a HAVING still takes \
+             (bd-w4pr1.13.32); otherwise the rows below need not come from the program"
+        );
+        let mut failures = Vec::new();
+        compare(
+            "[strict file] sorter",
+            &frank,
+            &stock,
+            &SORTER_COLUMN_QUERIES,
+            &mut failures,
+        )
+        .await;
+        frank
+            .execute("PRAGMA fsqlite.parity_cert_strict = OFF;")
+            .await
+            .expect("strict off");
+        compare(
+            "[file] grouped",
+            &frank,
+            &stock,
+            &SORTER_REFUSED_IN_STRICT_QUERIES,
+            &mut failures,
+        )
+        .await;
+        frank.close().await.expect("close");
+        assert!(
+            failures.is_empty(),
+            "{} queries differ from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
