@@ -58437,6 +58437,61 @@ impl Connection {
         Ok(Some(inserted_row_count))
     }
 
+    /// bd-qxdk4: the live rows an `INSERT OR REPLACE` into a
+    /// `contentless_delete=1` FTS5 table replaces. Those deletes must take the
+    /// durable delete path (a tombstone on a lazily reopened table, otherwise
+    /// the shadow rewrite): deleting them only in memory, then appending the
+    /// new rows' segment, left the old postings on disk, so a reopen still
+    /// matched the replaced text. A table with its own `%_content` rewrites
+    /// its shadows on REPLACE already, and the other FTS5 tables do not
+    /// replace (`Fts5Table::honors_conflict_replace`).
+    #[cfg(feature = "ext-fts5")]
+    async fn fts5_rowids_replaced_durably(
+        &self,
+        table_name: &str,
+        rows: &[LiveVtabInsertRow],
+    ) -> Result<Vec<i64>> {
+        let key = table_name.to_ascii_uppercase();
+        let (lazy, column_count) = {
+            let instances = self.vtab_instances.borrow();
+            let Some(fts5) = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            else {
+                return Ok(Vec::new());
+            };
+            if !fts5.config().contentless_delete_enabled() {
+                return Ok(Vec::new());
+            }
+            (fts5.is_lazy_on_disk(), fts5.columns().len())
+        };
+        let mut replaced = Vec::new();
+        for row in rows {
+            let Some(SqliteValue::Integer(rowid)) = row.explicit_rowid else {
+                continue;
+            };
+            if replaced.contains(&rowid) {
+                continue;
+            }
+            let live = if lazy {
+                self.with_lazy_fts5_reader(table_name, async |reader| {
+                    Ok(reader.read_docsize(rowid, column_count).await?.is_some())
+                })
+                .await?
+            } else {
+                self.vtab_instances
+                    .borrow()
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(|fts5| fts5.has_document_or_shadow_rowid(rowid))
+            };
+            if live {
+                replaced.push(rowid);
+            }
+        }
+        Ok(replaced)
+    }
+
     async fn execute_live_vtab_insert_rows(
         &self,
         table_name: &str,
@@ -58445,9 +58500,17 @@ impl Connection {
     ) -> Result<Vec<i64>> {
         let cx = self.op_cx()?;
         #[cfg(feature = "ext-fts5")]
+        if replace {
+            let replaced = self.fts5_rowids_replaced_durably(table_name, rows).await?;
+            if !replaced.is_empty() {
+                self.execute_live_vtab_delete_rowids(table_name, &replaced)
+                    .await?;
+            }
+        }
+        #[cfg(feature = "ext-fts5")]
         let key = table_name.to_ascii_uppercase();
         #[cfg(feature = "ext-fts5")]
-        let lazy_contentless = {
+        let lazy_contentless_new_rows = {
             let (is_lazy, column_count) = {
                 let instances = self.vtab_instances.borrow();
                 let fts5 = instances
@@ -58463,6 +58526,9 @@ impl Connection {
             if is_lazy && !contentless {
                 self.promote_lazy_fts5_table(table_name).await?;
             }
+            // bd-qxdk4: the rows this statement adds, as opposed to rows it
+            // lays over a live rowid; the lazy row count grows by these only.
+            let mut new_row_count = 0_usize;
             if contentless {
                 let mut rowids = HashSet::with_capacity(rows.len());
                 for row in rows {
@@ -58475,28 +58541,26 @@ impl Connection {
                             ))
                         })?
                         .to_integer();
-                    // Under INSERT OR REPLACE a duplicate rowid is not a conflict:
-                    // the per-row delete-then-insert below resolves it (last row
-                    // wins), so the primary-key pre-checks are skipped. Non-replace
-                    // inserts keep the strict PrimaryKeyViolation behavior. (GH #214)
-                    if !rowids.insert(rowid) && !replace {
-                        return Err(FrankenError::PrimaryKeyViolation {
-                            columns: String::new(),
-                        });
+                    // bd-qxdk4: a table without its own `%_content` (external
+                    // content, or contentless) has no rowid to conflict on in
+                    // stock, so neither a repeat within this statement nor a
+                    // rowid already in `_docsize` is an error: the new row's
+                    // segment lies over the old one (newest-wins per term).
+                    // Only a rowid seen for the first time adds a row.
+                    if !rowids.insert(rowid) {
+                        continue;
                     }
                     let exists = self
                         .with_lazy_fts5_reader(table_name, async |reader| {
                             Ok(reader.read_docsize(rowid, column_count).await?.is_some())
                         })
                         .await?;
-                    if exists && !replace {
-                        return Err(FrankenError::PrimaryKeyViolation {
-                            columns: String::new(),
-                        });
+                    if !exists {
+                        new_row_count += 1;
                     }
                 }
             }
-            contentless
+            contentless.then_some(new_row_count)
         };
         let (inserted_rowids, patch_first_column_with_rowid) = self
             .with_active_live_vtab_instance(&cx, table_name, "xBegin/xUpdate", |instance| {
@@ -58519,8 +58583,12 @@ impl Connection {
                     // argc==1 non-null delete convention is the standard live-vtab
                     // xUpdate delete; deleting an absent rowid is a harmless no-op.
                     // Skipped for an auto-assigned (NULL) rowid — nothing to
-                    // conflict with. (GH #214)
-                    if replace && matches!(new_rowid, SqliteValue::Integer(_)) {
+                    // conflict with. (GH #214) Skipped too for an FTS5 table
+                    // stock does not apply OR REPLACE to (bd-qxdk4).
+                    if replace
+                        && matches!(new_rowid, SqliteValue::Integer(_))
+                        && live_vtab_honors_conflict_replace(instance)
+                    {
                         instance.update(&cx, std::slice::from_ref(&new_rowid))?;
                     }
                     args.push(new_rowid);
@@ -58547,7 +58615,7 @@ impl Connection {
             .persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids, replace)
             .await?
         {
-            if lazy_contentless {
+            if let Some(new_row_count) = lazy_contentless_new_rows {
                 let mut instances = self.vtab_instances.borrow_mut();
                 let fts5 = instances
                     .get_mut(&key)
@@ -58557,7 +58625,7 @@ impl Connection {
                             "virtual table changed type during lazy insert: {table_name}"
                         ))
                     })?;
-                fts5.note_lazy_inserted_rows(&inserted_rowids);
+                fts5.note_lazy_inserted_rows(&inserted_rowids, new_row_count);
             }
             return Ok(inserted_rowids);
         }
@@ -164037,6 +164105,20 @@ fn is_rtree_instance(_instance: &dyn ErasedVtabInstance) -> bool {
     false
 }
 
+/// Whether `INSERT OR REPLACE` deletes a live vtab row that conflicts on the
+/// rowid before inserting. Stock's FTS5 does so only for a table with its own
+/// content or one declared `contentless_delete=1`; an external-content or
+/// legacy contentless table takes the row as a plain insert (bd-qxdk4). Every
+/// other module keeps SQLite's REPLACE (GH #214).
+#[cfg_attr(not(feature = "ext-fts5"), allow(unused_variables))]
+fn live_vtab_honors_conflict_replace(instance: &dyn ErasedVtabInstance) -> bool {
+    #[cfg(feature = "ext-fts5")]
+    if let Some(fts5) = instance.as_any().downcast_ref::<Fts5Table>() {
+        return fts5.honors_conflict_replace();
+    }
+    true
+}
+
 #[cfg(feature = "ext-fts5")]
 #[derive(Debug, Clone)]
 struct Fts5AuxTableContext {
@@ -237282,11 +237364,27 @@ SELECT x FROM t;
                 ))
             );
 
-            let duplicate = conn
-                .execute("INSERT INTO messages_fts(rowid, body) VALUES (4, 'duplicate');")
+            // bd-qxdk4: a contentless table has no %_content PRIMARY KEY, so
+            // stock accepts a live rowid and lays the new row over the old one.
+            // On SQLite 3.54.1 this sequence gives MATCH 'rust' 1, 3, 4, MATCH
+            // 'duplicate' 4, count(*) 5 and integrity_check ok. This test used
+            // to expect a PrimaryKeyViolation here, which is not stock's answer.
+            conn.execute("INSERT INTO messages_fts(rowid, body) VALUES (4, 'duplicate');")
                 .await
-                .expect_err("lazy append must reject an existing persisted rowid");
-            assert!(matches!(duplicate, FrankenError::PrimaryKeyViolation { .. }));
+                .expect("a contentless table accepts a live rowid, as stock does");
+            {
+                let instances = conn.vtab_instances.borrow();
+                let fts5 = instances
+                    .get("MESSAGES_FTS")
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .expect("contentless table should remain FTS5");
+                assert!(fts5.is_lazy_on_disk());
+                assert_eq!(
+                    fts5.row_count(),
+                    5,
+                    "a second write of rowid 4 adds no row"
+                );
+            }
             drop(conn);
 
             let sqlite = rusqlite::Connection::open(&db_path).unwrap();
@@ -237309,6 +237407,17 @@ SELECT x FROM t;
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap();
             assert_eq!(matched, vec![1, 3, 4]);
+            let overlaid: Vec<i64> = sqlite
+                .prepare(
+                    "SELECT rowid FROM messages_fts
+                 WHERE messages_fts MATCH 'duplicate' ORDER BY rowid",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(overlaid, vec![4]);
         });
     }
 

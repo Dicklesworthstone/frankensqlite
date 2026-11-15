@@ -6718,6 +6718,45 @@ impl InvertedIndex {
         }
     }
 
+    /// Lay `fresh` (one document's postings, built in a scratch index) on top
+    /// of what `docid` already holds. This is how stock SQLite reads a rowid
+    /// inserted twice into a contentless or external-content table (bd-qxdk4):
+    /// the second insert's segment is newer, and reads are newest-wins per
+    /// (term, rowid). So each term of the new row takes the new row's
+    /// postings, a term only the old row had keeps its postings, and the
+    /// document's length becomes the new row's (stock replaces its
+    /// `_docsize` row). The on-disk reader
+    /// (`collect_live_term_groups_from_shadow_rows`) applies the same rule.
+    #[allow(clippy::mutable_key_type)]
+    fn overlay_document_postings(&mut self, docid: i64, fresh: DocumentPostings) {
+        self.doc_ids.insert(docid);
+        if let Some(doc_lengths) = self.doc_lengths.as_mut() {
+            doc_lengths.insert(docid, fresh.doc_length.unwrap_or(0));
+        }
+        let doc_refs = self.doc_terms.entry(docid).or_default();
+        for (term, postings) in fresh.terms {
+            let list = self.index.entry(term.clone()).or_default();
+            list.retain(|posting| posting.docid != docid);
+            list.extend(postings);
+            doc_refs.terms.insert(term);
+        }
+        for (prefix_length, prefix, postings) in fresh.prefix_terms {
+            let list = self
+                .prefix_indexes
+                .entry(prefix_length)
+                .or_default()
+                .entry(prefix.clone())
+                .or_default();
+            list.retain(|posting| posting.docid != docid);
+            list.extend(postings);
+            doc_refs
+                .prefix_terms
+                .entry(prefix_length)
+                .or_default()
+                .insert(prefix);
+        }
+    }
+
     /// Look up postings for a term.
     #[must_use]
     pub fn get_postings(&self, term: &str) -> &[Posting] {
@@ -6923,6 +6962,23 @@ impl InvertedIndex {
 
         pending.row_count = self.doc_ids.len();
         Ok(pending)
+    }
+}
+
+/// Tokenize one document's indexed columns into `index`.
+fn index_document_columns(
+    index: &mut InvertedIndex,
+    indexed_columns: &[bool],
+    rowid: i64,
+    column_values: &[String],
+    tokenizer: &dyn Fts5Tokenizer,
+) {
+    #[allow(clippy::cast_possible_truncation)]
+    for (col_idx, text) in column_values.iter().enumerate() {
+        if matches!(indexed_columns.get(col_idx), Some(false)) {
+            continue;
+        }
+        index.add_text(rowid, col_idx as u32, tokenizer, text);
     }
 }
 
@@ -9602,13 +9658,13 @@ impl Fts5Table {
         column_values: &[String],
         tokenizer: &dyn Fts5Tokenizer,
     ) {
-        #[allow(clippy::cast_possible_truncation)]
-        for (col_idx, text) in column_values.iter().enumerate() {
-            if matches!(self.indexed_columns.get(col_idx), Some(false)) {
-                continue;
-            }
-            self.index.add_text(rowid, col_idx as u32, tokenizer, text);
-        }
+        index_document_columns(
+            &mut self.index,
+            &self.indexed_columns,
+            rowid,
+            column_values,
+            tokenizer,
+        );
     }
 
     fn store_document_with_tokenizer_and_locales(
@@ -9623,6 +9679,51 @@ impl Fts5Table {
         if self.documents.contains_key(&rowid) {
             self.index.remove_document(rowid);
         }
+        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
+        self.finish_document_write(rowid, &column_values, locales);
+        debug!(rowid, "fts5: indexed document");
+    }
+
+    /// bd-qxdk4: a second INSERT of the live `rowid` into a contentless or
+    /// external-content table, which stock accepts (only a table with its own
+    /// `%_content` has a PRIMARY KEY to refuse it). The new row is laid over
+    /// the old one, as [`InvertedIndex::overlay_document_postings`] describes.
+    fn overlay_document_with_tokenizer_and_locales(
+        &mut self,
+        rowid: i64,
+        column_values: Vec<String>,
+        locales: Vec<(usize, SmallText)>,
+        tokenizer: &dyn Fts5Tokenizer,
+    ) {
+        self.materialize_shadow_rows_for_mutation();
+        self.record_row_mutation_for_undo(rowid);
+        let mut fresh = InvertedIndex::with_options_and_tokendata(
+            self.index.tracks_column_sizes(),
+            &self.prefix_lengths,
+            self.index.detail_mode(),
+            self.index.tokendata_enabled(),
+        );
+        index_document_columns(
+            &mut fresh,
+            &self.indexed_columns,
+            rowid,
+            &column_values,
+            tokenizer,
+        );
+        self.index
+            .overlay_document_postings(rowid, fresh.document_postings(rowid));
+        self.finish_document_write(rowid, &column_values, locales);
+        debug!(rowid, "fts5: laid a document over a live rowid");
+    }
+
+    /// The row-level bookkeeping every document write ends with: the row's
+    /// locales, the rowid allocator, and the stored column values.
+    fn finish_document_write(
+        &mut self,
+        rowid: i64,
+        column_values: &[String],
+        locales: Vec<(usize, SmallText)>,
+    ) {
         self.row_locales.retain(|(existing_rowid, _column), _| {
             !matches!(existing_rowid.cmp(&rowid), std::cmp::Ordering::Equal)
         });
@@ -9631,12 +9732,27 @@ impl Fts5Table {
                 .into_iter()
                 .map(|(column, tag)| ((rowid, column), tag)),
         );
-        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
         self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
-        let stored_values = self.content_values_for_storage(&column_values);
+        let stored_values = self.content_values_for_storage(column_values);
         self.documents.insert(rowid, stored_values);
         self.shadow_rows = None;
-        debug!(rowid, "fts5: indexed document");
+    }
+
+    /// Whether this table keeps its own `%_content` rows. Their INTEGER
+    /// PRIMARY KEY is the only rowid check stock FTS5 makes: a contentless or
+    /// external-content table accepts any rowid, live or not (bd-qxdk4).
+    fn owns_content_rows(&self) -> bool {
+        self.config.content_mode == ContentMode::Stored && !self.external_content
+    }
+
+    /// Whether stock honours a statement's `OR REPLACE` against this table.
+    /// `fts5UpdateMethod` reads the conflict mode only for a table with its
+    /// own content or one declared `contentless_delete=1`; for an
+    /// external-content or legacy contentless table it stays ABORT, so
+    /// `INSERT OR REPLACE` is a plain insert there (bd-qxdk4).
+    #[must_use]
+    pub fn honors_conflict_replace(&self) -> bool {
+        self.owns_content_rows() || self.config.contentless_delete
     }
 
     fn content_values_for_storage(&self, column_values: &[String]) -> Vec<String> {
@@ -9837,7 +9953,10 @@ impl Fts5Table {
         Ok(())
     }
 
-    fn has_document_or_shadow_rowid(&self, rowid: i64) -> bool {
+    /// Whether `rowid` is a live row of this table, in memory or in its bound
+    /// shadow rows (a lazily reopened table answers from neither).
+    #[must_use]
+    pub fn has_document_or_shadow_rowid(&self, rowid: i64) -> bool {
         self.documents.contains_key(&rowid)
             || self.shadow_rows.as_ref().is_some_and(|rows| {
                 rows.content.iter().any(|row| row.rowid == rowid)
@@ -10093,11 +10212,13 @@ impl Fts5Table {
     /// only materialize the current INSERT delta in memory.  Once the host has
     /// persisted that delta, the cached count and rowid allocator must advance
     /// without clearing lazy mode or hydrating the historical corpus.
-    pub fn note_lazy_inserted_rows(&mut self, rowids: &[i64]) {
+    /// `new_row_count` is how many of `rowids` were not live before: a rowid
+    /// written again lies over its row instead of adding one (bd-qxdk4).
+    pub fn note_lazy_inserted_rows(&mut self, rowids: &[i64], new_row_count: usize) {
         if !self.lazy_on_disk {
             return;
         }
-        self.lazy_doc_count = self.lazy_doc_count.saturating_add(rowids.len());
+        self.lazy_doc_count = self.lazy_doc_count.saturating_add(new_row_count);
         if let Some(max_rowid) = rowids.iter().copied().max() {
             self.next_rowid = self.next_rowid.max(max_rowid.saturating_add(1));
         }
@@ -11313,7 +11434,11 @@ impl VirtualTable for Fts5Table {
                 self.next_rowid += 1;
                 r
             };
-            if self.has_document_or_shadow_rowid(rowid) {
+            // bd-qxdk4: only a table with its own `%_content` refuses a live
+            // rowid; a contentless or external-content table takes the new
+            // row on top of the old one, as stock does.
+            let rowid_is_live = self.has_document_or_shadow_rowid(rowid);
+            if rowid_is_live && self.owns_content_rows() {
                 return Err(FrankenError::PrimaryKeyViolation {
                     columns: String::new(),
                 });
@@ -11329,12 +11454,21 @@ impl VirtualTable for Fts5Table {
                 locales,
             } = self.decode_column_values(column_args)?;
             let tokenizer = self.create_tokenizer_instance();
-            self.store_document_with_tokenizer_and_locales(
-                rowid,
-                col_values,
-                locales,
-                tokenizer.as_ref(),
-            );
+            if rowid_is_live {
+                self.overlay_document_with_tokenizer_and_locales(
+                    rowid,
+                    col_values,
+                    locales,
+                    tokenizer.as_ref(),
+                );
+            } else {
+                self.store_document_with_tokenizer_and_locales(
+                    rowid,
+                    col_values,
+                    locales,
+                    tokenizer.as_ref(),
+                );
+            }
             return Ok(Some(rowid));
         }
 
@@ -16300,7 +16434,7 @@ mod tests {
                 "the current batch must materialize postings before persistence"
             );
 
-            table.note_lazy_inserted_rows(&rowids);
+            table.note_lazy_inserted_rows(&rowids, rowids.len());
 
             assert!(table.is_lazy_on_disk());
             assert_eq!(
