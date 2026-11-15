@@ -604,6 +604,13 @@ fn returning_first_row_subqueries_read_the_first_rows_state() {
              (SELECT count(*) FROM (SELECT * FROM u) WHERE n >= 100)",
             &[],
         ),
+        // The same through a CTE defined inside the subquery.
+        (
+            "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
+             (WITH c AS (SELECT n FROM u) SELECT count(*) FROM c WHERE n >= 100), \
+             (WITH c(m) AS (SELECT n FROM u) SELECT count(*) FROM c WHERE m >= 100)",
+            &[],
+        ),
         (
             "UPDATE u SET n = n + 100 WHERE id IN (2, 3, 4) RETURNING id, \
              (SELECT count(*) FROM k WHERE k.g IN (SELECT g FROM u WHERE n >= 100)), \

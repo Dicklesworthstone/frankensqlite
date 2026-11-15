@@ -91606,7 +91606,7 @@ impl Connection {
             &[],
             Some(&HashSet::new()),
             &HashSet::new(),
-            &HashSet::new(),
+            &CteScopes::new(),
         );
         if scalar_aliases_only {
             if self.expr_contains_aggregate_with_registry(&resolved) {
@@ -128137,7 +128137,7 @@ fn is_correlated_subquery_with_schema(subquery: &SelectStatement, schema: &[Tabl
         &lookup,
         &[],
         Some(&HashSet::new()),
-        &HashSet::new(),
+        &CteScopes::new(),
     );
     probed != *subquery
 }
@@ -128248,7 +128248,7 @@ fn expr_has_external_column_ref_with_schema_in_core_and_locals(
     if expr_has_external_column_ref(expr, &protected_tables) {
         return true;
     }
-    let opaque_cte_names = HashSet::new();
+    let cte_scopes = CteScopes::new();
     let lookup = OuterReferenceLookup {
         row: &[],
         col_map: &[],
@@ -128265,7 +128265,7 @@ fn expr_has_external_column_ref_with_schema_in_core_and_locals(
     let protected_unqualified_columns = protected_unqualified_columns_for_core(
         core,
         &lookup,
-        &opaque_cte_names,
+        &cte_scopes,
         Some(&HashSet::new()),
     );
     substitute_outer_refs_in_expr(
@@ -128274,7 +128274,7 @@ fn expr_has_external_column_ref_with_schema_in_core_and_locals(
         &protected_tables,
         protected_unqualified_columns.as_ref(),
         local_output_names,
-        &opaque_cte_names,
+        &cte_scopes,
     ) != *expr
 }
 
@@ -129593,9 +129593,11 @@ struct OuterReferenceLookup<'a> {
 /// This is deliberately fail-closed. Base tables present in the connection
 /// schema have a complete column inventory, so an unqualified name absent from
 /// all of them may continue resolving through outer scopes. A derived table's
-/// inventory comes from its own projection (`collect_derived_table_columns`).
-/// Sources whose output cannot be established (CTEs, views, table functions,
-/// attached/unknown relations) return `None`.
+/// inventory comes from its own projection (`collect_derived_table_columns`),
+/// and a CTE's from its column list or its query (`cte_scopes_with`). Sources
+/// whose output cannot be established (views, table functions,
+/// attached/unknown relations, CTEs whose output is not derivable) return
+/// `None`.
 /// Runtime substitution then leaves every unqualified reference untouched
 /// rather than accidentally capturing a local column as an outer value. The
 /// correlation-analysis probe still marks such a surviving reference as
@@ -129603,7 +129605,7 @@ struct OuterReferenceLookup<'a> {
 fn protected_unqualified_columns_for_core(
     core: &SelectCore,
     lookup: &OuterReferenceLookup<'_>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
     ancestor_columns: Option<&HashSet<String>>,
 ) -> Option<HashSet<String>> {
     let mut columns = ancestor_columns?.clone();
@@ -129613,9 +129615,9 @@ fn protected_unqualified_columns_for_core(
     else {
         return Some(columns);
     };
-    collect_known_source_columns(&from.source, lookup, opaque_cte_names, &mut columns)?;
+    collect_known_source_columns(&from.source, lookup, cte_scopes, &mut columns)?;
     for join in &from.joins {
-        collect_known_source_columns(&join.table, lookup, opaque_cte_names, &mut columns)?;
+        collect_known_source_columns(&join.table, lookup, cte_scopes, &mut columns)?;
     }
     Some(columns)
 }
@@ -129623,15 +129625,20 @@ fn protected_unqualified_columns_for_core(
 fn collect_known_source_columns(
     source: &TableOrSubquery,
     lookup: &OuterReferenceLookup<'_>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
     out: &mut HashSet<String>,
 ) -> Option<()> {
     match source {
         TableOrSubquery::Table { name, .. } => {
-            if opaque_cte_names.contains(&name.name.to_ascii_lowercase()) {
-                return None;
-            }
             let name_key = name.name.to_ascii_lowercase();
+            if let Some(cte_columns) = cte_scopes.get(&name_key) {
+                // A visible CTE shadows a table of the same name. A
+                // schema-qualified name never names a CTE, but which object it
+                // names here is not proven, so it stays opaque.
+                let columns = cte_columns.as_ref().filter(|_| name.schema.is_none())?;
+                out.extend(columns.iter().cloned());
+                return Some(());
+            }
             let table = match name.schema.as_deref() {
                 None => lookup
                     .schema
@@ -129683,17 +129690,74 @@ fn collect_known_source_columns(
             Some(())
         }
         TableOrSubquery::ParenJoin(from) => {
-            collect_known_source_columns(&from.source, lookup, opaque_cte_names, out)?;
+            collect_known_source_columns(&from.source, lookup, cte_scopes, out)?;
             for join in &from.joins {
-                collect_known_source_columns(&join.table, lookup, opaque_cte_names, out)?;
+                collect_known_source_columns(&join.table, lookup, cte_scopes, out)?;
             }
             Some(())
         }
         TableOrSubquery::Subquery { query, .. } => {
-            collect_derived_table_columns(query, lookup, opaque_cte_names, out)
+            collect_derived_table_columns(query, lookup, cte_scopes, out)
         }
         TableOrSubquery::TableFunction { .. } => None,
     }
+}
+
+/// bd-j9tg3: the CTEs visible at a point of the outer-reference walk, keyed
+/// by lowercased name. A CTE whose output names are derivable carries them,
+/// with the rowid aliases protected as for a derived table; `None` keeps it
+/// opaque.
+type CteScopes = HashMap<String, Option<HashSet<String>>>;
+
+/// bd-j9tg3: `outer` extended with a WITH clause's CTEs.
+///
+/// Every CTE of one WITH sees every other: stock resolves a reference to a
+/// later CTE of the same clause (`WITH a AS (SELECT * FROM b), b AS ...`), and
+/// any self-reference is recursive. So all the names enter as opaque first.
+/// A CTE is then derived from its column list, or else from its query as for
+/// a derived table. Passes repeat while one derives, so a CTE that reads a
+/// later one through `*` is derived once that one is; a name only ever goes
+/// from opaque to derived, so at most one pass per CTE is needed. A CTE that
+/// reads itself or an opaque source through `*` stays opaque.
+fn cte_scopes_with(
+    with: &fsqlite_ast::WithClause,
+    lookup: &OuterReferenceLookup<'_>,
+    outer: &CteScopes,
+) -> CteScopes {
+    let mut scopes = outer.clone();
+    for cte in &with.ctes {
+        scopes.insert(cte.name.to_ascii_lowercase(), None);
+    }
+    for _ in 0..with.ctes.len() {
+        let mut derived_any = false;
+        for cte in &with.ctes {
+            let key = cte.name.to_ascii_lowercase();
+            if scopes.get(&key).is_some_and(Option::is_some) {
+                continue;
+            }
+            let columns = if cte.columns.is_empty() {
+                let mut columns = HashSet::new();
+                collect_derived_table_columns(&cte.query, lookup, &scopes, &mut columns)
+                    .map(|()| columns)
+            } else {
+                let mut columns: HashSet<String> = cte
+                    .columns
+                    .iter()
+                    .map(|column| column.to_ascii_lowercase())
+                    .collect();
+                columns.extend(["rowid", "_rowid_", "oid"].map(str::to_owned));
+                Some(columns)
+            };
+            if columns.is_some() {
+                scopes.insert(key, columns);
+                derived_any = true;
+            }
+        }
+        if !derived_any {
+            break;
+        }
+    }
+    scopes
 }
 
 /// bd-j9tg3: the unqualified names a FROM-clause subquery exposes to the
@@ -129717,16 +129781,15 @@ fn collect_known_source_columns(
 fn collect_derived_table_columns(
     query: &SelectStatement,
     lookup: &OuterReferenceLookup<'_>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
     out: &mut HashSet<String>,
 ) -> Option<()> {
-    let mut query_cte_names;
+    let query_scopes;
     let cte_names = if let Some(with) = &query.with {
-        query_cte_names = opaque_cte_names.clone();
-        query_cte_names.extend(with.ctes.iter().map(|cte| cte.name.to_ascii_lowercase()));
-        &query_cte_names
+        query_scopes = cte_scopes_with(with, lookup, cte_scopes);
+        &query_scopes
     } else {
-        opaque_cte_names
+        cte_scopes
     };
     match &query.body.select {
         SelectCore::Values(rows) => {
@@ -129890,7 +129953,7 @@ fn substitute_outer_refs_in_expr(
     protected_tables: &[String],
     protected_unqualified_columns: Option<&HashSet<String>>,
     local_output_names: &HashSet<String>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
 ) -> Expr {
     let mut resolved = expr.clone();
     substitute_outer_refs_in_expr_mut(
@@ -129899,7 +129962,7 @@ fn substitute_outer_refs_in_expr(
         protected_tables,
         protected_unqualified_columns,
         local_output_names,
-        opaque_cte_names,
+        cte_scopes,
     );
     resolved
 }
@@ -129910,7 +129973,7 @@ fn substitute_outer_refs_in_expr_mut(
     protected_tables: &[String],
     protected_unqualified_columns: Option<&HashSet<String>>,
     local_output_names: &HashSet<String>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
 ) {
     match expr {
         Expr::Column(column, span) => {
@@ -129943,7 +130006,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
             substitute_outer_refs_in_expr_mut(
                 right,
@@ -129951,7 +130014,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
         Expr::UnaryOp { expr, .. }
@@ -129964,7 +130027,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
         Expr::Between {
@@ -129976,7 +130039,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
             substitute_outer_refs_in_expr_mut(
                 low,
@@ -129984,7 +130047,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
             substitute_outer_refs_in_expr_mut(
                 high,
@@ -129992,7 +130055,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
         Expr::In { expr, set, .. } => {
@@ -130005,7 +130068,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
             match set {
                 InSet::List(items) => {
@@ -130016,7 +130079,7 @@ fn substitute_outer_refs_in_expr_mut(
                             protected_tables,
                             protected_unqualified_columns,
                             local_output_names,
-                            opaque_cte_names,
+                            cte_scopes,
                         );
                     }
                 }
@@ -130026,7 +130089,7 @@ fn substitute_outer_refs_in_expr_mut(
                         lookup,
                         protected_tables,
                         protected_unqualified_columns,
-                        opaque_cte_names,
+                        cte_scopes,
                     );
                 }
                 InSet::Table(_) => {}
@@ -130044,7 +130107,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
             substitute_outer_refs_in_expr_mut(
                 pattern,
@@ -130052,7 +130115,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
             if let Some(escape) = escape {
                 substitute_outer_refs_in_expr_mut(
@@ -130061,7 +130124,7 @@ fn substitute_outer_refs_in_expr_mut(
                     protected_tables,
                     protected_unqualified_columns,
                     local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
         }
@@ -130078,7 +130141,7 @@ fn substitute_outer_refs_in_expr_mut(
                     protected_tables,
                     protected_unqualified_columns,
                     local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
             for (when_expr, then_expr) in whens {
@@ -130088,7 +130151,7 @@ fn substitute_outer_refs_in_expr_mut(
                     protected_tables,
                     protected_unqualified_columns,
                     local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
                 substitute_outer_refs_in_expr_mut(
                     then_expr,
@@ -130096,7 +130159,7 @@ fn substitute_outer_refs_in_expr_mut(
                     protected_tables,
                     protected_unqualified_columns,
                     local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
             if let Some(else_expr) = else_expr {
@@ -130106,7 +130169,7 @@ fn substitute_outer_refs_in_expr_mut(
                     protected_tables,
                     protected_unqualified_columns,
                     local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
         }
@@ -130116,7 +130179,7 @@ fn substitute_outer_refs_in_expr_mut(
                 lookup,
                 protected_tables,
                 protected_unqualified_columns,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
         Expr::FunctionCall {
@@ -130134,7 +130197,7 @@ fn substitute_outer_refs_in_expr_mut(
                         protected_tables,
                         protected_unqualified_columns,
                         local_output_names,
-                        opaque_cte_names,
+                        cte_scopes,
                     );
                 }
             }
@@ -130145,7 +130208,7 @@ fn substitute_outer_refs_in_expr_mut(
                     protected_tables,
                     protected_unqualified_columns,
                     local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
             if let Some(filter) = filter {
@@ -130155,7 +130218,7 @@ fn substitute_outer_refs_in_expr_mut(
                     protected_tables,
                     protected_unqualified_columns,
                     local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
             if let Some(window) = over {
@@ -130164,7 +130227,7 @@ fn substitute_outer_refs_in_expr_mut(
                     lookup,
                     protected_tables,
                     protected_unqualified_columns,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
         }
@@ -130175,7 +130238,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
             substitute_outer_refs_in_expr_mut(
                 path,
@@ -130183,7 +130246,7 @@ fn substitute_outer_refs_in_expr_mut(
                 protected_tables,
                 protected_unqualified_columns,
                 local_output_names,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
         Expr::RowValue(values, _) => {
@@ -130194,7 +130257,7 @@ fn substitute_outer_refs_in_expr_mut(
                     protected_tables,
                     protected_unqualified_columns,
                     local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
         }
@@ -130259,7 +130322,7 @@ fn substitute_outer_refs_in_select_with_schema_context(
         &lookup,
         &[],
         Some(&HashSet::new()),
-        &HashSet::new(),
+        &CteScopes::new(),
     );
 }
 
@@ -130268,12 +130331,14 @@ fn substitute_outer_refs_in_select_scoped(
     lookup: &OuterReferenceLookup<'_>,
     ancestor_tables: &[String],
     ancestor_unqualified_columns: Option<&HashSet<String>>,
-    outer_cte_names: &HashSet<String>,
+    outer_cte_scopes: &CteScopes,
 ) {
-    let mut visible_cte_names = outer_cte_names.clone();
-    if let Some(with) = &select.with {
-        visible_cte_names.extend(with.ctes.iter().map(|cte| cte.name.to_ascii_lowercase()));
-    }
+    // Derived before the walk below substitutes into the CTE queries, so an
+    // outer column a CTE projects bare keeps its name.
+    let visible_ctes = match &select.with {
+        Some(with) => cte_scopes_with(with, lookup, outer_cte_scopes),
+        None => outer_cte_scopes.clone(),
+    };
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
             substitute_outer_refs_in_select_scoped(
@@ -130281,7 +130346,7 @@ fn substitute_outer_refs_in_select_scoped(
                 lookup,
                 ancestor_tables,
                 ancestor_unqualified_columns,
-                &visible_cte_names,
+                &visible_ctes,
             );
         }
     }
@@ -130290,7 +130355,7 @@ fn substitute_outer_refs_in_select_scoped(
         lookup,
         ancestor_tables,
         ancestor_unqualified_columns,
-        &visible_cte_names,
+        &visible_ctes,
     );
     for (_, core) in &mut select.body.compounds {
         substitute_outer_refs_in_select_core(
@@ -130298,7 +130363,7 @@ fn substitute_outer_refs_in_select_scoped(
             lookup,
             ancestor_tables,
             ancestor_unqualified_columns,
-            &visible_cte_names,
+            &visible_ctes,
         );
     }
     // bd-2fong: statement-level ORDER BY and LIMIT resolve in the primary
@@ -130315,7 +130380,7 @@ fn substitute_outer_refs_in_select_scoped(
                 protected_unqualified_columns_for_core(
                     core,
                     lookup,
-                    &visible_cte_names,
+                    &visible_ctes,
                     ancestor_unqualified_columns,
                 ),
                 collect_select_core_result_aliases(core),
@@ -130328,7 +130393,7 @@ fn substitute_outer_refs_in_select_scoped(
                 &protected_tables,
                 protected_unqualified_columns.as_ref(),
                 &local_output_names,
-                &visible_cte_names,
+                &visible_ctes,
             );
         }
         if let Some(limit) = &mut select.limit {
@@ -130338,7 +130403,7 @@ fn substitute_outer_refs_in_select_scoped(
                 &protected_tables,
                 protected_unqualified_columns.as_ref(),
                 &local_output_names,
-                &visible_cte_names,
+                &visible_ctes,
             );
             if let Some(offset) = &mut limit.offset {
                 *offset = substitute_outer_refs_in_expr(
@@ -130347,7 +130412,7 @@ fn substitute_outer_refs_in_select_scoped(
                     &protected_tables,
                     protected_unqualified_columns.as_ref(),
                     &local_output_names,
-                    &visible_cte_names,
+                    &visible_ctes,
                 );
             }
         }
@@ -130359,13 +130424,13 @@ fn substitute_outer_refs_in_select_core(
     lookup: &OuterReferenceLookup<'_>,
     ancestor_tables: &[String],
     ancestor_unqualified_columns: Option<&HashSet<String>>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
 ) {
     let protected_tables = protected_tables_for_core(core, ancestor_tables);
     let protected_unqualified_columns = protected_unqualified_columns_for_core(
         core,
         lookup,
-        opaque_cte_names,
+        cte_scopes,
         ancestor_unqualified_columns,
     );
     let local_output_names = collect_select_core_result_aliases(core);
@@ -130379,7 +130444,7 @@ fn substitute_outer_refs_in_select_core(
                     &protected_tables,
                     protected_unqualified_columns.as_ref(),
                     &no_local_outputs,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
         }
@@ -130400,7 +130465,7 @@ fn substitute_outer_refs_in_select_core(
                         &protected_tables,
                         protected_unqualified_columns.as_ref(),
                         &no_local_outputs,
-                        opaque_cte_names,
+                        cte_scopes,
                     );
                 }
             }
@@ -130413,7 +130478,7 @@ fn substitute_outer_refs_in_select_core(
                     &protected_tables,
                     protected_unqualified_columns.as_ref(),
                     &local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
             if let Some(where_clause) = where_clause {
@@ -130423,7 +130488,7 @@ fn substitute_outer_refs_in_select_core(
                     &protected_tables,
                     protected_unqualified_columns.as_ref(),
                     &local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
             if let Some(from) = from {
@@ -130432,7 +130497,7 @@ fn substitute_outer_refs_in_select_core(
                     lookup,
                     &protected_tables,
                     protected_unqualified_columns.as_ref(),
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
             if let Some(having) = having {
@@ -130442,7 +130507,7 @@ fn substitute_outer_refs_in_select_core(
                     &protected_tables,
                     protected_unqualified_columns.as_ref(),
                     &local_output_names,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
             for window in windows {
@@ -130451,7 +130516,7 @@ fn substitute_outer_refs_in_select_core(
                     lookup,
                     &protected_tables,
                     protected_unqualified_columns.as_ref(),
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
         }
@@ -130463,7 +130528,7 @@ fn substitute_outer_refs_in_window_spec(
     lookup: &OuterReferenceLookup<'_>,
     protected_tables: &[String],
     protected_unqualified_columns: Option<&HashSet<String>>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
 ) {
     let no_local_outputs = HashSet::new();
     for expr in &mut window.partition_by {
@@ -130473,7 +130538,7 @@ fn substitute_outer_refs_in_window_spec(
             protected_tables,
             protected_unqualified_columns,
             &no_local_outputs,
-            opaque_cte_names,
+            cte_scopes,
         );
     }
     for term in &mut window.order_by {
@@ -130483,7 +130548,7 @@ fn substitute_outer_refs_in_window_spec(
             protected_tables,
             protected_unqualified_columns,
             &no_local_outputs,
-            opaque_cte_names,
+            cte_scopes,
         );
     }
     if let Some(frame) = &mut window.frame {
@@ -130492,7 +130557,7 @@ fn substitute_outer_refs_in_window_spec(
             lookup,
             protected_tables,
             protected_unqualified_columns,
-            opaque_cte_names,
+            cte_scopes,
         );
     }
 }
@@ -130502,14 +130567,14 @@ fn substitute_outer_refs_in_frame_spec(
     lookup: &OuterReferenceLookup<'_>,
     protected_tables: &[String],
     protected_unqualified_columns: Option<&HashSet<String>>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
 ) {
     substitute_outer_refs_in_frame_bound(
         &mut frame.start,
         lookup,
         protected_tables,
         protected_unqualified_columns,
-        opaque_cte_names,
+        cte_scopes,
     );
     if let Some(end) = &mut frame.end {
         substitute_outer_refs_in_frame_bound(
@@ -130517,7 +130582,7 @@ fn substitute_outer_refs_in_frame_spec(
             lookup,
             protected_tables,
             protected_unqualified_columns,
-            opaque_cte_names,
+            cte_scopes,
         );
     }
 }
@@ -130527,7 +130592,7 @@ fn substitute_outer_refs_in_frame_bound(
     lookup: &OuterReferenceLookup<'_>,
     protected_tables: &[String],
     protected_unqualified_columns: Option<&HashSet<String>>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
 ) {
     match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
@@ -130538,7 +130603,7 @@ fn substitute_outer_refs_in_frame_bound(
                 protected_tables,
                 protected_unqualified_columns,
                 &no_local_outputs,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
         FrameBound::UnboundedPreceding
@@ -130552,14 +130617,14 @@ fn substitute_outer_refs_in_from_clause(
     lookup: &OuterReferenceLookup<'_>,
     protected_tables: &[String],
     protected_unqualified_columns: Option<&HashSet<String>>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
 ) {
     substitute_outer_refs_in_table_or_subquery(
         &mut from.source,
         lookup,
         protected_tables,
         protected_unqualified_columns,
-        opaque_cte_names,
+        cte_scopes,
     );
     for join in &mut from.joins {
         substitute_outer_refs_in_table_or_subquery(
@@ -130567,7 +130632,7 @@ fn substitute_outer_refs_in_from_clause(
             lookup,
             protected_tables,
             protected_unqualified_columns,
-            opaque_cte_names,
+            cte_scopes,
         );
         if let Some(JoinConstraint::On(on_expr)) = &mut join.constraint {
             let no_local_outputs = HashSet::new();
@@ -130577,7 +130642,7 @@ fn substitute_outer_refs_in_from_clause(
                 protected_tables,
                 protected_unqualified_columns,
                 &no_local_outputs,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
     }
@@ -130588,7 +130653,7 @@ fn substitute_outer_refs_in_table_or_subquery(
     lookup: &OuterReferenceLookup<'_>,
     protected_tables: &[String],
     protected_unqualified_columns: Option<&HashSet<String>>,
-    opaque_cte_names: &HashSet<String>,
+    cte_scopes: &CteScopes,
 ) {
     match source {
         TableOrSubquery::Table { .. } => {}
@@ -130598,7 +130663,7 @@ fn substitute_outer_refs_in_table_or_subquery(
                 lookup,
                 protected_tables,
                 protected_unqualified_columns,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
         TableOrSubquery::TableFunction { args, .. } => {
@@ -130622,7 +130687,7 @@ fn substitute_outer_refs_in_table_or_subquery(
                     protected_tables,
                     arg_protected,
                     &no_local_outputs,
-                    opaque_cte_names,
+                    cte_scopes,
                 );
             }
         }
@@ -130632,7 +130697,7 @@ fn substitute_outer_refs_in_table_or_subquery(
                 lookup,
                 protected_tables,
                 protected_unqualified_columns,
-                opaque_cte_names,
+                cte_scopes,
             );
         }
     }

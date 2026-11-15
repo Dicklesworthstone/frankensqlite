@@ -256,6 +256,69 @@ fn bare_outer_reference_under_a_derived_table() {
     });
 }
 
+/// bd-j9tg3: the same for a CTE defined inside the subquery. Every such CTE
+/// used to be an opaque scope, and a bare outer column under one failed with
+/// "no such column: a".
+#[test]
+fn bare_outer_reference_under_a_cte_inside_a_subquery() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT a, (WITH c AS (SELECT n FROM u) SELECT count(*) FROM c WHERE n > a) FROM t ORDER BY id",
+            "CTE column beside a bare outer column",
+        ),
+        (
+            "SELECT a, (WITH c(m) AS (SELECT n FROM u) SELECT count(*) FROM c WHERE m > a) FROM t ORDER BY id",
+            "CTE with a column list",
+        ),
+        (
+            "SELECT a, (WITH c AS (SELECT n FROM u), d AS (SELECT n FROM c WHERE n > 10) SELECT count(*) FROM d WHERE n > a) FROM t ORDER BY id",
+            "CTE reading an earlier CTE",
+        ),
+        (
+            "SELECT a, (WITH x AS (SELECT * FROM y), y AS (SELECT n FROM u) SELECT count(*) FROM x WHERE n > a) FROM t ORDER BY id",
+            "CTE reading a later CTE through *",
+        ),
+        (
+            "SELECT a, (WITH c AS (SELECT * FROM u) SELECT count(*) FROM c WHERE n > a) FROM t ORDER BY id",
+            "CTE over *",
+        ),
+        (
+            "SELECT a, (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5) SELECT count(*) FROM c WHERE x > a / 10) FROM t ORDER BY id",
+            "recursive CTE with a column list",
+        ),
+        (
+            "SELECT a, (WITH c AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM c WHERE x < 5) SELECT count(*) FROM c WHERE x > a / 10) FROM t ORDER BY id",
+            "recursive CTE named by its first arm",
+        ),
+        (
+            "SELECT a, (WITH c AS (SELECT n FROM u WHERE n > a) SELECT count(*) FROM c) FROM t ORDER BY id",
+            "correlation inside the CTE",
+        ),
+        (
+            "SELECT a, (SELECT count(*) FROM (WITH c AS (SELECT n FROM u) SELECT n FROM c) WHERE n > a) FROM t ORDER BY id",
+            "derived table whose query has its own CTE",
+        ),
+        // Negative: the CTE's `id` shadows t.id (stock 2, 2, 2).
+        (
+            "SELECT id, (WITH c AS (SELECT id FROM u) SELECT count(*) FROM c WHERE id > 2) FROM t ORDER BY id",
+            "CTE column shadows the outer column of the same name",
+        ),
+        // Negative: the CTE named t shadows the table t, which has a column
+        // `a`; the CTE does not, so `a` is the outer t.a (stock 3, 2, 1). An
+        // inventory read from the table instead of the CTE refuses it.
+        (
+            "SELECT a, (WITH t AS (SELECT n FROM u) SELECT count(*) FROM t WHERE n > a) FROM t ORDER BY id",
+            "CTE shadows a table of the same name",
+        ),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for (sql, msg) in cases {
+            agree(DERIVED, sql, msg).await;
+            agree_file_backed(DERIVED, sql, msg).await;
+        }
+    });
+}
+
 /// bd-j9tg3: stock resolves `rowid` inside a derived table's scope locally
 /// (the derived table's own NULL rowid), not to t's rowid. fsqlite has no
 /// derived-table rowid yet and refuses with "no such column", which is the
