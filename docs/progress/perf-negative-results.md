@@ -87,6 +87,145 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - MEASURED WIN, NOT LANDED (gated on its base; the landing base moved under it): a WAL frame-cache hit hands the transaction the cached image instead of two copies (bd-05xlf, read/seek round 5, lever P1 v6)
+
+- Target: every first read of a page in a transaction that the WAL frame cache answers. Measured
+  on the prepared secondary-key lookup of bd-05xlf (`SELECT id FROM t WHERE a = ?1`,
+  prepared-dml-probe select-index, its four fetches per execution all frame-cache hits on the WAL
+  the load leaves), with the CLI read sweep for the miss-heavy and point rows. Such a fetch copied
+  the page twice: `WalFramePageCache::get` returned `bytes.to_vec()`, and the transaction read
+  cache's clone of that Owned page built an Arc copy; it also went through two boxed futures.
+- Touched: `crates/fsqlite-pager/src/traits.rs` (`WalPageImage`; `read_page_pinned` and
+  `read_page_pinned_without_io` answer it), `crates/fsqlite-pager/src/pager.rs` (`WalPageLookup`
+  carries it; the WAL-hit arm of `get_nonresident_page` keeps a shared image),
+  `crates/fsqlite-core/src/wal_adapter.rs` (the frame cache hands out its `Arc<[u8]>`; a committed
+  frame read from the file is cached and returned as that Arc; the without-I/O answer covers a
+  kept committed frame), three pager and two core test doubles, the adapter unit test and two
+  keepers in `crates/fsqlite-core/tests/cache_staleness_cross_txn_regression.rs`.
+- Ledger preflight: the 2026-11-15 P1 entry (rejected after four versions on rowid_lookups_200k
+  and range_noncovering_200k) and its retry condition: share on a hit without widening what a miss
+  moves. This version is the frame-cache-only variant that entry listed as untested, with the
+  lookup's answer kept at its old width: `Option<WalPageImage>` (Owned(Vec) or Shared(Arc<[u8]>))
+  is 24 bytes, as `Option<Vec<u8>>` was, where P1 v2-v5 moved a 48-byte `PageData`. The main page
+  cache's hit (`get_copy`) and every miss path are unchanged.
+- Result. thinkstation1, governor powersave, load 2.5 to 2.7, io_uring refused. main = origin/main
+  dbac12d40 (code-identical to 5cf0db4d5), CLI 7cfef3adb7de9a85 / probe 11421d122f9c03f8; v6 = the
+  same tree plus this change, CLI ba6d36a87c33f349 / probe 226bbbd5f523d511, both built from that
+  tree. Stock live in the same runs: sqlite3 3.46.1 (5a910e452929c124) for the sweep, the 3.54.1
+  amalgamation driver of the same prepared loop (9500dcc51bdca47c) for the probe. Every arm reads
+  files its own binary built; answers equal.
+
+  | row | stock | main | v6 |
+  |---|---|---|---|
+  | prepared select-index (WAL), instructions per execution | 5,058 | 78,001 (15.4x) | 69,269 (13.7x) |
+  | same, user cycles / CPU per execution | 3.8k / 3.82 us | 69.3k / 27.61 us | 61.9k / 24.79 us |
+  | select-index, checkpointed (control) | 5,058 | 75,452 | 75,619 |
+  | select-rowid (control) | 4,725 | 8,139 | 8,129 |
+  | autocommit INSERT (write control) | - | 141,424 | 141,435 |
+  | point_rowid_2000 | 44.0M | 181.8M (4.13x) | 178.5M (4.06x) |
+  | point_hot_2000 (2,000 cache-hit point SELECTs) | 42.8M | 171.6M (4.01x) | 167.8M (3.92x) |
+  | point_sec_key_2000 | 67.4M | 269.4M | 266.7M |
+  | orderby_page_500x20 / multicol_eq_1000 | 60.7M / 60.2M | 304.5M / 398.2M | 304.0M / 396.5M |
+  | rowid_lookups_200k | 554.4M | 2,684.9M | 2,689.2M (+0.16%) |
+  | range_noncovering_200k | 637.6M | 3,340.4M | 3,344.9M (+0.13%) |
+
+  The two miss rows again over 9 interleaved reps at load 8.6: the same instruction counts; user
+  cycles +1.2% and -0.8%, CPU +0.2% and -6.8%, inside run-to-run noise.
+- Prediction (bd-05xlf, before code): select-index 68.5k to 71.0k (inside), cycles -4% to -10%
+  (-10.7%, just beyond), CPU -0.5 to -2.5 us (-2.8 us, just beyond); checkpointed within 0.5k,
+  select-rowid within 0.15k, INSERT within 1.0% (all inside); point_rowid_2000 -1.5% to -4.5%
+  (-1.8%, inside); point_hot_2000 -6% to +0.3% (-2.2%, inside); the miss rows within 0.1%: MISSED
+  (+0.16%, +0.13%). Kill (miss rows worse than 0.2%, select-index under -5.0k, and the controls):
+  not crossed.
+- Why the miss rows still pay (callgrind of rowid_lookups_200k on both binaries, 188,566 WAL
+  lookups that find no frame): `read_page_pinned_without_io` costs 75.7 Ir a call against 60.7. On
+  main the adapter's answer was inlined into the path-refreshing wrapper; with its frame-cache arm
+  it is a call of its own. `get_nonresident_page`'s own code adds about 8 Ir a call; the file read
+  (`read_page_copy_outside_wal`) is unchanged.
+- Keeper: two stock-oracle tests in cache_staleness_cross_txn_regression (WAL file, checkpointed
+  file): a reader keeps the images it fetched while a peer commits newer frames and sees them at
+  its next begin; a write through a shared image rolls back to the committed bytes; after the
+  peer's wal_checkpoint(TRUNCATE), commits reuse the frame indexes of images the reader's frame
+  cache holds and the reader sees the new images. The adapter unit test checks that a kept
+  committed frame is answered as the cache's own image (`Arc::ptr_eq`) and that a newer frame of
+  the same page is not answered until it is kept.
+- Gate (rch, the measured tree 5cf0db4d5 + this change): clippy -D warnings on fsqlite-pager and
+  fsqlite-core, all targets: clean. fsqlite-pager --lib 1,113 passed, 1 failed
+  (`bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`, red on main, bd-mcpbv; this run
+  was on the tree that also carried L5, below, which touches no pager file). fsqlite-core --lib
+  with the savepoint / trigger / peer / staleness and prepared-statement / schema-change keepers
+  (the new keepers included): 4,340 passed, 3 failed: the t6741 pair (bd-nouem) and
+  `gh528_truncated_shm_first_attacher::explicit_read_only_recovery_handles_a_truncated_shm_beside_a_frameless_wal`
+  ("empty WAL: BusyRecovery", the bd-j2dtf read-only-open family; it fails the same way, at the
+  same line, on 5cf0db4d5 without this change, rch hz2). The join / seek and seek-key keepers with
+  the cross-process battery (`bulk_import_upsert_text_pk_phantom_pk`, gh534,
+  `bd_ih8ak_flush_floor_after_peer_growth`, gh524, strict_multi_process): 243 passed, 1 failed
+  (bd_8c68u's compile count, bd-f8m1v). fsqlite-e2e `split_claim_cross_process_e2e`,
+  `refused_commit_ends_transaction_e2e`, gh364 and nine concurrent-writer targets: 90 passed.
+  `multiprocess_autocommit_busy_timeout_e2e --test-threads=1`: 8 passed. The fsqlite
+  aggregate / min / max / range oracles (43 targets) and WAL-reader keepers: 78 passed, 1 failed
+  (`gh528_readonly_truncated_shm::compat_read_only_open_rebuilds_a_three_byte_shm`, red on main,
+  bd-j2dtf). Not run: btree and vdbe --lib (not touched).
+- Not landed. While the gate ran, origin/main moved to e1343d313, which changes
+  `wal_adapter.rs` and `connection.rs` (bd-reality-check-1022-llk6g.5.6's header-less WAL binding,
+  other hunks than this change's) and the VDBE row path. To land: rebase the patch (coordinator
+  scratchpad `rs5/p1v6_final_on_5cf0db4d5.patch`, measured diff e0f1ac6ecfec6148) onto the
+  landing tree, rebuild both arms there and repeat the A/B rows above, and re-run the core
+  keepers, the cross-process battery, the e2e set and the WAL-reader keepers on that exact tree.
+- Retry / next: (1) keep the no-frame answer inlinable (the frame-cache arm in a function of its
+  own) to take back the miss rows' 15 Ir a lookup; a new version with its own prediction. (2) The
+  main page cache's hit still copies twice (checkpointed lookup 75.6k); sharing it is what v2-v5
+  lost on, so it needs a probe that answers a miss without a PageData-sized value, not another
+  variant of that patch.
+
+## 2026-11-15 - REJECTED on its control kill line: a literal SELECT of aggregates or columns over ANDed integer keys runs parameterized (bd-w4pr1.13.18, read/seek round 5, lever L5)
+
+- Target: multicol_eq_1000 of the read sweep (`SELECT count(*), sum(val) FROM s WHERE g = <int>
+  AND h = <int>`, 1,000 distinct literal pairs, each its own autocommit statement through the CLI;
+  index s_gh(g, h) on the 500k-row table s): 398M user instructions against stock's 60.2M (6.6x).
+  Callgrind on main d8f44c18f, (300 minus 100 statements) / 200: 400.6k Ir a statement, of which
+  the parse 33.0k and the compile 52.9k. L2's entry named this widening.
+- Touched (never committed; coordinator scratchpad `rs5/l5/` and
+  `rs5/p1v6_plus_l5v1_combined.patch`): `crates/fsqlite-core/src/connection/literal_params.rs` (a
+  result column may be `count(*)` or count / sum / total / avg / min / max of one column;
+  `AND k = int` terms; `key_columns: Vec<String>` for `key_column: Option<String>`; the lexer
+  reference matcher, the agreement test and the refusal list),
+  `crates/fsqlite-core/src/connection.rs` (`literal_statement_may_run_parameterized` over every
+  key), the keeper in `crates/fsqlite-core/tests/bd_5310l_literal_parameterization_oracle.rs`.
+- Ledger preflight: L2 (2026-11-15) and bd-5310l's entries. EXPLAIN QUERY PLAN of the literal and
+  `?1`/`?2` forms is the same on fsqlite and stock (SEARCH s USING INDEX s_gh (g=? AND h=?)).
+- Result. thinkstation1, governor powersave, load about 4, io_uring refused, stock sqlite3 3.46.1
+  live, answers equal. Base = 5cf0db4d5 + P1 v6 (CLI ba6d36a87c33f349); L5 = that + this change
+  (CLI aec75fb51f978c22).
+
+  | row | stock | base | L5 |
+  |---|---|---|---|
+  | multicol_eq_1000, instructions | 60.2M | 396.7M (6.59x) | 297.6M (4.95x), -99k a statement |
+  | multicol_eq_1000, CPU | 27.0 ms | 144.8 ms | 109.1 ms |
+  | point_hot_2000, own databases, 9 reps (min / median) | 42.8M | 167.7M / 167.8M | 168.6M / 168.9M (+0.54% / +0.66%) |
+  | point_hot_2000, per-arm copies of one file, 9 reps | 42.8M | 165.9M / 166.1M | 165.9M / 166.4M |
+  | point_sec_key_2000, per-arm copies of one file, 9 reps | 67.4M | 263.5M / 264.5M | 264.6M / 265.1M (+0.42% / +0.23%) |
+  | point_rowid_2000, per-arm copies, 9 reps | 44.0M | 175.8M | 176.2M (+0.23%) |
+  | rowid_lookups_200k / autocommit INSERT | 554.4M / - | 2,689.2M / 141,386 | 2,689.2M / 141,392 |
+
+- Prediction (bd-w4pr1.13.18, before code): multicol_eq_1000 -60k to -95k a statement (-99k:
+  beyond the range, better), CPU -20 to -40 ms (-35.7 ms, inside); point_hot_2000,
+  point_rowid_2000 and point_sec_key_2000 within 0.3%: point_hot_2000 crossed on the prescribed
+  method (+0.54% min), and on the cleaner per-arm copies point_sec_key_2000 crossed by min
+  (+0.42%); rowid_lookups_200k and INSERT inside. Kill (a control outside its band): crossed.
+  REJECTED.
+- Measurement trap: fsqlite builds of the sweep database are not byte-identical, and one binary
+  reads two builds (or a build and its copy) up to 1.5% apart on point_hot_2000. For a control band
+  under about 0.5%, measure the arms on per-arm copies of one source file, and set the band from an
+  A/A of that method.
+- Why the controls pay: for the shapes the recognizer already took (one key), `key_columns` is a
+  Vec (one more allocation a statement), plus the result-column peek and the AND check after the
+  last key: about 100-200 Ir on statements of 83k-133k.
+- Retry condition: single-key shapes allocation-free (an inline key list, or the one-key Option
+  kept and a list only past the first AND), the controls predicted with a band the method
+  resolves (A/A first), measured on per-arm copies of one file. The gain to keep:
+  multicol_eq_1000 -99k a statement, 6.6x -> 4.95x stock.
+
 ## 2026-11-15 - WIN: a composite IN probe takes a second IN list or a range on the next key term (bd-5i6zm)
 
 - Target: `a IN (3, 77, 500) AND b IN (3, 4)` (36.6x stock) and `a IN (..) AND b BETWEEN ..`
