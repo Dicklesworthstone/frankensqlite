@@ -20937,12 +20937,14 @@ fn aggregate_index_is_null_target<'t>(
 }
 
 /// The rows a lone `COUNT(*)` counts from an index without reading them
-/// (bd-2fb53): a range its WHERE states exactly, the leading NULL keys, or
-/// every key after them.
+/// (bd-2fb53): a range its WHERE states exactly, the leading NULL keys, every
+/// key after them, or the entries an equality prefix pins (bd-zgbhb).
 enum CountIndexRange<'e> {
     Range(ColumnRangeTarget<'e>),
     Nulls,
     NotNulls,
+    /// The values of the index's leading key columns, in index order.
+    Prefix(Vec<&'e Expr>),
 }
 
 /// bd-2fb53: the index and the key range a `COUNT(*)` whose WHERE is exactly
@@ -20950,13 +20952,26 @@ enum CountIndexRange<'e> {
 /// [`aggregate_index_range_seek_target`]), `col IS NULL`
 /// ([`aggregate_index_is_null_target`]) or `col IS NOT NULL` on an ascending
 /// index's leading column counts, so the count can come from the index's
-/// pages (`Opcode::IdxCountBefore`).
+/// pages (`Opcode::IdxCountBefore`). bd-zgbhb: also an equality prefix that is
+/// exactly the WHERE ([`aggregate_index_eq_seek_target`], which already
+/// requires each comparison's collation to be the index key's) when every
+/// pinned value is as safe a seek bound as a range's
+/// ([`index_range_bound_is_seek_safe`]): the prefix is then the inclusive
+/// range from the values to themselves. A value that could need a conversion
+/// the probe would miss keeps the equality walk and its scan fallback.
 fn count_star_index_range_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
 ) -> Option<(&'t IndexSchema, CountIndexRange<'e>)> {
+    if let Some((index, values)) = aggregate_index_eq_seek_target(where_clause, table, table_alias)
+        && values.iter().zip(&index.columns).all(|(value, column)| {
+            index_range_bound_is_seek_safe(table, table_alias, schema, column, value)
+        })
+    {
+        return Some((index, CountIndexRange::Prefix(values)));
+    }
     if let Some((index, range, false)) =
         aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
     {
@@ -21066,6 +21081,31 @@ fn codegen_select_count_star_index_range(
         }
         CountIndexRange::Nulls => (None, Some((key_record(b, None), true))),
         CountIndexRange::NotNulls => (Some((key_record(b, None), Opcode::SeekGT)), None),
+        // bd-zgbhb: from the first entry the prefix pins up to the last.
+        CountIndexRange::Prefix(values) => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let base = b.alloc_regs(values.len() as i32);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            for (pos, value) in values.iter().enumerate() {
+                let reg = base + pos as i32;
+                emit_expr(b, value, reg, None);
+                if let Some(aff) = index
+                    .columns
+                    .get(pos)
+                    .and_then(|name| table.column_index(name))
+                    .map(|i| index_key_affinity(table.columns[i].affinity))
+                    .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'))
+                    && !bound_matches_affinity(aff, value)
+                {
+                    b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+                }
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+            }
+            let record = b.alloc_reg();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::MakeRecord, base, values.len() as i32, record, P4::None, 0);
+            (Some((record, Opcode::SeekGE)), Some((record, true)))
+        }
     };
     b.emit_op(
         Opcode::OpenRead,
@@ -51098,10 +51138,20 @@ mod tests {
     /// program never executes. Opcodes are the only ground truth here.
     #[test]
     fn bd_2dgf5_covering_aggregate_seek_omits_table_lookup() {
-        // COUNT(*) needs no column at all; SUM(id) reads the rowid, which the index
-        // entry carries via IdxRowid; SUM(k) reads the index key itself.
+        // A lone COUNT(*) over the exact equality counts the run from the index's
+        // pages (bd-zgbhb): no table, no row, no per-entry AggStep.
+        let ops = bd_2dgf5_program("SELECT COUNT(*) FROM t WHERE k = 2");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE)
+                && ops.iter().any(|op| op.opcode == Opcode::IdxCountBefore)
+                && !ops.iter().any(|op| op.opcode == Opcode::SeekRowid)
+                && !ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Table(name) if name == "t")),
+            "a lone COUNT(*) over k = 2 counts from idx_t_k alone: {ops:?}"
+        );
+        // COUNT(*) with an ORDER BY still accumulates; SUM(id) reads the rowid, which
+        // the index entry carries via IdxRowid; SUM(k) reads the index key itself.
         for sql in [
-            "SELECT COUNT(*) FROM t WHERE k = 2",
             "SELECT SUM(id) FROM t WHERE k = 2",
             "SELECT SUM(k) FROM t WHERE k = 2",
             "SELECT MIN(id), MAX(id) FROM t WHERE k = 2",
@@ -51171,8 +51221,10 @@ mod tests {
     /// the probe hit, which no value test on a populated table would catch.
     #[test]
     fn bd_2dgf5_seek_and_fallback_bodies_emit_identical_agg_steps() {
+        // A lone COUNT(*) over an exact equality counts from the index without a
+        // fallback (bd-zgbhb); with an ORDER BY it keeps the seek and its fallback.
         for sql in [
-            "SELECT COUNT(*) FROM t WHERE k = 2",
+            "SELECT COUNT(*) FROM t WHERE k = 2 ORDER BY 1",
             "SELECT SUM(id) FROM t WHERE k = 2",
             "SELECT SUM(k) FROM t WHERE k = 2",
             "SELECT COUNT(DISTINCT k) FROM t WHERE k = 2",

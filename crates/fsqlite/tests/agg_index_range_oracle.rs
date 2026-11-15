@@ -738,3 +738,97 @@ fn count_star_over_an_exact_index_range_counts_leaves_and_matches_sqlite() {
         f.close().await.unwrap();
     });
 }
+
+/// bd-zgbhb: a lone COUNT(*) whose WHERE is exactly an equality prefix of an
+/// index, with every value a safe seek bound, counts the pinned entries from
+/// the index's pages: values whose runs span leaves, an absent value, a
+/// two-column prefix, text, typeless and REAL keys, and parameters, against
+/// stock on a file database in strict mode. A value that could need a
+/// conversion (a text literal on an INTEGER column) and an equality beside a
+/// residual keep their programs.
+#[test]
+fn count_star_over_an_exact_equality_prefix_counts_leaves_and_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("count_equality_prefix.db");
+        let f = Connection::open(file.to_str().unwrap()).await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for stmt in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER, s TEXT, u, w REAL);",
+            "CREATE INDEX idx_a ON t(a);",
+            "CREATE INDEX idx_xa ON t(x, a);",
+            "CREATE INDEX idx_s ON t(s);",
+            "CREATE INDEX idx_u ON t(u);",
+            "CREATE INDEX idx_w ON t(w);",
+        ] {
+            f.execute(stmt).await.unwrap();
+            r.execute_batch(stmt).unwrap();
+        }
+        let mut batch = String::from("BEGIN;");
+        for i in 1..=12_000_i64 {
+            let a = if i % 13 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 7)
+            };
+            // The typeless column holds 5 as an integer and as text.
+            let u = if i % 2 == 0 {
+                format!("{}", i % 9)
+            } else {
+                format!("'{}'", i % 9)
+            };
+            batch.push_str(&format!(
+                "INSERT INTO t VALUES ({i}, {a}, {}, 'k{}', {u}, {});",
+                i % 3,
+                i % 11,
+                f64::from(u8::try_from(i % 6).unwrap()) / 2.0
+            ));
+        }
+        batch.push_str("COMMIT;");
+        f.execute_batch(&batch).await.unwrap();
+        r.execute_batch(&batch).unwrap();
+        f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .await
+            .unwrap();
+
+        let counted: &[(&str, &[i64])] = &[
+            ("SELECT count(*) FROM t WHERE a = 3", &[]),
+            ("SELECT count(*) FROM t WHERE 3 = a", &[]),
+            ("SELECT count(*) FROM t WHERE a = 999", &[]),
+            ("SELECT count(*) FROM t WHERE x = 1 AND a = 4", &[]),
+            ("SELECT count(*) FROM t WHERE a = 4 AND x = 1", &[]),
+            ("SELECT count(*) FROM t WHERE s = 'k3'", &[]),
+            ("SELECT count(*) FROM t WHERE u = 5", &[]),
+            ("SELECT count(*) FROM t WHERE w = 1.5", &[]),
+            ("SELECT count(*) FROM t WHERE w = 2", &[]),
+            ("SELECT count(*) FROM t WHERE a = ?1", &[6]),
+            ("SELECT count(*) FROM t WHERE x = ?1 AND a = ?2", &[2, 0]),
+        ];
+        for (sql, params) in counted {
+            assert_eq!(
+                frank_rows(&f, sql, params).await,
+                sqlite_rows(&r, sql, params),
+                "diverged: `{sql}` {params:?}"
+            );
+            assert!(
+                has_op(&f, sql, "IdxCountBefore").await,
+                "an exact equality prefix counts from the index's pages: `{sql}`"
+            );
+        }
+        for sql in [
+            "SELECT count(*) FROM t WHERE a = '3'",
+            "SELECT count(*) FROM t WHERE a = 3 AND s = 'k1'",
+        ] {
+            assert_eq!(
+                frank_rows(&f, sql, &[]).await,
+                sqlite_rows(&r, sql, &[]),
+                "diverged: `{sql}`"
+            );
+            assert!(
+                !has_op(&f, sql, "IdxCountBefore").await,
+                "not an exact equality prefix: `{sql}`"
+            );
+        }
+        f.close().await.unwrap();
+    });
+}
