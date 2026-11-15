@@ -136,3 +136,98 @@ fn derived_table_column_alias_match_rusqlite_oracle() {
         );
     });
 }
+
+/// bd-w4pr1.12 lever W2: a join or derived-table projection that is one plain
+/// column reads its source slot directly instead of evaluating the column on
+/// every row. Each query below projects through that loop: derived tables
+/// summed or grouped in an outer SELECT (window results among them), qualified
+/// and unqualified references, a column named in two sources, rowid aliases,
+/// NULL and mixed-type values. USING and NATURAL joins coalesce their shared
+/// columns (a RIGHT or FULL join's value is the right row's when the left one
+/// is missing), which a slot read from the left source gets wrong: those keep
+/// the evaluator and are compared too. File-backed and `:memory:`.
+#[test]
+fn join_and_derived_table_projections_match_rusqlite_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("w2.db");
+        let file = Connection::open(path.to_str().expect("utf-8 path"))
+            .await
+            .unwrap();
+        let memory = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut p_rows = Vec::new();
+        let mut q_rows = Vec::new();
+        for i in 1..=400_i64 {
+            let k = match i % 5 {
+                0 => "NULL".to_owned(),
+                1 => format!("{}", i % 7),
+                2 => format!("{}.5", i % 7),
+                3 => format!("'k{}'", i % 7),
+                _ => format!("x'{:02x}'", i % 7),
+            };
+            let c = if i % 6 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}.25", i % 13)
+            };
+            p_rows.push(format!("({i}, {}, 'b{}', {c}, {k})", i % 9, i % 4));
+            if i % 3 != 0 {
+                let b = if i % 4 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    format!("'b{}'", i % 4)
+                };
+                q_rows.push(format!("({i}, {}, {b}, {k})", i % 11));
+            }
+        }
+        let setup = [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, k)".to_owned(),
+            "CREATE TABLE q(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, k)".to_owned(),
+            format!("INSERT INTO p VALUES {}", p_rows.join(", ")),
+            format!("INSERT INTO q VALUES {}", q_rows.join(", ")),
+        ];
+        for s in &setup {
+            file.execute(s).await.unwrap();
+            memory.execute(s).await.unwrap();
+            r.execute(s, []).unwrap();
+        }
+        let queries = [
+            "SELECT sum(s), count(*) FROM (SELECT sum(c) OVER (PARTITION BY a) s FROM p)",
+            "SELECT sum(rn), max(rn) FROM (SELECT row_number() OVER (PARTITION BY a ORDER BY c) rn FROM p)",
+            "SELECT count(*), sum(a), total(c), max(b), min(k) FROM (SELECT a, b, c, k FROM p)",
+            "SELECT a, count(*), sum(x) FROM (SELECT a, c x FROM p) GROUP BY a ORDER BY a",
+            "SELECT count(*), sum(id), max(b) FROM (SELECT id, b FROM p WHERE a > 3)",
+            "SELECT p.id, q.id, p.a, q.a, p.b, q.b FROM p JOIN q ON q.id = p.id ORDER BY p.id",
+            "SELECT p.k, q.k, c FROM p LEFT JOIN q ON q.id = p.id WHERE p.id < 40 ORDER BY p.id",
+            "SELECT count(*), sum(p.a), sum(q.a), max(q.b) FROM p JOIN q ON q.a = p.a",
+            "SELECT p.rowid, q.oid, p._rowid_ FROM p JOIN q ON q.id = p.id WHERE p.id % 50 = 1 ORDER BY 1",
+            "SELECT id, p.b, q.b FROM p JOIN q USING (id) WHERE id < 30 ORDER BY id",
+            "SELECT id, a FROM p LEFT JOIN q USING (id, a) WHERE id < 30 ORDER BY id",
+            "SELECT id, q.b, p.k FROM q RIGHT JOIN p USING (id) WHERE id < 30 ORDER BY id",
+            "SELECT id, p.b, q.a FROM q FULL JOIN p USING (id) WHERE id < 30 ORDER BY id",
+            "SELECT id, q.a FROM q LEFT JOIN p USING (id) ORDER BY id DESC LIMIT 20",
+            "SELECT id, a, b, k FROM p NATURAL JOIN q ORDER BY id",
+            "SELECT count(*), sum(id) FROM (SELECT id FROM q FULL JOIN p USING (id))",
+            "SELECT x.a, y.a FROM (SELECT a FROM p WHERE id < 5) x, (SELECT a FROM q WHERE id < 5) y ORDER BY 1, 2",
+        ];
+        let mut diffs = Vec::new();
+        for (label, conn) in [("file", &file), ("memory", &memory)] {
+            for q in queries {
+                let fr = norm(fq(conn, q).await);
+                let rr = norm(rq(&r, q));
+                if fr != rr {
+                    diffs.push(format!(
+                        "  [{label}] `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} projection divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

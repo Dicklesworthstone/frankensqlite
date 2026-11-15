@@ -104436,7 +104436,7 @@ impl Connection {
         // joined rows. USING rewrites and subquery inlining can create new
         // expression trees per row, so those specialized paths retain their
         // existing resolver; the common projection path gets direct indices.
-        let _projection_bindings_guard = if !has_subqueries && using_skip.is_none() {
+        let projection_bindings_guard = if !has_subqueries && using_skip.is_none() {
             let mut bindings = JoinExprBindings::default();
             for column in columns {
                 if let ResultColumn::Expr { expr, .. } = column {
@@ -104450,6 +104450,27 @@ impl Connection {
         } else {
             None
         };
+        // Under those bindings a result column that is one plain column
+        // reference reads its source slot directly (bd-w4pr1.12, lever W2). It
+        // is resolved here exactly as `eval_join_expr` resolves it on every row:
+        // an unqualified USING column's coalesced projection first (left to the
+        // evaluator), then the bound index. A derived table summed in an outer
+        // SELECT evaluated each value, ~400 instructions a row.
+        let direct_slots: Vec<Option<usize>> = columns
+            .iter()
+            .map(|column| match column {
+                ResultColumn::Expr {
+                    expr: Expr::Column(col_ref, _),
+                    ..
+                } if projection_bindings_guard.is_some()
+                    && (col_ref.table.is_some()
+                        || current_join_using_column_projection(&col_ref.column).is_none()) =>
+                {
+                    resolve_join_expr_column_index(col_ref, &col_map).ok()
+                }
+                _ => None,
+            })
+            .collect();
 
         let mut result: Vec<Row> = Vec::with_capacity(combined.len());
         // bd-w4pr1.12: every projected row has the previous row's width, so
@@ -104464,7 +104485,7 @@ impl Connection {
         for row in combined {
             let row = &row;
             let mut values = Vec::with_capacity(projected_row_width);
-            for col in columns {
+            for (col, direct_slot) in columns.iter().zip(&direct_slots) {
                 match col {
                     ResultColumn::Star => {
                         for (i, v) in row.iter().enumerate() {
@@ -104500,7 +104521,9 @@ impl Connection {
                         }
                     }
                     ResultColumn::Expr { expr, .. } => {
-                        if has_subqueries && expr_has_any_subquery(expr) {
+                        if let Some(slot) = *direct_slot {
+                            values.push(row.get(slot).cloned().unwrap_or(SqliteValue::Null));
+                        } else if has_subqueries && expr_has_any_subquery(expr) {
                             let inlined = lean_future(|| {
                                 self.inline_subqueries_in_expr_with_using(
                                     expr, row, &col_map, using_skip,
@@ -179283,8 +179306,12 @@ mod tests {
         });
     }
 
+    /// The projected columns resolve through the prebound indexes, never by
+    /// rescanning the column map, and since bd-w4pr1.12 lever W2 once per
+    /// statement rather than once per result row: the same statement over
+    /// twice the rows takes the same number of binding lookups.
     #[test]
-    fn test_join_projection_columns_use_prebound_indexes_for_every_result_row() {
+    fn test_join_projection_columns_resolve_through_prebound_indexes_once_per_statement() {
         asupersync::test_utils::run_test(|| async {
             let _serial = super::fsqlite_core_test_serializer();
             let conn = Connection::open(":memory:").await.unwrap();
@@ -179300,19 +179327,62 @@ mod tests {
                 .prepare("SELECT l.payload, r.payload FROM l JOIN r ON r.id = l.id")
                 .await
                 .unwrap();
+            let payload_pairs = |rows: &[Row]| {
+                let mut pairs: Vec<(String, String)> = rows
+                    .iter()
+                    .map(|row| {
+                        let text = |value: &SqliteValue| value.as_text().unwrap_or("").to_owned();
+                        (text(&row.values()[0]), text(&row.values()[1]))
+                    })
+                    .collect();
+                pairs.sort();
+                pairs
+            };
 
-            let binding_hits_before = FSQLITE_JOIN_EXPR_BINDING_HITS.with(std::cell::Cell::get);
             let fallback_scans_before = FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(std::cell::Cell::get);
+            let binding_hits_before = FSQLITE_JOIN_EXPR_BINDING_HITS.with(std::cell::Cell::get);
             let rows = statement.query().await.unwrap();
-
-            assert_eq!(rows.len(), 3);
-            let binding_hits = FSQLITE_JOIN_EXPR_BINDING_HITS
+            let hits_three_rows = FSQLITE_JOIN_EXPR_BINDING_HITS
                 .with(std::cell::Cell::get)
                 .wrapping_sub(binding_hits_before);
+            let pair = |l: &str, r: &str| (l.to_owned(), r.to_owned());
+            assert_eq!(
+                payload_pairs(&rows),
+                vec![pair("a", "x"), pair("b", "y"), pair("c", "z")]
+            );
+
+            conn.execute(
+                "INSERT INTO l VALUES (4, 'd'), (5, 'e'), (6, 'f');
+             INSERT INTO r VALUES (4, 'u'), (5, 'v'), (6, 'w');",
+            )
+            .await
+            .unwrap();
+            let binding_hits_before = FSQLITE_JOIN_EXPR_BINDING_HITS.with(std::cell::Cell::get);
+            let rows = statement.query().await.unwrap();
+            let hits_six_rows = FSQLITE_JOIN_EXPR_BINDING_HITS
+                .with(std::cell::Cell::get)
+                .wrapping_sub(binding_hits_before);
+            assert_eq!(
+                payload_pairs(&rows),
+                vec![
+                    pair("a", "x"),
+                    pair("b", "y"),
+                    pair("c", "z"),
+                    pair("d", "u"),
+                    pair("e", "v"),
+                    pair("f", "w"),
+                ]
+            );
+
             assert!(
-                binding_hits >= 6,
-                "two projected columns across three result rows must use direct bindings \
-             (observed {binding_hits})"
+                hits_three_rows >= 2,
+                "both projected columns must resolve through the prebound indexes \
+             (observed {hits_three_rows})"
+            );
+            assert_eq!(
+                hits_six_rows, hits_three_rows,
+                "projected columns resolve once per statement, not once per result row \
+             (3 rows: {hits_three_rows} lookups, 6 rows: {hits_six_rows})"
             );
             assert_eq!(
                 FSQLITE_JOIN_EXPR_FALLBACK_SCANS
