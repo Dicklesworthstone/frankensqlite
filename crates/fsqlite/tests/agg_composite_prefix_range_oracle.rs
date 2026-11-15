@@ -371,3 +371,246 @@ fn agg_leading_range_with_a_residual_the_index_holds_reads_only_the_index() {
         }
     });
 }
+
+/// The schema and rows of `agg_composite_range_prefers_a_later_index_that_covers`.
+fn covering_choice_fixture() -> Vec<String> {
+    let mut stmts: Vec<String> = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, r REAL, c INTEGER);",
+        "CREATE INDEX idx_ab ON t(a, b);",
+        "CREATE INDEX idx_ar ON t(a, r);",
+        "CREATE TABLE w (a INTEGER NOT NULL, id INTEGER NOT NULL, b INTEGER, r REAL, \
+         PRIMARY KEY (a, id)) WITHOUT ROWID;",
+        "CREATE INDEX w_ab ON w(a, b);",
+        "CREATE INDEX w_ar ON w(a, r);",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    for i in 1..=3000_i64 {
+        let a = if i % 47 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("{}", i % 12)
+        };
+        let b = if i % 9 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("{}", i % 25)
+        };
+        // Whole and half values and NULLs. Stock stores a whole REAL as an integer in its
+        // records; read back, it must still be REAL.
+        let r = if i % 11 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("{}.{}", (i * 7) % 40, if i % 2 == 0 { 0 } else { 5 })
+        };
+        stmts.push(format!(
+            "INSERT INTO t VALUES ({i}, {a}, {b}, {r}, {});",
+            i % 5
+        ));
+        stmts.push(format!("INSERT INTO w VALUES ({}, {i}, {b}, {r});", i % 12));
+    }
+    stmts
+}
+
+/// bd-w4pr1.13.18 (read/seek round 3, lever R1): two composite indexes lead with `a`. `idx_ab(a,
+/// b)` is declared first and lacks `r`; `idx_ar(a, r)` holds it. An aggregate over a range on `a`
+/// that reads only `r` walks `idx_ar` and looks no row up, as stock does (`SEARCH t USING
+/// COVERING INDEX idx_ar`). Every index the composite range target admits enforces the whole
+/// WHERE, so the choice changes no answer; `group_concat(r)` checks that the entries come in
+/// stock's order. Negative cases: a WHERE only `idx_ab` pins keeps it with its lookups; a first
+/// index that covers stays chosen; when no index covers, the first one is kept. A WITHOUT ROWID
+/// twin, which this target declines, answers as before. Checked in memory, on a file fsqlite
+/// wrote and on a file stock wrote, in strict mode on the files.
+#[test]
+fn agg_composite_range_prefers_a_later_index_that_covers() {
+    asupersync::test_utils::run_test(|| async {
+        let fixture = covering_choice_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("covering_choice_ours.db");
+        let theirs = dir.path().join("covering_choice_stock.db");
+        {
+            let stock_writer = rusqlite::Connection::open(&theirs).unwrap();
+            for stmt in &fixture {
+                stock_writer.execute_batch(stmt).unwrap();
+            }
+        }
+        for path in [":memory:", ours.to_str().unwrap(), theirs.to_str().unwrap()] {
+            let stock_file = path == theirs.to_str().unwrap();
+            let f = Connection::open(path).await.expect("frank");
+            let r = if stock_file {
+                rusqlite::Connection::open(&theirs).expect("sqlite")
+            } else {
+                let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+                for stmt in &fixture {
+                    f.execute(stmt).await.unwrap();
+                    r.execute_batch(stmt).unwrap();
+                }
+                r
+            };
+            if path != ":memory:" {
+                f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+                    .await
+                    .unwrap();
+            }
+            // Covered by the later idx_ar only.
+            let covered = [
+                "SELECT SUM(r) FROM t WHERE a BETWEEN 2 AND 8",
+                "SELECT COUNT(*), SUM(r), TOTAL(r), AVG(r) FROM t WHERE a > 5",
+                "SELECT COUNT(r), SUM(a), SUM(r) FROM t WHERE a <= 3",
+                "SELECT group_concat(r) FROM t WHERE a >= 9",
+                "SELECT SUM(r) FROM t WHERE a > 100",
+                "SELECT SUM(r) FROM t WHERE a = 5 AND r > 12.0",
+            ];
+            for sql in covered {
+                assert_eq!(
+                    frank_rows(&f, sql).await,
+                    sqlite_rows(&r, sql),
+                    "diverged: `{sql}` at {path}"
+                );
+                assert_eq!(
+                    index_opened(&f, sql).await,
+                    ["idx_ar"],
+                    "`{sql}` must read only idx_ar at {path}"
+                );
+                assert!(
+                    !has_op(&f, sql, "SeekRowid").await,
+                    "`{sql}` must not look rows up at {path}"
+                );
+            }
+            // Only idx_ab can pin `b > 3`: it stays, and r is read from the row.
+            let pinned_by_ab = "SELECT SUM(r) FROM t WHERE a = 5 AND b > 3";
+            // idx_ab covers SUM(b) and is first: it stays.
+            let first_covers = "SELECT SUM(b) FROM t WHERE a > 5";
+            // Neither index holds c: the first one is kept, with lookups.
+            let none_covers = "SELECT SUM(c) FROM t WHERE a > 5";
+            for (sql, lookups) in [
+                (pinned_by_ab, true),
+                (first_covers, false),
+                (none_covers, true),
+            ] {
+                assert_eq!(
+                    frank_rows(&f, sql).await,
+                    sqlite_rows(&r, sql),
+                    "diverged: `{sql}` at {path}"
+                );
+                let opened = index_opened(&f, sql).await;
+                assert!(
+                    opened.contains(&"idx_ab".to_owned()) && !opened.contains(&"idx_ar".to_owned()),
+                    "`{sql}` must walk idx_ab at {path}: {opened:?}"
+                );
+                assert_eq!(
+                    has_op(&f, sql, "SeekRowid").await,
+                    lookups,
+                    "`{sql}` row lookups at {path}"
+                );
+            }
+            for sql in [
+                "SELECT SUM(r), COUNT(*) FROM w WHERE a BETWEEN 2 AND 8",
+                "SELECT COUNT(r), TOTAL(r) FROM w WHERE a >= 9",
+            ] {
+                assert_eq!(
+                    frank_rows(&f, sql).await,
+                    sqlite_rows(&r, sql),
+                    "diverged: `{sql}` at {path}"
+                );
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+/// bd-w4pr1.13.18 (read/seek round 3, lever R1b): the same choice for a plain SELECT over a
+/// range on `a` with no ORDER BY. A projection only `idx_ar` holds walks it and looks no row
+/// up, and the rows come out in stock's order (compared unsorted). Negative cases: a
+/// projection the first index holds keeps it; a WHERE only `idx_ab` pins keeps it with its
+/// lookups; with an ORDER BY the choice is left as it was (answers only); a projection no index
+/// holds is compared as a set, since either index's order is legal there.
+#[test]
+fn nonagg_composite_range_prefers_a_later_index_that_covers() {
+    asupersync::test_utils::run_test(|| async {
+        let fixture = covering_choice_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("nonagg_covering_choice_ours.db");
+        let theirs = dir.path().join("nonagg_covering_choice_stock.db");
+        {
+            let stock_writer = rusqlite::Connection::open(&theirs).unwrap();
+            for stmt in &fixture {
+                stock_writer.execute_batch(stmt).unwrap();
+            }
+        }
+        for path in [":memory:", ours.to_str().unwrap(), theirs.to_str().unwrap()] {
+            let stock_file = path == theirs.to_str().unwrap();
+            let f = Connection::open(path).await.expect("frank");
+            let r = if stock_file {
+                rusqlite::Connection::open(&theirs).expect("sqlite")
+            } else {
+                let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+                for stmt in &fixture {
+                    f.execute(stmt).await.unwrap();
+                    r.execute_batch(stmt).unwrap();
+                }
+                r
+            };
+            if path != ":memory:" {
+                f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+                    .await
+                    .unwrap();
+            }
+            for sql in [
+                "SELECT a, r FROM t WHERE a BETWEEN 2 AND 8",
+                "SELECT id, r FROM t WHERE a <= 3",
+                "SELECT r FROM t WHERE a > 9 LIMIT 7",
+                "SELECT r, a FROM t WHERE a = 5 AND r > 12.0",
+            ] {
+                assert_eq!(
+                    frank_rows(&f, sql).await,
+                    sqlite_rows(&r, sql),
+                    "diverged: `{sql}` at {path}"
+                );
+                assert_eq!(
+                    index_opened(&f, sql).await,
+                    ["idx_ar"],
+                    "`{sql}` must read only idx_ar at {path}"
+                );
+                assert!(
+                    !has_op(&f, sql, "SeekRowid").await,
+                    "`{sql}` must not look rows up at {path}"
+                );
+            }
+            // The first index holds the projection: it stays, covered.
+            let first_covers = "SELECT a, b FROM t WHERE a > 5";
+            // Only idx_ab can pin `b > 3`: it stays, and r is read from the row.
+            let pinned_by_ab = "SELECT r FROM t WHERE a = 5 AND b > 3";
+            for (sql, lookups) in [(first_covers, false), (pinned_by_ab, true)] {
+                assert_eq!(
+                    frank_rows(&f, sql).await,
+                    sqlite_rows(&r, sql),
+                    "diverged: `{sql}` at {path}"
+                );
+                let opened = index_opened(&f, sql).await;
+                assert!(
+                    opened.contains(&"idx_ab".to_owned()) && !opened.contains(&"idx_ar".to_owned()),
+                    "`{sql}` must walk idx_ab at {path}: {opened:?}"
+                );
+                assert_eq!(
+                    has_op(&f, sql, "SeekRowid").await,
+                    lookups,
+                    "`{sql}` row lookups at {path}"
+                );
+            }
+            let ordered = "SELECT a, r FROM t WHERE a BETWEEN 2 AND 8 ORDER BY a, r, id";
+            assert_eq!(
+                frank_rows(&f, ordered).await,
+                sqlite_rows(&r, ordered),
+                "diverged: `{ordered}` at {path}"
+            );
+            let uncovered = "SELECT a, c FROM t WHERE a > 5";
+            let mut ours_rows = frank_rows(&f, uncovered).await;
+            let mut stock_rows = sqlite_rows(&r, uncovered);
+            ours_rows.sort();
+            stock_rows.sort();
+            assert_eq!(ours_rows, stock_rows, "diverged: `{uncovered}` at {path}");
+            f.close().await.unwrap();
+        }
+    });
+}

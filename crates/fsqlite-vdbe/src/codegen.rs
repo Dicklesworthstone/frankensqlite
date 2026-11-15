@@ -3324,6 +3324,7 @@ pub fn codegen_select(
                     table_alias,
                     schema,
                     None,
+                    None,
                 )
                 .is_some()
                 || aggregate_index_prefix_literal_residual_target(
@@ -3885,12 +3886,21 @@ pub fn codegen_select(
         && having.is_none()
         && !table.without_rowid
     {
+        // Without an ORDER BY, an index that holds every output column walks without row
+        // lookups. With one, whether the walk satisfies it depends on the index, so the first
+        // qualifying index keeps being the choice.
+        let covers = |index: &IndexSchema| {
+            resolve_covering_output_sources(columns, table, table_alias, index).is_some()
+        };
         composite_index_prefix_range_target(
             where_clause.as_deref(),
             table,
             table_alias,
             schema,
             required_index,
+            stmt.order_by
+                .is_empty()
+                .then_some(&covers as &dyn Fn(&IndexSchema) -> bool),
         )
     } else {
         None
@@ -22464,7 +22474,16 @@ fn codegen_select_aggregate(
         && index_const_in_seek.is_none()
         && index_range_seek.is_none()
     {
-        composite_index_prefix_range_target(where_clause, table, table_alias, schema, None)
+        // An index that holds every column the aggregates read walks without row lookups.
+        let covers = |index: &IndexSchema| aggregate_seek_is_covering(&agg_columns, index, table);
+        composite_index_prefix_range_target(
+            where_clause,
+            table,
+            table_alias,
+            schema,
+            None,
+            Some(&covers),
+        )
     } else {
         None
     };
@@ -40706,17 +40725,25 @@ fn conjunct_pins_prefix_or_range(
 /// composite index whose leading columns are all pinned by `= <lit/param>` conjuncts and whose
 /// next column has a range; the prefix and range bounds must be seek-safe (same affinity/collation
 /// gate as the single-column range seek). Declines WITHOUT ROWID (PK-suffix probe not handled here).
+///
+/// Every index this admits enforces the whole WHERE (see the residual guard), so all of them
+/// visit the same entries. With `covers`, a qualifying index that fails it is only the fallback
+/// while a later qualifying index that passes it is looked for: one that holds every column the
+/// caller reads looks no row up, as stock's cost model prefers (bd-w4pr1.13.18, read/seek round 3).
+/// Without it the first qualifying index in declaration order is chosen.
 fn composite_index_prefix_range_target<'a>(
     where_clause: Option<&'a Expr>,
     table: &'a TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
     required_index: Option<&str>,
+    covers: Option<&dyn Fn(&IndexSchema) -> bool>,
 ) -> Option<CompositePrefixRange<'a>> {
     if table.without_rowid {
         return None;
     }
     let where_expr = where_clause?;
+    let mut fallback = None;
     for index in &table.indexes {
         // GH #291: an `INDEXED BY` hint pins the candidate set to the named
         // index (SQLite name resolution is case-insensitive).
@@ -40819,13 +40846,19 @@ fn composite_index_prefix_range_target<'a>(
         if !prefix_ok {
             continue;
         }
-        return Some(CompositePrefixRange {
+        let target = CompositePrefixRange {
             index,
             prefix_exprs,
             range,
-        });
+        };
+        match covers {
+            Some(covers) if !covers(index) => {
+                fallback.get_or_insert(target);
+            }
+            _ => return Some(target),
+        }
     }
-    None
+    fallback
 }
 
 /// Whether an index-range seek that streams in `(range_col, rowid)` order satisfies `order_by`
