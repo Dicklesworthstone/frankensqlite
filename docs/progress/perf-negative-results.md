@@ -87,6 +87,161 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN (small; retry of the 2026-11-12 rejection): a WAL refresh over a restarted WAL's stale tail reads one frame header, not a 15-frame batch (bd-w4pr1.7, lever L1)
+
+- Target: every WAL commit on a file-backed database after a checkpoint has restarted the WAL in
+  place. The file keeps the previous generation's frames past the new end. Until the new
+  generation outgrows them, the commit's append preflight (`native_append_baseline` ->
+  `WalFile::refresh`) finds frames past its prefix. It then read a batch of up to 15 frames
+  (61,800 bytes) into a freshly zeroed buffer, only to stop at the first one's salts.
+  Touched: `crates/fsqlite-wal/src/wal.rs` (`WalFile::refresh`, `WalFrameReader` allocates its
+  buffer at its first read, and the `AppendProbeFile` test helper records reads).
+- Ledger preflight: the 2026-11-12 entry "REJECTED: a WAL frame reader whose first read fetches one
+  frame, not a 15-frame batch (bd-w4pr1.7)". That variant read one 4,120-byte frame first. Its CPU
+  moved inside a ±7 us band over 5 runs. Its retry condition was "a profile showing the refresh's
+  frame read above 2% of commit CPU". Evidence that it is met:
+  - 5,420 of 6,000 CLI one-row commits and about 60% of the bench's commits issued the
+    61,800-byte pread;
+  - a C microbenchmark on this VM (scratchpad `p6_syscost.c`) costs it at 3.63 us against 0.87 us
+    for a 32-byte pread, plus 0.51 us for the calloc and free;
+  - 0.9 x 3.27 is 2.9 us of about 77 us commit CPU, 3.8%.
+- Change: before the absorb loop, `refresh` reads only the 24-byte header of frame `frame_count`.
+  When that read is whole and the salts are not this generation's, the loop would accept nothing,
+  so it scans no frame. The tail updates after the loop run as before: frame count to the last
+  commit, running checksum, recorded headers. A short read or matching salts runs the loop
+  unchanged; with a peer's frames to absorb, that costs one extra 24-byte pread. The GH#534 length
+  check, the header re-read and every frame validation are untouched.
+- Result. A = main fd57be379 (CLI 51afadb4260669a5, bench 0fca3befc638fbd2); B = A + L1 (CLI
+  b7ed138ebc761cca, bench 6a6890ac6bac2bb7). Stock live in every run; thinkstation1, governor
+  powersave, load 19-23 from other lanes.
+  - CLI `BEGIN; INSERT; COMMIT` x N, per transaction (N=6,000 minus N=2,000), 6 reps with the arms
+    rotated:
+    - tmpfs NORMAL CPU 136.3 -> 131.9 us (-4.4; paired -15.2 / +4.1 / -1.8 / +1.5 / -4.3 / -10.8;
+      stock 13.4, so 10.2x -> 9.8x stock);
+    - sys 39.4 -> 34.5 us;
+    - user instructions 223.4k -> 218.9k, kernel 102.4k -> 93.4k (stock 30.3k / 24.4k);
+    - disk NORMAL CPU 151.4 -> 149.2 us, wall 174.5 -> 166.0 (stock 18.5 / 45.3).
+  - pread per transaction: 4.06 -> 4.09 calls, and 60,990 -> 4,609 bytes.
+  - Exact (callgrind inside COMMIT, 3,000 commits, rep stosb counted per byte): 158.9k -> 112.3k per
+    commit; `WalFile::refresh` 48.4k -> 1.9k.
+  - mt-mvcc-bench, one row per transaction:
+    - 1 writer, 6 interleaved reps: B/A 1.006 (per rep 0.97-1.04), F/C 0.084 -> 0.085; COMMIT
+      stage 81.9 -> 80.5 us;
+    - 8 writers separate, 2 reps: 0.987 (0.95, 1.02), F/C 0.249 -> 0.268;
+    - 32 writers separate, 2 reps: 1.007 (0.98, 1.03), F/C 0.235 -> 0.264.
+  - Prediction (bead comment, before code), against the result:
+    - CLI CPU -2.0 to -3.5 us: -4.4, above the range;
+    - bench 1w +1% to +2.5%: +0.6%, missed low (fewer bench commits hit a stale tail);
+    - 8 / 32w within ±3%: met.
+  - Kill lines: CPU >= 1.0 us down, cleared; bytes >= 40 KB down, cleared (-56.4 KB); 1w >= -2%
+    and 8/32w >= -3%, not hit.
+- Test: `test_refresh_over_a_restarted_wal_reads_one_frame_header_of_its_stale_tail`.
+  - Setup: a peer restarts a 20-frame WAL in place and commits in the new generation.
+  - The reader's refresh must absorb the second new-generation commit.
+  - With nothing new, it must read no frame-sized block and must read the header of the first
+    frame past its prefix.
+  - It must end in the state of a fresh open.
+  - It fails on main's refresh, which reads `[(0, 32), (8272, 61800)]`. It also fails on a probe
+    that skips when the salts match (frame count 1, not 2).
+- Gate (rch, on fd57be379 + this change; reds are the known ones on main):
+  - fsqlite-wal lib 1,175 pass. One later run on a tree with another change had 22 reds: the
+    known native_commit metrics-lock poisoning flake, in a crate identical to this one.
+  - fsqlite-mvcc lib 1,682 pass.
+  - fsqlite-pager lib 1,113 pass + `bd_2jpu6_2`.
+  - fsqlite-core lib 4,192 pass + the t6741 pair.
+  - fsqlite-core keepers 8 targets pass: certificate append tail, flush floor after peer growth,
+    path identity once per transaction, `bulk_import_upsert_text_pk_phantom_pk`, cache staleness,
+    gh525, `gh534_sigkill_unpublished_wal_tail`, read-your-own-write peer races.
+  - fsqlite-e2e concurrent-writer / SSI / checkpoint / group-commit batch: 120 pass in 16 targets.
+    Second batch: 41 pass in 7 targets (`refused_commit_ends_transaction_e2e`,
+    `gh364_stale_wal_cert_file_replacement` among them).
+  - `multiprocess_autocommit_busy_timeout_e2e` with `--test-threads=1`: 8 pass.
+  - bd-73pfl's repro on this tree plus lever 4 (next entry): integrity ok 10/10.
+  - Clippy: `-D warnings --all-targets` on fsqlite-wal is clean on the rebased tree.
+- Landed as a4ff2c4ca, rebased onto d8f44c18f; no commit since fd57be379 touches fsqlite-wal.
+- Retry condition for what is left of the refresh: none for the stale tail. The duplicate 32-byte
+  WAL header pread at commit (the path check reads it, then the refresh reads it again under the
+  same append gate, about 0.9 us) is the next item. It needs the refresh to accept the header the
+  gate already validated, which crosses into the wal_adapter append paths the cross-process lane
+  (perf8) is working in.
+
+## 2026-11-15 - REJECTED on its one-writer kill line (8-64 writers far above the prediction): active-peer SSI candidates by a direct scan instead of a per-commit hash index (bd-i0tn6 scaling lever 4)
+
+- Target: the registry-guard holds of concurrent commits at 16-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`, separate and shared tables). Touched, then reverted:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`:
+  - new `HandleView::may_have_read`, `may_have_written` and `is_edge_peer_of`;
+  - new `overlaps_pages_or_cells`, `active_incoming_candidates` and `active_outgoing_candidates`;
+  - `pending_publication_blocks` scans with early exit;
+  - `ActiveEdgeDiscoveryIndex` becomes `cfg(test)`, as the oracle.
+  - Patch: scratchpad `i0_r3_lever4_scan_on_l3_wip.patch` (session 1f77802a), which applies to
+    fd57be379 as is.
+- Ledger preflight:
+  - lever 3 below (WIN) named the index builds and the pending check as the next item;
+  - lever 2 (WIN small) caches the view parts this scan reads;
+  - lever 1 (REJECTED) showed that removing waits elsewhere only lengthens these holds.
+- Evidence before (hold-split probe on lever 3's tree, bead comment 2026-11-15 02:00 UTC):
+  - at 64 writers the validate hold was 81.0 us: `pending_publication_blocks` 24.4 + SSI prepare
+    52.0 (peer views 16.8, `ActiveEdgeDiscoveryIndex::build` 16.3);
+  - publish was 69.9 us (views 19.7, index build 17.4, prune 9.7);
+  - each build fills six hash maps and four id lists over every registered peer's view, to answer
+    one incoming and one outgoing question.
+- Change: one pass over the views in collection order, with exactly the index's rules. The pending
+  check tests each pending peer under its handle lock and stops at the first candidate.
+- Result:
+  - Binaries: A = main fd57be379 + bd-w4pr1.7 lever L1 (mtbench sha256 6a6890ac6bac2bb7);
+    B = A + this change (706c6c767e49dbd8).
+  - Setup: thinkstation1, 64 hardware threads, governor powersave, tmpfs, NORMAL; 500 rows per
+    writer, 5 rounds; stock live in every run; pairs interleaved with the order alternating per
+    rep; load 15-23 from other lanes; 265 observed OS threads at 64 writers.
+  - B/A of the means over 4 reps, with F/C A -> B:
+    - separate tables:
+      - 1w 0.944 (pooled 12 reps 0.953, per rep 0.74-1.11), F/C 0.096 -> 0.090
+      - 8w 1.050, F/C 0.287 -> 0.277
+      - 16w 1.161, F/C 0.303 -> 0.367
+      - 32w 1.489 (every rep 1.47-1.52), F/C 0.268 -> 0.383
+      - 64w 1.744 (1.68-1.80), F/C 0.142 -> 0.274
+    - shared table:
+      - 1w 1.004 (pooled 12 reps 1.003)
+      - 8w 1.044
+      - 16w 1.109
+      - 32w 1.179, F/C 0.204 -> 0.226
+  - Registry hold (validate + publish), A -> B:
+    - 64w separate 117.9 -> 51.6 us (-56%);
+    - 32w separate 72.1 -> 37.8;
+    - 8w separate 27.0 -> 16.8;
+    - 32w shared 79.7 -> 53.5.
+  - Bulk (1,000-row transactions, 1 rep each): B/A 0.86-1.10. That is not resolvable with one
+    rep. The 1w bulk hold grew 15.3 -> 18.5 and 15.6 -> 21.3 us (see below).
+  - Worker failures: none.
+  - bd-73pfl repro (`mw_conflict.py explicit-same 8 300 10 5000`): stock integrity_check ok on
+    10/10 files per arm.
+  - Exact 1w work (callgrind of the bench's transaction body): 164.3k -> 164.6k per transaction.
+  - Prediction (bead comment, before code), against the result: 64w separate +8% to +20%, 32w +4%
+    to +12%, 16w 0 to +6%, 8w and 1w within ±2%, 64w hold -12% to -25%, shared 32w +3% to +12%.
+    Every multi-writer row missed high. The A arm's 64w hold had grown from round 3's 91 us to
+    117.9 us with main's changes since the prediction (250db23d7's structural claims among them),
+    so the index builds removed were larger than the ones the prediction sized.
+  - Kill line: 1w worse than -2%. Pre-registered before the extra reps, the 1w verdict is the
+    pooled mean of 12 reps per shape. Separate 1w came in at -4.7%: hit. Rejected; the kill line
+    is final.
+- Why the 1w reading is probably noise (recorded for the retry, not used against the verdict):
+  - at 1 writer the separate and shared shapes are the same workload, and their pooled means
+    differ by 5 points;
+  - the exact count differs by 0.18%.
+  - One real 1w cost exists: the scan tests the overlap rules before `is_edge_peer_of`, so it
+    searches the committer's own view. A 1,000-row summary makes that 3-6 us per commit (the bulk
+    hold above); a one-row transaction pays a few hundred instructions.
+- Tests (pass on B):
+  - `test_active_candidate_scan_matches_the_candidate_index`: 2,000 random cases, the same tokens
+    in the same order as the old index;
+  - `test_pending_publication_blocks_on_an_exact_cell_overlap_alone`;
+  - fsqlite-mvcc lib 1,684 pass / 0 fail.
+  - Negative run: with the exact-cell rule dropped, both new tests fail.
+- Retry condition: re-post a prediction on current main with the scan testing `is_edge_peer_of`
+  first. Decide the 1w line on a measurement that resolves 2%, such as the bench's 2,000 x 11
+  one-writer shape, 12 interleaved pairs at host load below 5, plus the exact count.
+
 ## 2026-11-15 - WIN (prediction missed, beyond its range): a literal SELECT keyed on any column of a rowid table without a partial index runs parameterized (bd-w4pr1.13.18, read/seek round 4, lever L2)
 
 - Target: the non-prepared point lookup by a secondary key, point_sec_key_2000 of the read sweep
