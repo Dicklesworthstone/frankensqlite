@@ -78113,6 +78113,28 @@ impl Connection {
         flattened
     }
 
+    /// An EXISTS probe needs only its first row, so one without a LIMIT of
+    /// its own runs with `LIMIT 1` and stops there, as stock's does (a row
+    /// past the first that would raise an error is never evaluated). bd-8c68u:
+    /// a nested-loop join the VDBE compiles refuses a LIMIT, which would route
+    /// the probe to the materializing join executor and scan both tables, so
+    /// such a probe stays unlimited; a lookup join compiles the LIMIT 1 and
+    /// stops at its first row (bd-9gl3w). bd-b887p: shared by the per-row
+    /// probe and the fold of an uncorrelated EXISTS.
+    fn limit_exists_probe_to_its_first_row(&self, probe: &mut SelectStatement) {
+        if probe.limit.is_some() {
+            return;
+        }
+        let unlimited_runs_in_vdbe = select_join_is_vdbe_eligible(probe);
+        probe.limit = Some(fsqlite_ast::LimitClause {
+            limit: Expr::Literal(Literal::Integer(1), fsqlite_ast::Span::new(0, 0)),
+            offset: None,
+        });
+        if unlimited_runs_in_vdbe && !self.select_join_runs_in_vdbe(probe) {
+            probe.limit = None;
+        }
+    }
+
     /// bd-kef4m: flatten the simple view or derived-table source of a
     /// correlated subquery whose outer references are bound, as executing it
     /// would, but before its `col = <bound>` equalities are relaxed, so the
@@ -94316,21 +94338,7 @@ impl Connection {
                     // the linear scan probe above never takes the flattened table.
                     self.flatten_correlated_probe_source(&mut sub_clone);
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
-                    // bd-8c68u: a nested-loop join the VDBE compiles refuses a
-                    // LIMIT, which would route the probe to the materializing
-                    // join executor and scan both tables per probe. EXISTS
-                    // needs no LIMIT for its answer. A lookup join compiles
-                    // the LIMIT 1 and stops at its first row (bd-9gl3w).
-                    if sub_clone.limit.is_none() {
-                        let unlimited_runs_in_vdbe = select_join_is_vdbe_eligible(&sub_clone);
-                        sub_clone.limit = Some(fsqlite_ast::LimitClause {
-                            limit: Expr::Literal(Literal::Integer(1), fsqlite_ast::Span::new(0, 0)),
-                            offset: None,
-                        });
-                        if unlimited_runs_in_vdbe && !self.select_join_runs_in_vdbe(&sub_clone) {
-                            sub_clone.limit = None;
-                        }
-                    }
+                    self.limit_exists_probe_to_its_first_row(&mut sub_clone);
                     // bd-ry6x7: a parameterized probe (a trigger WHEN guard)
                     // is identified by its text and reuses its program.
                     let _cache_guard = BoolCellRestoreGuard::new(
@@ -104920,6 +104928,7 @@ impl Connection {
                     if !is_correlated_subquery_with_schema(subquery, &self.schema.borrow()) {
                         let mut probe = (**subquery).clone();
                         strip_exists_subquery_projection(&mut probe);
+                        self.limit_exists_probe_to_its_first_row(&mut probe);
                         let rows = self
                             .execute_statement(&Statement::Select(probe), params)
                             .await?;
@@ -105561,6 +105570,7 @@ impl Connection {
                     // bd-kef4m: seek, as in eval_expr_with_subqueries.
                     self.flatten_correlated_probe_source(&mut sub_clone);
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
+                    self.limit_exists_probe_to_its_first_row(&mut sub_clone);
                     let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(sub_clone), None)
@@ -132831,8 +132841,11 @@ fn rewrite_in_expr<'a>(
                 if params.is_none() && select_contains_any_placeholder(subquery) {
                     return Ok(());
                 }
+                // bd-b887p: only whether a first row exists matters.
+                let mut probe = *subquery.clone();
+                conn.limit_exists_probe_to_its_first_row(&mut probe);
                 let rows = conn
-                    .execute_statement(&Statement::Select(*subquery.clone()), params)
+                    .execute_statement(&Statement::Select(probe), params)
                     .await?;
                 let exists = !rows.is_empty();
                 let result = if *not { !exists } else { exists };
