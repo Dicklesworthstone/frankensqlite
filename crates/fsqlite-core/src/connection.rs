@@ -29213,9 +29213,21 @@ impl Connection {
         &self,
         select: &SelectStatement,
     ) -> Option<(bool, Expr, Option<Expr>, bool)> {
+        self.select_uses_builtin_minmax_bare_tracking_with_keys(select, &[])
+    }
+
+    /// `select_uses_builtin_minmax_bare_tracking` for a grouped evaluator that
+    /// knows its GROUP BY keys' collations: `variant_group_keys` marks each
+    /// key whose collation admits several spellings in one group (bd-ukvhn).
+    fn select_uses_builtin_minmax_bare_tracking_with_keys(
+        &self,
+        select: &SelectStatement,
+        variant_group_keys: &[bool],
+    ) -> Option<(bool, Expr, Option<Expr>, bool)> {
         let walk = select_minmax_bare_tracking_walk(
             select,
             &self.having_alias_shadowing_column_names(select),
+            variant_group_keys,
         )?;
         let builtin = walk.seen_minmax.iter().all(|(is_max, _, _)| {
             !self.application_function_replaces_builtin(if *is_max { "max" } else { "min" }, 1)
@@ -29351,6 +29363,7 @@ impl Connection {
         let Some(walk) = select_minmax_bare_tracking_walk(
             select,
             &self.having_alias_shadowing_column_names(select),
+            &[],
         ) else {
             return false;
         };
@@ -90238,7 +90251,15 @@ impl Connection {
         } else {
             select
         };
-        if let Some(tracking) = self.select_uses_builtin_minmax_bare_tracking(tracking_source) {
+        // bd-ukvhn: a key with a non-BINARY collation reads its spelling from
+        // the same row as the bare columns.
+        let variant_group_keys: Vec<bool> = group_collations
+            .iter()
+            .map(|collation| group_key_collation_varies_spelling(collation.as_deref()))
+            .collect();
+        if let Some(tracking) = self
+            .select_uses_builtin_minmax_bare_tracking_with_keys(tracking_source, &variant_group_keys)
+        {
             for (_key, group_rows) in &mut groups {
                 if let Some(index) = self
                     .join_minmax_bare_extremum_index(
@@ -96189,7 +96210,14 @@ impl Connection {
         // extremum row, the streaming fast paths (which take an arbitrary row for
         // bare columns) cannot express it. Disqualify them so the row-grouping
         // loop below applies the extremum-row sourcing.
-        let minmax_bare_tracking = self.select_uses_builtin_minmax_bare_tracking(select);
+        // bd-ukvhn: a key with a non-BINARY collation reads its spelling from
+        // the same row as the bare columns.
+        let variant_group_keys: Vec<bool> = group_collations
+            .iter()
+            .map(|collation| group_key_collation_varies_spelling(collation.as_deref()))
+            .collect();
+        let minmax_bare_tracking =
+            self.select_uses_builtin_minmax_bare_tracking_with_keys(select, &variant_group_keys);
         let simple_streaming_outputs = if minmax_bare_tracking.is_some()
             || self.scalar_function_overridden.get()
             || self.custom_aggregate_registered.get()
@@ -112853,6 +112881,7 @@ fn frame_bound_has_expr(bound: &FrameBound, predicate: fn(&Expr) -> bool) -> boo
 fn select_minmax_bare_tracking_walk(
     select: &SelectStatement,
     having_column_names: &HashSet<String>,
+    variant_group_keys: &[bool],
 ) -> Option<MinMaxBareTrackingWalk> {
     if !select.body.compounds.is_empty() {
         return None;
@@ -112867,7 +112896,10 @@ fn select_minmax_bare_tracking_walk(
     else {
         return None;
     };
-    let mut state = MinMaxBareTrackingWalk::default();
+    let mut state = MinMaxBareTrackingWalk {
+        variant_group_keys: variant_group_keys.to_vec(),
+        ..MinMaxBareTrackingWalk::default()
+    };
     for col in columns {
         let ResultColumn::Expr { expr, .. } = col else {
             return None;
@@ -112951,6 +112983,12 @@ fn walk_aliased_minmax_bare_tracking(
     state.result_aliases = previous;
 }
 
+/// bd-ukvhn: whether a GROUP BY key's effective collation admits several
+/// spellings within one group, as every collation but BINARY does.
+fn group_key_collation_varies_spelling(collation: Option<&str>) -> bool {
+    collation.is_some_and(|name| !name.eq_ignore_ascii_case("binary"))
+}
+
 /// Traversal state for [`select_minmax_bare_tracking_walk`].
 #[derive(Default)]
 struct MinMaxBareTrackingWalk {
@@ -112981,6 +113019,11 @@ struct MinMaxBareTrackingWalk {
     /// Result-column aliases a bare name resolves to (set only while walking
     /// HAVING): the name stands for the aliased result expression.
     result_aliases: Vec<(String, Expr)>,
+    /// bd-ukvhn: per GROUP BY key, whether its collation lets one group hold
+    /// several spellings (NOCASE, RTRIM, any non-BINARY collation). SQLite
+    /// copies such a key with the bare columns, so it reads from the same
+    /// row and counts as a bare column here.
+    variant_group_keys: Vec<bool>,
 }
 
 /// Walk one result-column expression for [`select_minmax_bare_tracking_walk`],
@@ -112990,8 +113033,11 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
         return;
     }
     // A subexpression that is exactly a GROUP BY key is a grouped value, not a
-    // bare column; do not descend into it.
-    if group_by.iter().any(|g| g == expr) {
+    // bare column; do not descend into it. bd-ukvhn: a key whose collation
+    // admits several spellings in one group reads its value from the
+    // bare-column row, so it counts as bare.
+    if let Some(key) = group_by.iter().position(|g| g == expr) {
+        state.has_bare |= state.variant_group_keys.get(key).copied().unwrap_or(false);
         return;
     }
     match expr {
