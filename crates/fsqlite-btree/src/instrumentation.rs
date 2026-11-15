@@ -1385,10 +1385,26 @@ pub(crate) fn record_nonroot_balance(start: Option<Instant>) {
 /// Gated on the general B-tree metrics flag (not the copy-profile flag) so the
 /// production hot path pays a single `AtomicBool` load when metrics are off.
 pub(crate) fn record_balance_for_delete() {
+    #[cfg(test)]
+    THREAD_BALANCE_FOR_DELETE_CALLS.with(|calls| calls.set(calls.get() + 1));
     if !btree_metrics_enabled() {
         return;
     }
     BTREE_BALANCE_FOR_DELETE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Deferred-delete rebalances run on this thread, metrics on or off. The
+    /// process-global counter also counts every test running in parallel, so
+    /// a test about its own cursor reads this one (bd-w4pr1.13.20).
+    static THREAD_BALANCE_FOR_DELETE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The [`record_balance_for_delete`] calls made on the calling thread so far.
+#[cfg(test)]
+pub(crate) fn thread_balance_for_delete_calls() -> u64 {
+    THREAD_BALANCE_FOR_DELETE_CALLS.with(std::cell::Cell::get)
 }
 
 pub(crate) fn record_delete_leaf_run_materialize(start: Option<Instant>) {

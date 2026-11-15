@@ -19676,6 +19676,7 @@ mod tests {
             )
             .unwrap();
             let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
+            let leftmost_leaf = first_divider_cell.left_child.unwrap().get();
             assert!(
                 leftmost_max_rowid >= 1,
                 "leftmost leaf must hold >= 2 cells for this proof"
@@ -19683,23 +19684,58 @@ mod tests {
 
             // Phase A: delete every cell of the leftmost leaf EXCEPT the last. The
             // leaf stays non-empty, so the deferred-delete strategy performs no
-            // rebalance (balance_for_delete is gated on new_count == 0). The balance
-            // counter lives on the leaf-reuse snapshot; the DELETE op total on the
-            // metrics snapshot.
-            let before_balance = btree_leaf_reuse_snapshot();
+            // rebalance (balance_for_delete is gated on new_count == 0).
+            //
+            // The rebalance count is read per thread: the process-global
+            // `balance_for_delete_calls` also counts every concurrently running test
+            // whose delete empties a leaf while this test has metrics enabled (one
+            // such sibling made a gate read 1 here). The thread count is this
+            // cursor's alone, so its zero is exact; and no page but the leaf itself
+            // may change, which a rebalance or a separator rewrite would do.
+            let pages_before = cursor.pager.inner.pages.clone();
+            let before_thread_balance = crate::instrumentation::thread_balance_for_delete_calls();
             let before_ops = btree_metrics_snapshot();
             for rowid in 0..leftmost_max_rowid {
                 assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
                 cursor.delete(&cx).await.unwrap();
             }
+            let after_partial_thread_balance =
+                crate::instrumentation::thread_balance_for_delete_calls();
             let after_partial_balance = btree_leaf_reuse_snapshot();
             let after_partial_ops = btree_metrics_snapshot();
             assert_eq!(
-                after_partial_balance.balance_for_delete_calls
-                    - before_balance.balance_for_delete_calls,
+                after_partial_thread_balance - before_thread_balance,
                 0,
                 "deleting non-emptying cells must defer rebalancing (zero balance_for_delete)"
             );
+            let pages_after = &cursor.pager.inner.pages;
+            assert_eq!(
+                pages_after.len(),
+                pages_before.len(),
+                "Phase A allocated or freed a page"
+            );
+            for (page_no, bytes) in &pages_before {
+                if *page_no != leftmost_leaf {
+                    assert_eq!(
+                        pages_after.get(page_no),
+                        Some(bytes),
+                        "Phase A changed page {page_no}, not only the leaf it deleted from"
+                    );
+                }
+            }
+            let leaf = pages_after.get(&leftmost_leaf).unwrap();
+            let leaf_header = BtreePageHeader::parse(leaf, 0).unwrap();
+            assert_eq!(leaf_header.page_type, cell::BtreePageType::LeafTable);
+            assert_eq!(
+                leaf_header.cell_count, 1,
+                "the leaf keeps only its last cell"
+            );
+            for rowid in 0..leftmost_max_rowid {
+                assert!(
+                    !cursor.table_move_to(&cx, rowid).await.unwrap().is_found(),
+                    "Phase A must have performed real DELETEs (rowid {rowid} still found)"
+                );
+            }
             assert!(
                 after_partial_ops.fsqlite_btree_operations_total.delete
                     - before_ops.fsqlite_btree_operations_total.delete
@@ -19708,7 +19744,8 @@ mod tests {
             );
 
             // Phase B: delete the final cell of the leftmost leaf -> it empties ->
-            // the deferred rebalance runs exactly now.
+            // the deferred rebalance runs exactly now, on this thread, and takes the
+            // empty leaf out of the root.
             assert!(
                 cursor
                     .table_move_to(&cx, leftmost_max_rowid)
@@ -19719,11 +19756,33 @@ mod tests {
             cursor.delete(&cx).await.unwrap();
             let after_empty_balance = btree_leaf_reuse_snapshot();
             assert!(
-                after_empty_balance.balance_for_delete_calls
-                    - after_partial_balance.balance_for_delete_calls
+                crate::instrumentation::thread_balance_for_delete_calls()
+                    - after_partial_thread_balance
                     >= 1,
                 "emptying a leaf must trigger the deferred rebalance exactly then"
             );
+            assert!(
+                after_empty_balance.balance_for_delete_calls
+                    - after_partial_balance.balance_for_delete_calls
+                    >= 1,
+                "the process-wide metric counts the rebalance too"
+            );
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            if root_header.page_type == cell::BtreePageType::InteriorTable {
+                let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
+                let mut children = vec![root_header.right_child.map(PageNumber::get)];
+                for ptr in root_ptrs {
+                    let divider =
+                        CellRef::parse(root_page, usize::from(ptr), root_header.page_type, USABLE)
+                            .unwrap();
+                    children.push(divider.left_child.map(PageNumber::get));
+                }
+                assert!(
+                    !children.contains(&Some(leftmost_leaf)),
+                    "the emptied leaf must leave the root after the rebalance"
+                );
+            }
 
             set_btree_metrics_enabled(false);
 
