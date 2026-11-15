@@ -9180,9 +9180,10 @@ mod tests {
             }
             let mut payload = inner.clone();
             payload.extend_from_slice(&inner[..16]);
-            let lane_counts = payload
-                .chunks_exact(4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte lane count")))
+            let (lane_words, _) = payload.as_chunks::<4>();
+            let lane_counts = lane_words
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
                 .collect();
             let outer = ParallelWalDurableCertificateRecord::new(
                 backend.inner.inner().generation_identity(),

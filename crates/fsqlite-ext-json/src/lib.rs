@@ -2096,7 +2096,7 @@ impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisit
         A: serde::de::SeqAccess<'de>,
     {
         let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(JsonValueVisitor::<ESCAPE_STRINGS>)? {
+        while let Some(value) = sequence.next_element_seed(Self)? {
             values.push(value);
         }
         Ok(Value::Array(values))
@@ -2108,7 +2108,7 @@ impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisit
     {
         let mut values = Object::new();
         while let Some(key) = object.next_key::<String>()? {
-            let value = object.next_value_seed(JsonValueVisitor::<ESCAPE_STRINGS>)?;
+            let value = object.next_value_seed(Self)?;
             values.append(key, value);
         }
         Ok(Value::Object(values))
