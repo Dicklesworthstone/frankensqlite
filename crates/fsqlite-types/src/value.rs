@@ -458,8 +458,25 @@ impl SmallText {
     /// UTF-8 byte payload variant of [`Self::from_record_text_bytes_shared`]:
     /// valid UTF-8 becomes inline (short) or `HeapShared` (wide); invalid UTF-8
     /// keeps the byte-preserving raw representation.
+    ///
+    /// ASCII is UTF-8, so a payload that fits inline and has no byte with its
+    /// high bit set is copied in as [`Self::new`] would store it, without the
+    /// general validation: one OR over the zero-padded buffer instead of ~100
+    /// instructions for a ten-byte key (bd-w4pr1.13.28 follow-up, lever O1).
     #[inline]
     fn from_bytes_shared(bytes: &[u8]) -> Self {
+        if bytes.len() <= SMALL_TEXT_INLINE_CAP {
+            let mut buf = [0u8; SMALL_TEXT_INLINE_CAP];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            if buf.iter().fold(0u8, |high, byte| high | byte) < 0x80 {
+                return Self {
+                    repr: SmallTextRepr::Inline {
+                        len: bytes.len() as u8,
+                        buf,
+                    },
+                };
+            }
+        }
         match simdutf8::basic::from_utf8(bytes) {
             Ok(text) => Self::from_str_shared(text),
             Err(_) => Self::from_raw_bytes(Arc::from(bytes)),
@@ -3005,6 +3022,65 @@ mod tests {
         fn drop(&mut self) {
             pool_clear();
             reset_value_pool_test_stats();
+        }
+    }
+
+    /// bd-w4pr1.13.28 lever O1: the ASCII shortcut of `from_bytes_shared`
+    /// gives what the validating path gives (`SmallText::new` of valid UTF-8,
+    /// `HeapShared` past the inline capacity, byte-preserving Raw otherwise)
+    /// for every length up to one past the inline capacity, over ASCII, NUL,
+    /// one multi-byte character and one invalid byte at every position. A
+    /// shortcut that checked only some of the bytes would turn the non-ASCII
+    /// cases inline.
+    #[test]
+    fn record_text_ascii_shortcut_matches_validating_decode() {
+        fn reference(bytes: &[u8]) -> (Vec<u8>, bool, bool) {
+            match std::str::from_utf8(bytes) {
+                Ok(text) => {
+                    let inline = text.len() <= SMALL_TEXT_INLINE_CAP;
+                    (text.as_bytes().to_vec(), true, inline)
+                }
+                Err(_) => (bytes.to_vec(), false, false),
+            }
+        }
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for len in 0..=SMALL_TEXT_INLINE_CAP + 1 {
+            let ascii: Vec<u8> = (0..len)
+                .map(|i| b'a' + u8::try_from(i % 26).unwrap())
+                .collect();
+            cases.push(ascii.clone());
+            for at in 0..len {
+                let mut with_nul = ascii.clone();
+                with_nul[at] = 0;
+                cases.push(with_nul);
+                let mut invalid = ascii.clone();
+                invalid[at] = 0xFF;
+                cases.push(invalid);
+                let mut lone_continuation = ascii.clone();
+                lone_continuation[at] = 0x80;
+                cases.push(lone_continuation);
+                if at + 1 < len {
+                    let mut two_byte = ascii.clone();
+                    two_byte[at] = 0xC3;
+                    two_byte[at + 1] = 0xA9;
+                    cases.push(two_byte);
+                }
+                if at + 1 == len {
+                    let mut truncated = ascii.clone();
+                    truncated[at] = 0xC3;
+                    cases.push(truncated);
+                }
+            }
+        }
+        for bytes in &cases {
+            let decoded = SmallText::from_record_text_bytes_shared(bytes, TextEncoding::Utf8);
+            let (expected, valid, inline) = reference(bytes);
+            assert_eq!(decoded.as_bytes_direct(), expected.as_slice(), "{bytes:?}");
+            assert_eq!(decoded.is_valid_utf8(), valid, "{bytes:?}");
+            assert_eq!(decoded.is_inline(), inline, "{bytes:?}");
+            if valid {
+                assert_eq!(decoded, SmallText::new(std::str::from_utf8(bytes).unwrap()));
+            }
         }
     }
 
