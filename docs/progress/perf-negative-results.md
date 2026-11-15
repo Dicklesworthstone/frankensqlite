@@ -89,6 +89,115 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN: on Linux every file sync is fdatasync, as stock SQLite's, and a WAL the open creates syncs its directory (bd-w4pr1.7, lever S)
+
+- Target: every synchronous=FULL commit on Linux, and every checkpoint's file syncs at any level.
+  Touched:
+  - `crates/fsqlite-vfs/src/unix.rs`: `sync_writes_data_only`, used by `UnixFile::sync` and `durable_sync`;
+  - `crates/fsqlite-core/src/connection.rs`: `install_wal_backend_with_vfs` syncs the directory of a WAL it creates;
+  - docs in `crates/fsqlite-vfs/src/traits.rs` (`SyncKind`) and `crates/fsqlite-wal/src/recovery_fence.rs`.
+- Ledger preflight:
+  - nothing earlier on the sync call itself;
+  - round 1's handoff sized it at "0.7 ms of a 10 ms disk FULL commit". That was the wrong shape (below).
+- Evidence before:
+  - strace -f -y of the CLI, split into phases by `.read` markers (scratchpad `p6r2_synctrace.py`):
+    - distro sqlite3 3.46.1 issues fdatasync for every sync, directories included;
+    - the bench's stock arm issues fsync. It is libsqlite3-sys 0.39.1's bundled 3.54.1, compiled without HAVE_FDATASYNC, so sqlite3.c `#define`s fdatasync to fsync;
+    - fsqlite issued fsync for every WAL, database, cert-head and directory sync.
+  - What the call costs on this disk (C microbenchmark `p6r2_synccost.c`, a 4,120-byte write then a sync, ext4 on NVMe):
+    - a write that grows the file: fsync 8.9-9.6 ms, fdatasync 9.1-10.0 ms;
+    - a write inside the file: fsync 9.2-10.6 ms, fdatasync 3.0-3.2 ms. fsync commits the journal for the mtime alone.
+  - Once a checkpoint has restarted the WAL in place, every commit overwrites frames, so that steady state is the lever. Round 1's CLI shape only grew a fresh WAL, where both calls cost the same.
+- Why fdatasync is enough for files (sqlite3.c `full_fsync`: "as far as SQLite is concerned, an fdatasync() is always adequate"):
+  - fdatasync(2) also flushes a changed size and the block map, and skips timestamps;
+  - no fsqlite recovery path reads a timestamp; file identity is device + inode (checked by grep).
+- Directories stay fsync, which is stronger than stock's fdatasync:
+  - fsqlite syncs directories after renames (sidecar publication, snapshot transfer, the checkpoint handoff);
+  - on ext4 a rename that leaves a directory's size unchanged is not metadata fdatasync must flush;
+  - stock syncs a directory only after creating a journal or WAL, whose own sync already covers the new entry.
+  - The measured binary (fsqlite-s1) used fdatasync for directories too. The landed tree's directory fsyncs come once per WAL creation and once or twice per checkpoint, at most one per 400 measured commits.
+- Sync parity after the change, FULL. NORMAL makes the same checkpoint calls and none per commit.
+
+  | phase | distro stock 3.46.1 | fsqlite before | fsqlite after |
+  |---|---|---|---|
+  | WAL creation and first commit | fdatasync(-wal) x2, fdatasync(dir) x1 | fsync(-wal) x2; no directory sync ordered before the commit (the FEC worker's, on another thread, raced it) | fdatasync(-wal) x2, fsync(dir) x1 |
+  | each commit | fdatasync(-wal) x1 | fsync(-wal) x1 | fdatasync(-wal) x1 |
+  | PASSIVE checkpoint | fdatasync wal x1, db x1 | fsync wal x1, db x2, -wal-cert-head x1, dir x1 | the same counts, fdatasync except the directory |
+  | RESTART / TRUNCATE | fdatasync wal x1, db x1 | fsync wal x2, db x3, cert-head x1, dir x1-2, -wal-fec tmp x1 | the same counts, fdatasync except the FEC tmp and the directories |
+
+  Left as they are, with the reason for each:
+  - The checkpoint's extra database syncs: `checkpoint_executor_impl.rs` syncs at :325, truncates at :332 and syncs at :333, where stock truncates and then syncs once. A further "defensive" sync at :500 precedes a RESTART / TRUNCATE reset. They are the bulk lane's code, and each needs its recovery keeper (bd_yfdb6 / GH#193) named before one goes. This is the next sync item, worth 1-2 fdatasyncs (3-10 ms each on disk) per checkpoint.
+  - The cert-head sync: it records the certificate chain's head, which recovery reads, before the WAL generation moves.
+  - The FEC sidecar's tmp fsync, rename and directory fsync: they publish the repair sidecar atomically, the repair path reads it, and they run at WAL restart on the FEC worker, not on the commit thread.
+  - The migration-state tmp fsync: once per open. The namespace record was already fdatasync.
+- Result:
+  - Arms: A = main dbac12d40 (fsqlite-h1, sha256 58448b854b8e1ccf; the H diff in that build touches only the bench). B = A + this change, with fdatasync directories (fsqlite-s1, cde08ccceedb17a7).
+  - Setup: thinkstation1, governor powersave, ext4 NVMe, load about 5.8 from other lanes; distro sqlite3 3.46.1 live in every rep; 6 interleaved reps, arms rotated.
+  - Steady state (`disk-fullss`, (N=1,500 minus N=1,100)/400; every commit comes after the first autocheckpoint restarted the WAL):
+    - wall per commit 10.31 -> 3.67 ms (paired -5.6 / -6.2 / -11.0 / -5.1 / -2.5 / -9.4 ms), against stock 4.19 (median 3.64);
+    - that takes fsqlite from 2.5x to 0.9x stock wall;
+    - the disk is shared, so per-rep spread is ±1.3-2.0 ms.
+  - Growth (`disk-full`, (N=300 minus N=100)/200, a fresh WAL that only grows): 10.60 -> 10.76 ms (paired -1.1 to +2.2), stock 10.74. Unchanged, as predicted.
+  - mt-mvcc-bench disk FULL, 1 writer, 150 x 5. Its WAL never restarts, and both arms run against the same fsync-calling C arm. 3 interleaved reps per harness:
+    - new harness: F wps B/A 1.005 (0.97 / 1.01 / 1.03), F/C 0.990 -> 0.993;
+    - old harness: B/A 0.996 (1.00 / 1.01 / 0.98), F/C 0.938 -> 0.933.
+  - Prediction (bead comment, before code): steady state 10.9 -> 3.4-4.2 ms, met (3.67); growth within ±0.3 ms, met (+0.17); bench 150 x 5 within noise, met.
+  - Kill line (steady state not down by at least 3.0 ms): cleared (-6.6 ms).
+- Tests:
+  - `test_unix_vfs_sync_calls_match_stock_sqlite_on_linux`: the policy, plus every flag and kind and a directory sync succeeding on a grown file whose size a reopen reads back.
+  - `test_install_wal_backend_syncs_the_directory_of_a_wal_it_creates`. Creating the WAL must sync its directory exactly once, which fails without the new line. Adopting the existing WAL must sync none, which fails for a version that syncs on every install.
+- Gate: on the exact landing tree (26950fa4c plus this change, rch):
+  - clippy -D warnings --all-targets on fsqlite-vfs, fsqlite-wal, fsqlite-core and fsqlite-e2e: clean.
+  - fsqlite-vfs lib: 530 pass, 1 red: `uring::tests::test_local_cx_cancellation_submits_async_cancel_within_five_ms`, at 5.66 ms against its 5 ms bound on a loaded worker. That is io_uring cancellation latency, not a sync path; the s1 tree's run passed 531 of 531.
+  - fsqlite-core install_wal_backend tests: 7 pass, including the new one.
+  - fsqlite-core keepers, 6 targets, all pass: gh534_sigkill_unpublished_wal_tail, bulk_import_upsert_text_pk_phantom_pk, bd_ih8ak_flush_floor_after_peer_growth, bd_ih8ak_certificate_append_tail, bd_qyekq_unsynced_certificate_crash_images, self_connection_read_your_own_write_peer_races.
+  - fsqlite-e2e, 13 targets: 73 pass, 0 fail. Among them stock_headerless_wal_e2e (the .5.6 keeper), split_claim_cross_process_e2e, refused_commit_ends_transaction_e2e, gh364, the four recovery_* targets, bd_3wop3_1_4_wal_recovery_checkpoint, bd_yfdb6_wal_recovery_race, bd_2yqp6_6_3_crash_recovery_corruption_matrix, group-commit durability and the concurrent checkpoint oracle.
+  - multiprocess_autocommit_busy_timeout_e2e with --test-threads=1: 8 pass.
+  - fsqlite-wal lib: 1,175 pass (on the tree rebased onto 65377e134).
+  - bd-73pfl stress (`mw_conflict.py explicit-same 8 300 10 5000`): stock integrity_check ok 10/10 on main and on s1. Every lost row is a refused commit, as on main.
+  - Not run: fsqlite-pager lib (S does not touch it), the full fsqlite-core lib, the e2e concurrent-writer / SSI batches.
+- Caveat for every bench ratio at synchronous=FULL on a real disk: the bench's stock arm calls fsync, the distro's calls fdatasync. A bench FULL row whose WAL restarts now compares fdatasync against fsync and flatters fsqlite; the CLI rows above are like for like. Building the bench's rusqlite with `LIBSQLITE3_FLAGS=-DHAVE_FDATASYNC` would make the bench like for like. That is a harness decision, posted on bd-w4pr1.7.
+- Retry condition: none for the call. Next are the checkpoint's extra database syncs (above), each with its recovery keeper named first.
+
+## 2026-11-15 - HELD (its A/A null missed 1.0 by 0.8 points): mt-mvcc-bench's FrankenSQLite arm drives the engine as `fsqlite::blocking` does, and the stage profiler is opt-in (bd-w4pr1.7, harness change H)
+
+- Target: every mt-mvcc-bench F/C row. The fsqlite arm entered an asupersync current-thread runtime once per transaction attempt (`fsqlite_e2e::block_on`). It also read the thread CPU clock six times per one-row transaction (stage profiler) and switched on two engine diagnostics that default to off for users (`set_commit_phase_timing_enabled`, `set_vdbe_metrics_enabled`). The stock arm calls rusqlite and pays none of this.
+  Touched: `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` only. Patch: scratchpad `p6r2_H_harness.patch` (session 1f77802a), sha256 prefix 399c7e69e0ce5411. Not committed.
+- Change:
+  - `--fsqlite-driver=poll` (default) opens through `fsqlite::blocking::Connection::open` and polls each engine future on the worker thread, as `fsqlite::blocking` does. `=runtime` is the old harness, kept for side-by-side runs.
+  - `--stage-profile` (default off) turns on the profiler and the diagnostics.
+  - Both are recorded in a new `fsqlite_harness` field of every configuration receipt, so a pre-H report never compares as history.
+  - Engine calls, SQL, retry classifier and receipts are unchanged.
+- Evidence of the defect (exact, writer thread, callgrind, (N=2,000 minus N=500)/1,500, mtbench-h1 sha256 3b6f47202a539d20):
+  - old 216,846 instructions per transaction; runtime entry only 215,742; poll driver + profiler 156,779; new 155,034; stock arm 16,120.
+  - The runtime entry is 60.7k:
+    - `CurrentThreadDriver::drive` 48.9k;
+    - `block_on` outside it 3.8k;
+    - 10.3k of engine work that runs only when an asupersync context is current (the polled block is 163.1k inside a runtime, 152.8k outside).
+  - `fsqlite::blocking` (prepared-dml-probe under callgrind) runs no runtime function. Its driver costs about 70 instructions per call.
+  - Peak OS threads: old 7-8 at 1 writer and 274-293 at 64; new 2 and 66-68.
+- A/A null on the stock arm, same binary, C wps new/old:
+  - 1 writer, three batches: 1.068 [1.045, 1.092] (6 pairs), 1.008 [0.982, 1.035] (10 pairs), 1.014 (4 pairs). Pooled 20 pairs: 1.027 [1.008, 1.047].
+  - Multi-writer, 7 pairs: 8w 0.975 [0.83, 1.13], 32w 1.080 [1.01, 1.15], 64w 0.994 [0.91, 1.08]. The multi-writer stock arm spreads ±15% per run, with signs flipping between batches.
+  - The pre-registered condition was "1.0 within its CI". The pooled 1w CI misses it, so H is held for the coordinator.
+  - The direction it misses in, the stock arm slower under the old harness, lowers F/C under the new one. It cannot flatter fsqlite.
+- F/C, both harnesses, same binary:
+
+  | writers | reps | F new/old | F/C old -> new |
+  |---|---|---|---|
+  | 1 | 16 | 1.504 | 0.089 -> 0.131 |
+  | 8 separate | 7 | 1.289 | 0.270 -> 0.357 |
+  | 32 separate | 7 | 1.051 | 0.271 -> 0.264 |
+  | 64 separate | 7 | 1.021 | 0.172 -> 0.180 |
+
+- Prediction against the result:
+  - exact -45k to -60k: -61.8k, just above the range;
+  - 1w +17% to +27%: +50%, far above the range;
+  - 8w +2% to +8%: +29%, above the range;
+  - 32/64w 0% to +6%: met.
+- Tests (65 pass, clippy --all-targets clean): driver and flag parsing; the poll driver parks until a waker on another thread fires; the profiler off reads no clock and counts nothing; the receipt records the harness and a pre-H receipt has none.
+- Retry condition: the coordinator's decision on the A/A miss. If H lands, every lane's F/C baseline moves, and reports before it are not comparable (the receipt enforces that).
+
 ## 2026-11-15 - REJECTED on its kill lines (four versions): a GROUP BY over a table scan aggregates each row into its group through a hash table and sorts the groups, not the rows (bd-w4pr1.13.8, lever H1)
 
 - Target: the GROUP BY rows that sort every input row. `GROUP BY a` with sum(c) (x1.55-1.62 stock
