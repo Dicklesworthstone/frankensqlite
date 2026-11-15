@@ -870,12 +870,11 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   (not worse than 0.2%) as well as the prepared lookup; the hit-path gains above are what it has to
   keep. A frame-cache-only variant is untested and widens the WAL lookup's answer the same way.
 
-## 2026-11-15 - MEASURED WIN (small), NOT LANDED (gate incomplete): a repeat dirty mark of the root a statement marked last skips the hash insert (bd-w4pr1.13.20, lever M)
+## 2026-11-15 - WIN (small): a repeat dirty mark of the root a statement marked last skips the hash insert (bd-w4pr1.13.20, lever M)
 
 - Target: every row a storage-cursor INSERT, DELETE or UPDATE writes: the engine marks the table's root dirty for
   the MemDatabase mirror's lazy sync (bd-g595c) with a hashbrown `HashSet<i32>::insert` of the same root on every
-  row. Touched (not landed; patch `scratchpad/r4_M_v1.patch` of the bulk-write lane, diff sha256 3fe1135ae6764e76):
-  `crates/fsqlite-vdbe/src/engine.rs` (`DirtyRootPages`, the `dirty_root_pages` field).
+  row. Touched: `crates/fsqlite-vdbe/src/engine.rs` (`DirtyRootPages`, the `dirty_root_pages` field).
 - Evidence before (callgrind of a 100k-row INSERT ... SELECT, toggle on run_statement, main fd57be379):
   `mark_storage_root_page_dirty` 45 a row (4.50M over 100,000 calls); round 3 put the DELETE's dirty mark at ~80 a
   deleted row together with its cursor-to-root lookup.
@@ -897,14 +896,23 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
 - Test: fsqlite-vdbe `test_repeat_dirty_marks_of_one_root_leave_the_set_an_uncached_mark_leaves` (repeat and
   alternating marks leave the set an uncached mark leaves; after a sync clear and after an engine reset the root
   marked last is inserted again, the negative case a never-invalidated cache fails).
-- Gate (rch, on origin/main 78e67b4f6 + the change, partial): clippy -D warnings on fsqlite-vdbe with all targets
-  clean; fsqlite-vdbe lib 1,252 pass and 1 fail (bd-bhalc's indexed IN-list count test, red on main), the new test
-  among the passes; golden_bytecode_snapshots 8 pass. Not run: the 80 fsqlite-core keeper / EXPLAIN-reading targets,
-  the 71 fsqlite targets, fsqlite-core --lib (the gate was stopped to bisect a btree red for the coordinator, and
-  the rest did not fit the round).
-- Retry / widen: land after those stages, rebased (upstream had not touched engine.rs). Widen: the DELETE's
-  `mark_storage_table_dirty` still looks the cursor's root up in `cursor_root_pages` every row (~30); caching it
-  needs every `cursor_root_pages` mutation to invalidate it (eight sites).
+- Gate (rch). Round 4, on origin/main 78e67b4f6 + the change: clippy -D warnings on fsqlite-vdbe with all targets
+  clean; fsqlite-vdbe lib 1,252 pass and 1 fail (bd-bhalc's indexed IN-list count test, red on main);
+  golden_bytecode_snapshots 8 pass. Round 5, on the exact tree that landed (origin/main 5cf0db4d5 + the change, the
+  same diff): clippy -D warnings on fsqlite-vdbe with all targets clean; fsqlite-vdbe lib 1,254 pass and 1 fail
+  (test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion, red on main), the new test among the
+  passes; golden_bytecode_snapshots 8 pass; the 80 fsqlite-core keeper / EXPLAIN-reading targets 583 pass and 9 fail
+  (the gh516 trio, bd-d8s37's two fk_insert_conflict_oracle tests, bd_group_by_depth's indexed GROUP BY test,
+  bd-jlbrk's two bd_i3csr_1 tests, all red on main; and
+  bd_nn29x_conflict_clause_review_oracle::review_omitted_rowid_alias_ignores_defaults, red in every gate log of
+  three lanes since 2026-11-13 on trees without this change: a file-backed IPK table returns rowid 102 after deleting
+  its maximum where stock returns 101); the 71 fsqlite targets 227 pass and 1 fail
+  (compat_tests::gh294_read_only_namespace_recovery_changes_only_ns_use, bd-j2dtf, 151060e9b); fsqlite-core lib
+  4,192 pass and 2 fail (the t6741 pair, bd-nouem); fsqlite-e2e golden_bytecode_shapes_oracle_e2e 17 pass.
+- Landed in round 5, rebased on 5cf0db4d5 with the same diff (main had not touched the dirty-root code since the
+  measured base, so it was not re-measured). Retry / widen: the DELETE's `mark_storage_table_dirty` still looks the
+  cursor's root up in `cursor_root_pages` every row (~30); caching it needs every `cursor_root_pages` mutation to
+  invalidate it (eight sites).
 
 ## 2026-11-15 - REJECTED on its kill line (bulk +163M): a table row stores an integral real of a REAL-affinity column as an integer, as stock does (bd-w4pr1.13.20, lever L)
 

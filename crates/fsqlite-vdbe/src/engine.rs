@@ -8195,6 +8195,33 @@ fn serialize_compiled_record_into_vec(
     }
 }
 
+/// The root pages storage-cursor DML dirtied since the last MemDatabase sync
+/// (bd-g595c), and the root marked last. A DML loop marks the same root on
+/// every row; while the set still holds that root a repeat mark changes
+/// nothing, so it skips the hash insert (bd-w4pr1.13.20, lever M). Every way
+/// of emptying the set forgets the last root, so a root the set lost is
+/// always inserted again.
+#[derive(Debug, Default)]
+struct DirtyRootPages {
+    roots: HashSet<i32>,
+    last: Option<i32>,
+}
+
+impl DirtyRootPages {
+    #[inline]
+    fn insert(&mut self, root_page: i32) {
+        if self.last != Some(root_page) {
+            self.roots.insert(root_page);
+            self.last = Some(root_page);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.roots.clear();
+        self.last = None;
+    }
+}
+
 /// The VDBE bytecode interpreter.
 ///
 /// Executes a program produced by the code generator, maintaining a register
@@ -8424,7 +8451,7 @@ pub struct VdbeEngine {
     /// table dirty and bulk-sync only when a compatibility-path query needs
     /// MemDB data. This eliminates the 0.10 µs/row sync overhead for fast-path
     /// storage-cursor-backed workloads.
-    dirty_root_pages: HashSet<i32>,
+    dirty_root_pages: DirtyRootPages,
     /// Set by `reset_for_next_transaction`, cleared by every reuse reset
     /// (which precedes any binding or run): an engine parked across several
     /// commits without being used is reset once, not at every commit.
@@ -9074,7 +9101,7 @@ impl VdbeEngine {
             result_row_buf: Vec::new(),
             statement_state_clean: true,
             statement_cold_state: StatementColdState::empty(),
-            dirty_root_pages: HashSet::new(),
+            dirty_root_pages: DirtyRootPages::default(),
             transaction_state_clear: false,
         }
     }
@@ -10869,12 +10896,12 @@ impl VdbeEngine {
 
     /// Returns true if any tables have been modified and need MemDB sync.
     pub fn has_dirty_root_pages(&self) -> bool {
-        !self.dirty_root_pages.is_empty()
+        !self.dirty_root_pages.roots.is_empty()
     }
 
     /// Returns the set of dirty root pages for bulk sync.
     pub fn dirty_root_pages(&self) -> &HashSet<i32> {
-        &self.dirty_root_pages
+        &self.dirty_root_pages.roots
     }
 
     /// Clear dirty root pages after bulk sync completes.
@@ -29041,6 +29068,40 @@ mod tests {
         assert_eq!(engine.schema_cookie(), 0);
         assert!(engine.func_registry.is_none());
         assert!(!engine.has_dirty_root_pages());
+    }
+
+    #[test]
+    fn test_repeat_dirty_marks_of_one_root_leave_the_set_an_uncached_mark_leaves() {
+        // bd-w4pr1.13.20, lever M: a repeat mark of the root marked last skips
+        // its insert, and every way of emptying the set makes the next mark
+        // insert again (a remembered root that outlived the set would leave a
+        // modified table looking clean to the MemDatabase sync).
+        let roots = |engine: &VdbeEngine| {
+            let mut roots: Vec<i32> = engine.dirty_root_pages().iter().copied().collect();
+            roots.sort_unstable();
+            roots
+        };
+        let mut engine = VdbeEngine::new(4);
+        for _ in 0..3 {
+            engine.mark_root_page_dirty(7);
+        }
+        assert_eq!(roots(&engine), vec![7]);
+        for root in [9, 7, 9, 9, 7] {
+            engine.mark_root_page_dirty(root);
+        }
+        assert_eq!(roots(&engine), vec![7, 9], "two alternating roots both stay");
+
+        engine.clear_dirty_root_pages();
+        assert!(!engine.has_dirty_root_pages());
+        engine.mark_root_page_dirty(7);
+        assert_eq!(roots(&engine), vec![7], "the root marked last before a sync");
+
+        engine.reset_for_next_transaction();
+        assert!(!engine.has_dirty_root_pages());
+        engine.mark_root_page_dirty(7);
+        engine.mark_storage_root_page_dirty(7);
+        assert_eq!(roots(&engine), vec![7], "the root marked last before a reset");
+        assert!(!engine.storage_cursor_memdb_count_shortcuts_safe);
     }
 
     #[test]
