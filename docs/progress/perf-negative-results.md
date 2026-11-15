@@ -202,6 +202,110 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   the row went 21.3x -> 2.6x stock (ELF 4b3b5f58113e4925 -> 6b73b23b3b8c6892, exo_ab.py, stock
   live), meeting the probe; bd-b887p closed.
 
+## 2026-11-15 - MEASURED WIN, NOT LANDED (an existing test pins the read-back's per-page reads): the checkpoint read-back reads its pages and their WAL sources in runs (bd-w4pr1.13.20, lever N2)
+
+- Target: the autocheckpoint after a large commit (`delete_14pct_300k`, `update_10pct_300k`,
+  `bulk_insert_1M_one_txn`). Touched (not landed): `crates/fsqlite-wal/src/checkpoint_executor_impl.rs`
+  (`verify_checkpoint_pages_via_target`, `checkpoint_read_back_run`, `read_checkpoint_frame_run`, and
+  `CheckpointTarget::read_pages_if_supported` with a page-by-page default), `crates/fsqlite-pager/src/traits.rs`
+  (`CheckpointPageWriter::read_pages_if_supported`, the same default), `crates/fsqlite-pager/src/pager.rs`
+  (`SimplePagerCheckpointWriter::read_pages_if_supported`, one read), `crates/fsqlite-core/src/wal_adapter.rs` (the
+  method forwarded in `CheckpointTargetAdapterRef` and `CheckpointResetTarget`, nothing else).
+- Evidence before (bd-w4pr1.13.20, 2026-11-15 10:3xZ): commit + autocheckpoint of the DELETE is 53.8 ms task-clock
+  against stock's 13.6 ms, three quarters of it kernel time, and the checkpoint makes six page-sized I/Os a frame
+  against stock's two (a 4 KiB pread64 from the page cache costs 1.1-2.3 us of CPU on this VM). The read-back that
+  guards publication and reset (bd-yfdb6, once since E1) read each database page and its WAL frame on their own:
+  4,520 pread64 calls for the DELETE, 1.4k user instructions a db read and 0.83k a WAL read before the kernel.
+- Ledger preflight: E1 (one read-back per publication path; this keeps it), lever B (rejected on CPU: retaining the
+  window; this keeps no window), lever D (the certificate re-hash; untouched), the 2026-11-12 batched-header rejection
+  (bd-w4pr1.8 lever 1: batching only pays when the bytes are not read again).
+- Change: the read-back walks the expected pages in runs whose pages and frames are both consecutive, at most 64 KiB
+  of WAL bytes a run (as validation reads; within the VFS's inline-I/O bound, so no blocking-pool hop): one database
+  read and one WAL read a run. Every check stays per page and in the same order: a short database read, the frame's
+  page number, salts and validated XXH3-128 digest (WalCorrupt when the source changed after its write), the page-1
+  patch receipt, the byte compare (DatabaseCorrupt with the first bad page). A target without read-back still skips
+  verification. The backfill's per-frame re-read right before each write is not batched:
+  `checkpoint_integrity_copy_pass_is_bound_to_validated_source_bytes` pins that a source changed after the previous
+  page's write is refused before its own write.
+- Prediction (on bd-w4pr1.13.20 before code, against base + N1): delete pread64 -4,200 +-100, instructions -3M to
+  -6M, task-clock min -2 to -4 ms; update the same; bulk about -14,000 preads, -10M to -18M instructions, -6 to -12 ms;
+  memory_script unchanged. Kill: preads down by fewer than 3,500, instructions down by less than 2M, or task-clock min
+  up.
+- Result, stock sqlite3 3.46.1 live in the same runs (binaries on 593e3aca1: main + lever M b7a19401..., + N2
+  c169540b...; thinkstation1, governor powersave, load 5.3-5.4, io_uring refused, `scratchpad/r5_ab.sh` of the
+  bulk-write lane, 9 reps interleaved): `delete_14pct_300k` pread64 WAL 9,382 -> 7,274 and db 4,549 -> 2,444 (-4,213,
+  met), instructions 364.2M -> 358.8M (-5.4M, met; 3.02x -> 2.97x stock 120.7M), task-clock min 110.2 -> 99.8 ms and
+  median 112.6 -> 105.6 ms (stock 45.1 / 47.0; missed high, beyond the range; kernel cycles -19.1M, user cycles
+  -6.8M); `update_10pct_300k` -5.4M (563.5M -> 558.1M, 2.06x -> 2.04x), task-clock min -4.7 ms, preads -4,208;
+  `bulk_insert_1M_one_txn` 7,062.2M -> 7,032.8M (-29.4M, beyond; 1.69x -> 1.68x), task-clock min -1.1 ms and median
+  -5.9 ms (the min missed low), kernel cycles -43.5M; `memory_script_200k` 3,550.0M -> 3,549.9M (unchanged, as
+  predicted). Callgrind of the DELETE's commit + autocheckpoint 96,755,389 -> 91,876,740 (-4.88M; measured on top of
+  the rejected N1 it was -4.87M, so the two do not interact; that first measurement, task-clock min -9.6 ms, is on
+  bd-w4pr1.13.20). Answers equal stock's; stock integrity_check ok; bd-73pfl stress (`mw_conflict.py explicit-same 8
+  300 10 5000`) 0/10 integrity failures, every lost row a refused COMMIT with its error line, as on main.
+- Tests: fsqlite-wal `test_checkpoint_readback_runs_follow_consecutive_pages_and_frames` (40 frames read back in runs
+  of 15, 15 and 10; a page rewritten by a later frame splits the runs; consecutive frames of non-consecutive pages are
+  two runs, each read where it lies), `test_checkpoint_readback_refuses_a_source_changed_inside_a_run` (the middle
+  frame of a three-frame run changed after its write: WalCorrupt),
+  `test_checkpoint_readback_reports_the_first_bad_page_inside_a_run` (a database page corrupted inside a run, and a
+  file that ends inside a run, each report their own page); fsqlite-pager
+  `test_checkpoint_read_pages_reads_a_run_in_one_read` (one read for three pages, a run past the end returns the bytes
+  that exist, a buffer that is not whole pages is refused).
+- Gate (rch, on origin/main 5cf0db4d5 + M + N2): clippy -D warnings on fsqlite-vdbe, fsqlite-pager and fsqlite-wal
+  with all targets and on fsqlite-core --lib clean; fsqlite-wal lib 1,177 pass and 1 fail:
+  `test_all_checkpoint_modes_refuse_backfill_publication_on_mismatch` asserts `read_pages == [2]` and gets [2, 3]. Its
+  window is pages 2 and 3 from consecutive frames with page 2 corrupted at the last sync; N2 reads the whole run
+  before it compares, so it reads page 3 before it reports page 2. Publication and reset were still refused and the
+  WAL left intact, but the test pins that the read-back reads only up to the first bad page, and changing that line
+  is not the lane's call. Not landed; the code is clone stash "bulk-write r5 lever N2 v1" of the bulk-write lane,
+  patch `scratchpad/r5_N2_v1.patch` (sha256 5b6158601e368bdc). The rest of the gate was not run.
+- Retry condition: (a) N2', the WAL source reads batched alone (one WAL read a run, taken after the run's first
+  database page is read; the database reads stay page by page in order, so that test holds as written; fsqlite-wal
+  only, no trait method), predicted at about half of N2's syscall saving (-2,108 WAL preads on the delete row); or
+  (b) N2 as measured once the owner decides the read-back may read a run of at most 64 KiB before it reports its
+  first bad page.
+- Widen: the checkpoint still reads each frame three times (validation, the backfill's re-read, the read-back) and
+  each database page once, against stock's one WAL read: what is left is the price of the 128-bit binding of the
+  written bytes to the validated ones and of the post-sync read-back (bd-yfdb6). Batching the backfill's re-reads or
+  its pwrite64 calls the same way is not open as is: either one re-reads frame k+1 before page k is written, which
+  `checkpoint_integrity_copy_pass_is_bound_to_validated_source_bytes` refuses. The larger CPU piece of the commit +
+  autocheckpoint is now the commit's: per-page copies in build_group_commit_batch and the cache drain, and a 9.3 MB
+  coalesced WAL write buffer handed to a fresh blocking thread (the single-writer lane's code; ~5,000 page faults,
+  ~13 ms on the delete row).
+
+## 2026-11-15 - REJECTED on its CPU kill line (syscall and instruction arms met): a checkpoint pass reads a page's old bytes before writing it only until its first real write (bd-w4pr1.13.20, lever N1)
+
+- Target: the autocheckpoint after a large commit (`delete_14pct_300k`, `update_10pct_300k`,
+  `bulk_insert_1M_one_txn`). Touched (not landed; it was in the tree of lever N2's first measurement and removed before
+  N2's gate): `crates/fsqlite-pager/src/pager.rs` (`SimplePagerCheckpointWriter::write_page`, a test VFS that logs
+  main-file read and write offsets, and `test_checkpoint_compare_before_write_stops_at_the_first_changed_page`).
+- Evidence before: the N2 entry's; one of the checkpoint's six page I/Os a frame is GH#294's compare-before-write
+  pread64 of the old page (2,260 for the DELETE, each with a zeroed 4 KiB buffer).
+- Ledger preflight: E2 (2026-11-12: skipping that read for frames past the backfilled prefix is not sound, recovery
+  zeroes nBackfill so such frames can be revisits); the GH#294 compat keepers; lever B.
+- Change: the compare ran until the pass's first real write (`dirty`) and always for page 1. A pass that finds every
+  frame already backfilled still wrote nothing, which is what GH#294 needs; a pass that has written a changed page has
+  moved the file's timestamps and re-stamps the header anyway. Its one cost: a pass mixing already-backfilled frames
+  with new ones rewrites the identical pages after its first changed page.
+- Prediction (on bd-w4pr1.13.20 before code): delete db pread64 -2,259, instructions -1.5M to -2.5M, task-clock min
+  -3 to -5 ms; update the same; bulk about -7,500 preads, -5M to -8M, -10 to -15 ms. Kill: preads down by fewer than
+  2,200, or the delete row's task-clock min (9 interleaved reps) down by less than 1.5 ms, or instructions up.
+- Result, stock live in the same runs (binaries on 593e3aca1: main + lever M b7a19401..., + N1 98ff3332...;
+  thinkstation1, governor powersave, io_uring refused, `scratchpad/r5_ab.sh`): delete db pread64 4,550 -> 2,293
+  (-2,257, met), instructions 364.2M -> 360.9M (-3.3M, beyond the range), kernel cycles min -7.1M, task-clock min
+  109.5 -> 109.8 ms (+0.3) at load 5.8: killed. An earlier 9-rep run at load 3.4 gave 112.2 -> 109.9 ms (-2.3); the
+  18 reps pooled still give +0.3 on the min. update -3.5M and -3.6 ms; bulk -24.0M and -1.5 ms; callgrind of the
+  DELETE's commit + autocheckpoint 96,755,389 -> 84,877,971 (most of it calloc's rep stosb). Answers equal stock's;
+  stock integrity_check ok; bd-73pfl stress 0/10 integrity failures. A removed pread is real kernel work (-7 to -10M
+  kernel cycles), but at this host's load about 2 ms on 110 ms is not resolvable by a 9-rep min.
+- Gate (partial, before it was rejected): fsqlite-pager lib `checkpoint` filter 36 pass with the new test; clippy -D
+  warnings on fsqlite-vdbe, fsqlite-pager and fsqlite-wal with all targets clean on origin/main 5cf0db4d5 + M + N1 +
+  N2. The code is not kept: in `write_page`, `let compare = !self.dirty || page_no == PageNumber::ONE;` and the
+  compare read and its zeroed buffer only when `compare` holds; the test is described above.
+- Retry condition: with a CPU protocol that resolves 1.5 ms on this row (a quiet host, or 21+ interleaved reps with a
+  pre-registered paired statistic), or folded into a change that removes the checkpoint's other own-commit page reads
+  (the backfill re-read with a cheap retained window, or the certificate re-hash of lever D) under one joint kill line.
+
 ## 2026-11-15 - SMALL WIN (prediction missed, cost model refuted): an EXISTS opens its subquery table only where it reads a row (bd-tx55u)
 
 - Target: `SELECT id FROM t WHERE EXISTS (SELECT 1 FROM p WHERE p.tid = t.id) AND t.a = 5` (7.8x
