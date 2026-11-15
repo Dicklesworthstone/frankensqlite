@@ -87,6 +87,144 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - MEASURED WIN (small), NOT LANDED (gate incomplete): a repeat dirty mark of the root a statement marked last skips the hash insert (bd-w4pr1.13.20, lever M)
+
+- Target: every row a storage-cursor INSERT, DELETE or UPDATE writes: the engine marks the table's root dirty for
+  the MemDatabase mirror's lazy sync (bd-g595c) with a hashbrown `HashSet<i32>::insert` of the same root on every
+  row. Touched (not landed; patch `scratchpad/r4_M_v1.patch` of the bulk-write lane, diff sha256 3fe1135ae6764e76):
+  `crates/fsqlite-vdbe/src/engine.rs` (`DirtyRootPages`, the `dirty_root_pages` field).
+- Evidence before (callgrind of a 100k-row INSERT ... SELECT, toggle on run_statement, main fd57be379):
+  `mark_storage_root_page_dirty` 45 a row (4.50M over 100,000 calls); round 3 put the DELETE's dirty mark at ~80 a
+  deleted row together with its cursor-to-root lookup.
+- Ledger preflight: round 3's lever SD entry names this as its retry; the engine-reuse entry (dirty_root_pages
+  reset on an engine reset) is kept: the reset clears through the same type.
+- Change: the set remembers the root it inserted last and skips the insert when the same root is marked again;
+  every way of emptying the set (the MemDatabase sync's `clear_dirty_root_pages`, the commit-time engine reset)
+  goes through `DirtyRootPages::clear`, which forgets it. Which roots are dirty, and when, is unchanged.
+- Prediction (on bd-w4pr1.13.20 before code): bulk -35M to -42M, memory_script -8M to -14M, delete -1.5M to
+  -2.5M, update -0.8M to -1.5M. Kill: bulk under 20M removed.
+- Result, stock sqlite3 3.46.1 live in the same runs (binaries main fd57be379 167524ed..., the change on it
+  32e3c42f..., thinkstation1, governor powersave, load 17, io_uring refused for the DML rows):
+  `bulk_insert_1M_one_txn` min 7,096.6M -> 7,048.8M (-47.8M; 1.70x -> 1.69x stock 4,177.5M), median -11.3M (3 reps;
+  this row's count moves 10-40M between runs); callgrind of the same INSERT ... SELECT at 100k rows (exact):
+  599,149,765 -> 595,248,377, -39.0 a row, `mark_storage_root_page_dirty` 45 -> 6 a row. `memory_script_200k`
+  3,682.5M -> 3,672.3M (-10.2M); `delete_14pct_300k` 365.9M -> 364.3M (-1.6M); `update_10pct_300k` 567.3M ->
+  566.1M (-1.2M). All four inside their predictions; the kill line is cleared by the min and by callgrind, not by
+  the 3-rep median. CPU and wall inside the noise. Answers equal stock's; stock integrity_check ok.
+- Test: fsqlite-vdbe `test_repeat_dirty_marks_of_one_root_leave_the_set_an_uncached_mark_leaves` (repeat and
+  alternating marks leave the set an uncached mark leaves; after a sync clear and after an engine reset the root
+  marked last is inserted again, the negative case a never-invalidated cache fails).
+- Gate (rch, on origin/main 78e67b4f6 + the change, partial): clippy -D warnings on fsqlite-vdbe with all targets
+  clean; fsqlite-vdbe lib 1,252 pass and 1 fail (bd-bhalc's indexed IN-list count test, red on main), the new test
+  among the passes; golden_bytecode_snapshots 8 pass. Not run: the 80 fsqlite-core keeper / EXPLAIN-reading targets,
+  the 71 fsqlite targets, fsqlite-core --lib (the gate was stopped to bisect a btree red for the coordinator, and
+  the rest did not fit the round).
+- Retry / widen: land after those stages, rebased (upstream had not touched engine.rs). Widen: the DELETE's
+  `mark_storage_table_dirty` still looks the cursor's root up in `cursor_root_pages` every row (~30); caching it
+  needs every `cursor_root_pages` mutation to invalidate it (eight sites).
+
+## 2026-11-15 - REJECTED on its kill line (bulk +163M): a table row stores an integral real of a REAL-affinity column as an integer, as stock does (bd-w4pr1.13.20, lever L)
+
+- Target: table rows with an integral real in a REAL-affinity column (the scorecard's `c = value * 1.5`, integral
+  on half its rows) and file-size parity with stock. Touched (not landed; patches `scratchpad/r4_L_v1.patch` and
+  `r4_L_v2.patch` of the bulk-write lane, on fd57be379): `crates/fsqlite-types/src/record.rs`
+  (`real_affinity_stored_integer` and two helpers), `crates/fsqlite-vdbe/src/engine.rs` (MakeRecord with `E` in its
+  affinity string or a STRICT REAL slot; the compiled simple-INSERT template), `crates/fsqlite-vdbe/src/codegen.rs`
+  (v2: which table-row MakeRecords carry `E`; the record baked for a literal VALUES row),
+  `crates/fsqlite-core/src/connection.rs` (the prepared direct INSERT lane's three record builders), and a keeper in
+  `crates/fsqlite-core/tests/bd_real_affinity_stock_file_oracle.rs` (byte-compares every table and index b-tree of
+  a fsqlite-written file with stock's for the same statements, cross-reads both files, stock integrity_check).
+- Evidence before: stock stores 3.0 of a REAL column with serial type 1 where fsqlite used 7; the setup file had
+  2,250 leaves against stock's 2,052 (bd-w4pr1.13.20, 2026-11-15 05:37Z).
+- Ledger preflight: bd-real-affinity-on-read-lsjei (read side done, write side "optional and separate"); round 3's
+  handoff named this lever.
+- What "as stock stores it" means (probe of both versions with a page walker, `scratchpad/r4/l/walk.py`, and a
+  3.54.1 amalgamation driver, `r4/sq354`): SQLite 3.54 changed `OP_Affinity` (3.54.1 sqlite3.c, `case
+  OP_Affinity`): REAL affinity turns an integer into a plain real instead of `MEM_IntReal`, so only a `MakeRecord`
+  that applies the affinity itself stores the integer.
+
+  | table, statement | 3.54.1 (repo oracle) | 3.46.1 (benchmark stock) |
+  |---|---|---|
+  | no index, INSERT 3.0 / -0.0 | 1 / 8 | 1 / 8 |
+  | any index (even on another column, partial, expression), INSERT | 7 (-0.0 becomes +0.0) | 1 |
+  | a CHECK constraint, INSERT | 7 | 1 |
+  | WITHOUT ROWID | 7 | 1 |
+  | STRICT, rowid or WITHOUT ROWID, with or without an index or CHECK | 1 | 1 |
+  | indexed table, UPDATE of a non-indexed column / of an indexed column or the rowid | 1 / 7 | 1 / 1 |
+  | CREATE INDEX over integer-stored rows: the key | the stored integer | the stored integer |
+
+  v1 stored integers on every table row (3.46.1's rule): keeper red on the 32 rows of its indexed table. v2 follows
+  3.54.1 (codegen marks a REAL column `A` in the record's affinity string where stock's MakeRecord applies none):
+  every table record of the keeper is byte-equal; red only on the 47 keys CREATE INDEX built over integer-stored
+  rows (fsqlite reads the column with REAL affinity and keys an 8-byte real). The benchmark's table has no index,
+  so v1 and v2 write the same bytes there.
+- Prediction (on bd-w4pr1.13.20 before code): delete -8M to -12M, update -7M to -11M, bulk within +-15M,
+  memory_script within +-10M, setup file 8.9 -> 8.0-8.1 MB. Kill: delete under 5M removed or bulk up more than 25M.
+- Result, stock 3.46.1 live in the same runs (main 167524ed..., L v1 e3c52e49..., thinkstation1, governor
+  powersave, load 13-14, io_uring refused for the DML rows): `delete_14pct_300k` 365.9M -> 355.3M (-10.6M, met;
+  3.03x -> 2.94x stock 120.7M; task-clock min 119.5 -> 107.4 ms, 9 reps); `update_10pct_300k` 567.3M -> 566.0M
+  (-1.3M, missed); `bulk_insert_1M_one_txn` 7,104.7M -> 7,267.7M (+163.0M: killed); `memory_script_200k` 3,682.3M
+  -> 3,922.3M (+240.0M, missed); setup file 9,285,632 -> 8,466,432 bytes (stock 8,429,568), leaves 2,250 -> 2,057
+  (stock 2,051). Answers equal stock's; stock integrity_check ok.
+- Why (callgrind, toggle on run_statement): the conversion serializes through an iterator that substitutes the
+  integers, and the generic serializer walks it several times: `serialize_record_with_real_affinity_integers`
+  ~1,000 inclusive a converted row, ~+390 over the old path (100k-row INSERT ... SELECT: 599.1M -> 618.7M). On
+  memory_script about +170M of the +240M is the pager's per-transaction read cache in the JOIN's lookups of `u`
+  (`cache_transaction_read_page` 345 -> 862 a call, `get_nonresident_page` 919 -> 1,425, the same ~170k calls).
+  The mechanism is not established (the cache's budget branch is the first suspect: with the smaller `t` the
+  cache may still have room, so the insert branch runs where main's full cache takes the cheap one); pager code
+  this lever does not touch.
+- Also found: stock never keeps -0.0 in a REAL column (the integer 0, or +0.0 in 3.54 indexed tables); fsqlite
+  keeps -0.0 in table records and index keys, so `sqlite3_column_double` (rusqlite) returns -0.0 where stock
+  returns 0.0; printf, quote and comparisons already agree.
+- Retry condition: start from `r4_L_v2.patch`; (1) materialize the stored values once (a SmallVec of refs) or
+  substitute in the serializer's layout pass, so a converted row costs at most ~20 more, judged on the bulk row;
+  (2) CREATE INDEX keys a REAL column's stored integer as stock does (`sqlite3GenerateIndexKey` deletes the
+  `OP_RealAffinity`); (3) the read-cache cost on memory_script above explained and fixed or separated first
+  (point-lookup lane), or that row regresses; then a new prediction and kill line on all four rows.
+
+## 2026-11-15 - REJECTED on CPU (instruction kill line cleared): a checkpoint keeps the frames it validated and copies and verifies from them (bd-w4pr1.13.20, lever B)
+
+- Target: the autocheckpoint after a large commit (the scorecard's `delete_14pct_300k`, `update_10pct_300k`,
+  `bulk_insert_1M_one_txn`). Touched (not landed; patch `scratchpad/r4_B_v1.patch` of the bulk-write lane, on
+  fd57be379): `crates/fsqlite-wal/src/checkpoint_executor_impl.rs`, `checkpoint_validation.rs`,
+  `checkpoint_integrity_tests.rs`.
+- Evidence before (callgrind of the DELETE's commit on main fd57be379, attribution table on bd-w4pr1.13.20,
+  2026-11-15 05:25Z): commit + autocheckpoint is 73.0M user instructions under perf stat against stock's 2.3M
+  (32.3k against 1.1k a frame). The checkpoint hashes every frame three times with XXH3-128 (source validation,
+  the backfill's re-read, the read-back's re-read; 19.24M) and reads every frame from the WAL three times
+  (the two re-reads 3.76M).
+- Ledger preflight: lever E1 (2026-11-12, one read-back per checkpoint), lever D (2026-11-12, rejected: the
+  own-certificate re-hash), E2 (assessed unsound: the GH#294 compare-before-write read), and the 2026-11-13 16:17
+  analysis on bd-w4pr1.13.20, whose retry condition this is ("retain the validated payloads of the frames to be
+  copied (bounded memory) so the backfill writes exactly the validated bytes").
+- Change: a window of at most 64 MiB of WAL bytes is read by validation straight into one buffer, with no
+  digests; the backfill writes each page from those bytes and the read-back compares the database page against
+  them; a physical WAL header re-check before the read-back keeps refusing a replaced generation. A larger
+  window keeps the digest path. New and changed tests in `checkpoint_integrity_tests.rs` (both paths write the
+  same pages; a changed frame after validation cannot reach the database on the retained path and is still
+  refused on the digest path; a replaced generation refuses publication and reset).
+- Prediction (on bd-w4pr1.13.20 before code): `delete_14pct_300k` -18M to -23M user instructions, CPU -2% to
+  -5%; `update_10pct_300k` the same; bulk -60M to -80M, peak RSS up by up to the window. Kill: delete under 12M.
+- Result, stock sqlite3 3.46.1 live in the same runs (binaries main 167524ed..., lever 78b4fab9..., thinkstation1,
+  governor powersave, load 23-25, io_uring refused for the DML rows): instructions met. `delete_14pct_300k`
+  365.9M -> 342.5M (-23.4M, 0.4M beyond the range; 3.03x -> 2.84x stock 120.7M); `update_10pct_300k` 567.3M ->
+  543.9M (-23.4M); bulk 7,084.6M -> 7,018.6M (-66.0M), peak RSS 121.2 -> 151.2 MB (stock 16.7 MB). Callgrind:
+  execute_checkpoint 54.81M -> 31.69M for 2,260 frames. CPU is a loss: delete row, 9 reps interleaved, order
+  alternating (`r4_cpu_split.py`, `r4_cycles_split.py`): task-clock min 118.5 -> 126.0 ms and median 124.2 ->
+  136.0 ms (stock 47.3 / 55.6), user cycles min 184.8M -> 191.1M, kernel cycles min 267.0M -> 284.9M, page
+  faults 10,997 -> 13,219; the update row's median CPU 148.7 -> 154.9 ms and the bulk row's 1,047.5 -> 1,029.2 ms
+  (5 and 3 reps, inside this load's noise). The 9.3 MB buffer is fresh memory each checkpoint: 2,222 page faults at
+  about 8k kernel cycles each on this VM. User cycles rose too although 23M fewer instructions ran; the likely
+  cause, not separated, is that the backfill and the read-back read the window cold where the old path re-read
+  each frame into a hot 4 KiB buffer. Rejected: a lever that lowers instructions and raises CPU is not a win.
+- Gate (partial, the lever was rejected first): clippy -D warnings on fsqlite-wal with all targets clean;
+  fsqlite-wal lib 1,176 pass.
+- Retry condition: memory the process has already faulted in for the window (a buffer the WAL handle keeps and
+  reuses across checkpoints, so a long-lived connection pays the faults once), judged by task-clock and cycles
+  with the arms interleaved, not by instructions alone; or a host whose page faults cost under 1 us. Not on a
+  single-checkpoint CLI row like the scorecard's, where every checkpoint maps the window fresh.
+
 ## 2026-11-15 - WIN: a short ASCII TEXT value read from a record is stored inline without the general UTF-8 validation (bd-w4pr1.13.28, lever O1)
 
 - Target: `Column` of a TEXT column decodes through SmallText::from_record_text_bytes_shared ->
