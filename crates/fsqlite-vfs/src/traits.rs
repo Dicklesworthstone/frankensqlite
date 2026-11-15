@@ -681,17 +681,19 @@ pub enum ForeignWalParticipation {
 
 /// Durability level for `VfsFile::durable_sync`.
 ///
-/// Centralizes per-filesystem sync policy so callers express intent
-/// ("make WAL frames durable") and the VFS maps it to the correct
-/// syscall: fdatasync on ext4/XFS, fsync on btrfs/ZFS, F_FULLFSYNC
-/// on APFS.
+/// Centralizes per-platform sync policy so callers express intent
+/// ("make WAL frames durable") and the VFS maps it to a syscall. The Unix
+/// VFS on Linux issues `fdatasync` for every kind of file sync, as stock
+/// SQLite's `unixSync` does there: `fdatasync` also writes the metadata a
+/// later read needs (a size change, new blocks) and skips only timestamps.
+/// macOS uses `F_FULLFSYNC` for [`Self::FullDurable`]; other Unix systems use
+/// `fsync` for the two kinds that are not data-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncKind {
-    /// Data-only sync (fdatasync on Linux). Sufficient when file size
-    /// and metadata are unchanged (e.g. overwriting existing WAL frames).
+    /// Data-only sync (`fdatasync`).
     DataOnly,
-    /// Data + metadata sync (fsync on Linux). Required when new allocation
-    /// blocks must be persisted (file growth, btrfs CoW).
+    /// Data and the metadata needed to read it back, such as a file that
+    /// grew (`fdatasync` on Linux, `fsync` on other Unix systems).
     DataAndMetadata,
     /// Full durable barrier: the strongest sync the platform offers.
     /// On APFS this maps to F_FULLFSYNC; elsewhere identical to

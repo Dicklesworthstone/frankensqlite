@@ -54,6 +54,29 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
+/// Whether a file sync issues `fdatasync` rather than `fsync`.
+///
+/// On Linux every file sync does, whatever it was asked for, as stock
+/// SQLite's `unixSync` does there: `full_fsync` calls `fdatasync` for every
+/// sync flag, with the reasoning that "as far as SQLite is concerned, an
+/// fdatasync() is always adequate". `fdatasync` writes a file's data and the
+/// metadata a later read needs, its size and block map included (fdatasync(2)
+/// names a size change as metadata it must flush). What it skips is
+/// timestamps, and no recovery path here reads one: file identity is device
+/// and inode. On a write inside the file, the common case once a checkpoint
+/// has restarted the WAL in place, it also skips the journal commit `fsync`
+/// makes for the mtime alone: 3.0-3.2 ms against 9.2-10.6 ms per commit on an
+/// ext4 NVMe volume (bd-w4pr1.7 lever S). Elsewhere only a data-only request
+/// uses it; macOS's full-durable sync is `F_FULLFSYNC` before this is asked.
+///
+/// Directory syncs stay `fsync`. Stock syncs a directory only after creating
+/// a journal or WAL, whose own sync already covers the new entry; fsqlite
+/// also syncs directories after renames, and a rename that leaves the
+/// directory's size unchanged is not metadata `fdatasync` must flush.
+const fn sync_writes_data_only(data_only_requested: bool) -> bool {
+    cfg!(target_os = "linux") || data_only_requested
+}
+
 /// Main-lock admission check for the points before any wait: `UnixFile::lock`
 /// entry, the first attempt, and each nonblocking `F_SETLK` probe. Also the
 /// check after an inline `pread`, which a full checkpoint precedes.
@@ -4182,7 +4205,7 @@ impl VfsFile for UnixFile {
     }
 
     fn sync(&mut self, _cx: &Cx, flags: SyncFlags) -> Result<()> {
-        if flags.contains(SyncFlags::DATAONLY) {
+        if sync_writes_data_only(flags.contains(SyncFlags::DATAONLY)) {
             self.file_ref().sync_data().map_err(FrankenError::Io)
         } else {
             self.file_ref().sync_all().map_err(FrankenError::Io)
@@ -4205,11 +4228,10 @@ impl VfsFile for UnixFile {
             return Err(FrankenError::Io(std::io::Error::last_os_error()));
         }
 
-        match kind {
-            SyncKind::DataOnly => self.file_ref().sync_data().map_err(FrankenError::Io),
-            SyncKind::DataAndMetadata | SyncKind::FullDurable => {
-                self.file_ref().sync_all().map_err(FrankenError::Io)
-            }
+        if sync_writes_data_only(kind == SyncKind::DataOnly) {
+            self.file_ref().sync_data().map_err(FrankenError::Io)
+        } else {
+            self.file_ref().sync_all().map_err(FrankenError::Io)
         }
     }
 
@@ -9498,6 +9520,46 @@ mod tests {
         file.sync(&cx, SyncFlags::DATAONLY).unwrap();
 
         file.close(&cx).unwrap();
+    }
+
+    /// bd-w4pr1.7 lever S: on Linux every file sync is `fdatasync`, as stock
+    /// SQLite's `unixSync` is there; elsewhere only a data-only request is.
+    /// The syncs must still succeed for every flag and kind, then a directory
+    /// sync, on a grown file whose new size a reopen must read back.
+    #[test]
+    fn test_unix_vfs_sync_calls_match_stock_sqlite_on_linux() {
+        assert!(super::sync_writes_data_only(true));
+        assert_eq!(
+            super::sync_writes_data_only(false),
+            cfg!(target_os = "linux"),
+            "a non-data-only sync is fdatasync exactly on Linux"
+        );
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("sync_kinds.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, &[0x5a; 4096], 0).unwrap();
+        for kind in [
+            SyncKind::DataOnly,
+            SyncKind::DataAndMetadata,
+            SyncKind::FullDurable,
+        ] {
+            file.durable_sync(&cx, kind).unwrap();
+        }
+        file.write(&cx, &[0xa5; 4096], 4096).unwrap();
+        file.sync(&cx, SyncFlags::FULL).unwrap();
+        vfs.sync_parent_directory(&cx, &path).unwrap();
+        file.close(&cx).unwrap();
+
+        let (reopened, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        assert_eq!(reopened.file_size(&cx).unwrap(), 8192);
     }
 
     #[test]

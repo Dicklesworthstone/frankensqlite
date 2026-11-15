@@ -238,10 +238,12 @@ impl Drop for RecoveryFenceGuard<'_> {
 
 /// Ensure the database file is durable before any WAL truncate.
 ///
-/// This is the explicit full-`fsync` called out in the audit finding.
-/// `SyncFlags::FULL` (without `DATAONLY`) maps to a true `fsync`, not
-/// `fdatasync` — metadata must land too because WAL truncation implicitly
-/// rolls back the file-length / mtime story on the DB.
+/// This is the explicit database sync called out in the audit finding: the
+/// database's backfilled pages and its length must be durable before the WAL
+/// that holds them can go. `SyncFlags::FULL` asks for that. On Linux the Unix
+/// VFS issues `fdatasync` for it, as stock SQLite's checkpoint does:
+/// `fdatasync` writes a changed file length with the data; what it skips is
+/// timestamps, which no recovery path reads (bd-w4pr1.7 lever S).
 ///
 /// # Errors
 ///
@@ -268,7 +270,8 @@ where
 /// `VfsFile` for recovery paths that do not build a full
 /// [`CheckpointTarget`].
 ///
-/// Always issues `SyncFlags::FULL` (true `fsync`, not `fdatasync`).
+/// Always issues `SyncFlags::FULL` (`fdatasync` on Linux, see
+/// [`ensure_db_fsync_before_wal_truncate`]).
 pub fn fsync_db_file_full<F: VfsFile>(cx: &Cx, db_file: &mut F) -> Result<()> {
     db_file.sync(cx, SyncFlags::FULL).map_err(|err| {
         error!(

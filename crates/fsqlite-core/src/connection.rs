@@ -5824,7 +5824,18 @@ where
                 let (file, _) = vfs.open(cx, Some(path), create_flags)?;
                 // Random salts (GH #201) exclude frames from prior generations.
                 // Both the final inspection and physical creation are fenced.
-                WalFile::create(cx, file, *page_size, 0, WalSalts::generate()).await
+                let wal = WalFile::create(cx, file, *page_size, 0, WalSalts::generate()).await?;
+                // The new WAL's directory entry must be durable before a
+                // commit in it can be: stock SQLite syncs the directory at a
+                // new WAL's first sync (UNIXFILE_DIRSYNC), and
+                // `create_replacement_wal` does the same (bd-w4pr1.7 lever S).
+                if let Err(error) = vfs.sync_parent_directory(cx, path) {
+                    let cleanup_cx = cx.create_child();
+                    let _cleanup_mask = cleanup_cx.masked();
+                    let _ = wal.close(&cleanup_cx);
+                    return Err(error);
+                }
+                Ok(wal)
             })
         })
         .await?;
@@ -224678,6 +224689,8 @@ mod tests {
         readonly_open_attempted: Arc<std::sync::atomic::AtomicBool>,
         refuse_readwrite_wal: bool,
         hide_existing_wal_once: Arc<std::sync::atomic::AtomicBool>,
+        /// Every path whose parent directory this VFS was asked to sync.
+        synced_directories: Arc<std::sync::Mutex<Vec<PathBuf>>>,
     }
 
     impl Vfs for ReadOnlyWalProbeVfs {
@@ -224934,6 +224947,18 @@ mod tests {
             self.inner.delete(cx, path, sync_dir)
         }
 
+        fn sync_parent_directory(
+            &self,
+            cx: &Cx,
+            path: &Path,
+        ) -> std::result::Result<(), FrankenError> {
+            self.synced_directories
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(path.to_path_buf());
+            self.inner.sync_parent_directory(cx, path)
+        }
+
         fn access(
             &self,
             cx: &Cx,
@@ -225006,6 +225031,63 @@ mod tests {
         });
     }
 
+    /// bd-w4pr1.7 lever S: a WAL the install creates gets a directory sync,
+    /// as stock SQLite's first sync of a new WAL does (UNIXFILE_DIRSYNC), so
+    /// a crash after the first commit cannot lose the file's name. Adopting a
+    /// valid existing WAL creates nothing and syncs no directory.
+    #[test]
+    fn test_install_wal_backend_syncs_the_directory_of_a_wal_it_creates() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ReadWriteWalInstallProbeVfs {
+                inner: MemoryVfs::new(),
+                readonly_open_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                refuse_readwrite_wal: false,
+                hide_existing_wal_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                synced_directories: Arc::default(),
+            };
+            let synced = || {
+                vfs.synced_directories
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            };
+            let db_path = Path::new("/install-probe.db");
+            let wal_path = wal_path_for_db_path("/install-probe.db");
+
+            let pager = Arc::new(
+                SimplePager::open_with_cx(&cx, vfs.clone(), db_path, PageSize::DEFAULT)
+                    .await
+                    .unwrap(),
+            );
+            let before_install = synced().len();
+            super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
+                .await
+                .expect("install creates the WAL");
+            let created = synced();
+            assert_eq!(
+                created[before_install..],
+                [wal_path.clone()],
+                "creating the WAL must sync its directory exactly once"
+            );
+
+            let adopting = Arc::new(
+                SimplePager::open_with_cx(&cx, vfs.clone(), db_path, PageSize::DEFAULT)
+                    .await
+                    .unwrap(),
+            );
+            let before_adopt = synced().len();
+            super::install_wal_backend_with_vfs(&adopting, vfs.clone(), &cx, &wal_path)
+                .await
+                .expect("install adopts the existing WAL");
+            assert_eq!(
+                synced().len(),
+                before_adopt,
+                "adopting an existing valid WAL creates nothing and syncs no directory"
+            );
+        });
+    }
+
     #[test]
     fn test_install_wal_backend_rechecks_absence_before_replacing_peer_generation() {
         asupersync::test_utils::run_test(|| async {
@@ -225015,6 +225097,7 @@ mod tests {
                 readonly_open_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 refuse_readwrite_wal: false,
                 hide_existing_wal_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                synced_directories: Arc::default(),
             };
             let pager = Arc::new(
                 SimplePager::open_with_cx(
@@ -225187,6 +225270,7 @@ mod tests {
                 readonly_open_attempted: Arc::clone(&readonly_open_attempted),
                 refuse_readwrite_wal: true,
                 hide_existing_wal_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                synced_directories: Arc::default(),
             };
             let db_path = Path::new("/install-probe.db");
             let pager = Arc::new(
