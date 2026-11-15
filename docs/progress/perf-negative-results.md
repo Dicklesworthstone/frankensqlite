@@ -87,6 +87,262 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN: a short ASCII TEXT value read from a record is stored inline without the general UTF-8 validation (bd-w4pr1.13.28, lever O1)
+
+- Target: `Column` of a TEXT column decodes through SmallText::from_record_text_bytes_shared ->
+  from_bytes_shared -> simdutf8 (core::str::from_utf8 for short input): 108.4M Ir of from_utf8
+  over 1,000,000 calls plus 33.0M of from_record_text_bytes_shared on order_by_text_limit10 (a
+  9-to-11-byte "row-N" key). Touched: `crates/fsqlite-types/src/value.rs` (from_bytes_shared, a
+  unit test).
+- Ledger preflight: 2026-11-12 bd-w4pr1.13.28 (length() on stored bytes; its retry condition, a
+  from_utf8 above 2% of a measured statement, holds at 6.2%).
+- Pre-registered on bd-w4pr1.13.28 (recorded 02:19Z before the code, posted 02:39Z before any
+  build): order_by_text_limit10 Ir -100 to -125M, CPU -5 to -10 ms; rows reading no TEXT within
+  0.3%. Kill: under -60M Ir or CPU not lower, a no-TEXT row up more than 0.3%, or a TEXT / UTF-8 /
+  UTF-16 / invalid-UTF-8 oracle change.
+- Change: a payload of at most 23 bytes is copied into the zeroed inline buffer; when the OR of the
+  buffer's bytes is below 0x80 it is ASCII, hence UTF-8, and the inline value is returned as
+  SmallText::new builds it. A non-ASCII byte or a longer payload takes the simdutf8 path unchanged
+  (invalid UTF-8 stays byte-preserving Raw).
+- Result (method as in G3's entry below; base G3 24872ad9d13297b1, candidate acf247c9ce835877 = G3 +
+  G4 + W2 + O1; order_by_text_limit10 has no GROUP BY and a ten-row outer projection, so G4 and W2
+  do not reach it): order_by_text_limit10 1,735.5M -> 1,641.4M Ir (-94M; stock 778.0M; par_probe
+  1,732.7M -> 1,638.3M), CPU 134.6 -> 133.0 / 138.1 -> 132.2 ms (x2.01 -> x1.99, x2.02 -> x1.94
+  stock), and 150.5 -> 144.9 ms task-clock, 514.1 -> 505.1M cycles (medians, whole process) in 10
+  interleaved pairs. Rows reading no TEXT unchanged (scan_filter_agg 1,259.7M, count_star 59.4M).
+  Prediction: Ir missed low by 6M (-94M against -100..-125M: the copy into the buffer now precedes
+  the check), CPU at the low end (-1.6 to -5.9 ms against -5..-10). Kill lines not crossed.
+- Gate: the one in G3's entry below (fsqlite-types lib on both trees) and the unit test
+  `record_text_ascii_shortcut_matches_validating_decode` (every length 0..=24 over ASCII, NUL, a
+  two-byte character, 0xFF, a lone continuation byte and a truncated sequence at every position,
+  against the validating decode: bytes, validity, inline storage and equality with SmallText::new).
+- Verdict: WIN against stock live, small: order_by_text_limit10 x2.01-2.02 -> x1.94-1.99 CPU.
+- Retry condition: none (kept). `SmallText::as_str` of an inline value still re-validates on every
+  call (bd-w4pr1.13.28's note); a consumer that borrows inline TEXT as &str per row is the next
+  place, when a profile shows its from_utf8 above 2% of a statement.
+
+## 2026-11-15 - WIN: a join or derived-table projection that is one plain column reads its source slot directly (bd-w4pr1.12, lever W2)
+
+- Target: the outer SELECT of every window scorecard row materializes the window result through
+  execute_join_select, whose projection evaluated every value with
+  eval_join_expr_with_using_registry: 409.0M Ir for 1M one-column rows on `sum(c) OVER (PARTITION
+  BY a)` (eval_join_expr 305M; the fallback-registry guard 24M; per row a thread-local USING
+  probe, a binding lookup that hashes the ColumnRef's strings, the clone). Touched:
+  `crates/fsqlite-core/src/connection.rs` (execute_join_select's projection loop),
+  `crates/fsqlite-core/tests/bd_derived_table_column_alias_oracle_probe.rs`
+  (`join_and_derived_table_projections_match_rusqlite_oracle`).
+- Ledger preflight: 2026-11-12 "WIN on CPU: a table window SELECT reads a one-column key from the
+  scanned row" (same technique for window keys); 2026-11-13 steps 6+7 (the projection consumes its
+  rows; kept). No entry on the projection's per-row evaluation.
+- Pre-registered on bd-w4pr1.12 (recorded 02:07Z before the code, posted 02:39Z before any build):
+  sum(c) OVER (PARTITION BY a) Ir -330 to -390M, CPU -20 to -40 ms; the other window rows the same
+  per row; GROUP BY rows within 0.1%; scan rows unchanged. Kill: under -200M Ir or CPU not lower,
+  another read row up more than 0.3% Ir, or a join / derived / USING / NATURAL / window oracle
+  change.
+- Change: when the projection bindings are active (no subquery, no USING skip), a result column
+  that is `Expr::Column` is resolved once before the loop exactly as eval_join_expr resolves it on
+  every row under those bindings (an unqualified USING column's coalesced projection first, left
+  to the evaluator; then resolve_join_expr_column_index), and each row reads `row.get(slot)
+  .cloned()` (NULL past the row). Anything else keeps the evaluator.
+- Result (method as in G3's entry below; base for window rows: main 6a0e84b3c and G3 give
+  identical Ir on them; candidate acf247c9ce835877, whose G4 and O1 do not reach these statements --
+  no GROUP BY codegen, no TEXT read on the first three; three par_probe runs, reps 5, 5 and 9, plus
+  a 10-pair interleaved perf stat): sum(c) OVER (PARTITION BY a) 5,149.9M -> 4,778.8M Ir (-371M;
+  stock 6,587.3M), CPU 682.3 -> 652.0 / 664.2 -> 638.2 / 681.1 -> 651.1 ms (x1.33 -> x1.27, x0.95
+  -> x0.92, x1.35 -> x1.29; stock's own CPU moved 498-696 ms between runs); window_row_number
+  4,737.0M -> 4,367.0M, CPU 603.1 -> 596.8 / 657.4 -> 710.5 / 626.7 -> 602.9 ms (one run of three
+  higher; x0.89-0.93 in the other two); PARTITION BY a % 7 ORDER BY c * 2 6,263.3M -> 5,893.3M, CPU
+  860.8 -> 863.6 / 817.2 -> 822.2 / 839.6 -> 858.4 ms in par_probe (+0.3 to +2.3%), but 887.8 ->
+  868.8 ms task-clock and 2,508 -> 2,404M cycles (medians) in the interleaved pairs; rank() OVER
+  (ORDER BY b) (also reads TEXT b: O1 and W2 together) 5,197.6M -> 4,733.1M, CPU 618.4 -> 609.3 /
+  595.5 -> 565.0 / 604.9 -> 576.7 ms. Prediction: Ir inside (-371M against -330..-390M); CPU
+  inside on the measured row (-26 to -30 ms against -20..-40); on the other window rows the CPU
+  gain is smaller than the Ir and within their run-to-run spread. Kill lines not crossed.
+- Gate: the one in G3's entry below, including the new oracle (17 queries, file-backed and
+  :memory:, stock live: window results summed and grouped outside, qualified / unqualified /
+  shared-name / rowid-alias columns, NULL and mixed types, and USING / NATURAL / LEFT / RIGHT /
+  FULL joins whose shared column a left-slot read gets wrong). The rebased core lib run found the
+  one test this lever changes the mechanism of: `test_join_projection_columns_use_prebound_indexes_for_every_result_row`
+  required a binding lookup per result row (at least 6 for 3 rows; W2 takes 4). It becomes
+  `test_join_projection_columns_resolve_through_prebound_indexes_once_per_statement`: the columns
+  still resolve through the prebound indexes with no column-map rescan, the same statement over
+  twice the rows takes the same number of lookups (a per-row lookup fails it), and the joined
+  values are checked.
+- Verdict: WIN against stock live on its row: sum(c) OVER (PARTITION BY a) x1.33-1.35 ->
+  x1.27-1.29 CPU in the two runs whose stock arm was steady (x0.95 -> x0.92 in the third).
+- Retry condition: none (kept). Next on the same rows: the result-row handoff (VDBE ResultRow ->
+  take_reg_range -> SmallVec<[SqliteValue; 16]> by value -> TableRowSink::accept -> push_row:
+  ~780 Ir a two-column row, two ~400-byte moves), and execute_group_by_join_select_inner's own
+  per-row work for an ungrouped aggregate (dropping 1M (key, row) tuples 229M, the group-key
+  compare 31M).
+
+## 2026-11-15 - WIN: a sorted GROUP BY stops copying each sorter record into a register no opcode reads, which takes group_by_1000_groups below stock's CPU (bd-w4pr1.13.8, lever G4)
+
+- Target: the output loop of every sorted GROUP BY ran `SorterData sorter, r` once per row, and
+  codegen_select_group_by_aggregate never reads `r` (keys and aggregate arguments are read with
+  `Column` on the sorter cursor itself). Each row allocated an `Arc<[u8]>` copy of the record and
+  freed the previous one: execute_sorter_data 257-261M Ir inclusive on every 1M-row GROUP BY row,
+  ~8-10% of group_by_1000_groups' cycles after G3 (execute_sorter_data 2.1% + malloc 2.5% + free
+  0.7% + Arc drop 0.6% + most of set_reg's 5.5%). Touched: `crates/fsqlite-vdbe/src/codegen.rs`,
+  the `select_grouped_aggregate` and `aggregate_group_by_filtered` goldens.
+- Ledger preflight: no entry on SorterData or a dead sorter register; INDEX "Removing or adding
+  single arms of try_execute_hot_opcode" does not apply (no arm changes; an opcode leaves the
+  program).
+- Pre-registered on bd-w4pr1.13.8 (recorded 2026-11-15T01:38Z before the code, posted 02:39Z
+  before any build): group_by_1000_groups Ir -240 to -270M, CPU -12 to -25 ms; the other sorted
+  GROUP BY rows the same per row; other read rows within 0.3% Ir. Kill: under -150M Ir or CPU not
+  lower, another read row up more than 0.5% Ir, or a keeper / golden / EXPLAIN test changing
+  beyond the reviewed opcode removal.
+- Change: the sorter loop of codegen_select_group_by_aggregate no longer emits SorterData (nor
+  allocates its register); SorterNext returns to the first Column. GOLDEN-CHANGE, reviewed line by
+  line: in both goldens the SorterData line is gone, every address and jump target after it is one
+  lower (SorterNext's target stays: it now names the first Column), every register above the
+  removed one is one lower, and `registers:` drops by one; nothing else changes.
+  codegen_select_ordered_scan and five other loops emit the same dead SorterData; not in this
+  lever (no scorecard row runs them over more than ten rows).
+- Result (method as in G3's entry below; base G3 24872ad9d13297b1, candidate acf247c9ce835877 = G3
+  + this lever + W2 + O1, which touch other statements: the GROUP BY rows read no TEXT, and W2
+  changes only their outer projection; two par_probe runs, reps 5, load 5.2 and 6.0):
+  group_by_1000_groups 2,735.6M -> 2,448.6M Ir (-287M; stock 2,876.2M), CPU 209.6 -> 189.9 and
+  216.5 -> 189.6 ms (x1.03 -> x0.93, x1.03 -> x0.91 stock); GROUP BY a with sum(c) 4,144.6M ->
+  3,855.9M (-289M), CPU 440.7 -> 423.5 / 434.2 -> 416.7 ms (x1.69 -> x1.62, x1.63 -> x1.56);
+  GROUP BY a % 10 2,834.4M -> 2,541.2M, CPU 214.7 -> 196.4 / 223.0 -> 190.2 ms (x1.04 -> x0.95,
+  x1.04 -> x0.89); GROUP BY id % 100000 3,309.2M -> 2,943.8M (-365M: G4 plus W2 on its
+  100,000-row outer projection), CPU 403.2 -> 372.9 / 404.1 -> 383.7 ms (x2.13 -> x1.97, x2.02 ->
+  x1.92). scan_filter_agg 1,259.7M both, count_star 59.4M both. Prediction: Ir beyond its range by
+  17M (-287M against -240..-270M: the register the loop no longer writes also no longer frees the
+  previous row's Arc); CPU inside and above (-17 to -33 ms against -12..-25). Kill lines not
+  crossed.
+- Gate: the one in G3's entry below: golden_bytecode_snapshots 8/8 with this lever's two
+  GOLDEN-CHANGE snapshots on both trees, the GROUP BY EXPLAIN-pinning targets on the rebased tree.
+- Verdict: WIN against stock live: group_by_1000_groups x1.03 -> x0.91-0.93 CPU (below stock's
+  CPU); GROUP BY a % 10 x0.89-0.95. With G3, group_by_1000_groups went x1.76-1.83 -> x0.91-0.93
+  this round.
+- Retry condition: none (kept). Widen to codegen_select_ordered_scan's output loop (and the
+  grouped join, DML-without-rowid and IN-subquery sorter loops) when a row that outputs many
+  sorted rows is measured; each saves ~260 Ir a row output.
+
+## 2026-11-15 - WIN (CPU prediction missed, beyond its range): a sorter whose records repeat keeps one row and a count per distinct record, which takes group_by_1000_groups to stock's CPU (bd-w4pr1.13.8, lever G3)
+
+- Target: the sort of a GROUP BY whose aggregates read only its keys. Its sorter record is the key,
+  so group_by_1000_groups (1M rows, 1,000 groups) sorted a million copies of a thousand records:
+  `SorterCursor::sort` 422.7M Ir inclusive (the (i64, u32) pair sort 338.3M + the in-place cycle
+  permutation of 1M ~80-byte rows, whose dependent swaps serialize their cache misses), ~30% of the
+  cycles (`sort_rows_by_single_integer_key` 21.8% + its quicksort 7.5% + sort8 0.7%), the row drop
+  1.5%, ~5% kernel time faulting in the ~80 MB of rows; peak RSS 140.9 MB. Touched:
+  `crates/fsqlite-vdbe/src/engine.rs` (`SorterRuns`, `SorterCursor::{insert_program_record,
+  start_runs, collect_record, insert_record_with_runs, push_record, expand_runs, sort_runs,
+  position_at_first, advance}`, the spill writer, `sort`, `reset`, the Rewind/SorterSort and both
+  SorterNext arms, the IdxBulkLoad guard, two unit tests),
+  `crates/fsqlite-core/tests/bd_w4pr1_13_1_sync_lane_boundary_oracle.rs`
+  (`sorter_runs_match_sqlite_on_a_strict_file_database`).
+- Ledger preflight: 2026-11-10 bd-w4pr1.13.3 (the pair sort; kept, and still sorts every sorter
+  that does not collect); INDEX "Thinning sorter rows" (does not apply: rows are not thinned, the
+  sorter stores distinct records); INDEX "Narrow aggregate lanes" (no aggregate touched). No entry on
+  collapsing sorter records.
+- Pre-registered on bd-w4pr1.13.8 (2026-11-15T00:32Z): group_by_1000_groups Ir 3,009.8M ->
+  2,500-2,700M, CPU -80 to -120 ms, peak RSS under 60 MB; GROUP BY a % 10 about the same gain;
+  GROUP BY a with sum(c) and id % 100000 within 1% Ir and 3% CPU; the non-sorter rows within 0.3%;
+  CREATE INDEX over 300k rows within 1% Ir. Kill: under -40 ms on group_by_1000_groups, another
+  GROUP BY shape worse by more than 3% CPU, the CREATE INDEX probe worse by more than 2% Ir, or a
+  keeper change.
+- Change: a sorter opened without a top-N bound and with no collation on any key starts Undecided
+  and inserts as before. At 4,096 records, if it has not spilled or been positioned, it scans its
+  program once for a Rewind / Last / Prev on its cursor (an unsorted read of insertion order); with
+  none, no REAL key value, every pair of records with equal keys the same bytes, and at most half as
+  many distinct records as records, it keeps each key's first record with a count and collects from
+  then on: a record joins its key's run when it is the run's bytes. Keys are equal as the
+  comparator finds them with no collation (NULL, INTEGER by value, TEXT and BLOB by bytes), so any
+  arrangement of the multiset sorts to the same bytes and the distinct rows sorted, each emitted
+  its count times, are the stable sort. A REAL key (1 = 1.0, -0.0 = 0.0 in other bytes), equal keys
+  in other bytes (a payload that differs), under 2x compression at a doubling check (8,192, 16,384,
+  ...) or an insert after the sort turns the runs back into rows (copies beside each other, the
+  current position kept) and the sorter continues as before; a spill writes each run its count
+  times. SorterSort sorts the (row, count) pairs (distinct keys: one INTEGER key by the key, else
+  the comparator); positioning and both SorterNext lanes emit a row count times with the position
+  and row-decode cache in place; IdxBulkLoad declines runs; ResetSorter starts Undecided again;
+  `rows_sorted_total` counts records. The hash is a folded 64x64 multiply from a per-sorter random
+  seed (TEXT and BLOB bytes through foldhash). No bytecode change.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused, serial `parallel_workers=1`
+  on every arm; base main 6a0e84b3c sha256 77fe20def717213e, G3 24872ad9d13297b1 = 6a0e84b3c + this
+  diff; stock sqlite3 3.46.1 live in the same par_probe run, reps 5, two runs at load 7.9 and 5.9;
+  answers equal everywhere; all four levers were measured before the rebase, so both arms lack
+  origin/main's commits since 6a0e84b3c -- 250db23d7's cross-process structural claims, the
+  bulk-write lane's 908c771bc, bd-k66zh and bd-isckl -- which change write, subquery-aggregate and
+  JSON paths these read statements do not run): group_by_1000_groups 3,008.1M -> 2,730.0M Ir
+  (stock 2,876.2M), CPU 376.2 -> 208.9 ms and 374.4 -> 220.8 ms (x1.76 -> x0.98, x1.83 -> x1.08
+  stock); GROUP BY a % 10 3,108.2M -> 2,834.1M, 367.3 -> 225.7 / 365.1 -> 220.3 ms (x1.75 -> x1.07,
+  x1.73 -> x1.04); peak RSS 139.8 -> 31.8 MB (SELECT 1: 23.3 MB). Sorters that do not collect pay
+  ~39-42 Ir a record (the out-of-line runs test, the argument moves into the push, the first-check
+  test): GROUP BY a with sum(c) 4,103.7M -> 4,142.6M (+0.95%), CPU 462.0 -> 441.4 / 441.6 ->
+  431.7 ms; GROUP BY id % 100000 3,267.4M -> 3,308.9M (+1.3%), CPU 408.3 -> 400.1 / 391.6 -> 386.1
+  ms; CREATE INDEX ia ON t(a) over the 1M-row file, each run on a fresh copy, 5 alternating native
+  runs (perf stat, whole process): 2,986.6M -> 3,026.9M instructions (+1.35%), task-clock 450.4 ->
+  436.1 ms, cycles 1,283.9M -> 1,237.6M (callgrind's `execute_create_index` inclusive agrees:
+  2,878.9M -> 2,919.1M). Measurement trap: callgrind's whole-process count of that statement moved
+  by 350M between two runs of the same binary and by +1,354M between the arms, all of it in the
+  close-time WAL FEC flush and the scheduler's background lanes (valgrind serializes the threads);
+  compare a writing statement under callgrind by the statement's own inclusive count, or natively.
+  scan_filter_agg 1,259.7M -> 1,259.5M, order_by_text_limit10 1,735.6M -> 1,732.4M, count_star
+  59.4M both, window_row_number 4,737.0M -> 4,736.7M, sum(c) OVER (PARTITION BY a) 5,151.0M ->
+  5,150.7M. Prediction: CPU missed beyond its range (-155 to -167 ms against -80..-120: the sort's
+  cache misses and the fault-in of 80 MB cost more cycles than their instructions suggested); Ir
+  missed high by 30M (2,730M against 2,500-2,700M); RSS inside; the non-collecting shapes missed
+  the 1% Ir line (+1.3% on id % 100000) but are inside every kill line (CPU lower in both runs,
+  CREATE INDEX +1.35% against 2%). A first build (v1) cost the collecting path ~578 Ir a record (a
+  foldhash hasher per key, an out-of-line equality) and the plain path +41; v2 and v3 moved the
+  runs path out of line and hashed one INTEGER key with a single multiply.
+- Gate (one gate over this lever and G4, W2 and O1 above; rch). On 6a0e84b3c + the four diffs (the
+  tree measured): clippy -D warnings fsqlite-vdbe and fsqlite-types --all-targets and fsqlite-core
+  --lib + both keeper targets clean; fsqlite-types lib 592 passed; fsqlite-vdbe lib 1,253 passed, 1
+  failed (bd-bhalc's `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`,
+  red on main), golden_bytecode_snapshots 8/8 (G4's two GOLDEN-CHANGE snapshots included); round
+  1's 26 GROUP BY / ORDER BY / DISTINCT / aggregate / index-build / window keepers with the parallel
+  scan oracle (13/13) and budget (1/1) all pass but
+  `indexed_group_by_predicates_match_sqlite_without_table_scans` (red on main); the G3 keeper's file
+  3/3. A second job (fsqlite-core --lib with W1's window-using targets, the GROUP BY EXPLAIN-pinning
+  targets and the join / derived-table targets) timed out at 5,400 s on its worker while the lib's
+  slow `builder_refuses_a_build_that_exceeds_its_write_set_ceiling` ran (2,585 lib tests had
+  passed, the t6741 pair red as on main); its integration targets did not run on that tree.
+  Rebased onto origin/main fd57be379 (250db23d7 and 908c771bc change engine.rs, codegen.rs and
+  connection.rs in other functions; clean merge), on the exact tree pushed: clippy -D warnings
+  fsqlite-vdbe and fsqlite-types --all-targets clean, fsqlite-core --lib + both keeper targets clean
+  with `--no-deps` (without it clippy stops in fsqlite-ext-json: two `use_self` errors at lib.rs:2099
+  and 2111 that arrived with origin/main's 9d7e6e249, red on main); fsqlite-types lib 592 passed;
+  fsqlite-vdbe lib 1,253 passed, 1 failed (bd-bhalc), golden_bytecode_snapshots 8/8; 58 integration
+  targets of fsqlite-core and fsqlite (round 1's 26 keepers with the parallel scan oracle and budget,
+  the G3 and W2 keepers, 10 GROUP BY EXPLAIN-pinning targets, 4 join / derived-table / UTF-16
+  targets, the 14 fsqlite count / min / max / range / EXPLAIN oracles): 231 passed, 1 failed
+  (`indexed_group_by_predicates_match_sqlite_without_table_scans`, red on main); fsqlite-core lib,
+  after W2's updated unit test, 4,192 passed, 2 failed (the t6741 pair, bd-nouem). Rebased once more
+  onto 78e67b4f6 (bd-ukvhn, connection.rs's grouped evaluator) and the affected targets re-run on
+  the exact tree pushed (its new oracle, the G3 and W2 keepers' files, bd_group_by_depth, the two
+  min/max bare-row oracles, window_function_oracle): all pass but
+  `indexed_group_by_predicates_match_sqlite_without_table_scans` (red on main). Not run
+  on any tree: W1's window-using core targets beyond the 26 keepers and window_function_oracle, and
+  the fsqlite-e2e window / join / derived / bytecode-shape targets.
+  Keepers: `test_sorter_runs_emit_what_one_row_per_record_emits` (20,000-record sequences
+  inserted into a collecting and a plain sorter, sorted and compared record by record: 37 INTEGER
+  groups ASC and DESC; a key that turns REAL (3.0 among the 3s) and one with -0.0 / 0.0 after the
+  runs started; a REAL key from the start; a payload that follows the key for 6,000 records and then
+  varies -- a collapse by key alone reorders it; one that always follows it; ten keys for 8,000
+  records and then all new (expands at 16,384); unique keys; under 4,096 records; NULL / INTEGER /
+  TEXT / BLOB two-column keys under three direction pairs; a record shorter than its key; a program
+  with a Rewind on the sorter and one with a Rewind on another cursor; each case asserts the state
+  it ends in), `test_sorter_runs_spill_insert_after_sort_and_reset` (a spill while collecting, an
+  insert after the sort at record 26 of a run of 20, ResetSorter, the bulk-load guard), and the
+  stock oracle `sorter_runs_match_sqlite_on_a_strict_file_database` (20,000 rows on a strict file
+  database: 27 GROUP BY / ORDER BY / DISTINCT queries that run the sorter program over every case
+  above, 6 strict-refused shapes compared with strict off, CREATE INDEX over duplicated values, a
+  failing CREATE UNIQUE INDEX and integrity_check; NOCASE keys never collect and only their group
+  count is compared, since the spelling a group prints is bd-ukvhn's divergence).
+- Verdict: WIN against stock live: group_by_1000_groups x1.76-1.83 -> x0.98-1.08 CPU, GROUP BY
+  a % 10 x1.73-1.75 -> x1.04-1.07.
+- Retry condition: none (kept). The plain path's ~40 Ir a record is worth removing (keep the
+  plain push inline and the runs test at one compare) when a sorter-heavy row that does not
+  collect, such as CREATE INDEX or GROUP BY with a payload, is the lever. Hash aggregation
+  (bd-w4pr1.13.8's general fix) is what GROUP BY with sum(c) and the unique-key shapes still need.
+
 ## 2026-11-15 - WIN (prediction missed, beyond its range): a separator repair whose new rowid has the stored one's varint length writes it in place (bd-w4pr1.13.20, lever J)
 
 - Target: every table delete that removes a leaf's last cell, whose ancestor separator the b-tree then lowers to
