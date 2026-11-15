@@ -832,3 +832,93 @@ fn count_star_over_an_exact_equality_prefix_counts_leaves_and_matches_sqlite() {
         f.close().await.unwrap();
     });
 }
+
+/// bd-qyd3s: a lone COUNT(*) whose WHERE is exactly `col IN (<integer
+/// literals>)` on an INTEGER column counts each distinct member's run from the
+/// index's pages and adds the counts: runs spanning leaves on a single-column
+/// index and on a composite one with NULL trailing keys, duplicate, absent and
+/// past-the-end members, and a one-member list, against stock on a file
+/// database in strict mode. A text member, a residual and a TEXT column keep
+/// their programs.
+#[test]
+fn count_star_over_an_integer_in_list_counts_each_member_and_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("count_in_list.db");
+        let f = Connection::open(file.to_str().unwrap()).await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for stmt in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER, s TEXT);",
+            "CREATE INDEX idx_a ON t(a);",
+            "CREATE INDEX idx_xa ON t(x, a);",
+            "CREATE INDEX idx_s ON t(s);",
+        ] {
+            f.execute(stmt).await.unwrap();
+            r.execute_batch(stmt).unwrap();
+        }
+        let mut batch = String::from("BEGIN;");
+        for i in 1..=12_000_i64 {
+            let a = if i % 13 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 7)
+            };
+            batch.push_str(&format!(
+                "INSERT INTO t VALUES ({i}, {a}, {}, 'k{}');",
+                i % 3,
+                i % 11
+            ));
+        }
+        batch.push_str("COMMIT;");
+        f.execute_batch(&batch).await.unwrap();
+        r.execute_batch(&batch).unwrap();
+        f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .await
+            .unwrap();
+
+        // (sql, distinct members, each counted by its own IdxCountBefore)
+        let counted: &[(&str, usize)] = &[
+            ("SELECT count(*) FROM t WHERE a IN (1, 3, 5)", 3),
+            ("SELECT count(*) FROM t WHERE a IN (3, 3, 5, 3)", 2),
+            ("SELECT count(*) FROM t WHERE a IN (999, 3)", 2),
+            ("SELECT count(*) FROM t WHERE a IN (6, 100)", 2),
+            ("SELECT count(*) FROM t WHERE a IN (4)", 1),
+            ("SELECT count(*) FROM t WHERE a IN (0, 1, 2, 3, 4, 5, 6)", 7),
+            ("SELECT count(*) FROM t WHERE x IN (0, 2)", 2),
+            ("SELECT count(*) FROM t WHERE a = 1 OR a = 3 OR a = 1", 2),
+        ];
+        for (sql, members) in counted {
+            assert_eq!(
+                frank_rows(&f, sql, &[]).await,
+                sqlite_rows(&r, sql, &[]),
+                "diverged: `{sql}`"
+            );
+            let ops = opcodes(&f, sql).await;
+            assert_eq!(
+                ops.iter().filter(|op| *op == "IdxCountBefore").count(),
+                *members,
+                "each distinct member's run is counted from the index's pages: `{sql}` {ops:?}"
+            );
+            assert!(
+                !ops.iter().any(|op| op == "AggStep"),
+                "no entry is stepped: `{sql}` {ops:?}"
+            );
+        }
+        for sql in [
+            "SELECT count(*) FROM t WHERE a IN (3, '5')",
+            "SELECT count(*) FROM t WHERE a IN (1, 3) AND s = 'k1'",
+            "SELECT count(*) FROM t WHERE s IN ('k1', 'k2')",
+        ] {
+            assert_eq!(
+                frank_rows(&f, sql, &[]).await,
+                sqlite_rows(&r, sql, &[]),
+                "diverged: `{sql}`"
+            );
+            assert!(
+                !has_op(&f, sql, "IdxCountBefore").await,
+                "not an integer-literal IN list over an INTEGER column: `{sql}`"
+            );
+        }
+        f.close().await.unwrap();
+    });
+}

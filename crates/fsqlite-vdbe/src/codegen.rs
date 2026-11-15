@@ -20936,6 +20936,11 @@ fn aggregate_index_is_null_target<'t>(
         .min_by_key(|idx| idx.key_term_count())
 }
 
+/// A run [`codegen_select_count_star_index_range`] counts: its start (a key
+/// record and the seek that reaches it, or `None` to Rewind) and its upper
+/// bound (a key record and whether it is inclusive, or `None` to the end).
+type CountSegment = (Option<(i32, Opcode)>, Option<(i32, bool)>);
+
 /// The rows a lone `COUNT(*)` counts from an index without reading them
 /// (bd-2fb53): a range its WHERE states exactly, the leading NULL keys, every
 /// key after them, or the entries an equality prefix pins (bd-zgbhb).
@@ -20945,6 +20950,9 @@ enum CountIndexRange<'e> {
     NotNulls,
     /// The values of the index's leading key columns, in index order.
     Prefix(Vec<&'e Expr>),
+    /// bd-qyd3s: distinct integer values of the leading key column, each
+    /// counted as its own run.
+    Members(Vec<i64>),
 }
 
 /// bd-2fb53: the index and the key range a `COUNT(*)` whose WHERE is exactly
@@ -20959,12 +20967,21 @@ enum CountIndexRange<'e> {
 /// ([`index_range_bound_is_seek_safe`]): the prefix is then the inclusive
 /// range from the values to themselves. A value that could need a conversion
 /// the probe would miss keeps the equality walk and its scan fallback.
+/// bd-qyd3s: and a WHERE that is exactly `col IN (<integer literals>)` on an
+/// INTEGER-affinity column ([`index_integer_in_list_target`]): the members are
+/// de-duplicated, so their runs are disjoint and the counts add up.
 fn count_star_index_range_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
 ) -> Option<(&'t IndexSchema, CountIndexRange<'e>)> {
+    if !table.without_rowid
+        && let Some((index, members)) =
+            index_integer_in_list_target(where_clause, table, table_alias)
+    {
+        return Some((index, CountIndexRange::Members(members)));
+    }
     if let Some((index, values)) = aggregate_index_eq_seek_target(where_clause, table, table_alias)
         && values.iter().zip(&index.columns).all(|(value, column)| {
             index_range_bound_is_seek_safe(table, table_alias, schema, column, value)
@@ -21013,7 +21030,8 @@ fn count_star_index_range_target<'t, 'e>(
 /// none to the end), adding whole leaves without reading their rows, where
 /// stock steps through every entry. A NULL bound counts nothing, as the
 /// range then matches no row. The bounds get the index key's affinity, as in
-/// the aggregate range walk this replaces.
+/// the aggregate range walk this replaces. bd-qyd3s: an IN list's members are
+/// counted one run each (seek, count, add); a member with no entry adds 0.
 fn codegen_select_count_star_index_range(
     b: &mut ProgramBuilder,
     table: &TableSchema,
@@ -21058,8 +21076,9 @@ fn codegen_select_count_star_index_range(
         b.emit_op(Opcode::MakeRecord, value, 1, record, P4::None, 0);
         record
     };
-    // (start key record and seek, or `None` to Rewind) and (upper bound record, inclusive).
-    let (start, upper) = match range {
+    // Per counted run: (start key record and seek, or `None` to Rewind) and
+    // (upper bound record, inclusive).
+    let segments: Vec<CountSegment> = match range {
         CountIndexRange::Range(range) => {
             let start = match range.lower.as_ref() {
                 Some(bound) => (
@@ -21077,10 +21096,21 @@ fn codegen_select_count_star_index_range(
                 .upper
                 .as_ref()
                 .map(|bound| (key_record(b, Some(bound.expr())), bound.inclusive));
-            (Some(start), upper)
+            vec![(Some(start), upper)]
         }
-        CountIndexRange::Nulls => (None, Some((key_record(b, None), true))),
-        CountIndexRange::NotNulls => (Some((key_record(b, None), Opcode::SeekGT)), None),
+        CountIndexRange::Nulls => vec![(None, Some((key_record(b, None), true)))],
+        CountIndexRange::NotNulls => vec![(Some((key_record(b, None), Opcode::SeekGT)), None)],
+        // bd-qyd3s: each member's run, from its first entry up to its last.
+        CountIndexRange::Members(members) => members
+            .iter()
+            .map(|&member| {
+                let key = b.alloc_reg();
+                b.emit_op(Opcode::Int64, 0, key, 0, P4::Int64(member), 0);
+                let record = b.alloc_reg();
+                b.emit_op(Opcode::MakeRecord, key, 1, record, P4::None, 0);
+                (Some((record, Opcode::SeekGE)), Some((record, true)))
+            })
+            .collect(),
         // bd-zgbhb: from the first entry the prefix pins up to the last.
         CountIndexRange::Prefix(values) => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -21104,7 +21134,7 @@ fn codegen_select_count_star_index_range(
             let record = b.alloc_reg();
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             b.emit_op(Opcode::MakeRecord, base, values.len() as i32, record, P4::None, 0);
-            (Some((record, Opcode::SeekGE)), Some((record, true)))
+            vec![(Some((record, Opcode::SeekGE)), Some((record, true)))]
         }
     };
     b.emit_op(
@@ -21115,23 +21145,34 @@ fn codegen_select_count_star_index_range(
         P4::Index(index.name.clone()),
         0,
     );
-    match start {
-        Some((record, seek)) => {
-            b.emit_jump_to_label(seek, idx_cursor, record, done_label, P4::None, 0);
+    // Several runs are counted into a scratch register and added up; a run
+    // whose seek finds no entry counts nothing.
+    let counted = (segments.len() > 1).then(|| b.alloc_reg());
+    for (start, upper) in segments {
+        let next_run = b.emit_label();
+        let empty = if counted.is_some() { next_run } else { done_label };
+        match start {
+            Some((record, seek)) => {
+                b.emit_jump_to_label(seek, idx_cursor, record, empty, P4::None, 0);
+            }
+            None => {
+                b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, empty, P4::None, 0);
+            }
         }
-        None => {
-            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
+        let (upper_record, upper_inclusive) = upper.unwrap_or((0, false));
+        b.emit_op(
+            Opcode::IdxCountBefore,
+            idx_cursor,
+            counted.unwrap_or(out_reg),
+            upper_record,
+            P4::None,
+            u16::from(upper_inclusive),
+        );
+        if let Some(counted) = counted {
+            b.emit_op(Opcode::Add, counted, out_reg, out_reg, P4::None, 0);
         }
+        b.resolve_label(next_run);
     }
-    let (upper_record, upper_inclusive) = upper.unwrap_or((0, false));
-    b.emit_op(
-        Opcode::IdxCountBefore,
-        idx_cursor,
-        out_reg,
-        upper_record,
-        P4::None,
-        u16::from(upper_inclusive),
-    );
     b.resolve_label(done_label);
     b.emit_op(Opcode::ResultRow, out_reg, 1, 0, P4::None, 0);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
