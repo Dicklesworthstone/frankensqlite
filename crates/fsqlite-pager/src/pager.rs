@@ -20537,28 +20537,21 @@ where
         let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
         let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
-        let (mut pending_namespace, mut replace_quiescent_namespace_record) = if vfs.is_memory() {
-            (None, false)
+        let pending_namespace = if vfs.is_memory() {
+            None
         } else {
-            // GH #140: prefer strictly read-only admission — join the
+            // GH#140 / GH#535: strictly read-only admission joins the
             // existing namespace generation without creating or rewriting
             // any sidecar record. When no sidecars exist at all (a database
             // never opened by FrankenSQLite, e.g. a stock SQLite file),
-            // ReadOnlyExisting now succeeds SIDECAR-LESS (bd-daqmp: the
-            // zero-mutation clean-database case), so the Shared fallback
-            // below only fires for present-but-unopenable sidecar records.
-            // Busy is NOT a fallback trigger: it means a live generation
-            // transition is in flight and must stay retryable.
-            match PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::ReadOnlyExisting) {
-                Ok(pending) => (Some(pending), false),
-                Err(FrankenError::CannotOpen { .. }) => {
-                    let pending =
-                        begin_namespace_admission(cx, &db_path, NamespaceOpenIntent::Shared).await?;
-                    let replace_record = pending.has_quiescent_record_bytes()?;
-                    (Some(pending), replace_record)
-                }
-                Err(error) => return Err(error),
-            }
+            // ReadOnlyExisting admits it without sidecars. Malformed or
+            // copied records need a writable opener to rebind the namespace;
+            // falling back to Shared here would acquire exclusive authority
+            // and publish a record during an ostensibly read-only open.
+            Some(PendingNamespaceOpen::begin(
+                &db_path,
+                NamespaceOpenIntent::ReadOnlyExisting,
+            )?)
         };
         #[cfg(all(feature = "native", any(unix, windows)))]
         let namespace_expected_identity = pending_namespace
@@ -20577,46 +20570,6 @@ where
         #[cfg(not(all(feature = "native", any(unix, windows))))]
         let effective_expected_identity = expected_identity;
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-        #[cfg(all(feature = "native", any(unix, windows)))]
-        let (db_file, _actual_flags) = {
-            let initial_open = if let Some(identity) = effective_expected_identity {
-                vfs.open_with_expected_identity(cx, &db_path, flags, identity)
-            } else {
-                vfs.open(cx, Some(&db_path), flags)
-            };
-            match initial_open {
-                Ok(opened) => opened,
-                Err(FrankenError::CannotOpen { .. })
-                    if expected_identity.is_none() && namespace_expected_identity.is_some() =>
-                {
-                    // bd-g5rdj: namespace sidecars are machine-local runtime
-                    // state and are routinely copied alongside the database.
-                    // A valid record from the source inode must not make the
-                    // copied database permanently unopenable. Release the
-                    // read-only join and retry through Shared admission: when
-                    // the copied namespace is quiescent this takes `use`
-                    // exclusively, opens the current database identity, and
-                    // republishes that identity during `bind`. If a live peer
-                    // owns the namespace, Shared admission joins its identity
-                    // instead and the exact-identity open remains fail-closed.
-                    drop(pending_namespace.take());
-                    let replacement_pending =
-                        begin_namespace_admission(cx, &db_path, NamespaceOpenIntent::Shared).await?;
-                    let replacement_expected = replacement_pending.expected_identity();
-                    replace_quiescent_namespace_record =
-                        replacement_pending.has_quiescent_record_bytes()?;
-                    let opened = if let Some(identity) = replacement_expected {
-                        vfs.open_with_expected_identity(cx, &db_path, flags, identity)?
-                    } else {
-                        vfs.open(cx, Some(&db_path), flags)?
-                    };
-                    pending_namespace = Some(replacement_pending);
-                    opened
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        #[cfg(not(all(feature = "native", any(unix, windows))))]
         let (db_file, _actual_flags) = if let Some(expected_identity) = effective_expected_identity
         {
             vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
@@ -20653,11 +20606,7 @@ where
                 .ok_or_else(|| FrankenError::CannotOpen {
                     path: db_path.clone(),
                 })?;
-            let binding = if replace_quiescent_namespace_record {
-                pending.bind_replacing_quiescent_record(identity)?
-            } else {
-                pending.bind(identity)?
-            };
+            let binding = pending.bind(identity)?;
             binding.validate_path_identity()?;
             Some(binding)
         } else {
@@ -34047,40 +33996,64 @@ mod tests {
             }
             let target_bytes = std::fs::read(&target).expect("snapshot target database");
 
-            let readonly =
-                SimplePager::open_readonly_with_cx(&cx, UnixVfs::new(), &target, PageSize::DEFAULT)
-                    .await
-                    .expect("open copied namespace state read-only");
-            drop(readonly);
+            for corrupt in [false, true] {
+                if corrupt {
+                    std::fs::write(sidecar(&target, "-fsqlite-ns-use"), b"corrupt base record")
+                        .expect("corrupt quiescent namespace record");
+                }
+                let use_before = std::fs::read(sidecar(&target, "-fsqlite-ns-use"))
+                    .expect("snapshot namespace use record");
+                let gate_before = std::fs::read(sidecar(&target, "-fsqlite-ns-gate"))
+                    .expect("snapshot namespace gate record");
+                // GH#535: neither copied identities nor malformed records
+                // authorize a read-only opener to republish namespace state.
+                assert!(matches!(
+                    SimplePager::open_readonly_with_cx(
+                        &cx,
+                        UnixVfs::new(),
+                        &target,
+                        PageSize::DEFAULT,
+                    )
+                    .await,
+                    Err(FrankenError::CannotOpen { .. })
+                ));
+                assert_eq!(
+                    std::fs::read(sidecar(&target, "-fsqlite-ns-use")).unwrap(),
+                    use_before,
+                    "read-only admission must not rewrite namespace identity"
+                );
+                assert_eq!(
+                    std::fs::read(sidecar(&target, "-fsqlite-ns-gate")).unwrap(),
+                    gate_before,
+                    "read-only admission must not rewrite the namespace gate"
+                );
+                assert_eq!(
+                    std::fs::read(&target).expect("re-read target database"),
+                    target_bytes,
+                    "read-only refusal must not modify the main database"
+                );
 
-            std::fs::write(sidecar(&target, "-fsqlite-ns-use"), b"corrupt base record")
-                .expect("corrupt quiescent namespace record");
-            let repaired =
-                SimplePager::open_readonly_with_cx(&cx, UnixVfs::new(), &target, PageSize::DEFAULT)
-                    .await
-                    .expect("repair corrupt quiescent namespace state");
-            drop(repaired);
-            assert_eq!(
-                std::fs::read(&target).expect("re-read target database"),
-                target_bytes,
-                "read-only namespace repair must not modify the main database"
-            );
-
-            for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
-                std::fs::copy(sidecar(&source, suffix), sidecar(&target, suffix))
-                    .expect("restore namespace sidecar");
+                let writable = SimplePager::open_existing_with_cx_and_page_buffer_max(
+                    &cx,
+                    UnixVfs::new(),
+                    &target,
+                    PageSize::DEFAULT,
+                    None,
+                    None,
+                )
+                .await
+                .expect("a writable opener can repair quiescent namespace state");
+                drop(writable);
+                let readonly = SimplePager::open_readonly_with_cx(
+                    &cx,
+                    UnixVfs::new(),
+                    &target,
+                    PageSize::DEFAULT,
+                )
+                .await
+                .expect("read-only open succeeds after authorized repair");
+                drop(readonly);
             }
-            let writable = SimplePager::open_existing_with_cx_and_page_buffer_max(
-                &cx,
-                UnixVfs::new(),
-                &target,
-                PageSize::DEFAULT,
-                None,
-                None,
-            )
-            .await
-            .expect("open copied namespace state read-write");
-            drop(writable);
 
             let missing = dir.path().join("namespace-copy-missing-main.db");
             for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
