@@ -4824,6 +4824,7 @@ where
 
         let footer_size =
             u64::try_from(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE).unwrap_or(4);
+        let mut eof_candidate_error = None;
         if file_size >= footer_size {
             let footer = Self::read_certificate_sidecar_exact(
                 file,
@@ -4861,14 +4862,17 @@ where
                     && (bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
                         || durable_certificate_declares_len(&bytes, record_len))
                 {
-                    let record =
-                        decode_durable_certificate_record(&bytes, "append-boundary record")?;
-                    if record.wal_generation != generation {
-                        return Self::discard_prior_generation_certificate_sidecar(
-                            file, cx, file_size, generation,
-                        );
+                    match decode_durable_certificate_record(&bytes, "append-boundary record") {
+                        Ok(record) => {
+                            if record.wal_generation != generation {
+                                return Self::discard_prior_generation_certificate_sidecar(
+                                    file, cx, file_size, generation,
+                                );
+                            }
+                            return Ok(file_size);
+                        }
+                        Err(error) => eof_candidate_error = Some((record_start, error)),
                     }
-                    return Ok(file_size);
                 }
             }
         }
@@ -4930,8 +4934,25 @@ where
             if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
                 && let Ok(record) = ParallelWalDurableCertificateRecord::from_bytes(record_bytes)
             {
-                anchor_end = Some((candidate_end, record.wal_generation));
+                anchor_end = Some((record_start, candidate_end, record.wal_generation));
                 break;
+            }
+        }
+        // A torn suffix can make EOF's footer point into a valid record's
+        // payload. Only a strictly decoded anchor enclosing that candidate
+        // start may disprove the speculative error; a nested envelope or an
+        // older record cannot hide complete-record corruption (GH#537).
+        if let Some((candidate_start, error)) = eof_candidate_error {
+            let relative_start = candidate_start
+                .checked_sub(tail_offset)
+                .and_then(|offset| usize::try_from(offset).ok());
+            let candidate_is_inside_anchor = relative_start.is_some_and(|candidate_start| {
+                anchor_end
+                    .as_ref()
+                    .is_some_and(|(start, end, _)| (*start..*end).contains(&candidate_start))
+            });
+            if !candidate_is_inside_anchor {
+                return Err(error);
             }
         }
         if let Some(record_start) = legacy_record_start {
@@ -4943,7 +4964,7 @@ where
             );
         }
 
-        let safe_end = if let Some((anchor_end, anchor_generation)) = anchor_end {
+        let safe_end = if let Some((_, anchor_end, anchor_generation)) = anchor_end {
             validate_incomplete_certificate_suffix(&tail[anchor_end..], true)?;
             if anchor_generation != generation {
                 return Self::discard_prior_generation_certificate_sidecar(
@@ -5505,6 +5526,7 @@ where
         let footer_size =
             u64::try_from(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE).unwrap_or(4);
         let mut newest = None;
+        let mut eof_candidate_error = None;
         if file_size >= footer_size {
             let footer_offset = file_size - footer_size;
             let footer = Self::read_certificate_sidecar_exact(
@@ -5553,16 +5575,17 @@ where
                     );
                     return Ok(None);
                 }
-                // A matching magic or self-declared length makes this a
-                // fully-present envelope candidate. Strict decoding is
-                // mandatory even when its magic/version/CRC/footer is
-                // corrupt; complete corruption is never a torn suffix.
+                // EOF may name an interior payload after a torn append.
+                // Retain a strict error until the bounded scan can prove
+                // that this candidate starts inside a valid anchor.
                 if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
                     && (bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
                         || durable_certificate_declares_len(&bytes, record_len))
                 {
-                    let record = decode_durable_certificate_record(&bytes, "newest record")?;
-                    newest = Some((record_start, record));
+                    match decode_durable_certificate_record(&bytes, "newest record") {
+                        Ok(record) => newest = Some((record_start, record)),
+                        Err(error) => eof_candidate_error = Some((record_start, error)),
+                    }
                 }
             }
         }
@@ -5620,6 +5643,9 @@ where
                 // GH#372: a legacy envelope at an exact footer boundary
                 // means the whole sidecar predates this build — absent.
                 if durable_certificate_is_legacy_envelope(record_bytes) {
+                    if let Some((_, error)) = eof_candidate_error {
+                        return Err(error);
+                    }
                     tracing::debug!(
                         target: "fsqlite::wal::durability_combiner",
                         legacy_record_version =
@@ -5637,6 +5663,19 @@ where
                 }
             }
 
+            if let Some((candidate_start, error)) = eof_candidate_error {
+                let relative_start = candidate_start
+                    .checked_sub(tail_offset)
+                    .and_then(|offset| usize::try_from(offset).ok());
+                let candidate_is_inside_anchor = relative_start.is_some_and(|candidate_start| {
+                    anchor
+                        .as_ref()
+                        .is_some_and(|(start, end, _)| (*start..*end).contains(&candidate_start))
+                });
+                if !candidate_is_inside_anchor {
+                    return Err(error);
+                }
+            }
             if let Some((record_start, record_end, record)) = anchor {
                 validate_incomplete_certificate_suffix(&tail[record_end..], true)?;
                 let absolute_start = tail_offset
@@ -8284,6 +8323,159 @@ mod tests {
                         .expect("repaired sidecar remains readable"),
                     expected_certificate,
                     "an orphan append must not authorize any new WAL frames"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn durable_certificate_zero_suffix_ignores_an_interior_eof_candidate() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, mut authorized) = make_authorized_certificate_backend(&vfs, &cx);
+        authorized.lane_count = u16::MAX;
+        authorized.lane_record_counts = vec![1024; usize::from(u16::MAX)];
+        authorized.certificate_crc32c = authorized.computed_crc32c();
+        let authorized_bytes = ParallelWalDurableCertificateRecord::new(
+            backend.inner.inner().generation_identity(),
+            1,
+            1,
+            [0u8; 16],
+            authorized.clone(),
+        )
+        .expect("construct maximum-size authorized record")
+        .to_bytes();
+        assert_eq!(
+            authorized_bytes.len(),
+            PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE
+        );
+        let orphan = sample_certificate(2, 2, vec![1]);
+        let orphan_bytes = ParallelWalDurableCertificateRecord::new(
+            backend.inner.inner().generation_identity(),
+            2,
+            2,
+            [0u8; 16],
+            orphan.clone(),
+        )
+        .expect("construct next orphan record")
+        .to_bytes();
+
+        // GH#537: shifting this maximum-sized footer by one zero produces
+        // 1024, which also appears as a fake header length inside the lanes.
+        // Include a second copy to exercise a nonzero recovery-window offset.
+        for record_count in [1, 2] {
+            let prefix = authorized_bytes.repeat(record_count);
+            let mut sidecar = prefix.clone();
+            sidecar.push(0);
+            let footer = &sidecar[sidecar.len() - 4..];
+            let candidate_len = u32::from_le_bytes(footer.try_into().unwrap()) as usize;
+            assert_eq!(candidate_len, 1024);
+            let candidate = &sidecar[sidecar.len() - candidate_len..];
+            assert!(durable_certificate_declares_len(candidate, candidate_len));
+            assert!(!candidate.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC));
+            replace_certificate_sidecar(&vfs, &cx, &sidecar);
+
+            assert_eq!(
+                backend
+                    .latest_authorized_parallel_wal_commit_certificate(&cx)
+                    .wait()
+                    .expect("a speculative interior EOF candidate must not mask the anchor"),
+                Some(authorized.clone())
+            );
+            assert_eq!(read_certificate_sidecar(&vfs, &cx), sidecar);
+            backend
+                .persist_parallel_wal_commit_certificate(&cx, &orphan, 2, 2)
+                .expect("append replaces only the zero after the valid anchor");
+            let mut expected = prefix;
+            expected.extend_from_slice(&orphan_bytes);
+            assert_eq!(read_certificate_sidecar(&vfs, &cx), expected);
+            assert_eq!(
+                backend
+                    .latest_authorized_parallel_wal_commit_certificate(&cx)
+                    .wait()
+                    .expect("the repaired certificate chain remains readable"),
+                Some(authorized.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn durable_certificate_eof_errors_cannot_be_hidden_by_unrelated_anchors() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, _) = make_authorized_certificate_backend(&vfs, &cx);
+        let authorized_bytes = read_certificate_sidecar(&vfs, &cx);
+        let orphan = sample_certificate(2, 2, vec![1]);
+
+        // Without the retained EOF error, a complete record whose header
+        // length increased by one would look like an incomplete append.
+        let mut inflated_length = authorized_bytes.clone();
+        let declared_len = u32::try_from(inflated_length.len() + 1).unwrap();
+        inflated_length[10..14].copy_from_slice(&declared_len.to_le_bytes());
+        assert!(validate_incomplete_certificate_suffix(&inflated_length, true).is_ok());
+
+        // Lane counts can contain an entire CRC-valid inner envelope, then
+        // another partial header. Make the outer record valid before damaging
+        // only its magic: neither the nested anchor nor its plausible suffix
+        // can authorize discarding the enclosing complete corrupt record.
+        assert_eq!(authorized_bytes.len() % 4, 0);
+        let lane_record_counts = authorized_bytes
+            .chunks_exact(4)
+            .chain(authorized_bytes[..16].chunks_exact(4))
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        let enclosing = sample_certificate(2, 2, lane_record_counts);
+        let mut nested_record = ParallelWalDurableCertificateRecord::new(
+            backend.inner.inner().generation_identity(),
+            2,
+            2,
+            [0u8; 16],
+            enclosing,
+        )
+        .expect("construct enclosing record")
+        .to_bytes();
+        ParallelWalDurableCertificateRecord::from_bytes(&nested_record)
+            .expect("the enclosing record starts fully valid");
+        let nested_start = nested_record
+            .windows(authorized_bytes.len())
+            .position(|bytes| bytes == authorized_bytes)
+            .expect("lane payload contains the valid inner record");
+        assert!(nested_start > 0);
+        let nested_end = nested_start + authorized_bytes.len();
+        assert!(validate_incomplete_certificate_suffix(&nested_record[nested_end..], true).is_ok());
+        nested_record[0] ^= 1;
+        let mut nested_legacy = nested_record.clone();
+        nested_legacy[nested_start + 8..nested_start + 10].copy_from_slice(&2_u16.to_le_bytes());
+
+        for anchored in [false, true] {
+            for (scenario, corrupt_record) in [
+                ("inflated complete record length", &inflated_length),
+                ("bad magic enclosing a valid current record", &nested_record),
+                ("bad magic enclosing a legacy record", &nested_legacy),
+            ] {
+                let mut sidecar = if anchored {
+                    authorized_bytes.clone()
+                } else {
+                    Vec::new()
+                };
+                sidecar.extend_from_slice(corrupt_record);
+                replace_certificate_sidecar(&vfs, &cx, &sidecar);
+                assert_wal_corrupt(
+                    backend
+                        .latest_authorized_parallel_wal_commit_certificate(&cx)
+                        .wait(),
+                    scenario,
+                );
+                assert_wal_corrupt(
+                    backend
+                        .persist_parallel_wal_commit_certificate(&cx, &orphan, 2, 2)
+                        .wait(),
+                    scenario,
+                );
+                assert_eq!(
+                    read_certificate_sidecar(&vfs, &cx),
+                    sidecar,
+                    "rejected EOF record must remain intact: {scenario}, anchored={anchored}"
                 );
             }
         }
