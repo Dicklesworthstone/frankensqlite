@@ -87,6 +87,101 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN: committed SSI history keeps its page indexes entry by entry instead of rebuilding them at every commit, +44% at 64 separate-table writers and +59% at 32 shared-table writers (bd-i0tn6 scaling lever 3)
+
+- Target: the registry-guard holds of concurrent commits at 16-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`, separate and shared tables). Touched:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (`CommittedHistory<E>`, `CommittedHistoryInfo`,
+  `ConcurrentRegistry::committed_readers` / `committed_writers`,
+  `prune_committed_conflict_history`; `rebuild_committed_history_indexes`,
+  `index_committed_reader` / `index_committed_writer` and `collect_precise_candidates` removed).
+- Ledger preflight: lever 2 below (view parts shared until a peer changes, WIN small) named this
+  rebuild as the next item and the DRO coupling: history lengths feed `evaluate_prepare_t3_dro`,
+  so pruning must stay exact. Lever 1 below (REJECTED) showed that removing waits elsewhere only
+  lengthens these holds. Nothing earlier touched the committed-history indexes.
+- Evidence before (hold-split probe on 67fd99d10, bead comment 2026-11-14 16:57 UTC):
+  `prune_committed_conflict_history` ran at every commit under the guard and, after the retain,
+  cleared all eight committed-history index maps and re-summarized every retained record to
+  rebuild them, although each push had already indexed its own record: 46.3 us of a 56.2 us
+  prune at 64 writers (112 records retained), 92.3 us of 101.4 at 32 shared-table writers (440
+  records), 24% and 42% of the two holds.
+- Change: each record gets an id in publication order and keeps the witness summary computed at
+  push; the page / page-witness / exact-cell / global lists hold ids. `prune_at_or_before` pops
+  `(commit_seq, id)` from a min-heap while `commit_seq <= horizon`, so it finds a record wherever
+  it sits (publication order can differ from commit order since S3), and removes the id from its
+  own pages' lists, dropping a key once empty. A record pruned behind a retained one leaves an
+  empty slot until the older records go, so `len()`, iteration and candidate order equal a vector
+  in publication order with the same records removed. Pruning stays eager: same retain predicate,
+  horizon, MAX_HISTORY_ENTRIES path and clear-on-no-horizon path.
+- Prediction (bead comment, before the code was built): separate 64w +15% to +35%, 32w +12% to
+  +30%, 16w +5% to +20%, 8w +0% to +8%, 1w within 2%; shared 32w +20% to +60%, 16w +8% to +25%;
+  hold at 64w separate -20% to -35%, at 32w shared -30% to -45%; probe prune at 64w <= 12 us, at
+  32w shared <= 15 us. Kill: separate 32w or 64w below 1.05 in either rep; shared 32w below 1.08;
+  1w worse than -2% or 8w worse than -3% over the reps; 64w hold cut below 15%; probe prune at 64w
+  above 20 us; a worker failure A does not show; an SSI keeper red; the keepers passing on a lazy
+  variant.
+- Result (A = main 8fb2902ee mt-mvcc-bench sha256 6ef6eec0f6413d0b, B = A + this change
+  05592099d737f44f; thinkstation1, Threadripper PRO 5975WX, 64 hardware threads, governor
+  powersave, tmpfs, synchronous=NORMAL, 500 rows per writer, 5 rounds per row, stock SQLite live in
+  every run; pairs interleaved with the order alternating per rep; host load 4-7). B/A of the
+  means with F/C A -> B:
+
+  | writers | separate B/A (4 reps) | F/C A -> B | shared B/A (4 reps) | F/C A -> B |
+  |---|---|---|---|---|
+  | 1 | 0.998x (12 reps pooled, see below) | 0.096 -> 0.093 | 0.999x (12 reps pooled) | 0.094 -> 0.091 |
+  | 8 | 1.005x | 0.290 -> 0.279 | 1.034x | 0.169 -> 0.201 |
+  | 16 | 1.090x | 0.304 -> 0.306 | 1.170x | 0.168 -> 0.205 |
+  | 32 | 1.227x (every rep 1.20-1.25) | 0.229 -> 0.277 | 1.591x (1.45-1.75) | 0.146 -> 0.213 |
+  | 64 | 1.440x (1.37-1.49) | 0.123 -> 0.170 | not run | |
+
+  Separate F wps 64w 5,001 -> 7,202, 32w 7,855 -> 9,639. Registry hold (validate + publish, the
+  bench's unprobed decomposition) 64w separate 148.6 -> 91.1 us (-39%), 32w separate 82.6 ->
+  60.9, 32w shared 154.5 -> 72.3 (-53%). Probe (never landed) prune per commit: 64w separate
+  56.2 -> 9.7 us, 32w shared 101.4 -> 8.4. One writer (2,000 rows, 11 rounds, 3 reps): 0.994x
+  (F/C 0.087 both). Bulk (1,000-row transactions, 1 rep): separate 0.93-0.98x, shared 1.00-1.17x;
+  bulk commits are 1-64 per round, so this is not separated from noise with one rep. Worker
+  failures: none in B; A lost 26,000 rows at bulk shared 32w (main's bulk-shared abort storm).
+  1w: the first 4 reps of the sweeps' 1w rows read -4.4% (separate) and -2.8% (shared) with per-rep
+  B/A from 0.86 to 1.12; before running more, 8 more interleaved pairs per shape were
+  pre-registered on the bead with the verdict on the pooled 12-rep mean; that mean is -0.2% and
+  -0.1%. At one writer the history is pushed and cleared at every commit either way.
+  Against the prediction: 64w separate (+44%) and both hold cuts are above their bands; the rest
+  inside. No kill line hit. F/C stays at or below 0.31 at every writer count: fsqlite pays 11.4x
+  stock per one-row transaction at one writer (148.7 against 13.0 us), and concurrency recovers at
+  most about 3.3x of that (bd-i0tn6 step-2 comment, 2026-11-15).
+- Tests: `test_dro_pivot_decision_reads_the_exactly_pruned_history` (a lagging prune reads DRO
+  populations 19 / 19 where the exact one reads 3 / 3, which the default matrix decides
+  differently), `test_prune_drops_history_published_out_of_commit_order`,
+  `test_committed_history_matches_a_rebuilt_vector_under_out_of_order_pushes_and_prunes` (2,000
+  random steps against a Vec with retain and the old index rules). Negative runs: a lazy prune
+  (skip while <= 64 records) fails the first two; a front-only prune fails the second and third.
+- Landed as 57d3cb3c1 (the clone's commit, taken to main by the sweep before the gate below had
+  finished; the gate then completed on that exact tree, 8fb2902ee + this change).
+- Gate (rch, on 8fb2902ee + this change): clippy -D warnings on fsqlite-mvcc / core / e2e all
+  targets clean; fsqlite-mvcc lib 1,681 pass, 1 red that passed when rerun alone
+  (`lifecycle::tests::test_range_scan_tracking_overhead_under_five_percent`, a wall-clock ratio
+  with 900 us sleeps, 52.7% against 25% on a loaded worker; lifecycle.rs is not touched); core
+  keepers 195 + 7, fsqlite 8; fsqlite-e2e concurrent-writer / SSI / group-commit batch 118 pass
+  in 16 targets (`ssi_write_skew`, `ssi_conflict_oracle_e2e`, `bd_3plop_5`, `bd_2yqp6_6_1`,
+  `correctness_mvcc_isolation`, `observed_disjoint_writer_overlap_for_certificate` among them);
+  second batch 41 pass including `refused_commit_ends_transaction_e2e` 4 and
+  `mvcc_edge_case_oracle_e2e`, 1 red:
+  `multiprocess_autocommit_busy_timeout_e2e::cross_process_explicit_writers_on_own_tables_certify_the_durable_floor`,
+  whose failing assertion is its 8x300 own-table STOCK oracle shape (`run_shape("stock-explicit-own")`:
+  rusqlite child processes; 4 of 2,400 autocommit INSERTs got "database is locked" within the
+  5 s busy_timeout on the worker); no fsqlite code runs in those writers, so it is not this
+  change; reported to the coordinator, not rerun. fsqlite-core lib 4,186 pass with the 2 known
+  t6741 reds; fsqlite-pager lib 1,112 pass with the known bd_2jpu6_2 red (bd-mcpbv). Stock
+  integrity (bd-73pfl request): 20 shared-table runs at 8 / 16 / 32 writers, A and B interleaved,
+  every database checked with system sqlite3 3.46.1 `PRAGMA integrity_check`: 150 fsqlite files
+  per arm and 450 stock files per arm, all ok, every fsqlite file holding all of its rows.
+- Retry condition for what is left: at 64 writers the holds are now validate 81 / publish 70 us
+  on the probe's scale, of which `pending_publication_blocks` 24.4, the peer view collection 16.8
+  + 19.7 and `ActiveEdgeDiscoveryIndex::build` 16.3 + 17.4 (bd-i0tn6 lever 4 design: candidates by a
+  direct scan). Below 16 writers the holds are not the binding cost: the group-commit waiter wait
+  (167-282 us per commit at 8-16w) and the BEGIN refresh CPU (+140-188 us) are. Do not retry a lazy
+  or deferred prune: the DRO pivot decision reads the history length.
+
 ## 2026-11-14 - WIN: a composite index range walks a later qualifying index that covers the statement, not the first declared one (bd-w4pr1.13.18, read/seek round 3, levers R1 and R1b)
 
 - Target: the worst row of round 3's stock-live read sweep (`scratchpad/rs3_sweep.py`, table on
