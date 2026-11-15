@@ -21,11 +21,27 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use fsqlite::Connection;
 
 const CHILD_ENV: &str = "FSQLITE_MP_BUSY_CHILD";
+
+/// bd-bnbdo: every parent test here runs 4-8 writer processes. Run in
+/// parallel inside one binary on a loaded worker, they starved stock's own
+/// writers past busy_timeout (3-5 of 2400 'database is locked' in the stock
+/// oracle arm). Each parent test holds this lock, so the default harness runs
+/// them one at a time; the children are separate processes.
+static PARENT_TESTS: Mutex<()> = Mutex::new(());
+
+fn one_parent_test_at_a_time() -> MutexGuard<'static, ()> {
+    PARENT_TESTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// bd-bnbdo: how many times a stock oracle arm runs before the test gives up
+/// on this host.
+const ORACLE_ATTEMPTS: usize = 3;
 
 #[derive(Debug)]
 struct ChildReport {
@@ -444,15 +460,68 @@ fn assert_all_committed(label: &str, result: &ShapeResult, expected: usize) {
     );
 }
 
+/// Why a stock oracle arm missed its own answer, if it did: integrity ok,
+/// every reported commit durable and nothing else, every row committed, and
+/// for the explicit shapes no error line and the durable rows exactly the
+/// committed ones.
+fn stock_oracle_miss(backend: &str, result: &ShapeResult, expected: usize) -> Option<String> {
+    if result.integrity != "ok" {
+        return Some(format!("integrity_check: {}", result.integrity));
+    }
+    if usize::try_from(result.final_rows).ok() != Some(result.committed) {
+        return Some(format!(
+            "{} durable rows for {} reported commits",
+            result.final_rows, result.committed
+        ));
+    }
+    if result.committed != expected || !result.errors.is_empty() {
+        return Some(format!(
+            "{} of {expected} committed; errors: {:?}",
+            result.committed,
+            result.errors.iter().take(5).collect::<Vec<_>>()
+        ));
+    }
+    if backend.contains("explicit") && result.durable_rows != result.committed_rows {
+        return Some("the durable rows are not the committed rows".to_owned());
+    }
+    None
+}
+
+/// bd-bnbdo: run a stock-only arm as the oracle for a shape. Stock is the
+/// reference here, not the subject: a stock arm that misses its own answer
+/// means the host starved a writer past busy_timeout, and such a run cannot
+/// judge fsqlite. It is rerun, up to [`ORACLE_ATTEMPTS`] times; if every
+/// attempt misses, the test fails as "oracle invalid on this host". It never
+/// passes without a valid oracle, and the fsqlite arms are never rerun.
+fn stock_oracle(backend: &str, workers: usize, rows: usize) -> ShapeResult {
+    let expected = workers * rows;
+    let mut misses = Vec::new();
+    for attempt in 1..=ORACLE_ATTEMPTS {
+        let result = run_shape(backend, workers, rows, 5000);
+        let Some(miss) = stock_oracle_miss(backend, &result, expected) else {
+            return result;
+        };
+        eprintln!(
+            "event=mp_busy_oracle_invalid backend={backend} workers={workers} rows={rows} \
+             attempt={attempt} miss={miss}"
+        );
+        misses.push(miss);
+    }
+    panic!(
+        "{backend} {workers}x{rows}: oracle invalid on this host, rerun: the stock arm missed \
+         its own answer in all {ORACLE_ATTEMPTS} attempts: {misses:?}"
+    );
+}
+
 #[test]
 fn cross_process_autocommit_writers_honor_busy_timeout() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
+    let _one_at_a_time = one_parent_test_at_a_time();
     for (workers, rows) in [(4, 100), (8, 50)] {
         let label = format!("{workers}x{rows}");
-        let stock = run_shape("stock", workers, rows, 5000);
-        assert_all_committed(&format!("{label} stock oracle"), &stock, workers * rows);
+        let stock = stock_oracle("stock", workers, rows);
         // `execute` and `query` take different statement paths; both must
         // retry an autocommit conflict within busy_timeout.
         for backend in ["fsqlite", "fsqlite-query"] {
@@ -478,8 +547,8 @@ fn cross_process_fresh_connection_writers_honor_busy_timeout() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
-    let stock = run_shape("stock", 4, 100, 5000);
-    assert_all_committed("4x100 stock oracle", &stock, 400);
+    let _one_at_a_time = one_parent_test_at_a_time();
+    stock_oracle("stock", 4, 100);
     let frank = run_shape("fsqlite-fresh", 4, 100, 5000);
     assert_all_committed("4x100 fsqlite-fresh", &frank, 400);
 }
@@ -502,14 +571,9 @@ fn cross_process_explicit_writers_on_one_table_lose_only_refused_transactions() 
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
+    let _one_at_a_time = one_parent_test_at_a_time();
     let (workers, rows) = (4, 100);
-    let stock = run_shape("stock-explicit", workers, rows, 5000);
-    assert_all_committed("4x100 explicit stock oracle", &stock, workers * rows);
-    assert!(stock.errors.is_empty(), "stock: {:?}", stock.errors);
-    assert_eq!(
-        stock.durable_rows, stock.committed_rows,
-        "stock: durable rows"
-    );
+    stock_oracle("stock-explicit", workers, rows);
 
     let frank = run_shape("fsqlite-explicit", workers, rows, 5000);
     assert_eq!(frank.integrity, "ok", "fsqlite-explicit: integrity_check");
@@ -556,14 +620,9 @@ fn cross_process_explicit_writers_on_own_tables_certify_the_durable_floor() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
+    let _one_at_a_time = one_parent_test_at_a_time();
     let (workers, rows) = (8, 300);
-    let stock = run_shape("stock-explicit-own", workers, rows, 5000);
-    assert_all_committed("8x300 own-table stock oracle", &stock, workers * rows);
-    assert!(stock.errors.is_empty(), "stock: {:?}", stock.errors);
-    assert_eq!(
-        stock.durable_rows, stock.committed_rows,
-        "stock: durable rows"
-    );
+    stock_oracle("stock-explicit-own", workers, rows);
 
     let frank = run_shape("fsqlite-explicit-own", workers, rows, 5000);
     assert_eq!(
@@ -792,6 +851,7 @@ fn immediate_transaction_commit_survives_a_cross_process_autocommit_writer() {
     if std::env::var_os(CHILD_ENV).is_some() || std::env::var_os(IMMEDIATE_CHILD_ENV).is_some() {
         return;
     }
+    let _one_at_a_time = one_parent_test_at_a_time();
     // Stock: A commits after its 2 s hold, B's insert waits behind it.
     // fsqlite 0.4.12: A's COMMIT failed `database is busy` at ~7 s and its row
     // was rolled back while B took ~6.6 s (GH#519 lock-order inversion).
@@ -826,6 +886,7 @@ fn cross_process_writers_without_busy_timeout_stay_consistent() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
+    let _one_at_a_time = one_parent_test_at_a_time();
     // busy_timeout=0: contention may fail statements (as in stock), but every
     // failure is a busy-family error returned promptly, and what reported
     // success is exactly what is durable.
