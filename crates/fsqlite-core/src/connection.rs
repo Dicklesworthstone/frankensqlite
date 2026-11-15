@@ -118977,6 +118977,38 @@ fn table_function_column_names(name: &str) -> Option<&'static [&'static str]> {
     None
 }
 
+/// The HIDDEN columns a built-in table-valued function declares beyond
+/// [`table_function_column_names`], which a bare name in its scope binds to
+/// (bd-kj6tg). Checked on SQLite 3.54.1: json_each and json_tree declare
+/// `json` and `root`; the pragma functions whose pragma takes an argument
+/// declare `arg` and `schema`, and the argument-less ones neither.
+fn table_function_hidden_columns(name: &str) -> &'static [&'static str] {
+    #[cfg(feature = "ext-json")]
+    if name.eq_ignore_ascii_case("json_each") || name.eq_ignore_ascii_case("json_tree") {
+        return &["json", "root"];
+    }
+    let Some(pragma) = name
+        .get(..7)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("pragma_"))
+        .and_then(|_| name.get(7..))
+    else {
+        return &[];
+    };
+    let takes_argument = [
+        "table_info",
+        "table_xinfo",
+        "index_list",
+        "index_info",
+        "index_xinfo",
+        "foreign_key_list",
+        "foreign_key_check",
+        "table_list",
+    ]
+    .iter()
+    .any(|known| pragma.eq_ignore_ascii_case(known));
+    if takes_argument { &["arg", "schema"] } else { &[] }
+}
+
 /// The columns `*` shows for a table-valued function that declares HIDDEN
 /// columns, which stock leaves out of `*` (bd-cpa8b). `None` means every
 /// column is visible.
@@ -131269,17 +131301,40 @@ fn protected_unqualified_columns_for_core(
     else {
         return Some(columns);
     };
-    collect_known_source_columns(&from.source, lookup, cte_scopes, &mut columns)?;
+    collect_known_source_columns(
+        &from.source,
+        lookup,
+        cte_scopes,
+        SourceNames::Scope,
+        &mut columns,
+    )?;
     for join in &from.joins {
-        collect_known_source_columns(&join.table, lookup, cte_scopes, &mut columns)?;
+        collect_known_source_columns(
+            &join.table,
+            lookup,
+            cte_scopes,
+            SourceNames::Scope,
+            &mut columns,
+        )?;
     }
     Some(columns)
+}
+
+/// Which names of a FROM source [`collect_known_source_columns`] collects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceNames {
+    /// Every name a bare column reference in the source's scope binds to,
+    /// a table-valued function's HIDDEN columns and rowid included.
+    Scope,
+    /// The columns `*` expands to.
+    Star,
 }
 
 fn collect_known_source_columns(
     source: &TableOrSubquery,
     lookup: &OuterReferenceLookup<'_>,
     cte_scopes: &CteScopes,
+    names: SourceNames,
     out: &mut HashSet<String>,
 ) -> Option<()> {
     match source {
@@ -131329,38 +131384,79 @@ fn collect_known_source_columns(
                 // Attached schemas live behind separate Connection instances;
                 // this local inventory cannot prove their output names.
                 Some(_) => None,
-            }?;
+            };
+            let Some(table) = table else {
+                if name.schema.is_some() {
+                    return None;
+                }
+                // bd-kj6tg: an eponymous table-valued function named without
+                // arguments (`FROM pragma_database_list`).
+                return collect_table_function_columns(&name.name, names, out);
+            };
             out.extend(
                 table
                     .columns
                     .iter()
                     .map(|column| column.name.to_ascii_lowercase()),
             );
-            for rowid_name in ["rowid", "_rowid_", "oid"] {
-                if table_exposes_hidden_rowid_alias(table, rowid_name) {
-                    out.insert(rowid_name.to_owned());
+            // `*` never shows the hidden rowid.
+            if names == SourceNames::Scope {
+                for rowid_name in ["rowid", "_rowid_", "oid"] {
+                    if table_exposes_hidden_rowid_alias(table, rowid_name) {
+                        out.insert(rowid_name.to_owned());
+                    }
                 }
             }
             Some(())
         }
         TableOrSubquery::ParenJoin(from) => {
-            collect_known_source_columns(&from.source, lookup, cte_scopes, out)?;
+            collect_known_source_columns(&from.source, lookup, cte_scopes, names, out)?;
             for join in &from.joins {
-                collect_known_source_columns(&join.table, lookup, cte_scopes, out)?;
+                collect_known_source_columns(&join.table, lookup, cte_scopes, names, out)?;
             }
             Some(())
         }
         TableOrSubquery::Subquery { query, .. } => {
             collect_derived_table_columns(query, lookup, cte_scopes, out)
         }
-        TableOrSubquery::TableFunction { .. } => None,
+        TableOrSubquery::TableFunction { name, .. } => {
+            collect_table_function_columns(name, names, out)
+        }
     }
 }
 
+/// bd-kj6tg: a built-in table-valued function declares a fixed set of
+/// columns, so a bare name outside it resolves outward as stock does. Its
+/// HIDDEN columns and rowid are in its scope but not in its `*`. Any other
+/// function stays opaque (`None`).
+fn collect_table_function_columns(
+    name: &str,
+    names: SourceNames,
+    out: &mut HashSet<String>,
+) -> Option<()> {
+    let visible = table_function_column_names(name)?;
+    match names {
+        SourceNames::Star => {
+            let star = table_function_star_columns(name).unwrap_or(visible);
+            out.extend(star.iter().map(|column| column.to_ascii_lowercase()));
+        }
+        SourceNames::Scope => {
+            out.extend(
+                visible
+                    .iter()
+                    .chain(table_function_hidden_columns(name))
+                    .chain(&["rowid", "_rowid_", "oid"])
+                    .map(|column| column.to_ascii_lowercase()),
+            );
+        }
+    }
+    Some(())
+}
+
 /// bd-j9tg3: the CTEs visible at a point of the outer-reference walk, keyed
-/// by lowercased name. A CTE whose output names are derivable carries them,
-/// with the rowid aliases protected as for a derived table; `None` keeps it
-/// opaque.
+/// by lowercased name. A CTE whose output names are derivable carries them
+/// (like a derived table, it has no rowid of its own, bd-lawn3); `None` keeps
+/// it opaque.
 type CteScopes = HashMap<String, Option<HashSet<String>>>;
 
 /// bd-j9tg3: `outer` extended with a WITH clause's CTEs.
@@ -131394,12 +131490,11 @@ fn cte_scopes_with(
                 collect_derived_table_columns(&cte.query, lookup, &scopes, &mut columns)
                     .map(|()| columns)
             } else {
-                let mut columns: HashSet<String> = cte
+                let columns: HashSet<String> = cte
                     .columns
                     .iter()
                     .map(|column| column.to_ascii_lowercase())
                     .collect();
-                columns.extend(["rowid", "_rowid_", "oid"].map(str::to_owned));
                 Some(columns)
             };
             if columns.is_some() {
@@ -131424,9 +131519,11 @@ fn cte_scopes_with(
 /// with "no such column" rather than binding an outer value. A missing name
 /// would bind an outer value in its place. An unaliased expression is named
 /// by its source text, which only a quoted identifier can spell, so it adds
-/// nothing. Stock resolves `rowid`, `_rowid_` and `oid` inside a derived
-/// table's scope locally (`(SELECT * FROM u) WHERE rowid > 1` reads the
-/// derived table's own NULL rowid), so those stay protected too.
+/// nothing. bd-lawn3: a derived table has no rowid of its own, and `*` does
+/// not show its sources' hidden rowids, so `rowid`, `_rowid_` and `oid` are
+/// in its scope only as a projected name (`SELECT rowid, b FROM u`). On
+/// SQLite 3.54.1 `(SELECT * FROM u) WHERE rowid > 1` reads the ENCLOSING
+/// query's rowid (3.46.1 read a NULL rowid of the derived table instead).
 ///
 /// Before this, every derived table was opaque. A bare outer reference
 /// under one, `(SELECT count(*) FROM (SELECT n FROM u) WHERE n > a)`, then
@@ -131467,16 +131564,27 @@ fn collect_derived_table_columns(
                     ResultColumn::Expr { .. } => {}
                     ResultColumn::Star | ResultColumn::TableStar(_) => {
                         let from = from.as_ref()?;
-                        collect_known_source_columns(&from.source, lookup, cte_names, out)?;
+                        collect_known_source_columns(
+                            &from.source,
+                            lookup,
+                            cte_names,
+                            SourceNames::Star,
+                            out,
+                        )?;
                         for join in &from.joins {
-                            collect_known_source_columns(&join.table, lookup, cte_names, out)?;
+                            collect_known_source_columns(
+                                &join.table,
+                                lookup,
+                                cte_names,
+                                SourceNames::Star,
+                                out,
+                            )?;
                         }
                     }
                 }
             }
         }
     }
-    out.extend(["rowid", "_rowid_", "oid"].map(str::to_owned));
     Some(())
 }
 

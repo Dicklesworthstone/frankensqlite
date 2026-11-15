@@ -319,26 +319,116 @@ fn bare_outer_reference_under_a_cte_inside_a_subquery() {
     });
 }
 
-/// bd-j9tg3: stock resolves `rowid` inside a derived table's scope locally
-/// (the derived table's own NULL rowid), not to t's rowid. fsqlite has no
-/// derived-table rowid yet and refuses with "no such column", which is the
-/// fail-closed answer. Binding t.rowid would give 0, 4, 4.
-#[test]
-fn rowid_under_a_derived_table_never_binds_the_outer_rowid() {
-    asupersync::test_utils::run_test(|| async {
-        let sql = "SELECT a, (SELECT count(*) FROM (SELECT * FROM u) WHERE rowid > 1) FROM t ORDER BY id";
-        let f = Connection::open(":memory:").await.unwrap();
-        let r = rusqlite::Connection::open_in_memory().unwrap();
-        for s in DERIVED {
-            f.execute(s).await.unwrap();
-            r.execute_batch(s).unwrap();
+const ROWID_SCOPES: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)",
+    "INSERT INTO t VALUES (1, 15), (2, 25), (3, 35)",
+    "CREATE TABLE u(b INTEGER)",
+    "INSERT INTO u VALUES (10), (20)",
+    "CREATE TABLE r(rowid INTEGER, c INTEGER)",
+    "INSERT INTO r VALUES (7, 1), (8, 2)",
+    "CREATE VIEW vu AS SELECT * FROM u",
+];
+
+/// The error class of a failed statement: stock and fsqlite word some
+/// messages differently, so a refusal compares by its stock phrase.
+fn rowid_scope_outcome(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    match rows.as_slice() {
+        [row] if row.len() == 1 && row[0].starts_with("<ERR") => {
+            // fsqlite's rows carry the error's Debug form (`NoSuchColumn`).
+            let phrase = if row[0].contains("no such column") || row[0].contains("NoSuchColumn") {
+                "no such column"
+            } else {
+                row[0].as_str()
+            };
+            vec![vec![format!("<ERR {phrase}>")]]
         }
-        let fr = fq(&f, sql).await;
-        let rr = rq(&r, sql);
-        let refused = fr.len() == 1 && fr[0].len() == 1 && fr[0][0].starts_with("<ERR");
+        _ => rows,
+    }
+}
+
+/// bd-lawn3: a derived table, a CTE and a view have no rowid of their own,
+/// so on SQLite 3.54.1 an unqualified `rowid` (`_rowid_`, `oid`) in their
+/// scope resolves to the enclosing query's table, like any name the scope
+/// lacks, and `SELECT rowid FROM (SELECT * FROM u)` is "no such column". A
+/// projected name (`SELECT rowid, b FROM u`, a real column named rowid) and a
+/// base table beside the derived table keep the name inner.
+///
+/// This test was first written to 3.46.1, which reads a NULL rowid of the
+/// derived table (0, 0, 0 for the first case), and it accepted fsqlite's
+/// "no such column" refusal as fail-closed. Checked on rusqlite's bundled
+/// 3.54.1, the answer is t's rowid (0, 2, 2), so it now asks for equality,
+/// on `:memory:` and on a file.
+///
+/// Views are not covered yet (bd-lawn3 stays open for them): under the view
+/// `vu`, the correlated `(SELECT count(*) FROM vu WHERE rowid > 1)` is
+/// refused "no such column" (stock 0, 2, 2), and a top-level
+/// `SELECT rowid FROM vu` returns u's rowids where stock says "no such
+/// column".
+#[test]
+fn rowid_under_a_derived_table_resolves_like_stock() {
+    let cases: &[&str] = &[
+        "SELECT a, (SELECT count(*) FROM (SELECT * FROM u) WHERE rowid > 1) FROM t ORDER BY id",
+        "SELECT a, (WITH c AS (SELECT * FROM u) SELECT count(*) FROM c WHERE rowid > 1) \
+         FROM t ORDER BY id",
+        "SELECT a, (WITH c(x) AS (SELECT b FROM u) SELECT count(*) FROM c WHERE rowid >= 2) \
+         FROM t ORDER BY id",
+        "SELECT a, (SELECT count(*) FROM (SELECT * FROM u) WHERE _rowid_ > 1 AND oid > 1) \
+         FROM t ORDER BY id",
+        "SELECT a, (SELECT count(*) FROM (SELECT * FROM t) WHERE rowid > 1) FROM t ORDER BY id",
+        "SELECT a, (SELECT count(*) FROM (SELECT b FROM u) AS d WHERE rowid = 3) FROM t ORDER BY id",
+        "SELECT a, (SELECT count(*) FROM (SELECT * FROM u) WHERE rowid IS NULL) FROM t ORDER BY id",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u) WHERE rowid = 2) ORDER BY id",
+        // Inner names: a projected rowid, a real column named rowid, a base
+        // table beside the derived table, and rowid inside the derived table.
+        "SELECT a, (SELECT group_concat(rowid) FROM (SELECT rowid, b FROM u)) FROM t ORDER BY id",
+        "SELECT a, (SELECT group_concat(rowid) FROM (SELECT * FROM r)) FROM t ORDER BY id",
+        "SELECT a, (SELECT count(*) FROM (SELECT * FROM u), u AS u2 WHERE rowid > 1) \
+         FROM t ORDER BY id",
+        "SELECT a, (SELECT count(*) FROM (SELECT b FROM u WHERE rowid > 1)) FROM t ORDER BY id",
+        // With no enclosing query the name has no owner.
+        "SELECT rowid FROM (SELECT * FROM u)",
+        "SELECT rowid FROM (WITH c AS (SELECT * FROM u) SELECT * FROM c)",
+        "SELECT _rowid_ FROM (SELECT b FROM u)",
+        "SELECT rowid FROM (SELECT rowid, b FROM u)",
+        "SELECT rowid FROM (SELECT b AS rowid FROM u)",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = if file_backed {
+                (
+                    Connection::open(dir.path().join("f.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                    rusqlite::Connection::open(dir.path().join("r.db")).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            for s in ROWID_SCOPES {
+                f.execute(s).await.unwrap();
+                r.execute_batch(s).unwrap();
+            }
+            for sql in cases {
+                let fr = rowid_scope_outcome(fq(&f, sql).await);
+                let rr = rowid_scope_outcome(rq(&r, sql));
+                if fr != rr {
+                    diffs.push(format!(
+                        "  (file_backed={file_backed}) {sql}\n    frank ={fr:?}\n    sqlite={rr:?}"
+                    ));
+                }
+            }
+            f.close().await.unwrap();
+        }
         assert!(
-            fr == rr || refused,
-            "rowid under a derived table must resolve locally or refuse\n  frank ={fr:?}\n  sqlite={rr:?}"
+            diffs.is_empty(),
+            "rowid scope: {} divergence(s) from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
         );
     });
 }
