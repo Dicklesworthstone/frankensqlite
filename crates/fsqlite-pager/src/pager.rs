@@ -6694,8 +6694,10 @@ struct PagerMaintenanceState {
     /// remains armed; once every pre-existing transaction/opener drains, one
     /// surviving pager may adopt this receipt and run canonical recovery.
     orphaned_rollback_recovery: Option<OrphanedRollbackRecovery>,
-    /// GH#528: an explicitly recovering read-only pager holds a [`WalIndexRebuildDrain`] and waits
-    /// to become the sole owner; new same-process admissions answer `Busy`.
+    /// GH#528: a read-only pager rebuilding a WAL index (an uninitialized one,
+    /// or any one in the explicit recovery mode) holds a
+    /// [`WalIndexRebuildDrain`] and waits to become the sole owner; new
+    /// same-process admissions answer `Busy`.
     wal_index_rebuild_draining: bool,
 }
 
@@ -6715,8 +6717,8 @@ impl PagerMaintenanceState {
     }
 }
 
-/// Bound on how long an explicitly recovering read-only pager drains
-/// same-process admissions before it rebuilds a WAL index (GH#528). Counted openers fail fast
+/// Bound on how long a rebuilding read-only pager drains same-process
+/// admissions before it rebuilds a WAL index (GH#528). Counted openers fail fast
 /// once the drain is armed, so they leave within one admission attempt.
 const WAL_INDEX_REBUILD_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
@@ -6929,8 +6931,9 @@ impl PagerMaintenanceGate {
         })
     }
 
-    /// GH#528: arm the drain for one explicitly authorized read-only rebuild
-    /// of a WAL index. A drain or exclusive maintenance already in progress may
+    /// GH#528: arm the drain for one read-only rebuild of a WAL index (an
+    /// uninitialized one, or any one in the explicit recovery mode). A drain
+    /// or exclusive maintenance already in progress may
     /// publish that index itself, so a second claimant answers at once.
     fn begin_wal_index_rebuild_drain(self: &Arc<Self>) -> Result<WalIndexRebuildDrain> {
         let mut state = self
@@ -19150,6 +19153,48 @@ where
         Ok(outcome)
     }
 
+    /// Whether this pager's `-shm` exists; read-only opens never create it.
+    fn wal_index_shm_exists(&self, cx: &Cx) -> Result<bool> {
+        let mut shm_path = self.db_path.as_os_str().to_owned();
+        shm_path.push("-shm");
+        self.vfs.access(cx, Path::new(&shm_path), AccessFlags::EXISTS)
+    }
+
+    /// GH#528: classify the shared index for a pager that may rebuild only an
+    /// uninitialized one. The answer is authoritative only while the caller
+    /// holds every recovery fence, so no peer can publish, truncate, or read
+    /// through the index meanwhile. `false` means a peer published a valid
+    /// header first. An initialized header that fails validation stays
+    /// fail-closed.
+    async fn wal_index_is_uninitialized(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+    ) -> Result<bool> {
+        use fsqlite_wal::wal_index::{
+            read_shared_wal_index_header, shared_wal_index_header_is_uninitialized,
+        };
+        let source = WalIndexShmSource {
+            db_file: Arc::clone(&inner.db_file),
+            cleanup_queue: Arc::downgrade(&self.group_commit_queue),
+            can_publish_reader_marks: false,
+        };
+        let region = match source.map_region(cx, 0, false).await {
+            Ok(region) => region,
+            // Shorter than one region, like stock's 3-byte first-attacher
+            // marker: nothing was ever published there.
+            Err(FrankenError::CannotOpen { .. }) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if read_shared_wal_index_header(&region)?.is_some() {
+            return Ok(false);
+        }
+        if shared_wal_index_header_is_uninitialized(&region)? {
+            return Ok(true);
+        }
+        Err(FrankenError::BusyRecovery)
+    }
+
     /// Retire the whole reader attempt before a separately classified recovery.
     /// `observed` (bd-ih8ak) is offered to the first binding attempt only; one
     /// after a recovery states the `-wal` path itself.
@@ -19188,20 +19233,43 @@ where
             if read_only && reason == traits::WalNativeRecoveryReason::StaleReaderMarks {
                 return Err(FrankenError::ReadOnly);
             }
-            // GH#535: a truncated or uninitialized index is still a write
-            // to the database's file family. A plain read-only connection
-            // must refuse it before acquiring recovery authority; only the
-            // explicit WAL-index recovery mode may rebuild that sidecar.
-            if recovered_once || read_only {
+            // GH#528 / bd-j2dtf: a stock first attacher truncates `-shm` to
+            // 3 bytes and rebuilds it afterwards, so one that dies in between
+            // leaves an index nobody initialized. Stock's read-only
+            // connections rebuild it whenever they can write `-shm`: SQLite
+            // 3.46.1 with mode=ro and 3.54.1 on a 0444 database both rebuild
+            // a 3-byte `-shm` to 32768 bytes, read every row and leave the
+            // WAL unchanged. A plain read-only pager therefore rebuilds an
+            // EXISTING index found uninitialized, under every recovery fence.
+            // It never creates a missing `-shm` and never rewrites an
+            // initialized one: an initialized index that fails validation
+            // needs the explicit WAL-index recovery mode (GH#535).
+            let uninitialized_only = read_only
+                && matches!(
+                    reason,
+                    traits::WalNativeRecoveryReason::SharedIndexUnavailable
+                        | traits::WalNativeRecoveryReason::SharedHeaderInvalid
+                );
+            if recovered_once || (read_only && !uninitialized_only) {
                 return Err(FrankenError::BusyRecovery);
+            }
+            if uninitialized_only {
+                if !self.wal_index_shm_exists(cx)? {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                // Unlocked, this only turns an initialized index that fails
+                // validation away before peers are drained; the fenced check
+                // below settles the classification.
+                self.wal_index_is_uninitialized(cx, inner).await?;
             }
             external_lock.restore().await?;
             // Recovery needs sole same-process ownership, which openers that
-            // each wait for it while counted never reach. An explicitly
-            // authorized read-only rebuild drains instead: new admissions
-            // answer `Busy`, counted peers fail their own attempts, and the
-            // drain ends after the downgrade.
-            let rebuild_drain = if inner.access_mode == PagerAccessMode::ReadOnlyWithWalIndexRecovery {
+            // each wait for it while counted never reach. A read-only rebuild
+            // drains instead: new admissions answer `Busy`, counted peers
+            // fail their own attempts, and the drain ends after the downgrade.
+            let rebuild_drain = if uninitialized_only
+                || inner.access_mode == PagerAccessMode::ReadOnlyWithWalIndexRecovery
+            {
                 let drain = maintenance_lease.gate.begin_wal_index_rebuild_drain()?;
                 maintenance_lease.wait_until_sole_owner(cx).await?;
                 Some(drain)
@@ -19210,10 +19278,18 @@ where
             };
             let recovery_guard = self.recovery_fence.acquire_for_recovery()?;
             let prior_kind = maintenance_lease.upgrade_to_exclusive(inner.rollback_journal_recovery_owner)?;
-            let recovery_result = match external_lock.acquire_wal_recovery(cx).await {
-                Ok(()) => with_wal_backend(&self.wal_backend, cx, |wal, cx| {
+            let acquisition = external_lock.acquire_wal_recovery(cx).await;
+            let rebuild = match acquisition {
+                Ok(()) if uninitialized_only => self.wal_index_is_uninitialized(cx, inner).await,
+                Ok(()) => Ok(true),
+                Err(error) => Err(error),
+            };
+            let recovery_result = match rebuild {
+                Ok(true) => with_wal_backend(&self.wal_backend, cx, |wal, cx| {
                     Box::pin(async move { wal.recover_native_read_state(cx, reason).await })
                 }).await,
+                // A peer published a valid index first; rebind to it.
+                Ok(false) => Ok(()),
                 Err(error) => Err(error),
             };
             if let Err(restore_error) = external_lock.restore().await {
@@ -20537,21 +20613,27 @@ where
         let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
         let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
-        let pending_namespace = if vfs.is_memory() {
+        let mut pending_namespace = if vfs.is_memory() {
             None
         } else {
             // GH#140 / GH#535: strictly read-only admission joins the
             // existing namespace generation without creating or rewriting
             // any sidecar record. When no sidecars exist at all (a database
             // never opened by FrankenSQLite, e.g. a stock SQLite file),
-            // ReadOnlyExisting admits it without sidecars. Malformed or
-            // copied records need a writable opener to rebind the namespace;
-            // falling back to Shared here would acquire exclusive authority
-            // and publish a record during an ostensibly read-only open.
-            Some(PendingNamespaceOpen::begin(
-                &db_path,
-                NamespaceOpenIntent::ReadOnlyExisting,
-            )?)
+            // ReadOnlyExisting admits it without sidecars. Only a writable
+            // opener may rebind malformed or copied records; falling back to
+            // Shared here would take exclusive authority and publish a
+            // record during a read-only open. bd-j2dtf: such records must
+            // not refuse a database stock reads either, so a malformed one
+            // admits sidecar-less while the namespace is quiescent, writing
+            // nothing. Busy is never a fallback: it is a live transition.
+            match PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::ReadOnlyExisting) {
+                Ok(pending) => Some(pending),
+                Err(FrankenError::CannotOpen { .. }) => Some(
+                    PendingNamespaceOpen::begin_read_only_without_records(&db_path)?,
+                ),
+                Err(error) => return Err(error),
+            }
         };
         #[cfg(all(feature = "native", any(unix, windows)))]
         let namespace_expected_identity = pending_namespace
@@ -20570,6 +20652,35 @@ where
         #[cfg(not(all(feature = "native", any(unix, windows))))]
         let effective_expected_identity = expected_identity;
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let (db_file, _actual_flags) = {
+            let initial_open = if let Some(identity) = effective_expected_identity {
+                vfs.open_with_expected_identity(cx, &db_path, flags, identity)
+            } else {
+                vfs.open(cx, Some(&db_path), flags)
+            };
+            match initial_open {
+                Ok(opened) => opened,
+                Err(FrankenError::CannotOpen { .. })
+                    if expected_identity.is_none() && namespace_expected_identity.is_some() =>
+                {
+                    // bd-g5rdj / bd-j2dtf: namespace sidecars are
+                    // machine-local runtime state that is routinely copied
+                    // with the database, so a valid record may name the
+                    // source file. Release the join and admit sidecar-less
+                    // if the copied namespace is quiescent. Unlike the
+                    // writable path this republishes nothing (GH#535). If a
+                    // live connection owns the namespace, the path no longer
+                    // names its database and the open stays fail-closed.
+                    drop(pending_namespace.take());
+                    pending_namespace =
+                        Some(PendingNamespaceOpen::begin_read_only_without_records(&db_path)?);
+                    vfs.open(cx, Some(&db_path), flags)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
         let (db_file, _actual_flags) = if let Some(expected_identity) = effective_expected_identity
         {
             vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
@@ -34007,16 +34118,21 @@ mod tests {
                     .expect("snapshot namespace gate record");
                 // GH#535: neither copied identities nor malformed records
                 // authorize a read-only opener to republish namespace state.
-                assert!(matches!(
-                    SimplePager::open_readonly_with_cx(
-                        &cx,
-                        UnixVfs::new(),
-                        &target,
-                        PageSize::DEFAULT,
-                    )
-                    .await,
-                    Err(FrankenError::CannotOpen { .. })
-                ));
+                // bd-j2dtf: nor may they refuse the open. Stock has no such
+                // files and reads this database, so the quiescent namespace
+                // admits the read-only opener sidecar-less (151060e9b made
+                // this CannotOpen).
+                let readonly = SimplePager::open_readonly_with_cx(
+                    &cx,
+                    UnixVfs::new(),
+                    &target,
+                    PageSize::DEFAULT,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("corrupt={corrupt}: read-only open of a quiescent copy: {error:?}")
+                });
+                drop(readonly);
                 assert_eq!(
                     std::fs::read(sidecar(&target, "-fsqlite-ns-use")).unwrap(),
                     use_before,
@@ -34030,7 +34146,7 @@ mod tests {
                 assert_eq!(
                     std::fs::read(&target).expect("re-read target database"),
                     target_bytes,
-                    "read-only refusal must not modify the main database"
+                    "read-only admission must not modify the main database"
                 );
 
                 let writable = SimplePager::open_existing_with_cx_and_page_buffer_max(
@@ -34054,6 +34170,39 @@ mod tests {
                 .expect("read-only open succeeds after authorized repair");
                 drop(readonly);
             }
+
+            // bd-j2dtf negative: the sidecar-less admission is only for a
+            // quiescent namespace. With a live owner, a record the read-only
+            // opener cannot join stays fail-closed and is left as it is.
+            let live = SimplePager::open_existing_with_cx_and_page_buffer_max(
+                &cx,
+                UnixVfs::new(),
+                &target,
+                PageSize::DEFAULT,
+                None,
+                None,
+            )
+            .await
+            .expect("a live namespace owner");
+            std::fs::write(sidecar(&target, "-fsqlite-ns-use"), b"corrupt live record")
+                .expect("corrupt the live namespace record");
+            let use_before = std::fs::read(sidecar(&target, "-fsqlite-ns-use")).unwrap();
+            assert!(matches!(
+                SimplePager::open_readonly_with_cx(
+                    &cx,
+                    UnixVfs::new(),
+                    &target,
+                    PageSize::DEFAULT,
+                )
+                .await,
+                Err(FrankenError::CannotOpen { .. })
+            ));
+            assert_eq!(
+                std::fs::read(sidecar(&target, "-fsqlite-ns-use")).unwrap(),
+                use_before,
+                "a refused read-only open leaves the live record alone"
+            );
+            drop(live);
 
             let missing = dir.path().join("namespace-copy-missing-main.db");
             for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {

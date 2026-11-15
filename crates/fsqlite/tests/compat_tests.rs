@@ -1340,7 +1340,7 @@ fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
         );
         let repaired = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .await
-            .expect("corrupt quiescent namespace state must be repairable");
+            .expect("corrupt quiescent namespace state must not block read-only open");
         let repaired_row = repaired
             .query_row("SELECT value FROM copied_probe")
             .await
@@ -1372,31 +1372,36 @@ fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
                 );
             }
         }
-        assert_ne!(
+        // bd-j2dtf: this read-only open used to repair the record, the one
+        // file it changed. GH#535 forbids that write, and stock has no such
+        // file, so a read-only open now reads the database sidecar-less and
+        // leaves the corrupt record for a writable opener to rebind. The
+        // name keeps its bead reference (bd-13m32): no other file changes.
+        assert_eq!(
             after_recovery
                 .get(&namespace_use_name)
-                .expect("snapshot rebound namespace use artifact")
+                .expect("snapshot namespace use artifact after the read-only open")
                 .bytes,
             b"corrupt copied namespace state",
-            "GH #294 namespace recovery must replace the corrupt namespace identity"
+            "a read-only open must not rewrite the namespace identity (GH#535)"
         );
 
         let rebound = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .await
-            .expect("rebound namespace identity must remain valid for a new read-only open");
+            .expect("a second read-only open beside the corrupt record must succeed");
         let rebound_row = rebound
             .query_row("SELECT value FROM copied_probe")
             .await
-            .expect("query through the persisted rebound namespace identity");
+            .expect("query beside the corrupt namespace record");
         assert_eq!(rebound_row.get(0), Some(&SqliteValue::Integer(17)));
         rebound
             .close_without_checkpoint()
             .await
-            .expect("close read-only rebound namespace verification connection");
+            .expect("close the second read-only connection");
         assert_eq!(
             snapshot_directory_files(dir.path()),
             after_recovery,
-            "GH #294 valid rebound verification must not mutate any artifact"
+            "GH #294 a second read-only open must not mutate any artifact"
         );
 
         assert_eq!(

@@ -332,6 +332,38 @@ impl PendingNamespaceOpen {
         }))
     }
 
+    /// bd-j2dtf (GH#294, GH#535): read-only admission of a database whose
+    /// namespace records cannot be joined, because they are malformed or name
+    /// another file (sidecars copied beside a copied database). Stock has no
+    /// such files and reads the database, so a read-only open must too; it
+    /// may not repair them either, since that is a write.
+    ///
+    /// Admits sidecar-less ([`PendingLease::ReadOnlyUnadmitted`], as for a
+    /// database no FrankenSQLite ever admitted) only while the namespace is
+    /// quiescent. That is proven with non-blocking locks that are released
+    /// before returning: the gate shared, so no writable admission is in
+    /// flight, then `use` exclusive, so no connection owns the generation.
+    /// Nothing is created or written. A live owner keeps the open fail-closed
+    /// (`CannotOpen`); a writable admission in flight answers `Busy`.
+    pub fn begin_read_only_without_records(stable_path: &Path) -> Result<Self> {
+        validate_stable_path(stable_path)?;
+        let gate =
+            open_existing_secure_lock_file(stable_path, &sidecar_path(stable_path, GATE_SUFFIX))?;
+        let use_file =
+            open_existing_secure_lock_file(stable_path, &sidecar_path(stable_path, USE_SUFFIX))?;
+        try_lock(&gate, FileLockMode::Shared)?;
+        let quiescent = AdvisoryFileLock::try_lock(&use_file, FileLockMode::Exclusive);
+        release_namespace_locks(&gate, &use_file);
+        match quiescent {
+            Ok(()) => Ok(Self {
+                stable_path: stable_path.to_owned(),
+                lease: Some(PendingLease::ReadOnlyUnadmitted),
+            }),
+            Err(FileLockError::AlreadyLocked) => Err(cannot_open(stable_path)),
+            Err(FileLockError::Io(error)) => Err(error.into()),
+        }
+    }
+
     /// Identity of the live generation this admission must join.  When this
     /// returns `Some`, callers must strip CREATE/EXCLUSIVE and open that exact
     /// existing identity before calling [`Self::bind`].
