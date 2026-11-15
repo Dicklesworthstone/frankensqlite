@@ -3727,6 +3727,14 @@ fn validate_incomplete_certificate_suffix(bytes: &[u8], anchored: bool) -> Resul
         });
     }
 
+    // GH#537: an unsynced append can retain its length while its bytes read
+    // back as zeros after a crash. No record starts with zero, so a wholly
+    // zero-filled suffix cannot hide a certificate. Keep the size bound above
+    // and reject every other non-record suffix below, even if it contains zeros.
+    if bytes.iter().all(|&byte| byte == 0) {
+        return Ok(());
+    }
+
     if bytes.len() < PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC.len() {
         // A failed append can leave fewer bytes than the magic itself. Once a
         // strict record boundary anchors the suffix, those bytes are
@@ -8885,6 +8893,120 @@ mod tests {
                 .wait(),
             "append-time complete record corruption",
         );
+    }
+
+    #[test]
+    fn durable_certificate_zero_suffix_recovers_and_repairs_without_losing_records() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, authorized) = make_authorized_certificate_backend(&vfs, &cx);
+        let authorized_bytes = read_certificate_sidecar(&vfs, &cx);
+        let orphan = sample_certificate(2, 2, vec![1]);
+        let orphan_bytes = ParallelWalDurableCertificateRecord::new(
+            backend.inner.inner().generation_identity(),
+            2,
+            2,
+            [0u8; 16],
+            orphan.clone(),
+        )
+        .expect("construct orphan record")
+        .to_bytes();
+
+        // GH#537: a lost unsynced append can retain its file length while
+        // reading back as zeros, including the first append in the sidecar.
+        for anchored in [true, false] {
+            let prefix = if anchored { authorized_bytes.as_slice() } else { &[] };
+            let expected_certificate = anchored.then_some(authorized.clone());
+            for zero_len in [
+                1,
+                7,
+                8,
+                orphan_bytes.len(),
+                PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE,
+            ] {
+                let mut sidecar = prefix.to_vec();
+                sidecar.resize(sidecar.len() + zero_len, 0);
+                replace_certificate_sidecar(&vfs, &cx, &sidecar);
+                assert_eq!(
+                    backend
+                        .latest_authorized_parallel_wal_commit_certificate(&cx)
+                        .wait()
+                        .expect("bounded zero suffix must recover"),
+                    expected_certificate,
+                    "read recovery: anchored={anchored}, zero_len={zero_len}"
+                );
+                assert_eq!(
+                    read_certificate_sidecar(&vfs, &cx),
+                    sidecar,
+                    "read recovery must leave the certificate bytes untouched"
+                );
+
+                backend
+                    .persist_parallel_wal_commit_certificate(&cx, &orphan, 2, 2)
+                    .expect("append replaces the zero suffix at the validated boundary");
+                let mut expected_bytes = prefix.to_vec();
+                expected_bytes.extend_from_slice(&orphan_bytes);
+                assert_eq!(
+                    read_certificate_sidecar(&vfs, &cx),
+                    expected_bytes,
+                    "repair must retain every valid prefix byte: anchored={anchored}, zero_len={zero_len}"
+                );
+                assert_eq!(
+                    backend
+                        .latest_authorized_parallel_wal_commit_certificate(&cx)
+                        .wait()
+                        .expect("repaired sidecar remains readable"),
+                    expected_certificate,
+                    "an orphan append must not authorize any new WAL frames"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn durable_certificate_zero_suffix_recovery_rejects_garbage_and_excess_length() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, _) = make_authorized_certificate_backend(&vfs, &cx);
+        let authorized_bytes = read_certificate_sidecar(&vfs, &cx);
+        let orphan = sample_certificate(2, 2, vec![1]);
+        let mut bad_record = authorized_bytes.clone();
+        let crc_offset =
+            bad_record.len() - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE - 4;
+        bad_record[crc_offset] ^= 0x80;
+        bad_record.extend_from_slice(&[0; 8]);
+
+        for anchored in [true, false] {
+            for suffix in [
+                vec![0; PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE + 1],
+                b"GARBAGEGARBAGEGARBAGE".to_vec(),
+                vec![b'X', 0, 0, 0, 0, 0, 0, 0],
+                vec![0, 0, 0, 0, b'X', 0, 0, 0],
+                vec![0, 0, 0, 0, 0, 0, 0, b'X'],
+                bad_record.clone(),
+            ] {
+                let mut sidecar = if anchored { authorized_bytes.clone() } else { Vec::new() };
+                sidecar.extend_from_slice(&suffix);
+                replace_certificate_sidecar(&vfs, &cx, &sidecar);
+                assert_wal_corrupt(
+                    backend
+                        .latest_authorized_parallel_wal_commit_certificate(&cx)
+                        .wait(),
+                    "zero recovery must not admit garbage, a corrupt record, or an oversized suffix",
+                );
+                assert_wal_corrupt(
+                    backend
+                        .persist_parallel_wal_commit_certificate(&cx, &orphan, 2, 2)
+                        .wait(),
+                    "append must not discard an unrecognized suffix",
+                );
+                assert_eq!(
+                    read_certificate_sidecar(&vfs, &cx),
+                    sidecar,
+                    "a refused read or append must preserve the sidecar for diagnosis"
+                );
+            }
+        }
     }
 
     #[test]

@@ -284,6 +284,7 @@ fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
         let conn = open(&source).await;
         conn.execute("CREATE TABLE t(x INTEGER);").await.unwrap();
         conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").await.unwrap();
         conn.close_without_checkpoint().await.unwrap();
 
         // The source is closed before capturing any file, so every copy uses
@@ -309,12 +310,31 @@ fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
                 .iter()
                 .any(|(suffix, _, bytes)| *suffix == "-wal-cert" && !bytes.is_empty())
         );
+        let certificate_bytes = &snapshots
+            .iter()
+            .find(|(suffix, _, _)| *suffix == "-wal-cert")
+            .unwrap()
+            .2;
+        let record_len = u32::from_le_bytes(
+            certificate_bytes[certificate_bytes.len() - 4..]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let zero_record = vec![0; record_len];
+        let zero_max = vec![0; fsqlite_wal::PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE];
 
         for include_shm in [false, true] {
-            for (case, suffix_bytes) in [
-                ("intact", &[][..]),
-                ("torn", &fsqlite_wal::PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC[..4]),
-                ("garbage", b"GARBAGEGARBAGEGARBAGE".as_slice()),
+            // GH#537: zero-filled unwritten space is the same torn-append
+            // recovery case on either side of the eight-byte magic boundary.
+            for (case, suffix_bytes, replace_certificate) in [
+                ("intact", &[][..], false),
+                ("torn", &fsqlite_wal::PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC[..4], false),
+                ("zero_7", &[0; 7][..], false),
+                ("zero_8", &[0; 8][..], false),
+                ("zero_record", zero_record.as_slice(), false),
+                ("zero_max", zero_max.as_slice(), false),
+                ("only_zero_record", zero_record.as_slice(), true),
+                ("garbage", b"GARBAGEGARBAGEGARBAGE".as_slice(), false),
             ] {
                 let _guard = watchdog("copied snapshot recovery and append");
                 let name = format!("copy-{include_shm}-{case}.db");
@@ -328,7 +348,9 @@ fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
                     assert_eq!(std::fs::read(copied).unwrap(), *bytes);
                 }
                 let certificate = dir.path().join(format!("{name}-wal-cert"));
-                if !suffix_bytes.is_empty() {
+                if replace_certificate {
+                    std::fs::write(&certificate, suffix_bytes).unwrap();
+                } else if !suffix_bytes.is_empty() {
                     std::fs::OpenOptions::new()
                         .append(true)
                         .open(&certificate)
@@ -341,7 +363,7 @@ fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
                 if case == "garbage" {
                     let error = match opened {
                         Ok(copy) => {
-                            let error = copy.execute("INSERT INTO t VALUES (2);").await.unwrap_err();
+                            let error = copy.execute("INSERT INTO t VALUES (3);").await.unwrap_err();
                             let _ = copy.close_without_checkpoint().await;
                             error
                         }
@@ -358,16 +380,21 @@ fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
                     );
                 } else {
                     let copy = opened.expect("coherent copy with an intact or torn certificate opens");
-                    assert_eq!(count_rows(&copy).await, 1);
-                    copy.execute("INSERT INTO t VALUES (2);")
+                    assert_eq!(count_rows(&copy).await, 2);
+                    assert_eq!(
+                        std::fs::read(&certificate).unwrap(),
+                        before,
+                        "opening and reading must not mutate the certificate sidecar"
+                    );
+                    copy.execute("INSERT INTO t VALUES (3);")
                         .await
                         .expect("copied snapshot accepts writes");
-                    assert_eq!(count_rows(&copy).await, 2);
+                    assert_eq!(count_rows(&copy).await, 3);
                     copy.close_without_checkpoint().await.unwrap();
                     let reopened = Connection::open(destination.to_str().unwrap())
                         .await
                         .unwrap();
-                    assert_eq!(count_rows(&reopened).await, 2);
+                    assert_eq!(count_rows(&reopened).await, 3);
                     reopened.close_without_checkpoint().await.unwrap();
                 }
                 for (_, source_path, bytes) in &snapshots {
