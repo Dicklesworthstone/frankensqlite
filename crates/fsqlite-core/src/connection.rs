@@ -30222,6 +30222,14 @@ impl Connection {
     /// their own rules. A statement that filters on a key must name the
     /// table's rowid alias, so its plan is a rowid seek whatever the value
     /// and cannot depend on what the planner would have read from a literal.
+    ///
+    /// A SELECT may also filter on another column of a rowid table that has
+    /// no partial index (bd-05xlf). The planner reads a literal only to prove
+    /// a partial index's predicate (`k = 13` implies `k > 10`), which a bound
+    /// value cannot, so without one the plan is the same for every integer.
+    /// The comparison is the same too: an integer literal and an integer bound
+    /// to `?1` both have no affinity, so the column's affinity and collation
+    /// apply to either alike. UPDATE and DELETE keep the rowid-alias rule.
     fn literal_statement_may_run_parameterized(
         &self,
         statement: &literal_params::ParameterizedLiteralStatement,
@@ -30243,12 +30251,23 @@ impl Connection {
         else {
             return false;
         };
-        statement.key_column.as_deref().is_none_or(|key| {
-            table_schema
-                .columns
-                .iter()
-                .any(|column| column.is_ipk && column.name.eq_ignore_ascii_case(key))
-        })
+        let Some(key) = statement.key_column.as_deref() else {
+            return true;
+        };
+        let Some(key_column) = table_schema
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(key))
+        else {
+            return false;
+        };
+        key_column.is_ipk
+            || (statement.kind == literal_params::LiteralStatementKind::Select
+                && !table_schema.without_rowid
+                && table_schema
+                    .indexes
+                    .iter()
+                    .all(|index| index.where_clause.is_none()))
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters.

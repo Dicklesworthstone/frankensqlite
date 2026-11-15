@@ -32,8 +32,10 @@
 //! built on the lexer itself.
 //!
 //! The caller decides whether the statement may run parameterized against the
-//! current schema (the target must be an ordinary table and `k` its rowid
-//! alias, so the plan is a rowid seek whatever the value). A byte offset an
+//! current schema (the target must be an ordinary table, and `k` its rowid
+//! alias, so the plan is a rowid seek whatever the value, or, for a SELECT,
+//! another column of a rowid table no partial index could serve by reading the
+//! literal; bd-05xlf). A byte offset an
 //! error records in the rewritten text is moved back to the text the caller
 //! wrote with [`ParameterizedLiteralStatement::original_offset`].
 
@@ -44,9 +46,20 @@ use fsqlite_types::value::SqliteValue;
 /// literal text.
 const MAX_LITERAL_PARAMETERS: usize = 256;
 
+/// Which recognized statement shape a [`ParameterizedLiteralStatement`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LiteralStatementKind {
+    Insert,
+    Select,
+    Update,
+    Delete,
+}
+
 /// A literal statement rewritten to its parameterized form.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ParameterizedLiteralStatement {
+    /// The recognized shape.
+    pub(super) kind: LiteralStatementKind,
     /// The statement text with each parameterized literal replaced by `?N`.
     /// Everything else is copied verbatim.
     pub(super) sql: String,
@@ -106,22 +119,23 @@ pub(super) fn parameterize_literal_statement(sql: &str) -> Option<ParameterizedL
         slots: Vec::new(),
     };
     let verb = scan.word()?;
-    let (table, key_column) = if verb.eq_ignore_ascii_case("insert") {
-        (scan.insert()?, None)
+    let (kind, table, key_column) = if verb.eq_ignore_ascii_case("insert") {
+        (LiteralStatementKind::Insert, scan.insert()?, None)
     } else if verb.eq_ignore_ascii_case("select") {
         let (table, key) = scan.select()?;
-        (table, Some(key))
+        (LiteralStatementKind::Select, table, Some(key))
     } else if verb.eq_ignore_ascii_case("update") {
         let (table, key) = scan.update()?;
-        (table, Some(key))
+        (LiteralStatementKind::Update, table, Some(key))
     } else if verb.eq_ignore_ascii_case("delete") {
         let (table, key) = scan.delete()?;
-        (table, Some(key))
+        (LiteralStatementKind::Delete, table, Some(key))
     } else {
         return None;
     };
     scan.finish()?;
     Some(ParameterizedLiteralStatement {
+        kind,
         sql: scan.out,
         params: scan.params,
         table: table.to_owned(),
@@ -747,6 +761,7 @@ mod tests {
             "INSERT INTO t(a, b, c, d) VALUES (7, -2.5, 'it''s', NULL);",
         )
         .expect("recognized");
+        assert_eq!(statement.kind, LiteralStatementKind::Insert);
         assert_eq!(statement.table, "t");
         assert_eq!(statement.key_column, None);
         assert_eq!(
@@ -792,6 +807,7 @@ mod tests {
     fn key_lookups_parameterize_the_integer_key_only() {
         let select =
             parameterize_literal_statement("SELECT a, b FROM t WHERE id = 42").expect("recognized");
+        assert_eq!(select.kind, LiteralStatementKind::Select);
         assert_eq!(select.table, "t");
         assert_eq!(select.sql, "SELECT a, b FROM t WHERE id = ?1");
         assert_eq!(select.params, vec![SqliteValue::Integer(42)]);
@@ -803,6 +819,7 @@ mod tests {
 
         let delete =
             parameterize_literal_statement("DELETE FROM t WHERE id = 9").expect("recognized");
+        assert_eq!(delete.kind, LiteralStatementKind::Delete);
         assert_eq!(delete.key_column.as_deref(), Some("id"));
         assert_eq!(delete.sql, "DELETE FROM t WHERE id = ?1");
 
@@ -810,6 +827,7 @@ mod tests {
             "UPDATE t SET a = a + 1, b = 'x', c = d, e = NULL, f = g - 0.5 WHERE id = 5",
         )
         .expect("recognized");
+        assert_eq!(update.kind, LiteralStatementKind::Update);
         assert_eq!(update.key_column.as_deref(), Some("id"));
         assert_eq!(
             update.sql,

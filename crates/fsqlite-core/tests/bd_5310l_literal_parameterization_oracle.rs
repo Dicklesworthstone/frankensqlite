@@ -203,6 +203,38 @@ async fn compare(
     assert_eq!(ours, run_stock(stock, dump), "final contents: fsqlite vs stock");
 }
 
+/// Run `SELECT {columns} FROM {table} WHERE {key} = n` for the 60 keys from
+/// `first` on the parameterized arm with the hot-path profile reset first
+/// (texts no earlier call ran, so none is in a parse cache), then compare
+/// every answer with the text form and with stock. Returns the parameterized
+/// arm's parse-cache misses: a handful when the shape runs parameterized, at
+/// least 60 when it is left to the text path (bd-05xlf).
+async fn distinct_key_select_parses(
+    recognized: &Connection,
+    text: &Connection,
+    stock: &rusqlite::Connection,
+    table: &str,
+    columns: &str,
+    key: &str,
+    first: i64,
+) -> u64 {
+    let statements: Vec<String> = (first..first + 60)
+        .map(|n| format!("SELECT {columns} FROM {table} WHERE {key} = {n}"))
+        .collect();
+    reset_hot_path_profile();
+    let mut answers = Vec::with_capacity(statements.len());
+    for sql in &statements {
+        answers.push(run(recognized, sql).await);
+    }
+    let misses = hot_path_profile_snapshot().parser.parse_cache_misses;
+    for (sql, ours) in statements.iter().zip(&answers) {
+        let (_, text_sql) = forms(sql, table);
+        assert_eq!(ours, &run(text, &text_sql).await, "parameterized vs text: {sql}");
+        assert_eq!(ours, &run_stock(stock, sql), "fsqlite vs stock: {sql}");
+    }
+    misses
+}
+
 #[test]
 fn literal_statements_run_identically_parameterized_as_text_and_on_stock() {
     asupersync::test_utils::run_test(|| async {
@@ -483,7 +515,8 @@ fn literal_statements_run_identically_parameterized_as_text_and_on_stock() {
             assert_eq!(ours, run_stock(&stock, dump), "{dump}: fsqlite vs stock");
         }
 
-        // --- a key that is not the rowid alias is left to the text path -----
+        // --- a key that is not the rowid alias: the SELECT runs parameterized
+        // (bd-05xlf), the UPDATE and the DELETE are left to the text path ------
         for conn in [&recognized, &text] {
             conn.execute("CREATE TABLE w(k INTEGER, v TEXT)").await.expect("ddl");
             conn.execute("CREATE INDEX w_k ON w(k)").await.expect("index");
@@ -508,6 +541,80 @@ fn literal_statements_run_identically_parameterized_as_text_and_on_stock() {
             &non_key,
             "SELECT k, v FROM w ORDER BY rowid",
             StockCheck::Exact,
+        )
+        .await;
+
+        // --- a SELECT keyed on another column (bd-05xlf) ----------------------
+        // Every column affinity, indexed and not, a NOCASE column and a VIRTUAL
+        // generated column, holding integers, integer-looking text, reals,
+        // blobs and NULLs, several rows per key. An integer bound to ?1 must
+        // match the rows the literal matches, in stock's order.
+        let secondary = "CREATE TABLE sk(id INTEGER PRIMARY KEY, i INTEGER, t TEXT, r REAL, n NUMERIC, \
+                b BLOB, x, c TEXT COLLATE NOCASE, u INTEGER, g INTEGER GENERATED ALWAYS AS (i * 2) VIRTUAL); \
+            CREATE INDEX sk_i ON sk(i); CREATE INDEX sk_t ON sk(t); CREATE INDEX sk_r ON sk(r); \
+            CREATE INDEX sk_n ON sk(n); CREATE INDEX sk_b ON sk(b); CREATE INDEX sk_x ON sk(x); \
+            CREATE INDEX sk_c ON sk(c)";
+        for conn in [&recognized, &text] {
+            conn.execute_batch(secondary).await.expect("ddl");
+        }
+        stock.execute_batch(secondary).expect("stock ddl");
+        let stored = [
+            "13", "13", "'13'", "' 13'", "13.0", "13.5", "-7", "'-7'", "0", "NULL", "x'0d'", "'abc'",
+            "26",
+        ];
+        let secondary_rows: Vec<String> = stored
+            .iter()
+            .map(|value| {
+                format!(
+                    "INSERT INTO sk(i, t, r, n, b, x, c, u) VALUES ({value}, {value}, {value}, {value}, {value}, {value}, {value}, {value})"
+                )
+            })
+            .collect();
+        compare(
+            &recognized,
+            &text,
+            &stock,
+            "sk",
+            &secondary_rows,
+            "SELECT id, typeof(i), i, typeof(t), t, typeof(r), r, typeof(n), n, typeof(b), b, \
+                 typeof(x), x, typeof(c), c, typeof(u), u, g FROM sk ORDER BY id",
+            StockCheck::Exact,
+        )
+        .await;
+        let mut by_secondary = Vec::new();
+        for column in ["i", "t", "r", "n", "b", "x", "c", "u", "g"] {
+            for key in ["13", "+13", "-7", "0", "-0", "26", "424242"] {
+                by_secondary.push(format!("SELECT id, {column} FROM sk WHERE {column} = {key}"));
+            }
+        }
+        by_secondary.push("SELECT * FROM sk WHERE c = 13".to_owned());
+        by_secondary.push("SELECT id FROM sk WHERE i = NULL".to_owned());
+        compare(
+            &recognized,
+            &text,
+            &stock,
+            "sk",
+            &by_secondary,
+            "SELECT count(*) FROM sk",
+            StockCheck::Exact,
+        )
+        .await;
+        // An unknown projection column fails on the parameterized path as on
+        // the text path; an unknown key column is left to the text path. Their
+        // error wording against stock belongs to other suites.
+        let secondary_errors = [
+            "SELECT id, nosuch FROM sk WHERE i = 13",
+            "SELECT id FROM sk WHERE nosuch = 13",
+        ]
+        .map(str::to_owned);
+        compare(
+            &recognized,
+            &text,
+            &stock,
+            "sk",
+            &secondary_errors,
+            "SELECT count(*) FROM sk",
+            StockCheck::Outcome,
         )
         .await;
 
@@ -548,6 +655,72 @@ fn literal_statements_run_identically_parameterized_as_text_and_on_stock() {
         assert_eq!(
             run(&recognized, "SELECT count(*), sum(w), sum(length(s)) FROM e").await,
             run(&text, "SELECT count(*), sum(w), sum(length(s)) FROM e").await,
+        );
+
+        // --- a secondary key runs parameterized; a table whose plan could
+        // read the literal does not (bd-05xlf) -------------------------------
+        let keyed = "CREATE TABLE e2(id INTEGER PRIMARY KEY, k INTEGER, v TEXT); \
+            CREATE INDEX e2_k ON e2(k); \
+            CREATE TABLE pk2(id INTEGER PRIMARY KEY, k INTEGER, v TEXT); \
+            CREATE INDEX pk2_k ON pk2(k) WHERE k > 10; \
+            CREATE TABLE wr2(k INTEGER PRIMARY KEY, j INTEGER, v TEXT) WITHOUT ROWID; \
+            CREATE INDEX wr2_j ON wr2(j)";
+        let keyed_rows = "INSERT INTO e2(k, v) VALUES (1, 'a'), (5, 'b'), (5, 'c'), (11, 'd'), (59, 'e'), \
+                (105, 'f'), (205, 'g'); \
+            INSERT INTO pk2(k, v) VALUES (1, 'a'), (5, 'b'), (11, 'c'), (11, 'd'), (59, 'e'); \
+            INSERT INTO wr2(k, j, v) VALUES (1, 5, 'a'), (2, 5, 'b'), (3, 11, 'c'), (4, 59, 'd')";
+        for conn in [&recognized, &text] {
+            conn.execute_batch(keyed).await.expect("ddl");
+            conn.execute_batch(keyed_rows).await.expect("rows");
+        }
+        stock.execute_batch(keyed).expect("stock ddl");
+        stock.execute_batch(keyed_rows).expect("stock rows");
+        set_hot_path_profile_enabled(true);
+        let engaged =
+            distinct_key_select_parses(&recognized, &text, &stock, "e2", "id, v", "k", 0).await;
+        let partial =
+            distinct_key_select_parses(&recognized, &text, &stock, "pk2", "id, v", "k", 0).await;
+        let without_rowid =
+            distinct_key_select_parses(&recognized, &text, &stock, "wr2", "k, v", "j", 0).await;
+        // Schema changes between uses of one statement shape: a partial index
+        // added to the table turns the shape back to the text path, and
+        // dropping it admits the shape again.
+        for conn in [&recognized, &text] {
+            conn.execute("CREATE INDEX e2_v ON e2(v) WHERE k > 3")
+                .await
+                .expect("partial index");
+        }
+        stock
+            .execute_batch("CREATE INDEX e2_v ON e2(v) WHERE k > 3")
+            .expect("stock partial index");
+        let after_partial =
+            distinct_key_select_parses(&recognized, &text, &stock, "e2", "id, v", "k", 100).await;
+        for conn in [&recognized, &text] {
+            conn.execute("DROP INDEX e2_v").await.expect("drop index");
+        }
+        stock.execute_batch("DROP INDEX e2_v").expect("stock drop index");
+        let after_drop =
+            distinct_key_select_parses(&recognized, &text, &stock, "e2", "id, v", "k", 200).await;
+        set_hot_path_profile_enabled(false);
+        assert!(
+            engaged <= 4,
+            "60 secondary-key SELECTs parse a handful of times, got {engaged}"
+        );
+        assert!(
+            partial >= 60,
+            "a table with a partial index keeps the text path, got {partial}"
+        );
+        assert!(
+            without_rowid >= 60,
+            "a WITHOUT ROWID table keeps the text path, got {without_rowid}"
+        );
+        assert!(
+            after_partial >= 60,
+            "a partial index added later turns the shape away, got {after_partial}"
+        );
+        assert!(
+            after_drop <= 4,
+            "dropping it admits the shape again, got {after_drop}"
         );
     });
 }
