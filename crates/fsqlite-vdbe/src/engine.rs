@@ -8025,17 +8025,18 @@ pub type ResultRow = Box<[SqliteValue]>;
 
 /// Buffered result-row storage retained by the engine when row collection is on.
 ///
-/// Rows are boxed slices rather than the 16-value inline `SmallVec` the
-/// register drain produces: that is over 500 bytes per row whatever the
-/// width, so a million-row materialized SELECT (CREATE TABLE ... AS SELECT,
-/// a FROM-clause subquery) grew and copied a half-gigabyte buffer. Every
-/// consumer turns the row into a `Vec` anyway, which a boxed slice does
-/// without copying.
+/// Rows are boxed slices rather than a 16-value inline `SmallVec`: that is
+/// over 500 bytes per row whatever the width, so a million-row materialized
+/// SELECT (CREATE TABLE ... AS SELECT, a FROM-clause subquery) grew and
+/// copied a half-gigabyte buffer. Every consumer turns the row into a `Vec`
+/// anyway, which a boxed slice does without copying.
 type ResultRowStorage = Vec<ResultRow>;
 
+/// A retained row: the values are drained into a vector of the row's exact
+/// width, which boxes without reallocating.
 #[inline]
-fn retained_result_row(row: smallvec::SmallVec<[SqliteValue; 16]>) -> ResultRow {
-    row.into_vec().into_boxed_slice()
+fn retained_result_row(row: Vec<SqliteValue>) -> ResultRow {
+    row.into_boxed_slice()
 }
 
 #[derive(Debug, Default)]
@@ -8404,6 +8405,10 @@ pub struct VdbeEngine {
     /// Execution still continues to completion; rows past the cap are simply
     /// discarded while preserving register-clearing semantics.
     max_collected_result_rows: Option<usize>,
+    /// The row a [`ResultRowCallback`] is handed: `ResultRow` fills it from
+    /// its registers, the callback takes the values, and the buffer is
+    /// cleared and kept for the next row. It is empty between rows.
+    result_row_buf: Vec<SqliteValue>,
     /// Whether per-statement execution state is already in a fresh baseline.
     ///
     /// `reset_for_reuse()` establishes this for cached engines. The common
@@ -8426,7 +8431,12 @@ pub struct VdbeEngine {
     transaction_state_clear: bool,
 }
 
-type ResultRowCallback<'a> = dyn FnMut(smallvec::SmallVec<[SqliteValue; 16]>) -> Result<()> + 'a;
+/// A per-row result callback. It is handed the row's values in order in a
+/// buffer the engine owns and reuses: it may move the values out (draining or
+/// taking the `Vec`), and whatever it leaves is dropped when it returns. The
+/// row is lent rather than passed by value so a row does not cross the call
+/// as a ~400-byte inline vector (bd-w4pr1.12, lever W3).
+type ResultRowCallback<'a> = dyn FnMut(&mut Vec<SqliteValue>) -> Result<()> + 'a;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExactResultRowOutcome {
@@ -9061,6 +9071,7 @@ impl VdbeEngine {
             make_record_lookaside: MakeRecordStatementLookaside::default(),
             collect_result_rows: true,
             max_collected_result_rows: None,
+            result_row_buf: Vec::new(),
             statement_state_clean: true,
             statement_cold_state: StatementColdState::empty(),
             dirty_root_pages: HashSet::new(),
@@ -18268,7 +18279,7 @@ impl VdbeEngine {
             // IMPL-13: Fused `Integer(p1=lit, p2=reg) + ResultRow(p1=reg, p2=1)`.
             // Emits a single-column result row whose only value is the literal
             // integer `p1`, then clears the source register to mirror the
-            // drain semantics of `ResultRow` (`take_reg_range`).
+            // drain semantics of `ResultRow` (`take_reg_range_into`).
             //
             // Correctness: byte-equivalent to the unfused sequence. The
             // codegen-side peephole pass is responsible for verifying that
@@ -18278,7 +18289,7 @@ impl VdbeEngine {
                 let lit = i64::from(op.p1);
                 let reg = op.p2;
                 // Preserve Integer's write-then-ResultRow-drain side effects:
-                // the register ends up cleared after `take_reg_range`.
+                // the register ends up cleared after `take_reg_range_into`.
                 self.set_reg_int(reg, lit);
 
                 let should_retain_row = self.collect_result_rows
@@ -18289,9 +18300,12 @@ impl VdbeEngine {
                 if row_handler.is_some() || should_retain_row {
                     let materialize_start = collect_vdbe_metrics.then(Instant::now);
                     // Single-column row: drain the register just like
-                    // `take_reg_range(reg, 1)` would.
-                    let mut row: smallvec::SmallVec<[SqliteValue; 16]> =
-                        smallvec::SmallVec::with_capacity(1);
+                    // `take_reg_range_into(reg, 1, ..)` would.
+                    let mut row = if row_handler.is_some() {
+                        std::mem::take(&mut self.result_row_buf)
+                    } else {
+                        Vec::with_capacity(1)
+                    };
                     row.push(self.take_reg(reg));
                     if collect_vdbe_metrics {
                         if let Some(materialize_start) = materialize_start {
@@ -18304,7 +18318,7 @@ impl VdbeEngine {
                         record_result_row_metrics(&row);
                     }
                     if let Some(handler) = row_handler.as_mut() {
-                        (*handler)(row)?;
+                        self.hand_result_row(row, &mut **handler)?;
                     } else {
                         self.results.push(retained_result_row(row));
                     }
@@ -18988,26 +19002,51 @@ impl VdbeEngine {
                 None => true,
             };
         if row_handler.is_some() || should_retain_row {
-            let materialize_start = collect_vdbe_metrics.then(Instant::now);
-            let row = self.take_reg_range(op.p1, count);
-            if collect_vdbe_metrics {
-                if let Some(materialize_start) = materialize_start {
-                    FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
-                        u64::try_from(materialize_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                        AtomicOrdering::Relaxed,
-                    );
-                }
-                record_result_row_metrics(&row);
-            }
-            if let Some(handler) = row_handler.as_mut() {
-                (*handler)(row)?;
-            } else {
-                self.results.push(retained_result_row(row));
-            }
+            self.emit_register_result_row(op.p1, count, collect_vdbe_metrics, row_handler)
         } else {
             self.discard_reg_range(op.p1, count);
+            Ok(())
         }
-        Ok(())
+    }
+
+    /// A `ResultRow` whose row goes to the callback or is retained: drain
+    /// registers `start..start + count` into the row and hand it over. A row
+    /// for the callback is lent in the reused buffer; a retained row is
+    /// drained into a vector of its own width.
+    ///
+    /// Kept out of line: inlined into the interpreter loop it changed the
+    /// loop's code enough to cost sorting GROUP BY statements, which emit few
+    /// rows, ~5% of their cycles (bd-w4pr1.12, lever W3).
+    #[inline(never)]
+    fn emit_register_result_row(
+        &mut self,
+        start: i32,
+        count: usize,
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<()> {
+        let materialize_start = collect_vdbe_metrics.then(Instant::now);
+        let mut row = if row_handler.is_some() {
+            std::mem::take(&mut self.result_row_buf)
+        } else {
+            Vec::with_capacity(count)
+        };
+        self.take_reg_range_into(start, count, &mut row);
+        if collect_vdbe_metrics {
+            if let Some(materialize_start) = materialize_start {
+                FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+                    u64::try_from(materialize_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+            record_result_row_metrics(&row);
+        }
+        if let Some(handler) = row_handler.as_mut() {
+            self.hand_result_row(row, &mut **handler)
+        } else {
+            self.results.push(retained_result_row(row));
+            Ok(())
+        }
     }
 
     fn emit_compiled_result_row(
@@ -19023,7 +19062,12 @@ impl VdbeEngine {
             };
         if row_handler.is_some() || should_retain_row {
             let materialize_start = collect_vdbe_metrics.then(Instant::now);
-            let row: smallvec::SmallVec<[SqliteValue; 16]> = values.iter().cloned().collect();
+            let mut row = if row_handler.is_some() {
+                std::mem::take(&mut self.result_row_buf)
+            } else {
+                Vec::with_capacity(values.len())
+            };
+            row.extend_from_slice(values);
             if collect_vdbe_metrics {
                 if let Some(materialize_start) = materialize_start {
                     FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
@@ -19034,7 +19078,7 @@ impl VdbeEngine {
                 record_result_row_metrics(&row);
             }
             if let Some(handler) = row_handler.as_mut() {
-                (*handler)(row)?;
+                self.hand_result_row(row, &mut **handler)?;
             } else {
                 self.results.push(retained_result_row(row));
             }
@@ -19827,22 +19871,33 @@ impl VdbeEngine {
     }
 
     /// Like `collect_reg_range` but *moves* values out of the register file,
-    /// leaving Null in the source registers. This avoids deep-cloning Text and
-    /// Blob values on the hot ResultRow path where the registers are about to
-    /// be overwritten by the next iteration anyway.
+    /// leaving Null in the source registers, and appends them to `row`. This
+    /// avoids deep-cloning Text and Blob values on the hot ResultRow path
+    /// where the registers are about to be overwritten by the next iteration
+    /// anyway.
     #[inline]
-    fn take_reg_range(
-        &mut self,
-        start: i32,
-        count: usize,
-    ) -> smallvec::SmallVec<[SqliteValue; 16]> {
-        let mut row = smallvec::SmallVec::with_capacity(count);
+    fn take_reg_range_into(&mut self, start: i32, count: usize, row: &mut Vec<SqliteValue>) {
+        row.reserve_exact(count);
         for offset in 0..count {
             let val = Self::reg_with_offset(start, offset)
                 .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
             row.push(val);
         }
-        row
+    }
+
+    /// Hands the row in `self.result_row_buf` to `handler`, then empties the
+    /// buffer (dropping anything the handler left) and keeps it for the next
+    /// row, also when the handler fails.
+    #[inline]
+    fn hand_result_row(
+        &mut self,
+        mut row: Vec<SqliteValue>,
+        handler: &mut ResultRowCallback<'_>,
+    ) -> Result<()> {
+        let outcome = handler(&mut row);
+        row.clear();
+        self.result_row_buf = row;
+        outcome
     }
 
     #[inline]
@@ -26695,7 +26750,7 @@ mod tests {
             &program,
             None,
             &mut |row| {
-                streamed_rows.push(row.into_vec());
+                streamed_rows.push(std::mem::take(row));
                 Ok(())
             },
         ))
@@ -26713,6 +26768,78 @@ mod tests {
         );
         assert_eq!(engine.get_reg(r1), &SqliteValue::Null);
         assert_eq!(engine.get_reg(r2), &SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_result_row_handler_sees_each_row_alone_in_the_lent_buffer() {
+        // bd-w4pr1.12 lever W3: the callback is lent the row in a buffer the
+        // engine reuses. Whatever a callback leaves in it must not reach the
+        // next row, also after a callback fails.
+        let long_text = "a text value longer than the inline limit";
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r1 = b.alloc_reg();
+        let r2 = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 1, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::String8, 0, r2, 0, P4::Str(long_text.to_owned()), 0);
+        b.emit_op(Opcode::ResultRow, r1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::Null, 0, r2, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 3, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 4, r2, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let program = b.finish().expect("program should build");
+        let expected = vec![
+            vec![SqliteValue::Integer(1), SqliteValue::Text(long_text.into())],
+            vec![SqliteValue::Integer(2), SqliteValue::Null],
+            vec![SqliteValue::Integer(3), SqliteValue::Integer(4)],
+        ];
+
+        // A callback that moves out only the first value of each row and
+        // leaves the second one in the buffer.
+        let mut engine = VdbeEngine::new(program.register_count());
+        let mut seen = Vec::new();
+        let outcome = run_async(engine.execute_with_borrowed_bindings_and_row_handler(
+            &program,
+            None,
+            &mut |row| {
+                seen.push(row.clone());
+                let _first = row.remove(0);
+                Ok(())
+            },
+        ))
+        .expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(seen, expected, "each row arrives alone and whole");
+        assert!(engine.result_row_buf.is_empty(), "the buffer is empty between rows");
+        assert_eq!(engine.get_reg(r1), &SqliteValue::Null);
+        assert_eq!(engine.get_reg(r2), &SqliteValue::Null);
+
+        // A callback that fails on the second row, leaving that row behind.
+        let mut engine = VdbeEngine::new(program.register_count());
+        let mut calls = 0_usize;
+        let err = run_async(engine.execute_with_borrowed_bindings_and_row_handler(
+            &program,
+            None,
+            &mut |_row| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(FrankenError::internal("row handler refused the row"));
+                }
+                Ok(())
+            },
+        ))
+        .expect_err("a failing row handler stops the statement");
+        assert!(
+            err.to_string().contains("row handler refused the row"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(calls, 2, "no row is handed over after the failure");
+        assert!(engine.result_row_buf.is_empty(), "a failed row is not kept");
     }
 
     #[test]
@@ -28411,7 +28538,7 @@ mod tests {
             VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
 
         let mut rows = 0_usize;
-        let mut handler = |_row: smallvec::SmallVec<[SqliteValue; 16]>| -> Result<()> {
+        let mut handler = |_row: &mut Vec<SqliteValue>| -> Result<()> {
             rows += 1;
             if rows == 10 {
                 cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
@@ -35174,7 +35301,7 @@ mod tests {
 
             // Allocate, land that row, allocate again; output both rowids.
             //
-            // `ResultRow` CONSUMES its registers (`take_reg_range`), so the
+            // `ResultRow` CONSUMES its registers (`take_reg_range_into`), so the
             // allocated rowid is copied into a scratch register for output and
             // register 1 is kept intact for `Insert` to use as the rowid.
             // Emitting `ResultRow` directly on register 1 and then handing the
@@ -42959,7 +43086,7 @@ mod tests {
         // - counter == 1: decrement to 0, jump to p2
         // - counter == 0: fall through (no write, no jump)
         //
-        // `ResultRow` drains its source registers via `take_reg_range`, so
+        // `ResultRow` drains its source registers via `take_reg_range_into`, so
         // the asserts below reflect that move-out.
         //
         // Trace (r_counter seeded to 2, r_hit to 0):
@@ -43021,7 +43148,7 @@ mod tests {
         // - val == 0: fall through (no write, no jump)
         // - val < 0: fall through (no write, no jump)
         //
-        // `ResultRow` drains its source register via `take_reg_range`, so
+        // `ResultRow` drains its source register via `take_reg_range_into`, so
         // the asserts below reflect that move-out.
         //
         // Trace (r_offset seeded to 2, r_hit to 0; each IfPos has p3=1):
@@ -43086,7 +43213,7 @@ mod tests {
         // mutates the source register, so the seeded value stays put
         // across each IsNull dispatch.
         //
-        // `ResultRow` drains its source register via `take_reg_range`,
+        // `ResultRow` drains its source register via `take_reg_range_into`,
         // so the asserts below reflect that move-out.
         //
         // Trace (r_null seeded to NULL, r_int seeded to 7, r_hit to 0):

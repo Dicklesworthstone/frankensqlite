@@ -19396,7 +19396,7 @@ fn codegen_select_distinct_loose_scan(
     let n = scan.key_col_count as i32;
     // Emit the current distinct tuple (index columns 0..N-1), then skip its whole duplicate run.
     // The probe copy MUST precede ResultRow: the engine's ResultRow drains its source
-    // registers (`take_reg_range`), so a Copy placed after it reads NULL and the SeekGT
+    // registers (`take_reg_range_into`), so a Copy placed after it reads NULL and the SeekGT
     // probe becomes a constant `[NULL, …]` — the loop then re-emits one row forever (the
     // "skip-scan hang" this bead was blocked on).
     for i in 0..n {

@@ -7235,9 +7235,9 @@ impl FlatRows {
         }
     }
 
-    /// Appends one row; a row of any other width is refused, since it would
-    /// shift every later row off its stride.
-    fn push_row(&mut self, row: SmallVec<[SqliteValue; 16]>) -> Result<()> {
+    /// Appends one row, moving its values out of `row`; a row of any other
+    /// width is refused, since it would shift every later row off its stride.
+    fn push_row(&mut self, row: &mut Vec<SqliteValue>) -> Result<()> {
         if row.len() != self.width {
             return Err(FrankenError::Internal(format!(
                 "flat result row has {} values, expected {}",
@@ -7245,7 +7245,7 @@ impl FlatRows {
                 self.width
             )));
         }
-        self.values.extend(row);
+        self.values.append(row);
         self.len += 1;
         Ok(())
     }
@@ -7264,11 +7264,12 @@ enum TableRowSink<'a, 'h> {
 }
 
 impl TableRowSink<'_, '_> {
-    fn accept(&mut self, values: SmallVec<[SqliteValue; 16]>) -> Result<()> {
+    /// Takes one result row's values out of the engine's row buffer.
+    fn accept(&mut self, values: &mut Vec<SqliteValue>) -> Result<()> {
         match self {
             Self::Handler(handler) => {
                 let row = Row {
-                    values: values.into_vec(),
+                    values: std::mem::take(values),
                 };
                 (*handler)(&row)
             }
@@ -148151,7 +148152,7 @@ async fn execute_table_program_with_db(
     let export_started = trace_export_enabled.then(fsqlite_types::sync_primitives::Instant::now);
     let exec_res = if let Some(sink) = row_sink.as_mut() {
         engine.set_collect_result_rows(false);
-        let mut bridge = |values: SmallVec<[SqliteValue; 16]>| sink.accept(values);
+        let mut bridge = |values: &mut Vec<SqliteValue>| sink.accept(values);
         engine
             .execute_with_borrowed_bindings_and_row_handler(program, params, &mut bridge)
             .await
@@ -212418,20 +212419,18 @@ mod tests {
         let mut flat = FlatRows::new(2);
         let long_text = "a text value longer than the inline limit";
         let mut sink = TableRowSink::Flat(&mut flat);
-        sink.accept(smallvec::smallvec![
-            SqliteValue::Integer(1),
-            SqliteValue::Text(long_text.into())
-        ])
-        .unwrap();
-        sink.accept(smallvec::smallvec![
-            SqliteValue::Null,
-            SqliteValue::Blob(vec![1_u8, 2].into())
-        ])
-        .unwrap();
+        // The engine lends each row in one reused buffer (lever W3); an
+        // accepted row's values are moved out of it.
+        let mut buf = vec![SqliteValue::Integer(1), SqliteValue::Text(long_text.into())];
+        sink.accept(&mut buf).unwrap();
+        assert!(buf.is_empty(), "an accepted row is moved out of the buffer");
+        buf.extend([SqliteValue::Null, SqliteValue::Blob(vec![1_u8, 2].into())]);
+        sink.accept(&mut buf).unwrap();
+        assert!(buf.is_empty());
         // A row of another width would shift every later row off its stride.
-        assert!(sink.accept(smallvec::smallvec![SqliteValue::Integer(9)]).is_err());
+        assert!(sink.accept(&mut vec![SqliteValue::Integer(9)]).is_err());
         assert!(
-            sink.accept(smallvec::smallvec![
+            sink.accept(&mut vec![
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(2),
                 SqliteValue::Integer(3)
@@ -212454,11 +212453,31 @@ mod tests {
 
         // Zero-width rows still count, and read back empty.
         let mut empty_rows = FlatRows::new(0);
-        empty_rows.push_row(smallvec::SmallVec::new()).unwrap();
-        empty_rows.push_row(smallvec::SmallVec::new()).unwrap();
+        empty_rows.push_row(&mut Vec::new()).unwrap();
+        empty_rows.push_row(&mut Vec::new()).unwrap();
         let empty_rows = WindowScanRows::Flat(empty_rows);
         assert_eq!(empty_rows.len(), 2);
         assert!(empty_rows[1].is_empty());
+
+        // The handler sink hands the row's values over as the Row's values.
+        let mut seen: Vec<Vec<SqliteValue>> = Vec::new();
+        let mut handler = |row: &Row| -> Result<()> {
+            seen.push(row.values.clone());
+            Ok(())
+        };
+        let mut sink = TableRowSink::Handler(&mut handler);
+        let mut buf = vec![SqliteValue::Integer(5), SqliteValue::Text(long_text.into())];
+        sink.accept(&mut buf).unwrap();
+        assert!(buf.is_empty(), "the handler sink takes the row's values");
+        buf.push(SqliteValue::Integer(6));
+        sink.accept(&mut buf).unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                vec![SqliteValue::Integer(5), SqliteValue::Text(long_text.into())],
+                vec![SqliteValue::Integer(6)],
+            ]
+        );
     }
 
     #[test]
@@ -212589,7 +212608,7 @@ mod tests {
         // Flat rows all have the scan's width.
         let mut flat_rows = FlatRows::new(2);
         flat_rows
-            .push_row(smallvec::smallvec![
+            .push_row(&mut vec![
                 SqliteValue::Integer(30),
                 SqliteValue::Text("c".into())
             ])
