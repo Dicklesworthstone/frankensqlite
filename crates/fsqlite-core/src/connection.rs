@@ -146561,6 +146561,67 @@ fn index_seek_eqp_equality_key_terms(
         })
 }
 
+/// bd-zgbhb: the key terms stock prints for a seek that bounds the index's
+/// leading column instead of pinning it, as a COUNT(*) counted from the
+/// b-tree does: `k>?` for a lower bound (`>`, `>=`, `IS NOT NULL`), `k<?` for
+/// an upper one, and both for BETWEEN or a pair. `None` unless every WHERE
+/// term is such a bound on that column.
+fn index_seek_eqp_range_key_terms(
+    where_clause: Option<&Expr>,
+    table_name: &str,
+    table_alias: Option<&str>,
+    key_column: &str,
+) -> Option<String> {
+    let names_key = |expr: &Expr| {
+        let Expr::Column(column, _) = expr else {
+            return false;
+        };
+        column.column.eq_ignore_ascii_case(key_column)
+            && column.table.as_deref().is_none_or(|qualifier| {
+                qualifier.eq_ignore_ascii_case(table_alias.unwrap_or(table_name))
+            })
+    };
+    let (mut lower, mut upper) = (false, false);
+    for term in decompose_where(where_clause?) {
+        match term {
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                let bounds_below = match op {
+                    BinaryOp::Gt | BinaryOp::Ge => true,
+                    BinaryOp::Lt | BinaryOp::Le => false,
+                    _ => return None,
+                };
+                if names_key(left) {
+                    lower |= bounds_below;
+                    upper |= !bounds_below;
+                } else if names_key(right) {
+                    lower |= !bounds_below;
+                    upper |= bounds_below;
+                } else {
+                    return None;
+                }
+            }
+            Expr::Between {
+                expr, not: false, ..
+            } if names_key(expr) => {
+                lower = true;
+                upper = true;
+            }
+            Expr::IsNull {
+                expr, not: true, ..
+            } if names_key(expr) => lower = true,
+            _ => return None,
+        }
+    }
+    match (lower, upper) {
+        (true, true) => Some(format!("{key_column}>? AND {key_column}<?")),
+        (true, false) => Some(format!("{key_column}>?")),
+        (false, true) => Some(format!("{key_column}<?")),
+        (false, false) => None,
+    }
+}
+
 /// The single table a plain top-level SELECT reads, with its alias and WHERE.
 fn single_table_select_source<'a>(
     select: &'a SelectStatement,
@@ -146676,6 +146737,14 @@ fn index_seek_eqp_detail(
         index,
         seek_key_columns,
     )
+    .or_else(|| {
+        index_seek_eqp_range_key_terms(
+            where_clause.as_deref(),
+            &table.name,
+            alias.as_deref(),
+            key_column,
+        )
+    })
     .unwrap_or_else(|| format!("{key_column}=?"));
     let displayed = alias.as_deref().unwrap_or(&table.name);
     let covering = if seek.covering { "COVERING " } else { "" };
@@ -285186,6 +285255,24 @@ mod pager_routing_tests {
                     "SELECT COUNT(*) FROM t WHERE k = 2 ORDER BY 1",
                     "SEARCH t USING COVERING INDEX idx_t_k (k=?)",
                 ),
+                // A COUNT(*) counted from the b-tree (IdxCountBefore, no
+                // AggStep) is still a SEARCH of the index (bundled 3.54.1).
+                (
+                    "SELECT COUNT(*) FROM t WHERE k IN (1, 2)",
+                    "SEARCH t USING COVERING INDEX idx_t_k (k=?)",
+                ),
+                (
+                    "SELECT COUNT(*) FROM t WHERE k BETWEEN 2 AND 4",
+                    "SEARCH t USING COVERING INDEX idx_t_k (k>? AND k<?)",
+                ),
+                (
+                    "SELECT COUNT(*) FROM t WHERE k > 3",
+                    "SEARCH t USING COVERING INDEX idx_t_k (k>?)",
+                ),
+                (
+                    "SELECT COUNT(*) FROM t WHERE k IS NOT NULL",
+                    "SEARCH t USING COVERING INDEX idx_t_k (k>?)",
+                ),
                 // `v` is not in the index, so the row must be fetched: not covering.
                 (
                     "SELECT SUM(v) FROM t WHERE k = 2",
@@ -285244,6 +285331,8 @@ mod pager_routing_tests {
                 "SELECT COUNT(*) FROM t NOT INDEXED WHERE k = 2",
                 "SELECT COUNT(*) FROM t WHERE k = 2 GROUP BY k",
                 "SELECT COUNT(*) FROM t WHERE k IN (1, 2)",
+                "SELECT COUNT(*) FROM t WHERE k BETWEEN 2 AND 4",
+                "SELECT COUNT(*) FROM t WHERE k IS NOT NULL",
             ];
 
             for sql in queries {
@@ -285252,7 +285341,14 @@ mod pager_routing_tests {
                 // GH #415: a rowid probe (`SeekRowid` with no index seek) is a
                 // SEARCH too — `COUNT(*) WHERE id = 2` renders
                 // `USING INTEGER PRIMARY KEY (rowid=?)` like C SQLite.
-                let has_seek = ops.iter().any(|op| op == "SeekGE" || op == "SeekRowid");
+                // Any key seek positions the index; a count past the NULL keys
+                // (`k IS NOT NULL`) or from an exclusive bound starts with SeekGT.
+                let has_seek = ops.iter().any(|op| {
+                    matches!(
+                        op.as_str(),
+                        "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT" | "SeekRowid"
+                    )
+                });
                 let has_table_lookup = ops.iter().any(|op| op == "SeekRowid");
 
                 assert_eq!(

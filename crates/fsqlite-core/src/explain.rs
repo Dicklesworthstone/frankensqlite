@@ -305,12 +305,16 @@ pub fn program_index_seek_facts(program: &VdbeProgram) -> Option<IndexSeek> {
 }
 
 /// Aggregate-only compatibility wrapper for callers that require that shape.
+///
+/// The program steps an aggregate, or counts index entries from the b-tree
+/// (`IdxCountBefore`, bd-2fb53 / bd-zgbhb / bd-qyd3s), which is a COUNT(*)
+/// over the same seek without an `AggStep`.
 #[must_use]
 pub fn aggregate_index_seek_facts(program: &VdbeProgram) -> Option<IndexSeek> {
     if !program
         .ops()
         .iter()
-        .any(|op| op.opcode == Opcode::AggStep)
+        .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::IdxCountBefore))
     {
         return None;
     }
@@ -817,6 +821,41 @@ mod tests {
             aggregate_index_seek_facts(&prog),
             None,
             "a non-aggregate seek must not satisfy the aggregate-only wrapper"
+        );
+    }
+
+    /// A COUNT(*) counted from the b-tree has no AggStep: the seek it
+    /// positions with is still an aggregate's covering index search.
+    #[test]
+    fn test_aggregate_index_seek_facts_accepts_a_counted_index_run() {
+        let mut b = ProgramBuilder::new();
+        let end_label = b.emit_label();
+        let done_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, 2, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            1,
+            3,
+            0,
+            P4::Index("idx_t_k".to_owned()),
+            0,
+        );
+        b.emit_jump_to_label(Opcode::SeekGE, 1, 4, done_label, P4::None, 0);
+        b.emit_op(Opcode::IdxCountBefore, 1, 2, 4, P4::None, 1);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Close, 1, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+        let prog = b.finish().unwrap();
+        assert_eq!(
+            aggregate_index_seek_facts(&prog),
+            Some(IndexSeek {
+                index_name: "idx_t_k".to_owned(),
+                covering: true,
+            })
         );
     }
 
