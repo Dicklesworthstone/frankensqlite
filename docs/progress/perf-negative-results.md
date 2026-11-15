@@ -87,6 +87,119 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN: a composite index range walks a later qualifying index that covers the statement, not the first declared one (bd-w4pr1.13.18, read/seek round 3, levers R1 and R1b)
+
+- Target: the worst row of round 3's stock-live read sweep (`scratchpad/rs3_sweep.py`, table on
+  bd-w4pr1.13.18): `SELECT count(*), sum(val) FROM s WHERE g BETWEEN 100 AND 599` over a 500k-row
+  file table with s_gh(g, h) declared before s_gv(g, val). Stock walks s_gv as a covering index;
+  fsqlite walked s_gh and looked every entry's row up (IdxRowid + SeekRowid): 17.8x stock in
+  instructions, 26x in CPU. A plain `SELECT g, val ...` over the same range did the same (4.9x)
+  and returned its rows in s_gh's order, not stock's.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs`. `composite_index_prefix_range_target` takes an
+  optional covering test. Every index it admits enforces the whole WHERE (its residual guard
+  admits only conjuncts the prefix or the range column pins), so all of them visit the same
+  entries. With the test, a first qualifying index that fails it is kept as the fallback while a
+  later one that passes is looked for. The aggregate walk passes `aggregate_seek_is_covering` (R1);
+  the plain SELECT passes `resolve_covering_output_sources` when it has no ORDER BY (R1b), and
+  none with one, since `composite_order_by_satisfied` depends on the chosen index; the COUNT(*)
+  gate passes none. No IN-list path is touched.
+- Ledger preflight: no entry covers the choice among composite candidates. bd-k96op (2026-11-14)
+  orders residual-covering indexes first in the single-column/residual target; bd-bn45n made the
+  pure leading range a composite seek; bd-y8zgm's retry note asks the same of the eq-residual
+  target.
+- Result. thinkstation1, governor powersave, io_uring refused, 3 reps, stock sqlite3 3.46.1 live,
+  one fsqlite-built database (fsq.db 4842db3b7bb7fda1). Binaries main eb5782e1a 1a27ecdab9224dc4,
+  r1 518258c685cbd88b, r1b = r1 + R1b 510248630f228bb2. Answers equal stock's on all 20 rows with
+  r1b, including row order.
+
+  | statement | stock | main | r1b |
+  |---|---|---|---|
+  | range_covering_250k (aggregate) | 184.7M, 18.0 ms | 3,281.7M (17.77x), 470.0 ms | 849.0M (4.60x), 76.0 ms |
+  | nonagg_range_covering_50k (`SELECT g, val`, 50k rows) | 156.1M, 14.8 ms | 770.0M (4.93x), 104.5 ms, other order | 402.6M (2.58x), 42.4 ms, stock's order |
+  | nonagg_range_limit_1000 | 3.2M | 17.7M (5.57x), other order | 8.4M (2.63x), stock's order |
+  | point_rowid_2000 (control) | 44.0M | 178.6M | 178.7M |
+
+  Every other row within 0.1M or 0.1% of main, except point_sec_key_2000 at +0.8M (+0.18%) in R1's
+  own run and +0.2M in R1b's: callgrind puts that on the allocator's slow path (_int_malloc entered
+  70,330 times against 65,495 with unchanged malloc and free counts), a heap-layout effect of the
+  binary; the target's own code is +41 instructions on that row.
+- Predictions (bead, before code): R1 780M to 860M and 60 to 95 ms (measured 849.1M, 70.6 ms);
+  R1b 360M to 420M and 35 to 50 ms (402.6M, 42.4 ms), order equal to stock's. Controls inside.
+  Kill lines not crossed.
+- Behaviour: rows of a plain SELECT, and of an order-sensitive aggregate (group_concat), over such
+  a range now come in the covering index's order, which is the order stock returns.
+- Keepers (`crates/fsqlite/tests/agg_composite_prefix_range_oracle.rs`):
+  `agg_composite_range_prefers_a_later_index_that_covers` and
+  `nonagg_composite_range_prefers_a_later_index_that_covers`, against rusqlite in memory, on a file
+  fsqlite wrote and on a file stock wrote (whole REAL values stored as integers), strict mode on
+  the files, rows compared in order. Negative cases: a WHERE only the first index pins keeps it
+  with its lookups; a first index that covers stays chosen; when none covers the first is kept;
+  an ORDER BY keeps today's choice; a WITHOUT ROWID twin.
+- Gate (r3g4 on the landed diff, rch; then the rebase onto 64cb4061f brought d17095073 into
+  codegen.rs, and clippy, the vdbe lib suite with the goldens and the composite-range oracles
+  were run again on the rebased tree):
+  - clippy -D warnings on fsqlite-vdbe, fsqlite and fsqlite-e2e, all targets: clean;
+  - the keeper file 5/0;
+  - fsqlite-vdbe --lib 1,251/1 (test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion,
+    red on main: the same failure in round 2's r2g3 run at a527f8a1f), golden_bytecode_snapshots
+    8/0, hot_arm_stream_reachability 1/0, issue_531_grouped_index_input 14/0;
+  - 41 fsqlite aggregate / composite / range / min-max / count oracle targets, 65/0;
+  - round 2's keeper batches: join/seek 10 targets 29/1 (bd_8c68u's compile-count test,
+    bd-f8m1v), seek-key 8 targets 17/0, savepoint/trigger/peer/staleness 9 targets 65/0;
+  - --lib: btree 560/0, pager 1,113/1 (bd_2jpu6_2, bd-mcpbv), core 4,186/2 (the t6741 pair,
+    bd-nouem).
+  - Not run: the cross-process battery and the fsqlite-e2e concurrent-writer set (no pager, WAL
+    or cache change).
+  - The final rebase onto cb5fff4ea brought only `wal_adapter.rs` changes, in no file this
+    touches.
+- Landed in 514a631b4.
+- Retry / widen: the covered walk is 3,396 instructions a row against stock's 739 (aggregate) and
+  8,052 against 3,123 (plain, printed): the VDBE row loop (Column decode, AggStep, dispatch),
+  the serial read lane's. COUNT(*) over the same composite range still steps every entry (2,364
+  against 371 a row): bd-2fb53's own retry note.
+
+## 2026-11-14 - REJECTED on its kill line: interior routing keys kept on the decoded-page memo's hit, the keep folded into DecodedPageMemo::lookup (bd-w4pr1.13.18, read/seek round 3, lever R2)
+
+- Target: the interior binary search's routing-rowid decode, retried as the 2026-11-14 lever-4
+  entry below asks ("the served-again test folded into `DecodedPageMemo::lookup`, so `load_page`
+  gains no branch or move").
+- Touched (reverted, never committed; patch `scratchpad/rs3/r2_v1_only.patch` of the coordinator
+  session): `crates/fsqlite-btree/src/cursor.rs`. Lever 4's 32 direct-mapped routing-key entries
+  (empty, unallocated, until the first keep; an entry never handed to another page), filled on the
+  memo's hit branch from the hit's checked cell pointers and the page's usable bytes;
+  `table_seek_for_insert` searches a kept slice. Lever 4's three keepers, adapted, passed.
+- Result. thinkstation1, governor powersave, load 1.9 to 2.4, io_uring refused, 3 reps, stock
+  sqlite3 3.46.1 live, round 3's 17-row read sweep (`scratchpad/rs3_sweep.py`). Binaries r1
+  518258c685cbd88b (main + lever R1) and r12 = r1 + this diff 5a8ea6c681360590. Answers equal
+  stock's.
+
+  | statement | stock | r1 | r12 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,674.7M (4.82x) | 2,496.8M (4.50x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,477.2M (2.60x) | 4,427.7M (2.57x) |
+  | join3_pk_300k | 952.2M | 3,104.4M | 2,898.9M |
+  | range_noncovering_200k | 637.6M | 3,347.7M | 3,174.6M |
+  | point_rowid_2000 (control, one lookup a statement) | 44.0M | 178.7M | 178.7M |
+  | orderby_page_500x20 (20 lookups a statement) | 60.7M | 303.4M | 330.0M (+8.8%) |
+  | multicol_eq_1000 (5 lookups a statement) | 60.1M | 395.3M | 398.0M (+0.68%) |
+
+- Prediction (bead, before code): rowid -130M to -175M (measured -177.9M), join -25M to -45M
+  (-49.5M), the one-lookup control within +0.3M (0), other rows within 0.3%. Kill: another row
+  worse by more than 0.3%. Crossed twice: REJECTED and reverted.
+- Why (callgrind of both binaries on orderby_page_500x20, per statement +53.1k): the key decode
+  (+22.3k in `read_varint`, about 11k of iterator code), the `Vec<i64>` collect growing by realloc
+  (about 10k of malloc work) and the memo lookup (+8.3k), against 14.8k saved in
+  `table_interior_rowid_at`. A statement's fresh cursor makes 20 descents; each interior page of s
+  (about 250 cells) that the memo serves a second time pays a whole decode and is searched only a
+  few more times. Lever 4's sweep had no short multi-lookup statement, so it never showed this.
+- Retry condition: keep keys only after a page has been served enough times to repay its decode
+  (decode about 30 x cells, a slice search saves about 70 x log2(cells), so about 13 searches for
+  a 250-cell page), with a count that survives the 8-slot memo's evictions (333k of rowid's 600k
+  loads miss it) and a presized collect. Judge it on orderby_page_500x20 and multicol_eq_1000 as
+  well as the one-lookup control; the gains above are what it has to keep. Such a design (a
+  per-cursor counter, threshold 2 + cells/20) is drafted, not built, in
+  `scratchpad/rs3/r2b_code_draft.rs`, with its prediction on bd-w4pr1.13.18.
+
 ## 2026-11-14 - WIN (inside its prediction, at the low end on CPU): a Column on a sorter cursor runs on the synchronous hot lane (bd-w4pr1.13.8, lever G2)
 
 - Target: the output loop of a sorted GROUP BY (SorterData, Column on the sorter, IfPos, Ne, Copy,
