@@ -87,6 +87,21 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN (probe not met): COUNT(*) over an exact equality prefix of an index counts the run from the b-tree (bd-zgbhb)
+
+- Target: `SELECT count(*) FROM t WHERE a = 5` (5.0x stock): after bd-2fb53 the lone COUNT(*)
+  still took the aggregate equality seek and stepped every matching entry with an AggStep.
+  Touched: crates/fsqlite-vdbe/src/codegen.rs (count_star_index_range_target takes an equality
+  prefix that is exactly the WHERE when each value is index_range_bound_is_seek_safe; the
+  emitter builds one key record with each key term's affinity, seeks it and counts with
+  IdxCountBefore inclusive). A text literal on the INTEGER column keeps the equality walk.
+- Result (a3ae297ea; scratchpad cnt_ab.py, 200k-row t with ANALYZE, stock live, answers equal;
+  ELF before 631b8c89affe8939, after 9c188885bb0d2c38; thinkstation1): 603.0k -> 135.4k
+  (4.99x -> 1.12x stock); range, IS NULL and IS NOT NULL rows unchanged. The 1.0x probe is
+  missed by the seek itself: ~15k instructions against stock's ~2k.
+- Retry condition: a cheaper SeekGE from a fresh cursor (bd-w4pr1.13.15); counting is no
+  longer the cost.
+
 ## 2026-11-15 - WIN (small; retry of the 2026-11-12 rejection): a WAL refresh over a restarted WAL's stale tail reads one frame header, not a 15-frame batch (bd-w4pr1.7, lever L1)
 
 - Target: every WAL commit on a file-backed database after a checkpoint has restarted the WAL in
