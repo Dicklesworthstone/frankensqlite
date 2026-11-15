@@ -99658,6 +99658,31 @@ impl Connection {
                 [term] => window_key_row_column(&term.expr, &row_values, &col_map),
                 _ => None,
             };
+            // bd-w4pr1.12 lever W5: arguments that are each one plain column are
+            // read from the scanned row's slots, resolved here as the keys
+            // above are; a row's values go in a two-value inline vector. Any
+            // other argument list is evaluated per row as before.
+            let arg_slots: Option<smallvec::SmallVec<[usize; 2]>> = if win_args_are_star[wi] {
+                Some(smallvec::SmallVec::new())
+            } else {
+                win_args[wi]
+                    .iter()
+                    .map(|expr| window_key_row_column(expr, &row_values, &col_map))
+                    .collect()
+            };
+            let window_args = |row: &[SqliteValue]| -> Result<WindowArgValues> {
+                match &arg_slots {
+                    Some(slots) => Ok(slots.iter().map(|&slot| row[slot].clone()).collect()),
+                    None => build_window_args(
+                        &win_args[wi],
+                        win_args_are_star[wi],
+                        &win_order_by[wi],
+                        row,
+                        &col_map,
+                    )
+                    .map(WindowArgValues::from_vec),
+                }
+            };
             let mut partition_values = partition_column
                 .is_none()
                 .then(|| Vec::with_capacity(total_rows.saturating_mul(pb.len())));
@@ -100016,13 +100041,7 @@ impl Connection {
                             if !row_passes_filter(slot_ri) {
                                 continue;
                             }
-                            let args = build_window_args(
-                                &win_args[wi],
-                                win_args_are_star[wi],
-                                &win_order_by[wi],
-                                &row_values[slot_ri],
-                                &col_map,
-                            )?;
+                            let args = window_args(&row_values[slot_ri])?;
                             func.step(&mut excluded_state, &args)?;
                         }
                         func_vals.push(func.value(&excluded_state)?);
@@ -100045,13 +100064,7 @@ impl Connection {
                             if !row_passes_filter(slot_ri) {
                                 continue;
                             }
-                            let args = build_window_args(
-                                &win_args[wi],
-                                win_args_are_star[wi],
-                                &win_order_by[wi],
-                                &row_values[slot_ri],
-                                &col_map,
-                            )?;
+                            let args = window_args(&row_values[slot_ri])?;
                             func.step(&mut sliding_state, &args)?;
                         }
                         let _ = ri; // used only for symmetry with other paths
@@ -100063,13 +100076,7 @@ impl Connection {
                         if !row_passes_filter(ri) {
                             continue;
                         }
-                        let args = build_window_args(
-                            &win_args[wi],
-                            win_args_are_star[wi],
-                            &win_order_by[wi],
-                            &row_values[ri],
-                            &col_map,
-                        )?;
+                        let args = window_args(&row_values[ri])?;
                         func.step(&mut state, &args)?;
                     }
                     if uses_inverse_counter {
@@ -100100,13 +100107,7 @@ impl Connection {
                         let mut running_state = func.initial_state();
                         for &ri in partition_indices {
                             if row_passes_filter(ri) {
-                                let args = build_window_args(
-                                    &win_args[wi],
-                                    win_args_are_star[wi],
-                                    &win_order_by[wi],
-                                    &row_values[ri],
-                                    &col_map,
-                                )?;
+                                let args = window_args(&row_values[ri])?;
                                 func.step(&mut running_state, &args)?;
                             }
                             func_vals.push(func.value(&running_state)?);
@@ -100164,13 +100165,7 @@ impl Connection {
                                         if !row_passes_filter(ri) {
                                             continue;
                                         }
-                                        let args = build_window_args(
-                                            &win_args[wi],
-                                            win_args_are_star[wi],
-                                            &win_order_by[wi],
-                                            &row_values[ri],
-                                            &col_map,
-                                        )?;
+                                        let args = window_args(&row_values[ri])?;
                                         func.step(&mut gs_state, &args)?;
                                     }
                                 }
@@ -100196,13 +100191,7 @@ impl Connection {
                                     if !row_passes_filter(slot_ri) {
                                         continue;
                                     }
-                                    let args = build_window_args(
-                                        &win_args[wi],
-                                        win_args_are_star[wi],
-                                        &win_order_by[wi],
-                                        &row_values[slot_ri],
-                                        &col_map,
-                                    )?;
+                                    let args = window_args(&row_values[slot_ri])?;
                                     func.step(&mut rs_state, &args)?;
                                 }
                                 func_vals.push(func.value(&rs_state)?);
@@ -100233,13 +100222,7 @@ impl Connection {
                                 if !row_passes_filter(ri) {
                                     continue;
                                 }
-                                let args = build_window_args(
-                                    &win_args[wi],
-                                    win_args_are_star[wi],
-                                    &win_order_by[wi],
-                                    &row_values[ri],
-                                    &col_map,
-                                )?;
+                                let args = window_args(&row_values[ri])?;
                                 func.step(&mut state, &args)?;
                             }
                             let val = func.value(&state)?;
@@ -100251,13 +100234,7 @@ impl Connection {
                     } else {
                         for &ri in partition_indices {
                             if row_passes_filter(ri) {
-                                let args = build_window_args(
-                                    &win_args[wi],
-                                    win_args_are_star[wi],
-                                    &win_order_by[wi],
-                                    &row_values[ri],
-                                    &col_map,
-                                )?;
+                                let args = window_args(&row_values[ri])?;
                                 func.step(&mut state, &args)?;
                             }
                             func_vals.push(func.value(&state)?);
@@ -142909,6 +142886,11 @@ fn range_value_frame_bounds(
         (start, end)
     }
 }
+
+/// One row's arguments for a window function `step()` call: two inline, so a
+/// one- or two-argument window function steps a row without a heap block
+/// (bd-w4pr1.12, lever W5).
+type WindowArgValues = smallvec::SmallVec<[SqliteValue; 2]>;
 
 /// Build the SQL-visible argument list for a window function `step()` call.
 ///
