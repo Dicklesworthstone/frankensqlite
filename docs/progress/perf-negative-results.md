@@ -87,6 +87,71 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-14 - WIN (inside its prediction, at the low end on CPU): a Column on a sorter cursor runs on the synchronous hot lane (bd-w4pr1.13.8, lever G2)
+
+- Target: the output loop of a sorted GROUP BY (SorterData, Column on the sorter, IfPos, Ne, Copy,
+  AggStep, SorterNext) left the synchronous lane once per row for its `Column`: the sync Column arm
+  handled storage cursors only, so a sorter's Column went through `try_execute_hot_opcode_async`,
+  `execute_column_hot`, the async `column_to_reg_direct` probe that declines and the async
+  `cursor_column`: 524.7M Ir inclusive on group_by_1000_groups (cursor_column 133.0M x1M,
+  column_to_reg_direct 57.0M x1M, the async frame ~170M), ~400 Ir a row. Touched:
+  `crates/fsqlite-vdbe/src/engine.rs` (`sorter_current_row_column`, `try_sorter_column_to_reg`,
+  the sync Column arm, `cursor_column`'s sorter branch),
+  `crates/fsqlite-core/tests/bd_w4pr1_13_1_sync_lane_boundary_oracle.rs`
+  (`sorter_column_reads_match_sqlite_on_a_strict_file_database`).
+- Ledger preflight: 2026-11-11 bd-w4pr1.13.7 (SorterInsert / SorterCompare / SorterData moved to the
+  sync lane with their bodies unchanged; Column on a sorter was not among them); INDEX row "Removing
+  or adding single arms of try_execute_hot_opcode" -- no arm is added: the existing Column arm gains
+  a third lane, measured base and candidate in one invocation as its retry condition asks.
+- Pre-registered on bd-w4pr1.13.8 (2026-11-14T20:40Z): group_by_1000_groups Ir 3,406M ->
+  3,000-3,150M, CPU -25 to -50 ms; a GROUP BY reading a non-key sorter column lower by a similar
+  250-400 Ir per row read; other read rows within 0.1% Ir. Kill: under -150M Ir or CPU not lower on
+  group_by_1000_groups, another read row up by more than 0.5% Ir, a keeper change.
+- Change: cursor_column's sorter branch (it awaits nothing) becomes `sorter_current_row_column`,
+  called by `cursor_column` as before and by the sync Column arm after the two storage-cursor lanes
+  decline, for a cursor id that is neither a storage nor a memory cursor (cursor_column reads those
+  first) and is a sorter: the same value, `set_reg_fast`, metrics calls and errors. No bytecode
+  change.
+- Result (thinkstation1, governor powersave, io_uring refused, serial `parallel_workers=1`; base main
+  3dfe159c2 sha256 7e21f93bf43bfa15, G2 2007105f0a3df447 = 3dfe159c2 + this diff; stock sqlite3
+  3.46.1 live in the same par_probe run, reps 5, two runs at load 1.9 and 2.5; answers equal
+  everywhere): group_by_1000_groups 3,405.8M -> 3,010.8M Ir (-395M; stock 2,876.2M), CPU 378.4 ->
+  351.9 / 368.2 -> 340.4 (same run, second statement) / 374.0 -> 352.0 / 395.2 -> 340.0 ms
+  (x1.81-1.94 -> x1.67-1.75 stock); GROUP BY a with sum(c) (two sorter columns a row) 4,913.4M ->
+  4,106.4M, CPU x1.85-1.90 -> x1.62-1.66; GROUP BY a % 10 3,562.0M -> 3,170.0M, x1.82-1.93 ->
+  x1.66-1.73; GROUP BY id % 100000 3,717.1M -> 3,330.4M, x2.13-2.22 -> x1.88-1.95. scan_filter_agg
+  1,259.9M -> 1,262.4M (+2.5M, +0.2%: the Column arm's third lane changes the dispatcher's code
+  layout; inside the 0.5% kill line), order_by_text_limit10 1,740.3M -> 1,738.3M, count_star
+  unchanged. Prediction: Ir inside its range (-395M against -256..-406M); CPU -22 to -55 ms against
+  -25..-50 (low end); the non-key shape -807M (two Columns a row), above the per-read estimate.
+  Kill lines not crossed. After G2 the GROUP BY sort (`sort_rows_by_single_integer_key` 23.4% + its
+  quicksort 7.4%) is ~31% of group_by_1000_groups' cycles: the next lever there (G3, designed on
+  bd-w4pr1.13.8, not started).
+- Gate (on 3dfe159c2 + this diff): clippy -D warnings fsqlite-vdbe --all-targets and fsqlite-core
+  --lib + the keeper target clean; fsqlite-vdbe lib 1,249 passed, 1 failed (bd-bhalc's
+  `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, red on main),
+  golden_bytecode_snapshots 8/8; fsqlite-core lib 4,185 passed, 2 failed (the t6741 pair,
+  bd-nouem); 26 GROUP BY / ORDER BY / DISTINCT / aggregate / index-build / window keepers plus the
+  parallel scan oracle and budget: 71 passed, 2 failed --
+  `indexed_group_by_predicates_match_sqlite_without_table_scans` (red on main) and the first
+  version of the new keeper, whose 6 of 11 queries strict mode refused (a NOCASE key, an
+  expression key with DISTINCT aggregates, `typeof(k)`, a DESC key order with max(s), two grouped
+  derived tables: they do not run the sorter program; no answer differed). Those now run with
+  strict mode off as plain answers and 3 more program-run shapes read non-key sorter columns; the
+  revised keeper passes (2/2 in its target; 8 program-run queries under strict mode, 5 plain). Its
+  first rerun found a divergence that is not this lever's: `GROUP BY s` over a NOCASE column
+  prints the first row's spelling of a group ('Name-0', 'b') where stock prints the last row's
+  ('NAME-0', 'B'); the main 3dfe159c2 CLI prints the same as G2 in memory and on a file, so it is
+  left out of the keeper and reported on bd-w4pr1.13.8. fsqlite agg_index_range,
+  distinct_loose_scan and the six count / min / max / range oracles: 17 passed.
+- Verdict: WIN against stock live: group_by_1000_groups x1.81-1.94 -> x1.67-1.75 CPU (a
+  self-speedup of the serial path whose stock ratio moved; still a loss to stock). Landed as
+  bef295de6 (rebased over upstream codegen-only commits; clippy -D warnings fsqlite-vdbe --lib
+  clean on the rebased tree).
+- Retry condition: none (kept). A sorter Column of a non-key column still decodes through the
+  sorter's row cache (`sorter_current_row_column`); an in-place decode like the storage Column lane
+  is worth it when a profile puts that function at 5% or more of a GROUP BY row.
+
 ## 2026-11-14 - REJECTED on its point-SELECT kill line: an interior table image the cursor's memo serves again keeps all its routing keys, and the descent searches them as a slice (bd-w4pr1.13.18, join / rowid-seek round 2, lever 4)
 
 - Target: the interior binary search's routing-rowid decode (rowid_lookups_200k: 2.59M reads at
