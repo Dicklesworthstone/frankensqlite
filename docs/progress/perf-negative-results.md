@@ -102,7 +102,9 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   subquery).
 - Retry condition: part 2 gives the scalar fold LIMIT 1 (fsq-sfl); a TEXT value on a numeric
   column and a NULL value stay on the exact zero-match scan fallback until the equality walk
-  coerces its probe.
+  coerces its probe. Part 2 landed b6dd1e303: limit_probe_to_its_first_row at all five scalar
+  first-row sites; the no-LIMIT row 568.5x -> 2.8x (ELF 3ae0fcb4a04033b8 -> a91b28ed23803ca2).
+  The id rows stay 3.8x on per-row output cost (~4.6k instructions per emitted row vs ~1.2k).
 
 ## 2026-11-15 - MEASURED WIN, NOT LANDED (gate incomplete): a window function's arguments are read from their slots in the scanned row (bd-w4pr1.12, lever W5)
 
