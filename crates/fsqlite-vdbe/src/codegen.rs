@@ -6048,17 +6048,28 @@ fn codegen_select_index_equality_scan(
     let index_collation_is_binary = idx_schema
         .key_term_collation(0)
         .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
+    // bd-wp9s1: a folded scalar subquery's value (a BoundOuterValue the equality extractors admitted)
+    // is known when the program is built, so its storage class decides as a literal's does.
     let probe_needs_no_affinity_conversion = probe_column.is_some_and(|column| {
+        let text_probe_is_exact = || {
+            column.affinity == 'B'
+                && index_collation_is_binary
+                && column
+                    .collation
+                    .as_deref()
+                    .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"))
+        };
         match target_expr {
-            Expr::Literal(Literal::Integer(_), _) => column.affinity == 'D',
-            Expr::Literal(Literal::String(_), _) => {
-                column.affinity == 'B'
-                    && index_collation_is_binary
-                    && column
-                        .collation
-                        .as_deref()
-                        .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"))
-            }
+            Expr::Literal(Literal::Integer(_), _)
+            | Expr::BoundOuterValue {
+                value: SqliteValue::Integer(_),
+                ..
+            } => column.affinity == 'D',
+            Expr::Literal(Literal::String(_), _)
+            | Expr::BoundOuterValue {
+                value: SqliteValue::Text(_),
+                ..
+            } => text_probe_is_exact(),
             _ => false,
         }
     });
@@ -38900,12 +38911,12 @@ fn extract_index_column_equality_expr<'a>(
     };
 
     if expr_matches_index_column(left, table, table_alias, expected_column)
-        && is_simple_constant(right)
+        && is_exact_equality_seek_value(right, table, expected_column)
     {
         return Some(right);
     }
     if expr_matches_index_column(right, table, table_alias, expected_column)
-        && is_simple_constant(left)
+        && is_exact_equality_seek_value(left, table, expected_column)
     {
         return Some(left);
     }
@@ -39507,6 +39518,45 @@ fn is_simple_constant(expr: &Expr) -> bool {
     // parameters on the fast path, and make correlated values use the
     // comparator-correct scan path.
     matches!(expr, Expr::Placeholder(..) | Expr::Literal(..)) || is_constant_seek_key_expr(expr)
+}
+
+/// bd-wp9s1: whether `value` is an exact seek key for `column = value` on
+/// `table`. A literal or bind parameter is ([`is_simple_constant`]). So is
+/// the folded value of an uncorrelated scalar subquery, a `BoundOuterValue`
+/// with no collation of its own, when the comparison converts only the
+/// value, as the seek's key-affinity coercion does: a numeric column against
+/// a numeric value (neither converts) or a TEXT value (NUMERIC applies to the
+/// value), and a TEXT column against a TEXT value. A numeric value against a
+/// TEXT column converts the column side, and a column without affinity
+/// converts to the value's, so those keep the comparator-correct scan, as
+/// does any value carrying a collation (a correlated column's binding).
+fn is_exact_equality_seek_value(value: &Expr, table: &TableSchema, column: &str) -> bool {
+    if is_simple_constant(value) {
+        return true;
+    }
+    let Expr::BoundOuterValue {
+        collation: fsqlite_ast::BoundCollation::Unspecified,
+        affinity: Some(value_affinity),
+        ..
+    } = value
+    else {
+        return false;
+    };
+    let Some(column_affinity) = table
+        .column_index(column)
+        .and_then(|position| table.columns.get(position))
+        .map(|info| info.affinity.to_ascii_uppercase())
+    else {
+        return false;
+    };
+    match column_affinity {
+        'C' | 'D' | 'E' => matches!(
+            value_affinity,
+            TypeAffinity::Numeric | TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Text
+        ),
+        'B' => matches!(value_affinity, TypeAffinity::Text),
+        _ => false,
+    }
 }
 
 /// Whether `expr` is a constant expression a b-tree probe can take as its
@@ -40385,12 +40435,12 @@ fn extract_column_eq_target<'a>(
     } = expr
     {
         if let Some(col_name) = column_name(left, table, table_alias)
-            && is_simple_constant(right)
+            && is_exact_equality_seek_value(right, table, &col_name)
         {
             return Some((col_name, right));
         }
         if let Some(col_name) = column_name(right, table, table_alias)
-            && is_simple_constant(left)
+            && is_exact_equality_seek_value(left, table, &col_name)
         {
             return Some((col_name, left));
         }
@@ -40436,13 +40486,13 @@ fn extract_labeled_eq_conjunct_target<'a>(
             } => {
                 if let Some(col_name) = column_name(left, table, table_alias)
                     && col_name.eq_ignore_ascii_case(key_label)
-                    && is_simple_constant(right)
+                    && is_exact_equality_seek_value(right, table, &col_name)
                 {
                     return Some(right);
                 }
                 if let Some(col_name) = column_name(right, table, table_alias)
                     && col_name.eq_ignore_ascii_case(key_label)
-                    && is_simple_constant(left)
+                    && is_exact_equality_seek_value(left, table, &col_name)
                 {
                     return Some(left);
                 }
@@ -57764,6 +57814,63 @@ mod tests {
         assert!(
             extract_exists_rowid_probe(&nested_bound_rowid_eq, inner_table, Some("s")).is_none(),
         );
+    }
+
+    /// bd-wp9s1: a folded scalar subquery value (no collation of its own) is
+    /// an equality seek key exactly when the comparison converts only it.
+    #[test]
+    fn folded_scalar_values_are_seek_keys_where_only_the_value_converts() {
+        let folded = |affinity: TypeAffinity| Expr::BoundOuterValue {
+            value: SqliteValue::Integer(5),
+            collation: BoundCollation::Unspecified,
+            affinity: Some(affinity),
+            span: Span::ZERO,
+        };
+        let eq = |column: &str, value: Expr| Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare(column), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(value),
+            span: Span::ZERO,
+        };
+        // `b` is NUMERIC in this schema.
+        let numeric = test_schema_with_index();
+        for affinity in [
+            TypeAffinity::Integer,
+            TypeAffinity::Real,
+            TypeAffinity::Numeric,
+            TypeAffinity::Text,
+        ] {
+            let term = eq("b", folded(affinity));
+            assert!(
+                extract_column_eq_target(Some(&term), &numeric[0], None).is_some(),
+                "{affinity:?} on a NUMERIC column"
+            );
+        }
+        assert!(
+            extract_column_eq_target(Some(&eq("b", folded(TypeAffinity::Blob))), &numeric[0], None)
+                .is_none()
+        );
+        // `b` is TEXT here: only a TEXT value compares without converting the column.
+        let text = test_schema_with_text_index();
+        assert!(
+            extract_column_eq_target(Some(&eq("b", folded(TypeAffinity::Text))), &text[0], None)
+                .is_some()
+        );
+        for affinity in [TypeAffinity::Integer, TypeAffinity::Real, TypeAffinity::Numeric] {
+            let term = eq("b", folded(affinity));
+            assert!(
+                extract_column_eq_target(Some(&term), &text[0], None).is_none(),
+                "{affinity:?} converts the TEXT column"
+            );
+        }
+        // A value carrying a collation (a correlated binding) stays out.
+        let collated = Expr::BoundOuterValue {
+            value: SqliteValue::Integer(5),
+            collation: BoundCollation::Binary,
+            affinity: Some(TypeAffinity::Integer),
+            span: Span::ZERO,
+        };
+        assert!(extract_column_eq_target(Some(&eq("b", collated)), &numeric[0], None).is_none());
     }
 
     #[test]

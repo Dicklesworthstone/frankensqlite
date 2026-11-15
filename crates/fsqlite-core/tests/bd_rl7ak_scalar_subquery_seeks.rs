@@ -688,3 +688,80 @@ fn seeking_subqueries_visit_few_rows() {
         );
     });
 }
+
+/// bd-wp9s1: `col = (uncorrelated scalar subquery)` folds the subquery to its
+/// value, which carries the result column's affinity. The outer equality
+/// seeks the column's index when the comparison converts only that value (a
+/// numeric column against a numeric or TEXT value, a TEXT column against a
+/// TEXT value), in either operand order, for a row list and a COUNT(*). A
+/// numeric value against a TEXT column converts the column side and a BLOB
+/// column compares without converting, so those scan, and a seek there would
+/// miss rows: each answer is compared with rusqlite's.
+#[test]
+fn equality_with_an_uncorrelated_scalar_subquery_seeks_the_index() {
+    const ROWS: u64 = 2000;
+    // A seek visits the 40 rows of one key; a scan steps all 2,000.
+    const SEEK_LIMIT: u64 = 2000;
+    let setup = format!(
+        "CREATE TABLE o(id INTEGER PRIMARY KEY, a INTEGER, s TEXT, r REAL, x);\
+         CREATE INDEX o_a ON o(a); CREATE INDEX o_s ON o(s); CREATE INDEX o_r ON o(r);\
+         CREATE INDEX o_x ON o(x);\
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {ROWS}) \
+         INSERT INTO o SELECT i, i % 50, CAST(i % 50 AS TEXT), (i % 50) * 1.0, i % 50 FROM n;\
+         CREATE TABLE p(pid INTEGER PRIMARY KEY, w INTEGER, ws TEXT, wr REAL);\
+         INSERT INTO p VALUES (1, 7, '7', 7.0), (2, 9, '09', 9.5), (3, NULL, NULL, NULL);"
+    );
+    // (sql, Some(seeks), or None where only the answer is pinned: a NULL value or a TEXT value the
+    // NUMERIC column converts may take the equality walk's zero-match scan fallback, which is exact)
+    let shapes: &[(&str, Option<bool>)] = &[
+        ("SELECT id FROM o WHERE a = (SELECT w FROM p WHERE pid = 1)", Some(true)),
+        ("SELECT id FROM o WHERE (SELECT w FROM p WHERE pid = 1) = a", Some(true)),
+        ("SELECT count(*) FROM o WHERE a = (SELECT w FROM p WHERE pid = 1)", Some(true)),
+        ("SELECT id FROM o WHERE s = (SELECT ws FROM p WHERE pid = 1)", Some(true)),
+        ("SELECT id FROM o WHERE r = (SELECT wr FROM p WHERE pid = 1)", Some(true)),
+        ("SELECT id FROM o WHERE a = (SELECT w FROM p WHERE pid = 1) - 2", None),
+        ("SELECT id FROM o WHERE a = (SELECT ws FROM p WHERE pid = 2)", None),
+        ("SELECT count(*) FROM o WHERE a = (SELECT ws FROM p WHERE pid = 2)", None),
+        ("SELECT a, count(*) FROM o WHERE a = (SELECT ws FROM p WHERE pid = 2) GROUP BY a", None),
+        ("SELECT id FROM o WHERE a = (SELECT ws FROM p WHERE pid = 2) AND s IN ('9', '7')", None),
+        ("SELECT id FROM o WHERE a = (SELECT w FROM p WHERE pid = 3)", None),
+        ("SELECT id FROM o WHERE a = (SELECT w FROM p WHERE pid = 99)", None),
+        ("SELECT id FROM o WHERE s = (SELECT w FROM p WHERE pid = 1)", Some(false)),
+        ("SELECT id FROM o WHERE x = (SELECT ws FROM p WHERE pid = 1)", Some(false)),
+        ("SELECT id FROM o WHERE x = (SELECT w FROM p WHERE pid = 1)", Some(false)),
+    ];
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Connection::open(dir.path().join("wp9s1.db").to_str().unwrap())
+            .await
+            .unwrap();
+        f.execute_batch(&setup).await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        r.execute_batch(&setup).unwrap();
+        let mut wrong = Vec::new();
+        for &(sql, seeks) in shapes {
+            let mut expected = rq(&r, sql, &[]).unwrap();
+            expected.sort();
+            set_vdbe_metrics_enabled(true);
+            reset_vdbe_metrics();
+            let got = fq(&f, sql, &[], false).await;
+            let opcodes = vdbe_metrics_snapshot().opcodes_executed_total;
+            set_vdbe_metrics_enabled(false);
+            let mut got = got.unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+            got.sort();
+            assert_eq!(got, expected, "`{sql}`");
+            if let Some(seeks) = seeks
+                && (opcodes <= SEEK_LIMIT) != seeks
+            {
+                wrong.push(format!("  {opcodes} opcodes, seeks={seeks}: `{sql}`"));
+            }
+        }
+        f.close().await.unwrap();
+        assert!(
+            wrong.is_empty(),
+            "the seeks must stay at or under {SEEK_LIMIT} opcodes and the scans over it:\n{}",
+            wrong.join("\n")
+        );
+    });
+}
