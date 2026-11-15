@@ -1912,3 +1912,255 @@ fn concurrent_implicit_rowid_append_with_autocheckpoint_and_large_rows_bd_ujp0h_
         }
     });
 }
+
+
+const STRUCTURAL_SPLIT_CASE_DIR: &str = "FSQLITE_STRUCTURAL_SPLIT_CASE_DIR";
+
+struct StructuralSplitPeer(Option<std::process::Child>);
+
+impl StructuralSplitPeer {
+    fn wait_for(&mut self, path: &std::path::Path) {
+        let started = std::time::Instant::now();
+        while !path.exists() {
+            assert!(
+                self.0
+                    .as_mut()
+                    .expect("split peer spawned")
+                    .try_wait()
+                    .expect("split peer status")
+                    .is_none(),
+                "split peer exited before {}",
+                path.display()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "timed out waiting for {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finish(mut self) {
+        let output = self
+            .0
+            .take()
+            .expect("split peer spawned")
+            .wait_with_output()
+            .expect("split peer output");
+        assert!(
+            output.status.success(),
+            "split peer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+impl Drop for StructuralSplitPeer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn structural_split_commit_verdict(result: fsqlite_error::Result<usize>) -> &'static str {
+    match result {
+        Ok(_) => "committed",
+        Err(fsqlite_error::FrankenError::BusySnapshot { .. }) => "busy_snapshot",
+        Err(error) => panic!("unexpected structural split COMMIT error: {error:?}"),
+    }
+}
+
+async fn structural_split_last_rowid(conn: &fsqlite::Connection) -> i64 {
+    match conn
+        .query("SELECT last_insert_rowid()")
+        .await
+        .expect("last rowid")[0]
+        .values()[0]
+    {
+        SqliteValue::Integer(rowid) => rowid,
+        ref value => panic!("last rowid is not an integer: {value:?}"),
+    }
+}
+
+/// The small appender runs in a separate process, with a separate page-lock
+/// table and commit index. A thread would see the splitter's in-process claim
+/// and would not reproduce the missing WAL conflict marker (bd-73pfl).
+#[test]
+fn structural_split_peer_process() {
+    let Some(case_dir) = std::env::var_os(STRUCTURAL_SPLIT_CASE_DIR) else {
+        return;
+    };
+    let case_dir = std::path::PathBuf::from(case_dir);
+    asupersync::test_utils::run_test(|| async {
+        let path = case_dir.join("split.db");
+        let conn = fsqlite::Connection::open(path.to_str().expect("UTF-8 path"))
+            .await
+            .expect("open small appender");
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+            .await
+            .expect("disable autocheckpoint");
+        conn.execute("PRAGMA busy_timeout=5000")
+            .await
+            .expect("busy timeout");
+        conn.execute("BEGIN").await.expect("small appender BEGIN");
+        conn.execute("INSERT INTO split_guard(payload) VALUES(zeroblob(16))")
+            .await
+            .expect("small row fits the old rightmost leaf");
+        assert_eq!(structural_split_last_rowid(&conn).await, 3);
+        std::fs::write(case_dir.join("small-staged"), b"ready").expect("signal staged row");
+
+        for signal in ["commit-small", "finish-small"] {
+            let started = std::time::Instant::now();
+            while !case_dir.join(signal).exists() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "parent never sent {signal}"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            if signal == "commit-small" {
+                let verdict = structural_split_commit_verdict(conn.execute("COMMIT").await);
+                assert!(
+                    !conn.in_transaction(),
+                    "either COMMIT verdict ends the transaction"
+                );
+                let result_pending = case_dir.join("small-result-pending");
+                std::fs::write(&result_pending, verdict).expect("write small appender verdict");
+                std::fs::rename(result_pending, case_dir.join("small-result"))
+                    .expect("publish complete small appender verdict");
+            }
+        }
+        conn.close().await.expect("close small appender");
+    });
+}
+
+/// A split caps an unchanged old leaf with a parent divider. Its structural
+/// claim must both validate against earlier peer writes and appear in the WAL
+/// for later peer commits. Exercise both commit orders deterministically.
+#[test]
+fn cross_process_right_edge_split_conflicts_with_old_leaf_append_bd_73pfl() {
+    for small_commits_first in [false, true] {
+        let dir = tempfile::tempdir().expect("split case directory");
+        let path = dir.path().join("split.db");
+        {
+            let stock = rusqlite::Connection::open(&path).expect("stock seed open");
+            stock
+                .execute_batch(
+                    "PRAGMA page_size=4096;
+                     PRAGMA journal_mode=WAL;
+                     CREATE TABLE split_guard(id INTEGER PRIMARY KEY, payload BLOB);
+                     INSERT INTO split_guard(payload) VALUES(zeroblob(3500)),(zeroblob(3500));
+                     PRAGMA wal_checkpoint(TRUNCATE);",
+                )
+                .expect("seed two large rows on separate leaves");
+        }
+        // Fix the structural precondition, rather than hoping a workload
+        // happens to reach a split: root 2 has one divider, and its right leaf
+        // has one 3500-byte row. Another large row splits; a 16-byte row fits.
+        let seed = std::fs::read(&path).expect("seed image");
+        let root = &seed[4096..8192];
+        assert_eq!(root[0], 0x05, "seed root is an interior table page");
+        assert_eq!(u16::from_be_bytes([root[3], root[4]]), 1);
+        let right_page = u32::from_be_bytes(root[8..12].try_into().unwrap());
+        let right_offset = (right_page as usize - 1) * 4096;
+        let right_leaf = &seed[right_offset..right_offset + 4096];
+        assert_eq!(right_leaf[0], 0x0d);
+        assert_eq!(u16::from_be_bytes([right_leaf[3], right_leaf[4]]), 1);
+
+        let mut peer = StructuralSplitPeer(Some(
+            std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "structural_split_peer_process",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(STRUCTURAL_SPLIT_CASE_DIR, dir.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn independent small appender"),
+        ));
+        peer.wait_for(&dir.path().join("small-staged"));
+
+        let mut split_verdict = None;
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(path.to_str().expect("UTF-8 path"))
+                .await
+                .expect("open splitter");
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+                .await
+                .expect("disable autocheckpoint");
+            conn.execute("PRAGMA busy_timeout=5000")
+                .await
+                .expect("busy timeout");
+            conn.execute("BEGIN").await.expect("splitter BEGIN");
+            conn.execute("INSERT INTO split_guard(payload) VALUES(zeroblob(3500))")
+                .await
+                .expect("large row splits the old rightmost leaf");
+            assert_eq!(structural_split_last_rowid(&conn).await, 3);
+            if small_commits_first {
+                std::fs::write(dir.path().join("commit-small"), b"commit")
+                    .expect("allow small appender commit");
+                peer.wait_for(&dir.path().join("small-result"));
+            }
+            split_verdict = Some(structural_split_commit_verdict(conn.execute("COMMIT").await));
+            assert!(
+                !conn.in_transaction(),
+                "either COMMIT verdict ends the transaction"
+            );
+            if !small_commits_first {
+                std::fs::write(dir.path().join("commit-small"), b"commit")
+                    .expect("allow small appender commit");
+                peer.wait_for(&dir.path().join("small-result"));
+            }
+            conn.close().await.expect("close splitter");
+        });
+        let split_verdict = split_verdict.expect("splitter commit ran");
+        let small_verdict = std::fs::read_to_string(dir.path().join("small-result"))
+            .expect("small appender verdict");
+        std::fs::write(dir.path().join("finish-small"), b"finish")
+            .expect("release small appender");
+        peer.finish();
+
+        let stock = rusqlite::Connection::open(&path).expect("stock reopen");
+        let integrity: Vec<String> = stock
+            .prepare("PRAGMA integrity_check")
+            .expect("prepare stock integrity check")
+            .query_map([], |row| row.get(0))
+            .expect("stock integrity check")
+            .collect::<rusqlite::Result<_>>()
+            .expect("all integrity results");
+        assert_eq!(
+            integrity,
+            ["ok"],
+            "small_commits_first={small_commits_first}, split={split_verdict}, small={small_verdict}"
+        );
+        let expected_verdicts = if small_commits_first {
+            ("busy_snapshot", "committed")
+        } else {
+            ("committed", "busy_snapshot")
+        };
+        assert_eq!((split_verdict, small_verdict.as_str()), expected_verdicts);
+        let rows: Vec<(i64, i64)> = stock
+            .prepare("SELECT id, length(payload) FROM split_guard ORDER BY id")
+            .expect("prepare durable rows")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("read durable rows")
+            .collect::<rusqlite::Result<_>>()
+            .expect("all durable rows");
+        assert_eq!(
+            rows,
+            vec![
+                (1, 3500),
+                (2, 3500),
+                (3, if small_commits_first { 16 } else { 3500 }),
+            ],
+            "durable rows must equal the seed plus the one reported successful COMMIT"
+        );
+    }
+}
