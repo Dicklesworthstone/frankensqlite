@@ -33208,6 +33208,9 @@ fn emit_without_rowid_upsert_probe(
             register_base: Some(RegisterRow::columns(val_regs)),
             secondaries: &[],
         };
+        // A row outside a partial index cannot violate its UNIQUE constraint.
+        // Test membership before looking up a key that an indexed row may share.
+        emit_index_predicate_guard(b, index, &scan_ctx, no_conflict_label);
         let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
         for key_pos in 0..n_idx_cols {
             emit_index_key_term(b, index, key_pos, idx_key_regs + key_pos as i32, &scan_ctx);
@@ -33303,6 +33306,7 @@ fn emit_without_rowid_upsert_probe(
                     register_base: Some(RegisterRow::columns(val_regs)),
                     secondaries: &[],
                 };
+                emit_index_predicate_guard(b, index, &scan_ctx, next_index);
                 let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
                 for key_pos in 0..n_idx_cols {
                     emit_index_key_term(

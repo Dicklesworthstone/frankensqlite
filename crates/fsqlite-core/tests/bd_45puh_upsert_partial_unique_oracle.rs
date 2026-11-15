@@ -161,3 +161,88 @@ fn upsert_against_partial_unique_indexes_matches_stock() {
         );
     });
 }
+
+
+/// WITHOUT ROWID uses a separate UPSERT probe. A candidate outside a partial
+/// index must not borrow an indexed row's key and spuriously take an update or
+/// DO NOTHING arm. False and NULL predicates both exclude the candidate.
+#[test]
+fn without_rowid_upsert_checks_partial_index_membership_before_conflict() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for target in ["", "(value) WHERE active = 1"] {
+                    for action in ["DO NOTHING", "DO UPDATE SET note = excluded.note"] {
+                        for active in ["0", "NULL", "1"] {
+                            let dir = tempfile::tempdir().expect("temp dir");
+                            let path = if file_backed {
+                                dir.path()
+                                    .join("partial_wr.db")
+                                    .to_str()
+                                    .expect("utf-8 path")
+                                    .to_owned()
+                            } else {
+                                ":memory:".to_owned()
+                            };
+                            let f = Connection::open(&path).await.expect("open");
+                            let r = rusqlite::Connection::open_in_memory().expect("stock open");
+                            for sql in [
+                                "CREATE TABLE q(id INTEGER PRIMARY KEY, value INT, active INT,
+                                    note TEXT) WITHOUT ROWID",
+                                "CREATE UNIQUE INDEX q_partial ON q(value) WHERE active = 1",
+                                "INSERT INTO q VALUES(1, 5, 1, 'original'), (2, 7, 0, 'outside')",
+                            ] {
+                                f.execute(sql).await.expect("frank setup");
+                                r.execute(sql, []).expect("stock setup");
+                            }
+                            let sql = format!(
+                                "INSERT INTO q VALUES(3, 5, {active}, 'candidate')
+                                 ON CONFLICT {target} {action}"
+                            );
+                            let label = format!("file={file_backed}, prepared={prepared}, {sql}");
+                            let expected_changes = if active == "1" && action == "DO NOTHING" {
+                                0
+                            } else {
+                                1
+                            };
+                            let expected = format!("changed {expected_changes}");
+                            // Require a successful stock execution, not equal errors.
+                            assert_eq!(stock_outcome(&r, &sql), expected, "{label}");
+                            assert_eq!(
+                                frank_outcome(&f, &sql, prepared).await,
+                                expected,
+                                "{label}"
+                            );
+                            let state = "SELECT id, value, active, note FROM q ORDER BY id";
+                            let actual: Vec<Vec<String>> = f
+                                .query(state)
+                                .await
+                                .expect("frank state")
+                                .iter()
+                                .map(|row| row.values().iter().map(tag_f).collect())
+                                .collect();
+                            assert_eq!(
+                                actual,
+                                stock_rows(&r, state).expect("stock state"),
+                                "{label}"
+                            );
+                            f.close().await.expect("close");
+                            if file_backed {
+                                let stored = rusqlite::Connection::open(&path).expect("stock reopen");
+                                assert_eq!(
+                                    stock_rows(&stored, state).expect("stock reads written file"),
+                                    stock_rows(&r, state).expect("stock state"),
+                                    "{label}: persisted rows"
+                                );
+                                let integrity: String = stored
+                                    .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                                    .expect("integrity check");
+                                assert_eq!(integrity, "ok", "{label}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
