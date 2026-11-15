@@ -23,6 +23,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use tracing::{debug, info, warn};
 
+use crate::host_fs;
 use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
     WAL_CKPT_LOCK, WAL_TOTAL_LOCKS, WAL_WRITE_LOCK,
@@ -1561,15 +1562,18 @@ impl Vfs for WindowsVfs {
         Ok(())
     }
 
-    fn sync_parent_directory(&self, _cx: &Cx, _path: &Path) -> Result<()> {
-        // Win32 does not expose a portable fsync-directory operation. SQLite's
-        // own Windows VFS establishes journal create/delete durability through
-        // FlushFileBuffers on the journal handle, which `WindowsFile::sync_all`
-        // performs before this hook is reached. Keep the namespace hook an
-        // explicit no-op rather than attempting FlushFileBuffers on a directory
-        // handle (unsupported on common filesystems and liable to return
-        // ERROR_INVALID_HANDLE).
-        Ok(())
+    fn sync_parent_directory(&self, _cx: &Cx, path: &Path) -> Result<()> {
+        // Best-effort attempt to flush the parent directory after a
+        // rename-over commit. This is not a documented Win32
+        // crash-durability guarantee.
+        // The helper opens the directory with `FILE_FLAG_BACKUP_SEMANTICS` +
+        // `GENERIC_WRITE` and flushes it; this succeeds on NTFS (non-admin,
+        // measured), but Windows publishes no Win32 contract that a
+        // directory-handle flush persists the namespace entry across a crash
+        // or power loss. A read-only handle fails with
+        // `ERROR_ACCESS_DENIED`, so the helper does not request read access.
+        // See `host_fs::sync_directory_handle` for the contract caveat.
+        host_fs::sync_parent_directory(path)
     }
 
     fn access(&self, _cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {

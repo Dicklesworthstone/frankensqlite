@@ -138,6 +138,71 @@ pub mod host_fs {
         open_existing_regular_file_with_access(path, false)
     }
 
+    /// Flush a directory's own entry to stable storage.
+    ///
+    /// The caller passes a directory path; that directory is the one whose
+    /// namespace entry must reach the disk. On Unix, opening the directory
+    /// read-only and calling `sync_all()` is the portable, well-supported
+    /// operation. On Windows this is an empirically verified best-effort
+    /// attempt: a directory handle opened with `FILE_FLAG_BACKUP_SEMANTICS`
+    /// and `GENERIC_WRITE` accepts `FlushFileBuffers` on NTFS (non-admin,
+    /// measured here), while a read-only handle fails with
+    /// `ERROR_ACCESS_DENIED`. `FlushFileBuffers` only requires
+    /// `GENERIC_WRITE`, so no read access is requested — asking for read as
+    /// well could make a directory that an ACL denies reads to fail to flush.
+    ///
+    /// Windows has no published Win32 contract that flushing a directory
+    /// handle persists a namespace entry across a crash or power loss:
+    /// `FlushFileBuffers` documents the `GENERIC_WRITE` requirement but not a
+    /// directory-durability guarantee, the "Directory Handles" documentation
+    /// does not list it among the supported directory operations, and MS-FSA
+    /// §2.1.5.7 describes filesystem-implementer semantics rather than an
+    /// application contract. A successful return therefore means the call
+    /// completed, not that crash durability was proven. This is a
+    /// best-effort attempt to make the Windows side do what the POSIX side
+    /// already does; callers on filesystems that reject the open or the flush
+    /// get the I/O error propagated.
+    #[cfg(any(unix, windows))]
+    pub fn sync_directory_handle(directory: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            File::open(directory)?.sync_all()?;
+        }
+        #[cfg(windows)]
+        {
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            let handle = OpenOptions::new()
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(directory)?;
+            // Best-effort directory flush: reached through `sync_all()`, which
+            // calls `FlushFileBuffers` on this handle. Verified to succeed on
+            // NTFS, but not a documented Win32 durability contract (see the
+            // function docs) — a success here is not a crash-durability proof.
+            handle.sync_all()?;
+            // `handle` is dropped here, closing the directory handle.
+            let _ = handle;
+        }
+        Ok(())
+    }
+
+    /// Flush the parent directory of a file path to stable storage.
+    ///
+    /// A `rename`-over commit (the atomic-replace pattern used across the engine)
+    /// only reaches the disk's namespace once the *directory* holding the file is
+    /// persisted. This mirrors the engine's POSIX `sync_parent_directory` path,
+    /// which already fsyncs the parent on Unix. The Windows half is
+    /// best-effort, with the contract caveat described on
+    /// `sync_directory_handle`.
+    #[cfg(any(unix, windows))]
+    pub fn sync_parent_directory(path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_directory_handle(parent)
+    }
+
     /// Open an existing, identity-checked WAL for synchronous guarded repair.
     ///
     /// Never creates, truncates, or replaces a file. The caller must retain the
