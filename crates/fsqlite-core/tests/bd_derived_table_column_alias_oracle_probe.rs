@@ -231,3 +231,164 @@ fn join_and_derived_table_projections_match_rusqlite_oracle() {
         );
     });
 }
+
+/// bd-w4pr1.12 levers W3 and A1. A1: an aggregate with no GROUP BY over a
+/// derived table or a join keeps the input rows as one group in input order
+/// instead of sorting them by an empty key, so every query below folds
+/// order-dependent aggregates (group_concat, REAL sums whose last bits depend
+/// on the addition order, DISTINCT first occurrences) over window results and
+/// joins, plus empty input, HAVING without GROUP BY, FILTER and mixed types.
+/// A group built in any other order changes a concatenation or a REAL sum.
+/// W3: result rows reach a row sink through one reused buffer; the window
+/// scans above use the flat sink, and `query_with_params_for_each` the handler
+/// sink, whose rows are compared here too, including a callback that fails
+/// mid-statement and a statement run after it. File-backed and `:memory:`.
+#[test]
+fn ungrouped_aggregates_and_streamed_rows_match_rusqlite_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("a1.db");
+        let file = Connection::open(path.to_str().expect("utf-8 path"))
+            .await
+            .unwrap();
+        let memory = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut p_rows = Vec::new();
+        let mut q_rows = Vec::new();
+        for i in 1..=400_i64 {
+            let k = match i % 5 {
+                0 => "NULL".to_owned(),
+                1 => format!("{}", i % 7),
+                2 => format!("{}.5", i % 7),
+                3 => format!("'k{}'", i % 7),
+                _ => format!("x'{:02x}'", i % 7),
+            };
+            let c = if i % 6 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}.1", i % 13)
+            };
+            p_rows.push(format!("({i}, {}, 'b{}', {c}, {k})", i % 9, i % 4));
+            if i % 3 != 0 {
+                q_rows.push(format!("({i}, {}, 'q{}')", i % 11, i % 5));
+            }
+        }
+        let setup = [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, k)".to_owned(),
+            "CREATE TABLE q(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)".to_owned(),
+            "CREATE TABLE m(id INTEGER PRIMARY KEY, v)".to_owned(),
+            format!("INSERT INTO p VALUES {}", p_rows.join(", ")),
+            format!("INSERT INTO q VALUES {}", q_rows.join(", ")),
+            "INSERT INTO m VALUES (1, 1), (2, 1.0), (3, -0.0), (4, 0.0), (5, 0), (6, NULL), \
+             (7, 'a'), (8, x'00'), (9, 2.5), (10, 'A')"
+                .to_owned(),
+        ];
+        for s in &setup {
+            file.execute(s).await.unwrap();
+            memory.execute(s).await.unwrap();
+            r.execute(s, []).unwrap();
+        }
+        let rn = "SELECT id, a, c, k, row_number() OVER (ORDER BY id) rn FROM p";
+        let queries = [
+            format!("SELECT count(*), group_concat(rn, ','), total(rn * 0.1) FROM ({rn})"),
+            format!("SELECT group_concat(c, ';'), sum(c), total(c * 0.3), avg(c) FROM ({rn})"),
+            "SELECT group_concat(s, ' '), sum(s), total(s) FROM (SELECT sum(c) OVER (ORDER BY id \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) s FROM p WHERE id <= 90)"
+                .to_owned(),
+            format!(
+                "SELECT count(*), sum(rn), group_concat(rn), max(rn), total(rn) FROM ({rn} WHERE id < 0)"
+            ),
+            format!("SELECT count(*), sum(rn) FROM ({rn}) HAVING count(*) > 1000"),
+            format!("SELECT count(*), sum(rn) FROM ({rn}) HAVING sum(rn) > 0"),
+            format!(
+                "SELECT count(*) FILTER (WHERE rn % 3 = 0), count(DISTINCT rn % 7), \
+                 group_concat(DISTINCT rn % 5), sum(c) FILTER (WHERE a > 4) FROM ({rn})"
+            ),
+            format!(
+                "SELECT count(k), group_concat(typeof(k)), min(k), max(k), count(DISTINCT k) FROM ({rn})"
+            ),
+            "SELECT count(DISTINCT v), group_concat(v, '|'), group_concat(typeof(v)), sum(v), \
+             total(v) FROM (SELECT v, row_number() OVER (ORDER BY id) n FROM m)"
+                .to_owned(),
+            "SELECT count(*), sum(s), group_concat(s) FROM (SELECT sum(a) OVER (PARTITION BY a) s \
+             FROM p WHERE id <= 30)"
+                .to_owned(),
+            "SELECT count(*), sum(p.a), total(q.a * 0.1), sum(id) FROM p JOIN q USING (id)".to_owned(),
+            "SELECT count(*), total(p.c * 0.7), max(q.b) FROM p LEFT JOIN q USING (id, a)".to_owned(),
+            "SELECT count(*), group_concat(b) FROM (SELECT b FROM p WHERE a > 6)".to_owned(),
+        ];
+        let mut diffs = Vec::new();
+        for (label, conn) in [("file", &file), ("memory", &memory)] {
+            for q in &queries {
+                let fr = norm(fq(conn, q).await);
+                let rr = norm(rq(&r, q));
+                if fr != rr {
+                    diffs.push(format!(
+                        "  [{label}] `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            }
+        }
+
+        // The handler sink: rows streamed through query_with_params_for_each.
+        let streamed = [
+            "SELECT id, b, c, k FROM p WHERE id % 7 = 3 ORDER BY id",
+            "SELECT p.id, q.b, p.k FROM p JOIN q ON q.id = p.id WHERE p.id < 60 ORDER BY p.id",
+            "SELECT id, v, typeof(v) FROM m ORDER BY id",
+            "SELECT count(*), sum(c) FROM p",
+            "SELECT id FROM p WHERE id < 0",
+        ];
+        for (label, conn) in [("file", &file), ("memory", &memory)] {
+            for q in streamed {
+                let mut rows: Vec<Vec<String>> = Vec::new();
+                conn.query_with_params_for_each(q, &[], |row| {
+                    rows.push(row.values().iter().map(tag_f).collect());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+                let rr = rq(&r, q);
+                if rows != rr {
+                    diffs.push(format!(
+                        "  [{label} streamed] `{q}`\n     frank= {rows:?}\n     stock= {rr:?}"
+                    ));
+                }
+            }
+            // A callback that fails on the third row stops the statement with
+            // its error; the next statement streams its own rows only.
+            let mut seen = 0_usize;
+            let err = conn
+                .query_with_params_for_each("SELECT id, b FROM p ORDER BY id", &[], |_row| {
+                    seen += 1;
+                    if seen == 3 {
+                        return Err(fsqlite_error::FrankenError::internal("callback stop"));
+                    }
+                    Ok(())
+                })
+                .await
+                .expect_err("a failing callback stops the statement");
+            assert!(err.to_string().contains("callback stop"), "[{label}] {err:?}");
+            assert_eq!(seen, 3, "[{label}] no row is handed over after the failure");
+            let mut after: Vec<Vec<String>> = Vec::new();
+            let q = "SELECT id, k FROM p WHERE id <= 6 ORDER BY id";
+            conn.query_with_params_for_each(q, &[], |row| {
+                after.push(row.values().iter().map(tag_f).collect());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let rr = rq(&r, q);
+            if after != rr {
+                diffs.push(format!(
+                    "  [{label} after a failed callback] `{q}`\n     frank= {after:?}\n     stock= {rr:?}"
+                ));
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} ungrouped-aggregate / streamed-row divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

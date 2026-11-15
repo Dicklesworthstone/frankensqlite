@@ -90183,7 +90183,18 @@ impl Connection {
             std::cmp::Ordering::Equal
         };
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
-        if !group_by_exprs.is_empty() && group_keys_support_hash_grouping(&group_collations) {
+        if group_by_exprs.is_empty() {
+            // No GROUP BY: every row belongs to the one group, in input order,
+            // and no input still makes the one (empty) group whose aggregates
+            // take their defaults (COUNT -> 0, ...). Sorting the rows by their
+            // empty keys built the same group: the stable sort kept the input
+            // order and every key equalled the one before it (bd-w4pr1.12,
+            // lever A1).
+            groups.push((
+                Vec::new(),
+                join_rows.into_iter().map(|row| row.values).collect(),
+            ));
+        } else if group_keys_support_hash_grouping(&group_collations) {
             let mut group_index: HashMap<HashableJoinKey, usize> = HashMap::new();
             for row in join_rows {
                 let row_values = row.values;
@@ -90241,11 +90252,6 @@ impl Connection {
                 }
                 groups.push((key, vec![row_values]));
             }
-        }
-        // Implicit aggregation (no GROUP BY): empty input must still
-        // produce one row with default aggregate values (COUNT→0, etc.).
-        if groups.is_empty() && group_by_exprs.is_empty() {
-            groups.push((Vec::new(), Vec::new()));
         }
 
         // bd-xik4y: when the query's only aggregate is a single min()/max() and
