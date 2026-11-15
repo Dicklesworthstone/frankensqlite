@@ -78124,15 +78124,16 @@ impl Connection {
         flattened
     }
 
-    /// An EXISTS probe needs only its first row, so one without a LIMIT of
-    /// its own runs with `LIMIT 1` and stops there, as stock's does (a row
-    /// past the first that would raise an error is never evaluated). bd-8c68u:
-    /// a nested-loop join the VDBE compiles refuses a LIMIT, which would route
-    /// the probe to the materializing join executor and scan both tables, so
-    /// such a probe stays unlimited; a lookup join compiles the LIMIT 1 and
-    /// stops at its first row (bd-9gl3w). bd-b887p: shared by the per-row
-    /// probe and the fold of an uncorrelated EXISTS.
-    fn limit_exists_probe_to_its_first_row(&self, probe: &mut SelectStatement) {
+    /// An EXISTS probe or a scalar subquery needs only its first row, so one
+    /// without a LIMIT of its own runs with `LIMIT 1` and stops there, as
+    /// stock's does (a row past the first that would raise an error is never
+    /// evaluated). bd-8c68u: a nested-loop join the VDBE compiles refuses a
+    /// LIMIT, which would route the probe to the materializing join executor
+    /// and scan both tables, so such a probe stays unlimited; a lookup join
+    /// compiles the LIMIT 1 and stops at its first row (bd-9gl3w). bd-b887p:
+    /// shared by the per-row probes and the folds of uncorrelated EXISTS;
+    /// bd-wp9s1: and of scalar subqueries.
+    fn limit_probe_to_its_first_row(&self, probe: &mut SelectStatement) {
         if probe.limit.is_some() {
             return;
         }
@@ -94289,6 +94290,8 @@ impl Connection {
                     // statement seeks instead of scanning once per outer row.
                     self.flatten_correlated_probe_source(&mut sub_clone);
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
+                    // bd-wp9s1: only the first row is read.
+                    self.limit_probe_to_its_first_row(&mut sub_clone);
                     // BoundOuterValue display intentionally omits affinity and
                     // collation metadata, so its SQL text cannot identify a
                     // reusable program or planner directive. Recompile this
@@ -94349,7 +94352,7 @@ impl Connection {
                     // the linear scan probe above never takes the flattened table.
                     self.flatten_correlated_probe_source(&mut sub_clone);
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
-                    self.limit_exists_probe_to_its_first_row(&mut sub_clone);
+                    self.limit_probe_to_its_first_row(&mut sub_clone);
                     // bd-ry6x7: a parameterized probe (a trigger WHEN guard)
                     // is identified by its text and reuses its program.
                     let _cache_guard = BoolCellRestoreGuard::new(
@@ -104911,8 +104914,11 @@ impl Connection {
                         // compares affinity-less (0 instead of SQLite's 1).
                         let folded_affinity =
                             scalar_subquery_result_affinity(sub, &self.schema.borrow());
+                        // bd-wp9s1: only the first row is read.
+                        let mut probe = (**sub).clone();
+                        self.limit_probe_to_its_first_row(&mut probe);
                         let rows = self
-                            .execute_statement(&Statement::Select((**sub).clone()), params)
+                            .execute_statement(&Statement::Select(probe), params)
                             .await?;
                         let val = rows
                             .into_iter()
@@ -104941,7 +104947,7 @@ impl Connection {
                     if !is_correlated_subquery_with_schema(subquery, &self.schema.borrow()) {
                         let mut probe = (**subquery).clone();
                         strip_exists_subquery_projection(&mut probe);
-                        self.limit_exists_probe_to_its_first_row(&mut probe);
+                        self.limit_probe_to_its_first_row(&mut probe);
                         let rows = self
                             .execute_statement(&Statement::Select(probe), params)
                             .await?;
@@ -105474,6 +105480,7 @@ impl Connection {
                     // donor keeps the subquery's own result metadata.
                     self.flatten_correlated_probe_source(&mut bound_subquery);
                     self.relax_correlated_exists_equalities_for_seek(&mut bound_subquery);
+                    self.limit_probe_to_its_first_row(&mut bound_subquery);
                     // As for a scalar subquery in eval_expr_with_subqueries: a
                     // parameterized one without BoundOuterValue leaves is
                     // identified by its text and reuses its program.
@@ -105556,6 +105563,7 @@ impl Connection {
                     // bd-kef4m: seek, as in eval_expr_with_subqueries.
                     self.flatten_correlated_probe_source(&mut sub_clone);
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
+                    self.limit_probe_to_its_first_row(&mut sub_clone);
                     let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(sub_clone), None)
@@ -105583,7 +105591,7 @@ impl Connection {
                     // bd-kef4m: seek, as in eval_expr_with_subqueries.
                     self.flatten_correlated_probe_source(&mut sub_clone);
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
-                    self.limit_exists_probe_to_its_first_row(&mut sub_clone);
+                    self.limit_probe_to_its_first_row(&mut sub_clone);
                     let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(sub_clone), None)
@@ -132890,7 +132898,7 @@ fn rewrite_in_expr<'a>(
                 }
                 // bd-b887p: only whether a first row exists matters.
                 let mut probe = *subquery.clone();
-                conn.limit_exists_probe_to_its_first_row(&mut probe);
+                conn.limit_probe_to_its_first_row(&mut probe);
                 let rows = conn
                     .execute_statement(&Statement::Select(probe), params)
                     .await?;
@@ -132938,8 +132946,11 @@ fn rewrite_in_expr<'a>(
                 // affinity) whenever the subquery has a derivable affinity;
                 // resolve_operand_affinity already reads it back first.
                 let folded_affinity = scalar_subquery_result_affinity(sub, &conn.schema.borrow());
+                // bd-wp9s1: only the first row is read.
+                let mut probe = *sub.clone();
+                conn.limit_probe_to_its_first_row(&mut probe);
                 let rows = conn
-                    .execute_statement(&Statement::Select(*sub.clone()), params)
+                    .execute_statement(&Statement::Select(probe), params)
                     .await?;
                 let val = rows
                     .into_iter()

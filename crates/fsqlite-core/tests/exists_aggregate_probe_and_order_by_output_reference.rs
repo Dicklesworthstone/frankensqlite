@@ -299,6 +299,42 @@ fn folded_exists_conjuncts_keep_their_answers() {
     });
 }
 
+/// bd-wp9s1: a scalar subquery reads only its first row, uncorrelated (folded
+/// once) or correlated, so a later row whose WHERE would raise an error is
+/// never evaluated, as in stock. ORDER BY, LIMIT / OFFSET, an aggregate and an
+/// empty subquery keep their answers.
+#[test]
+fn scalar_subquery_reads_only_its_first_row() {
+    asupersync::test_utils::run_test(|| async {
+        let past_first = "CASE WHEN x = 2 THEN abs(-9223372036854775807 - 1) ELSE 1 END";
+        assert_matches_sqlite(
+            &format!("SELECT (SELECT x FROM kx WHERE {past_first})"),
+            &[&["1"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            &format!("SELECT count(*) FROM oc WHERE z = (SELECT x FROM kx WHERE {past_first})"),
+            &[&["1"]],
+        )
+        .await;
+        // Correlated: the first row in key or rowid order (x = 1) qualifies
+        // for every outer row, so no plan reaches x = 5.
+        assert_matches_sqlite(
+            "SELECT z, (SELECT k2.x FROM kx AS k2 WHERE k2.x <= oc.z \
+             AND CASE WHEN k2.x = 5 THEN abs(-9223372036854775807 - 1) ELSE 1 END) \
+             FROM oc WHERE z IS NOT NULL ORDER BY z",
+            &[&["1", "1"], &["2", "1"], &["3", "1"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            "SELECT (SELECT x FROM kx ORDER BY x DESC), (SELECT x FROM kx LIMIT 1 OFFSET 1), \
+             (SELECT count(*) FROM kx), (SELECT x FROM kx WHERE x > 100)",
+            &[&["5", "2", "3", "NULL"]],
+        )
+        .await;
+    });
+}
+
 /// GH#427: a correlated EXISTS in the result list over an aggregate subquery
 /// is true for every outer row, like the WHERE-clause form above.
 #[test]
