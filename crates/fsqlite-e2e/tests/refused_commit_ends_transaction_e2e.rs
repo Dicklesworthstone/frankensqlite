@@ -21,6 +21,17 @@
 //! The negative case: a retryable `Busy` at COMMIT (another fsqlite process
 //! holds the write lock with BEGIN IMMEDIATE) keeps the transaction open, and a
 //! second COMMIT succeeds once the holder is done.
+//!
+//! bd-reality-check-1022-llk6g.5.5: a transaction open while a STOCK process
+//! commits. The file starts with no `-wal`; the fsqlite connection creates one
+//! with no frames, and stock's first commit into a frame-less WAL writes a new
+//! header with fresh salts on the same inode. On main cdb079ffa every COMMIT
+//! of the open transaction then returned "database is busy (recovery in
+//! progress)", forever, and its row was lost; 1e0b54d7d made it a single
+//! BusySnapshot that ends the transaction. The transaction read no WAL frame,
+//! so its COMMIT must decide like any other: commit when the peer wrote other
+//! pages, refuse once with BusySnapshot (and end the transaction) when the
+//! peer wrote the same page. An fsqlite peer keeps committing.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -33,6 +44,7 @@ const SQLITE_BUSY: i32 = 5;
 const SQLITE_BUSY_SNAPSHOT: i32 = 517;
 const HOLDER_ENV: &str = "FSQLITE_REFUSED_COMMIT_HOLDER";
 const STOCK_HOLDER_ENV: &str = "FSQLITE_REFUSED_COMMIT_STOCK_HOLDER";
+const PEER_ENV: &str = "FSQLITE_OPEN_TRANSACTION_PEER";
 
 struct HolderGuard(Option<Child>);
 
@@ -556,4 +568,315 @@ fn stock_peer_commit_does_not_leave_a_retryable_recovery_loop() {
         vec![(1, "seed".to_owned()), (2, "retried".to_owned())]
     );
     assert_eq!(stock_integrity(&db), "ok");
+}
+
+fn wal_path(db: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", db.display()))
+}
+
+/// The WAL header's salts (bytes 16..24); `None` while there is no header.
+fn wal_salts(db: &Path) -> Option<[u8; 8]> {
+    let bytes = std::fs::read(wal_path(db)).ok()?;
+    bytes
+        .get(16..24)
+        .map(|salts| salts.try_into().expect("eight salt bytes"))
+}
+
+fn stock_h(db: &Path) -> i64 {
+    rusqlite::Connection::open(db)
+        .expect("stock open")
+        .query_row("SELECT v FROM h WHERE id = 1", [], |row| row.get(0))
+        .expect("h row")
+}
+
+/// The peer process for the open-transaction cases: one write transaction,
+/// `BEGIN IMMEDIATE; <sql>; COMMIT`, through stock SQLite (rusqlite) or
+/// fsqlite, committed while the parent's transaction is open. It reports
+/// `committed` and keeps its connection open until the parent reports `done`,
+/// so its close cannot checkpoint or reset the WAL under the parent's COMMIT.
+#[test]
+fn open_transaction_peer_child() {
+    let Ok(spec) = std::env::var(PEER_ENV) else {
+        return;
+    };
+    let mut parts = spec.splitn(4, '|');
+    let mut field = |name: &str| {
+        parts
+            .next()
+            .unwrap_or_else(|| panic!("peer spec lacks {name}"))
+            .to_owned()
+    };
+    let (engine, db, dir, sql) = (field("engine"), field("db"), field("dir"), field("sql"));
+    let dir = PathBuf::from(dir);
+    match engine.as_str() {
+        "stock" => {
+            let peer = rusqlite::Connection::open(&db).expect("stock peer open");
+            peer.busy_timeout(Duration::from_secs(5))
+                .expect("stock busy_timeout");
+            peer.execute_batch(&format!("BEGIN IMMEDIATE; {sql}; COMMIT;"))
+                .expect("stock peer commit");
+            std::fs::write(dir.join("committed"), b"").expect("committed");
+            assert!(
+                wait_for(&dir.join("done"), Duration::from_secs(120)),
+                "parent never finished"
+            );
+            drop(peer);
+        }
+        "fsqlite" => asupersync::test_utils::run_test(|| async move {
+            let peer = Connection::open(&db).await.expect("fsqlite peer open");
+            peer.execute("PRAGMA busy_timeout=5000")
+                .await
+                .expect("fsqlite busy_timeout");
+            peer.execute("BEGIN IMMEDIATE")
+                .await
+                .expect("fsqlite peer BEGIN IMMEDIATE");
+            peer.execute(&sql).await.expect("fsqlite peer write");
+            peer.execute("COMMIT").await.expect("fsqlite peer COMMIT");
+            std::fs::write(dir.join("committed"), b"").expect("committed");
+            assert!(
+                wait_for(&dir.join("done"), Duration::from_secs(120)),
+                "parent never finished"
+            );
+            peer.close().await.expect("fsqlite peer close");
+        }),
+        other => panic!("unknown peer engine {other}"),
+    }
+}
+
+/// Tells the peer to close however the parent's run ends, so a failed run
+/// does not leave it waiting.
+struct ReleasePeer(PathBuf);
+
+impl Drop for ReleasePeer {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.0.join("done"), b"");
+    }
+}
+
+struct OpenAcrossPeerCommit {
+    _dir: tempfile::TempDir,
+    db: PathBuf,
+    /// The WAL header salts just before and just after the peer's commit.
+    wal_salts: (Option<[u8; 8]>, Option<[u8; 8]>),
+    commit: Result<(), FrankenError>,
+    open_after_commit: bool,
+    /// What a second COMMIT reported, when the first was refused.
+    second_commit: Option<String>,
+    fsqlite_ids: Vec<i64>,
+}
+
+/// An fsqlite connection opens a WAL database that has no `-wal` (so it
+/// creates one with no frames) and runs `BEGIN; INSERT INTO t (2)`. A peer
+/// process (`engine`) then commits `peer_sql`; the parent's COMMIT follows.
+fn open_transaction_across_peer_commit(engine: &str, peer_sql: &str) -> OpenAcrossPeerCommit {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("open.db");
+    rusqlite::Connection::open(&db)
+        .expect("seed open")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, w INTEGER NOT NULL, s TEXT NOT NULL);
+             CREATE TABLE h(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+             INSERT INTO t VALUES (1, 0, 'seed');
+             INSERT INTO h VALUES (1, 0);",
+        )
+        .expect("seed");
+    assert!(
+        !wal_path(&db).exists(),
+        "the seed's last close checkpoints and removes its WAL"
+    );
+    let path = db.to_str().expect("utf8 path").to_owned();
+    let work = dir.path().to_path_buf();
+    let spec = format!("{engine}|{}|{}|{peer_sql}", db.display(), work.display());
+    let mut peer = None;
+    let mut observed = None;
+    let (peer_slot, observed_slot) = (&mut peer, &mut observed);
+    let db_for_salts = db.clone();
+    asupersync::test_utils::run_test(|| async move {
+        let _release = ReleasePeer(work.clone());
+        let conn = Connection::open(&path).await.expect("open");
+        conn.execute("PRAGMA busy_timeout=1000")
+            .await
+            .expect("busy_timeout");
+        conn.execute("BEGIN").await.expect("BEGIN");
+        conn.execute("INSERT INTO t VALUES (2, 1, 'fsqlite')")
+            .await
+            .expect("INSERT before the peer commits");
+        let before = wal_salts(&db_for_salts);
+        let child = peer_slot.insert(
+            Command::new(std::env::current_exe().expect("test binary path"))
+                .args([
+                    "--exact",
+                    "open_transaction_peer_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(PEER_ENV, &spec)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn peer"),
+        );
+        let started = Instant::now();
+        while !work.join("committed").exists() {
+            assert!(
+                child.try_wait().expect("peer status").is_none(),
+                "the peer exited before committing"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "the peer never committed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let after = wal_salts(&db_for_salts);
+        let commit = conn.execute("COMMIT").await.map(|_| ());
+        let open_after_commit = conn.in_transaction();
+        let second_commit = if commit.is_err() {
+            conn.execute("COMMIT")
+                .await
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
+        if conn.in_transaction() {
+            conn.execute("ROLLBACK")
+                .await
+                .expect("ROLLBACK the transaction the refusal left open");
+        }
+        let ids = fsqlite_ids(&conn).await;
+        conn.close().await.expect("close");
+        *observed_slot = Some((
+            (before, after),
+            commit,
+            open_after_commit,
+            second_commit,
+            ids,
+        ));
+    });
+    let (wal_salts, commit, open_after_commit, second_commit, fsqlite_ids) =
+        observed.expect("the parent ran to completion");
+    let output = peer
+        .expect("peer spawned")
+        .wait_with_output()
+        .expect("peer output");
+    assert!(
+        output.status.success(),
+        "peer failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    OpenAcrossPeerCommit {
+        _dir: dir,
+        db,
+        wal_salts,
+        commit,
+        open_after_commit,
+        second_commit,
+        fsqlite_ids,
+    }
+}
+
+/// The stock peer's commit is what started a new WAL generation in place:
+/// without it these cases would not reach the defect.
+fn assert_generation_started_in_place(run: &OpenAcrossPeerCommit) {
+    let (before, after) = run.wal_salts;
+    assert!(
+        before.is_some() && after.is_some() && before != after,
+        "shape: the fsqlite connection's frame-less WAL got a new header from the stock \
+         commit: {before:?} -> {after:?}"
+    );
+}
+
+/// The stock peer wrote another table: the open transaction read no WAL
+/// frame and wrote no page the peer wrote, so its COMMIT commits, at once.
+/// 1e0b54d7d answered BusySnapshot here and ended the transaction.
+#[test]
+fn transaction_open_across_a_stock_commit_on_another_table_commits() {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    let run = open_transaction_across_peer_commit("stock", "UPDATE h SET v = v + 1 WHERE id = 1");
+    assert_generation_started_in_place(&run);
+    if let Err(error) = &run.commit {
+        panic!("COMMIT after a stock commit on another table must commit, got {error:?}");
+    }
+    assert!(!run.open_after_commit);
+    assert_eq!(run.fsqlite_ids, vec![1, 2]);
+    assert_eq!(
+        stock_rows(&run.db),
+        vec![(1, "seed".to_owned()), (2, "fsqlite".to_owned())],
+        "a fresh stock connection sees the committed row"
+    );
+    assert_eq!(stock_h(&run.db), 1, "the stock peer's commit is durable");
+    assert_eq!(stock_integrity(&run.db), "ok");
+}
+
+/// Negative case: the stock peer wrote the same leaf page of `t`. The
+/// generation change must not let the stale page through: COMMIT is refused
+/// once with BusySnapshot, the transaction ends (.5.1), and the peer's row is
+/// the one that survives. A fix that rebinds without the page check fails
+/// here, and so does one whose page check reads the image through the
+/// transaction's pinned snapshot (observed: the COMMIT committed over the
+/// peer's row).
+#[test]
+fn transaction_open_across_a_stock_commit_on_the_same_page_is_refused_once() {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    let run = open_transaction_across_peer_commit("stock", "INSERT INTO t VALUES (3, 2, 'stock')");
+    assert_generation_started_in_place(&run);
+    let error = match &run.commit {
+        Ok(()) => panic!("a same-page stock commit must refuse the stale page"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, FrankenError::BusySnapshot { .. }),
+        "the refusal must be the snapshot conflict, got {error:?}"
+    );
+    assert_eq!(error.extended_error_code(), SQLITE_BUSY_SNAPSHOT);
+    assert!(
+        !run.open_after_commit,
+        "a COMMIT refused with BusySnapshot ends its transaction"
+    );
+    let second = run.second_commit.as_deref().unwrap_or("");
+    assert!(
+        second.contains("no transaction is active"),
+        "the refusal is reported once; a second COMMIT finds no transaction, got {second:?}"
+    );
+    assert_eq!(run.fsqlite_ids, vec![1, 3]);
+    assert_eq!(
+        stock_rows(&run.db),
+        vec![(1, "seed".to_owned()), (3, "stock".to_owned())],
+        "the peer's row survives and the refused row is absent"
+    );
+    assert_eq!(stock_h(&run.db), 0);
+    assert_eq!(stock_integrity(&run.db), "ok");
+}
+
+/// Negative case: an fsqlite peer in the same shape. Its commit appends to
+/// the generation the parent's snapshot already names, and the parent's
+/// COMMIT commits, as it did before this change.
+#[test]
+fn transaction_open_across_an_fsqlite_commit_on_another_table_commits() {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    let run = open_transaction_across_peer_commit("fsqlite", "UPDATE h SET v = v + 1 WHERE id = 1");
+    if let Err(error) = &run.commit {
+        panic!(
+            "COMMIT after an fsqlite commit on another table must commit, got {error:?} \
+             (WAL salts {:?})",
+            run.wal_salts
+        );
+    }
+    assert!(!run.open_after_commit);
+    assert_eq!(run.fsqlite_ids, vec![1, 2]);
+    assert_eq!(
+        stock_rows(&run.db),
+        vec![(1, "seed".to_owned()), (2, "fsqlite".to_owned())]
+    );
+    assert_eq!(stock_h(&run.db), 1);
+    assert_eq!(stock_integrity(&run.db), "ok");
 }

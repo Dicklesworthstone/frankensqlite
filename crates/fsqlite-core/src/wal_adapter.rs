@@ -631,6 +631,23 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             || !self.pending_publication_frames.is_empty()
     }
 
+    /// Whether this handle's retained native read claim admits no WAL frame.
+    ///
+    /// The pinned snapshot then reads every page from the database file
+    /// (`pinned_page_read` answers `NoFrame`), and while the claim is held no
+    /// checkpoint can backfill past its empty horizon. So the file is still
+    /// the snapshot's image, and every frame in the WAL now on disk, whatever
+    /// its generation, was committed after the snapshot.
+    fn native_read_admits_no_wal_frame(&self) -> bool {
+        self.native_read_binding
+            .as_ref()
+            .is_some_and(|binding| binding.boundary().maximum_wal_frame == 0)
+            && self
+                .read_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.last_commit_frame.is_none())
+    }
+
     /// Attach publication to the pager's exact main-file SHM capability.
     ///
     /// This performs no mapping, reader admission, recovery, or publication.
@@ -4527,7 +4544,17 @@ where
                 continue;
             }
 
-            let current_page = match self.inner.read_page(cx, page_number).await {
+            // The newest committed image, read from the appended tail: this
+            // runs under the append gate, after the preflight refreshed the
+            // handle. `read_page` would resolve through the transaction's
+            // pinned snapshot, which is still pinned at COMMIT, and so would
+            // return the very image the baseline holds and miss the peer's
+            // newer commit of the page (bd-reality-check-1022-llk6g.5.5).
+            let current_page = match self
+                .inner
+                .read_page_at_appended_tail(cx, page_number)
+                .await
+            {
                 Ok(Some(page)) if page.len() == page_size => page,
                 Ok(Some(_)) | Err(_) => {
                     conflicts.push(page_number);
@@ -4679,7 +4706,10 @@ where
     }
 
     /// Validate an attached native descriptor without creating or replacing it.
-    /// Existing-path rebinding belongs to fresh read/recovery admission only.
+    /// Existing-path rebinding belongs to fresh read/recovery admission only,
+    /// except for an append whose snapshot read no WAL frame, which may follow
+    /// a generation started in place on the same file
+    /// ([`Self::rebind_append_to_in_place_generation`]).
     ///
     /// `for_append`: frames written through a handle whose path no longer
     /// names a file land in an unlinked inode — acknowledged, then lost
@@ -4723,6 +4753,9 @@ where
     /// Refuse that snapshot so the connection can retire the pin and retry
     /// from fresh read admission. An unresolved physical publication still
     /// owns its original generation and must retain its recovery obligation.
+    /// A pin that read no WAL frame is rebound instead
+    /// ([`Self::rebind_append_to_in_place_generation`]); this refusal covers
+    /// every pin that cannot be.
     fn native_wal_path_mismatch(&self, for_append: bool) -> FrankenError {
         if for_append
             && self.inner.native_read_binding.is_some()
@@ -4766,6 +4799,13 @@ where
         // documents as unsupported, not cover for an interop defect.
         match self.current_handle_names_wal_path(cx, false, None).await? {
             Some(true) => return Ok(()),
+            Some(false)
+                if for_append
+                    && self.inner.native_read_admits_no_wal_frame()
+                    && !self.inner.has_pending_publication() =>
+            {
+                return self.rebind_append_to_in_place_generation(cx).await;
+            }
             Some(false) => return Err(self.native_wal_path_mismatch(for_append)),
             None => {}
         }
@@ -4800,6 +4840,34 @@ where
             (Err(validation), Err(close)) => Err(FrankenError::internal(format!(
                 "native WAL path validation and close failed: validation={validation}; close={close}"
             ))),
+        }
+    }
+
+    /// bd-reality-check-1022-llk6g.5.5: rebind an append to the WAL generation
+    /// another writer started in place, in the one shape where that is sound.
+    ///
+    /// A WAL with no frames gets a new header from its next writer. Stock's
+    /// first commit into it writes one with fresh salts on the same inode, so
+    /// a transaction that began before that commit finds the path naming its
+    /// own descriptor under a header it has never seen. Refusing it
+    /// ([`Self::native_wal_path_mismatch`]) ends a transaction that the same
+    /// commit would have let through had the WAL held a frame when it began,
+    /// or had the peer been an fsqlite process appending to the old header.
+    ///
+    /// The caller has established that the transaction's read claim admits no
+    /// WAL frame ([`WalBackendAdapter::native_read_admits_no_wal_frame`]):
+    /// nothing it read came from the replaced generation, and every frame of
+    /// the new one is a commit made after its snapshot. The refreshed handle
+    /// lets the append's preflight bind that generation's published prefix.
+    /// The conflict check then sees the generation change and compares each
+    /// written page's snapshot image with its newest committed one
+    /// ([`Self::conflicts_after_generation_change`]), so a page the peer
+    /// changed is still refused with `BusySnapshot`.
+    async fn rebind_append_to_in_place_generation(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal.refresh(cx).await?;
+        match self.current_handle_names_wal_path(cx, false, None).await? {
+            Some(true) => Ok(()),
+            Some(false) | None => Err(self.native_wal_path_mismatch(true)),
         }
     }
 
