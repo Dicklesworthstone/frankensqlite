@@ -1313,6 +1313,7 @@ dependencies = [
  "fsqlite-types",
  "json5",
  "memchr",
+ "rusqlite",
  "serde",
  "serde_json",
 ]

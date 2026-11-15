@@ -18,5 +18,8 @@ json5 = "1.3"
 memchr = { workspace = true }
 serde = { workspace = true }
 
+[dev-dependencies]
+rusqlite = { workspace = true }
+
 [lints]
 workspace = true

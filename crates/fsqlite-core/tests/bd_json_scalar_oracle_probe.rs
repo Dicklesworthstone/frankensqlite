@@ -44,6 +44,107 @@ fn rval(conn: &rusqlite::Connection, sql: &str) -> String {
     .unwrap_or_else(|e| panic!("rusqlite `{sql}`: {e:?}"))
 }
 
+/// bd-isckl: duplicate object members must survive every input representation
+/// and compound JSON function. Paths and edits address the first matching label.
+#[test]
+fn duplicate_json_members_match_stock_across_text_jsonb_and_sql_paths() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicate-json.db");
+        for database in [":memory:", path.to_str().unwrap()] {
+            let frank = Connection::open(database).await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let setup = "CREATE TABLE duplicate_items(k TEXT, v INTEGER); \
+                         INSERT INTO duplicate_items VALUES ('a',1),('a',2),('b',3);";
+            frank.execute_batch(setup).await.unwrap();
+            stock.execute_batch(setup).unwrap();
+
+            let mut queries = Vec::new();
+            for document in [
+                r#"{"a":1,"b":0,"a":2}"#,
+                r#"{"a":{"x":1,"x":2},"b":0,"a":3}"#,
+                r#"{"a":1.50,"a":1E2}"#,
+                r#"{"a":null,"a":[],"":1,"":2}"#,
+                "{a:1,b:0,a:2,}",
+            ] {
+                for source in [
+                    format!("'{document}'"),
+                    format!("jsonb('{document}')"),
+                    format!("CAST('{document}' AS BLOB)"),
+                ] {
+                    queries.extend([
+                        format!("SELECT json({source})"),
+                        format!("SELECT json_extract({source}, '$.a')"),
+                        format!("SELECT json_type({source}, '$.a')"),
+                        format!("SELECT json_valid({source}, 10)"),
+                        format!("SELECT {source} -> '$.a'"),
+                        format!("SELECT {source} ->> '$.a'"),
+                        format!("SELECT json_extract({source}, '$.a', '$.missing')"),
+                        format!("SELECT json_set({source}, '$.a', 9)"),
+                        format!("SELECT json_replace({source}, '$.a', 9)"),
+                        format!("SELECT json_insert({source}, '$.a', 9, '$.new', 4)"),
+                        format!("SELECT json_remove({source}, '$.a')"),
+                        format!("SELECT json_remove({source}, '$.a', '$.a')"),
+                        format!("SELECT json_patch({source}, '{{\"a\":null}}')"),
+                        format!("SELECT json_patch({source}, '{{\"a\":8,\"a\":9}}')"),
+                        format!("SELECT json(jsonb_set({source}, '$.a', 9))"),
+                        format!("SELECT json(jsonb_extract({source}, '$'))"),
+                        format!("SELECT json_pretty({source})"),
+                        format!("SELECT json_array(json({source}))"),
+                        format!("SELECT json_object('nested', json({source}))"),
+                        format!("SELECT count(*) FROM json_each({source})"),
+                        format!("SELECT count(*) FROM json_tree({source})"),
+                        format!("SELECT group_concat(key || ':' || type || ':' || \
+                                 coalesce(value, 'NULL'), '|') FROM json_each({source})"),
+                        format!("SELECT group_concat(fullkey || ':' || type || ':' || \
+                                 coalesce(atom, 'NULL'), '|') FROM json_tree({source})"),
+                    ]);
+                }
+            }
+            queries.extend([
+                "SELECT hex(jsonb('{\"a\":1,\"a\":2,\"b\":3}'))".to_owned(),
+                "SELECT hex(jsonb('{\"a\":1,\"b\":2,\"c\":[3,4]}'))".to_owned(),
+                "SELECT json(jsonb_group_object(k,v)) FROM duplicate_items".to_owned(),
+                "SELECT json(jsonb_group_object(k,v) OVER ()) FROM duplicate_items LIMIT 1"
+                    .to_owned(),
+                "SELECT json_array(json_group_object(k,v)) FROM duplicate_items".to_owned(),
+                "SELECT json_group_array(json('{\"a\":1,\"a\":2}')) FROM duplicate_items"
+                    .to_owned(),
+                "SELECT json(jsonb_group_array(json('{\"a\":1,\"a\":2}'))) FROM duplicate_items"
+                    .to_owned(),
+                "SELECT json_set('{\"a\":{\"x\":1,\"x\":2},\"a\":3}', '$.a.x', 9)"
+                    .to_owned(),
+                "SELECT json_extract('{\"a\":1,\"\\u0061\":2}', '$.a')".to_owned(),
+                "SELECT count(*) FROM json_each('{\"a\":1,\"\\u0061\":2}')".to_owned(),
+                "SELECT json_patch('{}', '{\"a\":1,\"a\":2}')".to_owned(),
+                "SELECT json_patch('{\"a\":1,\"b\":0,\"a\":2}', '{\"a\":null,\"a\":9}')"
+                    .to_owned(),
+            ]);
+            let mut differences = Vec::new();
+            for sql in queries {
+                let expected = rval(&stock, &sql);
+                let direct = fval(&frank, &sql).await;
+                let prepared = frank.prepare(&sql).await.unwrap();
+                let rows = prepared.query().await.unwrap();
+                assert_eq!(rows.len(), 1, "{database}: prepared {sql}");
+                let prepared_value = tag_f(&rows[0].values()[0]);
+                if direct != expected || prepared_value != expected {
+                    differences.push(format!(
+                        "{sql}\n  direct={direct}\n  prepared={prepared_value}\n  stock={expected}"
+                    ));
+                }
+            }
+            frank.close().await.unwrap();
+            assert!(
+                differences.is_empty(),
+                "{database}: {} duplicate-member divergences:\n{}",
+                differences.len(),
+                differences.join("\n")
+            );
+        }
+    });
+}
+
 /// User strings can contain the private numeric-text tag, including its NUL
 /// bytes. They must remain strings across parsers, constructors, SQL subtype
 /// boundaries, table functions, aggregates, windows, and JSONB round trips.

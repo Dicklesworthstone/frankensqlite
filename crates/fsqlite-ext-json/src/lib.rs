@@ -19,7 +19,7 @@
 //! - `$[#-N]` reverse array index
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
@@ -28,7 +28,169 @@ use fsqlite_func::{
     VirtualTable, VirtualTableCursor, WindowFunction,
 };
 use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
-use serde_json::{Map, Number, Value};
+use serde_json::Number;
+
+/// JSON objects are ordered sequences of members, not maps: SQLite retains
+/// repeated labels and a path selects the first matching member. Keep this
+/// representation private so every parser, renderer and edit shares that rule.
+#[derive(Debug, Clone, PartialEq)]
+enum Value {
+    Null,
+    Bool(bool),
+    Number(Number),
+    String(String),
+    Array(Vec<Self>),
+    Object(Object),
+}
+
+impl Value {
+    fn get(&self, key: &str) -> Option<&Self> {
+        match self {
+            Self::Object(object) => object.get(key),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&Vec<Self>> {
+        match self {
+            Self::Array(array) => Some(array),
+            _ => None,
+        }
+    }
+
+    fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
+        match self {
+            Self::Array(array) => Some(array),
+            _ => None,
+        }
+    }
+
+    fn as_object_mut(&mut self) -> Option<&mut Object> {
+        match self {
+            Self::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+}
+
+/// Members retain their source order, including duplicate labels. Large
+/// objects also keep a first-member index, avoiding a linear search for each
+/// path lookup; small objects need neither a hash table nor a second key copy.
+#[derive(Debug, Clone, Default)]
+struct Object {
+    members: Vec<(String, Value)>,
+    first_by_key: Option<HashMap<String, usize>>,
+}
+
+impl PartialEq for Object {
+    fn eq(&self, other: &Self) -> bool {
+        self.members == other.members
+    }
+}
+
+impl Object {
+    const INDEX_THRESHOLD: usize = 16;
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, (String, Value)> {
+        self.members.iter()
+    }
+
+    fn first_index(&self, key: &str) -> Option<usize> {
+        match &self.first_by_key {
+            Some(index) => index.get(key).copied(),
+            None => self.members.iter().position(|(label, _)| label == key),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.first_index(key).map(|index| &self.members[index].1)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.first_index(key)
+            .map(|index| &mut self.members[index].1)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.first_index(key).is_some()
+    }
+
+    /// Parsing always appends: even an existing label names another member.
+    fn append(&mut self, key: String, value: Value) {
+        if let Some(index) = &mut self.first_by_key {
+            index.entry(key.clone()).or_insert(self.members.len());
+        }
+        self.members.push((key, value));
+        if self.first_by_key.is_none() && self.members.len() >= Self::INDEX_THRESHOLD {
+            self.rebuild_index();
+        }
+    }
+
+    /// Edits replace the first matching member without disturbing duplicates.
+    fn insert(&mut self, key: String, value: Value) {
+        if let Some(prior) = self.get_mut(&key) {
+            *prior = value;
+        } else {
+            self.append(key, value);
+        }
+    }
+
+    /// Removing the first member exposes the next duplicate to path lookup.
+    fn shift_remove(&mut self, key: &str) {
+        if let Some(index) = self.first_index(key) {
+            self.members.remove(index);
+            if self.first_by_key.is_some() {
+                self.rebuild_index();
+            }
+        }
+    }
+
+    fn rebuild_index(&mut self) {
+        if self.members.len() < Self::INDEX_THRESHOLD {
+            self.first_by_key = None;
+            return;
+        }
+        let mut index = HashMap::with_capacity(self.members.len());
+        for (position, (key, _)) in self.members.iter().enumerate() {
+            index.entry(key.clone()).or_insert(position);
+        }
+        self.first_by_key = Some(index);
+    }
+}
+
+impl IntoIterator for Object {
+    type Item = (String, Value);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.members.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Object {
+    type Item = &'a (String, Value);
+    type IntoIter = std::slice::Iter<'a, (String, Value)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.members.iter()
+    }
+}
 
 const JSON_VALID_DEFAULT_FLAGS: u8 = 0x01;
 const JSON_VALID_RFC_8259_FLAG: u8 = 0x01;
@@ -1821,50 +1983,76 @@ fn parse_json_text(input: &str) -> Result<Value> {
 /// Deserialize JSON5 without letting serde_json turn infinite floats into null.
 struct Json5Value(Value);
 
+impl<'de> serde::Deserialize<'de> for Value {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Strict JSON has already passed through the numeric-text rewrite,
+        // including escaping genuine strings that begin with its private tag.
+        deserializer.deserialize_any(JsonValueVisitor::<false>)
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for Json5Value {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_any(Json5ValueVisitor)
+        deserializer
+            .deserialize_any(JsonValueVisitor::<true>)
+            .map(Self)
     }
 }
 
-struct Json5ValueVisitor;
+struct JsonValueVisitor<const ESCAPE_STRINGS: bool>;
 
-impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
-    type Value = Json5Value;
+impl<'de, const ESCAPE_STRINGS: bool> serde::de::DeserializeSeed<'de>
+    for JsonValueVisitor<ESCAPE_STRINGS>
+{
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisitor<ESCAPE_STRINGS> {
+    type Value = Value;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON5 value")
+        formatter.write_str("a JSON value")
     }
 
     fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::Null))
+        Ok(Value::Null)
     }
 
     fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::Bool(value)))
+        Ok(Value::Bool(value))
     }
 
     fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::from(value)))
+        Ok(Value::Number(value.into()))
     }
 
     fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::from(value)))
+        Ok(Value::Number(value.into()))
     }
 
     fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
@@ -1880,23 +2068,27 @@ impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
                 "9e999"
             })
         } else {
-            Value::from(value)
+            Value::Number(Number::from_f64(value).expect("finite JSON number"))
         };
-        Ok(Json5Value(value))
+        Ok(value)
     }
 
     fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(json_string_value(value.to_owned())))
+        self.visit_string(value.to_owned())
     }
 
     fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(json_string_value(value)))
+        Ok(if ESCAPE_STRINGS {
+            json_string_value(value)
+        } else {
+            Value::String(value)
+        })
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
@@ -1904,21 +2096,22 @@ impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
         A: serde::de::SeqAccess<'de>,
     {
         let mut values = Vec::new();
-        while let Some(value) = sequence.next_element::<Json5Value>()? {
-            values.push(value.0);
+        while let Some(value) = sequence.next_element_seed(JsonValueVisitor::<ESCAPE_STRINGS>)? {
+            values.push(value);
         }
-        Ok(Json5Value(Value::Array(values)))
+        Ok(Value::Array(values))
     }
 
     fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
     where
         A: serde::de::MapAccess<'de>,
     {
-        let mut values = Map::new();
-        while let Some((key, value)) = object.next_entry::<String, Json5Value>()? {
-            values.insert(key, value.0);
+        let mut values = Object::new();
+        while let Some(key) = object.next_key::<String>()? {
+            let value = object.next_value_seed(JsonValueVisitor::<ESCAPE_STRINGS>)?;
+            values.append(key, value);
         }
-        Ok(Json5Value(Value::Object(values)))
+        Ok(Value::Object(values))
     }
 }
 
@@ -2192,7 +2385,7 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
         }
         JSONB_OBJECT_TYPE => {
             let mut cursor = 0usize;
-            let mut map = Map::new();
+            let mut map = Object::new();
             while cursor < payload.len() {
                 let (key_type, key_payload, key_used) = decode_jsonb_node(&payload[cursor..])?;
                 cursor += key_used;
@@ -2207,7 +2400,7 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
                 }
                 let (item, used) = decode_jsonb_value(&payload[cursor..])?;
                 cursor += used;
-                map.insert(key, item);
+                map.append(key, item);
             }
             Value::Object(map)
         }
@@ -2675,8 +2868,10 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
 
 fn append_object_path(base: &str, key: &str) -> String {
     // Quote keys containing special characters that would make the path
-    // ambiguous (dots, brackets, quotes, whitespace).
-    if key.contains(|c: char| matches!(c, '.' | '[' | ']' | '"' | '\'') || c.is_whitespace()) {
+    // ambiguous (dots, brackets, quotes, whitespace), including an empty label.
+    if key.is_empty()
+        || key.contains(|c: char| matches!(c, '.' | '[' | ']' | '"' | '\'') || c.is_whitespace())
+    {
         format!("{base}.\"{}\"", key.replace('"', "\\\""))
     } else {
         format!("{base}.{key}")
@@ -3005,7 +3200,7 @@ fn array_insert_scaffold(next: Option<&PathSegment>) -> Value {
         Some(PathSegment::Index(_) | PathSegment::Append | PathSegment::FromEnd(_)) => {
             Value::Array(Vec::new())
         }
-        _ => Value::Object(Map::new()),
+        _ => Value::Object(Object::new()),
     }
 }
 
@@ -3298,10 +3493,7 @@ fn remove_at_path(root: &mut Value, segments: &[PathSegment]) {
 
     match (parent, last_segment) {
         (Value::Object(object), PathSegment::Key(key)) => {
-            // shift_remove (order-preserving), NOT remove (== swap_remove under
-            // serde_json's preserve_order IndexMap backing, which swaps the last
-            // member into the hole). SQLite's json_remove keeps the remaining
-            // object members in their original order.
+            // Preserve member order and remove only the first matching label.
             object.shift_remove(key.as_ref());
         }
         (Value::Array(array), PathSegment::Index(index)) if *index < array.len() => {
@@ -3358,7 +3550,7 @@ fn resolve_parent_for_edit<'a>(
             Some(PathSegment::Index(_) | PathSegment::Append | PathSegment::FromEnd(_)) => {
                 Value::Array(Vec::new())
             }
-            _ => Value::Object(Map::new()),
+            _ => Value::Object(Object::new()),
         }
     }
 
@@ -3444,7 +3636,7 @@ fn merge_patch(target: Value, patch: Value) -> Value {
         Value::Object(patch_map) => {
             let mut target_map = match target {
                 Value::Object(map) => map,
-                _ => Map::new(),
+                _ => Object::new(),
             };
 
             for (key, patch_value) in patch_map {
@@ -5172,6 +5364,449 @@ mod tests {
     use super::*;
     use fsqlite_func::FunctionRegistry;
 
+    fn stock_json_rows(
+        stock: &rusqlite::Connection,
+        sql: &str,
+        args: &[SqliteValue],
+    ) -> rusqlite::Result<Vec<Vec<SqliteValue>>> {
+        let parameters: Vec<rusqlite::types::Value> = args
+            .iter()
+            .map(|value| match value {
+                SqliteValue::Null => rusqlite::types::Value::Null,
+                SqliteValue::Integer(value) => rusqlite::types::Value::Integer(*value),
+                SqliteValue::Float(value) => rusqlite::types::Value::Real(*value),
+                SqliteValue::Text(value) => rusqlite::types::Value::Text(value.to_string()),
+                SqliteValue::Blob(value) => rusqlite::types::Value::Blob(value.to_vec()),
+            })
+            .collect();
+        let mut statement = stock.prepare(sql)?;
+        let width = statement.column_count();
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                (0..width)
+                    .map(|index| {
+                        row.get::<_, rusqlite::types::Value>(index)
+                            .map(|value| match value {
+                                rusqlite::types::Value::Null => SqliteValue::Null,
+                                rusqlite::types::Value::Integer(value) => {
+                                    SqliteValue::Integer(value)
+                                }
+                                rusqlite::types::Value::Real(value) => SqliteValue::Float(value),
+                                rusqlite::types::Value::Text(value) => {
+                                    SqliteValue::Text(value.into())
+                                }
+                                rusqlite::types::Value::Blob(value) => {
+                                    SqliteValue::Blob(value.into())
+                                }
+                            })
+                    })
+                    .collect()
+            })?
+            .collect();
+        rows
+    }
+
+    fn stock_json_scalar(
+        stock: &rusqlite::Connection,
+        sql: &str,
+        args: &[SqliteValue],
+    ) -> SqliteValue {
+        stock_json_rows(stock, sql, args)
+            .unwrap()
+            .remove(0)
+            .remove(0)
+    }
+
+    fn normalized_jsonb(stock: &rusqlite::Connection, value: SqliteValue) -> SqliteValue {
+        if matches!(value, SqliteValue::Blob(_)) {
+            // Stock independently decodes our output. JSONB permits several
+            // string encodings; membership and values must be identical.
+            stock_json_scalar(stock, "SELECT json(?1)", &[value])
+        } else {
+            value
+        }
+    }
+
+    #[test]
+    fn duplicate_members_match_live_sqlite_oracle() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let cases = [
+            ("json", vec![]),
+            ("jsonb", vec![]),
+            ("json_type", vec![text("$.a")]),
+            ("json_valid", vec![SqliteValue::Integer(10)]),
+            ("json_extract", vec![text("$.a")]),
+            ("json_extract", vec![text("$.a"), text("$.missing")]),
+            ("jsonb_extract", vec![text("$")]),
+            ("->", vec![text("$.a")]),
+            ("->>", vec![text("$.a")]),
+            ("json_set", vec![text("$.a"), SqliteValue::Integer(9)]),
+            ("jsonb_set", vec![text("$.a"), SqliteValue::Integer(9)]),
+            ("json_replace", vec![text("$.a"), SqliteValue::Integer(9)]),
+            ("jsonb_replace", vec![text("$.a"), SqliteValue::Integer(9)]),
+            (
+                "json_insert",
+                vec![
+                    text("$.a"),
+                    SqliteValue::Integer(9),
+                    text("$.new"),
+                    SqliteValue::Integer(4),
+                ],
+            ),
+            (
+                "jsonb_insert",
+                vec![
+                    text("$.a"),
+                    SqliteValue::Integer(9),
+                    text("$.new"),
+                    SqliteValue::Integer(4),
+                ],
+            ),
+            ("json_remove", vec![text("$.a")]),
+            ("json_remove", vec![text("$.a"), text("$.a")]),
+            ("jsonb_remove", vec![text("$.a")]),
+            ("json_patch", vec![text(r#"{"a":null}"#)]),
+            ("json_patch", vec![text(r#"{"a":8,"a":9}"#)]),
+            ("jsonb_patch", vec![text(r#"{"a":null,"a":9}"#)]),
+            ("json_pretty", vec![]),
+        ];
+        let mut documents = vec![
+            r#"{"a":1,"b":0,"a":2}"#.to_owned(),
+            r#"{"a":{"x":1,"x":2},"b":0,"a":3}"#.to_owned(),
+            r#"{"a":1.50,"a":1E2}"#.to_owned(),
+            r#"{"a":null,"a":[],"":1,"":2}"#.to_owned(),
+            "{a:1,b:0,a:2,}".to_owned(),
+            r#"{"a":1,"b":[2,3]}"#.to_owned(),
+            "{}".to_owned(),
+        ];
+        let mut large = vec![r#""a":1"#.to_owned()];
+        large.extend((0..32).map(|index| format!(r#""k{index}":{index}"#)));
+        large.push(r#""a":2"#.to_owned());
+        documents.push(format!("{{{}}}", large.join(",")));
+        for document in documents {
+            let stock_binary = stock_json_scalar(&stock, "SELECT jsonb(?1)", &[text(&document)]);
+            for source in [
+                text(&document),
+                SqliteValue::Blob(document.as_bytes().into()),
+                stock_binary,
+            ] {
+                for (name, tail) in &cases {
+                    let mut args = vec![source.clone()];
+                    args.extend(tail.iter().cloned());
+                    let sql = if matches!(*name, "->" | "->>") {
+                        format!("SELECT ?1 {name} ?2")
+                    } else {
+                        let parameters: Vec<_> =
+                            (1..=args.len()).map(|index| format!("?{index}")).collect();
+                        format!("SELECT {name}({})", parameters.join(","))
+                    };
+                    let expected = stock_json_scalar(&stock, &sql, &args);
+                    let actual = registry
+                        .find_scalar(name, args.len() as i32)
+                        .unwrap()
+                        .invoke(&args)
+                        .unwrap();
+                    assert_eq!(
+                        std::mem::discriminant(&actual),
+                        std::mem::discriminant(&expected),
+                        "{sql}: {args:?}"
+                    );
+                    assert_eq!(
+                        normalized_jsonb(&stock, actual),
+                        normalized_jsonb(&stock, expected),
+                        "{sql}: {args:?}"
+                    );
+                }
+                for recursive in [false, true] {
+                    let name = if recursive { "json_tree" } else { "json_each" };
+                    let actual = match (&source, recursive) {
+                        (SqliteValue::Text(input), false) => json_each(input, None),
+                        (SqliteValue::Text(input), true) => json_tree(input, None),
+                        (SqliteValue::Blob(input), false) => json_each_blob(input, None),
+                        (SqliteValue::Blob(input), true) => json_tree_blob(input, None),
+                        _ => unreachable!(),
+                    }
+                    .unwrap();
+                    let actual: Vec<Vec<_>> = actual
+                        .into_iter()
+                        .map(|row| {
+                            vec![
+                                row.key,
+                                row.value,
+                                text(row.type_name),
+                                row.atom,
+                                SqliteValue::Text(row.fullkey.into()),
+                                SqliteValue::Text(row.path.into()),
+                            ]
+                        })
+                        .collect();
+                    let sql = format!("SELECT key,value,type,atom,fullkey,path FROM {name}(?1)");
+                    assert_eq!(
+                        actual,
+                        stock_json_rows(&stock, &sql, &[source.clone()]).unwrap(),
+                        "{sql}: {source:?}"
+                    );
+                }
+                let canonical = JsonFunc.invoke(&[source.clone()]).unwrap();
+                for name in ["json_array", "jsonb_array"] {
+                    let actual = registry
+                        .find_scalar(name, 1)
+                        .unwrap()
+                        .invoke_with_arg_subtypes(&[canonical.clone()], &[JSON_SUBTYPE])
+                        .unwrap();
+                    let expected = stock_json_scalar(
+                        &stock,
+                        &format!("SELECT {name}(json(?1))"),
+                        &[source.clone()],
+                    );
+                    assert_eq!(
+                        normalized_jsonb(&stock, actual),
+                        normalized_jsonb(&stock, expected),
+                        "{name}: {source:?}"
+                    );
+                }
+            }
+        }
+        for document in [r#"{"a":1,"b":2}"#, r#"{"a":1,"a":2}"#] {
+            assert_eq!(
+                JsonbFunc.invoke(&[text(document)]).unwrap(),
+                stock_json_scalar(&stock, "SELECT jsonb(?1)", &[text(document)])
+            );
+        }
+        // Escape spellings denote the same key for lookup, but both members
+        // survive. Preserving a label's original escape spelling in rendered
+        // JSON and fullkey is a separate lexical-format concern.
+        let escaped = text(r#"{"a":1,"\u0061":2}"#);
+        let escaped_binary = stock_json_scalar(&stock, "SELECT jsonb(?1)", &[escaped.clone()]);
+        for source in [escaped, escaped_binary] {
+            let args = [source.clone(), text("$.a")];
+            assert_eq!(
+                JsonExtractFunc.invoke(&args).unwrap(),
+                stock_json_scalar(&stock, "SELECT json_extract(?1,?2)", &args)
+            );
+            let rows = match &source {
+                SqliteValue::Text(input) => json_each(input, None),
+                SqliteValue::Blob(input) => json_each_blob(input, None),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let rows: Vec<Vec<_>> = rows
+                .into_iter()
+                .map(|row| vec![row.key, row.value])
+                .collect();
+            assert_eq!(
+                rows,
+                stock_json_rows(&stock, "SELECT key,value FROM json_each(?1)", &[source]).unwrap()
+            );
+        }
+        for document in [r#"{"a":1,"a":}"#, r#"{"a":1,"a":2"#] {
+            let args = [text(document), text("$.a")];
+            assert!(JsonExtractFunc.invoke(&args).is_err());
+            assert!(stock_json_rows(&stock, "SELECT json_extract(?1,?2)", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn duplicate_aggregate_members_match_live_sqlite_oracle() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        stock
+            .execute_batch(
+                "CREATE TABLE entries(k,v); INSERT INTO entries VALUES \
+            ('a',1),('a',2),('b',3),(char(0)||'a',4),(char(0)||'b',5)",
+            )
+            .unwrap();
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let entries = [("a", 1), ("a", 2), ("b", 3), ("\0a", 4), ("\0b", 5)];
+        for name in ["json_group_object", "jsonb_group_object"] {
+            let aggregate = registry.find_aggregate(name, 2).unwrap();
+            let mut state = aggregate.initial_state();
+            for (key, value) in entries {
+                aggregate
+                    .step(&mut state, &[text(key), SqliteValue::Integer(value)])
+                    .unwrap();
+            }
+            let actual = aggregate.finalize(state).unwrap();
+            let expected =
+                stock_json_scalar(&stock, &format!("SELECT {name}(k,v) FROM entries"), &[]);
+            assert_eq!(
+                normalized_jsonb(&stock, actual.clone()),
+                normalized_jsonb(&stock, expected.clone()),
+                "{name}"
+            );
+            assert_eq!(
+                JsonFunc.invoke(&[actual]).unwrap(),
+                JsonFunc.invoke(&[expected]).unwrap()
+            );
+        }
+        for name in ["json_group_array", "jsonb_group_array"] {
+            let aggregate = registry.find_aggregate(name, 1).unwrap();
+            let mut state = aggregate.initial_state();
+            let document = text(r#"{"a":1,"a":2}"#);
+            for _ in entries {
+                aggregate
+                    .step_with_arg_subtypes(&mut state, &[document.clone()], &[JSON_SUBTYPE])
+                    .unwrap();
+            }
+            let actual = aggregate.finalize(state).unwrap();
+            let expected = stock_json_scalar(
+                &stock,
+                &format!("SELECT {name}(json(?1)) FROM entries"),
+                &[document],
+            );
+            assert_eq!(
+                normalized_jsonb(&stock, actual.clone()),
+                normalized_jsonb(&stock, expected.clone()),
+                "{name}"
+            );
+            assert_eq!(
+                JsonFunc.invoke(&[actual]).unwrap(),
+                JsonFunc.invoke(&[expected]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_object_members_survive_parsers_jsonb_and_table_walks() {
+        let canonical = r#"{"a":{"x":1,"x":2},"b":0,"a":3}"#;
+        for input in [canonical, "{a:{x:1,x:2},b:0,a:3}"] {
+            let binary = jsonb(input).unwrap();
+            assert_eq!(json_from_jsonb(&binary).unwrap(), canonical);
+            assert_eq!(
+                json_extract(input, &["$.a.x"]).unwrap(),
+                SqliteValue::Integer(1)
+            );
+            assert_eq!(
+                json_arrow(input, "$.a").unwrap(),
+                SqliteValue::Text(r#"{"x":1,"x":2}"#.into())
+            );
+            for rows in [
+                json_each(input, None).unwrap(),
+                json_each_blob(&binary, None).unwrap(),
+            ] {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0].key, SqliteValue::Text("a".into()));
+                assert_eq!(rows[0].value, SqliteValue::Text(r#"{"x":1,"x":2}"#.into()));
+                assert_eq!(rows[1].key, SqliteValue::Text("b".into()));
+                assert_eq!(rows[2].key, SqliteValue::Text("a".into()));
+                assert_eq!(rows[2].value, SqliteValue::Integer(3));
+            }
+            for rows in [
+                json_tree(input, None).unwrap(),
+                json_tree_blob(&binary, None).unwrap(),
+            ] {
+                assert_eq!(rows.len(), 6);
+                assert_eq!(rows[2].fullkey, "$.a.x");
+                assert_eq!(rows[3].fullkey, "$.a.x");
+                assert_eq!(rows[2].value, SqliteValue::Integer(1));
+                assert_eq!(rows[3].value, SqliteValue::Integer(2));
+            }
+        }
+        // Different escape spellings of a label identify the same first key.
+        let escaped = r#"{"a":1,"\u0061":2}"#;
+        assert_eq!(json_each(escaped, None).unwrap().len(), 2);
+        assert_eq!(
+            json_extract(escaped, &["$.a"]).unwrap(),
+            SqliteValue::Integer(1)
+        );
+        for malformed in [r#"{"a":1,"a":}"#, r#"{"a":1,"a":2"#] {
+            assert!(json_extract(malformed, &["$.a"]).is_err());
+            assert!(jsonb(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn duplicate_object_edits_address_only_the_first_member() {
+        let input = r#"{"a":1,"b":0,"a":2}"#;
+        let replacement = [("$.a", SqliteValue::Integer(9))];
+        for edited in [
+            json_set(input, &replacement).unwrap(),
+            json_replace(input, &replacement).unwrap(),
+            json_from_jsonb(&jsonb_set(input, &replacement).unwrap()).unwrap(),
+            json_from_jsonb(&jsonb_replace(input, &replacement).unwrap()).unwrap(),
+        ] {
+            assert_eq!(edited, r#"{"a":9,"b":0,"a":2}"#);
+        }
+        assert_eq!(json_insert(input, &replacement).unwrap(), input);
+        assert_eq!(json_remove(input, &["$.a"]).unwrap(), r#"{"b":0,"a":2}"#);
+        assert_eq!(json_remove(input, &["$.a", "$.a"]).unwrap(), r#"{"b":0}"#);
+        assert_eq!(
+            json_set(
+                r#"{"a":{"x":1,"x":2},"a":3}"#,
+                &[("$.a.x", SqliteValue::Integer(7))]
+            )
+            .unwrap(),
+            r#"{"a":{"x":7,"x":2},"a":3}"#
+        );
+        for (target, patch, expected) in [
+            (input, r#"{"a":null}"#, r#"{"b":0,"a":2}"#),
+            (input, r#"{"a":9,"a":10}"#, r#"{"a":10,"b":0,"a":2}"#),
+            (input, r#"{"a":null,"a":9}"#, r#"{"b":0,"a":9}"#),
+            ("{}", r#"{"a":1,"a":2}"#, r#"{"a":2}"#),
+        ] {
+            assert_eq!(json_patch(target, patch).unwrap(), expected);
+            assert_eq!(
+                json_from_jsonb(&jsonb_patch(target, patch).unwrap()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_lookup_remains_correct_across_large_object_edits() {
+        let mut members = vec![r#""a":1"#.to_owned()];
+        members.extend((0..32).map(|index| format!(r#""k{index}":{index}"#)));
+        members.extend([r#""a":2"#.to_owned(), r#""a":3"#.to_owned()]);
+        let mut document = format!("{{{}}}", members.join(","));
+        for value in 1..=3 {
+            assert_eq!(
+                json_extract(&document, &["$.a"]).unwrap(),
+                SqliteValue::Integer(value)
+            );
+            assert_eq!(
+                json_extract(&document, &["$.k31"]).unwrap(),
+                SqliteValue::Integer(31)
+            );
+            document = json_remove(&document, &["$.a"]).unwrap();
+        }
+        assert_eq!(
+            json_extract(&document, &["$.a"]).unwrap(),
+            SqliteValue::Null
+        );
+        // Shrink below the indexed-object threshold, then grow through it again.
+        for index in 0..24 {
+            document = json_remove(&document, &[&format!("$.k{index}")]).unwrap();
+        }
+        for index in 0..24 {
+            document = json_set(
+                &document,
+                &[(&format!("$.k{index}"), SqliteValue::Integer(index))],
+            )
+            .unwrap();
+        }
+        for index in 0..32 {
+            assert_eq!(
+                json_extract(&document, &[&format!("$.k{index}")]).unwrap(),
+                SqliteValue::Integer(index)
+            );
+        }
+        assert_eq!(
+            json_from_jsonb(&jsonb(&document).unwrap()).unwrap(),
+            document
+        );
+        // The unique-label binary encoding remains exactly the same format.
+        assert_eq!(
+            jsonb(r#"{"a":1,"b":2}"#).unwrap(),
+            b"\x8c\x17a\x131\x17b\x132"
+        );
+        assert_eq!(
+            jsonb(r#"{"a":1,"a":2}"#).unwrap(),
+            b"\x8c\x17a\x131\x17a\x132"
+        );
+    }
+
     #[test]
     fn reserved_number_tag_strings_remain_text() {
         for repetitions in 1..=3 {
@@ -5551,10 +6186,14 @@ mod tests {
     fn json5_number_text_values_survive_nested_containers() {
         let value = parse_json5_text("{a:[Infinity,{b:-Infinity,c:NaN}],s:'Infinity'}")
             .expect("nested JSON5 non-finite values parse");
-        assert_eq!(value["a"][0], number_text_value("9e999"));
-        assert_eq!(value["a"][1]["b"], number_text_value("-9e999"));
-        assert_eq!(value["a"][1]["c"], Value::Null);
-        assert_eq!(value["s"], Value::String("Infinity".to_owned()));
+        for (path, expected) in [
+            ("$.a[0]", number_text_value("9e999")),
+            ("$.a[1].b", number_text_value("-9e999")),
+            ("$.a[1].c", Value::Null),
+            ("$.s", Value::String("Infinity".to_owned())),
+        ] {
+            assert_eq!(resolve_path(&value, path).unwrap(), Some(&expected));
+        }
         assert_eq!(
             encode_json_text("nested JSON5", &value).unwrap(),
             r#"{"a":[9e999,{"b":-9e999,"c":null}],"s":"Infinity"}"#
@@ -5572,16 +6211,23 @@ mod tests {
             }",
         )
         .expect("ordinary JSON5 values keep their representation");
-        assert_eq!(value["Infinity"].as_u64(), Some(1));
-        assert_eq!(value["NaN"].as_str(), Some("NaN"));
-        assert_eq!(value["u"].as_u64(), Some(u64::MAX));
-        assert_eq!(value["i"].as_i64(), Some(i64::MIN));
-        assert_eq!(value["z"].as_f64().unwrap().to_bits(), (-0.0_f64).to_bits());
-        assert_eq!(value["v"].as_str(), Some("\u{000B}"));
-        assert_eq!(value["s"].as_str(), Some("\\Infinity"));
-        assert_eq!(value["b"], Value::Bool(true));
-        assert_eq!(value["n"], Value::Null);
-        assert_eq!(value["a"], Value::Array(Vec::new()));
+        for (key, expected) in [
+            ("Infinity", Value::Number(1_u64.into())),
+            ("NaN", Value::String("NaN".to_owned())),
+            ("u", Value::Number(u64::MAX.into())),
+            ("i", Value::Number(i64::MIN.into())),
+            ("v", Value::String("\u{000B}".to_owned())),
+            ("s", Value::String("\\Infinity".to_owned())),
+            ("b", Value::Bool(true)),
+            ("n", Value::Null),
+            ("a", Value::Array(Vec::new())),
+        ] {
+            assert_eq!(value.get(key), Some(&expected), "{key}");
+        }
+        let Some(Value::Number(zero)) = value.get("z") else {
+            panic!("negative zero remains a finite number");
+        };
+        assert_eq!(zero.as_f64().unwrap().to_bits(), (-0.0_f64).to_bits());
     }
 
     #[test]
@@ -8125,7 +8771,6 @@ mod tests {
         // JSON number (yielding a single scalar row) instead of erroring
         // "must be TEXT or BLOB JSON". C SQLite: json_each(1.5) -> type='real'
         // atom=1.5; json_tree(7) -> type='integer'.
-        use serde_json::Value;
         let (v_float, path) = super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)])
             .unwrap()
             .unwrap();
@@ -8140,7 +8785,7 @@ mod tests {
         let (v_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)])
             .unwrap()
             .unwrap();
-        assert_eq!(v_int, Value::from(7_i64));
+        assert_eq!(v_int, Value::Number(7_i64.into()));
         // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
         // single row (type='real', atom=Inf), so a bare +Inf renders as the
         // numeric literal 9.0e+999 rather than erroring. The non-finite REAL is
@@ -8550,7 +9195,10 @@ mod tests {
         let huge = format!("[1{}]", "0".repeat(400));
         assert!(!may_hold_float_token(&huge));
         let parsed = parse_json_text(&huge).expect("an overflowing integer parses");
-        assert_eq!(json_type_name(&parsed[0]), "real");
+        assert_eq!(
+            json_type_name(&parsed.as_array().expect("the parsed input is an array")[0]),
+            "real"
+        );
         assert!(parse_json_value_lenient(&huge).is_ok());
         for token in [
             "1.50",
