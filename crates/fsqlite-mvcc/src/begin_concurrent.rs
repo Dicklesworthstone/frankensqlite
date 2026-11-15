@@ -19,7 +19,9 @@
 //!    reverts write-set state but preserves page locks and the snapshot.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque, hash_map};
+use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
 
 use fsqlite_types::{
@@ -1169,25 +1171,9 @@ pub struct ConcurrentRegistry {
     /// Refcounted index of registered session snapshot highs.
     gc_horizon_counts: BTreeMap<CommitSeq, usize>,
     /// Committed-reader history (RCRI-like) for SSI edge discovery.
-    committed_readers: Vec<CommittedReaderInfo>,
-    /// Page-local index into committed reader history (identity-hashed).
-    committed_readers_by_page: PageMap<Vec<usize>>,
-    /// Page witness-local index into committed reader history (identity-hashed).
-    committed_readers_by_page_witness: PageMap<Vec<usize>>,
-    /// Exact cell-local index into committed reader history.
-    committed_readers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
-    /// Committed reader entries that include at least one global witness.
-    committed_readers_with_global_keys: Vec<usize>,
+    committed_readers: CommittedHistory<CommittedReaderInfo>,
     /// Committed-writer history (commit-log-like) for SSI edge discovery.
-    committed_writers: Vec<CommittedWriterInfo>,
-    /// Page-local index into committed writer history (identity-hashed).
-    committed_writers_by_page: PageMap<Vec<usize>>,
-    /// Page witness-local index into committed writer history (identity-hashed).
-    committed_writers_by_page_witness: PageMap<Vec<usize>>,
-    /// Exact cell-local index into committed writer history.
-    committed_writers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
-    /// Committed writer entries that include at least one global witness.
-    committed_writers_with_global_keys: Vec<usize>,
+    committed_writers: CommittedHistory<CommittedWriterInfo>,
     /// Detached handles kept for reuse so hot autocommit loops do not hit the
     /// general allocator for a fresh handle every statement.
     recycled_handles: Vec<SharedConcurrentHandle>,
@@ -1216,16 +1202,8 @@ impl ConcurrentRegistry {
             active: HashMap::new(),
             active_snapshot_highs: HashMap::new(),
             gc_horizon_counts: BTreeMap::new(),
-            committed_readers: Vec::new(),
-            committed_readers_by_page: PageMap::default(),
-            committed_readers_by_page_witness: PageMap::default(),
-            committed_readers_by_exact_cell: HashMap::new(),
-            committed_readers_with_global_keys: Vec::new(),
-            committed_writers: Vec::new(),
-            committed_writers_by_page: PageMap::default(),
-            committed_writers_by_page_witness: PageMap::default(),
-            committed_writers_by_exact_cell: HashMap::new(),
-            committed_writers_with_global_keys: Vec::new(),
+            committed_readers: CommittedHistory::new(),
+            committed_writers: CommittedHistory::new(),
             recycled_handles: Vec::new(),
             next_session_id: 1,
             last_owner_id: 0,
@@ -1626,24 +1604,20 @@ impl ConcurrentRegistry {
     }
 
     /// Prune committed SSI history that cannot overlap any active transaction.
+    ///
+    /// Runs at every commit exit of finalize. The retained set is exactly the
+    /// entries committed after the retention horizon (the DRO pivot decision
+    /// reads its size); bd-i0tn6 made the index upkeep proportional to the
+    /// entries removed instead of rebuilding every index from every retained
+    /// entry.
     fn prune_committed_conflict_history(&mut self) {
         let Some(min_active_begin) = self.history_retention_horizon() else {
             self.committed_readers.clear();
-            self.committed_readers_by_page.clear();
-            self.committed_readers_by_page_witness.clear();
-            self.committed_readers_by_exact_cell.clear();
-            self.committed_readers_with_global_keys.clear();
             self.committed_writers.clear();
-            self.committed_writers_by_page.clear();
-            self.committed_writers_by_page_witness.clear();
-            self.committed_writers_by_exact_cell.clear();
-            self.committed_writers_with_global_keys.clear();
             return;
         };
-        self.committed_readers
-            .retain(|reader| reader.commit_seq > min_active_begin);
-        self.committed_writers
-            .retain(|writer| writer.commit_seq > min_active_begin);
+        self.committed_readers.prune_at_or_before(min_active_begin);
+        self.committed_writers.prune_at_or_before(min_active_begin);
 
         // C7 (bd-l9k8e.7): Safety bound for SSI history memory.
         // Reduced from 16384 to 4096 for tighter memory control.
@@ -1680,24 +1654,14 @@ impl ConcurrentRegistry {
                 let new_horizon = self
                     .history_retention_horizon()
                     .unwrap_or(CommitSeq::new(u64::MAX));
-                self.committed_readers
-                    .retain(|reader| reader.commit_seq > new_horizon);
-                self.committed_writers
-                    .retain(|writer| writer.commit_seq > new_horizon);
+                self.committed_readers.prune_at_or_before(new_horizon);
+                self.committed_writers.prune_at_or_before(new_horizon);
             } else {
                 // If we couldn't find an active transaction to abort (should be impossible if
                 // history is bounded by active transactions), just clear everything.
                 tracing::warn!("prune_committed_conflict_history: forced to clear SSI history");
                 self.committed_readers.clear();
-                self.committed_readers_by_page.clear();
-                self.committed_readers_by_page_witness.clear();
-                self.committed_readers_by_exact_cell.clear();
-                self.committed_readers_with_global_keys.clear();
                 self.committed_writers.clear();
-                self.committed_writers_by_page.clear();
-                self.committed_writers_by_page_witness.clear();
-                self.committed_writers_by_exact_cell.clear();
-                self.committed_writers_with_global_keys.clear();
                 break;
             }
         }
@@ -1713,68 +1677,6 @@ impl ConcurrentRegistry {
                 active_txns = self.active.len(),
                 "ssi_history_status"
             );
-        }
-
-        self.rebuild_committed_history_indexes();
-    }
-
-    fn rebuild_committed_history_indexes(&mut self) {
-        self.committed_readers_by_page.clear();
-        self.committed_readers_by_page_witness.clear();
-        self.committed_readers_by_exact_cell.clear();
-        self.committed_readers_with_global_keys.clear();
-        for (idx, reader) in self.committed_readers.iter().enumerate() {
-            let summary = summarize_witness_keys(&reader.keys);
-            if summary.has_global_keys {
-                self.committed_readers_with_global_keys.push(idx);
-            }
-            for page in summary.pages {
-                self.committed_readers_by_page
-                    .entry(page)
-                    .or_default()
-                    .push(idx);
-            }
-            for page in summary.page_witness_pages {
-                self.committed_readers_by_page_witness
-                    .entry(page)
-                    .or_default()
-                    .push(idx);
-            }
-            for cell in summary.cell_witnesses {
-                self.committed_readers_by_exact_cell
-                    .entry(cell.exact_key())
-                    .or_default()
-                    .push(idx);
-            }
-        }
-
-        self.committed_writers_by_page.clear();
-        self.committed_writers_by_page_witness.clear();
-        self.committed_writers_by_exact_cell.clear();
-        self.committed_writers_with_global_keys.clear();
-        for (idx, writer) in self.committed_writers.iter().enumerate() {
-            let summary = summarize_witness_keys(&writer.keys);
-            if summary.has_global_keys {
-                self.committed_writers_with_global_keys.push(idx);
-            }
-            for page in summary.pages {
-                self.committed_writers_by_page
-                    .entry(page)
-                    .or_default()
-                    .push(idx);
-            }
-            for page in summary.page_witness_pages {
-                self.committed_writers_by_page_witness
-                    .entry(page)
-                    .or_default()
-                    .push(idx);
-            }
-            for cell in summary.cell_witnesses {
-                self.committed_writers_by_exact_cell
-                    .entry(cell.exact_key())
-                    .or_default()
-                    .push(idx);
-            }
         }
     }
 
@@ -1802,62 +1704,6 @@ impl ConcurrentRegistry {
         }
     }
 
-    fn index_committed_reader(&mut self, entry_idx: usize) {
-        let Some(reader) = self.committed_readers.get(entry_idx) else {
-            return;
-        };
-        let summary = summarize_witness_keys(&reader.keys);
-        if summary.has_global_keys {
-            self.committed_readers_with_global_keys.push(entry_idx);
-        }
-        for page in summary.pages {
-            self.committed_readers_by_page
-                .entry(page)
-                .or_default()
-                .push(entry_idx);
-        }
-        for page in summary.page_witness_pages {
-            self.committed_readers_by_page_witness
-                .entry(page)
-                .or_default()
-                .push(entry_idx);
-        }
-        for cell in summary.cell_witnesses {
-            self.committed_readers_by_exact_cell
-                .entry(cell.exact_key())
-                .or_default()
-                .push(entry_idx);
-        }
-    }
-
-    fn index_committed_writer(&mut self, entry_idx: usize) {
-        let Some(writer) = self.committed_writers.get(entry_idx) else {
-            return;
-        };
-        let summary = summarize_witness_keys(&writer.keys);
-        if summary.has_global_keys {
-            self.committed_writers_with_global_keys.push(entry_idx);
-        }
-        for page in summary.pages {
-            self.committed_writers_by_page
-                .entry(page)
-                .or_default()
-                .push(entry_idx);
-        }
-        for page in summary.page_witness_pages {
-            self.committed_writers_by_page_witness
-                .entry(page)
-                .or_default()
-                .push(entry_idx);
-        }
-        for cell in summary.cell_witnesses {
-            self.committed_writers_by_exact_cell
-                .entry(cell.exact_key())
-                .or_default()
-                .push(entry_idx);
-        }
-    }
-
     fn committed_reader_candidates(
         &self,
         committing_txn: TxnToken,
@@ -1868,22 +1714,11 @@ impl ConcurrentRegistry {
         if self.committed_readers.is_empty() {
             return Vec::new();
         }
-        let candidate_indexes = if write_key_summary.has_global_keys {
-            (0..self.committed_readers.len()).collect::<Vec<_>>()
-        } else {
-            collect_precise_candidates(
-                &self.committed_readers_with_global_keys,
-                &self.committed_readers_by_page,
-                &self.committed_readers_by_page_witness,
-                &self.committed_readers_by_exact_cell,
-                write_key_summary,
-            )
-        };
         let committing_begin = committing_begin_seq.get();
         let committing_end = committing_commit_seq.get();
-        candidate_indexes
+        self.committed_readers
+            .candidates(write_key_summary)
             .into_iter()
-            .filter_map(|idx| self.committed_readers.get(idx))
             .filter(|reader| {
                 !same_txn_identity(reader.token, committing_txn)
                     && committing_begin < reader.commit_seq.get()
@@ -1903,21 +1738,10 @@ impl ConcurrentRegistry {
         if self.committed_writers.is_empty() {
             return Vec::new();
         }
-        let candidate_indexes = if read_key_summary.has_global_keys {
-            (0..self.committed_writers.len()).collect::<Vec<_>>()
-        } else {
-            collect_precise_candidates(
-                &self.committed_writers_with_global_keys,
-                &self.committed_writers_by_page,
-                &self.committed_writers_by_page_witness,
-                &self.committed_writers_by_exact_cell,
-                read_key_summary,
-            )
-        };
         let committing_begin = committing_begin_seq.get();
-        candidate_indexes
+        self.committed_writers
+            .candidates(read_key_summary)
             .into_iter()
-            .filter_map(|idx| self.committed_writers.get(idx))
             .filter(|writer| {
                 !same_txn_identity(writer.token, committing_txn)
                     && committing_begin < writer.commit_seq.get()
@@ -2935,43 +2759,338 @@ fn hydrate_finalize_witness_state(
     Some((read_keys, read_key_summary, write_keys, write_key_summary))
 }
 
-fn collect_precise_candidates(
-    global_indexes: &[usize],
-    indexes_by_page: &PageMap<Vec<usize>>,
-    indexes_by_page_witness: &PageMap<Vec<usize>>,
-    indexes_by_exact_cell: &HashMap<(PageNumber, u64), Vec<usize>>,
-    summary: &WitnessKeySummary,
-) -> Vec<usize> {
-    // Short-circuit: when every committed-history index is empty there is
-    // nothing to probe per summary page/cell. This is the hot shape when
-    // no committed SSI history exists yet — every commit otherwise walks
-    // `summary.page_witness_pages` doing wasted HashMap probes.
-    if global_indexes.is_empty()
-        && indexes_by_page.is_empty()
-        && indexes_by_page_witness.is_empty()
-        && indexes_by_exact_cell.is_empty()
-    {
-        return Vec::new();
+/// A committed-history record as `CommittedHistory` stores it.
+trait CommittedHistoryInfo {
+    fn commit_seq(&self) -> CommitSeq;
+    fn keys(&self) -> &[WitnessKey];
+}
+
+impl CommittedHistoryInfo for CommittedReaderInfo {
+    fn commit_seq(&self) -> CommitSeq {
+        self.commit_seq
     }
-    let mut candidate_indexes = global_indexes.to_vec();
-    for &page in &summary.page_witness_pages {
-        if let Some(indexes) = indexes_by_page.get(&page) {
-            candidate_indexes.extend(indexes.iter().copied());
+
+    fn keys(&self) -> &[WitnessKey] {
+        &self.keys
+    }
+}
+
+impl CommittedHistoryInfo for CommittedWriterInfo {
+    fn commit_seq(&self) -> CommitSeq {
+        self.commit_seq
+    }
+
+    fn keys(&self) -> &[WitnessKey] {
+        &self.keys
+    }
+}
+
+/// One retained committed-history record and the witness summary its index
+/// entries were made from, kept so removal can find them again.
+#[derive(Debug)]
+struct CommittedHistoryEntry<E> {
+    info: E,
+    summary: WitnessKeySummary,
+}
+
+/// Committed SSI history (readers or writers) with indexes that are kept
+/// up to date entry by entry (bd-i0tn6).
+///
+/// Every record gets an id in publication order and the index lists hold
+/// ids, so pruning a record touches only the lists of its own pages; the
+/// earlier layout held vector positions and rebuilt every index from every
+/// retained record at each commit. `slots[i]` holds record `first_id + i`.
+/// A record pruned while an older one is retained (publication order can
+/// differ from commit order) leaves an empty slot until every older record
+/// is gone, so `len`, iteration and candidate order are those of a vector
+/// in publication order with the same records removed.
+#[derive(Debug)]
+struct CommittedHistory<E> {
+    slots: VecDeque<Option<CommittedHistoryEntry<E>>>,
+    /// Id of `slots[0]`.
+    first_id: u64,
+    /// Id the next pushed record gets; `first_id + slots.len()`.
+    next_id: u64,
+    /// Number of occupied slots.
+    live: usize,
+    /// `(commit_seq, id)` of every retained record, least first, so a prune
+    /// finds each record at or below its horizon without scanning the rest.
+    by_commit_seq: BinaryHeap<Reverse<(CommitSeq, u64)>>,
+    /// Records with a page in their summary's `pages` (identity-hashed).
+    by_page: PageMap<VecDeque<u64>>,
+    /// Records with a page in their summary's `page_witness_pages`.
+    by_page_witness: PageMap<VecDeque<u64>>,
+    /// Records with an exact cell witness, by `(btree_root, tag)`.
+    by_exact_cell: HashMap<(PageNumber, u64), VecDeque<u64>>,
+    /// Records with at least one global witness.
+    with_global_keys: VecDeque<u64>,
+}
+
+impl<E: CommittedHistoryInfo> CommittedHistory<E> {
+    fn new() -> Self {
+        Self {
+            slots: VecDeque::new(),
+            first_id: 0,
+            next_id: 0,
+            live: 0,
+            by_commit_seq: BinaryHeap::new(),
+            by_page: PageMap::default(),
+            by_page_witness: PageMap::default(),
+            by_exact_cell: HashMap::new(),
+            with_global_keys: VecDeque::new(),
         }
     }
-    for cell in &summary.cell_witnesses {
-        for page in [cell.btree_root, cell.leaf_page] {
-            if let Some(indexes) = indexes_by_page_witness.get(&page) {
-                candidate_indexes.extend(indexes.iter().copied());
+
+    /// Number of retained records.
+    const fn len(&self) -> usize {
+        self.live
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// Retained records in publication order.
+    fn iter(&self) -> impl Iterator<Item = &E> {
+        self.slots.iter().flatten().map(|entry| &entry.info)
+    }
+
+    fn get(&self, id: u64) -> Option<&E> {
+        let offset = usize::try_from(id.checked_sub(self.first_id)?).ok()?;
+        self.slots.get(offset)?.as_ref().map(|entry| &entry.info)
+    }
+
+    /// Append a record and index it under its pages, page witnesses, exact
+    /// cells and global keys.
+    fn push(&mut self, info: E) {
+        let summary = summarize_witness_keys(info.keys());
+        let id = self.next_id;
+        self.next_id += 1;
+        if summary.has_global_keys {
+            self.with_global_keys.push_back(id);
+        }
+        for &page in &summary.pages {
+            self.by_page.entry(page).or_default().push_back(id);
+        }
+        for &page in &summary.page_witness_pages {
+            self.by_page_witness.entry(page).or_default().push_back(id);
+        }
+        for cell in &summary.cell_witnesses {
+            // Two cells of one record can share `(btree_root, tag)`; list the
+            // record once.
+            let ids = self.by_exact_cell.entry(cell.exact_key()).or_default();
+            if ids.back() != Some(&id) {
+                ids.push_back(id);
             }
         }
-        if let Some(indexes) = indexes_by_exact_cell.get(&cell.exact_key()) {
-            candidate_indexes.extend(indexes.iter().copied());
+        self.by_commit_seq.push(Reverse((info.commit_seq(), id)));
+        self.slots
+            .push_back(Some(CommittedHistoryEntry { info, summary }));
+        self.live += 1;
+    }
+
+    /// Drop every record with `commit_seq <= horizon`, wherever it sits.
+    fn prune_at_or_before(&mut self, horizon: CommitSeq) {
+        while let Some(&Reverse((commit_seq, id))) = self.by_commit_seq.peek() {
+            if commit_seq > horizon {
+                break;
+            }
+            self.by_commit_seq.pop();
+            self.remove(id);
+        }
+        while matches!(self.slots.front(), Some(None)) {
+            self.slots.pop_front();
+            self.first_id += 1;
         }
     }
-    candidate_indexes.sort_unstable();
-    candidate_indexes.dedup();
-    candidate_indexes
+
+    fn remove(&mut self, id: u64) {
+        let Some(entry) = id
+            .checked_sub(self.first_id)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| self.slots.get_mut(offset))
+            .and_then(Option::take)
+        else {
+            debug_assert!(false, "committed-history id {id} has no retained record");
+            return;
+        };
+        self.live -= 1;
+        let summary = entry.summary;
+        if summary.has_global_keys {
+            remove_history_id(&mut self.with_global_keys, id);
+        }
+        for page in summary.pages {
+            remove_indexed_history_id(&mut self.by_page, page, id);
+        }
+        for page in summary.page_witness_pages {
+            remove_indexed_history_id(&mut self.by_page_witness, page, id);
+        }
+        for cell in summary.cell_witnesses {
+            remove_indexed_history_id(&mut self.by_exact_cell, cell.exact_key(), id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.first_id = self.next_id;
+        self.live = 0;
+        self.by_commit_seq.clear();
+        self.by_page.clear();
+        self.by_page_witness.clear();
+        self.by_exact_cell.clear();
+        self.with_global_keys.clear();
+    }
+
+    /// Records that may overlap a transaction whose witnesses `summary`
+    /// describes, in publication order: every record if the summary has a
+    /// global key, else the records with a global key, a page among the
+    /// summary's page witnesses, a page witness on a cell's root or leaf, or
+    /// the same exact cell.
+    fn candidates(&self, summary: &WitnessKeySummary) -> Vec<&E> {
+        if summary.has_global_keys {
+            return self.iter().collect();
+        }
+        // Short-circuit: when every index is empty there is nothing to probe
+        // per summary page/cell. This is the hot shape when no committed SSI
+        // history exists yet; every commit otherwise walks
+        // `summary.page_witness_pages` doing wasted HashMap probes.
+        if self.with_global_keys.is_empty()
+            && self.by_page.is_empty()
+            && self.by_page_witness.is_empty()
+            && self.by_exact_cell.is_empty()
+        {
+            return Vec::new();
+        }
+        let mut ids: Vec<u64> = self.with_global_keys.iter().copied().collect();
+        for page in &summary.page_witness_pages {
+            if let Some(page_ids) = self.by_page.get(page) {
+                ids.extend(page_ids.iter().copied());
+            }
+        }
+        for cell in &summary.cell_witnesses {
+            for page in [cell.btree_root, cell.leaf_page] {
+                if let Some(page_ids) = self.by_page_witness.get(&page) {
+                    ids.extend(page_ids.iter().copied());
+                }
+            }
+            if let Some(cell_ids) = self.by_exact_cell.get(&cell.exact_key()) {
+                ids.extend(cell_ids.iter().copied());
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().filter_map(|id| self.get(id)).collect()
+    }
+
+    /// Test check: the incrementally kept state equals what a full rebuild
+    /// from the retained records produces.
+    #[cfg(test)]
+    fn assert_matches_rebuild(&self) {
+        let mut by_page: HashMap<PageNumber, Vec<u64>> = HashMap::new();
+        let mut by_page_witness: HashMap<PageNumber, Vec<u64>> = HashMap::new();
+        let mut by_exact_cell: HashMap<(PageNumber, u64), Vec<u64>> = HashMap::new();
+        let mut with_global_keys = Vec::new();
+        let mut by_commit_seq = Vec::new();
+        let mut live = 0;
+        for (offset, slot) in self.slots.iter().enumerate() {
+            let Some(entry) = slot else {
+                continue;
+            };
+            let id = self.first_id + u64::try_from(offset).expect("slot offset fits u64");
+            live += 1;
+            let summary = summarize_witness_keys(entry.info.keys());
+            assert_eq!(
+                summary.pages, entry.summary.pages,
+                "stored summary of id {id}"
+            );
+            assert_eq!(
+                summary.page_witness_pages, entry.summary.page_witness_pages,
+                "stored summary of id {id}"
+            );
+            assert_eq!(
+                summary.cell_witnesses, entry.summary.cell_witnesses,
+                "stored summary of id {id}"
+            );
+            if summary.has_global_keys {
+                with_global_keys.push(id);
+            }
+            for page in summary.pages {
+                by_page.entry(page).or_default().push(id);
+            }
+            for page in summary.page_witness_pages {
+                by_page_witness.entry(page).or_default().push(id);
+            }
+            for cell in summary.cell_witnesses {
+                let ids = by_exact_cell.entry(cell.exact_key()).or_default();
+                if ids.last() != Some(&id) {
+                    ids.push(id);
+                }
+            }
+            by_commit_seq.push((entry.info.commit_seq(), id));
+        }
+        assert_eq!(self.live, live, "live count");
+        assert!(
+            !matches!(self.slots.front(), Some(None)),
+            "a leading empty slot is popped"
+        );
+        assert_eq!(
+            self.next_id,
+            self.first_id + u64::try_from(self.slots.len()).expect("slot count fits u64"),
+            "ids are contiguous over the slots"
+        );
+        let mut heap: Vec<(CommitSeq, u64)> =
+            self.by_commit_seq.iter().map(|Reverse(key)| *key).collect();
+        heap.sort_unstable();
+        by_commit_seq.sort_unstable();
+        assert_eq!(heap, by_commit_seq, "commit-sequence heap");
+        let as_vecs = |index: &PageMap<VecDeque<u64>>| -> HashMap<PageNumber, Vec<u64>> {
+            index
+                .iter()
+                .map(|(&page, ids)| (page, ids.iter().copied().collect()))
+                .collect()
+        };
+        assert_eq!(as_vecs(&self.by_page), by_page, "page index");
+        assert_eq!(
+            as_vecs(&self.by_page_witness),
+            by_page_witness,
+            "page-witness index"
+        );
+        let exact_cells: HashMap<(PageNumber, u64), Vec<u64>> = self
+            .by_exact_cell
+            .iter()
+            .map(|(&key, ids)| (key, ids.iter().copied().collect()))
+            .collect();
+        assert_eq!(exact_cells, by_exact_cell, "exact-cell index");
+        assert_eq!(
+            self.with_global_keys.iter().copied().collect::<Vec<_>>(),
+            with_global_keys,
+            "global-key list"
+        );
+    }
+}
+
+/// Remove `id` from an ascending id list.
+fn remove_history_id(ids: &mut VecDeque<u64>, id: u64) {
+    if ids.front() == Some(&id) {
+        ids.pop_front();
+    } else if let Ok(position) = ids.binary_search(&id) {
+        ids.remove(position);
+    }
+}
+
+/// Remove `id` from the list under `key`, dropping the key once its list is
+/// empty so an index never keeps a page no retained record has.
+fn remove_indexed_history_id<K: Eq + Hash, S: BuildHasher>(
+    index: &mut HashMap<K, VecDeque<u64>, S>,
+    key: K,
+    id: u64,
+) {
+    if let hash_map::Entry::Occupied(mut ids) = index.entry(key) {
+        remove_history_id(ids.get_mut(), id);
+        if ids.get().is_empty() {
+            ids.remove();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -4190,7 +4309,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                     had_out_rw: false,
                     keys: write_keys.to_vec(),
                 });
-                registry.index_committed_writer(registry.committed_writers.len() - 1);
             }
             registry.prune_committed_conflict_history();
             return;
@@ -4259,7 +4377,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                 had_in_rw: false,
                 keys: read_keys.to_vec(),
             });
-            registry.index_committed_reader(registry.committed_readers.len() - 1);
         }
         if !write_keys.is_empty() {
             registry.committed_writers.push(CommittedWriterInfo {
@@ -4268,7 +4385,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                 had_out_rw: false,
                 keys: write_keys.to_vec(),
             });
-            registry.index_committed_writer(registry.committed_writers.len() - 1);
         }
         registry.prune_committed_conflict_history();
         return;
@@ -4400,7 +4516,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             had_in_rw: has_in_rw,
             keys: read_keys.to_vec(),
         });
-        registry.index_committed_reader(registry.committed_readers.len() - 1);
     }
     if !write_keys.is_empty() {
         registry.committed_writers.push(CommittedWriterInfo {
@@ -4409,7 +4524,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             had_out_rw: has_out_rw,
             keys: write_keys.to_vec(),
         });
-        registry.index_committed_writer(registry.committed_writers.len() - 1);
     }
     registry.prune_committed_conflict_history();
 }
@@ -4596,12 +4710,12 @@ mod tests {
     use crate::ssi_validation::{ActiveTxnView, SsiAbortReason};
 
     use super::{
-        ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
-        ConcurrentRegistry, FcwResult, HandleView, HandleViewParts, MAX_CONCURRENT_WRITERS,
-        OwnerAllocationDomain,
-        concurrent_abort, concurrent_clear_page_state, concurrent_commit,
-        concurrent_commit_read_only, concurrent_commit_with_ssi, concurrent_free_page,
-        concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt, concurrent_page_is_freed,
+        ActiveEdgeDiscoveryIndex, CommittedHistory, CommittedReaderInfo, CommittedWriterInfo,
+        ConcurrentHandle, ConcurrentRegistry, FcwResult, HandleView, HandleViewParts,
+        MAX_CONCURRENT_WRITERS, OwnerAllocationDomain, WitnessKeySummary, concurrent_abort,
+        concurrent_clear_page_state, concurrent_commit, concurrent_commit_read_only,
+        concurrent_commit_with_ssi, concurrent_free_page, concurrent_is_metadata_exempt,
+        concurrent_mark_metadata_exempt, concurrent_page_is_freed,
         concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status,
         concurrent_page_state, concurrent_prepare_write_page, concurrent_read_page,
         concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
@@ -7753,7 +7867,6 @@ mod tests {
             had_in_rw: false,
             keys: vec![WitnessKey::Page(test_page(99))],
         });
-        registry.index_committed_reader(0);
         registry.committed_readers.push(CommittedReaderInfo {
             token: relevant,
             begin_seq: CommitSeq::new(5),
@@ -7761,7 +7874,6 @@ mod tests {
             had_in_rw: false,
             keys: vec![WitnessKey::Page(test_page(7))],
         });
-        registry.index_committed_reader(1);
         registry.committed_readers.push(CommittedReaderInfo {
             token: global,
             begin_seq: CommitSeq::new(5),
@@ -7772,7 +7884,6 @@ mod tests {
                 bytes: b"global-reader".to_vec(),
             }],
         });
-        registry.index_committed_reader(2);
 
         let summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
         let mut candidates = registry
@@ -7803,14 +7914,12 @@ mod tests {
             had_out_rw: false,
             keys: vec![WitnessKey::Page(test_page(88))],
         });
-        registry.index_committed_writer(0);
         registry.committed_writers.push(CommittedWriterInfo {
             token: relevant,
             commit_seq: CommitSeq::new(12),
             had_out_rw: false,
             keys: vec![WitnessKey::Page(test_page(9))],
         });
-        registry.index_committed_writer(1);
         registry.committed_writers.push(CommittedWriterInfo {
             token: global,
             commit_seq: CommitSeq::new(12),
@@ -7820,7 +7929,6 @@ mod tests {
                 bytes: b"global-writer".to_vec(),
             }],
         });
-        registry.index_committed_writer(2);
 
         let summary = summarize_witness_keys(&[WitnessKey::Page(test_page(9))]);
         let mut candidates = registry
@@ -7854,7 +7962,6 @@ mod tests {
                 b"key-b",
             )],
         });
-        registry.index_committed_reader(0);
         registry.committed_readers.push(CommittedReaderInfo {
             token: global,
             begin_seq: CommitSeq::new(5),
@@ -7865,7 +7972,6 @@ mod tests {
                 bytes: b"global-reader".to_vec(),
             }],
         });
-        registry.index_committed_reader(1);
 
         let (write_cell, write_page) =
             WitnessKey::for_point_write(test_page(70), b"key-a", test_page(700));
@@ -7898,7 +8004,6 @@ mod tests {
             had_out_rw: false,
             keys: vec![writer_cell, writer_page],
         });
-        registry.index_committed_writer(0);
         registry.committed_writers.push(CommittedWriterInfo {
             token: global,
             commit_seq: CommitSeq::new(12),
@@ -7908,7 +8013,6 @@ mod tests {
                 bytes: b"global-writer".to_vec(),
             }],
         });
-        registry.index_committed_writer(1);
 
         let read_cell = WitnessKey::for_cell_read(test_page(71), test_page(710), b"key-a");
         let mut candidates = registry
@@ -8306,7 +8410,6 @@ mod tests {
             had_in_rw: false,
             keys: vec![WitnessKey::for_cell_read(root, leaf_b, b"key-b")],
         });
-        registry.index_committed_reader(0);
         let (writer_cell, writer_page) = WitnessKey::for_point_write(root, b"key-b", leaf_b);
         registry.committed_writers.push(CommittedWriterInfo {
             token: test_token(632),
@@ -8314,7 +8417,6 @@ mod tests {
             had_out_rw: false,
             keys: vec![writer_cell, writer_page],
         });
-        registry.index_committed_writer(0);
 
         let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
         {
@@ -8658,6 +8760,484 @@ mod tests {
         );
     }
 
+    /// bd-i0tn6: the committed-history lengths are population inputs of the
+    /// DRO active-pivot decision (`evaluate_prepare_t3_dro`), so every commit
+    /// must prune exactly. A long-running session pins the history of 16
+    /// commits, and its own commit moves the retention horizon past all of
+    /// them. The pivot decision that follows sees 3 readers and 3 writers,
+    /// where the DRO lets the active pivot continue. A prune that lags (keeps
+    /// those 16 records) reads 19 / 19, which the default matrix aborts.
+    #[test]
+    fn test_dro_pivot_decision_reads_the_exactly_pruned_history() {
+        use crate::ssi_abort_policy::{DroLiveController, DroLiveControllerConfig};
+
+        let default_matrix =
+            DroLiveController::new(DroLiveControllerConfig::default()).current_matrix();
+        assert!(
+            !default_matrix.evaluate(3, 3).should_abort(),
+            "precondition: the default DRO matrix lets a pivot at 3 / 3 continue"
+        );
+        assert!(
+            default_matrix.evaluate(19, 19).should_abort(),
+            "precondition: the default DRO matrix aborts a pivot at 19 / 19, so a lagging \
+             prune changes the decision"
+        );
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let long_running = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(long_running).unwrap();
+            handle.record_read(test_page(900));
+            concurrent_write_page(&mut handle, &lock_table, test_page(901), test_data()).unwrap();
+        }
+        for i in 0..16_u32 {
+            let session = registry
+                .begin_concurrent(test_snapshot(10 + u64::from(i)))
+                .unwrap();
+            {
+                let mut handle = registry.get_mut(session).unwrap();
+                handle.record_read(test_page(100 + i));
+                concurrent_write_page(&mut handle, &lock_table, test_page(200 + i), test_data())
+                    .unwrap();
+            }
+            concurrent_commit_with_ssi(
+                &mut registry,
+                &commit_index,
+                &lock_table,
+                session,
+                CommitSeq::new(11 + u64::from(i)),
+            )
+            .expect("a disjoint transaction commits");
+            registry
+                .remove(session)
+                .expect("the committed session leaves the registry");
+        }
+        assert_eq!(
+            (
+                registry.committed_readers.len(),
+                registry.committed_writers.len()
+            ),
+            (16, 16),
+            "the long-running session (snapshot 10) pins every later commit"
+        );
+
+        // The pivot reads 300 and writes 301. `in_source` reads 301, so its
+        // commit gives the pivot an incoming edge; `out_target` writes 300,
+        // so its commit gives the pivot the outgoing edge.
+        let pivot = registry.begin_concurrent(test_snapshot(26)).unwrap();
+        let in_source = registry.begin_concurrent(test_snapshot(26)).unwrap();
+        let out_target = registry.begin_concurrent(test_snapshot(26)).unwrap();
+        {
+            let mut handle = registry.get_mut(pivot).unwrap();
+            handle.record_read(test_page(300));
+            concurrent_write_page(&mut handle, &lock_table, test_page(301), test_data()).unwrap();
+        }
+        {
+            let mut handle = registry.get_mut(in_source).unwrap();
+            handle.record_read(test_page(301));
+            concurrent_write_page(&mut handle, &lock_table, test_page(302), test_data()).unwrap();
+        }
+        {
+            let mut handle = registry.get_mut(out_target).unwrap();
+            handle.record_read(test_page(303));
+            concurrent_write_page(&mut handle, &lock_table, test_page(300), test_data()).unwrap();
+        }
+
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            long_running,
+            CommitSeq::new(27),
+        )
+        .expect("the long-running session commits");
+        registry
+            .remove(long_running)
+            .expect("the long-running session leaves the registry");
+        assert_eq!(
+            (
+                registry.committed_readers.len(),
+                registry.committed_writers.len()
+            ),
+            (1, 1),
+            "its commit prunes the 16 records at or below the new horizon 26"
+        );
+
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            in_source,
+            CommitSeq::new(28),
+        )
+        .expect("the incoming-edge source commits");
+        registry
+            .remove(in_source)
+            .expect("the incoming-edge source leaves the registry");
+        {
+            let handle = registry.get(pivot).unwrap();
+            assert!(handle.has_in_rw(), "in_source read what the pivot writes");
+            assert!(!handle.has_out_rw());
+            assert!(!handle.is_marked_for_abort());
+        }
+        assert_eq!(
+            (
+                registry.committed_readers.len(),
+                registry.committed_writers.len()
+            ),
+            (2, 2)
+        );
+
+        let live_matrix = DroLiveController::global().current_matrix();
+        let expected_mark = live_matrix.evaluate(3, 3).should_abort();
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            out_target,
+            CommitSeq::new(29),
+        )
+        .expect("the outgoing-edge target prepares");
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &prepared,
+            CommitSeq::new(29),
+        );
+
+        {
+            let handle = registry.get(pivot).unwrap();
+            assert!(
+                handle.has_in_rw() && handle.has_out_rw(),
+                "the pivot carries both rw flags"
+            );
+            assert_eq!(
+                handle.is_marked_for_abort(),
+                expected_mark,
+                "the active pivot is marked exactly when the DRO decision at the pruned \
+                 populations (3 readers, 3 writers) aborts"
+            );
+        }
+        let decision = prepared
+            .dro_t3_decision()
+            .expect("an edgeful prepare materializes a DRO decision");
+        assert_eq!(
+            (decision.active_readers, decision.active_writers),
+            (3, 3),
+            "the DRO populations count 1 other active session plus 2 retained records each side"
+        );
+    }
+
+    /// bd-i0tn6: physical commits run outside the registry guard, so history
+    /// can be published out of commit order. A prune drops every record at or
+    /// below the horizon wherever it sits, and its pages stop yielding it as a
+    /// candidate; a prune that only pops from the front keeps it.
+    #[test]
+    fn test_prune_drops_history_published_out_of_commit_order() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let pin = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let later_horizon = registry.begin_concurrent(test_snapshot(20)).unwrap();
+        let older = registry.begin_concurrent(test_snapshot(18)).unwrap();
+        let newer = registry.begin_concurrent(test_snapshot(18)).unwrap();
+        for (session, page) in [(pin, 600), (later_horizon, 610), (older, 620), (newer, 630)] {
+            let mut handle = registry.get_mut(session).unwrap();
+            handle.record_read(test_page(page));
+            concurrent_write_page(&mut handle, &lock_table, test_page(page + 1), test_data())
+                .unwrap();
+        }
+        let newer_token = registry.get(newer).unwrap().txn_token();
+
+        let older_prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            older,
+            CommitSeq::new(19),
+        )
+        .expect("older prepares");
+        let newer_prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            newer,
+            CommitSeq::new(21),
+        )
+        .expect("newer prepares");
+        // The later commit publishes first.
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &newer_prepared,
+            CommitSeq::new(21),
+        );
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &older_prepared,
+            CommitSeq::new(19),
+        );
+        registry.remove(older).expect("older leaves the registry");
+        registry.remove(newer).expect("newer leaves the registry");
+
+        let commit_seqs = |registry: &ConcurrentRegistry| {
+            (
+                registry
+                    .committed_readers
+                    .iter()
+                    .map(|reader| reader.commit_seq.get())
+                    .collect::<Vec<_>>(),
+                registry
+                    .committed_writers
+                    .iter()
+                    .map(|writer| writer.commit_seq.get())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            commit_seqs(&registry),
+            (vec![21, 19], vec![21, 19]),
+            "published out of commit order and pinned by the snapshot-10 session"
+        );
+
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            pin,
+            CommitSeq::new(22),
+        )
+        .expect("the pinning session commits");
+        registry.remove(pin).expect("pin leaves the registry");
+        assert_eq!(
+            commit_seqs(&registry),
+            (vec![21, 22], vec![21, 22]),
+            "with the horizon at 20 the record committed at 19 goes although a retained \
+             record precedes it"
+        );
+        registry.committed_readers.assert_matches_rebuild();
+        registry.committed_writers.assert_matches_rebuild();
+
+        let probe = |page: u32| summarize_witness_keys(&[WitnessKey::Page(test_page(page))]);
+        let reader_hits = |page: u32| {
+            registry
+                .committed_reader_candidates(
+                    test_token(999),
+                    CommitSeq::new(0),
+                    CommitSeq::new(100),
+                    &probe(page),
+                )
+                .into_iter()
+                .map(|reader| reader.token)
+                .collect::<Vec<_>>()
+        };
+        let writer_hits = |page: u32| {
+            registry
+                .committed_writer_candidates(
+                    test_token(999),
+                    CommitSeq::new(0),
+                    CommitSeq::new(100),
+                    &probe(page),
+                )
+                .into_iter()
+                .map(|writer| writer.token)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            reader_hits(620).is_empty(),
+            "the pruned reader is unindexed"
+        );
+        assert!(
+            writer_hits(621).is_empty(),
+            "the pruned writer is unindexed"
+        );
+        assert_eq!(reader_hits(630), vec![newer_token]);
+        assert_eq!(writer_hits(631), vec![newer_token]);
+
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            later_horizon,
+            CommitSeq::new(23),
+        )
+        .expect("the last session commits");
+        assert!(registry.committed_readers.is_empty());
+        assert!(registry.committed_writers.is_empty());
+        registry.committed_readers.assert_matches_rebuild();
+        registry.committed_writers.assert_matches_rebuild();
+    }
+
+    /// bd-i0tn6: against the earlier layout (a vector in publication order,
+    /// `retain` on prune, indexes of positions rebuilt from every record), the
+    /// incremental history keeps the same records in the same order, returns
+    /// the same candidates in the same order, and its indexes equal a rebuild
+    /// after every step. Pushes arrive up to three commits out of order and
+    /// horizons move both ways.
+    #[test]
+    fn test_committed_history_matches_a_rebuilt_vector_under_out_of_order_pushes_and_prunes() {
+        struct XorShift(u64);
+
+        impl XorShift {
+            fn below(&mut self, bound: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % bound
+            }
+
+            fn page(&mut self) -> PageNumber {
+                test_page(1 + u32::try_from(self.below(12)).expect("page fits u32"))
+            }
+
+            fn keys(&mut self) -> Vec<WitnessKey> {
+                let count = 1 + self.below(3);
+                (0..count)
+                    .map(|_| match self.below(9) {
+                        0..=3 => WitnessKey::Page(self.page()),
+                        4 | 5 => WitnessKey::Cell {
+                            btree_root: test_page(1 + u32::try_from(self.below(3)).unwrap()),
+                            leaf_page: self.page(),
+                            tag: self.below(4),
+                        },
+                        6 => WitnessKey::ByteRange {
+                            page: self.page(),
+                            start: 0,
+                            len: 8,
+                        },
+                        7 => WitnessKey::KeyRange {
+                            btree_root: test_page(1 + u32::try_from(self.below(3)).unwrap()),
+                            lo: Vec::new(),
+                            hi: vec![1],
+                        },
+                        _ => {
+                            if self.below(4) == 0 {
+                                WitnessKey::Custom {
+                                    namespace: 1,
+                                    bytes: vec![u8::try_from(self.below(3)).unwrap()],
+                                }
+                            } else {
+                                WitnessKey::Page(self.page())
+                            }
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        /// The earlier position-index lookup, written as a scan.
+        fn reference_candidates(
+            model: &[CommittedWriterInfo],
+            probe: &WitnessKeySummary,
+        ) -> Vec<TxnToken> {
+            model
+                .iter()
+                .filter(|entry| {
+                    if probe.has_global_keys {
+                        return true;
+                    }
+                    let own = summarize_witness_keys(&entry.keys);
+                    own.has_global_keys
+                        || probe
+                            .page_witness_pages
+                            .iter()
+                            .any(|page| own.pages.contains(page))
+                        || probe.cell_witnesses.iter().any(|cell| {
+                            own.page_witness_pages.contains(&cell.btree_root)
+                                || own.page_witness_pages.contains(&cell.leaf_page)
+                                || own
+                                    .cell_witnesses
+                                    .iter()
+                                    .any(|own_cell| own_cell.exact_key() == cell.exact_key())
+                        })
+                })
+                .map(|entry| entry.token)
+                .collect()
+        }
+
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        let mut history: CommittedHistory<CommittedWriterInfo> = CommittedHistory::new();
+        let mut model: Vec<CommittedWriterInfo> = Vec::new();
+        let mut frontier = 100_u64;
+        let mut pruned_out_of_order = 0_usize;
+        for step in 1..=2_000_u64 {
+            match rng.below(100) {
+                0..=54 => {
+                    frontier += 1;
+                    let info = CommittedWriterInfo {
+                        token: test_token(step),
+                        commit_seq: CommitSeq::new(frontier - rng.below(4)),
+                        had_out_rw: false,
+                        keys: rng.keys(),
+                    };
+                    history.push(info.clone());
+                    model.push(info);
+                }
+                55..=89 => {
+                    let horizon = frontier.saturating_sub(rng.below(10));
+                    let first_kept = model
+                        .iter()
+                        .position(|entry| entry.commit_seq.get() > horizon);
+                    if let Some(first_kept) = first_kept
+                        && model[first_kept..]
+                            .iter()
+                            .any(|entry| entry.commit_seq.get() <= horizon)
+                    {
+                        pruned_out_of_order += 1;
+                    }
+                    history.prune_at_or_before(CommitSeq::new(horizon));
+                    model.retain(|entry| entry.commit_seq.get() > horizon);
+                }
+                90 => {
+                    history.clear();
+                    model.clear();
+                }
+                _ => {}
+            }
+
+            assert_eq!(history.len(), model.len(), "step {step}: length");
+            assert_eq!(history.is_empty(), model.is_empty(), "step {step}");
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|entry| (entry.token, entry.commit_seq))
+                    .collect::<Vec<_>>(),
+                model
+                    .iter()
+                    .map(|entry| (entry.token, entry.commit_seq))
+                    .collect::<Vec<_>>(),
+                "step {step}: retained records in publication order"
+            );
+            history.assert_matches_rebuild();
+            for _ in 0..3 {
+                let probe = summarize_witness_keys(&rng.keys());
+                assert_eq!(
+                    history
+                        .candidates(&probe)
+                        .into_iter()
+                        .map(|entry| entry.token)
+                        .collect::<Vec<_>>(),
+                    reference_candidates(&model, &probe),
+                    "step {step}: candidates for {probe:?}"
+                );
+            }
+        }
+        // The fixed seed prunes behind a retained record 47 times in 2,000
+        // steps; the bound keeps the schedule from silently losing that case.
+        assert!(
+            pruned_out_of_order >= 25,
+            "the schedule prunes behind a retained record often ({pruned_out_of_order} times)"
+        );
+    }
+
     // Test 15: SSI - pivot detection aborts transaction with both in/out edges.
     #[test]
     fn test_ssi_pivot_abort() {
@@ -8742,7 +9322,11 @@ mod tests {
         check(&mut handle, "creation");
         handle.record_read(test_page(3));
         check(&mut handle, "record_read");
-        handle.record_read_witness(WitnessKey::for_cell_read(test_page(40), test_page(41), b"k"));
+        handle.record_read_witness(WitnessKey::for_cell_read(
+            test_page(40),
+            test_page(41),
+            b"k",
+        ));
         check(&mut handle, "record_read_witness");
         handle.record_read_witness(WitnessKey::Custom {
             namespace: 2,
@@ -8811,8 +9395,14 @@ mod tests {
             h3.record_read(test_page(91));
             concurrent_write_page(&mut h3, &lock_table, test_page(90), test_data()).unwrap();
         }
-        concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s3, CommitSeq::new(11))
-            .expect("the unrelated writer commits");
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s3,
+            CommitSeq::new(11),
+        )
+        .expect("the unrelated writer commits");
         for session in [s1, s2] {
             assert!(
                 registry.get(session).unwrap().view_parts_cache.is_some(),
@@ -8832,12 +9422,23 @@ mod tests {
             concurrent_write_page(&mut h2, &lock_table, test_page(5), test_data()).unwrap();
         }
 
-        let result1 =
-            concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s1, CommitSeq::new(12));
+        let result1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(12),
+        );
         let (err, _) = result1.expect_err("T1 has both rw edges with active T2 and must abort");
         assert_eq!(err, MvccError::BusySnapshot);
-        concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s2, CommitSeq::new(12))
-            .expect("T2 commits once the pivot T1 has aborted");
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        )
+        .expect("T2 commits once the pivot T1 has aborted");
     }
 
     // Test 16: SSI - transaction marked for abort fails.
