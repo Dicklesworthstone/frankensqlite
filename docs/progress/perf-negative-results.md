@@ -87,6 +87,19 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - WIN (probe not met; also a correctness fix): an EXISTS probe without a LIMIT stops at its first row (bd-b887p)
+
+- Target: `count(*) FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE w = 3)` (201x stock):
+  the fold of an uncorrelated EXISTS ran its subquery to the end, and evaluated rows stock never
+  reaches (a later row raising an error failed the statement). Touched:
+  crates/fsqlite-core/src/connection.rs (Connection::limit_exists_probe_to_its_first_row, the
+  bd-8c68u rule, used by the per-row probe, the join evaluator's probe and both folds).
+- Result (2a3f8563c; scratchpad exo_ab.py, stock live, answers equal; ELF before
+  ea1aec8d7519ec2a, after 4b3b5f58113e4925; thinkstation1): 201.4x -> 21.4x; other rows
+  unchanged. The 3x probe is missed by the folded `a = 5 AND 1`: the constant conjunct counts as a
+  residual and moves the COUNT(*) off its index (2,803k against 130k for `a = 5`).
+- Retry condition: drop constant TRUE conjuncts after the fold (follow-up on bd-b887p).
+
 ## 2026-11-15 - SMALL WIN (prediction missed, cost model refuted): an EXISTS opens its subquery table only where it reads a row (bd-tx55u)
 
 - Target: `SELECT id FROM t WHERE EXISTS (SELECT 1 FROM p WHERE p.tid = t.id) AND t.a = 5` (7.8x
