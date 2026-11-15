@@ -87,6 +87,20 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-15 - SMALL WIN (prediction missed, cost model refuted): an EXISTS opens its subquery table only where it reads a row (bd-tx55u)
+
+- Target: `SELECT id FROM t WHERE EXISTS (SELECT 1 FROM p WHERE p.tid = t.id) AND t.a = 5` (7.8x
+  stock, 28.5k instructions per outer row). emit_exists_subquery opened (and closed) the subquery
+  table's cursor on every evaluation, though a residual-free index probe reads only the index and
+  the once-materialized path never closed it. Touched: crates/fsqlite-vdbe/src/codegen.rs.
+- Result (f9b601677; scratchpad exo_ab.py, stock live, answers equal; ELF before
+  ea1aec8d7519ec2a, after d717a5598182c86b; thinkstation1): 8.2x -> 7.9x; NOT EXISTS count
+  12.6x -> 12.3x. Predicted about 21k per outer row (-7k); measured about -0.9k. Refuted: an
+  OpenRead/Close pair is not ~7k here; that figure came from the rowid-probe difference, which
+  the SeekRowid dominates.
+- Retry condition: opening the index cursor once per statement (Once) buys at most another ~1k
+  per row; not as a standalone patch. The cost is the per-row index seek (bd-05xlf's lane).
+
 ## 2026-11-15 - MEASURED WIN, NOT LANDED (gated on its base; the landing base moved under it): a WAL frame-cache hit hands the transaction the cached image instead of two copies (bd-05xlf, read/seek round 5, lever P1 v6)
 
 - Target: every first read of a page in a transaction that the WAL frame cache answers. Measured
