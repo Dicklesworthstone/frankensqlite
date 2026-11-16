@@ -89,6 +89,67 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-16 - REJECTED on the bulk instruction kill line (four versions; a correctness fix, measured like a lever; not landed): the shared rowid allocator learns which sessions hold a claim on a table from the post-insert floor bump (bd-hi7qg v1-v4)
+
+- Target: the cost of bd-hi7qg's fix (an implicit rowid after a deleted maximum is `max(rowid)+1` again, as in stock,
+  when no live session holds a claim on the table and no write commit became visible since BEGIN). The fix needs every
+  live session that inserted into a table recorded as a claimant. v1 and v2 recorded it on every row's post-insert bump
+  (`ConcurrentRowIdAllocator::note_inserted_row`, called from `bump_concurrent_storage_rowid_floor`), and
+  `bulk_insert_1M_one_txn` takes that bump once per row (explicit rowids, `id = value`). Touched:
+  `crates/fsqlite-mvcc/src/rowid_alloc.rs`, `crates/fsqlite-vdbe/src/engine.rs`, `crates/fsqlite-core/src/connection.rs`.
+- Kill line (round 6, before code): bulk instructions up more than 10M, or task-clock min up more than 15 ms.
+- v1 (round 6's patch): the per-row path was restructured into a non-inlined `floor_state` that took a 64-byte
+  `TableAllocatorState` (with a `claimants: Vec<u64>`) by value, through the entry API, and still built the state with
+  its init-log callsite on every row.
+  - Result: base e996d32b9 (sha256 e0449205a40196ee) against v1 (f7a9bd1234ff6566); stock sqlite3 3.46.1 live; 5 reps
+    on bulk, 9 on the mutation rows; scratchpad `r7/ab_hi7qg.txt` of the bulk-write lane.
+  - Bulk 7,030.2M -> 7,077.6M user instructions (+47.4M); task-clock min 852.0 -> 876.0 ms (+24.0). Both lines crossed.
+  - Callgrind of the 200k-row bulk statement: the bump was 100 instructions a row on base (`ensure_table_floor`) and
+    137 on v1. The claim itself was about 5 of those 37; the rest was the restructure.
+- v2: the per-row path back on base's shape (a scalar `TableAllocatorState::tip`, a `get_mut` hit that raises in
+  place, a state built only for a new table); the claim still recorded on every row.
+  - Result: v2 sha256 184f38c7286b0896; scratchpad `r7/ab_hi7qg_v2.txt`.
+  - Bulk 7,034.7M -> 7,052.6M (+17.9M), task-clock min +12.6 ms. The instruction line is crossed.
+  - Callgrind: `note_inserted_row` 22.4M against base's 20.0M per 200k rows (about 12 a row), plus about 3 in the
+    engine call.
+- v3: the claim recorded once per cursor and session (a `(session, schema epoch)` marker on the storage cursor); every
+  later row called `ensure_table_floor`, which then delegated to v2's out-of-line `raise_floor(tables, key, max,
+  seq, mode, claimant)` helper.
+  - Result: v3 sha256 e1920f90e70142fd; scratchpad `r7/ab_hi7qg_v3.txt`.
+  - Bulk 7,032.1M -> 7,065.8M (+33.7M), task-clock min +15.6 ms. Both lines crossed.
+  - Callgrind: +20 a row in the statement. The marker compare is about 5; the out-of-line six-argument helper is about
+    17 above base's single inlined body.
+- v4: v3's per-cursor marker; `ensure_table_floor` and `note_inserted_row` each one body in base's shape (a scalar
+  tip, one `get_mut` hit, a state built only for an unknown table).
+  - Result: v4 sha256 3ea8c68c8bd1c0d5; scratchpad `r7/ab_hi7qg_v4.txt`.
+  - Bulk min 7,031.9M -> 7,055.3M (+23.4M; medians +10.7M); task-clock min 867.4 -> 841.6 ms (medians 896.3 ->
+    868.2). The instruction line is crossed; the time line is not.
+  - Scale check, interleaved, scratchpad `r7_scale.py`: +4.6M at 200k rows, +22.8M at 1M. So it is about 23 a row,
+    per-row work. Statement callgrind (200k): +10.5 a row. The engine's bump closure is about 13 of it (the marker
+    compare and the session / epoch plumbing in the async closure), `ensure_table_floor` 3.
+  - The other about 12 a row scales with rows but is outside the toggled main-thread program. Not attributed.
+  - The CPU instrument does not see a cost: v4 task-clock is lower in the A/B. In the scale check the min is +20 ms and
+    the median -20 ms (noise).
+- Delete, update and memory_script were flat in all four (within 1.2M instructions). Answers equal stock's, and stock
+  integrity_check was ok on every file.
+- The fix is correct and kept for the next version, not landed:
+  - v4 code: scratchpad `r7/hi7qg_r7_v4_code.diff` of the bulk-write lane;
+  - its keeper: `bd_hi7qg_rowid_after_deleted_max_oracle` (stock-compared on four lanes; red on main on the
+    allocator lane, 4 against stock's 3);
+  - green: the keeper and bd_nn29x 19/19 (`review_omitted_rowid_alias_ignores_defaults` included);
+  - a mutation run of fsqlite-mvcc's lib (generation check disabled, old rewind rule restored) fails exactly the two
+    new allocator unit tests (1,682 pass).
+- Retry condition: none for a per-row claim, and none for routing the per-row bump through a helper. A next version
+  must:
+  - record the claim once per INSERT statement and table, at a point outside the per-row bump (for example where an
+    INSERT program opens its table cursor), leaving the per-row bump exactly base's `ensure_table_floor` call. Not at
+    every write-cursor open: a DELETE's or UPDATE's cursor would then claim, and the in-transaction "delete the max,
+    then insert" case the keeper pins would lose its lowering;
+  - first attribute v4's about 12 instructions a row outside the statement's main thread (a frame-pointer CLI, perf
+    record -e instructions:u per thread), which has to be gone too before the 10M line can be met.
+  Any later change that adds work to the per-row post-insert bump is measured on `bulk_insert_1M_one_txn`, where
+  even 12 instructions a row is 12M.
+
 ## 2026-11-16 - WIN (small): the publication epoch notifies its condvar only while a validator waits on it, one FUTEX_WAKE fewer per concurrent commit (bd-w4pr1.7, round 3 item 5a)
 
 - Target: every concurrent commit. Its publication lease's drop moved a process-wide epoch and
