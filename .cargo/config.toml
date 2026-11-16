@@ -9,7 +9,18 @@
 # etc. and `core_sql_rusqlite_conformance::math_functions_match_rusqlite`
 # fails on the rusqlite side ("no such function: sqrt") rather than measuring
 # FrankenSQLite parity. FrankenSQLite already implements these correctly.
-LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
+#
+# HAVE_FDATASYNC makes the bundled SQLite sync with fdatasync(2), as the
+# distro's configure-built sqlite3 does. Without it sqlite3.c `#define`s
+# fdatasync to fsync, which on a real disk also commits the journal for an
+# mtime change (a WAL frame overwrite: about 9.5 ms against 3.1 ms here).
+# FrankenSQLite syncs files with fdatasync on Linux (bd-w4pr1.7 lever S), so
+# without this the stock arm of mt-mvcc-bench and the other C SQLite baselines
+# paid fsync where FrankenSQLite paid fdatasync, flattering FrankenSQLite in
+# synchronous=FULL rows (bd-w4pr1.7, coordinator decision 2026-11-15). The flag
+# changes only which sync call SQLite makes; rusqlite is linked by the benches,
+# the harness and the conformance oracles, never by a release artifact.
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS -DHAVE_FDATASYNC"
 
 # Give test threads 8 MiB instead of the 2 MiB default. A stack overflow in a
 # test does not fail that test -- it aborts the whole test binary with SIGABRT,
