@@ -3042,7 +3042,7 @@ fn generate_wal_fec_repair_symbols_inner(
             }
         })?;
         WalFecRepairEncoder::Coefficients(
-            wal_fec_repair_coefficients(k, encoder_seed, esis).ok_or_else(singular)?,
+            cached_wal_fec_repair_coefficients(k, encoder_seed, esis).ok_or_else(singular)?,
         )
     } else {
         WalFecRepairEncoder::Systematic(Box::new(
@@ -3147,6 +3147,61 @@ fn wal_fec_repair_coefficients(
         .collect();
     let encoder = asupersync::raptorq::systematic::SystematicEncoder::new(&unit_sources, k, seed)?;
     Some(esis.map(|esi| encoder.repair_symbol(esi)).collect())
+}
+
+/// Groups larger than this solve their coefficients every time: their rows
+/// are K bytes each, and such a group is one transaction's many pages.
+const WAL_FEC_COEFFICIENT_CACHE_MAX_K: usize = 64;
+
+/// The most entries the coefficient cache keeps (64 group sizes times a few
+/// repair counts fit many times over).
+const WAL_FEC_COEFFICIENT_CACHE_MAX_ENTRIES: usize = 512;
+
+/// Repair coefficients already solved, by (K, first ESI, end ESI), for K up
+/// to [`WAL_FEC_COEFFICIENT_CACHE_MAX_K`].
+///
+/// RFC 6330's constraint matrix and the tuple of each repair symbol depend on
+/// K and the ESI only, so the coefficient rows of one (K, ESI range) are the
+/// same for every group of that shape. asupersync's `SystematicEncoder::new`
+/// takes a seed and does not use it (0.6.2: `build_ldpc_rows`,
+/// `build_hdpc_rows` and `build_lt_rows` all take `_seed`);
+/// `test_cached_repair_coefficients_serve_groups_with_other_seeds` fails if
+/// that changes. Without the cache every one-page commit at synchronous=FULL
+/// re-solved its K-row system on the repair worker: about 103k of the
+/// worker's 121k instructions per commit (bd-w4pr1.7, round 3 item 4).
+static WAL_FEC_REPAIR_COEFFICIENTS: Mutex<WalFecCoefficientCache> = Mutex::new(BTreeMap::new());
+
+/// A group shape: (K, first ESI, end ESI).
+type WalFecCoefficientShape = (usize, u32, u32);
+
+/// One coefficient row per repair symbol, by group shape.
+type WalFecCoefficientCache = BTreeMap<WalFecCoefficientShape, Vec<Vec<u8>>>;
+
+/// [`wal_fec_repair_coefficients`], served from
+/// [`WAL_FEC_REPAIR_COEFFICIENTS`] when this shape was solved before.
+fn cached_wal_fec_repair_coefficients(
+    k: usize,
+    seed: u64,
+    esis: std::ops::Range<u32>,
+) -> Option<Vec<Vec<u8>>> {
+    if k > WAL_FEC_COEFFICIENT_CACHE_MAX_K {
+        return wal_fec_repair_coefficients(k, seed, esis);
+    }
+    let key = (k, esis.start, esis.end);
+    let cached = lock_unpoisoned(&WAL_FEC_REPAIR_COEFFICIENTS)
+        .get(&key)
+        .cloned();
+    if cached.is_some() {
+        return cached;
+    }
+    let rows = wal_fec_repair_coefficients(k, seed, esis)?;
+    {
+        let mut cache = lock_unpoisoned(&WAL_FEC_REPAIR_COEFFICIENTS);
+        if cache.len() < WAL_FEC_COEFFICIENT_CACHE_MAX_ENTRIES {
+            cache.insert(key, rows.clone());
+        }
+    }
+    Some(rows)
 }
 
 fn validate_source_pages(meta: &WalFecGroupMeta, source_pages: &[Vec<u8>]) -> Result<()> {
@@ -5079,6 +5134,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// bd-w4pr1.7 round 3: the coefficient cache serves groups whose seeds
+    /// differ from the one that filled it, and every (K, r) shape gets its
+    /// own rows. Each symbol is compared with a fresh page-width encoder
+    /// built with that group's own seed, so a cache keyed without K or
+    /// without r, or a RaptorQ encoder that starts using its seed, fails.
+    #[test]
+    fn test_cached_repair_coefficients_serve_groups_with_other_seeds() {
+        for k in [1_usize, 2, 3, 7] {
+            let k_esi = u32::try_from(k).unwrap();
+            assert_eq!(
+                wal_fec_repair_coefficients(k, 0x0123_4567_89AB_CDEF, k_esi..k_esi + 3),
+                wal_fec_repair_coefficients(k, 0xFEDC_BA98_7654_3210, k_esi..k_esi + 3),
+                "repair coefficients must not depend on the encoder seed (k={k})"
+            );
+        }
+
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[5]
+        };
+        let page_size = 4096_u32;
+        let mut seeds = BTreeMap::<(u32, u32), Vec<u64>>::new();
+        for round in 0..2_u32 {
+            for (k, r_repair) in [(1_u32, 2_u32), (2, 2), (1, 3), (3, 2), (2, 1), (1, 2)] {
+                let mut init = make_test_init(k);
+                init.r_repair = r_repair;
+                // Another frame range and salt each round: another seed.
+                init.start_frame_no = 1 + round * 100;
+                init.end_frame_no = init.start_frame_no + k - 1;
+                init.wal_salt1 ^= round + 1;
+                let pages: Vec<Vec<u8>> = (0..k)
+                    .map(|_| (0..page_size).map(|_| next_byte()).collect())
+                    .collect();
+                init.source_page_xxh3_128 = build_source_page_hashes(&pages);
+                let meta = WalFecGroupMeta::from_init(init).expect("meta");
+                let seed = derive_repair_seed(&meta, 0);
+                seeds.entry((k, r_repair)).or_default().push(seed);
+                let encoder = asupersync::raptorq::systematic::SystematicEncoder::new(
+                    &pages,
+                    page_size as usize,
+                    seed,
+                )
+                .expect("page-width encoder");
+                let symbols =
+                    generate_wal_fec_repair_symbols(&meta, &pages).expect("repair symbols");
+                assert_eq!(symbols.len(), r_repair as usize);
+                for (index, symbol) in symbols.iter().enumerate() {
+                    let esi = k + u32::try_from(index).unwrap();
+                    assert_eq!(symbol.esi, esi);
+                    assert_eq!(
+                        symbol.symbol_data,
+                        encoder.repair_symbol(esi),
+                        "round={round} k={k} r={r_repair} esi={esi}"
+                    );
+                }
+            }
+        }
+        // Rounds used different seeds for every shape, so the later groups
+        // of each shape were served rows another seed had filled.
+        assert!(
+            seeds
+                .values()
+                .all(|shape_seeds| shape_seeds.len() >= 2
+                    && shape_seeds.first() != shape_seeds.last()),
+            "{seeds:?}"
+        );
+        assert!(
+            lock_unpoisoned(&WAL_FEC_REPAIR_COEFFICIENTS).contains_key(&(1, 1, 3)),
+            "a one-page, two-repair-symbol group is cached"
+        );
     }
 
     #[test]
