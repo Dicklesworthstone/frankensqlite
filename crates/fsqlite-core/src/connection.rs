@@ -29189,7 +29189,7 @@ impl Connection {
         expr: &Expr,
         values: &[SqliteValue],
         columns: &[ResultColumn],
-        group_rows: &[&Vec<SqliteValue>],
+        group_rows: &GroupRows<'_>,
         col_map: &[(String, String, bool)],
     ) -> Result<bool> {
         self.with_fallback_function_registry(|| {
@@ -90596,18 +90596,18 @@ impl Connection {
             .iter()
             .map(|collation| group_key_collation_varies_spelling(collation.as_deref()))
             .collect();
+        // bd-5i14u: each group's bare-column row, by index. The rows stay in
+        // scan order, which every other aggregate steps over.
+        let mut bare_row_indices: Vec<Option<usize>> = vec![None; groups.len()];
         if let Some(tracking) = self
             .select_uses_builtin_minmax_bare_tracking_with_keys(tracking_source, &variant_group_keys)
         {
-            for (_key, group_rows) in &mut groups {
-                if let Some(index) = self
+            for ((_key, group_rows), bare_row_index) in groups.iter().zip(&mut bare_row_indices) {
+                *bare_row_index = self
                     .join_minmax_bare_extremum_index(
                         &tracking, group_rows, &col_map, using_skip, &coll_snap,
                     )
-                    .await?
-                {
-                    group_rows.swap(0, index);
-                }
+                    .await?;
             }
         }
 
@@ -90616,7 +90616,10 @@ impl Connection {
         let mut result = Vec::with_capacity(groups.len());
         let mut result_group_indices = Vec::with_capacity(groups.len());
         for (group_index, (_key, group_rows)) in groups.iter().enumerate() {
-            let representative_row = group_rows.first().unwrap_or(&empty_group_row);
+            let bare_row = bare_row_indices[group_index].and_then(|index| group_rows.get(index));
+            let representative_row = bare_row
+                .or_else(|| group_rows.first())
+                .unwrap_or(&empty_group_row);
             let owned_group_rows: Vec<&Vec<SqliteValue>> = if owns_subquery_aggregates {
                 group_rows.iter().collect()
             } else {
@@ -90657,8 +90660,9 @@ impl Connection {
                                 expr
                             };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            let rows = GroupRows::with_bare_row(&refs, bare_row);
                             self.with_fallback_function_registry(|| {
-                                eval_group_agg_join_expr(effective, &refs, &col_map)
+                                eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
                         } else if expr_has_any_subquery(expr) {
                             let inlined = self
@@ -90985,13 +90989,13 @@ impl Connection {
                 } else {
                     having
                 };
-                // The min()/max() extremum row was already moved to the front.
+                // HAVING's bare columns read the min()/max() extremum row too.
                 let group_row_refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
                 if !self.evaluate_having_predicate_with_registry(
                     effective_having,
                     &values,
                     &expanded_columns,
-                    &group_row_refs,
+                    &GroupRows::with_bare_row(&group_row_refs, bare_row),
                     &col_map,
                 )? {
                     continue;
@@ -91032,7 +91036,11 @@ impl Connection {
                 // already-built result set.
                 for (result_index, &group_index) in result_group_indices.iter().enumerate() {
                     let group_rows = &groups[group_index].1;
-                    let representative_row = group_rows.first().unwrap_or(&empty_group_row);
+                    let bare_row =
+                        bare_row_indices[group_index].and_then(|index| group_rows.get(index));
+                    let representative_row = bare_row
+                        .or_else(|| group_rows.first())
+                        .unwrap_or(&empty_group_row);
                     let mut extra_values = Vec::with_capacity(extra_order_terms.len());
                     for (term_idx, expr) in &extra_order_terms {
                         let owned_bound;
@@ -91061,8 +91069,9 @@ impl Connection {
                                 expr
                             };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            let rows = GroupRows::with_bare_row(&refs, bare_row);
                             self.with_fallback_function_registry(|| {
-                                eval_group_agg_join_expr(effective, &refs, &col_map)
+                                eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
                         } else if expr_has_any_subquery(expr) {
                             let inlined = self
@@ -92510,7 +92519,7 @@ impl Connection {
             let registry = Arc::clone(&self.func_registry.borrow());
             let custom_aggregate_keys = Arc::clone(&self.custom_aggregate_keys.borrow());
             with_sync_function_registry(registry, custom_aggregate_keys, || {
-                eval_group_agg_join_expr(effective, &group_rows, &empty_col_map)
+                eval_group_agg_join_expr(effective, &GroupRows::new(&group_rows), &empty_col_map)
             })
         } else {
             self.eval_expr_with_subqueries(expr, &empty_row, &empty_col_map, None)
@@ -92764,7 +92773,13 @@ impl Connection {
                     values.push(with_sync_function_registry(
                         registry,
                         custom_aggregate_keys,
-                        || eval_group_agg_join_expr(expr, &included_rows, &empty_col_map),
+                        || {
+                            eval_group_agg_join_expr(
+                                expr,
+                                &GroupRows::new(&included_rows),
+                                &empty_col_map,
+                            )
+                        },
                     )?);
                 }
                 ResultColumn::Expr { expr, .. } => {
@@ -92805,7 +92820,7 @@ impl Connection {
                     effective_having,
                     &values,
                     columns,
-                    &included_rows,
+                    &GroupRows::new(&included_rows),
                     &empty_col_map,
                 )?
             }
@@ -93177,7 +93192,7 @@ impl Connection {
             let registry = Arc::clone(&self.func_registry.borrow());
             let custom_aggregate_keys = Arc::clone(&self.custom_aggregate_keys.borrow());
             with_sync_function_registry(registry, custom_aggregate_keys, || {
-                eval_group_agg_join_expr(effective, &group_rows, &empty_col_map)
+                eval_group_agg_join_expr(effective, &GroupRows::new(&group_rows), &empty_col_map)
             })?;
         } else {
             self.eval_expr_with_subqueries(expr, &empty_row, &empty_col_map, None)
@@ -96850,30 +96865,15 @@ impl Connection {
                             } else {
                                 expr
                             };
-                            // bd-0174u: when the single-min/max bare-column
-                            // optimization applies, bare columns nested in this
+                            // bd-0174u / bd-5i14u: bare columns nested in this
                             // mixed output expression (for example
-                            // `max(price) || name`) must be sourced from the
-                            // extremum representative row, not the group's first
-                            // row. The group-aggregate evaluator reads
-                            // non-aggregate leaves from the first row it is
-                            // given, so present the representative row first. The
-                            // lone tracked min/max is order-independent, so this
-                            // reordering does not change its computed value.
-                            let refs: Vec<&Vec<SqliteValue>> = if minmax_bare_tracking.is_some()
-                                && let Some(repr) = repr_row
-                            {
-                                let mut ordered = Vec::with_capacity(group_rows.len());
-                                ordered.push(repr);
-                                ordered.extend(
-                                    group_rows.iter().filter(|row| !std::ptr::eq(*row, repr)),
-                                );
-                                ordered
-                            } else {
-                                group_rows.iter().collect()
-                            };
+                            // `max(price) || name`) read the representative
+                            // (extremum) row, while its aggregates step over
+                            // the group in scan order.
+                            let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            let rows = GroupRows::with_bare_row(&refs, repr_row);
                             self.with_fallback_function_registry(|| {
-                                eval_group_agg_join_expr(effective, &refs, &col_map)
+                                eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
                         } else if expr_has_any_subquery(expr) {
                             // Correlated scalar subqueries need to be inlined
@@ -97215,25 +97215,15 @@ impl Connection {
                 } else {
                     having
                 };
-                // bd-xik4y: HAVING's bare columns read the same row as the
-                // result columns — the min()/max() extremum row when that
-                // tracking applies (the evaluator reads bare values from the
-                // first row; the lone min()/max() and count() are order-free).
-                let group_row_refs: Vec<&Vec<SqliteValue>> = if minmax_bare_tracking.is_some()
-                    && let Some(repr) = repr_row
-                {
-                    let mut ordered = Vec::with_capacity(group_rows.len());
-                    ordered.push(repr);
-                    ordered.extend(group_rows.iter().filter(|row| !std::ptr::eq(*row, repr)));
-                    ordered
-                } else {
-                    group_rows.iter().collect()
-                };
+                // bd-xik4y / bd-5i14u: HAVING's bare columns read the same
+                // row as the result columns: the min()/max() extremum row when
+                // that tracking applies.
+                let group_row_refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
                 if !self.evaluate_having_predicate_with_registry(
                     effective_having,
                     &values,
                     &expanded_columns,
-                    &group_row_refs,
+                    &GroupRows::with_bare_row(&group_row_refs, repr_row),
                     &col_map,
                 )? {
                     continue;
@@ -97283,24 +97273,15 @@ impl Connection {
                             } else {
                                 expr
                             };
-                            // bd-xik4y: as for the result columns, bare leaves
-                            // nested in the aggregate expression read the first
-                            // row, so the min()/max() extremum row goes first.
-                            let refs: Vec<&Vec<SqliteValue>> = if minmax_bare_tracking.is_some()
-                                && let Some(index) = result_representative_indices[result_index]
-                                && let Some(repr) = group_rows.get(index)
-                            {
-                                let mut ordered = Vec::with_capacity(group_rows.len());
-                                ordered.push(repr);
-                                ordered.extend(
-                                    group_rows.iter().filter(|row| !std::ptr::eq(*row, repr)),
-                                );
-                                ordered
-                            } else {
-                                group_rows.iter().collect()
-                            };
+                            // bd-xik4y / bd-5i14u: as for the result columns,
+                            // bare leaves nested in the aggregate expression
+                            // read the min()/max() extremum row.
+                            let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            let bare_row = result_representative_indices[result_index]
+                                .and_then(|index| group_rows.get(index));
+                            let rows = GroupRows::with_bare_row(&refs, bare_row);
                             self.with_fallback_function_registry(|| {
-                                eval_group_agg_join_expr(effective, &refs, &col_map)
+                                eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
                         } else if expr_has_any_subquery(expr) {
                             let inlined = self
@@ -113201,8 +113182,9 @@ fn frame_bound_has_expr(bound: &FrameBound, predicate: fn(&Expr) -> bool) -> boo
 
 /// bd-xplxa / bd-0174u: Detect SQLite's "bare column tracks the min()/max() row"
 /// special case. It applies when a query's aggregates include a `min(x)` or
-/// `max(x)` (one argument, no window spec; besides count()) and at least one
-/// result column references a bare (un-grouped, non-aggregate) value. SQLite
+/// `max(x)` (one argument, no window spec; other aggregates beside it do not
+/// matter, bd-5i14u) and at least one result column references a bare
+/// (un-grouped, non-aggregate) value. SQLite
 /// then sources every bare column from the row that produced the extremum
 /// rather than an arbitrary row; with several distinct min()/max() calls, from
 /// the last one's (bd-6lijo). The walk's `minmax` is that aggregate's
@@ -113345,9 +113327,8 @@ struct MinMaxBareTrackingWalk {
     minmax_distinct: bool,
     /// Whether a bare (non-aggregate, non-GROUP-BY) column reference was found.
     has_bare: bool,
-    /// Set when a shape disqualifies the optimization (window function, a
-    /// second distinct min()/max() beside a DISTINCT or FILTER one, or an
-    /// aggregate other than min/max/count).
+    /// Set when a shape disqualifies the optimization (a window function, or
+    /// a second distinct min()/max() beside a DISTINCT or FILTER one).
     bail: bool,
     /// bd-6lijo: walking ORDER BY, where other aggregates and window
     /// functions leave the tracking alone instead of disqualifying it.
@@ -113404,9 +113385,10 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
         // calls decide which row supplies the bare columns (only they skip the
         // accumulator load); with several, SQLite's last one does (bd-6lijo),
         // and a repeat of an earlier call is that same aggregate (its AggInfo
-        // deduplicates equal expressions). count() never decides it and is
-        // exact and order-free, so the join path may still move the extremum
-        // row first.
+        // deduplicates equal expressions). bd-5i14u: every other aggregate
+        // (count, sum, avg, group_concat, ...) neither decides the row nor
+        // stops the tracking, as in stock, and the grouped evaluators keep
+        // the rows in scan order for it (`GroupRows`).
         Expr::FunctionCall {
             name,
             args,
@@ -113415,9 +113397,9 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
             ..
         } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
             let lname = name.to_ascii_lowercase();
-            if lname == "count" {
-                // Its argument and FILTER belong to the aggregate, not to the
-                // bare-column set.
+            if lname != "min" && lname != "max" {
+                // Its arguments, FILTER and ORDER BY belong to the aggregate,
+                // not to the bare-column set.
                 return;
             }
             let arg = match args {
@@ -113427,10 +113409,6 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
                     return;
                 }
             };
-            if lname != "min" && lname != "max" {
-                state.bail |= !state.in_order_by;
-                return;
-            }
             let call = (lname == "max", arg.clone(), filter.as_deref().cloned());
             if state.seen_minmax.contains(&call) {
                 state.minmax_distinct |= *distinct;
@@ -124863,7 +124841,7 @@ impl Connection {
             ));
         }
         let value = self.with_fallback_function_registry(|| {
-            eval_group_agg_join_expr(call, group_rows, col_map)
+            eval_group_agg_join_expr(call, &GroupRows::new(group_rows), col_map)
         })?;
         let span = match call {
             Expr::FunctionCall { span, .. } => *span,
@@ -134805,12 +134783,56 @@ fn eval_json_aggregate_arg(
     Ok((value, LAST_VARYING_RESULT_SUBTYPE.with(Cell::get)))
 }
 
+/// The rows of one group as the grouped evaluators read them (bd-5i14u). Every
+/// aggregate steps over `rows` in scan order; a bare column (one outside any
+/// aggregate) reads `bare`, the row SQLite's accumulator holds: the
+/// min()/max() extremum row when that tracking applies, else the first row.
+/// Keeping the two apart is what lets an order-sensitive aggregate
+/// (group_concat, json_group_array, a REAL sum) sit beside the extremum row.
+#[derive(Clone, Copy)]
+struct GroupRows<'a> {
+    rows: &'a [&'a Vec<SqliteValue>],
+    bare: Option<&'a Vec<SqliteValue>>,
+}
+
+impl<'a> GroupRows<'a> {
+    /// Bare columns read the group's first row.
+    const fn new(rows: &'a [&'a Vec<SqliteValue>]) -> Self {
+        Self {
+            rows,
+            bare: rows.first().copied(),
+        }
+    }
+
+    /// Bare columns read `bare`, or the first row when it is `None`.
+    fn with_bare_row(rows: &'a [&'a Vec<SqliteValue>], bare: Option<&'a Vec<SqliteValue>>) -> Self {
+        Self {
+            rows,
+            bare: bare.or_else(|| rows.first().copied()),
+        }
+    }
+
+    /// The row a bare column reads; `None` for an empty group.
+    const fn bare_row(&self) -> Option<&'a Vec<SqliteValue>> {
+        self.bare
+    }
+}
+
+impl<'a> std::ops::Deref for GroupRows<'a> {
+    type Target = [&'a Vec<SqliteValue>];
+
+    fn deref(&self) -> &Self::Target {
+        self.rows
+    }
+}
+
 /// Evaluate an expression that may contain aggregate function calls against
-/// a group of rows. Aggregate sub-expressions are computed over the full
-/// group; the remaining scalar parts are evaluated against the first row.
+/// a group of rows. Aggregate sub-expressions are computed over every row of
+/// the group; the remaining scalar parts read its bare row
+/// ([`GroupRows::bare_row`]).
 fn eval_group_agg_join_expr(
     expr: &Expr,
-    group_rows: &[&Vec<SqliteValue>],
+    group_rows: &GroupRows<'_>,
     col_map: &[(String, String, bool)],
 ) -> Result<SqliteValue> {
     match expr {
@@ -134848,7 +134870,7 @@ fn eval_group_agg_join_expr(
                 // passes FILTER.
                 let fixed_subtype = fixed_json_aggregate_arg_subtype(arg);
                 let mut items: Vec<((SqliteValue, u32), Vec<SqliteValue>)> = Vec::new();
-                for row in group_rows {
+                for row in group_rows.iter() {
                     if let Some(filter_expr) = filter
                         && !is_sqlite_truthy(&eval_join_expr(filter_expr, row, col_map)?)
                     {
@@ -134908,7 +134930,7 @@ fn eval_group_agg_join_expr(
                 }
                 let fixed_subtype = fixed_json_aggregate_arg_subtype(&exprs[1]);
                 let mut items: Vec<JsonObjectAggregateItem> = Vec::new();
-                for row in group_rows {
+                for row in group_rows.iter() {
                     if let Some(filter_expr) = filter
                         && !is_sqlite_truthy(&eval_join_expr(filter_expr, row, col_map)?)
                     {
@@ -134980,7 +135002,7 @@ fn eval_group_agg_join_expr(
             // expression evaluates to true.
             let filtered_rows: Vec<&Vec<SqliteValue>> = if let Some(filter_expr) = filter {
                 let mut filtered = Vec::with_capacity(group_rows.len());
-                for &row in group_rows {
+                for &row in group_rows.iter() {
                     if is_sqlite_truthy(&eval_join_expr(filter_expr, row, col_map)?) {
                         filtered.push(row);
                     }
@@ -135110,7 +135132,9 @@ fn eval_group_agg_join_expr(
         }
         Expr::FunctionCall { name, args, .. } => {
             // Scalar function — evaluate args which may themselves contain aggs.
-            let row = group_rows.first().map_or(&[][..], |row| row.as_slice());
+            let row = group_rows
+                .bare_row()
+                .map_or(&[][..], |row| row.as_slice());
             let application_kind =
                 current_application_function_kind(name, aggregate_args_len_for_lookup(args));
             if application_kind.is_none()
@@ -135386,14 +135410,14 @@ fn eval_group_agg_join_expr(
             Ok(apply_cast(val, &type_name.name))
         }
         Expr::Collate { expr: inner, .. } => eval_group_agg_join_expr(inner, group_rows, col_map),
-        // No aggregate sub-expressions: delegate to per-row eval on first row.
-        // When group_rows is empty (implicit aggregation on an empty table),
-        // still try evaluating with an empty row — this correctly handles
-        // literals, constants, and expressions that don't reference columns
-        // (e.g. the `1` in `SELECT COUNT(*) + 1 FROM empty_table`).
+        // No aggregate sub-expressions: delegate to per-row eval on the bare
+        // row. When group_rows is empty (implicit aggregation on an empty
+        // table), still try evaluating with an empty row — this correctly
+        // handles literals, constants, and expressions that don't reference
+        // columns (e.g. the `1` in `SELECT COUNT(*) + 1 FROM empty_table`).
         other => {
             let empty = Vec::new();
-            let row: &Vec<SqliteValue> = group_rows.first().copied().unwrap_or(&empty);
+            let row: &Vec<SqliteValue> = group_rows.bare_row().unwrap_or(&empty);
             eval_join_expr(other, row, col_map)
         }
     }
@@ -143993,13 +144017,13 @@ pub(crate) fn is_sqlite_truthy(v: &SqliteValue) -> bool {
 ///
 /// `group_rows` and `col_map` allow computing aggregates that are not in the
 /// SELECT list (e.g. `HAVING COUNT(*) > 1` when COUNT(*) is not a result column).
-/// Bare columns read the FIRST of `group_rows`, so a caller tracking the
-/// single-min()/max() extremum row passes that row first (bd-xik4y).
+/// Bare columns read the group's bare row, which a caller tracking the
+/// min()/max() extremum row sets to that row (bd-xik4y, bd-5i14u).
 fn evaluate_having_predicate(
     expr: &Expr,
     values: &[SqliteValue],
     columns: &[ResultColumn],
-    group_rows: &[&Vec<SqliteValue>],
+    group_rows: &GroupRows<'_>,
     col_map: &[(String, String, bool)],
 ) -> Result<bool> {
     Ok(is_sqlite_truthy(&evaluate_having_value(
@@ -144040,7 +144064,7 @@ fn evaluate_having_value(
     expr: &Expr,
     values: &[SqliteValue],
     columns: &[ResultColumn],
-    group_rows: &[&Vec<SqliteValue>],
+    group_rows: &GroupRows<'_>,
     col_map: &[(String, String, bool)],
 ) -> Result<SqliteValue> {
     match expr {
@@ -144065,7 +144089,7 @@ fn evaluate_having_value(
             // data via col_map FIRST, before the alias/result-name checks below.
             if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, None) {
                 return Ok(group_rows
-                    .first()
+                    .bare_row()
                     .and_then(|r| r.get(idx))
                     .cloned()
                     .unwrap_or(SqliteValue::Null));
@@ -144578,7 +144602,9 @@ fn evaluate_having_value(
                 LikeOp::Like => simple_like_match(&p, &s, esc_char),
                 LikeOp::Glob => simple_glob_match(&p, &s),
                 LikeOp::Match => {
-                    let match_row = group_rows.first().map_or(&[][..], |row| row.as_slice());
+                    let match_row = group_rows
+                        .bare_row()
+                        .map_or(&[][..], |row| row.as_slice());
                     match_query_with_table_columns(inner, &p, &s, match_row, col_map)
                 }
                 // REGEXP requires a user-defined function; this fallback
