@@ -89,6 +89,154 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-16 - WIN (landed; re-measured on main f818d8531, A/A arm in the run): a WAL frame-cache hit hands the transaction the cached image instead of two copies (bd-05xlf, read/seek round 6, lever P1 v6)
+
+- What: the round-5 entry below ("MEASURED WIN, NOT LANDED"), unchanged code. Its diff applied
+  at offsets only: first to origin/main bf8b3377b, then to f818d8531. Both arms were rebuilt on
+  each of those trees and the A/B repeated, with an A/A arm. It then rebased onto 404d5a6b3 to
+  land (see the landing rerun below). Touched files and keepers are as listed in that entry.
+- Method change from round 5 (see its measurement trap):
+  - one database per row family, built by a main binary;
+  - copied per arm with its WAL, shm, WAL certificate and migration state. A bare `cp` reruns the
+    migration pass on its first open and then takes the uncertified-WAL open path: 7.05M, then
+    4.17M open instructions, against 4.52M for a full copy;
+  - an A/A arm (the main binaries again, on their own copies) in the same invocation.
+- Result on f818d8531. thinkstation1, governor powersave, load 3.3 to 4.1, io_uring refused,
+  9 sweep reps and 7 lookup reps interleaved.
+  - main f818d8531: CLI ca0d03729bdb2317, probe 3a708fc9c55faf51.
+  - v6: CLI 5556e8ca264f7851, probe 83e7629d31634acc.
+  - Stock live: sqlite3 3.46.1 for the sweep; the 3.54.1 amalgamation driver (9500dcc51bdca47c)
+    for the prepared loop.
+  - Answers equal stock's.
+
+  | row | stock | main | A/A | v6 |
+  |---|---|---|---|---|
+  | prepared select-index (WAL), instructions per execution | 5,058 | 76,582 (15.1x) | 76,674 | 68,591 (13.6x) |
+  | same, CPU per execution | 4.13 us | 26.49 us (6.4x) | 26.47 us | 24.70 us (6.0x) |
+  | select-index, checkpointed (control) | 5,058 | 74,116 | 74,145 | 74,184 |
+  | select-rowid (control) | 4,725 | 8,139 | 8,139 | 8,129 |
+  | autocommit INSERT (write control) | - | 141,328 | 141,506 | 141,200 |
+  | point_rowid_2000 | 44.0M | 179.4M (4.08x) | 179.4M | 176.6M (4.01x) |
+  | point_hot_2000 | 42.8M | 168.5M | 168.2M | 165.6M |
+  | point_sec_key_2000 | 67.4M | 268.2M | 268.0M | 265.2M |
+  | rowid_lookups_200k | 554.4M | 2,684.9M | 2,684.9M | 2,689.1M (+0.16%) |
+  | range_noncovering_200k | 637.6M | 3,340.4M | 3,340.4M | 3,344.6M (+0.13%) |
+
+  On bf8b3377b (main CLI fb54c6904e89a5c1, v6 dc073c477fe09422), the same method gave:
+  select-index 76,585 -> 68,060; miss rows +0.16% / +0.12%; point_rowid_2000 -1.5%.
+- Prediction (bd-05xlf, round 6, before the candidate was built):
+  - select-index -7.5k to -10.0k (-8.0k: inside), CPU -1.5 to -3.5 us (-1.8 us: inside);
+  - checkpointed within 0.5k, select-rowid within 0.15k, INSERT within 1.0%: all inside;
+  - point_rowid_2000 -1.5% to -4.5% (-1.6%: inside); point_hot_2000 -6% to +0.3% (-1.7%: inside);
+  - miss rows +0.10% to +0.20%: inside.
+  - Kill lines, unchanged from round 5 (miss rows worse than 0.2%, select-index under -5.0k,
+    controls, the A/A arm outside a band): none crossed. The A/A arm sat within 0.18% everywhere.
+- Gate (rch) on f818d8531 + this change:
+  - clippy -D warnings on fsqlite-pager and fsqlite-core, all targets: clean;
+  - fsqlite-pager --lib: 1,113 passed, 1 failed (bd_2jpu6_2, bd-mcpbv);
+  - fsqlite-core --lib with the join/seek, seek-key, savepoint/trigger/peer/staleness and
+    prepared-statement keepers and the cross-process battery (48 targets): 4,584 passed, 5 failed.
+    Four are main reds (test_retained_autocommit_flush_propagates_nontransient_post_commit_
+    checkpoint_failure, the t6741 pair, bd_8c68u). The fifth, gh534
+    `sigkill_during_a_commit_loop_never_blocks_the_next_commit` (trial 1 read 2 rows where stock
+    read 3), passed in two reruns on the same tree, once on f818d8531 without the change, and
+    again on the landing tree;
+  - fsqlite-e2e: stock_headerless_wal_e2e, split_claim, refused_commit, gh364 and the
+    concurrent-writer set, 13 targets: 95 passed. multiprocess_autocommit_busy_timeout_e2e
+    --test-threads=1: 8 passed;
+  - the whole fsqlite crate, 124 targets: 1,098 passed.
+- Landing rerun. The rebase onto 404d5a6b3 brought other lanes' hunks into pager.rs, traits.rs,
+  wal_adapter.rs and connection.rs. On that exact tree:
+  - clippy: clean;
+  - pager --lib: 1,114 passed, 1 failed (bd_2jpu6_2);
+  - core --lib with P1's keeper, bd_7zs8a_stock_wal_lifetime_probe, the cross-process battery and
+    the prepared-statement staleness keepers (11 targets): 4,449 passed, 2 failed (the t6741
+    pair).
+- Landed in d93eda4b7, on b3abcb66a (a ledger-only commit after 404d5a6b3).
+- Retry / next: unchanged from round 5.
+  - (1) Keep the no-frame answer inlinable, to take back the miss rows' 15 Ir a lookup.
+  - (2) The main page cache's hit still copies twice (checkpointed lookup 74.2k). Sharing it
+    needs a probe that answers a miss without a PageData-sized value.
+
+## 2026-11-15 - REJECTED on its keeper kill line (measured gain kept: multicol_eq_1000 6.60x -> 4.92x stock): a literal SELECT of aggregates or columns over ANDed integer keys runs parameterized, with one-key shapes allocation-free (bd-w4pr1.13.18, read/seek round 6, lever L5 v2)
+
+- Target: multicol_eq_1000 of the read sweep (`SELECT count(*), sum(val) FROM s WHERE g = <int>
+  AND h = <int>`, 1,000 distinct literal pairs, each its own autocommit statement). This is the
+  retry of the L5 rejection below.
+- Touched (never committed; clone perf5-shm stash "rs6 L5 v2 ...", coordinator scratchpad
+  `rs6/l5v2_on_bf8b3377b_p1v6.patch` and `rs6/l5v2/`):
+  - `crates/fsqlite-core/src/connection/literal_params.rs`: v1's recognizer with
+    `key_columns: SmallVec<[String; 1]>` and a `SmallVec<[&str; 2]>` scan list in place of v1's
+    two Vecs;
+  - `crates/fsqlite-core/src/connection.rs`: `literal_statement_may_run_parameterized` over every
+    key;
+  - the keeper in `crates/fsqlite-core/tests/bd_5310l_literal_parameterization_oracle.rs`: v1's,
+    plus one-key aggregates over every affinity column and a one-key engagement count.
+- Ledger preflight: L5 (below) and its retry condition, followed here: one-key shapes
+  allocation-free, an A/A of the method before setting bands, per-arm copies of one file. Also L2's
+  entry and bd-5310l's.
+- A/A of the method: the main bf8b3377b CLI on two copies of one file, 9 reps, run twice.
+  point_hot_2000 -0.24% / 0.00%, point_sec_key_2000 -0.19% / -0.19%, point_rowid_2000 +0.06% /
+  0.00%, insert_literal_400 +0.27% / -0.14% (min). Bands set from it before the build: point_hot
+  0.5%, point_sec_key 0.4%, point_rowid 0.3%, rowid_lookups 0.2%, insert 0.6%.
+- Measurement trap found while sizing it: a bare `cp` of an fsqlite database without its
+  `-wal-cert`, `-wal-cert-head` and `.fsqlite-migration-state` sidecars takes another open path.
+  The first open reruns the migration pass and later opens take the uncertified-WAL path: 7.05M,
+  then 4.17M open instructions, against 4.52M for the original. Round 5's per-arm copies were bare
+  copies. Copy every sidecar except the `-fsqlite-ns-*` lock files.
+- Result. thinkstation1, governor powersave, load about 5, io_uring refused, stock sqlite3 3.46.1
+  live, 9 reps, answers equal on every sweep row. Base = bf8b3377b + P1 v6 (CLI
+  dc073c477fe09422); L5 v2 = that + this change (CLI be71f5d58122b0c3); the A/A arm is the base
+  CLI on its own copy.
+
+  | row | stock | base | A/A | L5 v2 (min / median) |
+  |---|---|---|---|---|
+  | multicol_eq_1000, instructions | 60.1M | 397.2M (6.60x) | 396.9M | 295.8M (4.92x), -101.4k a statement |
+  | multicol_eq_1000, CPU | 29.5 ms | 135.8 ms | 144.0 ms | 102.0 ms |
+  | point_rowid_2000 | 44.0M | 176.6M | 176.6M | 177.0M (+0.23% / +0.17%) |
+  | point_hot_2000 | 42.8M | 166.1M | 165.5M | 165.9M (-0.12% / -0.12%) |
+  | point_sec_key_2000 | 67.4M | 265.0M | 265.1M | 265.4M (+0.15% / +0.30%) |
+  | orderby_page_500x20 / rowid_lookups_200k | 60.7M / 554.4M | 291.6M / 2,689.1M | same | 291.6M / 2,689.0M |
+  | insert_literal_400 | 9.1M | 72.9M | 72.8M | 73.1M (+0.27% / -0.13%) |
+
+- Prediction (bd-w4pr1.13.18, round 6, before the build):
+  - multicol_eq_1000 -85k to -105k a statement (-101.4k: inside); CPU -25 to -40 ms (-33.8 ms:
+    inside).
+  - One-key controls +0.00% to +0.10%: MISSED on point_rowid_2000 (+0.23%) and
+    point_sec_key_2000 (+0.15%), inside their bands. Callgrind of point_rowid statements 100-300 on
+    both CLIs: `parameterize_literal_statement` 2,217 -> 2,337 Ir and
+    `literal_statement_may_run_parameterized` 858 -> 876. That is about 140 Ir a one-key statement
+    (the SmallVec collect, the result-column and AND peeks), against 30-80 predicted.
+  - Kill lines: every measurement line held. The keeper line, "a keeper failing that is not a
+    known main red", was CROSSED. REJECTED.
+- Why it is rejected. Gate on 983eff8c6 + P1 v6 + L5 v2: fsqlite-core --lib with the T1/T2/T3/PS/XP
+  keepers, 4,583 passed and 6 failed (the t6741 pair, bd_8c68u and gh528 are known reds).
+  - `bd_d4rbi_bare_column_aggregate_seeks::bare_column_aggregates_match_stock` showed 14
+    divergences, every one an aggregate beside a bare column over `a = 5 AND n = 2`.
+    `SELECT id, b, c, count(*) FROM t WHERE a = 5 AND n = 2` answers stock's 357|0|v14|7 on the
+    base CLI and on the `main.t` text path, and 27|2|v20|7 on the L5 CLI. With the keys bound,
+    fsqlite visits the rows in rowid order instead of from the t_ab seek. L2's premise, "without a
+    partial index the plan is the same for every integer", is false for this shape.
+  - Checked and not a problem: codegen's bd-2dgf5 comment says an aggregate's rowid-equality
+    seek takes only an INTEGER literal and that a bound key falls back to the scan. Yet 20
+    `SELECT count(*), sum(a) FROM t WHERE id = N` on the 1M-row t cost 8.1M instructions on the
+    L5 CLI against 9.4M on the base CLI, with answers equal to stock's. The bound form does not
+    scan, so that comment no longer describes the code.
+  - The new keeper's partial-index check failed on a main divergence, not on L5:
+    `SELECT count(*), sum(val) FROM pk3 WHERE g = 1 AND h = 0` with
+    `CREATE INDEX pk3_gh ON pk3(g, h) WHERE h > 10` answers 0|NULL on the main CLIs of bf8b3377b
+    and f818d8531 (text path, in memory and in a file; EQP SEARCH pk3 USING INDEX pk3_gh), against
+    stock's 4|-4.0. A partial index is used whose WHERE the query does not imply. Repro:
+    coordinator scratchpad `rs6/div/pk3.sql`.
+- Retry condition (v3, its own prediction):
+  - (a) admit only shapes whose bound form compiles to the same program as the literal form,
+    shown by an EXPLAIN bytecode comparison per admitted shape in the keeper. Otherwise keep the
+    shapes that differ on the text path until codegen takes bound keys as it takes literals:
+    bare columns beside aggregates, and possibly order-sensitive aggregates (sum or avg of REAL).
+  - (b) the partial-index engagement check uses a partial index the WHERE cannot select.
+  - (c) the ~140 Ir a one-key statement is taken back.
+  - The prize is unchanged: multicol_eq_1000 -101k a statement, 6.6x -> 4.9x stock.
+
 ## 2026-11-16 - REJECTED on the bulk instruction kill line (four versions; a correctness fix, measured like a lever; not landed): the shared rowid allocator learns which sessions hold a claim on a table from the post-insert floor bump (bd-hi7qg v1-v4)
 
 - Target: the cost of bd-hi7qg's fix (an implicit rowid after a deleted maximum is `max(rowid)+1` again, as in stock,
