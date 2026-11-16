@@ -11,10 +11,12 @@
 //! - `RESERVED_BYTE` = `0x4000_0001` (1 byte)
 //! - `SHARED_FIRST`  = `0x4000_0002` (510 bytes)
 //!
-//! **Key design:** POSIX fcntl locks are per-process, not per-fd. If one fd in
-//! a process holds a lock, closing *any* fd to the same file releases it. We
-//! handle this with a global inode table (`InodeTable`) that coalesces locks
-//! across all file handles in the same process.
+//! **Key design:** Linux and macOS use open-file-description (OFD) locks, so
+//! closing an unrelated descriptor cannot release a live database or SHM lock.
+//! A global inode table (`InodeTable`) coalesces logical owners onto one
+//! canonical descriptor per inode; siblings therefore share an OFD and only
+//! the last claim releases each lock. Other Unix platforms use classic POSIX
+//! locks and defer redundant descriptor closes while a claim survives.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -552,7 +554,7 @@ const DARWIN_F_OFD_GETLK: libc::c_int = 92;
 /// handle and refuse it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FileLockStyle {
-    /// Byte-range advisory lock: Linux `F_SETLK` or Darwin `F_OFD_SETLK`.
+    /// Byte-range advisory lock: Linux/Darwin OFD or other Unix classic fcntl.
     ByteRange,
     /// Coarse whole-file `flock(2)` fallback (C SQLite's flock locking style).
     WholeFileFlock,
@@ -560,23 +562,24 @@ enum FileLockStyle {
 
 /// Issue an `F_SETLK`-family request for `flock` on `file`.
 ///
-/// Linux keeps its proven classic per-process `F_SETLK` path (via `nix`), so
-/// its concurrency behavior is byte-for-byte unchanged. Darwin (>= 10.12) uses
-/// `F_OFD_SETLK` (open-file-description locks, fcntl cmd 90) so the lock is
-/// owned by the open file description rather than the whole process: it is not
-/// silently dropped when an unrelated descriptor for the same inode is closed —
-/// the per-process footgun the classic path must otherwise work around. All
-/// locking here funnels through the single shared canonical descriptor per
-/// inode, so one OFD is authoritative. Other Unix keep classic byte-range
-/// `F_SETLK`. Only when the filesystem itself rejects byte-range / OFD fcntl
-/// locks (EINVAL/ENOTSUP — e.g. AFP/SMB network mounts, pre-10.12 kernels) do
-/// we drop to coarse whole-file `flock(2)` (C SQLite's flock locking style):
-/// correct, but it collapses the per-byte SHARED/RESERVED/PENDING/EXCLUSIVE
-/// regions to one whole-file lock, forfeiting byte-range writer concurrency.
+/// Linux (>= 3.15, via `nix`) and Darwin (>= 10.12, fcntl cmd 90) use
+/// `F_OFD_SETLK`: the open file description owns the lock, so closing an
+/// unrelated descriptor for the same inode cannot silently release it. GH#540
+/// lost committed rows when such a close erased the main-file WAL lifetime
+/// claim and stock SQLite then unlinked the live WAL and SHM files.
+///
+/// All main-file and SHM locking uses the shared canonical descriptor for its
+/// inode. Lifetime claims and transaction locks must use the same primitive:
+/// an OFD claim would conflict with a classic lock even in this same process.
+/// Linux fails if OFD locking is unavailable; falling back to classic locks
+/// would restore the data-loss bug. Other Unix platforms keep classic
+/// byte-range `F_SETLK`. The non-Linux backend can fall back to whole-file
+/// `flock(2)` on EINVAL/ENOTSUP (e.g. AFP/SMB mounts or pre-10.12 Darwin),
+/// forfeiting byte-range writer concurrency.
 fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<FileLockStyle> {
     #[cfg(target_os = "linux")]
     {
-        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_SETLK(flock))
+        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_OFD_SETLK(flock))
             .map(|_| FileLockStyle::ByteRange)
     }
     #[cfg(not(target_os = "linux"))]
@@ -611,7 +614,7 @@ fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<FileLockSty
 fn fcntl_getlk(file: &impl AsFd, flock: &mut libc::flock) -> nix::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_GETLK(flock)).map(|_| ())
+        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_OFD_GETLK(flock)).map(|_| ())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -669,7 +672,7 @@ fn descriptor_is_read_only(file: &impl AsFd) -> bool {
 
 /// Attempt a non-blocking POSIX advisory lock via [`fcntl_setlk`].
 ///
-/// On Linux this is a safe `nix` `F_SETLK` wrapper; on Darwin/other Unix it
+/// On Linux this is a safe `nix` `F_OFD_SETLK` wrapper; on Darwin/other Unix it
 /// dispatches through [`fcntl_setlk`] (OFD locks, with a `flock(2)` fallback).
 ///
 /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if it would
@@ -770,7 +773,8 @@ fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
 
 /// Query whether a lock would succeed without acquiring it.
 ///
-/// Uses `fcntl(F_GETLK)` and returns the kernel-filled `flock`.
+/// Uses the matching OFD/classic `fcntl` query and returns the kernel-filled
+/// `flock`. OFD queries also see classic locks held by this process.
 #[allow(clippy::cast_possible_wrap)]
 fn posix_getlk(
     file: &impl AsFd,
@@ -808,19 +812,19 @@ type InodeKey = FileIdentity;
 
 /// Per-inode lock state shared across all file handles in this process.
 ///
-/// Because POSIX fcntl locks are per-process (not per-fd), we must coalesce
-/// lock operations through a single canonical fd and track how many handles
-/// want each lock level. The OS-level lock is only released when the last
-/// handle drops its claim.
+/// Coalesce lock operations through a single canonical fd and track how many
+/// handles want each lock level. On OFD platforms, independent opens would
+/// otherwise conflict with each other. On classic POSIX platforms, sibling
+/// descriptors instead share process-wide locks. In both cases the OS-level
+/// lock is released only when the last logical owner drops its claim.
 #[derive(Debug)]
 struct InodeInfo {
     /// Canonical file descriptor for this inode.
     ///
-    /// POSIX fcntl locks are per-process, and closing *any* fd for the file can
-    /// release the process' locks. To avoid that, we keep exactly one canonical
-    /// fd per inode for I/O/locking and share it across handles via `Arc`.
-    /// Racing redundant opens remain inert in `deferred_close_files` until no
-    /// process lock claim survives.
+    /// Share one fd per inode for I/O/locking via `Arc`, so every logical owner
+    /// operates on the same open file description. Racing redundant opens
+    /// remain inert in `deferred_close_files` until no lock claim survives;
+    /// this also protects classic POSIX locks on platforms without OFD locks.
     file: Arc<File>,
     /// Total number of open file handles referencing this inode.
     n_ref: u32,
@@ -913,9 +917,9 @@ const INODE_TABLE_SHARDS: usize = 16;
 
 /// Global per-process table mapping (dev, ino) to shared lock state.
 ///
-/// This prevents the \"POSIX close drops all locks\" problem: we only issue
-/// OS-level lock/unlock calls through one canonical fd per inode, and track
-/// how many handles want each lock level.
+/// Issue OS-level lock/unlock calls through one canonical fd per inode and
+/// track how many handles want each lock level. This also lets classic POSIX
+/// platforms defer redundant closes without releasing live process locks.
 struct InodeTable {
     shards: [Mutex<HashMap<InodeKey, Arc<Mutex<InodeInfo>>>>; INODE_TABLE_SHARDS],
 }
@@ -1730,8 +1734,9 @@ fn with_retained_probe_descriptor<T>(
 impl InodeTable {
     /// Probe the main file at `path` through a retained read-only descriptor
     /// only while no descriptor for its inode is registered in this process.
-    /// A registered inode means this process already participates, and its
-    /// own locks are invisible to `F_GETLK`.
+    /// A registered inode means this VFS already participates: a probe through
+    /// an independent descriptor could report its own OFD locks as a peer,
+    /// while classic queries would miss its own process locks entirely.
     fn probe_unregistered_main_file(&self, path: &Path) -> PeerLockProbe {
         use std::os::unix::fs::MetadataExt;
         let Ok(meta) = fs::metadata(path) else {
@@ -4940,12 +4945,12 @@ impl VfsFile for UnixFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        // F_GETLK never reports classic fcntl locks owned by this process.
-        // Consult the coalesced inode state first so a different connection in
-        // this process observes RESERVED, PENDING, or EXCLUSIVE exactly as
-        // SQLite's xCheckReservedLock contract requires. Keep the inode mutex
-        // through F_GETLK so a local writer cannot enter the gap between the
-        // process-local and kernel-level checks.
+        // A kernel query ignores locks owned by its own OFD (or process on
+        // classic platforms). Consult the coalesced inode state first so a
+        // sibling connection observes RESERVED, PENDING, or EXCLUSIVE exactly
+        // as SQLite's xCheckReservedLock contract requires. Keep the inode
+        // mutex through the query so a local writer cannot enter the gap
+        // between the logical-owner and kernel-level checks.
         let inode_info = Arc::clone(self.inode_info_ref());
         let info = inode_info
             .lock()
@@ -11022,8 +11027,8 @@ mod tests {
             ForeignWalParticipation::NoParticipant
         );
 
-        // Once this process registers the inode, its own locks are invisible
-        // to F_GETLK, so the probe must not claim a verdict.
+        // Once this VFS registers the inode, a separate descriptor cannot
+        // distinguish its own participation from a peer on every platform.
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (mut file, _) = vfs
@@ -11042,7 +11047,7 @@ mod tests {
     }
 
     /// A classic per-process `F_SETLK`/`F_GETLK` request, as stock SQLite
-    /// issues on Linux and macOS (this VFS uses OFD locks on macOS).
+    /// issues on Linux and macOS (this VFS uses OFD locks on both).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn classic_flock(lock_type: impl Into<i32>, start: u64, len: u64) -> libc::flock {
@@ -11168,7 +11173,7 @@ mod tests {
         file.close(&cx).unwrap();
     }
 
-    /// GH #343 / bd-qll76: on a local filesystem (Linux `F_SETLK`, Darwin
+    /// GH #343 / bd-qll76: on a local filesystem (Linux/Darwin
     /// `F_OFD_SETLK`) byte-range locking succeeds, so the whole-file `flock(2)`
     /// fallback is never taken and the handle reports no downgrade. This pins
     /// the accessor plumbing end-to-end for the non-degraded case (the degraded

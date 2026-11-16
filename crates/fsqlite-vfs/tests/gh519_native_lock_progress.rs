@@ -1,6 +1,6 @@
 #![cfg(all(unix, feature = "native"))]
 
-//! Native, multiprocess GH#519 progress and ownership regressions.
+//! Native, multiprocess GH#519 progress and GH#540 ownership regressions.
 //!
 //! Every adversarial schedule waits for a production trace from an actual
 //! failed kernel lock, or for an acknowledged acquired lock. There are no
@@ -508,6 +508,8 @@ fn main_contention_never_retains_wal_and_all_fences_progress() {
             "main" => run_actor(Path::new(&path), false),
             "wal" => run_actor(Path::new(&path), true),
             "siblings" => run_siblings(Path::new(&path)),
+            #[cfg(target_os = "linux")]
+            "classic" => gh540::run_classic_probe(Path::new(&path)),
             other => panic!("unknown actor kind: {other}"),
         }
         return;
@@ -716,4 +718,211 @@ fn checkpoint_slot_contention_restores_the_entire_new_prefix() {
     checkpoint.finish();
     stock_order.finish();
     assert_unchanged(&path);
+}
+
+#[cfg(target_os = "linux")]
+mod gh540 {
+    use std::fs::{File, OpenOptions};
+    use std::io::Read as _;
+    use std::path::{Path, PathBuf};
+
+    use fsqlite_error::ErrorCode;
+    use fsqlite_types::LockLevel;
+    use fsqlite_types::cx::Cx;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_vfs::shm::{SHM_SEGMENT_SIZE, WAL_WRITE_LOCK};
+    use fsqlite_vfs::{UnixVfs, Vfs, VfsFile};
+
+    use super::{
+        Actor, RESERVED, SHARED, assert_unchanged, emit, input, serial_scenario, setup, wal_slot,
+    };
+
+    fn shm_path(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push("-shm");
+        PathBuf::from(name)
+    }
+
+    // Use SQLite's classic POSIX primitive as an independent oracle, never
+    // the production lock helper. OFD and classic locks must still conflict.
+    fn classic_lock(file: &File, start: u64, length: u64, kind: i32) -> nix::Result<()> {
+        let lock = libc::flock {
+            l_type: kind as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: start as libc::off_t,
+            l_len: length as libc::off_t,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_SETLK(&lock)).map(|_| ())
+    }
+
+    pub(super) fn run_classic_probe(path: &Path) {
+        let main = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let shm = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(shm_path(path))
+            .unwrap();
+        emit("ready");
+        loop {
+            let command = input();
+            if command == "finish" {
+                emit("done");
+                return;
+            }
+            let (expectation, target) = command.split_once(' ').unwrap();
+            let (file, start, length) = match target {
+                "main" => (&main, SHARED, 510),
+                "dms" => (&shm, 128, 1),
+                "write" => (&shm, 120, 1),
+                other => panic!("unknown classic probe target: {other}"),
+            };
+            match classic_lock(file, start, length, libc::F_WRLCK) {
+                Ok(()) => {
+                    classic_lock(file, start, length, libc::F_UNLCK).unwrap();
+                    assert_eq!(expectation, "free", "{command}: live ownership was lost");
+                }
+                Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => {
+                    assert_eq!(expectation, "busy", "{command}: ownership was not released");
+                }
+                Err(error) => panic!("{command}: unexpected kernel error {error}"),
+            }
+            emit("ok");
+        }
+    }
+
+    fn read_and_close(path: &Path) {
+        let mut unrelated = File::open(path).unwrap();
+        unrelated.read_exact(&mut [0_u8; 1]).unwrap();
+        drop(unrelated);
+    }
+
+    #[test]
+    fn database_lifetime_survives_unrelated_descriptor_and_hardlink_closes() {
+        let _scenario = serial_scenario();
+        let (directory, path) = setup();
+        let alias = directory.path().join("main-alias.db");
+        std::fs::hard_link(&path, &alias).unwrap();
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut first, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let first_region = first.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        let (mut sibling, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let sibling_region = sibling.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        let mut stock = Actor::spawn(&path, "classic", "GH540 classic main-lock oracle");
+
+        stock.command("busy main");
+        for unrelated in [&path, &alias] {
+            read_and_close(unrelated);
+            // Probe before asking our VFS for anything: reacquiring a lock on
+            // a later transaction cannot protect an idle live connection.
+            stock.command("busy main");
+        }
+        // Transaction escalation must share the lifetime claim's canonical
+        // description; a separate OFD would conflict with its own SHARED lock.
+        first.lock(&cx, LockLevel::Exclusive).unwrap();
+        first.unlock(&cx, LockLevel::None).unwrap();
+        stock.command("busy main");
+        drop(first_region);
+        first.close(&cx).unwrap();
+        stock.command("busy main");
+        sibling.lock(&cx, LockLevel::Shared).unwrap();
+        sibling.unlock(&cx, LockLevel::None).unwrap();
+        stock.command("busy main");
+        drop(sibling_region);
+        sibling.close(&cx).unwrap();
+        stock.command("free main");
+        stock.finish();
+        assert_unchanged(&path);
+    }
+
+    #[test]
+    fn shm_lifetime_and_write_slot_survive_unrelated_descriptor_and_hardlink_closes() {
+        let _scenario = serial_scenario();
+        let (directory, path) = setup();
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut first, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let first_region = first.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        let (mut sibling, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let sibling_region = sibling.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        let shm = shm_path(&path);
+        let alias = directory.path().join("shm-alias");
+        std::fs::hard_link(&shm, &alias).unwrap();
+        wal_slot(&mut first, &cx, WAL_WRITE_LOCK, true).unwrap();
+        let mut stock = Actor::spawn(&path, "classic", "GH540 classic SHM-lock oracle");
+
+        stock.command("busy dms");
+        stock.command("busy write");
+        for unrelated in [&shm, &alias] {
+            read_and_close(unrelated);
+            stock.command("busy dms");
+            stock.command("busy write");
+        }
+        drop(first_region);
+        first.close(&cx).unwrap();
+        stock.command("busy dms");
+        stock.command("free write");
+        wal_slot(&mut sibling, &cx, WAL_WRITE_LOCK, true).unwrap();
+        stock.command("busy write");
+        wal_slot(&mut sibling, &cx, WAL_WRITE_LOCK, false).unwrap();
+        stock.command("free write");
+        stock.command("busy dms");
+        sibling.close(&cx).unwrap();
+        // A mapping may outlive its VFS handle. Its retained attachment must
+        // keep both lifetime locks, including across another raw SHM close.
+        stock.command("busy main");
+        stock.command("busy dms");
+        read_and_close(&shm);
+        stock.command("busy main");
+        stock.command("busy dms");
+        drop(sibling_region);
+        stock.command("free dms");
+        stock.command("free main");
+        stock.finish();
+        assert_unchanged(&path);
+    }
+
+    #[test]
+    fn reserved_probe_sees_same_process_classic_owner_and_canonical_sibling() {
+        let _scenario = serial_scenario();
+        let (_directory, path) = setup();
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let (mut sibling, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let stock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        classic_lock(&stock, RESERVED, 1, libc::F_WRLCK).unwrap();
+        assert!(
+            file.check_reserved_lock(&cx).unwrap(),
+            "OFD GETLK must report another description's classic lock even in the same process"
+        );
+        assert_eq!(
+            file.lock(&cx, LockLevel::Reserved)
+                .expect_err("classic writer must exclude a VFS writer")
+                .error_code(),
+            ErrorCode::Busy
+        );
+        classic_lock(&stock, RESERVED, 1, libc::F_UNLCK).unwrap();
+        assert!(!file.check_reserved_lock(&cx).unwrap());
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        assert!(sibling.check_reserved_lock(&cx).unwrap());
+        file.unlock(&cx, LockLevel::None).unwrap();
+        assert!(!sibling.check_reserved_lock(&cx).unwrap());
+        sibling.close(&cx).unwrap();
+        file.close(&cx).unwrap();
+        assert_unchanged(&path);
+    }
 }

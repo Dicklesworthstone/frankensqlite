@@ -175,10 +175,12 @@ family. The contract:
 - `busy_timeout` supplies a contention budget at participating Connection/VFS
   boundaries. It is not permission to retry every error indefinitely, nor a
   wall-clock bound on a complete transaction or syscall.
-- Unix locking currently distinguishes Linux `F_SETLK` from Darwin
-  `F_OFD_SETLK`; see `fcntl_setlk`/`UnixFile::lock` in
-  `crates/fsqlite-vfs/src/unix.rs`. Error and retry behavior must be checked at
-  the actual acquisition site rather than inferred from a generic fcntl label.
+- Linux and Darwin use `F_OFD_SETLK` and `F_OFD_GETLK` on shared canonical
+  descriptors. Unrelated descriptor closes therefore preserve the main-file
+  WAL lifetime claim, SHM dead-man-switch claim, and transaction locks
+  (GH#540). Linux requires OFD support and does not fall back to classic
+  process-owned locks. See `fcntl_setlk`/`UnixFile::lock` in
+  `crates/fsqlite-vfs/src/unix.rs` for platform-specific error and retry behavior.
 - Busy, recovery and stale-snapshot errors remain observable. A stale snapshot
   may require rolling back and restarting the transaction; caller retry policy
   must preserve the error, attempt count and deadline. The swarm harness's

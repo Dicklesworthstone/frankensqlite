@@ -4729,13 +4729,13 @@ where
             // it as the legacy path does when we are allowed to create, and only
             // fall back to requesting recovery when we are not.
             //
-            // A same-process stock SQLite library is the realistic way to reach
-            // this: POSIX fcntl locks are per process, so stock cannot see our
-            // shared dead-man-switch hold, believes it is the last connection,
-            // checkpoints, and unlinks the companions. Cross-process stock DOES
-            // see the hold and leaves them alone (measured on bd-1nq3j), so the
-            // data is in the main database and creating a fresh WAL loses
-            // nothing.
+            // Historically, same-process stock SQLite could miss our classic
+            // POSIX lifetime locks and unlink the companions on close. GH#540
+            // also showed an unrelated descriptor close erasing those locks
+            // before a foreign process did the same. Linux and Darwin now use
+            // OFD lifetime locks, visible to stock even in this process and
+            // preserved across unrelated closes. Recreating a missing WAL is
+            // recovery behavior, not a substitute for those lifetime claims.
             if self.create_missing && !self.inner.has_pending_publication() {
                 self.replace_with_created_wal(cx).await?;
                 return Ok(WalNativeReadOutcome::Ready);
@@ -4783,8 +4783,8 @@ where
     ///
     /// `for_append`: frames written through a handle whose path no longer
     /// names a file land in an unlinked inode — acknowledged, then lost
-    /// (bd-7zs8a: an in-process stock connection, blind to our fcntl locks,
-    /// checkpoints and unlinks the companions it believes it owns). Reads may
+    /// (bd-7zs8a: stock missed the former classic same-process lifetime locks
+    /// and unlinked the companions it believed it owned). Reads may
     /// continue on the pinned snapshot; an append refuses with `BusySnapshot`,
     /// and the retry's fresh read admission recreates the companion.
     async fn validate_current_native_wal_path(&mut self, cx: &Cx, for_append: bool) -> Result<()> {
@@ -4861,12 +4861,10 @@ where
         // so a transient here just spins until busy_timeout. Recreate, exactly as
         // the legacy path does.
         //
-        // A same-process stock SQLite library is the realistic way to reach this:
-        // POSIX fcntl locks are per process, so stock cannot see our shared
-        // dead-man-switch hold and unlinks the companions on its own close.
-        // Cross-process stock DOES see it and leaves them alone (measured on
-        // bd-1nq3j), so this is tolerance for a configuration stock itself
-        // documents as unsupported, not cover for an interop defect.
+        // Linux/Darwin OFD lifetime locks now prevent a stock close from
+        // unlinking live companions, including after unrelated descriptor
+        // closes (GH#540). Still validate the actual path: a missing or
+        // replaced WAL cannot be trusted merely because a claim was recorded.
         match self.current_handle_names_wal_path(cx, false, None).await? {
             Some(true) => return Ok(()),
             Some(false)
