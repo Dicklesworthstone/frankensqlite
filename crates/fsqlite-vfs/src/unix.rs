@@ -905,10 +905,28 @@ impl InodeInfo {
     }
 
     /// Close redundant descriptors only while the inode mutex proves that no
-    /// thread can establish a new process-wide record lock concurrently.
+    /// thread can establish a new process-wide record lock concurrently, and
+    /// no other lock manager in this process holds a classic lock that the
+    /// close would release (bd-drufq).
     fn close_deferred_files_if_unlocked(&mut self) {
-        if !self.has_lock_claims() {
+        if !self.has_lock_claims()
+            && !self.deferred_close_files.is_empty()
+            && process_holds_classic_lock(&self.file) == Some(false)
+        {
             self.deferred_close_files.clear();
+        }
+    }
+
+    /// Dispose of a redundant descriptor while no claim of ours is live: close
+    /// it, or keep it with the deferred descriptors while another lock manager
+    /// in this process holds a classic lock its close would release
+    /// (bd-drufq). Later opens then reuse the canonical descriptor instead of
+    /// opening more ([`InodeTable::reuse_retained_file`]).
+    fn close_or_defer_redundant(&mut self, file: Arc<File>) {
+        if process_holds_classic_lock(&self.file) == Some(false) {
+            drop(file);
+        } else {
+            self.deferred_close_files.push(file);
         }
     }
 }
@@ -1109,7 +1127,7 @@ impl InodeTable {
                     if info.has_lock_claims() {
                         info.deferred_close_files.push(opened);
                     } else {
-                        drop(opened);
+                        info.close_or_defer_redundant(opened);
                     }
                     return Err(FrankenError::internal(
                         "Unix inode-table open-reference count overflow",
@@ -1123,7 +1141,7 @@ impl InodeTable {
                     // Keep the inode mutex held while the redundant descriptor
                     // closes, so no thread can establish a record lock in the
                     // close-vs-lock window.
-                    drop(opened);
+                    info.close_or_defer_redundant(opened);
                 }
                 canonical
             };
@@ -1269,7 +1287,7 @@ impl InodeTable {
                 if current_guard.has_lock_claims() {
                     current_guard.deferred_close_files.push(file);
                 } else {
-                    drop(file);
+                    current_guard.close_or_defer_redundant(file);
                 }
                 drop(current_guard);
                 drop(inode_info);
@@ -1282,12 +1300,18 @@ impl InodeTable {
             if guard.n_ref == 0 {
                 guard.close_deferred_files_if_unlocked();
             }
+            // bd-drufq: retiring the generation closes its canonical
+            // descriptor. While another lock manager in this process (a stock
+            // SQLite library) holds classic locks on the inode, keep the idle
+            // generation registered instead; the next open reuses it, and the
+            // next final close here retires it once those locks are gone.
             let remove = guard.n_ref == 0
                 && !guard.has_lock_claims()
                 && guard.deferred_close_files.is_empty()
                 && Arc::ptr_eq(&guard.file, &file)
                 && Arc::strong_count(&file) == 2
-                && Arc::strong_count(&inode_info) == 2;
+                && Arc::strong_count(&inode_info) == 2
+                && process_holds_classic_lock(&guard.file) == Some(false);
             drop(guard);
 
             // The closing handle's descriptor must disappear before the table
@@ -1468,17 +1492,37 @@ impl ShmTable {
             .map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let info = if let Some(existing) = map.get(&path) {
-            if existing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .namespace_unlinked
-            {
-                // A failed post-unlink cleanup still owns this old inode.
-                // Never attach a new caller to its now-orphaned descriptor.
-                return Err(FrankenError::Busy);
+        let reusable = match map.get(&path) {
+            Some(existing) => {
+                let guard = existing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.namespace_unlinked {
+                    // A failed post-unlink cleanup still owns this old inode.
+                    // Never attach a new caller to its now-orphaned descriptor.
+                    return Err(FrankenError::Busy);
+                }
+                // bd-drufq: an idle entry (kept for a same-process classic
+                // owner, or by a surviving observer) may outlive the `-shm`
+                // it opened: a stock connection that was last to close
+                // unlinks it. Never attach a new owner to that orphan.
+                let orphaned = guard.owner_refs.is_empty()
+                    && guard.mapping_owners.is_empty()
+                    && !path_names_open_file(&path, &guard.file);
+                drop(guard);
+                if orphaned {
+                    if let Some(stale) = map.remove(&path) {
+                        retire_orphaned_shm_entry(stale);
+                    }
+                    None
+                } else {
+                    Some(Arc::clone(existing))
+                }
             }
-            Arc::clone(existing)
+            None => None,
+        };
+        let info = if let Some(existing) = reusable {
+            existing
         } else {
             use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -1540,10 +1584,17 @@ impl ShmTable {
             // No old canonical fd may close after a new generation opens.
             // A surviving local observer keeps this canonical entry reusable;
             // it holds no fence after the last registered owner has drained.
+            // bd-drufq: so does a classic lock another lock manager in this
+            // process (a stock SQLite library) holds on the `-shm`: closing
+            // the canonical descriptor would release its dead-man-switch lock.
+            // An unlinked namespace retires regardless; we unlinked it under
+            // main-file EXCLUSIVE, which no live stock connection allows.
             let retire = info.owner_refs.is_empty()
                 && info.mapping_owners.is_empty()
                 && (info.namespace_unlinked
-                    || (Arc::strong_count(&expected) == 2 && Arc::strong_count(&info.file) == 1));
+                    || (Arc::strong_count(&expected) == 2
+                        && Arc::strong_count(&info.file) == 1
+                        && process_holds_classic_lock(&info.file) == Some(false)));
             drop(info);
             if retire {
                 let removed = map.remove(path);
@@ -1559,6 +1610,40 @@ impl ShmTable {
 fn global_shm_table() -> &'static ShmTable {
     static TABLE: OnceLock<ShmTable> = OnceLock::new();
     TABLE.get_or_init(ShmTable::new)
+}
+
+/// Whether `path` still names the inode `file` has open. Only a missing path
+/// or a different inode answers `false`; an unreadable path is not proof that
+/// the entry is orphaned.
+fn path_names_open_file(path: &Path, file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match fs::metadata(path) {
+        Ok(named) => file.metadata().map_or(true, |open| {
+            named.dev() == open.dev() && named.ino() == open.ino()
+        }),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Dispose of an idle `-shm` entry whose path no longer names its inode
+/// (bd-drufq): close its descriptor, or, while a classic lock this process
+/// holds on that inode would be released by the close, keep the entry for the
+/// life of the process. Nothing maps or locks through it any more.
+fn retire_orphaned_shm_entry(stale: Arc<Mutex<ShmInfo>>) {
+    static ORPHANED: OnceLock<Mutex<Vec<Arc<Mutex<ShmInfo>>>>> = OnceLock::new();
+    let keep = process_holds_classic_lock(
+        &stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .file,
+    ) != Some(false);
+    if keep {
+        ORPHANED
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(stale);
+    }
 }
 
 static SHM_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1655,6 +1740,70 @@ fn foreign_lock_on_range(file: &File, start: u64, len: u64) -> Option<bool> {
     #[allow(clippy::cast_possible_truncation)]
     let unlocked: libc::c_short = libc::F_UNLCK as libc::c_short;
     Some(flock.l_type != unlocked)
+}
+
+/// bd-drufq: whether this process holds a classic (process-owned) POSIX
+/// record lock on the inode `file` names.
+///
+/// On Linux this VFS locks only through open-file-description locks, so such a
+/// lock belongs to another lock manager in this process, such as a stock
+/// SQLite library linked beside this one. Closing ANY descriptor of the inode
+/// releases every classic lock the process holds on it: retiring our
+/// canonical descriptor would strip a live stock connection's lifetime SHARED
+/// and dead-man-switch locks, after which a stock process elsewhere takes
+/// itself for the last connection and unlinks the live WAL and `-shm`.
+///
+/// `Some(false)` is proof: the OFD query from `file` reports no lock of any
+/// other owner. A reported lock owned by this pid proves one (OFD locks report
+/// pid -1). Any other reported lock can hide ours behind it, so the kernel
+/// lock table decides; `None` when it cannot be read. Callers keep the
+/// descriptor open unless the answer is `Some(false)`.
+#[cfg(target_os = "linux")]
+fn process_holds_classic_lock(file: &File) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let reported = posix_getlk(file, libc::F_WRLCK, 0, 0).ok()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let unlocked = libc::F_UNLCK as libc::c_short;
+    if reported.l_type == unlocked {
+        return Some(false);
+    }
+    let pid = std::process::id();
+    if u32::try_from(reported.l_pid).ok() == Some(pid) {
+        return Some(true);
+    }
+    let inode = file.metadata().ok()?.ino();
+    let table = fs::read_to_string("/proc/locks").ok()?;
+    Some(lock_table_names_classic_lock(&table, pid, inode))
+}
+
+/// Classic locks have no owner this VFS can tell apart from its own on these
+/// platforms (other Unix), or are not probed (Darwin), so retirement proceeds
+/// exactly as before bd-drufq.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn process_holds_classic_lock(_file: &File) -> Option<bool> {
+    Some(false)
+}
+
+/// Whether the `/proc/locks` text `table` lists a held classic POSIX lock
+/// owned by `pid` on inode `inode`. Lines read
+/// `N: POSIX ADVISORY WRITE <pid> <maj>:<min>:<ino> <start> <end>`; a blocked
+/// request reads `N: -> POSIX ...` and holds nothing. The device is not
+/// compared: `/proc/locks` names the superblock device, which differs from
+/// `st_dev` on btrfs subvolumes, and a false match only keeps a descriptor
+/// open longer.
+#[cfg(target_os = "linux")]
+fn lock_table_names_classic_lock(table: &str, pid: u32, inode: u64) -> bool {
+    table.lines().any(|line| {
+        let mut fields = line.split_whitespace().skip(1);
+        fields.next() == Some("POSIX")
+            && fields.nth(2).and_then(|owner| owner.parse::<u32>().ok()) == Some(pid)
+            && fields
+                .next()
+                .and_then(|identity| identity.rsplit(':').next())
+                .and_then(|number| number.parse::<u64>().ok())
+                == Some(inode)
+    })
 }
 
 /// Whether `F_GETLK` on this file's filesystem reports other processes'

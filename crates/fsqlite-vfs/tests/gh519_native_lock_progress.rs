@@ -756,7 +756,7 @@ mod gh540 {
         nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_SETLK(&lock)).map(|_| ())
     }
 
-    pub(super) fn run_classic_probe(path: &Path) {
+    pub fn run_classic_probe(path: &Path) {
         let main = OpenOptions::new()
             .read(true)
             .write(true)
@@ -923,6 +923,93 @@ mod gh540 {
         assert!(!sibling.check_reserved_lock(&cx).unwrap());
         sibling.close(&cx).unwrap();
         file.close(&cx).unwrap();
+        assert_unchanged(&path);
+    }
+
+    /// Descriptors of this process that name `path`.
+    fn descriptors_naming(path: &Path) -> usize {
+        let target = std::fs::canonicalize(path).unwrap();
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|link| *link == target)
+            .count()
+    }
+
+    /// One full attachment of ours: open, map the SHM, lock, unlock, close.
+    fn attach_and_close(vfs: &UnixVfs, cx: &Cx, path: &Path) {
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut ours, _) = vfs.open(cx, Some(path), flags).unwrap();
+        let region = ours.shm_map(cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        ours.lock(cx, LockLevel::Shared).unwrap();
+        ours.unlock(cx, LockLevel::None).unwrap();
+        drop(region);
+        ours.close(cx).unwrap();
+        drop(ours);
+    }
+
+    /// bd-drufq: closing ANY descriptor of an inode drops every classic lock
+    /// the process holds on it. A stock SQLite library in this same process
+    /// holds classic locks for its connection's lifetime (main-file SHARED,
+    /// SHM DMS). Our final close of the canonical main and SHM descriptors
+    /// must not strip them: a stock process elsewhere would then take itself
+    /// for the last connection and unlink the live WAL and SHM.
+    #[test]
+    fn final_close_keeps_same_process_classic_owner_locks() {
+        let _scenario = serial_scenario();
+        let (_directory, path) = setup();
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        // Ours first creates the SHM; the in-process stock owner then opens
+        // its own descriptors and takes its lifetime read locks, as a stock
+        // WAL connection does.
+        let (mut ours, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let region = ours.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        let shm = shm_path(&path);
+        let stock_main = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let stock_shm = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&shm)
+            .unwrap();
+        classic_lock(&stock_main, SHARED, 510, libc::F_RDLCK).unwrap();
+        classic_lock(&stock_shm, 128, 1, libc::F_RDLCK).unwrap();
+        let mut foreign = Actor::spawn(&path, "classic", "bd-drufq foreign classic oracle");
+        foreign.command("busy main");
+        foreign.command("busy dms");
+
+        drop(region);
+        ours.close(&cx).unwrap();
+        drop(ours);
+        foreign.command("busy main");
+        foreign.command("busy dms");
+        // A reopen and a second final close of ours must keep them as well.
+        attach_and_close(&vfs, &cx, &path);
+        foreign.command("busy main");
+        foreign.command("busy dms");
+
+        // Negative: once the classic owner releases, its locks are gone, and
+        // our next final close leaves no extra descriptor behind.
+        classic_lock(&stock_main, SHARED, 510, libc::F_UNLCK).unwrap();
+        classic_lock(&stock_shm, 128, 1, libc::F_UNLCK).unwrap();
+        foreign.command("free main");
+        foreign.command("free dms");
+        attach_and_close(&vfs, &cx, &path);
+        foreign.command("free main");
+        foreign.command("free dms");
+        foreign.finish();
+        assert_eq!(
+            (descriptors_naming(&path), descriptors_naming(&shm)),
+            (1, 1),
+            "only the stock owner's own descriptors may remain; one kept for its \
+             released locks must be closed"
+        );
+        drop((stock_main, stock_shm));
         assert_unchanged(&path);
     }
 }

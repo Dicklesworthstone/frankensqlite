@@ -232665,20 +232665,39 @@ mod autocommit_txn_tests {
         let wal = WalFile::open(cx, file)
             .await
             .expect("reopen existing WAL for checkpoint-failure injection");
+        let backend = PathRefreshingWalBackend::new(
+            vfs,
+            pager.db_path(),
+            wal_path,
+            pager.page_size().get(),
+            wal,
+            false,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            pager.namespace_binding(),
+        );
+        // bd-drufq: publish through the pager's WAL-index SHM exactly as the
+        // production install (`install_opened_wal_backend`) does. Without it
+        // this backend appended frames a stock connection could not see: the
+        // `-shm` header kept the previous commit, and stock trusts that header
+        // once it sees our dead-man-switch lock. Before our locks were OFD
+        // locks, a stock connection in this process could not see that lock,
+        // rebuilt the index from the WAL, and so hid the missing publication.
+        #[cfg(all(feature = "native", unix))]
+        let backend = {
+            let mut backend = backend;
+            if !pager.vfs_handle().is_memory() {
+                backend
+                    .attach_wal_index_shm_source(
+                        pager
+                            .wal_index_shm_source()
+                            .expect("pager WAL-index SHM source"),
+                    )
+                    .expect("attach WAL-index SHM publication");
+            }
+            backend
+        };
         pager
-            .set_wal_backend(Box::new(CheckpointFailingWalBackend::new(
-                PathRefreshingWalBackend::new(
-                    vfs,
-                    pager.db_path(),
-                    wal_path,
-                    pager.page_size().get(),
-                    wal,
-                    false,
-                    #[cfg(all(feature = "native", any(unix, windows)))]
-                    pager.namespace_binding(),
-                ),
-                failure,
-            )))
+            .set_wal_backend(Box::new(CheckpointFailingWalBackend::new(backend, failure)))
             .expect("install checkpoint-failing WAL backend");
     }
 
