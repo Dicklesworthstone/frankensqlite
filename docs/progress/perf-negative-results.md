@@ -89,6 +89,40 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-16 - WIN (landed; cycles lost on rows it does not run): a window function's arguments are read from their slots in the scanned row (bd-w4pr1.12, lever W5)
+
+- Target and change: the 2026-11-15 "MEASURED WIN, NOT LANDED" entry for W5 below. That diff,
+  rebased unchanged onto origin/main d4e3d189c, landed as 84989ece6. Touched:
+  crates/fsqlite-core/src/connection.rs (execute_window_select's step sites, `WindowArgValues`).
+- Pre-registered: round 4's prediction and kill lines, unchanged (bd-w4pr1.12, 2026-11-15 19:38Z),
+  restated before the rebuild (2026-11-16): sum(c) OVER Ir -300 to -550M, CPU -20 to -60 ms; other
+  rows within 0.3% Ir. Added: cycles for every read row, and a window row up more than 2% cycles in
+  the pairs reported as a miss.
+- Result (thinkstation1, powersave, io_uring refused, serial on every arm, stock 3.46.1 live; base
+  f328c069d sha256 a31638df6cf3ecf0, W5 ceb111983534bd37; two par_probe runs with cycles, reps 5,
+  plus 10 interleaved pairs; answers equal): sum(c) OVER (PARTITION BY a) 4,049.4M -> 3,684.4M Ir,
+  CPU x1.05 -> x0.99 and x1.06 -> x1.01 stock, cycles 1,424.7 -> 1,320.2M (pairs 0.924). Other
+  window rows +0.04..+0.11% Ir, pairs cycles 0.999..1.013. Every non-window row identical in Ir;
+  at that equal Ir the pairs put cycles up on GROUP BY a (1.041), GROUP BY id (1.016),
+  scan_filter_agg (1.040) and order_by_text_limit10 (1.051, min 1.030). That is the layout effect
+  of the ledger's trap line. It came from a change outside the VDBE crate, so the trap is not
+  confined to try_execute_hot_opcode_sync.
+- Gate:
+  - On the measured tree (f328c069d + W5): clippy fsqlite-core all targets clean; core lib + 62
+    GROUP BY / aggregate / min/max / join / conformance / EXPLAIN-pinning keepers 6,381 pass / 4 fail
+    (t6741 pair, indexed_group_by_predicates, without_rowid_secondary_suffix_order_matches_stock,
+    the last also red on the base CLI); window batch 178 / 0; e2e 126 / 2 (bd-4qvcr); fsqlite crate
+    1,097 / 1 (bd-qxdk4, fixed upstream since).
+  - Re-gated by the coordinator on the exact pushed tree (d4e3d189c + W5, rch hz3/hz4): clippy
+    fsqlite-core all targets clean; core lib + 13 window + 9 derived/join keepers 4,273 / 3 (t6741
+    pair, plus test_retained_autocommit_flush_propagates_nontransient_post_commit_checkpoint_failure,
+    which fails identically on d4e3d189c without W5); 5 e2e targets 43 / 0.
+- Verdict: WIN against stock live (sum(c) OVER x1.05 -> x0.99-1.01 CPU, -365M Ir), landed. Missed
+  and stated: 1.6-5.1% cycles on four rows that run none of it, at equal instructions.
+- Retry condition: none for W5. The window rows left above stock CPU are the computed keys
+  (`PARTITION BY a % 7 ORDER BY c * 2`, x1.05-1.09): their keys still go through the evaluator per
+  row (lever W6 in the read-loop lane's list).
+
 ## 2026-11-15 - WIN (probe partly met): an indexed equality seeks with a folded uncorrelated scalar subquery's value (bd-wp9s1 part 1)
 
 - Target: `SELECT id FROM t WHERE a = (SELECT w FROM p WHERE pid > 10 LIMIT 1)` (606x stock):
