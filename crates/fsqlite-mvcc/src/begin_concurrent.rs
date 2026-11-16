@@ -323,24 +323,92 @@ impl Drop for PublicationPendingLease {
     }
 }
 
-// bd-i0tn6: process-wide count of publication-pending marks withdrawn
-// (published, aborted, or lease dropped), with a condvar, so a validator
-// waiting for a peer's pending publication sleeps until one is withdrawn
-// instead of polling the registry. A leaf lock: nothing else is acquired while
-// it is held. Waiters capture the epoch before they test the registry, so a
-// withdrawal after that test is never missed; spurious wakeups (another
-// database, an unrelated session) only cost a re-check.
-static PUBLICATION_EPOCH: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-static PUBLICATION_EPOCH_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+/// bd-i0tn6: a count of publication-pending marks withdrawn (published,
+/// aborted, or lease dropped), with a condvar, so a validator waiting for a
+/// peer's pending publication sleeps until one is withdrawn instead of
+/// polling the registry. A leaf lock: nothing else is acquired while it is
+/// held. Waiters capture the epoch before they test the registry, so a
+/// withdrawal after that test is never missed; spurious wakeups (another
+/// database, an unrelated session) only cost a re-check.
+///
+/// bd-w4pr1.7: the condvar is notified only while a waiter is registered.
+/// std's condvar makes a FUTEX_WAKE system call on every notify, waiter or
+/// not, and every concurrent commit withdraws one mark, so a commit nobody
+/// waits for (every commit at one writer) paid that call for nothing. A
+/// waiter registers under the mutex before it sleeps (the wait releases the
+/// mutex atomically) and unregisters after it wakes or times out, and the
+/// epoch moves under the same mutex, so a withdrawal either sees the waiter
+/// registered and notifies it, or comes before the waiter locked and is seen
+/// by the wait's predicate. No wakeup is lost.
+struct PublicationEpochCell {
+    state: std::sync::Mutex<PublicationEpochState>,
+    changed: std::sync::Condvar,
+}
+
+struct PublicationEpochState {
+    epoch: u64,
+    /// Threads inside [`PublicationEpochCell::wait_for_change`].
+    waiters: u32,
+}
+
+impl PublicationEpochCell {
+    const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(PublicationEpochState {
+                epoch: 0,
+                waiters: 0,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PublicationEpochState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Move the epoch; wake the waiters if there are any. Returns whether it
+    /// notified.
+    fn advance(&self) -> bool {
+        let waiters = {
+            let mut state = self.lock();
+            state.epoch = state.epoch.wrapping_add(1);
+            state.waiters
+        };
+        let notify = waiters != 0;
+        if notify {
+            self.changed.notify_all();
+        }
+        notify
+    }
+
+    fn current(&self) -> u64 {
+        self.lock().epoch
+    }
+
+    fn wait_for_change(&self, observed: u64, timeout: std::time::Duration) -> bool {
+        let mut state = self.lock();
+        state.waiters = state.waiters.saturating_add(1);
+        let (mut state, _timed_out) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.epoch == observed)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiters = state.waiters.saturating_sub(1);
+        state.epoch != observed
+    }
+
+    #[cfg(test)]
+    fn waiters(&self) -> u32 {
+        self.lock().waiters
+    }
+}
+
+/// Process-wide: one validator may wait for a peer of any database.
+static PUBLICATION_EPOCH: PublicationEpochCell = PublicationEpochCell::new();
 
 fn advance_publication_epoch() {
-    {
-        let mut epoch = PUBLICATION_EPOCH
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *epoch = epoch.wrapping_add(1);
-    }
-    PUBLICATION_EPOCH_CHANGED.notify_all();
+    PUBLICATION_EPOCH.advance();
 }
 
 /// bd-i0tn6: the current publication epoch; capture it before testing
@@ -348,9 +416,7 @@ fn advance_publication_epoch() {
 /// [`wait_for_publication_epoch_change`].
 #[must_use]
 pub fn publication_epoch() -> u64 {
-    *PUBLICATION_EPOCH
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    PUBLICATION_EPOCH.current()
 }
 
 /// bd-i0tn6: block the calling thread until some publication-pending mark is
@@ -358,13 +424,7 @@ pub fn publication_epoch() -> u64 {
 /// whether the epoch moved. Callers hold no other lock.
 #[must_use]
 pub fn wait_for_publication_epoch_change(observed: u64, timeout: std::time::Duration) -> bool {
-    let guard = PUBLICATION_EPOCH
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (guard, _timed_out) = PUBLICATION_EPOCH_CHANGED
-        .wait_timeout_while(guard, timeout, |epoch| *epoch == observed)
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard != observed
+    PUBLICATION_EPOCH.wait_for_change(observed, timeout)
 }
 
 /// Result of first-committer-wins validation.
@@ -7389,6 +7449,54 @@ mod tests {
             "an aborted session cannot be marked"
         );
         drop(lease);
+    }
+
+    /// bd-w4pr1.7: the publication epoch notifies only while a waiter is
+    /// registered, and loses no wakeup. On a private cell, so no other test's
+    /// commits move it. An advance with nobody waiting must not notify (a
+    /// cell that always notifies fails); a registered waiter must be woken
+    /// well inside its timeout (a cell that never notifies fails); and every
+    /// wait, woken or timed out, must unregister (a cell that forgets on the
+    /// timeout path would notify forever after).
+    #[test]
+    fn test_publication_epoch_notifies_only_registered_waiters() {
+        static CELL: super::PublicationEpochCell = super::PublicationEpochCell::new();
+
+        let before = CELL.current();
+        assert!(!CELL.advance(), "an advance with no waiter must not notify");
+        assert_ne!(CELL.current(), before);
+
+        let observed = CELL.current();
+        assert!(
+            !CELL.wait_for_change(observed, std::time::Duration::from_millis(20)),
+            "nothing advanced, so the wait must time out"
+        );
+        assert_eq!(CELL.waiters(), 0, "a timed-out wait must unregister");
+
+        let observed = CELL.current();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let moved = CELL.wait_for_change(observed, std::time::Duration::from_secs(30));
+            (moved, started.elapsed())
+        });
+        let registered_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while CELL.waiters() == 0 && std::time::Instant::now() < registered_by {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            CELL.waiters(),
+            1,
+            "the waiter must register before it sleeps"
+        );
+        assert!(CELL.advance(), "an advance with a waiter must notify");
+        let (moved, waited) = waiter.join().unwrap();
+        assert!(moved);
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the waiter must be woken, not time out ({waited:?})"
+        );
+        assert_eq!(CELL.waiters(), 0, "a woken wait must unregister");
+        assert!(!CELL.advance(), "with the waiter gone, no notify again");
     }
 
     #[test]
