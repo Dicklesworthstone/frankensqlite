@@ -25,7 +25,9 @@ use crate::checkpoint::{
     CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
     plan_checkpoint,
 };
-use crate::checksum::{WAL_FRAME_HEADER_SIZE, WalHeader, WalSalts, Xxh3Checksum128};
+use crate::checksum::{
+    WAL_FRAME_HEADER_SIZE, WalFrameHeader, WalHeader, WalSalts, Xxh3Checksum128,
+};
 use crate::recovery_fence::CheckpointChecksumVerdict;
 use crate::wal::WalFile;
 
@@ -81,6 +83,41 @@ pub trait CheckpointTarget: Send {
         _buf: &'a mut [u8],
     ) -> CheckpointTargetFuture<'a, Option<usize>> {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Read back `buf.len() / page_size` consecutive database pages starting
+    /// at `first_page`, for the same verification: the read-back walks a run
+    /// of pages written from consecutive WAL frames at once (bd-w4pr1.13.20,
+    /// lever N2). Returns the bytes read, which end at the first short page,
+    /// or `None` when the target cannot read back.
+    ///
+    /// The default reads page by page through
+    /// [`Self::read_page_if_supported`]; a target over one file overrides it
+    /// with a single read.
+    fn read_pages_if_supported<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        first_page: PageNumber,
+        page_size: usize,
+        buf: &'a mut [u8],
+    ) -> CheckpointTargetFuture<'a, Option<usize>> {
+        Box::pin(async move {
+            let mut read = 0;
+            for (page, chunk) in (first_page.get()..).zip(buf.chunks_mut(page_size)) {
+                let page_no = PageNumber::new(page).ok_or_else(|| FrankenError::OutOfRange {
+                    what: "checkpoint read-back page number".to_owned(),
+                    value: page.to_string(),
+                })?;
+                let Some(n) = self.read_page_if_supported(cx, page_no, chunk).await? else {
+                    return Ok(None);
+                };
+                read += n;
+                if n != chunk.len() {
+                    break;
+                }
+            }
+            Ok(Some(read))
+        })
     }
 
     /// Exact page-1 header fields accepted or written by this checkpoint target.
@@ -571,12 +608,73 @@ async fn require_checkpoint_pages_match<F: VfsFile>(
     }
 }
 
+/// WAL bytes one read-back read fetches at most, as frame validation reads.
+const CHECKPOINT_RUN_READ_BYTES: usize = 64 * 1024;
+
+/// How many entries at the head of `pages` form one read-back run: their
+/// pages follow one another in the database and their source frames follow
+/// one another in the WAL. At most `max`.
+fn checkpoint_read_back_run(pages: &[CheckpointPageExpectation], max: usize) -> usize {
+    let Some(first) = pages.first() else {
+        return 0;
+    };
+    let mut run = 1;
+    while run < max.min(pages.len())
+        && pages[run].frame_index == first.frame_index + run
+        && pages[run]
+            .page
+            .get()
+            .checked_sub(first.page.get())
+            .and_then(|distance| usize::try_from(distance).ok())
+            == Some(run)
+    {
+        run += 1;
+    }
+    run
+}
+
+/// Read the `count` WAL frames from frame `first` with one read into `buf`.
+async fn read_checkpoint_frame_run<F: VfsFile>(
+    wal: &WalFile<F>,
+    cx: &Cx,
+    first: usize,
+    count: usize,
+    buf: &mut [u8],
+) -> Result<()> {
+    let end = first.saturating_add(count);
+    if end > wal.frame_count() {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "checkpoint frames {first}..{end} out of range (count: {})",
+                wal.frame_count()
+            ),
+        });
+    }
+    let wanted = count * wal.frame_size();
+    let read = wal
+        .file()
+        .read(cx, &mut buf[..wanted], wal.frame_offset(first))
+        .await?;
+    if read != wanted {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!("short checkpoint read at frame {first}: got {read}, need {wanted}"),
+        });
+    }
+    Ok(())
+}
+
 /// Walk each expected page through the target's optional read-back hook
 /// and compare all bytes against the unchanged WAL source plus the target's
 /// exact page-1 normalization receipt. When the target opts out
-/// (`read_page_if_supported` returns `None`), verification is silently
+/// (`read_pages_if_supported` returns `None`), verification is silently
 /// skipped — which matches the audit-requested behaviour of "additive
 /// insurance, not a hard invariant" for targets without a read path.
+///
+/// Pages written from consecutive frames are read in runs of at most
+/// [`CHECKPOINT_RUN_READ_BYTES`] of WAL bytes: one database read and one WAL
+/// read a run (bd-w4pr1.13.20, lever N2). Every page is still checked on
+/// its own and in order: a short database read, then its source frame's page
+/// number, salts and validated digest, then the bytes.
 async fn verify_checkpoint_pages_via_target<F: VfsFile>(
     cx: &Cx,
     wal: &WalFile<F>,
@@ -584,51 +682,60 @@ async fn verify_checkpoint_pages_via_target<F: VfsFile>(
     expected: &[CheckpointPageExpectation],
 ) -> Result<CheckpointChecksumVerdict> {
     let page_size = wal.page_size();
-    let mut buf = vec![0u8; page_size];
-    let mut frame_buf = vec![0; wal.frame_size()];
+    let frame_size = wal.frame_size();
+    let max_run = (CHECKPOINT_RUN_READ_BYTES / frame_size).max(1);
+    let buffered = max_run.min(expected.len());
+    let mut pages = vec![0u8; page_size * buffered];
+    let mut frames = vec![0u8; frame_size * buffered];
     let page1_patch = target.checkpoint_page1_header_patch();
-    for exp in expected {
+    let mut start = 0;
+    while start < expected.len() {
+        let run = checkpoint_read_back_run(&expected[start..], max_run);
+        let first = &expected[start];
         let maybe_read = target
-            .read_page_if_supported(cx, exp.page, &mut buf)
+            .read_pages_if_supported(cx, first.page, page_size, &mut pages[..run * page_size])
             .await?;
-        let Some(n) = maybe_read else {
+        let Some(read) = maybe_read else {
             // Target does not support read-back; abort further checks.
             return Ok(CheckpointChecksumVerdict::Match);
         };
-        if n != page_size {
-            return Ok(CheckpointChecksumVerdict::Mismatch {
-                first_bad_page: exp.page,
-            });
-        }
-        let header = wal
-            .read_frame_into(cx, exp.frame_index, &mut frame_buf)
-            .await?;
-        if header.page_number != exp.page.get()
-            || header.salts != wal.header().salts
-            || !exp.source_checksum.verify(&frame_buf)
-        {
-            return Err(FrankenError::WalCorrupt {
-                detail: "checkpoint verification source changed after its database write"
-                    .to_owned(),
-            });
-        }
-        let page = &mut frame_buf[WAL_FRAME_HEADER_SIZE..];
-        if exp.page == PageNumber::ONE
-            && let Some(patch) = page1_patch
-        {
-            if page.len() < 96 {
-                return Err(FrankenError::WalCorrupt {
-                    detail: "checkpoint page-1 patch exceeds the WAL page".to_owned(),
+        read_checkpoint_frame_run(wal, cx, first.frame_index, run, &mut frames).await?;
+        for (k, exp) in expected[start..start + run].iter().enumerate() {
+            if read < (k + 1) * page_size {
+                return Ok(CheckpointChecksumVerdict::Mismatch {
+                    first_bad_page: exp.page,
                 });
             }
-            page[24..32].copy_from_slice(&patch[..8]);
-            page[92..96].copy_from_slice(&patch[8..]);
+            let frame = &mut frames[k * frame_size..(k + 1) * frame_size];
+            let header = WalFrameHeader::from_bytes(&frame[..WAL_FRAME_HEADER_SIZE])?;
+            if header.page_number != exp.page.get()
+                || header.salts != wal.header().salts
+                || !exp.source_checksum.verify(frame)
+            {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "checkpoint verification source changed after its database write"
+                        .to_owned(),
+                });
+            }
+            let page = &mut frame[WAL_FRAME_HEADER_SIZE..];
+            if exp.page == PageNumber::ONE
+                && let Some(patch) = page1_patch
+            {
+                if page.len() < 96 {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: "checkpoint page-1 patch exceeds the WAL page".to_owned(),
+                    });
+                }
+                page[24..32].copy_from_slice(&patch[..8]);
+                page[92..96].copy_from_slice(&patch[8..]);
+            }
+            if *page != pages[k * page_size..(k + 1) * page_size] {
+                return Ok(CheckpointChecksumVerdict::Mismatch {
+                    first_bad_page: exp.page,
+                });
+            }
         }
-        if page != buf.as_slice() {
-            return Ok(CheckpointChecksumVerdict::Mismatch {
-                first_bad_page: exp.page,
-            });
-        }
+        start += run;
     }
     Ok(CheckpointChecksumVerdict::Match)
 }
@@ -1831,6 +1938,212 @@ mod tests {
         }
     }
 
+    /// bd-w4pr1.13.20, lever N2: the expectations and target of a three-page
+    /// window from consecutive frames (pages 2..=4), backfilled and synced.
+    fn readback_run_fixture(
+        vfs: &MemoryVfs,
+        cx: &Cx,
+    ) -> (
+        WalFile<<MemoryVfs as Vfs>::File>,
+        ReadbackTarget,
+        Vec<CheckpointPageExpectation>,
+    ) {
+        let mut wal = WalFile::create(cx, open_wal_file(vfs, cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        let mut target = ReadbackTarget::new(vfs, cx);
+        let mut expected = Vec::new();
+        let mut frame = vec![0; wal.frame_size()];
+        for (frame_index, page_no) in (2..=4_u32).enumerate() {
+            let data = sample_page(u8::try_from(page_no).expect("small page number"));
+            wal.append_frame(cx, page_no, &data, if page_no == 4 { 4 } else { 0 })
+                .expect("append frame");
+            wal.read_frame_into(cx, frame_index, &mut frame)
+                .expect("capture source");
+            let page = PageNumber::new(page_no).expect("valid page");
+            target.write_page(cx, page, &data).wait().expect("backfill");
+            expected.push(CheckpointPageExpectation {
+                page,
+                frame_index,
+                source_checksum: Xxh3Checksum128::compute(&frame),
+            });
+        }
+        target.sync_db(cx).wait().expect("sync database");
+        (wal, target, expected)
+    }
+
+    #[test]
+    fn test_checkpoint_readback_runs_follow_consecutive_pages_and_frames() {
+        // A window longer than one run (15 frames of a 4 KiB page per 64 KiB
+        // read) reads back and resets, every page compared in page order.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        populate_wal(&mut wal, &cx, 40);
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        let state = CheckpointState {
+            total_frames: 40,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .wait()
+                .expect("a clean 40-page window reads back");
+        assert!(result.wal_was_reset);
+        let pages: Vec<PageNumber> = (1..=40)
+            .map(|n| PageNumber::new(n).expect("page"))
+            .collect();
+        assert_eq!(target.read_pages, pages);
+        assert_eq!(
+            CHECKPOINT_RUN_READ_BYTES
+                / (usize::try_from(PAGE_SIZE).expect("page size") + WAL_FRAME_HEADER_SIZE),
+            15,
+            "the runs here are 15, 15 and 10 frames"
+        );
+
+        // Page 2 rewritten by a later frame: its source (frame 3) does not
+        // follow page 3's (frame 1), so the runs are [2] and [3, 4]. Each page
+        // reads back its own newest source.
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        for (page_no, seed, db_size) in [(2, 20, 0), (3, 3, 0), (4, 4, 0), (2, 21, 4)] {
+            wal.append_frame(&cx, page_no, &sample_page(seed), db_size)
+                .expect("append frame");
+        }
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        let state = CheckpointState {
+            total_frames: 4,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .wait()
+                .expect("split runs read back");
+        assert!(result.wal_was_reset);
+        let pages: Vec<PageNumber> = (2..=4).map(|n| PageNumber::new(n).expect("page")).collect();
+        assert_eq!(target.read_pages, pages);
+        let mut on_disk = vec![0; usize::try_from(PAGE_SIZE).expect("page size")];
+        for (page_no, seed) in [(2_u32, 21), (3, 3), (4, 4)] {
+            target
+                .file
+                .read(
+                    &cx,
+                    &mut on_disk,
+                    u64::from(page_no - 1) * u64::from(PAGE_SIZE),
+                )
+                .expect("database page");
+            assert_eq!(
+                on_disk,
+                sample_page(seed),
+                "page {page_no} holds its newest source"
+            );
+        }
+
+        // Consecutive frames of pages 2 and 5: the pages do not follow one
+        // another in the file, so they are two runs, each read where it is.
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        wal.append_frame(&cx, 2, &sample_page(2), 0)
+            .expect("append frame");
+        wal.append_frame(&cx, 5, &sample_page(5), 5)
+            .expect("append frame");
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        let state = CheckpointState {
+            total_frames: 2,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .wait()
+                .expect("pages with a gap read back");
+        assert!(result.wal_was_reset);
+        assert_eq!(
+            target.read_pages,
+            vec![
+                PageNumber::new(2).expect("page"),
+                PageNumber::new(5).expect("page")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_readback_refuses_a_source_changed_inside_a_run() {
+        // The middle frame of a three-frame run changes after its write: the
+        // batched source read still checks that frame's digest.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (wal, mut target, expected) = readback_run_fixture(&vfs, &cx);
+        assert_eq!(
+            checkpoint_read_back_run(&expected, 15),
+            3,
+            "one run of three"
+        );
+        let offset = u64::try_from(
+            crate::checksum::WAL_HEADER_SIZE + wal.frame_size() + WAL_FRAME_HEADER_SIZE + 100,
+        )
+        .expect("frame offset fits u64");
+        let mut byte = [0];
+        wal.file()
+            .read(&cx, &mut byte, offset)
+            .expect("source byte");
+        wal.file()
+            .write(&cx, &[byte[0] ^ 0x80], offset)
+            .expect("mutate the middle source after backfill");
+        assert!(matches!(
+            verify_checkpoint_pages_via_target(&cx, &wal, &mut target, &expected).wait(),
+            Err(FrankenError::WalCorrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn test_checkpoint_readback_reports_the_first_bad_page_inside_a_run() {
+        // A database page changed after the sync, and a database that ends
+        // inside the run, each report their own page, not the run's first.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (wal, mut target, expected) = readback_run_fixture(&vfs, &cx);
+        let verdict = |wal: &WalFile<<MemoryVfs as Vfs>::File>, target: &mut ReadbackTarget| {
+            verify_checkpoint_pages_via_target(&cx, wal, target, &expected)
+                .wait()
+                .expect("the sources are unchanged")
+        };
+        assert_eq!(verdict(&wal, &mut target), CheckpointChecksumVerdict::Match);
+        let offset = 2 * u64::from(PAGE_SIZE) + 100;
+        let mut byte = [0];
+        target
+            .file
+            .read(&cx, &mut byte, offset)
+            .expect("database byte");
+        target
+            .file
+            .write(&cx, &[byte[0] ^ 0x80], offset)
+            .expect("corrupt page 3");
+        assert_eq!(
+            verdict(&wal, &mut target),
+            CheckpointChecksumVerdict::Mismatch {
+                first_bad_page: PageNumber::new(3).expect("page"),
+            }
+        );
+
+        let vfs = MemoryVfs::new();
+        let (wal, mut target, _) = readback_run_fixture(&vfs, &cx);
+        target
+            .file
+            .truncate(&cx, 3 * u64::from(PAGE_SIZE))
+            .expect("drop page 4");
+        assert_eq!(
+            verdict(&wal, &mut target),
+            CheckpointChecksumVerdict::Mismatch {
+                first_bad_page: PageNumber::new(4).expect("page"),
+            }
+        );
+    }
+
     #[test]
     fn test_checkpoint_readback_accepts_exact_page1_patch_receipt() {
         assert_checkpoint_page1_patch_readback(None);
@@ -1971,8 +2284,40 @@ mod tests {
             !partial && matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate);
         let gate = u32::from(reset_path);
         assert_eq!((target.gate_acquired, target.gate_released), (gate, gate));
-        assert_eq!(target.read_pages, vec![page]);
-        assert_eq!(target.read_after_syncs, vec![target.sync_count]);
+        if partial {
+            assert_eq!(target.read_pages, vec![page]);
+            assert_eq!(target.read_after_syncs, vec![target.sync_count]);
+        } else {
+            // bd-w4pr1.13.20 lever N2 (coordinator decision, 2026-11-15): the
+            // read-back may read the rest of a run of pages written from
+            // consecutive frames before it reports the first bad one. It
+            // still reads the corrupt page, only pages this pass backfilled,
+            // each once in ascending order, and only after the last sync.
+            let backfilled = [page, PageNumber::new(3).expect("valid page")];
+            assert!(
+                target.read_pages.contains(&page),
+                "the corrupt page is read back"
+            );
+            assert!(
+                target
+                    .read_pages
+                    .iter()
+                    .all(|read| backfilled.contains(read)),
+                "only pages this pass backfilled are read back"
+            );
+            assert!(
+                target.read_pages.windows(2).all(|pair| pair[0] < pair[1]),
+                "each page is read back once, in ascending order"
+            );
+            assert_eq!(target.read_after_syncs.len(), target.read_pages.len());
+            assert!(
+                target
+                    .read_after_syncs
+                    .iter()
+                    .all(|&syncs| syncs == target.sync_count),
+                "every read-back follows the pass's last sync"
+            );
+        }
         assert_eq!(checkpoint_test_wal_bytes(&wal, &cx), original);
         assert_eq!(wal.frame_count(), 2);
         let mut observed = vec![0; page_data.len()];

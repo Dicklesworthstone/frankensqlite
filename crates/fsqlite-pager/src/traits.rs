@@ -1626,6 +1626,38 @@ pub trait CheckpointPageWriter: sealed::Sealed + Send {
         Box::pin(async { Ok(None) })
     }
 
+    /// Read `buf.len() / page_size` consecutive database pages starting at
+    /// `first_page` for the same verification, which reads back a run of
+    /// pages at once (bd-w4pr1.13.20, lever N2). Returns the bytes read,
+    /// which end at the first short page, or `None` when the writer cannot
+    /// read back. The default reads page by page through
+    /// [`Self::read_page_if_supported`].
+    fn read_pages_if_supported<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        first_page: PageNumber,
+        page_size: usize,
+        buf: &'a mut [u8],
+    ) -> WalFuture<'a, Option<usize>> {
+        Box::pin(async move {
+            let mut read = 0;
+            for (page, chunk) in (first_page.get()..).zip(buf.chunks_mut(page_size)) {
+                let page_no = PageNumber::new(page).ok_or_else(|| FrankenError::OutOfRange {
+                    what: "checkpoint read-back page number".to_owned(),
+                    value: page.to_string(),
+                })?;
+                let Some(n) = self.read_page_if_supported(cx, page_no, chunk).await? else {
+                    return Ok(None);
+                };
+                read += n;
+                if n != chunk.len() {
+                    break;
+                }
+            }
+            Ok(Some(read))
+        })
+    }
+
     /// GH#399: take the cross-process gate that excludes every WAL reader
     /// pinned to the current generation while it is replaced by a
     /// RESTART/TRUNCATE reset. `Ok(false)` means a peer reader still pins the

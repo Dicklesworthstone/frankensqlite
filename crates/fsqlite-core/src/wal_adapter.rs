@@ -7371,6 +7371,17 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
         self.writer.read_page_if_supported(cx, page_no, buf)
     }
 
+    fn read_pages_if_supported<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        first_page: PageNumber,
+        page_size: usize,
+        buf: &'a mut [u8],
+    ) -> CheckpointTargetFuture<'a, Option<usize>> {
+        self.writer
+            .read_pages_if_supported(cx, first_page, page_size, buf)
+    }
+
     fn write_page<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -7421,6 +7432,9 @@ impl<F: VfsFile> CheckpointTarget for CheckpointResetTarget<'_, F> {
     }
     fn read_page_if_supported<'a>(&'a mut self, cx: &'a Cx, page_no: PageNumber, buf: &'a mut [u8]) -> CheckpointTargetFuture<'a, Option<usize>> {
         self.delegate.read_page_if_supported(cx, page_no, buf)
+    }
+    fn read_pages_if_supported<'a>(&'a mut self, cx: &'a Cx, first_page: PageNumber, page_size: usize, buf: &'a mut [u8]) -> CheckpointTargetFuture<'a, Option<usize>> {
+        self.delegate.read_pages_if_supported(cx, first_page, page_size, buf)
     }
     fn acquire_wal_reset_gate<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, bool> {
         self.delegate.acquire_wal_reset_gate(cx)

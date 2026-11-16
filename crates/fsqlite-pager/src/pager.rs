@@ -31098,6 +31098,33 @@ where
         })
     }
 
+    /// One read of the whole run (bd-w4pr1.13.20, lever N2).
+    fn read_pages_if_supported<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        first_page: PageNumber,
+        page_size: usize,
+        buf: &'a mut [u8],
+    ) -> WalFuture<'a, Option<usize>> {
+        Box::pin(async move {
+            let (db_file, file_page_size) = {
+                let inner = self.inner.lock().map_err(|_| {
+                    FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
+                })?;
+                (Arc::clone(&inner.db_file), inner.page_size.as_usize())
+            };
+            if page_size != file_page_size || buf.is_empty() || !buf.len().is_multiple_of(page_size)
+            {
+                return Err(FrankenError::internal(
+                    "checkpoint verification requires complete page buffers",
+                ));
+            }
+            let offset = u64::from(first_page.get() - 1) * page_size as u64;
+            let db_file = shared_db_file_read(&db_file, cx).await?;
+            db_file.read(cx, buf, offset).await.map(Some)
+        })
+    }
+
     fn checkpoint_page1_header_patch(&self) -> Option<[u8; 12]> {
         self.page1_header_patch
     }
@@ -45086,6 +45113,10 @@ mod tests {
         /// (0 = none yet; see `encode_sync_request`). Used by the GH #198
         /// regression to prove the checkpoint fence asks for `FullDurable`.
         last_db_sync_request: Arc<std::sync::atomic::AtomicU8>,
+        /// Offsets of every read of the main-DB file, in order
+        /// (bd-w4pr1.13.20, lever N2: the checkpoint read-back reads a run of
+        /// pages with one read).
+        db_reads: Arc<std::sync::Mutex<Vec<u64>>>,
     }
 
     /// Encoding for `last_db_sync_request`: plain `sync` calls record
@@ -45109,6 +45140,7 @@ mod tests {
                 fail_next_write: Arc::new(AtomicBool::new(false)),
                 fail_next_sync: Arc::new(AtomicBool::new(false)),
                 last_db_sync_request: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                db_reads: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -45119,6 +45151,7 @@ mod tests {
         fail_next_write: Arc<AtomicBool>,
         fail_next_sync: Arc<AtomicBool>,
         last_db_sync_request: Arc<std::sync::atomic::AtomicU8>,
+        db_reads: Arc<std::sync::Mutex<Vec<u64>>>,
     }
 
     impl Vfs for CheckpointFaultVfs {
@@ -45142,6 +45175,7 @@ mod tests {
                     fail_next_write: Arc::clone(&self.fail_next_write),
                     fail_next_sync: Arc::clone(&self.fail_next_sync),
                     last_db_sync_request: Arc::clone(&self.last_db_sync_request),
+                    db_reads: Arc::clone(&self.db_reads),
                 },
                 actual_flags,
             ))
@@ -45179,6 +45213,9 @@ mod tests {
             buf: &'a mut [u8],
             offset: u64,
         ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+            if self.is_main_db {
+                self.db_reads.lock().unwrap().push(offset);
+            }
             self.inner.read(cx, buf, offset)
         }
 
@@ -45345,6 +45382,58 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(pager.inner.lock().unwrap().db_size, 50);
+        });
+    }
+
+    /// bd-w4pr1.13.20, lever N2: the checkpoint read-back reads a run of
+    /// pages with one read; a run past the end of the file returns only the
+    /// bytes that exist, and a buffer that is not whole pages is refused.
+    #[test]
+    fn test_checkpoint_read_pages_reads_a_run_in_one_read() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::traits::CheckpointPageWriter as _;
+            let cx = Cx::new();
+            let vfs = CheckpointFaultVfs::new();
+            let reads = Arc::clone(&vfs.db_reads);
+            let pager = SimplePager::open(vfs, Path::new("/ckpt-read-run-n2.db"), PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page = |n: u32| PageNumber::new(n).unwrap();
+            let mut writer = pager.checkpoint_writer();
+            for n in 2..=4_u32 {
+                let fill = vec![u8::try_from(n).unwrap(); page_size];
+                writer.write_page(&cx, page(n), &fill).await.unwrap();
+            }
+            reads.lock().unwrap().clear();
+            let mut run = vec![0u8; 3 * page_size];
+            let got = writer
+                .read_pages_if_supported(&cx, page(2), page_size, &mut run)
+                .await
+                .unwrap();
+            assert_eq!(got, Some(3 * page_size));
+            assert_eq!(
+                *reads.lock().unwrap(),
+                vec![u64::try_from(page_size).unwrap()],
+                "one read, at page 2"
+            );
+            for (k, chunk) in run.chunks(page_size).enumerate() {
+                assert!(chunk.iter().all(|&b| usize::from(b) == k + 2), "page {} of the run", k + 2);
+            }
+            let mut past_end = vec![0u8; 3 * page_size];
+            let got = writer
+                .read_pages_if_supported(&cx, page(3), page_size, &mut past_end)
+                .await
+                .unwrap();
+            assert_eq!(got, Some(2 * page_size), "pages 3 and 4 exist, page 5 does not");
+            let mut partial = vec![0u8; page_size + 1];
+            assert!(
+                writer
+                    .read_pages_if_supported(&cx, page(2), page_size, &mut partial)
+                    .await
+                    .is_err(),
+                "a buffer that is not whole pages is refused"
+            );
         });
     }
 
