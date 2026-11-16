@@ -89,6 +89,226 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-16 - WIN (small): the publication epoch notifies its condvar only while a validator waits on it, one FUTEX_WAKE fewer per concurrent commit (bd-w4pr1.7, round 3 item 5a)
+
+- Target: every concurrent commit. Its publication lease's drop moved a process-wide epoch and
+  called `Condvar::notify_all`, and std's futex condvar makes a FUTEX_WAKE system call on every
+  notify, waiter or not. At one writer nobody ever waits. Touched:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (`PublicationEpochCell`: the epoch and a count of
+  registered waiters under one mutex; `advance` notifies only when the count is non-zero).
+- Ledger preflight: "Lock, wakeup and counter micro-levers on the commit path" (INDEX; 2026-05-06,
+  2026-05-12, 2026-08-17 bd-8euyp) were rejected on measured time. This one is judged on the
+  system call it removes, with time as a secondary reading; the publication epoch itself
+  (bd-i0tn6) is newer than those entries.
+- Why no wakeup is lost: a waiter registers under the mutex before `wait_timeout_while` releases
+  it, and unregisters after the wait returns, timeout included; the epoch moves under the same
+  mutex, so a withdrawal either sees the waiter registered and notifies it, or comes before the
+  waiter locked and is seen by the wait's predicate. `publication_epoch()`, the capture-before-test
+  rule and the process-wide scope are unchanged.
+- Result. A = the tree with item 2, bd-i0tn6 lever 4 v2 and lever 4a (mtbench-fec sha256
+  17531a9c69ab2262); B = A + this (mtbench-fut 75f1679ddafbb2c0). Old harness; stock live.
+  - strace -ff -k, 300 one-row transactions, wakes attributed by resolved stack: the 1.000 per
+    transaction under `Connection::execute_commit_with_attached_participants` (the lease drop) is
+    0 in B; every other wake site is unchanged (2.01 per transaction from spawn_blocking for the
+    io_uring driver, 1.00 from the old harness's worker loan). Whole F writer thread, 2,000
+    transactions: futex 2.755 -> 1.270 per transaction (wakes 2.683 -> 1.223). Predicted 1.0 ->
+    about 0 for the epoch notify: met. (The kill line's "futex per 1w transaction below 0.1" means
+    that notify; under the old harness the writer has other futex users, as the prediction said.)
+  - 1w CPU, 12 interleaved pairs of 2,000 x 11, disk NORMAL: F writer 157.37 -> 156.26 us per
+    transaction, pooled B/A 0.9930 [0.9881, 0.9994]; predicted -0.5 to -1.0 us, measured -1.1, just
+    beyond. F wps B/A 1.009 [1.002, 1.016]; F/C 0.269 -> 0.274.
+  - Separate tables, 500 x 5, 4 interleaved reps, disk NORMAL: 8w 1.036 [0.978, 1.090], 32w 1.020
+    [0.997, 1.046], 64w 0.993 [0.954, 1.032]; predicted ±3%, 8w just above; kill line (any row
+    below -5%) not hit. F/C 0.464 -> 0.466, 0.659 -> 0.656, 0.411 -> 0.443.
+  - bd-73pfl repro (`mw_conflict.py explicit-same 8 300 10 5000`, disk) on a CLI of the full
+    stack (item 2 + lever 4 v2 + lever 4a + this) against main: stock integrity_check ok 10/10 on
+    both; every lost row is a refused commit (error lines 4,390 = rows lost; main 3,821 = 3,821);
+    wall median 6,243 -> 3,139 ms.
+- Tests: `test_publication_epoch_notifies_only_registered_waiters` on a private cell: an advance
+  with no waiter does not notify; a registered waiter on another thread is woken well inside its
+  30 s timeout; woken and timed-out waits both unregister. A cell that always notifies, never
+  notifies, or forgets to unregister on timeout fails it.
+  `test_withdrawn_publication_wakes_a_waiter_and_an_unrelated_one_does_not` unchanged.
+- Retry condition: none for this notify. The two spawn_blocking wakes per transaction for the
+  io_uring driver (`IoUringRuntime::ensure_driver`) are the larger futex source under an
+  asupersync runtime; whether `fsqlite::blocking` users pay them is not measured here.
+
+## 2026-11-16 - WIN (prediction missed low on size): synchronous=FULL's WAL-FEC worker reuses the repair coefficients of a group shape instead of building a RaptorQ encoder per commit, -44 us CPU per one-row FULL commit (bd-w4pr1.7, round 3 item 4, lever 4a)
+
+- Target: every commit at synchronous=FULL (or EXTRA). Each one hands its frames to the WAL-FEC
+  repair worker, which re-read them and, per group, built a `SystematicEncoder` over K unit
+  vectors to get K x r coefficient bytes. FEC stays on by default (owner freeze bd-w4pr1.17
+  untouched); what it writes and when it syncs are unchanged. Touched:
+  `crates/fsqlite-wal/src/wal_fec.rs` (`cached_wal_fec_repair_coefficients`, a process-wide map
+  keyed by (K, first ESI, end ESI) for K <= 64, at most 512 entries).
+- Ledger preflight: bd-wqmil (the coefficient path itself, K-byte rows instead of page-width
+  ones) is the change this one caches. Nothing earlier on the FEC worker's per-commit cost.
+- Evidence before (main d4e3d189c, CLI, tmpfs, 1,000 one-row transactions):
+  - FULL 338 us CPU per transaction against NORMAL 194 and FULL with
+    `raptorq_repair_symbols=0` 188 (5 reps, /usr/bin/time): the FEC pipeline was about 150 us
+    of CPU per commit (user +94, sys +56).
+  - callgrind of `process_committed_wal_range`, 300 FULL commits: 121.5k instructions per
+    commit, `SystematicEncoder::new` 102.7k (84.5%).
+  - strace: 25.6 syscalls per commit on the two FEC threads (openat 6.0, close 6.0, read 4.0,
+    statx 2.0, flock 2.0, futex 2.0, write 1.3, io_uring_enter 1.1, lseek 1.0).
+- Why reuse is exact: RFC 6330's constraint matrix and each repair symbol's tuple depend on K
+  and the ESI only. asupersync 0.6.2's `SystematicEncoder::new` takes a seed and ignores it
+  (`build_ldpc_rows`, `build_hdpc_rows`, `build_lt_rows` all take `_seed`); the decoder builds
+  the same matrix. `test_cached_repair_coefficients_serve_groups_with_other_seeds` pins it:
+  coefficient rows equal for two seeds at K = 1/2/3/7, and twelve groups of six (K, r) shapes over
+  two seeds each compared byte for byte with a fresh page-width encoder built with the group's
+  own seed. A cache keyed without K or without r, or an encoder that starts using its seed, fails.
+- Result. A = mtbench/CLI l4 (d4e3d189c + item 2 + bd-i0tn6 lever 4 v2; CLI sha256
+  e0d3f31c6f4aa61d), B = A + this (fsqlite-fec dd251e0934b11445, mtbench-fec
+  17531a9c69ab2262). thinkstation1, governor powersave, load 2-4.
+  - Exact: FEC worker 143.4k -> 15.3k instructions per FULL commit (callgrind, 300 commits; a
+    second A capture, on main, read 121.5k: how many commits one job covers varies run to run).
+    Predicted 15k-25k: met.
+  - CLI tmpfs, 1,000 one-row transactions, 5 interleaved reps (bash `time`, ms resolution),
+    distro sqlite3 live: FULL user 186.4 -> 146.4 us, sys 107.2 -> 102.8, CPU 293.6 -> 249.2
+    (-44.4; paired -62 / -21 / -51 / +7 / -95), wall 186.4 -> 176.4. NORMAL CPU 170.0 -> 164.2
+    (within noise). Stock: 20.8 us CPU per FULL transaction. A second batch of 5 reps, run after
+    the verdict and not used for it: FULL CPU 328.8 -> 262.4 (-66.4), user 209.6 -> 150.2, wall
+    211.8 -> 185.2; NORMAL 203.6 -> 184.2. Per-rep FULL CPU spans 247-294 (B) and 268-376 (A).
+  - Prediction: user 218 -> 125-145 and CPU 338 -> 245-270, from a baseline taken with
+    /usr/bin/time (10 ms resolution) on main. The A arm measured 294, not 338, so the absolute
+    B (249) is in range but the drop (-44) missed the predicted -68 to -93 low. Kill line (CPU
+    down by at least 40 us, mean of 5 reps): cleared, by 4 us, with one of five pairs going the
+    other way.
+  - mt-mvcc-bench disk FULL, 1 writer, 150 x 5, 3 interleaved reps (old harness): F wps B/A 0.988
+    [0.983, 0.992] (predicted within ±3%: met), F process CPU 838.8 -> 778.9 us per commit
+    (predicted -60 to -100: met), F/C 0.933 -> 0.932.
+- Tests: the new one above; `test_coefficient_repair_symbols_match_systematic_encoder` unchanged.
+- Retry condition / next (lever 4b, not done): the six opens per FEC job. One `-wal` descriptor
+  per job for the post-lock generation check and the frame read; the `.lock` file's descriptor
+  kept across jobs with flock still taken and released per job (other connections, checkpoint
+  reclaim and recovery take it); the sidecar's append descriptor kept with the (dev, inode)
+  check the sidecar cache already does. Worth up to the 56 us of sys time per FULL commit;
+  needs the cross-process lock and replacement rules (main's 04d6fd0c9 and 7e16b363f on locks)
+  read first.
+
+## 2026-11-16 - WIN (retry of the 2026-11-15 rejection, version 2): active-peer SSI candidates by a direct scan that tests the cheap peer filter first, +67% at 64 separate-table writers and +18% at 32 shared-table writers, 1 writer unchanged (bd-i0tn6 scaling lever 4 v2)
+
+- Target: the registry-guard holds of concurrent commits at 16-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`). Touched: `crates/fsqlite-mvcc/src/begin_concurrent.rs`:
+  `HandleView::may_have_read`, `may_have_written` and `is_edge_peer_of`;
+  `overlaps_pages_or_cells`, `active_incoming_candidates` and `active_outgoing_candidates`;
+  `pending_publication_blocks` scans with early exit; `ActiveEdgeDiscoveryIndex` becomes
+  `cfg(test)`, the oracle. Version 2 is round 1's patch with one change: both candidate filters
+  test `is_edge_peer_of` (not the committer, active, begun before the commit) before the overlap
+  rules, so the committer's own view and finished peers are never searched.
+- Ledger preflight: the 2026-11-15 REJECTED entry below (version 1: 8-64 writers far above its
+  prediction, killed by its 1-writer line at -4.7% pooled, which the entry's own analysis read as
+  noise plus a self-view search); its retry condition (cheap filter first; a 1w measurement that
+  resolves 2%, with the exact count) is what this version and its pre-registration (bd-i0tn6,
+  2026-11-15 13:49Z) met. Lever 3 (WIN) and lever 2 (WIN small) are the base it builds on.
+- Pre-registered 1w verdict, both met:
+  - exact (callgrind of the F worker closure, which inlines the whole one-row loop; old harness;
+    (N=2,000 minus N=500)/1,500; tmpfs NORMAL; io_uring refused): 217,873 -> 216,937
+    instructions per transaction, -0.43%. Kill: worse than +0.5%. Predicted -0.1% to +0.1%,
+    missed low (B did less work than predicted).
+  - CPU (F writer `writer_on_cpu_us`, 24 interleaved pairs of 2,000 x 11, disk NORMAL): 156.71
+    -> 156.30 us per transaction, pooled B/A 0.9973 (per-pair mean 0.9974 [0.9899, 1.0047]).
+    Kill: worse than +2%. Predicted within ±1%: met. F wps B/A 1.004 [0.995, 1.012].
+- Multi-writer (6 interleaved reps, 500 rows per writer x 5 rounds, disk NORMAL, amended from
+  tmpfs before any run because of the /dev/shm budget; old harness; stock live in every run; F
+  p50 wps B/A with its bootstrap CI, F/C A -> B, registry hold A -> B):
+  - separate tables: 8w 1.025 [0.989, 1.062] (0.422 -> 0.458, hold 12.4 -> 7.4 us); 16w 1.198
+    [1.172, 1.222] (0.567 -> 0.651, 19.8 -> 10.4); 32w 1.525 [1.492, 1.558] (0.421 -> 0.676,
+    30.7 -> 15.4); 64w 1.667 [1.657, 1.678] (0.273 -> 0.444, 46.7 -> 21.4);
+  - shared table: 8w 1.101 [1.039, 1.145] (0.275 -> 0.294); 16w 1.074 [1.022, 1.125] (0.410 ->
+    0.477); 32w 1.184 [1.146, 1.223] (0.345 -> 0.382, 26.7 -> 17.4);
+  - against the prediction: separate 8w 0..+8% met, 16w +8..+20% met, 32w +30..+55% met, 64w
+    +50..+85% met, 64w hold -45..-60% met (-54%); shared 8w 0..+8% missed high (+10.1%), 16w
+    +5..+15% met, 32w +10..+25% met;
+  - kill lines: no 8-64 writer row below -3%; no worker failure.
+- Binaries: A = mtbench-fds (origin/main d4e3d189c + the stock-arm HAVE_FDATASYNC change, sha256
+  71fc188ef22c0148), B = A + this (mtbench-l4, 923075e6257fda01). thinkstation1, 64 hardware
+  threads, governor powersave, load 2.4-7.7 from other lanes, 259 observed OS threads at 64
+  writers. Harness: main's mt-mvcc-bench (H did not land).
+- Tests (fsqlite-mvcc lib): `test_active_candidate_scan_matches_the_candidate_index` (2,000 random
+  cases, the same tokens in the same order as the old index) and
+  `test_pending_publication_blocks_on_an_exact_cell_overlap_alone`; with the exact-cell rule
+  dropped both fail.
+- Retry condition for what is left of the holds: the next item in the hold split is the peer view
+  construction itself (16.8 and 19.7 us of the 64w validate and publish holds before this lever);
+  re-split the holds on a tree with this lever before choosing.
+
+## 2026-11-16 - HARNESS (fairness, not a lever): mt-mvcc-bench's stock arm syncs with fdatasync like distro sqlite3; FULL rows that restart the WAL had flattered FrankenSQLite 2.1x (bd-w4pr1.7, coordinator decision 3)
+
+- Target: every C SQLite baseline built from the bundled rusqlite (mt-mvcc-bench's stock arm, the
+  harness, the conformance oracles) at synchronous=FULL on a real disk. Touched:
+  `.cargo/config.toml` (`LIBSQLITE3_FLAGS` gains `-DHAVE_FDATASYNC`).
+- Why: libsqlite3-sys 0.39.1 compiles its bundled 3.54.1 without HAVE_FDATASYNC, so sqlite3.c:44392
+  `#define`s fdatasync to fsync. The distro's configure build calls fdatasync, and since lever S
+  (the 2026-11-15 WIN entry below) so does FrankenSQLite. fsync also commits the journal for the
+  mtime change of a frame overwrite (9.2-10.6 ms against 3.0-3.2 ms per sync on this disk), so
+  once a checkpoint had restarted the WAL the bench compared FrankenSQLite's fdatasync with
+  stock's fsync.
+- Scope: rusqlite is a dependency of fsqlite-e2e and fsqlite-harness and a dev-dependency
+  elsewhere; no release artifact links it. libsqlite3-sys passes `-D` flags through and reruns
+  on a change (build.rs:340-351); HAVE_FDATASYNC has one use in sqlite3.c.
+- Evidence (A = mtbench-m4, origin/main d4e3d189c, sha256 24fd1bf653375b72; B = A + the flag,
+  mtbench-fds 71fc188ef22c0148; thinkstation1, ext4 NVMe, load 1.5-3.4; old harness; 3
+  interleaved reps; FrankenSQLite live in the same runs):
+  - strace -f -y, disk FULL, 1 writer, 100 one-row transactions: stock arm per commit
+    fsync(-wal) 1.05 -> fdatasync(-wal) 1.05, fsync 0; its db, journal and directory syncs become
+    fdatasync too. FrankenSQLite's calls unchanged (fdatasync(-wal) 1.04 per commit).
+  - Growth shape (150 x 5, the WAL never restarts): stock C p50 wps B/A 1.016 [0.974, 1.044];
+    F 1.015; F/C 0.929 -> 0.929. Unchanged, as predicted (both calls journal a size change).
+  - Restart shape (`FSQLITE_BENCH_WAL_AUTOCHECKPOINT=50` for both engines, 300 x 5): stock C p50
+    104 -> 221 wps, B/A 2.132 [2.082, 2.219] (predicted x1.8 to x2.6); F 1.007; F/C 1.653 ->
+    0.789. The bench had reported FrankenSQLite 1.65x ahead in this shape; like for like it is
+    0.79x.
+  - Prediction (bead comment 2026-11-15, before building): met on every line.
+- Retry condition: none. Every FULL-mode bench F/C before this commit compared fdatasync against
+  fsync once the WAL restarted and is not a win (coordinator decision 3, 2026-11-15).
+
+## 2026-11-16 - NOT LANDED (its candidate mechanism refuted; the A/A null fails as often with the stock arm in another process): what the harness before H leaves beside mt-mvcc-bench's stock arm (bd-w4pr1.7, harness change H, round 3)
+
+- Target: the coordinator's condition for landing H (bd-w4pr1.7, 2026-11-15): explain round 2's
+  stock-arm A/A miss (1w pooled 1.027 [1.008, 1.047]) by a measured mechanism. Candidate: the old
+  harness's asupersync runtime threads take CPU or scheduler time while the stock arm runs.
+  Touched (not landed): `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs`, on top of H: an
+  `arm_isolation` line per invocation of either arm (the writers' schedstat from just before the
+  start gate to their last commit, all non-writer process CPU inside the timed window, and the
+  threads alive across the invocation with their names and schedstat), read only at an
+  invocation's edges; `--csqlite-process=child`, which runs every stock invocation in a fresh
+  process of the same binary and returns its result as JSON. Patch: scratchpad
+  `p6r3_H3_bench.patch` (session 1f77802a), sha256 prefix fd3b1c721210b3e4.
+- Rules (registered before the probe was built): land H only if (a) the isolated A/A (child vs
+  child) includes 1.0, (b) new in-process vs new isolated includes 1.0, and (c) old in-process is
+  below old isolated with a CI excluding 1.0 AND the census shows the old harness's residents
+  taking CPU or timeslices during the stock arm.
+- Result (mtbench-h2, sha256 d1a1151c513e1793 = f38d2403d + H + probe; thinkstation1, governor
+  powersave, tmpfs NORMAL, load 2.1-3.3; 1 writer, 2,000 rows x 11 rounds; four modes rotated per
+  rep, 16 reps each):
+  - (a) child/child 0.993 [0.969, 1.016], met; (b) 1.009 [0.985, 1.033], met;
+  - (c) old in-process / old child 1.029 [1.000, 1.056]: not below 1.0. Not met;
+  - in-process A/A new/old 0.975 [0.950, 0.999]: a miss in the other direction from round 2's.
+  - Census during the stock arm: at 1w the old harness's 1.82 residents (both `asupersync-work`:
+    the main thread's block_on runtime) take 0.0 us on-CPU and 0.0 timeslices over 528 stock
+    invocations; the stock writer's runqueue wait and timeslices per transaction are equal under
+    both harnesses (0.018 us, 0.001). At 8 / 32 / 64 writers the residents take 9-125 us (old)
+    and 5-70 us (new) per stock invocation, under 0.02% of the writers' CPU; the old harness's
+    274-293 OS threads exist only during F invocations.
+  - A second 16-rep batch, run after the verdict and not used for it: in-process 0.993 [0.965,
+    1.021] (pass), child/child 1.019 [1.001, 1.037] (FAIL). Across five batches on the same ELF the
+    in-process A/A read 1.068 / 1.008 / 1.014 / 0.975 / 0.993, and the isolated one failed once in
+    two. Per-rep stock ratios spread 0.87-1.13 in every mode.
+- Reading: the candidate mechanism does not exist. The miss is this null's run-to-run variance,
+  which a bootstrap over one batch's per-rep ratios understates: an A/A whose two arms cannot be
+  affected by the harness (stock in separate processes) fails at about the same rate. H's F-side
+  effect stands: F new/old 1.493 [1.481, 1.505] at 1w (F/C 0.088 -> 0.136), 1.235 / 1.022 / 1.046
+  at 8 / 32 / 64 separate writers (2 reps); the old harness spends 19.6-20.3 ms of non-writer CPU
+  per 305 ms 1w F invocation (the F worker's runtime thread), the new one none.
+- Side finding for the concurrency lane: under the new harness (`fsqlite::blocking`) at 32 and 64
+  writers, the `asupersync-fall` resident runs 141 and 292 ms on-CPU per F invocation with 19k and
+  37k timeslices: engine work fsqlite::blocking routes to its fallback thread.
+- Retry condition: a coordinator decision on this evidence, or an A/A design that resolves 2% at
+  1 writer (for example many short batches with the order randomized, or a variance estimate that
+  includes batch-to-batch drift). Until then every mt-mvcc-bench number is under the old harness.
+
 ## 2026-11-16 - FIX (regression from lever L1): a WAL refresh reads one frame header ahead of its batch only while a stale tail is known for its generation (bd-2qo7z, bd-w4pr1.7)
 
 - Target: lever L1 (a4ff2c4ca, the 2026-11-15 WIN entry below) read the 24-byte header of the first
