@@ -43736,12 +43736,18 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &delete_event,
                 );
+                let fk_delete_actions = self.fk_cascade_propagation_enabled()
+                    && self.table_has_foreign_key_delete_actions(table_name);
                 // A self-read, or a subquery affected by triggers/FK actions,
                 // must run after the delete. Unaffected external-table probes
                 // keep their compiled path. Preserve the deleted row's column
                 // image separately from the live tables those subqueries read.
+                // FK actions also precede scalar RETURNING expressions such
+                // as total_changes(), so capture the row and project it only
+                // after those implicit trigger programs have completed.
                 let returning_needs_select_path = !self.has_live_vtab_instance(table_name)
-                    && (self
+                    && ((fk_delete_actions && !effective_delete.returning.is_empty())
+                        || self
                         .returning_has_uncompiled_correlated_subquery(&effective_delete.returning)
                         || self.returning_has_correlated_target_subquery(
                             &effective_delete.returning,
@@ -43799,22 +43805,27 @@ impl Connection {
                     })
                     .await;
                 }
-                // bd-5pt42: stock SQLite deletes a multi-row target one row at a
+                // bd-5pt42 / bd-fqud7 / bd-n8g76: stock deletes a multi-row target one row at a
                 // time — row N's BEFORE triggers, delete, FK actions and AFTER
                 // triggers all run before row N+1's BEFORE triggers, so each
                 // trigger body observes the rows already deleted. Replay each
                 // frozen row as its own single-row DELETE to get that order.
-                if (has_before_delete || has_after_delete)
+                // FK actions can observe this order even without triggers on
+                // the parent: child triggers see the partially deleted parent,
+                // and a self-cascade can remove a later frozen target. Replay
+                // then skips that missing row instead of counting it twice.
+                if (has_before_delete || has_after_delete || fk_delete_actions)
                     && !self.has_live_vtab_instance(table_name)
                     && !self.dml_where_pins_one_row(
                         &effective_delete.table,
                         effective_delete.where_clause.as_ref(),
                     )
-                    && self.delete_trigger_order_is_observable(
-                        table_name,
-                        has_before_delete,
-                        has_after_delete,
-                    )
+                    && (fk_delete_actions
+                        || self.delete_trigger_order_is_observable(
+                            table_name,
+                            has_before_delete,
+                            has_after_delete,
+                        ))
                     && let Some((locator_columns, locator_rows)) = lean_future(|| {
                         self.materialize_dml_replay_locators(
                             &effective_delete.table,
@@ -51587,6 +51598,21 @@ impl Connection {
         })
     }
 
+    /// These actions execute child DML between individual parent deletions.
+    /// NO ACTION and RESTRICT only validate references and do not themselves
+    /// require the row-replay lane when the parent has no triggers.
+    fn table_has_foreign_key_delete_actions(&self, table_name: &str) -> bool {
+        self.schema.borrow().iter().any(|table| {
+            table.foreign_keys.iter().any(|fk| {
+                fk.parent_table.eq_ignore_ascii_case(table_name)
+                    && matches!(
+                        fk.on_delete,
+                        FkActionType::Cascade | FkActionType::SetNull | FkActionType::SetDefault
+                    )
+            })
+        })
+    }
+
     fn table_needs_runtime_column_defaults(&self, table_name: &str) -> bool {
         let Some(idx) = self.schema_index_of(table_name) else {
             return false;
@@ -57405,11 +57431,26 @@ impl Connection {
                 };
                 match row_result {
                     Ok(rows) => {
+                        let row_changes = self.last_changes.get();
+                        // Stock publishes the outer statement's own changes
+                        // only when it finishes. Keep completed trigger/FK
+                        // changes visible, but hide this replayed row's direct
+                        // changes from the next row's total_changes().
+                        self.total_changes
+                            .set(self.total_changes.get().saturating_sub(row_changes));
+                        self.sync_change_tracking_context();
                         statement_changes =
-                            statement_changes.saturating_add(self.last_changes.get());
+                            statement_changes.saturating_add(row_changes);
                         returning_rows.extend(rows);
                     }
                     Err(error) => {
+                        // Restore the deferred successful rows before the
+                        // existing FAIL/rollback accounting handles the error.
+                        // The failed row has not had its own count deferred.
+                        self.total_changes.set(
+                            self.total_changes.get().saturating_add(statement_changes),
+                        );
+                        self.sync_change_tracking_context();
                         let preserve_rows = self
                             .statement_failure_keeps_rows(preserve_constraint_failure_rows, &error);
                         if preserve_rows {
@@ -57447,7 +57488,7 @@ impl Connection {
                     }
                 }
             }
-            self.set_statement_change_count(statement_changes);
+            self.record_statement_changes(statement_changes);
             Ok(returning_rows)
         })
         .await
@@ -76070,6 +76111,10 @@ impl Connection {
     /// CONFLICT` clause or the outer statement's clause says, and the child's
     /// UPDATE triggers run under ABORT. CASCADE's DELETE has no clause.
     async fn execute_fk_delete_action(&self, action: &FkDeleteAction) -> Result<()> {
+        // FK actions are implicit trigger programs. Their completed changes
+        // contribute to total_changes(), while changes()/last_insert_rowid()
+        // return to the caller's frame even on an error or cancellation.
+        let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
         match action {
             FkDeleteAction::Allow => Ok(()),
             FkDeleteAction::Cascade {

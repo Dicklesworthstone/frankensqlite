@@ -104,6 +104,234 @@ const FK_SELF: &[&str] = &[
     "INSERT INTO t VALUES (1, NULL, 0), (2, 1, 1), (3, 2, 0), (4, NULL, 1), (5, 4, 0), (6, 5, 1), (7, NULL, 0)",
 ];
 
+// bd-fqud7 / bd-n8g76: FK programs have observable per-parent ordering even
+// when the parent itself has no triggers. A child's trigger must see later
+// parents still present, and a cascade may remove a later DELETE target.
+const FK_CASCADE_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, parents INTEGER)",
+    "INSERT INTO p VALUES (1), (2), (3)",
+    "INSERT INTO c VALUES (10, 1), (11, 1), (20, 2), (30, 3)",
+    "CREATE TRIGGER c_bd BEFORE DELETE ON c BEGIN \
+     INSERT INTO audit(child, parents) VALUES (old.id, (SELECT count(*) FROM p)); END",
+];
+const FK_CASCADE_ORDER_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM p ORDER BY id",
+    "SELECT * FROM c ORDER BY id",
+    "SELECT child, parents FROM audit ORDER BY seq",
+    "PRAGMA foreign_key_check",
+    "PRAGMA integrity_check",
+];
+const FK_SET_NULL_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL)",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, old_pid INTEGER, new_pid INTEGER, parents INTEGER)",
+    "INSERT INTO p VALUES (1), (2), (3)",
+    "INSERT INTO c VALUES (10, 1), (20, 2), (30, 3)",
+    "CREATE TRIGGER c_bu BEFORE UPDATE ON c BEGIN \
+     INSERT INTO audit(child, old_pid, new_pid, parents) \
+     VALUES (old.id, old.pid, new.pid, (SELECT count(*) FROM p)); END",
+];
+const FK_SET_DEFAULT_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER DEFAULT 3 REFERENCES p(id) ON DELETE SET DEFAULT)",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, old_pid INTEGER, new_pid INTEGER, parents INTEGER)",
+    "INSERT INTO p VALUES (1), (2), (3)",
+    "INSERT INTO c VALUES (10, 1), (20, 2), (30, 3)",
+    "CREATE TRIGGER c_bu BEFORE UPDATE ON c BEGIN \
+     INSERT INTO audit(child, old_pid, new_pid, parents) \
+     VALUES (old.id, old.pid, new.pid, (SELECT count(*) FROM p)); END",
+];
+const FK_SET_ORDER_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM p ORDER BY id",
+    "SELECT * FROM c ORDER BY id",
+    "SELECT child, old_pid, new_pid, parents FROM audit ORDER BY seq",
+    "PRAGMA foreign_key_check",
+    "PRAGMA integrity_check",
+];
+const FK_WITHOUT_ROWID_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE p(kind TEXT, id INTEGER, PRIMARY KEY(kind, id)) WITHOUT ROWID",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, kind TEXT, pid INTEGER, \
+     FOREIGN KEY(kind, pid) REFERENCES p(kind, id) ON DELETE CASCADE) WITHOUT ROWID",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, parents INTEGER)",
+    "INSERT INTO p VALUES ('a', 1), ('a', 2), ('b', 1)",
+    "INSERT INTO c VALUES (10, 'a', 1), (20, 'a', 2), (30, 'b', 1)",
+    "CREATE TRIGGER c_bd BEFORE DELETE ON c BEGIN \
+     INSERT INTO audit(child, parents) VALUES (old.id, (SELECT count(*) FROM p)); END",
+];
+const FK_WITHOUT_ROWID_ORDER_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM p ORDER BY kind, id",
+    "SELECT * FROM c ORDER BY id",
+    "SELECT child, parents FROM audit ORDER BY seq",
+    "PRAGMA foreign_key_check",
+    "PRAGMA integrity_check",
+];
+const FK_NESTED_CASCADE_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE g(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, gid INTEGER REFERENCES g(id) ON DELETE CASCADE)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, parents INTEGER)",
+    "INSERT INTO g VALUES (1)",
+    "INSERT INTO p VALUES (10, 1), (20, 1)",
+    "INSERT INTO c VALUES (100, 10), (200, 20)",
+    "CREATE TRIGGER c_bd BEFORE DELETE ON c BEGIN \
+     INSERT INTO audit(child, parents) VALUES (old.id, (SELECT count(*) FROM p)); END",
+];
+const FK_ACTION_CASES: &[Case] = &[
+    // Direct changes belong to the whole DELETE and become visible only
+    // when it finishes, even if an action-capable FK has no child rows.
+    Case {
+        setup: &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "INSERT INTO p VALUES (1), (2)",
+        ],
+        statement: "DELETE FROM p RETURNING id, changes(), total_changes()",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT * FROM p ORDER BY id",
+            "PRAGMA foreign_key_check",
+        ],
+    },
+    // Completed child actions and trigger statements do contribute to
+    // total_changes() while earlier direct parent deletions stay pending.
+    Case {
+        setup: &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "CREATE TABLE audit(seq INTEGER PRIMARY KEY, stage TEXT, child INTEGER, changed INTEGER, total INTEGER)",
+            "INSERT INTO p VALUES (1), (2)",
+            "INSERT INTO c VALUES (10, 1), (20, 2)",
+            "CREATE TRIGGER c_bd BEFORE DELETE ON c BEGIN \
+             INSERT INTO audit(stage, child, changed, total) \
+             VALUES ('before', old.id, changes(), total_changes()); END",
+            "CREATE TRIGGER c_ad AFTER DELETE ON c BEGIN \
+             INSERT INTO audit(stage, child, changed, total) \
+             VALUES ('after', old.id, changes(), total_changes()); END",
+        ],
+        statement: "DELETE FROM p",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT stage, child, changed, total FROM audit ORDER BY seq",
+            "SELECT * FROM p ORDER BY id",
+            "SELECT * FROM c ORDER BY id",
+            "PRAGMA foreign_key_check",
+            "PRAGMA integrity_check",
+        ],
+    },
+    Case {
+        setup: FK_SELF,
+        statement: "DELETE FROM t WHERE k = 1",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT * FROM t ORDER BY id",
+            "PRAGMA foreign_key_check",
+        ],
+    },
+    Case {
+        setup: FK_SELF,
+        statement: "DELETE FROM t WHERE k = 1 RETURNING id, parent, changes(), total_changes()",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT * FROM t ORDER BY id",
+            "PRAGMA foreign_key_check",
+        ],
+    },
+    Case {
+        setup: FK_CASCADE_ORDER,
+        statement: "DELETE FROM p WHERE id < 3",
+        states: FK_CASCADE_ORDER_STATE,
+    },
+    Case {
+        setup: FK_CASCADE_ORDER,
+        statement: "DELETE FROM p WHERE id < 3 RETURNING id, changes(), total_changes()",
+        states: FK_CASCADE_ORDER_STATE,
+    },
+    Case {
+        setup: FK_SET_NULL_ORDER,
+        statement: "DELETE FROM p WHERE id < 3",
+        states: FK_SET_ORDER_STATE,
+    },
+    Case {
+        setup: FK_SET_DEFAULT_ORDER,
+        statement: "DELETE FROM p WHERE id < 3",
+        states: FK_SET_ORDER_STATE,
+    },
+    Case {
+        setup: FK_WITHOUT_ROWID_ORDER,
+        statement: "DELETE FROM p WHERE kind = 'a'",
+        states: FK_WITHOUT_ROWID_ORDER_STATE,
+    },
+    // The outer DELETE pins one row; only its nested FK program deletes
+    // multiple parents. Propagation must retain row order at cascade depth > 0.
+    Case {
+        setup: FK_NESTED_CASCADE_ORDER,
+        statement: "DELETE FROM g WHERE id = 1",
+        states: FK_CASCADE_ORDER_STATE,
+    },
+    Case {
+        setup: FK_NESTED_CASCADE_ORDER,
+        statement: "DELETE FROM g WHERE id = 1 RETURNING id, changes(), total_changes()",
+        states: FK_CASCADE_ORDER_STATE,
+    },
+    Case {
+        setup: &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE CASCADE, k INTEGER)",
+            "INSERT INTO t VALUES (1, NULL, 0), (2, 1, 1), (3, 2, 0), (4, NULL, 1), (5, 4, 0), (6, 5, 1), (7, NULL, 0)",
+            "BEGIN",
+            "SAVEPOINT before_delete",
+        ],
+        statement: "DELETE FROM t WHERE k = 1",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT * FROM t ORDER BY id",
+            "ROLLBACK TO before_delete",
+            "SELECT * FROM t ORDER BY id",
+            "RELEASE before_delete",
+            "COMMIT",
+            "PRAGMA foreign_key_check",
+            "PRAGMA integrity_check",
+        ],
+    },
+    Case {
+        setup: &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "CREATE TABLE audit(id INTEGER)",
+            "INSERT INTO p VALUES (1), (2), (3)",
+            "INSERT INTO c VALUES (10, 1), (20, 2), (30, 3)",
+            "CREATE TRIGGER c_bd BEFORE DELETE ON c WHEN old.id = 20 \
+             BEGIN SELECT RAISE(ABORT, 'stop second cascade'); END",
+            "CREATE TRIGGER c_ad AFTER DELETE ON c \
+             BEGIN INSERT INTO audit VALUES (old.id); END",
+            "BEGIN",
+            "INSERT INTO audit VALUES (99)",
+        ],
+        statement: "DELETE FROM p WHERE id < 3",
+        states: &[
+            "SELECT * FROM p ORDER BY id",
+            "SELECT * FROM c ORDER BY id",
+            "SELECT * FROM audit ORDER BY rowid",
+            "COMMIT",
+            "PRAGMA foreign_key_check",
+            "PRAGMA integrity_check",
+        ],
+    },
+];
+
 const WITHOUT_ROWID: &[&str] = &[
     "CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID",
     "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'), (6, 'f')",
@@ -915,16 +1143,6 @@ async fn frank_outcome(f: &Connection, sql: &str, prepared: bool) -> String {
     }
 }
 
-/// The one statement whose change count differs from stock for a reason
-/// older than the one-pass delete (bd-n8g76, the same on the two-pass base):
-/// a self-referencing cascade removes a row the statement also matches, stock
-/// does not count that row and this engine, which runs FK actions after the
-/// program, does. Its table state is still compared.
-fn count_differs_by_bd_n8g76(case: &Case) -> bool {
-    // By content: a `const` slice has no single address to compare.
-    case.setup == FK_SELF && case.statement == "DELETE FROM t WHERE k = 1"
-}
-
 async fn check_case(case: &Case, file_backed: bool, prepared: bool) -> Vec<String> {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = if file_backed {
@@ -949,7 +1167,7 @@ async fn check_case(case: &Case, file_backed: bool, prepared: bool) -> Vec<Strin
     );
     let fo = frank_outcome(&f, case.statement, prepared).await;
     let so = stock_outcome(&r, case.statement);
-    if fo != so && !count_differs_by_bd_n8g76(case) {
+    if fo != so {
         failures.push(format!("{label}: frank {fo:?} vs stock {so:?}"));
     }
     for state in case.states {
@@ -986,6 +1204,19 @@ async fn check_cases(cases: &[Case]) -> Vec<String> {
         }
     }
     failures
+}
+
+#[test]
+fn foreign_key_delete_actions_match_stock_row_order() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(FK_ACTION_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} FK action differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
 }
 
 #[test]
