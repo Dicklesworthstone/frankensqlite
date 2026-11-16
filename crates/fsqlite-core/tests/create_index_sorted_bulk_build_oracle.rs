@@ -254,11 +254,8 @@ fn overflow_keys() -> Scenario {
 /// the key does not already hold; the table is scanned in PRIMARY KEY order,
 /// which is descending for `z` and two columns wide for `c`.
 ///
-/// `z.v` has no repeated value. Where two entries share a key, stock orders
-/// the appended PRIMARY KEY column in the PRIMARY KEY's own direction (DESC
-/// for `z`) and fsqlite orders it ascending, on the per-row path as much as on
-/// this one; stock's integrity_check rejects such an index. That predates the
-/// sorted build and is not what this keeper pins.
+/// Repeated `z.v` values require the appended PRIMARY KEY suffix to keep its
+/// DESC direction (bd-aoukl), including across leaf and interior boundaries.
 fn without_rowid() -> Scenario {
     let mut statements = owned(&[
         "CREATE TABLE w (k INTEGER PRIMARY KEY, v INTEGER) WITHOUT ROWID",
@@ -272,7 +269,7 @@ fn without_rowid() -> Scenario {
     ));
     statements.extend(inserts(
         "z",
-        (1..=6_000_i64).map(|k| format!("({k}, {})", (k * 31) % 6_007)),
+        (1..=6_000_i64).map(|k| format!("({k}, {})", (k * 31) % 53)),
     ));
     statements.extend(inserts(
         "c",
@@ -559,6 +556,203 @@ fn sorted_bulk_index_builds_match_stock() {
             failures.extend(run(scenario).await);
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    });
+}
+
+/// bd-aoukl: the physical secondary key includes the missing PRIMARY KEY
+/// columns and their collations. Explicit indexes inherit PK directions;
+/// implicit UNIQUE indexes preserve stock's historical ASC-suffix exception.
+/// Exercise both index creation orders and both engines as the file creator;
+/// stock must accept and query files after fsqlite mutates and rebuilds them.
+#[test]
+fn without_rowid_secondary_suffix_order_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        struct Case {
+            label: &'static str,
+            table: &'static str,
+            indexes: &'static [&'static str],
+            rows: &'static str,
+            edits: &'static [&'static str],
+            checks: &'static [&'static str],
+        }
+        let cases = [
+            Case {
+                label: "descending integer PK",
+                table: "CREATE TABLE t(k INTEGER PRIMARY KEY DESC, v INTEGER, u INTEGER UNIQUE) WITHOUT ROWID",
+                indexes: &[
+                    "CREATE INDEX ix_v ON t(v)",
+                    "CREATE INDEX ix_vk ON t(v, k ASC)",
+                    "CREATE UNIQUE INDEX ux_u ON t(u)",
+                ],
+                rows: "INSERT INTO t VALUES(1,7,NULL),(2,7,NULL),(3,7,NULL),(4,8,4)",
+                edits: &[
+                    "INSERT INTO t VALUES(5,7,NULL),(6,7,NULL)",
+                    "UPDATE t SET k=9, v=7 WHERE k=4",
+                    "DELETE FROM t WHERE k=2",
+                    "REINDEX t",
+                ],
+                checks: &[
+                    "PRAGMA index_xinfo(ix_v)",
+                    "PRAGMA index_xinfo(ix_vk)",
+                    "PRAGMA index_xinfo(ux_u)",
+                    "PRAGMA index_xinfo(sqlite_autoindex_t_2)",
+                    "SELECT k,v FROM t INDEXED BY ix_v WHERE v=7",
+                    "SELECT count(*) FROM t INDEXED BY ix_v WHERE v=7 AND k=3",
+                    "SELECT k FROM t INDEXED BY ix_v WHERE v=7 AND k>=3",
+                    "SELECT k,v FROM t INDEXED BY ix_vk WHERE v=7",
+                    "SELECT k FROM t INDEXED BY ux_u WHERE u IS NULL",
+                    "SELECT k FROM t INDEXED BY sqlite_autoindex_t_2 WHERE u IS NULL",
+                ],
+            },
+            Case {
+                label: "mixed PK directions and NOCASE suffix",
+                table: "CREATE TABLE t(a TEXT COLLATE NOCASE, b INTEGER, v INTEGER, \
+                        PRIMARY KEY(a DESC,b ASC)) WITHOUT ROWID",
+                indexes: &[
+                    "CREATE INDEX ix_v ON t(v)",
+                    "CREATE INDEX ix_vb ON t(v,b DESC)",
+                    "CREATE INDEX ix_va ON t(v,a COLLATE NOCASE ASC)",
+                    "CREATE INDEX ix_va_binary ON t(v,a COLLATE BINARY)",
+                    "CREATE INDEX ix_expr ON t(v+1,b DESC)",
+                ],
+                rows: "INSERT INTO t VALUES('a',1,7),('B',1,7),('b',2,7),('c',1,7),('A',2,8)",
+                edits: &[
+                    "INSERT INTO t VALUES('D',1,7),('d',2,7)",
+                    "UPDATE t SET a='e',b=3,v=7 WHERE a='A' AND b=2",
+                    "DELETE FROM t WHERE a='B' AND b=1",
+                    "REINDEX t",
+                ],
+                checks: &[
+                    "PRAGMA index_xinfo(ix_v)",
+                    "PRAGMA index_xinfo(ix_vb)",
+                    "PRAGMA index_xinfo(ix_va)",
+                    "PRAGMA index_xinfo(ix_va_binary)",
+                    "PRAGMA index_xinfo(ix_expr)",
+                    "SELECT a,b,v FROM t INDEXED BY ix_v WHERE v=7",
+                    "SELECT a,b,v FROM t INDEXED BY ix_vb WHERE v=7",
+                    "SELECT a,b,v FROM t INDEXED BY ix_va WHERE v=7",
+                    "SELECT a,b,v FROM t INDEXED BY ix_va_binary WHERE v=7",
+                    "SELECT a,b,v FROM t INDEXED BY ix_expr WHERE v+1=8",
+                    "SELECT a,b FROM t INDEXED BY ix_v WHERE v=7 AND a>'a'",
+                ],
+            },
+            Case {
+                label: "nonleading mixed PK with RTRIM",
+                table: "CREATE TABLE t(v INTEGER,a TEXT COLLATE RTRIM,b INTEGER, \
+                        PRIMARY KEY(a ASC,b DESC)) WITHOUT ROWID",
+                indexes: &[
+                    "CREATE INDEX ix_v ON t(v)",
+                    "CREATE INDEX ix_va ON t(v,a DESC)",
+                    "CREATE UNIQUE INDEX ux_ba ON t(b,a)",
+                ],
+                rows: "INSERT INTO t VALUES(7,'a',1),(7,'a ',2),(7,'b',1),(7,'b ',2),(8,'c',1)",
+                edits: &[
+                    "INSERT INTO t VALUES(7,'a  ',3),(7,'b  ',3)",
+                    "UPDATE t SET b=4,v=7 WHERE a='c'",
+                    "DELETE FROM t WHERE a='a' AND b=1",
+                    "REINDEX t",
+                ],
+                checks: &[
+                    "PRAGMA index_xinfo(ix_v)",
+                    "PRAGMA index_xinfo(ix_va)",
+                    "PRAGMA index_xinfo(ux_ba)",
+                    "SELECT v,a,b FROM t INDEXED BY ix_v WHERE v=7",
+                    "SELECT v,a,b FROM t INDEXED BY ix_va WHERE v=7",
+                    "SELECT b,a,v FROM t INDEXED BY ux_ba WHERE b>=2",
+                ],
+            },
+        ];
+
+        for case in &cases {
+            for indexes_first in [false, true] {
+                let mut setup = vec![case.table];
+                if indexes_first {
+                    setup.extend_from_slice(case.indexes);
+                    setup.push(case.rows);
+                } else {
+                    setup.push(case.rows);
+                    setup.extend_from_slice(case.indexes);
+                }
+                for creator in ["memory", "fsqlite", "stock"] {
+                    let label = format!("{}: {creator}, indexes_first={indexes_first}", case.label);
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let file_path = dir.path().join("subject.db");
+                    let path = if creator == "memory" {
+                        ":memory:"
+                    } else {
+                        file_path.to_str().expect("utf-8 path")
+                    };
+                    let oracle = rusqlite::Connection::open_in_memory().expect("stock oracle");
+                    for sql in &setup {
+                        oracle.execute_batch(sql).expect("stock setup");
+                    }
+                    if creator == "stock" {
+                        let seed = rusqlite::Connection::open(&file_path).expect("stock seed");
+                        for sql in &setup {
+                            seed.execute_batch(sql).expect("stock file setup");
+                        }
+                        seed.close().expect("close stock seed");
+                    }
+                    let frank = Connection::open(path).await.expect("fsqlite open");
+                    if creator != "stock" {
+                        for sql in &setup {
+                            frank.execute(sql).await.unwrap_or_else(|error| {
+                                panic!("{label}: setup `{sql}`: {error}")
+                            });
+                        }
+                    }
+                    for edit in std::iter::once(None)
+                        .chain(case.edits.iter().map(|sql| Some(*sql)))
+                    {
+                        if let Some(sql) = edit {
+                            oracle.execute_batch(sql).expect("stock edit");
+                            frank.execute(sql).await.unwrap_or_else(|error| {
+                                panic!("{label}: edit `{sql}`: {error}")
+                            });
+                        }
+                        for sql in case.checks {
+                            assert_eq!(
+                                frank_rows(&frank, sql).await,
+                                stock_rows(&oracle, sql),
+                                "{label}: after {edit:?}: `{sql}`",
+                            );
+                        }
+                        assert_eq!(
+                            frank_rows(&frank, "PRAGMA integrity_check").await,
+                            vec![vec!["'ok'".to_owned()]],
+                            "{label}: own integrity after {edit:?}",
+                        );
+                    }
+                    frank.close().await.expect("close fsqlite");
+                    if creator != "memory" {
+                        let reread = rusqlite::Connection::open(&file_path)
+                            .expect("stock opens fsqlite-written file");
+                        assert_eq!(
+                            stock_rows(&reread, "PRAGMA integrity_check"),
+                            vec![vec!["'ok'".to_owned()]],
+                            "{label}: stock integrity of fsqlite-written file",
+                        );
+                        for sql in case.checks {
+                            assert_eq!(
+                                stock_rows(&reread, sql),
+                                stock_rows(&oracle, sql),
+                                "{label}: stock file query `{sql}`",
+                            );
+                        }
+                        reread.close().expect("close stock reread");
+                        let reopened = Connection::open(path).await.expect("fsqlite reopen");
+                        for sql in case.checks {
+                            assert_eq!(
+                                frank_rows(&reopened, sql).await,
+                                stock_rows(&oracle, sql),
+                                "{label}: reloaded schema `{sql}`",
+                            );
+                        }
+                        reopened.close().await.expect("close reopened fsqlite");
+                    }
+                }
+            }
+        }
     });
 }
 

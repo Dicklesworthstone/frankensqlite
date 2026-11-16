@@ -13263,6 +13263,10 @@ struct TableExecutionMetadataCacheEntry {
     schema_generation: u64,
     /// Original DDL proves an ASC/BINARY primary key; unknown schemas decline.
     wr_binary_ascending_roots: Vec<i32>,
+    /// WITHOUT ROWID table roots whose DDL proves that each PK term uses
+    /// its column's collation. Their secondary-key suffix can use the same
+    /// deduplication and ordering metadata as ordinary DML (bd-aoukl).
+    wr_index_suffix_roots: Vec<i32>,
     autoincrement_table_name_by_root_page: Arc<HbHashMap<i32, String>>,
     rowid_alias_col_by_root_page: Arc<HbHashMap<i32, usize>>,
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
@@ -18541,13 +18545,13 @@ impl Connection {
         };
         // Row-locator suffix. A rowid table appends its integer rowid; a
         // WITHOUT ROWID indexes append only PK fields not already represented
-        // by an index term with the same collation. Match the proven backfill
-        // layout; leave unproven PK metadata on the existing validation path.
+        // by an index term with the same collation, when the original DDL
+        // proves that compact schema metadata describes the PK collations.
         if table.without_rowid {
             let pk = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
             let suffix = if self
                 .table_execution_metadata()
-                .wr_binary_ascending_roots
+                .wr_index_suffix_roots
                 .contains(&table.root_page)
             {
                 without_rowid_index_appended_pk(table, index, &pk)
@@ -18840,18 +18844,19 @@ impl Connection {
         let spec = Self::bounded_index_spec(table, index)?;
         let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
         let index_root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
-        let descending = (0..index.key_term_count())
-            .map(|position| index.key_term_descending(position))
-            .collect::<Vec<_>>();
-        let collations = (0..index.key_term_count())
-            .map(|position| index.key_term_collation(position).map(str::to_owned))
-            .collect::<Vec<_>>();
+        let metadata = self.table_execution_metadata();
+        let descending = metadata
+            .index_desc_flags_by_root_page
+            .get(&index.root_page)
+            .cloned()
+            .unwrap_or_default();
+        let collations = metadata
+            .index_collations_by_root_page
+            .get(&index.root_page)
+            .cloned()
+            .unwrap_or_default();
         let pk = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
-        let pk_count = if self
-            .table_execution_metadata()
-            .wr_binary_ascending_roots
-            .contains(&table.root_page)
-        {
+        let pk_count = if metadata.wr_index_suffix_roots.contains(&table.root_page) {
             without_rowid_index_appended_pk(table, index, &pk).len()
         } else {
             pk.len()
@@ -68749,6 +68754,7 @@ impl Connection {
         let original_ddl = self.original_ddl_sql.borrow();
         let temp_names = self.temp_table_names.borrow();
         let mut wr_binary_ascending_roots = Vec::new();
+        let mut wr_index_suffix_roots = Vec::new();
         let mut autoincrement_table_name_by_root_page = HbHashMap::new();
         let mut rowid_alias_col_by_root_page = HbHashMap::new();
         let mut table_column_count_by_root_page = HbHashMap::with_capacity(schema.len());
@@ -68819,36 +68825,59 @@ impl Connection {
                     .iter()
                     .find(|slot| slot.hidden_without_rowid_primary_key)
                 && table.primary_key_constraints.first() == Some(&pk.definition.columns)
-                && pk
-                    .definition
-                    .key_sort_directions
-                    .iter()
-                    .all(|direction| *direction == SortDirection::Asc)
-                && pk.definition.key_collations.iter().all(|collation| {
-                    collation
-                        .as_deref()
-                        .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
-                })
-                && without_rowid_pk_desc
+            {
+                // The compact TableSchema loses a table-level PK COLLATE
+                // override. Do not infer the suffix from column defaults in
+                // that case: retain the existing handling until that metadata
+                // reaches DML codegen too. DESC and inherited non-BINARY
+                // collations are fully represented and are safe here.
+                let collations_match_columns = pk.definition.key_collations.len()
+                    == pk.definition.columns.len()
+                    && pk.definition.columns.iter().zip(&pk.definition.key_collations).all(
+                        |(name, pk_collation)| {
+                            table.column_index(name).is_some_and(|column| {
+                                table.columns[column]
+                                    .collation
+                                    .as_deref()
+                                    .unwrap_or("BINARY")
+                                    .eq_ignore_ascii_case(pk_collation.as_deref().unwrap_or("BINARY"))
+                            })
+                        },
+                    );
+                let directions_match = without_rowid_pk_desc
                     .get(&table_name_key)
                     .is_some_and(|flags| {
                         flags.len() == pk.definition.columns.len()
-                            && flags.iter().all(|descending| !descending)
-                    })
-                && pk.definition.columns.iter().all(|name| {
-                    table
-                        .columns
+                            && pk.definition.key_sort_directions.len() == flags.len()
+                            && flags.iter().zip(&pk.definition.key_sort_directions).all(
+                                |(descending, direction)| {
+                                    *descending == (*direction == SortDirection::Desc)
+                                },
+                            )
+                    });
+                if collations_match_columns && directions_match {
+                    wr_index_suffix_roots.push(table.root_page);
+                }
+                if collations_match_columns
+                    && pk
+                        .definition
+                        .key_sort_directions
                         .iter()
-                        .find(|column| column.name.eq_ignore_ascii_case(name))
-                        .is_some_and(|column| {
-                            column
-                                .collation
-                                .as_deref()
-                                .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+                        .all(|direction| *direction == SortDirection::Asc)
+                    && pk.definition.key_collations.iter().all(|collation| {
+                        collation
+                            .as_deref()
+                            .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+                    })
+                    && without_rowid_pk_desc
+                        .get(&table_name_key)
+                        .is_some_and(|flags| {
+                            flags.len() == pk.definition.columns.len()
+                                && flags.iter().all(|descending| !descending)
                         })
-                })
-            {
-                wr_binary_ascending_roots.push(table.root_page);
+                {
+                    wr_binary_ascending_roots.push(table.root_page);
+                }
             }
             if autoincrement_tables.contains(&table_name_key) {
                 autoincrement_table_name_by_root_page
@@ -68910,19 +68939,52 @@ impl Connection {
                         .collect::<Vec<_>>(),
                 );
             }
+            let primary_key = if table.without_rowid
+                && wr_index_suffix_roots.contains(&table.root_page)
+            {
+                without_rowid_pk_indices(table).ok()
+            } else {
+                None
+            };
             for index in &table.indexes {
-                index_desc_flags_by_root_page.insert(
-                    index.root_page,
-                    (0..index.key_term_count())
-                        .map(|key_pos| index.key_term_descending(key_pos))
-                        .collect(),
-                );
-                index_collations_by_root_page.insert(
-                    index.root_page,
-                    (0..index.key_term_count())
-                        .map(|key_pos| index.key_term_collation(key_pos).map(str::to_owned))
-                        .collect(),
-                );
+                let mut descending: Vec<bool> = (0..index.key_term_count())
+                    .map(|key_pos| index.key_term_descending(key_pos))
+                    .collect();
+                let mut collations: Vec<Option<String>> = (0..index.key_term_count())
+                    .map(|key_pos| index.key_term_collation(key_pos).map(str::to_owned))
+                    .collect();
+                // bd-aoukl: a WITHOUT ROWID secondary index ends in the PK
+                // columns its logical key does not already contain. Those
+                // fields retain the PRIMARY KEY's collation and, for explicit
+                // indexes, its direction. The cursor, bulk build sorter and
+                // integrity checker share this full ordering.
+                if let Some(pk) = primary_key.as_ref() {
+                    // SQLite preserves an old file-format quirk for implicit
+                    // UNIQUE indexes: their appended PK fields sort ASC even
+                    // when the PK is DESC (convertToWithoutRowidTable's
+                    // bAscKeyBug, ticket bba7b69f9849b5bf). Explicit CREATE
+                    // INDEX suffixes inherit the declared PK direction.
+                    let inherits_pk_direction =
+                        parse_autoindex_ordinal(&index.name, &table.name).is_none();
+                    let pk_desc = without_rowid_pk_desc
+                        .get(&table_name_key)
+                        .filter(|flags| flags.len() == pk.len());
+                    for column in without_rowid_index_appended_pk(table, index, pk) {
+                        let position = pk.iter().position(|&pk_column| pk_column == column);
+                        descending.push(
+                            inherits_pk_direction
+                                && position
+                                    .and_then(|position| {
+                                        pk_desc.and_then(|flags| flags.get(position))
+                                    })
+                                    .copied()
+                                    .unwrap_or(false),
+                        );
+                        collations.push(table.columns[column].collation.clone());
+                    }
+                }
+                index_desc_flags_by_root_page.insert(index.root_page, descending);
+                index_collations_by_root_page.insert(index.root_page, collations);
             }
             // WITHOUT ROWID tables are stored as an index b-tree keyed by the
             // PRIMARY KEY. Register the table's own root page with the PK
@@ -68989,6 +69051,7 @@ impl Connection {
         let entry = Arc::new(TableExecutionMetadataCacheEntry {
             schema_generation,
             wr_binary_ascending_roots,
+            wr_index_suffix_roots,
             autoincrement_table_name_by_root_page,
             rowid_alias_col_by_root_page,
             table_column_count_by_root_page,
@@ -72870,19 +72933,23 @@ impl Connection {
         let (idx_col_positions, key_exprs, where_expr) =
             self.bind_index_runtime_dependencies(table, index)?;
         let columns_label = index.key_label_qualified(&table.name);
-        // The compact schema does not retain table-level PK collation
-        // overrides. Only deduplicate when the original DDL proves the PK
-        // layout; retain the existing backfill path for other shapes.
-        let deduplicate_pk = self
-            .table_execution_metadata()
-            .wr_binary_ascending_roots
-            .contains(&table.root_page);
+        let metadata = self.table_execution_metadata();
+        let deduplicate_pk = metadata.wr_index_suffix_roots.contains(&table.root_page);
+        let descending = metadata
+            .index_desc_flags_by_root_page
+            .get(&index.root_page)
+            .map_or(&[][..], Vec::as_slice);
+        let collations = metadata
+            .index_collations_by_root_page
+            .get(&index.root_page)
+            .map_or(&[][..], Vec::as_slice);
 
         self.with_codegen_function_context(|| {
             Self::compile_index_backfill(
                 table,
                 index,
                 deduplicate_pk,
+                (descending, collations),
                 &idx_col_positions,
                 &key_exprs,
                 index.is_unique,
@@ -73968,6 +74035,7 @@ impl Connection {
         table: &TableSchema,
         index: &IndexSchema,
         deduplicate_pk: bool,
+        index_ordering: (&[bool], &[Option<String>]),
         idx_col_positions: &[usize],
         key_exprs: &[Expr],
         is_unique: bool,
@@ -74025,8 +74093,9 @@ impl Connection {
         // which is index order. A WITHOUT ROWID table is scanned in PRIMARY
         // KEY order, which need not be the order of the PRIMARY KEY columns
         // appended to the index record, so there the whole record is the sort
-        // key. Fields after the key terms sort ascending under BINARY, as the
-        // index compares them.
+        // key. Use the storage cursor's comparator metadata, including suffix
+        // collations and the explicit/implicit index direction distinction
+        // (bd-aoukl).
         let sort_key_cols = if without_rowid_pk.is_some() {
             n_record_cols
         } else {
@@ -74034,7 +74103,7 @@ impl Connection {
         };
         let sort_orders: String = (0..sort_key_cols)
             .map(|key_pos| {
-                if key_pos < n_idx_cols && index.key_term_descending(key_pos) {
+                if index_ordering.0.get(key_pos).copied().unwrap_or(false) {
                     '-'
                 } else {
                     '+'
@@ -74043,11 +74112,11 @@ impl Connection {
             .collect();
         let sort_collations: Vec<&str> = (0..sort_key_cols)
             .map(|key_pos| {
-                index
-                    .key_term_collation(key_pos)
-                    .filter(|collation| {
-                        key_pos < n_idx_cols && !collation.eq_ignore_ascii_case("BINARY")
-                    })
+                index_ordering
+                    .1
+                    .get(key_pos)
+                    .and_then(Option::as_deref)
+                    .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"))
                     .unwrap_or("")
             })
             .collect();
@@ -83130,6 +83199,9 @@ impl Connection {
                 ),
             }
         }
+        let metadata = self.table_execution_metadata();
+        let descending = metadata.index_desc_flags_by_root_page.get(&index.root_page);
+        let collations = metadata.index_collations_by_root_page.get(&index.root_page);
         let registry = self
             .collation_registry
             .lock()
@@ -83137,7 +83209,11 @@ impl Connection {
         let text_encoding = self.db_text_encoding.get();
         let shared_len = lhs.len().min(rhs.len());
         for idx in 0..shared_len {
-            let mut ord = match (index.key_term_collation(idx), &lhs[idx], &rhs[idx]) {
+            let collation = collations
+                .and_then(|collations| collations.get(idx))
+                .and_then(Option::as_deref)
+                .or_else(|| index.key_term_collation(idx));
+            let mut ord = match (collation, &lhs[idx], &rhs[idx]) {
                 (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right))
                     if !(coll_name.eq_ignore_ascii_case("BINARY")
                         && registry.uses_builtin_implementation("BINARY")) =>
@@ -83151,7 +83227,11 @@ impl Connection {
                 }
                 _ => lhs[idx].partial_cmp(&rhs[idx])?,
             };
-            if index.key_term_descending(idx) {
+            if descending
+                .and_then(|descending| descending.get(idx))
+                .copied()
+                .unwrap_or_else(|| index.key_term_descending(idx))
+            {
                 ord = ord.reverse();
             }
             if ord != std::cmp::Ordering::Equal {
@@ -86841,7 +86921,8 @@ impl Connection {
                 };
                 // index_xinfo extends index_info (seqno, cid, name) with the
                 // desc (sort order), coll (collation), key (1=index key term,
-                // 0=covered) columns plus a trailing rowid entry (bd-ewj3w).
+                // 0=covered) columns plus the row locator: a rowid or the
+                // non-duplicated WITHOUT ROWID PRIMARY KEY fields.
                 let is_xinfo = full_name == "index_xinfo";
                 let tables = self.pragma_table_schemas_for_scope(pragma_schema_scope(pragma));
                 for table in &tables {
@@ -86943,7 +87024,49 @@ impl Connection {
                                     }
                                 })
                                 .collect();
-                            if is_xinfo {
+                            if is_xinfo
+                                && table.without_rowid
+                                && self
+                                    .table_execution_metadata()
+                                    .wr_index_suffix_roots
+                                    .contains(&table.root_page)
+                            {
+                                let pk = without_rowid_pk_indices(table)
+                                    .map_err(codegen_error_to_franken)?;
+                                let metadata = self.table_execution_metadata();
+                                for (suffix_position, column) in
+                                    without_rowid_index_appended_pk(table, idx, &pk)
+                                        .into_iter()
+                                        .enumerate()
+                                {
+                                    let definition = &table.columns[column];
+                                    let sequence = key_count + suffix_position;
+                                    let desc = metadata
+                                        .index_desc_flags_by_root_page
+                                        .get(&idx.root_page)
+                                        .and_then(|flags| flags.get(sequence))
+                                        .copied()
+                                        .unwrap_or(false);
+                                    let collation = metadata
+                                        .index_collations_by_root_page
+                                        .get(&idx.root_page)
+                                        .and_then(|collations| collations.get(sequence))
+                                        .and_then(Option::as_deref)
+                                        .unwrap_or("BINARY");
+                                    rows.push(Row {
+                                        values: vec![
+                                            SqliteValue::Integer(
+                                                i64::try_from(sequence).unwrap_or(0),
+                                            ),
+                                            SqliteValue::Integer(i64::try_from(column).unwrap_or(-1)),
+                                            SqliteValue::Text(definition.name.clone().into()),
+                                            SqliteValue::Integer(i64::from(desc)),
+                                            SqliteValue::Text(collation.into()),
+                                            SqliteValue::Integer(0),
+                                        ],
+                                    });
+                                }
+                            } else if is_xinfo {
                                 // Trailing rowid (covered) entry: SQLite appends the
                                 // implicit rowid with cid=-1, NULL name, key=0.
                                 let seqno = i64::try_from(key_count).unwrap_or(0);
