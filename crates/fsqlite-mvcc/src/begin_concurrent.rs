@@ -1570,37 +1570,29 @@ impl ConcurrentRegistry {
         {
             return false;
         }
-        let pending_views: Vec<HandleView> = self
-            .pending_publication_sessions
-            .iter()
-            .filter(|&&pending| pending != session_id)
-            .filter_map(|pending| {
-                self.active.get(pending).map(|handle| {
-                    let mut guard = handle.lock();
-                    HandleView::new(&mut guard)
-                })
-            })
-            .collect();
-        let Some((token, begin_seq, read_summary, write_summary)) =
-            self.get(session_id).map(|handle| {
-                (
-                    handle.token(),
-                    handle.begin_seq(),
-                    summarize_witness_keys(&handle.read_witness_keys()),
-                    summarize_witness_keys(&handle.write_witness_keys()),
-                )
-            })
-        else {
+        let Some((token, read_summary, write_summary)) = self.get(session_id).map(|handle| {
+            (
+                handle.token(),
+                summarize_witness_keys(&handle.read_witness_keys()),
+                summarize_witness_keys(&handle.write_witness_keys()),
+            )
+        }) else {
             return false;
         };
-        let index = ActiveEdgeDiscoveryIndex::build(&pending_views);
+        // Each pending peer is tested under its own handle lock and the scan
+        // stops at the first candidate (bd-i0tn6 lever 4); no view vector and
+        // no candidate index.
         let unbounded = CommitSeq::new(u64::MAX);
-        !index
-            .incoming_candidate_refs(&pending_views, token, begin_seq, unbounded, &write_summary)
-            .is_empty()
-            || !index
-                .outgoing_candidate_refs(&pending_views, token, begin_seq, unbounded, &read_summary)
-                .is_empty()
+        self.pending_publication_sessions
+            .iter()
+            .filter(|&&pending| pending != session_id)
+            .filter_map(|pending| self.active.get(pending))
+            .any(|handle| {
+                let mut guard = handle.lock();
+                let view = HandleView::new(&mut guard);
+                view.is_edge_peer_of(token, unbounded)
+                    && (view.may_have_read(&write_summary) || view.may_have_written(&read_summary))
+            })
     }
 
     /// Prune committed SSI history that cannot overlap any active transaction.
@@ -2637,6 +2629,114 @@ impl HandleView {
     const fn has_global_write_witnesses(&self) -> bool {
         self.flags.has_global_write_witnesses()
     }
+
+    /// Whether this peer may have read something that a committer whose
+    /// writes `write_summary` describes wrote: an incoming rw-antidependency
+    /// candidate. The rules are the ones the per-commit candidate index
+    /// applied (bd-i0tn6 lever 4 replaced the index with this test): a global
+    /// key on either side, a committer page-witness page among the peer's
+    /// read pages, a committer cell whose root or leaf is one of the peer's
+    /// read page-witness pages, or the same exact cell.
+    fn may_have_read(&self, write_summary: &WitnessKeySummary) -> bool {
+        self.has_read_witnesses()
+            && (write_summary.has_global_keys
+                || self.has_global_read_witnesses()
+                || overlaps_pages_or_cells(
+                    write_summary,
+                    &self.read_pages,
+                    &self.read_page_witness_pages,
+                    &self.read_exact_cells,
+                ))
+    }
+
+    /// Whether this peer may have written something that a committer whose
+    /// reads `read_summary` describes read: an outgoing candidate, by the
+    /// same rules on the write side.
+    fn may_have_written(&self, read_summary: &WitnessKeySummary) -> bool {
+        self.has_write_witnesses()
+            && (read_summary.has_global_keys
+                || self.has_global_write_witnesses()
+                || overlaps_pages_or_cells(
+                    read_summary,
+                    &self.write_pages,
+                    &self.write_page_witness_pages,
+                    &self.write_exact_cells,
+                ))
+    }
+
+    /// Whether this peer can be the other end of an edge with the committer:
+    /// not the committer itself, still active, and begun before the
+    /// committer's commit sequence.
+    fn is_edge_peer_of(&self, committing_txn: TxnToken, committing_commit_seq: CommitSeq) -> bool {
+        !same_txn_identity(self.token, committing_txn)
+            && self.is_currently_active()
+            && self.begin_seq.get() < committing_commit_seq.get()
+    }
+}
+
+/// The page / cell part of the candidate rules: a page-witness page of
+/// `probe` among `pages`, a cell of `probe` whose root or leaf is among
+/// `page_witness_pages`, or a cell of `probe` among `exact_cells` by
+/// `(btree_root, tag)`. The three peer sets are sorted and deduplicated.
+fn overlaps_pages_or_cells(
+    probe: &WitnessKeySummary,
+    pages: &[PageNumber],
+    page_witness_pages: &[PageNumber],
+    exact_cells: &[(PageNumber, u64)],
+) -> bool {
+    probe
+        .page_witness_pages
+        .iter()
+        .any(|page| pages.binary_search(page).is_ok())
+        || probe.cell_witnesses.iter().any(|cell| {
+            page_witness_pages.binary_search(&cell.btree_root).is_ok()
+                || page_witness_pages.binary_search(&cell.leaf_page).is_ok()
+                || exact_cells.binary_search(&cell.exact_key()).is_ok()
+        })
+}
+
+/// Active peers in `views` that may have read what the committer wrote and
+/// can be an edge's other end, in `views` order.
+///
+/// bd-i0tn6 lever 4: one pass over the views. Every prepare and finalize
+/// used to build a hash index of every peer's pages and cells
+/// (`ActiveEdgeDiscoveryIndex`, kept below as the test oracle) to answer
+/// this one question, which cost more than the question. The cheap peer test
+/// runs first, so the committer's own view and finished peers are never
+/// searched (lever 4 v2).
+fn active_incoming_candidates<'a>(
+    views: &'a [HandleView],
+    committing_txn: TxnToken,
+    committing_commit_seq: CommitSeq,
+    write_key_summary: &WitnessKeySummary,
+) -> Vec<&'a dyn ActiveTxnView> {
+    views
+        .iter()
+        .filter(|view| {
+            view.is_edge_peer_of(committing_txn, committing_commit_seq)
+                && view.may_have_read(write_key_summary)
+        })
+        .map(|view| view as &dyn ActiveTxnView)
+        .collect()
+}
+
+/// Active peers in `views` that may have written what the committer read and
+/// can be an edge's other end, in `views` order (see
+/// [`active_incoming_candidates`]).
+fn active_outgoing_candidates<'a>(
+    views: &'a [HandleView],
+    committing_txn: TxnToken,
+    committing_commit_seq: CommitSeq,
+    read_key_summary: &WitnessKeySummary,
+) -> Vec<&'a dyn ActiveTxnView> {
+    views
+        .iter()
+        .filter(|view| {
+            view.is_edge_peer_of(committing_txn, committing_commit_seq)
+                && view.may_have_written(read_key_summary)
+        })
+        .map(|view| view as &dyn ActiveTxnView)
+        .collect()
 }
 
 impl HandleViewParts {
@@ -3093,6 +3193,11 @@ fn remove_indexed_history_id<K: Eq + Hash, S: BuildHasher>(
     }
 }
 
+/// The per-commit candidate index that prepare, finalize and the pending
+/// check built before bd-i0tn6 lever 4. Kept only as the oracle that
+/// `test_active_candidate_scan_matches_the_candidate_index` compares
+/// [`active_incoming_candidates`] / [`active_outgoing_candidates`] against.
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct ActiveEdgeDiscoveryIndex {
     all_readers: Vec<usize>,
@@ -3112,6 +3217,7 @@ struct ActiveEdgeDiscoveryIndex {
     writers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
 }
 
+#[cfg(test)]
 impl ActiveEdgeDiscoveryIndex {
     fn build(views: &[HandleView]) -> Self {
         // Pre-size the PageNumber-keyed maps to avoid the reserve_rehash
@@ -3795,14 +3901,8 @@ pub fn prepare_concurrent_commit_with_ssi(
                 guard.is_active().then(|| HandleView::new(&mut guard))
             })
             .collect::<Vec<_>>();
-        let active_index = ActiveEdgeDiscoveryIndex::build(&views);
-        let active_reader_candidates = active_index.incoming_candidate_refs(
-            &views,
-            txn,
-            begin_seq,
-            planned_commit_seq,
-            &write_key_summary,
-        );
+        let active_reader_candidates =
+            active_incoming_candidates(&views, txn, planned_commit_seq, &write_key_summary);
         let committed_reader_candidates = registry.committed_reader_candidates(
             txn,
             begin_seq,
@@ -3910,21 +4010,10 @@ pub fn prepare_concurrent_commit_with_ssi(
             guard.is_active().then(|| HandleView::new(&mut guard))
         })
         .collect::<Vec<_>>();
-    let active_index = ActiveEdgeDiscoveryIndex::build(&views);
-    let active_reader_candidates = active_index.incoming_candidate_refs(
-        &views,
-        txn,
-        begin_seq,
-        planned_commit_seq,
-        &write_key_summary,
-    );
-    let active_writer_candidates = active_index.outgoing_candidate_refs(
-        &views,
-        txn,
-        begin_seq,
-        planned_commit_seq,
-        &read_key_summary,
-    );
+    let active_reader_candidates =
+        active_incoming_candidates(&views, txn, planned_commit_seq, &write_key_summary);
+    let active_writer_candidates =
+        active_outgoing_candidates(&views, txn, planned_commit_seq, &read_key_summary);
     let committed_reader_candidates = registry.committed_reader_candidates(
         txn,
         begin_seq,
@@ -4278,11 +4367,9 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                 HandleView::new(&mut guard)
             })
             .collect();
-        let active_index = ActiveEdgeDiscoveryIndex::build(&active_views);
-        let active_reader_candidates = active_index.incoming_candidate_refs(
+        let active_reader_candidates = active_incoming_candidates(
             &active_views,
             prepared.txn_token,
-            prepared.begin_seq,
             committed_seq,
             write_key_summary,
         );
@@ -4326,18 +4413,15 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             HandleView::new(&mut guard)
         })
         .collect();
-    let active_index = ActiveEdgeDiscoveryIndex::build(&active_views);
-    let active_reader_candidates = active_index.incoming_candidate_refs(
+    let active_reader_candidates = active_incoming_candidates(
         &active_views,
         prepared.txn_token,
-        prepared.begin_seq,
         committed_seq,
         write_key_summary,
     );
-    let active_writer_candidates = active_index.outgoing_candidate_refs(
+    let active_writer_candidates = active_outgoing_candidates(
         &active_views,
         prepared.txn_token,
-        prepared.begin_seq,
         committed_seq,
         read_key_summary,
     );
@@ -4711,8 +4795,9 @@ mod tests {
 
     use super::{
         ActiveEdgeDiscoveryIndex, CommittedHistory, CommittedReaderInfo, CommittedWriterInfo,
-        ConcurrentHandle, ConcurrentRegistry, FcwResult, HandleView, HandleViewParts,
-        MAX_CONCURRENT_WRITERS, OwnerAllocationDomain, WitnessKeySummary, concurrent_abort,
+        ConcurrentHandle, ConcurrentRegistry, FcwResult, HandleView, HandleViewFlags,
+        HandleViewParts, MAX_CONCURRENT_WRITERS, OwnerAllocationDomain, WitnessKeySummary,
+        active_incoming_candidates, active_outgoing_candidates, concurrent_abort,
         concurrent_clear_page_state, concurrent_commit, concurrent_commit_read_only,
         concurrent_commit_with_ssi, concurrent_free_page, concurrent_is_metadata_exempt,
         concurrent_mark_metadata_exempt, concurrent_page_is_freed,
@@ -8085,7 +8170,7 @@ mod tests {
     }
 
     #[test]
-    fn test_active_edge_discovery_index_indexes_page_write_witnesses_without_page_state() {
+    fn test_active_candidate_scan_finds_page_write_witnesses_without_page_state() {
         let mut page_writer = ConcurrentHandle::new(test_snapshot(10), test_token(303));
         page_writer.record_write_witness(WitnessKey::Page(test_page(7)));
         assert!(
@@ -8107,27 +8192,20 @@ mod tests {
             HandleView::new(&mut global_writer),
             HandleView::new(&mut unrelated_writer),
         ];
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
         let read_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
 
-        let mut candidate_tokens = index
-            .outgoing_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &read_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
+        let mut candidate_tokens =
+            active_outgoing_candidates(&views, test_token(399), CommitSeq::new(20), &read_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
         candidate_tokens.sort_by_key(|token| token.id.get());
 
         assert_eq!(candidate_tokens, vec![test_token(303), test_token(304)]);
     }
 
     #[test]
-    fn test_active_edge_discovery_index_keeps_tracked_write_pages_without_write_index() {
+    fn test_active_candidate_scan_keeps_tracked_write_pages_without_write_index() {
         let mut tracked_writer = ConcurrentHandle::new(test_snapshot(10), test_token(306));
         tracked_writer
             .ensure_page_state(test_page(11))
@@ -8136,26 +8214,19 @@ mod tests {
         assert!(tracked_writer.write_index.is_empty());
 
         let views = vec![HandleView::new(&mut tracked_writer)];
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
         let read_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(11))]);
 
-        let candidate_tokens = index
-            .outgoing_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &read_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
+        let candidate_tokens =
+            active_outgoing_candidates(&views, test_token(399), CommitSeq::new(20), &read_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
 
         assert_eq!(candidate_tokens, vec![test_token(306)]);
     }
 
     #[test]
-    fn test_active_edge_discovery_index_skips_disjoint_point_keys_on_same_root() {
+    fn test_active_candidate_scan_skips_disjoint_point_keys_on_same_root() {
         let root = test_page(51);
         let leaf_a = test_page(510);
         let leaf_b = test_page(511);
@@ -8169,40 +8240,27 @@ mod tests {
         writer.record_write_witness(write_page.clone());
 
         let views = vec![HandleView::new(&mut reader), HandleView::new(&mut writer)];
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
         let write_summary = summarize_witness_keys(&[write_cell.clone(), write_page.clone()]);
         let read_summary =
             summarize_witness_keys(&[WitnessKey::for_cell_read(root, leaf_a, b"key-a")]);
 
-        let incoming = index
-            .incoming_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &write_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
-        let outgoing = index
-            .outgoing_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &read_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
+        let incoming =
+            active_incoming_candidates(&views, test_token(399), CommitSeq::new(20), &write_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
+        let outgoing =
+            active_outgoing_candidates(&views, test_token(399), CommitSeq::new(20), &read_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
 
         assert!(incoming.is_empty());
         assert!(outgoing.is_empty());
     }
 
     #[test]
-    fn test_active_edge_discovery_index_uses_presence_flags_without_materialized_keys() {
+    fn test_active_candidate_scan_uses_presence_flags_without_materialized_keys() {
         let mut page_reader = ConcurrentHandle::new(test_snapshot(10), test_token(311));
         page_reader.record_read(test_page(7));
 
@@ -8220,23 +8278,226 @@ mod tests {
             HandleView::new(&mut global_reader),
             HandleView::new(&mut unrelated_reader),
         ];
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
         let write_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
 
-        let mut candidate_tokens = index
-            .incoming_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &write_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
+        let mut candidate_tokens =
+            active_incoming_candidates(&views, test_token(399), CommitSeq::new(20), &write_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
         candidate_tokens.sort_by_key(|token| token.id.get());
 
         assert_eq!(candidate_tokens, vec![test_token(311), test_token(312)]);
+    }
+
+    /// bd-i0tn6 lever 4: the candidate scan returns exactly what the
+    /// per-commit candidate index returned, the same peers in the same order,
+    /// for random peer views and committer summaries: page, page-witness and
+    /// exact-cell overlaps, global keys on either side, inactive peers, the
+    /// committer's own view, and peers that began at or after the commit
+    /// sequence.
+    #[test]
+    fn test_active_candidate_scan_matches_the_candidate_index() {
+        struct XorShift(u64);
+
+        impl XorShift {
+            fn below(&mut self, bound: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % bound
+            }
+
+            fn page(&mut self) -> PageNumber {
+                test_page(1 + u32::try_from(self.below(10)).expect("page fits u32"))
+            }
+
+            fn pages(&mut self) -> Vec<PageNumber> {
+                let mut pages: Vec<PageNumber> = (0..self.below(4)).map(|_| self.page()).collect();
+                pages.sort_unstable();
+                pages.dedup();
+                pages
+            }
+
+            fn cells(&mut self) -> Vec<(PageNumber, u64)> {
+                let mut cells: Vec<(PageNumber, u64)> = (0..self.below(3))
+                    .map(|_| {
+                        (
+                            test_page(1 + u32::try_from(self.below(3)).expect("root fits u32")),
+                            self.below(4),
+                        )
+                    })
+                    .collect();
+                cells.sort_unstable();
+                cells.dedup();
+                cells
+            }
+
+            fn keys(&mut self) -> Vec<WitnessKey> {
+                (0..=self.below(3))
+                    .map(|_| match self.below(8) {
+                        0..=2 => WitnessKey::Page(self.page()),
+                        3..=5 => WitnessKey::Cell {
+                            btree_root: test_page(
+                                1 + u32::try_from(self.below(3)).expect("root fits u32"),
+                            ),
+                            leaf_page: self.page(),
+                            tag: self.below(4),
+                        },
+                        6 => WitnessKey::KeyRange {
+                            btree_root: test_page(
+                                1 + u32::try_from(self.below(3)).expect("root fits u32"),
+                            ),
+                            lo: Vec::new(),
+                            hi: vec![1],
+                        },
+                        _ => {
+                            if self.below(6) == 0 {
+                                WitnessKey::Custom {
+                                    namespace: 1,
+                                    bytes: vec![1],
+                                }
+                            } else {
+                                WitnessKey::Page(self.page())
+                            }
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        let tokens = |candidates: Vec<&dyn ActiveTxnView>| {
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>()
+        };
+        let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+        let committer = test_token(100_000);
+        let (mut incoming_hits, mut outgoing_hits) = (0_usize, 0_usize);
+        for case in 0..2_000_u64 {
+            let peers = rng.below(8);
+            let views: Vec<HandleView> = (0..peers)
+                .map(|peer| {
+                    let mut bits = 0;
+                    if rng.below(5) != 0 {
+                        bits |= HandleViewFlags::ACTIVE;
+                    }
+                    if rng.below(8) == 0 {
+                        bits |= HandleViewFlags::GLOBAL_READ_WITNESSES;
+                    }
+                    if rng.below(8) == 0 {
+                        bits |= HandleViewFlags::GLOBAL_WRITE_WITNESSES;
+                    }
+                    HandleView {
+                        token: if rng.below(10) == 0 {
+                            committer
+                        } else {
+                            test_token(case * 16 + peer + 1)
+                        },
+                        begin_seq: CommitSeq::new(5 + rng.below(10)),
+                        flags: HandleViewFlags(bits),
+                        parts: std::sync::Arc::new(HandleViewParts {
+                            read_pages: rng.pages(),
+                            read_page_witness_pages: rng.pages(),
+                            read_exact_cells: rng.cells(),
+                            write_pages: rng.pages(),
+                            write_page_witness_pages: rng.pages(),
+                            write_exact_cells: rng.cells(),
+                        }),
+                        has_in_rw: std::cell::Cell::new(false),
+                        has_out_rw: std::cell::Cell::new(false),
+                    }
+                })
+                .collect();
+            let index = ActiveEdgeDiscoveryIndex::build(&views);
+            let commit_seq = CommitSeq::new(5 + rng.below(12));
+            let write_summary = summarize_witness_keys(&rng.keys());
+            let read_summary = summarize_witness_keys(&rng.keys());
+
+            let expected_incoming = tokens(index.incoming_candidate_refs(
+                &views,
+                committer,
+                CommitSeq::new(1),
+                commit_seq,
+                &write_summary,
+            ));
+            let expected_outgoing = tokens(index.outgoing_candidate_refs(
+                &views,
+                committer,
+                CommitSeq::new(1),
+                commit_seq,
+                &read_summary,
+            ));
+            assert_eq!(
+                tokens(active_incoming_candidates(
+                    &views,
+                    committer,
+                    commit_seq,
+                    &write_summary
+                )),
+                expected_incoming,
+                "case {case}: incoming candidates for {write_summary:?}"
+            );
+            assert_eq!(
+                tokens(active_outgoing_candidates(
+                    &views,
+                    committer,
+                    commit_seq,
+                    &read_summary
+                )),
+                expected_outgoing,
+                "case {case}: outgoing candidates for {read_summary:?}"
+            );
+            incoming_hits += expected_incoming.len();
+            outgoing_hits += expected_outgoing.len();
+        }
+        assert!(
+            incoming_hits >= 200 && outgoing_hits >= 200,
+            "the schedule must produce candidates on both sides (incoming {incoming_hits}, \
+             outgoing {outgoing_hits})"
+        );
+    }
+
+    /// bd-i0tn6 lever 4: the pending-publication check applies the full
+    /// candidate rules to each pending peer. A validator that reads the same
+    /// key as the pending session wrote, through another leaf (an exact-cell
+    /// overlap and nothing else), must wait; one that reads another key on
+    /// the same root must not.
+    #[test]
+    fn test_pending_publication_blocks_on_an_exact_cell_overlap_alone() {
+        let root = test_page(61);
+        let mut registry = ConcurrentRegistry::new();
+        let pending = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(pending).unwrap();
+            let (cell, page) = WitnessKey::for_point_write(root, b"key-k", test_page(610));
+            handle.record_write_witness(cell);
+            handle.record_write_witness(page);
+        }
+        let same_key = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        registry
+            .get_mut(same_key)
+            .unwrap()
+            .record_read_witness(WitnessKey::for_cell_read(root, test_page(611), b"key-k"));
+        let other_key = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        registry
+            .get_mut(other_key)
+            .unwrap()
+            .record_read_witness(WitnessKey::for_cell_read(root, test_page(612), b"key-z"));
+
+        let token = registry.get(pending).unwrap().txn_token();
+        let lease = registry.mark_publication_pending(pending, token).unwrap();
+        assert!(
+            registry.pending_publication_blocks(same_key),
+            "the same key through another leaf can form an rw-edge into the pending session"
+        );
+        assert!(
+            !registry.pending_publication_blocks(other_key),
+            "another key on the same root is disjoint"
+        );
+        drop(lease);
+        assert!(!registry.pending_publication_blocks(same_key));
     }
 
     #[test]
@@ -10185,21 +10446,27 @@ mod tests {
         }
     }
 
-    /// Microbench for `ActiveEdgeDiscoveryIndex::build`. Constructs N handle
-    /// views with M disjoint read/write pages each and times the build loop.
-    /// Reports ns/build averaged over trials. Not a correctness test; ignored
-    /// by default.
+    /// Microbench for one validation's active-peer candidate lookup: the
+    /// per-commit `ActiveEdgeDiscoveryIndex` (build plus one incoming and one
+    /// outgoing query, the pre-bd-i0tn6-lever-4 path) against the two scans
+    /// that replaced it. Constructs N handle views with M disjoint read/write
+    /// pages each and a committer disjoint from all of them (the
+    /// separate-tables shape). Reports ns per lookup for each. Not a
+    /// correctness test; ignored by default.
     ///
     /// Run with:
     /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
-    ///    bench_active_edge_index_build --ignored --nocapture`
+    ///    bench_active_candidate_scan_against_the_index --ignored --nocapture`
     #[test]
     #[ignore = "microbench — run manually"]
-    fn bench_active_edge_index_build() {
+    fn bench_active_candidate_scan_against_the_index() {
         use std::cell::Cell;
         use std::time::Instant;
 
-        use super::{ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, HandleViewParts};
+        use super::{
+            ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, HandleViewParts,
+            active_incoming_candidates, active_outgoing_candidates, summarize_witness_keys,
+        };
 
         fn make_view(token_id: u64, page_base: u32, pages_per_view: u32) -> HandleView {
             let mut read_pages: Vec<PageNumber> = (0..pages_per_view)
@@ -10243,30 +10510,73 @@ mod tests {
                 )
             })
             .collect();
+        // The committer touches pages above every view's range.
+        let committer = test_token(999);
+        let committer_begin = CommitSeq::new(1);
+        let committer_end = CommitSeq::new(2);
+        let first_free_page = (VIEWS as u32) * PAGES_PER_VIEW * 2 + 1;
+        let committer_keys = |offset: u32| -> Vec<WitnessKey> {
+            (0..PAGES_PER_VIEW)
+                .map(|i| WitnessKey::Page(test_page(first_free_page + offset + i)))
+                .collect()
+        };
+        let read_summary = summarize_witness_keys(&committer_keys(0));
+        let write_summary = summarize_witness_keys(&committer_keys(PAGES_PER_VIEW));
 
-        // Warm-up.
-        for _ in 0..BUILDS_PER_TRIAL {
-            std::hint::black_box(ActiveEdgeDiscoveryIndex::build(&views));
-        }
+        let index_lookup = || {
+            let index = ActiveEdgeDiscoveryIndex::build(&views);
+            let incoming = index.incoming_candidate_refs(
+                &views,
+                committer,
+                committer_begin,
+                committer_end,
+                &write_summary,
+            );
+            let outgoing = index.outgoing_candidate_refs(
+                &views,
+                committer,
+                committer_begin,
+                committer_end,
+                &read_summary,
+            );
+            std::hint::black_box((incoming.len(), outgoing.len()));
+        };
+        let scan_lookup = || {
+            let incoming =
+                active_incoming_candidates(&views, committer, committer_end, &write_summary);
+            let outgoing =
+                active_outgoing_candidates(&views, committer, committer_end, &read_summary);
+            std::hint::black_box((incoming.len(), outgoing.len()));
+        };
 
-        let mut samples = Vec::with_capacity(TRIALS);
-        for _ in 0..TRIALS {
-            let start = Instant::now();
+        for (label, lookup) in [
+            ("index", &index_lookup as &dyn Fn()),
+            ("scan", &scan_lookup as &dyn Fn()),
+        ] {
+            // Warm-up.
             for _ in 0..BUILDS_PER_TRIAL {
-                std::hint::black_box(ActiveEdgeDiscoveryIndex::build(&views));
+                lookup();
             }
-            let elapsed = start.elapsed();
-            let ns_per_build = elapsed.as_nanos() as f64 / f64::from(BUILDS_PER_TRIAL);
-            eprintln!("  trial: {ns_per_build:.0} ns/build ({elapsed:?} total)");
-            samples.push(ns_per_build);
+            let mut samples = Vec::with_capacity(TRIALS);
+            for _ in 0..TRIALS {
+                let start = Instant::now();
+                for _ in 0..BUILDS_PER_TRIAL {
+                    lookup();
+                }
+                let elapsed = start.elapsed();
+                let ns_per_lookup = elapsed.as_nanos() as f64 / f64::from(BUILDS_PER_TRIAL);
+                eprintln!("  {label} trial: {ns_per_lookup:.0} ns/lookup ({elapsed:?} total)");
+                samples.push(ns_per_lookup);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = samples[TRIALS / 2];
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+            eprintln!(
+                "bench_active_candidate_scan_against_the_index {label}: median={median:.0} \
+                 ns/lookup, mean={mean:.0} ns/lookup (n={TRIALS}, views={VIEWS}, \
+                 pages_per_view={PAGES_PER_VIEW})"
+            );
         }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = samples[TRIALS / 2];
-        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-        eprintln!(
-            "bench_active_edge_index_build: median={median:.0} ns/build, mean={mean:.0} \
-             ns/build (n={TRIALS}, views={VIEWS}, pages_per_view={PAGES_PER_VIEW})"
-        );
     }
 
     /// Microbench comparing the VDBE read hot-path's current double
@@ -10353,15 +10663,12 @@ mod tests {
         );
     }
 
-    /// Microbench for the new `all_readers.is_empty()` short-circuit in
-    /// `ActiveEdgeDiscoveryIndex::incoming_candidate_refs`. Builds an index
-    /// from write-only views (readers vec empty) and a committer's write
-    /// summary that covers N pages, then times repeated
-    /// `incoming_candidate_refs` calls. Without the short-circuit each
-    /// call clones `self.readers_with_global_keys`, probes
-    /// `readers_by_page` / `readers_by_page_witness` N times each, and
-    /// runs sort+dedup; with the short-circuit each call is a single
-    /// atomic-length check.
+    /// Microbench for the incoming-candidate scan over write-only views (no
+    /// peer has read anything) and a committer's write summary that covers N
+    /// pages. The scan rejects each view on `has_read_witnesses()` before any
+    /// page probe; this is the shape the index's `all_readers.is_empty()`
+    /// short-circuit was added for before bd-i0tn6 lever 4 replaced the
+    /// index.
     #[test]
     #[ignore = "microbench — run manually"]
     fn bench_incoming_candidate_refs_empty_readers() {
@@ -10369,7 +10676,7 @@ mod tests {
         use std::time::Instant;
 
         use super::{
-            ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, HandleViewParts,
+            HandleView, HandleViewFlags, HandleViewParts, active_incoming_candidates,
             summarize_witness_keys,
         };
 
@@ -10410,9 +10717,7 @@ mod tests {
             })
             .collect();
 
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
         let committer_token = test_token(999);
-        let committer_begin = CommitSeq::new(1);
         let committer_end = CommitSeq::new(2);
         let committer_write_keys: Vec<WitnessKey> = (1..=PAGES_PER_VIEW)
             .map(|i| WitnessKey::Page(test_page(i)))
@@ -10421,10 +10726,9 @@ mod tests {
 
         // Warm-up.
         for _ in 0..CALLS_PER_TRIAL {
-            std::hint::black_box(index.incoming_candidate_refs(
+            std::hint::black_box(active_incoming_candidates(
                 &views,
                 committer_token,
-                committer_begin,
                 committer_end,
                 &write_summary,
             ));
@@ -10434,10 +10738,9 @@ mod tests {
         for _ in 0..TRIALS {
             let start = Instant::now();
             for _ in 0..CALLS_PER_TRIAL {
-                std::hint::black_box(index.incoming_candidate_refs(
+                std::hint::black_box(active_incoming_candidates(
                     &views,
                     committer_token,
-                    committer_begin,
                     committer_end,
                     &write_summary,
                 ));
