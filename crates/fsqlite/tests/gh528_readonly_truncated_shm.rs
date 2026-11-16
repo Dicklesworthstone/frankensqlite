@@ -308,6 +308,42 @@ fn rebuilt_index(shm: &[u8], context: &str) -> (fsqlite_wal::wal_index::WalIndex
     (header, shm[SHM_ENTRIES_OFFSET..].to_vec())
 }
 
+/// Whether this process can open `path` for writing. A 0444 mode does not
+/// bind a process that bypasses file modes (root, as on the vmi workers).
+fn writable(path: &Path) -> bool {
+    std::fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
+/// `chattr +i` on files, which no process may open for writing, root
+/// included; cleared again on drop so the temporary directory can be removed.
+struct ImmutableFiles(Vec<PathBuf>);
+
+impl ImmutableFiles {
+    fn set(paths: &[PathBuf]) -> Option<Self> {
+        let mut guard = Self(Vec::new());
+        for path in paths {
+            let set = Command::new("chattr")
+                .arg("+i")
+                .arg(path)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !set {
+                return None;
+            }
+            guard.0.push(path.clone());
+        }
+        Some(guard)
+    }
+}
+
+impl Drop for ImmutableFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = Command::new("chattr").arg("-i").arg(path).status();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadOnlyShape {
     /// Stock's first-attacher marker left by one that died (GH#528).
@@ -365,6 +401,37 @@ fn read_only_opens_match_a_live_stock_process() {
                     ReadOnlyShape::Immutable => {}
                 }
             }
+            // The 0444 shape needs a `-shm` neither engine can write. Root
+            // ignores the mode, so there the files are made immutable; where
+            // that is impossible the shape cannot be built and is skipped,
+            // loudly, instead of comparing two engines that may both write.
+            let shms = arms
+                .iter()
+                .map(|db| sidecar(db, "-shm"))
+                .collect::<Vec<_>>();
+            let _immutable = if shape == ReadOnlyShape::ShmValidReadOnly
+                && shms.iter().any(|shm| writable(shm))
+            {
+                match ImmutableFiles::set(&shms) {
+                    Some(guard) if !shms.iter().any(|shm| writable(shm)) => {
+                        eprintln!(
+                            "event=bd_j2dtf_read_only_open shape={shape:?} note=\"0444 does not \
+                             bind this process (root); the -shm copies are chattr +i instead\""
+                        );
+                        Some(guard)
+                    }
+                    _ => {
+                        eprintln!(
+                            "event=bd_j2dtf_read_only_open shape={shape:?} SKIPPED: this process \
+                             writes a 0444 -shm (root) and chattr +i is unavailable here, so an \
+                             unwritable -shm cannot be built"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let query = if shape == ReadOnlyShape::Immutable {
                 "mode=ro&immutable=1"
             } else {
