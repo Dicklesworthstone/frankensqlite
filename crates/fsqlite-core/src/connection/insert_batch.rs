@@ -1215,8 +1215,15 @@ impl Connection {
         // changed them. Multi-row inputs were replayed above so this snapshot
         // is evaluated before the next row and before AFTER triggers.
         let fk_snapshot = self.upsert_foreign_key_snapshot(insert);
-        let snapshot_statement = (returning_projection.is_some() || fk_snapshot.is_some()).then(|| {
-            let mut snapshot_insert = insert.clone();
+        let snapshot_statement = if returning_projection.is_some() || fk_snapshot.is_some() {
+            // A snapshot recompiles the statement instead of reusing its
+            // prepared program. Number every original placeholder before
+            // replacing or extending RETURNING, so explicit slots, anonymous
+            // slots and repeated names retain their statement-wide identity.
+            let mut snapshot_insert = canonicalize_insert_placeholders_with_state(
+                insert,
+                &mut BindParamState::default(),
+            )?;
             if let Some(projection) = &returning_projection {
                 snapshot_insert
                     .returning
@@ -1228,8 +1235,10 @@ impl Connection {
                     .returning
                     .extend(snapshot.columns.iter().cloned());
             }
-            Statement::Insert(snapshot_insert)
-        });
+            Some(Statement::Insert(snapshot_insert))
+        } else {
+            None
+        };
         let compiled_statement = snapshot_statement.as_ref().unwrap_or(statement);
         let compiled_insert = match compiled_statement {
             Statement::Insert(compiled_insert) => compiled_insert,

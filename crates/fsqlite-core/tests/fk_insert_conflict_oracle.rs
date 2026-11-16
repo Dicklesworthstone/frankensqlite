@@ -82,8 +82,17 @@ fn rusqlite_table_dump(
     sql: &str,
     ncols: usize,
 ) -> Vec<Vec<SqliteValue>> {
+    rusqlite_table_dump_with_params(conn, sql, ncols, [])
+}
+
+fn rusqlite_table_dump_with_params(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    ncols: usize,
+    params: impl rusqlite::Params,
+) -> Vec<Vec<SqliteValue>> {
     let mut stmt = conn.prepare(sql).unwrap();
-    stmt.query_map([], |row| {
+    stmt.query_map(params, |row| {
         let mut v = Vec::with_capacity(ncols);
         for i in 0..ncols {
             let val = match row.get_ref(i).unwrap() {
@@ -746,5 +755,96 @@ fn fk_upsert_prepared_returning_keeps_parameters_and_evaluates_set_once() {
             rusqlite_table_dump(&r, projected, 3)
         );
         f.close().await.unwrap();
+    });
+}
+
+#[test]
+fn fk_upsert_snapshot_preserves_mixed_parameter_identity() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("upsert_parameters.db");
+                let f = Connection::open(if file_backed {
+                    path.to_str().unwrap()
+                } else {
+                    ":memory:"
+                })
+                .await
+                .unwrap();
+                let r = rusqlite::Connection::open_in_memory().unwrap();
+                let setup = "PRAGMA foreign_keys=ON;
+                    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                    INSERT INTO parent VALUES(1),(2),(3);
+                    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                        parent_id INTEGER REFERENCES parent(id));";
+                f.execute(setup).await.unwrap();
+                r.execute_batch(setup).unwrap();
+                // Numbered slots leave a gap, anonymous slots follow the
+                // largest preceding number, and a repeated name reuses its
+                // first slot. FK snapshots must preserve that namespace on
+                // both INSERT and DO UPDATE, including retained preparation.
+                let sql = "INSERT INTO child VALUES(?2,?1)
+                    ON CONFLICT(id) DO UPDATE SET parent_id=?3
+                    RETURNING ?5,id,parent_id,?,:label,:label,?";
+                let retained = if prepared {
+                    Some(f.prepare(sql).await.unwrap())
+                } else {
+                    None
+                };
+                for (round, (id, candidate, updated)) in
+                    [(10, 1, 2), (10, 99, 3), (20, 2, 1), (20, 99, 2)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    let marker = i64::try_from(round).unwrap() * 100;
+                    let label = format!("round-{round}");
+                    let native_params = [
+                        SqliteValue::Integer(candidate),
+                        SqliteValue::Integer(id),
+                        SqliteValue::Integer(updated),
+                        SqliteValue::Null,
+                        SqliteValue::Integer(marker + 5),
+                        SqliteValue::Integer(marker + 6),
+                        SqliteValue::Text(label.clone().into()),
+                        SqliteValue::Integer(marker + 8),
+                    ];
+                    let stock_params = [
+                        rusqlite::types::Value::Integer(candidate),
+                        rusqlite::types::Value::Integer(id),
+                        rusqlite::types::Value::Integer(updated),
+                        rusqlite::types::Value::Null,
+                        rusqlite::types::Value::Integer(marker + 5),
+                        rusqlite::types::Value::Integer(marker + 6),
+                        rusqlite::types::Value::Text(label),
+                        rusqlite::types::Value::Integer(marker + 8),
+                    ];
+                    let actual = if let Some(retained) = &retained {
+                        retained.query_with_params(&native_params).await
+                    } else {
+                        f.query_with_params(sql, &native_params).await
+                    }
+                    .unwrap();
+                    let expected = rusqlite_table_dump_with_params(
+                        &r,
+                        sql,
+                        7,
+                        rusqlite::params_from_iter(stock_params),
+                    );
+                    assert_eq!(
+                        actual.iter().map(|row| row.values().to_vec()).collect::<Vec<_>>(),
+                        expected,
+                        "file={file_backed}, prepared={prepared}, round={round}"
+                    );
+                    assert_eq!(
+                        franken_table_dump(&f, SELECT_CHILD).await,
+                        rusqlite_table_dump(&r, SELECT_CHILD, 2),
+                        "file={file_backed}, prepared={prepared}, round={round}"
+                    );
+                }
+                drop(retained);
+                f.close().await.unwrap();
+            }
+        }
     });
 }
