@@ -89,6 +89,43 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-16 - FIX (regression from lever L1): a WAL refresh reads one frame header ahead of its batch only while a stale tail is known for its generation (bd-2qo7z, bd-w4pr1.7)
+
+- Target: lever L1 (a4ff2c4ca, the 2026-11-15 WIN entry below) read the 24-byte header of the first
+  frame past the prefix before every refresh's batch. On a valid continuation (a peer's frames, a
+  fresh reader catching up) that re-read offset 32 and turned the first read into a probe, which
+  broke two fsqlite-wal `wal_reopen` I/O-contract tests
+  (`replay_batches_io_but_reads_every_frame_byte`,
+  `append_during_batched_replay_waits_for_the_next_sampled_horizon`). L1's gate ran `fsqlite-wal
+  --lib` only; `wal_reopen` needs `--features fault-injection`. Touched:
+  `crates/fsqlite-wal/src/wal.rs` (`StaleTail`, `WalFile::stale_tail`, `stale_tail_ahead`,
+  `note_stale_tail`).
+- Change: a scan of the current generation that stops on another generation's frame (refresh's
+  batch, `rebuild_state_from_file`, `open`) records the generation's salts and the file's frame
+  count. `refresh` probes only while that tail is ahead of its prefix; otherwise it batches from
+  the first read, as before L1. A reset or a peer's restart changes the salts; a prefix past the
+  old end retires it. After a restart in place the first refresh pays one batch, then every
+  refresh in that generation reads one header, as under L1.
+- Result (A = origin/main 2fc4fb383, CLI sha256 898c53b5b934e8ef; B = A + this,
+  65c2b73bb5705ee6; stock live; 6 rotated reps):
+  - `cargo test -p fsqlite-wal --features fault-injection --tests`: `wal_reopen` 10/10 (main 8/2);
+    every integration target green; the lib 1,174 + 2 reds in `telemetry::tests`, a race on the
+    process-global WAL metrics (`frames_written_total` 3, expected 1) and the lock poisoning that
+    follows it; the lib re-run whole was 1,176 / 0 and `telemetry::tests` alone 32 / 0.
+  - clippy `--all-targets --features fault-injection` clean; the core WAL keepers and the e2e
+    checkpoint / recovery batch (11 targets) pass.
+  - CLI tmpfs NORMAL: CPU 125.9 -> 123.8 us per transaction, user instructions -0.2%; disk NORMAL
+    CPU 146.7 -> 142.7; pread bytes per transaction 4,530-4,537 -> 4,548-4,622 over three runs
+    (one 61,800-byte batch per WAL restart). L1's win stands.
+  - Prediction (bd-2qo7z, before building): met on every line.
+- Tests: `test_refresh_over_a_peers_frames_batches_from_the_first_read` (new: no stale tail known,
+  a peer's frames are read in one batch from the first frame) and L1's
+  `test_refresh_over_a_restarted_wal_reads_one_frame_header_of_its_stale_tail` (the probe still
+  runs over a known stale tail). Main's unconditional probe fails the first; a version that never
+  probes fails the second. The two `wal_reopen` tests are unchanged.
+- Retry condition: none. A lever that changes WAL read patterns gates on fsqlite-wal's
+  integration targets with `--features fault-injection`, not only its lib.
+
 ## 2026-11-16 - WIN (landed as 797ddd090; one early-stop test assertion replaced under the coordinator's decision): the checkpoint read-back reads its pages and their WAL sources in runs (bd-w4pr1.13.20, lever N2)
 
 - Target, change, prediction and kill lines: the round-5 entry below ("MEASURED WIN, NOT LANDED ... lever N2"). The
