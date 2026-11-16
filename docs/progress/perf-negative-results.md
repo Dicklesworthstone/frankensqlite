@@ -89,6 +89,46 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-16 - WIN (landed as 797ddd090; one early-stop test assertion replaced under the coordinator's decision): the checkpoint read-back reads its pages and their WAL sources in runs (bd-w4pr1.13.20, lever N2)
+
+- Target, change, prediction and kill lines: the round-5 entry below ("MEASURED WIN, NOT LANDED ... lever N2"). The
+  code is that entry's N2 v1, unchanged (`scratchpad/r5_N2_v1.patch` of the bulk-write lane, sha256 5b6158601e368bdc),
+  plus the replaced assertion; landed as 797ddd090.
+- Why it was held, and the decision: `test_all_checkpoint_modes_refuse_backfill_publication_on_mismatch` asserted
+  `read_pages == [2]` and `read_after_syncs == [sync_count]`, i.e. that the read-back stops at the first bad page;
+  N2 reads the run [2, 3] before it reports page 2. Coordinator decision on bd-w4pr1.13.20 (2026-11-15 19:51Z): every
+  safety assertion of the test still holds and the early stop is over-specified; replace that one assertion with the
+  strictest equivalent. On the complete-window path it now asserts that the corrupt page is read back, only pages the
+  pass backfilled are read, each once in ascending order, and every read follows the pass's last sync. The
+  partial-window sibling keeps the old lines unchanged. No other assertion changed.
+- Result, re-measured on the landing base (both arms built on main d4e3d189c, which carries levers M and S: base
+  620b9e52a7dafdbe, N2 803daba4995aae82; thinkstation1, governor powersave, load 4.3-5.0, stock sqlite3 3.46.1 live
+  in the same invocation, 9 interleaved reps, bulk 3, memory_script 5, io_uring refused; `scratchpad/r6_ab.py` of the
+  bulk-write lane, output `r6/abN2d4.txt`): `delete_14pct_300k` pread64 WAL 9,382 -> 7,274 and db 4,552 -> 2,445
+  (-4,215, met), instructions 364.1M -> 358.7M (-5.4M, met; 3.02x -> 2.97x stock's 120.7M), kernel cycles -23.2M
+  (met), task-clock min 106.2 -> 102.1 ms (-4.1, 0.9 ms below the predicted -5 to -11) and median 112.3 -> 104.1 ms
+  (CPU 2.49x -> 2.39x stock's 42.7 ms); `update_10pct_300k` -5.5M (2.06x -> 2.04x), task-clock min -2.2 ms (met);
+  `bulk_insert_1M_one_txn` -17.6M (1.69x -> 1.68x; below the predicted -20M to -35M), task-clock min -63.6 ms (3 reps,
+  noisy); `memory_script_200k` unchanged. The same pair built on 94573de28 the day before (`r6/abN2.txt`): delete
+  -4,216 preads, -5.4M, task-clock min -8.0 ms; update -5.3M, -10.7 ms; bulk -18.5M, -15.8 ms. Kill lines (preads
+  down at least 3,500, instructions down at least 2M, task-clock min not up) cleared on both bases. Answers equal
+  stock's; stock integrity_check ok; bd-73pfl stress (`mw_conflict.py explicit-same 8 300 10 5000`) 0/10 integrity
+  failures in every arm, every lost row a refused COMMIT with its error line (base 5,588, N2 5,408).
+- Gate (rch; d4e3d189c + the N2 diff, sha256 6b720e3a461273a2, every red also red on main without N2): clippy
+  -D warnings wal + pager + core all targets clean; fsqlite-wal lib 1,179 / 0; wal integration targets
+  (fault-injection) 127 / 2 (wal_reopen x2, red since lever L1 a4ff2c4ca, bd-2qo7z); pager lib + integration
+  1,124 / 1 (bd_2jpu6_2); core lib 4,194 / 3 (t6741 pair; bd-drufq); core crash + cross-process checkpoint battery
+  230 / 1 (gh19 native_full_commits); 78 core keeper / EXPLAIN targets 410 / 8 (gh516 trio, bd-d8s37, bd-jlbrk x2,
+  bd-hi7qg, indexed_group_by_predicates); e2e checkpoint / crash / concurrent-writer batch 133 / 0; vdbe goldens
+  8 / 0; fsqlite crate lib 748 + 123 integration targets 349 + doc 1, all pass. Landed by the coordinator on main
+  past 84989ece6 / 2fc4fb383 (connection.rs window and aggregate paths only), with clippy wal + pager + core all
+  targets re-run on that exact tree.
+- Retry condition: none for the read-back. Widen: the backfill's per-frame re-read and its pwrite64 calls stay one a
+  frame (`checkpoint_integrity_copy_pass_is_bound_to_validated_source_bytes`); the checkpoint's next pieces are the
+  three XXH3-128 passes and the chain checksum (guarantee costs, the round-5 attribution on bd-w4pr1.13.20) and its
+  extra database / certificate-head / directory syncs (reported by the single-writer lane on bd-w4pr1.7). The commit's
+  three whole-transaction page copies are the single-writer lane's (attribution on bd-w4pr1.7, 2026-11-15).
+
 ## 2026-11-16 - WIN (landed; cycles lost on rows it does not run): a window function's arguments are read from their slots in the scanned row (bd-w4pr1.12, lever W5)
 
 - Target and change: the 2026-11-15 "MEASURED WIN, NOT LANDED" entry for W5 below. That diff,
