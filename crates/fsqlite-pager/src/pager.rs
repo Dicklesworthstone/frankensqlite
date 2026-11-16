@@ -47,6 +47,7 @@ use crate::prefetch_l1_read;
 use crate::s3_fifo::S3FifoConfig;
 use crate::traits::{
     self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend, WalFuture,
+    WalPageImage,
 };
 
 fn atomic_usize_checked_update(
@@ -5992,7 +5993,7 @@ async fn capture_wal_conflict_snapshot_at_begin(
 }
 
 enum WalReadLookup {
-    Ready(Option<Vec<u8>>),
+    Ready(Option<WalPageImage>),
     NeedsWriteFallback,
 }
 
@@ -6003,13 +6004,16 @@ async fn read_page_from_wal_backend(
 ) -> Result<Option<Vec<u8>>> {
     Ok(lookup_page_in_wal_backend(wal_backend, cx, page_no)
         .await?
-        .data)
+        .data
+        .map(WalPageImage::into_vec))
 }
 
 /// What one WAL lookup of a page found.
 struct WalPageLookup {
-    /// The page's latest image in the WAL, if the WAL holds one.
-    data: Option<Vec<u8>>,
+    /// The page's latest image in the WAL, if the WAL holds one. A pinned
+    /// read of a committed frame may share the image the backend keeps
+    /// (bd-05xlf).
+    data: Option<WalPageImage>,
     /// Whether the reader's pinned snapshot answered. That snapshot changes
     /// only at a transaction boundary, so within one page read a second
     /// lookup through it gives the same answer.
@@ -6030,8 +6034,9 @@ async fn lookup_page_in_wal_backend(
         let guard = async_rwlock_read_for_page(&backend, cx, "WAL backend").await?;
         if guard.supports_pinned_reads() {
             // A page the pinned snapshot holds no frame of (the usual answer
-            // on a page-cache miss) is answered without the boxed read
-            // futures; a frame is read through `read_page_pinned`.
+            // on a page-cache miss), or one whose committed frame the backend
+            // already keeps, is answered without the boxed read futures; any
+            // other frame is read through `read_page_pinned`.
             let data = match guard.read_page_pinned_without_io(page_no.get()) {
                 Some(answer) => answer?,
                 None => guard.read_page_pinned(cx, page_no.get()).await?,
@@ -6045,7 +6050,8 @@ async fn lookup_page_in_wal_backend(
         WalReadLookup::Ready(data) => Ok(WalPageLookup { data, pinned: true }),
         WalReadLookup::NeedsWriteFallback => Ok(WalPageLookup {
             data: with_wal_backend(wal_backend, cx, |wal, cx| wal.read_page(cx, page_no.get()))
-                .await?,
+                .await?
+                .map(WalPageImage::Owned),
             pinned: false,
         }),
     }
@@ -27353,14 +27359,17 @@ where
             // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
             let pinned_wal_miss = if self.journal_mode == JournalMode::Wal {
                 let lookup = lookup_page_in_wal_backend(&self.wal_backend, cx, page_no).await?;
-                if let Some(data) = lookup.data {
+                if let Some(image) = lookup.data {
                     if dk9ra_trace_enabled()
                         && page_no.get() > 1
-                        && data.iter().all(|&b| b == 0)
+                        && image.as_bytes().iter().all(|&b| b == 0)
                     {
                         eprintln!("DK9RA_O81OV GETPAGE_WAL_ZERO page={}", page_no.get());
                     }
-                    let page = PageData::from_vec(data);
+                    // A committed frame's image stays shared with the WAL
+                    // frame cache, so the read cache below keeps it with a
+                    // refcount instead of a second copy (bd-05xlf).
+                    let page = image.into_page_data();
                     self.ensure_uncached_snapshot_sequence(
                         page_no,
                         self.published.snapshot().visible_commit_seq,
@@ -67138,10 +67147,10 @@ mod tests {
                     &'a self,
                     _cx: &'a Cx,
                     _page_number: u32,
-                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                ) -> WalFuture<'a, Option<WalPageImage>> {
                     Box::pin(async move {
                         *self.pinned_calls.lock().unwrap() += 1;
-                        Ok(Some(self.response.clone()))
+                        Ok(Some(WalPageImage::Owned(self.response.clone())))
                     })
                 }
 
@@ -67388,10 +67397,11 @@ mod tests {
                     &'a self,
                     _cx: &'a Cx,
                     page_number: u32,
-                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                ) -> WalFuture<'a, Option<WalPageImage>> {
                     Box::pin(async move {
                         *self.pinned_calls.lock().unwrap() += 1;
-                        Ok((page_number == self.wal_page).then(|| self.image.clone()))
+                        Ok((page_number == self.wal_page)
+                            .then(|| WalPageImage::Owned(self.image.clone())))
                     })
                 }
 
@@ -67538,7 +67548,7 @@ mod tests {
                     &'a self,
                     _cx: &'a Cx,
                     _page_number: u32,
-                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                ) -> WalFuture<'a, Option<WalPageImage>> {
                     Box::pin(async {
                         Err(fsqlite_error::FrankenError::WalCorrupt {
                             detail: "simulated corruption in pinned read".to_owned(),

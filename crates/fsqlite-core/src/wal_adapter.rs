@@ -20,7 +20,7 @@ use fsqlite_pager::traits::{
 };
 use fsqlite_pager::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, ParallelWalCommitReconciliation,
-    WalBackend, WalIndexShmSource, WalPageIndex, WalPublicationSnapshot,
+    WalBackend, WalIndexShmSource, WalPageImage, WalPageIndex, WalPublicationSnapshot,
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -456,17 +456,30 @@ impl WalFramePageCache {
     /// Frames kept per connection (4 MiB at 4 KiB pages).
     const CAPACITY: usize = 1024;
 
-    fn get(&self, generation: WalGenerationIdentity, frame_index: usize, page_number: u32) -> Option<Vec<u8>> {
+    /// The kept image of frame `frame_index` of `generation`, if that frame
+    /// holds `page_number`: the cache's own immutable image, shared.
+    fn get(
+        &self,
+        generation: WalGenerationIdentity,
+        frame_index: usize,
+        page_number: u32,
+    ) -> Option<Arc<[u8]>> {
         if self.generation != Some(generation) {
             return None;
         }
         self.pages
             .get(&frame_index)
             .filter(|(cached_page, _)| *cached_page == page_number)
-            .map(|(_, bytes)| bytes.to_vec())
+            .map(|(_, bytes)| Arc::clone(bytes))
     }
 
-    fn insert(&mut self, generation: WalGenerationIdentity, frame_index: usize, page_number: u32, bytes: &[u8]) {
+    fn insert(
+        &mut self,
+        generation: WalGenerationIdentity,
+        frame_index: usize,
+        page_number: u32,
+        bytes: Arc<[u8]>,
+    ) {
         if self.generation != Some(generation) {
             self.pages.clear();
             self.insertion_order.clear();
@@ -474,7 +487,7 @@ impl WalFramePageCache {
         }
         if self
             .pages
-            .insert(frame_index, (page_number, Arc::from(bytes)))
+            .insert(frame_index, (page_number, bytes))
             .is_none()
         {
             self.insertion_order.push_back(frame_index);
@@ -485,6 +498,15 @@ impl WalFramePageCache {
             }
         }
     }
+}
+
+/// Whether frame `frame_index` is at or below `snapshot`'s commit horizon,
+/// so its bytes never change within the snapshot's WAL generation and
+/// [`WalFramePageCache`] may keep them.
+fn frame_is_committed_in(snapshot: &WalPublishedSnapshot, frame_index: usize) -> bool {
+    snapshot
+        .last_commit_frame
+        .is_some_and(|last_commit_frame| frame_index <= last_commit_frame)
 }
 
 impl<F: VfsFile> WalBackendAdapter<F> {
@@ -498,18 +520,85 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         frame_index: usize,
         page_number: u32,
     ) -> Result<Vec<u8>> {
-        let cacheable = snapshot
-            .last_commit_frame
-            .is_some_and(|last_commit_frame| frame_index <= last_commit_frame);
-        if cacheable
-            && let Some(page) = self
-                .frame_page_cache
+        let cacheable = frame_is_committed_in(snapshot, frame_index);
+        if cacheable && let Some(page) = self.cached_frame_page(snapshot, frame_index, page_number)
+        {
+            return Ok(page.to_vec());
+        }
+        let frame_buf = self.read_frame_page(cx, frame_index, page_number).await?;
+        if cacheable {
+            self.frame_page_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(snapshot.generation, frame_index, page_number)
-        {
-            return Ok(page);
+                .insert(
+                    snapshot.generation,
+                    frame_index,
+                    page_number,
+                    Arc::from(frame_buf.as_slice()),
+                );
         }
+        Ok(frame_buf)
+    }
+
+    /// [`Self::read_resolved_frame_page`] for a caller that keeps the image
+    /// rather than mutating it: a committed frame is answered with the image
+    /// [`WalFramePageCache`] keeps, and one read from the file is kept there
+    /// and handed out as that same image, so the caller's read cache shares
+    /// it instead of copying it twice (bd-05xlf). A frame above the commit
+    /// horizon is read for this caller alone.
+    async fn read_resolved_frame_image(
+        &self,
+        cx: &Cx,
+        snapshot: &WalPublishedSnapshot,
+        frame_index: usize,
+        page_number: u32,
+    ) -> Result<WalPageImage> {
+        if !frame_is_committed_in(snapshot, frame_index) {
+            return self
+                .read_frame_page(cx, frame_index, page_number)
+                .await
+                .map(WalPageImage::Owned);
+        }
+        if let Some(page) = self.cached_frame_page(snapshot, frame_index, page_number) {
+            return Ok(WalPageImage::Shared(page));
+        }
+        let page: Arc<[u8]> = Arc::from(self.read_frame_page(cx, frame_index, page_number).await?);
+        self.frame_page_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                snapshot.generation,
+                frame_index,
+                page_number,
+                Arc::clone(&page),
+            );
+        Ok(WalPageImage::Shared(page))
+    }
+
+    /// The image [`WalFramePageCache`] keeps of the committed frame
+    /// `frame_index` of `snapshot`'s generation, if it holds `page_number`.
+    /// The caller has checked that the frame is at or below the snapshot's
+    /// commit horizon.
+    fn cached_frame_page(
+        &self,
+        snapshot: &WalPublishedSnapshot,
+        frame_index: usize,
+        page_number: u32,
+    ) -> Option<Arc<[u8]>> {
+        self.frame_page_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(snapshot.generation, frame_index, page_number)
+    }
+
+    /// The page bytes of frame `frame_index`, read from the WAL file, which
+    /// must hold `page_number`.
+    async fn read_frame_page(
+        &self,
+        cx: &Cx,
+        frame_index: usize,
+        page_number: u32,
+    ) -> Result<Vec<u8>> {
         let mut frame_buf = vec![0u8; self.wal.frame_size()];
         let header = self
             .wal
@@ -532,12 +621,6 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let page_size = self.wal.page_size();
         frame_buf.copy_within(header_size.., 0);
         frame_buf.truncate(page_size);
-        if cacheable {
-            self.frame_page_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(snapshot.generation, frame_index, page_number, &frame_buf);
-        }
         Ok(frame_buf)
     }
 
@@ -3217,7 +3300,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         &'a self,
         cx: &'a Cx,
         page_number: u32,
-    ) -> WalFuture<'a, Option<Vec<u8>>> {
+    ) -> WalFuture<'a, Option<WalPageImage>> {
         Box::pin(async move {
             let snapshot = match self.pinned_page_read(page_number)? {
                 PinnedPageRead::NoFrame => return Ok(None),
@@ -3230,16 +3313,29 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             let Some(frame_index) = resolution.frame_index() else {
                 return Ok(None);
             };
-            self.read_resolved_frame_page(cx, snapshot, frame_index, page_number)
+            self.read_resolved_frame_image(cx, snapshot, frame_index, page_number)
                 .await
                 .map(Some)
         })
     }
 
-    fn read_page_pinned_without_io(&self, page_number: u32) -> Option<Result<Option<Vec<u8>>>> {
+    fn read_page_pinned_without_io(
+        &self,
+        page_number: u32,
+    ) -> Option<Result<Option<WalPageImage>>> {
         match self.pinned_page_read(page_number) {
             Ok(PinnedPageRead::NoFrame) => Some(Ok(None)),
-            Ok(PinnedPageRead::Frame(_)) => None,
+            // An index hit is the frame `resolve_visible_frame` answers
+            // (`AuthoritativeHit`); when that frame is committed and its
+            // image is kept, `read_page_pinned` would answer that image.
+            Ok(PinnedPageRead::Frame(snapshot)) => {
+                let &frame_index = snapshot.page_index.get(&page_number)?;
+                if !frame_is_committed_in(snapshot, frame_index) {
+                    return None;
+                }
+                self.cached_frame_page(snapshot, frame_index, page_number)
+                    .map(|page| Ok(Some(WalPageImage::Shared(page))))
+            }
             Err(error) => Some(Err(error)),
         }
     }
@@ -7108,11 +7204,14 @@ where
         &'a self,
         cx: &'a Cx,
         page_number: u32,
-    ) -> WalFuture<'a, Option<Vec<u8>>> {
+    ) -> WalFuture<'a, Option<WalPageImage>> {
         Box::pin(async move { self.inner.read_page_pinned(cx, page_number).await })
     }
 
-    fn read_page_pinned_without_io(&self, page_number: u32) -> Option<Result<Option<Vec<u8>>>> {
+    fn read_page_pinned_without_io(
+        &self,
+        page_number: u32,
+    ) -> Option<Result<Option<WalPageImage>>> {
         self.inner.read_page_pinned_without_io(page_number)
     }
 
@@ -11479,7 +11578,13 @@ mod tests {
         let pinned = fixture.adapter.pinned_read_snapshot().unwrap();
         assert_eq!(pinned.last_commit_frame, Some(0));
         assert_eq!(fixture.adapter.native_read_binding().unwrap().header().n_page, 1);
-        assert_eq!(fixture.adapter.read_page_pinned(&cx, 1).expect("old pinned page"), Some(old_page));
+        assert_eq!(
+            fixture
+                .adapter
+                .read_page_pinned(&cx, 1)
+                .expect("old pinned page"),
+            Some(WalPageImage::Owned(old_page))
+        );
         assert_eq!(fixture.adapter.read_page_pinned(&cx, 2).expect("new page stays hidden"), None);
         assert_eq!(fixture.adapter.native_recovery_required(), None);
         fixture.adapter.preflight_native_append(&cx).expect("aligned shared prefix advances only the conflict view");
@@ -11505,7 +11610,13 @@ mod tests {
         let next_token = next_binding.token().clone();
         fixture.adapter.begin_native_read(&cx, next_binding).expect("bind next transaction");
         assert_eq!(fixture.adapter.pinned_read_snapshot().unwrap().last_commit_frame, Some(2));
-        assert_eq!(fixture.adapter.read_page_pinned(&cx, 1).expect("new pinned page"), Some(new_page));
+        assert_eq!(
+            fixture
+                .adapter
+                .read_page_pinned(&cx, 1)
+                .expect("new pinned page"),
+            Some(WalPageImage::Owned(new_page))
+        );
         fixture.adapter.end_native_read(&next_token).unwrap();
         next.release().expect("release next claim");
         peer.close(&cx).unwrap();
@@ -11645,7 +11756,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adapter_pinned_read_without_io_answers_only_pages_without_a_frame() {
+    fn test_adapter_pinned_read_without_io_answers_pages_without_a_frame_and_kept_frames() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let mut adapter = make_adapter(&vfs, &cx);
@@ -11665,12 +11776,28 @@ mod tests {
         adapter.sync(&cx).expect("publish commit");
         adapter.begin_transaction(&cx).expect("pin snapshot");
 
-        // Page 1 has a frame: only read_page_pinned answers, with its bytes.
+        // Page 1 has a frame not read yet: only read_page_pinned answers,
+        // with its bytes, which the frame cache then keeps and shares.
         assert!(adapter.read_page_pinned_without_io(1).is_none());
-        assert_eq!(
-            adapter.read_page_pinned(&cx, 1).expect("frame of page 1"),
-            Some(page1)
-        );
+        let first = adapter
+            .read_page_pinned(&cx, 1)
+            .expect("frame of page 1")
+            .expect("page 1 has a frame");
+        assert_eq!(first, WalPageImage::Owned(page1.clone()));
+        let WalPageImage::Shared(kept) = &first else {
+            panic!("a committed frame is answered with the image the cache keeps");
+        };
+        // Now the kept image answers without I/O: the same image, not a copy.
+        let without_io = adapter
+            .read_page_pinned_without_io(1)
+            .expect("a kept committed frame is answered without I/O")
+            .expect("no refusal")
+            .expect("page 1 has a frame");
+        let WalPageImage::Shared(shared) = &without_io else {
+            panic!("the without-I/O answer shares the kept image");
+        };
+        assert!(Arc::ptr_eq(kept, shared));
+        assert_eq!(without_io, WalPageImage::Owned(page1.clone()));
         // Page 2 has none: answered without I/O, as read_page_pinned answers.
         assert_eq!(
             adapter
@@ -11696,12 +11823,54 @@ mod tests {
             Some(None),
             "the pinned snapshot predates page 2's frame"
         );
-        // ...and is in the next one, where only read_page_pinned answers.
+        // ...and is in the next one, where only read_page_pinned answers
+        // until its frame is kept.
         adapter.begin_transaction(&cx).expect("pin next snapshot");
         assert!(adapter.read_page_pinned_without_io(2).is_none());
         assert_eq!(
             adapter.read_page_pinned(&cx, 2).expect("frame of page 2"),
-            Some(page2)
+            Some(WalPageImage::Owned(page2.clone()))
+        );
+        assert_eq!(
+            adapter
+                .read_page_pinned_without_io(2)
+                .map(|answer| answer.expect("no refusal")),
+            Some(Some(WalPageImage::Owned(page2)))
+        );
+        // Page 1's frame is the same committed frame in this snapshot, so the
+        // image kept under the older snapshot still answers it.
+        assert_eq!(
+            adapter
+                .read_page_pinned_without_io(1)
+                .map(|answer| answer.expect("no refusal")),
+            Some(Some(WalPageImage::Owned(page1.clone())))
+        );
+
+        // A newer frame of page 1 replaces the older one in the next snapshot:
+        // the kept image of the older frame never answers for it.
+        let page1_new = sample_page(0x30);
+        adapter
+            .append_frame(&cx, 1, &page1_new, 2)
+            .expect("append a newer page 1");
+        adapter.sync(&cx).expect("publish the newer page 1");
+        adapter
+            .begin_transaction(&cx)
+            .expect("pin the newest snapshot");
+        assert!(
+            adapter.read_page_pinned_without_io(1).is_none(),
+            "the newer frame of page 1 is not kept yet"
+        );
+        assert_eq!(
+            adapter
+                .read_page_pinned(&cx, 1)
+                .expect("newer frame of page 1"),
+            Some(WalPageImage::Owned(page1_new.clone()))
+        );
+        assert_eq!(
+            adapter
+                .read_page_pinned_without_io(1)
+                .map(|answer| answer.expect("no refusal")),
+            Some(Some(WalPageImage::Owned(page1_new)))
         );
     }
 

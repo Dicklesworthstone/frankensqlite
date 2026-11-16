@@ -623,3 +623,249 @@ fn autocommit_statements_see_each_peer_commit_and_their_own() -> TestResult {
     });
     outcome
 }
+
+/// One step of [`shared_page_image_steps`]: which connection runs `sql`.
+#[derive(Clone, Copy)]
+enum Peer {
+    A,
+    B,
+}
+
+/// bd-05xlf: a page a transaction fetches from the WAL is the image the WAL
+/// frame cache keeps of that committed frame, shared rather than copied.
+/// These steps read a table and an index through it, let a peer commit newer
+/// frames of the same pages while a reader holds the old images, write
+/// through a shared image and roll it back, and reset the WAL (the peer's
+/// TRUNCATE checkpoint) so the next commits reuse its frame indexes for other
+/// pages. Every answer must equal stock SQLite's on the same steps: a reader
+/// handed a newer frame by page number, a cache that kept a rolled-back write,
+/// or a frame cache that served an old generation's frame answers differently.
+fn shared_page_image_steps() -> Vec<(Peer, &'static str)> {
+    vec![
+        // Warm-up reads put the pages in A's caches.
+        (Peer::A, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'x5'"),
+        (Peer::A, "SELECT count(*), sum(length(v)) FROM t"),
+        // A's transaction reads the shared images; B commits newer ones.
+        (Peer::A, "BEGIN"),
+        (Peer::A, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'x5'"),
+        (Peer::B, "UPDATE t SET v = 'y5' WHERE pk = 5"),
+        (
+            Peer::B,
+            "UPDATE t SET v = 'y' || pk WHERE pk BETWEEN 200 AND 210",
+        ),
+        (Peer::A, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'x5'"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'y5'"),
+        (
+            Peer::A,
+            "SELECT count(*), sum(length(v)) FROM t WHERE v LIKE 'y%'",
+        ),
+        (Peer::A, "COMMIT"),
+        // The next statements see B's commits.
+        (Peer::A, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'y5'"),
+        (
+            Peer::A,
+            "SELECT count(*), sum(length(v)) FROM t WHERE v LIKE 'y%'",
+        ),
+        // A writes through images it shares with its caches, then rolls back.
+        (Peer::A, "BEGIN"),
+        (Peer::A, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::A, "UPDATE t SET v = 'z5' WHERE pk = 5"),
+        (
+            Peer::A,
+            "UPDATE t SET v = 'z' || pk WHERE pk BETWEEN 200 AND 205",
+        ),
+        (Peer::A, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::A, "ROLLBACK"),
+        (Peer::A, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'z5'"),
+        (
+            Peer::A,
+            "SELECT count(*), sum(length(v)) FROM t WHERE v LIKE 'z%'",
+        ),
+        (Peer::B, "SELECT v FROM t WHERE pk = 5"),
+        // ...and commits, which B sees.
+        (Peer::A, "UPDATE t SET v = 'w5' WHERE pk = 5"),
+        (Peer::B, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::B, "SELECT pk FROM t WHERE v = 'w5'"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'y5'"),
+        (Peer::A, "SELECT count(*), sum(pk), sum(length(v)) FROM t"),
+        // B resets the WAL; its next commits reuse the frame indexes A's
+        // frame cache holds images of, for other pages and newer images.
+        (Peer::B, "PRAGMA wal_checkpoint(TRUNCATE)"),
+        (
+            Peer::B,
+            "UPDATE t SET v = 'q' || pk WHERE pk BETWEEN 300 AND 320",
+        ),
+        (Peer::B, "UPDATE t SET v = 'r5' WHERE pk = 5"),
+        (Peer::A, "SELECT v FROM t WHERE pk = 5"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'r5'"),
+        (Peer::A, "SELECT pk FROM t WHERE v = 'w5'"),
+        (Peer::A, "SELECT count(*), sum(pk) FROM t WHERE v LIKE 'q%'"),
+        (Peer::A, "SELECT count(*), sum(pk), sum(length(v)) FROM t"),
+        (Peer::B, "PRAGMA integrity_check"),
+    ]
+}
+
+/// Whether a step's rows are compared with stock's. A checkpoint's row
+/// counts frames, which the two engines lay out differently.
+fn step_is_compared(sql: &str) -> bool {
+    sql.starts_with("SELECT") || sql == "PRAGMA integrity_check"
+}
+
+fn stock_answer(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+    let mut stmt = conn.prepare(sql).expect("stock prepare");
+    let columns = stmt.column_count();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((0..columns)
+                .map(|i| match row.get::<_, rusqlite::types::Value>(i) {
+                    Ok(rusqlite::types::Value::Integer(n)) => n.to_string(),
+                    Ok(rusqlite::types::Value::Text(s)) => s,
+                    Ok(rusqlite::types::Value::Null) => "NULL".to_owned(),
+                    Ok(other) => format!("{other:?}"),
+                    Err(error) => format!("<ERR {error}>"),
+                })
+                .collect())
+        })
+        .expect("stock query");
+    rows.map(|row| row.expect("stock row")).collect()
+}
+
+fn frank_answer(rows: &[fsqlite_core::connection::Row]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|value| match value {
+                    SqliteValue::Integer(n) => n.to_string(),
+                    SqliteValue::Text(s) => s.to_string(),
+                    SqliteValue::Null => "NULL".to_owned(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Rows of the shared-image table: enough 200-byte rows for several table
+/// leaves and index pages.
+const SHARED_IMAGE_ROWS: i64 = 400;
+const SHARED_IMAGE_SCHEMA: [&str; 2] = [
+    "CREATE TABLE t(pk INTEGER PRIMARY KEY, v TEXT, pad TEXT)",
+    "CREATE INDEX t_v ON t(v)",
+];
+
+/// The stock answers of [`shared_page_image_steps`] on a WAL file, optionally
+/// checkpointed (TRUNCATE) after the load.
+fn stock_shared_image_answers(path: &std::path::Path, checkpoint: bool) -> Vec<Vec<Vec<String>>> {
+    let a = rusqlite::Connection::open(path).expect("stock open a");
+    a.execute_batch("PRAGMA journal_mode = WAL;")
+        .expect("stock wal");
+    for statement in SHARED_IMAGE_SCHEMA {
+        a.execute_batch(statement).expect("stock schema");
+    }
+    {
+        let mut insert = a
+            .prepare("INSERT INTO t(pk, v, pad) VALUES (?1, ?2, ?3)")
+            .expect("stock insert");
+        for pk in 1..=SHARED_IMAGE_ROWS {
+            insert
+                .execute(rusqlite::params![pk, format!("x{pk}"), "p".repeat(200)])
+                .expect("stock row");
+        }
+    }
+    if checkpoint {
+        a.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("stock checkpoint");
+    }
+    let b = rusqlite::Connection::open(path).expect("stock open b");
+    shared_page_image_steps()
+        .into_iter()
+        .map(|(peer, sql)| {
+            let conn = match peer {
+                Peer::A => &a,
+                Peer::B => &b,
+            };
+            if step_is_compared(sql) {
+                stock_answer(conn, sql)
+            } else {
+                conn.execute_batch(sql).expect("stock statement");
+                Vec::new()
+            }
+        })
+        .collect()
+}
+
+fn run_shared_page_image_steps(checkpoint: bool) -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let stock = stock_shared_image_answers(&dir.path().join("stock.db"), checkpoint);
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let db_path = dir.path().join("shared-image.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+            let conn_a = open_wal_db(&db_path).await?;
+            for statement in SHARED_IMAGE_SCHEMA {
+                conn_a.execute(statement).await?;
+            }
+            for pk in 1..=SHARED_IMAGE_ROWS {
+                conn_a
+                    .execute_with_params(
+                        "INSERT INTO t(pk, v, pad) VALUES (?1, ?2, ?3)",
+                        &[
+                            SqliteValue::Integer(pk),
+                            SqliteValue::Text(format!("x{pk}").into()),
+                            SqliteValue::Text("p".repeat(200).into()),
+                        ],
+                    )
+                    .await?;
+            }
+            if checkpoint {
+                conn_a.query("PRAGMA wal_checkpoint(TRUNCATE)").await?;
+            }
+            let conn_b = open_wal_db(&db_path).await?;
+            for (step, ((peer, sql), expected)) in shared_page_image_steps()
+                .into_iter()
+                .zip(&stock)
+                .enumerate()
+            {
+                let conn = match peer {
+                    Peer::A => &conn_a,
+                    Peer::B => &conn_b,
+                };
+                let answer = if sql.starts_with("SELECT") || sql.starts_with("PRAGMA") {
+                    let rows = conn.query(sql).await?;
+                    if step_is_compared(sql) {
+                        frank_answer(&rows)
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    conn.execute(sql).await?;
+                    Vec::new()
+                };
+                assert_eq!(
+                    &answer, expected,
+                    "step {step} ({sql}), checkpointed {checkpoint}: fsqlite differs from stock"
+                );
+            }
+            Ok(())
+        }
+        .await;
+    });
+    outcome
+}
+
+#[test]
+fn transactions_keep_the_shared_page_images_they_fetched_from_the_wal() -> TestResult {
+    run_shared_page_image_steps(false)
+}
+
+#[test]
+fn transactions_keep_the_shared_page_images_they_fetched_from_the_main_file() -> TestResult {
+    run_shared_page_image_steps(true)
+}

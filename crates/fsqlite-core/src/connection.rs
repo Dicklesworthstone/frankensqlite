@@ -232126,7 +232126,7 @@ mod autocommit_txn_tests {
             &'a self,
             cx: &'a Cx,
             page_number: u32,
-        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<fsqlite_pager::WalPageImage>> {
             Box::pin(async move { self.inner.read_page_pinned(cx, page_number).await })
         }
 
@@ -232529,7 +232529,7 @@ mod autocommit_txn_tests {
             &'a self,
             cx: &'a Cx,
             page_number: u32,
-        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<fsqlite_pager::WalPageImage>> {
             Box::pin(async move { self.inner.read_page_pinned(cx, page_number).await })
         }
 

@@ -91,5 +91,5 @@ pub use traits::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MemoryMockMvccPager,
     MemoryMockTransaction, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,
     PagerCommitState, ParallelWalCommitReconciliation, TransactionHandle, TransactionKind,
-    TransactionMode, WalBackend, WalPublicationSnapshot,
+    TransactionMode, WalBackend, WalPageImage, WalPublicationSnapshot,
 };

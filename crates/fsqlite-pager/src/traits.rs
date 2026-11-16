@@ -247,6 +247,59 @@ impl WalNativeReadBinding {
 /// instead of writing a rollback journal.
 pub type WalFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+/// A page image a pinned WAL read answers.
+///
+/// It is bytes read for this caller alone, or the immutable image a backend
+/// keeps of a committed frame, which the caller shares instead of copying
+/// (bd-05xlf). `Option<WalPageImage>` is as wide as the `Option<Vec<u8>>` the
+/// pinned reads answered before, so a lookup that finds no frame moves no more
+/// than it did.
+#[derive(Debug, Clone)]
+pub enum WalPageImage {
+    /// Bytes no one else holds.
+    Owned(Vec<u8>),
+    /// A committed frame's image, shared with the backend's frame cache.
+    Shared(Arc<[u8]>),
+}
+
+/// Two images are equal when their bytes are, however each is held.
+impl PartialEq for WalPageImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for WalPageImage {}
+
+impl WalPageImage {
+    /// The page bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+
+    /// The bytes as an owned buffer; a shared image is copied.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes.to_vec(),
+        }
+    }
+
+    /// The image as page data; a shared image stays shared.
+    #[must_use]
+    pub fn into_page_data(self) -> PageData {
+        match self {
+            Self::Owned(bytes) => PageData::from_vec(bytes),
+            Self::Shared(bytes) => PageData::from_shared(bytes),
+        }
+    }
+}
+
 /// Source guard for the conservative tracked-WAL defaults.
 ///
 /// Constructing the guard before the async block is returned is intentional:
@@ -757,12 +810,16 @@ pub trait WalBackend: Send + Sync {
     /// immutable pinned snapshot should override this to avoid contention with
     /// the append path.
     ///
+    /// A backend that keeps committed frames in memory answers such a frame
+    /// with [`WalPageImage::Shared`], so the caller's read cache holds the
+    /// same image instead of a copy (bd-05xlf).
+    ///
     /// # bd-db300.3.8.7: write-lock-scope narrowing
     fn read_page_pinned<'a>(
         &'a self,
         _cx: &'a Cx,
         _page_number: u32,
-    ) -> WalFuture<'a, Option<Vec<u8>>> {
+    ) -> WalFuture<'a, Option<WalPageImage>> {
         Box::pin(async {
             // Default: signal that the implementation doesn't support pinned reads.
             // Callers must fall back to read_page(&mut self) via write lock.
@@ -773,14 +830,18 @@ pub trait WalBackend: Send + Sync {
     }
 
     /// [`Self::read_page_pinned`]'s answer when the pinned snapshot gives it
-    /// without reading the WAL: no frame of `page_number` in the snapshot, or
-    /// the refusal `read_page_pinned` raises before it looks. `None` means a
-    /// frame must be read (or a partial index scanned), so only
-    /// `read_page_pinned` can answer. Synchronous: a page-cache miss on a page
-    /// the WAL does not hold skips the boxed read futures (bd-w4pr1.13.18).
+    /// without reading the WAL: no frame of `page_number` in the snapshot, the
+    /// image of the snapshot's committed frame of it that the backend already
+    /// keeps, or the refusal `read_page_pinned` raises before it looks. `None`
+    /// means a frame must be read (or a partial index scanned), so only
+    /// `read_page_pinned` can answer. Synchronous: a page-cache miss answered
+    /// this way skips the boxed read futures (bd-w4pr1.13.18, bd-05xlf).
     ///
     /// The default answers `None` for every page.
-    fn read_page_pinned_without_io(&self, _page_number: u32) -> Option<Result<Option<Vec<u8>>>> {
+    fn read_page_pinned_without_io(
+        &self,
+        _page_number: u32,
+    ) -> Option<Result<Option<WalPageImage>>> {
         None
     }
 
