@@ -449,6 +449,7 @@ pub(crate) static GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK: LazyLock<Mutex<()>> =
     LazyLock::new(|| Mutex::new(()));
 
 /// Atomic counters tracking parallel WAL group commit activity.
+#[derive(Debug)]
 pub struct GroupCommitMetrics {
     /// Total group commit flushes (each flush = 1 fsync1 + 1 fsync2).
     pub group_commits_total: AtomicU64,

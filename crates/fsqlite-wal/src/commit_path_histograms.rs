@@ -24,7 +24,7 @@ mod tests {
     fn with_global_metrics<T>(body: impl FnOnce() -> T) -> T {
         let _guard = GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK
             .lock()
-            .expect("global consolidation metrics test lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _reset = ResetGlobalMetrics;
         GLOBAL_CONSOLIDATION_METRICS.reset();
         body()

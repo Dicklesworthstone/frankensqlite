@@ -293,16 +293,44 @@ pub struct WalTelemetrySnapshot {
     pub consolidation: crate::group_commit::ConsolidationMetricsSnapshot,
 }
 
+/// The five counter registries a [`WalTelemetrySnapshot`] is read from.
+struct WalTelemetrySources<'a> {
+    wal: &'a crate::metrics::WalMetrics,
+    fec_repair: &'a crate::metrics::WalFecRepairCounters,
+    recovery: &'a crate::metrics::WalRecoveryCounters,
+    group_commit: &'a crate::metrics::GroupCommitMetrics,
+    consolidation: &'a crate::group_commit::ConsolidationMetrics,
+}
+
+impl WalTelemetrySources<'static> {
+    /// The process-global registries.
+    fn global() -> Self {
+        Self {
+            wal: &crate::metrics::GLOBAL_WAL_METRICS,
+            fec_repair: &crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS,
+            recovery: &crate::metrics::GLOBAL_WAL_RECOVERY_METRICS,
+            group_commit: &crate::metrics::GLOBAL_GROUP_COMMIT_METRICS,
+            consolidation: &crate::group_commit::GLOBAL_CONSOLIDATION_METRICS,
+        }
+    }
+}
+
+impl WalTelemetrySources<'_> {
+    fn snapshot(&self) -> WalTelemetrySnapshot {
+        WalTelemetrySnapshot {
+            wal: self.wal.snapshot(),
+            fec_repair: self.fec_repair.snapshot(),
+            recovery: self.recovery.snapshot(),
+            group_commit: self.group_commit.snapshot(),
+            consolidation: self.consolidation.snapshot(),
+        }
+    }
+}
+
 /// Collect a point-in-time snapshot of all global WAL telemetry counters.
 #[must_use]
 pub fn wal_telemetry_snapshot() -> WalTelemetrySnapshot {
-    WalTelemetrySnapshot {
-        wal: crate::metrics::GLOBAL_WAL_METRICS.snapshot(),
-        fec_repair: crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.snapshot(),
-        recovery: crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.snapshot(),
-        group_commit: crate::metrics::GLOBAL_GROUP_COMMIT_METRICS.snapshot(),
-        consolidation: crate::group_commit::GLOBAL_CONSOLIDATION_METRICS.snapshot(),
-    }
+    WalTelemetrySources::global().snapshot()
 }
 
 // ===========================================================================
@@ -666,31 +694,53 @@ mod tests {
 
     // ── Composite snapshot tests ──
 
+    /// bd-alz8f: exact values are asserted on private registries. The globals
+    /// are written without any lock by every WAL, recovery and native page
+    /// store test, so an exact count on them is a race, not a check.
     #[test]
     fn composite_snapshot_captures_all_globals() {
-        let _group_metrics_guard = crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
-            .lock()
-            .expect("global group commit metrics test lock poisoned");
-        let _guard = crate::group_commit::GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK
-            .lock()
-            .expect("global consolidation metrics test lock poisoned");
-        let _reset = ResetTelemetryGlobals;
-        // Reset globals to known state.
-        crate::metrics::GLOBAL_WAL_METRICS.reset();
-        crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.reset();
-        crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.reset();
-        crate::metrics::GLOBAL_GROUP_COMMIT_METRICS.reset();
-        crate::group_commit::GLOBAL_CONSOLIDATION_METRICS.reset();
+        let global = WalTelemetrySources::global();
+        assert!(std::ptr::eq(
+            global.wal,
+            &raw const crate::metrics::GLOBAL_WAL_METRICS
+        ));
+        assert!(std::ptr::eq(
+            global.fec_repair,
+            &raw const crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS
+        ));
+        assert!(std::ptr::eq(
+            global.recovery,
+            &raw const crate::metrics::GLOBAL_WAL_RECOVERY_METRICS
+        ));
+        assert!(std::ptr::eq(
+            global.group_commit,
+            &raw const crate::metrics::GLOBAL_GROUP_COMMIT_METRICS
+        ));
+        let global_consolidation: &crate::group_commit::ConsolidationMetrics =
+            &crate::group_commit::GLOBAL_CONSOLIDATION_METRICS;
+        assert!(std::ptr::eq(global.consolidation, global_consolidation));
+
+        let wal = crate::metrics::WalMetrics::new();
+        let fec_repair = crate::metrics::WalFecRepairCounters::new();
+        let recovery = crate::metrics::WalRecoveryCounters::new();
+        let group_commit = crate::metrics::GroupCommitMetrics::new();
+        let consolidation = crate::group_commit::ConsolidationMetrics::new();
 
         // Record some activity.
-        crate::metrics::GLOBAL_WAL_METRICS.record_frame_write(4096);
-        crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_repair(true, 100);
-        crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.record_recovery(5, 1, 1);
-        crate::metrics::GLOBAL_GROUP_COMMIT_METRICS.record_group_commit(2, 500);
-        crate::group_commit::GLOBAL_CONSOLIDATION_METRICS
-            .record_phase_timing(10, 20, 30, true, 40, 50, 60, 70, 80, 0);
+        wal.record_frame_write(4096);
+        fec_repair.record_repair(true, 100);
+        recovery.record_recovery(5, 1, 1);
+        group_commit.record_group_commit(2, 500);
+        consolidation.record_phase_timing(10, 20, 30, true, 40, 50, 60, 70, 80, 0);
 
-        let snap = wal_telemetry_snapshot();
+        let snap = WalTelemetrySources {
+            wal: &wal,
+            fec_repair: &fec_repair,
+            recovery: &recovery,
+            group_commit: &group_commit,
+            consolidation: &consolidation,
+        }
+        .snapshot();
         assert_eq!(snap.wal.frames_written_total, 1);
         assert_eq!(snap.fec_repair.repairs_succeeded, 1);
         assert_eq!(snap.recovery.recovery_frames_total, 5);
@@ -791,10 +841,10 @@ mod tests {
     fn wal_telemetry_snapshot_debug_and_serialize() {
         let _group_metrics_guard = crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
             .lock()
-            .expect("global group commit metrics test lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = crate::group_commit::GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK
             .lock()
-            .expect("lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _reset = ResetTelemetryGlobals;
         crate::metrics::GLOBAL_WAL_METRICS.reset();
         crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.reset();

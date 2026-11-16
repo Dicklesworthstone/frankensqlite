@@ -35,7 +35,7 @@ use fsqlite_types::{
 };
 use tracing::{debug, info, trace, warn};
 
-use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
+use crate::metrics::{GLOBAL_GROUP_COMMIT_METRICS, GroupCommitMetrics};
 
 // ---------------------------------------------------------------------------
 // §7.11.1 Writer submission request
@@ -303,6 +303,9 @@ pub struct WriteCoordinator {
     shutting_down: bool,
     /// Monotonic epoch counter: incremented once per group commit flush.
     epoch: u64,
+    /// Where this coordinator's group-commit counters go: the process-global
+    /// registry, or a private one for a test that asserts exact counts.
+    metrics: &'static GroupCommitMetrics,
 }
 
 impl WriteCoordinator {
@@ -312,8 +315,27 @@ impl WriteCoordinator {
     /// marker chain, clock, or conflict index. Use [`Self::from_recovered_commits`]
     /// when resuming a native marker stream.
     /// `group_commit_max` is the maximum batch size for group commit.
+    /// Metrics are recorded into [`GLOBAL_GROUP_COMMIT_METRICS`].
     #[must_use]
     pub fn new(mode: OperatingMode, initial_seq: CommitSeq, group_commit_max: usize) -> Self {
+        Self::with_metrics(
+            mode,
+            initial_seq,
+            group_commit_max,
+            &GLOBAL_GROUP_COMMIT_METRICS,
+        )
+    }
+
+    /// [`Self::new`], recording into `metrics` instead of the process-global
+    /// registry. Tests that assert exact counts use a private registry, so
+    /// tests committing concurrently through the global cannot move their
+    /// numbers (bd-alz8f).
+    fn with_metrics(
+        mode: OperatingMode,
+        initial_seq: CommitSeq,
+        group_commit_max: usize,
+        metrics: &'static GroupCommitMetrics,
+    ) -> Self {
         info!(
             mode = %mode,
             initial_seq = initial_seq.get(),
@@ -330,6 +352,7 @@ impl WriteCoordinator {
             batch: GroupCommitBatch::new(group_commit_max),
             shutting_down: false,
             epoch: 0,
+            metrics,
         }
     }
 
@@ -423,7 +446,7 @@ impl WriteCoordinator {
     /// the write-set summary against the commit index.
     pub fn validate(&self, submission: &CommitSubmission) -> Result<(), CommitResult> {
         if self.shutting_down {
-            GLOBAL_GROUP_COMMIT_METRICS.record_shutdown_rejection();
+            self.metrics.record_shutdown_rejection();
             warn!(
                 phase = "validate",
                 "rejecting submission: coordinator shutting down"
@@ -436,7 +459,7 @@ impl WriteCoordinator {
             .commit_index
             .check_conflicts(&submission.write_set_pages, submission.begin_seq);
         if !conflicts.is_empty() {
-            GLOBAL_GROUP_COMMIT_METRICS.record_fcw_conflict();
+            self.metrics.record_fcw_conflict();
             debug!(
                 phase = "validate",
                 begin_seq = submission.begin_seq.get(),
@@ -498,7 +521,7 @@ impl WriteCoordinator {
         now_unix_ns: u64,
         proof_object_id: ObjectId,
     ) -> CommitSeq {
-        GLOBAL_GROUP_COMMIT_METRICS.record_submission();
+        self.metrics.record_submission();
         let new_seq = self.allocated_seq_tip.next();
         let commit_time = now_unix_ns.max(self.last_commit_time_ns.saturating_add(1));
 
@@ -548,7 +571,7 @@ impl WriteCoordinator {
             return 0;
         }
         self.batch.mark_fsync1_complete();
-        GLOBAL_GROUP_COMMIT_METRICS.record_fsync1();
+        self.metrics.record_fsync1();
         debug!(
             target: "fsqlite_wal::native_commit",
             phase = "fsync1",
@@ -598,7 +621,7 @@ impl WriteCoordinator {
         // Step 6: FSYNC_2 on marker stream
         self.batch.mark_fsync2_complete();
         self.commit_seq_tip = last_marker.commit_seq;
-        GLOBAL_GROUP_COMMIT_METRICS.record_fsync2();
+        self.metrics.record_fsync2();
 
         debug!(
             target: "fsqlite_wal::native_commit",
@@ -684,7 +707,8 @@ impl WriteCoordinator {
 
         #[allow(clippy::cast_possible_truncation)]
         let latency_us = start.elapsed().as_micros() as u64;
-        GLOBAL_GROUP_COMMIT_METRICS.record_group_commit(group_size as u64, latency_us);
+        self.metrics
+            .record_group_commit(group_size as u64, latency_us);
 
         info!(
             target: "fsqlite_wal::native_commit",
@@ -781,10 +805,29 @@ mod tests {
         }
     }
 
+    // A failed assertion under the lock poisons it; tolerate that, so one real
+    // failure is reported once instead of failing every later guarded test.
     fn group_commit_metrics_test_guard() -> std::sync::MutexGuard<'static, ()> {
         crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
             .lock()
-            .expect("global group commit metrics test lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A coordinator recording into its own registry. Exact-count assertions
+    /// on it need no lock: tests that commit through the process-global
+    /// registry without the lock (the native page store's durable driver)
+    /// cannot move these counters (bd-alz8f).
+    fn coordinator_with_private_metrics(
+        group_commit_max: usize,
+    ) -> (WriteCoordinator, &'static GroupCommitMetrics) {
+        let metrics: &'static GroupCommitMetrics = Box::leak(Box::new(GroupCommitMetrics::new()));
+        let coord = WriteCoordinator::with_metrics(
+            OperatingMode::Native,
+            CommitSeq::ZERO,
+            group_commit_max,
+            metrics,
+        );
+        (coord, metrics)
     }
 
     // ── bd-15jh test 1: test_compat_mode_wal_format ──
@@ -1212,9 +1255,7 @@ mod tests {
 
     #[test]
     fn test_barrier_retries_are_idempotent() {
-        let _metrics_guard = group_commit_metrics_test_guard();
-        GLOBAL_GROUP_COMMIT_METRICS.reset();
-        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        let (mut coord, metrics) = coordinator_with_private_metrics(16);
         assert_eq!(coord.fsync1(), 0);
         assert!(coord.append_markers_and_fsync2().is_empty());
         coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
@@ -1227,7 +1268,7 @@ mod tests {
         assert_eq!(coord.fsync1(), 0);
         assert!(coord.append_markers_and_fsync2().is_empty());
 
-        let metrics = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        let metrics = metrics.snapshot();
         assert_eq!(metrics.fsync1_total, 1);
         assert_eq!(metrics.fsync2_total, 1);
     }
@@ -1287,9 +1328,7 @@ mod tests {
 
     #[test]
     fn test_repeated_single_commits_do_not_recount_uncollected_results() {
-        let _metrics_guard = group_commit_metrics_test_guard();
-        GLOBAL_GROUP_COMMIT_METRICS.reset();
-        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        let (mut coord, metrics) = coordinator_with_private_metrics(16);
         coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
         for seed in 2_u8..=3 {
             assert!(matches!(
@@ -1312,7 +1351,7 @@ mod tests {
             }]
         );
         assert_eq!(coord.current_epoch(), 2);
-        let metrics = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        let metrics = metrics.snapshot();
         assert_eq!(metrics.group_commits_total, 2);
         assert_eq!(metrics.group_commit_size_sum, 3);
         assert_eq!(metrics.fsync1_total, 2);
@@ -1553,14 +1592,8 @@ mod tests {
     /// Reduction ratio: 2N / 2 = N (for N >= 6, ratio > 5x).
     #[test]
     fn test_fsync_reduction_proof_deterministic() {
-        let _metrics_guard = group_commit_metrics_test_guard();
-        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
-
-        // Reset global metrics for this test.
-        GLOBAL_GROUP_COMMIT_METRICS.reset();
-
         let n = 10_u8; // 10 concurrent writers
-        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 32);
+        let (mut coord, metrics) = coordinator_with_private_metrics(32);
 
         let base_time = 1_700_000_000_000_000_000_u64;
 
@@ -1578,9 +1611,9 @@ mod tests {
         assert_eq!(results.len(), usize::from(n));
 
         // Record the group commit metric
-        GLOBAL_GROUP_COMMIT_METRICS.record_group_commit(u64::from(n), 0);
+        metrics.record_group_commit(u64::from(n), 0);
 
-        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        let snap = metrics.snapshot();
 
         // Verify: N submissions, but only 1 fsync1 + 1 fsync2 = 2 fsyncs total
         assert_eq!(snap.submissions_total, u64::from(n));
@@ -1610,17 +1643,12 @@ mod tests {
     /// Verify metrics are emitted during submit_and_commit convenience path.
     #[test]
     fn test_submit_and_commit_records_metrics() {
-        let _metrics_guard = group_commit_metrics_test_guard();
-        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
-
-        GLOBAL_GROUP_COMMIT_METRICS.reset();
-
-        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        let (mut coord, metrics) = coordinator_with_private_metrics(16);
         let sub = make_submission(&[1], 0, 1);
         let result = coord.submit_and_commit(sub, 1_000_000);
         assert!(matches!(result, CommitResult::Committed { .. }));
 
-        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        let snap = metrics.snapshot();
         assert_eq!(snap.submissions_total, 1);
         assert_eq!(snap.group_commits_total, 1);
         assert_eq!(snap.group_commit_size_sum, 1);
@@ -1631,12 +1659,7 @@ mod tests {
     /// Verify FCW conflict increments the metric counter.
     #[test]
     fn test_fcw_conflict_metric() {
-        let _metrics_guard = group_commit_metrics_test_guard();
-        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
-
-        GLOBAL_GROUP_COMMIT_METRICS.reset();
-
-        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        let (mut coord, metrics) = coordinator_with_private_metrics(16);
 
         // First commit succeeds
         let sub1 = make_submission(&[1], 0, 1);
@@ -1647,26 +1670,21 @@ mod tests {
         let result = coord.submit(sub2, 2_000_000);
         assert!(matches!(result, Err(CommitResult::ConflictFcw { .. })));
 
-        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        let snap = metrics.snapshot();
         assert_eq!(snap.fcw_conflicts_total, 1);
     }
 
     /// Verify shutdown rejection increments the metric counter.
     #[test]
     fn test_shutdown_rejection_metric() {
-        let _metrics_guard = group_commit_metrics_test_guard();
-        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
-
-        GLOBAL_GROUP_COMMIT_METRICS.reset();
-
-        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        let (mut coord, metrics) = coordinator_with_private_metrics(16);
         coord.initiate_shutdown();
 
         let sub = make_submission(&[1], 0, 1);
         let result = coord.submit(sub, 1_000_000);
         assert!(matches!(result, Err(CommitResult::ShuttingDown)));
 
-        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        let snap = metrics.snapshot();
         assert_eq!(snap.shutdown_rejections_total, 1);
     }
 
@@ -1675,12 +1693,7 @@ mod tests {
     /// Verify flush_batch increments epoch and records metrics.
     #[test]
     fn test_flush_batch_epoch_tracking() {
-        let _metrics_guard = group_commit_metrics_test_guard();
-        use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
-
-        GLOBAL_GROUP_COMMIT_METRICS.reset();
-
-        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 32);
+        let (mut coord, metrics) = coordinator_with_private_metrics(32);
         assert_eq!(coord.current_epoch(), 0);
 
         // First batch: 3 commits
@@ -1702,12 +1715,49 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(coord.current_epoch(), 2);
 
-        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        let snap = metrics.snapshot();
         assert_eq!(snap.group_commits_total, 2);
         assert_eq!(snap.group_commit_size_sum, 5); // 3 + 2
         assert_eq!(snap.submissions_total, 5);
         assert_eq!(snap.fsync1_total, 2);
         assert_eq!(snap.fsync2_total, 2);
+    }
+
+    /// bd-alz8f: `new` records into the process-global registry, and a
+    /// private registry diverts every record away from it. Group-commit
+    /// counts are exact under the lock: only the model's flush path records
+    /// them, the durable driver never does (it records submissions, fsyncs
+    /// and conflicts, which unguarded native page store tests write).
+    #[test]
+    fn test_default_coordinator_records_into_the_global_registry() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        assert!(std::ptr::eq(
+            coord.metrics,
+            &raw const GLOBAL_GROUP_COMMIT_METRICS
+        ));
+
+        GLOBAL_GROUP_COMMIT_METRICS.reset();
+        for i in 0..3u8 {
+            let sub = make_submission(&[u32::from(i) + 1], 0, i);
+            coord.submit(sub, 1_000 + u64::from(i)).unwrap();
+        }
+        assert_eq!(coord.flush_batch().len(), 3);
+        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        assert_eq!(snap.group_commits_total, 1);
+        assert_eq!(snap.group_commit_size_sum, 3);
+
+        let (mut private, metrics) = coordinator_with_private_metrics(16);
+        assert!(!std::ptr::eq(
+            private.metrics,
+            &raw const GLOBAL_GROUP_COMMIT_METRICS
+        ));
+        let result = private.submit_and_commit(make_submission(&[1], 0, 1), 1_000);
+        assert!(matches!(result, CommitResult::Committed { .. }));
+        assert_eq!(metrics.snapshot().group_commits_total, 1);
+        let snap = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        assert_eq!(snap.group_commits_total, 1);
+        assert_eq!(snap.group_commit_size_sum, 3);
     }
 
     /// flush_batch on empty batch is a no-op.

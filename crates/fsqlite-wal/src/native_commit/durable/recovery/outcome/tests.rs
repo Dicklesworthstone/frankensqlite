@@ -193,7 +193,7 @@ type Replay = NativeCoordinatorRecovery<File, File, Codec>;
 fn run(future: impl Future<Output = ()>) {
     let _guard = crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
         .lock()
-        .unwrap();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     RuntimeBuilder::current_thread()
         .blocking_threads(1, 2)
         .build()

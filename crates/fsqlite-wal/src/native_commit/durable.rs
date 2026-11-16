@@ -25,7 +25,6 @@ use fsqlite_types::{
 use fsqlite_vfs::{VfsFile, VfsWriteCompletion};
 
 use super::{CommitResult, CommitSubmission, FsyncBarriers, WriteCoordinator};
-use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 use crate::native_durability::{
     NativeDurabilityLimits, NativeDurabilityLog, NativeDurabilityReceipt, NativeDurabilityRecovery,
     RecoveredNativeLog,
@@ -561,7 +560,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
                 .copied()
                 .collect();
             if !conflicts.is_empty() {
-                GLOBAL_GROUP_COMMIT_METRICS.record_fcw_conflict();
+                self.coordinator.metrics.record_fcw_conflict();
                 return Err(DurableCommitError::Rejected(CommitResult::ConflictFcw {
                     conflicting_pages: conflicts,
                 }));
@@ -803,8 +802,8 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
         self.proofs.clear();
         self.proof_bytes = 0;
         self.recovery_required = false;
-        GLOBAL_GROUP_COMMIT_METRICS.record_fsync1();
-        GLOBAL_GROUP_COMMIT_METRICS.record_fsync2();
+        self.coordinator.metrics.record_fsync1();
+        self.coordinator.metrics.record_fsync2();
         Ok(Some(receipt))
     }
 
@@ -995,7 +994,7 @@ mod group_admission_tests {
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     fn assert_unreserved(driver: &Driver) {
         assert_eq!(driver.pending_count(), 0);
