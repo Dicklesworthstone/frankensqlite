@@ -41179,8 +41179,8 @@ fn conjunct_pins_prefix_or_range(
 /// next column has a range; the prefix and range bounds must be seek-safe (same affinity/collation
 /// gate as the single-column range seek). Declines WITHOUT ROWID (PK-suffix probe not handled here).
 ///
-/// Every index this admits enforces the whole WHERE (see the residual guard), so all of them
-/// visit the same entries. With `covers`, a qualifying index that fails it is only the fallback
+/// Every index this admits enforces the whole WHERE and contains every matching row.
+/// With `covers`, a qualifying index that fails it is only the fallback
 /// while a later qualifying index that passes it is looked for: one that holds every column the
 /// caller reads looks no row up, as stock's cost model prefers (bd-w4pr1.13.18, read/seek round 3).
 /// Without it the first qualifying index in declaration order is chosen.
@@ -41283,6 +41283,12 @@ fn composite_index_prefix_range_target<'a>(
         if !all_conjuncts
             .iter()
             .all(|term| conjunct_pins_prefix_or_range(term, index, range_pos, table, table_alias))
+            || !index_partial_predicate_is_covered_by_query_conjuncts(
+                index,
+                &all_conjuncts,
+                table,
+                table_alias,
+            )
         {
             continue;
         }

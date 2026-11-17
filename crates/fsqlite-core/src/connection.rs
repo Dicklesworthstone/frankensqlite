@@ -104255,6 +104255,7 @@ impl Connection {
                     }
                     None => None,
                 };
+                let full_scan = point_rows.is_none();
                 let mut row_data = if let Some(result) = point_rows {
                     result?
                 } else if let Some(row_data) = self.try_scan_join_source_from_memdb(src) {
@@ -104308,12 +104309,13 @@ impl Connection {
                         .map(bounded_sqlite_value_bytes)
                         .sum::<usize>();
                 }
-                // Only clone into the cache when the same table might appear
-                // again (self-join, CTE).  Check remaining sources for a match.
-                let might_reuse = table_sources[i + 1..]
-                    .iter()
-                    .any(|later| later.scan_cache_key.eq(&src.scan_cache_key));
-                if might_reuse {
+                // A later alias of the same table needs every row. A rowid
+                // seek for the primary alias cannot seed its scan cache.
+                if full_scan
+                    && table_sources[i + 1..]
+                        .iter()
+                        .any(|later| later.scan_cache_key.eq(&src.scan_cache_key))
+                {
                     scanned_cache.insert(src.scan_cache_key.clone(), row_data.clone());
                 }
                 table_rows.push(maybe_filter_primary_join_rows(
