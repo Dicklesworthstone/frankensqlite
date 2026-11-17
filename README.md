@@ -3171,12 +3171,13 @@ still serves as an authoritative reference.
   a fresh database with explicit `INSERT` column lists. Compare the values
   before switching readers. The 0.4.x shell's `.dump` emits generated values
   that SQLite rejects on import.
-- **External-content FTS5 has a residual projection gap.** The
-  content-table-rename lifecycle defect
-  ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)) is
-  fixed — the connection stays usable and renaming back recovers — but
-  external-content column projection can still return NULL even with the
-  content table present (tracked as bd-c6jre).
+- **FTS5 can return NULL for missing external content.** A MATCH query
+  can still return NULL for projected document columns when a matching
+  content row is missing or its source table has been renamed. Stock
+  SQLite reports an error in those cases. Simple single-table MATCH queries
+  that only select hit rowids or count them can read the index alone, even
+  when the content schema is missing a document column. The remaining
+  projection behavior is tracked in bd-c6jre. [GH#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)
 - **The workspace is developed on a pinned nightly.** `rust-toolchain.toml`
   names the dated nightly the whole workspace (tests, benches, optional
   features such as `nightly-simd`) is built with. The published library crates

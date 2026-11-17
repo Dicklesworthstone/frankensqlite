@@ -199,10 +199,31 @@ const CASES: &[(&str, &[&str], &[&str])] = &[
         "content_column_missing",
         &[
             "CREATE TABLE d(id INTEGER PRIMARY KEY, title TEXT)",
-            "INSERT INTO d VALUES (1, 'one')",
+            "INSERT INTO d VALUES (1, 'one'), (2, 'two')",
             "CREATE VIRTUAL TABLE ft USING fts5(title, body, content='d', content_rowid='id')",
+            "INSERT INTO ft(rowid, title, body) VALUES
+                (1, 'one', 'beta'), (2, 'two', 'beta'), (3, 'other', 'delta')",
         ],
-        &["SELECT * FROM ft", "INSERT INTO ft(ft) VALUES ('rebuild')"],
+        &[
+            "SELECT rowid FROM ft WHERE ft MATCH 'beta' ORDER BY rowid DESC",
+            "SELECT f._rowid_ FROM ft AS f WHERE ft MATCH 'beta' ORDER BY f._rowid_",
+            "SELECT rowid FROM ft WHERE ft MATCH 'beta' ORDER BY rowid DESC LIMIT 1",
+            "SELECT count(*) FROM ft WHERE ft MATCH 'beta'",
+            "SELECT rowid, title FROM ft WHERE ft MATCH 'beta'",
+            "SELECT rowid FROM ft WHERE ft MATCH 'beta' ORDER BY body",
+            "SELECT * FROM ft",
+            "INSERT INTO ft(ft) VALUES ('rebuild')",
+        ],
+    ),
+    (
+        "declared_rowid_alias",
+        &[
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, _rowid_ TEXT, body TEXT)",
+            "INSERT INTO d VALUES (1, 'marker-one', 'alpha beta'), (2, 'marker-two', 'gamma beta')",
+            "CREATE VIRTUAL TABLE ft USING fts5(_rowid_ UNINDEXED, body, content='d', content_rowid='id')",
+            "INSERT INTO ft(ft) VALUES ('rebuild')",
+        ],
+        &["SELECT _rowid_, rowid FROM ft WHERE ft MATCH 'beta' ORDER BY rowid"],
     ),
 ];
 

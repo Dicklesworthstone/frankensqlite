@@ -23576,6 +23576,7 @@ impl Connection {
         &self,
         src: &JoinTableSource,
         plan: &LiveVtabScanPlan,
+        #[cfg(feature = "ext-fts5")] select: &SelectStatement,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         #[cfg(feature = "ext-fts5")]
         let key = src.table_name.to_ascii_uppercase();
@@ -23617,7 +23618,7 @@ impl Connection {
             if let Some(is_lazy) = lazy_fts5 {
                 if let Some(content) = self.fts5_external_content(&src.table_name) {
                     return self
-                        .scan_external_content_fts5_rows(src, plan, is_lazy, &content)
+                        .scan_external_content_fts5_rows(src, plan, is_lazy, &content, select)
                         .await;
                 }
                 if is_lazy {
@@ -24752,6 +24753,7 @@ impl Connection {
         plan: &LiveVtabScanPlan,
         is_lazy: bool,
         content: &Fts5ExternalContent,
+        select: &SelectStatement,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let rows = match plan.idx_num {
             0 => {
@@ -24786,10 +24788,11 @@ impl Connection {
                         .map(|(rowid, _)| rowid)
                         .collect()
                 };
-                // Stock reads a hit's content row only when a column of it is
-                // read, so a MATCH that projects only rowids still works once
-                // the content table is renamed or dropped (GH#211).
-                let mut found = if self.fts5_content_source_exists(content) {
+                // A MATCH whose residual, projection and sort need only
+                // postings can answer even if the content table lacks a column.
+                let needs_content =
+                    plan.residual_where.is_some() || !fts5_match_reads_only_postings(select, src);
+                let mut found = if needs_content && self.fts5_content_source_exists(content) {
                     self.fts5_external_content_rows(content, &rowids).await?
                 } else {
                     HashMap::new()
@@ -104229,7 +104232,15 @@ impl Connection {
                 )?);
             } else {
                 if let Some(plan) = live_vtab_scan_plans[i].as_ref() {
-                    let row_data = lean_future(|| self.scan_live_vtab_rows(src, plan)).await?;
+                    let row_data = lean_future(|| {
+                        self.scan_live_vtab_rows(
+                            src,
+                            plan,
+                            #[cfg(feature = "ext-fts5")]
+                            select,
+                        )
+                    })
+                    .await?;
                     scanned_cache.insert(src.scan_cache_key.clone(), row_data.clone());
                     table_rows.push(maybe_filter_primary_join_rows(
                         row_data,
@@ -164211,6 +164222,50 @@ struct LiveVtabScanPlan {
     idx_str: Option<String>,
     args: Vec<SqliteValue>,
     residual_where: Option<Expr>,
+}
+
+/// A single-source MATCH can project and sort literal values and the hidden
+/// rowid from its postings. Declared columns can shadow a rowid alias.
+/// Auxiliary functions and rank may need to read document content.
+#[cfg(feature = "ext-fts5")]
+fn fts5_match_reads_only_postings(select: &SelectStatement, source: &JoinTableSource) -> bool {
+    let SelectCore::Select {
+        columns,
+        from: Some(from),
+        group_by,
+        having,
+        windows,
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    if !from.joins.is_empty()
+        || !select.body.compounds.is_empty()
+        || !group_by.is_empty()
+        || having.is_some()
+        || !windows.is_empty()
+    {
+        return false;
+    }
+    let reads_only_postings = |expr: &Expr| match expr {
+        Expr::Literal(..) => true,
+        Expr::Column(column, _) => {
+            source.hidden_rowid_projection.is_some()
+                && is_hidden_rowid_alias_name(&column.column)
+                && !source
+                    .col_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&column.column))
+        }
+        _ => false,
+    };
+    columns.iter().all(|column| {
+        matches!(column, ResultColumn::Expr { expr, .. } if reads_only_postings(expr))
+    }) && select
+        .order_by
+        .iter()
+        .all(|term| reads_only_postings(&term.expr))
 }
 
 #[cfg(feature = "ext-rtree")]
