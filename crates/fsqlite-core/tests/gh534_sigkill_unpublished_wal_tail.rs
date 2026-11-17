@@ -11,6 +11,10 @@
 //!   post-crash files), and `PRAGMA integrity_check` is `ok`;
 //! - a crash at any step of a commit leaves the commit either wholly present
 //!   or wholly absent, the same way stock reads it;
+//! - a writer killed within its first commits after a checkpointing close,
+//!   with a second database open beside it in both processes, leaves a state
+//!   the next opener commits on at once (the shape of the downstream repro,
+//!   `kill_during_commit_recovers`);
 //! - a connection that stayed open in another process across the crash still
 //!   commits, retrying at most a transaction refused with `BusySnapshot`;
 //! - a writer that is alive between its WAL sync and its publication is never
@@ -182,6 +186,58 @@ fn sigkill_during_a_commit_loop_never_blocks_the_next_commit() {
             let stock_rows = stock_count_of_copy(&db, &dir.path().join("stock"));
             assert!(stock_rows >= 1);
             assert_next_writer_commits_on_top(&db, stock_rows, &format!("trial {trial}")).await;
+        }
+    });
+}
+
+/// Two fresh WAL databases, `a.db` and `b.db`, each holding `items(1)` and each
+/// closed WITH its checkpoint, so the next writer's first commit starts a new
+/// WAL. Returns `(a, b)`.
+async fn create_pair_checkpointed(dir: &Path) -> (PathBuf, PathBuf) {
+    let mut made = Vec::new();
+    for name in ["a.db", "b.db"] {
+        let db = dir.join(name);
+        let conn = open(&db).await;
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create");
+        conn.execute("INSERT INTO items VALUES (1)")
+            .await
+            .expect("seed");
+        conn.close().await.expect("close with checkpoint");
+        made.push(db);
+    }
+    let b = made.pop().expect("b.db");
+    let a = made.pop().expect("a.db");
+    (a, b)
+}
+
+/// The downstream repro of GH#534: a writer holding two databases open commits
+/// single rows to the second; it is killed a few milliseconds into its first
+/// commits; the reopening process opens both databases again and commits.
+/// Recovery must complete within [`PROMPT`], on top of exactly the rows stock
+/// reads from a copy of the post-crash files, with `integrity_check` ok. Unlike
+/// the loop above, the databases were closed with a checkpoint (so the kill can
+/// land while the writer starts a new WAL) and a second database is open in both
+/// processes.
+#[test]
+fn kill_during_commit_recovers() {
+    let trials: u64 = std::env::var("GH534_TRIALS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    asupersync::test_utils::run_test(|| async move {
+        for trial in 0..trials {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (peer, db) = create_pair_checkpointed(dir.path()).await;
+            let mut writer = ChildProcess::spawn("writer_beside_peer", &db, &[]);
+            writer.witness("committing");
+            std::thread::sleep(Duration::from_millis(1 + trial % 8));
+            writer.sigkill();
+            let stock_rows = stock_count_of_copy(&db, &dir.path().join("stock"));
+            assert!(stock_rows >= 1, "trial {trial}: stock reads {stock_rows} rows");
+            let _peer = open(&peer).await;
+            assert_next_writer_commits_on_top(&db, stock_rows, &format!("pair trial {trial}")).await;
         }
     });
 }
@@ -406,6 +462,20 @@ fn gh534_child_process() {
                 }
                 witness("done", &(last - 1).to_string());
                 expect_line("exit");
+            }
+            // The downstream repro's writer: a second database open beside the
+            // one it commits single rows to, until it is killed.
+            "writer_beside_peer" => {
+                let _peer = open(&db.with_file_name("a.db")).await;
+                let conn = open(&db).await;
+                witness("committing", "");
+                for id in 2..=i64::MAX {
+                    conn.execute("BEGIN").await.expect("begin");
+                    conn.execute(&format!("INSERT INTO items VALUES ({id})"))
+                        .await
+                        .expect("insert");
+                    conn.execute("COMMIT").await.expect("commit");
+                }
             }
             "survivor" => {
                 let conn = open(&db).await;
