@@ -5,7 +5,7 @@
 //! row of the right table (NULL-extending unmatched left columns); FULL OUTER
 //! JOIN keeps matched rows plus left-only and right-only rows; the `USING` form
 //! coalesces the join column across both sides. Each scenario asserts
-//! per-statement agreement with rusqlite (bundled SQLite ~3.46), then compares
+//! per-statement agreement with rusqlite (bundled SQLite 3.54.1), then compares
 //! query results; row order is pinned with COALESCE-based ORDER BY so NULL
 //! placement is deterministic.
 
@@ -308,12 +308,13 @@ fn chained_using_coalesce_takes_first_table_collation_and_affinity() {
     });
 }
 
-// Stock `selectExpander`: in `tbl.*` (and `*`), a column of a table left of the
-// last RIGHT/FULL JOIN whose name a later join uses in USING expands to the
-// coalesced value; `tbl.col` written out stays raw. Without a RIGHT/FULL join
-// every column stays raw, even when two left tables share the USING name.
+// Stock 3.54.1 `selectExpander`: in a bare `*`, a column of a table left of
+// the last RIGHT/FULL JOIN whose name a later join uses in USING expands to
+// the coalesced value (`outer_join_star_emits_coalesced_using_column`); a
+// `tbl.*` keeps every column qualified, i.e. the table's own raw value, as
+// `tbl.col` written out does. (3.46 coalesced in `tbl.*` too; bd-4qvcr.)
 #[test]
-fn table_star_coalesces_using_columns_left_of_outer_join() {
+fn table_star_keeps_raw_using_columns_beside_outer_join() {
     asupersync::test_utils::run_test(|| async {
         let mut stmts = ABC.to_vec();
         stmts.extend([
@@ -416,5 +417,76 @@ fn outer_join_where_outer_col_is_null() {
             "outer_join_where_outer_col_is_null",
         )
         .await;
+    });
+}
+
+// bd-4qvcr: `tbl.*` over LEFT / RIGHT / FULL JOIN with USING or NATURAL, alone
+// and chained with a later ON join, gives each table's own raw columns, as
+// stock 3.54.1 does, on `:memory:` and on a file; `a.*` beside a chained ON
+// join that names `a.id` is not ambiguous. Negative: the bare `*` and the
+// unqualified USING column still coalesce (the right row's key for RIGHT JOIN,
+// COALESCE of both sides for FULL JOIN), so a fix that stops coalescing
+// everywhere fails, and so does one that leaves `tbl.*` coalesced.
+#[test]
+fn table_star_and_using_columns_match_stock_on_memory_and_file() {
+    asupersync::test_utils::run_test(|| async {
+        let queries = [
+            "SELECT a.*, b.* FROM a FULL JOIN b USING(id) ORDER BY 1, 2, 3, 4",
+            "SELECT a.*, b.* FROM a RIGHT JOIN b USING(id) ORDER BY 1, 2, 3, 4",
+            "SELECT a.*, b.* FROM a LEFT JOIN b USING(id) ORDER BY 1, 2, 3, 4",
+            "SELECT a.* FROM a NATURAL FULL JOIN b ORDER BY 1, 2",
+            "SELECT b.* FROM a NATURAL RIGHT JOIN b ORDER BY 1, 2",
+            "SELECT a.*, id FROM a RIGHT JOIN b USING(id) ORDER BY 1, 2, 3",
+            "SELECT a.* FROM a JOIN b USING(id) FULL JOIN c ON a.id = c.id ORDER BY 1, 2",
+            "SELECT a.*, c.* FROM a JOIN b USING(id) FULL JOIN c ON a.id = c.id \
+             ORDER BY 1, 2, 3, 4",
+            "SELECT a.*, b.*, c.* FROM a FULL JOIN b USING(id) FULL JOIN c USING(id) \
+             ORDER BY 1, 2, 3, 4, 5, 6",
+            "SELECT a.*, b.* FROM a LEFT JOIN b USING(id) RIGHT JOIN c USING(id) \
+             ORDER BY 1, 2, 3, 4",
+            "SELECT b.*, d.* FROM a FULL JOIN b USING(id) LEFT JOIN d ON d.k = b.id \
+             ORDER BY 1, 2, 3, 4",
+            "SELECT * FROM a FULL JOIN b USING(id) ORDER BY 1, 2, 3",
+            "SELECT *, a.* FROM a RIGHT JOIN b USING(id) ORDER BY 1, 2, 3, 4, 5",
+            "SELECT id, a.id, b.id FROM a FULL JOIN b USING(id) ORDER BY 1, 2, 3",
+            "SELECT id FROM a NATURAL FULL JOIN b ORDER BY 1",
+        ];
+        // b's right-only row: the unqualified `id` coalesces to b's 3, while
+        // `a.*` keeps a's own NULL.
+        let pinned = [
+            (
+                "SELECT id, a.id, b.id FROM a FULL JOIN b USING(id) WHERE b.y = 'b3'",
+                vec![vec!["3".to_owned(), "NULL".to_owned(), "3".to_owned()]],
+            ),
+            (
+                "SELECT a.* FROM a FULL JOIN b USING(id) WHERE b.y = 'b3'",
+                vec![vec!["NULL".to_owned(), "NULL".to_owned()]],
+            ),
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("subject.db");
+        for path in [":memory:", file_path.to_str().expect("utf-8 path")] {
+            let f = Connection::open(path).await.expect("open frank");
+            let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+            for s in ABC.iter().chain(&[
+                "CREATE TABLE d (k INTEGER, w TEXT)",
+                "INSERT INTO d VALUES (3,'d3')",
+            ]) {
+                f.execute(s).await.expect("frank setup");
+                r.execute_batch(s).expect("rusqlite setup");
+            }
+            for q in queries {
+                assert_eq!(frank_rows(&f, q).await, sqlite_rows(&r, q), "{path}: {q}");
+            }
+            for (q, expected) in &pinned {
+                assert_eq!(sqlite_rows(&r, q).as_ref(), Ok(expected), "stock: {q}");
+                assert_eq!(
+                    frank_rows(&f, q).await.as_ref(),
+                    Ok(expected),
+                    "{path}: {q}"
+                );
+            }
+            f.close().await.expect("close frank");
+        }
     });
 }

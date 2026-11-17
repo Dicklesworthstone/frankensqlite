@@ -56018,24 +56018,15 @@ impl Connection {
         }
     }
 
+    /// `tbl.*` over a join: a qualified reference to each of the table's
+    /// visible columns. A USING column stays the table's own raw value, never
+    /// the coalesced one, as stock 3.54.1 expands a star with a table name
+    /// (bd-4qvcr).
     fn expand_table_star_result_columns_from_col_map(
         &self,
         sources: &[&TableOrSubquery],
         col_map: &[(String, String, bool)],
         qualifier: &QualifiedName,
-    ) -> Vec<ResultColumn> {
-        self.expand_join_table_star_result_columns(sources, col_map, qualifier, &HashSet::new())
-    }
-
-    /// `tbl.*` over a join: qualified column references, except that a column
-    /// in `coalesced` (see `collect_join_coalesced_star_indices`) expands to
-    /// its bare name, which reads the join's coalesced USING value.
-    fn expand_join_table_star_result_columns(
-        &self,
-        sources: &[&TableOrSubquery],
-        col_map: &[(String, String, bool)],
-        qualifier: &QualifiedName,
-        coalesced: &HashSet<usize>,
     ) -> Vec<ResultColumn> {
         let matching_labels: Vec<String> = sources
             .iter()
@@ -56048,23 +56039,18 @@ impl Connection {
 
         col_map
             .iter()
-            .enumerate()
-            .filter(|(_, (table, _, hidden))| {
+            .filter(|(table, _, hidden)| {
                 !*hidden
                     && matching_labels
                         .iter()
                         .any(|label| label.eq_ignore_ascii_case(table))
             })
-            .map(|(index, (table, column, _))| {
-                let column_ref = if coalesced.contains(&index) {
-                    ColumnRef::bare(column.clone())
-                } else {
-                    ColumnRef::qualified(table.clone(), column.clone())
-                };
-                ResultColumn::Expr {
-                    expr: Expr::Column(column_ref, Span::new(0, 0)),
-                    alias: None,
-                }
+            .map(|(table, column, _)| ResultColumn::Expr {
+                expr: Expr::Column(
+                    ColumnRef::qualified(table.clone(), column.clone()),
+                    Span::new(0, 0),
+                ),
+                alias: None,
             })
             .collect()
     }
@@ -104638,9 +104624,12 @@ impl Connection {
         // sort_rows_by_order_terms can resolve integer positions and column
         // name lookups against the actual projected columns.
         //
-        // A column in `coalesced_star_indices` expands to its bare name, so it
-        // reads the coalesced USING value (see `join_star_column_value`), and,
-        // as in stock, that name must not be ambiguous among the sources.
+        // In a bare `*`, a column in `coalesced_star_indices` expands to its
+        // bare name, so it reads the coalesced USING value (see
+        // `join_star_column_value`), and, as in stock, that name must not be
+        // ambiguous among the sources. A `tbl.*` keeps every column qualified
+        // and raw: stock 3.54.1's selectExpander writes the bare name only when
+        // the star has no table name (bd-4qvcr).
         let mut expanded_columns: Vec<ResultColumn> = Vec::with_capacity(columns.len());
         for col in columns {
             let expanded = match col {
@@ -104661,11 +104650,10 @@ impl Connection {
                     })
                     .collect::<Vec<_>>(),
                 ResultColumn::TableStar(tbl_name) => self
-                    .expand_join_table_star_result_columns(
+                    .expand_table_star_result_columns_from_col_map(
                         &all_sources,
                         &col_map,
                         tbl_name,
-                        &coalesced_star_indices,
                     ),
                 other @ ResultColumn::Expr { .. } => {
                     expanded_columns.push(other.clone());
@@ -104829,20 +104817,14 @@ impl Connection {
                             }
                         }
                     }
+                    // `tbl.*` reads each column raw, never the coalesced USING
+                    // value (bd-4qvcr; see the expansion above).
                     ResultColumn::TableStar(table_name) => {
                         let mut offset = 0;
                         for (source, src) in all_sources.iter().zip(&table_sources) {
                             if source_matches_name(source, table_name) {
-                                let visible = offset..offset + src.col_names.len();
-                                for (v, i) in row[visible.clone()].iter().zip(visible) {
-                                    values.push(join_star_column_value(
-                                        row,
-                                        i,
-                                        v,
-                                        &col_map,
-                                        &coalesced_star_indices,
-                                    ));
-                                }
+                                values
+                                    .extend_from_slice(&row[offset..offset + src.col_names.len()]);
                             }
                             offset += src.scan_width();
                         }
@@ -163893,10 +163875,11 @@ fn collect_join_using_skip_indices(
     using_skip_indices
 }
 
-/// Stock `selectExpander`: in `*` and `tbl.*`, a column of a source to the
-/// left of the last RIGHT or FULL JOIN whose name a later join matches by
-/// USING or NATURAL expands to the bare name, i.e. the join's coalesced value,
-/// instead of the source's own column. Returns those combined-row indices.
+/// Stock `selectExpander`: in a bare `*`, a column of a source to the left of
+/// the last RIGHT or FULL JOIN whose name a later join matches by USING or
+/// NATURAL expands to the bare name, i.e. the join's coalesced value, instead
+/// of the source's own column. Returns those combined-row indices. (A `tbl.*`
+/// keeps the source's own column in 3.54.1, bd-4qvcr.)
 fn collect_join_coalesced_star_indices(
     table_sources: &[JoinTableSource],
     joins: &[JoinClause],
@@ -164419,7 +164402,7 @@ impl JoinUsingProjection {
     }
 }
 
-/// The value a join's `*` or `tbl.*` emits for the column at `index`: for a
+/// The value a join's bare `*` emits for the column at `index`: for a
 /// column in `coalesced` (see `collect_join_coalesced_star_indices`), the
 /// join's coalesced USING value (the right row's for RIGHT JOIN,
 /// coalesce(left, right) for FULL JOIN); otherwise the raw value.
