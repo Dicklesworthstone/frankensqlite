@@ -3162,6 +3162,15 @@ still serves as an authoritative reference.
   together, and close all old-engine processes before starting new ones. The
   reverse guard will ship with the next cross-process contract change, as a
   one-way namespace-record upgrade.
+- **Export affected 0.4.x generated-column tables before upgrading.** The old
+  row format reserved a slot for each `VIRTUAL` generated column. A 0.5.0
+  reader follows SQLite's layout and can return shifted values for columns
+  that follow a virtual column in an old file, even when
+  `PRAGMA integrity_check` returns `ok`. Use the original writer release
+  on a preserved copy to read the writable columns, then restore them into
+  a fresh database with explicit `INSERT` column lists. Compare the values
+  before switching readers. The 0.4.x shell's `.dump` emits generated values
+  that SQLite rejects on import.
 - **External-content FTS5 has a residual projection gap.** The
   content-table-rename lifecycle defect
   ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)) is

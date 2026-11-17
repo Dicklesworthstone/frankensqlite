@@ -2791,18 +2791,25 @@ where
     }
 
     for row in &table_rows {
-        let Some(SqliteValue::Text(table_name)) = row.get(0) else {
+        let (Some(SqliteValue::Text(table_name)), Some(SqliteValue::Text(create_sql))) =
+            (row.get(0), row.get(1))
+        else {
             continue;
         };
         let quoted_table = quote_identifier(table_name);
+        let writable_columns = dump_generated_table_columns(create_sql);
+        let projection = writable_columns.as_deref().unwrap_or("*");
+        let insert_columns = writable_columns
+            .as_ref()
+            .map_or_else(String::new, |columns| format!(" ({columns})"));
         let rows = connection
-            .query(&format!("SELECT * FROM {quoted_table};"))
+            .query(&format!("SELECT {projection} FROM {quoted_table};"))
             .await
             .map_err(|error| error.to_string())?;
         for row in rows {
             writeln!(
                 out,
-                "INSERT INTO {quoted_table} VALUES({});",
+                "INSERT INTO {quoted_table}{insert_columns} VALUES({});",
                 row.values()
                     .iter()
                     .map(sql_literal)
@@ -2834,6 +2841,36 @@ where
 
     write_sql_statement(out, "COMMIT;", colorize_sql).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// VIRTUAL and STORED generated values are both recomputed by INSERT.
+/// Return an explicit projection only for tables with generated columns.
+fn dump_generated_table_columns(create_sql: &str) -> Option<String> {
+    use fsqlite_ast::{ColumnConstraintKind, CreateTableBody, Statement};
+
+    let (Statement::CreateTable(table), _) = Parser::from_sql(create_sql)
+        .parse_next_statement_with_tail()
+        .ok()??
+    else {
+        return None;
+    };
+    let CreateTableBody::Columns { mut columns, .. } = table.body else {
+        return None;
+    };
+    let total = columns.len();
+    columns.retain(|column| {
+        !column
+            .constraints
+            .iter()
+            .any(|constraint| matches!(constraint.kind, ColumnConstraintKind::Generated { .. }))
+    });
+    (columns.len() != total).then(|| {
+        columns
+            .iter()
+            .map(|column| quote_identifier(&column.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 async fn write_sqlite_sequence_dump<W>(
@@ -5627,6 +5664,71 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
             assert!(
                 stdout.contains("COMMIT;"),
                 "expected transaction trailer in dump, got: {stdout}",
+            );
+        });
+    }
+
+    #[test]
+    fn test_dump_generated_columns_restore_in_stock_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("generated.db");
+            {
+                let stock = rusqlite::Connection::open(&path).expect("create stock file");
+                stock
+                    .execute_batch(
+                        r#"CREATE TABLE "g data"(
+                            id INTEGER PRIMARY KEY, raw INTEGER,
+                            twice INTEGER AS (raw * 2) VIRTUAL, "select" TEXT,
+                            plus INTEGER AS (raw + 1) STORED, "a""b" INTEGER
+                        );
+                        INSERT INTO "g data"(id, raw, "select", "a""b")
+                        VALUES (1, 7, 'keep''quoted', 29);"#,
+                    )
+                    .expect("populate generated columns");
+            }
+            let args = vec![
+                OsString::from("fsqlite"),
+                path.into_os_string(),
+                ".dump".into(),
+            ];
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let status = run(args, &mut Cursor::new(Vec::new()), &mut out, &mut err).await;
+            assert_eq!(status, 0, "{}", String::from_utf8_lossy(&err));
+            let dump = String::from_utf8(out).expect("dump SQL");
+            assert!(
+                dump.contains(r#"INSERT INTO "g data" ("id", "raw", "select", "a""b") VALUES"#),
+                "{dump}"
+            );
+            let restored = rusqlite::Connection::open_in_memory().expect("restore destination");
+            restored.execute_batch(&dump).expect("stock restores dump");
+            let row: (i64, i64, i64, String, i64, i64) = restored
+                .query_row(
+                    r#"SELECT id, raw, twice, "select", plus, "a""b" FROM "g data""#,
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .expect("restored row");
+            assert_eq!(
+                row,
+                (
+                    1_i64,
+                    7_i64,
+                    14_i64,
+                    "keep'quoted".to_owned(),
+                    8_i64,
+                    29_i64
+                )
             );
         });
     }
