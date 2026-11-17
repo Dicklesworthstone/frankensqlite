@@ -106829,6 +106829,9 @@ impl Connection {
                 };
                 if let Some(directive) = directive {
                     let mut directive_seek_key_columns = None;
+                    // bd-r39kx: facts of the verified index seek's program.
+                    let mut directive_seek_covering = false;
+                    let mut directive_seek_sorts = false;
                     let verified = match directive.access_kind {
                         PlannerSelectAccessKind::FullTableScan => {
                             // bd-2fong red 3 (bd-jyyae family): a FullTableScan
@@ -106866,6 +106869,24 @@ impl Connection {
                                 ) {
                                     return vec![to_row(2, 0, 0, detail)];
                                 }
+                                // bd-r39kx: a rowid range the program seeks.
+                                if crate::explain::program_seeks_rowid_range_on_table(
+                                    &program,
+                                    &directive.table_name,
+                                ) && let Some(detail) =
+                                    rowid_range_eqp_detail(select, &self.schema.borrow())
+                                {
+                                    let mut rows = vec![to_row(2, 0, 0, detail)];
+                                    if program_sorts_for_order_by(select, &program) {
+                                        rows.push(to_row(
+                                            3,
+                                            0,
+                                            0,
+                                            "USE TEMP B-TREE FOR ORDER BY".to_owned(),
+                                        ));
+                                    }
+                                    return rows;
+                                }
                             }
                             true
                         }
@@ -106893,6 +106914,16 @@ impl Connection {
                                         crate::explain::program_index_seek_key_width(
                                             &program, index_name,
                                         );
+                                    directive_seek_covering =
+                                        crate::explain::program_index_seek_facts(&program)
+                                            .is_some_and(|seek| {
+                                                seek.covering
+                                                    && seek
+                                                        .index_name
+                                                        .eq_ignore_ascii_case(index_name)
+                                            });
+                                    directive_seek_sorts =
+                                        program_sorts_for_order_by(select, &program);
                                     true
                                 }
                                 _ => false,
@@ -106900,27 +106931,69 @@ impl Connection {
                         }
                     };
                     if verified {
-                        let detail = if matches!(
-                            directive.access_kind,
-                            PlannerSelectAccessKind::IndexEquality
-                        ) && !directive.index_key_is_expression
-                            && let Some(key_terms) =
+                        let schema = self.schema.borrow();
+                        let source = single_table_select_source(select, &schema);
+                        // bd-r39kx: stock names the source by its alias; an
+                        // index seek that never looks the row up is COVERING
+                        // (a rowid table's lookup is IdxRowid + SeekRowid, which
+                        // a WITHOUT ROWID lookup lacks, so it keeps the
+                        // planner's flag); a range prints its bounds.
+                        let displayed = source
+                            .and_then(|(_, alias, _)| alias)
+                            .unwrap_or(directive.table_name.as_str());
+                        let covering = directive.covering
+                            || (directive_seek_covering
+                                && source.is_some_and(|(table, _, _)| !table.without_rowid));
+                        let key_terms = match directive.access_kind {
+                            _ if directive.index_key_is_expression => None,
+                            // A one-column key prints `({label}=?)`, as
+                            // `explain_query_plan_detail_from_directive` does.
+                            PlannerSelectAccessKind::IndexEquality => {
                                 directive_index_equality_key_terms(
                                     select,
                                     &directive,
                                     directive_seek_key_columns,
-                                    &self.schema.borrow(),
-                                ) {
-                            format!(
-                                "SEARCH {} USING {}INDEX {} ({key_terms})",
-                                directive.table_name,
-                                if directive.covering { "COVERING " } else { "" },
-                                directive.index_name.as_deref().unwrap_or("(unknown)"),
-                            )
-                        } else {
-                            explain_query_plan_detail_from_directive(&directive)
+                                    &schema,
+                                )
+                                .or_else(|| {
+                                    directive
+                                        .index_key_label
+                                        .as_deref()
+                                        .map(|label| format!("{label}=?"))
+                                })
+                            }
+                            PlannerSelectAccessKind::IndexRange => source
+                                .zip(directive.index_key_label.as_deref())
+                                .and_then(|((table, alias, where_clause), key_column)| {
+                                    index_seek_eqp_range_key_terms(
+                                        where_clause,
+                                        &table.name,
+                                        alias,
+                                        key_column,
+                                    )
+                                }),
+                            PlannerSelectAccessKind::FullTableScan
+                            | PlannerSelectAccessKind::RowidLookup => None,
                         };
-                        return vec![to_row(2, 0, 0, detail)];
+                        let detail = match (directive.access_kind, key_terms) {
+                            (_, Some(key_terms)) => format!(
+                                "SEARCH {displayed} USING {}INDEX {} ({key_terms})",
+                                if covering { "COVERING " } else { "" },
+                                directive.index_name.as_deref().unwrap_or("(unknown)"),
+                            ),
+                            (PlannerSelectAccessKind::FullTableScan, None) => {
+                                format!("SCAN {displayed}")
+                            }
+                            (PlannerSelectAccessKind::RowidLookup, None) => {
+                                format!("SEARCH {displayed} USING INTEGER PRIMARY KEY (rowid=?)")
+                            }
+                            _ => explain_query_plan_detail_from_directive(&directive),
+                        };
+                        let mut rows = vec![to_row(2, 0, 0, detail)];
+                        if directive_seek_sorts {
+                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
+                        }
+                        return rows;
                     }
                 }
 
@@ -106966,7 +107039,17 @@ impl Connection {
                             &self.schema.borrow(),
                         )
                     {
-                        return vec![to_row(2, 0, 0, detail)];
+                        let mut rows = vec![to_row(2, 0, 0, detail)];
+                        // bd-r39kx: the ORDER BY's sorter. An IN list's probe
+                        // set has a sorter of its own, and an aggregate's is
+                        // its grouping's, so those keep the single row.
+                        if !aggregate
+                            && program_sorts_for_order_by(select, &program)
+                            && !select_contains_expr_leaf(select, ExprLeaf::InPredicate)
+                        {
+                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
+                        }
+                        return rows;
                     }
 
                     // GH #415: a rowid membership / equality seek under ORDER BY
@@ -106994,6 +107077,21 @@ impl Connection {
                             .iter()
                             .any(|row| row.detail == "USE TEMP B-TREE FOR ORDER BY")
                         {
+                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
+                        }
+                        return rows;
+                    }
+
+                    // bd-r39kx: a rowid range the program seeks, as the
+                    // directive-verified path reports it.
+                    if simple_top_level_select
+                        && let Some(table_name) =
+                            single_table_source_name_from_core(&select.body.select)
+                        && crate::explain::program_seeks_rowid_range_on_table(&program, table_name)
+                        && let Some(detail) = rowid_range_eqp_detail(select, &self.schema.borrow())
+                    {
+                        let mut rows = vec![to_row(2, 0, 0, detail)];
+                        if program_sorts_for_order_by(select, &program) {
                             rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
                         }
                         return rows;
@@ -123830,6 +123928,8 @@ fn select_contains_bound_outer_value(select: &SelectStatement) -> bool {
 enum ExprLeaf {
     Placeholder,
     BoundOuterValue,
+    /// An `IN` / `NOT IN` predicate of any kind.
+    InPredicate,
 }
 
 fn select_contains_expr_leaf(select: &SelectStatement, leaf: ExprLeaf) -> bool {
@@ -123916,7 +124016,8 @@ fn select_contains_expr_leaf(select: &SelectStatement, leaf: ExprLeaf) -> bool {
             Expr::In {
                 expr: inner, set, ..
             } => {
-                expr(inner, leaf)
+                leaf == ExprLeaf::InPredicate
+                    || expr(inner, leaf)
                     || match set {
                         InSet::List(values) => values.iter().any(|e| expr(e, leaf)),
                         InSet::Subquery(query) => select_contains_expr_leaf(query, leaf),
@@ -147052,6 +147153,97 @@ fn index_seek_eqp_range_key_terms(
         (false, true) => Some(format!("{key_column}<?")),
         (false, false) => None,
     }
+}
+
+/// bd-r39kx: `SEARCH t USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)` for a
+/// plain single-table SELECT whose WHERE bounds the rowid, in stock's words:
+/// `rowid>?` for a lower bound (`>`, `>=`, BETWEEN), `rowid<?` for an upper
+/// one; other conjuncts are the residual stock does not name. The caller has
+/// read off the program that it seeks the table by a rowid range. `None` for a
+/// WITHOUT ROWID table, a GROUP BY or DISTINCT (whose temp b-tree this does not
+/// report), or a WHERE that bounds no rowid.
+fn rowid_range_eqp_detail(select: &SelectStatement, schema: &[TableSchema]) -> Option<String> {
+    let SelectCore::Select {
+        group_by, distinct, ..
+    } = &select.body.select
+    else {
+        return None;
+    };
+    if !group_by.is_empty() || matches!(distinct, fsqlite_ast::Distinctness::Distinct) {
+        return None;
+    }
+    let (table, alias, where_clause) = single_table_select_source(select, schema)?;
+    if table.without_rowid {
+        return None;
+    }
+    let displayed = alias.unwrap_or(&table.name);
+    let names_rowid = |expr: &Expr| {
+        let Expr::Column(column, _) = expr else {
+            return false;
+        };
+        let name = &column.column;
+        column
+            .table
+            .as_deref()
+            .is_none_or(|qualifier| qualifier.eq_ignore_ascii_case(displayed))
+            && (table
+                .columns
+                .iter()
+                .any(|candidate| candidate.is_ipk && candidate.name.eq_ignore_ascii_case(name))
+                || (["rowid", "_rowid_", "oid"]
+                    .iter()
+                    .any(|alias_name| alias_name.eq_ignore_ascii_case(name))
+                    && !table
+                        .columns
+                        .iter()
+                        .any(|candidate| candidate.name.eq_ignore_ascii_case(name))))
+    };
+    let (mut lower, mut upper) = (false, false);
+    for term in decompose_where(where_clause?) {
+        match term {
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                let bounds_below = match op {
+                    BinaryOp::Gt | BinaryOp::Ge => true,
+                    BinaryOp::Lt | BinaryOp::Le => false,
+                    _ => continue,
+                };
+                if names_rowid(left) {
+                    lower |= bounds_below;
+                    upper |= !bounds_below;
+                } else if names_rowid(right) {
+                    lower |= !bounds_below;
+                    upper |= bounds_below;
+                }
+            }
+            Expr::Between {
+                expr, not: false, ..
+            } if names_rowid(expr) => {
+                lower = true;
+                upper = true;
+            }
+            _ => {}
+        }
+    }
+    let terms = match (lower, upper) {
+        (true, true) => "rowid>? AND rowid<?",
+        (true, false) => "rowid>?",
+        (false, true) => "rowid<?",
+        (false, false) => return None,
+    };
+    Some(format!(
+        "SEARCH {displayed} USING INTEGER PRIMARY KEY ({terms})"
+    ))
+}
+
+/// bd-r39kx: whether the program sorts for the SELECT's ORDER BY, which stock
+/// reports as its own `USE TEMP B-TREE FOR ORDER BY` row.
+fn program_sorts_for_order_by(select: &SelectStatement, program: &VdbeProgram) -> bool {
+    !select.order_by.is_empty()
+        && crate::explain::explain_query_plan(program)
+            .iter()
+            .any(|row| row.detail == "USE TEMP B-TREE FOR ORDER BY")
 }
 
 /// The single table a plain top-level SELECT reads, with its alias and WHERE.

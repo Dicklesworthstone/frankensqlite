@@ -449,6 +449,48 @@ pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> 
     })
 }
 
+/// True when the program seeks a rowid range on `table_name` (bd-r39kx).
+///
+/// A cursor opened on the table is positioned with a range seek
+/// (`SeekGE`/`SeekGT`/`SeekLE`/`SeekLT` on the table b-tree), and no index is
+/// positioned, walked or read: stock reports that as `SEARCH t USING INTEGER
+/// PRIMARY KEY (rowid>? ...)`.
+#[must_use]
+pub fn program_seeks_rowid_range_on_table(program: &VdbeProgram, table_name: &str) -> bool {
+    let ops = program.ops();
+    let mut table_cursors: HashSet<i32> = HashSet::new();
+    let mut index_cursors: HashSet<i32> = HashSet::new();
+    for op in ops {
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            match &op.p4 {
+                P4::Table(name) if name == table_name => {
+                    table_cursors.insert(op.p1);
+                }
+                P4::Index(_) => {
+                    index_cursors.insert(op.p1);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut range_seek = false;
+    for op in ops {
+        let positions = matches!(
+            op.opcode,
+            Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+        );
+        let walks_or_reads = matches!(
+            op.opcode,
+            Opcode::Rewind | Opcode::Last | Opcode::Next | Opcode::Prev | Opcode::IdxRowid
+        );
+        if (positions || walks_or_reads) && index_cursors.contains(&op.p1) {
+            return false;
+        }
+        range_seek |= positions && table_cursors.contains(&op.p1);
+    }
+    range_seek
+}
+
 /// True when the program's ONLY way onto `table_name` is by rowid (GH #415).
 ///
 /// Every access to a cursor opened on the table must be a rowid probe
