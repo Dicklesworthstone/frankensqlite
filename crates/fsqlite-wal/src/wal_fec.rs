@@ -2521,10 +2521,86 @@ fn wal_fec_generation_matches(wal_path: &Path, expected: WalHeader) -> Result<bo
         Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(err) => return Err(err.into()),
     }
+    wal_fec_header_bytes_match(&bytes, expected)
+}
+
+fn wal_fec_header_bytes_match(
+    bytes: &[u8; crate::WAL_HEADER_SIZE],
+    expected: WalHeader,
+) -> Result<bool> {
     Ok(
-        WalHeader::from_bytes(&bytes).is_ok_and(|header| header == expected)
-            && validate_wal_header_checksum(&bytes, expected.big_endian_checksum())?,
+        WalHeader::from_bytes(bytes).is_ok_and(|header| header == expected)
+            && validate_wal_header_checksum(bytes, expected.big_endian_checksum())?,
     )
+}
+
+/// The `-wal` as one committed range's job reads it: one descriptor for the
+/// job's three generation checks and its frame read (bd-w4pr1.7 lever 4b).
+///
+/// Each check keeps the meaning of [`wal_fec_generation_matches`]: the PATH
+/// still names a WAL whose header is this generation's. The descriptor is
+/// opened by path once; a later check requires the path to name the
+/// descriptor's (device, inode) and reads the header through it, which is the
+/// header a fresh open would read. A missing path or another inode is a
+/// mismatch. The frames are read through the same descriptor, so they come
+/// from the inode whose header was just checked. Without a file identity
+/// (non-Unix) every check reopens by path, as before.
+struct WalFecSourceWal {
+    file: fs::File,
+    identity: Option<(u64, u64)>,
+}
+
+impl WalFecSourceWal {
+    /// Open `wal_path` and check its header against `expected`. `None` is a
+    /// generation mismatch (missing path, short file, other header).
+    fn open_if_generation_matches(wal_path: &Path, expected: WalHeader) -> Result<Option<Self>> {
+        let file = match fs::File::open(wal_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let identity = wal_fec_sidecar_identity(&file.metadata()?);
+        let source = Self { file, identity };
+        Ok(source.header_matches(expected)?.then_some(source))
+    }
+
+    /// Whether `wal_path` still names this generation's WAL.
+    fn generation_matches(&self, wal_path: &Path, expected: WalHeader) -> Result<bool> {
+        let Some(identity) = self.identity else {
+            return wal_fec_generation_matches(wal_path, expected);
+        };
+        let metadata = match fs::metadata(wal_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        if wal_fec_sidecar_identity(&metadata) != Some(identity) {
+            return Ok(false);
+        }
+        self.header_matches(expected)
+    }
+
+    fn header_matches(&self, expected: WalHeader) -> Result<bool> {
+        let mut bytes = [0_u8; crate::WAL_HEADER_SIZE];
+        match self.read_exact_at(&mut bytes, 0) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(err) => return Err(err.into()),
+        }
+        wal_fec_header_bytes_match(&bytes, expected)
+    }
+
+    #[cfg(unix)]
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(&self.file, buf, offset)
+    }
+
+    #[cfg(not(unix))]
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
+    }
 }
 
 /// Read only the admitted interval, validating the rolling checksum against
@@ -2549,12 +2625,13 @@ fn process_committed_wal_range(
             detail: "invalid durable WAL-FEC interval".to_owned(),
         });
     }
-    if cancel_flag.load(Ordering::Acquire)
-        || cx.checkpoint().is_err()
-        || !wal_fec_generation_matches(&range.wal_path, range.header)?
-    {
+    if cancel_flag.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         return Ok(WalFecWorkOutcome::Canceled);
     }
+    let Some(source) = WalFecSourceWal::open_if_generation_matches(&range.wal_path, range.header)?
+    else {
+        return Ok(WalFecWorkOutcome::Canceled);
+    };
     // Admission is nonblocking and precedes encoding. Busy retries release the
     // caller's blocking-pool thread and wait in the async worker instead.
     let _sidecar_guard = try_lock_wal_fec_sidecar(&wal_fec_path_for_wal(&range.wal_path))?;
@@ -2562,7 +2639,7 @@ fn process_committed_wal_range(
     // while we hold it; its pending cleanup will retire this range's groups. If
     // cleanup already finished, this check refuses the late job before any
     // sidecar I/O.
-    if !wal_fec_generation_matches(&range.wal_path, range.header)? {
+    if !source.generation_matches(&range.wal_path, range.header)? {
         return Ok(WalFecWorkOutcome::Canceled);
     }
     // Taken, not borrowed: any early return (error, cancellation) leaves the
@@ -2572,12 +2649,11 @@ fn process_committed_wal_range(
     let page_size =
         usize::try_from(range.header.page_size).map_err(|_| FrankenError::DatabaseFull)?;
     let frame_size = crate::WAL_FRAME_HEADER_SIZE + page_size;
-    let offset = u64::from(range.start_frame_no - 1)
-        .checked_mul(u64::try_from(frame_size).map_err(|_| FrankenError::DatabaseFull)?)
+    let frame_bytes = u64::try_from(frame_size).map_err(|_| FrankenError::DatabaseFull)?;
+    let mut offset = u64::from(range.start_frame_no - 1)
+        .checked_mul(frame_bytes)
         .and_then(|bytes| bytes.checked_add(32))
         .ok_or(FrankenError::DatabaseFull)?;
-    let mut file = fs::File::open(&range.wal_path)?;
-    file.seek(SeekFrom::Start(offset))?;
     let mut frame = vec![0_u8; frame_size];
     let mut previous = range.previous_checksum;
     let mut pages = Vec::new();
@@ -2587,7 +2663,10 @@ fn process_committed_wal_range(
         if cancel_flag.load(Ordering::Acquire) || cx.checkpoint().is_err() {
             return Ok(WalFecWorkOutcome::Canceled);
         }
-        file.read_exact(&mut frame)?;
+        source.read_exact_at(&mut frame, offset)?;
+        offset = offset
+            .checked_add(frame_bytes)
+            .ok_or(FrankenError::DatabaseFull)?;
         let header = WalFrameHeader::from_bytes(&frame)?;
         let checksum = compute_wal_frame_checksum(
             &frame,
@@ -2675,7 +2754,7 @@ fn process_committed_wal_range(
                 return Ok(WalFecWorkOutcome::Canceled);
             };
             let group = WalFecGroupRecord::new(meta, symbols)?;
-            if !wal_fec_generation_matches(&range.wal_path, range.header)?
+            if !source.generation_matches(&range.wal_path, range.header)?
                 || cancel_flag.load(Ordering::Acquire)
                 || cx.checkpoint().is_err()
             {
@@ -2756,6 +2835,11 @@ fn reclaim_retired_fec_on_open(
 /// through a rename, and every mutation holds the sidecar guard, so the same
 /// inode with a longer length means records were only appended. The appended
 /// suffix is scanned; anything else reloads the whole file.
+///
+/// The append descriptor of the last range that appended is kept with the
+/// map (bd-w4pr1.7 lever 4b) and reused only through
+/// [`CommittedRangeSidecar::extend_cached`], whose identity check under the
+/// guard proves the path still names its inode; a reload drops it.
 #[derive(Debug)]
 struct CommittedRangeSidecarCache {
     path: PathBuf,
@@ -2765,9 +2849,12 @@ struct CommittedRangeSidecarCache {
     present: HashMap<WalFecGroupId, WalFecGroupMeta>,
     /// Ranges whose appended records are not yet fsynced.
     unsynced_ranges: u32,
+    /// An append descriptor of the file `identity` names.
+    output: Option<fs::File>,
 }
 
-/// `(device, inode)` of the sidecar. Without one (non-Unix) nothing is reused.
+/// `(device, inode)` of a file (the sidecar, or the `-wal` a job reads).
+/// Without one (non-Unix) nothing is reused.
 #[cfg_attr(unix, allow(clippy::unnecessary_wraps))] // `None` off Unix.
 fn wal_fec_sidecar_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
     #[cfg(unix)]
@@ -2798,10 +2885,16 @@ struct CommittedRangeSidecar {
     /// Whether the sidecar did not exist or was empty (the first sync also
     /// syncs the parent directory).
     created: bool,
-    /// Append handle holding this range's records; [`Self::finish_range`]
-    /// closes it. An unsynced tail lost to a crash is a truncated suffix,
-    /// which the next catch-up replaces.
+    /// Append handle holding this range's records, carried from the cache or
+    /// opened by the first append. An unsynced tail lost to a crash is a
+    /// truncated suffix, which the next catch-up replaces.
     output: Option<fs::File>,
+    /// Bytes this range appended.
+    appended: u64,
+    /// When the map came from the cache: the file's identity and length as
+    /// read under the guard at load. With the guard held, the length after
+    /// this range is that length plus `appended`.
+    loaded: Option<((u64, u64), u64)>,
     /// Earlier ranges whose records are not yet fsynced.
     unsynced_ranges: u32,
 }
@@ -2866,7 +2959,10 @@ impl CommittedRangeSidecar {
             salts: cached.salts,
             present,
             created: len == 0,
-            output: None,
+            // Same inode as the path, checked above under the guard.
+            output: cached.output,
+            appended: 0,
+            loaded: Some((cached.identity, len)),
             unsynced_ranges: cached.unsynced_ranges,
         }))
     }
@@ -2909,6 +3005,8 @@ impl CommittedRangeSidecar {
                 .collect(),
             created: bytes.is_empty(),
             output: None,
+            appended: 0,
+            loaded: None,
             unsynced_ranges: 0,
         })
     }
@@ -2916,23 +3014,50 @@ impl CommittedRangeSidecar {
     /// The group map to carry to the next range, taken after
     /// [`Self::finish_range`] while the caller still holds the sidecar guard,
     /// so the recorded length is exactly the records this map describes.
+    ///
+    /// A map that came from the cache keeps its append descriptor, and its
+    /// length is the one read at load plus this range's appends: nothing else
+    /// writes the file while the guard is held. After a full load (which may
+    /// have replaced the file) the identity and length are read from the path,
+    /// and the descriptor is kept only if it is that file's.
     fn into_cache(self) -> Result<Option<CommittedRangeSidecarCache>> {
-        debug_assert!(self.output.is_none(), "into_cache follows finish_range");
+        if let Some((identity, len)) = self.loaded {
+            let len = len
+                .checked_add(self.appended)
+                .ok_or(FrankenError::DatabaseFull)?;
+            return Ok(Some(CommittedRangeSidecarCache {
+                path: self.path,
+                salts: self.salts,
+                identity,
+                len,
+                present: self.present,
+                unsynced_ranges: self.unsynced_ranges,
+                output: self.output,
+            }));
+        }
         let metadata = match fs::metadata(&self.path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        Ok(
-            wal_fec_sidecar_identity(&metadata).map(|identity| CommittedRangeSidecarCache {
-                path: self.path,
-                salts: self.salts,
-                identity,
-                len: metadata.len(),
-                present: self.present,
-                unsynced_ranges: self.unsynced_ranges,
-            }),
-        )
+        let Some(identity) = wal_fec_sidecar_identity(&metadata) else {
+            return Ok(None);
+        };
+        let output = match self.output {
+            Some(output) if wal_fec_sidecar_identity(&output.metadata()?) == Some(identity) => {
+                Some(output)
+            }
+            _ => None,
+        };
+        Ok(Some(CommittedRangeSidecarCache {
+            path: self.path,
+            salts: self.salts,
+            identity,
+            len: metadata.len(),
+            present: self.present,
+            unsynced_ranges: self.unsynced_ranges,
+            output,
+        }))
     }
 
     /// Whether an identical group is already durable. A group with the same
@@ -2964,16 +3089,23 @@ impl CommittedRangeSidecar {
                     use std::os::unix::fs::OpenOptionsExt;
                     options.mode(0o600);
                 }
+                #[cfg(test)]
+                tests::SIDECAR_APPEND_OPENS.with(|opens| opens.set(opens.get() + 1));
                 output.insert(options.open(&self.path)?)
             }
         };
         output.write_all(&record)?;
+        self.appended = self
+            .appended
+            .checked_add(u64::try_from(record.len()).map_err(|_| FrankenError::DatabaseFull)?)
+            .ok_or(FrankenError::DatabaseFull)?;
         self.present
             .insert(group.meta.group_id(), group.meta.clone());
         Ok(())
     }
 
-    /// Close this range's appends, fsyncing them only periodically.
+    /// End this range's appends, fsyncing them only periodically. The append
+    /// descriptor stays open for [`Self::into_cache`].
     ///
     /// The sidecar is auxiliary to the WAL, which the commit already made
     /// durable. A crash that loses unsynced records leaves a truncated suffix,
@@ -2984,7 +3116,10 @@ impl CommittedRangeSidecar {
     /// exits ([`sync_wal_fec_sidecar_at_exit`]), not once per commit: that
     /// doubled the fsyncs of every `synchronous=FULL` commit (bd-wqmil).
     fn finish_range(&mut self) -> Result<()> {
-        let Some(output) = self.output.take() else {
+        if self.appended == 0 {
+            return Ok(());
+        }
+        let Some(output) = self.output.as_ref() else {
             return Ok(());
         };
         self.unsynced_ranges = self.unsynced_ranges.saturating_add(1);
@@ -4803,6 +4938,10 @@ mod tests {
         /// Whole-sidecar loads by committed-range processing on this thread.
         pub(super) static FULL_SIDECAR_LOADS: std::cell::Cell<usize> =
             const { std::cell::Cell::new(0) };
+        /// Sidecar append descriptors opened by committed-range processing on
+        /// this thread.
+        pub(super) static SIDECAR_APPEND_OPENS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
     }
 
     fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -6616,6 +6755,230 @@ mod tests {
         process(&range, &cache);
         assert!(loads() - before <= 1);
         assert_eq!(groups(), 24);
+    }
+
+    /// bd-w4pr1.7 lever 4b: the worker keeps one sidecar append descriptor
+    /// between ranges, and only while the path still names its inode. A
+    /// sidecar replaced by rename gets a new descriptor; the replaced inode
+    /// gets no record.
+    #[cfg(all(unix, feature = "native"))]
+    #[test]
+    fn test_committed_ranges_keep_one_sidecar_append_descriptor() {
+        use crate::test_support::FutureResultTestExt as _;
+        use crate::wal::WalFile;
+        use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+        use fsqlite_vfs::traits::Vfs as _;
+
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("keep.db-wal");
+        let sidecar_path = wal_fec_path_for_wal(&wal_path);
+        let cx = Cx::default();
+        let vfs = fsqlite_vfs::UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), flags).expect("open WAL");
+        let salts = WalSalts {
+            salt1: 0x4B45_4550,
+            salt2: 0x0D15_C0DE,
+        };
+        let mut wal = WalFile::create(&cx, file, 4096, 0, salts).expect("create WAL");
+        let commit = |wal: &mut WalFile<_>, page: u32| {
+            let previous_checksum = wal.running_checksum();
+            let data = vec![u8::try_from(page % 251).unwrap(); 4096];
+            wal.append_frame(&cx, page, &data, page)
+                .expect("append commit frame");
+            wal.sync(&cx, SyncFlags::NORMAL).expect("sync WAL");
+            WalFecCommittedRange {
+                wal_path: wal_path.clone(),
+                header: *wal.header(),
+                start_frame_no: page,
+                end_frame_no: page,
+                previous_checksum,
+                end_checksum: wal.running_checksum(),
+                repair_symbols: 2,
+            }
+        };
+        let diagnostics = WalFecRepairDiagnostics {
+            pipeline_id: 0,
+            queue_capacity: 1,
+            rejected_admissions: AtomicUsize::new(0),
+            processed_groups: AtomicUsize::new(0),
+        };
+        let cancel = AtomicBool::new(false);
+        let process = |range: &WalFecCommittedRange,
+                       cache: &Mutex<Option<CommittedRangeSidecarCache>>| {
+            let outcome = process_committed_wal_range(
+                range,
+                &cx,
+                &cancel,
+                Duration::ZERO,
+                &diagnostics,
+                cache,
+            )
+            .expect("process committed range");
+            assert_eq!(outcome, WalFecWorkOutcome::Completed);
+        };
+        let opens = || SIDECAR_APPEND_OPENS.with(std::cell::Cell::get);
+        let groups = || {
+            scan_wal_fec(&sidecar_path)
+                .expect("scan sidecar")
+                .groups
+                .len()
+        };
+        let cached_len = |cache: &Mutex<Option<CommittedRangeSidecarCache>>| {
+            lock_unpoisoned(cache).as_ref().map(|cached| cached.len)
+        };
+
+        // Twelve ranges through one worker: one append descriptor, and the
+        // cache's length is the file's.
+        let cache = Mutex::new(None);
+        let before = opens();
+        for page in 1..=12 {
+            let range = commit(&mut wal, page);
+            process(&range, &cache);
+        }
+        assert_eq!(
+            opens() - before,
+            1,
+            "one append descriptor for twelve ranges"
+        );
+        assert_eq!(groups(), 12);
+        assert_eq!(
+            cached_len(&cache),
+            Some(fs::metadata(&sidecar_path).unwrap().len()),
+            "the cached length is the file's"
+        );
+
+        // A range whose group is already durable appends nothing and keeps
+        // the descriptor and the length.
+        let range = commit(&mut wal, 13);
+        process(&range, &Mutex::new(None));
+        let before = opens();
+        process(&range, &cache);
+        assert_eq!(opens() - before, 0);
+        assert_eq!(groups(), 13);
+        assert_eq!(
+            cached_len(&cache),
+            Some(fs::metadata(&sidecar_path).unwrap().len())
+        );
+
+        // Replace the sidecar by rename, as retirement, tail repair and header
+        // migration do. The next range must append to the new inode through a
+        // new descriptor; the replaced inode keeps exactly its old bytes.
+        let replaced = fs::File::open(&sidecar_path).expect("hold the replaced inode");
+        let replaced_len = replaced.metadata().unwrap().len();
+        let bytes = fs::read(&sidecar_path).unwrap();
+        let permissions = fs::metadata(&sidecar_path).unwrap().permissions();
+        replace_wal_fec_sidecar(&sidecar_path, permissions, |output| {
+            output.write_all(&bytes)?;
+            Ok(())
+        })
+        .unwrap();
+        let before = opens();
+        let range = commit(&mut wal, 14);
+        process(&range, &cache);
+        assert_eq!(
+            opens() - before,
+            1,
+            "a replaced sidecar gets a new descriptor"
+        );
+        assert_eq!(groups(), 14, "the record is in the file the path names");
+        assert_eq!(
+            replaced.metadata().unwrap().len(),
+            replaced_len,
+            "the replaced inode got no record"
+        );
+        let before = opens();
+        let range = commit(&mut wal, 15);
+        process(&range, &cache);
+        assert_eq!(opens() - before, 0, "the new descriptor is kept");
+        assert_eq!(groups(), 15);
+        assert_eq!(
+            cached_len(&cache),
+            Some(fs::metadata(&sidecar_path).unwrap().len())
+        );
+    }
+
+    /// bd-w4pr1.7 lever 4b: one `-wal` descriptor per job, whose generation
+    /// checks keep the open-by-path meaning: the path must still name the
+    /// descriptor's inode, and that inode's header must be the generation's.
+    #[cfg(all(unix, feature = "native"))]
+    #[test]
+    fn test_wal_fec_source_wal_checks_follow_the_path() {
+        use crate::test_support::FutureResultTestExt as _;
+        use crate::wal::WalFile;
+        use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+        use fsqlite_vfs::traits::Vfs as _;
+
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("source.db-wal");
+        let cx = Cx::default();
+        let vfs = fsqlite_vfs::UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), flags).expect("open WAL");
+        let salts = WalSalts {
+            salt1: 0x5052_4345,
+            salt2: 0x0000_0042,
+        };
+        let mut wal = WalFile::create(&cx, file, 4096, 0, salts).expect("create WAL");
+        wal.append_frame(&cx, 1, &[7_u8; 4096], 1)
+            .expect("append frame");
+        wal.sync(&cx, SyncFlags::NORMAL).expect("sync WAL");
+        let header = *wal.header();
+
+        let source = WalFecSourceWal::open_if_generation_matches(&wal_path, header)
+            .expect("open source")
+            .expect("generation matches");
+        assert!(source.generation_matches(&wal_path, header).unwrap());
+        let mut frame = vec![0_u8; crate::WAL_FRAME_HEADER_SIZE + 4096];
+        source.read_exact_at(&mut frame, 32).expect("read frame 1");
+        assert_eq!(WalFrameHeader::from_bytes(&frame).unwrap().page_number, 1);
+        assert!(
+            frame[crate::WAL_FRAME_HEADER_SIZE..]
+                .iter()
+                .all(|&b| b == 7)
+        );
+
+        // Another generation's header is refused at open.
+        let mut other = header;
+        other.salts.salt2 ^= 1;
+        assert!(
+            WalFecSourceWal::open_if_generation_matches(&wal_path, other)
+                .unwrap()
+                .is_none()
+        );
+
+        // The path renamed to another inode with byte-identical contents: the
+        // descriptor's own header still matches, but the path no longer names
+        // it, so the check refuses as reopening by path would not.
+        let copy = dir.path().join("source.db-wal.copy");
+        fs::copy(&wal_path, &copy).unwrap();
+        fs::rename(&copy, &wal_path).unwrap();
+        assert!(
+            wal_fec_generation_matches(&wal_path, header).unwrap(),
+            "the new inode has the same header bytes"
+        );
+        assert!(
+            !source.generation_matches(&wal_path, header).unwrap(),
+            "another inode at the path is a mismatch"
+        );
+        let fresh = WalFecSourceWal::open_if_generation_matches(&wal_path, header)
+            .unwrap()
+            .expect("the new inode matches when opened by path");
+
+        // An in-place header rewrite (a reset) is seen through the descriptor.
+        let mut bytes = fs::read(&wal_path).unwrap();
+        bytes[16] ^= 0xFF;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap()
+            .write_all(&bytes[..crate::WAL_HEADER_SIZE])
+            .unwrap();
+        assert!(!fresh.generation_matches(&wal_path, header).unwrap());
+
+        // A missing path is a mismatch, not an error.
+        fs::remove_file(&wal_path).unwrap();
+        assert!(!fresh.generation_matches(&wal_path, header).unwrap());
     }
 
     /// A WAL-FEC group is one commit, and RaptorQ cannot encode a source
