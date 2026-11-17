@@ -5954,6 +5954,19 @@ impl IndexEqRowidBounds {
     }
 }
 
+/// Whether a seek into `index` may follow its one key value with the rowid
+/// floor (`i64::MIN`, or `i64::MAX` walking down). Only a rowid table's
+/// one-key index qualifies: its entries are `(key, rowid)`, the rowid an
+/// ascending integer. A WITHOUT ROWID entry ends in its PRIMARY KEY columns,
+/// stored in the key's declared direction and of any storage class
+/// (bd-aoukl), so `i64::MIN` sorts after a DESC key's whole run and above a
+/// REAL below -2^63 even ASC: such a seek starts past rows it must return.
+/// The key alone is the floor there, since a shorter probe sorts before every
+/// entry it begins.
+fn index_probe_takes_rowid_floor(table: &TableSchema, index: &IndexSchema) -> bool {
+    !table.without_rowid && index.key_term_count() == 1
+}
+
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_index_equality_scan(
     b: &mut ProgramBuilder,
@@ -6137,20 +6150,22 @@ fn codegen_select_index_equality_scan(
     // A composite index must be positioned with a true one-field prefix
     // record. Padding unconstrained trailing terms with NULL is not a block
     // floor when any such term is DESC: SeekGE would start in the trailing-NULL
-    // region and silently skip preceding non-NULL entries. Single-key indexes
-    // retain the exact `(key, rowid-floor)` record needed for rowid-order walks.
-    let composite_prefix_probe = idx_schema.key_term_count() > 1;
+    // region and silently skip preceding non-NULL entries. A rowid table's
+    // single-key index retains the exact `(key, rowid-floor)` record needed for
+    // rowid-order walks; a WITHOUT ROWID one has no rowid after its key, so it
+    // takes the prefix record too (bd-aoukl, `index_probe_takes_rowid_floor`).
+    let prefix_probe = !index_probe_takes_rowid_floor(table, idx_schema);
     // bd-gtjlv: with a residual, further key terms the WHERE pins exactly
     // join the prefix, so `a = 1 AND k = 'x' AND ...` on `(a, k)` seeks the
     // `(1, 'x')` block instead of walking every `a = 1` entry. The residual
     // filter still checks the whole WHERE on each row.
-    let extra_prefix = if composite_prefix_probe && residual_filter && !descending {
+    let extra_prefix = if prefix_probe && residual_filter && !descending {
         composite_equality_scan_extra_prefix(idx_schema, table, table_alias, schema, where_clause)
     } else {
         Vec::new()
     };
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let probe_field_count = if composite_prefix_probe {
+    let probe_field_count = if prefix_probe {
         1 + extra_prefix.len() as i32
     } else {
         2
@@ -6208,7 +6223,7 @@ fn codegen_select_index_equality_scan(
 
     // bd-z3a05: the far rowid bound (ascending: upper; descending: lower), in
     // a register the walk compares each entry's rowid against.
-    let rowid_far_bound_reg = if composite_prefix_probe {
+    let rowid_far_bound_reg = if prefix_probe {
         None
     } else {
         rowid_bounds
@@ -6219,7 +6234,7 @@ fn codegen_select_index_equality_scan(
                 reg
             })
     };
-    if !composite_prefix_probe {
+    if !prefix_probe {
         let rowid_floor_reg = probe_key_regs + 1;
         // Ascending seeks to `(val, i64::MIN)` (lowest rowid of the value)
         // then walks up; descending seeks to `(val, i64::MAX)` (highest
@@ -7886,8 +7901,15 @@ fn codegen_select_index_range_scan(
         .and_then(|name| table.column_index(name))
         .map(|idx| index_key_affinity(table.columns[idx].affinity))
         .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
+    // The lower probe is `(bound, i64::MIN)` on a rowid table; a WITHOUT ROWID
+    // entry ends in its PRIMARY KEY, so there the bound alone (bd-aoukl).
+    let lower_probe_fields: i32 = if index_probe_takes_rowid_floor(table, idx_schema) {
+        2
+    } else {
+        1
+    };
     let lower_probe = index_range.lower.as_ref().map(|bound| {
-        let base = b.alloc_regs(2);
+        let base = b.alloc_regs(lower_probe_fields);
         emit_expr(b, &bound.expr, base, None);
         if let Some(aff) = bound_affinity
             && !bound_matches_affinity(aff, &bound.expr)
@@ -7902,7 +7924,9 @@ fn codegen_select_index_range_scan(
             );
         }
         b.emit_jump_to_label(Opcode::IsNull, base, 0, done_label, P4::None, 0);
-        b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
+        if lower_probe_fields == 2 {
+            b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
+        }
         (base, bound.clone())
     });
     let upper_reg = index_range.upper.as_ref().map(|bound| {
@@ -7967,7 +7991,7 @@ fn codegen_select_index_range_scan(
         b.emit_op(
             Opcode::MakeRecord,
             *lower_reg,
-            2,
+            lower_probe_fields,
             probe_record_reg,
             P4::None,
             0,
@@ -20493,6 +20517,11 @@ fn index_integer_in_list_target<'t>(
     table: &'t TableSchema,
     table_alias: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<i64>)> {
+    // The seeks this feeds probe `[value, i64::MIN]` and read the row through
+    // `IdxRowid`; a WITHOUT ROWID entry has no rowid after its key (bd-aoukl).
+    if table.without_rowid {
+        return None;
+    }
     let (column, ints) = column_int_list_from_predicate(where_clause, table, table_alias)?;
     let col_name = column_name(column, table, table_alias)?;
     // INTEGER-affinity column only (see the no-fallback argument above).
@@ -40882,7 +40911,9 @@ fn extract_count_indexed_in_target<'a>(
     // later usable single-column index.  Composite indexes are safe only for
     // the ordered semijoin below: the materialized/list fallback seeks with a
     // two-field `(key, min-rowid)` record, whose physical contract is exactly a
-    // single-key index followed by rowid.
+    // single-key index followed by rowid. A WITHOUT ROWID entry ends in its
+    // PRIMARY KEY instead, which `i64::MIN` does not bound (bd-aoukl), so only
+    // the merge takes one.
     let find_index = |allow_composite: bool| {
         table.indexes.iter().find(|idx| {
             let matches_hint = match index_hint {
@@ -40894,7 +40925,7 @@ fn extract_count_indexed_in_target<'a>(
             };
             matches_hint
                 && idx.supports_direct_column_lookup()
-                && (allow_composite || idx.key_term_count() == 1)
+                && (allow_composite || (idx.key_term_count() == 1 && !table.without_rowid))
                 && !idx.key_term_descending(0)
                 && idx
                     .columns
