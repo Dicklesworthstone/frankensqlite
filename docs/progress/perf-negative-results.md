@@ -89,6 +89,111 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-16 - WIN (small, maintenance-sized): a WAL-FEC repair job reads the -wal through one descriptor and keeps the sidecar's append descriptor between commits, -9.8 syscalls and ~-11 us kernel time per one-row FULL commit (bd-w4pr1.7, round 4, lever 4b)
+
+- Target: every commit at synchronous=FULL (or EXTRA) on a connection with a caller-owned runtime
+  (the CLI, async callers; `fsqlite::blocking` runs no WAL-FEC at all, see the H entry of this
+  round). Each commit's FEC job made 22 file system calls on a blocking-pool thread: the -wal opened
+  and closed four times (three generation checks, the frame read with an lseek), the sidecar opened
+  and closed for its append, two statx of the sidecar. Touched: `crates/fsqlite-wal/src/wal_fec.rs`
+  (`WalFecSourceWal`; `CommittedRangeSidecarCache::output`; `CommittedRangeSidecar::{appended,
+  loaded}`).
+- Ledger preflight: bd-sid3o (the group map this extends), bd-wqmil (periodic sidecar sync), GH#453
+  (the guard unlocks explicitly), round 3's lever 4a entry, which named this as next. Nothing
+  earlier on the worker's descriptors.
+- Per-call cost on this host (tmpfs, `p6r4/syscost/fec_syscost.c`): open+read32+close 4.08 us,
+  open+close 3.26, lseek+read 4 KiB 1.50, open(append)+close 3.18, statx(path) 1.83, fstat 0.77,
+  pread 32 B 0.79.
+- Change: one -wal descriptor per job, opened by path for the pre-guard check; the post-guard and
+  pre-append checks require statx of the path to name the descriptor's (device, inode) and re-read
+  the header through it (a missing path or another inode is a mismatch, as a reopen by path would
+  find); frames read positionally through it. The sidecar's append descriptor stays in the worker's
+  cache and is reused only after `extend_cached`'s statx under the guard shows the same inode; a
+  full load keeps it only if its fstat names the path's file. A cached range records its length as
+  the length read at load plus its appends. Every check, write and sync is unchanged; the lock file
+  is still opened per job.
+- Result (A = main 404d5a6b3, CLI d8bf2ee3f32b0599; B = A + this, CLI fafbe29d27fdbdff; scratch ext4
+  NVMe, distro sqlite3 3.46.1 live, 6 rotated reps):
+  - strace per FULL transaction: 52.22 -> 42.39 (openat 5.90 -> 2.01, close 5.90 -> 2.01, lseek 0.98
+    -> 0, statx 13.03 -> 15.04, futex 2.04 -> 1.48); stock 9.05. NORMAL 25.76 -> 25.03.
+  - CLI disk FULL per txn: CPU 514.4 -> 453.6 us (task-clock mean; paired -0.2 to -198.8, sync
+    noise), kernel instructions -43.1k and kernel cycles -46.4k with all six pairs between -41.6k
+    and -49.7k (~-11 us), wall 3,809 -> 3,850 us (+1.1%, inside the sync noise). Stock 86.4 us CPU,
+    3,354 us wall: CPU ratio 5.95x -> 5.25x.
+  - CLI disk NORMAL CPU 140.0 -> 135.6 (stock 18.0).
+  - mt-mvcc-bench disk FULL 1w 150 x 5 (old harness, 3 interleaved reps): F wps B/A 0.982 (predicted
+    +-3%), F/C 0.950 -> 0.921, F process CPU 787.9 -> 769.6 us per commit.
+  - Two more FULL batches, not used for the verdict: CPU -43.1 and -8.9 us, kernel cycles -47.3k and
+    -52.7k (every pair negative), wall +4.7% and +20% (the latter carried by reps where stock also
+    ran up to 2x slower: another lane on the same volume). In quiet reps B's 3,000-commit run was
+    0.1-1.0 s slower in 15 of 17 pairs; three direct A/B pairs of the same script without the probe:
+    mean -0.03 s. strace shows the same sync calls (2,096 vs 2,094 per 2,000 commits) and only the
+    intended open/close cuts. No mechanism found; a +1-3% FULL wall effect from the worker's changed
+    timing against the WAL's journal commits is not excluded.
+  - Prediction (FULL CPU -8 to -18 us, syscalls 22 -> 15 per job, bench within +-3%, NORMAL within
+    +-3%): met. Kill lines: cleared.
+  - bd-73pfl stress (`mw_conflict.py explicit-same 8 300 10 5000`, disk) on B and on main: stock
+    integrity_check ok 10/10 for both; every lost row is a refused commit (error lines = rows lost:
+    4,595 and 3,958).
+- Gate: on 404d5a6b3 + this: clippy -D warnings on fsqlite-wal all targets, default and
+  fault-injection, clean; fsqlite-wal lib 1,182/0; every fsqlite-wal integration target with
+  --features fault-injection green (wal_reopen 10/10); its lib under fault-injection had the
+  bd-alz8f metrics-lock cascade (24 reds from one counter race), fixed upstream by 05fe3c5b1; core
+  keepers green (bulk_import_upsert 13, gh385, gh534 2, bd_ih8ak flush floor, bd_qyekq crash images,
+  wal_fec_commit_pipeline 18); e2e concurrent-writer/SSI/checkpoint/group-commit batches green; libs
+  mvcc 1,685/0, vfs 531/0, pager 1,114 + bd_2jpu6_2 (known), core 4,193 + the t6741 pair (known) +
+  commit_repair's runtime-requeue timing test (passes alone on main and here);
+  multiprocess_autocommit_busy_timeout 7/1 (the durable-floor test, which fails the same way on
+  clean main 05fe3c5b1, bd-w4pr1.7 2026-11-17). Re-gate on the landing base 05fe3c5b1 + this: clippy
+  (fault-injection) clean, fsqlite-wal --features fault-injection --tests all green (lib 1,183/0),
+  wal lib 1,183/0, multiprocess 8/8 twice, commit_repair 6/6, wal_fec_commit_pipeline 18/18.
+- Tests: `test_committed_ranges_keep_one_sidecar_append_descriptor` (one append descriptor over
+  twelve ranges; a rename-replaced sidecar gets a new descriptor and the replaced inode no record;
+  the cached length equals the file's) and `test_wal_fec_source_wal_checks_follow_the_path` (a
+  byte-identical WAL renamed over the path fails the check through the kept descriptor, which a
+  header-only re-read would pass; an in-place header rewrite and a removed path fail too).
+- Retry condition / next: re-measure FULL wall on a quiet disk or tmpfs before building more on the
+  worker's timing. Then the lock file's descriptor (open(create)+flock+unlock+close 4.82 us against
+  1.37 us kept; needs a path identity check, ~1.6 us net). Larger, for the CLI: the worker's async
+  loop runs on the connection's own runtime, so each FULL commit also costs the committing thread
+  ~20-47 us in asupersync's scheduler, clock reads and FEC submission (perf: CLI tmpfs FULL vs
+  NORMAL +20 us; disk FULL with FEC vs `raptorq_repair_symbols=0`, one pair of 2,000-commit runs,
+  +47 us); moving the per-job orchestration off the connection's executor is the next FEC lever.
+
+## 2026-11-16 - NOT LANDED (mechanism measured, new A/A null passes, no verdict moves; held on a configuration difference: H's FrankenSQLite arm runs without WAL-FEC): mt-mvcc-bench's FrankenSQLite arm through fsqlite::blocking (bd-w4pr1.7, harness change H, round 4)
+
+- Target: the coordinator's two conditions for H (bd-w4pr1.7, 2026-11-16 18:25Z): the F-side
+  mechanism measured, and an A/A null that resolves +-3% with batch drift, plus the integrity table.
+  Touched (not landed): `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs`, round 3's patch unchanged
+  (`p6r3_H3_bench.patch`, sha256 prefix fd3b1c721210b3e4; clone perf6 stash "p6r3: harness H ...").
+- Mechanism (mtbench-r4h = main 404d5a6b3 + H, 1w tmpfs NORMAL 2,000 x 11, 6 reps per mode): F
+  x1.499 [1.482, 1.517] is the writer's own CPU, 146.9 -> 96.8 us per transaction, not off-CPU time
+  (2.5 vs 0.1 us) or wakeups. 5.9 us is the stage profiler and its two engine diagnostics; 44.2 us
+  is the per-transaction `fsqlite_e2e::block_on` (callgrind +64.5k instructions: asupersync
+  scheduler +25.5k, root-future memcpy +23.9k, Cx budget clock reads ~6k, engine crates +1.6k; +4.6
+  syscalls: sched_yield 2.0, futex_wake 1.2, eventfd 1.4). io_uring refused: F 0.999 [0.988, 1.011].
+  The old harness's extra threads (1w peak 7: two runtimes' `asupersync-worker-0`, their blocking
+  pools, one `iou-wrk`; 64w peak 219) are the harness's runtimes; FrankenSQLite creates none.
+  `fsqlite-c-api` has the same driver (thread-local current-thread runtime, `block_on` per C call):
+  a product cost for C-ABI users, handed to its owner.
+- A/A (pre-registered, then amended before any batch ran to 8 batches on disk): r = stock arm
+  C_new/C_old, 8 x 6 interleaved pairs, disk NORMAL 1w, batch random effect, TOST +-3%: mu 1.0039,
+  90% CI [0.9906, 1.0174], PASS. The old single-batch rule fails 1 of these 8 batches. Re-scored:
+  rounds 2-3's five in-process batches FAIL together under the new rule ([0.978, 1.044]); old rule 2
+  pass / 3 fail; moves pass -> FAIL for hab2 and h2ab, none FAIL -> pass.
+- Integrity table (13 rows: disk NORMAL 1/8/32/64w separate and shared and disk FULL 1w, 3 reps;
+  tmpfs NORMAL 1/8/32/64w separate and 8w shared, 1 rep): 0 verdict moves, every row LOSE under both
+  harnesses; F/C rises everywhere (disk NORMAL 1w 0.265 -> 0.399, 8w sep 0.452 -> 0.645, 64w sep
+  0.421 -> 0.473, disk FULL 1w 0.947 -> 0.994).
+- Why held: `fsqlite::blocking` runs no WAL-FEC (`ensure_wal_fec_pipeline` needs a caller-owned
+  runtime; the blocking API has none). The F arm writes no `-wal-fec` under H and 1-6 MB of it under
+  the old harness. At disk FULL 1w F gains 6.5% where the runtime entry is ~0.5% of the commit.
+  Landing H would make every FULL F number FEC-free without a decision.
+- Retry condition: the owner's FEC decision for the blocking API. If the blocking API gets a repair
+  worker, H lands as is; if not, H lands with `wal_fec` named in the bench's configuration receipt
+  and FULL rows quoted with it. The null and the NORMAL rows above need not be rerun. Until then
+  every mt-mvcc-bench number stays at the old harness.
+
 ## 2026-11-16 - WIN (landed; re-measured on main f818d8531, A/A arm in the run): a WAL frame-cache hit hands the transaction the cached image instead of two copies (bd-05xlf, read/seek round 6, lever P1 v6)
 
 - What: the round-5 entry below ("MEASURED WIN, NOT LANDED"), unchanged code. Its diff applied
