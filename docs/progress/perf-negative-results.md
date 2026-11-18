@@ -89,6 +89,114 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - WIN (landed as 04062b0c5; re-measured on main 0dd0e7102 with an A/A arm; inside its prediction, the write row gained a little more than predicted): a prepared read's begin is its staleness check, the reader recheck is stock's one-copy compare, and the read transaction's journal path and exit locks are taken once (bd-05xlf, read/seek round 7, lever 1)
+
+- Target: the per-execution read transaction of the prepared secondary-key lookup (bd-05xlf,
+  prepared-dml-probe select-index), about 27k of its 84k callgrind Ir on main b09bb8209: the
+  standalone staleness refresh before the begin (2.9k), the begin (18.2k) and the end (5.8k).
+  Ledger preflight: the 2026-11-14 lever B entry (its retry condition asks for one redesign of the
+  admission's round trips, not pieces), the 2026-11-14 lever D entry (the access(-journal) probe,
+  left alone here), and round 5's design on bd-05xlf. Plan, prediction and kill lines were posted
+  on bd-05xlf before code, with a review request to the cross-process lane.
+- Change, one set across the admission and its two ends:
+  - `crates/fsqlite-core/src/connection.rs` prepare_connection_for_prepared_read: with no
+    transaction open, the standalone refresh_memdb_if_stale is skipped. The ReadOnly begin that
+    follows binds the latest WAL-index header in its reader admission and reloads the memdb when
+    its bound commit sequence is past the mirror's, the decision the refresh made from a header
+    read of its own. When the begin reloaded, it publishes the committed schema cookie, as the
+    refresh's reload did. Inside an open transaction and on the memdb fast-path branches nothing
+    changes.
+  - `crates/fsqlite-wal/src/wal_index.rs` revalidate_shared_wal_index_reader: after the read-mark
+    lock the recheck is stock walTryBeginRead's (nBackfill, barrier, the read mark, one copy of the
+    live header against the captured one, which read_shared_wal_index_header checksummed at
+    capture), not a second validated two-copy read plus a checksum of the captured header.
+  - `crates/fsqlite-pager/src/pager.rs`: the rollback-journal path is built once at open
+    (SimplePager.rollback_journal_path) and shared by the begin's refresh and every
+    SimpleTransaction; coordinated_transaction_exit releases the reader claim and restores the
+    external snapshot under one database-file guard (release_wal_reader_slot gains the flag).
+- Result on origin/main 0dd0e7102 (both arms rebuilt there; the change's lines are those measured
+  on b09bb8209 below). thinkstation1, governor powersave, load 1.3, io_uring refused; main-0dd
+  (CLI 1dfecdc77ae384cc, probe 3977a3d88a7c6243), l1-0dd = main + this change (CLI
+  64333c2fa0b85820, probe 95c0d808e32149d1), an A/A arm (the main binaries on their own copies);
+  one database per row family, built by a main binary and copied per arm with every sidecar;
+  stock live (the 3.54.1 prepared-loop driver 9500dcc51bdca47c, sqlite3 3.46.1
+  5a910e452929c124); 5 reps interleaved; answers equal stock's everywhere.
+
+  | row | stock | main | A/A | l1 |
+  |---|---|---|---|---|
+  | prepared select-index (WAL), instructions per execution | 5,058 | 68,236 (13.49x) | 68,110 | 62,712 (12.40x), -5.5k |
+  | same, CPU per execution | 3.74 us | 23.68 us (6.32x) | 24.17 us | 21.47 us (5.73x) |
+  | select-index, checkpointed | 5,058 | 74,683 (14.76x) | 74,658 | 68,471 (13.54x), -6.2k |
+  | select-rowid (control) | 4,725 | 8,148 | 8,148 | 8,149 |
+  | autocommit INSERT (write row) | - | 141,315 | 141,623 | 139,140 (-1.5%) |
+  | point_rowid_2000 | 44.0M | 176.9M (4.02x) | 176.9M | 172.0M (3.91x), -2.8% |
+  | point_hot_2000 | 42.8M | 165.9M (3.87x) | 166.8M | 160.9M (3.76x), -3.0% |
+  | point_sec_key_2000 | 67.4M | 265.3M (3.94x) | 265.3M | 260.3M (3.86x), -1.9% |
+  | rowid_lookups_200k (one statement, control) | 554.4M | 2,688.9M | 2,689.0M | 2,689.1M |
+
+  The A/A arm is within 0.13k on the lookups and 0.54% (point_hot_2000) on the sweep.
+
+- The first measurement, on b09bb8209 (main CLI 0a112825795c109e / probe b374ab87fb745db1, l1 CLI
+  8103c1d6a2a45a70 / probe 334e9cff3795bccc; 7 lookup and 9 sweep reps, load 2.7 to 4.0):
+  select-index 68,767 -> 62,744 (13.6x -> 12.4x stock), CPU 25.27 -> 23.46 us, checkpointed
+  74,189 -> 68,542, select-rowid 8,129 -> 8,130, INSERT 141,379 -> 138,964, syscalls per
+  select-index execution 7 -> 6 (strace -c: one -shm statx fewer; stock makes 2),
+  point_rowid_2000 -2.7%, point_hot_2000 -3.1%, point_sec_key_2000 -1.8%, multicol_eq_1000
+  -0.7%, orderby_page_500x20 -0.4%, insert_literal_400 -1.5%, rowid_lookups_200k and
+  range_noncovering_200k 0.00%; the A/A arm within 0.56k / 0.18%.
+  Callgrind of the prepared loop there: 83.9k -> 78.1k Ir per execution; the standalone refresh
+  -2.9k, the begin -2.2k (the two journal PathBufs, the one-copy recheck), the end -0.3k (one
+  guard), the finish -0.5k.
+- Prediction (bd-05xlf, before code): select-index -4.0k to -6.5k (-6.0k, -5.5k against the A/A
+  arm: inside); checkpointed the same (-5.6k: inside); CPU -0.8 to -2.5 us (-1.8 us: inside);
+  syscalls 7 -> 6 (met); select-rowid within 0.15k (+1: inside); autocommit INSERT -0.4k to -2.0k
+  (-2.4k: just beyond, better); point rows -1.0% to -3.5% (-2.7%, -3.1%, -1.8%: inside);
+  multicol_eq_1000 -0.3% to -1.5% (-0.7%: inside); the one-statement miss rows within 0.1%
+  (0.00%: inside). Kill lines (select-index under 3.0k, checkpointed under 2.5k, a control outside
+  its band, the A/A arm outside a band, an answer, a keeper): none crossed. The A/A arm was 0.56k
+  under main on select-index and within 0.18% elsewhere.
+- Keepers: prepared_statement_cross_process_staleness_oracle gains
+  held_integer_key_lookups_see_every_commit_and_release_their_read_mark (held lookups of the
+  probe's shape across a stock child's commits, an in-process peer's, a stock RESTART and TRUNCATE,
+  an fsqlite child's, a bulk insert and an index build and drop, each compared with stock; a stock
+  TRUNCATE checkpoint between executions must answer 0|0|0 with an empty -wal; an explicit
+  transaction keeps its snapshot while the peer and stock commit) and
+  held_integer_key_lookup_reads_whole_commits_while_stock_commits_and_restarts (a stock writer
+  committing with a RESTART every 20th row while the lookup runs; every answer one commit's
+  state). fsqlite-wal's revalidation test covers the one-copy recheck (copy 2 alone accepted,
+  copy 1 moved refused).
+  The keeper's rowid probe (`SELECT b FROM k WHERE id = ?1`) was left out. On main 0dd0e7102 alone
+  it answers the pre-UPDATE row after the stock UPDATE until an fsqlite process commits, with the
+  same mismatch report with and without this change (a main bug in the prepared memdb fast path,
+  reported on bd-05xlf 2026-11-18).
+- Gate (rch, any worker, batches under 20 targets) on 0dd0e7102 + this change:
+  - clippy -D warnings on fsqlite-wal, fsqlite-pager and fsqlite-core, all targets: clean;
+  - wal, pager and core --lib with the prepared-statement keepers (19 targets): 6,664 passed,
+    5 failed: the t6741 pair and bd_2jpu6_2 (main reds), the keeper's rowid probe above, and an
+    uncommitted bound-key probe that reproduces a main divergence (reported on bd-5i14u). The
+    keeper file without the rowid probe: 4 passed;
+  - core join/seek and seek-key keepers (18 targets): 46 passed, 1 failed (the bd_8c68u compile
+    count, a main red);
+  - core savepoint/trigger/staleness keepers and the cross-process battery (14): 263 passed;
+  - fsqlite-e2e (stock_headerless_wal_e2e, split_claim, refused_commit, gh364, the
+    concurrent-writer set and mpbusy, 14 targets, --test-threads=1): 105 passed;
+  - the fsqlite crate (lib and 123 test targets in 7 batches): 1,097 passed.
+- Landing rerun. origin/main 25e3e883b's 5d98aff3e (bd-j2dtf, immutable=1) rewrote the read-only
+  journal check in refresh_runtime_committed_state; the one conflict was that call, resolved as
+  its immutable branch with this change's borrowed journal path. On that exact tree: clippy clean;
+  wal, pager and core --lib with the prepared-statement, staleness, path-identity and
+  cross-process keepers (13 targets) 6,809 passed, 1 failed (bd_2jpu6_2); fsqlite
+  gh528_readonly_truncated_shm 4 passed. Landed in 04062b0c5, on 1954f46cb (two test-only commits
+  in other files after 25e3e883b).
+- Not taken (each its own decision, unchanged): the access(-journal) probe (lever D's retry
+  condition), the admission's -shm fstat (bd-7do1d), merging try_bind_runtime_native_reader's
+  WAL-backend read and write guards (lock order against the db-file lock), and acquire_snapshot's
+  separate db-file lock (the journal probe needs SHARED before admission).
+- Retry / next: what is left of the read transaction is the reader admission's lock round trips
+  (WAL-backend and db-file locks about 1.3k), BeginAdmission (1.8k), the -wal path identity (one
+  statx, owner rule) and the access probe; the facade's statement-future move is the next large
+  piece outside it. The prepared lookup is 12.4x stock instructions, 5.7x CPU (0dd0e7102 run).
+
 ## 2026-11-18 - FIX (landed as 3a76f8e09; a correctness fix measured like a lever, inside its kill line in v5 and v6): the rowid allocator's claim is taken where the Insert arm seeks, once per cursor and session, so the per-row append path is base's (bd-hi7qg v5, v6)
 
 - Target: bd-hi7qg's fix (an implicit rowid after a deleted maximum is `max(rowid)+1` again, as in stock, when no live
