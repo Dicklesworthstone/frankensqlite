@@ -206,6 +206,83 @@ fn after_update_rowid_no_ipk() {
 }
 
 #[test]
+fn before_insert_ipk_aliases_use_the_pending_rowid() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = if file_backed {
+                (
+                    Connection::open(dir.path().join("frank.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                    rusqlite::Connection::open(dir.path().join("stock.db")).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            for sql in [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT DEFAULT 'default',
+                                generated INTEGER AS (id + 10))",
+                "CREATE TABLE audit(phase, label, ipk, rid, oid, rid_alias, storage, computed)",
+                "CREATE TABLE pending(label)",
+                "CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+                     INSERT INTO audit VALUES ('before', NEW.label, NEW.id, NEW.rowid,
+                         NEW.oid, NEW._rowid_, typeof(NEW.id), NEW.generated);
+                 END",
+                "CREATE TRIGGER bi_pending BEFORE INSERT ON t
+                 WHEN NEW.id = -1 AND NEW.rowid = -1 AND NEW.oid = -1 AND NEW._rowid_ = -1
+                 BEGIN INSERT INTO pending VALUES (NEW.label); END",
+                "CREATE TRIGGER ai AFTER INSERT ON t BEGIN
+                     INSERT INTO audit VALUES ('after', NEW.label, NEW.id, NEW.rowid,
+                         NEW.oid, NEW._rowid_, typeof(NEW.id), NEW.generated);
+                 END",
+                "INSERT INTO t DEFAULT VALUES",
+                "INSERT INTO t(label) VALUES ('omitted')",
+                "INSERT INTO t(id, label) VALUES (NULL, 'null'), (40, 'explicit')",
+                "INSERT INTO t(label) SELECT 'select-a' UNION ALL SELECT 'select-b'",
+                "CREATE TABLE w(id INTEGER PRIMARY KEY, label TEXT) WITHOUT ROWID",
+                "CREATE TRIGGER wb BEFORE INSERT ON w BEGIN
+                     INSERT INTO audit (phase, label, ipk, storage)
+                         VALUES ('without-rowid', NEW.label, NEW.id, typeof(NEW.id));
+                 END",
+                "INSERT INTO w VALUES (9, 'ordinary key')",
+            ] {
+                exec_both(&f, &r, sql).await;
+            }
+            assert_agree(&f, &r, "SELECT * FROM audit").await;
+            assert_agree(&f, &r, "SELECT id, label, generated FROM t").await;
+            assert_agree(&f, &r, "SELECT label FROM pending").await;
+            assert_frank_eq(
+                &f,
+                "SELECT phase, ipk, rid, oid, rid_alias, storage, computed
+                 FROM audit WHERE label = 'omitted'",
+                &[
+                    &["'before'", "-1", "-1", "-1", "-1", "'integer'", "9"],
+                    &["'after'", "2", "2", "2", "2", "'integer'", "12"],
+                ],
+            )
+            .await;
+            assert_frank_eq(
+                &f,
+                "SELECT label FROM pending",
+                &[
+                    &["'default'"],
+                    &["'omitted'"],
+                    &["'null'"],
+                    &["'select-a'"],
+                    &["'select-b'"],
+                ],
+            )
+            .await;
+            f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
 fn before_insert_rowid_no_ipk() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();

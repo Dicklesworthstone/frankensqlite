@@ -74839,6 +74839,16 @@ impl Connection {
         // NEW, VIRTUAL and STORED alike — in BEFORE UPDATE from only the
         // base columns it loaded (`new_loaded`), the others reading NULL.
         if let Some(row) = new_row.as_mut() {
+            // BEFORE INSERT supplies -1 for an automatic rowid. The trigger's
+            // INTEGER PRIMARY KEY slot also serves its unshadowed rowid aliases
+            // and must carry that value before evaluating generated columns.
+            if old_values.is_none()
+                && let (Some(rowid), Some(index)) = (new_rowid, rowid_alias_col_idx)
+                && let Some(alias) = row.get_mut(index)
+                && alias.is_null()
+            {
+                *alias = SqliteValue::Integer(rowid);
+            }
             let rowid = new_rowid.unwrap_or(-1);
             match new_loaded {
                 None => Self::fill_generated_columns(
