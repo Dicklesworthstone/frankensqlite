@@ -89,6 +89,64 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - FIX (landed as 3a76f8e09; a correctness fix measured like a lever, inside its kill line in v5 and v6): the rowid allocator's claim is taken where the Insert arm seeks, once per cursor and session, so the per-row append path is base's (bd-hi7qg v5, v6)
+
+- Target: bd-hi7qg's fix (an implicit rowid after a deleted maximum is `max(rowid)+1` again, as in stock, when no live
+  session holds a claim on the table and no write commit became visible since BEGIN) without the per-row cost that
+  rejected v1-v4 (the 2026-11-16 entry). Touched: `crates/fsqlite-mvcc/src/rowid_alloc.rs`,
+  `crates/fsqlite-vdbe/src/engine.rs`, `crates/fsqlite-core/src/connection.rs`.
+- v4's "about 12 a row outside the statement" was not outside it. It stayed whole on the main thread alone
+  (`perf stat -i`), with no commit (a rolled-back INSERT), and pinned to one CPU. Exact whole-process callgrind of that
+  rollback shape split v4's +23 a row into:
+  - +24 a row of code: the bump closure 13, the Insert arm carrying the session id 7, ensure_table_floor 3, malloc 1;
+  - -12 a row of `__memcpy_avx_unaligned_erms`, which callgrind counts per byte of rep movsb and perf barely sees (the
+    2026-11-15 bd-05xlf P1 trap).
+  Round 7's statement-only callgrind (+10.5) was the sum of the two.
+- v5:
+  - claims in their own map, so TableAllocatorState and ensure_table_floor stay base's code;
+  - an Insert that is not an append (the existence-seek path, which every cursor's first insert takes, and REPLACE)
+    claims before it writes, and an append rides on that claim;
+  - a retained cursor reopened under another session or schema epoch drops its append hint;
+  - the random-rowid fallback claims.
+- v6: v5 plus a per-cursor flag, so the seek path takes the claim's lock once per cursor and session.
+- Kill line (round 6, before code): bulk instructions up more than 10M, or task-clock min up more than 15 ms.
+- Result (base b3abcb66a sha256 c6b9d55dc0715266; v5 d3ad4cd3617cf0c7; v6 4eaa3bf7a740f6ad; stock sqlite3 3.46.1 live;
+  scratchpad `r8/ab_v5.txt`, `r8/ab_v6.txt`, `r8/bulkreps_a.txt`, `r8/bulkreps_b.txt`, `r8/seek_a.txt`, `r8/seek_b.txt`
+  of the bulk-write lane):
+  - bulk_insert_1M_one_txn instructions:u min:
+    - base 7,032.9M, v5 7,036.8M, v6 7,036.4M (+3.5M);
+    - both arms bimodal about 11M apart; mode against mode +4.4M / +6.0M;
+    - task-clock min 912.9 / 896.5 / 880.5 ms;
+    - stock 4,177.4M / 450.3 ms (x1.96 task-clock with v6).
+  - delete, update, memory_script: flat in v5 and v6 (within 0.1M, memory_script within base's own 2.6M spread);
+    stock 120.7M / 273.3M / 1,914.0M.
+  - Scattered explicit-rowid INSERT ... SELECT, 200k rows (every row seeks): base 4,003.3M, v5 4,025.6M (+108 a row,
+    the claim's lock on every row), v6 4,010.8M (+37 a row). Stock 1,242.1M.
+  - Re-check after the rebase onto main 768578346 (code-identical to 0dd0e7102; the commit after it touches .beads
+    only). Arms: main sha256 1dfecdc77ae384cc, built with the same release-perf flags in the perf5-shm clone; v6
+    rebased 26db8281e8cba0eb; stock 5a910e452929c124; load 1.7-2.4.
+    - r6_ab, 7 reps, `r8/ab_land.txt`: bulk instructions:u min 7,030.3M -> 7,035.7M (+5.4M; medians +5.0M);
+      task-clock min 865.9 -> 831.7 ms; stock 4,177.4M / 430.5 ms. Answers equal stock's.
+    - Every rep, 7 each, `r8/bulkreps_land.txt`: main 7,031.7-7,045.9M, v6 7,039.1-7,051.0M (min +7.5M);
+      task-clock min 873.5 -> 852.6 ms.
+    - Inside the kill line.
+  - Re-check on main 5ee2326ea + v6, both arms built in the bulk-write clone: main sha256 ad9c3e38225fb449, v6
+    e5575570e93cf70c; load 5.3-5.8.
+    - r6_ab, 7 reps, `r8/ab_land5ee2.txt`: bulk instructions:u min 7,032.4M -> 7,035.9M (+3.5M); task-clock min
+      839.7 -> 826.2 ms; stock 4,177.4M / 431.4 ms (x1.92 task-clock with v6).
+    - Every rep, `r8/bulkreps_land5ee2.txt`: min 7,030.3M -> 7,036.2M (+5.9M); task-clock min 844.9 -> 848.8 ms (+3.9).
+    - Inside the kill line.
+    - Main moved twice more before the push (5d98aff3e: immutable=1 open and the top-N preflight in engine.rs;
+      3e6cc4c0c: RETURNING bindings). Its tests were re-run on 3e6cc4c0c + v6; its cost was not re-measured there.
+  - Exact v6 cost (callgrind, rollback shapes):
+    - appends: ensure_table_floor +4 a row, from the grown allocator struct's field offsets;
+    - scattered rows: the out-of-line claim helper's call +19 and its argument setup in the Insert arm +14, on top of
+      the +4.
+- Retry condition: none for the claim's placement. The scattered shape's +33 a row goes to about 3 by testing
+  `rowid_claimed` at the call site with the claim out of line; take that with the next change to the Insert arm. Any
+  later change that adds work to the per-row append bump is measured on `bulk_insert_1M_one_txn` against this entry.
+  FB (bd-w4pr1.13), the per-claimant slot that replaces that bump, is where the remaining +4 a row comes back.
+
 ## 2026-11-18 - WIN (disk; tmpfs unchanged as predicted): a checkpoint persists the certificate handoff only on the path that resets the WAL, so 8 writer processes on a disk stop losing rows (x70 -> x3.9 stock) (bd-1qmz4, multi-process lane round 1, lever 2)
 
 - Target: the scorecard's `multiproc` shape on a real disk (ext4, synchronous=NORMAL), 8 and 16
