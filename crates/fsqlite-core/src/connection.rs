@@ -64446,6 +64446,7 @@ impl Connection {
             boxed_future(|| self.pay_owed_memdb_rows(cx)).await?;
         }
 
+        let mut staleness_left_to_begin = false;
         if self.committed_pager_refresh_allowed() {
             // PR#401 / GH#492: schema-only and large ordinary file connections
             // keep prepared reads pager-backed. Only small ordinary images
@@ -64465,7 +64466,7 @@ impl Connection {
                     .await?;
             } else if !self.memdb_rows_loaded.get() && self.should_eagerly_hydrate_memdb_rows() {
                 self.reload_memdb_from_pager(cx).await?;
-            } else {
+            } else if self.in_transaction.get() || self.active_txn_is_open_or_borrowed() {
                 // A file connection that rejects the MemDatabase row fallback
                 // keeps rows unloaded by design: its reads go through pager
                 // cursors. Reloading here on "unloaded" bound a publication,
@@ -64475,15 +64476,32 @@ impl Connection {
                 // unprepared statements. The staleness refresh still reloads
                 // as soon as a commit is published past the mirror.
                 self.refresh_memdb_if_stale(cx).await?;
+            } else {
+                // bd-05xlf: with no transaction open, the ReadOnly begin
+                // below opens the pager transaction this read runs in. Its
+                // reader admission binds the current WAL-index header, and it
+                // reloads the mirror from that transaction once its bound
+                // commit sequence is past the mirror's, which is what the
+                // staleness refresh decided from a header read of its own.
+                staleness_left_to_begin = true;
             }
         }
 
         // Match the generic statement path: establish an autocommit read
         // snapshot after any retained-autocommit flush so prepared reads see
         // the same pager/memdb view as ad-hoc SELECT execution.
+        let mirror_commit_seq_before_begin = *self.memdb_visible_commit_seq.borrow();
         let prepared_auto_read = self
             .ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, cx, None)
             .await?;
+        if staleness_left_to_begin
+            && *self.memdb_visible_commit_seq.borrow() > mirror_commit_seq_before_begin
+        {
+            // The staleness refresh's reload published the schema cookie it
+            // read, which concurrent commits validate their schema snapshot
+            // against; a reload by the begin publishes it as that one did.
+            self.publish_committed_schema_cookie(self.schema_cookie());
+        }
         match stmt.ensure_schema_unchanged_with_prebound_publication(cx).await {
             Ok(entry_proof) => Ok((prepared_auto_read, entry_proof)),
             Err(error) => {

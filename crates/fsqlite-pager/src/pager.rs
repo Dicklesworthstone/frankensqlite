@@ -14582,6 +14582,9 @@ pub struct SimplePager<V: Vfs> {
     vfs: Arc<V>,
     /// Path to the database file.
     db_path: PathBuf,
+    /// `Self::journal_path(&db_path)`, built once at open: every begin
+    /// probes it and every transaction keeps it (bd-05xlf).
+    rollback_journal_path: Arc<Path>,
     /// Native namespace generation retained for the pager lifetime.
     #[cfg(all(feature = "native", any(unix, windows)))]
     namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
@@ -15441,7 +15444,7 @@ where
                 let maintenance_lease = admission.complete(&mut inner)?;
                 return Ok(SimpleTransaction {
                     vfs: Arc::clone(&self.vfs),
-                    journal_path: Self::journal_path(&self.db_path),
+                    journal_path: Arc::clone(&self.rollback_journal_path),
                     #[cfg(all(feature = "native", any(unix, windows)))]
                     namespace_binding: self.namespace_binding.clone(),
                     #[cfg(all(feature = "native", any(unix, windows)))]
@@ -15687,7 +15690,7 @@ where
 
             Ok(SimpleTransaction {
                 vfs: Arc::clone(&self.vfs),
-                journal_path: Self::journal_path(&self.db_path),
+                journal_path: Arc::clone(&self.rollback_journal_path),
                 #[cfg(all(feature = "native", any(unix, windows)))]
                 namespace_binding: self.namespace_binding.clone(),
                 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -19369,7 +19372,7 @@ where
         begin_external_lock: Option<&mut BeginExternalLockState<V::File>>,
         reserve_writer: bool,
     ) -> Result<(CommittedStateRefresh, bool)> {
-        let journal_path = Self::journal_path(&self.db_path);
+        let journal_path: &Path = &self.rollback_journal_path;
         // File-backed begin admission passes its persistent external-lock
         // guard here. Retain the final verified SHARED snapshot in that guard
         // so no cross-process writer can change the image between recovery
@@ -19384,7 +19387,7 @@ where
             .expect("runtime refresh must own one external-lock attempt guard");
         external_lock.acquire_snapshot(cx).await?;
 
-        let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
+        let journal_exists = match self.vfs.access(cx, journal_path, AccessFlags::EXISTS) {
             Ok(exists) => exists,
             Err(error) => {
                 return match external_lock.restore().await {
@@ -19410,7 +19413,7 @@ where
                     Self::verify_readonly_snapshot_journal_state(
                         cx,
                         &*self.vfs,
-                        &journal_path,
+                        journal_path,
                         &*db_file,
                         &self.maintenance_gate,
                     )
@@ -19453,7 +19456,7 @@ where
                 .rollback_journal_recovery_namespace
                 .as_ref()
                 .map_or_else(
-                    || journal_path.clone(),
+                    || journal_path.to_path_buf(),
                     |namespace| namespace.journal_path.clone(),
                 );
             let recovery_result = Self::recover_runtime_rollback_journal(
@@ -20461,6 +20464,7 @@ where
         let rollback_recovery_pending = Arc::clone(&maintenance_gate.rollback_recovery_pending);
         let pager = Self {
             vfs,
+            rollback_journal_path: Arc::from(Self::journal_path(&db_path)),
             db_path,
             #[cfg(all(feature = "native", any(unix, windows)))]
             namespace_binding,
@@ -20909,6 +20913,7 @@ where
         let rollback_recovery_pending = Arc::clone(&maintenance_gate.rollback_recovery_pending);
         let pager = Self {
             vfs,
+            rollback_journal_path: Arc::from(Self::journal_path(&db_path)),
             db_path,
             #[cfg(all(feature = "native", any(unix, windows)))]
             namespace_binding,
@@ -21936,7 +21941,8 @@ where
     V::File: 'static,
 {
     vfs: Arc<V>,
-    journal_path: PathBuf,
+    /// The pager's rollback-journal path (bd-05xlf: shared, not rebuilt).
+    journal_path: Arc<Path>,
     #[cfg(all(feature = "native", any(unix, windows)))]
     namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
     /// bd-ih8ak: this transaction's begin validated the path identity in
@@ -27168,8 +27174,17 @@ async fn register_wal_reader_slot<F: VfsFile>(
 
 /// GH#399: release the reader slot held for the active-transaction window
 /// that just closed. Idempotent: a pager without a slot is a no-op.
-async fn release_wal_reader_slot<F: VfsFile>(inner: &mut PagerInner<F>, cx: &Cx) -> Result<()> {
-    if inner.wal_reader.is_none() {
+///
+/// With `restore_external_snapshot`, the window's external snapshot fence is
+/// restored next under the same database-file guard (bd-05xlf: the last
+/// transaction's exit took that guard twice). A failed slot release returns
+/// before the fence is touched, leaving both for the retry.
+async fn release_wal_reader_slot<F: VfsFile>(
+    inner: &mut PagerInner<F>,
+    cx: &Cx,
+    restore_external_snapshot: bool,
+) -> Result<()> {
+    if inner.wal_reader.is_none() && !restore_external_snapshot {
         return Ok(());
     }
     // Retire the exact backend pin first, without retaining its guard across
@@ -27179,7 +27194,11 @@ async fn release_wal_reader_slot<F: VfsFile>(inner: &mut PagerInner<F>, cx: &Cx)
     }
     let db_file = Arc::clone(&inner.db_file);
     let mut file = shared_db_file_write(&db_file, cx).await?;
-    release_wal_reader_claim(inner, &mut *file, cx)
+    release_wal_reader_claim(inner, &mut *file, cx)?;
+    if restore_external_snapshot {
+        file.restore_external_shared_snapshot_attempt(cx)?;
+    }
+    Ok(())
 }
 
 fn release_wal_reader_claim<F: VfsFile>(
@@ -27261,8 +27280,7 @@ async fn coordinated_transaction_exit<F: VfsFile>(
         // Keep the main-file fence and transaction accounting until the exact
         // reader claim is released. A failed release retains the slot in
         // PagerInner for this transaction or its rooted detached exit to retry.
-        release_wal_reader_slot(inner, &cleanup_cx).await?;
-        shared_db_restore_external_snapshot_attempt(&inner.db_file, &cleanup_cx).await?;
+        release_wal_reader_slot(inner, &cleanup_cx, true).await?;
     } else {
         let preserve_level = retained_lock_level_after_txn_exit(
             remaining_active_transactions,
@@ -32439,14 +32457,14 @@ mod tests {
                     let cancelled = Cx::new();
                     cancelled.cancel();
                     assert!(matches!(
-                        release_wal_reader_slot(&mut inner, &cancelled).await,
+                        release_wal_reader_slot(&mut inner, &cancelled, false).await,
                         Err(FrankenError::Abort)
                     ));
                 } else {
                     let guard = shared_db_file_read(&db_file, &cx)
                         .await
                         .expect("hold file guard across release poll");
-                    let mut release = Box::pin(release_wal_reader_slot(&mut inner, &cx));
+                    let mut release = Box::pin(release_wal_reader_slot(&mut inner, &cx, false));
                     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                     assert!(std::future::Future::poll(release.as_mut(), &mut context).is_pending());
                     drop(release);
@@ -32462,11 +32480,11 @@ mod tests {
                     "failed or dropped file-lock acquisition must retain the actual reader owner"
                 );
                 assert!(!peer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
-                release_wal_reader_slot(&mut inner, &cx)
+                release_wal_reader_slot(&mut inner, &cx, false)
                     .await
                     .expect("retry exact reader release");
                 assert!(inner.wal_reader.is_none());
-                release_wal_reader_slot(&mut inner, &cx)
+                release_wal_reader_slot(&mut inner, &cx, false)
                     .await
                     .expect("idempotent release");
                 assert!(peer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());

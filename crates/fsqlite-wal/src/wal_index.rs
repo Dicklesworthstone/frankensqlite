@@ -557,12 +557,23 @@ pub fn shared_wal_index_reader_marks_exceed(
 
 /// Revalidate a captured publication after acquiring its native reader slot.
 ///
+/// `expected_header` is the header this reader captured with
+/// [`read_shared_wal_index_header`], which validated its checksum.
+///
 /// Sample `nBackfill` before the barrier and header reread. Otherwise a newer
 /// checkpoint could make an older page appear safe in the database while its
 /// replacement lies beyond this reader's publication. A changed header or
 /// mark asks the caller to release the exact slot and retry before reading any
 /// database or WAL page. Slot zero ignores the stored mark and requires a
 /// completely backfilled image. This function never acquires or releases locks.
+///
+/// The header reread is stock `walTryBeginRead`'s: copy 1 of the live header
+/// compared with the captured one (bd-05xlf). A publisher stores copy 2 and
+/// then copy 1, so copy 2 alone moving is a publication of frames past this
+/// reader's `mxFrame`, which leaves the captured snapshot readable. A WAL
+/// reset cannot be half done here: it needs every reader slot from 1 up
+/// exclusively and rewrites both copies before it releases them, and slot
+/// zero reads no WAL frame.
 pub fn revalidate_shared_wal_index_reader(
     region: &ShmRegion,
     expected_header: &WalIndexHdr,
@@ -570,7 +581,6 @@ pub fn revalidate_shared_wal_index_reader(
     expected_read_mark: u32,
 ) -> Result<Option<WalIndexReadBoundary>> {
     validate_shared_segment(region)?;
-    expected_header.validate()?;
     if usize::try_from(slot).map_or(true, |slot| slot >= WAL_READ_MARK_COUNT) {
         return Err(FrankenError::BusyRecovery);
     }
@@ -584,7 +594,7 @@ pub fn revalidate_shared_wal_index_reader(
     {
         return Ok(None);
     }
-    if read_shared_wal_index_header(region)? != Some(*expected_header)
+    if read_shared_header_copy(region, 0)? != expected_header.to_bytes()
         || backfilled_frames > expected_header.mx_frame
         || (slot == 0 && backfilled_frames != expected_header.mx_frame)
     {
@@ -2371,6 +2381,27 @@ mod tests {
         newer.i_change += 1;
         newer.update_checksum().unwrap();
         publish_shared_wal_index_header(&region, &newer).unwrap();
+        assert!(
+            revalidate_shared_wal_index_reader(&region, &header, 2, 12)
+                .unwrap()
+                .is_none()
+        );
+        // bd-05xlf: the recheck is stock's one-copy compare. A publisher
+        // between its two stores (copy 2 new, copy 1 still the captured
+        // header) leaves the captured snapshot readable; copy 1 moving
+        // refuses it whatever copy 2 holds.
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        write_shared_header_copy(&region, WAL_INDEX_HDR_BYTES, &newer.to_bytes()).unwrap();
+        assert_eq!(
+            revalidate_shared_wal_index_reader(&region, &header, 2, 12).unwrap(),
+            Some(WalIndexReadBoundary {
+                backfilled_frames: 8,
+                maximum_wal_frame: 20,
+                database_only: false,
+            })
+        );
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        write_shared_header_copy(&region, 0, &newer.to_bytes()).unwrap();
         assert!(
             revalidate_shared_wal_index_reader(&region, &header, 2, 12)
                 .unwrap()
