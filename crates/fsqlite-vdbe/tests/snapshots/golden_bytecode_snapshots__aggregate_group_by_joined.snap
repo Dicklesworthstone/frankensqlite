@@ -36,7 +36,7 @@ addr  opcode           p1    p2    p3    p4                 p5
 21    Goto             0     39    0                        0 
 22    IfPos            10    34    1                        0 
 23    Ne               11    25    6                        128
-24    Goto             0     34    0                        0 
+24    Goto             0     35    0                        0 
 25    AggFinal         7     0     0     (func)COUNT        0 
 26    AggFinal         8     1     0     (func)SUM          0 
 27    Copy             6     1     0                        0 

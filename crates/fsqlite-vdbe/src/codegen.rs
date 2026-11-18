@@ -26388,6 +26388,39 @@ fn codegen_select_group_by_aggregate(
     let num_group_keys = group_by_keys.len();
     let num_aggs = agg_columns.len();
 
+    // bd-36aed: with a builtin min() or max(), stock prints a group's keys as
+    // the row that aggregate picks spells them (the last such aggregate's,
+    // as for bare columns, bd-6hoc8). That row is tracked only where the
+    // spellings of one key can differ: a key that is not a plain column of
+    // TEXT, NUMERIC or INTEGER affinity under BINARY (those store one spelling
+    // per value). As in SQLite's updateAccumulator, an OP_CollSeq precedes each
+    // min()/max() step, and a FILTERed one first copies the group's use flag
+    // into the register (0 on the group's first row), so a row its FILTER
+    // rejects moves the keys only when it starts the group. A DISTINCT
+    // min()/max() keeps the first row, as the aggregate without GROUP BY does
+    // (bd-6hoc8): SQLite lets a row repeating its value keep the register as
+    // the row before left it, which the engine's DISTINCT step cannot report.
+    let key_spellings_may_differ = group_by_keys.iter().any(|key| match key {
+        GroupByKey::Column(column) => {
+            let column = &table.columns[*column];
+            column.generated_expr.is_some()
+                || !matches!(column.affinity.to_ascii_uppercase(), 'B' | 'C' | 'D')
+                || column
+                    .collation
+                    .as_deref()
+                    .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
+        }
+        GroupByKey::Expression(_) => true,
+    });
+    let mut minmax_aggregates = agg_columns
+        .iter()
+        .filter(|agg| agg_column_is_minmax(agg))
+        .peekable();
+    let key_spelling_tracked = key_spellings_may_differ
+        && minmax_aggregates.peek().is_some()
+        && minmax_aggregates
+            .all(|agg| !agg.distinct && builtin_aggregate_semantics_available(&agg.name, 1));
+
     // Collect unique table-column indices needed for aggregate arguments.
     let mut agg_arg_table_cols: Vec<usize> = Vec::new();
     for agg in &agg_columns {
@@ -27053,6 +27086,14 @@ fn codegen_select_group_by_aggregate(
             ),
             None => alloc_group_state(b, false),
         };
+    let key_spelling_skip_reg = key_spelling_tracked.then(|| b.alloc_reg());
+    let key_spelling_use_flag = key_spelling_skip_reg
+        .filter(|_| {
+            agg_columns
+                .iter()
+                .any(|agg| agg_column_is_minmax(agg) && agg.filter.is_some())
+        })
+        .map(|_| b.alloc_reg());
     let final_group = b.emit_label();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let read_slot = |b: &mut ProgramBuilder, slot: usize, dst: i32| {
@@ -27205,19 +27246,30 @@ fn codegen_select_group_by_aggregate(
     // first_row: (jumped here when first_flag was 1, skipping comparison).
     b.resolve_label(first_row_label);
 
-    // same_group: copy current keys to previous, then AggStep.
-    b.resolve_label(same_group_label);
+    // A group's keys print as its first row spells them, as stock's do
+    // (bd-36aed): 3 and 3.0, or -0.0 and 0, are one group, and the previous-key
+    // registers take the row that starts it. With a min() or max() they follow
+    // the row that aggregate picks instead (`key_spelling_skip_reg`, below).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for i in 0..num_group_keys {
-        b.emit_op(
-            Opcode::Copy,
-            cur_key_base + i as i32,
-            prev_key_base + i as i32,
-            0,
-            P4::None,
-            0,
-        );
+    let copy_keys_to_previous = |b: &mut ProgramBuilder| {
+        for i in 0..num_group_keys {
+            b.emit_op(
+                Opcode::Copy,
+                cur_key_base + i as i32,
+                prev_key_base + i as i32,
+                0,
+                P4::None,
+                0,
+            );
+        }
+    };
+    copy_keys_to_previous(b);
+    if let Some(use_flag) = key_spelling_use_flag {
+        b.emit_op(Opcode::Integer, 0, use_flag, 0, P4::None, 0);
     }
+
+    // same_group: AggStep.
+    b.resolve_label(same_group_label);
 
     // Copy non-grouped columns from the row to prev_nongrouped registers.
     // These hold the latest (arbitrary) value for each non-grouped column.
@@ -27238,6 +27290,12 @@ fn codegen_select_group_by_aggregate(
 
         // FILTER clause: read the row's boolean and skip AggStep if false/NULL.
         let filter_skip_label = if let Some(filt_col) = filter_sorter_col[i] {
+            // bd-36aed: SQLite's "magnet" before a FILTERed min()/max().
+            if let (Some(skip_reg), Some(use_flag)) = (key_spelling_skip_reg, key_spelling_use_flag)
+                && agg_column_is_minmax(agg)
+            {
+                b.emit_op(Opcode::Copy, use_flag, skip_reg, 0, P4::None, 0);
+            }
             let skip_lbl = b.emit_label();
             let filt_reg = b.alloc_temp();
             read_slot(b, filt_col, filt_reg);
@@ -27277,6 +27335,13 @@ fn codegen_select_group_by_aggregate(
                 emit_expr(b, extra_expr, extra_reg, None);
             }
             let step_p5 = u16::try_from(agg.num_args).unwrap_or_default();
+            // bd-36aed: SQLite's OP_CollSeq before a min()/max() step names
+            // the register that step sets when this row is not its extremum.
+            if let Some(skip_reg) = key_spelling_skip_reg
+                && agg_column_is_minmax(agg)
+            {
+                b.emit_op(Opcode::CollSeq, skip_reg, 0, 0, P4::None, 0);
+            }
             // bd-lgwjd(a): thread the aggregate's declared collation into the
             // GROUP BY substrate AggStep (a direct `max(name)` under GROUP BY was
             // emitted BINARY here, ignoring `agg.collation`). `agg_func_p4` yields
@@ -27296,6 +27361,17 @@ fn codegen_select_group_by_aggregate(
         if let Some(skip_lbl) = filter_skip_label {
             b.resolve_label(skip_lbl);
         }
+    }
+    // bd-36aed: the keys take every row the min()/max() steps did not skip,
+    // so they end on the row the last of those aggregates picked.
+    if let Some(skip_reg) = key_spelling_skip_reg {
+        let keep_keys = b.emit_label();
+        b.emit_jump_to_label(Opcode::If, skip_reg, 0, keep_keys, P4::None, 0);
+        copy_keys_to_previous(b);
+        b.resolve_label(keep_keys);
+    }
+    if let Some(use_flag) = key_spelling_use_flag {
+        b.emit_op(Opcode::Integer, 1, use_flag, 0, P4::None, 0);
     }
 
     if let Some(return_reg) = group_row_return {

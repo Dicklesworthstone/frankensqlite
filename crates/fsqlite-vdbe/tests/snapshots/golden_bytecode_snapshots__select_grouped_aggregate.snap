@@ -30,7 +30,7 @@ addr  opcode           p1    p2    p3    p4                 p5
 15    Column           1     0     7                        0 
 16    IfPos            12    38    1                        0 
 17    Ne               7     19    8                        128
-18    Goto             0     38    0                        0 
+18    Goto             0     39    0                        0 
 19    AggFinal         9     0     0     (func)COUNT        0 
 20    AggFinal         10    1     0     (func)SUM          0 
 21    Copy             8     1     0                        0 

@@ -20,6 +20,10 @@
 //! 3.54.1, in memory and in a file, ad hoc and prepared. In memory with
 //! parity-cert strict on, a statement must answer as stock or be refused:
 //! strict mode refuses the grouped evaluator these keys run on.
+//!
+//! bd-36aed holds the same rule for an untyped key whose group mixes INTEGER
+//! and REAL spellings (3 and 3.0), on the VDBE GROUP BY program: see
+//! `mixed_integer_real_group_by_key_spelling_matches_stock_on_a_strict_file_database`.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -191,6 +195,151 @@ async fn compare(file_backed: bool, strict: bool) -> (Vec<String>, usize) {
     }
     f.close().await.unwrap();
     (diffs, statements)
+}
+
+/// bd-36aed: one GROUP BY group of an untyped column can hold an INTEGER and
+/// a REAL spelling of one value (3 and 3.0, -0.0 and 0, 5.0 and 5). Stock
+/// prints the key as the row its bare columns come from spells it: the
+/// group's first row, or the row the last min()/max() picks (ties keep the
+/// earlier row; a FILTERed one's rejected row counts only as the group's
+/// first). The VDBE sorted plan printed the group's last row.
+///
+/// Not covered, and not claimed: a DISTINCT min()/max() beside such a key.
+/// Stock lets a row repeating the DISTINCT value keep the choice the row
+/// before it made; the program keeps the group's first row there, as the
+/// aggregate without GROUP BY does (bd-6hoc8), and differs from stock when
+/// the extremum's row spells the key otherwise (`max(DISTINCT n)` over
+/// `(5.0, 1), (5, 2)`: stock 5, fsqlite 5.0).
+///
+/// `m` and `w` hold the same rows in opposite rowid order and `mi` holds
+/// `w`'s rows under an index on the key, which the plan walks instead of
+/// sorting. On a file database with parity-cert strict on, each statement of
+/// the first list runs the GROUP BY program (strict refuses the grouped
+/// evaluator; a HAVING is the control that it does) and must answer as stock,
+/// ad hoc and prepared. The second list holds shapes strict mode refuses there
+/// (a HAVING, typeof() of the key, a DESC order), compared with strict off.
+const MIXED_SPELLING_SCHEMA: &str = "\
+CREATE TABLE m(id INTEGER PRIMARY KEY, a, b, n INTEGER);\
+INSERT INTO m VALUES (1, 3, 1, 10), (2, 3.0, 1.0, 5), (3, 3, 1, 7), (4, 5.0, 2, 1), \
+  (5, 5, 2.0, 2), (6, -0.0, 1, 4), (7, 0, 1, 3), (8, 2.5, 1, 1), (9, NULL, 1, 1), \
+  (10, NULL, 1.0, 2), (11, 'x', 1, 1), (12, 7, 1, 9), (13, 7.0, 1, 9), (14, 8.0, 1, NULL), \
+  (15, 8, 1.0, 3), (16, 8.0, 1, 3), (17, 9, 1, 6), (18, 9.0, 1.0, 6), (19, 9, 1, 2), \
+  (20, x'01', 1, 1);\
+CREATE TABLE w(id INTEGER PRIMARY KEY, a, b, n INTEGER);\
+INSERT INTO w SELECT 21 - id, a, b, n FROM m;\
+CREATE TABLE mi(id INTEGER PRIMARY KEY, a, b, n INTEGER);\
+INSERT INTO mi SELECT * FROM w;\
+CREATE INDEX mi_a ON mi(a);";
+
+/// `@T@` is replaced by `m` and by `w`.
+const MIXED_SPELLING_STRICT: &[&str] = &[
+    "SELECT a, count(*) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, count(*), sum(n) FROM @T@ GROUP BY a",
+    "SELECT a, max(n) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, min(n) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, min(n), max(n) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, max(n), min(n) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT max(n), a, count(*) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, count(DISTINCT n), sum(DISTINCT n) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, max(n) FILTER (WHERE n > 2) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, max(n) FILTER (WHERE n > 2), min(n) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, count(*) FROM @T@ WHERE n > 1 GROUP BY a ORDER BY a",
+    "SELECT a, count(*) FROM @T@ GROUP BY a ORDER BY a LIMIT 3 OFFSET 2",
+    "SELECT a, b, count(*), max(n) FROM @T@ GROUP BY a, b ORDER BY a, b",
+    "SELECT b, a, sum(n), avg(n) FROM @T@ GROUP BY b, a ORDER BY b, a",
+    "SELECT a, group_concat(n) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, count(*) FROM mi GROUP BY a",
+    "SELECT a, max(n) FROM mi GROUP BY a LIMIT 100",
+    "SELECT a, min(n) FROM mi GROUP BY a ORDER BY a LIMIT 100",
+];
+
+/// `@T@` is replaced by `m` and by `w`.
+///
+/// Not covered, and not claimed: a max() beside the key in a shape strict
+/// mode refuses (`... HAVING max(n) > 2`, `SELECT a + 0, max(n) ... GROUP BY
+/// a`, `... ORDER BY max(n), a`). Those run on the connection's grouped
+/// evaluator, which prints a tied or later extremum row's spelling (8.0 where
+/// stock prints 8), the same with or without the fix to the program.
+const MIXED_SPELLING_STRICT_OFF: &[&str] = &[
+    "SELECT a, count(*) FROM @T@ GROUP BY a HAVING count(*) > 1 ORDER BY a",
+    "SELECT typeof(a), a, count(*) FROM @T@ GROUP BY a ORDER BY a",
+    "SELECT a, total(n), count(n) FROM @T@ GROUP BY a ORDER BY a DESC",
+];
+
+#[test]
+fn mixed_integer_real_group_by_key_spelling_matches_stock_on_a_strict_file_database() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Connection::open(dir.path().join("f.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let r = rusqlite::Connection::open(dir.path().join("r.db")).unwrap();
+        f.execute_batch(MIXED_SPELLING_SCHEMA).await.unwrap();
+        r.execute_batch(MIXED_SPELLING_SCHEMA).unwrap();
+        f.execute("PRAGMA fsqlite.parity_cert_strict = ON")
+            .await
+            .unwrap();
+        assert!(
+            f.query("SELECT a, count(*) FROM m GROUP BY a HAVING count(*) > 1")
+                .await
+                .is_err(),
+            "strict mode must refuse the grouped evaluator, which a HAVING takes; otherwise \
+             the strict list need not run the GROUP BY program"
+        );
+        let mut diffs = Vec::new();
+        let mut statements = 0usize;
+        for (strict, templates) in [
+            (true, MIXED_SPELLING_STRICT),
+            (false, MIXED_SPELLING_STRICT_OFF),
+        ] {
+            let pragma = if strict {
+                "PRAGMA fsqlite.parity_cert_strict = ON"
+            } else {
+                "PRAGMA fsqlite.parity_cert_strict = OFF"
+            };
+            f.execute(pragma).await.unwrap();
+            let label = if strict { "strict file" } else { "file" };
+            for template in templates {
+                let tables: &[&str] = if template.contains("@T@") {
+                    &["m", "w"]
+                } else {
+                    &[""]
+                };
+                for table in tables {
+                    let sql = template.replace("@T@", table);
+                    statements += 1;
+                    let rr = rq(&r, &sql);
+                    let adhoc = f
+                        .query(&sql)
+                        .await
+                        .map(|rows| tag_rows(&rows))
+                        .map_err(|e| e.to_string());
+                    let prepared = match f.prepare(&sql).await {
+                        Ok(stmt) => stmt
+                            .query()
+                            .await
+                            .map(|rows| tag_rows(&rows))
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    for (path, fr) in [("ad hoc", adhoc), ("prepared", prepared)] {
+                        if !same_outcome(&fr, &rr) {
+                            diffs.push(format!(
+                                "  [{label}, {path}] `{sql}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "{} divergence(s) over {statements} statement(s) from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
 }
 
 #[test]
