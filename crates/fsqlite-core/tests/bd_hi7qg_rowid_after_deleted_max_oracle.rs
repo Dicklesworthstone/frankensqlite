@@ -24,6 +24,14 @@
 //! here checks the end state: every committed row stored exactly once, every
 //! refused one not at all, and the file intact, on both insert lanes.
 //!
+//! bd-mkon7's original shape (an emptied table, 20,000 prepared inserts a
+//! round, rowids restarting at 1 as in stock) runs on both lanes. Its
+//! negatives (an emptied table keeps its old floor while another session
+//! holds a claim on it, or after a write commit since the BEGIN sample) are
+//! allocator cases in `a_deleted_maximum_is_reused_only_when_provably_free`:
+//! through SQL a peer's live rows hold the leaf, and a concurrent BEGIN's
+//! snapshot still shows the rows a later commit deleted.
+//!
 //! Left out, a recorded divergence (bd-hi7qg): a transaction that inserts the
 //! maximum itself, deletes it and inserts again in the same transaction keeps
 //! the gap on the allocator lane.
@@ -563,4 +571,95 @@ async fn run_two_writer_schedule(name: &str, steps: &[Step], shape: Shape) {
         vec![vec![format!("int:{}", 3 + committed.len())]],
         "{label}: no other row appeared or vanished"
     );
+}
+
+/// `min(id)`, `max(id)`, `count(*)` and `last_insert_rowid()` after a round.
+const ROUND_CHECK: &str = "SELECT min(id), max(id), count(*), last_insert_rowid() FROM u";
+
+/// bd-mkon7's original shape (the blocking_vs_rusqlite_bench cross-check,
+/// 2026-11-10): one connection on a file-backed WAL database empties `u`
+/// with an unconditional DELETE, then inserts 20,000 rows through one
+/// prepared `INSERT INTO u(a, b) VALUES (?1, ?2)` inside BEGIN ... COMMIT.
+/// Stock restarts at rowid 1 every round (an emptied table's
+/// `max(rowid) + 1`); fsqlite used to continue from the old high-water
+/// (round 1: 40000 where stock says 20000). The same rounds run again with
+/// `RETURNING id` through `query_with_params`, the allocator lane, and every
+/// rowid it hands out is compared with stock's.
+#[test]
+fn an_emptied_table_restarts_prepared_rowids_at_one_like_stock() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        const SCHEMA: &str = "CREATE TABLE u(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)";
+        const CLEAR: &str = "DELETE FROM u";
+        const INSERT: &str = "INSERT INTO u(a, b) VALUES (?1, ?2)";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stock = rusqlite::Connection::open(dir.path().join("stock.db")).expect("stock");
+        stock
+            .execute_batch(&format!("PRAGMA journal_mode = WAL; {SCHEMA};"))
+            .expect("stock schema");
+        let conn = Connection::open(dir.path().join("frank.db").to_string_lossy().into_owned())
+            .await
+            .expect("fsqlite");
+        conn.execute("PRAGMA journal_mode = WAL")
+            .await
+            .expect("journal_mode");
+        conn.execute(SCHEMA).await.expect("schema");
+        for (lane, rows) in [("prepared execute", 20_000_i64), ("RETURNING", 2_000)] {
+            for round in 0..3 {
+                let label = format!("{lane}, round {round}");
+                stock.execute_batch(CLEAR).expect("stock clear");
+                conn.execute(CLEAR).await.expect("clear");
+                stock.execute_batch("BEGIN").expect("stock begin");
+                conn.execute("BEGIN").await.expect("begin");
+                let statement = if lane == "RETURNING" {
+                    format!("{INSERT} RETURNING id")
+                } else {
+                    INSERT.to_owned()
+                };
+                let mut stock_statement = stock.prepare(&statement).expect("stock prepare");
+                let frank_statement = conn.prepare(&statement).await.expect("prepare");
+                for i in 0..rows {
+                    let params = [SqliteValue::Integer(i), SqliteValue::from("payload")];
+                    if lane == "RETURNING" {
+                        let expected: i64 = stock_statement
+                            .query_row(rusqlite::params![i, "payload"], |row| row.get(0))
+                            .expect("stock insert");
+                        let taken = frank_statement
+                            .query_with_params(&params)
+                            .await
+                            .expect("insert");
+                        assert_eq!(
+                            taken
+                                .iter()
+                                .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                                .collect::<Rows>(),
+                            vec![vec![format!("int:{expected}")]],
+                            "[{label}] the rowid of insert {i}"
+                        );
+                    } else {
+                        stock_statement
+                            .execute(rusqlite::params![i, "payload"])
+                            .expect("stock insert");
+                        frank_statement
+                            .execute_with_params(&params)
+                            .await
+                            .expect("insert");
+                    }
+                }
+                drop(stock_statement);
+                drop(frank_statement);
+                stock.execute_batch("COMMIT").expect("stock commit");
+                conn.execute("COMMIT").await.expect("commit");
+                assert_eq!(
+                    frank_rows(&conn, ROUND_CHECK).await,
+                    stock_rows(&stock, ROUND_CHECK),
+                    "[{label}] min, max, count and last_insert_rowid()"
+                );
+            }
+        }
+        assert_eq!(
+            frank_rows(&conn, "PRAGMA integrity_check").await,
+            vec![vec!["text:ok".to_owned()]]
+        );
+    });
 }

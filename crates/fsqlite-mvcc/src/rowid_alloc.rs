@@ -2159,13 +2159,32 @@ mod tests {
         );
         assert_eq!(alloc.next_rowid(&k), Some(102));
 
-        // An empty table starts over at 1.
+        // An empty table starts over at 1 (bd-mkon7) ...
         let (alloc, _, k) = quiescent_tip_above_the_max();
         assert_eq!(
             alloc
                 .allocate_one_above_visible_max(k, 0, 0, RowIdMode::Normal, 2, 0, 7)
                 .unwrap(),
             RowId::new(1)
+        );
+        // ... but not while another session holds a claim on it, nor after a
+        // write commit since the BEGIN sample: the emptied table's old floor
+        // stays.
+        let (alloc, _, k) = quiescent_tip_above_the_max();
+        alloc.claim_table(k, 3);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 0, 0, RowIdMode::Normal, 2, 0, 7)
+                .unwrap(),
+            RowId::new(102)
+        );
+        let (alloc, generation, k) = quiescent_tip_above_the_max();
+        generation.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 0, 0, RowIdMode::Normal, 2, 0, 7)
+                .unwrap(),
+            RowId::new(102)
         );
 
         // A live claim of another session (a reservation, or a row it
