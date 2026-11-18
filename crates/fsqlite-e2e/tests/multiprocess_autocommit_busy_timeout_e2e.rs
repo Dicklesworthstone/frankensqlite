@@ -643,6 +643,18 @@ const BUSY_COMMIT_KEPT_OPEN: &str = "commit code=5 autocommit_after=false: ";
 /// The next row's BEGIN after such a COMMIT: its transaction is still open.
 const BEGIN_WITHIN_TRANSACTION: &str = "begin: cannot start a transaction within a transaction";
 
+/// Whether a writer may end its run still inside a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAtClose {
+    /// Every transaction ended by COMMIT or by a refusal.
+    Forbidden,
+    /// The writer's last COMMITs may have returned BUSY and kept their
+    /// transaction open (decision (b1)). The close then rolls that one
+    /// transaction back: its rows were reported failed and never land. This
+    /// happens when a short busy_timeout runs out on the last rows.
+    AfterBusyCommit,
+}
+
 /// The explicit shapes' accounting (bd-reality-check-1022-llk6g.5.1, bd-igdof
 /// decision (b1)), returning the refused COMMITs:
 /// - integrity_check is ok;
@@ -652,7 +664,8 @@ const BEGIN_WITHIN_TRANSACTION: &str = "begin: cannot start a transaction within
 ///   `refused_commit_ends_transaction_e2e`'s stock arm). Every committed row
 ///   is durable and nothing else is;
 /// - every inserted row either landed or was lost with a transaction that a
-///   BusySnapshot refusal ended; none was lost at close;
+///   BusySnapshot refusal ended. None was lost at close, unless `open_at_close`
+///   allows it (see [`OpenAtClose`]);
 /// - a refusal costs its own transaction's rows: one, plus at most one per
 ///   BUSY COMMIT whose row was still pending in it;
 /// - the only errors are such a refusal, a BUSY COMMIT that kept its
@@ -661,6 +674,7 @@ fn assert_explicit_accounting<'a>(
     label: &str,
     frank: &'a ShapeResult,
     expected: usize,
+    open_at_close: OpenAtClose,
 ) -> Vec<&'a String> {
     assert_eq!(frank.integrity, "ok", "{label}: integrity_check");
     assert_eq!(
@@ -709,10 +723,38 @@ fn assert_explicit_accounting<'a>(
         .iter()
         .filter(|(_, _, how)| how != "ended")
         .collect();
-    assert!(
-        closed.is_empty(),
-        "{label}: rows lost when a connection closed inside a transaction: {closed:?}"
-    );
+    match open_at_close {
+        OpenAtClose::Forbidden => assert!(
+            closed.is_empty(),
+            "{label}: rows lost when a connection closed inside a transaction: {closed:?}"
+        ),
+        OpenAtClose::AfterBusyCommit => {
+            // A writer's rows pending at close are one transaction's: the
+            // rows after its last successful COMMIT, consecutive, each
+            // INSERTed and then COMMITted with BUSY (any other error fails
+            // the error check above), and none of them is durable.
+            let mut by_worker: std::collections::BTreeMap<i64, Vec<i64>> =
+                std::collections::BTreeMap::new();
+            for (worker, seq, _) in &closed {
+                by_worker.entry(*worker).or_default().push(*seq);
+            }
+            for (worker, mut seqs) in by_worker {
+                seqs.sort_unstable();
+                let last_committed = frank
+                    .committed_rows
+                    .iter()
+                    .filter(|(committed_worker, _)| *committed_worker == worker)
+                    .map(|(_, seq)| *seq)
+                    .max()
+                    .unwrap_or(-1);
+                assert!(
+                    seqs[0] > last_committed && seqs.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                    "{label}: worker {worker} lost rows {seqs:?} at close, which are not the \
+                     transaction left open after its last COMMIT (seq {last_committed})"
+                );
+            }
+        }
+    }
     assert_eq!(
         frank.committed + frank.lost_rows.len(),
         expected,
@@ -728,10 +770,11 @@ fn assert_explicit_accounting<'a>(
     );
     eprintln!(
         "event=mp_busy_accounting label={label} committed={} lost={} refused={} \
-         busy_commits={busy_commits} begins_within={begins_within}",
+         busy_commits={busy_commits} begins_within={begins_within} lost_at_close={}",
         frank.committed,
         frank.lost_rows.len(),
-        refused.len()
+        refused.len(),
+        closed.len()
     );
     refused
 }
@@ -755,7 +798,12 @@ fn cross_process_explicit_writers_on_one_table_lose_only_refused_transactions() 
     stock_oracle("stock-explicit", workers, rows);
 
     let frank = run_shape("fsqlite-explicit", workers, rows, 5000);
-    let refused = assert_explicit_accounting("fsqlite-explicit", &frank, workers * rows);
+    let refused = assert_explicit_accounting(
+        "fsqlite-explicit",
+        &frank,
+        workers * rows,
+        OpenAtClose::Forbidden,
+    );
     assert!(
         !refused.is_empty(),
         "non-vacuity: {workers} writers on one leaf page produced no COMMIT refusal, so this \
@@ -789,7 +837,12 @@ fn cross_process_explicit_writers_on_own_tables_certify_the_durable_floor() {
     stock_oracle("stock-explicit-own", workers, rows);
 
     let frank = run_shape("fsqlite-explicit-own", workers, rows, 5000);
-    assert_explicit_accounting("fsqlite-explicit-own", &frank, workers * rows);
+    assert_explicit_accounting(
+        "fsqlite-explicit-own",
+        &frank,
+        workers * rows,
+        OpenAtClose::Forbidden,
+    );
     let floor_refusals: Vec<&String> = frank
         .errors
         .iter()
@@ -806,6 +859,47 @@ fn cross_process_explicit_writers_on_own_tables_certify_the_durable_floor() {
         frank.floor_certified > 0,
         "non-vacuity: no commit certified the durable floor, so this run did not reach the \
          prep-to-gate race the fix covers"
+    );
+}
+
+/// bd-igdof's own path, made routine. At the default busy_timeout the shape
+/// above rarely gets a COMMIT that returns BUSY (none in 80 runs on hz3 and
+/// vmi1153651 at 83da909e2), so it seldom checks the case the bead found:
+/// a BUSY COMMIT keeps its transaction open (decision (b1)), and the row lands
+/// only when a later COMMIT of that transaction succeeds. At 50 ms, commits
+/// that wait for the write lock run out of budget. The same accounting must
+/// then hold:
+/// - committed is exactly durable, in both directions;
+/// - every BUSY COMMIT kept its transaction open;
+/// - a refusal costs its own row plus at most one pending row per BUSY COMMIT.
+/// - a writer may end its run inside the one transaction its last COMMITs
+///   left open with BUSY. The close rolls it back, so those rows were reported
+///   failed and are not durable; at 50 ms that happens on loaded hosts.
+///
+/// Non-vacuity: at least one COMMIT returned BUSY, or the run proved nothing.
+#[test]
+fn cross_process_explicit_writers_on_own_tables_account_busy_commits_at_a_short_busy_timeout() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    let _one_at_a_time = one_parent_test_at_a_time();
+    let (workers, rows) = (8, 300);
+    let frank = run_shape("fsqlite-explicit-own", workers, rows, 50);
+    assert_explicit_accounting(
+        "fsqlite-explicit-own-busy-50ms",
+        &frank,
+        workers * rows,
+        OpenAtClose::AfterBusyCommit,
+    );
+    let busy_commits = frank
+        .errors
+        .iter()
+        .filter(|error| error.starts_with(BUSY_COMMIT_KEPT_OPEN))
+        .count();
+    assert!(
+        busy_commits > 0,
+        "non-vacuity: no COMMIT returned BUSY at busy_timeout 50 ms, so this run never checked \
+         the accounting of a BUSY COMMIT whose transaction stayed open"
     );
 }
 
