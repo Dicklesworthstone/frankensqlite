@@ -36,6 +36,10 @@ mod insert_batch;
 mod literal_params;
 mod pragma_maintenance;
 mod qualified_column_binding;
+mod txn_replay;
+
+use txn_replay::{ReplayCallKind, TxnReplayState};
+pub use txn_replay::{TxnReplayCounts, txn_replay_counts};
 
 /// Required mirror refreshes and optional prepared-read acceleration have
 /// different admission rules. Only the latter may decline row hydration.
@@ -10408,6 +10412,16 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query and return all result rows.
     pub async fn query(&self) -> Result<Vec<Row>> {
+        let replay = self
+            .conn
+            .txn_replay_enter(ReplayCallKind::PreparedQuery, &self.original_sql);
+        let result = self.query_unrecorded().await;
+        self.conn
+            .txn_replay_leave(replay, &self.original_sql, &[], result)
+            .await
+    }
+
+    async fn query_unrecorded(&self) -> Result<Vec<Row>> {
         self.conn.background_status()?;
         self.conn.settle_pending_transaction_cleanup().await?;
         self.with_same_connection_schema_reprepare(async |stmt| {
@@ -10420,6 +10434,16 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub async fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        let replay = self
+            .conn
+            .txn_replay_enter(ReplayCallKind::PreparedQueryWithParams, &self.original_sql);
+        let result = self.query_with_params_unrecorded(params).await;
+        self.conn
+            .txn_replay_leave(replay, &self.original_sql, params, result)
+            .await
+    }
+
+    async fn query_with_params_unrecorded(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
         self.conn.background_status()?;
         // Settlement MUST precede the fast path: returning early from
         // `try_query_clean_memory_indexed_equality_fast` would otherwise serve a
@@ -10478,12 +10502,25 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query and return exactly one row.
     pub async fn query_row(&self) -> Result<Row> {
-        self.query_row_internal(None).await
+        let replay = self
+            .conn
+            .txn_replay_enter(ReplayCallKind::PreparedQueryRow, &self.original_sql);
+        let result = self.query_row_internal(None).await;
+        self.conn
+            .txn_replay_leave(replay, &self.original_sql, &[], result)
+            .await
     }
 
     /// Execute as a query with parameters and return exactly one row.
     pub async fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row> {
-        self.query_row_internal(Some(params)).await
+        let replay = self.conn.txn_replay_enter(
+            ReplayCallKind::PreparedQueryRowWithParams,
+            &self.original_sql,
+        );
+        let result = self.query_row_internal(Some(params)).await;
+        self.conn
+            .txn_replay_leave(replay, &self.original_sql, params, result)
+            .await
     }
 
     async fn query_row_internal(&self, params: Option<&[SqliteValue]>) -> Result<Row> {
@@ -10556,6 +10593,16 @@ impl PreparedStatement<'_> {
     /// constraints, and autocommit.  For SELECT statements, this returns
     /// the number of result rows.
     pub async fn execute(&self) -> Result<usize> {
+        let replay = self
+            .conn
+            .txn_replay_enter(ReplayCallKind::PreparedExecute, &self.original_sql);
+        let result = self.execute_unrecorded().await;
+        self.conn
+            .txn_replay_leave(replay, &self.original_sql, &[], result)
+            .await
+    }
+
+    async fn execute_unrecorded(&self) -> Result<usize> {
         if self.dml_dispatch.is_some() {
             return self
                 .with_same_connection_schema_reprepare(async |stmt| {
@@ -10573,6 +10620,17 @@ impl PreparedStatement<'_> {
     /// constraints, and autocommit.  For SELECT statements, this returns
     /// the number of result rows.
     pub async fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize> {
+        let replay = self.conn.txn_replay_enter(
+            ReplayCallKind::PreparedExecuteWithParams,
+            &self.original_sql,
+        );
+        let result = self.execute_with_params_unrecorded(params).await;
+        self.conn
+            .txn_replay_leave(replay, &self.original_sql, params, result)
+            .await
+    }
+
+    async fn execute_with_params_unrecorded(&self, params: &[SqliteValue]) -> Result<usize> {
         if self.dml_dispatch.is_some() {
             return self
                 .with_same_connection_schema_reprepare(async |stmt| {
@@ -14562,6 +14620,9 @@ pub struct Connection {
     /// only question at the next entry point is "is there an abandoned
     /// transaction to unwind?".
     pending_transaction_cleanup: Cell<bool>,
+    /// bd-q4o7z: the record of the open plain-BEGIN transaction, replayed if
+    /// its COMMIT loses a page conflict (see `connection/txn_replay.rs`).
+    txn_replay: TxnReplayState,
     /// Connection-level flag: when set, plain `BEGIN` is promoted to
     /// `BEGIN CONCURRENT`.  Controlled by `PRAGMA fsqlite.concurrent_mode`.
     concurrent_mode_default: RefCell<bool>,
@@ -16843,6 +16904,7 @@ impl Connection {
             implicit_txn: Cell::new(false),
             concurrent_txn: Cell::new(false),
             pending_transaction_cleanup: Cell::new(false),
+            txn_replay: TxnReplayState::default(),
             concurrent_mode_default: RefCell::new(true),
             dqs_enabled: Cell::new(true),
             parallel_workers: Cell::new(default_parallel_workers()),
@@ -17430,6 +17492,7 @@ impl Connection {
             implicit_txn: Cell::new(false),
             concurrent_txn: Cell::new(false),
             pending_transaction_cleanup: Cell::new(false),
+            txn_replay: TxnReplayState::default(),
             concurrent_mode_default: RefCell::new(true),
             dqs_enabled: Cell::new(true),
             parallel_workers: Cell::new(default_parallel_workers()),
@@ -21181,6 +21244,8 @@ impl Connection {
 
     /// Return the background-runtime health for this connection's database.
     pub fn background_status(&self) -> Result<()> {
+        // Every SQL operation passes here first (bd-q4o7z).
+        self.txn_replay_note_operation();
         if self.live_vtab_callback_depth.get() != 0 {
             return Err(FrankenError::Internal(
                 "recursive SQL is not allowed while a virtual-table callback is active".to_owned(),
@@ -21381,7 +21446,10 @@ impl Connection {
     /// Return the most recent successful INSERT rowid on this connection.
     #[must_use]
     pub fn last_insert_rowid(&self) -> i64 {
-        self.current_last_insert_rowid()
+        let rowid = self.current_last_insert_rowid();
+        // bd-q4o7z: a rowid the caller has seen must survive a replay.
+        self.txn_replay_note_rowid_read(rowid);
+        rowid
     }
 
     async fn current_btree_cursor_sizes_in_txn<T: TransactionHandle + ?Sized>(
@@ -29870,6 +29938,9 @@ impl Connection {
 
     /// Prepare SQL into a statement.
     pub async fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
+        // bd-q4o7z: preparing runs no statement, so it neither records nor
+        // ends a transaction's replay record.
+        let _replay = self.txn_replay_enter_neutral();
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         self.prepare_after_background_status(sql).await
@@ -30365,6 +30436,12 @@ impl Connection {
     /// **last** statement are returned. Intermediate statement results are
     /// discarded. This matches common SQL driver semantics (last statement wins).
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        let replay = self.txn_replay_enter(ReplayCallKind::Query, sql);
+        let result = self.query_unrecorded(sql).await;
+        self.txn_replay_leave(replay, sql, &[], result).await
+    }
+
+    async fn query_unrecorded(&self, sql: &str) -> Result<Vec<Row>> {
         let rewritten = self.dqs_proactive_rewrite(sql);
         let sql = rewritten.as_ref();
         // Run the (possibly DQS-retried) query, then, at this outermost boundary
@@ -30575,6 +30652,16 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub async fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        let replay = self.txn_replay_enter(ReplayCallKind::QueryWithParams, sql);
+        let result = self.query_with_params_unrecorded(sql, params).await;
+        self.txn_replay_leave(replay, sql, params, result).await
+    }
+
+    async fn query_with_params_unrecorded(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>> {
         let rewritten = self.dqs_proactive_rewrite(sql);
         let sql = rewritten.as_ref();
         // See `query`: append SQLite's " in <SQL> at offset N" suffix at this
@@ -30732,6 +30819,12 @@ impl Connection {
 
     /// Prepare and execute SQL as a query, returning exactly one row.
     pub async fn query_row(&self, sql: &str) -> Result<Row> {
+        let replay = self.txn_replay_enter(ReplayCallKind::QueryRow, sql);
+        let result = self.query_row_unrecorded(sql).await;
+        self.txn_replay_leave(replay, sql, &[], result).await
+    }
+
+    async fn query_row_unrecorded(&self, sql: &str) -> Result<Row> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -30782,6 +30875,16 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters, returning exactly one row.
     pub async fn query_row_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Row> {
+        let replay = self.txn_replay_enter(ReplayCallKind::QueryRowWithParams, sql);
+        let result = self.query_row_with_params_unrecorded(sql, params).await;
+        self.txn_replay_leave(replay, sql, params, result).await
+    }
+
+    async fn query_row_with_params_unrecorded(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Row> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         let statements = {
@@ -30835,6 +30938,12 @@ impl Connection {
     /// rows.  For SELECT and other statement types it returns the number of
     /// result rows.
     pub async fn execute(&self, sql: &str) -> Result<usize> {
+        let replay = self.txn_replay_enter(ReplayCallKind::Execute, sql);
+        let result = self.execute_unrecorded(sql).await;
+        self.txn_replay_leave(replay, sql, &[], result).await
+    }
+
+    async fn execute_unrecorded(&self, sql: &str) -> Result<usize> {
         let rewritten = self.dqs_proactive_rewrite(sql);
         let sql = rewritten.as_ref();
         // See `query`: append SQLite's " in <SQL> at offset N" suffix at this
@@ -31007,6 +31116,12 @@ impl Connection {
     /// Empty batches and batches containing only whitespace, semicolons, or
     /// SQL comments are treated as a no-op, matching SQLite batch semantics.
     pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+        let replay = self.txn_replay_enter(ReplayCallKind::ExecuteBatch, sql);
+        let result = self.execute_batch_unrecorded(sql).await;
+        self.txn_replay_leave(replay, sql, &[], result).await
+    }
+
+    async fn execute_batch_unrecorded(&self, sql: &str) -> Result<()> {
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
         if batch_is_noop(sql)? {
@@ -31021,6 +31136,12 @@ impl Connection {
     /// absent, so `concurrent_mode_default` still controls whether the
     /// transaction auto-promotes to concurrent mode.
     pub async fn begin_transaction(&self) -> Result<()> {
+        let replay = self.txn_replay_enter(ReplayCallKind::BeginTransaction, "");
+        let result = self.begin_transaction_unrecorded().await;
+        self.txn_replay_leave(replay, "", &[], result).await
+    }
+
+    async fn begin_transaction_unrecorded(&self) -> Result<()> {
         self.background_status()?;
         // Unwind any abandoned transaction before opening a new one, so the
         // new transaction never inherits an abandoned one's uncommitted state.
@@ -31031,6 +31152,12 @@ impl Connection {
 
     /// Commit the active transaction without reparsing a `COMMIT` statement.
     pub async fn commit_transaction(&self) -> Result<()> {
+        let replay = self.txn_replay_enter(ReplayCallKind::CommitTransaction, "");
+        let result = self.commit_transaction_unrecorded().await;
+        self.txn_replay_leave(replay, "", &[], result).await
+    }
+
+    async fn commit_transaction_unrecorded(&self) -> Result<()> {
         self.background_status()?;
         // An abandoned transaction cannot be committed after the fact: unwind
         // it first so a stale wrapper cannot resurrect uncommitted writes.
@@ -31109,6 +31236,16 @@ impl Connection {
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub async fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+        let replay = self.txn_replay_enter(ReplayCallKind::ExecuteWithParams, sql);
+        let result = self.execute_with_params_unrecorded(sql, params).await;
+        self.txn_replay_leave(replay, sql, params, result).await
+    }
+
+    async fn execute_with_params_unrecorded(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize> {
         let rewritten = self.dqs_proactive_rewrite(sql);
         let sql = rewritten.as_ref();
         // See `query`: append SQLite's " in <SQL> at offset N" suffix here. bd-ttof2.
@@ -31337,6 +31474,19 @@ impl Connection {
 
     /// Execute a prepared DML statement (INSERT/UPDATE/DELETE) with bound parameters.
     pub async fn execute_prepared_with_params(
+        &self,
+        stmt: &PreparedStatement<'_>,
+        params: &[SqliteValue],
+    ) -> Result<usize> {
+        let replay = self.txn_replay_enter(ReplayCallKind::ExecutePrepared, &stmt.original_sql);
+        let result = self
+            .execute_prepared_with_params_unrecorded(stmt, params)
+            .await;
+        self.txn_replay_leave(replay, &stmt.original_sql, params, result)
+            .await
+    }
+
+    async fn execute_prepared_with_params_unrecorded(
         &self,
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
@@ -41142,6 +41292,9 @@ impl Connection {
         params: Option<&'a [SqliteValue]>,
     ) -> FallbackStatementFuture<'a, Result<Vec<Row>>> {
         self.with_fallback_statement(Box::pin(async move {
+            // bd-q4o7z: a statement a replay may not re-run ends the
+            // transaction's replay record.
+            self.txn_replay_note_statement(statement);
             // bd-b4u1r (GH #367) + #335: extend the autocommit conflict retry
             // from PRAGMA (bd-tc8u7) to plain reads. A bare `SELECT` at an
             // autocommit boundary can transiently observe a SQLITE_BUSY-family
@@ -79783,6 +79936,8 @@ impl Connection {
         self.set_fast_path_bit(fast_path_gate::IN_TRANSACTION, true);
         self.concurrent_txn.set(is_concurrent);
         self.txn_metrics_mark_started();
+        // bd-q4o7z: a plain BEGIN that was promoted starts a replay record.
+        self.txn_replay_note_begin(begin.mode.is_none() && is_concurrent);
         record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
         Ok(())
     }
@@ -80688,7 +80843,11 @@ impl Connection {
         }
         let full_rollback = fsqlite_ast::RollbackStatement { to_savepoint: None };
         match Box::pin(self.execute_rollback_with_cx(cx, &full_rollback)).await {
-            Ok(()) => error,
+            Ok(()) => {
+                // bd-q4o7z: the COMMIT's caller may replay the transaction.
+                self.txn_replay_note_refused_commit_ended();
+                error
+            }
             Err(rollback_error) if self.in_transaction.get() => {
                 tracing::debug!(
                     %error,

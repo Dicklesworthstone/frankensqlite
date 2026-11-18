@@ -696,7 +696,10 @@ fn a_busy_commit_behind_a_stock_writer_stays_open_and_a_later_commit_lands_its_r
     assert_eq!(h, 1, "the stock holder's commit is durable");
     assert_eq!(stock_integrity(&db), "ok");
 
-    // Negative: a same-page stock commit while the transaction is open.
+    // Negative: a same-page stock commit while the transaction is open. The
+    // transaction reads `count(*)` after its INSERT, and the peer's row changes
+    // that count, so the refused COMMIT cannot be replayed (bd-q4o7z): without
+    // the read it would be replayed and commit.
     let neg = dir.path().join("refused.db");
     rusqlite::Connection::open(&neg)
         .expect("seed open")
@@ -727,6 +730,11 @@ fn a_busy_commit_behind_a_stock_writer_stays_open_and_a_later_commit_lands_its_r
         conn.execute("INSERT INTO t VALUES (2, 1, 'refused')")
             .await
             .expect("INSERT");
+        assert_eq!(
+            scalar(&conn, "SELECT count(*) FROM t").await,
+            2,
+            "the transaction sees its own row"
+        );
         let child = Command::new(std::env::current_exe().expect("test binary path"))
             .args([
                 "--exact",
@@ -965,12 +973,62 @@ struct OpenAcrossPeerCommit {
     /// What a second COMMIT reported, when the first was refused.
     second_commit: Option<String>,
     fsqlite_ids: Vec<i64>,
+    /// What each step of the transaction returned to the caller, in order.
+    observed: Vec<String>,
+    /// `last_insert_rowid()` after the COMMIT.
+    rowid_after_commit: i64,
+    /// How many times the application function `app_counter()` ran.
+    app_calls: usize,
+}
+
+/// One statement or API read of the open transaction, before the peer commits.
+#[derive(Clone, Copy)]
+enum Step {
+    Execute(&'static str),
+    Query(&'static str),
+    /// `query_with_params_for_each`, counting the streamed rows.
+    Stream(&'static str),
+    /// `Connection::last_insert_rowid()`.
+    ReadRowid,
+}
+
+/// The transaction most cases run: one INSERT with an explicit id, which
+/// returns nothing but its count.
+const INSERT_ID_2: &[Step] = &[Step::Execute("INSERT INTO t VALUES (2, 1, 'fsqlite')")];
+
+/// bd-q4o7z: an application function with a call counter.
+struct AppCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl fsqlite_func::ScalarFunction for AppCounter {
+    fn invoke(
+        &self,
+        _args: &[fsqlite::SqliteValue],
+    ) -> fsqlite_error::Result<fsqlite::SqliteValue> {
+        let calls = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(fsqlite::SqliteValue::Integer(
+            i64::try_from(calls).expect("call count"),
+        ))
+    }
+
+    fn num_args(&self) -> i32 {
+        0
+    }
+
+    fn name(&self) -> &str {
+        "app_counter"
+    }
 }
 
 /// An fsqlite connection opens a WAL database that has no `-wal` (so it
-/// creates one with no frames) and runs `BEGIN; INSERT INTO t (2)`. A peer
-/// process (`engine`) then commits `peer_sql`; the parent's COMMIT follows.
-fn open_transaction_across_peer_commit(engine: &str, peer_sql: &str) -> OpenAcrossPeerCommit {
+/// creates one with no frames) and runs `BEGIN` plus `steps`. A peer process
+/// (`engine`) then commits `peer_sql`; the parent's COMMIT follows. With
+/// `app_function`, the connection registers `app_counter()` before BEGIN.
+fn open_transaction_across_peer_commit(
+    engine: &str,
+    peer_sql: &str,
+    steps: &'static [Step],
+    app_function: bool,
+) -> OpenAcrossPeerCommit {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("open.db");
     rusqlite::Connection::open(&db)
@@ -994,16 +1052,49 @@ fn open_transaction_across_peer_commit(engine: &str, peer_sql: &str) -> OpenAcro
     let mut observed = None;
     let (peer_slot, observed_slot) = (&mut peer, &mut observed);
     let db_for_salts = db.clone();
+    let app_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app_calls_in = std::sync::Arc::clone(&app_calls);
     asupersync::test_utils::run_test(|| async move {
         let _release = ReleasePeer(work.clone());
         let conn = Connection::open(&path).await.expect("open");
         conn.execute("PRAGMA busy_timeout=1000")
             .await
             .expect("busy_timeout");
+        if app_function {
+            conn.register_nondeterministic_scalar_function(AppCounter(app_calls_in));
+        }
         conn.execute("BEGIN").await.expect("BEGIN");
-        conn.execute("INSERT INTO t VALUES (2, 1, 'fsqlite')")
-            .await
-            .expect("INSERT before the peer commits");
+        let mut observed = Vec::new();
+        for step in steps {
+            observed.push(match *step {
+                Step::Execute(sql) => format!(
+                    "{:?}",
+                    conn.execute(sql)
+                        .await
+                        .unwrap_or_else(|error| panic!("{sql} before the peer commits: {error}"))
+                ),
+                Step::Query(sql) => format!(
+                    "{:?}",
+                    conn.query(sql)
+                        .await
+                        .unwrap_or_else(|error| panic!("{sql} before the peer commits: {error}"))
+                        .iter()
+                        .map(|row| row.values().to_vec())
+                        .collect::<Vec<_>>()
+                ),
+                Step::Stream(sql) => {
+                    let mut streamed = 0_usize;
+                    conn.query_with_params_for_each(sql, &[], |_| {
+                        streamed += 1;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql} before the peer commits: {error}"));
+                    format!("streamed {streamed}")
+                }
+                Step::ReadRowid => format!("rowid {}", conn.last_insert_rowid()),
+            });
+        }
         let before = wal_salts(&db_for_salts);
         let child = peer_slot.insert(
             Command::new(std::env::current_exe().expect("test binary path"))
@@ -1033,6 +1124,7 @@ fn open_transaction_across_peer_commit(engine: &str, peer_sql: &str) -> OpenAcro
         }
         let after = wal_salts(&db_for_salts);
         let commit = conn.execute("COMMIT").await.map(|_| ());
+        let rowid_after_commit = conn.last_insert_rowid();
         let open_after_commit = conn.in_transaction();
         let second_commit = if commit.is_err() {
             conn.execute("COMMIT")
@@ -1055,10 +1147,19 @@ fn open_transaction_across_peer_commit(engine: &str, peer_sql: &str) -> OpenAcro
             open_after_commit,
             second_commit,
             ids,
+            observed,
+            rowid_after_commit,
         ));
     });
-    let (wal_salts, commit, open_after_commit, second_commit, fsqlite_ids) =
-        observed.expect("the parent ran to completion");
+    let (
+        wal_salts,
+        commit,
+        open_after_commit,
+        second_commit,
+        fsqlite_ids,
+        observed,
+        rowid_after_commit,
+    ) = observed.expect("the parent ran to completion");
     let output = peer
         .expect("peer spawned")
         .wait_with_output()
@@ -1077,6 +1178,9 @@ fn open_transaction_across_peer_commit(engine: &str, peer_sql: &str) -> OpenAcro
         open_after_commit,
         second_commit,
         fsqlite_ids,
+        observed,
+        rowid_after_commit,
+        app_calls: app_calls.load(std::sync::atomic::Ordering::SeqCst),
     }
 }
 
@@ -1099,7 +1203,12 @@ fn transaction_open_across_a_stock_commit_on_another_table_commits() {
     if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
         return;
     }
-    let run = open_transaction_across_peer_commit("stock", "UPDATE h SET v = v + 1 WHERE id = 1");
+    let run = open_transaction_across_peer_commit(
+        "stock",
+        "UPDATE h SET v = v + 1 WHERE id = 1",
+        INSERT_ID_2,
+        false,
+    );
     assert_generation_started_in_place(&run);
     if let Err(error) = &run.commit {
         panic!("COMMIT after a stock commit on another table must commit, got {error:?}");
@@ -1122,12 +1231,30 @@ fn transaction_open_across_a_stock_commit_on_another_table_commits() {
 /// here, and so does one whose page check reads the image through the
 /// transaction's pinned snapshot (observed: the COMMIT committed over the
 /// peer's row).
+///
+/// bd-q4o7z: the transaction also reads `count(*)` after its INSERT, and the
+/// peer's row changes that count, so a replay would show the caller a
+/// different answer and the refusal stands. Without that read the refused
+/// COMMIT is replayed (the next test).
 #[test]
 fn transaction_open_across_a_stock_commit_on_the_same_page_is_refused_once() {
     if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
         return;
     }
-    let run = open_transaction_across_peer_commit("stock", "INSERT INTO t VALUES (3, 2, 'stock')");
+    let run = open_transaction_across_peer_commit(
+        "stock",
+        "INSERT INTO t VALUES (3, 2, 'stock')",
+        &[
+            Step::Execute("INSERT INTO t VALUES (2, 1, 'fsqlite')"),
+            Step::Query("SELECT count(*) FROM t"),
+        ],
+        false,
+    );
+    assert_eq!(
+        run.observed,
+        ["1", "[[Integer(2)]]"],
+        "shape: what the caller saw"
+    );
     assert_generation_started_in_place(&run);
     let error = match &run.commit {
         Ok(()) => panic!("a same-page stock commit must refuse the stale page"),
@@ -1157,6 +1284,267 @@ fn transaction_open_across_a_stock_commit_on_the_same_page_is_refused_once() {
     assert_eq!(stock_integrity(&run.db), "ok");
 }
 
+/// `(id, w)` of every row of `t`, read by stock.
+fn stock_ws(db: &Path) -> Vec<(i64, i64)> {
+    let stock = rusqlite::Connection::open(db).expect("stock open");
+    let mut stmt = stock
+        .prepare("SELECT id, w FROM t ORDER BY id")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("rows")
+}
+
+/// The refusal a bd-q4o7z negative must end with: SQLITE_BUSY_SNAPSHOT once,
+/// the transaction ended, and the peer's rows the only new ones.
+fn assert_refused_once(label: &str, run: &OpenAcrossPeerCommit, stock_rows_after: &[(i64, &str)]) {
+    let error = match &run.commit {
+        Ok(()) => {
+            panic!("{label}: a replay would change what the caller saw, so COMMIT must refuse")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, FrankenError::BusySnapshot { .. }),
+        "{label}: the refusal must be the snapshot conflict, got {error:?}"
+    );
+    assert_eq!(error.extended_error_code(), SQLITE_BUSY_SNAPSHOT, "{label}");
+    assert!(
+        !run.open_after_commit,
+        "{label}: the refusal ends the transaction"
+    );
+    let second = run.second_commit.as_deref().unwrap_or("");
+    assert!(
+        second.contains("no transaction is active"),
+        "{label}: the refusal is reported once, got {second:?}"
+    );
+    let expected: Vec<(i64, String)> = stock_rows_after
+        .iter()
+        .map(|(id, s)| (*id, (*s).to_owned()))
+        .collect();
+    assert_eq!(
+        stock_rows(&run.db),
+        expected,
+        "{label}: nothing of the refused transaction is durable"
+    );
+    assert_eq!(stock_integrity(&run.db), "ok", "{label}");
+}
+
+/// bd-q4o7z positive: the same race on the same leaf page, but nothing the
+/// transaction returned depends on the peer's row. It read `h` (which the
+/// peer does not write) and inserted a row without an id, and `execute`
+/// reported one row. The refused COMMIT replays the transaction on the newest
+/// snapshot and commits. Its row takes the id after the peer's, and
+/// `last_insert_rowid()` after the COMMIT names that row, so what the caller
+/// can still read agrees with the database. Before bd-q4o7z this COMMIT was
+/// refused and the row lost.
+#[test]
+fn transaction_open_across_a_stock_commit_on_the_same_page_is_replayed_when_nothing_it_returned_changes()
+ {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    let run = open_transaction_across_peer_commit(
+        "stock",
+        "INSERT INTO t(w, s) VALUES (2, 'stock')",
+        &[
+            Step::Query("SELECT v FROM h WHERE id = 1"),
+            Step::Execute("INSERT INTO t(w, s) VALUES (1, 'fsqlite')"),
+        ],
+        false,
+    );
+    assert_generation_started_in_place(&run);
+    assert_eq!(
+        run.observed,
+        ["[[Integer(0)]]", "1"],
+        "shape: what the caller saw"
+    );
+    if let Err(error) = &run.commit {
+        panic!("the refused COMMIT must be replayed and commit, got {error:?}");
+    }
+    assert!(!run.open_after_commit);
+    assert_eq!(
+        stock_rows(&run.db),
+        vec![
+            (1, "seed".to_owned()),
+            (2, "stock".to_owned()),
+            (3, "fsqlite".to_owned()),
+        ],
+        "the peer's row and the replayed row are both durable"
+    );
+    assert_eq!(
+        run.rowid_after_commit, 3,
+        "last_insert_rowid() after the COMMIT names the replayed row"
+    );
+    assert_eq!(run.fsqlite_ids, vec![1, 2, 3]);
+    assert_eq!(stock_integrity(&run.db), "ok");
+}
+
+const ROWID_THROUGH_API: &[Step] = &[
+    Step::Execute("INSERT INTO t(w, s) VALUES (1, 'fsqlite')"),
+    Step::ReadRowid,
+];
+const ROWID_THROUGH_RETURNING: &[Step] = &[Step::Query(
+    "INSERT INTO t(w, s) VALUES (1, 'fsqlite') RETURNING id",
+)];
+const ROWID_THROUGH_SQL: &[Step] = &[
+    Step::Execute("INSERT INTO t(w, s) VALUES (1, 'fsqlite')"),
+    Step::Query("SELECT last_insert_rowid()"),
+];
+
+/// bd-q4o7z negatives a naive replay fails: the caller learned its new row's
+/// id, through `last_insert_rowid()`, through RETURNING, or through
+/// `SELECT last_insert_rowid()`, and the peer's commit took that id. A replay
+/// would give the row another id than the one the caller holds, so the
+/// refusal stands, and the id the caller saw names the peer's row.
+#[test]
+fn transaction_that_returned_its_rowid_is_refused_when_a_peer_takes_that_rowid() {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    for (label, steps, saw) in [
+        ("api", ROWID_THROUGH_API, &["1", "rowid 2"][..]),
+        (
+            "returning",
+            ROWID_THROUGH_RETURNING,
+            &["[[Integer(2)]]"][..],
+        ),
+        ("sql", ROWID_THROUGH_SQL, &["1", "[[Integer(2)]]"][..]),
+    ] {
+        let run = open_transaction_across_peer_commit(
+            "stock",
+            "INSERT INTO t(w, s) VALUES (2, 'stock')",
+            steps,
+            false,
+        );
+        assert_eq!(run.observed, saw, "{label}: shape: the caller saw id 2");
+        assert_refused_once(label, &run, &[(1, "seed"), (2, "stock")]);
+    }
+}
+
+/// bd-q4o7z negative: an `UPDATE ... WHERE` reported one changed row; after
+/// the peer's commit the same statement changes two. A replay would report a
+/// different `changes()`, so the refusal stands and no row is updated.
+#[test]
+fn transaction_whose_changes_count_would_differ_is_refused() {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    let run = open_transaction_across_peer_commit(
+        "stock",
+        "INSERT INTO t VALUES (3, 2, 'stock')",
+        &[Step::Execute("UPDATE t SET w = w + 10 WHERE w < 5")],
+        false,
+    );
+    assert_eq!(
+        run.observed,
+        ["1"],
+        "shape: the UPDATE changed the seed row"
+    );
+    assert_refused_once("changes", &run, &[(1, "seed"), (3, "stock")]);
+    assert_eq!(
+        stock_ws(&run.db),
+        vec![(1, 0), (3, 2)],
+        "no row was updated"
+    );
+}
+
+/// bd-q4o7z negative: the replay of an INSERT that succeeded meets a
+/// constraint error, because the peer took its primary key. The replay is not
+/// committed: the refusal stands and the peer's row keeps the key.
+#[test]
+fn transaction_whose_replay_meets_a_new_constraint_error_is_refused() {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    let run = open_transaction_across_peer_commit(
+        "stock",
+        "INSERT INTO t VALUES (2, 2, 'stock')",
+        INSERT_ID_2,
+        false,
+    );
+    assert_eq!(run.observed, ["1"]);
+    assert_refused_once("constraint", &run, &[(1, "seed"), (2, "stock")]);
+}
+
+/// bd-q4o7z negative: a transaction on a connection with an application
+/// function is never replayed, so the function never runs twice: the refusal
+/// stands and `app_counter()` ran once.
+#[test]
+fn transaction_that_called_an_application_function_is_never_replayed() {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    let run = open_transaction_across_peer_commit(
+        "stock",
+        "INSERT INTO t(w, s) VALUES (2, 'stock')",
+        &[Step::Execute(
+            "INSERT INTO t(w, s) VALUES (app_counter(), 'fsqlite')",
+        )],
+        true,
+    );
+    assert_eq!(run.observed, ["1"]);
+    assert_refused_once("application function", &run, &[(1, "seed"), (2, "stock")]);
+    assert_eq!(
+        run.app_calls, 1,
+        "the application function ran exactly once"
+    );
+}
+
+const RAN_A_PRAGMA: &[Step] = &[
+    Step::Execute("PRAGMA user_version = 7"),
+    Step::Execute("INSERT INTO t(w, s) VALUES (1, 'fsqlite')"),
+];
+const RAN_SCHEMA_DDL: &[Step] = &[
+    Step::Execute("CREATE TABLE u(a)"),
+    Step::Execute("INSERT INTO t(w, s) VALUES (1, 'fsqlite')"),
+];
+const STREAMED_A_READ: &[Step] = &[
+    Step::Stream("SELECT id FROM t"),
+    Step::Execute("INSERT INTO t(w, s) VALUES (1, 'fsqlite')"),
+];
+
+/// bd-q4o7z negative: a transaction that ran a PRAGMA or schema DDL, or read
+/// through the streaming API (whose rows the record does not hold), is never
+/// replayed, even though nothing it returned would change: the refusal
+/// stands, and neither its INSERT nor its PRAGMA or table is durable.
+#[test]
+fn transaction_that_ran_a_call_a_replay_cannot_repeat_is_never_replayed() {
+    if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
+        return;
+    }
+    for (label, steps) in [
+        ("pragma", RAN_A_PRAGMA),
+        ("schema ddl", RAN_SCHEMA_DDL),
+        ("streamed read", STREAMED_A_READ),
+    ] {
+        let run = open_transaction_across_peer_commit(
+            "stock",
+            "INSERT INTO t(w, s) VALUES (2, 'stock')",
+            steps,
+            false,
+        );
+        assert_refused_once(label, &run, &[(1, "seed"), (2, "stock")]);
+        let stock = rusqlite::Connection::open(&run.db).expect("stock open");
+        let user_version: i64 = stock
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        let tables: i64 = stock
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'u'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sqlite_master");
+        assert_eq!(
+            (user_version, tables),
+            (0, 0),
+            "{label}: nothing else is durable"
+        );
+    }
+}
+
 /// Negative case: an fsqlite peer in the same shape. Its commit appends to
 /// the generation the parent's snapshot already names, and the parent's
 /// COMMIT commits, as it did before this change.
@@ -1165,7 +1553,12 @@ fn transaction_open_across_an_fsqlite_commit_on_another_table_commits() {
     if std::env::var_os(PEER_ENV).is_some() || std::env::var_os(HOLDER_ENV).is_some() {
         return;
     }
-    let run = open_transaction_across_peer_commit("fsqlite", "UPDATE h SET v = v + 1 WHERE id = 1");
+    let run = open_transaction_across_peer_commit(
+        "fsqlite",
+        "UPDATE h SET v = v + 1 WHERE id = 1",
+        INSERT_ID_2,
+        false,
+    );
     if let Err(error) = &run.commit {
         panic!(
             "COMMIT after an fsqlite commit on another table must commit, got {error:?} \

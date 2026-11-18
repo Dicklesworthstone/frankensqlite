@@ -53,6 +53,9 @@ struct ChildReport {
     /// closed inside it).
     lost_seqs: Vec<(usize, String)>,
     errors: Vec<String>,
+    /// bd-q4o7z: refused COMMITs this fsqlite writer replayed, as
+    /// `(committed, refused after all)`.
+    replays: (u64, u64),
 }
 
 #[derive(Debug)]
@@ -72,6 +75,10 @@ struct ShapeResult {
     /// for a non-growing commit (`VNXJD FLOOR-CERTIFIED`, traced with
     /// `DW8OE_TRACE` in the own-table fsqlite shape).
     floor_certified: usize,
+    /// bd-q4o7z: refused COMMITs the fsqlite writers replayed and committed.
+    replayed: u64,
+    /// bd-q4o7z: refused COMMITs whose replay diverged or ran out of time.
+    replay_refused: u64,
 }
 
 const FLOOR_CERTIFIED_MARKER: &str = "VNXJD FLOOR-CERTIFIED";
@@ -145,11 +152,23 @@ fn parse_report(stdout: &str) -> Option<ChildReport> {
     let errors = events(stdout, "event=mp_busy_error ")
         .map(str::to_owned)
         .collect();
+    let replays = events(stdout, "event=mp_busy_replays ")
+        .next()
+        .map_or((0, 0), |line| {
+            let field = |name: &str| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix(name))
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0)
+            };
+            (field("committed="), field("refused="))
+        });
     Some(ChildReport {
         committed,
         committed_seqs,
         lost_seqs,
         errors,
+        replays,
     })
 }
 
@@ -205,6 +224,7 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
     let mut lost_rows = Vec::new();
     let mut errors = Vec::new();
     let mut floor_certified = 0;
+    let (mut replayed, mut replay_refused) = (0, 0);
     for (worker, drain) in draining {
         let output = drain.join().expect("drain thread").expect("writer output");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -220,6 +240,8 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
             )
         });
         committed += report.committed;
+        replayed += report.replays.0;
+        replay_refused += report.replays.1;
         let worker = i64::try_from(worker).expect("worker");
         committed_rows.extend(
             report
@@ -262,16 +284,21 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
         durable_rows,
         integrity,
         floor_certified,
+        replayed,
+        replay_refused,
     };
     eprintln!(
         "event=mp_busy_shape backend={backend} workers={workers} rows={rows} busy_timeout_ms={busy_timeout_ms} \
-         committed={} errors={} elapsed_ms={} final_rows={} integrity={} floor_certified={} sample_errors={:?}",
+         committed={} errors={} elapsed_ms={} final_rows={} integrity={} floor_certified={} \
+         replayed={} replay_refused={} sample_errors={:?}",
         result.committed,
         result.errors.len(),
         result.elapsed.as_millis(),
         result.final_rows,
         result.integrity,
         result.floor_certified,
+        result.replayed,
+        result.replay_refused,
         result.errors.iter().take(5).collect::<Vec<_>>()
     );
     result
@@ -354,6 +381,13 @@ fn mp_busy_writer_child() {
     };
     let (db, dir) = (PathBuf::from(db), PathBuf::from(dir));
     let worker: usize = worker.parse().expect("worker");
+    // bd-q4o7z: the mixed shape alternates stock and fsqlite writers on one
+    // table, so fsqlite's replays race real stock commits.
+    let backend = match backend {
+        "mixed-explicit" if worker.is_multiple_of(2) => "stock-explicit",
+        "mixed-explicit" => "fsqlite-explicit",
+        other => other,
+    };
     let rows: usize = rows.parse().expect("rows");
     let busy_timeout_ms: u64 = busy_timeout_ms.parse().expect("busy_timeout_ms");
     let mut committed = 0;
@@ -396,7 +430,9 @@ fn mp_busy_writer_child() {
             }
             lost_seqs.extend(open.close().into_iter().map(|seq| (seq, "closed")));
         }
-        "fsqlite-explicit" | "fsqlite-explicit-own" => {
+        // `-query` runs every statement through `query`, as the shell does.
+        "fsqlite-explicit" | "fsqlite-explicit-own" | "fsqlite-explicit-query" => {
+            let via_query = backend == "fsqlite-explicit-query";
             let (committed, committed_seqs, errors, lost_seqs) = (
                 &mut committed,
                 &mut committed_seqs,
@@ -413,12 +449,20 @@ fn mp_busy_writer_child() {
                 std::fs::write(ready_path(&dir, worker), b"").expect("ready");
                 assert!(wait_for(&dir.join("go"), Duration::from_secs(120)), "no go");
                 let mut open = OpenTransactionRows::default();
+                let run = |sql: String| {
+                    let conn = &conn;
+                    async move {
+                        if via_query {
+                            conn.query(&sql).await.map(drop)
+                        } else {
+                            conn.execute(&sql).await.map(drop)
+                        }
+                    }
+                };
                 for seq in 0..rows {
-                    let begin = conn.execute("BEGIN").await;
-                    let insert = conn
-                        .execute(&explicit_insert_sql(backend, worker, seq))
-                        .await;
-                    let commit = conn.execute("COMMIT").await;
+                    let begin = run("BEGIN".to_owned()).await;
+                    let insert = run(explicit_insert_sql(backend, worker, seq)).await;
+                    let commit = run("COMMIT".to_owned()).await;
                     if let Err(error) = &begin {
                         errors.push(format!("begin: {error}"));
                     }
@@ -519,6 +563,11 @@ fn mp_busy_writer_child() {
     for (seq, how) in &lost_seqs {
         println!("event=mp_busy_lost_seq {seq} {how}");
     }
+    let replays = fsqlite_core::connection::txn_replay_counts();
+    println!(
+        "event=mp_busy_replays committed={} refused={}",
+        replays.committed, replays.refused
+    );
     println!(
         "event=mp_busy_child backend={backend} worker={worker} committed={committed} errors={}",
         errors.len()
@@ -779,36 +828,61 @@ fn assert_explicit_accounting<'a>(
     refused
 }
 
-/// bd-reality-check-1022-llk6g.5.1: processes running explicit `BEGIN; INSERT;
-/// COMMIT` transactions on ONE table, CLI-style (no ROLLBACK after an error).
-/// Stock commits every row: a write-first transaction waits for the write
-/// lock at its INSERT. fsqlite's page MVCC refuses the second committer of a
-/// leaf page with BusySnapshot (first-committer-wins, the owner's design), and
-/// that refusal must end its transaction, so it costs exactly its own row. On
-/// main 714e81184 the refused transaction stayed open: the next BEGIN failed
-/// "within a transaction", the next INSERTs landed in the doomed transaction,
-/// and 8 CLI writers x 300 committed 300-312 of 2400 rows.
+/// bd-q4o7z: processes running explicit `BEGIN; INSERT; COMMIT` transactions
+/// on ONE table, CLI-style (no ROLLBACK after an error), commit every row, as
+/// stock does. Stock's write-first transaction waits for the write lock at its
+/// INSERT. fsqlite's plain BEGIN is promoted to BEGIN CONCURRENT, so the second
+/// committer of a leaf page is refused first-committer-wins; the transaction
+/// exposed nothing a replay could change (its INSERT returned 1 row), so the
+/// refused COMMIT replays it on the newest snapshot within busy_timeout.
+///
+/// History: on main 714e81184 a refused transaction stayed open and 8 CLI
+/// writers x 300 committed 300-312 of 2400 rows; .5.1 ended it, so each
+/// refusal cost exactly its own row (a median 1,910 of 2,400 committed at
+/// b1526ddf1). Three fsqlite arms: `execute`, `query` (the shell's path), and
+/// stock and fsqlite writers alternating on the same file. The accounting is
+/// [`assert_explicit_accounting`]'s; on top of it no COMMIT is refused and no
+/// row is lost. Non-vacuity: the fsqlite writers replayed at least one refused
+/// COMMIT.
 #[test]
-fn cross_process_explicit_writers_on_one_table_lose_only_refused_transactions() {
+fn cross_process_explicit_writers_on_one_table_commit_every_row_as_stock() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
     let _one_at_a_time = one_parent_test_at_a_time();
-    let (workers, rows) = (4, 100);
+    let (workers, rows) = (8, 300);
     stock_oracle("stock-explicit", workers, rows);
 
-    let frank = run_shape("fsqlite-explicit", workers, rows, 5000);
-    let refused = assert_explicit_accounting(
+    for backend in [
         "fsqlite-explicit",
-        &frank,
-        workers * rows,
-        OpenAtClose::Forbidden,
-    );
-    assert!(
-        !refused.is_empty(),
-        "non-vacuity: {workers} writers on one leaf page produced no COMMIT refusal, so this \
-         run did not exercise the refused-COMMIT path"
-    );
+        "fsqlite-explicit-query",
+        "mixed-explicit",
+    ] {
+        let frank = run_shape(backend, workers, rows, 5000);
+        let refused =
+            assert_explicit_accounting(backend, &frank, workers * rows, OpenAtClose::Forbidden);
+        assert!(
+            refused.is_empty(),
+            "{backend}: no COMMIT may be refused, as in stock; got {}, e.g. {:?}",
+            refused.len(),
+            refused.iter().take(5).collect::<Vec<_>>()
+        );
+        assert!(
+            frank.lost_rows.is_empty(),
+            "{backend}: no row may be lost, as in stock; lost {:?}",
+            frank.lost_rows.iter().take(5).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            frank.committed,
+            workers * rows,
+            "{backend}: every transaction commits, as in stock"
+        );
+        assert!(
+            frank.replayed > 0,
+            "non-vacuity: {backend}'s fsqlite writers replayed no refused COMMIT, so this run \
+             did not exercise the replay"
+        );
+    }
 }
 
 /// bd-reality-check-1022-llk6g.5.2: processes running explicit transactions on

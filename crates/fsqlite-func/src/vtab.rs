@@ -13,10 +13,28 @@
 //! require `&Cx` since they operate on already-fetched row data.
 
 use std::any::Any;
+use std::cell::Cell;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
 use fsqlite_types::cx::Cx;
+
+thread_local! {
+    /// Writes (INSERT, UPDATE or DELETE) through any virtual table on this
+    /// thread. Every write reaches a module through the sealed
+    /// [`ErasedVtabInstance::update`] below.
+    static VIRTUAL_TABLE_WRITES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many virtual-table writes this thread has run.
+///
+/// bd-q4o7z: a connection that may replay a transaction compares this before
+/// and after each statement, because a transaction that wrote through a virtual
+/// table is never replayed (its effects can reach outside the database file).
+#[must_use]
+pub fn virtual_table_write_count() -> u64 {
+    VIRTUAL_TABLE_WRITES.with(Cell::get)
+}
 
 // ---------------------------------------------------------------------------
 // Query planner types
@@ -789,6 +807,7 @@ where
         Ok(Box::new(cursor))
     }
     fn update(&mut self, cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>> {
+        VIRTUAL_TABLE_WRITES.with(|writes| writes.set(writes.get().wrapping_add(1)));
         VirtualTable::update(self, cx, args)
     }
     fn restore_materialized_rows(
