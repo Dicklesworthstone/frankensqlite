@@ -26576,6 +26576,7 @@ impl Connection {
             rowid_allocator: Arc::clone(&self._shared_mvcc_state.rowid_allocator),
             schema_epoch: SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
             rowid_statement: self.concurrent_rowid_statement.get(),
+            rowid_begin_generation: self.concurrent_begin_write_generation.get(),
             #[allow(clippy::cast_sign_loss)]
             busy_timeout_ms: self.pragma_state.borrow().busy_timeout_ms.max(0) as u64,
         }))
@@ -129156,6 +129157,7 @@ impl SharedMvccCoordinationState {
 
     fn new() -> Self {
         let conflict_observer = Arc::new(MetricsObserver::new(1024));
+        let concurrent_write_generation = Arc::new(AtomicU64::new(0));
         Self {
             registry: Arc::new(Mutex::new(ConcurrentRegistry::new())),
             conflict_observer: Arc::clone(&conflict_observer),
@@ -129164,14 +129166,19 @@ impl SharedMvccCoordinationState {
                 conflict_observer as Arc<dyn fsqlite_observability::ConflictObserver>,
             )),
             commit_index: Arc::new(CommitIndex::new()),
-            rowid_allocator: Arc::new(ConcurrentRowIdAllocator::new(SchemaEpoch::ZERO)),
+            // bd-hi7qg: the allocator reads the same write-commit order a
+            // transaction samples at BEGIN.
+            rowid_allocator: Arc::new(ConcurrentRowIdAllocator::with_write_generation(
+                SchemaEpoch::ZERO,
+                Arc::clone(&concurrent_write_generation),
+            )),
             active_commit_seqs: Arc::new(Mutex::new(smallvec::SmallVec::new())),
             next_commit_seq: Arc::new(AtomicU64::new(1)),
             stable_commit_seq: Arc::new(AtomicU64::new(0)),
             committed_schema_cookie: Arc::new(AtomicU32::new(0)),
             open_connection_count: Arc::new(AtomicUsize::new(0)),
             data_version_global: Arc::new(AtomicU64::new(0)),
-            concurrent_write_generation: Arc::new(AtomicU64::new(0)),
+            concurrent_write_generation,
             is_poisoned: AtomicBool::new(false),
             poison_cause: Mutex::new(None),
         }
@@ -148862,6 +148869,9 @@ struct ConcurrentExecContext {
     schema_epoch: SchemaEpoch,
     /// bd-8a8pr: the statement the program's implicit rowids belong to.
     rowid_statement: u64,
+    /// bd-hi7qg: the write generation the transaction sampled at BEGIN,
+    /// before its snapshot bound.
+    rowid_begin_generation: u64,
     busy_timeout_ms: u64,
 }
 
@@ -149102,6 +149112,7 @@ async fn execute_table_program_with_db(
                 ctx.schema_epoch,
                 ctx.session_id,
                 ctx.rowid_statement,
+                ctx.rowid_begin_generation,
             );
         } else {
             engine.set_transaction(txn);
@@ -149364,6 +149375,7 @@ async fn execute_table_program_exactly_one_row_with_db(
                 ctx.schema_epoch,
                 ctx.session_id,
                 ctx.rowid_statement,
+                ctx.rowid_begin_generation,
             );
         } else {
             engine.set_transaction(txn);

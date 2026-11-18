@@ -6098,6 +6098,17 @@ struct StorageCursor {
     /// it when the caller proved the insert landed at EOF/rightmost, because
     /// only then can a strictly larger next rowid safely reuse the append path.
     last_successful_insert_rowid: Option<i64>,
+    /// The concurrent session and schema epoch `last_successful_insert_rowid`
+    /// was learned under ((0, ZERO) without the shared rowid allocator). An
+    /// insert that is not an append claims its table for the session
+    /// (bd-hi7qg); an append rides on the claim of the insert that set the
+    /// hint. So a cursor `OpenWrite` reuses under another session or epoch
+    /// drops the hint, and its first insert there claims.
+    append_hint_scope: (u64, SchemaEpoch),
+    /// Whether the session of `append_hint_scope` already holds its claim on
+    /// this cursor's table (bd-hi7qg): a claim lasts until the session ends,
+    /// so the cursor's later non-append inserts skip the claim's lock.
+    rowid_claimed: bool,
     /// Last UNIQUE index prefix known to have been inserted at the right edge.
     ///
     /// For monotonic composite UNIQUE streams, this lets `IdxInsert` skip the
@@ -8366,6 +8377,11 @@ pub struct VdbeEngine {
     /// reservations, so a rolled-back statement can give them back (bd-8a8pr).
     /// 0 outside a statement savepoint.
     concurrent_rowid_statement: u64,
+    /// The database's write generation the bound concurrent transaction
+    /// sampled at BEGIN, before its snapshot bound: what the shared allocator
+    /// compares to decide that the transaction has seen every committed row
+    /// (bd-hi7qg).
+    concurrent_rowid_begin_generation: u64,
     /// INTEGER PRIMARY KEY alias column positions keyed by root page number.
     /// Used to decode storage-cursor payload columns for rowid tables.
     rowid_alias_col_by_root_page: Arc<HashMap<i32, usize>>,
@@ -9076,6 +9092,7 @@ impl VdbeEngine {
             concurrent_rowid_schema_epoch: SchemaEpoch::ZERO,
             concurrent_rowid_session_id: 0,
             concurrent_rowid_statement: 0,
+            concurrent_rowid_begin_generation: 0,
             rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
             table_column_count_by_root_page: Arc::new(HashMap::new()),
             first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
@@ -9444,6 +9461,7 @@ impl VdbeEngine {
         self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
         self.concurrent_rowid_session_id = 0;
         self.concurrent_rowid_statement = 0;
+        self.concurrent_rowid_begin_generation = 0;
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
         self.make_record_lookaside.reset();
@@ -11035,6 +11053,7 @@ impl VdbeEngine {
         self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
         self.concurrent_rowid_session_id = 0;
         self.concurrent_rowid_statement = 0;
+        self.concurrent_rowid_begin_generation = 0;
     }
 
     /// Lend a pager transaction with MVCC concurrent context (bd-kivg / 5E.2).
@@ -11063,19 +11082,22 @@ impl VdbeEngine {
         );
     }
 
-    /// Provide the shared concurrent rowid allocator for implicit inserts, and
-    /// the session and statement (0 for none, bd-8a8pr) the rowids belong to.
+    /// Provide the shared concurrent rowid allocator for implicit inserts, the
+    /// session and statement (0 for none, bd-8a8pr) the rowids belong to, and
+    /// the write generation the session sampled at BEGIN (bd-hi7qg).
     pub fn set_concurrent_rowid_allocator(
         &mut self,
         allocator: Arc<ConcurrentRowIdAllocator>,
         schema_epoch: SchemaEpoch,
         session_id: u64,
         statement: u64,
+        begin_generation: u64,
     ) {
         self.concurrent_rowid_allocator = Some(allocator);
         self.concurrent_rowid_schema_epoch = schema_epoch;
         self.concurrent_rowid_session_id = session_id;
         self.concurrent_rowid_statement = statement;
+        self.concurrent_rowid_begin_generation = begin_generation;
     }
 
     /// Allocate a rowid on a MemDatabase (TEMP) table. bd-nb49a: an ordinary
@@ -11205,14 +11227,16 @@ impl VdbeEngine {
     }
 
     // bd-gh-147 added `session_id` (8th arg) to attribute reservations to the
-    // concurrent session, bd-8a8pr `statement` to the statement within it; the
-    // params are a flat threading list, not worth a dedicated struct.
+    // concurrent session, bd-8a8pr `statement` to the statement within it,
+    // bd-hi7qg the session's BEGIN write generation; the params are a flat
+    // threading list, not worth a dedicated struct.
     #[allow(clippy::too_many_arguments)]
     async fn allocate_concurrent_storage_rowid(
         allocator: &ConcurrentRowIdAllocator,
         schema_epoch: SchemaEpoch,
         session_id: u64,
         statement: u64,
+        begin_generation: u64,
         root_page: i32,
         mode: RowIdMode,
         autoinc_max: i64,
@@ -11243,16 +11267,27 @@ impl VdbeEngine {
                 .max(autoinc_max)
         };
         if visible_max == i64::MAX {
+            // bd-hi7qg: the random rowid's row is the session's too, and the
+            // append hint it may leave rides on this claim.
+            Self::claim_concurrent_storage_rowid_table(allocator, schema_epoch, session_id, sc)?;
             return Self::allocate_random_storage_rowid(sc).await;
         }
         let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
-        allocator.ensure_table_floor(
+        // bd-hi7qg: a table no live session holds a claim on, read by a
+        // transaction that has seen every committed row, gets stock's
+        // `max(rowid) + 1` back even after its maximum was deleted. The
+        // allocation leaves the session holding a claim, exhausted or not.
+        let allocated = allocator.allocate_one_above_visible_max(
             key,
-            (visible_max > 0).then(|| RowId::new(visible_max)),
+            visible_max,
             autoinc_max,
             mode,
+            session_id,
+            statement,
+            begin_generation,
         );
-        let rowid = match allocator.allocate_one_for_statement(key, session_id, statement) {
+        sc.rowid_claimed = true;
+        let rowid = match allocated {
             Ok(rowid) => rowid.get(),
             // bd-6i9c5: the shared floor reached the top of the rowid range.
             Err(RowIdAllocError::Exhausted) => {
@@ -11263,6 +11298,24 @@ impl VdbeEngine {
         sc.last_alloc_rowid = rowid;
         sc.last_alloc_landed = false;
         Ok(rowid)
+    }
+
+    /// bd-hi7qg: the bound concurrent session is about to write a row through
+    /// `sc` on its table that no other transaction can see. It holds a claim
+    /// on the table until it ends, so no peer's allocation lowers the table's
+    /// tip below that row. The cursor remembers the claim for its scope.
+    fn claim_concurrent_storage_rowid_table(
+        allocator: &ConcurrentRowIdAllocator,
+        schema_epoch: SchemaEpoch,
+        session_id: u64,
+        sc: &mut StorageCursor,
+    ) -> Result<()> {
+        if !sc.rowid_claimed {
+            let key = Self::concurrent_rowid_key(schema_epoch, sc.root_page)?;
+            allocator.claim_table(key, session_id);
+            sc.rowid_claimed = true;
+        }
+        Ok(())
     }
 
     async fn bump_concurrent_storage_rowid_floor(
@@ -11290,7 +11343,8 @@ impl VdbeEngine {
         // row). `visible_max >= rowid` leaves the table's next rowid at or above
         // `rowid + 1` (or exhausted, which the bump also leaves alone) and an
         // AUTOINCREMENT high-water at or above `rowid`, and creates a missing
-        // entry.
+        // entry. (The session's claim on the table was recorded before the
+        // row was written, bd-hi7qg; see the Insert arm.)
         allocator.ensure_table_floor(
             key,
             (visible_max > 0).then(|| RowId::new(visible_max)),
@@ -12779,6 +12833,11 @@ impl VdbeEngine {
                                 membership_set,
                                 staged_build,
                                 last_successful_insert_rowid: None,
+                                append_hint_scope: (
+                                    self.concurrent_rowid_session_id,
+                                    self.concurrent_rowid_schema_epoch,
+                                ),
+                                rowid_claimed: false,
                                 last_rightmost_unique_index_prefix: None,
                                 last_rightmost_unique_index_position: None,
                                 cached_rowid: None,
@@ -13762,6 +13821,7 @@ impl VdbeEngine {
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
                     let concurrent_rowid_statement = self.concurrent_rowid_statement;
+                    let concurrent_rowid_begin_generation = self.concurrent_rowid_begin_generation;
                     // GH #186: capture the AUTOINCREMENT table's root page so the
                     // allocated rowid can be folded into the program-scoped
                     // high-water AFTER the `sc` borrow ends (sqlite_sequence must
@@ -13797,6 +13857,7 @@ impl VdbeEngine {
                                         concurrent_schema_epoch,
                                         concurrent_rowid_session_id,
                                         concurrent_rowid_statement,
+                                        concurrent_rowid_begin_generation,
                                         root_page,
                                         rowid_mode,
                                         autoinc_max,
@@ -14024,6 +14085,15 @@ impl VdbeEngine {
                                     // bit above the conflict-mode nibble.
                                     if oe_flag == 5 {
                                         // OE_REPLACE: Delete old, insert new
+                                        if let Some(allocator) = concurrent_allocator.as_ref() {
+                                            // bd-hi7qg: not an append, so claim.
+                                            Self::claim_concurrent_storage_rowid_table(
+                                                allocator,
+                                                concurrent_schema_epoch,
+                                                self.concurrent_rowid_session_id,
+                                                sc,
+                                            )?;
+                                        }
                                         lean_future(|| self.native_replace_row(cursor_id, rowid)).await?;
                                         let sc2 = self
                                             .storage_cursors
@@ -14091,6 +14161,20 @@ impl VdbeEngine {
                                     // No conflict — reuse the successor/EOF position from the
                                     // existence probe when it already proved the row is absent.
                                     if insert_seek_result == Some(SeekResult::NotFound) {
+                                        // bd-hi7qg: every insert that is not an
+                                        // append seeks, a cursor's first insert
+                                        // in a session included (its append hint
+                                        // starts empty), so this is where the
+                                        // session claims the table. An append
+                                        // follows an insert that claimed.
+                                        if let Some(allocator) = concurrent_allocator.as_ref() {
+                                            Self::claim_concurrent_storage_rowid_table(
+                                                allocator,
+                                                concurrent_schema_epoch,
+                                                self.concurrent_rowid_session_id,
+                                                sc,
+                                            )?;
+                                        }
                                         let rightmost_insert = sc.cursor.eof();
                                         lean_future(|| sc.cursor.table_insert_prechecked_absent(&sc.cx, rowid, blob))
                                             .await?;
@@ -18547,6 +18631,7 @@ impl VdbeEngine {
                 let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                 let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
                 let concurrent_rowid_statement = self.concurrent_rowid_statement;
+                let concurrent_rowid_begin_generation = self.concurrent_rowid_begin_generation;
                 let previous_last_insert_rowid = self.last_insert_rowid;
                 let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
@@ -18562,6 +18647,7 @@ impl VdbeEngine {
                                 concurrent_schema_epoch,
                                 concurrent_rowid_session_id,
                                 concurrent_rowid_statement,
+                                concurrent_rowid_begin_generation,
                                 root_page,
                                 rowid_mode,
                                 autoinc_max,
@@ -19135,6 +19221,7 @@ impl VdbeEngine {
         let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
         let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
         let concurrent_rowid_statement = self.concurrent_rowid_statement;
+        let concurrent_rowid_begin_generation = self.concurrent_rowid_begin_generation;
         let previous_last_insert_rowid = self.last_insert_rowid;
         let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
@@ -19156,6 +19243,7 @@ impl VdbeEngine {
                     concurrent_schema_epoch,
                     concurrent_rowid_session_id,
                     concurrent_rowid_statement,
+                    concurrent_rowid_begin_generation,
                     template.root_page,
                     rowid_mode,
                     autoinc_max,
@@ -19788,6 +19876,8 @@ impl VdbeEngine {
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 last_successful_insert_rowid: None,
+                append_hint_scope: old_sc.append_hint_scope,
+                rowid_claimed: false,
                 last_rightmost_unique_index_prefix: None,
                 last_rightmost_unique_index_position: None,
                 ipk_col_idx: old_sc.ipk_col_idx,
@@ -21112,6 +21202,10 @@ impl VdbeEngine {
         let has_txn = self.txn_page_io.is_some();
         let txn_cx = self.derive_execution_cx();
         let (rowid_mode, autoincrement_high_water) = self.storage_cursor_runtime_meta(root_page);
+        let append_hint_scope = (
+            self.concurrent_rowid_session_id,
+            self.concurrent_rowid_schema_epoch,
+        );
         // bd-a3g0m: an OpenRead of the same root takes back the read cursor
         // parked in this slot (the reuse branch below); a parked cursor on
         // another root is dropped. An OpenWrite drops every parked cursor and
@@ -21143,6 +21237,14 @@ impl VdbeEngine {
                 existing.root_page = root_page;
                 existing.rowid_mode = rowid_mode;
                 existing.autoincrement_high_water = autoincrement_high_water;
+                // bd-hi7qg: an append hint learned under another session (or
+                // schema epoch) rides on no claim of this one; dropping it
+                // makes the cursor's next insert seek, and claim.
+                if existing.append_hint_scope != append_hint_scope {
+                    existing.last_successful_insert_rowid = None;
+                    existing.append_hint_scope = append_hint_scope;
+                    existing.rowid_claimed = false;
+                }
                 self.cursor_root_pages.insert(cursor_id, root_page);
                 tracing::trace!(
                     cursor_id,
@@ -21358,6 +21460,8 @@ impl VdbeEngine {
                             last_alloc_rowid: 0,
                             last_alloc_landed: false,
                             last_successful_insert_rowid: None,
+                            append_hint_scope,
+                            rowid_claimed: false,
                             last_rightmost_unique_index_prefix: None,
                             last_rightmost_unique_index_position: None,
                             payload_buf: Vec::new(),
@@ -21529,6 +21633,8 @@ impl VdbeEngine {
                             last_alloc_rowid: 0,
                             last_alloc_landed: false,
                             last_successful_insert_rowid: None,
+                            append_hint_scope,
+                            rowid_claimed: false,
                             last_rightmost_unique_index_prefix: None,
                             last_rightmost_unique_index_position: None,
                             payload_buf: Vec::new(),
@@ -21735,6 +21841,8 @@ impl VdbeEngine {
                 last_alloc_rowid: 0,
                 last_alloc_landed: false,
                 last_successful_insert_rowid: None,
+                append_hint_scope,
+                rowid_claimed: false,
                 last_rightmost_unique_index_prefix: None,
                 last_rightmost_unique_index_position: None,
                 payload_buf: Vec::new(),
@@ -36267,6 +36375,117 @@ mod tests {
         // Only one row with the updated value.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], SqliteValue::Integer(99));
+    }
+
+    /// bd-hi7qg: a session that inserts explicit rowids holds a claim on the
+    /// table, so no peer's allocation lowers the shared tip below its rows,
+    /// which no peer can see. The claim is taken where the Insert arm seeks
+    /// (the cursor's first insert); the appends after it take none. A retained
+    /// cursor reopened under another session drops the append hint it learned
+    /// before, so the new session's first insert seeks and claims too: without
+    /// that, every row of the second run below is an append on the old hint
+    /// and the session never claims.
+    #[test]
+    fn test_explicit_rowid_inserts_claim_their_table_for_the_session() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let epoch = SchemaEpoch::new(1);
+        let key = AllocatorKey {
+            schema_epoch: epoch,
+            table_id: TableId::new(u32::try_from(root).expect("small root")),
+        };
+        let allocator = Arc::new(ConcurrentRowIdAllocator::with_write_generation(
+            epoch,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        // A peer whose view of the table is empty, at the current write
+        // generation: it lowers the tip to 1 unless a live session claims the
+        // table.
+        let peer_allocates = |session: u64| {
+            allocator
+                .allocate_one_above_visible_max(key, 0, 0, RowIdMode::Normal, session, 0, 0)
+                .expect("peer allocation")
+                .get()
+        };
+        // Insert explicit rowids `first..first + 3` (the first seeks, the rest
+        // append), then return every rowid the cursor holds.
+        let program = |first: i32| {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            for rowid in first..first + 3 {
+                b.emit_op(Opcode::Integer, rowid, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 7, 2, 0, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+                b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+            }
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Rowid, 0, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+            let next_target = i32::try_from(body).expect("small program");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Close, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            b.finish().expect("program should build")
+        };
+        let rowids = |engine: &mut VdbeEngine| -> Vec<i64> {
+            engine
+                .take_results()
+                .into_iter()
+                .map(|row| row.into_vec()[0].to_integer())
+                .collect()
+        };
+
+        // Run 1, session 7: rows 10, 11, 12.
+        let first_run = program(10);
+        let mut engine = VdbeEngine::new(first_run.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_retain_storage_cursors_on_close(true);
+        engine.set_concurrent_rowid_allocator(Arc::clone(&allocator), epoch, 7, 0, 0);
+        assert_eq!(
+            run_async(engine.execute(&first_run)).expect("first run"),
+            ExecOutcome::Done
+        );
+        assert_eq!(rowids(&mut engine), vec![10, 11, 12]);
+        assert_eq!(allocator.next_rowid(&key), Some(13));
+        assert_eq!(peer_allocates(9), 13, "session 7's claim holds the tip");
+        allocator.clear_session(9);
+
+        // Run 2, session 8 after session 7 ended, on the retained cursor (it
+        // still holds rows 10..=12): rows 20, 21, 22 are all above its hint.
+        allocator.clear_session(7);
+        let second_run = program(20);
+        engine.reset_for_reuse_ex(
+            second_run.register_count(),
+            &Cx::new(),
+            PageSize::DEFAULT,
+            true,
+        );
+        engine.set_reject_mem_fallback(false);
+        engine.set_retain_storage_cursors_on_close(true);
+        engine.set_concurrent_rowid_allocator(Arc::clone(&allocator), epoch, 8, 0, 0);
+        assert_eq!(
+            run_async(engine.execute(&second_run)).expect("second run"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            rowids(&mut engine),
+            vec![10, 11, 12, 20, 21, 22],
+            "the second run reused the retained cursor"
+        );
+        assert_eq!(peer_allocates(10), 23, "session 8's claim holds the tip");
+
+        // Control: with no live claim, the same peer view lowers the tip.
+        allocator.clear_session(8);
+        allocator.clear_session(10);
+        assert_eq!(peer_allocates(11), 1);
     }
 
     #[test]

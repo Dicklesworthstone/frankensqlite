@@ -7,8 +7,14 @@
 //! The allocator state lives in the coordinator (§5.9) and is **not** stored in
 //! the SQLite file format. Single-process deployments use an in-memory map;
 //! multi-process deployments serve reservations over IPC (`ROWID_RESERVE`).
+//!
+//! bd-hi7qg: the shared tip falls back to `max(rowid)+1` (stock's answer)
+//! when that is provably free: no live session holds a claim on the table and
+//! no write commit became visible since the allocating transaction's snapshot
+//! (see [`ConcurrentRowIdAllocator::allocate_one_above_visible_max`]).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use foldhash::fast::FixedState;
@@ -68,6 +74,88 @@ struct TableAllocatorState {
 }
 
 impl TableAllocatorState {
+    /// Raise the state to the floor `derived` (a [`Self::new`] from the
+    /// table's largest rowid) describes: the next rowid and an AUTOINCREMENT
+    /// high-water never fall.
+    #[inline]
+    fn raise_to(&mut self, derived: &Self, mode: RowIdMode) {
+        self.next_rowid = max_rowid_tip(self.next_rowid, derived.next_rowid);
+        self.mode = mode;
+        if mode == RowIdMode::AutoIncrement {
+            self.autoincrement_high_water = self
+                .autoincrement_high_water
+                .max(derived.autoincrement_high_water);
+        } else {
+            self.autoincrement_high_water = 0;
+        }
+    }
+
+    /// Reserve `count` rowids from the tip, returning the range and the
+    /// AUTOINCREMENT high-water just before.
+    fn reserve(
+        &mut self,
+        key: AllocatorKey,
+        count: u32,
+    ) -> Result<(RangeReservation, i64), RowIdAllocError> {
+        let start = self.next_rowid;
+        let prior_high_water = self.autoincrement_high_water;
+
+        // In concurrent mode, rowids are always in [1, MAX].  If the allocator
+        // wrapped past MAX (via `wrapping_add`), `start` becomes negative and
+        // we are exhausted.
+        if start < 1 {
+            error!(
+                attempted_next = start,
+                max_rowid = RowId::MAX.get(),
+                "MAX_ROWID saturation: SQLITE_FULL"
+            );
+            return Err(RowIdAllocError::Exhausted);
+        }
+
+        let count_i64 = i64::from(count);
+
+        // Remaining capacity: how many rowids [start, MAX] are available.
+        // Safe because start >= 1 and MAX = i64::MAX.
+        let remaining_capacity = RowId::MAX.get() - start + 1;
+        if count_i64 > remaining_capacity {
+            error!(
+                attempted_next = start,
+                count,
+                remaining_capacity,
+                max_rowid = RowId::MAX.get(),
+                "MAX_ROWID saturation: SQLITE_FULL"
+            );
+            return Err(RowIdAllocError::Exhausted);
+        }
+
+        // Advance.  When we allocate exactly through MAX, wrapping_add sends
+        // next_rowid to i64::MIN, which the `start < 1` guard catches next time.
+        self.next_rowid = start.wrapping_add(count_i64);
+
+        // Update AUTOINCREMENT high-water (last allocated rowid in range).
+        if self.mode == RowIdMode::AutoIncrement {
+            let last_in_range = start + (count_i64 - 1);
+            self.autoincrement_high_water = self.autoincrement_high_water.max(last_in_range);
+        }
+
+        debug!(
+            schema_epoch = key.schema_epoch.get(),
+            table_id = key.table_id.get(),
+            start_rowid = start,
+            count,
+            next_rowid_after = self.next_rowid,
+            "range reservation"
+        );
+
+        Ok((
+            RangeReservation {
+                start_rowid: RowId::new(start),
+                count,
+            },
+            prior_high_water,
+        ))
+    }
+
     /// Initialise from the durable tip (§5.10.1.1 "Coordinator Initialization").
     fn new(max_committed_rowid: Option<RowId>, sqlite_sequence_seq: i64, mode: RowIdMode) -> Self {
         let max_committed = max_committed_rowid.map_or(0, RowId::get);
@@ -99,6 +187,18 @@ impl TableAllocatorState {
             mode,
             autoincrement_high_water: high_water,
         }
+    }
+}
+
+/// bd-hi7qg: record a claim of `session_id` on `key` in the claims map.
+fn record_claim(
+    claims: &mut HashMap<AllocatorKey, Vec<u64>, FixedState>,
+    key: AllocatorKey,
+    session_id: u64,
+) {
+    let claimants = claims.entry(key).or_default();
+    if claimants.last() != Some(&session_id) && !claimants.contains(&session_id) {
+        claimants.push(session_id);
     }
 }
 
@@ -254,6 +354,19 @@ pub struct ConcurrentRowIdAllocator {
     /// savepoint (so no other writer's committed id is ever reissued). A
     /// concurrent writer that intervened leaves the gap intact (§5.10.1.1).
     session_reservations: Mutex<HashMap<(u64, AllocatorKey), SessionReservations, FixedState>>,
+    /// bd-hi7qg: per table, the live sessions holding a claim on it: a rowid
+    /// they reserved there or a row they insert (explicit or allocated). Their
+    /// rows are invisible to every other transaction, so while one holds a
+    /// claim the table's `next_rowid` never falls. 0 stands for reservations
+    /// made without a session (IPC, standalone callers), which never end.
+    /// Kept apart from `tables` so the per-row floor raise of a bulk insert
+    /// touches only its state. Lock order: `tables`, then `claims`.
+    claims: Mutex<HashMap<AllocatorKey, Vec<u64>, FixedState>>,
+    /// bd-hi7qg: the database's count of in-process write commits, bumped
+    /// after each commit is physically visible (the core's
+    /// `concurrent_write_generation`, bd-11sz4). A transaction whose BEGIN
+    /// sample still equals it has seen every committed row.
+    write_generation: Arc<AtomicU64>,
 }
 
 /// One session's reservations on one table (bd-gh-147, bd-8a8pr).
@@ -333,10 +446,23 @@ impl ConcurrentRowIdAllocator {
     /// Create a new allocator with the given current schema epoch.
     #[must_use]
     pub fn new(current_epoch: SchemaEpoch) -> Self {
+        Self::with_write_generation(current_epoch, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Create an allocator for a database whose in-process write commits
+    /// `write_generation` counts (bd-hi7qg): the counter a transaction samples
+    /// at BEGIN, before its snapshot binds.
+    #[must_use]
+    pub fn with_write_generation(
+        current_epoch: SchemaEpoch,
+        write_generation: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             current_epoch: AtomicU64::new(current_epoch.get()),
             tables: Mutex::new(HashMap::with_hasher(FixedState::default())),
             session_reservations: Mutex::new(HashMap::with_hasher(FixedState::default())),
+            claims: Mutex::new(HashMap::with_hasher(FixedState::default())),
+            write_generation,
         }
     }
 
@@ -446,15 +572,22 @@ impl ConcurrentRowIdAllocator {
                 .map_or((0, (sp_next, sp_high_water)), |reservations| {
                     (reservations.count, reservations.first_prior)
                 });
-            let (target_next, target_high_water) = if sp_count == 0 && current_count > 0 {
-                (
-                    max_rowid_tip(sp_next, first_prior.0),
-                    sp_high_water.max(first_prior.1),
-                )
-            } else {
-                (sp_next, sp_high_water)
-            };
             if let Some(state) = tables.get_mut(&key) {
+                // bd-hi7qg: with no claim at mark time, the tail to give back
+                // starts at the tip just before this session's first
+                // reservation. A tip a quiescent allocation lowered after the
+                // mark (only on a Normal table) can sit below `sp_next`; the
+                // mark would then prove a tail a peer holds.
+                let (target_next, target_high_water) = if sp_count == 0 && current_count > 0 {
+                    let next = if state.mode == RowIdMode::Normal {
+                        first_prior.0
+                    } else {
+                        max_rowid_tip(sp_next, first_prior.0)
+                    };
+                    (next, sp_high_water.max(first_prior.1))
+                } else {
+                    (sp_next, sp_high_water)
+                };
                 rewind_reserved_tail(
                     state,
                     target_next,
@@ -557,11 +690,17 @@ impl ConcurrentRowIdAllocator {
 
     /// Drop all reservation tracking for `session_id` (bd-gh-147). Called when
     /// the session's transaction ends (COMMIT or full ROLLBACK) so the map does
-    /// not accumulate dead sessions.
+    /// not accumulate dead sessions. It also ends the session's claims
+    /// (bd-hi7qg); a committing session calls it after its commit is visible
+    /// and the write generation counts it.
     pub fn clear_session(&self, session_id: u64) {
         self.session_reservations
             .lock()
             .retain(|&(session, _), _| session != session_id);
+        self.claims.lock().retain(|_, claimants| {
+            claimants.retain(|&claimant| claimant != session_id);
+            !claimants.is_empty()
+        });
     }
 
     /// Number of live per-`(session, table)` reservation entries.
@@ -604,30 +743,102 @@ impl ConcurrentRowIdAllocator {
         mode: RowIdMode,
     ) {
         let derived = TableAllocatorState::new(max_committed_rowid, sqlite_sequence_seq, mode);
-
-        // Raise the epoch to the key's if it is newer: one load when it is not
-        // (every insert), one atomic max when it is.
-        let epoch = key.schema_epoch.get();
-        if epoch > self.current_epoch.load(Ordering::Acquire) {
-            self.current_epoch.fetch_max(epoch, Ordering::AcqRel);
-        }
-
+        self.raise_epoch(key);
         let mut tables = self.tables.lock();
         match tables.get_mut(&key) {
-            Some(state) => {
-                state.next_rowid = max_rowid_tip(state.next_rowid, derived.next_rowid);
-                state.mode = mode;
-                if mode == RowIdMode::AutoIncrement {
-                    state.autoincrement_high_water = state
-                        .autoincrement_high_water
-                        .max(derived.autoincrement_high_water);
-                } else {
-                    state.autoincrement_high_water = 0;
-                }
-            }
+            Some(state) => state.raise_to(&derived, mode),
             None => {
                 tables.insert(key, derived);
             }
+        }
+    }
+
+    /// Record that `session_id` holds a claim on `key` until it ends
+    /// (bd-hi7qg): it is about to write a row there that no other transaction
+    /// can see. The engine calls it before an insert that is not an append to
+    /// its own cursor's last row; an append follows an insert that claimed.
+    /// No table state is needed: a claim only keeps the tip from falling.
+    pub fn claim_table(&self, key: AllocatorKey, session_id: u64) {
+        record_claim(&mut self.claims.lock(), key, session_id);
+    }
+
+    /// Allocate one rowid for an implicit-rowid insert by `session_id`
+    /// (statement `statement`, as [`Self::allocate_one_for_statement`]),
+    /// whose view shows `visible_max` as the table's largest rowid (its own
+    /// writes included; 0 for an empty table), after raising the floor to it
+    /// as [`Self::ensure_table_floor`] does.
+    ///
+    /// bd-hi7qg: stock takes `max(rowid) + 1`, so a deleted maximum is
+    /// reused. On a table without AUTOINCREMENT the tip falls back to
+    /// `visible_max + 1` when every rowid between is provably free: no live
+    /// session holds a claim on the table (their rows are invisible here),
+    /// and the database's write generation still equals `begin_generation`,
+    /// the transaction's sample taken before its snapshot bound (so no row
+    /// committed since is missing from `visible_max`). Otherwise the tip
+    /// stays and the gap is kept, as before. AUTOINCREMENT never reuses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_one_above_visible_max(
+        &self,
+        key: AllocatorKey,
+        visible_max: i64,
+        sqlite_sequence_seq: i64,
+        mode: RowIdMode,
+        session_id: u64,
+        statement: u64,
+        begin_generation: u64,
+    ) -> Result<RowId, RowIdAllocError> {
+        let max_rowid = (visible_max > 0).then(|| RowId::new(visible_max));
+        let derived = TableAllocatorState::new(max_rowid, sqlite_sequence_seq, mode);
+        let floor = derived.next_rowid;
+        self.raise_epoch(key);
+        let mut tables = self.tables.lock();
+        let state = match tables.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let state = entry.into_mut();
+                state.raise_to(&derived, mode);
+                state
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(derived),
+        };
+        // The claim test, the lowering and this session's claim are one step
+        // under both locks, so no claim can land between them.
+        let mut claims = self.claims.lock();
+        if mode == RowIdMode::Normal
+            && floor >= 1
+            && (state.next_rowid < 1 || state.next_rowid > floor)
+            && claims.get(&key).is_none_or(Vec::is_empty)
+            && self.write_generation.load(Ordering::Acquire) == begin_generation
+        {
+            debug!(
+                schema_epoch = key.schema_epoch.get(),
+                table_id = key.table_id.get(),
+                next_rowid_before = state.next_rowid,
+                next_rowid_after = floor,
+                "quiescent table: tip back to max(rowid) + 1"
+            );
+            state.next_rowid = floor;
+        }
+        record_claim(&mut claims, key, session_id);
+        drop(claims);
+        let (reservation, prior_high_water) = state.reserve(key, 1)?;
+        drop(tables);
+        self.note_session_reservation(
+            session_id,
+            key,
+            i64::from(reservation.count),
+            (reservation.start_rowid.get(), prior_high_water),
+            statement,
+        );
+        Ok(reservation.start_rowid)
+    }
+
+    /// Raise the current epoch to the key's if it is newer: one load when it
+    /// is not (every insert), one atomic max when it is.
+    #[inline]
+    fn raise_epoch(&self, key: AllocatorKey) {
+        let epoch = key.schema_epoch.get();
+        if epoch > self.current_epoch.load(Ordering::Acquire) {
+            self.current_epoch.fetch_max(epoch, Ordering::AcqRel);
         }
     }
 
@@ -651,16 +862,18 @@ impl ConcurrentRowIdAllocator {
         key: AllocatorKey,
         count: u32,
     ) -> Result<RangeReservation, RowIdAllocError> {
-        self.reserve_range_reporting_prior(key, count)
+        self.reserve_range_reporting_prior(key, count, 0)
             .map(|(reservation, _)| reservation)
     }
 
-    /// [`Self::reserve_range`], also returning the AUTOINCREMENT high-water
-    /// the table had just before (its tip before is the range's start).
+    /// [`Self::reserve_range`] by `claimant` (0 without a session), also
+    /// returning the AUTOINCREMENT high-water the table had just before (its
+    /// tip before is the range's start).
     fn reserve_range_reporting_prior(
         &self,
         key: AllocatorKey,
         count: u32,
+        claimant: u64,
     ) -> Result<(RangeReservation, i64), RowIdAllocError> {
         if count == 0 {
             return Ok((
@@ -676,67 +889,11 @@ impl ConcurrentRowIdAllocator {
         let state = tables
             .get_mut(&key)
             .ok_or(RowIdAllocError::NotInitialized(key))?;
-
-        let start = state.next_rowid;
-        let prior_high_water = state.autoincrement_high_water;
-
-        // In concurrent mode, rowids are always in [1, MAX].  If the allocator
-        // wrapped past MAX (via `wrapping_add`), `start` becomes negative and
-        // we are exhausted.
-        if start < 1 {
-            error!(
-                attempted_next = start,
-                max_rowid = RowId::MAX.get(),
-                "MAX_ROWID saturation: SQLITE_FULL"
-            );
-            return Err(RowIdAllocError::Exhausted);
-        }
-
-        let count_i64 = i64::from(count);
-
-        // Remaining capacity: how many rowids [start, MAX] are available.
-        // Safe because start >= 1 and MAX = i64::MAX.
-        let remaining_capacity = RowId::MAX.get() - start + 1;
-        if count_i64 > remaining_capacity {
-            error!(
-                attempted_next = start,
-                count,
-                remaining_capacity,
-                max_rowid = RowId::MAX.get(),
-                "MAX_ROWID saturation: SQLITE_FULL"
-            );
-            return Err(RowIdAllocError::Exhausted);
-        }
-
-        // Advance.  When we allocate exactly through MAX, wrapping_add sends
-        // next_rowid to i64::MIN, which the `start < 1` guard catches next time.
-        state.next_rowid = start.wrapping_add(count_i64);
-
-        // Update AUTOINCREMENT high-water (last allocated rowid in range).
-        if state.mode == RowIdMode::AutoIncrement {
-            let last_in_range = start + (count_i64 - 1);
-            state.autoincrement_high_water = state.autoincrement_high_water.max(last_in_range);
-        }
-
-        let next_after = state.next_rowid;
-        drop(tables);
-
-        debug!(
-            schema_epoch = key.schema_epoch.get(),
-            table_id = key.table_id.get(),
-            start_rowid = start,
-            count,
-            next_rowid_after = next_after,
-            "range reservation"
-        );
-
-        Ok((
-            RangeReservation {
-                start_rowid: RowId::new(start),
-                count,
-            },
-            prior_high_water,
-        ))
+        let reserved = state.reserve(key, count)?;
+        // Under the tables lock, so no lowering runs between the reservation
+        // and its claim.
+        record_claim(&mut self.claims.lock(), key, claimant);
+        Ok(reserved)
     }
 
     /// Allocate a single RowId (convenience wrapper over `reserve_range`).
@@ -765,7 +922,8 @@ impl ConcurrentRowIdAllocator {
         session_id: u64,
         statement: u64,
     ) -> Result<RowId, RowIdAllocError> {
-        let (reservation, prior_high_water) = self.reserve_range_reporting_prior(key, 1)?;
+        let (reservation, prior_high_water) =
+            self.reserve_range_reporting_prior(key, 1, session_id)?;
         self.note_session_reservation(
             session_id,
             key,
@@ -783,7 +941,8 @@ impl ConcurrentRowIdAllocator {
         count: u32,
         session_id: u64,
     ) -> Result<RangeReservation, RowIdAllocError> {
-        let (reservation, prior_high_water) = self.reserve_range_reporting_prior(key, count)?;
+        let (reservation, prior_high_water) =
+            self.reserve_range_reporting_prior(key, count, session_id)?;
         self.note_session_reservation(
             session_id,
             key,
@@ -1963,5 +2122,192 @@ mod tests {
         assert_eq!(alloc.current_epoch(), epoch(2));
         alloc.ensure_table_floor(key(4, 1), None, 0, RowIdMode::Normal);
         assert_eq!(alloc.current_epoch(), epoch(4));
+    }
+
+    /// bd-hi7qg: an allocator whose table tip sits at 102 after rowid 101 was
+    /// reserved by session 1, which has ended; the database's write
+    /// generation is 7.
+    fn quiescent_tip_above_the_max() -> (ConcurrentRowIdAllocator, Arc<AtomicU64>, AllocatorKey) {
+        let generation = Arc::new(AtomicU64::new(7));
+        let alloc =
+            ConcurrentRowIdAllocator::with_write_generation(epoch(1), Arc::clone(&generation));
+        let k = key(1, 1);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 1, 0, 7)
+                .unwrap(),
+            RowId::new(101)
+        );
+        alloc.clear_session(1);
+        assert_eq!(alloc.next_rowid(&k), Some(102));
+        (alloc, generation, k)
+    }
+
+    /// bd-hi7qg: with the maximum (101) deleted, a transaction that has seen
+    /// every commit and finds no live claim on the table gets stock's
+    /// `max(rowid) + 1` again, also from an exhausted tip and on an empty
+    /// table; without those proofs, or with AUTOINCREMENT, the gap stays.
+    #[test]
+    fn a_deleted_maximum_is_reused_only_when_provably_free() {
+        // Quiescent and current: 101 again.
+        let (alloc, _, k) = quiescent_tip_above_the_max();
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 2, 0, 7)
+                .unwrap(),
+            RowId::new(101)
+        );
+        assert_eq!(alloc.next_rowid(&k), Some(102));
+
+        // An empty table starts over at 1.
+        let (alloc, _, k) = quiescent_tip_above_the_max();
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 0, 0, RowIdMode::Normal, 2, 0, 7)
+                .unwrap(),
+            RowId::new(1)
+        );
+
+        // A live claim of another session (a reservation, or a row it
+        // inserted: claimed before the row is written, the floor raised after)
+        // keeps the tip: its rows are invisible here.
+        let (alloc, _, k) = quiescent_tip_above_the_max();
+        alloc.claim_table(k, 3);
+        alloc.ensure_table_floor(k, Some(RowId::new(100)), 0, RowIdMode::Normal);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 2, 0, 7)
+                .unwrap(),
+            RowId::new(102)
+        );
+        let (alloc, _, k) = quiescent_tip_above_the_max();
+        alloc.allocate_one_for_session(k, 3).unwrap();
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 2, 0, 7)
+                .unwrap(),
+            RowId::new(103)
+        );
+        // ... until that session ends.
+        alloc.clear_session(3);
+        alloc.clear_session(2);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 4, 0, 7)
+                .unwrap(),
+            RowId::new(101)
+        );
+
+        // The allocating session's own earlier claim keeps the tip too.
+        let (alloc, _, k) = quiescent_tip_above_the_max();
+        alloc.claim_table(k, 2);
+        alloc.ensure_table_floor(k, Some(RowId::new(100)), 0, RowIdMode::Normal);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 2, 0, 7)
+                .unwrap(),
+            RowId::new(102)
+        );
+
+        // A write commit after the transaction's BEGIN sample may hold a row
+        // above the visible maximum: the tip stays.
+        let (alloc, generation, k) = quiescent_tip_above_the_max();
+        generation.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 2, 0, 7)
+                .unwrap(),
+            RowId::new(102)
+        );
+
+        // AUTOINCREMENT never reuses.
+        let generation = Arc::new(AtomicU64::new(7));
+        let alloc =
+            ConcurrentRowIdAllocator::with_write_generation(epoch(1), Arc::clone(&generation));
+        let k = key(1, 1);
+        alloc
+            .allocate_one_above_visible_max(k, 100, 0, RowIdMode::AutoIncrement, 1, 0, 7)
+            .unwrap();
+        alloc.clear_session(1);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 100, RowIdMode::AutoIncrement, 2, 0, 7)
+                .unwrap(),
+            RowId::new(102)
+        );
+
+        // An exhausted tip comes back when the maximum is gone (stock takes
+        // max(rowid) + 1 while that fits).
+        let generation = Arc::new(AtomicU64::new(0));
+        let alloc = ConcurrentRowIdAllocator::with_write_generation(epoch(1), generation);
+        let k = key(1, 1);
+        alloc.claim_table(k, 1);
+        alloc.ensure_table_floor(k, Some(RowId::MAX), 0, RowIdMode::Normal);
+        alloc.clear_session(1);
+        assert_eq!(alloc.next_rowid(&k), Some(EXHAUSTED_NEXT_ROWID));
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 5, 0, RowIdMode::Normal, 2, 0, 0)
+                .unwrap(),
+            RowId::new(6)
+        );
+    }
+
+    /// bd-hi7qg: a session whose mark predates a quiescent lowering gives back
+    /// only the tail it reserved. Before the fix the mark's `sp_next` (104)
+    /// proved the tail [104, 105): session 2's ROLLBACK found tip 105 == 104 +
+    /// 1 and rewound to 104, which session 1 holds.
+    #[test]
+    fn a_rewind_after_a_lowering_never_reissues_a_peers_rowid() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let alloc = ConcurrentRowIdAllocator::with_write_generation(epoch(1), generation);
+        let k = key(1, 1);
+        alloc.ensure_table_floor(k, Some(RowId::new(103)), 0, RowIdMode::Normal);
+        assert_eq!(alloc.next_rowid(&k), Some(104));
+        let mark = alloc.mark_savepoint(2);
+        // Session 1 sees max 100 (103 was deleted) and lowers the tip.
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 1, 0, 0)
+                .unwrap(),
+            RowId::new(101)
+        );
+        assert_eq!(
+            alloc.allocate_one_for_session(k, 2).unwrap(),
+            RowId::new(102)
+        );
+        assert_eq!(
+            alloc.allocate_one_for_session(k, 1).unwrap(),
+            RowId::new(103)
+        );
+        assert_eq!(
+            alloc.allocate_one_for_session(k, 1).unwrap(),
+            RowId::new(104)
+        );
+        alloc.rewind_to_mark(&mark);
+        assert_eq!(
+            alloc.next_rowid(&k),
+            Some(105),
+            "102 is not at the tip, so it stays a gap"
+        );
+        let next = alloc.allocate_one_for_session(k, 3).unwrap();
+        assert!(
+            ![101, 103, 104].contains(&next.get()),
+            "no rowid session 1 holds is reissued: {next:?}"
+        );
+
+        // Without a peer, the same session's tail is given back as before.
+        let generation = Arc::new(AtomicU64::new(0));
+        let alloc = ConcurrentRowIdAllocator::with_write_generation(epoch(1), generation);
+        alloc.ensure_table_floor(k, Some(RowId::new(103)), 0, RowIdMode::Normal);
+        let mark = alloc.mark_savepoint(2);
+        assert_eq!(
+            alloc
+                .allocate_one_above_visible_max(k, 100, 0, RowIdMode::Normal, 2, 0, 0)
+                .unwrap(),
+            RowId::new(101)
+        );
+        alloc.rewind_to_mark(&mark);
+        assert_eq!(alloc.next_rowid(&k), Some(101));
     }
 }
