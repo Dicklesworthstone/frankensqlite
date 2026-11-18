@@ -329,6 +329,71 @@ const SCENARIOS: &[Scenario] = &[
 
 const COUNTERS: &str = "SELECT changes(), total_changes(), last_insert_rowid()";
 
+#[test]
+fn insert_select_reads_the_callers_change_counters() {
+    asupersync::test_utils::run_test(|| async {
+        for file in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("frank.db");
+            let f = Connection::open(if file { path.to_str().unwrap() } else { ":memory:" })
+                .await
+                .unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let setup = "CREATE TABLE src(n INTEGER PRIMARY KEY); CREATE TABLE dst(c,t,r); \
+                         INSERT INTO src VALUES (11),(22),(33)";
+            f.execute_batch(setup).await.unwrap();
+            r.execute_batch(setup).unwrap();
+            for sql in [
+                "INSERT INTO dst SELECT changes(),total_changes(),last_insert_rowid()",
+                "INSERT INTO dst SELECT changes(),total_changes(),last_insert_rowid() FROM src WHERE n=22",
+                "WITH s AS (SELECT n FROM src WHERE n=22) INSERT INTO dst SELECT changes(),total_changes(),last_insert_rowid() FROM s",
+                "INSERT INTO dst SELECT changes(),total_changes(),last_insert_rowid() FROM src LIMIT 1",
+                "INSERT INTO dst SELECT changes(),total_changes(),last_insert_rowid() FROM src WHERE n=99",
+                "INSERT INTO dst SELECT n,n,n FROM src WHERE 0",
+            ] {
+                let seed = "UPDATE src SET n=n WHERE n IN (11,22)";
+                assert_eq!(f.execute(seed).await.unwrap(), 2);
+                assert_eq!(r.execute(seed, []).unwrap(), 2);
+                let stored = "SELECT c,t,r FROM dst ORDER BY rowid";
+                assert_eq!(
+                    f.execute(sql).await.unwrap(),
+                    r.execute(sql, []).unwrap(),
+                    "{sql}"
+                );
+                for check in [stored, COUNTERS] {
+                    assert_eq!(
+                        fq(&f, check).await.unwrap(),
+                        rq(&r, check).unwrap(),
+                        "file={file}, {sql}, {check}"
+                    );
+                }
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn insert_select_change_counts_stay_stable_across_source_chunks() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "CREATE TABLE src(n INTEGER PRIMARY KEY); CREATE TABLE dst(c,t); \
+                     INSERT INTO src SELECT value FROM generate_series(1,10003); \
+                     UPDATE src SET n=n WHERE n<4";
+        f.execute_batch(setup).await.unwrap();
+        r.execute_batch(&stock_sql(setup)).unwrap();
+        let sql = "INSERT INTO dst SELECT changes(), total_changes() FROM src";
+        assert_eq!(f.execute(sql).await.unwrap(), 10003);
+        assert_eq!(r.execute(sql, []).unwrap(), 10003);
+        let groups = "SELECT c,t,count(*) FROM dst GROUP BY c,t";
+        let expected = rq(&r, groups).unwrap();
+        assert_eq!(expected, [["int:3", "int:10006", "int:10003"]]);
+        assert_eq!(fq(&f, groups).await.unwrap(), expected);
+        assert_eq!(fq(&f, COUNTERS).await.unwrap(), rq(&r, COUNTERS).unwrap());
+    });
+}
+
 /// Runs every scenario on fresh connection pairs opened by `open`, comparing
 /// each step's outcome, the counters after it, and the checks. Returns the
 /// divergences and the number of statements compared.

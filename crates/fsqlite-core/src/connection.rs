@@ -15814,6 +15814,35 @@ impl Drop for U64CellRestoreGuard<'_> {
     }
 }
 
+/// A later source chunk is still part of the same INSERT. Its SELECT sees
+/// the counts from before the INSERT, even though replay has already counted
+/// earlier chunks. Keep the live rowid and restore the replay counters on exit.
+struct InsertSelectSourceCounts<'a> {
+    connection: &'a Connection,
+    changes: usize,
+    total: usize,
+}
+
+impl<'a> InsertSelectSourceCounts<'a> {
+    fn enter(connection: &'a Connection, changes: usize, total: usize) -> Self {
+        let guard = Self {
+            connection,
+            changes: connection.last_changes.replace(changes),
+            total: connection.total_changes.replace(total),
+        };
+        connection.sync_change_tracking_context();
+        guard
+    }
+}
+
+impl Drop for InsertSelectSourceCounts<'_> {
+    fn drop(&mut self) {
+        self.connection.last_changes.set(self.changes);
+        self.connection.total_changes.set(self.total);
+        self.connection.sync_change_tracking_context();
+    }
+}
+
 /// Held for one trigger program (all statements of one firing): like stock's
 /// trigger frame (OP_Program saves `nChange`/`lastRowid`, sqlite3VdbeFrameRestore
 /// puts them back), `changes()` and `last_insert_rowid()` move as the body's
@@ -44979,6 +45008,8 @@ impl Connection {
         // past the previous chunk's last rowid (bd-qdve2): an OFFSET re-reads
         // every row before it, so the chunks cost quadratic time in total.
         let keyset_rowid = self.insert_select_keyset_rowid(select_stmt);
+        let source_changes = self.last_changes.get();
+        let source_total = self.total_changes.get();
         let mut after_rowid = None;
         let mut total_outcome = InsertSelectReplayOutcome::default();
         let mut offset: i64 = 0;
@@ -45001,9 +45032,12 @@ impl Connection {
                     None
                 },
             });
-            let mut source_rows = self
-                .materialize_insert_select_source_rows(insert, &chunked_select, params)
-                .await?;
+            let mut source_rows = {
+                let _source_counts = (offset > 0)
+                    .then(|| InsertSelectSourceCounts::enter(self, source_changes, source_total));
+                self.materialize_insert_select_source_rows(insert, &chunked_select, params)
+                    .await?
+            };
             if keyset_rowid.is_some() {
                 // The appended last column is the rowid the next chunk seeks past.
                 for row in &mut source_rows {
@@ -45694,13 +45728,15 @@ impl Connection {
         source_rows: &'a [Row],
     ) -> Pin<Box<dyn Future<Output = Result<InsertSelectReplayOutcome>> + 'a>> {
         Box::pin(async move {
-            self.execute_insert_select_row_stream(insert, async |emitter| {
+            let outcome = self.execute_insert_select_row_stream(insert, async |emitter| {
                 for row in source_rows {
                     emitter.emit_row(row.values()).await?;
                 }
                 Ok(())
             })
-            .await
+            .await?;
+            self.set_statement_change_count(outcome.changes);
+            Ok(outcome)
         })
     }
 
@@ -45733,6 +45769,7 @@ impl Connection {
             Ok(())
         }))
         .await?;
+        self.set_statement_change_count(outcome.changes);
         Ok(outcome.changes)
     }
 
@@ -46004,8 +46041,6 @@ impl InsertSelectReplayEmitter<'_> {
     }
 
     fn into_outcome(self) -> InsertSelectReplayOutcome {
-        self.connection
-            .set_statement_change_count(self.statement_changes);
         InsertSelectReplayOutcome {
             changes: self.statement_changes,
             returning_rows: self.returning_rows,
@@ -48363,6 +48398,9 @@ impl Connection {
             })
             .await?;
         if streamed {
+            // A stream that handled an empty source publishes zero. A stream
+            // that declined leaves changes() available to the fallback SELECT.
+            self.set_statement_change_count(outcome.changes);
             Ok(Some(outcome))
         } else {
             Ok(None)
