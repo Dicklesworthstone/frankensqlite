@@ -311,6 +311,13 @@ fn typed_index_membership_seeks_and_matches_stock() {
                 "CREATE TABLE mismatched(k TEXT)",
                 "CREATE INDEX mismatched_nocase ON mismatched(k COLLATE NOCASE)",
                 "INSERT INTO mismatched VALUES('A'),('a'),('b')",
+                // bd-bhalc: the codegen test
+                // test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion
+                // pins this shape's sorted probe set; its counts are checked here.
+                "CREATE TABLE count_probe(a, b NUMERIC)",
+                "CREATE INDEX count_probe_b ON count_probe(b)",
+                "INSERT INTO count_probe VALUES \
+                 (1,1),(2,2),(3,2),(4,'2'),(5,2.0),(6,9),(7,NULL),(8,8),(9,'8.0'),(10,'x')",
             ] {
                 frank.execute(sql).await.unwrap();
                 stock.execute_batch(sql).unwrap();
@@ -370,6 +377,12 @@ fn typed_index_membership_seeks_and_matches_stock() {
                 "SELECT count(*) FROM partial_only WHERE k = -1 OR k = 1.5".to_owned(),
                 "SELECT k FROM mismatched WHERE k IN ('A','b')".to_owned(),
                 "SELECT count(*) FROM mismatched WHERE k = 'A' OR k = 'b'".to_owned(),
+                // bd-bhalc: duplicate members, members equal after NUMERIC
+                // affinity, and NULL each count a row once.
+                "SELECT count(*) FROM count_probe WHERE b IN (1, 2, 3, 4, 5, 6, 7, 8)".to_owned(),
+                "SELECT count(*) FROM count_probe WHERE b IN (2, 2.0, '2', 2)".to_owned(),
+                "SELECT count(*) FROM count_probe WHERE b IN (2, '2', NULL, 8, '8', 8.0, 'x')".to_owned(),
+                "SELECT count(*) FROM count_probe WHERE b IN (NULL, 'absent')".to_owned(),
             ]);
             for sql in &queries {
                 let expected = stock_rows(&stock, sql, &[]);

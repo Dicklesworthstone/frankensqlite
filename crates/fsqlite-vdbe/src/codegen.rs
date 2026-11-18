@@ -60899,30 +60899,81 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
+        let ops = prog.ops();
         assert!(
-            prog.ops().iter().any(|op| matches!(&op.p4, P4::Index(name) if op.opcode == Opcode::OpenRead && name == "idx_t_b")),
+            ops.iter().any(|op| matches!(&op.p4, P4::Index(name) if op.opcode == Opcode::OpenRead && name == "idx_t_b")),
             "count(*) with indexed IN-list should open the outer index"
         );
+        // bd-bhalc: the probe set is the statement-local sorter of
+        // emit_index_const_list_rows (bd7d3f7b8), not the OpenAutoindex this
+        // test first pinned, so it needs no MemDatabase. Its members are
+        // inserted once each, sorted, and a member equal to the previous one
+        // is skipped (`Eq previous` jumps past the seek).
         assert!(
-            prog.ops()
+            !ops.iter().any(|op| op.opcode == Opcode::OpenAutoindex)
+                && !prog.requires_attached_memdb(),
+            "count(*) with indexed IN-list should probe without an automatic index or MemDatabase"
+        );
+        let sorter_open = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SorterOpen)
+            .expect("count(*) with indexed IN-list should build a sorted probe set");
+        let probe_cursor = ops[sorter_open].p1;
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::SorterInsert && op.p1 == probe_cursor)
+                .count(),
+            8,
+            "each IN member should enter the probe set once"
+        );
+        let sorter_sort = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SorterSort && op.p1 == probe_cursor)
+            .expect("the probe set should be sorted before it is walked");
+        let sorter_next = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SorterNext && op.p1 == probe_cursor)
+            .expect("the probes should be visited in a sorter loop");
+        let seek = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SeekGE)
+            .expect(
+                "count(*) with indexed IN-list should seek into the outer index per probe value",
+            );
+        assert!(
+            sorter_sort < seek && seek < sorter_next,
+            "the seek should run once per sorted probe"
+        );
+        assert_eq!(
+            ops.iter().filter(|op| op.opcode == Opcode::SeekGE).count(),
+            1,
+            "one seek instruction serves every probe"
+        );
+        assert!(
+            ops[sorter_sort..seek]
                 .iter()
-                .any(|op| op.opcode == Opcode::OpenAutoindex),
-            "count(*) with indexed IN-list should build a deduplicated probe set"
+                .any(|op| op.opcode == Opcode::Eq),
+            "a probe equal to the previous one should be skipped before the seek"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
-            "count(*) with indexed IN-list should seek into the outer index per probe value"
-        );
-        assert!(
-            !prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
+            !ops.iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
             "count(*) with indexed IN-list should not fall back to opening the base table"
         );
+        // bd-bhalc: since bd-2dgf5 a COUNT(*) over an indexed IN list yields
+        // to codegen_select_aggregate (see the simple_count_star gate in
+        // codegen_select), so the count is an AggStep fed from the covering
+        // index run, as 3.54.1 counts it too, never from a table row.
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::AggStep
+                    && matches!(&op.p4, P4::FuncName(name) if name.eq_ignore_ascii_case("count")))
+                .count(),
+            1,
+            "count(*) with indexed IN-list should count the index runs with one COUNT step"
+        );
         assert!(
-            !prog
-                .ops()
-                .iter()
-                .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal)),
-            "count(*) with indexed IN-list should stay on the direct counter path"
+            !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "the count should be answered from the index without reading table rows"
         );
     }
 
