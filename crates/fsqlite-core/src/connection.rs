@@ -16061,7 +16061,7 @@ impl<'a> MaterializedBindingsVisibilityGuard<'a> {
         // Conservatively reserve the rendered statement too, so a later lexical
         // binding cannot capture the private relation names inserted below.
         let reserved_sql = insert.to_string().to_ascii_lowercase();
-        let guard = Self::hide_reserving(conn, Some(&name), &reserved_sql);
+        let guard = Self::hide_reserving(conn, Some(&name), &reserved_sql, true);
         if let Some((root_page, _)) = guard.names.first() {
             // Schema order is binding precedence: the first same-name CTE is
             // the one that the source expressions could resolve before hiding.
@@ -16073,11 +16073,30 @@ impl<'a> MaterializedBindingsVisibilityGuard<'a> {
         guard
     }
 
-    fn hide(conn: &'a Connection, only_name: Option<&str>) -> Self {
-        Self::hide_reserving(conn, only_name, "")
+    /// Enter a trigger's scope. Its WHEN clause and body cannot see the
+    /// caller's materialized bindings, so every one is hidden, and the
+    /// caller's compiled-program cache bypass is lifted until the scope ends
+    /// (bd-fpr5g). Each bypass protects the caller's own statement: its CTE
+    /// names resolve to temporary roots, or its text omits a bound value's
+    /// affinity. A body statement now resolves only persistent and TEMP
+    /// relations and binds NEW / OLD as parameters, so its text identifies
+    /// its program, as outside any WITH scope. A body statement with its own
+    /// WITH clause sets the bypass again for itself.
+    fn for_trigger_scope(conn: &'a Connection) -> Self {
+        Self::hide_reserving(conn, None, "", false)
     }
 
-    fn hide_reserving(conn: &'a Connection, only_name: Option<&str>, reserved_sql: &str) -> Self {
+    /// Hide the materialized bindings named `only_name` (all when `None`)
+    /// under private names. With `inherit_cache_bypass`, the statement stays
+    /// in the caller's scope: it keeps the caller's bypass and adds one when a
+    /// binding is hidden, since it then reads that temporary root under its
+    /// private name.
+    fn hide_reserving(
+        conn: &'a Connection,
+        only_name: Option<&str>,
+        reserved_sql: &str,
+        inherit_cache_bypass: bool,
+    ) -> Self {
         let mut names = Vec::new();
         {
             let roots = conn.materialized_temp_root_pages.borrow();
@@ -16106,7 +16125,8 @@ impl<'a> MaterializedBindingsVisibilityGuard<'a> {
         if !names.is_empty() {
             conn.rebuild_schema_indices();
         }
-        let bypass_cache = conn.bypass_compiled_cache.get() || !names.is_empty();
+        let bypass_cache =
+            inherit_cache_bypass && (conn.bypass_compiled_cache.get() || !names.is_empty());
         Self {
             conn,
             names,
@@ -77230,7 +77250,7 @@ impl Connection {
             return Ok(false);
         }
 
-        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
+        let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
         let new_loaded = match event {
             fsqlite_ast::TriggerEvent::Update(assigned_columns) => {
                 self.before_update_new_loaded_columns(table_name, assigned_columns, &matching)
@@ -77335,7 +77355,7 @@ impl Connection {
             return Ok(());
         }
 
-        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
+        let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
         let base_frame =
             self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid, None)?;
         for trigger in matching {
@@ -77844,7 +77864,7 @@ impl Connection {
         if matching.is_empty() {
             return Ok(false);
         }
-        let _materialized_scope = MaterializedBindingsVisibilityGuard::hide(self, None);
+        let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
         let base_frame = TriggerFrame {
             table_name: view_name.to_owned(),
             trigger_name: String::new(),
