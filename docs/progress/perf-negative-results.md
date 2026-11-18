@@ -89,6 +89,75 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - WIN (landed as b6f81da87; inside its prediction): a trigger fired under a WITH scope reuses its body's compiled programs (bd-fpr5g, SQL lane round 5, lever 1)
+
+- Target: bd-fpr5g's script, an AFTER INSERT trigger (WHEN guard, INSERT and UPDATE in the body)
+  firing for 20,000 rows that arrive from a recursive CTE. Callgrind (release-perf, LTO off, 2,000
+  rows) put about 95k instructions per inserted row in recompiling the body: compile_with_cache,
+  compile_table_update / compile_table_insert and Vec<TableSchema>::clone. The same rows from a real
+  table hit the compiled-program cache.
+- Cause: execute_insert_with_ctes sets bypass_compiled_cache for its WITH scope (its CTE names
+  resolve to temporary roots), and the trigger scope (MaterializedBindingsVisibilityGuard::hide)
+  kept the caller's bypass and added its own whenever it hid a binding.
+- Ledger preflight: no entry on trigger bodies, the compile-cache bypass or trigger-definition
+  clones. The 2026-07-11 bd-5310l entry (planner-directive cache fronted by the program cache) is
+  the nearest, and does not touch the bypass.
+- Change (crates/fsqlite-core/src/connection.rs): `MaterializedBindingsVisibilityGuard::for_trigger_scope`
+  hides every materialized binding (as before) and sets the bypass to false until the scope ends.
+  `for_insert_target` keeps inheriting it. This is sound because every bypass site guards the
+  caller's own statement text, while a trigger body cannot see the caller's bindings and binds NEW
+  and OLD as parameters.
+- Prediction (posted on bd-fpr5g before code): trig_cte -1.5G to -1.9G; trig_src, trig_values and
+  notrig_cte within +-1%.
+- Kill line: trig_cte gains less than 10%; any other row worse by more than 1%; any answer differs.
+- Measured: release-perf CLIs as shipped (LTO, one codegen unit, stripped). Base 47a2d1ee6, sha256
+  8474709c216271aa; lever, sha256 43076f3b42109eac. Conditions: :memory:, instructions:u and
+  task-clock, medians of 5 interleaved reps, stock 3.54.1 live in the same runs, answers
+  byte-equal, thinkstation1, governor powersave, single-threaded CLI. A/A arm (base against
+  itself, 3 reps): every row within 0.46%.
+
+  | row | base | lever | lever / base | x stock, instructions | x stock, CPU |
+  |---|---|---|---|---|---|
+  | trig_cte (the bead's script) | 5,216.4M | 3,604.2M | 0.691 | 21.6 -> 14.9 | 46.7 -> 28.0 |
+  | trig_src | 3,654.7M | 3,655.1M | 1.000 | | |
+  | trig_values | 3,690.3M | 3,690.2M | 1.000 | | |
+  | notrig_cte | 293.6M | 293.9M | 1.001 | | |
+
+  Inside the prediction (-1.61G).
+- Landing binary (rebased onto 895ee627a, the same code as the pushed commit; sha256
+  07d8430d4c3df48d), against base 47a2d1ee6, 5 reps, same conditions: trig_cte 5,207.9M ->
+  3,618.4M (0.695). Against stock that is x21.6 -> x15.0 in instructions and x45.5 -> x27.6 in CPU.
+  trig_src +0.36%, trig_values +0.01%, notrig_cte -0.01%.
+- Keepers:
+  - crates/fsqlite-core/tests/bd_fpr5g_trigger_body_cache_under_cte.rs, stock live, :memory: and a
+    file. At most 40 compilations for a 300-row CTE-fed insert; it compiled 515 before the change
+    (red) and 3 after, on :memory: and on a file. Scope negatives: a CTE named like a body table,
+    cache warm in both orders, and a body naming only a caller's CTE.
+  - bd_8c68u's compile-count keeper (red on main as bd-f8m1v: 92 against its limit of 60) passes
+    at 44.
+- Gate (rch), on d2b048e09 (the lever on 47a2d1ee6):
+  - clippy -D warnings, fsqlite-core all targets: clean;
+  - 19 trigger / CTE keeper targets: 1,779 passed, 0 failed;
+  - 19 more trigger targets: 117 passed, 0 failed;
+  - 19 CTE / view / DML targets: 85 passed, 3 failed. Two are bd-jlbrk's known pair in
+    bd_i3csr_1_insert_select_one_program, red on main. The third is
+    bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack: there rusqlite 3.54.1 itself
+    refuses `SELECT * FROM v999` ("VIEWs and/or subqueries nested too deep") before fsqlite runs,
+    so it is red on any tree;
+  - fsqlite-core --lib: 4,198 passed, 0 failed;
+  - the fsqlite crate, --lib and its 123 default-feature targets: 1,099 passed, 0 failed;
+  - 6 e2e trigger / RETURNING / upsert targets: 57 passed, 0 failed.
+  After the rebase onto 895ee627a (bd-s9i69's binding order, a pager fix): clippy clean; 16
+  keeper targets 91 passed, 0 failed (with --nocapture, for the counts above); the fsqlite-core
+  lib tests matching "trigger" 142 passed, 0 failed. It was pushed onto 5afb99152 (bd-bwmol:
+  INSERT ... SELECT change counts, in other functions), with the same diff and a clean merge.
+- Left on the row: the trigger still costs about 165k instructions per inserted row (3,604M with
+  it, 294M without it, over 20,000 rows). Stock pays about 7.5k (241M against 91M). The planned
+  levers, in bd-fpr5g's order: the TriggerDef list cloned per row (about 15k), the body
+  bound per row (about 17k), the dispatcher around each body statement (about 30k of its 56k) and
+  the outer row-by-row replay (about 49k).
+- Retry condition: none for this lever.
+
 ## 2026-11-18 - WIN (landed as f9c9e9965): a rowid seek that lands on the leaf the cursor already stands on is answered without a wait, from the main loop's SeekRowid arm (bd-w4pr1.12, read-loop round 7, lever SL1 v3)
 
 - Target: join_1M_to_pk_1000 (`SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`),
