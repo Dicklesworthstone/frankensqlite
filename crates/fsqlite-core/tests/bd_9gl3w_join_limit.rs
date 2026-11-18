@@ -19,7 +19,7 @@
 //!
 //! Left out, each diverging the same way before this change: a correlated
 //! EXISTS with a WHERE term on the joined table (bd-jf4s4) or with an OFFSET
-//! (bd-zje20), and `LIMIT ?, ?` (bd-s9i69). `k JOIN t ON t.g = k.g` is left
+//! (bd-zje20). `k JOIN t ON t.g = k.g` is left
 //! out because stock scans `t` first and fsqlite scans `k`.
 
 use fsqlite_core::connection::{
@@ -256,7 +256,6 @@ fn join_limit_parameters_match_stock() {
             "SELECT t.id, p.note FROM t JOIN p ON p.code = t.v LIMIT ?2 OFFSET ?1",
             &[1, 3],
         ),
-        // Numbered: `LIMIT ?, ?` binds in the wrong order (bd-s9i69).
         (
             "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g LIMIT ?1, ?2",
             &[2, 3],
@@ -306,6 +305,72 @@ fn join_limit_parameters_match_stock() {
             diffs.len(),
             diffs.join("\n")
         );
+    });
+}
+
+/// The comma spelling numbers the OFFSET first, even though the engine must
+/// evaluate the LIMIT first. Bind each prepared statement twice to catch reuse.
+#[test]
+fn pagination_binds_in_sql_text_order() {
+    type PageCase = (&'static str, [i64; 2], &'static [i64], &'static [i64]);
+
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let shapes = [
+            "SELECT id FROM t WHERE id BETWEEN 1 AND 6 ORDER BY id",
+            "SELECT t.id FROM t JOIN k ON k.g = t.g WHERE t.id <= 6 ORDER BY t.id",
+            "SELECT min(id) AS id FROM t WHERE id <= 6 GROUP BY id ORDER BY id",
+            "SELECT id FROM t WHERE id <= 3 UNION ALL SELECT id FROM t WHERE id BETWEEN 4 AND 6 ORDER BY id",
+        ];
+        let cases: &[PageCase] = &[
+            ("LIMIT ?, ?", [2, 3], &[3, 4, 5], &[4, 5]),
+            ("LIMIT ? OFFSET ?", [2, 3], &[4, 5], &[3, 4, 5]),
+            ("LIMIT ?1, ?2", [2, 3], &[3, 4, 5], &[4, 5]),
+            ("LIMIT (SELECT ? + 1), max(?, 0)", [1, 3], &[3, 4, 5], &[5]),
+            ("LIMIT :skip, :take + :skip", [1, 2], &[2, 3, 4], &[3, 4, 5]),
+            ("LIMIT ?, ?", [0, 2], &[1, 2], &[]),
+        ];
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            for shape in shapes {
+                for &(limit, [a, b], first_page, second_page) in cases {
+                    let sql = format!("{shape} {limit}");
+                    let prepared = f.prepare(&sql).await.expect(&sql);
+                    for (params, ids) in [([a, b], first_page), ([b, a], second_page)] {
+                        let expected: Vec<_> =
+                            ids.iter().map(|id| vec![format!("int:{id}")]).collect();
+                        assert_eq!(rq(&r, &sql, &params).unwrap(), expected, "stock {sql}");
+                        let values = params.map(SqliteValue::Integer);
+                        let rows = f
+                            .query_with_params(&sql, &values)
+                            .await
+                            .unwrap_or_else(|err| panic!("ad hoc {sql} {params:?}: {err}"));
+                        assert_eq!(tag_rows(&rows), expected, "ad hoc {sql} {params:?}");
+                        let rows = prepared
+                            .query_with_params(&values)
+                            .await
+                            .unwrap_or_else(|err| panic!("prepared {sql} {params:?}: {err}"));
+                        assert_eq!(tag_rows(&rows), expected, "prepared {sql} {params:?}");
+                    }
+                }
+            }
+            // Splitting a compound into arms must preserve the slot numbers
+            // of predicates in both arms and of both trailing operands.
+            let sql = "SELECT id FROM t WHERE id <= ? UNION ALL \
+                       SELECT id FROM t WHERE id > ? AND id <= 6 ORDER BY id LIMIT ?, ?";
+            let prepared = f.prepare(sql).await.expect(sql);
+            for (params, ids) in [([3, 3, 2, 3], [3, 4, 5]), ([1, 4, 0, 6], [1, 5, 6])] {
+                let expected: Vec<_> = ids.iter().map(|id| vec![format!("int:{id}")]).collect();
+                assert_eq!(rq(&r, sql, &params).unwrap(), expected);
+                let values = params.map(SqliteValue::Integer);
+                let rows = f.query_with_params(sql, &values).await.expect(sql);
+                assert_eq!(tag_rows(&rows), expected);
+                let rows = prepared.query_with_params(&values).await.expect(sql);
+                assert_eq!(tag_rows(&rows), expected);
+            }
+            f.close().await.unwrap();
+        }
     });
 }
 

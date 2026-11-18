@@ -890,11 +890,21 @@ fn write_expr_tasks(f: &mut fmt::Formatter<'_>, root: ExprWriteTask<'_>) -> fmt:
                 tasks.push(ExprWriteTask::Ident(&window.name));
             }
             ExprWriteTask::Limit(limit) => {
-                if let Some(offset) = &limit.offset {
-                    tasks.push(ExprWriteTask::Expr(offset));
-                    tasks.push(ExprWriteTask::Text(" OFFSET "));
-                }
-                tasks.push(ExprWriteTask::Expr(&limit.limit));
+                let first = match &limit.offset {
+                    Some(offset) if limit.offset_first() => {
+                        tasks.push(ExprWriteTask::Expr(&limit.limit));
+                        tasks.push(ExprWriteTask::Text(", "));
+                        offset
+                    }
+                    offset => {
+                        if let Some(offset) = offset {
+                            tasks.push(ExprWriteTask::Expr(offset));
+                            tasks.push(ExprWriteTask::Text(" OFFSET "));
+                        }
+                        &limit.limit
+                    }
+                };
+                tasks.push(ExprWriteTask::Expr(first));
                 tasks.push(ExprWriteTask::Text("LIMIT "));
             }
             ExprWriteTask::Update(update) => {
@@ -1823,11 +1833,7 @@ impl fmt::Display for WindowDef {
 
 impl fmt::Display for LimitClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LIMIT {}", self.limit)?;
-        if let Some(ref off) = self.offset {
-            write!(f, " OFFSET {off}")?;
-        }
-        Ok(())
+        write_expr_tasks(f, ExprWriteTask::Limit(self))
     }
 }
 

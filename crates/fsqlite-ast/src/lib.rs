@@ -1661,6 +1661,28 @@ pub struct LimitClause {
     pub offset: Option<Expr>,
 }
 
+impl LimitClause {
+    /// Was the OFFSET written first, as in `LIMIT offset, count`?
+    #[must_use]
+    pub fn offset_first(&self) -> bool {
+        self.offset.as_ref().is_some_and(|offset| {
+            let span = offset.span();
+            span != Span::ZERO && span.end <= self.limit.span().start
+        })
+    }
+
+    /// Bind placeholders in their original SQL order, before either operand
+    /// is rewritten. Synthetic clauses without spans use LIMIT then OFFSET.
+    pub fn expressions_in_sql_order_mut(&mut self) -> impl Iterator<Item = &mut Expr> {
+        let offset_first = self.offset_first();
+        let (first, second) = match self.offset.as_mut() {
+            Some(offset) if offset_first => (offset, Some(&mut self.limit)),
+            offset => (&mut self.limit, offset),
+        };
+        std::iter::once(first).chain(second)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // INSERT statement
 // ---------------------------------------------------------------------------

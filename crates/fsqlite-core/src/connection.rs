@@ -29253,9 +29253,8 @@ impl Connection {
         let mut bound = clause.clone();
         let mut bind_state = BindParamState::default();
         let params = params.unwrap_or_default();
-        bind_placeholders_in_expr(&mut bound.limit, &mut bind_state, params)?;
-        if let Some(offset) = &mut bound.offset {
-            bind_placeholders_in_expr(offset, &mut bind_state, params)?;
+        for expr in bound.expressions_in_sql_order_mut() {
+            bind_placeholders_in_expr(expr, &mut bind_state, params)?;
         }
         self.with_fallback_function_registry(|| apply_limit_clause(rows, &bound))
     }
@@ -100630,6 +100629,16 @@ impl Connection {
             resolve_compound_order_output_indices(self, select, &[])?
         };
 
+        // Each arm runs as a separate statement. Assign slots before splitting
+        // it off so the arms and the final LIMIT share one parameter sequence.
+        let numbered;
+        let select = if select_contains_any_placeholder(select) {
+            numbered = canonicalize_select_placeholders(select)?;
+            &numbered
+        } else {
+            select
+        };
+
         let mut cores = Vec::with_capacity(select.body.compounds.len() + 1);
         cores.push(&select.body.select);
         cores.extend(select.body.compounds.iter().map(|(_, core)| core));
@@ -100829,10 +100838,8 @@ impl Connection {
             )?;
         }
 
-        // Post-process: LIMIT / OFFSET.
-        if let Some(ref limit_clause) = select.limit {
-            self.apply_limit_clause(&mut result, limit_clause, None)?;
-        }
+        let limit = self.resolve_expression_only_limit(select, params).await?;
+        apply_resolved_expression_limit(&mut result, limit);
 
         Ok(result)
     }
@@ -161642,9 +161649,8 @@ fn canonicalize_update_placeholders_with_state(
         canonicalize_expr_placeholders(&mut ordering.expr, bind_state)?;
     }
     if let Some(limit_clause) = &mut normalized.limit {
-        canonicalize_expr_placeholders(&mut limit_clause.limit, bind_state)?;
-        if let Some(offset) = &mut limit_clause.offset {
-            canonicalize_expr_placeholders(offset, bind_state)?;
+        for expr in limit_clause.expressions_in_sql_order_mut() {
+            canonicalize_expr_placeholders(expr, bind_state)?;
         }
     }
 
@@ -161683,9 +161689,8 @@ fn canonicalize_delete_placeholders_with_state(
         canonicalize_expr_placeholders(&mut ordering.expr, bind_state)?;
     }
     if let Some(limit_clause) = &mut normalized.limit {
-        canonicalize_expr_placeholders(&mut limit_clause.limit, bind_state)?;
-        if let Some(offset) = &mut limit_clause.offset {
-            canonicalize_expr_placeholders(offset, bind_state)?;
+        for expr in limit_clause.expressions_in_sql_order_mut() {
+            canonicalize_expr_placeholders(expr, bind_state)?;
         }
     }
     Ok(normalized)
@@ -161782,9 +161787,8 @@ fn canonicalize_select_placeholders_in_statement(
         canonicalize_expr_placeholders(&mut ordering.expr, bind_state)?;
     }
     if let Some(limit_clause) = &mut select.limit {
-        canonicalize_expr_placeholders(&mut limit_clause.limit, bind_state)?;
-        if let Some(offset) = &mut limit_clause.offset {
-            canonicalize_expr_placeholders(offset, bind_state)?;
+        for expr in limit_clause.expressions_in_sql_order_mut() {
+            canonicalize_expr_placeholders(expr, bind_state)?;
         }
     }
 
@@ -162084,9 +162088,8 @@ fn bind_placeholders_in_select_statement(
         }
     }
     if let Some(limit_clause) = &mut select.limit {
-        bind_placeholders_in_expr(&mut limit_clause.limit, bind_state, params)?;
-        if let Some(offset) = &mut limit_clause.offset {
-            bind_placeholders_in_expr(offset, bind_state, params)?;
+        for expr in limit_clause.expressions_in_sql_order_mut() {
+            bind_placeholders_in_expr(expr, bind_state, params)?;
         }
     }
 
@@ -163692,9 +163695,8 @@ fn bind_placeholders_in_update_statement(
         bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
     }
     if let Some(limit_clause) = &mut update.limit {
-        bind_placeholders_in_expr(&mut limit_clause.limit, bind_state, params)?;
-        if let Some(offset) = &mut limit_clause.offset {
-            bind_placeholders_in_expr(offset, bind_state, params)?;
+        for expr in limit_clause.expressions_in_sql_order_mut() {
+            bind_placeholders_in_expr(expr, bind_state, params)?;
         }
     }
     Ok(())
@@ -163720,9 +163722,8 @@ fn bind_placeholders_in_delete_statement(
         bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
     }
     if let Some(limit_clause) = &mut delete.limit {
-        bind_placeholders_in_expr(&mut limit_clause.limit, bind_state, params)?;
-        if let Some(offset) = &mut limit_clause.offset {
-            bind_placeholders_in_expr(offset, bind_state, params)?;
+        for expr in limit_clause.expressions_in_sql_order_mut() {
+            bind_placeholders_in_expr(expr, bind_state, params)?;
         }
     }
     Ok(())
