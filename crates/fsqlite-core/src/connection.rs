@@ -10838,6 +10838,22 @@ impl TriggerFrame {
             .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"))
     }
 
+    /// bd-7b1wh: whether `column_name` names the rowid: the INTEGER PRIMARY
+    /// KEY column, or `rowid` / `_rowid_` / `oid` when no real column has that
+    /// name. Stock gives such a reference INTEGER affinity (the rowid's,
+    /// `sqlite3TableColumnAffinity` of a negative column), and no other
+    /// column's NEW / OLD reference any.
+    fn names_rowid(&self, column_name: &str) -> bool {
+        // Every bound reference asks, so the column list is scanned only for
+        // a rowid alias name, to learn whether a real column shadows it.
+        let names_ipk = self.rowid_alias_col_idx.is_some_and(|index| {
+            self.column_names
+                .get(index)
+                .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+        });
+        names_ipk || (is_rowid_alias(column_name) && self.column_index(column_name).is_none())
+    }
+
     fn hidden_rowid_column_index(&self, column_name: &str) -> Option<usize> {
         self.column_index(column_name)
             .is_none()
@@ -163242,8 +163258,25 @@ fn bind_trigger_columns_in_expr_inner(
             if frame.references_pseudo_column(table_prefix, &column_name)
                 && let Some(value) = frame.lookup_value(table_prefix, &column_name)
             {
-                *expr = trigger_bound_param(table_prefix, &column_name, &value)
+                let bound = trigger_bound_param(table_prefix, &column_name, &value)
                     .unwrap_or_else(|| value_to_literal_expr(value));
+                // bd-7b1wh: a parameter or a literal has no affinity, but the
+                // rowid has INTEGER affinity. The value is already an integer
+                // (or NULL), so the cast changes no value, only the affinity.
+                *expr = if frame.names_rowid(&column_name) {
+                    let span = bound.span();
+                    Expr::Cast {
+                        expr: Box::new(bound),
+                        type_name: fsqlite_ast::TypeName {
+                            name: "INTEGER".to_owned(),
+                            arg1: None,
+                            arg2: None,
+                        },
+                        span,
+                    }
+                } else {
+                    bound
+                };
             }
         }
         Expr::BinaryOp { left, right, .. } => {
