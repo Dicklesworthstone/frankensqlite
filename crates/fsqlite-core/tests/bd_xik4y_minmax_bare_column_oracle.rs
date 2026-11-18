@@ -173,6 +173,20 @@ const NAME_QUERIES: &[&str] = &[
     "SELECT a + 1 FROM t UNION ALL SELECT a FROM t",
     "SELECT max(a) FROM t GROUP BY c HAVING count(*) > 1 ORDER BY 1 LIMIT 2",
     "  SELECT  a  +  1  FROM t;",
+    // bd-literal-star-name-qzqb4: an expression beside `*` or `tbl.*` is named
+    // by its text too, at its position after the expansion; aliases, plain
+    // columns and the expanded names stay as they are.
+    "SELECT *, 1 FROM t",
+    "SELECT 1, * FROM t",
+    "SELECT 1, *, 'x', a + 1 FROM t",
+    "SELECT *, a, a AS alias, (b) FROM t",
+    "SELECT t.*, t.a * 2, u.*, x || '!' FROM t JOIN u ON u.a = t.a",
+    "SELECT u.*, 1 FROM t JOIN u USING (a)",
+    "SELECT *, max(a) FROM t",
+    "SELECT * , NULL /* comment */ FROM t",
+    "SELECT *, 1 FROM t UNION ALL SELECT *, 2 FROM t",
+    "SELECT *, 1 FROM (SELECT a, b FROM t)",
+    "SELECT *, count(*) OVER () FROM vt",
 ];
 
 async fn assert_values_agree(fconn: &Connection, rconn: &rusqlite::Connection, sql: &str) {
@@ -225,25 +239,42 @@ fn single_minmax_bare_columns_come_from_the_extremum_row() {
 
 #[test]
 fn unaliased_result_expressions_are_named_by_their_source_text() {
-    asupersync::test_utils::run_test(|| async move {
-        let f = Connection::open(":memory:").await.unwrap();
-        let r = rusqlite::Connection::open_in_memory().unwrap();
-        for sql in SETUP {
-            f.execute(sql).await.unwrap();
-            r.execute(sql, []).unwrap();
-        }
-        for sql in NAME_QUERIES {
-            let prepared = f
-                .prepare(sql)
-                .await
-                .unwrap_or_else(|e| panic!("franken prepare `{sql}`: {e:?}"));
-            let franken: Vec<String> = prepared.column_names();
-            let stmt = r.prepare(sql).expect("rusqlite prepare");
-            let stock: Vec<String> = stmt
-                .column_names()
-                .map(str::to_owned)
-                .collect();
-            assert_eq!(franken, stock, "column names of `{sql}`");
-        }
-    });
+    for file_backed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let target = if file_backed {
+                dir.path()
+                    .join("bd_xik4y_names.db")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&target).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in SETUP {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in NAME_QUERIES {
+                let prepared = f
+                    .prepare(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("franken prepare `{sql}`: {e:?}"));
+                let franken: Vec<String> = prepared.column_names();
+                let stmt = r.prepare(sql).expect("rusqlite prepare");
+                let stock: Vec<String> = stmt.column_names().map(str::to_owned).collect();
+                assert_eq!(
+                    franken, stock,
+                    "column names of `{sql}` (file_backed={file_backed})"
+                );
+            }
+            // bd-literal-star-name-qzqb4: CREATE TABLE ... AS SELECT names its
+            // columns the same way.
+            let ctas = "CREATE TABLE ctas AS SELECT *, 1, a + 1 FROM t";
+            f.execute(ctas).await.unwrap();
+            r.execute(ctas, []).unwrap();
+            assert_values_agree(&f, &r, "SELECT name FROM pragma_table_info('ctas')").await;
+        });
+    }
 }

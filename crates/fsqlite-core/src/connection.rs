@@ -45291,7 +45291,8 @@ impl Connection {
         rows: &[Row],
         ddl_source: Option<&str>,
     ) -> Vec<ColumnInfo> {
-        let mut col_names = self.select_result_column_names(select_stmt, &[], &mut Vec::new());
+        let (mut col_names, result_column_widths) =
+            self.select_result_column_names_with_widths(select_stmt, &[], &mut Vec::new());
         // The spans must index into `ddl_source`, so name from that text's own
         // parse, and only when it is this same statement. bd-at0bx: the
         // statement executing is that parse after schema-qualified column
@@ -45303,7 +45304,12 @@ impl Connection {
             && let CreateTableBody::AsSelect(parsed_select) = &parsed.body
             && **parsed_select == *select_stmt
         {
-            overlay_select_result_expression_source_names(&mut col_names, parsed_select, sql);
+            overlay_select_result_expression_source_names(
+                &mut col_names,
+                &result_column_widths,
+                parsed_select,
+                sql,
+            );
         }
         // Derive each column's affinity from the SELECT result-column decltype
         // (via the AST), matching C SQLite CTAS. Sniffing the first materialized
@@ -49636,9 +49642,20 @@ impl Connection {
         // Column metadata can invoke user vtab factories, which may re-register
         // modules or functions. Finish every callback-capable metadata lookup
         // before snapshotting the callable registry and its generation.
-        let mut prepared_column_names = self.prepared_statement_column_names(statement);
+        let (mut prepared_column_names, mut result_column_widths) =
+            self.prepared_statement_column_names(statement);
+        // A rewrite (a flattened FROM subquery) can spell out the `*` of the
+        // statement the names overlay; count the original's columns then.
+        if !result_column_widths_fit(
+            original_statement,
+            &result_column_widths,
+            prepared_column_names.len(),
+        ) {
+            result_column_widths = self.prepared_statement_column_names(original_statement).1;
+        }
         overlay_result_expression_source_names(
             &mut prepared_column_names,
+            &result_column_widths,
             original_statement,
             original_sql,
         );
@@ -54381,15 +54398,22 @@ impl Connection {
         self.select_result_column_count(&single_core, outer_ctes, &mut Vec::new())
     }
 
-    fn prepared_statement_column_names(&self, statement: &Statement) -> Vec<String> {
+    /// A prepared statement's result column names, with the number of names
+    /// each result column (or RETURNING column) produced, for
+    /// [`overlay_result_expression_source_names`]; the widths are empty when
+    /// the statement has no such list.
+    fn prepared_statement_column_names(&self, statement: &Statement) -> (Vec<String>, Vec<usize>) {
         match statement {
             Statement::Select(select) => {
-                self.select_result_column_names(select, &[], &mut Vec::new())
+                self.select_result_column_names_with_widths(select, &[], &mut Vec::new())
             }
-            Statement::Pragma(pragma) => pragma_result_columns(pragma)
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
+            Statement::Pragma(pragma) => (
+                pragma_result_columns(pragma)
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect(),
+                Vec::new(),
+            ),
             Statement::Insert(insert) => {
                 self.returning_result_column_names(&insert.returning, &insert.table.name)
             }
@@ -54399,7 +54423,7 @@ impl Connection {
             Statement::Delete(delete) => {
                 self.returning_result_column_names(&delete.returning, &delete.table.name.name)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), Vec::new()),
         }
     }
 
@@ -54407,10 +54431,17 @@ impl Connection {
     /// names them: an alias, else a bare column's name, else the expression
     /// (whose source text [`overlay_result_expression_source_names`] restores),
     /// with `*` expanded to the target table's columns. Empty without
-    /// RETURNING, so a prepared DML statement reports its true width.
-    fn returning_result_column_names(&self, returning: &[ResultColumn], table: &str) -> Vec<String> {
+    /// RETURNING, so a prepared DML statement reports its true width. The
+    /// second list is the number of names each RETURNING column produced.
+    fn returning_result_column_names(
+        &self,
+        returning: &[ResultColumn],
+        table: &str,
+    ) -> (Vec<String>, Vec<usize>) {
         let mut names = Vec::with_capacity(returning.len());
+        let mut widths = Vec::with_capacity(returning.len());
         for column in returning {
+            let start = names.len();
             match column {
                 ResultColumn::Star | ResultColumn::TableStar(_) => {
                     let schema = self.schema.borrow();
@@ -54430,8 +54461,9 @@ impl Connection {
                     (None, other) => other.to_string(),
                 }),
             }
+            widths.push(names.len() - start);
         }
-        names
+        (names, widths)
     }
 
     fn select_result_column_names(
@@ -54440,17 +54472,33 @@ impl Connection {
         outer_ctes: &[fsqlite_ast::Cte],
         active_ctes: &mut Vec<String>,
     ) -> Vec<String> {
+        self.select_result_column_names_with_widths(select, outer_ctes, active_ctes)
+            .0
+    }
+
+    /// [`Self::select_result_column_names`], with the number of names each
+    /// result column of the first SELECT core produced (a `*` or `tbl.*`
+    /// produces several). The widths are empty when that core is a VALUES
+    /// list.
+    fn select_result_column_names_with_widths(
+        &self,
+        select: &SelectStatement,
+        outer_ctes: &[fsqlite_ast::Cte],
+        active_ctes: &mut Vec<String>,
+    ) -> (Vec<String>, Vec<usize>) {
         let mut visible_ctes = outer_ctes.to_vec();
         if let Some(with) = &select.with {
             visible_ctes.extend(with.ctes.clone());
         }
 
         let SelectCore::Select { columns, from, .. } = &select.body.select else {
-            return infer_select_column_names(select);
+            return (infer_select_column_names(select), Vec::new());
         };
 
         let mut resolved = Vec::with_capacity(columns.len());
+        let mut widths = Vec::with_capacity(columns.len());
         for (i, column) in columns.iter().enumerate() {
+            let start = resolved.len();
             match column {
                 ResultColumn::Star => {
                     if let Some(from_clause) = from {
@@ -54492,9 +54540,10 @@ impl Connection {
                     _ => resolved.push(format!("_c{i}")),
                 },
             }
+            widths.push(resolved.len() - start);
         }
 
-        resolved
+        (resolved, widths)
     }
 
     /// Resolve the declared SQL type (decltype) of each output column of a
@@ -121866,16 +121915,52 @@ fn compound_op_error_name(op: CompoundOp) -> &'static str {
 /// column reference by its source text (`max(v)`, `count(*)`, `x + 1`,
 /// `(a)`), where the name derivation above falls back to a positional `_cN`.
 /// `original` must be the statement parsed from `sql` (its spans index into
-/// it), not a rewritten one. Lists with `*` are left alone because their
-/// expansion shifts result positions.
-fn overlay_result_expression_source_names(names: &mut [String], original: &Statement, sql: &str) {
+/// it), not a rewritten one. `widths` holds the number of names each result
+/// column produced; a list with `*` or `tbl.*` is named only when they
+/// account for every name, since the expansion shifts result positions
+/// (bd-literal-star-name-qzqb4).
+fn overlay_result_expression_source_names(
+    names: &mut [String],
+    widths: &[usize],
+    original: &Statement,
+    sql: &str,
+) {
     match original {
-        Statement::Select(select) => overlay_select_result_expression_source_names(names, select, sql),
-        Statement::Insert(insert) => overlay_result_column_source_names(names, &insert.returning, sql),
-        Statement::Update(update) => overlay_result_column_source_names(names, &update.returning, sql),
-        Statement::Delete(delete) => overlay_result_column_source_names(names, &delete.returning, sql),
+        Statement::Select(select) => {
+            overlay_select_result_expression_source_names(names, widths, select, sql);
+        }
+        Statement::Insert(insert) => {
+            overlay_result_column_source_names(names, widths, &insert.returning, sql);
+        }
+        Statement::Update(update) => {
+            overlay_result_column_source_names(names, widths, &update.returning, sql);
+        }
+        Statement::Delete(delete) => {
+            overlay_result_column_source_names(names, widths, &delete.returning, sql);
+        }
         _ => {}
     }
+}
+
+/// Whether [`overlay_result_expression_source_names`] can place `original`'s
+/// result columns with `widths` over `name_count` names: always without a
+/// `*` (it does not read the widths then), else when the widths are one per
+/// result column and account for every name.
+fn result_column_widths_fit(original: &Statement, widths: &[usize], name_count: usize) -> bool {
+    let columns: &[ResultColumn] = match original {
+        Statement::Select(select) => match &select.body.select {
+            SelectCore::Select { columns, .. } => columns,
+            SelectCore::Values(_) => return true,
+        },
+        Statement::Insert(insert) => &insert.returning,
+        Statement::Update(update) => &update.returning,
+        Statement::Delete(delete) => &delete.returning,
+        _ => return true,
+    };
+    !columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Star | ResultColumn::TableStar(_)))
+        || (widths.len() == columns.len() && widths.iter().sum::<usize>() == name_count)
 }
 
 /// [`overlay_result_expression_source_names`] for a SELECT parsed from `sql`
@@ -121883,36 +121968,58 @@ fn overlay_result_expression_source_names(names: &mut [String], original: &State
 /// stock derives the same way in sqlite3ColumnsFromExprList).
 fn overlay_select_result_expression_source_names(
     names: &mut [String],
+    widths: &[usize],
     select: &SelectStatement,
     sql: &str,
 ) {
     let SelectCore::Select { columns, .. } = &select.body.select else {
         return;
     };
-    overlay_result_column_source_names(names, columns, sql);
+    overlay_result_column_source_names(names, widths, columns, sql);
 }
 
 /// Name each unaliased, non-column result expression of `columns` (a SELECT
 /// result list or a RETURNING clause parsed from `sql`) by its source text.
-fn overlay_result_column_source_names(names: &mut [String], columns: &[ResultColumn], sql: &str) {
-    if columns.len() != names.len()
-        || columns
+/// Without a `*`, column `i` named `names[i]`; with one, `widths[i]` names
+/// each column produced, and an expression column must have produced one.
+fn overlay_result_column_source_names(
+    names: &mut [String],
+    widths: &[usize],
+    columns: &[ResultColumn],
+    sql: &str,
+) {
+    let has_star = columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Star | ResultColumn::TableStar(_)));
+    let positions: Vec<usize> = if has_star {
+        if widths.len() != columns.len() || widths.iter().sum::<usize>() != names.len() {
+            return;
+        }
+        widths
             .iter()
-            .any(|column| matches!(column, ResultColumn::Star | ResultColumn::TableStar(_)))
-    {
-        return;
-    }
+            .scan(0, |start, width| {
+                let position = *start;
+                *start += width;
+                Some(position)
+            })
+            .collect()
+    } else {
+        if columns.len() != names.len() {
+            return;
+        }
+        (0..columns.len()).collect()
+    };
     let mut tokens: Option<Vec<fsqlite_parser::Token>> = None;
-    for (name, column) in names.iter_mut().zip(columns) {
+    for (index, (column, position)) in columns.iter().zip(positions).enumerate() {
         let ResultColumn::Expr { expr, alias: None } = column else {
             continue;
         };
-        if matches!(expr, Expr::Column(..)) {
+        if matches!(expr, Expr::Column(..)) || (has_star && widths[index] != 1) {
             continue;
         }
         let tokens = tokens.get_or_insert_with(|| Lexer::tokenize(sql));
         if let Some(text) = result_expression_source_text(expr, sql, tokens) {
-            text.clone_into(name);
+            text.clone_into(&mut names[position]);
         }
     }
 }

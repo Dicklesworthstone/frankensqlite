@@ -59,8 +59,12 @@ const SHAPES: &[&str] = &[
     "SELECT * FROM {f} a NATURAL JOIN t",
     "SELECT a.*, t.* FROM {f} a JOIN t USING(key)",
     "SELECT t.*, a.* FROM {f} a JOIN t USING(key)",
+    // bd-literal-star-name-qzqb4: an unaliased literal beside `*` is named by
+    // its text, as stock names it.
+    "SELECT *, 1 FROM {f} a JOIN t USING(key)",
+    "SELECT 1, *, note FROM {f} a JOIN t USING(key)",
     "SELECT *, 1 AS one FROM {f} a JOIN t USING(key)",
-    "SELECT 1 AS one, *, note FROM {f} a JOIN t USING(key)",
+    "SELECT a.*, key + 1, t.* FROM {f} a JOIN t USING(key)",
     "SELECT * FROM {f} a JOIN t USING(key) WHERE a.key = 1",
     "SELECT * FROM {f} a JOIN t USING(key) ORDER BY 1 DESC",
     "SELECT * FROM {f} a JOIN t USING(key) ORDER BY note",
