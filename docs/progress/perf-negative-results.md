@@ -89,6 +89,118 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - WIN (disk; tmpfs unchanged as predicted): a checkpoint persists the certificate handoff only on the path that resets the WAL, so 8 writer processes on a disk stop losing rows (x70 -> x3.9 stock) (bd-1qmz4, multi-process lane round 1, lever 2)
+
+- Target: the scorecard's `multiproc` shape on a real disk (ext4, synchronous=NORMAL), 8 and 16
+  writer processes. Touched: `crates/fsqlite-core/src/wal_adapter.rs` (landed as 345016f91):
+  - `PathRefreshingWalBackend::checkpoint` builds a `CertificateHandoffFence` instead of writing
+    the handoff;
+  - `WalBackendAdapter::checkpoint_with_reset_fence`;
+  - `CheckpointResetTarget::prepare_wal_reset` persists the fence before it arms the reset;
+  - `persist_checkpoint_certificate_handoff` takes vfs and path.
+- Evidence before (LD_PRELOAD census in every writer, scratchpad `mp1/`):
+  - At N=8 on disk, 93% of the wall was an in-lock `fdatasync(-wal-cert-head)`, 0.41 per txn
+    at about 16 ms each.
+  - These are autocheckpoint attempts (Restart, zero busy budget). Each one persisted the handoff
+    at the checkpoint's entry, copied nothing because peers' read marks pinned the safe frame,
+    and could not reset (nBackfill frozen; `mp1/shm_sampler.py`).
+  - The writer lock was 97% busy. Waiters on 100 ms sleeps starved until busy_timeout, and rows
+    were lost.
+- Ledger preflight: the 2026-11-12 "certificate record lookup reads footer and record in one tail
+  read" entry and GH#294's unchanged-bytes skip both touched sidecar I/O. Neither covered the
+  handoff written by non-resetting checkpoints.
+- Prediction (bd-1qmz4, before code): in-lock handoff fdatasync 0.41 -> 0.01 or less per txn; disk
+  N=8 median under 2 s; 0 rows lost at N=8/16; tmpfs within noise; explicit-same within 5% of base.
+  Kill: any of these missed, or a handoff / checkpoint keeper changing outcome.
+- Result (stock sqlite3 3.46.1 live and interleaved in every probe):
+  - On main 05fe3c5b1, release-perf CLIs da793902bb33619e vs b3d549876f9f5a66 (scratchpad
+    `mp1/ab_L2.txt`):
+    - disk NORMAL census N=8: handoff fdatasync 0.42 -> 0 per txn; RESERVED 96% -> 52% busy, mean
+      hold 2,900 -> 127 us; wall 17.6 -> 1.06 s;
+    - disk N=8 (3 reps): 18.9 s (x70, rows lost) -> 1.04 s (x3.85, none). N=16: 24.1 s (x36, 19
+      rows lost) -> 1.19 s (x1.78, none);
+    - bd-73pfl stress, 8 x 300: explicit-same committed median 1,837 -> 1,821 (-0.9%);
+      explicit-sep refused 2 -> 0; auto-same 0 and 0; integrity ok everywhere;
+    - tmpfs: scorecard row 0.854 -> 0.807 s (inside the row's spread); scaled N=1 117.1 -> 114.6
+      us, N=8 216.6 -> 212.2 us.
+  - Landing tree: on b1526ddf1, release-perf CLIs f7a4dddb250cba04 (base) vs cf5aa2dc6d9ded8a (this
+    change), 2 reps (scratchpad `mp1/ab_L2land_disk.json`):
+    - disk N=8 12.3 / 6.6 s with 2 / 0 rows lost (x46 by median) -> 0.91 / 1.03 s with none (x4.74);
+    - N=16 27.5 / 22.1 s with 6 / 6 lost (x37) -> 1.36 / 1.35 s with none (x2.04);
+    - stock 0.18-0.23 s and 0.66-0.67 s;
+    - explicit-same (6 reps): committed median 1,762 -> 1,910 of 2,400 (stock 2,400); integrity ok.
+- Test: `checkpoint_handoff_is_written_only_by_a_checkpoint_that_resets_the_wal`. A PASSIVE
+  checkpoint writes and syncs no handoff (the old code fails). A TRUNCATE that resets leaves a
+  synced handoff with the old generation's latest certificate, and the clock survives the reset (a
+  never-write change fails).
+- Gate (rch, on b1526ddf1 plus the change):
+  - clippy -D warnings on fsqlite-core, all targets: clean.
+  - fsqlite-core lib 4195 / 2 (the known t6741 pair).
+  - Core keepers green: bulk_import_upsert_text_pk_phantom_pk, gh534, bd_7zs8a, bd_ih8ak, gh441,
+    wal_fec_commit_pipeline, bd_qyekq, gh385. wal_reset_with_foreign_reader 12 / 1 (the known gh19
+    native_full_commits hang).
+  - fsqlite-wal: lib alone 1183 / 0; fault-injection targets 1314 / 0 (16 targets).
+  - e2e: concurrent-writer / SSI / checkpoint / group-commit batch 132 / 0 (19 targets);
+    cross-process batch 56 / 0 (10); multiprocess_autocommit_busy_timeout_e2e --test-threads=1
+    8 / 0.
+  - mvcc lib 1685 / 0; pager lib 1114 / 1 (the known bd_2jpu6_2); vfs lib 531 / 0; gh519 10 / 0.
+  - fsqlite crate 1098 / 0 (126 binaries).
+  - Main later moved past b1526ddf1 without touching wal_adapter.rs; the rebased tree was not
+    re-gated.
+- Retry condition / next: none for this lever. Autocheckpoint attempts that copy nothing still take
+  the writer lock (CKPT, READ_LOCK(0), the reader-horizon probes). If disk rows show
+  checkpoint-attempt time again, the next step is an autocheckpoint that skips while the safe frame
+  equals nBackfill, the way stock's PASSIVE does nothing when there is nothing to copy.
+
+## 2026-11-17 - REJECTED (two versions; the negative case is explicit transactions refused at COMMIT): a contended main-file lock wait that keeps losing writers polling (v1: 50 us doubling to a 2 ms cap; v1b: 1 ms doubling to a 5 ms cap; main: 1 ms doubling to 100 ms) (bd-1qmz4, multi-process lane round 1, lever 1)
+
+- Target: the scorecard's `multiproc_8x500` (8 CLI processes x 500 autocommit INSERTs into one WAL
+  database) and its scaled variant (1-16 processes, 4,000 rows in all), tmpfs and disk.
+  - Touched, not kept: `crates/fsqlite-vfs/src/unix.rs`, `UnixFile::lock`'s native-contention
+    wait.
+  - Patches: scratchpad `mp1/L1_v1.patch` (diff sha256 b6b780ff9015ccb0) and `mp1/L1b.patch`
+    (cedd8a2daaea69c5), each with the keeper
+    `contended_reserved_wait_takes_the_lock_soon_after_the_holder_releases`.
+- Evidence before:
+  - Tools: an LD_PRELOAD census in every writer of both engines, with lock-hold intervals merged
+    across processes (scratchpad `mp1/mp1shim.c`, `mp1_census.py`).
+  - At N=8 on tmpfs, the commit's writer lock (main-file RESERVED, taken before WAL_WRITE) sat idle
+    127.5 of 215.7 us per txn while 3-6 writers slept. All 297 main-thread sleeps of 1 ms or more
+    were this wait.
+  - On disk (NORMAL), waiters on 100 ms sleeps starved behind a lock 97% busy until busy_timeout,
+    losing rows.
+- Ledger preflight: nothing earlier touches this wait.
+- v1 prediction (bd-1qmz4, before code): tmpfs scorecard shape -40%; disk unchanged. Kill: tmpfs
+  N=8 under -15%, N=1 +3%, CPU at N=8 +20%, any tmpfs error, disk NORMAL N=4/8 worse.
+- v1 result (stock sqlite3 3.46.1 live; release-perf CLIs b3abcb66a 4d27023cdc111870 vs
+  ff80c9be62a7f738, main 05fe3c5b1 da793902bb33619e vs 5981bc76792dd665):
+  - tmpfs scorecard row -7.5% to -18% across four runs, centred on the kill line. Scaled probe:
+    N=8 -3% to -13%, N=16 -20%, N=1 unchanged.
+  - Disk NORMAL: N=8 10.8-15.4 s with 1-3 rows lost per run -> about 1.0 s with none; N=16
+    18.7-26.7 s with 4-7 lost -> 1.3 s with none (stock 0.2-0.9 s).
+  - Disk FULL: wall unchanged, CPU at N=8 +28%.
+- v1 negative case, the bd-73pfl stress (`mw_conflict.py`, 8 x 300, busy_timeout 5000):
+  - explicit-same: commits fall 1670-2109 -> 871-953 of 2400 per run (refused 23% -> 62%; stock
+    refuses none);
+  - explicit-sep: 0 -> 2 refused;
+  - integrity ok everywhere.
+- v1b (prediction and kill posted before code; the kill included explicit-same within 5% of
+  base):
+  - explicit-same: commits 1752-1976 -> 1365-1526 (median -22%, refused 22% -> 40%). KILLED.
+  - Disk NORMAL: N=8 5.5-18.4 s -> 1.2-1.5 s, and N=16 19.9-23.9 s -> 2.1-2.3 s, both with no rows
+    lost.
+  - tmpfs scorecard row -6.4%. Disk FULL CPU +8%.
+- Why: base's long sleeps take losing writers out of the race. The writer that just committed
+  then runs several transactions in a row with no peer commit in its window. Any schedule that keeps
+  losers polling keeps more writers in the race, so more explicit transactions meet a peer's commit
+  to the shared leaf before their COMMIT validates. Under cross-process first-committer-wins
+  (bd-reality-check-1022-llk6g.5), that is a refusal the application sees.
+- Retry condition: not while cross-process explicit-transaction refusals depend on how many writers
+  are in the race. Retry once .5's conflict protocol stops refusing appends to a shared page (then
+  re-measure the idle share), or together with an admission rule that keeps the explicit-same
+  refusal rate at or under base's. The disk starvation is attacked at its cause instead: the
+  autocheckpoint handoff fsync inside the writer lock (lever 2, the entry above).
+
 ## 2026-11-17 - REJECTED on its other-rows kill lines (join gain kept on record: join_1M_to_pk_1000 -339M Ir, x2.32 -> x2.05 stock CPU): a rowid seek that lands on the leaf a cursor is already on runs synchronously on the hot lane (bd-w4pr1.12, read-loop round 6, lever SL1 v2)
 
 - Target: the SeekRowid into u in join_1M_to_pk_1000, 1,680 of 4,414 Ir per row on main 05fe3c5b1
