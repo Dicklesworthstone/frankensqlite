@@ -911,3 +911,206 @@ fn cross_process_writers_without_busy_timeout_stay_consistent() {
         frank.elapsed
     );
 }
+
+const HOLDER_CHILD_ENV: &str = "FSQLITE_MP_WRITE_HOLDER_CHILD";
+
+/// bd-4qocc child: a stock connection holds `BEGIN IMMEDIATE` plus an
+/// uncommitted UPDATE, so WAL WRITE, until the parent creates `release`.
+#[test]
+fn mp_write_holder_child() {
+    let Ok(spec) = std::env::var(HOLDER_CHILD_ENV) else {
+        return;
+    };
+    let (db, dir) = spec.split_once('|').expect("holder spec");
+    let (db, dir) = (PathBuf::from(db), PathBuf::from(dir));
+    let conn = rusqlite::Connection::open(&db).expect("holder open");
+    conn.execute_batch("BEGIN IMMEDIATE; UPDATE h SET v = v + 1 WHERE id = 1;")
+        .expect("hold WAL WRITE");
+    std::fs::write(dir.join("held"), b"").expect("held");
+    assert!(
+        wait_for(&dir.join("release"), Duration::from_secs(120)),
+        "no release"
+    );
+    conn.execute_batch("COMMIT").expect("holder commit");
+}
+
+/// A stock child holding WAL WRITE; `dir` is a fresh directory per holder.
+struct WriteHolder {
+    child: Child,
+    dir: PathBuf,
+}
+
+impl WriteHolder {
+    fn hold(db: &Path, dir: PathBuf) -> Self {
+        std::fs::create_dir(&dir).expect("holder dir");
+        let child = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "mp_write_holder_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                HOLDER_CHILD_ENV,
+                format!("{}|{}", db.display(), dir.display()),
+            )
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn holder");
+        assert!(
+            wait_for(&dir.join("held"), Duration::from_secs(120)),
+            "the holder never took WRITE"
+        );
+        Self { child, dir }
+    }
+
+    fn release(mut self) {
+        std::fs::write(self.dir.join("release"), b"").expect("release");
+        assert!(
+            self.child.wait().expect("holder exit").success(),
+            "holder failed"
+        );
+    }
+}
+
+impl Drop for WriteHolder {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// bd-4qocc: a write refused behind a stock writer spends `busy_timeout`
+/// once, as stock does. Main spent it twice (603 ms at 300, 2003 ms at 1000):
+/// the pager's flush ran one clock and the connection's retry a second.
+#[test]
+fn a_refused_write_behind_a_stock_writer_spends_busy_timeout_once() {
+    if std::env::var_os(CHILD_ENV).is_some() || std::env::var_os(HOLDER_CHILD_ENV).is_some() {
+        return;
+    }
+    let _one_at_a_time = one_parent_test_at_a_time();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("held.db");
+    rusqlite::Connection::open(&db)
+        .expect("seed open")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE h(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+             INSERT INTO h VALUES (1, 0);
+             CREATE TABLE t(id INTEGER PRIMARY KEY, worker INTEGER NOT NULL, seq INTEGER NOT NULL);",
+        )
+        .expect("seed");
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(db.to_str().expect("utf8 path"))
+            .await
+            .expect("fsqlite open");
+        let is_busy = |error: &fsqlite::FrankenError| {
+            matches!(
+                error,
+                fsqlite::FrankenError::Busy | fsqlite::FrankenError::BusyRecovery
+            )
+        };
+        for timeout_ms in [300_u64, 1000] {
+            let timeout = Duration::from_millis(timeout_ms);
+            let holder = WriteHolder::hold(&db, dir.path().join(format!("hold-{timeout_ms}")));
+
+            // The oracle, live: stock's own refusal behind the same holder.
+            let stock = rusqlite::Connection::open(&db).expect("stock open");
+            stock.busy_timeout(timeout).expect("stock busy_timeout");
+            let started = Instant::now();
+            let stock_refusal = stock.execute(&insert_sql(9, 0), []);
+            let stock_elapsed = started.elapsed();
+            drop(stock);
+            assert!(
+                stock_refusal.is_err() && stock_elapsed >= timeout,
+                "stock oracle: {stock_refusal:?} after {stock_elapsed:?}"
+            );
+            // Host stalls inflate both arms alike; the bound follows stock.
+            let ceiling = timeout.max(stock_elapsed) + Duration::from_millis(100);
+
+            frank
+                .execute(&format!("PRAGMA busy_timeout={timeout_ms}"))
+                .await
+                .expect("fsqlite busy_timeout");
+            let started = Instant::now();
+            let autocommit = frank.execute(&insert_sql(1, 0)).await;
+            let autocommit_elapsed = started.elapsed();
+            frank.execute("BEGIN").await.expect("BEGIN");
+            frank.execute(&insert_sql(1, 1)).await.expect("INSERT");
+            let started = Instant::now();
+            let commit = frank.execute("COMMIT").await;
+            let commit_elapsed = started.elapsed();
+            if commit.is_err() {
+                frank.execute("ROLLBACK").await.expect("ROLLBACK");
+            }
+            holder.release();
+            eprintln!(
+                "event=bd_4qocc busy_timeout_ms={timeout_ms} stock_ms={} autocommit_ms={} \
+                 commit_ms={} autocommit={autocommit:?} commit={commit:?}",
+                stock_elapsed.as_millis(),
+                autocommit_elapsed.as_millis(),
+                commit_elapsed.as_millis()
+            );
+            for (label, result, elapsed) in [
+                (
+                    "autocommit INSERT",
+                    autocommit.map(drop),
+                    autocommit_elapsed,
+                ),
+                ("COMMIT", commit.map(drop), commit_elapsed),
+            ] {
+                let error = result.expect_err(label);
+                assert!(is_busy(&error), "{label}: {error:?}");
+                assert!(
+                    elapsed >= timeout,
+                    "{label} at busy_timeout {timeout_ms}: refused after {elapsed:?}"
+                );
+                assert!(
+                    elapsed <= ceiling,
+                    "{label} at busy_timeout {timeout_ms}: refused after {elapsed:?}, \
+                     stock after {stock_elapsed:?}"
+                );
+            }
+        }
+
+        // Negative: the holder commits 150 ms in, so the INSERT commits.
+        frank
+            .execute("PRAGMA busy_timeout=1000")
+            .await
+            .expect("fsqlite busy_timeout");
+        let holder = WriteHolder::hold(&db, dir.path().join("hold-release"));
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            holder.release();
+        });
+        let started = Instant::now();
+        frank
+            .execute(&insert_sql(2, 0))
+            .await
+            .expect("the INSERT commits once the holder commits");
+        assert!(started.elapsed() < Duration::from_millis(1000));
+        releaser.join().expect("releaser");
+
+        // Negative: busy_timeout 0 still refuses at once.
+        frank
+            .execute("PRAGMA busy_timeout=0")
+            .await
+            .expect("fsqlite busy_timeout");
+        let holder = WriteHolder::hold(&db, dir.path().join("hold-zero"));
+        let started = Instant::now();
+        let error = frank
+            .execute(&insert_sql(3, 0))
+            .await
+            .expect_err("busy_timeout 0 refuses");
+        let elapsed = started.elapsed();
+        holder.release();
+        assert!(is_busy(&error), "busy_timeout 0: {error:?}");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "busy_timeout 0 refused after {elapsed:?}"
+        );
+        frank.close().await.expect("close");
+    });
+}

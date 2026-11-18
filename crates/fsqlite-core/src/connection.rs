@@ -372,27 +372,32 @@ struct BeginBusyRetryHandoff {
 /// retry for a second full budget (2.00x at every timeout, since 2cce5f3d8).
 /// The budget starts at the statement's FIRST wait, not at statement start,
 /// so a long statement that meets a transient late still gets a full budget.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// bd-4qocc: the pager's own waits share it too. Every op cx of an armed
+/// statement carries the statement's `BusyWaitBudget`, so `pager_busy_wait_cx`
+/// reuses it instead of installing a fresh one, and a refused COMMIT or
+/// autocommit write no longer spends one budget in the pager's flush retries
+/// and a second one in the connection's retry loop.
+#[derive(Debug, Clone, Default)]
 enum BusyBudgetScope {
     /// No statement retry is armed; every wait loop owns its own budget.
     #[default]
     Inactive,
-    /// A statement retry is armed and nothing has waited yet.
-    Armed,
-    /// The statement's first wait began here; later waits count from it.
-    Started(Instant),
+    /// A statement retry is armed with this budget. Its clock starts at the
+    /// statement's first contention, in the pager or in the connection.
+    Armed(BusyWaitBudget),
 }
 
 /// Disarms the statement's shared busy budget when the arming scope ends.
 struct BusyBudgetScopeGuard<'a> {
-    scope: &'a Cell<BusyBudgetScope>,
+    scope: &'a RefCell<BusyBudgetScope>,
     owner: bool,
 }
 
 impl Drop for BusyBudgetScopeGuard<'_> {
     fn drop(&mut self) {
         if self.owner {
-            self.scope.set(BusyBudgetScope::Inactive);
+            *self.scope.borrow_mut() = BusyBudgetScope::Inactive;
         }
     }
 }
@@ -15099,7 +15104,7 @@ pub struct Connection {
     /// `connection/conformal_retry.rs` for the coverage proof sketch.
     conformal_retry_budget: ConformalRetryBudgetCell,
     /// GH#423: the current statement's shared `busy_timeout` budget.
-    busy_budget_scope: Cell<BusyBudgetScope>,
+    busy_budget_scope: RefCell<BusyBudgetScope>,
     // ── AAC-P6: Regenerative-renewal statement micro-batcher ────────────────
     /// PRAGMA fsqlite.stmt_microbatch — enable/disable the renewal-amortization
     /// ceremony coalescer for consecutive identical prepared-statement
@@ -16786,7 +16791,7 @@ impl Connection {
             time_travel_capture_enabled: Cell::new(true),
             time_travel_commit_delta: RefCell::new(None),
             conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
-            busy_budget_scope: Cell::new(BusyBudgetScope::Inactive),
+            busy_budget_scope: RefCell::new(BusyBudgetScope::Inactive),
             // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
             // 16-row burst budget, 200 µs staleness deadline.
             stmt_microbatch_enabled: Cell::new(true),
@@ -17393,7 +17398,7 @@ impl Connection {
             time_travel_capture_enabled: Cell::new(true),
             time_travel_commit_delta: RefCell::new(None),
             conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
-            busy_budget_scope: Cell::new(BusyBudgetScope::Inactive),
+            busy_budget_scope: RefCell::new(BusyBudgetScope::Inactive),
             // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
             // 16-row burst budget, 200 µs staleness deadline.
             stmt_microbatch_enabled: Cell::new(true),
@@ -26633,6 +26638,7 @@ impl Connection {
             .unwrap_or(&self.root_cx)
             .clone()
             .with_decision_id(next_decision_id());
+        let op_cx = self.with_statement_busy_budget(op_cx);
         if tracing::enabled!(target: "fsqlite::cx", tracing::Level::DEBUG) {
             tracing::debug!(
                 target: "fsqlite::cx",
@@ -28168,9 +28174,12 @@ impl Connection {
     /// Arm the shared busy budget for one statement (GH#423). A nested arming
     /// inside an already-armed statement leaves the outer scope in charge.
     fn arm_busy_budget_scope(&self) -> BusyBudgetScopeGuard<'_> {
-        let owner = self.busy_budget_scope.get() == BusyBudgetScope::Inactive;
+        let owner = matches!(*self.busy_budget_scope.borrow(), BusyBudgetScope::Inactive);
         if owner {
-            self.busy_budget_scope.set(BusyBudgetScope::Armed);
+            let timeout_ms =
+                u64::try_from(self.pragma_state.borrow().busy_timeout_ms.max(0)).unwrap_or(0);
+            *self.busy_budget_scope.borrow_mut() =
+                BusyBudgetScope::Armed(BusyWaitBudget::new(Duration::from_millis(timeout_ms)));
         }
         BusyBudgetScopeGuard {
             scope: &self.busy_budget_scope,
@@ -28179,16 +28188,23 @@ impl Connection {
     }
 
     /// Start of the `busy_timeout` budget for a wait loop that begins now:
-    /// the armed statement's first wait if there is one, otherwise now.
+    /// the armed statement's first contention if there was one (in the pager
+    /// or here), otherwise now.
     fn busy_budget_start(&self) -> Instant {
-        match self.busy_budget_scope.get() {
+        match &*self.busy_budget_scope.borrow() {
             BusyBudgetScope::Inactive => Instant::now(),
-            BusyBudgetScope::Armed => {
-                let now = Instant::now();
-                self.busy_budget_scope.set(BusyBudgetScope::Started(now));
-                now
+            BusyBudgetScope::Armed(budget) => budget.start(),
+        }
+    }
+
+    /// bd-4qocc: attach the armed statement's budget to `cx` unless it
+    /// already carries one, so the pager's waits count from the same clock.
+    fn with_statement_busy_budget(&self, cx: Cx) -> Cx {
+        match &*self.busy_budget_scope.borrow() {
+            BusyBudgetScope::Armed(budget) if cx.busy_wait_budget().is_none() => {
+                cx.with_busy_wait_budget(budget.clone())
             }
-            BusyBudgetScope::Started(started) => started,
+            _ => cx,
         }
     }
 
@@ -31212,6 +31228,9 @@ impl Connection {
         params: &[SqliteValue],
     ) -> Result<usize> {
         let autocommit_entry = self.autocommit_conflict_retry_boundary();
+        // bd-4qocc: one busy budget for the first attempt (its pager waits
+        // included) and every retry, as the statement dispatch path arms it.
+        let _busy_budget_scope = autocommit_entry.then(|| self.arm_busy_budget_scope());
         let mut result = self
             .execute_prepared_with_params_after_background_status(stmt, params, false)
             .await;
@@ -31234,7 +31253,7 @@ impl Connection {
         retry_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
         let deadline = Duration::from_millis(busy_timeout_ms);
-        let started = Instant::now();
+        let started = self.busy_budget_start();
         let mut handoff = BeginBusyRetryHandoff::default();
         while let Some(wait) = handoff.next_wait(started, deadline) {
             retry_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
@@ -80282,6 +80301,12 @@ impl Connection {
                 "cannot commit - no transaction is active".to_owned(),
             ));
         }
+        // bd-4qocc: the COMMIT's pager waits and its retry loop below share
+        // one busy budget, so a refused COMMIT returns after busy_timeout,
+        // not after twice that.
+        let _busy_budget_scope = self.arm_busy_budget_scope();
+        let commit_cx = self.with_statement_busy_budget(cx.clone());
+        let cx = &commit_cx;
         let commit_metrics_started =
             (!fsqlite_observability::metrics::metrics_disabled()).then(Instant::now);
         // AAC-P6: txn boundary — the micro-batch epoch ends at COMMIT.
@@ -80545,7 +80570,9 @@ impl Connection {
                 let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
                 if busy_timeout_ms > 0 {
                     let deadline = Duration::from_millis(busy_timeout_ms);
-                    let started = Instant::now();
+                    // bd-4qocc: the first attempt's pager waits started this
+                    // statement's clock; the retries spend what is left of it.
+                    let started = self.busy_budget_start();
                     let mut handoff = BeginBusyRetryHandoff::default();
 
                     while let Some(wait) = handoff.next_wait(started, deadline) {
