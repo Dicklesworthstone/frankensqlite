@@ -46,8 +46,12 @@ const ORACLE_ATTEMPTS: usize = 3;
 #[derive(Debug)]
 struct ChildReport {
     committed: usize,
-    /// `seq` of every row whose transaction reported success (explicit shapes).
+    /// `seq` of every row a successful COMMIT made durable (explicit shapes).
     committed_seqs: Vec<usize>,
+    /// `seq` of every inserted row its transaction's end lost, with `ended`
+    /// (a failed COMMIT ended the transaction) or `closed` (the connection
+    /// closed inside it).
+    lost_seqs: Vec<(usize, String)>,
     errors: Vec<String>,
 }
 
@@ -56,6 +60,8 @@ struct ShapeResult {
     committed: usize,
     /// `(worker, seq)` of every reported commit (explicit shapes).
     committed_rows: Vec<(i64, i64)>,
+    /// `(worker, seq, cause)` of every inserted row its transaction's end lost.
+    lost_rows: Vec<(i64, i64, String)>,
     errors: Vec<String>,
     elapsed: Duration,
     final_rows: i64,
@@ -130,12 +136,19 @@ fn parse_report(stdout: &str) -> Option<ChildReport> {
     let committed_seqs = events(stdout, "event=mp_busy_committed_seq ")
         .map(|seq| seq.trim().parse().expect("committed seq"))
         .collect();
+    let lost_seqs = events(stdout, "event=mp_busy_lost_seq ")
+        .map(|line| {
+            let (seq, how) = line.trim().split_once(' ').expect("lost seq and cause");
+            (seq.parse().expect("lost seq"), how.to_owned())
+        })
+        .collect();
     let errors = events(stdout, "event=mp_busy_error ")
         .map(str::to_owned)
         .collect();
     Some(ChildReport {
         committed,
         committed_seqs,
+        lost_seqs,
         errors,
     })
 }
@@ -189,6 +202,7 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
         .collect();
     let mut committed = 0;
     let mut committed_rows = Vec::new();
+    let mut lost_rows = Vec::new();
     let mut errors = Vec::new();
     let mut floor_certified = 0;
     for (worker, drain) in draining {
@@ -213,9 +227,16 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
                 .iter()
                 .map(|&seq| (worker, i64::try_from(seq).expect("seq"))),
         );
+        lost_rows.extend(
+            report
+                .lost_seqs
+                .into_iter()
+                .map(|(seq, how)| (worker, i64::try_from(seq).expect("seq"), how)),
+        );
         errors.extend(report.errors);
     }
     committed_rows.sort_unstable();
+    lost_rows.sort_unstable();
     let elapsed = started.elapsed();
     let stock = rusqlite::Connection::open(&db).expect("verify open");
     let final_rows: i64 = stock
@@ -234,6 +255,7 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
     let result = ShapeResult {
         committed,
         committed_rows,
+        lost_rows,
         errors,
         elapsed,
         final_rows,
@@ -277,6 +299,49 @@ fn explicit_insert_sql(backend: &str, worker: usize, seq: usize) -> String {
     }
 }
 
+/// bd-igdof: the rows of a CLI-style writer's open transaction. A row whose
+/// INSERT succeeded is pending until its transaction ends. A COMMIT that
+/// fails with a retryable BUSY leaves the transaction open, as stock's COMMIT
+/// BUSY does ("the transaction remains active"); the next row's BEGIN then
+/// fails "within a transaction", its INSERT joins the open transaction, and
+/// the next COMMIT that succeeds makes every pending row durable at once. A
+/// transaction that ends any other way (a refusal that rolled it back, or
+/// the close of a connection still inside it) loses its pending rows.
+#[derive(Default)]
+struct OpenTransactionRows {
+    pending: Vec<usize>,
+}
+
+impl OpenTransactionRows {
+    /// Settle one row's statements: whether its INSERT and its COMMIT
+    /// succeeded, and whether the connection is still inside a transaction
+    /// afterwards. Returns the rows that COMMIT made durable and the rows the
+    /// end of the transaction lost.
+    fn settle(
+        &mut self,
+        seq: usize,
+        inserted: bool,
+        committed: bool,
+        open_after: bool,
+    ) -> (Vec<usize>, Vec<usize>) {
+        if inserted {
+            self.pending.push(seq);
+        }
+        if committed {
+            (std::mem::take(&mut self.pending), Vec::new())
+        } else if open_after {
+            (Vec::new(), Vec::new())
+        } else {
+            (Vec::new(), std::mem::take(&mut self.pending))
+        }
+    }
+
+    /// The rows a close loses: closing inside a transaction rolls it back.
+    fn close(self) -> Vec<usize> {
+        self.pending
+    }
+}
+
 /// The writer process body; a no-op unless the parent set `CHILD_ENV`.
 #[test]
 fn mp_busy_writer_child() {
@@ -294,17 +359,19 @@ fn mp_busy_writer_child() {
     let mut committed = 0;
     let mut committed_seqs = Vec::new();
     let mut errors = Vec::new();
+    let mut lost_seqs = Vec::new();
     match backend {
         // bd-reality-check-1022-llk6g.5.1: `BEGIN; INSERT; COMMIT` per row,
         // the way a CLI script runs it: every statement runs, an error is
-        // recorded, and nothing rolls back. The row counts as committed only
-        // when both its INSERT and its COMMIT succeeded.
+        // recorded, and nothing rolls back. Which rows a COMMIT made durable
+        // is `OpenTransactionRows`'s accounting (bd-igdof).
         "stock-explicit" | "stock-explicit-own" => {
             let conn = rusqlite::Connection::open(&db).expect("stock open");
             conn.busy_timeout(Duration::from_millis(busy_timeout_ms))
                 .expect("stock busy_timeout");
             std::fs::write(ready_path(&dir, worker), b"").expect("ready");
             assert!(wait_for(&dir.join("go"), Duration::from_secs(120)), "no go");
+            let mut open = OpenTransactionRows::default();
             for seq in 0..rows {
                 let begin = conn.execute_batch("BEGIN");
                 let insert = conn.execute(&explicit_insert_sql(backend, worker, seq), []);
@@ -321,15 +388,21 @@ fn mp_busy_writer_child() {
                         conn.is_autocommit()
                     ));
                 }
-                if insert.is_ok() && commit.is_ok() {
-                    committed += 1;
-                    committed_seqs.push(seq);
-                }
+                let (landed, lost) =
+                    open.settle(seq, insert.is_ok(), commit.is_ok(), !conn.is_autocommit());
+                committed += landed.len();
+                committed_seqs.extend(landed);
+                lost_seqs.extend(lost.into_iter().map(|seq| (seq, "ended")));
             }
+            lost_seqs.extend(open.close().into_iter().map(|seq| (seq, "closed")));
         }
         "fsqlite-explicit" | "fsqlite-explicit-own" => {
-            let (committed, committed_seqs, errors) =
-                (&mut committed, &mut committed_seqs, &mut errors);
+            let (committed, committed_seqs, errors, lost_seqs) = (
+                &mut committed,
+                &mut committed_seqs,
+                &mut errors,
+                &mut lost_seqs,
+            );
             asupersync::test_utils::run_test(|| async move {
                 let conn = Connection::open(db.to_str().expect("utf8 path"))
                     .await
@@ -339,6 +412,7 @@ fn mp_busy_writer_child() {
                     .expect("fsqlite busy_timeout");
                 std::fs::write(ready_path(&dir, worker), b"").expect("ready");
                 assert!(wait_for(&dir.join("go"), Duration::from_secs(120)), "no go");
+                let mut open = OpenTransactionRows::default();
                 for seq in 0..rows {
                     let begin = conn.execute("BEGIN").await;
                     let insert = conn
@@ -358,11 +432,13 @@ fn mp_busy_writer_child() {
                             !conn.in_transaction()
                         ));
                     }
-                    if insert.is_ok() && commit.is_ok() {
-                        *committed += 1;
-                        committed_seqs.push(seq);
-                    }
+                    let (landed, lost) =
+                        open.settle(seq, insert.is_ok(), commit.is_ok(), conn.in_transaction());
+                    *committed += landed.len();
+                    committed_seqs.extend(landed);
+                    lost_seqs.extend(lost.into_iter().map(|seq| (seq, "ended")));
                 }
+                lost_seqs.extend(open.close().into_iter().map(|seq| (seq, "closed")));
                 let _ = conn.close().await;
             });
         }
@@ -439,6 +515,9 @@ fn mp_busy_writer_child() {
     }
     for seq in &committed_seqs {
         println!("event=mp_busy_committed_seq {seq}");
+    }
+    for (seq, how) in &lost_seqs {
+        println!("event=mp_busy_lost_seq {seq} {how}");
     }
     println!(
         "event=mp_busy_child backend={backend} worker={worker} committed={committed} errors={}",
@@ -557,6 +636,106 @@ fn cross_process_fresh_connection_writers_honor_busy_timeout() {
 /// connection was back in autocommit mode.
 const REFUSED_COMMIT_ENDED: &str = "commit code=517 autocommit_after=true: ";
 
+/// bd-igdof: the error text of a COMMIT that failed with the retryable BUSY
+/// (5) and left its transaction open, as stock's COMMIT BUSY does.
+const BUSY_COMMIT_KEPT_OPEN: &str = "commit code=5 autocommit_after=false: ";
+
+/// The next row's BEGIN after such a COMMIT: its transaction is still open.
+const BEGIN_WITHIN_TRANSACTION: &str = "begin: cannot start a transaction within a transaction";
+
+/// The explicit shapes' accounting (bd-reality-check-1022-llk6g.5.1, bd-igdof
+/// decision (b1)), returning the refused COMMITs:
+/// - integrity_check is ok;
+/// - the durable rows are exactly the rows a successful COMMIT made durable.
+///   That includes the row of a COMMIT that returned BUSY when a later COMMIT
+///   of its still-open transaction landed it (stock's contract, shown by
+///   `refused_commit_ends_transaction_e2e`'s stock arm). Every committed row
+///   is durable and nothing else is;
+/// - every inserted row either landed or was lost with a transaction that a
+///   BusySnapshot refusal ended; none was lost at close;
+/// - a refusal costs its own transaction's rows: one, plus at most one per
+///   BUSY COMMIT whose row was still pending in it;
+/// - the only errors are such a refusal, a BUSY COMMIT that kept its
+///   transaction open, and the following BEGIN's "within a transaction".
+fn assert_explicit_accounting<'a>(
+    label: &str,
+    frank: &'a ShapeResult,
+    expected: usize,
+) -> Vec<&'a String> {
+    assert_eq!(frank.integrity, "ok", "{label}: integrity_check");
+    assert_eq!(
+        frank.durable_rows, frank.committed_rows,
+        "{label}: the durable rows are exactly the rows a successful COMMIT made durable"
+    );
+    let refused: Vec<&String> = frank
+        .errors
+        .iter()
+        .filter(|error| error.starts_with(REFUSED_COMMIT_ENDED))
+        .collect();
+    let busy_commits = frank
+        .errors
+        .iter()
+        .filter(|error| error.starts_with(BUSY_COMMIT_KEPT_OPEN))
+        .count();
+    let begins_within = frank
+        .errors
+        .iter()
+        .filter(|error| error.starts_with(BEGIN_WITHIN_TRANSACTION))
+        .count();
+    let other: Vec<&String> = frank
+        .errors
+        .iter()
+        .filter(|error| {
+            !error.starts_with(REFUSED_COMMIT_ENDED)
+                && !error.starts_with(BUSY_COMMIT_KEPT_OPEN)
+                && !error.starts_with(BEGIN_WITHIN_TRANSACTION)
+        })
+        .collect();
+    assert!(
+        other.is_empty(),
+        "{label}: the only errors may be a BusySnapshot COMMIT refusal that ended its \
+         transaction, a BUSY COMMIT that kept it open, and the next BEGIN inside it; got {} \
+         others, e.g. {:?}",
+        other.len(),
+        other.iter().take(5).collect::<Vec<_>>()
+    );
+    assert!(
+        begins_within <= busy_commits,
+        "{label}: {begins_within} BEGINs inside an open transaction, but only {busy_commits} \
+         BUSY COMMITs left one open"
+    );
+    let closed: Vec<_> = frank
+        .lost_rows
+        .iter()
+        .filter(|(_, _, how)| how != "ended")
+        .collect();
+    assert!(
+        closed.is_empty(),
+        "{label}: rows lost when a connection closed inside a transaction: {closed:?}"
+    );
+    assert_eq!(
+        frank.committed + frank.lost_rows.len(),
+        expected,
+        "{label}: every row either landed or was lost with a refused transaction"
+    );
+    assert!(
+        frank.lost_rows.len() >= refused.len()
+            && frank.lost_rows.len() <= refused.len() + busy_commits,
+        "{label}: {} rows lost to {} refusals with {busy_commits} BUSY COMMITs: a refusal costs \
+         its own transaction's rows",
+        frank.lost_rows.len(),
+        refused.len()
+    );
+    eprintln!(
+        "event=mp_busy_accounting label={label} committed={} lost={} refused={} \
+         busy_commits={busy_commits} begins_within={begins_within}",
+        frank.committed,
+        frank.lost_rows.len(),
+        refused.len()
+    );
+    refused
+}
+
 /// bd-reality-check-1022-llk6g.5.1: processes running explicit `BEGIN; INSERT;
 /// COMMIT` transactions on ONE table, CLI-style (no ROLLBACK after an error).
 /// Stock commits every row: a write-first transaction waits for the write
@@ -576,28 +755,7 @@ fn cross_process_explicit_writers_on_one_table_lose_only_refused_transactions() 
     stock_oracle("stock-explicit", workers, rows);
 
     let frank = run_shape("fsqlite-explicit", workers, rows, 5000);
-    assert_eq!(frank.integrity, "ok", "fsqlite-explicit: integrity_check");
-    assert_eq!(
-        frank.durable_rows, frank.committed_rows,
-        "fsqlite-explicit: the durable rows are exactly the transactions whose COMMIT \
-         succeeded (no refused row became durable, no later row was lost)"
-    );
-    let (refused, other): (Vec<&String>, Vec<&String>) = frank
-        .errors
-        .iter()
-        .partition(|error| error.starts_with(REFUSED_COMMIT_ENDED));
-    assert!(
-        other.is_empty(),
-        "fsqlite-explicit: the only error may be a BusySnapshot COMMIT refusal that ended its \
-         transaction; got {} others, e.g. {:?}",
-        other.len(),
-        other.iter().take(5).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        frank.committed + refused.len(),
-        workers * rows,
-        "fsqlite-explicit: each refused transaction costs exactly its own row"
-    );
+    let refused = assert_explicit_accounting("fsqlite-explicit", &frank, workers * rows);
     assert!(
         !refused.is_empty(),
         "non-vacuity: {workers} writers on one leaf page produced no COMMIT refusal, so this \
@@ -615,6 +773,12 @@ fn cross_process_explicit_writers_on_one_table_lose_only_refused_transactions() 
 /// (bd-reality-check-1022-llk6g.5.3), which with .5.1 costs exactly its own
 /// row. Non-vacuity: the pager traces each floor certification under
 /// `DW8OE_TRACE`, and the run must have made at least one.
+///
+/// bd-igdof: a COMMIT that waited out busy_timeout returns BUSY and keeps its
+/// transaction open, as stock's does, so the next COMMIT of that transaction
+/// lands its row; this test counted that row as failed and then found it
+/// durable. The accounting now follows the transaction (decision (b1)), and
+/// committed-implies-durable stays exact in both directions.
 #[test]
 fn cross_process_explicit_writers_on_own_tables_certify_the_durable_floor() {
     if std::env::var_os(CHILD_ENV).is_some() {
@@ -625,14 +789,7 @@ fn cross_process_explicit_writers_on_own_tables_certify_the_durable_floor() {
     stock_oracle("stock-explicit-own", workers, rows);
 
     let frank = run_shape("fsqlite-explicit-own", workers, rows, 5000);
-    assert_eq!(
-        frank.integrity, "ok",
-        "fsqlite-explicit-own: integrity_check"
-    );
-    assert_eq!(
-        frank.durable_rows, frank.committed_rows,
-        "fsqlite-explicit-own: the durable rows are exactly the transactions whose COMMIT succeeded"
-    );
+    assert_explicit_accounting("fsqlite-explicit-own", &frank, workers * rows);
     let floor_refusals: Vec<&String> = frank
         .errors
         .iter()
@@ -644,21 +801,6 @@ fn cross_process_explicit_writers_on_own_tables_certify_the_durable_floor() {
          certify the durable floor instead: {:?}",
         floor_refusals.len(),
         floor_refusals.iter().take(5).collect::<Vec<_>>()
-    );
-    let (refused, other): (Vec<&String>, Vec<&String>) = frank
-        .errors
-        .iter()
-        .partition(|error| error.starts_with(REFUSED_COMMIT_ENDED));
-    assert!(
-        other.is_empty(),
-        "fsqlite-explicit-own: the only error may be a BusySnapshot COMMIT refusal that ended its \
-         transaction; got {:?}",
-        other.iter().take(5).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        frank.committed + refused.len(),
-        workers * rows,
-        "fsqlite-explicit-own: each refused transaction costs exactly its own row"
     );
     assert!(
         frank.floor_certified > 0,

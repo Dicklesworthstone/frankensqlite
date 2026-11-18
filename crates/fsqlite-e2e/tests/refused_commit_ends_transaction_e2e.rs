@@ -22,6 +22,9 @@
 //! holds the write lock with BEGIN IMMEDIATE) keeps the transaction open, and a
 //! second COMMIT succeeds once the holder is done.
 //!
+//! bd-igdof: the same with a STOCK process holding the write lock, run the way
+//! a CLI script runs it, against stock's own answer to that sequence.
+//!
 //! bd-reality-check-1022-llk6g.5.5: a transaction open while a STOCK process
 //! commits. The file starts with no `-wal`; the fsqlite connection creates one
 //! with no frames, and stock's first commit into a frame-less WAL writes a new
@@ -486,6 +489,305 @@ fn retryable_busy_at_commit_keeps_the_transaction_open() {
         .expect("holder row");
     assert_eq!(h, 1, "the holder's commit is durable");
     assert_eq!(stock_integrity(&db), "ok");
+}
+
+/// What a CLI-style writer (`BEGIN; INSERT; COMMIT` per row, every statement
+/// run, nothing rolled back) sees around a COMMIT that fails with BUSY.
+#[derive(Debug, PartialEq, Eq)]
+struct CliAfterBusyCommit {
+    /// Extended code of the failed COMMIT.
+    commit_code: i32,
+    /// Still inside the transaction after it.
+    open_after_busy: bool,
+    /// The next row's BEGIN error.
+    next_begin_error: Option<String>,
+    /// The next row's INSERT and COMMIT succeeded.
+    next_insert_ok: bool,
+    next_commit_ok: bool,
+    /// `(id, s)` of the durable rows at the end.
+    durable: Vec<(i64, String)>,
+}
+
+/// Stock's answer for the CLI sequence after a COMMIT BUSY: "If COMMIT fails
+/// with SQLITE_BUSY, the transaction remains active", so the next BEGIN fails
+/// "within a transaction", the next INSERT joins the open transaction, and
+/// the next COMMIT makes both rows durable. A stock WAL writer takes WRITE at
+/// its INSERT and never waits at COMMIT, so stock's COMMIT BUSY is shown in
+/// rollback-journal mode: a reader's SHARED lock keeps the writer from the
+/// EXCLUSIVE lock its COMMIT needs.
+fn stock_cli_after_busy_commit(db: &Path) -> CliAfterBusyCommit {
+    let writer = rusqlite::Connection::open(db).expect("stock writer open");
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, w INTEGER NOT NULL, s TEXT NOT NULL);
+             INSERT INTO t VALUES (1, 0, 'seed');",
+        )
+        .expect("stock seed");
+    writer
+        .busy_timeout(Duration::from_millis(200))
+        .expect("stock busy_timeout");
+    let reader = rusqlite::Connection::open(db).expect("stock reader open");
+    reader.execute_batch("BEGIN").expect("reader BEGIN");
+    let seen: i64 = reader
+        .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+        .expect("reader takes SHARED");
+    assert_eq!(seen, 1);
+    writer.execute_batch("BEGIN").expect("stock BEGIN");
+    writer
+        .execute("INSERT INTO t VALUES (2, 1, 'busy')", [])
+        .expect("stock INSERT");
+    let commit_code = match writer.execute_batch("COMMIT") {
+        Err(rusqlite::Error::SqliteFailure(error, _)) => error.extended_code,
+        other => panic!("stock COMMIT behind a SHARED reader must fail with BUSY, got {other:?}"),
+    };
+    let open_after_busy = !writer.is_autocommit();
+    let next_begin_error = writer
+        .execute_batch("BEGIN")
+        .err()
+        .map(|error| error.to_string());
+    let next_insert_ok = writer
+        .execute("INSERT INTO t VALUES (3, 1, 'next')", [])
+        .is_ok();
+    reader.execute_batch("COMMIT").expect("reader ends");
+    let next_commit_ok = writer.execute_batch("COMMIT").is_ok();
+    drop(reader);
+    drop(writer);
+    CliAfterBusyCommit {
+        commit_code,
+        open_after_busy,
+        next_begin_error,
+        next_insert_ok,
+        next_commit_ok,
+        durable: stock_rows(db),
+    }
+}
+
+/// bd-igdof, decision (b1): a COMMIT that waits out busy_timeout behind a
+/// STOCK process holding the write lock (BEGIN IMMEDIATE) returns the
+/// retryable BUSY and writes nothing: stock's durable rows and the WAL are
+/// unchanged right after it, and the transaction stays open. Run CLI-style,
+/// the next row's BEGIN fails "within a transaction", its INSERT joins the
+/// open transaction, and once the holder commits, the next COMMIT makes both
+/// rows durable exactly once: what stock does (`stock_cli_after_busy_commit`,
+/// compared field by field). An implementation that ends the transaction on
+/// a BUSY COMMIT (decision (b2)) fails here: the BEGIN succeeds and the BUSY
+/// row never lands.
+///
+/// Negative: a BusySnapshot refusal is not a BUSY. A stock peer commits to the
+/// same page while the transaction is open; the COMMIT is refused with 517,
+/// the transaction ends, its row never lands, and the next BEGIN works.
+#[test]
+fn a_busy_commit_behind_a_stock_writer_stays_open_and_a_later_commit_lands_its_row_once() {
+    if std::env::var_os(HOLDER_ENV).is_some() || std::env::var_os(PEER_ENV).is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stock = stock_cli_after_busy_commit(&dir.path().join("stock.db"));
+    assert_eq!(
+        (stock.commit_code, stock.open_after_busy),
+        (SQLITE_BUSY, true),
+        "stock: COMMIT BUSY keeps the transaction"
+    );
+    assert_eq!(
+        stock.durable,
+        vec![
+            (1, "seed".to_owned()),
+            (2, "busy".to_owned()),
+            (3, "next".to_owned())
+        ],
+        "stock: the next COMMIT lands both rows"
+    );
+
+    let db = dir.path().join("busy.db");
+    rusqlite::Connection::open(&db)
+        .expect("seed open")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, w INTEGER NOT NULL, s TEXT NOT NULL);
+             CREATE TABLE h(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+             INSERT INTO t VALUES (1, 0, 'seed');
+             INSERT INTO h VALUES (1, 0);",
+        )
+        .expect("seed");
+    let path = db.to_str().expect("utf8 path").to_owned();
+    let work = dir.path().to_path_buf();
+    let mut holder = None;
+    let mut observed = None;
+    let (holder_slot, observed_slot, holder_db) = (&mut holder, &mut observed, db.clone());
+    asupersync::test_utils::run_test(|| async move {
+        let conn = Connection::open(&path).await.expect("open");
+        conn.execute("PRAGMA busy_timeout=200")
+            .await
+            .expect("busy_timeout");
+        *holder_slot = Some(spawn_holder(&holder_db, &work, true));
+        assert!(
+            wait_for(&work.join("held"), Duration::from_secs(120)),
+            "the stock holder never took the write lock"
+        );
+        conn.execute("BEGIN").await.expect("BEGIN");
+        conn.execute("INSERT INTO t VALUES (2, 1, 'busy')")
+            .await
+            .expect("INSERT while stock holds WRITE");
+        let wal_before = std::fs::metadata(wal_path(&holder_db)).map_or(0, |meta| meta.len());
+        let error = conn
+            .execute("COMMIT")
+            .await
+            .expect_err("COMMIT behind stock's write lock returns BUSY");
+        assert!(
+            matches!(error, FrankenError::Busy),
+            "a COMMIT that waited out busy_timeout is the retryable Busy, got {error:?}"
+        );
+        let commit_code = error.extended_error_code();
+        let open_after_busy = conn.in_transaction();
+        assert_eq!(
+            stock_rows(&holder_db),
+            vec![(1, "seed".to_owned())],
+            "the BUSY COMMIT made nothing durable"
+        );
+        assert_eq!(
+            std::fs::metadata(wal_path(&holder_db)).map_or(0, |meta| meta.len()),
+            wal_before,
+            "the BUSY COMMIT appended no frame"
+        );
+        let next_begin_error = conn
+            .execute("BEGIN")
+            .await
+            .err()
+            .map(|error| error.to_string());
+        let next_insert_ok = conn
+            .execute("INSERT INTO t VALUES (3, 1, 'next')")
+            .await
+            .is_ok();
+        std::fs::write(work.join("release"), b"").expect("release");
+        assert!(
+            wait_for(&work.join("released"), Duration::from_secs(120)),
+            "the stock holder never committed"
+        );
+        let next_commit_ok = conn.execute("COMMIT").await.is_ok();
+        assert!(!conn.in_transaction());
+        conn.close().await.expect("close");
+        std::fs::write(work.join("done"), b"").expect("done");
+        *observed_slot = Some(CliAfterBusyCommit {
+            commit_code,
+            open_after_busy,
+            next_begin_error,
+            next_insert_ok,
+            next_commit_ok,
+            durable: stock_rows(&holder_db),
+        });
+    });
+    let output = holder.expect("holder spawned").finish();
+    assert!(
+        output.status.success(),
+        "stock holder failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let frank = observed.expect("the fsqlite arm ran");
+    assert_eq!(
+        frank, stock,
+        "fsqlite answers the CLI sequence after a BUSY COMMIT as stock does"
+    );
+    let h: i64 = rusqlite::Connection::open(&db)
+        .expect("verify open")
+        .query_row("SELECT v FROM h WHERE id = 1", [], |row| row.get(0))
+        .expect("holder row");
+    assert_eq!(h, 1, "the stock holder's commit is durable");
+    assert_eq!(stock_integrity(&db), "ok");
+
+    // Negative: a same-page stock commit while the transaction is open.
+    let neg = dir.path().join("refused.db");
+    rusqlite::Connection::open(&neg)
+        .expect("seed open")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, w INTEGER NOT NULL, s TEXT NOT NULL);
+             INSERT INTO t VALUES (1, 0, 'seed');",
+        )
+        .expect("seed");
+    let neg_dir = dir.path().join("neg");
+    std::fs::create_dir(&neg_dir).expect("negative dir");
+    let neg_path = neg.to_str().expect("utf8 path").to_owned();
+    let spec = format!(
+        "stock|{}|{}|INSERT INTO t VALUES (10, 9, 'peer')",
+        neg.display(),
+        neg_dir.display()
+    );
+    let mut peer = None;
+    let peer_slot = &mut peer;
+    let neg_db = neg.clone();
+    asupersync::test_utils::run_test(|| async move {
+        let _release = ReleasePeer(neg_dir.clone());
+        let conn = Connection::open(&neg_path).await.expect("open");
+        conn.execute("PRAGMA busy_timeout=1000")
+            .await
+            .expect("busy_timeout");
+        conn.execute("BEGIN").await.expect("BEGIN");
+        conn.execute("INSERT INTO t VALUES (2, 1, 'refused')")
+            .await
+            .expect("INSERT");
+        let child = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "open_transaction_peer_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PEER_ENV, &spec)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stock peer");
+        *peer_slot = Some(HolderGuard(Some(child)));
+        assert!(
+            wait_for(&neg_dir.join("committed"), Duration::from_secs(120)),
+            "the stock peer never committed"
+        );
+        let error = conn
+            .execute("COMMIT")
+            .await
+            .expect_err("a same-page stock commit refuses the stale page");
+        assert!(
+            matches!(error, FrankenError::BusySnapshot { .. }),
+            "the refusal is the snapshot conflict, not BUSY: {error:?}"
+        );
+        assert_eq!(error.extended_error_code(), SQLITE_BUSY_SNAPSHOT);
+        assert!(
+            !conn.in_transaction(),
+            "a BusySnapshot refusal ends the transaction"
+        );
+        assert_eq!(
+            stock_rows(&neg_db),
+            vec![(1, "seed".to_owned()), (10, "peer".to_owned())],
+            "the refused row is not durable"
+        );
+        conn.execute("BEGIN")
+            .await
+            .expect("the next BEGIN works: no transaction is left open");
+        conn.execute("INSERT INTO t VALUES (3, 1, 'next')")
+            .await
+            .expect("next INSERT");
+        conn.execute("COMMIT").await.expect("next COMMIT");
+        conn.close().await.expect("close");
+    });
+    let output = peer.expect("peer spawned").finish();
+    assert!(
+        output.status.success(),
+        "stock peer failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stock_rows(&neg),
+        vec![
+            (1, "seed".to_owned()),
+            (3, "next".to_owned()),
+            (10, "peer".to_owned())
+        ],
+        "the refused row never lands; the next transaction's does"
+    );
+    assert_eq!(stock_integrity(&neg), "ok");
 }
 
 /// bd-reality-check-1022-llk6g.5.5: a stock writer can restart an empty,
