@@ -10844,8 +10844,6 @@ impl TriggerDef {
 #[derive(Debug, Clone)]
 struct TriggerFrame {
     table_name: String,
-    /// Name of the trigger being executed (for recursive_triggers guard).
-    trigger_name: String,
     column_names: Vec<String>,
     /// bd-90jrv: each column's declared collation, parallel to
     /// `column_names` (`None` for BINARY, for the INTEGER PRIMARY KEY, and
@@ -10977,7 +10975,7 @@ impl TriggerFrame {
 }
 
 struct TriggerFrameGuard<'a> {
-    stack: &'a RefCell<Vec<TriggerFrame>>,
+    stack: &'a RefCell<Vec<String>>,
     _fk_check_suppression: BoolCellRestoreGuard<'a>,
 }
 
@@ -12577,7 +12575,7 @@ struct SchemaSnapshot {
     temp_default_cache_size: i64,
     shadowed_main_tables: HashMap<String, TableSchema>,
     views: Vec<ViewDef>,
-    triggers: Vec<TriggerDef>,
+    triggers: Vec<Arc<TriggerDef>>,
     rowid_alias_columns: HashMap<String, usize>,
     autoincrement_tables: HashSet<String>,
     original_ddl_sql: HashMap<String, String>,
@@ -14538,12 +14536,15 @@ pub struct Connection {
     /// local namespace. TEMP and MAIN views may coexist under the same name;
     /// unqualified lookup selects TEMP before MAIN.
     views_by_name: RefCell<HashMap<String, ScopedViewIndices>>,
-    /// Trigger definitions stored in-memory.
-    triggers: TxnRestorableCell<Vec<TriggerDef>>,
+    /// Trigger definitions stored in-memory, shared so that firing a trigger
+    /// and snapshotting the list clone pointers, not definitions (bd-fpr5g).
+    triggers: TxnRestorableCell<Vec<Arc<TriggerDef>>>,
     /// HashMap side-index for O(1) trigger name lookup. See `schema_by_name` for semantics.
     triggers_by_name: RefCell<HashMap<String, usize>>,
-    /// Stack of active trigger OLD/NEW bindings for nested trigger execution.
-    trigger_frame_stack: RefCell<Vec<TriggerFrame>>,
+    /// Names of the triggers executing, outermost first: its depth is the
+    /// trigger recursion depth, and `recursive_triggers = OFF` refuses a name
+    /// already on it. A trigger's OLD/NEW frame stays with its firing loop.
+    trigger_frame_stack: RefCell<Vec<String>>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
     /// Wrapped in `RefCell` to allow UDF registration after connection creation.
     func_registry: RefCell<Arc<FunctionRegistry>>,
@@ -71240,7 +71241,7 @@ impl Connection {
                             if triggers[i].table_name.eq_ignore_ascii_case(obj_name) {
                                 let trigger = triggers.remove(i);
                                 if !trigger.temporary {
-                                    triggers_to_drop.push(trigger.name);
+                                    triggers_to_drop.push(trigger.name.clone());
                                 }
                             } else {
                                 i += 1;
@@ -71395,7 +71396,7 @@ impl Connection {
                             if triggers[i].table_name.eq_ignore_ascii_case(obj_name) {
                                 let trigger = triggers.remove(i);
                                 if !trigger.temporary {
-                                    triggers_to_drop.push(trigger.name);
+                                    triggers_to_drop.push(trigger.name.clone());
                                 }
                             } else {
                                 i += 1;
@@ -73192,6 +73193,10 @@ impl Connection {
         let mut updates = Vec::new();
         let mut triggers = self.triggers.borrow_mut();
         for trigger in triggers.iter_mut() {
+            // A savepoint's schema snapshot may share this definition: the
+            // rename edits this connection's copy, and a rollback restores
+            // the shared original.
+            let trigger = Arc::make_mut(trigger);
             let mut changed = if trigger.table_name.eq_ignore_ascii_case(old_name) {
                 trigger.table_name.clear();
                 trigger.table_name.push_str(new_name);
@@ -73280,7 +73285,7 @@ impl Connection {
         }
 
         for trigger in self.triggers.borrow().iter() {
-            let mut trigger_probe = trigger.clone();
+            let mut trigger_probe = TriggerDef::clone(trigger);
             let target_matches = trigger_probe.table_name.eq_ignore_ascii_case(table_name);
             let mut dependency_found = false;
             if let Some(when_clause) = &mut trigger_probe.when_clause {
@@ -73400,6 +73405,8 @@ impl Connection {
         let mut updates = Vec::new();
         let mut triggers = self.triggers.borrow_mut();
         for trigger in triggers.iter_mut() {
+            // As in the table rename: a snapshot keeps the original.
+            let trigger = Arc::make_mut(trigger);
             let mut changed = false;
             let trigger_target_matches = trigger.table_name.eq_ignore_ascii_case(table_name);
             if trigger_target_matches {
@@ -75398,7 +75405,7 @@ impl Connection {
             });
         let mut trigger_def = TriggerDef::from_create_statement(stmt, create_sql.clone());
         trigger_def.temporary = is_temp_trigger;
-        self.triggers.borrow_mut().push(trigger_def);
+        self.triggers.borrow_mut().push(Arc::new(trigger_def));
         self.rebuild_schema_indices();
 
         // TEMP triggers are connection-local and not persisted to sqlite_master.
@@ -75532,7 +75539,6 @@ impl Connection {
         }
         Ok(TriggerFrame {
             table_name: table_schema.name.clone(),
-            trigger_name: String::new(), // set per-trigger in the fire loop
             column_names,
             column_collations,
             rowid_alias_col_idx,
@@ -75556,7 +75562,7 @@ impl Connection {
         &self,
         table_name: &str,
         assigned_columns: &[String],
-        triggers: &[TriggerDef],
+        triggers: &[Arc<TriggerDef>],
     ) -> Option<Vec<bool>> {
         if assigned_columns.is_empty() {
             return None;
@@ -75628,10 +75634,12 @@ impl Connection {
         (!loaded.iter().all(|&column_loaded| column_loaded)).then_some(loaded)
     }
 
-    fn push_trigger_frame(&self, frame: TriggerFrame) -> TriggerFrameGuard<'_> {
+    fn push_trigger_frame(&self, trigger_name: &str) -> TriggerFrameGuard<'_> {
         #[cfg(test)]
         record_trigger_stack_probe(trigger_probe_site::FRAME_PUSH);
-        self.trigger_frame_stack.borrow_mut().push(frame);
+        self.trigger_frame_stack
+            .borrow_mut()
+            .push(trigger_name.to_owned());
         TriggerFrameGuard {
             stack: &self.trigger_frame_stack,
             _fk_check_suppression: BoolCellRestoreGuard::new(
@@ -77819,7 +77827,7 @@ impl Connection {
                     .trigger_frame_stack
                     .borrow()
                     .iter()
-                    .any(|f| f.trigger_name.eq_ignore_ascii_case(&trigger.name))
+                    .any(|name| name.eq_ignore_ascii_case(&trigger.name))
             {
                 continue;
             }
@@ -77829,15 +77837,13 @@ impl Connection {
             // execute, and would also charge triggers suppressed by
             // `recursive_triggers = OFF`.
             self.ensure_trigger_admission_available()?;
-            let mut frame = base_frame.clone();
-            frame.trigger_name.clone_from(&trigger.name);
-            let _frame_guard = self.push_trigger_frame(frame.clone());
+            let _frame_guard = self.push_trigger_frame(&trigger.name);
             // Evaluate the bound WHEN predicate against the current OLD/NEW frame.
             let pin_main_relations = self.trigger_pins_main_relations(&trigger);
             if !trigger_when_matches(
                 self,
                 trigger.when_clause.as_ref(),
-                Some(&frame),
+                Some(&base_frame),
                 pin_main_relations,
             )
             .await?
@@ -77850,7 +77856,7 @@ impl Connection {
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
                 let (bound_stmt, bound_params) =
-                    bind_trigger_body_statement(stmt, &frame, pin_main_relations);
+                    bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
                     .await?
@@ -77912,19 +77918,17 @@ impl Connection {
                     .trigger_frame_stack
                     .borrow()
                     .iter()
-                    .any(|f| f.trigger_name.eq_ignore_ascii_case(&trigger.name))
+                    .any(|name| name.eq_ignore_ascii_case(&trigger.name))
             {
                 continue;
             }
             self.ensure_trigger_admission_available()?;
-            let mut frame = base_frame.clone();
-            frame.trigger_name.clone_from(&trigger.name);
-            let _frame_guard = self.push_trigger_frame(frame.clone());
+            let _frame_guard = self.push_trigger_frame(&trigger.name);
             let pin_main_relations = self.trigger_pins_main_relations(&trigger);
             if !trigger_when_matches(
                 self,
                 trigger.when_clause.as_ref(),
-                Some(&frame),
+                Some(&base_frame),
                 pin_main_relations,
             )
             .await?
@@ -77937,7 +77941,7 @@ impl Connection {
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
                 let (bound_stmt, bound_params) =
-                    bind_trigger_body_statement(stmt, &frame, pin_main_relations);
+                    bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
                     .await?
@@ -78412,7 +78416,6 @@ impl Connection {
         let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
         let base_frame = TriggerFrame {
             table_name: view_name.to_owned(),
-            trigger_name: String::new(),
             column_names: column_names.to_vec(),
             // bd-90jrv: a view column's collation is not tracked here yet.
             column_collations: Vec::new(),
@@ -78429,19 +78432,17 @@ impl Connection {
                     .trigger_frame_stack
                     .borrow()
                     .iter()
-                    .any(|f| f.trigger_name.eq_ignore_ascii_case(&trigger.name))
+                    .any(|name| name.eq_ignore_ascii_case(&trigger.name))
             {
                 continue;
             }
             self.ensure_trigger_admission_available()?;
-            let mut frame = base_frame.clone();
-            frame.trigger_name.clone_from(&trigger.name);
-            let _frame_guard = self.push_trigger_frame(frame.clone());
+            let _frame_guard = self.push_trigger_frame(&trigger.name);
             let pin_main_relations = self.trigger_pins_main_relations(&trigger);
             if !trigger_when_matches(
                 self,
                 trigger.when_clause.as_ref(),
-                Some(&frame),
+                Some(&base_frame),
                 pin_main_relations,
             )
             .await?
@@ -78453,7 +78454,7 @@ impl Connection {
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
                 let (bound_stmt, bound_params) =
-                    bind_trigger_body_statement(stmt, &frame, pin_main_relations);
+                    bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
                     .await?
@@ -110569,10 +110570,10 @@ impl Connection {
                             ),
                         });
                     }
-                    new_triggers.push(TriggerDef::from_create_statement(
+                    new_triggers.push(Arc::new(TriggerDef::from_create_statement(
                         &stmt,
                         create_sql.to_string(),
-                    ));
+                    )));
                     continue;
                 }
 
@@ -172486,7 +172487,7 @@ mod tests {
         ImplicitAutoindexSlot, InProcessPageLockTable, IoPollStrategy, LiveVtabRegistryUndo,
         MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH, PagerBackend, PagerPublishedSnapshot,
         PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
-        SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard,
+        SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrameGuard,
         arm_settle_rollback_error_once, arm_trigger_stack_probe, attached_schema_key,
         bind_placeholders_in_select_for_fallback, build_canonical_hash_join_key,
         canonical_hash_join_value, canonicalize_select_placeholders,
@@ -198976,7 +198977,6 @@ mod tests {
         .unwrap();
         let frame = super::TriggerFrame {
             table_name: "t".to_owned(),
-            trigger_name: "trg".to_owned(),
             column_names: vec!["id".to_owned(), "name".to_owned()],
             column_collations: Vec::new(),
             rowid_alias_col_idx: None,
@@ -200879,17 +200879,6 @@ mod tests {
     fn trigger_frame_and_fk_guards_restore_state_on_drop() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            let frame = || TriggerFrame {
-                table_name: "t".to_owned(),
-                trigger_name: "trg".to_owned(),
-                column_names: Vec::new(),
-                column_collations: Vec::new(),
-                rowid_alias_col_idx: None,
-                old_row: None,
-                new_row: None,
-                old_rowid: None,
-                new_rowid: None,
-            };
             for foreign_keys in [true, false] {
                 conn.execute(if foreign_keys {
                     "PRAGMA foreign_keys = ON"
@@ -200899,7 +200888,7 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(conn.fk_enforcement_enabled(), foreign_keys);
-                let frame_guard = conn.push_trigger_frame(frame());
+                let frame_guard = conn.push_trigger_frame("trg");
                 assert_eq!(conn.trigger_frame_stack.borrow().len(), 1);
                 assert_eq!(conn.fk_enforcement_enabled(), foreign_keys);
 
@@ -200911,7 +200900,7 @@ mod tests {
 
                 // Trigger checks resume without releasing the enclosing FK
                 // action's recursion charge, and never override PRAGMA OFF.
-                let nested_frame_guard = conn.push_trigger_frame(frame());
+                let nested_frame_guard = conn.push_trigger_frame("trg");
                 assert_eq!(conn.fk_cascade_depth.get(), 1);
                 assert_eq!(conn.active_recursive_program_depth(), 3);
                 assert!(!conn.fk_action_checks_suppressed.get());
@@ -201439,17 +201428,7 @@ mod tests {
             .await
             .unwrap();
 
-            let frame_guard = conn.push_trigger_frame(TriggerFrame {
-                table_name: "t".to_owned(),
-                trigger_name: "trg".to_owned(),
-                column_names: Vec::new(),
-                column_collations: Vec::new(),
-                rowid_alias_col_idx: None,
-                old_row: None,
-                new_row: None,
-                old_rowid: None,
-                new_rowid: None,
-            });
+            let frame_guard = conn.push_trigger_frame("trg");
             let fk_guard = conn.enter_fk_cascade().unwrap();
             conn.with_attached_connection("aux", |child| {
                 assert_eq!(
@@ -201537,17 +201516,7 @@ mod tests {
     /// main-schema trigger program — SQL cannot hold one open across a
     /// qualified statement, see [`build_cross_schema_fk_chain`]).
     fn push_parent_program_frame(conn: &Connection) -> TriggerFrameGuard<'_> {
-        conn.push_trigger_frame(TriggerFrame {
-            table_name: "start".to_owned(),
-            trigger_name: "start_trg".to_owned(),
-            column_names: Vec::new(),
-            column_collations: Vec::new(),
-            rowid_alias_col_idx: None,
-            old_row: None,
-            new_row: None,
-            old_rowid: None,
-            new_rowid: None,
-        })
+        conn.push_trigger_frame("start_trg")
     }
 
     /// bd-wymdl.3 criterion 2: an active main program plus a delegated
@@ -201648,17 +201617,7 @@ mod tests {
             let aux_sql = format!("ATTACH DATABASE '{}' AS aux;", aux_path.to_string_lossy());
             let conn = Connection::open(":memory:").await.unwrap();
 
-            let frame_guard = conn.push_trigger_frame(TriggerFrame {
-                table_name: "t".to_owned(),
-                trigger_name: "trg".to_owned(),
-                column_names: Vec::new(),
-                column_collations: Vec::new(),
-                rowid_alias_col_idx: None,
-                old_row: None,
-                new_row: None,
-                old_rowid: None,
-                new_rowid: None,
-            });
+            let frame_guard = conn.push_trigger_frame("trg");
             let error = conn
                 .execute(&aux_sql)
                 .await
@@ -317646,17 +317605,7 @@ mod pager_routing_tests {
 
             // At aggregate depth 49, one trigger frame is admissible.
             conn.ensure_trigger_admission_available().unwrap();
-            conn.trigger_frame_stack.borrow_mut().push(TriggerFrame {
-                table_name: "t".to_owned(),
-                trigger_name: "tr".to_owned(),
-                column_names: Vec::new(),
-                column_collations: Vec::new(),
-                rowid_alias_col_idx: None,
-                old_row: None,
-                new_row: None,
-                old_rowid: None,
-                new_rowid: None,
-            });
+            conn.trigger_frame_stack.borrow_mut().push("tr".to_owned());
 
             // The active trigger now consumes slot 50. Neither another trigger
             // nor an FK action may be admitted independently of it.

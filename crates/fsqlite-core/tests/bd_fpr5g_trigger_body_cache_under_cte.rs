@@ -16,6 +16,14 @@
 //! hot-path profile counters are process-global, so the tests run one at a
 //! time. A statement that fires a trigger is replayed row by row, which strict
 //! mode refuses, so these run without it.
+//!
+//! Lever 2 shares the trigger definitions (`Arc`) between the connection's
+//! list, its savepoint snapshots and each firing, and keeps only trigger names
+//! on the recursion stack. The last two keepers hold what that touches: an
+//! ALTER TABLE RENAME / RENAME COLUMN rolled back (or rolled back to a
+//! savepoint) leaves the trigger as it was, a committed one rewrites it, and
+//! `recursive_triggers` OFF stops only the trigger re-entering itself, while ON
+//! lets it recurse.
 
 use fsqlite_core::connection::{
     Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
@@ -252,5 +260,96 @@ fn caller_ctes_stay_invisible_to_cached_trigger_bodies() {
                 );
             }
         }
+    });
+}
+
+/// Runs every statement on both engines; a statement returning rows is a
+/// checkpoint whose rows must be stock's.
+async fn assert_script_matches_stock(script: &[&str], context: &str) {
+    for file_backed in [false, true] {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(&database_path(&dir, file_backed))
+            .await
+            .unwrap();
+        for sql in script {
+            if sql.trim_start().starts_with("SELECT") {
+                assert_eq!(
+                    fsqlite_rows(&conn, sql).await,
+                    stock_rows(&stock, sql),
+                    "{context}: file_backed={file_backed}: {sql}"
+                );
+            } else {
+                stock.execute_batch(sql).unwrap();
+                conn.execute(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{context}: file_backed={file_backed}: {sql}: {e}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn renamed_trigger_tables_and_columns_roll_back_with_the_transaction() {
+    const SCRIPT: &[&str] = &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE TABLE lg(tag, v)",
+        "CREATE TRIGGER ti AFTER INSERT ON t BEGIN \
+           INSERT INTO lg VALUES ('ti', (SELECT count(*) FROM t) * 100 + NEW.a); END",
+        "INSERT INTO t VALUES (1, 1)",
+        "BEGIN",
+        "ALTER TABLE t RENAME TO t2",
+        "INSERT INTO t2 VALUES (2, 2)",
+        // The rename reached the trigger inside the transaction.
+        "SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'",
+        "SELECT * FROM lg ORDER BY rowid",
+        "ROLLBACK",
+        // Rolled back: the trigger is on t again and reads t.
+        "INSERT INTO t VALUES (3, 3)",
+        "SAVEPOINT s",
+        "ALTER TABLE t RENAME COLUMN a TO b",
+        "INSERT INTO t VALUES (4, 4)",
+        "ROLLBACK TO s",
+        "RELEASE s",
+        "INSERT INTO t VALUES (5, 5)",
+        "BEGIN",
+        "ALTER TABLE t RENAME COLUMN a TO c",
+        "INSERT INTO t VALUES (6, 6)",
+        "COMMIT",
+        // Committed: the trigger now reads NEW.c.
+        "INSERT INTO t VALUES (7, 7)",
+        "SELECT * FROM lg ORDER BY rowid",
+        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'",
+    ];
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        assert_script_matches_stock(SCRIPT, "rename rollback").await;
+    });
+}
+
+#[test]
+fn recursive_triggers_off_stops_only_self_reentry() {
+    const SCRIPT: &[&str] = &[
+        "CREATE TABLE r(n INTEGER)",
+        "CREATE TABLE rl(tag, n)",
+        "CREATE TRIGGER r_self AFTER INSERT ON r WHEN NEW.n < 4 BEGIN \
+           INSERT INTO rl VALUES ('self', NEW.n); INSERT INTO r VALUES (NEW.n + 1); END",
+        "CREATE TRIGGER r_sib AFTER INSERT ON r BEGIN INSERT INTO rl VALUES ('sib', NEW.n); END",
+        // OFF (the default): r_self's own INSERT does not fire r_self again,
+        // but it does fire r_sib.
+        "INSERT INTO r VALUES (1)",
+        "SELECT * FROM rl ORDER BY rowid",
+        "SELECT count(*) FROM r",
+        "DELETE FROM rl",
+        "DELETE FROM r",
+        "PRAGMA recursive_triggers = ON",
+        // ON: r_self recurses until its WHEN stops it.
+        "INSERT INTO r VALUES (1)",
+        "SELECT * FROM rl ORDER BY rowid",
+        "SELECT * FROM r ORDER BY rowid",
+    ];
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        assert_script_matches_stock(SCRIPT, "recursive_triggers").await;
     });
 }
