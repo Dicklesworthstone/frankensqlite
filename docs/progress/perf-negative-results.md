@@ -89,6 +89,105 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - WIN (landed as f9c9e9965): a rowid seek that lands on the leaf the cursor already stands on is answered without a wait, from the main loop's SeekRowid arm (bd-w4pr1.12, read-loop round 7, lever SL1 v3)
+
+- Target: join_1M_to_pk_1000 (`SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`),
+  4,414 Ir per row against stock's 1,721 on main 0f7d6a289, 1,680 of them the SeekRowid into u.
+  About 60% of the probes land on the cursor's current leaf, which the seek cache answers without a
+  load. Such a hit still cost about 1,150 Ir, about 320 of it the leaf search, the witness and the
+  slot update; the rest was the async path (see the SL1 v2 entry below).
+- Touched: `crates/fsqlite-btree/src/cursor.rs` (`BtCursor::try_table_seek_within_leaf`, the
+  synchronous form of the seek-cache hit on the stack-top leaf, unchanged from v2, with its keeper),
+  `crates/fsqlite-vdbe/src/engine.rs` (`CursorBackend::try_table_seek_within_leaf`; the main loop's
+  `SeekRowid` arm tries it before `lean_future(table_move_to)` when no RowSet advance applies),
+  `crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs` (the end-to-end keeper).
+  `try_execute_hot_opcode_sync` is untouched: that is what separates v3 from the rejected v2.
+- Ledger preflight: the SL1 v2 entry below (its retry condition, option 3, is this change); the
+  2026-11-14 join / rowid-seek rounds (page load, interior search, eviction tracker, parked leaves)
+  left the async path of a hit alone.
+- Prediction (bd-w4pr1.12, 2026-11-17 22:17, restated 2026-11-18 before the build): join -200 to
+  -350M Ir, CPU -15 to -45 ms; memory_script_200k -40 to -80M; rowid_lookups_200k within +0.5% Ir;
+  other rows within 0.3% Ir. Kill: join under 150M or CPU not lower in each of two runs,
+  rowid_lookups +0.5% or more, another row +0.3% or more, an oracle red.
+- Result: base 0f7d6a289 (sha256 f15dfa085a9a3ac6) against base + SL1 v3 (7e52ed82d4170700), an
+  A/A arm (the base ELF again) in the same runs, stock sqlite3 3.46.1 live. thinkstation1,
+  powersave, load 11-15, io_uring refused, serial (0 extra threads observed); two runs, 7 reps with
+  the arms interleaved per rep; answers equal everywhere.
+  - join_1M_to_pk_1000: 4,414.1M -> 4,124.0M Ir (x2.56 -> x2.40 stock); cycles 0.907 / 0.903 in
+    the pairs (A/A 0.972 / 0.982); CPU x2.32 -> x2.18 and x2.33 -> x2.14 stock.
+  - memory_script_200k: -57.8M Ir (its join); CPU x2.05 -> x1.88 and x2.01 -> x1.94.
+  - rowid_lookups_200k: +10.4M (+0.39%), the decline on every probe (none lands on the current
+    leaf): about 52 Ir a probe against the ~20 predicted. CursorBackend's forwarder is an
+    out-of-line call returning `Result<Option<SeekResult>>`.
+  - Every other read row within 1M Ir (+0.07% at most). Cycles at that equal Ir moved inside about
+    two points of the A/A arm's, except GROUP BY id % 100000 (1.021 / 1.024 against 1.000 /
+    1.004) and GROUP BY 1000 groups the other way (0.958 / 0.947).
+  - On the landing binary (rebased onto 1954f46cb, sha256 049f1f407e62914b, against that parent
+    3c8325ba1e24939e, load 3-6, same method): join 4,413.7M -> 4,124.1M Ir, cycles 0.944 / 0.953, CPU
+    x2.29 -> x2.12 and x2.23 -> x2.11 stock; memory_script -57.7M, CPU x1.90 -> x1.90 and x2.00 ->
+    x1.95; rowid_lookups +10.8M (+0.40%); every other row within 1M Ir. At that equal Ir,
+    scan_filter_agg 1.034 / 1.064 and GROUP BY a % 10 1.024 / 1.029 in cycles (A/A 1.016 / 1.004,
+    0.999 / 0.998): the layout effect, here in the other direction from the 0f7d6a289 runs.
+- Gate (rch): clippy -D warnings btree / vdbe / core all targets clean; btree / vdbe / core lib,
+  goldens, hot_arm_stream_reachability and 46 core join / seek / rowid / UPDATE-FROM / trigger /
+  conformance targets 6,216 passed, 2 failed (bd_8c68u's known compile-count red, and this lever's
+  btree keeper, which compared page image tokens across two separate stores; fixed in the test to
+  compare the stamped position, then btree lib 563 / 0 and btree clippy clean); 15 e2e oracle targets
+  103 / 0; fsqlite crate suite 126 binaries, 1,098 / 0. After the rebase onto 1954f46cb (bd-hi7qg
+  changed engine.rs; no overlap), on the exact pushed tree: vdbe lib 1,257 / 0, core lib 4,197 / 0,
+  nine seek / rowid / join / UPDATE-FROM keepers 39 / 0.
+- Keepers: fsqlite-btree
+  `test_try_table_seek_within_leaf_matches_table_move_to_and_declines_off_its_leaf` (16 seeks over
+  a five-leaf tree against a cursor that only runs `table_move_to`, 10 answered and 6 declined, and
+  a cursor moved off the cached leaf must decline); fsqlite-core
+  `same_leaf_rowid_lookups_match_sqlite_across_leaves_and_after_writes` (6,012 outer keys striding
+  across a 3,000-row table with every 13th row missing; NULL / REAL / TEXT / BLOB keys; joins,
+  LEFT JOIN, scalar subqueries, a prepared bound; one transaction that dirties the table's leaves
+  and one UPDATE whose subquery reads the row it has just written; rusqlite live, file-backed and
+  :memory:).
+- Retry condition: none for the main-loop fast path. Left on the join row: the 405k probes that
+  change leaf (u is five leaves in our layout against stock's four, so the four-slot seek cache
+  cycles), the lane exit and re-entry around every SeekRowid, and the decline's ~52 Ir on lookups
+  that never hit (an inline precheck of the newest slot's bounds before the out-of-line call would
+  take most of it). The 405k leaf changes are lever SC8's target (the seek cache's four slots
+  against u's five leaves; prediction on bd-w4pr1.12 2026-11-18; its patch, with the slot-count
+  tests re-expressed over any slot count, is drafted but neither built nor tested). The hot-lane
+  retry (v4: v3's try moved into an out-of-line arm of try_execute_hot_opcode_sync) still needs the
+  no-op-arm A/A first.
+
+## 2026-11-18 - NOT ATTEMPTED (the effect is inside this host's layout band): moving TN1's top-N preflight out of line to give the GROUP BY rows back their cycles (bd-w4pr1.12, read-loop round 7, lever TN1-out)
+
+- Target: the cycles TN1 (landed 6c8033397) cost rows that run none of it, at equal instructions:
+  GROUP BY a 1.034, GROUP BY a % 10 1.047, join_1M_to_pk 1.018, rowid_lookups 1.016 (TN1 entry).
+- Ledger preflight: W5 (2026-11-16) moved the ResultRow body out of line and cut its cost on rows
+  that run none of it from +5.6 / +6.6% cycles to +1.3 / +1.8%; the 2026-11-15 VColumn / VNext
+  entry marked two helpers `#[inline(never)]` and gained nothing.
+- Why the planned change does not apply: in the landed binary execute_sorter_compare is already an
+  out-of-line function (0xb2b bytes, top_n_preflight_retains inlined into it), and
+  run_hot_opcodes_sync has the same size in the base and in an unrelated change (0x1806e); the
+  preflight is not in the hot loop. What moved is where the loop sits: the same function starts at
+  ...b10 in the base and ...440 in SL1 v3's build (a 6,448-byte shift from code placed before it).
+- Bands measured on this host (thinkstation1, powersave, load 11-15, stock 3.46.1 live, 7
+  interleaved reps, two runs):
+  - same ELF on two database copies (A/A): pair medians 0.974..1.017 on the GROUP BY rows;
+  - SL1 v3, a change in code the GROUP BY rows never run: GROUP BY 1000 groups 0.958 / 0.947,
+    GROUP BY a % 10 0.957 / 0.988, GROUP BY id % 100000 1.021 / 1.024, GROUP BY a sum(c) 1.003 /
+    1.012, at identical instructions;
+  - the same SL1 v3 change rebased onto 1954f46cb, against that parent: GROUP BY 1000 groups 1.027 /
+    1.011, GROUP BY a % 10 1.024 / 1.029, GROUP BY id % 100000 0.984 / 0.967, scan_filter_agg
+    1.034 / 1.064, again at identical instructions: the same change moved the same rows the other way
+    on another base;
+  - the do-nothing build this round planned (a SeekRowid arm in try_execute_hot_opcode_sync whose
+    #[inline(never)] helper always declines, scratchpad rl7/aa_noop.patch) was not built: rch
+    admission took the round.
+  TN1's +3.4% / +4.7% lies inside the -5.3%..+6.4% that one unrelated change moved these rows on
+  two bases. An out-of-line preflight would be judged against that band and could not be told from
+  it.
+- Retry condition: a build whose hot loop's placement does not move with unrelated code (a fixed
+  alignment for run_hot_opcodes_sync; this workspace avoids nightly features such as fn_align, so
+  that needs a decision), or a measurement that averages over several layouts of each arm.
+  Recovering a specific change's cycles before then is reading noise.
+
 ## 2026-11-18 - WIN (landed as 04062b0c5; re-measured on main 0dd0e7102 with an A/A arm; inside its prediction, the write row gained a little more than predicted): a prepared read's begin is its staleness check, the reader recheck is stock's one-copy compare, and the read transaction's journal path and exit locks are taken once (bd-05xlf, read/seek round 7, lever 1)
 
 - Target: the per-execution read transaction of the prepared secondary-key lookup (bd-05xlf,
