@@ -94,6 +94,36 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - REJECTED on its time kill line (instructions -78.6M, user cycles +97.8M): the Affinity arm reads its code bytes, maps them inline and clears subtypes only when the program has any (bd-w4pr1.13, bulk-write round 9, lever AF)
+
+- Target: the per-row `Affinity` of an INSERT row body (the scorecard's `bulk_insert_1M_one_txn`, one op over 4
+  registers a row, all no-ops). Touched (not landed; patch `scratchpad/r9/af_v1_on_ec9625181.diff` of the
+  bulk-write lane, `git diff` sha256 4863e84493796119, on ec9625181): `crates/fsqlite-vdbe/src/engine.rs` (the
+  `Opcode::Affinity` arm iterates `aff.as_bytes()`, `char_to_affinity` replaced by an inline `const fn
+  affinity_from_code(u8)` at both call sites, `has_register_subtypes` read once per op; test
+  `test_affinity_codes_map_in_either_case_one_register_a_byte`), `crates/fsqlite-types/src/value.rs`
+  (`#[inline]` on `SqliteValue::affinity_is_noop`).
+- Evidence before (callgrind of the bulk row on main c216c0852, exact call counts): per row `Chars` decoding 53,
+  `char_to_affinity` 32 (not inlined), `affinity_is_noop` 65 (not inlined, cross-crate), `clear_register_subtype`
+  32 instructions; native self cycles 0.74%, 0.43% and 1.19%.
+- Ledger preflight: bd-i3csr.3 (WIN, the no-op path) and bd-w4pr1.13.21 lever A (WIN, the second Affinity removed)
+  are the arm's earlier levers; 2026-05-24 "VDBE `Opcode::Affinity` hot-dispatch promotion" (rejected) is not
+  retried, the op stays in the main match.
+- Prediction (bd-w4pr1.13, before code): bulk -90M to -150M user instructions, task-clock min -5 to -20 ms;
+  memory_script -15M to -35M; update -1M to -5M; delete within +-1M. Kill: bulk down less than 60M, bulk task-clock
+  min not down, any other row up more than 1M.
+- Result (stock sqlite3 3.46.1 live, thinkstation1, governor powersave, `r6_ab.py`, answers equal stock's; base
+  ec9625181 392891538c30..., AF 461c77c6da32...): bulk 7,036.7M -> 6,958.1M min (-78.6M; median -65.8M), user cycles
+  2,932.5M -> 3,030.3M (+97.8M), task-clock min 856.9 -> 878.9 ms and median 879.6 -> 900.0 (stock 4,177.4M,
+  1,386.1M cycles, 435.1 ms): killed. memory_script -17.8M instructions, +26.1M cycles, +6.5 ms; update -2.4M;
+  delete unchanged. The instructions go and the cycles come back with more: the arm sits in
+  `execute_program_body`'s huge match, and inlining `affinity_is_noop` there moved that function's code more than
+  it saved (the same effect as SC8 v2's identical-Ir loss).
+- Retry condition: not as a change to the arm in `execute_program_body`. Take the per-row Affinity only together
+  with moving it (and `Concat`) onto the synchronous lane, under the 2026-05-24 promotion entries' retry condition:
+  this row's profile shows 3 lane exits a row (Concat, Affinity, Insert; `execute_program_body` self 631M over 3.0M
+  dispatches), and the focused criterion dispatch benchmark still needs its same-worker A/B.
+
 ## 2026-11-18 - REJECTED on its time kill line at the landing parent (instructions met in six runs): a staged row write borrows the transaction's concurrent context and lends a slot's image with a token-free stand-in (bd-w4pr1.13, bulk-write round 9, lever D)
 
 - Target: every appended, staged-deleted and same-size-updated row: the scorecard's `bulk_insert_1M_one_txn`,
