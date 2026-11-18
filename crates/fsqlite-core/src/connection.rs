@@ -250400,13 +250400,16 @@ mod pager_routing_tests {
             outcome = async {
         let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) = open_t6751_file_backed_connection("strict_inner_join_vdbe_storage.db").await?;
-        conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);").await?;
-        conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);").await?;
-        conn.execute("INSERT INTO customers VALUES (1, 'alice'), (2, 'bob'), (3, 'cara');").await?;
-        conn.execute(
+        let setup = [
+            "CREATE TABLE customers (id INTEGER, name TEXT);",
+            "CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);",
+            "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob'), (3, 'cara');",
             "INSERT INTO orders VALUES \
              (10, 1, 'first'), (11, 1, 'second'), (12, 2, 'third'), (13, NULL, 'orphan');",
-        ).await?;
+        ];
+        for statement in setup {
+            conn.execute(statement).await?;
+        }
         conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;").await?;
 
         let sql = "SELECT c.name, o.label \
@@ -250419,10 +250422,7 @@ mod pager_routing_tests {
             "simple file-backed INNER JOIN should be eligible for VDBE storage cursor execution"
         );
         let program = conn.compile_table_select(&select).await?;
-        assert!(
-            !program.requires_attached_memdb(),
-            "simple INNER JOIN should compile to pager-backed VDBE storage cursors without MemDatabase"
-        );
+        assert_t6741_autoindex_is_the_only_memdb_requirement(&program, &["customers", "orders"]);
         let open_read_count = program
             .ops()
             .iter()
@@ -250515,6 +250515,7 @@ mod pager_routing_tests {
             "temp_materialization_mode=\"vdbe_storage_cursors\"",
         );
         assert_t6751_storage_log_field(dispatch_line, "rows_out=3");
+        assert_t6741_join_rows_match_stock(&setup, sql, &rows).await?;
         Ok(())
             }
             .await;
@@ -250662,13 +250663,16 @@ mod pager_routing_tests {
             outcome = async {
         let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) = open_t6751_file_backed_connection("strict_left_join_vdbe_storage.db").await?;
-        conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);").await?;
-        conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);").await?;
-        conn.execute("INSERT INTO customers VALUES (1, 'alice'), (2, 'bob'), (3, 'cara');").await?;
-        conn.execute(
+        let setup = [
+            "CREATE TABLE customers (id INTEGER, name TEXT);",
+            "CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);",
+            "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob'), (3, 'cara');",
             "INSERT INTO orders VALUES \
              (10, 1, 'first'), (11, 1, 'second'), (12, 2, 'third'), (13, 99, 'dangling');",
-        ).await?;
+        ];
+        for statement in setup {
+            conn.execute(statement).await?;
+        }
         conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;").await?;
 
         let sql = "SELECT c.name, o.label \
@@ -250681,10 +250685,7 @@ mod pager_routing_tests {
             "LEFT JOIN shape should use the VDBE storage cursor path"
         );
         let program = conn.compile_table_select(&select).await?;
-        assert!(
-            !program.requires_attached_memdb(),
-            "LEFT JOIN should compile to pager-backed VDBE storage cursors without MemDatabase"
-        );
+        assert_t6741_autoindex_is_the_only_memdb_requirement(&program, &["customers", "orders"]);
         let open_read_count = program
             .ops()
             .iter()
@@ -250787,6 +250788,7 @@ mod pager_routing_tests {
             "temp_materialization_mode=\"vdbe_storage_cursors\"",
         );
         assert_t6751_storage_log_field(dispatch_line, "rows_out=4");
+        assert_t6741_join_rows_match_stock(&setup, sql, &rows).await?;
         Ok(())
             }
             .await;
@@ -251044,6 +251046,106 @@ mod pager_routing_tests {
             line.contains(field),
             "expected storage substrate log field `{field}` in line: {line}"
         );
+    }
+
+    /// bd-nouem: since bd-w4pr1.10 an unindexed equi-join probes an automatic
+    /// index, the plan 3.54.1 runs too (`SEARCH o USING AUTOMATIC COVERING
+    /// INDEX (customer_id=?)`). The engine numbers that ephemeral index's root
+    /// from the attached MemDatabase, so the program reports a MemDatabase
+    /// requirement. The automatic index must be the only one, and every input
+    /// table must still be read by a pager-backed cursor on the main database.
+    fn assert_t6741_autoindex_is_the_only_memdb_requirement(
+        program: &VdbeProgram,
+        tables: &[&str],
+    ) {
+        assert_eq!(
+            program.attached_memdb_requirement_reason(),
+            Some("memdb_or_virtual_table_opcode"),
+            "the automatic index should be the join's MemDatabase requirement; program: {program:?}"
+        );
+        let ops = program.ops();
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::OpenAutoindex)
+                .count(),
+            1,
+            "the join should probe exactly one automatic index; program: {program:?}"
+        );
+        for op in ops {
+            assert!(
+                !matches!(
+                    op.opcode,
+                    Opcode::OpenEphemeral
+                        | Opcode::OpenPseudo
+                        | Opcode::OpenDup
+                        | Opcode::ReopenIdx
+                        | Opcode::CreateBtree
+                        | Opcode::Clear
+                        | Opcode::Destroy
+                        | Opcode::Pagecount
+                        | Opcode::Program
+                        | Opcode::VBegin
+                        | Opcode::VCreate
+                        | Opcode::VDestroy
+                        | Opcode::VOpen
+                        | Opcode::VCheck
+                        | Opcode::VInitIn
+                        | Opcode::VFilter
+                        | Opcode::VColumn
+                        | Opcode::VNext
+                        | Opcode::VRename
+                        | Opcode::VUpdate
+                ),
+                "only the automatic index may need MemDatabase, found {:?}; program: {program:?}",
+                op.opcode
+            );
+            if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+                assert_eq!(
+                    op.p3, 0,
+                    "every storage cursor should read the main database; program: {program:?}"
+                );
+            }
+        }
+        for table in tables {
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Table(name) if name.eq_ignore_ascii_case(table))),
+                "the join should read `{table}` through a pager-backed storage cursor; program: {program:?}"
+            );
+        }
+    }
+
+    /// bd-nouem: the join's rows from the file-backed connection, and from a
+    /// strict `:memory:` connection, equal rusqlite's (bundled 3.54.1).
+    async fn assert_t6741_join_rows_match_stock(
+        setup: &[&str],
+        sql: &str,
+        file_rows: &[Row],
+    ) -> Result<()> {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        for statement in setup {
+            stock.execute_batch(statement).unwrap();
+        }
+        let expected = super::join_keyset_stream_tests::stock_rows(&stock, sql, []);
+        assert_eq!(
+            super::join_keyset_stream_tests::values_of(file_rows),
+            expected,
+            "file-backed `{sql}` vs stock"
+        );
+        let memory = Connection::open(":memory:").await?;
+        for statement in setup {
+            memory.execute(statement).await?;
+        }
+        memory
+            .execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .await?;
+        let rows = memory.query(sql).await?;
+        assert_eq!(
+            super::join_keyset_stream_tests::values_of(&rows),
+            expected,
+            ":memory: `{sql}` vs stock"
+        );
+        Ok(())
     }
 
     #[test]
