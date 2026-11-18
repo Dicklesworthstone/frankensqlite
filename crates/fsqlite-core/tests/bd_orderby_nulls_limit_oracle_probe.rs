@@ -108,3 +108,134 @@ fn orderby_nulls_limit_match_rusqlite_oracle() {
         );
     });
 }
+
+/// 400 rows whose sort keys repeat (`a`), differ only in case (`b`), hold
+/// NULLs (`a`, `c`) and mix storage classes (`d`), so a bounded sorter meets
+/// ties, NULLs and cross-class comparisons when it turns rows away. The rows
+/// come from a recursive CTE: the bundled stock library has no
+/// generate_series.
+const TOP_N_SCHEMA: &str = "\
+CREATE TABLE k(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d);\
+INSERT INTO k WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s \
+  WHERE value < 400) \
+  SELECT value, CASE WHEN value % 37 = 0 THEN NULL ELSE (value * 7) % 9 END, \
+  CASE value % 3 WHEN 0 THEN 'Row-' WHEN 1 THEN 'row-' ELSE 'ROW-' END || ((value * 13) % 50), \
+  CASE WHEN value % 11 = 0 THEN NULL ELSE ((value * 17) % 23) * 0.5 END, \
+  CASE value % 5 WHEN 0 THEN NULL WHEN 1 THEN value % 7 WHEN 2 THEN (value % 7) * 1.0 \
+    WHEN 3 THEN 'v' || (value % 7) ELSE x'07' END \
+  FROM s;";
+
+/// Every statement bounds a sorter with LIMIT, so each row meets the top-N
+/// preflight. Ties must keep the earlier row, as stock's bounded sorter does.
+const TOP_N_STATEMENTS: &[&str] = &[
+    "SELECT id, b FROM k ORDER BY b DESC LIMIT 10",
+    "SELECT id, b FROM k ORDER BY b LIMIT 7",
+    "SELECT id, a FROM k ORDER BY a LIMIT 15",
+    "SELECT id, a FROM k ORDER BY a DESC LIMIT 15",
+    "SELECT id FROM k ORDER BY a, b DESC LIMIT 12",
+    "SELECT id FROM k ORDER BY a DESC, b LIMIT 12",
+    "SELECT id, b FROM k ORDER BY b COLLATE NOCASE LIMIT 9",
+    "SELECT id, b FROM k ORDER BY b COLLATE NOCASE DESC, a LIMIT 9",
+    "SELECT id, d FROM k ORDER BY d LIMIT 20",
+    "SELECT id, d FROM k ORDER BY d DESC LIMIT 20",
+    "SELECT id, c FROM k ORDER BY c NULLS LAST LIMIT 11",
+    "SELECT id, c FROM k ORDER BY c DESC NULLS FIRST LIMIT 11",
+    "SELECT id FROM k ORDER BY a DESC NULLS FIRST, id LIMIT 8 OFFSET 5",
+    "SELECT id FROM k ORDER BY b DESC LIMIT 3 OFFSET 397",
+    "SELECT count(*), sum(id) FROM (SELECT id FROM k ORDER BY b DESC LIMIT 10)",
+    "SELECT id FROM k WHERE a > 3 ORDER BY b LIMIT 6",
+    "SELECT id FROM k ORDER BY a + 0, c LIMIT 13",
+    "SELECT id FROM k ORDER BY b DESC LIMIT (SELECT 4)",
+    "SELECT DISTINCT a FROM k ORDER BY a DESC LIMIT 5",
+    "SELECT id, a IN (SELECT a FROM k ORDER BY b DESC LIMIT 3) FROM k ORDER BY id LIMIT 40",
+    "SELECT id FROM k WHERE id IN (SELECT id FROM k ORDER BY d DESC, id LIMIT 6) ORDER BY id",
+];
+
+async fn top_n_diffs(file_backed: bool) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let (f, r) = if file_backed {
+        (
+            Connection::open(dir.path().join("f.db").to_str().unwrap())
+                .await
+                .unwrap(),
+            rusqlite::Connection::open(dir.path().join("r.db")).unwrap(),
+        )
+    } else {
+        (
+            Connection::open(":memory:").await.unwrap(),
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )
+    };
+    f.execute_batch(TOP_N_SCHEMA).await.unwrap();
+    r.execute_batch(TOP_N_SCHEMA).unwrap();
+    if file_backed {
+        // Strict mode refuses the connection's fallback evaluators, so each
+        // statement answers from its VDBE program.
+        f.execute("PRAGMA fsqlite.parity_cert_strict = ON")
+            .await
+            .unwrap();
+        // Not vacuous: the bounded sorter's program has a top-N preflight.
+        let explain = fq(&f, "EXPLAIN SELECT id, b FROM k ORDER BY b DESC LIMIT 10").await;
+        assert!(
+            explain
+                .iter()
+                .any(|row| row.get(1).is_some_and(|op| op == "text:SorterCompare")),
+            "ORDER BY ... LIMIT must run a top-N preflight: {explain:?}"
+        );
+    }
+    let label = if file_backed {
+        "file, strict"
+    } else {
+        "memory"
+    };
+    let mut diffs = Vec::new();
+    for sql in TOP_N_STATEMENTS {
+        let stock = rq(&r, sql);
+        let adhoc = f.query(sql).await.map(|rows| {
+            rows.iter()
+                .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        });
+        let prepared = match f.prepare(sql).await {
+            Ok(stmt) => stmt.query().await.map(|rows| {
+                rows.iter()
+                    .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            }),
+            Err(e) => Err(e),
+        };
+        for (path, frank) in [("ad hoc", adhoc), ("prepared", prepared)] {
+            match frank {
+                Ok(rows) if rows == stock => {}
+                // Strict mode refuses the connection evaluator an aggregate
+                // over a derived table runs on; only that shape may be
+                // refused, and it is compared in memory, where strict is off.
+                Err(e)
+                    if file_backed
+                        && sql.starts_with("SELECT count(*), sum(id) FROM (")
+                        && e.to_string().contains(
+                            "in-memory fallback disabled in strict parity-cert mode",
+                        ) => {}
+                other => diffs.push(format!(
+                    "  [{label}, {path}] `{sql}`\n     frank= {other:?}\n     stock= {stock:?}"
+                )),
+            }
+        }
+    }
+    f.close().await.unwrap();
+    diffs
+}
+
+#[test]
+fn top_n_limit_rows_match_stock_file_backed_and_in_memory() {
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = top_n_diffs(true).await;
+        diffs.extend(top_n_diffs(false).await);
+        assert!(
+            diffs.is_empty(),
+            "{} top-N divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

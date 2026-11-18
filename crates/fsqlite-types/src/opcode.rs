@@ -288,11 +288,11 @@ pub enum Opcode {
     // === Sorter Operations ===
     /// Compare a sorter key.
     ///
-    /// With `SORTER_COMPARE_TOP_N_PREFLIGHT`, P3 is a packed candidate-key
-    /// record and execution jumps to P2 when the bounded sorter is full and
-    /// the candidate cannot displace its current worst row.
-    /// The preflight form consumes P3; it is dead and undefined after either
-    /// the jump or fallthrough and must be rewritten before any later read.
+    /// With `SORTER_COMPARE_TOP_N_PREFLIGHT`, the candidate key is the P4
+    /// (`P4::Int`) registers from P3, and execution jumps to P2 when the
+    /// bounded sorter is full and the candidate cannot displace its current
+    /// worst row. The preflight form reads its key registers and leaves them
+    /// as they were.
     SorterCompare = 104,
     /// Read data from the sorter.
     SorterData = 105,

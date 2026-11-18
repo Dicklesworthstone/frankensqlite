@@ -358,13 +358,14 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
             (read_start, read_len, -1, 0)
         }
         Opcode::SorterCompare => {
-            let (read_start, read_len) = register_range(op.p3, 1);
-            let (write_start, write_len) = if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 {
-                (read_start, read_len)
-            } else {
-                (-1, 0)
+            // A top-N preflight reads its P4 key registers from P3; the
+            // ordinary form reads the record in P3. Neither writes.
+            let key_registers = match op.p4 {
+                P4::Int(count) if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 => count,
+                _ => 1,
             };
-            (read_start, read_len, write_start, write_len)
+            let (read_start, read_len) = register_range(op.p3, key_registers);
+            (read_start, read_len, -1, 0)
         }
         Opcode::SorterOpen if (op.p5 & SORTER_OPEN_TOP_N_REGISTER) != 0 => {
             let (read_start, read_len) = register_range(op.p3, 1);
@@ -3476,7 +3477,7 @@ mod tests {
             0,
             2,
             7,
-            P4::None,
+            P4::Int(3),
             fsqlite_types::opcode::SORTER_COMPARE_TOP_N_PREFLIGHT,
         );
         builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
@@ -3484,13 +3485,13 @@ mod tests {
         let program = builder.finish().expect("program should build");
         assert_eq!(
             program.register_count(),
-            8,
-            "runtime SorterOpen.p3 and SorterCompare.p3 must contribute to register sizing"
+            9,
+            "runtime SorterOpen.p3 and every SorterCompare preflight key register must contribute to register sizing"
         );
     }
 
     #[test]
-    fn test_sorter_compare_register_spans_distinguish_preflight_consumption() {
+    fn test_sorter_compare_register_spans_read_the_preflight_key_registers() {
         let ordinary = VdbeOp {
             opcode: Opcode::SorterCompare,
             p1: 0,
@@ -3501,6 +3502,7 @@ mod tests {
         };
         let ordinary_spans = opcode_register_spans(&ordinary);
         let preflight = VdbeOp {
+            p4: P4::Int(3),
             p5: SORTER_COMPARE_TOP_N_PREFLIGHT,
             ..ordinary
         };
@@ -3520,11 +3522,11 @@ mod tests {
             preflight_spans,
             OpcodeRegisterSpans {
                 read_start: 7,
-                read_len: 1,
-                write_start: 7,
-                write_len: 1,
+                read_len: 3,
+                write_start: -1,
+                write_len: 0,
             },
-            "top-N preflight must model P3 as consumed"
+            "a top-N preflight reads its P4 key registers from P3 and writes none"
         );
     }
 

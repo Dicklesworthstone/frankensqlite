@@ -11852,24 +11852,16 @@ fn codegen_select_ordered_scan(
         }
 
         if top_n_bound_reg.is_some() {
-            let key_record = b.alloc_temp();
-            b.emit_op(
-                Opcode::MakeRecord,
-                sorter_base,
-                num_sort_keys as i32,
-                key_record,
-                P4::None,
-                0,
-            );
+            // The bounded sorter judges the key registers themselves, as
+            // SQLite's IdxLE does: a row it turns away builds no record.
             b.emit_jump_to_label(
                 Opcode::SorterCompare,
                 sorter_cursor,
-                key_record,
+                sorter_base,
                 skip_label,
-                P4::None,
+                P4::Int(num_sort_keys as i32),
                 SORTER_COMPARE_TOP_N_PREFLIGHT,
             );
-            b.free_temp(key_record);
         }
 
         // For non-DISTINCT top-N, evaluate only outputs not already shared with
@@ -43190,24 +43182,15 @@ fn try_emit_complex_in_subquery(
         }
 
         if top_n_bound_reg.is_some() {
-            let key_record = b.alloc_temp();
-            b.emit_op(
-                Opcode::MakeRecord,
-                sorter_base,
-                num_sort_keys as i32,
-                key_record,
-                P4::None,
-                0,
-            );
+            // The key registers themselves are judged; see the ordered SELECT.
             b.emit_jump_to_label(
                 Opcode::SorterCompare,
                 sorter_cursor,
-                key_record,
+                sorter_base,
                 next_source_row,
-                P4::None,
+                P4::Int(num_sort_keys as i32),
                 SORTER_COMPARE_TOP_N_PREFLIGHT,
             );
-            b.free_temp(key_record);
         }
 
         if !value_emitted {
