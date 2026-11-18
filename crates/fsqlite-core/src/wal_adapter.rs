@@ -3648,6 +3648,30 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         backfilled_frames: u32,
         oldest_reader_frame: Option<u32>,
     ) -> WalFuture<'a, CheckpointResult> {
+        self.checkpoint_with_reset_fence(
+            cx,
+            mode,
+            writer,
+            backfilled_frames,
+            oldest_reader_frame,
+            None,
+        )
+    }
+}
+
+impl<F: VfsFile> WalBackendAdapter<F> {
+    /// [`WalBackend::checkpoint`], with `reset_fence` persisted on the reset
+    /// path only: after the reader gate is held and before the reset is
+    /// prepared (bd-1qmz4). A checkpoint that resets nothing never runs it.
+    fn checkpoint_with_reset_fence<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        mode: CheckpointMode,
+        writer: &'a mut dyn CheckpointPageWriter,
+        backfilled_frames: u32,
+        oldest_reader_frame: Option<u32>,
+        reset_fence: Option<&'a mut (dyn CheckpointResetFence + 'a)>,
+    ) -> WalFuture<'a, CheckpointResult> {
         Box::pin(async move {
             if self.native_read_binding.is_some() {
                 return Err(FrankenError::BusyRecovery);
@@ -3705,6 +3729,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 pending: &mut self.pending_checkpoint_reset,
                 previous_header: *self.wal.header(),
                 native,
+                reset_fence,
             };
 
             // Execute the checkpoint.
@@ -5896,15 +5921,19 @@ where
         }
     }
 
+    /// Durably replace the checkpoint certificate handoff at `handoff_path`
+    /// with `record`. It fences the certificate clock across a WAL generation
+    /// reset, so only a checkpoint about to reset writes it (bd-1qmz4, see
+    /// [`CertificateHandoffFence`]).
     async fn persist_checkpoint_certificate_handoff(
-        &self,
+        vfs: &V,
         cx: &Cx,
+        handoff_path: &Path,
         record: &ParallelWalDurableCertificateRecord,
     ) -> Result<()> {
-        let handoff_path = self.certificate_checkpoint_handoff_path();
-        let existed = self.vfs.access(cx, &handoff_path, AccessFlags::EXISTS)?;
+        let existed = vfs.access(cx, handoff_path, AccessFlags::EXISTS)?;
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
-        let (mut file, _) = self.vfs.open(cx, Some(&handoff_path), flags)?;
+        let (mut file, _) = vfs.open(cx, Some(handoff_path), flags)?;
         let record_bytes = record.to_bytes();
         if record_bytes.len() > PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE {
             let cleanup_cx = cx.create_child();
@@ -5979,7 +6008,7 @@ where
             Ok(())
         };
         let directory_sync_result = if !existed && truncate_result.is_ok() && sync_result.is_ok() {
-            self.vfs.sync_parent_directory(&mutation_cx, &handoff_path)
+            vfs.sync_parent_directory(&mutation_cx, handoff_path)
         } else {
             Ok(())
         };
@@ -7376,20 +7405,36 @@ where
             let checkpoint_handoff = self
                 .latest_authorized_durable_certificate_record(cx, None)
                 .await?;
-            if let Some(record) = checkpoint_handoff.as_ref() {
-                // Fence the certificate clock before the checkpoint is
-                // allowed to reset the WAL generation. Replacing the handoff
-                // is intentionally non-authoritative while the old WAL and
-                // sidecar remain reconstructible: a crash, cancellation, or
-                // write failure here aborts the checkpoint without destroying
-                // the previous generation's source of truth.
-                self.persist_checkpoint_certificate_handoff(cx, record)
-                    .await?;
-            }
-            let checkpoint_result = self
-                .inner
-                .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
-                .await;
+            // Fence the certificate clock before the checkpoint is allowed to
+            // reset the WAL generation, and only then: the fence is persisted
+            // on the reset path, once the reader gate is held (bd-1qmz4). A
+            // checkpoint that copies nothing or whose reset is deferred no
+            // longer syncs a handoff it never uses; under 8 writer processes
+            // on a disk that was a ~16 ms fdatasync every other commit, inside
+            // the writer lock. Replacing the handoff stays non-authoritative
+            // while the old WAL and sidecar remain reconstructible: a crash,
+            // cancellation, or write failure aborts the reset without
+            // destroying the previous generation's source of truth.
+            let handoff_path = self.certificate_checkpoint_handoff_path();
+            let checkpoint_result = {
+                let mut handoff_fence = checkpoint_handoff.map(|record| CertificateHandoffFence {
+                    vfs: &self.vfs,
+                    path: handoff_path,
+                    record,
+                });
+                self.inner
+                    .checkpoint_with_reset_fence(
+                        cx,
+                        mode,
+                        writer,
+                        backfilled_frames,
+                        oldest_reader_frame,
+                        handoff_fence
+                            .as_mut()
+                            .map(|fence| fence as &mut dyn CheckpointResetFence),
+                    )
+                    .await
+            };
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if let Some(salts) = self.inner.checkpoint_retired_salts
                 && !self.pending_fec_reclamation.contains(&salts)
@@ -7507,15 +7552,52 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
     }
 }
 
+/// A durable write a checkpoint must complete before it may reset the WAL
+/// generation. The reset path runs it once, with the reader gate held, just
+/// before the reset is prepared; a checkpoint that resets nothing (PASSIVE,
+/// nothing to copy, or a reset a peer reader defers) never runs it.
+trait CheckpointResetFence: Send {
+    fn persist<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()>;
+}
+
+/// bd-1qmz4: the checkpoint certificate handoff as a [`CheckpointResetFence`].
+/// It carries the old generation's latest authorized certificate across the
+/// reset. Persisting it at every checkpoint entry instead cost a FullDurable
+/// sync per autocheckpoint attempt, inside the writer lock, even when the
+/// attempt copied nothing and could not reset.
+struct CertificateHandoffFence<'v, V: Vfs> {
+    vfs: &'v V,
+    path: PathBuf,
+    record: ParallelWalDurableCertificateRecord,
+}
+
+impl<V> CheckpointResetFence for CertificateHandoffFence<'_, V>
+where
+    V: Vfs + 'static,
+    V::File: Send + Sync + 'static,
+{
+    fn persist<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(PathRefreshingWalBackend::<V>::persist_checkpoint_certificate_handoff(
+            self.vfs,
+            cx,
+            &self.path,
+            &self.record,
+        ))
+    }
+}
+
 /// Bridges the writer while retaining reset state in the adapter across Drop.
-struct CheckpointResetTarget<'a, F: VfsFile> {
+struct CheckpointResetTarget<'a, 'f, F: VfsFile> {
     delegate: CheckpointTargetAdapterRef<'a>,
     pending: &'a mut Option<PendingCheckpointReset<F>>,
     previous_header: WalHeader,
     native: Option<NativeCheckpointView<F>>,
+    /// Persisted by [`CheckpointTarget::prepare_wal_reset`] before it arms
+    /// the reset, and only there.
+    reset_fence: Option<&'f mut (dyn CheckpointResetFence + 'f)>,
 }
 
-impl<F: VfsFile> CheckpointTarget for CheckpointResetTarget<'_, F> {
+impl<F: VfsFile> CheckpointTarget for CheckpointResetTarget<'_, '_, F> {
     fn checkpoint_page1_header_patch(&self) -> Option<[u8; 12]> {
         self.delegate.checkpoint_page1_header_patch()
     }
@@ -7551,11 +7633,18 @@ impl<F: VfsFile> CheckpointTarget for CheckpointResetTarget<'_, F> {
         })
     }
     fn prepare_wal_reset<'a>(
-        &'a mut self, _cx: &'a Cx, header: &'a WalHeader, new_checkpoint_seq: u32,
+        &'a mut self, cx: &'a Cx, header: &'a WalHeader, new_checkpoint_seq: u32,
         new_salts: WalSalts, truncate: bool,
     ) -> CheckpointTargetFuture<'a, Option<VfsWriteCompletion>> {
         Box::pin(async move {
             if self.pending.is_some() || header != &self.previous_header { return Err(FrankenError::BusyRecovery); }
+            // bd-1qmz4: the fence is durable before anything of the reset is
+            // armed. A failure here returns before `pending` exists, so the
+            // executor releases the reset gate and the old WAL stays
+            // authoritative, as when a peer reader defers the reset.
+            if let Some(fence) = self.reset_fence.take() {
+                fence.persist(cx).await?;
+            }
             let target = WalHeader { checkpoint_seq: new_checkpoint_seq, salts: new_salts,
                 checksum: SqliteWalChecksum::default(), ..*header };
             let target_header = WalHeader::from_bytes(&target.to_bytes()?)?;
@@ -10052,10 +10141,14 @@ mod tests {
             .wait()
             .expect("read authorized certificate record")
             .expect("authorized certificate record must exist");
-        backend
-            .persist_checkpoint_certificate_handoff(&cx, &record)
-            .wait()
-            .expect("persist checkpoint certificate handoff");
+        PathRefreshingWalBackend::persist_checkpoint_certificate_handoff(
+            &backend.vfs,
+            &cx,
+            &backend.certificate_checkpoint_handoff_path(),
+            &record,
+        )
+        .wait()
+        .expect("persist checkpoint certificate handoff");
         assert_eq!(
             vfs.take_sync_observations(),
             vec![CertificateSyncObservation::Durable(
@@ -10200,6 +10293,74 @@ mod tests {
             "checkpoint should remain pending inside the injected handoff write"
         );
         assert_authoritative_wal_unchanged(&mut backend, &vfs, &cx, &before);
+    }
+
+    /// bd-1qmz4: only a checkpoint that resets the WAL generation writes and
+    /// syncs the certificate handoff. Persisting it at every checkpoint's
+    /// entry cost a FullDurable sync per autocheckpoint attempt inside the
+    /// writer lock, even when the attempt copied nothing and could not reset
+    /// (about 16 ms each on disk, every other commit under 8 writer processes).
+    /// The negative half: a reset still leaves a durable handoff carrying the
+    /// old generation's latest certificate, so the clock survives the reset.
+    #[test]
+    fn checkpoint_handoff_is_written_only_by_a_checkpoint_that_resets_the_wal() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let (mut backend, certificate, _) = make_checkpoint_handoff_fault_backend(&vfs, &cx);
+        let mut checkpoint_writer = MockCheckpointPageWriter;
+        let handoff_synced = |observations: &[CertificateSyncObservation]| {
+            observations.iter().any(|observation| match observation {
+                CertificateSyncObservation::Ordinary(path)
+                | CertificateSyncObservation::Durable(path, _) => {
+                    path == Path::new(CHECKPOINT_HANDOFF_PATH)
+                }
+            })
+        };
+        let _ = vfs.take_sync_observations();
+
+        let passive = backend
+            .checkpoint(&cx, CheckpointMode::Passive, &mut checkpoint_writer, 0, None)
+            .wait()
+            .expect("passive checkpoint");
+        assert!(!passive.wal_was_reset, "PASSIVE never resets the WAL");
+        assert!(
+            !handoff_synced(&vfs.take_sync_observations()),
+            "a checkpoint that does not reset must not sync the handoff"
+        );
+        assert_eq!(
+            backend
+                .checkpoint_certificate_handoff(&cx)
+                .wait()
+                .expect("read the handoff"),
+            None,
+            "a checkpoint that does not reset must not write the handoff"
+        );
+
+        let truncate = backend
+            .checkpoint(&cx, CheckpointMode::Truncate, &mut checkpoint_writer, 0, None)
+            .wait()
+            .expect("truncate checkpoint");
+        assert!(truncate.wal_was_reset, "TRUNCATE resets the WAL here");
+        assert!(
+            handoff_synced(&vfs.take_sync_observations()),
+            "the reset must sync the handoff"
+        );
+        assert_eq!(
+            backend
+                .checkpoint_certificate_handoff(&cx)
+                .wait()
+                .expect("read the handoff"),
+            Some(certificate.clone()),
+            "the handoff carries the old generation's latest certificate"
+        );
+        assert_eq!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .wait()
+                .expect("read the certificate clock"),
+            Some(certificate),
+            "the certificate clock survives the generation reset"
+        );
     }
 
     #[test]
