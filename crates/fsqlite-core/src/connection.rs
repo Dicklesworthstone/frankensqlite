@@ -74734,18 +74734,21 @@ impl Connection {
             .map(|column| column.name.clone())
             .collect();
         // bd-90jrv: the INTEGER PRIMARY KEY is the rowid, which has no
-        // collation in stock.
-        let column_collations = table_schema
+        // collation in stock. A table whose columns are all BINARY keeps no
+        // list, so the binder skips its collation pass for every row.
+        let column_collations = if table_schema
             .columns
             .iter()
-            .map(|column| {
-                if column.is_ipk {
-                    None
-                } else {
-                    column.collation.clone()
-                }
-            })
-            .collect();
+            .any(|column| trigger_column_collation(column).is_some())
+        {
+            table_schema
+                .columns
+                .iter()
+                .map(|column| trigger_column_collation(column).map(str::to_owned))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let rowid_alias_col_idx = table_schema.columns.iter().position(|column| column.is_ipk);
         // bd-oh34i: stock applies each column's affinity to the NEW record
         // before any BEFORE or AFTER trigger reads it (sqlite3TableAffinity),
@@ -163291,6 +163294,15 @@ fn bind_trigger_prefixed_only_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
     bind_trigger_columns_in_expr_inner(expr, frame, true, false);
 }
 
+/// bd-90jrv: the collation an OLD/NEW reference to `column` carries, when it
+/// is not BINARY. The INTEGER PRIMARY KEY is the rowid, which has none.
+fn trigger_column_collation(column: &ColumnInfo) -> Option<&str> {
+    column
+        .collation
+        .as_deref()
+        .filter(|name| !column.is_ipk && !name.eq_ignore_ascii_case("BINARY"))
+}
+
 /// Whether the trigger binder may replace a column reference qualified by
 /// `table_prefix` with its OLD/NEW value.
 fn trigger_binder_may_bind_prefix(
@@ -163383,6 +163395,10 @@ fn wrap_trigger_operand_collations(
     prefix_only: bool,
     trigger_table_name_shadowed: bool,
 ) {
+    // Every column BINARY (make_trigger_frame keeps no list): nothing to wrap.
+    if frame.column_collations.is_empty() {
+        return;
+    }
     let collation_of = |operand: &Expr| {
         trigger_pseudo_column_collation(operand, frame, prefix_only, trigger_table_name_shadowed)
     };
