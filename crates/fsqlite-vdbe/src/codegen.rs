@@ -1346,59 +1346,77 @@ pub fn find_upsert_target_index<'a>(
     target: Option<&UpsertTarget>,
 ) -> Option<(usize, &'a IndexSchema)> {
     let target = target?;
-    // Only plain columns can match this direct UNIQUE-index probe. Expression
-    // targets fail closed until the probe can evaluate expression-index keys.
-    let target_cols: Vec<(&str, Option<&str>)> = target
+    // Each target term is an expression and an optional collation; the
+    // parser reads `x COLLATE c` as one expression, so a top-level COLLATE is
+    // the term's collation.
+    let target_terms: Vec<(&Expr, Option<&str>)> = target
         .columns
         .iter()
-        .map(|indexed_column| match &indexed_column.expr {
-            Expr::Column(column, _) => {
-                Some((column.column.as_ref(), indexed_column.collation.as_deref()))
-            }
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    if target_cols.is_empty() {
+        .map(
+            |indexed_column| match (&indexed_column.expr, &indexed_column.collation) {
+                (
+                    Expr::Collate {
+                        expr, collation, ..
+                    },
+                    None,
+                ) => (expr.as_ref(), Some(collation.as_str())),
+                (expr, collation) => (expr, collation.as_deref()),
+            },
+        )
+        .collect();
+    if target_terms.is_empty() {
         return None;
     }
-    // Check if the target matches a UNIQUE index (not the PK).
+    // Check if the target matches a UNIQUE index (not the PK). As in stock's
+    // sqlite3UpsertAnalyzeTarget, every term matches one key term, in any
+    // order: a column by its name, an expression key (bd-d8s37) by its
+    // structure. An explicit collation must be the key term's.
     for (idx_offset, index) in table.indexes.iter().enumerate() {
-        if !index.is_unique
-            || index.columns.is_empty()
-            || index.columns.len() != index.key_term_count()
-            || index.columns.len() != target_cols.len()
-        {
+        let key_terms = index.key_term_count();
+        if !index.is_unique || key_terms == 0 || key_terms != target_terms.len() {
             continue;
         }
-        let mut matched_index_columns = vec![false; index.columns.len()];
-        let columns_match = target_cols.iter().all(|(target_column, target_collation)| {
-            let Some(index_position) =
-                index
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .position(|(index_position, index_column)| {
-                        matched_index_columns
-                            .get(index_position)
-                            .is_some_and(|matched| !matched)
-                            && index_column.eq_ignore_ascii_case(target_column)
-                            && target_collation.is_none_or(|target_collation| {
-                                index
-                                    .key_term_collation(index_position)
-                                    .unwrap_or("BINARY")
-                                    .eq_ignore_ascii_case(target_collation)
-                            })
-                    })
+        let key_exprs = if index.has_plain_column_key() {
+            None
+        } else {
+            let Some(exprs) = (0..key_terms)
+                .map(|key_pos| parse_sql_expr(index.key_term_sql(key_pos)?).ok())
+                .collect::<Option<Vec<Expr>>>()
             else {
+                continue;
+            };
+            Some(exprs)
+        };
+        let term_matches_key = |term: &Expr, collation: Option<&str>, key_pos: usize| {
+            collation.is_none_or(|collation| {
+                index
+                    .key_term_collation(key_pos)
+                    .unwrap_or("BINARY")
+                    .eq_ignore_ascii_case(collation)
+            }) && match &key_exprs {
+                None => match term {
+                    Expr::Column(column, _) => index
+                        .columns
+                        .get(key_pos)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&column.column)),
+                    _ => false,
+                },
+                Some(exprs) => exprs
+                    .get(key_pos)
+                    .is_some_and(|key| expressions_match_table_locally(term, key, table, None)),
+            }
+        };
+        let mut matched_key_terms = vec![false; key_terms];
+        let terms_match = target_terms.iter().all(|&(term, collation)| {
+            let Some(key_pos) = (0..key_terms).find(|&key_pos| {
+                !matched_key_terms[key_pos] && term_matches_key(term, collation, key_pos)
+            }) else {
                 return false;
             };
-            let Some(matched) = matched_index_columns.get_mut(index_position) else {
-                return false;
-            };
-            *matched = true;
+            matched_key_terms[key_pos] = true;
             true
         });
-        if columns_match && upsert_target_matches_index_predicate(table, target, index) {
+        if terms_match && upsert_target_matches_index_predicate(table, target, index) {
             return Some((idx_offset, index));
         }
     }
@@ -27905,20 +27923,34 @@ fn emit_upsert_probe(
         // UNIQUE index conflict check.
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
         let idx_cursor = cursor + 1 + idx_offset as i32;
-        let n_key_cols = index.columns.len() as i32;
+        let n_key_cols = index.key_term_count() as i32;
 
-        // Build probe key from attempted insert values.
+        // Build probe key from attempted insert values: a column key copies
+        // the column's register, an expression key (bd-d8s37) is computed
+        // from the attempted row, as index maintenance computes it.
         let key_val_regs = b.alloc_regs(n_key_cols);
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        for (key_pos, col_name) in index.columns.iter().enumerate() {
-            if let Some(col_idx) = table.column_index(col_name) {
-                b.emit_op(
-                    Opcode::Copy,
-                    val_regs + col_idx as i32,
+        if index.has_plain_column_key() {
+            for (key_pos, col_name) in index.columns.iter().enumerate() {
+                if let Some(col_idx) = table.column_index(col_name) {
+                    b.emit_op(
+                        Opcode::Copy,
+                        val_regs + col_idx as i32,
+                        key_val_regs + key_pos as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                }
+            }
+        } else {
+            for key_pos in 0..index.key_term_count() {
+                emit_index_key_term(
+                    b,
+                    index,
+                    key_pos,
                     key_val_regs + key_pos as i32,
-                    0,
-                    P4::None,
-                    0,
+                    &attempted_row_ctx,
                 );
             }
         }
