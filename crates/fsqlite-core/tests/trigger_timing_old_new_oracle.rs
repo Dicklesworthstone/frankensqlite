@@ -198,3 +198,113 @@ fn trigger_timing_esoteric() {
             "UPDATE t SET a = 30 WHERE id = 1", "SELECT id, a FROM mirror", "compound body NEW-OLD mix").await;
     });
 }
+
+/// bd-90jrv: `NEW.x` / `OLD.x` compare with their column's collation as a
+/// declared (not explicit) collation, in trigger bodies, subqueries and WHEN
+/// clauses: it beats a literal, loses to an explicit COLLATE on either side
+/// and to a column on its left, and does not survive `||`. Every logged row,
+/// on `:memory:` and on a file, with the DML run directly and prepared,
+/// matches bundled SQLite 3.54.1.
+#[test]
+fn trigger_old_new_compare_with_the_column_collation() {
+    const SETUP: &[&str] = &[
+        "CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT, r TEXT COLLATE RTRIM, n TEXT COLLATE NOCASE)",
+        "CREATE TABLE lg(k TEXT, m)",
+        "CREATE TABLE u(v TEXT, w TEXT COLLATE NOCASE)",
+        "INSERT INTO u VALUES ('ABC', 'ABC')",
+        "CREATE TRIGGER ti AFTER INSERT ON t BEGIN \
+           INSERT INTO lg VALUES ('lit=N', 'ABC' = NEW.a); \
+           INSERT INTO lg VALUES ('N=lit', NEW.a = 'ABC'); \
+           INSERT INTO lg VALUES ('N>B', NEW.a > 'B'); \
+           INSERT INTO lg VALUES ('N<>lit', NEW.a <> 'ABC'); \
+           INSERT INTO lg VALUES ('N is lit', NEW.a IS 'ABC'); \
+           INSERT INTO lg VALUES ('N in1', NEW.a IN ('ABC')); \
+           INSERT INTO lg VALUES ('N in2', NEW.a IN ('ABC', 'zz')); \
+           INSERT INTO lg VALUES ('N in sub', NEW.a IN (SELECT v FROM u)); \
+           INSERT INTO lg VALUES ('between', NEW.a BETWEEN 'ABC' AND 'ABC'); \
+           INSERT INTO lg VALUES ('lit between N', 'ABC' BETWEEN NEW.a AND NEW.n); \
+           INSERT INTO lg VALUES ('case', CASE NEW.a WHEN 'ABC' THEN 1 ELSE 0 END); \
+           INSERT INTO lg VALUES ('case when N', CASE 'ABC' WHEN NEW.a THEN 1 ELSE 0 END); \
+           INSERT INTO lg VALUES ('nullif', quote(nullif(NEW.a, 'ABC'))); \
+           INSERT INTO lg VALUES ('max', max(NEW.a, 'ABD')); \
+           INSERT INTO lg VALUES ('min', min('ABD', NEW.a)); \
+           INSERT INTO lg VALUES ('cast', CAST(NEW.a AS TEXT) = 'ABC'); \
+           INSERT INTO lg VALUES ('plus', +NEW.a = 'ABC'); \
+           INSERT INTO lg VALUES ('rtrim', NEW.r = 'x'); \
+           INSERT INTO lg VALUES ('N=Nb', NEW.a = NEW.b); \
+           INSERT INTO lg VALUES ('Nb=N', NEW.b = NEW.a); \
+           INSERT INTO lg VALUES ('N=u.v', (SELECT count(*) FROM u WHERE NEW.a = u.v)); \
+           INSERT INTO lg VALUES ('lit=N sub', (SELECT count(*) FROM u WHERE 'ABC' = NEW.a)); \
+           INSERT INTO lg VALUES ('exists', EXISTS (SELECT 1 FROM u WHERE NEW.a = 'ABC')); \
+           INSERT INTO lg VALUES ('neg concat', NEW.a || '' = 'ABC'); \
+           INSERT INTO lg VALUES ('neg explicit right', NEW.a = 'ABC' COLLATE BINARY); \
+           INSERT INTO lg VALUES ('neg explicit left', NEW.a COLLATE BINARY = 'ABC'); \
+           INSERT INTO lg VALUES ('neg column left', (SELECT count(*) FROM u WHERE u.v = NEW.a)); \
+           INSERT INTO lg VALUES ('neg nocase column left', (SELECT count(*) FROM u WHERE u.w = NEW.b)); \
+           INSERT INTO lg VALUES ('neg list member', 'ABC' IN (NEW.a, 'zz')); \
+           INSERT INTO lg VALUES ('neg binary column', NEW.b = 'ABC'); \
+           INSERT INTO lg VALUES ('neg nullif binary', quote(nullif(NEW.b, 'ABC'))); \
+         END",
+        "CREATE TRIGGER tw AFTER INSERT ON t WHEN NEW.a = 'ABC' BEGIN \
+           INSERT INTO lg VALUES ('when', 1); END",
+        "CREATE TRIGGER twn AFTER INSERT ON t WHEN NEW.b = 'ABC' BEGIN \
+           INSERT INTO lg VALUES ('neg when binary', 1); END",
+        "CREATE TRIGGER tws AFTER INSERT ON t \
+           WHEN (SELECT count(*) FROM u) = 1 AND NEW.a = 'ABC' BEGIN \
+           INSERT INTO lg VALUES ('when and', 1); END",
+        "CREATE TRIGGER tu AFTER UPDATE ON t BEGIN \
+           INSERT INTO lg VALUES ('old', OLD.a = 'ABC'); \
+           INSERT INTO lg VALUES ('new', NEW.a = 'XYZ'); \
+           UPDATE u SET w = 'update hit' WHERE OLD.a = 'ABC' AND NEW.a = 'XYZ'; \
+           INSERT INTO lg VALUES ('update body where', (SELECT w FROM u)); \
+         END",
+        "CREATE TRIGGER td BEFORE DELETE ON t WHEN OLD.a = 'XYZ' BEGIN \
+           INSERT INTO lg VALUES ('del', OLD.a > 'Y'); \
+           UPDATE u SET v = 'delete hit' WHERE OLD.a = 'XYZ'; \
+           INSERT INTO lg VALUES ('delete body where', (SELECT v FROM u)); \
+         END",
+    ];
+    const DML: &[&str] = &[
+        "INSERT INTO t VALUES ('abc', 'abc', 'x  ', 'ABC')",
+        "UPDATE t SET a = 'xyz'",
+        "DELETE FROM t",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in SETUP.iter().chain(DML) {
+            r.execute_batch(sql).unwrap();
+        }
+        let verify = "SELECT k, m FROM lg ORDER BY rowid";
+        let expected = rqe(&r, verify);
+        assert!(
+            expected.len() > 30,
+            "the stock log should record every probe: {expected:?}"
+        );
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = if file_backed {
+                    dir.path().join("collation.db").to_str().unwrap().to_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let f = Connection::open(&path).await.unwrap();
+                for sql in SETUP {
+                    f.execute(sql).await.unwrap();
+                }
+                for sql in DML {
+                    if prepared {
+                        f.prepare(sql).await.unwrap().execute().await.unwrap();
+                    } else {
+                        f.execute(sql).await.unwrap();
+                    }
+                }
+                assert_eq!(
+                    fq(&f, verify).await,
+                    expected,
+                    "file_backed={file_backed} prepared={prepared}"
+                );
+            }
+        }
+    });
+}

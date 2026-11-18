@@ -10732,6 +10732,11 @@ struct TriggerFrame {
     /// Name of the trigger being executed (for recursive_triggers guard).
     trigger_name: String,
     column_names: Vec<String>,
+    /// bd-90jrv: each column's declared collation, parallel to
+    /// `column_names` (`None` for BINARY, for the INTEGER PRIMARY KEY, and
+    /// when the frame does not know it). Stock compares `NEW.x` / `OLD.x`
+    /// with it as a column's (not an explicit) collation.
+    column_collations: Vec<Option<String>>,
     rowid_alias_col_idx: Option<usize>,
     old_row: Option<Vec<SqliteValue>>,
     new_row: Option<Vec<SqliteValue>>,
@@ -10819,6 +10824,16 @@ impl TriggerFrame {
 
     fn lookup_from_row(row: Option<&[SqliteValue]>, column_index: usize) -> Option<SqliteValue> {
         row.and_then(|values| values.get(column_index).cloned())
+    }
+
+    /// bd-90jrv: the non-BINARY collation a reference to `column_name` (a
+    /// real column, not a rowid alias) carries in a trigger.
+    fn declared_collation(&self, column_name: &str) -> Option<&str> {
+        let index = self.column_index(column_name)?;
+        self.column_collations
+            .get(index)?
+            .as_deref()
+            .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"))
     }
 
     fn hidden_rowid_column_index(&self, column_name: &str) -> Option<usize> {
@@ -74669,6 +74684,19 @@ impl Connection {
             .iter()
             .map(|column| column.name.clone())
             .collect();
+        // bd-90jrv: the INTEGER PRIMARY KEY is the rowid, which has no
+        // collation in stock.
+        let column_collations = table_schema
+            .columns
+            .iter()
+            .map(|column| {
+                if column.is_ipk {
+                    None
+                } else {
+                    column.collation.clone()
+                }
+            })
+            .collect();
         let rowid_alias_col_idx = table_schema.columns.iter().position(|column| column.is_ipk);
         // bd-oh34i: stock applies each column's affinity to the NEW record
         // before any BEFORE or AFTER trigger reads it (sqlite3TableAffinity),
@@ -74739,6 +74767,7 @@ impl Connection {
             table_name: table_schema.name.clone(),
             trigger_name: String::new(), // set per-trigger in the fire loop
             column_names,
+            column_collations,
             rowid_alias_col_idx,
             old_row: old_values.map(ToOwned::to_owned),
             new_row,
@@ -77618,6 +77647,8 @@ impl Connection {
             table_name: view_name.to_owned(),
             trigger_name: String::new(),
             column_names: column_names.to_vec(),
+            // bd-90jrv: a view column's collation is not tracked here yet.
+            column_collations: Vec::new(),
             rowid_alias_col_idx: None,
             old_row: old_values.map(<[SqliteValue]>::to_vec),
             new_row: new_values.map(<[SqliteValue]>::to_vec),
@@ -163003,6 +163034,8 @@ fn bind_trigger_body_statement(
 /// Walk the AND / OR / NOT skeleton of a WHEN clause: EXISTS leaves bind with
 /// parameters, everything else through the ordinary literal binder.
 fn bind_trigger_when_skeleton(expr: &mut Expr, frame: &TriggerFrame) {
+    // bd-90jrv: the comparison leaf below binds each operand on its own.
+    wrap_trigger_operand_collations(expr, frame, false, false);
     match expr {
         Expr::BinaryOp {
             left,
@@ -163073,6 +163106,225 @@ fn bind_trigger_prefixed_only_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
     bind_trigger_columns_in_expr_inner(expr, frame, true, false);
 }
 
+/// Whether the trigger binder may replace a column reference qualified by
+/// `table_prefix` with its OLD/NEW value.
+fn trigger_binder_may_bind_prefix(
+    table_prefix: Option<&str>,
+    frame: &TriggerFrame,
+    prefix_only: bool,
+    trigger_table_name_shadowed: bool,
+) -> bool {
+    // In prefix_only mode (DML WHERE/SET inside trigger bodies), only column
+    // references with an explicit OLD or NEW qualifier are replaced. Bare
+    // names (`id`) and table-qualified names (`t.id`) must resolve against
+    // the DML's target table at execution time — they are NOT trigger
+    // pseudo-columns.
+    if prefix_only
+        && !table_prefix
+            .is_some_and(|p| p.eq_ignore_ascii_case("old") || p.eq_ignore_ascii_case("new"))
+    {
+        return false;
+    }
+    !(trigger_table_name_shadowed
+        && table_prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(&frame.table_name)))
+}
+
+/// bd-90jrv: the non-BINARY collation of the OLD/NEW column `operand` names,
+/// directly or through CAST or unary `+` (stock's sqlite3ExprCollSeq passes
+/// through both), when the binder will replace that reference with a value.
+fn trigger_pseudo_column_collation(
+    operand: &Expr,
+    frame: &TriggerFrame,
+    prefix_only: bool,
+    trigger_table_name_shadowed: bool,
+) -> Option<String> {
+    let Expr::Column(col_ref, _) = declared_collation_source(operand) else {
+        return None;
+    };
+    // The collation first: a BINARY column needs no further checks.
+    let collation = frame.declared_collation(&col_ref.column)?;
+    let table_prefix = col_ref.table.as_deref();
+    if !trigger_binder_may_bind_prefix(
+        table_prefix,
+        frame,
+        prefix_only,
+        trigger_table_name_shadowed,
+    ) || !frame.references_pseudo_column(table_prefix, &col_ref.column)
+        || frame.lookup_value(table_prefix, &col_ref.column).is_none()
+    {
+        return None;
+    }
+    Some(collation.to_owned())
+}
+
+/// The expression whose declared (column) collation `expr` carries: through
+/// CAST and unary `+`, as stock's sqlite3ExprCollSeq walks.
+fn declared_collation_source(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Cast { expr, .. }
+        | Expr::UnaryOp {
+            op: UnaryOp::Plus,
+            expr,
+            ..
+        } => declared_collation_source(expr),
+        _ => expr,
+    }
+}
+
+/// Whether `expr` may carry a declared collation that ends stock's precedence
+/// search (a column reference, OLD/NEW included, or a bound outer value). A
+/// subquery counts too, conservatively.
+fn may_carry_declared_collation(expr: &Expr) -> bool {
+    matches!(
+        declared_collation_source(expr),
+        Expr::Column(..) | Expr::BoundOuterValue { .. } | Expr::Subquery(..)
+    )
+}
+
+/// bd-90jrv: stock gives `NEW.x` / `OLD.x` its column's collation as a
+/// declared, not explicit, collation (TK_TRIGGER in sqlite3ExprCollSeq).
+/// The binder turns the reference into a value that carries none, so at
+/// each node that chooses a comparison collation, wrap the operand whose
+/// declared collation wins stock's precedence (an explicit COLLATE on either
+/// side, then the left operand's declared collation, then the right's) in
+/// an explicit COLLATE of that name. The wrapper only applies where no
+/// explicit COLLATE competes, so it yields exactly stock's choice. BINARY is
+/// never wrapped: the value compares BINARY unless the other operand is a
+/// column with its own collation, and an explicit BINARY on a probe value
+/// would cost that column's index seek.
+fn wrap_trigger_operand_collations(
+    expr: &mut Expr,
+    frame: &TriggerFrame,
+    prefix_only: bool,
+    trigger_table_name_shadowed: bool,
+) {
+    let collation_of = |operand: &Expr| {
+        trigger_pseudo_column_collation(operand, frame, prefix_only, trigger_table_name_shadowed)
+    };
+    let explicit = |operand: &Expr| first_explicit_collation_name(operand).is_some();
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::Is
+                | BinaryOp::IsNot,
+            right,
+            ..
+        } => {
+            if explicit(left) || explicit(right) {
+                return;
+            }
+            if let Some(collation) = collation_of(left) {
+                wrap_in_trigger_collation(left, collation);
+            } else if !may_carry_declared_collation(left)
+                && let Some(collation) = collation_of(right)
+            {
+                wrap_in_trigger_collation(right, collation);
+            }
+        }
+        // An IN list or subquery compares with its left operand's collation.
+        Expr::In {
+            expr: operand, set, ..
+        } => {
+            let right_explicit = match set {
+                InSet::List(values) => values.iter().any(&explicit),
+                InSet::Subquery(select) => match &select.body.select {
+                    SelectCore::Select { columns, .. } => columns.first().is_some_and(|column| {
+                        matches!(column, ResultColumn::Expr { expr, .. } if explicit(expr))
+                    }),
+                    SelectCore::Values(_) => false,
+                },
+                InSet::Table(_) => false,
+            };
+            if !explicit(operand)
+                && !right_explicit
+                && let Some(collation) = collation_of(operand)
+            {
+                wrap_in_trigger_collation(operand, collation);
+            }
+        }
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            ..
+        } => {
+            if explicit(operand) || explicit(low) || explicit(high) {
+                return;
+            }
+            if let Some(collation) = collation_of(operand) {
+                wrap_in_trigger_collation(operand, collation);
+            } else if !may_carry_declared_collation(operand) {
+                for bound in [low, high] {
+                    if let Some(collation) = collation_of(bound) {
+                        wrap_in_trigger_collation(bound, collation);
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand: Some(base),
+            whens,
+            ..
+        } => {
+            if explicit(base) || whens.iter().any(|(value, _)| explicit(value)) {
+                return;
+            }
+            if let Some(collation) = collation_of(base) {
+                wrap_in_trigger_collation(base, collation);
+            } else if !may_carry_declared_collation(base) {
+                for (value, _) in whens {
+                    if let Some(collation) = collation_of(value) {
+                        wrap_in_trigger_collation(value, collation);
+                    }
+                }
+            }
+        }
+        // NULLIF and scalar MIN / MAX use the first argument that has a
+        // collation.
+        Expr::FunctionCall {
+            name,
+            args: FunctionArgs::List(args),
+            filter: None,
+            over: None,
+            ..
+        } if name.eq_ignore_ascii_case("nullif")
+            || (args.len() >= 2
+                && (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max"))) =>
+        {
+            for arg in args.iter_mut() {
+                if explicit(arg) {
+                    return;
+                }
+                if let Some(collation) = collation_of(arg) {
+                    wrap_in_trigger_collation(arg, collation);
+                    return;
+                }
+                if may_carry_declared_collation(arg) {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn wrap_in_trigger_collation(operand: &mut Expr, collation: String) {
+    let span = operand.span();
+    let inner = std::mem::replace(operand, Expr::Literal(Literal::Null, span));
+    *operand = Expr::Collate {
+        expr: Box::new(inner),
+        collation,
+        span,
+    };
+}
+
 #[allow(clippy::too_many_lines)]
 fn bind_trigger_columns_in_expr_inner(
     expr: &mut Expr,
@@ -163080,6 +163332,7 @@ fn bind_trigger_columns_in_expr_inner(
     prefix_only: bool,
     trigger_table_name_shadowed: bool,
 ) {
+    wrap_trigger_operand_collations(expr, frame, prefix_only, trigger_table_name_shadowed);
     match expr {
         Expr::BoundOuterValue { .. }
         | Expr::Literal(_, _)
@@ -163087,22 +163340,12 @@ fn bind_trigger_columns_in_expr_inner(
         | Expr::Placeholder(_, _) => {}
         Expr::Column(col_ref, _) => {
             let table_prefix = col_ref.table.as_deref();
-            if prefix_only {
-                // In prefix_only mode (DML WHERE/SET inside trigger bodies),
-                // only replace column references with an explicit OLD or NEW
-                // qualifier.  Bare names (`id`) and table-qualified names
-                // (`t.id`) must resolve against the DML's target table at
-                // execution time — they are NOT trigger pseudo-columns.
-                let is_old_or_new = table_prefix.is_some_and(|p| {
-                    p.eq_ignore_ascii_case("old") || p.eq_ignore_ascii_case("new")
-                });
-                if !is_old_or_new {
-                    return;
-                }
-            }
-            if trigger_table_name_shadowed
-                && table_prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(&frame.table_name))
-            {
+            if !trigger_binder_may_bind_prefix(
+                table_prefix,
+                frame,
+                prefix_only,
+                trigger_table_name_shadowed,
+            ) {
                 return;
             }
             let column_name = col_ref.column.clone();
@@ -198003,6 +198246,7 @@ mod tests {
             table_name: "t".to_owned(),
             trigger_name: "trg".to_owned(),
             column_names: vec!["id".to_owned(), "name".to_owned()],
+            column_collations: Vec::new(),
             rowid_alias_col_idx: None,
             old_row: None,
             new_row: Some(vec![
@@ -199907,6 +200151,7 @@ mod tests {
                 table_name: "t".to_owned(),
                 trigger_name: "trg".to_owned(),
                 column_names: Vec::new(),
+                column_collations: Vec::new(),
                 rowid_alias_col_idx: None,
                 old_row: None,
                 new_row: None,
@@ -200466,6 +200711,7 @@ mod tests {
                 table_name: "t".to_owned(),
                 trigger_name: "trg".to_owned(),
                 column_names: Vec::new(),
+                column_collations: Vec::new(),
                 rowid_alias_col_idx: None,
                 old_row: None,
                 new_row: None,
@@ -200563,6 +200809,7 @@ mod tests {
             table_name: "start".to_owned(),
             trigger_name: "start_trg".to_owned(),
             column_names: Vec::new(),
+            column_collations: Vec::new(),
             rowid_alias_col_idx: None,
             old_row: None,
             new_row: None,
@@ -200673,6 +200920,7 @@ mod tests {
                 table_name: "t".to_owned(),
                 trigger_name: "trg".to_owned(),
                 column_names: Vec::new(),
+                column_collations: Vec::new(),
                 rowid_alias_col_idx: None,
                 old_row: None,
                 new_row: None,
@@ -316418,6 +316666,7 @@ mod pager_routing_tests {
                 table_name: "t".to_owned(),
                 trigger_name: "tr".to_owned(),
                 column_names: Vec::new(),
+                column_collations: Vec::new(),
                 rowid_alias_col_idx: None,
                 old_row: None,
                 new_row: None,
