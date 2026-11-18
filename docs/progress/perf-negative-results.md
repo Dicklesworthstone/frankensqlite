@@ -94,6 +94,86 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - REJECTED on its third kill line at the landing parent (code layout at identical Ir; v1 rejected on rowid_lookups): the table seek cache keeps eight leaves, scanned in place (bd-w4pr1.12, read-loop round 8, lever SC8 v2)
+
+- Target: join_1M_to_pk_1000 after SL1 v3, 4,124 Ir per row against stock's 1,721. Callgrind:
+  CursorBackend::table_move_to 1,047.7M inclusive for the 405k probes that change leaf, about 2,590
+  Ir each (two load_page, the interior search, the landing). u is five leaves in the fsqlite-built
+  file and the keys step by -81, so the four-slot seek cache missed on every leaf change.
+- Ledger preflight: no entry changed the slot count; bd-w4pr1.13.13 (the bounds filter) and
+  bd-w4pr1.13.27 (the in-place hit rotation) keep a miss cheap; the SL1 v3 entry named this lever.
+- Touched (not landed; patch `scratchpad rl8/sc8v2.patch`, applied unchanged to a7c78382f and
+  5afb99152): `crates/fsqlite-btree/src/cursor.rs`: `TABLE_SEEK_CACHE_SLOTS` 4 -> 8;
+  `next_table_seek_slot` (a synchronous scan for the next slot whose landing admits the target, by
+  reference) drives `try_table_seek_cache`; `remember_table_seek` updates the array in place (the
+  slot naming the leaf, else the first empty one, else the last gives way; the slots before it
+  rotate down one). The two tests that pinned four slots are re-expressed over the constant.
+- Prediction (bd-w4pr1.12, 2026-11-18, before each build): v1 join -450 to -700M Ir, rowid_lookups
+  within +0.5%; v2 join -450 to -560M, CPU -50 to -90 ms, memory_script -180 to -240M,
+  rowid_lookups -10..+10M. Kill (predeclared): join under 300M or CPU not lower in each of two
+  runs; any read row +0.5% Ir or more; a row's cycles pair median above its A/A arm's highest pair
+  ratio in both runs; a rewritten test passing on a planted capacity-minus-one mutant.
+- v1 (the constant alone, sha256 d8082089078db55c): join -442.2M Ir, cycles 0.818, CPU x2.05 ->
+  x1.70 stock; rowid_lookups +44.2M (+1.64%) in both runs: REJECTED. Callgrind: remember_table_seek
+  rebuilt and copied back the doubled slot array (+123 Ir a probe) and the async slot loop copied
+  each slot out (+100 Ir a probe for four more slots).
+- v2 on a7c78382f (base sha256 28470d810fff20d9, v2 d44bf588e521b2b0, an A/A arm = the base ELF
+  again, and v1 in the same runs; stock sqlite3 3.46.1 live; thinkstation1, powersave, load about
+  3, io_uring refused, serial (0 extra threads observed); two runs of 7 interleaved reps; answers
+  equal everywhere): join 4,123.5M -> 3,661.1M Ir (x2.40 -> x2.13 stock), cycles 0.840 / 0.842,
+  CPU x2.05 -> x1.73 and x1.97 -> x1.68 stock; memory_script_200k -208.6M Ir (its :memory: join);
+  rowid_lookups_200k +0.4M (+0.02%); every other read row within 0.4M Ir. Cycles above the A/A
+  arm's highest pair ratio in one run only (window_sum_over, GROUP BY a with sum(c)); scan_filter_agg
+  0.982 / 1.014 and gb_id 1.004 / 1.012. All three kill lines passed on this binary.
+- v2 on its landing parent 5afb99152 (parent CLI sha256 f6491e56a20c5570, landing
+  34d5040b367cf11e, A/A = the parent ELF on its own copy; same host and method, load 4.6-6.8):
+  - Kill line 1 passes: join -462.4M / -462.5M Ir, cycles 0.863 / 0.838, CPU pair medians 0.868 /
+    0.823.
+  - Kill line 2 passes: memory_script -208.6M, rowid_lookups +0.4M, every read row under +0.08% Ir.
+  - Kill line 3 fires on two rows, at identical Ir, in both runs: scan_filter_agg cycles 1.056
+    against its A/A arm's highest pair ratio 1.036, and 1.066 against 1.039 (CPU 1.039 / 1.042);
+    gb_id 1.032 against 1.016, and 1.020 against 1.017.
+- Why (pure layout; scratchpad `rl8/c11_layout.md`, bead comment 2026-11-18): of 16,012 text symbols
+  95 changed size, all in the seek / insert / delete / bulk-load / cursor-open code, and the two rows
+  execute three of them once per statement (about 880 Ir). The 40 hottest functions of each row
+  (98.3% / 95.4% of Ir) and the 21 multi-instance hot symbols have identical instruction streams;
+  every one moved by +0x4b0 to +0xa20, 16-48 B mod 64 (run_hot_opcodes_sync 16 -> 48). Zen3 counters
+  (5 interleaved reps per group, no multiplexing, net of SELECT 1): instructions, retired ops and
+  taken branches equal; stalled-cycles-frontend x1.46 (+11.7M) on scan_filter_agg and x2.20
+  (+71.9M) on gb_id, gb_id instruction-cache misses x1.53; branch misses +1.3k / +43k. A v3 with
+  the fill and miss code out of line would change no code these rows run, so it was not built.
+- Planted mutants (rch): both rewritten tests fail (rc 101) on v1's capacity-minus-one rebuild and
+  on v2's (the last slot cleared after every landing): the LRU test sees seven slots where eight
+  were filled, the loads-only test reads root + leaf for a leaf that should be cached.
+- Gate (a7c78382f + v2): clippy on fsqlite-btree / -vdbe / -core clean; 52 test binaries, 6,219
+  passed, 1 failed (the known bd_8c68u compile-count red). The fsqlite-e2e oracle targets and the
+  fsqlite crate never returned results (infra: a link failure and an unconfirmed completion on
+  vmi1293453, RCH-E330 disk budget on hz3).
+- Retry condition: a landing binary that passes all three kill lines above, measured on the exact
+  parent and landing ELFs, with e2e and fsqlite results. Next attempt: the sc8v2 arm of SL2's
+  four-arm run (parent, A/A, sc8v2, sc8v2 + SL2) on the next parent, judged on its own lines.
+
+## 2026-11-18 - REJECTED on its kill lines: an inline test of the newest seek-cache slot's bounds before the same-leaf fast path's call (bd-w4pr1.12, read-loop round 8, lever DEC v1)
+
+- Target: rowid_lookups_200k's ~52 Ir a probe for SL1 v3's declined fast path (200k probes, none
+  on the current leaf).
+- Touched (reverted; patch `scratchpad rl8/dec_v1.patch`): `crates/fsqlite-btree/src/cursor.rs`
+  (`BtCursor::table_seek_within_leaf_admits`, which the fast path also uses as its first test; the
+  SL1 keeper asserts every answer was admitted, every decline in its walk was not, and the
+  moved-off-leaf case is admitted yet declined), `crates/fsqlite-vdbe/src/engine.rs`
+  (`CursorBackend::try_table_seek_within_leaf` tests admission inline and calls an
+  `#[inline(never)]` remainder).
+- Prediction (2026-11-18, before the build): rowid_lookups -6 to -9M Ir, join -10 to -20M. Kill:
+  rowid_lookups down by less than 4M, another row +0.5% Ir.
+- Result (on SC8 v1, against it, same invocation, 3 interleaved reps, stock live): rowid_lookups
+  -3.4M (-0.12%); join +24.4M (+0.66%), cycles 1.070. Both kill lines crossed.
+- Why: the CursorBackend match over three cursor types stays in the caller, so a decline saves
+  about 17 Ir; an admitted probe pays the bounds test twice and one more call layer (+40 Ir on the
+  join's 595k same-leaf hits).
+- Retry condition: a decline test that reads the newest slot's bounds without the per-backend match
+  (the bounds mirrored in the VDBE's StorageCursor when a seek lands, for instance) and adds
+  nothing to an admitted probe.
+
 ## 2026-11-18 - WIN (structural, landed as dc795a9ba; the gain grows with the schema): an explicit transaction keeps a ROLLBACK copy of the catalog only when it changes it, -310k user instructions and -25 us per transaction over 20 tables with two indexes each (bd-w4pr1.7, round 5, lever L1)
 
 - Target: every explicit transaction, read or write. BEGIN called `snapshot()`, which deep-copied
