@@ -90729,12 +90729,15 @@ impl Connection {
                         let expr: &Expr = if owned_plan.is_empty() {
                             expr
                         } else {
-                            owned_bound = self.bind_owned_subquery_aggregates(
-                                expr,
-                                owned_plan,
-                                &owned_group_rows,
-                                &col_map,
-                            )?;
+                            owned_bound = self
+                                .bind_owned_subquery_aggregates(
+                                    expr,
+                                    owned_plan,
+                                    &owned_group_rows,
+                                    &col_map,
+                                    using_skip,
+                                )
+                                .await?;
                             &owned_bound
                         };
                         let val = if self.expr_contains_aggregate_with_registry(expr) {
@@ -91063,12 +91066,15 @@ impl Connection {
                 let having = if having_owned_plan.is_empty() {
                     having
                 } else {
-                    owned_having = self.bind_owned_subquery_aggregates(
-                        having,
-                        &having_owned_plan,
-                        &owned_group_rows,
-                        &col_map,
-                    )?;
+                    owned_having = self
+                        .bind_owned_subquery_aggregates(
+                            having,
+                            &having_owned_plan,
+                            &owned_group_rows,
+                            &col_map,
+                            using_skip,
+                        )
+                        .await?;
                     &owned_having
                 };
                 let resolved_having;
@@ -91143,8 +91149,11 @@ impl Connection {
                         let expr: &Expr = match order_owned_plans.get(*term_idx) {
                             Some(plan) if !plan.is_empty() => {
                                 let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                                owned_bound =
-                                    self.bind_owned_subquery_aggregates(expr, plan, &refs, &col_map)?;
+                                owned_bound = self
+                                    .bind_owned_subquery_aggregates(
+                                        expr, plan, &refs, &col_map, using_skip,
+                                    )
+                                    .await?;
                                 &owned_bound
                             }
                             _ => expr,
@@ -124825,6 +124834,44 @@ fn walk_window_spec_exprs_mut(
 }
 
 /// The SELECT of a scalar, EXISTS or IN subquery node.
+/// bd-p42bj: the table label of the per-row subquery values an owned aggregate
+/// call reads (see `eval_owned_subquery_aggregate`); no SQL name can match it.
+const OWNED_AGGREGATE_PROBE_TABLE: &str = "\u{1}owned aggregate probe";
+
+/// bd-k66zh: visit each call of `expr` that `plan` (from
+/// `plan_owned_subquery_aggregates`) marks as owned, in walk order, and
+/// replace it with what `visit` returns. The walk never enters an owned call,
+/// so it takes the same path whether or not `visit` replaces it.
+fn visit_owned_subquery_aggregates(
+    expr: &mut Expr,
+    plan: &[Vec<bool>],
+    visit: &mut dyn FnMut(&Expr) -> Option<Expr>,
+) {
+    let mut subqueries = plan.iter();
+    walk_expr_mut(expr, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |node, _| {
+        let Some(subquery) = direct_subquery_mut(node) else {
+            return true;
+        };
+        let Some(owned) = subqueries.next() else {
+            return true;
+        };
+        let mut owned = owned.iter();
+        walk_select_exprs_mut(subquery, &mut |call, _| {
+            if !is_owned_aggregate_candidate(call) {
+                return true;
+            }
+            if !owned.next().copied().unwrap_or(false) {
+                return true;
+            }
+            if let Some(value) = visit(call) {
+                *call = value;
+            }
+            false
+        });
+        true
+    });
+}
+
 fn direct_subquery_mut(expr: &mut Expr) -> Option<&mut SelectStatement> {
     match expr {
         Expr::Subquery(subquery, _)
@@ -125040,70 +125087,101 @@ impl Connection {
 
     /// bd-k66zh: `expr` with each owned call of `plan` replaced by its value
     /// over `group_rows`, the rows of one group of the owning core.
-    fn bind_owned_subquery_aggregates(
+    async fn bind_owned_subquery_aggregates(
         &self,
         expr: &Expr,
         plan: &[Vec<bool>],
         group_rows: &[&Vec<SqliteValue>],
         col_map: &[(String, String, bool)],
+        using_skip: Option<&HashSet<usize>>,
     ) -> Result<Expr> {
+        // bd-p42bj: a call's arguments may hold subqueries, which run once per
+        // row, so the calls are collected by one walk, evaluated, and put back
+        // by a second walk that takes the same path through `expr`.
+        let mut calls = Vec::new();
+        visit_owned_subquery_aggregates(&mut expr.clone(), plan, &mut |call| {
+            calls.push(call.clone());
+            None
+        });
+        let mut values = Vec::with_capacity(calls.len());
+        for call in &calls {
+            values.push(
+                self.eval_owned_subquery_aggregate(call, group_rows, col_map, using_skip)
+                    .await?,
+            );
+        }
         let mut bound = expr.clone();
-        let mut subqueries = plan.iter();
-        let mut failure = None;
-        walk_expr_mut(
-            &mut bound,
-            UNPLACED_AGGREGATE_WALK_SITE,
-            false,
-            &mut |node, _| {
-                if failure.is_some() {
-                    return false;
-                }
-                let Some(subquery) = direct_subquery_mut(node) else {
-                    return true;
-                };
-                let Some(owned) = subqueries.next() else {
-                    return true;
-                };
-                let mut owned = owned.iter();
-                walk_select_exprs_mut(subquery, &mut |call, _| {
-                    if failure.is_some() {
-                        return false;
-                    }
-                    if !is_owned_aggregate_candidate(call) {
-                        return true;
-                    }
-                    if !owned.next().copied().unwrap_or(false) {
-                        return true;
-                    }
-                    match self.eval_owned_subquery_aggregate(call, group_rows, col_map) {
-                        Ok(value) => *call = value,
-                        Err(error) => failure = Some(error),
-                    }
-                    false
-                });
-                true
-            },
-        );
-        failure.map_or(Ok(bound), Err)
+        let mut values = values.into_iter();
+        visit_owned_subquery_aggregates(&mut bound, plan, &mut |_| values.next());
+        Ok(bound)
     }
 
     /// bd-k66zh: the value of `call`, an aggregate of the grouped core, over
     /// one group's rows, as the literal its subquery reads.
-    fn eval_owned_subquery_aggregate(
+    async fn eval_owned_subquery_aggregate(
         &self,
         call: &Expr,
         group_rows: &[&Vec<SqliteValue>],
         col_map: &[(String, String, bool)],
+        using_skip: Option<&HashSet<usize>>,
     ) -> Result<Expr> {
-        if expr_has_any_subquery(call) {
-            return Err(FrankenError::NotImplemented(
-                "an aggregate of an enclosing query whose arguments hold a subquery (bd-k66zh)"
-                    .to_owned(),
-            ));
-        }
-        let value = self.with_fallback_function_registry(|| {
-            eval_group_agg_join_expr(call, &GroupRows::new(group_rows), col_map)
-        })?;
+        let value = if expr_has_any_subquery(call) {
+            // bd-p42bj: `sum((SELECT n))`. Each subquery the call holds reads
+            // the owning core's columns, so it is evaluated against every row
+            // of the group, and the call aggregates those values as extra
+            // columns of the rows.
+            let mut aggregated = call.clone();
+            let mut probes = Vec::new();
+            walk_expr_mut(
+                &mut aggregated,
+                UNPLACED_AGGREGATE_WALK_SITE,
+                false,
+                &mut |node, _| {
+                    if direct_subquery_mut(node).is_none() {
+                        return true;
+                    }
+                    let column = Expr::Column(
+                        ColumnRef::qualified(
+                            OWNED_AGGREGATE_PROBE_TABLE,
+                            format!("p{}", probes.len()),
+                        ),
+                        node.span(),
+                    );
+                    probes.push(std::mem::replace(node, column));
+                    false
+                },
+            );
+            let mut probe_col_map = col_map.to_vec();
+            probe_col_map.extend((0..probes.len()).map(|index| {
+                (
+                    OWNED_AGGREGATE_PROBE_TABLE.to_owned(),
+                    format!("p{index}"),
+                    false,
+                )
+            }));
+            let mut probe_rows = Vec::with_capacity(group_rows.len());
+            for row in group_rows {
+                let mut probe_row = Vec::with_capacity(row.len() + probes.len());
+                probe_row.extend_from_slice(row);
+                for probe in &probes {
+                    let inlined = self
+                        .inline_subqueries_in_expr_with_using(probe, row, col_map, using_skip)
+                        .await?;
+                    probe_row.push(self.with_fallback_function_registry(|| {
+                        eval_join_expr(&inlined, row, col_map)
+                    })?);
+                }
+                probe_rows.push(probe_row);
+            }
+            let probe_refs: Vec<&Vec<SqliteValue>> = probe_rows.iter().collect();
+            self.with_fallback_function_registry(|| {
+                eval_group_agg_join_expr(&aggregated, &GroupRows::new(&probe_refs), &probe_col_map)
+            })?
+        } else {
+            self.with_fallback_function_registry(|| {
+                eval_group_agg_join_expr(call, &GroupRows::new(group_rows), col_map)
+            })?
+        };
         let span = match call {
             Expr::FunctionCall { span, .. } => *span,
             _ => Span::ZERO,

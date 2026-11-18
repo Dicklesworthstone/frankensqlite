@@ -166,6 +166,25 @@ const STATEMENTS: &[&str] = &[
     "SELECT k, (SELECT count(*) FROM g WHERE g.n < max(p.v)) FROM p GROUP BY k ORDER BY k",
     "SELECT count(*) FROM g GROUP BY s HAVING (SELECT max(n)) > 1",
     "SELECT * FROM g WHERE n > (SELECT avg(v) FROM p)",
+    // bd-p42bj: an owned call whose arguments hold subqueries over the owning
+    // core's row, evaluated per row of the group.
+    "SELECT (SELECT sum((SELECT n))) FROM g",
+    "SELECT (SELECT count((SELECT n + 1))), (SELECT max((SELECT n * 2))) FROM g",
+    "SELECT (SELECT sum((SELECT n) + 1)) FROM g",
+    "SELECT (SELECT group_concat((SELECT s), '-')) FROM g",
+    "SELECT n % 2, (SELECT sum((SELECT n))) FROM g GROUP BY n % 2 ORDER BY 1",
+    "SELECT k FROM p GROUP BY k HAVING (SELECT sum((SELECT v))) > 2 ORDER BY k",
+    "SELECT (SELECT sum((SELECT count(*) FROM p WHERE p.v <= g.n))) FROM g",
+    "SELECT (SELECT sum(EXISTS (SELECT 1 FROM p WHERE p.v = g.n * 2))) FROM g",
+    "SELECT (SELECT sum(n IN (SELECT v FROM p WHERE k = 'a'))) FROM g",
+    "SELECT (SELECT (SELECT max((SELECT n * 10)))) FROM g",
+    "SELECT (SELECT count(DISTINCT (SELECT n % 2))) FROM g",
+    "SELECT (SELECT sum((SELECT n))) FROM g WHERE n > 5",
+    "SELECT k, (SELECT sum((SELECT v)) + count(*)) FROM p GROUP BY k ORDER BY k",
+    "SELECT (SELECT sum((SELECT n FROM g AS h WHERE h.id = g.id))) FROM g",
+    // ... and calls that stay the subquery's own: one per outer row.
+    "SELECT (SELECT total((SELECT NULL))) FROM g",
+    "SELECT (SELECT sum((SELECT n)) FROM g AS h) FROM g",
     // Positions stock rejects.
     "SELECT count(*) FROM g WHERE (SELECT sum(n)) > 1",
     "SELECT id FROM g ORDER BY (SELECT sum(n))",
