@@ -94,6 +94,92 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - WIN (drop-in correctness, stock live; not a speed claim): a plain-BEGIN transaction whose COMMIT loses a page conflict is replayed within busy_timeout when nothing it returned would change; 8 CLI writers x 300 'BEGIN; INSERT; COMMIT' on one table commit 2,400 of 2,400 rows as stock does (median 1,888.5 before) (bd-q4o7z, mp lane round 2)
+
+- Target: the .5.4 shape, explicit-same in `mw_conflict.py`. N CLI processes x M
+  `BEGIN; INSERT; COMMIT` on one shared table, busy_timeout 5000, tmpfs. Landed as a3d329d47.
+  - New: `crates/fsqlite-core/src/connection/txn_replay.rs`.
+  - `connection.rs`: enter/leave around the public SQL calls, plus hooks in `background_status`,
+    statement dispatch, `execute_begin`, the .5.1 refusal path and `last_insert_rowid()`.
+  - `fsqlite-func/src/vtab.rs`: a per-thread virtual-table write count.
+- Ledger preflight: no earlier entry touches transaction replay. Lever 1 v1/v1b (2026-11-17, below)
+  died on explicit-same refusals. This change turns those refusals into replays, one of lever 1's
+  retry conditions.
+- Prediction (bd-q4o7z, before code): explicit-same median 1,910 -> 2,400; wall flat to +30%. Kill
+  lines:
+  - median under 2,390;
+  - any negative keeper committing;
+  - an integrity failure in the one-table or own-tables stress;
+  - single-process cost over 2%.
+- Result, stock sqlite3 3.46.1 live. Landing tree 26d81df3d, release-perf CLIs: base
+  e2079f015e4c5912, this change c6c1e01c3bd9a48e. Host thinkstation1, 64 threads, governor
+  powersave.
+  - explicit-same 8 x 300 (6 reps): 1,736-1,931 committed (3,195 rows lost) -> 2,400 in every rep,
+    0 error lines. Wall median 534 -> 633 ms (stock 146 ms).
+  - 16 x 150: 1,702-1,855 -> 2,400. Wall 638 -> 866 ms (stock 119 ms).
+  - explicit-sep 8 x 300: 583 -> 598 ms. Base lost 1 row in 3 reps; this change lost none.
+  - A first A/B on 25e3e883b gave the same picture: 1,630-2,080 -> 2,400, 561 -> 649 ms.
+  - The scorecard multiproc row (autocommit, which never records), interleaved `mp1_scale.py`:
+    - 787.7 -> 750.8 ms over 15 reps (x5.49 -> x5.23 stock);
+    - 790.1 -> 833.4 ms over 9 reps, and 837.0 -> 831.5 ms on 25e3e883b;
+    - N=16: 1,139.6 -> 1,103.4 ms.
+    Unchanged within noise.
+  - Single process:
+    - User instructions per transaction (`perf stat`, 7 interleaved reps): explicit 220,290 ->
+      222,355 (+0.9%); autocommit 178,853 -> 177,398.
+    - Native CPU (15 reps pinned to one CPU) varies 2-3% between runs of the same pair:
+      - explicit: +0.2% / +0.9% (mean / median) on 25e3e883b; +2.6% / +1.9% on 26d81df3d;
+      - autocommit: -0.5%; and +1.5% / +3.1%.
+  - An earlier shape (v1) took each call's future by value. That cost +1.0% CPU, and callgrind
+    showed about 54 KB per transaction more `memcpy`. The landed shape awaits the call in place
+    between a synchronous enter and a small leave.
+  - Do not use callgrind totals on this CLI. Main-thread Ir at 1,500 transactions swung from 0.37G
+    to 5.3G between runs of one binary: the waits on the WAL-FEC flush at close, and the scheduler
+    polling inside them, follow valgrind's thread scheduling.
+  - Stress, 20 reps each (CLI 25e3e883b plus this change): one table and own tables, 8 x 300. 2,400
+    every rep, integrity ok, 0 error lines.
+- Keepers:
+  - `multiprocess_autocommit_busy_timeout_e2e::cross_process_explicit_writers_on_one_table_commit_every_row_as_stock`.
+    Under a no-replay variant it fails with 747 refusals.
+  - `refused_commit_ends_transaction_e2e::..._is_replayed_when_nothing_it_returned_changes`. Under
+    the no-replay variant it fails with BusySnapshot.
+  - Seven negatives: rowid via API / RETURNING / SQL, changes(), a new constraint error, an
+    application function, PRAGMA / DDL / a streamed read, and the two count-reading refusal
+    keepers. Each fails under a naive-replay variant (no poisoning, no outcome or rowid check).
+- Gate (rch):
+  - Full gate on 26d81df3d plus the change:
+    - clippy clean; fsqlite-core lib 4200/0; fsqlite-func 533/0;
+    - e2e: concurrent-writer 132/0; cross-process 62 pass, 1 fail (the p3_fair_wakeup flake: it
+      never replays, and its worst row took 84 of 100 attempts in 10 repeats); multiprocess 10/0;
+    - wal fault-injection 1314/0; wal 1183/0; mvcc 1687/0; pager 1114 pass, 1 fail (known
+      bd_2jpu6_2); fsqlite crate 1100/0;
+    - core keepers green except gh19 (known).
+  - Re-run on 9c1183f44:
+    - clippy clean; core lib 4200/0; cross-process 63/0; concurrent-writer 132/0;
+    - vfs 531/0; gh519 10/0;
+    - the multiprocess file's stock oracle was invalid on an overloaded worker.
+  - Re-run on dc7142eec:
+    - clippy clean; refused-commit 15/0; multiprocess 10/0;
+    - core lib 4199 pass, 1 fail: a commit_repair timing assertion that passed on both earlier trees
+      and involves no Connection.
+  - Re-run on fa0390991, after rebasing past the single-writer lane's catalog-copy change dc795a9ba
+    (it reshapes BEGIN and ROLLBACK, which the replay runs through):
+    - clippy clean; core lib 4201/0; core keepers green except gh19;
+    - refused-commit 15/0; multiprocess 10/0.
+  - The landed a3d329d47 is fa0390991 rebased past bf5138830 (the cross-process lane's new
+    short-busy_timeout arm, merged by hand into this file's keeper). On it: e2e clippy clean,
+    refused-commit 15/0, multiprocess 11/0.
+  - Not re-run after the last rebases: the WAL, mvcc, pager and vfs libs, the fsqlite crate, and the
+    concurrent-writer and cross-process batches.
+- Retry condition / next:
+  - In-process same-page writers (8 connections, one process) commit 346-416 of 2,400. The losses
+    are INSERT-time page-lock refusals, with 0 replays. Retry when that statement-level conflict
+    has a decided answer: wait for the page lock within busy_timeout, or replay at the statement.
+  - ORM-style transactions that read their new id still get 517 under contention: the
+    rowid-commute follow-up named in the decision.
+  - Streamed `query_with_params_for_each` reads (the compat facade's `query_map`) are not recorded.
+    Retry by digesting streamed rows once a workload shows them refused.
+
 ## 2026-11-18 - REJECTED on its time kill line (instructions -78.6M, user cycles +97.8M): the Affinity arm reads its code bytes, maps them inline and clears subtypes only when the program has any (bd-w4pr1.13, bulk-write round 9, lever AF)
 
 - Target: the per-row `Affinity` of an INSERT row body (the scorecard's `bulk_insert_1M_one_txn`, one op over 4
