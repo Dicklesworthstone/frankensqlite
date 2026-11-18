@@ -9,6 +9,7 @@
 mod display;
 pub use display::quote_ident_if_needed;
 pub mod rebase;
+pub mod row_value;
 
 use std::fmt;
 use std::sync::Arc;

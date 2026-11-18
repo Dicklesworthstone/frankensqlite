@@ -35516,13 +35516,18 @@ fn emit_default_value(
     }
 }
 
-/// Parse column DEFAULT SQL text into an expression AST.
+/// Parse a schema expression's SQL text (a column DEFAULT, a CHECK
+/// constraint, a generated column) into an expression AST, with its
+/// row-value comparisons expanded into scalar ones (bd-s7gqh): codegen reads
+/// a row value as NULL, so `CHECK ((x, y) <> (0, 0))` passed every row.
 fn parse_default_expr(default_sql: &str) -> Option<Expr> {
     let trimmed = default_sql.trim();
     if trimmed.is_empty() {
         return None;
     }
-    parse_sql_expr(trimmed).ok()
+    let mut expr = parse_sql_expr(trimmed).ok()?;
+    fsqlite_ast::row_value::lower_row_values_in_expr(&mut expr);
+    Some(expr)
 }
 
 /// A column DEFAULT's text as the value expression INSERT evaluates. The text

@@ -10981,6 +10981,10 @@ async fn trigger_when_matches(
         return Ok(true);
     };
     let mut bound_expr = expr.clone();
+    // bd-s7gqh: a WHEN clause is not a statement, so it does not pass the
+    // statement rewrite stage; check and expand its row values here.
+    fsqlite_ast::row_value::check_and_lower_row_values_in_expr(&mut bound_expr)
+        .map_err(|misused| FrankenError::FunctionError(misused.to_string()))?;
     // bd-f5s4w: see `bind_trigger_body_statement`.
     if pin_main_relations {
         qualify_persistent_view_expr(&mut bound_expr, &mut Vec::new());
@@ -44403,6 +44407,26 @@ impl Connection {
         statement: &'a Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Cow<'a, Statement>> {
+        // bd-s7gqh: codegen and the connection's evaluators compare single
+        // values, and codegen reads a row value as NULL, so `(a, n) IS (NULL,
+        // 1)` matched every row and `(a, n) = ('abc', 1)` none. Every
+        // statement (execute, query, prepare, each trigger body statement)
+        // passes this rewrite stage, so this is where its row-value
+        // comparisons are checked against stock's misuse rules and expanded
+        // into scalar ones, in every clause and nested subquery. A statement
+        // without a row value is only walked, not cloned. The expansion
+        // repeats operands, so placeholders are numbered first, in text order
+        // as stock numbers them: a repeated `?` would take a new number.
+        if fsqlite_ast::row_value::check_statement_row_values(statement)
+            .map_err(|misused| FrankenError::FunctionError(misused.to_string()))?
+        {
+            let mut lowered = number_statement_placeholders(statement)?;
+            fsqlite_ast::row_value::lower_row_values_in_statement(&mut lowered);
+            let rewritten = Box::pin(self.rewrite_subquery_statement(&lowered, params))
+                .await?
+                .into_owned();
+            return Ok(Cow::Owned(rewritten));
+        }
         // bd-1ht9p: a leading parenthesized join is an ordinary join list.
         if let Statement::Select(select) = statement
             && select_has_leading_paren_join(select)
@@ -89628,9 +89652,11 @@ impl Connection {
         let prof = hot_path_profile_enabled();
         let t = prof.then(Instant::now);
         let mut canonical_select = canonicalize_select_placeholders(select)?;
-        // bd-l2si0: expand row-value (tuple) comparisons into scalar boolean
-        // expressions before codegen, which otherwise collapses them to false.
-        rewrite_row_value_comparisons_in_select(&mut canonical_select);
+        // bd-l2si0 / bd-s7gqh: codegen compares single values only, so expand
+        // row-value comparisons into scalar ones. A statement arrives here
+        // already expanded and checked (`rewrite_subquery_statement`); this
+        // pass covers the SELECTs the engine builds itself.
+        fsqlite_ast::row_value::lower_row_values_in_select(&mut canonical_select);
         record_hot_path_duration(&FSQLITE_COMPILE_CANONICAL_NS, t);
 
         // bd-5310l: the whole schema is deep-cloned per compile ONLY as a defensive snapshot,
@@ -132979,446 +133005,6 @@ async fn rewrite_in_limit_clause(
     Ok(())
 }
 
-/// bd-l2si0: Expand a row-value (tuple) comparison `(a0,..) OP (b0,..)` into the
-/// equivalent scalar boolean expression. SQLite defines row-value comparisons
-/// element-wise (`=`/`<>`) and lexicographically (`<`/`<=`/`>`/`>=`) with the
-/// usual three-valued logic; the VDBE codegen otherwise silently collapses such
-/// comparisons to false, and the table-less expression path errors on a bare
-/// `RowValue`. Both operands must be the same non-empty length; returns `None`
-/// for unsupported operators (e.g. `IS`) so the caller leaves the node intact.
-fn expand_row_value_comparison(a: &[Expr], b: &[Expr], op: BinaryOp, span: Span) -> Option<Expr> {
-    let cmp = |l: &Expr, r: &Expr, o: BinaryOp| Expr::BinaryOp {
-        left: Box::new(l.clone()),
-        op: o,
-        right: Box::new(r.clone()),
-        span,
-    };
-    let join = |op: BinaryOp| {
-        move |acc: Expr, e: Expr| Expr::BinaryOp {
-            left: Box::new(acc),
-            op,
-            right: Box::new(e),
-            span,
-        }
-    };
-    match op {
-        // (a,b) = (c,d)  ->  a = c AND b = d
-        BinaryOp::Eq => a
-            .iter()
-            .zip(b)
-            .map(|(l, r)| cmp(l, r, BinaryOp::Eq))
-            .reduce(join(BinaryOp::And)),
-        // (a,b) <> (c,d)  ->  a <> c OR b <> d
-        BinaryOp::Ne => a
-            .iter()
-            .zip(b)
-            .map(|(l, r)| cmp(l, r, BinaryOp::Ne))
-            .reduce(join(BinaryOp::Or)),
-        // (a,b) IS (c,d)  ->  a IS c AND b IS d  (NULL-safe, componentwise).
-        // Also covers `IS NOT DISTINCT FROM`, which parses to IS. (GH #170, #243)
-        BinaryOp::Is => a
-            .iter()
-            .zip(b)
-            .map(|(l, r)| cmp(l, r, BinaryOp::Is))
-            .reduce(join(BinaryOp::And)),
-        // (a,b) IS NOT (c,d)  ->  a IS NOT c OR b IS NOT d. Also covers
-        // `IS DISTINCT FROM`, which parses to IS NOT. (GH #170, #243)
-        BinaryOp::IsNot => a
-            .iter()
-            .zip(b)
-            .map(|(l, r)| cmp(l, r, BinaryOp::IsNot))
-            .reduce(join(BinaryOp::Or)),
-        // Lexicographic: a0 STRICT b0 OR (a0 = b0 AND <rest>), last element uses
-        // the original (possibly non-strict) operator.
-        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            let strict = match op {
-                BinaryOp::Lt | BinaryOp::Le => BinaryOp::Lt,
-                _ => BinaryOp::Gt,
-            };
-            Some(expand_row_value_order(a, b, strict, op, span))
-        }
-        _ => None,
-    }
-}
-
-/// Recursive lexicographic expansion helper for [`expand_row_value_comparison`].
-fn expand_row_value_order(
-    a: &[Expr],
-    b: &[Expr],
-    strict: BinaryOp,
-    last: BinaryOp,
-    span: Span,
-) -> Expr {
-    let cmp = |l: &Expr, r: &Expr, o: BinaryOp| Expr::BinaryOp {
-        left: Box::new(l.clone()),
-        op: o,
-        right: Box::new(r.clone()),
-        span,
-    };
-    if a.len() == 1 {
-        return cmp(&a[0], &b[0], last);
-    }
-    let head_strict = cmp(&a[0], &b[0], strict);
-    let head_eq = cmp(&a[0], &b[0], BinaryOp::Eq);
-    let rest = expand_row_value_order(&a[1..], &b[1..], strict, last, span);
-    let and_part = Expr::BinaryOp {
-        left: Box::new(head_eq),
-        op: BinaryOp::And,
-        right: Box::new(rest),
-        span,
-    };
-    Expr::BinaryOp {
-        left: Box::new(head_strict),
-        op: BinaryOp::Or,
-        right: Box::new(and_part),
-        span,
-    }
-}
-
-/// bd-47svm: Statically-known result-column arity of a subquery used as an
-/// operand of a row-value comparison `(a, b) OP (SELECT x, y ...)`. Returns
-/// `None` for shapes whose arity is not knowable here (compound / `VALUES`
-/// bodies, or `*` / `table.*` result columns), so the caller leaves the node
-/// intact rather than mis-projecting it.
-fn row_value_comparison_subquery_arity(select: &SelectStatement) -> Option<usize> {
-    if !select.body.compounds.is_empty() {
-        return None;
-    }
-    let SelectCore::Select { columns, .. } = &select.body.select else {
-        return None;
-    };
-    if columns
-        .iter()
-        .any(|c| !matches!(c, ResultColumn::Expr { .. }))
-    {
-        return None;
-    }
-    Some(columns.len())
-}
-
-/// bd-47svm: Project a row-value subquery down to its `col_idx`-th result column,
-/// preserving FROM/WHERE/ORDER BY/LIMIT so every projected column is drawn from
-/// the same (first) row and any outer correlation survives — mirroring the
-/// UPDATE `SET (a, b) = (SELECT ...)` projection (bd-6utze). `None` for the same
-/// unsupported shapes as [`row_value_comparison_subquery_arity`].
-fn project_row_value_comparison_subquery_column(
-    select: &SelectStatement,
-    col_idx: usize,
-) -> Option<SelectStatement> {
-    if !select.body.compounds.is_empty() {
-        return None;
-    }
-    let SelectCore::Select { columns, .. } = &select.body.select else {
-        return None;
-    };
-    let target = columns.get(col_idx)?;
-    if !matches!(target, ResultColumn::Expr { .. }) {
-        return None;
-    }
-    let target = target.clone();
-    let mut projected = select.clone();
-    if let SelectCore::Select { columns, .. } = &mut projected.body.select {
-        *columns = vec![target];
-    }
-    Some(projected)
-}
-
-/// bd-47svm: Materialize a single-row multi-column subquery into a vector of
-/// per-column scalar subqueries `[(SELECT x ...), (SELECT y ...)]`, so a
-/// row-value comparison whose operand is a subquery can reuse
-/// [`expand_row_value_comparison`]'s element-wise / lexicographic lowering. Each
-/// projected scalar subquery reads the same (first) row, matching SQLite's
-/// row-value subquery semantics. `None` when the subquery arity is not
-/// statically known.
-fn row_value_comparison_subquery_columns(
-    select: &SelectStatement,
-    span: Span,
-) -> Option<Vec<Expr>> {
-    let arity = row_value_comparison_subquery_arity(select)?;
-    let mut cols = Vec::with_capacity(arity);
-    for i in 0..arity {
-        let projected = project_row_value_comparison_subquery_column(select, i)?;
-        cols.push(Expr::Subquery(Box::new(projected), span));
-    }
-    Some(cols)
-}
-
-/// bd-l2si0: Recursively expand every `RowValue OP RowValue` comparison in an
-/// expression tree. `IN (list)` / `IN (SELECT ...)` row values are handled by
-/// `rewrite_in_expr` and are only descended into here, not transformed.
-fn rewrite_row_value_comparisons(expr: &Expr) -> Expr {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op,
-            right,
-            span,
-        } => {
-            let l = rewrite_row_value_comparisons(left);
-            let r = rewrite_row_value_comparisons(right);
-            if let (Expr::RowValue(la, _), Expr::RowValue(ra, _)) = (&l, &r)
-                && !la.is_empty()
-                && la.len() == ra.len()
-                && let Some(expanded) = expand_row_value_comparison(la, ra, *op, *span)
-            {
-                return expanded;
-            }
-            // bd-47svm: `(a, b) OP (SELECT x, y ...)` — the RHS is a single-row
-            // multi-column subquery, not a literal tuple, so the `RowValue`
-            // guard above misses it and the VDBE codegen collapses the subquery
-            // to its first column (0 rows). Materialize the subquery into
-            // per-column scalar subqueries and reuse the same element-wise /
-            // lexicographic lowering. Symmetric for a subquery LHS.
-            if let (Expr::RowValue(la, _), Expr::Subquery(sub, sub_span)) = (&l, &r)
-                && !la.is_empty()
-                && row_value_comparison_subquery_arity(sub) == Some(la.len())
-                && let Some(rb) = row_value_comparison_subquery_columns(sub, *sub_span)
-                && let Some(expanded) = expand_row_value_comparison(la, &rb, *op, *span)
-            {
-                return expanded;
-            }
-            if let (Expr::Subquery(sub, sub_span), Expr::RowValue(ra, _)) = (&l, &r)
-                && !ra.is_empty()
-                && row_value_comparison_subquery_arity(sub) == Some(ra.len())
-                && let Some(lb) = row_value_comparison_subquery_columns(sub, *sub_span)
-                && let Some(expanded) = expand_row_value_comparison(&lb, ra, *op, *span)
-            {
-                return expanded;
-            }
-            Expr::BinaryOp {
-                left: Box::new(l),
-                op: *op,
-                right: Box::new(r),
-                span: *span,
-            }
-        }
-        Expr::UnaryOp {
-            op,
-            expr: inner,
-            span,
-        } => Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(rewrite_row_value_comparisons(inner)),
-            span: *span,
-        },
-        Expr::Between {
-            expr: e,
-            low,
-            high,
-            not,
-            span,
-        } => {
-            let e2 = rewrite_row_value_comparisons(e);
-            let low2 = rewrite_row_value_comparisons(low);
-            let high2 = rewrite_row_value_comparisons(high);
-            // Row-value BETWEEN expands to (e >= low) AND (e <= high); row-value
-            // NOT BETWEEN to (e < low) OR (e > high) — each side compared
-            // lexicographically via the row-value comparison expansion. (GH #171)
-            if let (Expr::RowValue(ea, _), Expr::RowValue(la, _), Expr::RowValue(ha, _)) =
-                (&e2, &low2, &high2)
-                && !ea.is_empty()
-                && ea.len() == la.len()
-                && ea.len() == ha.len()
-            {
-                let (lo_op, hi_op, combine) = if *not {
-                    (BinaryOp::Lt, BinaryOp::Gt, BinaryOp::Or)
-                } else {
-                    (BinaryOp::Ge, BinaryOp::Le, BinaryOp::And)
-                };
-                if let (Some(lo_cmp), Some(hi_cmp)) = (
-                    expand_row_value_comparison(ea, la, lo_op, *span),
-                    expand_row_value_comparison(ea, ha, hi_op, *span),
-                ) {
-                    return Expr::BinaryOp {
-                        left: Box::new(lo_cmp),
-                        op: combine,
-                        right: Box::new(hi_cmp),
-                        span: *span,
-                    };
-                }
-            }
-            Expr::Between {
-                expr: Box::new(e2),
-                low: Box::new(low2),
-                high: Box::new(high2),
-                not: *not,
-                span: *span,
-            }
-        }
-        Expr::In {
-            expr: e,
-            set,
-            not,
-            span,
-        } => Expr::In {
-            expr: Box::new(rewrite_row_value_comparisons(e)),
-            set: match set {
-                InSet::List(items) => {
-                    InSet::List(items.iter().map(rewrite_row_value_comparisons).collect())
-                }
-                other => other.clone(),
-            },
-            not: *not,
-            span: *span,
-        },
-        Expr::Like {
-            expr: e,
-            pattern,
-            escape,
-            op,
-            not,
-            span,
-        } => Expr::Like {
-            expr: Box::new(rewrite_row_value_comparisons(e)),
-            pattern: Box::new(rewrite_row_value_comparisons(pattern)),
-            escape: escape
-                .as_ref()
-                .map(|x| Box::new(rewrite_row_value_comparisons(x))),
-            op: *op,
-            not: *not,
-            span: *span,
-        },
-        Expr::Case {
-            operand,
-            whens,
-            else_expr,
-            span,
-        } => Expr::Case {
-            operand: operand
-                .as_ref()
-                .map(|x| Box::new(rewrite_row_value_comparisons(x))),
-            whens: whens
-                .iter()
-                .map(|(w, t)| {
-                    (
-                        rewrite_row_value_comparisons(w),
-                        rewrite_row_value_comparisons(t),
-                    )
-                })
-                .collect(),
-            else_expr: else_expr
-                .as_ref()
-                .map(|x| Box::new(rewrite_row_value_comparisons(x))),
-            span: *span,
-        },
-        Expr::Cast {
-            expr: e,
-            type_name,
-            span,
-        } => Expr::Cast {
-            expr: Box::new(rewrite_row_value_comparisons(e)),
-            type_name: type_name.clone(),
-            span: *span,
-        },
-        Expr::FunctionCall {
-            name,
-            args,
-            distinct,
-            order_by,
-            filter,
-            over,
-            span,
-        } => Expr::FunctionCall {
-            name: name.clone(),
-            args: match args {
-                FunctionArgs::List(exprs) => {
-                    FunctionArgs::List(exprs.iter().map(rewrite_row_value_comparisons).collect())
-                }
-                FunctionArgs::Star => FunctionArgs::Star,
-            },
-            distinct: *distinct,
-            order_by: order_by.clone(),
-            filter: filter
-                .as_ref()
-                .map(|x| Box::new(rewrite_row_value_comparisons(x))),
-            over: over.clone(),
-            span: *span,
-        },
-        Expr::Collate {
-            expr: e,
-            collation,
-            span,
-        } => Expr::Collate {
-            expr: Box::new(rewrite_row_value_comparisons(e)),
-            collation: collation.clone(),
-            span: *span,
-        },
-        Expr::IsNull { expr: e, not, span } => Expr::IsNull {
-            expr: Box::new(rewrite_row_value_comparisons(e)),
-            not: *not,
-            span: *span,
-        },
-        Expr::JsonAccess {
-            expr: e,
-            path,
-            arrow,
-            span,
-        } => Expr::JsonAccess {
-            expr: Box::new(rewrite_row_value_comparisons(e)),
-            path: Box::new(rewrite_row_value_comparisons(path)),
-            arrow: *arrow,
-            span: *span,
-        },
-        Expr::RowValue(items, span) => Expr::RowValue(
-            items.iter().map(rewrite_row_value_comparisons).collect(),
-            *span,
-        ),
-        Expr::BoundOuterValue { .. }
-        | Expr::Literal(..)
-        | Expr::Column(..)
-        | Expr::Exists { .. }
-        | Expr::Subquery(..)
-        | Expr::Raise { .. }
-        | Expr::Placeholder(..) => expr.clone(),
-    }
-}
-
-/// bd-l2si0: Apply [`rewrite_row_value_comparisons`] across every expression in
-/// a SELECT (result columns, WHERE/HAVING, GROUP BY, ORDER BY, and compounds).
-fn rewrite_row_value_comparisons_in_select(select: &mut SelectStatement) {
-    rewrite_row_value_comparisons_in_select_core(&mut select.body.select);
-    for (_, core) in &mut select.body.compounds {
-        rewrite_row_value_comparisons_in_select_core(core);
-    }
-    for term in &mut select.order_by {
-        term.expr = rewrite_row_value_comparisons(&term.expr);
-    }
-}
-
-fn rewrite_row_value_comparisons_in_select_core(core: &mut SelectCore) {
-    match core {
-        SelectCore::Select {
-            columns,
-            where_clause,
-            group_by,
-            having,
-            ..
-        } => {
-            for col in columns.iter_mut() {
-                if let ResultColumn::Expr { expr, .. } = col {
-                    *expr = rewrite_row_value_comparisons(expr);
-                }
-            }
-            if let Some(w) = where_clause.as_mut() {
-                **w = rewrite_row_value_comparisons(w.as_ref());
-            }
-            for g in group_by.iter_mut() {
-                *g = rewrite_row_value_comparisons(g);
-            }
-            if let Some(h) = having.as_mut() {
-                **h = rewrite_row_value_comparisons(h.as_ref());
-            }
-        }
-        SelectCore::Values(rows) => {
-            for row in rows.iter_mut() {
-                for e in row.iter_mut() {
-                    *e = rewrite_row_value_comparisons(e);
-                }
-            }
-        }
-    }
-}
-
 ///
 /// True when a subquery's SELECT projects a wildcard (`*` or `table.*`) in any
 /// branch, so its result width cannot be determined without a resolved FROM
@@ -160919,7 +160505,7 @@ fn compile_expression_select(
     // table-less expression codegen otherwise cannot lower a bare `RowValue`.
     let rewritten_select = {
         let mut owned = select.clone();
-        rewrite_row_value_comparisons_in_select(&mut owned);
+        fsqlite_ast::row_value::lower_row_values_in_select(&mut owned);
         owned
     };
     let select = &rewritten_select;
@@ -161986,6 +161572,23 @@ fn delete_is_plain(delete: &DeleteStatement) -> bool {
         && delete.order_by.is_empty()
         && delete.limit.is_none()
         && delete.where_clause.as_ref().is_none_or(expr_is_plain)
+}
+
+/// bd-s7gqh: a copy of `statement` with every placeholder numbered in text
+/// order, as stock numbers them, so a rewrite that repeats an operand keeps
+/// its parameter. Other statement kinds are copied as they are.
+fn number_statement_placeholders(statement: &Statement) -> Result<Statement> {
+    Ok(match statement {
+        Statement::Select(select) => Statement::Select(canonicalize_select_placeholders(select)?),
+        Statement::Insert(insert) => Statement::Insert(canonicalize_insert_placeholders(insert)?),
+        Statement::Update(update) => Statement::Update(canonicalize_update_placeholders(update)?),
+        Statement::Delete(delete) => Statement::Delete(canonicalize_delete_placeholders(delete)?),
+        Statement::Explain { query_plan, stmt } => Statement::Explain {
+            query_plan: *query_plan,
+            stmt: Box::new(number_statement_placeholders(stmt)?),
+        },
+        other => other.clone(),
+    })
 }
 
 fn canonicalize_update_placeholders(
