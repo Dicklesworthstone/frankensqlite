@@ -10943,6 +10943,38 @@ fn pop_allocatable_freelist_page<F: VfsFile>(inner: &mut PagerInner<F>) -> Optio
     None
 }
 
+/// bd-ivhow: the next in-memory freelist page `allocate_page` may hand out
+/// as free.
+///
+/// In WAL mode `inner.freelist` holds two kinds of page number. Pages on the
+/// durable freelist (`durable_freelist_view`, the published page-1 chain)
+/// are free in the committed image. The rest are volatile: the unused tail
+/// of a page lease, or an abandoned EOF reservation, parked here while it
+/// lay above `db_size` and so never published as free. A peer process can
+/// grow the file through such a number and commit it as a live page. Once
+/// this pager's `db_size` covers it without a full committed-state refresh
+/// (its own commit certified the peer's larger floor, and its next begins
+/// took the "nothing committed since" early return), handing it out puts
+/// one physical page in two b-trees. Neither the EOF anti-alias gate (the
+/// page lies within the snapshot) nor first-committer-wins (the peer
+/// committed before the snapshot) can see that. Such a page goes to the
+/// abandonment pool instead: the commit fold's no-committed-frame test
+/// drops it when a peer wrote it, and publishes it free when it is a hole.
+/// A rollback-journal or private-memory pager has no fold and keeps the
+/// plain pop.
+fn pop_reusable_freelist_page<F: VfsFile>(inner: &mut PagerInner<F>) -> Option<PageNumber> {
+    if inner.journal_mode != JournalMode::Wal {
+        return pop_allocatable_freelist_page(inner);
+    }
+    while let Some(page) = pop_allocatable_freelist_page(inner) {
+        if page.get() > inner.db_size || inner.durable_freelist_view.contains(&page.get()) {
+            return Some(page);
+        }
+        inner.abandoned_eof_reservations.push(page);
+    }
+    None
+}
+
 fn normalize_freelist(pages: &[PageNumber], db_size: u32, page_size: PageSize) -> Vec<PageNumber> {
     let reserved = crate::journal::lock_byte_page(page_size);
     let mut normalized: Vec<PageNumber> = pages
@@ -11315,6 +11347,17 @@ fn clear_disowned_ledger<F: VfsFile>(inner: &PagerInner<F>) {
 /// among them while their frames were visible, and keeping the rest would
 /// reintroduce the very generation-crossing double-grant the clear guards.
 fn preserve_above_extent_at_generation_boundary<F: VfsFile>(inner: &mut PagerInner<F>) {
+    // bd-ivhow: the volatile-only part of the in-memory freelist (lease
+    // tails and abandoned reservations parked while above db_size) is
+    // generation-scoped like the pool. An in-range entry that a peer made
+    // live in the discarded generation has no frame in the new one, so the
+    // commit fold could no longer tell it from a hole: drop it here. A full
+    // refresh replaces the freelist right after; the unchanged-extent
+    // early return keeps it, and this is what clears it there.
+    let boundary_db_size = inner.db_size;
+    inner.freelist.retain(|page| {
+        page.get() > boundary_db_size || inner.durable_freelist_view.contains(&page.get())
+    });
     if ioq6x_ledger_disabled() {
         // Kill-switch: revert exactly to the pre-ledger behavior (discard the
         // parked pool; the ledger is inert because disown/adopt are no-ops).
@@ -27812,11 +27855,14 @@ where
                 // file — handing it out again would alias the peer's
                 // committed page (pinned by test_concurrent_rollback_
                 // quarantines_peer_claimed_eof_page_until_refresh). When
-                // the gate holds, begin-time refresh has replaced the
-                // freelist from durable state, and any race with a peer
-                // allocating the same page after our snapshot resolves at
-                // commit through WAL first-committer-wins conflict
-                // detection, exactly as for EOF growth.
+                // the gate holds, a race with a peer allocating the same
+                // page after our snapshot resolves at commit through WAL
+                // first-committer-wins conflict detection, exactly as for
+                // EOF growth. The begin-time refresh does NOT always
+                // replace the freelist from durable state (its unchanged
+                // early return keeps it), so a volatile entry that a peer
+                // grew through before our snapshot is screened out by
+                // `pop_reusable_freelist_page` (bd-ivhow).
                 let sole_current_snapshot = inner.active_transactions == 1
                     && (snapshot_gate_amplify_enabled()
                         || self.published_visible_commit_seq.get() == inner.commit_seq);
@@ -27857,8 +27903,13 @@ where
                 // Without this arm, default (concurrent) transactions
                 // never reused committed free pages and every churn
                 // workload grew the file at EOF without bound.
+                //
+                // bd-ivhow: "committed" is load-bearing. A volatile-only
+                // entry at or below db_size is not on the committed
+                // freelist and may be a peer's live page; it goes to the
+                // abandonment pool, not to this transaction.
                 if sole_current_snapshot
-                    && let Some(page) = pop_allocatable_freelist_page(&mut inner)
+                    && let Some(page) = pop_reusable_freelist_page(&mut inner)
                 {
                     let durable_origin = inner.durable_freelist_view.contains(&page.get());
                     if durable_origin {
@@ -27881,7 +27932,7 @@ where
                     );
                     return Ok(page);
                 }
-            } else if let Some(page) = pop_allocatable_freelist_page(&mut inner) {
+            } else if let Some(page) = pop_reusable_freelist_page(&mut inner) {
                 if inner.durable_freelist_view.contains(&page.get()) {
                     self.allocated_from_durable_freelist.insert(page.get());
                 }
