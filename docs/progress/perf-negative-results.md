@@ -94,6 +94,56 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - REJECTED on its time kill line at the landing parent (instructions met in six runs): a staged row write borrows the transaction's concurrent context and lends a slot's image with a token-free stand-in (bd-w4pr1.13, bulk-write round 9, lever D)
+
+- Target: every appended, staged-deleted and same-size-updated row: the scorecard's `bulk_insert_1M_one_txn`,
+  `delete_14pct_300k`, `update_10pct_300k`, `memory_script_200k`. Touched (not landed; patch
+  `scratchpad/r9/d_v1_on_dc7142eec.diff` of the bulk-write lane, `git diff` sha256 74a979f25eca6459, on dc7142eec):
+  `crates/fsqlite-vdbe/src/engine.rs` (`SharedTxnPageIo::try_mutate_staged_page_data` borrows `concurrent` for the
+  handle check instead of cloning the `ConcurrentContext`, three Arc increments and decrements a call),
+  `crates/fsqlite-types/src/lib.rs` (`PageData::placeholder`: no bytes, image token 0, which no image is minted
+  with), `crates/fsqlite-btree/src/cursor.rs` (the three `mem::replace` stand-ins of
+  `try_rewrite_top_page_in_staged_image` and `try_append_in_staged_image_of_cached_leaf`, where
+  `PageData::from_vec(Vec::new())` took a token with an atomic add).
+- Ledger preflight: the standalone ConcurrentContext borrow was rejected on 2026-05-05 and 2026-05-07 (twice); its
+  profile and scoped-borrow retry clauses were met (2.28% of bulk user cycles self time).
+- Prediction (bd-w4pr1.13, before code): bulk -15M to -40M user instructions, task-clock min -5 to -20 ms; delete
+  -1M to -3M; update -0.7M to -2M; memory_script within +-1M. Kill: bulk down less than 10M, bulk task-clock min not
+  down, or delete / update instructions up. Tie rule, declared on the bead before it was used: when runs disagree, a
+  15-rep interleaved bulk run decides, killing the lever if its task-clock min or median is not below base's.
+- Result (stock sqlite3 3.46.1 live in every run, thinkstation1, governor powersave, answers equal stock's): bulk
+  user instructions -30.5M, -31.0M, -30.6M, -31.2M, -30.9M and -31.3M min in six runs (-0.44%; 1.68x stock
+  4,177.4M either way); delete -1.1M to -1.2M, update -0.7M to -0.8M, memory_script -2.3M. Bulk task-clock min
+  -34.0, +1.3, -7.5 (first deciding run, pre-rebase binaries 762b140e... / 54d4082d...), -15.1, +22.5 ms. On the
+  landing binaries (base dc7142eec f0465c16..., lever 658a07f4...) the second deciding run gave task-clock min 852.1
+  -> 852.4 ms and median 872.0 -> 879.0, user cycles min 2,859.4M -> 2,875.5M and median 2,949.7M -> 2,980.6M
+  (stock 439.0 ms, 1,389.5M): killed. The ~31 instructions a row are below this row's time resolution, and the
+  rebased layout spent them back in cycles.
+- Retry condition: not as a standalone patch. Fold the borrow and the placeholder into a lever on the same per-row
+  staged-write path whose predicted bulk gain resolves on task-clock (at least ~15 ms at this row's +-20 ms run-to-run
+  spread on min).
+
+## 2026-11-18 - ABANDONED at step 0 (correctness, no code): a row's first change mutates the clean leaf image in place by releasing this connection's other holders (bd-w4pr1.13, bulk-write round 9, lever OWN1)
+
+- Target: the first change of each leaf in `delete_14pct_300k` / `update_10pct_300k` (2,250 leaves; each pays an
+  `Arc::make_mut` copy into a fresh 4 KiB page, part of fsqlite's ~11,000 page faults against stock's ~700).
+- Step 0 (callgrind of `BEGIN; DELETE FROM m WHERE id % 7 = 0; ROLLBACK` and the UPDATE twin on main c216c0852, the
+  300k-row table built by the same binary): every leaf comes from a WAL frame (2,264 `read_frame_page`, 2,264 frame
+  cache inserts, at most 7 published-plane hits), so its clean image is held only by this connection: the cursor's
+  stack entry, a transient clone, the WAL frame cache and `SimpleTransaction.txn_read_cache`.
+- Why abandoned: `txn_read_cache` is the snapshot's record of images already observed, not a cache. It is consulted
+  before every shared latest-image source (GH #129): removing an entry must mark the snapshot incomplete, after which
+  `ensure_uncached_snapshot_sequence` answers an uncached read with BusySnapshot once a peer has committed. And
+  `conflict_page_baselines` takes each written page's pre-image from it for the validator that byte-compares after a
+  mid-transaction WAL generation change, where an in-range page without a baseline fails closed (bd-jygg3). Dropping
+  the entry would turn a savepoint re-read after a peer commit, and a commit spanning a peer's WAL reset, into
+  BusySnapshot: a concurrent-writer behaviour change the lever's sign-off (this connection's caches only) did not
+  cover. Releasing only the other three holders gains nothing: the read cache still shares the image, so make_mut
+  copies anyway. With the pre-image kept, two live images per changed page is this design's minimum; stock keeps one
+  because it re-reads the WAL on rollback and has no cross-process baseline.
+- Retry condition: an owner decision that those two cases may fail closed, or a design that rebuilds a written
+  page's baseline from somewhere other than memory.
+
 ## 2026-11-18 - REJECTED on its third kill line at the landing parent (code layout at identical Ir; v1 rejected on rowid_lookups): the table seek cache keeps eight leaves, scanned in place (bd-w4pr1.12, read-loop round 8, lever SC8 v2)
 
 - Target: join_1M_to_pk_1000 after SL1 v3, 4,124 Ir per row against stock's 1,721. Callgrind:
