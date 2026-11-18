@@ -1043,14 +1043,24 @@ mod tests {
             .unwrap(),
             Some(1)
         );
-        // Stock stores 0.1 as the f32 just below it (low end) and just above
-        // it (high end); the shell prints them as these doubles.
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        stock
+            .execute_batch(
+                "CREATE VIRTUAL TABLE r USING rtree(id, x0, x1, y0, y1); \
+                 INSERT INTO r VALUES (1, 0.1, 0.1, 0, 1);",
+            )
+            .unwrap();
+        let (low, high): (f64, f64) = stock
+            .query_row("SELECT x0, x1 FROM r WHERE id = 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
         assert_eq!(
             full_scan(&table),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Float(0.099_999_986_588_954_93),
-                SqliteValue::Float(0.100_000_001_490_116_12),
+                SqliteValue::Float(low),
+                SqliteValue::Float(high),
                 SqliteValue::Float(0.0),
                 SqliteValue::Float(1.0),
             ]]

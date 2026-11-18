@@ -39,30 +39,57 @@ pub const RTREE_MIN_NODE_SIZE: usize = 512 - 64;
 /// `RTREE_DEFAULT_ROWEST`: the row estimate without `sqlite_stat1` data.
 pub const RTREE_DEFAULT_ROWEST: i64 = 1_048_576;
 
-/// `rtreeValueDown` / `rtreeValueUp` rounding factors.
-const RNDTOWARDS: f64 = 1.0 - 1.0 / 8_388_608.0;
-const RNDAWAY: f64 = 1.0 + 1.0 / 8_388_608.0;
-
 /// Converts a coordinate to `f32`, rounding toward negative infinity
 /// (`rtreeValueDown`), so a stored lower bound never exceeds the value.
 #[must_use]
 pub fn rtree_value_down(d: f64) -> f32 {
-    let mut f = d as f32;
-    if f64::from(f) > d {
-        f = (d * if d < 0.0 { RNDAWAY } else { RNDTOWARDS }) as f32;
-    }
-    f
+    let f = d as f32;
+    if f64::from(f) > d { f.next_down() } else { f }
 }
 
 /// Converts a coordinate to `f32`, rounding toward positive infinity
 /// (`rtreeValueUp`), so a stored upper bound is never below the value.
 #[must_use]
 pub fn rtree_value_up(d: f64) -> f32 {
-    let mut f = d as f32;
-    if f64::from(f) < d {
-        f = (d * if d < 0.0 { RNDTOWARDS } else { RNDAWAY }) as f32;
+    let f = d as f32;
+    if f64::from(f) < d { f.next_up() } else { f }
+}
+
+#[cfg(test)]
+#[test]
+fn outward_rounding_matches_stock_for_inexact_and_extreme_coordinates() {
+    let stock = rusqlite::Connection::open_in_memory().unwrap();
+    stock
+        .execute_batch("CREATE VIRTUAL TABLE r USING rtree(id, lo, hi)")
+        .unwrap();
+    let mut bounds = stock.prepare("SELECT lo, hi FROM r WHERE id = 1").unwrap();
+    let half_smallest_subnormal = f64::from(f32::from_bits(1)) / 2.0;
+    for coordinate in [
+        -9_746.1,
+        9_746.1,
+        -half_smallest_subnormal,
+        half_smallest_subnormal,
+        -f64::MAX,
+        f64::MAX,
+        1.25,
+    ] {
+        stock
+            .execute("INSERT OR REPLACE INTO r VALUES (1, ?1, ?1)", [coordinate])
+            .unwrap();
+        let (lo, hi): (f64, f64) = bounds
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert_eq!(
+            f64::from(rtree_value_down(coordinate)).to_bits(),
+            lo.to_bits(),
+            "lower bound for {coordinate}"
+        );
+        assert_eq!(
+            f64::from(rtree_value_up(coordinate)).to_bits(),
+            hi.to_bits(),
+            "upper bound for {coordinate}"
+        );
     }
-    f
 }
 
 /// The fixed shape of one tree's node images.
