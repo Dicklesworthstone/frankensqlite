@@ -2970,15 +2970,13 @@ fn quote_identifier(name: &str) -> String {
 
 fn sql_literal(value: &SqliteValue) -> String {
     match value {
-        SqliteValue::Text(text) => format!("'{}'", text.replace('\'', "''")),
-        SqliteValue::Blob(bytes) => {
-            let mut rendered = String::from("X'");
-            for byte in bytes.iter() {
-                let _ = write!(rendered, "{byte:02X}");
-            }
-            rendered.push('\'');
-            rendered
+        SqliteValue::Text(text) if !text.is_valid_utf8() => {
+            format!("CAST({} AS TEXT)", blob_sql_literal(text.as_bytes_direct()))
         }
+        // A NUL terminates SQL input, and line-oriented shells can normalize CRLF.
+        SqliteValue::Text(text) if text.contains(['\0', '\r']) => dump_control_text(text),
+        SqliteValue::Text(text) => format!("'{}'", text.replace('\'', "''")),
+        SqliteValue::Blob(bytes) => blob_sql_literal(bytes),
         // Non-finite REALs have no SQL literal form; sqlite3's .dump emits
         // 9.0e+999 / -9.0e+999 (which parse back as infinities) and NULL
         // for NaN. `Display` would render `Inf`, a syntax error on reload.
@@ -2988,6 +2986,33 @@ fn sql_literal(value: &SqliteValue) -> String {
         }
         _ => value.to_string(),
     }
+}
+
+fn dump_control_text(text: &str) -> String {
+    // char() constructs characters in the destination encoding. Use a fixed
+    // expression depth even for long runs of controls. Decode escaped tildes
+    // last so literal "~0" and "~r" survive.
+    let mut sql = String::from("replace(replace(replace('");
+    for ch in text.chars() {
+        match ch {
+            '\'' => sql.push_str("''"),
+            '~' => sql.push_str("~e"),
+            '\0' => sql.push_str("~0"),
+            '\r' => sql.push_str("~r"),
+            _ => sql.push(ch),
+        }
+    }
+    sql.push_str("','~0',char(0)),'~r',char(13)),'~e','~')");
+    sql
+}
+
+fn blob_sql_literal(bytes: &[u8]) -> String {
+    let mut rendered = String::from("X'");
+    for byte in bytes {
+        let _ = write!(rendered, "{byte:02X}");
+    }
+    rendered.push('\'');
+    rendered
 }
 
 fn is_block_comment_start(bytes: &[u8], i: usize) -> bool {
@@ -5665,6 +5690,91 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
                 stdout.contains("COMMIT;"),
                 "expected transaction trailer in dump, got: {stdout}",
             );
+        });
+    }
+
+    #[test]
+    fn test_dump_restores_exact_text_bytes_in_stock_and_fsqlite() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("text.db");
+            {
+                let stock = rusqlite::Connection::open(&path).expect("create source file");
+                stock
+                    .execute_batch(
+                        "CREATE TABLE t(v);
+                         INSERT INTO t VALUES (CAST(X'410042' AS TEXT)), (CAST(X'00' AS TEXT)),
+                           (CAST(X'804127FF' AS TEXT)), (CAST(X'FF0080' AS TEXT)),
+                           (CAST(X'410D0A42' AS TEXT)), ('é''s'), (''),
+                           (X'FF0080'), (X''), (NULL),
+                           ('~0' || char(0) || '~r' || char(13) || '~e''~é');",
+                    )
+                    .expect("populate source");
+            }
+            let mut dump = Vec::new();
+            let mut err = Vec::new();
+            let status = run(
+                vec!["fsqlite".into(), path.into_os_string(), ".dump".into()],
+                &mut Cursor::new(Vec::new()),
+                &mut dump,
+                &mut err,
+            )
+            .await;
+            assert_eq!(status, 0, "{}", String::from_utf8_lossy(&err));
+            let dump = String::from_utf8(dump).expect("UTF-8 SQL dump");
+            let query = "SELECT typeof(v) || ':' || hex(v) FROM t ORDER BY rowid;";
+            let expected = [
+                "text:410042",
+                "text:00",
+                "text:804127FF",
+                "text:FF0080",
+                "text:410D0A42",
+                "text:C3A92773",
+                "text:",
+                "blob:FF0080",
+                "blob:",
+                "null:",
+                "text:7E30007E720D7E65277EC3A9",
+            ];
+
+            let stock = rusqlite::Connection::open_in_memory().expect("restore destination");
+            stock.execute_batch(&dump).expect("stock restores dump");
+            let restored = stock
+                .prepare(query)
+                .expect("read restored data")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query stock")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("read stock rows");
+            assert_eq!(restored, expected);
+
+            for encoding in ["UTF-16le", "UTF-16be"] {
+                let db = rusqlite::Connection::open_in_memory().expect("UTF-16 destination");
+                db.pragma_update(None, "encoding", encoding)
+                    .expect("set encoding");
+                db.execute_batch(&dump).expect("restore into UTF-16");
+                let actual_encoding: String = db
+                    .pragma_query_value(None, "encoding", |row| row.get(0))
+                    .expect("read destination encoding");
+                assert_eq!(actual_encoding, encoding);
+                let text: String = db
+                    .query_row("SELECT v FROM t WHERE rowid=11", [], |row| row.get(0))
+                    .expect("read restored Unicode text");
+                assert_eq!(text, "~0\0~r\r~e'~é", "{encoding}");
+            }
+
+            let mut out = Vec::new();
+            let status = run_with_shell_options(
+                vec!["fsqlite".into()],
+                &mut Cursor::new(format!("{dump}{query}\n")),
+                &mut out,
+                &mut err,
+                ShellOptions::batch(),
+            )
+            .await;
+            assert_eq!(status, 0, "{}", String::from_utf8_lossy(&err));
+            let restored = String::from_utf8(out).expect("shell output");
+            assert_eq!(restored.lines().collect::<Vec<_>>(), expected);
         });
     }
 
