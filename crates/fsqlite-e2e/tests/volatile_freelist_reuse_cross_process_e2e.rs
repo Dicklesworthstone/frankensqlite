@@ -35,9 +35,11 @@
 //! durable free pages instead; then the freelist publication guard refuses
 //! a stale reuse (safely), which is why the seed fixes the page layout.
 //!
-//! Required: stock finds the file intact, and each table's durable rows are
-//! exactly its writer's committed rows. On main 3e6cc4c0c step 5 hands R one
-//! of P's pages.
+//! Required: stock finds the file intact, each table's durable rows are
+//! exactly its writer's committed rows, and R never allocates P's page. On
+//! main 3e6cc4c0c step 5 hands R one of P's pages. Since bd-iay3d, R's commit
+//! in step 4 (which jumped past P's) makes its next begin re-read the
+//! committed state, which drops the unused tail, so step 5 allocates at EOF.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -48,6 +50,10 @@ use fsqlite::Connection;
 
 const ACTOR_ENV: &str = "FSQLITE_BD_IVHOW_ACTOR";
 const FLOOR_CERTIFIED_MARKER: &str = "VNXJD FLOOR-CERTIFIED";
+/// The pager's `PAGE_LEASE_BATCH_SIZE`: a concurrent transaction's second
+/// EOF allocation reserves this many numbers, uses the first and leases the
+/// rest.
+const LEASE_BATCH: u32 = 8;
 
 fn wait_for(path: &Path) {
     let started = Instant::now();
@@ -305,10 +311,18 @@ fn a_writer_never_reuses_a_reserved_page_number_a_peer_committed_live() {
     let r_trace = r.exit();
     p.exit();
 
-    // Non-vacuity, from the allocation ledgers: P's new page is a number of
-    // R's lease tail (below the tail pages R itself went on to take from its
-    // freelist), and R kept allocating after that tail ran out, so the
-    // number P took was the next freelist candidate R had left.
+    // Non-vacuity, from the allocation ledgers. R's first transaction took
+    // two EOF pages: a single page, then the first page of a lease whose
+    // other `LEASE_BATCH - 1` numbers R reserved and returned unused. P's
+    // growth page must be one of those reserved numbers, and R must allocate
+    // again after P committed it: that is the collision.
+    // - Before bd-iay3d, R's next begins kept the tail and popped it
+    //   (`alloc_freelist_hi`). The bd-ivhow guard kept P's number from being
+    //   handed out; main 3e6cc4c0c handed it out (`alloc_freelist_gated`).
+    // - Since bd-iay3d, R's commit after P's makes R's next begin re-read the
+    //   committed state, which drops the unused tail, so R allocates at EOF.
+    // Either way R must never take P's page. The guard has its own pager
+    // unit test (bd_ivhow_wal_reuse_hands_out_a_reserved_number_only_if_free).
     if let Some(certified) = r_trace
         .lines()
         .find(|line| line.contains(FLOOR_CERTIFIED_MARKER))
@@ -331,25 +345,40 @@ fn a_writer_never_reuses_a_reserved_page_number_a_peer_committed_live() {
     let p_growth = *pages(&p_ledger, "alloc_eof")
         .first()
         .unwrap_or_else(|| panic!("non-vacuity: P grew no page; ledger:\n{p_ledger}"));
-    let r_tail = pages(&r_ledger, "alloc_freelist_hi");
-    let tail_low = r_tail.iter().copied().min().unwrap_or_else(|| {
-        panic!("non-vacuity: R took nothing from a lease tail on its freelist; ledger:\n{r_ledger}")
-    });
-    assert!(
-        p_growth < tail_low,
-        "non-vacuity: P's page {p_growth} is not a number of R's lease tail (R took {r_tail:?})"
-    );
-    let after_tail = r_ledger
+    // Every allocation R made, in order, as (event, page).
+    let r_allocations: Vec<(String, u32)> = r_ledger
         .lines()
-        .skip_while(|line| !line.contains("alloc_freelist_hi"))
-        .filter(|line| !line.contains("alloc_freelist_hi"))
-        .count();
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            Some(((*fields.get(1)?).to_owned(), fields.get(2)?.parse().ok()?))
+        })
+        .collect();
+    let (first_txn, later) = r_allocations.split_at(r_allocations.len().min(2));
+    let [(single, _), (leased, lease_first)] = first_txn else {
+        panic!("non-vacuity: R's first transaction made fewer than two allocations:\n{r_ledger}");
+    };
     assert!(
-        after_tail > 0,
-        "non-vacuity: R stopped allocating at the end of its lease tail; ledger:\n{r_ledger}"
+        single == "alloc_eof" && leased == "alloc_eof",
+        "non-vacuity: R's first transaction did not take its two pages at EOF:\n{r_ledger}"
+    );
+    let reserved = lease_first + 1..lease_first + LEASE_BATCH;
+    assert!(
+        reserved.contains(&p_growth),
+        "non-vacuity: P's page {p_growth} is not a number R reserved in its lease \
+         {reserved:?}; R's ledger:\n{r_ledger}"
+    );
+    assert!(
+        !later.is_empty(),
+        "non-vacuity: R made no allocation after P committed its page; ledger:\n{r_ledger}"
+    );
+    assert!(
+        later.iter().all(|(_, page)| *page != p_growth),
+        "R took page {p_growth}, which P committed live: {later:?}"
     );
     eprintln!(
-        "event=bd_ivhow_shape p_growth={p_growth} r_tail={r_tail:?} r_after_tail={after_tail}"
+        "event=bd_ivhow_shape p_growth={p_growth} r_reserved={reserved:?} \
+         r_tail_popped={:?} r_later={later:?}",
+        pages(&r_ledger, "alloc_freelist_hi")
     );
 
     let stock = rusqlite::Connection::open(&db).expect("verify open");
@@ -377,4 +406,109 @@ fn a_writer_never_reuses_a_reserved_page_number_a_peer_committed_live() {
             .expect("foreign rows");
         assert_eq!(foreign, 0, "{table} lists rows of the other table");
     }
+}
+
+/// bd-iay3d: after a peer process takes pages from the durable freelist, a
+/// writer whose own commit jumped past that peer commit must read the
+/// freelist again before it allocates.
+///
+/// R's first transaction allocates four pages on a fresh WAL. Its page
+/// lease pops from the top, so the lease's unused tail lies inside R's
+/// committed extent and R's commit publishes it on the durable freelist. R
+/// then begins an in-place UPDATE; P takes three of those free pages for a
+/// split of its own table and commits; R commits. On main 83da909e2 R's next
+/// begin kept its pre-P freelist (the refresh's "nothing committed since"
+/// early return, since R's own commit was the newest), so its next INSERT
+/// popped a page P had taken, the commit's freelist guard refused it (517
+/// "snapshot conflict on pages: 6,7,8"), and every internal retry popped the
+/// same page again: the INSERT failed for good where stock commits it.
+#[test]
+fn a_writer_rereads_the_freelist_after_a_peer_took_free_pages_before_its_commit() {
+    if std::env::var_os(ACTOR_ENV).is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("iay3d.db");
+    rusqlite::Connection::open(&db)
+        .expect("seed open")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE r(id INTEGER PRIMARY KEY, pad TEXT NOT NULL);
+             CREATE TABLE p(id INTEGER PRIMARY KEY, pad TEXT NOT NULL);",
+        )
+        .expect("schema");
+    let _diagnostics = Diagnostics(dir.path().to_path_buf());
+    let mut r = Actor::spawn(&db, dir.path(), "r");
+    let mut p = Actor::spawn(&db, dir.path(), "p");
+    let (mut r_rows, mut p_rows) = (BTreeSet::new(), BTreeSet::new());
+
+    // 1. R's four pages; the lease tail inside its extent is published free.
+    let mut first = String::from("BEGIN\n");
+    for id in 1..=4 {
+        first.push_str(&big_row("r", id));
+        first.push('\n');
+    }
+    first.push_str("COMMIT");
+    let results = r.run(&first);
+    assert!(all_ok(&results), "R's first transaction: {results:?}");
+    r_rows.extend(1..=4);
+    let results = p.run(&big_row("p", 1));
+    assert!(all_ok(&results), "P's first row: {results:?}");
+    p_rows.insert(1);
+
+    // 2. R begins a transaction that rewrites a row in place.
+    let opened = r.run(&format!(
+        "BEGIN\nUPDATE r SET pad = 'r{}' WHERE id = 1",
+        "y".repeat(3000)
+    ));
+    assert!(all_ok(&opened), "R's open transaction: {opened:?}");
+
+    // 3. P splits its table onto pages from the durable freelist.
+    let results = p.run(&format!(
+        "BEGIN\n{}\n{}\nCOMMIT",
+        big_row("p", 2),
+        big_row("p", 3)
+    ));
+    assert!(all_ok(&results), "P's split: {results:?}");
+    p_rows.extend([2, 3]);
+
+    // 4. R commits, after P.
+    let results = r.run("COMMIT");
+    assert!(all_ok(&results), "R's in-place commit: {results:?}");
+
+    // 5. R's autocommit INSERTs must commit, as stock's do.
+    for id in 5..=12 {
+        let results = r.run(&big_row("r", id));
+        assert!(
+            all_ok(&results),
+            "R's INSERT {id} after P took free pages: {results:?}"
+        );
+        r_rows.insert(id);
+    }
+    for id in 4..=6 {
+        let results = p.run(&big_row("p", id));
+        assert!(all_ok(&results), "P's row {id}: {results:?}");
+        p_rows.insert(id);
+    }
+    r.exit();
+    p.exit();
+
+    // Non-vacuity: P really took pages from the durable freelist.
+    let p_ledger = std::fs::read_to_string(dir.path().join("p.alloc")).expect("P's ledger");
+    assert!(
+        p_ledger.contains("alloc_freelist_gated"),
+        "non-vacuity: P took no page from the durable freelist; ledger:\n{p_ledger}"
+    );
+
+    let stock = rusqlite::Connection::open(&db).expect("verify open");
+    let integrity: Vec<String> = stock
+        .prepare("PRAGMA integrity_check")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("integrity")
+        .collect::<rusqlite::Result<_>>()
+        .expect("integrity rows");
+    assert_eq!(integrity, ["ok"], "stock integrity_check");
+    assert_eq!(stock_ids(&stock, "r"), r_rows, "R's durable rows");
+    assert_eq!(stock_ids(&stock, "p"), p_rows, "P's durable rows");
 }

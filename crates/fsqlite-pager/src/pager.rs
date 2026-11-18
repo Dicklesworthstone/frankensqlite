@@ -4024,6 +4024,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
                 2
             };
             inner.next_page = inner.next_page.max(next_unallocated_page);
+            inner.note_own_wal_commit_first_seq(receipt.certificate.commit_seq_lo);
             inner.record_local_wal_commit_at(receipt.certificate.commit_seq_hi);
             PublishedPagerUpdate {
                 visible_commit_seq: receipt.certificate.commit_seq_hi,
@@ -8594,6 +8595,14 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// The append-gate double-consumption guard (bd-gh302/bd-0shxy) must
     /// only refuse durable-origin pops.
     durable_freelist_view: HashSet<u32>,
+    /// bd-iay3d: the first commit sequence of this pager's own WAL commit
+    /// that jumped past peer commits it never refreshed for (the
+    /// certificate's first sequence was above `commit_seq + 1`). `commit_seq`
+    /// now names the newest commit, but the freelist, `durable_freelist_view`
+    /// and the rest of the committed state still predate the peers' commits,
+    /// so while this is set the next refresh must not take its unchanged
+    /// early return. Cleared by a full refresh.
+    committed_state_behind_peer_commit: Option<CommitSeq>,
     /// GH#410: the durable page-1 freelist metadata names more entries than
     /// this pager could legally load — e.g. an archive whose trunk chain
     /// records the reserved lock-byte page, a page beyond the file, or a
@@ -9525,6 +9534,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
         };
         inner.next_page = inner.next_page.max(next_unallocated_page);
         let certificate_commit_seq_lo = authorization.durability_receipt.certificate.commit_seq_lo;
+        inner.note_own_wal_commit_first_seq(certificate_commit_seq_lo);
         inner.record_local_wal_commit_at(publication_intent.visible_commit_seq);
         let committed_snapshot = Arc::new(PagerCommittedSnapshot::from_inner(&inner));
         *self
@@ -10591,6 +10601,18 @@ impl<F: VfsFile> PagerInner<F> {
         }
     }
 
+    /// bd-iay3d: before an own WAL commit's sequence is recorded, note
+    /// whether peer commits landed between this pager's committed-state view
+    /// and the commit (its certificate's first sequence is above
+    /// `commit_seq + 1`). Recording jumps `commit_seq` past them, but nothing
+    /// re-read the freelist or the rest of the committed state for them, so
+    /// the next refresh must be a full one.
+    fn note_own_wal_commit_first_seq(&mut self, first_commit_seq: CommitSeq) {
+        if first_commit_seq.get() > self.commit_seq.get().saturating_add(1) {
+            self.committed_state_behind_peer_commit = Some(first_commit_seq);
+        }
+    }
+
     /// Catch this pager up to an already-certified WAL group horizon without
     /// deriving commit order from Phase C thread arrival.
     fn record_local_wal_commit_at(&mut self, certified_commit_seq: CommitSeq) {
@@ -10678,10 +10700,14 @@ impl<F: VfsFile> PagerInner<F> {
         let wal_generation_changed = self.journal_mode == JournalMode::Wal
             && self.committed_wal_generation.is_some()
             && self.committed_wal_generation != probe.wal_generation;
+        // bd-iay3d: an own commit that jumped `commit_seq` past peer commits
+        // left the rest of the committed state behind them; only a full
+        // refresh brings it up to date.
         if mode == CommittedStateRefreshMode::Normal
             && probe.visible_commit_seq == self.commit_seq
             && probe.file_size == self.committed_db_file_size_bytes
             && !probe.durable_identity_changed
+            && self.committed_state_behind_peer_commit.is_none()
         {
             // Nothing was committed since this pager's view, so its extent is
             // the new generation's.
@@ -10887,6 +10913,7 @@ impl<F: VfsFile> PagerInner<F> {
         };
         self.committed_db_file_size_bytes = probe.file_size;
         self.committed_db_change_counter = probe.db_change_counter;
+        self.committed_state_behind_peer_commit = None;
         let generation_moved = self.committed_wal_generation != probe.wal_generation;
         self.committed_wal_generation = probe.wal_generation;
         if generation_moved {
@@ -20531,6 +20558,7 @@ where
                 checkpoint_active: false,
                 access_mode: PagerAccessMode::Writable,
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
+                committed_state_behind_peer_commit: None,
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
                 // GH#410: the durable chain named entries this load could not
@@ -20982,6 +21010,7 @@ where
                     .iter()
                     .map(|page: &PageNumber| page.get())
                     .collect(),
+                committed_state_behind_peer_commit: None,
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
                 freelist_repair_pending: false,
@@ -28936,6 +28965,11 @@ where
                     })
                     .transpose()?;
                 if let Some(intent) = wal_publication_intent {
+                    if let Some(authorization) = wal_publication_authorization.as_ref() {
+                        inner.note_own_wal_commit_first_seq(
+                            authorization.durability_receipt.certificate.commit_seq_lo,
+                        );
+                    }
                     inner.record_local_wal_commit_at(intent.visible_commit_seq);
                     self.own_commit_seq = wal_publication_authorization
                         .as_ref()
@@ -29786,6 +29820,11 @@ where
                     })
                     .transpose()?;
                 if let Some(intent) = wal_publication_intent {
+                    if let Some(authorization) = wal_publication_authorization.as_ref() {
+                        inner.note_own_wal_commit_first_seq(
+                            authorization.durability_receipt.certificate.commit_seq_lo,
+                        );
+                    }
                     inner.record_local_wal_commit_at(intent.visible_commit_seq);
                     self.own_commit_seq = wal_publication_authorization
                         .as_ref()
@@ -33691,6 +33730,42 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// bd-ivhow: in WAL mode an in-memory freelist number at or below
+    /// db_size is handed out only when it is on the durable freelist. A
+    /// volatile one (a lease's unused tail, never published free) goes to
+    /// the abandonment pool instead, since a peer may have committed it as a
+    /// live page. Since bd-iay3d no cross-process shape is known to reach
+    /// this state (the full refresh drops the tail first), so this is the
+    /// guard's direct keeper. A rollback-journal pager keeps the plain pop.
+    #[test]
+    fn bd_ivhow_wal_reuse_hands_out_a_reserved_number_only_if_free() {
+        asupersync::test_utils::run_test(|| async {
+            let page = |number: u32| PageNumber::new(number).unwrap();
+            let (pager, _) = wal_pager().await;
+            let mut inner = pager.inner.lock().unwrap();
+            assert_eq!(inner.journal_mode, JournalMode::Wal);
+            inner.db_size = 20;
+            // Popped from the end: 10 (volatile, in range), 12 (durable free),
+            // 25 (volatile, above db_size).
+            inner.freelist = vec![page(25), page(12), page(10)];
+            inner.durable_freelist_view = HashSet::from([12]);
+            inner.abandoned_eof_reservations.clear();
+
+            assert_eq!(pop_reusable_freelist_page(&mut inner), Some(page(12)));
+            assert_eq!(inner.abandoned_eof_reservations, vec![page(10)]);
+            assert_eq!(pop_reusable_freelist_page(&mut inner), Some(page(25)));
+            assert_eq!(pop_reusable_freelist_page(&mut inner), None);
+            assert_eq!(inner.abandoned_eof_reservations, vec![page(10)]);
+
+            // Negative: the plain pop a rollback-journal pager uses hands out
+            // the volatile in-range number.
+            inner.journal_mode = JournalMode::Delete;
+            inner.freelist = vec![page(10)];
+            assert_eq!(pop_reusable_freelist_page(&mut inner), Some(page(10)));
+            inner.journal_mode = JournalMode::Wal;
+        });
     }
 
     #[test]
