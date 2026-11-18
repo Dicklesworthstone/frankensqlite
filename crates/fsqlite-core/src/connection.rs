@@ -12331,6 +12331,97 @@ fn select_indexed_numeric_probe_spec_for_column(
     Some((column_index, index_root_page))
 }
 
+/// Catalog state that an explicit transaction's ROLLBACK puts back
+/// (bd-w4pr1.7 round 5, lever L1).
+///
+/// BEGIN used to copy all of it into the transaction's snapshot and COMMIT to
+/// drop the copy: O(schema) per transaction, read or write, though most
+/// transactions never change the catalog (over 20 tables with two indexes
+/// each, 182k instructions to copy and about 135k to drop, 85% of an empty
+/// transaction). Instead BEGIN arms each cell, and the first mutable access
+/// while armed keeps a copy of the value as it was. ROLLBACK writes the kept
+/// copies back; the end of the transaction drops them. Every mutation goes
+/// through [`Self::borrow_mut`] or [`Self::replace`], so none escapes the copy.
+#[derive(Debug)]
+struct TxnRestorableCell<T: Clone> {
+    value: RefCell<T>,
+    /// Set by BEGIN; cleared by the first mutable access, which keeps the copy.
+    armed: Cell<bool>,
+    /// The value as BEGIN saw it, kept at the first change after BEGIN.
+    before_txn: RefCell<Option<T>>,
+}
+
+impl<T: Clone> TxnRestorableCell<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value: RefCell::new(value),
+            armed: Cell::new(false),
+            before_txn: RefCell::new(None),
+        }
+    }
+
+    fn borrow(&self) -> std::cell::Ref<'_, T> {
+        self.value.borrow()
+    }
+
+    fn try_borrow(&self) -> std::result::Result<std::cell::Ref<'_, T>, std::cell::BorrowError> {
+        self.value.try_borrow()
+    }
+
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
+        self.keep_value_before_first_change();
+        self.value.borrow_mut()
+    }
+
+    fn replace(&self, value: T) -> T {
+        self.keep_value_before_first_change();
+        self.value.replace(value)
+    }
+
+    fn keep_value_before_first_change(&self) {
+        if self.armed.replace(false) {
+            let before = self.value.borrow().clone();
+            *self.before_txn.borrow_mut() = Some(before);
+        }
+    }
+
+    /// BEGIN: keep the value as of now if anything changes it.
+    fn arm(&self) {
+        drop(self.before_txn.borrow_mut().take());
+        self.armed.set(true);
+    }
+
+    /// ROLLBACK: put back the value BEGIN saw, if it changed. The rollback
+    /// then reloads the catalog from the pager, so the cell stops keeping:
+    /// that reload must not cost a copy. The kept copy itself stays until the
+    /// end of the transaction.
+    fn restore_before_txn(&self) -> bool {
+        self.armed.set(false);
+        let before = self.before_txn.borrow();
+        let Some(before) = before.as_ref() else {
+            return false;
+        };
+        self.value.borrow_mut().clone_from(before);
+        true
+    }
+
+    /// The end of the transaction: stop keeping and drop the copy.
+    fn end_txn(&self) {
+        self.armed.set(false);
+        drop(self.before_txn.borrow_mut().take());
+    }
+
+    #[cfg(test)]
+    fn keeps_before_txn_copy(&self) -> bool {
+        self.before_txn.borrow().is_some()
+    }
+
+    #[cfg(test)]
+    fn is_armed(&self) -> bool {
+        self.armed.get()
+    }
+}
+
 /// Snapshot of the database + schema state at a point in time.
 /// Used for transaction rollback and savepoint restore.
 #[derive(Debug, Clone)]
@@ -12341,11 +12432,26 @@ struct DbSnapshot {
     schema_cookie: u32,
     schema_generation: u64,
     live_vtab_registry_undo_len: usize,
-    /// The schema metadata. `None` for a statement-level snapshot of a
-    /// statement that cannot change it (plain DML with `writable_schema` off):
-    /// copying every table, index, view and trigger per statement made each
-    /// statement in a transaction O(schema) (bd-ry6x7).
-    schema_state: Option<SchemaSnapshot>,
+    schema_state: SnapshotSchemaState,
+}
+
+/// How a [`DbSnapshot`] holds the schema metadata.
+#[derive(Debug, Clone)]
+enum SnapshotSchemaState {
+    /// A statement-level snapshot of a statement that cannot change it (plain
+    /// DML with `writable_schema` off): copying every table, index, view and
+    /// trigger per statement made each statement in a transaction O(schema)
+    /// (bd-ry6x7). Restoring it keeps the current metadata.
+    Unchanged,
+    /// A copy taken with the snapshot (savepoints, schema-changing statements).
+    Copied(Box<SchemaSnapshot>),
+    /// An explicit transaction's snapshot (bd-w4pr1.7 round 5): the
+    /// [`TxnRestorableCell`]s keep what changes, and only the two scalars are
+    /// stored here.
+    InCells {
+        temp_default_cache_size: i64,
+        next_master_rowid: i64,
+    },
 }
 
 /// The schema-metadata half of a [`DbSnapshot`].
@@ -14284,7 +14390,7 @@ pub struct Connection {
     /// page. Any other write path clears the hint.
     prepared_direct_insert_append_hint: RefCell<Option<PreparedDirectInsertAppendHint>>,
     /// Schema registry: table metadata used by the code generator.
-    schema: RefCell<Vec<TableSchema>>,
+    schema: TxnRestorableCell<Vec<TableSchema>>,
     /// HashMap side-index for O(1) schema name lookup.
     ///
     /// Keyed by lowercased table name, value is the index into `schema`.
@@ -14298,7 +14404,7 @@ pub struct Connection {
     /// the shadowed `main` table (if any) is parked in `shadowed_main_tables`.
     /// `TEMP` tables are never written to the main `sqlite_master`, mirroring
     /// the `TriggerDef::temporary` precedent.
-    temp_table_names: RefCell<HashSet<String>>,
+    temp_table_names: TxnRestorableCell<HashSet<String>>,
     /// Next connection-local TEMP root, allocated downward from
     /// [`TEMP_MEMDB_ROOT_START`] so it cannot collide with ordinary main pager
     /// roots or advance the ordinary MemDatabase root allocator.
@@ -14311,15 +14417,15 @@ pub struct Connection {
     /// keyed by lowercased name. Kept out of `schema` so unqualified references
     /// resolve to the `TEMP` table; restored into `schema` when the `TEMP`
     /// table is dropped, and consulted to resolve `main.<name>` references.
-    shadowed_main_tables: RefCell<HashMap<String, TableSchema>>,
+    shadowed_main_tables: TxnRestorableCell<HashMap<String, TableSchema>>,
     /// View definitions stored in-memory.
-    views: RefCell<Vec<ViewDef>>,
+    views: TxnRestorableCell<Vec<ViewDef>>,
     /// HashMap side-index for O(1) view lookup by lowercase name and exact
     /// local namespace. TEMP and MAIN views may coexist under the same name;
     /// unqualified lookup selects TEMP before MAIN.
     views_by_name: RefCell<HashMap<String, ScopedViewIndices>>,
     /// Trigger definitions stored in-memory.
-    triggers: RefCell<Vec<TriggerDef>>,
+    triggers: TxnRestorableCell<Vec<TriggerDef>>,
     /// HashMap side-index for O(1) trigger name lookup. See `schema_by_name` for semantics.
     triggers_by_name: RefCell<HashMap<String, usize>>,
     /// Stack of active trigger OLD/NEW bindings for nested trigger execution.
@@ -14512,7 +14618,7 @@ pub struct Connection {
     /// Maps table name (lowercased) to the 0-based column index of the
     /// `INTEGER PRIMARY KEY` column, which is an alias for `rowid`.
     /// Used by fallback paths (GROUP BY, JOIN) to resolve rowid/\_rowid\_/oid.
-    rowid_alias_columns: RefCell<HashMap<String, usize>>,
+    rowid_alias_columns: TxnRestorableCell<HashMap<String, usize>>,
     /// bd-w9r11 (GH#222/#223): per-table descending flags for WITHOUT ROWID
     /// PRIMARY KEY columns, keyed by lowercase table name (one Vec<bool> per
     /// PK column, in PK order). Populated at CREATE TABLE and full schema
@@ -14526,7 +14632,7 @@ pub struct Connection {
     /// object name.  Used by `build_sqlite_master_rows` so that
     /// `SELECT sql FROM sqlite_master` retains source spelling after required
     /// CREATE-prefix normalization, without gratuitous identifier quoting.
-    original_ddl_sql: RefCell<HashMap<String, String>>,
+    original_ddl_sql: TxnRestorableCell<HashMap<String, String>>,
     /// Verbatim source text of the single top-level `CREATE` statement currently
     /// being executed through [`Connection::execute`], captured so DDL persists
     /// into `sqlite_master` with original body spelling after CREATE-prefix
@@ -14541,7 +14647,7 @@ pub struct Connection {
     pending_alter_source: RefCell<Option<String>>,
     /// Set of table names (lowercased) declared as
     /// `INTEGER PRIMARY KEY AUTOINCREMENT`.
-    autoincrement_tables: RefCell<HashSet<String>>,
+    autoincrement_tables: TxnRestorableCell<HashSet<String>>,
     /// Cached sqlite_sequence high-water values keyed by lowercased table name.
     sqlite_sequence_cache: RefCell<HashMap<String, i64>>,
     /// AUTOINCREMENT high-water values of TEMP tables, keyed by lowercased
@@ -16693,15 +16799,15 @@ impl Connection {
             pending_direct_delete_leaf_runs: RefCell::new(Vec::new()),
             pending_direct_delete_leaf_run_active: Cell::new(false),
             prepared_direct_insert_append_hint: RefCell::new(None),
-            schema: RefCell::new(Vec::new()),
+            schema: TxnRestorableCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
-            temp_table_names: RefCell::new(HashSet::new()),
+            temp_table_names: TxnRestorableCell::new(HashSet::new()),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
             materialized_temp_root_pages: RefCell::new(HashSet::new()),
-            shadowed_main_tables: RefCell::new(HashMap::new()),
-            views: RefCell::new(Vec::new()),
+            shadowed_main_tables: TxnRestorableCell::new(HashMap::new()),
+            views: TxnRestorableCell::new(Vec::new()),
             views_by_name: RefCell::new(HashMap::new()),
-            triggers: RefCell::new(Vec::new()),
+            triggers: TxnRestorableCell::new(Vec::new()),
             triggers_by_name: RefCell::new(HashMap::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
             func_registry: RefCell::new(default_function_registry(&collation_registry)),
@@ -16748,12 +16854,12 @@ impl Connection {
             vectorized_makerecord_enabled: Cell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
             differential_registry: DifferentialRegistry::default(),
-            rowid_alias_columns: RefCell::new(HashMap::new()),
+            rowid_alias_columns: TxnRestorableCell::new(HashMap::new()),
             without_rowid_pk_desc: RefCell::new(HashMap::new()),
-            original_ddl_sql: RefCell::new(HashMap::new()),
+            original_ddl_sql: TxnRestorableCell::new(HashMap::new()),
             pending_ddl_source: RefCell::new(None),
             pending_alter_source: RefCell::new(None),
-            autoincrement_tables: RefCell::new(HashSet::new()),
+            autoincrement_tables: TxnRestorableCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             temp_sqlite_sequence: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
@@ -17280,15 +17386,15 @@ impl Connection {
             pending_direct_delete_leaf_runs: RefCell::new(Vec::new()),
             pending_direct_delete_leaf_run_active: Cell::new(false),
             prepared_direct_insert_append_hint: RefCell::new(None),
-            schema: RefCell::new(Vec::new()),
+            schema: TxnRestorableCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
-            temp_table_names: RefCell::new(HashSet::new()),
+            temp_table_names: TxnRestorableCell::new(HashSet::new()),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
             materialized_temp_root_pages: RefCell::new(HashSet::new()),
-            shadowed_main_tables: RefCell::new(HashMap::new()),
-            views: RefCell::new(Vec::new()),
+            shadowed_main_tables: TxnRestorableCell::new(HashMap::new()),
+            views: TxnRestorableCell::new(Vec::new()),
             views_by_name: RefCell::new(HashMap::new()),
-            triggers: RefCell::new(Vec::new()),
+            triggers: TxnRestorableCell::new(Vec::new()),
             triggers_by_name: RefCell::new(HashMap::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
             func_registry: RefCell::new(default_function_registry(&collation_registry)),
@@ -17335,12 +17441,12 @@ impl Connection {
             vectorized_makerecord_enabled: Cell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
             differential_registry: DifferentialRegistry::default(),
-            rowid_alias_columns: RefCell::new(HashMap::new()),
+            rowid_alias_columns: TxnRestorableCell::new(HashMap::new()),
             without_rowid_pk_desc: RefCell::new(HashMap::new()),
-            original_ddl_sql: RefCell::new(HashMap::new()),
+            original_ddl_sql: TxnRestorableCell::new(HashMap::new()),
             pending_ddl_source: RefCell::new(None),
             pending_alter_source: RefCell::new(None),
-            autoincrement_tables: RefCell::new(HashSet::new()),
+            autoincrement_tables: TxnRestorableCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             temp_sqlite_sequence: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
@@ -28744,6 +28850,7 @@ impl Connection {
             *self.implicit_txn.get_mut() = false;
             *self.concurrent_txn.get_mut() = false;
             *self.txn_snapshot.get_mut() = None;
+            self.end_transaction_catalog_cells();
             self.savepoints.get_mut().clear();
             self.db.borrow_mut().commit_undo();
         }
@@ -79313,15 +79420,8 @@ impl Connection {
         if hot_path_profile_enabled() {
             FSQLITE_CONNECTION_SNAPSHOTS.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        let db_version = self.db.borrow_mut().undo_version();
-        DbSnapshot {
-            db_version,
-            sqlite_sequence_cache: self.sqlite_sequence_cache.borrow().clone(),
-            temp_sqlite_sequence: self.temp_sqlite_sequence.borrow().clone(),
-            schema_cookie: *self.schema_cookie.borrow(),
-            schema_generation: self.schema_generation.get(),
-            live_vtab_registry_undo_len: self.live_vtab_registry_undo.borrow().len(),
-            schema_state: with_schema.then(|| SchemaSnapshot {
+        let schema_state = if with_schema {
+            SnapshotSchemaState::Copied(Box::new(SchemaSnapshot {
                 schema: self.schema.borrow().clone(),
                 temp_table_names: self.temp_table_names.borrow().clone(),
                 temp_default_cache_size: self.pragma_state.borrow().temp_default_cache_size,
@@ -79332,8 +79432,58 @@ impl Connection {
                 autoincrement_tables: self.autoincrement_tables.borrow().clone(),
                 original_ddl_sql: self.original_ddl_sql.borrow().clone(),
                 next_master_rowid: *self.next_master_rowid.borrow(),
-            }),
+            }))
+        } else {
+            SnapshotSchemaState::Unchanged
+        };
+        self.snapshot_with_schema_state(schema_state)
+    }
+
+    fn snapshot_with_schema_state(&self, schema_state: SnapshotSchemaState) -> DbSnapshot {
+        let db_version = self.db.borrow_mut().undo_version();
+        DbSnapshot {
+            db_version,
+            sqlite_sequence_cache: self.sqlite_sequence_cache.borrow().clone(),
+            temp_sqlite_sequence: self.temp_sqlite_sequence.borrow().clone(),
+            schema_cookie: *self.schema_cookie.borrow(),
+            schema_generation: self.schema_generation.get(),
+            live_vtab_registry_undo_len: self.live_vtab_registry_undo.borrow().len(),
+            schema_state,
         }
+    }
+
+    /// The snapshot an explicit BEGIN keeps for its ROLLBACK (bd-w4pr1.7
+    /// round 5, lever L1): the catalog cells are armed instead of copied, and
+    /// keep a copy only of what the transaction goes on to change.
+    fn transaction_snapshot(&self) -> DbSnapshot {
+        if hot_path_profile_enabled() {
+            FSQLITE_CONNECTION_SNAPSHOTS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.schema.arm();
+        self.temp_table_names.arm();
+        self.shadowed_main_tables.arm();
+        self.views.arm();
+        self.triggers.arm();
+        self.rowid_alias_columns.arm();
+        self.autoincrement_tables.arm();
+        self.original_ddl_sql.arm();
+        self.snapshot_with_schema_state(SnapshotSchemaState::InCells {
+            temp_default_cache_size: self.pragma_state.borrow().temp_default_cache_size,
+            next_master_rowid: *self.next_master_rowid.borrow(),
+        })
+    }
+
+    /// The end of an explicit transaction, committed or not: the catalog
+    /// cells stop keeping and drop what they kept.
+    fn end_transaction_catalog_cells(&self) {
+        self.schema.end_txn();
+        self.temp_table_names.end_txn();
+        self.shadowed_main_tables.end_txn();
+        self.views.end_txn();
+        self.triggers.end_txn();
+        self.rowid_alias_columns.end_txn();
+        self.autoincrement_tables.end_txn();
+        self.original_ddl_sql.end_txn();
     }
 
     /// Restore a snapshot, replacing the current database + schema state.
@@ -79373,10 +79523,35 @@ impl Connection {
         self.db.borrow_mut().rollback_to(snap.db_version);
         (*self.sqlite_sequence_cache.borrow_mut()).clone_from(&snap.sqlite_sequence_cache);
         (*self.temp_sqlite_sequence.borrow_mut()).clone_from(&snap.temp_sqlite_sequence);
-        // A statement snapshot without schema state belongs to a statement that
-        // could not change the schema metadata: keep the current copy.
-        let Some(state) = snap.schema_state.as_ref() else {
-            return;
+        let state = match &snap.schema_state {
+            // A statement snapshot without schema state belongs to a statement
+            // that could not change the schema metadata: keep the current copy.
+            SnapshotSchemaState::Unchanged => return,
+            SnapshotSchemaState::Copied(state) => state,
+            SnapshotSchemaState::InCells {
+                temp_default_cache_size,
+                next_master_rowid,
+            } => {
+                // Every cell the transaction changed kept its BEGIN-time
+                // value at the first change; the others still hold it.
+                let schema_restored = self.schema.restore_before_txn();
+                self.temp_table_names.restore_before_txn();
+                self.shadowed_main_tables.restore_before_txn();
+                let views_restored = self.views.restore_before_txn();
+                let triggers_restored = self.triggers.restore_before_txn();
+                self.rowid_alias_columns.restore_before_txn();
+                self.autoincrement_tables.restore_before_txn();
+                self.original_ddl_sql.restore_before_txn();
+                if schema_restored || views_restored || triggers_restored {
+                    self.rebuild_schema_indices();
+                }
+                self.validate_schema_index();
+                self.pragma_state.borrow_mut().temp_default_cache_size = *temp_default_cache_size;
+                *self.next_master_rowid.borrow_mut() = *next_master_rowid;
+                *self.schema_cookie.borrow_mut() = snap.schema_cookie;
+                self.schema_generation.set(snap.schema_generation);
+                return;
+            }
         };
         // bd-e6zfc: rebuild the case-insensitive side indices from the snapshot
         // (positions match the about-to-be-cloned Vecs) and publish each data
@@ -79599,7 +79774,7 @@ impl Connection {
                 .mark_savepoint(session_id)
         });
         self.db.borrow_mut().begin_undo();
-        *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
+        *self.txn_snapshot.borrow_mut() = Some(self.transaction_snapshot());
         self.in_transaction.set(true);
         // IMPL-28 / AG-O3: explicit transaction now active — open the
         // IN_TRANSACTION gate bit. Composite `fast_paths_enabled()` also
@@ -80597,6 +80772,7 @@ impl Connection {
             };
 
             *self.txn_snapshot.borrow_mut() = None;
+            self.end_transaction_catalog_cells();
             self.savepoints.borrow_mut().clear();
             self.in_transaction.set(false);
             // GH #161: defer_foreign_keys is switched off at every txn end.
@@ -81204,6 +81380,7 @@ impl Connection {
 
         // Discard rollback snapshot and savepoints — changes are committed.
         *self.txn_snapshot.borrow_mut() = None;
+        self.end_transaction_catalog_cells();
         self.savepoints.borrow_mut().clear();
         self.in_transaction.set(false);
         // GH #161: defer_foreign_keys is switched off at the conclusion of the
@@ -81822,6 +81999,7 @@ impl Connection {
             // retryable so a caller cannot accidentally commit around them.
             self.deferred_fk_checks.borrow_mut().clear();
             *self.txn_snapshot.borrow_mut() = None;
+            self.end_transaction_catalog_cells();
             self.savepoints.borrow_mut().clear();
             self.in_transaction.set(false);
             // GH #161: defer_foreign_keys is switched off at every txn end.
@@ -233465,6 +233643,258 @@ mod autocommit_txn_tests {
             .await
             .expect("CREATE INDEX concurrent commit planning and finalization must not be Busy");
             assert_quiescent("after CREATE INDEX commit");
+            conn.close().await.unwrap();
+        });
+    }
+
+    /// bd-w4pr1.7 round 5 (lever L1): the catalog state an explicit
+    /// transaction's ROLLBACK must put back, in an order-independent form.
+    fn txn_catalog_fingerprint(conn: &Connection) -> String {
+        fn sorted<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
+            let mut items: Vec<String> = items.into_iter().collect();
+            items.sort();
+            items
+        }
+        let schema = conn.schema.borrow();
+        let tables = sorted(schema.iter().map(|table| {
+            format!(
+                "{}@{}:{}:{}",
+                table.name,
+                table.root_page,
+                table
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                sorted(table.indexes.iter().map(|index| index.name.clone())).join(",")
+            )
+        }));
+        let by_name = sorted(
+            conn.schema_by_name
+                .borrow()
+                .iter()
+                .map(|(name, index)| format!("{name}={}", schema[*index].name)),
+        );
+        drop(schema);
+        format!(
+            "tables={tables:?} by_name={by_name:?} temp={:?} shadowed={:?} views={:?} triggers={:?} \
+             aliases={:?} autoinc={:?} ddl={:?} master_rowid={}",
+            sorted(conn.temp_table_names.borrow().iter().cloned()),
+            sorted(conn.shadowed_main_tables.borrow().keys().cloned()),
+            sorted(conn.views.borrow().iter().map(|view| view.name.clone())),
+            sorted(
+                conn.triggers
+                    .borrow()
+                    .iter()
+                    .map(|trigger| trigger.name.clone())
+            ),
+            sorted(
+                conn.rowid_alias_columns
+                    .borrow()
+                    .iter()
+                    .map(|(name, column)| format!("{name}={column}"))
+            ),
+            sorted(conn.autoincrement_tables.borrow().iter().cloned()),
+            sorted(
+                conn.original_ddl_sql
+                    .borrow()
+                    .iter()
+                    .map(|(name, sql)| format!("{name}={sql}"))
+            ),
+            *conn.next_master_rowid.borrow(),
+        )
+    }
+
+    fn txn_catalog_cells(conn: &Connection) -> [(bool, bool); 8] {
+        [
+            (conn.schema.is_armed(), conn.schema.keeps_before_txn_copy()),
+            (
+                conn.temp_table_names.is_armed(),
+                conn.temp_table_names.keeps_before_txn_copy(),
+            ),
+            (
+                conn.shadowed_main_tables.is_armed(),
+                conn.shadowed_main_tables.keeps_before_txn_copy(),
+            ),
+            (conn.views.is_armed(), conn.views.keeps_before_txn_copy()),
+            (
+                conn.triggers.is_armed(),
+                conn.triggers.keeps_before_txn_copy(),
+            ),
+            (
+                conn.rowid_alias_columns.is_armed(),
+                conn.rowid_alias_columns.keeps_before_txn_copy(),
+            ),
+            (
+                conn.autoincrement_tables.is_armed(),
+                conn.autoincrement_tables.keeps_before_txn_copy(),
+            ),
+            (
+                conn.original_ddl_sql.is_armed(),
+                conn.original_ddl_sql.keeps_before_txn_copy(),
+            ),
+        ]
+    }
+
+    /// bd-w4pr1.7 round 5 (lever L1): BEGIN arms the catalog cells instead of
+    /// copying the catalog. A transaction that changes the catalog keeps a
+    /// copy at its first change, and its ROLLBACK must put back every kind of
+    /// change; a DML-only transaction keeps nothing. The negative is the DDL
+    /// case itself: without the kept copies, the rolled-back objects stay in
+    /// the connection's catalog and the fingerprint comparison fails.
+    #[test]
+    fn test_txn_rollback_restores_the_catalog_from_copies_kept_at_its_first_change() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("txn_catalog_copies.db");
+            let db_str = db_path.to_str().unwrap();
+            let conn = Connection::open(db_str).await.unwrap();
+            for sql in [
+                "CREATE TABLE base (id INTEGER PRIMARY KEY, v TEXT);",
+                "CREATE TABLE seq (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);",
+                "CREATE INDEX base_v ON base(v);",
+                "INSERT INTO base VALUES (1, 'a');",
+                "INSERT INTO seq(v) VALUES ('s');",
+            ] {
+                conn.execute(sql).await.unwrap();
+            }
+            let master_sql =
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name;";
+            let master = |rows: Vec<Row>| {
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>()
+            };
+            let master_before = master(conn.query(master_sql).await.unwrap());
+            let before = txn_catalog_fingerprint(&conn);
+            let count = |rows: Vec<Row>| rows[0].values()[0].clone();
+
+            // A DML-only transaction keeps no copy, before or after COMMIT.
+            conn.execute("BEGIN;").await.unwrap();
+            assert_eq!(
+                txn_catalog_cells(&conn),
+                [(true, false); 8],
+                "BEGIN arms every catalog cell and copies none"
+            );
+            for sql in [
+                "INSERT INTO base VALUES (2, 'b');",
+                "UPDATE base SET v = 'bb' WHERE id = 2;",
+                "INSERT INTO seq(v) VALUES ('t');",
+                "DELETE FROM base WHERE id = 1;",
+            ] {
+                conn.execute(sql).await.unwrap();
+            }
+            assert_eq!(
+                count(conn.query("SELECT count(*) FROM base;").await.unwrap()),
+                SqliteValue::Integer(1)
+            );
+            assert!(
+                txn_catalog_cells(&conn).iter().all(|(_, kept)| !kept),
+                "plain DML changes no catalog state: {:?}",
+                txn_catalog_cells(&conn)
+            );
+            conn.execute("COMMIT;").await.unwrap();
+            assert_eq!(txn_catalog_cells(&conn), [(false, false); 8]);
+            assert_eq!(txn_catalog_fingerprint(&conn), before);
+
+            // Every kind of catalog change, rolled back.
+            conn.execute("BEGIN;").await.unwrap();
+            for sql in [
+                "CREATE TABLE n1 (id INTEGER PRIMARY KEY, x INTEGER);",
+                "CREATE INDEX n1_x ON n1(x);",
+                "CREATE TABLE n2 (id INTEGER PRIMARY KEY AUTOINCREMENT, y TEXT);",
+                "INSERT INTO n2(y) VALUES ('n');",
+                "CREATE VIEW v1 AS SELECT id, v FROM base;",
+                "CREATE TRIGGER tr1 AFTER INSERT ON base BEGIN INSERT INTO n1(x) VALUES (new.id); END;",
+                "ALTER TABLE base ADD COLUMN extra TEXT DEFAULT 'e';",
+                "ALTER TABLE n1 RENAME TO n1r;",
+                "DROP INDEX base_v;",
+                "DROP TABLE seq;",
+                "CREATE TEMP TABLE base (id INTEGER PRIMARY KEY, shadow TEXT);",
+                "SAVEPOINT inner_sp;",
+                "CREATE TABLE in_savepoint (id INTEGER PRIMARY KEY);",
+                "ROLLBACK TO inner_sp;",
+                "RELEASE inner_sp;",
+            ] {
+                conn.execute(sql)
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            }
+            assert_ne!(
+                txn_catalog_fingerprint(&conn),
+                before,
+                "precondition: the transaction changed the catalog"
+            );
+            let kept = txn_catalog_cells(&conn)
+                .iter()
+                .filter(|(_, kept)| *kept)
+                .count();
+            assert!(
+                kept >= 6,
+                "the changed cells kept their BEGIN-time values: {:?}",
+                txn_catalog_cells(&conn)
+            );
+            conn.execute("ROLLBACK;").await.unwrap();
+            assert_eq!(
+                txn_catalog_fingerprint(&conn),
+                before,
+                "ROLLBACK restores the catalog BEGIN saw"
+            );
+            assert_eq!(txn_catalog_cells(&conn), [(false, false); 8]);
+            assert_eq!(master(conn.query(master_sql).await.unwrap()), master_before);
+            for gone in [
+                "SELECT * FROM n1r;",
+                "SELECT * FROM n2;",
+                "SELECT * FROM v1;",
+                "SELECT extra FROM base;",
+                "SELECT shadow FROM base;",
+            ] {
+                assert!(
+                    conn.query(gone).await.is_err(),
+                    "{gone} must fail after ROLLBACK"
+                );
+            }
+            conn.execute("INSERT INTO base VALUES (3, 'c');")
+                .await
+                .unwrap();
+            assert_eq!(
+                count(conn.query("SELECT count(*) FROM main.base;").await.unwrap()),
+                SqliteValue::Integer(2)
+            );
+            assert_eq!(
+                count(conn.query("SELECT count(*) FROM seq;").await.unwrap()),
+                SqliteValue::Integer(2)
+            );
+            assert_eq!(txn_catalog_fingerprint(&conn), before);
+
+            // A peer's committed DDL between two transactions is seen by the
+            // second, and that transaction's ROLLBACK keeps it.
+            let peer = Connection::open(db_str).await.unwrap();
+            peer.execute("CREATE TABLE peer_t (id INTEGER PRIMARY KEY, z TEXT);")
+                .await
+                .unwrap();
+            peer.execute("INSERT INTO peer_t VALUES (1, 'p');")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            assert_eq!(
+                count(conn.query("SELECT z FROM peer_t;").await.unwrap()),
+                SqliteValue::Text("p".into())
+            );
+            conn.execute("CREATE TABLE gone_again (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("ROLLBACK;").await.unwrap();
+            assert_eq!(
+                count(conn.query("SELECT count(*) FROM peer_t;").await.unwrap()),
+                SqliteValue::Integer(1)
+            );
+            assert!(conn.query("SELECT * FROM gone_again;").await.is_err());
+            let after_peer = txn_catalog_fingerprint(&conn);
+            assert!(after_peer.contains("peer_t"), "{after_peer}");
+            assert!(!after_peer.contains("gone_again"), "{after_peer}");
+            peer.close().await.unwrap();
             conn.close().await.unwrap();
         });
     }
