@@ -1207,6 +1207,12 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
     /// Whether this pager was opened read-only.
     fn is_readonly(&self) -> bool;
 
+    /// Whether this pager was opened `immutable=1` (bd-j2dtf): read-only,
+    /// lock-free, and reading the main file alone, never a `-wal`.
+    fn is_immutable(&self) -> bool {
+        false
+    }
+
     /// Switch the journal mode.
     ///
     /// Switching from `Delete` to `Wal` requires providing a [`WalBackend`]

@@ -174,6 +174,9 @@ fn validate_open_flags(flags: OpenFlags) -> Result<(), FrankenError> {
 struct ResolvedOpen<'a> {
     path: Cow<'a, str>,
     disposition: OpenDisposition,
+    /// `immutable=1` (bd-j2dtf): read-only whatever `mode` says, with no
+    /// locks and no WAL, as stock opens an immutable file.
+    immutable: bool,
 }
 
 fn uri_error(detail: impl Into<String>) -> FrankenError {
@@ -246,9 +249,10 @@ fn narrow_uri_mode(
 }
 
 /// Only values explicitly requesting no change may use an unsupported boolean
-/// VFS option. Do not silently accept a locking/immutability promise we cannot
-/// enforce. In particular, mapping immutable=1 to an ordinary writable open is
-/// wrong, and disabling native locks would undermine concurrent writers.
+/// VFS option. Do not silently accept a locking promise we cannot enforce:
+/// nolock=1 on a writable connection would undermine concurrent writers.
+/// immutable=1 is supported (bd-j2dtf): it never maps to a writable open, but
+/// to stock's lock-free read of the main file alone.
 fn disabled_uri_boolean(value: &str) -> bool {
     value.is_empty()
         || value.bytes().all(|byte| byte == b'0')
@@ -257,12 +261,20 @@ fn disabled_uri_boolean(value: &str) -> bool {
             .any(|word| value.eq_ignore_ascii_case(word))
 }
 
+/// What a URI query resolves to.
+struct ResolvedQuery {
+    disposition: OpenDisposition,
+    memory: bool,
+    immutable: bool,
+}
+
 fn resolve_uri_query(
     query: &str,
     mut disposition: OpenDisposition,
     mut shared_cache: bool,
-) -> Result<(OpenDisposition, bool), FrankenError> {
+) -> Result<ResolvedQuery, FrankenError> {
     let mut memory = false;
+    let mut immutable = None;
     for parameter in query.split('&').filter(|parameter| !parameter.is_empty()) {
         let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         let key = decode_uri_component(key)?;
@@ -292,8 +304,14 @@ fn resolve_uri_query(
                     _ => return Err(uri_error(format!("no such cache mode: {value}"))),
                 };
             }
-            "immutable" | "nolock" if disabled_uri_boolean(&value) => {}
-            "immutable" | "nolock" | "vfs" | "modeof" | "psow" => {
+            // As in stock, the first immutable parameter decides
+            // (sqlite3_uri_parameter returns the first match), read with
+            // sqlite3GetBoolean's rules.
+            "immutable" => {
+                immutable.get_or_insert_with(|| stock_uri_boolean(&value));
+            }
+            "nolock" if disabled_uri_boolean(&value) => {}
+            "nolock" | "vfs" | "modeof" | "psow" => {
                 return Err(FrankenError::NotImplemented(format!(
                     "database URI option {key}={value} is not supported"
                 )));
@@ -307,7 +325,24 @@ fn resolve_uri_query(
             "shared-cache database URIs are not supported; use cache=private".to_owned(),
         ));
     }
-    Ok((disposition, memory))
+    Ok(ResolvedQuery {
+        disposition,
+        memory,
+        immutable: immutable.unwrap_or(false),
+    })
+}
+
+/// sqlite3GetBoolean with a false default, as sqlite3_uri_boolean reads a
+/// URI parameter: a leading digit means its integer value, otherwise
+/// yes/on/true and no/off/false (any case); anything else is false.
+fn stock_uri_boolean(value: &str) -> bool {
+    let digits: &str = &value[..value.bytes().take_while(u8::is_ascii_digit).count()];
+    if !digits.is_empty() {
+        return digits.bytes().any(|digit| digit != b'0');
+    }
+    ["yes", "on", "true"]
+        .iter()
+        .any(|word| value.eq_ignore_ascii_case(word))
 }
 
 fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, FrankenError> {
@@ -322,6 +357,7 @@ fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, Franke
         return Ok(ResolvedOpen {
             path: Cow::Borrowed(path),
             disposition,
+            immutable: false,
         });
     };
 
@@ -342,11 +378,20 @@ fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, Franke
         .split_once('?')
         .unwrap_or((without_fragment, ""));
     let mut filename = decode_uri_component(raw_path)?;
-    let (disposition, memory) = resolve_uri_query(
+    let ResolvedQuery {
+        disposition,
+        memory,
+        immutable,
+    } = resolve_uri_query(
         query,
         disposition,
         flags.contains(OpenFlags::SQLITE_OPEN_SHARED_CACHE),
     )?;
+    if memory && immutable {
+        return Err(FrankenError::NotImplemented(
+            "immutable :memory: connections are not supported".to_owned(),
+        ));
+    }
     if memory {
         filename = Cow::Borrowed(":memory:");
     } else if filename.is_empty() {
@@ -374,6 +419,7 @@ fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, Franke
     Ok(ResolvedOpen {
         path: filename,
         disposition,
+        immutable,
     })
 }
 
@@ -448,6 +494,10 @@ pub async fn open_with_flags_with_env(
 ) -> Result<Connection, FrankenError> {
     let resolved = resolve_open(path, flags)?;
     let path = resolved.path.as_ref();
+    // Stock always opens an immutable file read-only, whatever the mode.
+    if resolved.immutable {
+        return Connection::open_immutable_with_env(path, env).await;
+    }
     match resolved.disposition {
         OpenDisposition::ReadOnly => open_read_only_connection_with_env(path, env).await,
         OpenDisposition::WriteExisting => {
@@ -760,13 +810,45 @@ mod tests {
         assert!(resolve_open("plain\0name", OpenFlags::default_flags()).is_err());
     }
 
+    /// bd-j2dtf: immutable=1 is supported now, so it left the unsupported
+    /// list below. It resolves read-only whatever mode says, the first
+    /// immutable parameter decides (stock's sqlite3_uri_parameter), and its
+    /// value is read like sqlite3GetBoolean reads it.
+    #[test]
+    fn uri_immutable_resolves_read_only_as_stock_reads_the_parameter() {
+        for (query, immutable) in [
+            ("immutable=1", true),
+            ("immutable=TRUE", true),
+            ("immutable=yes", true),
+            ("immutable=On", true),
+            ("immutable=2", true),
+            ("immutable=1&immutable=0", true),
+            ("immutable=0&immutable=1", false),
+            ("immutable=0", false),
+            ("immutable=off", false),
+            ("immutable=", false),
+            ("immutable=maybe", false),
+            ("immutable=0x1", false),
+            ("mode=rwc&immutable=1", true),
+        ] {
+            let uri = format!("file:a.db?{query}");
+            let resolved = resolve_open(&uri, uri_flags()).unwrap();
+            assert_eq!(resolved.immutable, immutable, "{query}");
+            assert_eq!(resolved.path, "a.db", "{query}");
+        }
+        assert!(resolve_open("file:a.db?mode=memory&immutable=1", uri_flags()).is_err());
+        assert!(
+            !resolve_open("a.db?immutable=1", OpenFlags::default_flags())
+                .unwrap()
+                .immutable
+        );
+    }
+
     #[test]
     fn uri_unsupported_vfs_requests_fail_instead_of_silently_changing_semantics() {
         for query in [
             "vfs=unix",
             "vfs=",
-            "immutable=1",
-            "immutable=TRUE",
             "nolock=1",
             "nolock=yes",
             "modeof=owner.db",

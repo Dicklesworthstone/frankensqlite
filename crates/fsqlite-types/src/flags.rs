@@ -229,6 +229,11 @@ bitflags! {
         const READONLY         = 0x0000_0001;
         /// Delete on close.
         const DELETEONCLOSE    = 0x0000_0008;
+        /// FrankenSQLite only, no SQLite counterpart: the file takes no locks
+        /// and maps no `-shm`, for a read-only `immutable=1` open (bd-j2dtf).
+        /// Every lock request succeeds without touching the file, every
+        /// write-lock request is refused, and shared memory is unavailable.
+        const NO_LOCK          = 0x0400_0000;
     }
 }
 

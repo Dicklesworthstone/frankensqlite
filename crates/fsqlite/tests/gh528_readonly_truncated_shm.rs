@@ -360,9 +360,10 @@ enum ReadOnlyShape {
 /// same file family. Stock (here the bundled 3.54.1 in a child process; the
 /// bead also measured 3.46.1) rebuilds a short or uninitialized writable
 /// `-shm`, reads every row and leaves the main file and the WAL unchanged.
-/// FrankenSQLite must give the same rows and the same rebuilt index. A
-/// read-only `-shm` and `immutable=1` are not implemented yet (bd-j2dtf
-/// items 2 and 3): for them FrankenSQLite may refuse, but it may never answer
+/// FrankenSQLite must give the same rows and the same rebuilt index.
+/// `immutable=1` (bd-j2dtf item 3) must read what stock reads, the main file
+/// alone, and write nothing. A read-only `-shm` is not implemented yet
+/// (bd-j2dtf item 2): there FrankenSQLite may refuse, but it may never answer
 /// differently from stock or write anything.
 #[test]
 fn read_only_opens_match_a_live_stock_process() {
@@ -507,15 +508,137 @@ fn read_only_opens_match_a_live_stock_process() {
                         "{context}: fsqlite rebuilds the index stock rebuilds"
                     );
                 }
-                ReadOnlyShape::ShmValidReadOnly | ReadOnlyShape::Immutable => {
+                ReadOnlyShape::ShmValidReadOnly => {
                     assert_eq!(stock_after, before, "{context}: stock writes nothing");
                     assert_eq!(frank_after, before, "{context}: fsqlite must write nothing");
                     if let Ok(rows) = frank {
                         assert_eq!(rows, stock_rows, "{context}: never a different answer");
                     }
                 }
+                ReadOnlyShape::Immutable => {
+                    assert_eq!(stock_after, before, "{context}: stock writes nothing");
+                    assert_eq!(frank_after, before, "{context}: fsqlite must write nothing");
+                    // A plain mode=ro read would also see the 20 WAL-only
+                    // rows; stock ignores the WAL of an immutable file.
+                    assert_eq!(
+                        frank,
+                        Ok(stock_rows),
+                        "{context}: fsqlite reads the main file alone, as stock does"
+                    );
+                }
             }
         }
         drop(writer);
+    });
+}
+
+/// bd-j2dtf item 3: `immutable=1` takes no locks and creates no file, as
+/// stock opens an immutable file (like a temp file: no locking, no WAL).
+///
+/// - A WAL family copied without its `-shm`: both engines read the main
+///   file's rows, and neither creates a `-shm`, a `-wal` or anything else.
+/// - A rollback-journal database whose EXCLUSIVE lock this process holds
+///   (an open `BEGIN EXCLUSIVE` with a pending row): stock in a child reads
+///   the committed rows immutably. Negative: a plain `mode=ro` read, which
+///   locks, is refused by both engines, so the lock binds fsqlite and an
+///   implementation that locks would fail the immutable read.
+#[test]
+fn immutable_open_takes_no_locks_and_creates_no_sidecar() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (writer, source) = stock_fixture(dir.path());
+        let main_rows: Rows = expected_rows()
+            .into_iter()
+            .take(usize::try_from(MAIN_FILE_ROWS).unwrap())
+            .collect();
+        let mut arms = Vec::new();
+        for engine in ["stock", "frank"] {
+            let to = dir.path().join(format!("no-shm-{engine}"));
+            std::fs::create_dir_all(&to).unwrap();
+            let db = to.join("copy.db");
+            for suffix in ["", "-wal"] {
+                std::fs::copy(sidecar(&source, suffix), sidecar(&db, suffix)).unwrap();
+            }
+            arms.push(db);
+        }
+        let before = family(&arms[0]);
+        assert_eq!(family(&arms[1]), before, "identical copies");
+        assert!(!before.contains_key("-shm"), "the copies have no -shm");
+        let stock = stock_read(&arms[0], "immutable=1");
+        let frank = frank_read(&arms[1], "immutable=1").await;
+        eprintln!(
+            "event=bd_j2dtf_immutable shape=no_shm stock={:?} frank={:?}",
+            stock.as_ref().map(Vec::len),
+            frank.as_ref().map(Vec::len)
+        );
+        assert_eq!(
+            stock,
+            Ok(main_rows.clone()),
+            "stock reads the main file alone"
+        );
+        assert_eq!(
+            frank,
+            Ok(main_rows.clone()),
+            "fsqlite reads what stock reads"
+        );
+        assert_eq!(
+            family(&arms[0]),
+            before,
+            "stock creates and changes nothing"
+        );
+        assert_eq!(
+            family(&arms[1]),
+            before,
+            "fsqlite creates and changes nothing"
+        );
+        drop(writer);
+
+        let locked = dir.path().join("locked").join("rollback.db");
+        std::fs::create_dir_all(locked.parent().unwrap()).unwrap();
+        let holder = rusqlite::Connection::open(&locked).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL);",
+            )
+            .unwrap();
+        for (id, v) in &main_rows {
+            holder
+                .execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, v])
+                .unwrap();
+        }
+        holder
+            .execute_batch("BEGIN EXCLUSIVE; INSERT INTO t VALUES (99, 'uncommitted');")
+            .unwrap();
+        let stock_plain = stock_read(&locked, "mode=ro");
+        let frank_plain = frank_read(&locked, "mode=ro").await;
+        let stock_immutable = stock_read(&locked, "immutable=1");
+        let frank_immutable = frank_read(&locked, "immutable=1").await;
+        eprintln!(
+            "event=bd_j2dtf_immutable shape=exclusive_lock stock_plain={stock_plain:?} \
+             frank_plain={:?} stock_immutable={:?} frank_immutable={:?}",
+            frank_plain.as_ref().map(Vec::len),
+            stock_immutable.as_ref().map(Vec::len),
+            frank_immutable.as_ref().map(Vec::len)
+        );
+        assert!(
+            stock_plain.is_err(),
+            "the stock oracle: EXCLUSIVE refuses a locking read"
+        );
+        assert!(
+            frank_plain.is_err(),
+            "negative control: the EXCLUSIVE lock refuses fsqlite's locking read too"
+        );
+        assert_eq!(
+            stock_immutable,
+            Ok(main_rows.clone()),
+            "stock reads an immutable file without locking"
+        );
+        assert_eq!(
+            frank_immutable,
+            Ok(main_rows),
+            "fsqlite reads an immutable file without locking, as stock does"
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
     });
 }

@@ -2417,6 +2417,22 @@ pub struct UnixFile {
 }
 
 impl UnixFile {
+    /// bd-j2dtf: an `immutable=1` open takes no locks at all, as stock's
+    /// immutable files do (opened like a temp file: `noLock`, no WAL).
+    fn takes_no_locks(&self) -> bool {
+        self.open_flags.contains(VfsOpenFlags::NO_LOCK)
+    }
+
+    /// A lock-free handle grants SHARED without touching the file. Anything
+    /// stronger would announce a writer, and an immutable file is never
+    /// written, so it is refused.
+    fn refuse_write_lock_without_locking(level: LockLevel) -> Result<()> {
+        if level > LockLevel::Shared {
+            return Err(FrankenError::ReadOnly);
+        }
+        Ok(())
+    }
+
     /// A never-mapped handle still shares POSIX ownership with sibling SHM
     /// users. Inspect an existing registration without creating or joining it.
     /// No SHM/table guard survives this method or overlaps the inode mutex.
@@ -4437,6 +4453,9 @@ impl VfsFile for UnixFile {
 
     fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
         checkpoint_or_abort_if_cancel_published(cx)?;
+        if self.takes_no_locks() {
+            return Self::refuse_write_lock_without_locking(level);
+        }
         let timeout = Duration::from_millis(self.busy_timeout_ms);
         let prior_level = self.lock_level;
         let mut wait_started = None;
@@ -4782,7 +4801,9 @@ impl VfsFile for UnixFile {
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if level >= self.lock_level && !self.transient_shared_pending_gate {
+        if self.takes_no_locks()
+            || (level >= self.lock_level && !self.transient_shared_pending_gate)
+        {
             return Ok(());
         }
 
@@ -4800,6 +4821,9 @@ impl VfsFile for UnixFile {
     }
 
     fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        if self.takes_no_locks() {
+            return checkpoint_or_abort_if_cancel_published(cx);
+        }
         if self.external_append_attempt.is_some() {
             return Err(FrankenError::internal(
                 "cannot acquire a Unix snapshot inside a WAL append attempt",
@@ -4824,6 +4848,9 @@ impl VfsFile for UnixFile {
     }
 
     fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        if self.takes_no_locks() {
+            return Ok(());
+        }
         if self.external_append_attempt.is_some() {
             return Err(FrankenError::internal(
                 "restore the Unix WAL append attempt before its enclosing snapshot",
@@ -4848,6 +4875,9 @@ impl VfsFile for UnixFile {
 
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        if self.takes_no_locks() {
+            return Err(FrankenError::ReadOnly);
+        }
         if self.external_append_attempt.is_some() || self.external_maintenance_attempt.is_some() {
             return Err(FrankenError::internal(
                 "Unix WAL append cannot overlap another append or maintenance attempt",
@@ -4984,10 +5014,16 @@ impl VfsFile for UnixFile {
     }
 
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        if self.takes_no_locks() {
+            return Err(FrankenError::ReadOnly);
+        }
         self.acquire_external_maintenance_fence(cx, wal_mode, LockLevel::Exclusive, false)
     }
 
     fn lock_external_wal_checkpoint(&mut self, cx: &Cx) -> Result<()> {
+        if self.takes_no_locks() {
+            return Err(FrankenError::ReadOnly);
+        }
         // FrankenSQLite appends under the main-file RESERVED byte; stock
         // SQLite appends under WAL_WRITE_LOCK. Hold both, plus CKPT, while
         // allowing foreign idle WAL-lifetime SHARED claims. The caller must
@@ -4997,6 +5033,9 @@ impl VfsFile for UnixFile {
 
     fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        if self.takes_no_locks() {
+            return Err(FrankenError::ReadOnly);
+        }
         // A database this process cannot write has only a read-only canonical
         // descriptor, and a POSIX write lock on one fails with EBADF, so its
         // reader recovers under SHARED, as stock's walIndexRecover always
@@ -5135,6 +5174,9 @@ impl VfsFile for UnixFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+        if self.takes_no_locks() {
+            return Ok(false);
+        }
         // A kernel query ignores locks owned by its own OFD (or process on
         // classic platforms). Consult the coalesced inode state first so a
         // sibling connection observes RESERVED, PENDING, or EXCLUSIVE exactly
@@ -5166,6 +5208,9 @@ impl VfsFile for UnixFile {
     }
 
     fn claim_wal_lifetime_before_join(&mut self, cx: &Cx) -> Result<bool> {
+        if self.takes_no_locks() {
+            return Ok(false);
+        }
         if self.wal_lifetime_claim == WalLifetimeClaim::Held {
             return Ok(true);
         }
@@ -5201,6 +5246,11 @@ impl VfsFile for UnixFile {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
         checkpoint_or_abort(cx)?;
+        if self.takes_no_locks() {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
         if self.closed || !self.open_flags.contains(VfsOpenFlags::MAIN_DB) {
             return Err(FrankenError::Unsupported);
         }
@@ -5365,6 +5415,11 @@ impl VfsFile for UnixFile {
         size: u32,
         extend: bool,
     ) -> Result<crate::shm::ShmRegion> {
+        if self.takes_no_locks() {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
         if size == 0 {
             return Err(FrankenError::LockFailed {
                 detail: "shm_map size must be > 0".to_string(),
@@ -5489,6 +5544,11 @@ impl VfsFile for UnixFile {
     }
 
     fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        if self.takes_no_locks() {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
         Self::validate_shm_request(offset, n)?;
         let lock_requested = flags & SQLITE_SHM_LOCK != 0;
         let unlock_requested = flags & SQLITE_SHM_UNLOCK != 0;

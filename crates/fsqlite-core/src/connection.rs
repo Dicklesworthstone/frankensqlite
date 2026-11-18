@@ -131,7 +131,6 @@ use fsqlite_func::{
     builtin_function_surface_inventory, get_last_changes, get_last_insert_rowid, get_total_changes,
     sqlite_compile_options,
 };
-#[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
 pub use fsqlite_pager::page_cache::PageCachePeakSnapshot;
 pub use fsqlite_pager::pager::DatabaseImageReceipt;
@@ -5102,13 +5101,16 @@ impl PagerBackend {
     async fn open_readonly_with_page_buffer_max(
         path: &str,
         cx: &Cx,
-        expected_identity: Option<FileIdentity>,
+        mode: ConnectionPagerOpenMode,
         page_buffer_max: Option<usize>,
         memory_vfs_config: Option<MemoryVfsConfig>,
-        recover_wal_index: bool,
     ) -> Result<Self> {
         if path == ":memory:" {
-            if expected_identity.is_some() {
+            if !matches!(
+                mode,
+                ConnectionPagerOpenMode::ReadOnly(None)
+                    | ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(None)
+            ) {
                 return Err(FrankenError::CannotOpen {
                     path: PathBuf::from(path),
                 });
@@ -5126,11 +5128,7 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                if recover_wal_index {
-                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
-                } else {
-                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
-                },
+                mode,
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -5146,11 +5144,7 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                if recover_wal_index {
-                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
-                } else {
-                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
-                },
+                mode,
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -5166,11 +5160,7 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                if recover_wal_index {
-                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
-                } else {
-                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
-                },
+                mode,
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -5178,7 +5168,7 @@ impl PagerBackend {
         }
         #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
         {
-            let _ = (expected_identity, recover_wal_index);
+            let _ = mode;
             Err(FrankenError::NotImplemented(
                 "file-backed pager not available on this platform".to_owned(),
             ))
@@ -5277,6 +5267,18 @@ impl PagerBackend {
             Self::Unix(p) => p.is_readonly(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.is_readonly(),
+        }
+    }
+
+    fn is_immutable(&self) -> bool {
+        match self {
+            Self::Memory(p) => p.is_immutable(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.is_immutable(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.is_immutable(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.is_immutable(),
         }
     }
 
@@ -16095,6 +16097,8 @@ impl Drop for MaterializedBindingsVisibilityGuard<'_> {
 enum SchemaOnlyPagerDisposition {
     Ordinary,
     RecoverWalIndex,
+    /// `immutable=1` (bd-j2dtf): the main file alone, no locks.
+    Immutable,
     #[cfg(not(target_arch = "wasm32"))]
     ReservedEmptyRollback(FileIdentity),
 }
@@ -16343,6 +16347,25 @@ impl Connection {
         .await
     }
 
+    /// Open an `immutable=1` connection (bd-j2dtf), as stock SQLite opens an
+    /// immutable file: read-only, taking no locks, and reading the main file
+    /// alone. No `-wal`, `-shm`, rollback journal or namespace sidecar is
+    /// opened or created, so committed frames still in a WAL are not seen.
+    pub async fn open_immutable_with_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+            path.into(),
+            None,
+            env,
+            false,
+            false,
+            SchemaOnlyPagerDisposition::Immutable,
+        )
+        .await
+    }
+
     /// Open a writable, existing-only schema connection with an explicit
     /// runtime environment.
     pub async fn open_existing_schema_only_with_env(
@@ -16456,8 +16479,10 @@ impl Connection {
         let path = path.into();
         if path.is_empty()
             || (writable && path == ":memory:")
-            || (matches!(disposition, SchemaOnlyPagerDisposition::RecoverWalIndex)
-                && path == ":memory:")
+            || (matches!(
+                disposition,
+                SchemaOnlyPagerDisposition::RecoverWalIndex | SchemaOnlyPagerDisposition::Immutable
+            ) && path == ":memory:")
             || (expected_identity.is_some() && path == ":memory:")
         {
             return Err(FrankenError::CannotOpen {
@@ -16481,15 +16506,23 @@ impl Connection {
                 })
                 .await?
             }
-            SchemaOnlyPagerDisposition::Ordinary | SchemaOnlyPagerDisposition::RecoverWalIndex => {
+            SchemaOnlyPagerDisposition::Ordinary
+            | SchemaOnlyPagerDisposition::RecoverWalIndex
+            | SchemaOnlyPagerDisposition::Immutable => {
+                let mode = match disposition {
+                    SchemaOnlyPagerDisposition::RecoverWalIndex => {
+                        ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+                    }
+                    SchemaOnlyPagerDisposition::Immutable => ConnectionPagerOpenMode::Immutable,
+                    _ => ConnectionPagerOpenMode::ReadOnly(expected_identity),
+                };
                 retry_busy_connection_bootstrap(&bootstrap_cx, || {
                     PagerBackend::open_readonly_with_page_buffer_max(
                         &path,
                         &bootstrap_cx,
-                        expected_identity,
+                        mode,
                         env.page_buffer_max(),
                         env.memory_vfs_config(),
-                        matches!(disposition, SchemaOnlyPagerDisposition::RecoverWalIndex),
                     )
                 })
                 .await?
@@ -88306,7 +88339,9 @@ impl Connection {
     async fn apply_current_journal_mode_to_pager_readonly(&self) -> Result<()> {
         let journal_mode = self.pragma_state.borrow().journal_mode.clone();
         let cx = self.op_cx()?;
-        if !journal_mode.eq_ignore_ascii_case("wal") {
+        // bd-j2dtf: stock opens an immutable file like a temp file and never
+        // opens its WAL, so a WAL-format file reads as its main file alone.
+        if !journal_mode.eq_ignore_ascii_case("wal") || self.pager.is_immutable() {
             return Ok(());
         }
 

@@ -7890,6 +7890,8 @@ enum PagerAccessMode {
     Writable,
     ReadOnly,
     ReadOnlyWithWalIndexRecovery,
+    /// `immutable=1`: the main file is the whole database (bd-j2dtf).
+    Immutable,
 }
 
 impl PagerAccessMode {
@@ -7897,6 +7899,16 @@ impl PagerAccessMode {
     const fn is_readonly(self) -> bool {
         !matches!(self, Self::Writable)
     }
+}
+
+/// How a read-only open joins the database's runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOnlyAdmission {
+    /// Join the namespace generation (GH#140 / GH#535), finishing its
+    /// bootstrap here or leaving that to the connection.
+    Namespace { finish_bootstrap: bool },
+    /// `immutable=1` (bd-j2dtf): no namespace sidecars, no locks, no WAL.
+    Immutable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14927,6 +14939,10 @@ pub enum ConnectionPagerOpenMode {
     ReadOnly(Option<FileIdentity>),
     /// Read-only database/WAL access with explicit derived WAL-index recovery.
     ReadOnlyWithWalIndexRecovery(Option<FileIdentity>),
+    /// `immutable=1` (bd-j2dtf): read the main file alone, as stock opens an
+    /// immutable file like a temp file. No locks, no `-wal`/`-shm`, no
+    /// namespace sidecars, no rollback-journal check.
+    Immutable,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
@@ -15747,6 +15763,14 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.access_mode.is_readonly()
+    }
+
+    fn is_immutable(&self) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.access_mode == PagerAccessMode::Immutable
     }
 
     /// Set the post-commit rollback-journal cleanup strategy (bd-sw2k5). Chosen
@@ -19378,14 +19402,20 @@ where
                 Err(FrankenError::BusyRecovery)
             } else {
                 let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-                let journal_state = Self::verify_readonly_snapshot_journal_state(
-                    cx,
-                    &*self.vfs,
-                    &journal_path,
-                    &*db_file,
-                    &self.maintenance_gate,
-                )
-                .await;
+                // bd-j2dtf: stock never looks for a journal beside an
+                // immutable file.
+                let journal_state = if inner.access_mode == PagerAccessMode::Immutable {
+                    Ok(())
+                } else {
+                    Self::verify_readonly_snapshot_journal_state(
+                        cx,
+                        &*self.vfs,
+                        &journal_path,
+                        &*db_file,
+                        &self.maintenance_gate,
+                    )
+                    .await
+                };
                 drop(db_file);
                 match journal_state {
                     Ok(()) => {
@@ -19614,7 +19644,9 @@ where
                     requested_page_size,
                     expected_identity,
                     page_buffer_max,
-                    false,
+                    ReadOnlyAdmission::Namespace {
+                        finish_bootstrap: false,
+                    },
                 )
                 .await?;
                 if matches!(mode, ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(_)) {
@@ -19623,6 +19655,18 @@ where
                         .access_mode = PagerAccessMode::ReadOnlyWithWalIndexRecovery;
                 }
                 Ok(pager)
+            }
+            ConnectionPagerOpenMode::Immutable => {
+                Self::open_readonly_with_optional_expected_identity(
+                    cx,
+                    vfs,
+                    path,
+                    requested_page_size,
+                    None,
+                    page_buffer_max,
+                    ReadOnlyAdmission::Immutable,
+                )
+                .await
             }
         }
     }
@@ -20571,7 +20615,9 @@ where
             _requested_page_size,
             None,
             page_buffer_max,
-            true,
+            ReadOnlyAdmission::Namespace {
+                finish_bootstrap: true,
+            },
         )
         .await
     }
@@ -20596,7 +20642,9 @@ where
             _requested_page_size,
             Some(expected_identity),
             page_buffer_max,
-            true,
+            ReadOnlyAdmission::Namespace {
+                finish_bootstrap: true,
+            },
         )
         .await
     }
@@ -20609,8 +20657,9 @@ where
         _requested_page_size: PageSize,
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
-        finish_namespace_bootstrap: bool,
+        admission: ReadOnlyAdmission,
     ) -> Result<Self> {
+        let immutable = admission == ReadOnlyAdmission::Immutable;
         let vfs = Arc::new(vfs);
         let db_path = vfs.full_pathname(cx, path)?;
         if !vfs.is_memory() {
@@ -20618,8 +20667,10 @@ where
         }
         let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
         let path_maintenance_lease = path_maintenance_gate.enter_open()?;
+        // bd-j2dtf: an immutable open reads no sidecar and takes no lock,
+        // the namespace gate's included.
         #[cfg(all(feature = "native", any(unix, windows)))]
-        let mut pending_namespace = if vfs.is_memory() {
+        let mut pending_namespace = if vfs.is_memory() || immutable {
             None
         } else {
             // GH#140 / GH#535: strictly read-only admission joins the
@@ -20657,7 +20708,11 @@ where
         };
         #[cfg(not(all(feature = "native", any(unix, windows))))]
         let effective_expected_identity = expected_identity;
-        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        let flags = if immutable {
+            VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB | VfsOpenFlags::NO_LOCK
+        } else {
+            VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB
+        };
         #[cfg(all(feature = "native", any(unix, windows)))]
         let (db_file, _actual_flags) = {
             let initial_open = if let Some(identity) = effective_expected_identity {
@@ -20741,6 +20796,7 @@ where
             journal_path.clone(),
             db_path.clone(),
             Arc::clone(&maintenance_gate),
+            immutable,
         );
         let (file_size, header_bytes) = with_main_shared_lock(
             cx,
@@ -20748,14 +20804,18 @@ where
             &db_file,
             &mut header_state,
             |cx, db_file, state| {
-            let (vfs, journal_path, db_path, maintenance_gate) = state;
+            let (vfs, journal_path, db_path, maintenance_gate, immutable) = state;
             Box::pin(async move {
             // Read-only and schema-only opens cannot replay. A RESERVED owner
             // makes its journal live rather than hot; our retained SHARED
             // fence protects the committed image until this header is read.
-            Self::verify_readonly_snapshot_journal_state(
-                cx, &*vfs, journal_path, db_file, maintenance_gate,
-            ).await?;
+            // An immutable file has no journal to consider: stock opens it
+            // like a temp file and never looks (bd-j2dtf).
+            if !*immutable {
+                Self::verify_readonly_snapshot_journal_state(
+                    cx, &*vfs, journal_path, db_file, maintenance_gate,
+                ).await?;
+            }
             let file_size = db_file.file_size(cx)?;
             if file_size == 0 {
                 return Err(FrankenError::CannotOpen {
@@ -20785,14 +20845,15 @@ where
         .await?;
         let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
             Ok(header)
-                if stale_main_header_can_be_recovered_from_live_wal(
-                    cx,
-                    &*vfs,
-                    &db_path,
-                    &header_bytes,
-                    true,
-                )
-                .await? =>
+                if !immutable
+                    && stale_main_header_can_be_recovered_from_live_wal(
+                        cx,
+                        &*vfs,
+                        &db_path,
+                        &header_bytes,
+                        true,
+                    )
+                    .await? =>
             {
                 // Stale live-WAL bootstrap stub: the real page 1 lives in the
                 // WAL, so only the page size is taken from the main file.
@@ -20885,7 +20946,11 @@ where
                 journal_mode: JournalMode::Delete,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
-                access_mode: PagerAccessMode::ReadOnly,
+                access_mode: if immutable {
+                    PagerAccessMode::Immutable
+                } else {
+                    PagerAccessMode::ReadOnly
+                },
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
                 rollback_journal_recovery_owner: None,
                 rollback_journal_recovery_namespace: None,
@@ -20928,7 +20993,11 @@ where
             shared_connection_count: OnceLock::new(),
             group_commit_queue,
         };
-        if finish_namespace_bootstrap {
+        if admission
+            == (ReadOnlyAdmission::Namespace {
+                finish_bootstrap: true,
+            })
+        {
             pager.finish_namespace_bootstrap()?;
         }
         Ok(pager)
