@@ -6264,6 +6264,78 @@ impl<P: PageReader> BtCursor<P> {
         Ok(Some(true))
     }
 
+    /// Synchronous fast path of [`BtreeCursorOps::table_move_to`]: a rowid
+    /// seek that the most recent seek-cache slot answers on the leaf the
+    /// cursor is already on.
+    ///
+    /// Returns `Ok(None)` with the cursor untouched whenever the general path
+    /// is needed: btree debug tracing on, no landing remembered for the
+    /// current leaf, a leaf this transaction has written, a target outside the
+    /// rowids that landing recorded, or one the leaf cannot place (before its
+    /// first cell or past its last). Otherwise it does what that cache hit
+    /// does inside `table_move_to`: search the leaf, land on it as the
+    /// cursor's whole stack, remember the landing, record the point witness,
+    /// and refresh the depth gauge.
+    pub fn try_table_seek_within_leaf(
+        &mut self,
+        cx: &Cx,
+        target_rowid: i64,
+    ) -> Result<Option<SeekResult>> {
+        let Some(cached) = self.seek_cache[0] else {
+            return Ok(None);
+        };
+        if (target_rowid < cached.rowid && cached.cell_idx == 0)
+            || target_rowid < cached.first_rowid
+            || target_rowid > cached.last_rowid
+        {
+            return Ok(None);
+        }
+        let Some(top) = self.stack.last() else {
+            return Ok(None);
+        };
+        if top.page_no != cached.page_no
+            || !(top.header.page_type.is_leaf() && top.header.page_type.is_table())
+            || tracing::enabled!(target: "fsqlite.btree", Level::DEBUG)
+            || self.pager.is_dirty(cached.page_no)
+        {
+            return Ok(None);
+        }
+        observe_cursor_cancellation(cx)?;
+        let (idx, seek_result) = match Self::search_integer_key_table_leaf(cx, top, target_rowid)? {
+            BinarySearchResult::Found(idx) => (idx, SeekResult::Found),
+            BinarySearchResult::NotFound(idx) if idx > 0 && idx < top.header.cell_count => {
+                (idx, SeekResult::NotFound)
+            }
+            BinarySearchResult::NotFound(_) => return Ok(None),
+        };
+        instrumentation::record_operation(BtreeOpType::Seek);
+        self.note_page_visit(cached.page_no);
+        if self.stack.len() > 1 {
+            let leaf = self
+                .stack
+                .pop()
+                .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+            self.stack.clear();
+            self.stack.push(leaf);
+        }
+        if let Some(leaf) = self.stack.last_mut() {
+            leaf.cell_idx = idx;
+        }
+        self.at_eof = false;
+        self.remember_table_cache_hit(0, target_rowid, cached.page_no, idx);
+        self.record_point_witness(
+            cx,
+            WitnessKey::Cell {
+                btree_root: self.root_page,
+                leaf_page: cached.page_no,
+                tag: Self::cell_tag_from_rowid(target_rowid),
+            },
+        );
+        self.last_known_depth = Some(self.stack.len());
+        instrumentation::set_depth_gauge(self.stack.len());
+        Ok(Some(seek_result))
+    }
+
     /// Move to the previous entry. Returns false if at the beginning.
     ///
     /// Forward-progress fix (frankensqlite#95, symmetric to `advance_next_impl`):
@@ -23631,6 +23703,111 @@ mod tests {
             assert!(stepped.eof() && reference.eof());
             assert_eq!(stepped.try_advance_next_within_leaf(&cx).unwrap(), None);
             assert_eq!(stepped.witness_keys(), reference.witness_keys());
+        });
+    }
+
+    #[test]
+    fn test_try_table_seek_within_leaf_matches_table_move_to_and_declines_off_its_leaf() {
+        fn five_leaf_tree() -> MemPageStore {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
+            );
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"a"), (14, b"b"), (20, b"c")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(30, b"d"), (40, b"e")]));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(50, b"f"), (60, b"g")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(70, b"h"), (80, b"i")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(90, b"j"), (100, b"k")]));
+            store
+        }
+
+        run_async(async {
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(five_leaf_tree(), pn(2), USABLE, true);
+            let mut fast = BtCursor::new(five_leaf_tree(), pn(2), USABLE, true);
+
+            // No landing remembered yet: the fast path declines untouched.
+            assert_eq!(fast.try_table_seek_within_leaf(&cx, 14).unwrap(), None);
+            assert!(fast.position_stamp().is_none());
+
+            let mut answered = 0;
+            let mut declined = 0;
+            // Found and not-found targets on the current leaf (14, 12, 20,
+            // 60), targets the current leaf cannot place (5 before its first
+            // cell, 25 between leaves, 105 past the end) and leaf changes.
+            for target in [
+                14_i64, 12, 20, 10, 25, 30, 40, 35, 5, 60, 55, 50, 105, 100, 95, 14,
+            ] {
+                let expected = reference.table_move_to(&cx, target).await.unwrap();
+                let before = fast.position_stamp();
+                let result = match fast.try_table_seek_within_leaf(&cx, target).unwrap() {
+                    Some(result) => {
+                        answered += 1;
+                        result
+                    }
+                    None => {
+                        // Declining must leave the cursor exactly where it was.
+                        assert_eq!(fast.position_stamp(), before, "target {target}");
+                        declined += 1;
+                        fast.table_move_to(&cx, target).await.unwrap()
+                    }
+                };
+                assert_eq!(result.is_found(), expected.is_found(), "target {target}");
+                assert_eq!(fast.eof(), reference.eof(), "target {target}");
+                assert_eq!(
+                    fast.current_page_path(),
+                    reference.current_page_path(),
+                    "target {target}"
+                );
+                // The two cursors read separate stores, and each store gives
+                // its page images their own tokens: compare the position the
+                // stamp records, not the image identity.
+                let position = |stamp: Option<CursorPositionStamp>| {
+                    stamp.map(|stamp| (stamp.page_no(), stamp.cell_idx(), stamp.row_image_epoch()))
+                };
+                assert_eq!(
+                    position(fast.position_stamp()),
+                    position(reference.position_stamp()),
+                    "target {target}"
+                );
+                assert_eq!(fast.seek_cache, reference.seek_cache, "target {target}");
+                if !fast.eof() {
+                    assert_eq!(
+                        fast.rowid(&cx).await.unwrap(),
+                        reference.rowid(&cx).await.unwrap(),
+                        "target {target}"
+                    );
+                }
+            }
+            // Answered: 12, 20, 10 (leaf 3), 30, 40, 35 (leaf 4), 55, 50
+            // (leaf 5), 100, 95 (leaf 7). Declined: the first 14 (nothing
+            // remembered), 25, 5, 60, 105 and the last 14 (outside the latest
+            // landing's leaf).
+            assert_eq!(answered, 10);
+            assert_eq!(declined, 6);
+            assert_eq!(fast.witness_keys(), reference.witness_keys());
+
+            // A cursor moved off the leaf of the latest landing: the cache
+            // still names leaf 4 and admits 35, but the cursor is on leaf 3,
+            // so the fast path must not search the wrong page.
+            assert!(!fast.table_move_to(&cx, 25).await.unwrap().is_found());
+            assert!(fast.first(&cx).await.unwrap());
+            assert_eq!(fast.rowid(&cx).await.unwrap(), 10);
+            assert_eq!(fast.seek_cache[0].map(|cached| cached.page_no), Some(pn(4)));
+            let before = fast.position_stamp();
+            assert_eq!(fast.try_table_seek_within_leaf(&cx, 35).unwrap(), None);
+            assert_eq!(fast.position_stamp(), before);
         });
     }
 

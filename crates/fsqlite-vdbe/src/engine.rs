@@ -5125,6 +5125,18 @@ impl CursorBackend {
         }
     }
 
+    /// [`Self::table_move_to`] without waiting, for a seek that lands on the
+    /// current leaf page. `None` means the cursor is untouched and
+    /// `table_move_to` must run.
+    #[inline]
+    fn try_table_seek_within_leaf(&mut self, cx: &Cx, rowid: i64) -> Result<Option<SeekResult>> {
+        match self {
+            Self::Mem(c) => c.try_table_seek_within_leaf(cx, rowid),
+            Self::Txn(c) => c.try_table_seek_within_leaf(cx, rowid),
+            Self::TimeTravel(c) => c.try_table_seek_within_leaf(cx, rowid),
+        }
+    }
+
     /// bd-wwqen.1: Count all rows by walking leaf page headers without
     /// decoding cell payloads. Much cheaper than first()/while next().
     async fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
@@ -13305,6 +13317,13 @@ impl VdbeEngine {
                         let seek_result = if use_rowset_advance {
                             lean_future(|| cursor.cursor.table_advance_to(&cursor.cx, rowid_val))
                                 .await?
+                        } else if let Some(landed) = cursor
+                            .cursor
+                            .try_table_seek_within_leaf(&cursor.cx, rowid_val)?
+                        {
+                            // The seek cache's latest landing is the leaf the
+                            // cursor is on and holds the target: no wait.
+                            landed
                         } else {
                             lean_future(|| cursor.cursor.table_move_to(&cursor.cx, rowid_val))
                                 .await?

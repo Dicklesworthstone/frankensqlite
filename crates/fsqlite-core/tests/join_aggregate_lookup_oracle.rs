@@ -2373,3 +2373,124 @@ fn inner_joins_drive_from_the_table_their_where_pins_by_row_estimates() {
         });
     }
 }
+
+/// bd-w4pr1.12 (lever SL1 v3): a rowid lookup whose target lies on the leaf
+/// the cursor already stands on is answered by the b-tree without a wait
+/// (`BtCursor::try_table_seek_within_leaf`); everything else takes the
+/// general seek. The outer keys step through `u` by a large stride, as
+/// join_1M_to_pk_1000's do, so lookups alternate between the current leaf
+/// and other leaves. They also land on missing rowids inside a leaf (every
+/// 13th row is absent), before the first and past the last row, and key on
+/// NULL, REAL, TEXT and BLOB values.
+const SAME_LEAF_SETUP: &[&str] = &[
+    "CREATE TABLE u(a INTEGER PRIMARY KEY, name TEXT)",
+    "WITH RECURSIVE s(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM s WHERE v < 2999) \
+     INSERT INTO u SELECT v, 'name-' || v || '-' || substr('abcdefghijklmnopqrstuvwxyz', 1 + v % 26) \
+     FROM s WHERE v % 13 <> 5",
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a)",
+    "WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 6000) \
+     INSERT INTO t SELECT v, (v * 7919) % 3000 FROM s",
+    "INSERT INTO t VALUES (6001, NULL), (6002, -1), (6003, 3000), (6004, 99999), (6005, 17.0), \
+     (6006, 17.5), (6007, '18'), (6008, ' 19 '), (6009, x'3230'), (6010, 2999), (6011, 5), (6012, 0)",
+];
+
+const SAME_LEAF_QUERIES: &[&str] = &[
+    "SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a",
+    "SELECT count(*), sum(t.id), sum(length(u.name)) FROM t JOIN u ON u.a = t.a WHERE t.id > 5980",
+    "SELECT count(*), sum(t.id), sum(u.a) FROM t, u WHERE u.rowid = t.a",
+    "SELECT count(*), count(u.a), sum(t.id) FROM t LEFT JOIN u ON u.a = t.a",
+    "SELECT t.id, u.a, u.name FROM t LEFT JOIN u ON u.a = t.a WHERE t.id > 5995 ORDER BY t.id",
+    "SELECT t.id, (SELECT name FROM u WHERE u.a = t.a) FROM t WHERE t.id > 5990 ORDER BY t.id",
+    "SELECT sum(length(x)) FROM (SELECT (SELECT name FROM u WHERE u.a = t.a) x FROM t)",
+];
+
+/// The negative cases write `u` and then seek it: inside one transaction
+/// after an UPDATE dirtied its leaves, and inside one UPDATE whose subquery
+/// reads the row that statement changed just before, on a leaf it has
+/// dirtied. A fast path that skipped its dirty-leaf check would answer those
+/// from a stale page. Compared with rusqlite, file-backed and in memory, ad
+/// hoc and prepared.
+#[test]
+fn same_leaf_rowid_lookups_match_sqlite_across_leaves_and_after_writes() {
+    for file_backed in [true, false] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = if file_backed {
+                dir.path()
+                    .join("same_leaf.db")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&path).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in SAME_LEAF_SETUP {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in SAME_LEAF_QUERIES {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            let bounded =
+                "SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a WHERE t.id <= ?1";
+            let stmt = f.prepare(bounded).await.unwrap();
+            for bound in [1_i64, 2, 81, 4000, 6012] {
+                let ours: Vec<Vec<String>> = stmt
+                    .query_with_params(&[SqliteValue::Integer(bound)])
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect();
+                let theirs: Vec<Vec<String>> = r
+                    .prepare(bounded)
+                    .unwrap()
+                    .query_map([bound], |row| {
+                        Ok((0..2)
+                            .map(|i| tag_r(&row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                            .collect())
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert_eq!(
+                    ours, theirs,
+                    "prepared bound {bound}, file-backed {file_backed}"
+                );
+            }
+
+            // Leaves this transaction has written.
+            for sql in ["BEGIN", "UPDATE u SET name = name || '!' WHERE a % 50 = 0"] {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            assert_agree(&f, &r, SAME_LEAF_QUERIES[0], &[], &[]).await;
+            assert_agree(&f, &r, SAME_LEAF_QUERIES[5], &[], &[]).await;
+            f.execute("COMMIT").await.unwrap();
+            r.execute("COMMIT", []).unwrap();
+
+            // One statement writes a leaf and then seeks it: row k's subquery
+            // reads row k - 1, which this UPDATE has just changed.
+            let chain = "UPDATE u SET name = coalesce((SELECT p.name FROM u AS p WHERE p.a = u.a - 1), \
+                         'none') || '.' WHERE u.a % 3 <> 0";
+            f.execute(chain).await.unwrap();
+            r.execute(chain, []).unwrap();
+            for sql in [
+                "SELECT count(*), sum(length(name)), max(name), min(name) FROM u",
+                "SELECT a, name FROM u WHERE a < 12 OR a > 2990 ORDER BY a",
+                SAME_LEAF_QUERIES[0],
+            ] {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+
+            // Non-vacuity: the join looks u up by rowid.
+            let ops = opcodes(&f, SAME_LEAF_QUERIES[0]).await;
+            assert!(
+                ops.iter().any(|op| op == "SeekRowid"),
+                "the join must look u up by rowid: {ops:?}"
+            );
+            f.close().await.unwrap();
+        });
+    }
+}
