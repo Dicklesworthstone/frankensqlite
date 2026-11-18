@@ -63,6 +63,7 @@ written; this is where their scope is recorded.
 | Widening the table page-run / bulk builders | 2026-05-06 (two), 2026-05-10, 2026-07-22 | rejected | each entry's own; none as a standalone patch |
 | DELETE / UPDATE direct-lane micro-levers | May 2026 series, 2026-07-22 BLOCKER | rejected | only as a transaction-level mutation set with the live cell-delta adapter |
 | One-entry prepared caches, exact BEGIN/COMMIT fast paths | 2026-05-05, 2026-05-07, 2026-05-09 (two) | rejected, absolute medians worse | with a broader prepare / transaction lifecycle change |
+| Keeping compiled programs across the connection's write COMMIT | 2026-11-18 bd-w4pr1.7 round 5 lever L2 | rejected: one-row transaction -14.1k instructions, read-only +1.03% against a +0.5% kill line (allocator paths after the cache entry grew 40 -> 56 bytes) | the same lever with the entry's size unchanged, read-only over at least 7 callgrind runs |
 | Planner-directive cache bypass | 2026-07-11 REJECT | correctness blocker | none without redesigning the cache-key contract |
 | Group commit | 2026-07-23 bd-6hgad | exists, never coalesces at `synchronous=NORMAL` | `FULL`/`EXTRA`, many small overlapping transactions, null-controlled A/B with CV under 5% |
 | Lock, wakeup and counter micro-levers on the commit path | 2026-05-06 (two), 2026-05-12 (two), 2026-08-17 bd-8euyp | rejected | each entry's own; none is the fixed per-commit cost |
@@ -81,13 +82,189 @@ valgrind changes the I/O path (2026-11-10); a remote build can return a stale bi
 (2026-07-23); VDBE metrics are process-global (2026-07-10); counters can be observer-dominated
 (2026-08-02 bd-he3ua); `ResultRow` drains its source registers (2026-07-22); an arm added to or
 reshaped in `try_execute_hot_opcode_sync` moves other statements' cycles (2026-11-15 W3) and their
-instruction counts by up to 1.3% (2026-11-15 H1) without running any of the change.
+instruction counts by up to 1.3% (2026-11-15 H1) without running any of the change. One callgrind
+run of a write shape is not exact on the 64-thread host (2026-11-18 bd-w4pr1.7 round 5):
+async-runtime polling while work waits lands inside statements, so the same binary's statement
+count moves by up to +-3k on autocommit and +-3-6k on a one-row write between runs (whole program
+1.3M-4.7M a transaction); decide such kill lines on means over repeated runs.
 
 ### New entries
 
 Every entry from here on ends with a retry condition a later agent can grep and test: a profile
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
+
+## 2026-11-18 - WIN (structural, landed as dc795a9ba; the gain grows with the schema): an explicit transaction keeps a ROLLBACK copy of the catalog only when it changes it, -310k user instructions and -25 us per transaction over 20 tables with two indexes each (bd-w4pr1.7, round 5, lever L1)
+
+- Target: every explicit transaction, read or write. BEGIN called `snapshot()`, which deep-copied
+  the connection's catalog (every `TableSchema` with its indexes, views, triggers, the DDL text map,
+  the rowid-alias and AUTOINCREMENT maps, TEMP names and shadowed tables) into `txn_snapshot`, and
+  COMMIT dropped the copy. With one table that is 2.0k + ~1k instructions; over a schema of 20
+  tables with two indexes each it was 182k to copy and ~135k to drop, 85% of an empty transaction
+  (callgrind, main 1bad282e2). Stock keeps no such copy (a ROLLBACK that changed the schema reloads
+  it). Touched: `crates/fsqlite-core/src/connection.rs` (`TxnRestorableCell`, `SnapshotSchemaState`,
+  `transaction_snapshot`, `end_transaction_catalog_cells`, `restore_snapshot_state`, the eight
+  catalog fields of `Connection`).
+- Ledger preflight: bd-ry6x7 (1f724e542) did the statement-level half (a plain DML statement's
+  savepoint snapshot skips the schema copy). Nothing covered the transaction snapshot. Not in
+  bd-ih8ak's scope (committed-state refreshes).
+- Change: the eight fields became `TxnRestorableCell`s. BEGIN arms them; the first mutable access
+  while armed keeps a copy of the value as it was; ROLLBACK (and the commit-failure path that
+  restores the snapshot) writes the kept copies back, rebuilds the by-name indexes and stops the
+  cells keeping, so the reload that follows costs no copy; every end of the transaction drops the
+  copies. Every mutation goes through the cell's `borrow_mut`/`replace`, so the compiler, not a
+  statement classifier, covers paths such as an AUTOINCREMENT INSERT that creates
+  `sqlite_sequence`, CTE/view materialization and in-transaction schema reloads. The two scalars
+  (`temp_default_cache_size`, `next_master_rowid`) are still stored at BEGIN. Savepoint and
+  statement snapshots keep their full copies.
+- Result on the rebased tree (both arms built from origin/main d4ad26c40; 1954f46cb, where the full
+  gate ran, changes only tests after it; the lever landed as dc795a9ba on 77649f22f after rebases
+  over commits that touch neither the catalog fields nor the transaction snapshot. M = main, CLI sha256
+  0d74b1c0b1ca9885; L1 = M + L1, CLI 9e20b27b2a9a2285; release-perf, rch; stock sqlite3 3.46.1 and
+  the 3.54.1 driver live in the same invocation; thinkstation1, 64 threads, governor powersave,
+  load 2.4-4.5, scratch NVMe, synchronous=NORMAL). Native: perf stat, whole process, medians of 7
+  rotated reps (means are pulled by single outlier reps, e.g. one M txn10 rep at 88 us against
+  ~205). Exact: callgrind, statement execution only, (N1500 - N500)/1000. One callgrind run is not
+  exact on the write shapes on this host (the same binary moves by up to +-3k on autocommit and
+  +-3-6k on the one-row write between runs, from async-runtime polling while work waits), so the
+  kill lines were decided on means over repeated runs, under a rule written down before the extra
+  runs: 3 runs per arm, 7 for read-only, 23 for autocommit.
+
+  | row (per transaction) | stock 3.46.1 (native) | M: native CPU / perf user instr / callgrind | L1: same | L1 - M |
+  |---|---|---|---|---|
+  | empty BEGIN; COMMIT, 1 table | 1.0 us / 8.6k | 23.6 us / 61.2k / 53.1k | 23.2 us / 58.8k / 50.7k | -2.5k exact (perf -2.4k) |
+  | same over 20 more tables with 2 indexes each | 1.1 us | 45.7 us / 371.6k / 360.5k | 21.1 us / 58.8k / 50.1k | -310.4k exact, -24.6 us |
+  | read-only BEGIN; SELECT; COMMIT | 8.6 us / 27.5k | 52.7 us / 111.6k / 102.7k | 50.4 us / 108.9k / 98.8k | -3.9k exact (7 runs: 95% CI -3.4% to -4.2%) |
+  | one-row write, 1 table | 18.7 us / 30.4k | 140.8 us / 221.8k / 211.7k | 137.4 us / 217.5k / 206.6k | -5.1k exact (perf -4.3k) |
+  | one-row write over 20 tables | 17.9 us | 171.0 us / 548.5k | 140.4 us / 216.5k | -332.0k perf, -30.6 us |
+  | autocommit INSERT | 16.4 us / 22.2k | 118.1 us / 176.5k / 176.2k | 117.7 us / 177.0k / 176.7k | +0.4k (+0.25%; 23 runs: 95% CI -0.31% to +0.82%) |
+  | txn_1000x10_rows shape (per 10-row txn) | 36.2 us / 152.8k | 205.7 us / 519.7k / 494.8k | 199.4 us / 511.9k / 488.2k | -6.6k exact (perf -7.8k) |
+
+  Syscalls: the empty transaction's are identical (7.02 / 6.97 per transaction); the write's file
+  syscalls are identical (access 1.00, fcntl 8.00, pread64 4.10, statx 10.01), and only the wake-up
+  calls (epoll, futex, io_uring_enter, timerfd) move, by amounts that also come out negative across
+  the N difference. mt-mvcc-bench (--one-row-per-transaction, shared table, 500 rows x 5, 3
+  interleaved reps, scratch NVMe at NORMAL; mtbench 06ca94d12620a4a7 / bf1d941feef3e71e; each run
+  prints the bench's "benchmark evidence is non-comparable or invalid" line, as every run of the
+  earlier trees did): F wps L1/M 1.07 / 0.97 / 1.00 at 1 / 8 / 32 writers (per-rep pairs 1.02-1.10,
+  0.93-1.04, 0.98-1.02; stock's own wps moved by up to 14% between the arms' runs).
+- On origin/main 5d98aff3e (2026-11-18, one callgrind run per arm, tmpfs, load 7.7-9.3): empty
+  over 20 tables 364.0k -> 49.6k, -27.4 us; write over 20 tables -313.8k, -33.1 us; one table:
+  empty -2.4k, read-only -2.1k, one-row write -2.1k, autocommit -1.9k, txn10 -4.4k; syscalls
+  unchanged; mt-mvcc-bench 1/8/32 writers 1.04 / 0.97 / 0.99.
+- First measurement, on 1bad282e2 (2026-11-17, 5 reps, load 1.7-3.6): empty over 20 tables 367.3k
+  -> 57.8k user instructions, 50.3 -> 24.2 us; write over 20 tables 540.5k -> 214.1k, 150.9 ->
+  124.6 us; one table empty -2.6k, read-only -3.3k.
+- Prediction (posted before code): 20-table empty -280k..-320k instructions (landing tree
+  -310.4k: met), CPU -15..-22 us (-24.6: beyond); 20-table write -280k..-320k (-332.0k perf: just
+  beyond), CPU -15..-25 (-30.6: beyond); one table -2k..-4k (empty -2.5k, read-only -3.9k: met;
+  one-row write -5.1k, txn10 -6.6k: beyond). Kill (20-table empty under -200k, any one-table shape
+  above +1%, a keeper changing outcome): none crossed on any of the three trees; autocommit, the
+  only one-table shape that rose, is +0.25% over 23 runs.
+- Tests: `test_txn_rollback_restores_the_catalog_from_copies_kept_at_its_first_change` (every kind
+  of catalog change, a savepoint rolled back inside it, a TEMP table shadowing a main one, then
+  ROLLBACK: the catalog fingerprint, sqlite_master and the rolled-back names are as before BEGIN; a
+  DML-only transaction keeps no copy; a peer's DDL between two transactions survives the second's
+  ROLLBACK).
+- Gate: rch, on origin/main 1954f46cb + L1 (the full gate): clippy -D warnings on fsqlite-core,
+  all targets: clean. fsqlite-core --lib: 4,198 passed, 0 failed, 4 ignored (the t6741 trio and
+  test_schema_only_opens_racing_committing_peers_do_not_fail_busy among them). Core keepers
+  (bulk_import_upsert_text_pk_phantom_pk, gh534, bd_ih8ak flush floor, wal_fec_commit_pipeline 18,
+  bd_qyekq crash images, gh385): all green. Schema-change and prepared-statement keepers (31
+  targets): 131 passed, 1 failed, bd_8c68u's compile count (92 for 300 rows, as on main: bd-f8m1v).
+  fsqlite-e2e concurrent-writer / SSI / checkpoint / group-commit batch (16 targets): 120 passed,
+  0 failed; second batch (14 targets, the schema-cache races among them): 108 passed, 1 failed,
+  bd_e6zfc s5_schema_coherence_after_storm, red on main (bd-mc5pp; the same DDL Busy /
+  BusySnapshot with no pages). multiprocess_autocommit_busy_timeout_e2e --test-threads=1: 10/10.
+  The fsqlite crate, all 125 test binaries with the lib and doc tests: 1,100 passed, 0 failed, 34
+  ignored (its first run hit rch's 90-minute limit while still compiling; rerun on the same worker).
+  After the rebase onto origin/main 9c1183f44 (main moved during the gate; its connection.rs
+  changes are bd-s7gqh's row-value rewrite, bd-7b1wh's trigger rowid alias and bd-05xlf's prepared
+  read begin, none near the lever's code), on that exact tree: clippy clean; fsqlite-core --lib
+  4,198 passed, 0 failed; the six core keepers green; the 31 schema and prepared-statement keepers
+  179 passed, 1 failed (bd_8c68u, 92 compilations as on main). Main moved once more (bd-bwmol and
+  bd-s9i69 in connection.rs, not near the lever); on origin/main 5afb99152 + L1: clippy clean,
+  fsqlite-core --lib 4,198 passed, 0 failed. Main then took b6f81da87 (bd-fpr5g: 40 lines of
+  connection.rs that use none of the eight catalog fields) and its ledger entry; on the pushed tree,
+  origin/main 77649f22f + L1 (landed as dc795a9ba): clippy -D warnings on fsqlite-core, all
+  targets: clean.
+  NOT run: fsqlite-wal integration targets with --features fault-injection, and the fsqlite-mvcc /
+  pager / vfs --lib suites: those crates do not depend on fsqlite-core, the only crate changed.
+  Earlier trees: 1bad282e2 + L1 + L2 and 5d98aff3e + L1 + L2 (clippy clean on both; on
+  5d98aff3e the core --lib run hit a new intermittent hang in the VFS io_uring path, in a test
+  neither lever's code is on: a shared-ring Read/Write SQE consumed by the kernel with no CQE for
+  20 minutes while its connection held the WAL write lock; it passed on this tree).
+- Retry condition / next: none for this cost. SAVEPOINT still takes a full copy (`snapshot()` at
+  SAVEPOINT); the same cells would serve it if a savepoint-heavy shape profiles it.
+
+## 2026-11-18 - REJECTED (kill line crossed on the landing tree): a compiled program that survives the connection's explicit write COMMIT, -14.1k user instructions per one-row transaction but +1.0k (+1.03%) per read-only transaction against a +0.5% kill line (bd-w4pr1.7, round 5, lever L2)
+
+- Target: every explicit write transaction that runs a statement it ran before, the shell's
+  `BEGIN; INSERT ...; COMMIT` and the scorecard's txn_1000x10_rows in particular. The COMMIT's
+  `clear_compilation_reuse_caches_after_write_commit` clears `compiled_cache`, so the next
+  transaction recompiles its INSERT (`compile_table_insert` 11.2k plus allocations). Autocommit
+  write commits never clear it. Touched: `crates/fsqlite-core/src/connection.rs`
+  (`CompiledCacheEntry`, `lookup_compiled_cache`, `insert_compiled_cache`, `compile_with_cache`,
+  `sqlite_stat1_hints`, `btree_join_sample`, `clear_compilation_reuse_caches_after_write_commit`).
+- Ledger preflight: issue #72 (2026-04) added the clear because a prepared SELECT template bound
+  to a MemDatabase snapshot returned stale rows; e7db0ad3f (2026-05-10) narrowed the prepared
+  half to `can_survive_write_commit` and kept the compiled half. A read-only audit of the four
+  compile functions found no program input from rows, counts, commit sequences or page images
+  (the cache already survived autocommit write commits, peers' commits, read-only commits and
+  ROLLBACK) and two inputs that needed handling: a `NewRowid`'s p3 carries the concurrent mode,
+  and a plan can read row statistics (`sqlite_stat1_hints`, `btree_join_sample`).
+- Change (not landed): the write COMMIT advanced a per-connection epoch instead of clearing the
+  cache; an entry kept `concurrent_mode: Option<bool>` (set when its program holds a `NewRowid`;
+  missed in the other mode) and `plan_statistics_epoch: Option<u64>` (set when its compile read
+  statistics; expired at the next write COMMIT). Test
+  `test_compiled_program_survives_write_commit_and_follows_what_changes_it` (control hit after a
+  write COMMIT; the mode key; the statistics expiry; a peer's CREATE UNIQUE INDEX, a shadowing
+  TEMP table, PRAGMA foreign_keys=ON, a replaced function and collation, ATTACH/DETACH) passed on
+  every tree; it is not landed with the lever. Patch: session 1f77802a scratchpad
+  p6r5/l2_on_d4ad.patch.
+- Results. 1bad282e2 (2026-11-17, one callgrind run per arm): one-row 208.0k -> 193.0k, txn10
+  485.0k -> 470.4k. origin/main 5d98aff3e (2026-11-18, one run per arm): one-row -14.7k, txn10
+  -15.6k, autocommit -1.2k, read-only -0.1k, empty +0.08k. Landing tree origin/main 1954f46cb
+  (engine code identical to d4ad26c40, where the arms were built: the commits after it change only
+  tests; A = main + L1, CLI sha256 9e20b27b2a9a2285; B = A + L2, 2f8bc42be973dfaa; release-perf,
+  rch): one callgrind run per arm is NOT exact on the write shapes on this host. The same binary's
+  statement-execution count moves by up to +-3k (autocommit) and +-3-6k (one-row write) between
+  runs: the async runtime polls while work waits (over three runs of main's autocommit shape the
+  whole program's count per transaction was 1.30M, 1.91M and 4.73M, `three_lane::next_task` alone
+  80k-323k), and part of that polling lands inside statements. Decided on means over repeated runs
+  (rule written down before the extra runs):
+
+  | shape (per transaction, user instructions, callgrind, statement execution) | runs per arm | A | B | B - A, 95% CI |
+  |---|---|---|---|---|
+  | one-row write BEGIN; INSERT; COMMIT | 3 | 206.6k median | 192.5k median | -14.1k (all three B runs below all three A runs) |
+  | txn_1000x10_rows shape (per 10-row txn) | 3 | 488.2k | 472.9k | -15.3k |
+  | autocommit INSERT | 23 | 176,664 mean | 176,154 | -510 (-0.29%), [-0.80%, +0.23%] |
+  | empty BEGIN; COMMIT, 1 table / over 20 tables | 3 | 50.65k / 50.12k | 50.58k / 50.19k | -0.07k / +0.07k |
+  | read-only BEGIN; SELECT; COMMIT | 7 | 98,840 mean | 99,860 | +1,020 (+1.03%), [+0.65%, +1.42%]; every B run above every A run |
+
+  Native, same invocation as stock sqlite3 3.46.1 (perf stat, whole process, medians of 7 rotated
+  reps; thinkstation1, 64 threads, governor powersave, load 2.4-4.5, scratch NVMe,
+  synchronous=NORMAL; means are pulled by single outlier reps): one-row 137.4 -> 132.6 us, 217.5k
+  -> 202.6k user instructions (stock 18.7 us); txn10 199.4 -> 189.8 us, 511.9k -> 496.8k (stock
+  36.2 us); autocommit 117.7 -> 118.7 us, 177.0k -> 178.5k (stock 16.4 us); read-only 50.4 -> 48.5
+  us, 108.9k -> 109.2k (+0.3%; stock 8.6 us). The kill line was set on the callgrind count and the
+  decision rule was written before the extra runs, so the native read-only figure does not
+  overturn it.
+- Prediction (posted before code): -9k to -14k on the one-row transaction (landing tree -14.1k:
+  met), the same on txn10 (-15.3k: just beyond), every other shape within +-0.5% (read-only
+  +1.03%: NOT met). Kill line: "another shape above +0.5%": crossed by the read-only shape, so the
+  lever does not land.
+- Attribution of the read-only +1.0k (self cost, B - A, one run each): `lookup_compiled_cache` +7
+  (the two new checks); the rest is inside glibc's allocator (`_int_malloc` +482,
+  `_int_free_merge_chunk` +277, `unlink_chunk` +109, `_int_free_chunk` +107, `__libc_malloc2` +97,
+  `_int_free_maybe_trim` +95) while the malloc / calloc / free call counts move by under 30 a
+  transaction: longer allocator paths, not more allocations. The change grew `CompiledCacheEntry`
+  from 40 to 56 bytes (`Option<u64>` + `Option<bool>`), which moves its `Arc` allocation to
+  another size class; that this is the cause is a hypothesis, not shown.
+- Retry condition: keep `CompiledCacheEntry`'s size (the struct has 7 bytes of padding after
+  `reverse_unordered_selects`: a `u32` epoch with 0 for none and a `u8` mode fit there), then
+  re-measure read-only over at least 7 callgrind runs and autocommit over at least 20, both arms
+  built from the same base, and the native CPU beside them.
 
 ## 2026-11-18 - WIN (landed as b6f81da87; inside its prediction): a trigger fired under a WITH scope reuses its body's compiled programs (bd-fpr5g, SQL lane round 5, lever 1)
 
