@@ -10412,7 +10412,7 @@ impl PreparedStatement<'_> {
         self.conn.settle_pending_transaction_cleanup().await?;
         self.with_same_connection_schema_reprepare(async |stmt| {
             stmt.conn
-                .query_prepared_with_params_after_background_status(stmt, &[])
+                .query_prepared_with_params_after_background_status(stmt, None)
                 .await
         })
         .await
@@ -10431,7 +10431,7 @@ impl PreparedStatement<'_> {
                 return Ok(rows);
             }
             stmt.conn
-                .query_prepared_with_params_after_background_status(stmt, params)
+                .query_prepared_with_params_after_background_status(stmt, Some(params))
                 .await
         })
         .await
@@ -30467,7 +30467,7 @@ impl Connection {
             return prepared
                 .with_same_connection_schema_reprepare(async |stmt| {
                     stmt.conn
-                        .query_prepared_with_params_after_background_status(stmt, params)
+                        .query_prepared_with_params_after_background_status(stmt, Some(params))
                         .await
                 })
                 .await;
@@ -31620,7 +31620,7 @@ impl Connection {
                 })
             } else {
                 Ok(self
-                    .query_prepared_with_params_after_background_status(stmt, params)
+                    .query_prepared_with_params_after_background_status(stmt, Some(params))
                     .await?
                     .len())
             }
@@ -31630,7 +31630,7 @@ impl Connection {
     async fn query_prepared_with_params_after_background_status(
         &self,
         stmt: &PreparedStatement<'_>,
-        params: &[SqliteValue],
+        params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         self.with_fallback_statement(Box::pin(async {
             let _record_profile_scope =
@@ -31660,11 +31660,7 @@ impl Connection {
                     let rows_result = lean_future(|| {
                         self.execute_statement_impl_after_background_status(
                             dml,
-                            if params.is_empty() {
-                                None
-                            } else {
-                                Some(params)
-                            },
+                            params,
                             stmt.dispatch_precompiled_program(),
                             false,
                         )
@@ -31681,6 +31677,7 @@ impl Connection {
                         .to_owned(),
                 ));
             }
+            let params = params.unwrap_or(&[]);
             if stmt.may_observe_change_tracking {
                 self.sync_change_tracking_context();
             }
@@ -32006,7 +32003,7 @@ impl Connection {
                     }
                 {
                     let rows = self
-                        .query_prepared_with_params_after_background_status(stmt, params)
+                        .query_prepared_with_params_after_background_status(stmt, Some(params))
                         .await?;
                     for row in rows {
                         f(&row)?;
@@ -32061,7 +32058,7 @@ impl Connection {
 
             if !can_stream_with_row_handler {
                 let rows = self
-                    .query_prepared_with_params_after_background_status(stmt, params)
+                    .query_prepared_with_params_after_background_status(stmt, Some(params))
                     .await?;
                 for row in rows {
                     f(&row)?;
@@ -32146,10 +32143,7 @@ impl Connection {
                     }
                 {
                     let rows = self
-                        .query_prepared_with_params_after_background_status(
-                            stmt,
-                            params.unwrap_or(&[]),
-                        )
+                        .query_prepared_with_params_after_background_status(stmt, params)
                         .await?;
                     return exactly_one_row_or_error(rows);
                 }
@@ -57278,6 +57272,23 @@ impl Connection {
         snapshots: Vec<Row>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        if snapshots.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The synthesized SELECT uses explicit binds on its fallback paths.
+        // With no caller binds, fill the original RETURNING slots with NULL
+        // before the first-row fold or a correlated projection reads them.
+        let unbound_params;
+        let params = if params.is_none() && select_contains_any_placeholder(&projection.select) {
+            let mut select = projection.select.clone();
+            let mut bind_state = BindParamState::default();
+            canonicalize_select_placeholders_in_statement(&mut select, &mut bind_state)?;
+            let slots = usize::try_from(bind_state.next_index - 1).expect("bind slots fit usize");
+            unbound_params = vec![SqliteValue::Null; slots];
+            Some(unbound_params.as_slice())
+        } else {
+            params
+        };
         let table = &projection.table;
         let mut col_map = table
             .columns
@@ -57306,7 +57317,7 @@ impl Connection {
         }
         // bd-j9tg3: fold the subqueries stock evaluates once, at the first
         // row's RETURNING. No row, no evaluation, as in stock.
-        let first_row_columns = if projection.first_row_fold && !snapshots.is_empty() {
+        let first_row_columns = if projection.first_row_fold {
             Some(self.fold_returning_first_row(projection, params).await?)
         } else {
             None

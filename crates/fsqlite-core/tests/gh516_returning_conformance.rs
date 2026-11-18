@@ -298,6 +298,9 @@ async fn compare_correlated_dml_returning(
             let expected = stock_unbound_rows(&stock, sql);
             let actual = if prepared {
                 match native.prepare(sql).await {
+                    Ok(statement) if statement.column_count() == 0 => {
+                        native.execute_prepared(&statement).await.map(|_| Vec::new())
+                    }
                     Ok(statement) => statement.query().await,
                     Err(error) => Err(error),
                 }
