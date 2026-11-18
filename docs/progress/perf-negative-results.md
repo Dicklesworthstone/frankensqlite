@@ -89,6 +89,184 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-17 - REJECTED on its other-rows kill lines (join gain kept on record: join_1M_to_pk_1000 -339M Ir, x2.32 -> x2.05 stock CPU): a rowid seek that lands on the leaf a cursor is already on runs synchronously on the hot lane (bd-w4pr1.12, read-loop round 6, lever SL1 v2)
+
+- Target: the SeekRowid into u in join_1M_to_pk_1000, 1,680 of 4,414 Ir per row on main 05fe3c5b1
+  (stock's whole row: 1,721). u is five leaves in our layout (143/255/255/255/92 cells; stock packs
+  the same rows in four), and t.a steps by -81, so 595k of 1M probes land on the current leaf and
+  405k descend: the four-slot seek cache cycles through five leaves. A same-leaf hit costs about
+  1,150 Ir, about 320 of it the leaf search, the witness and the slot update; the rest is the
+  async path to them (main-loop arm, CursorBackend::table_move_to, with_btree_op and its
+  depth-gauge postlude, table_seek, table_seek_for_insert, try_table_seek_cache).
+- Touched (reverted, never committed; patch `scratchpad/rl6/sl1_v2.patch`):
+  `crates/fsqlite-btree/src/cursor.rs` (`BtCursor::try_table_seek_within_leaf`, the synchronous form
+  of the seek-cache hit on the stack-top leaf, with a keeper that compares 16 seeks against a cursor
+  that only runs `table_move_to` and the negative case of a cursor moved off the cached leaf) and
+  `crates/fsqlite-vdbe/src/engine.rs` (`CursorBackend::try_table_seek_within_leaf`, a `SeekRowid` arm
+  in `try_execute_hot_opcode_sync`).
+- Ledger preflight: the join / rowid-seek rounds of 2026-11-14 (page load, interior search,
+  eviction tracker, the parked-leaf pool) left the async path of a hit alone.
+- Prediction (bd-w4pr1.12, 2026-11-17, before the build): join -300 to -600M Ir, CPU -25 to -70 ms;
+  rowid_lookups_200k within +0.5% Ir; rows without SeekRowid within 0.3% Ir.
+- Result (thinkstation1, powersave, io_uring refused, serial, stock 3.46.1 live, par_probe with
+  cycles, reps 5; base fsqlite-rl6-base-05fe sha256 18bd46e290c9ce36, SL1 de278a0ea879268a; answers
+  equal): join 4,414.3M -> 4,075.1M Ir, cycles -12.6%, CPU 454.6 -> 400.5 ms (x2.32 -> x2.05
+  stock), inside the prediction. Rows that run no SeekRowid: GROUP BY a +0.90%, a with sum(c)
+  +0.62%, a % 10 +1.17%, id % 100000 +1.54%, id +1.13%, scan_filter_agg +1.45%, the two window rows
+  +0.25%; rowid_lookups_200k +0.75%. Both kill lines crossed: REJECTED and reverted.
+- Why (callgrind of scan_filter_agg, which runs none of it): the arm's body, with the btree fast
+  path, is inlined into run_hot_opcodes_sync (its self cost 482.1M -> 525.6M), and the loop's other
+  arms got heavier: +18.5 Ir per scanned row. The H1 entry's trap, larger than H1's +1.3%. The
+  0.3% line was set without the no-op-arm A/A the H1 entry asks for.
+- Retry condition: an A/A build whose SeekRowid arm calls an `#[inline(never)]` helper that always
+  declines, to set the other-rows band, then the fast path inside that helper judged against the
+  band; or the same btree fast path called from the main loop's SeekRowid arm before its
+  `lean_future`, which leaves `try_execute_hot_opcode_sync` alone and keeps most of the saving
+  (the async layers) at the cost of the lane exit.
+
+## 2026-11-17 - WIN (landed as 6c8033397; prediction missed, beyond its range): a top-N preflight judges the sort-key registers and builds no record for a row the bounded sorter turns away (bd-w4pr1.12, read-loop round 6, lever TN1)
+
+- Target: order_by_text_limit10 (`SELECT ... FROM (SELECT id FROM t ORDER BY b DESC LIMIT 10)`,
+  1M rows), 1,649 Ir per row against stock's 777 on main 05fe3c5b1. The heap is full after 10 rows,
+  so 999,990 rows reach the preflight and 499 are inserted. Each built a record of its key
+  (MakeRecord, 127 Ir) that SorterCompare re-parsed (compare_packed_sorter_key, 202 of its 306).
+  Stock's IdxLE compares its key registers with the heap's last entry.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs` (both preflight sites: the ordered SELECT and an
+  IN-subquery ORDER BY ... LIMIT emit `SorterCompare cursor, skip, first_key_reg,
+  P4::Int(key_count), PREFLIGHT` and no MakeRecord), `engine.rs` (`top_n_preflight_retains` hands
+  the registers to the sorter's own `would_retain_top_n`, materializing MakeRecord's sideband first
+  should a key register hold it; `compare_packed_sorter_key` and the packed-verdict path removed;
+  the ordinary GROUP BY SorterCompare unchanged), `lib.rs` (register spans: the preflight reads its
+  key registers, writes none), `crates/fsqlite-types/src/opcode.rs` (doc).
+- Ledger preflight: this replaces the 2026-11-12 WIN "a top-N preflight compares the packed key
+  with the heap's worst row without decoding it (bd-w4pr1.13)". No entry judged the registers.
+- Prediction (bd-w4pr1.12, 2026-11-17, before the build): -280 to -420M Ir, CPU -15 to -35 ms;
+  other read rows within 0.3% Ir. Kill: under 150M, CPU not lower in each of two runs, another row
+  +0.3% Ir, an oracle red.
+- Result, on the landing binary itself, the rebased tree's release-perf CLI (sha256
+  092110bcaf0e1efd), against its parent with bd-36aed (sha256 086225e73df4d526). Stock 3.46.1 was
+  live in the same invocations. thinkstation1, powersave, serial (0 extra threads observed),
+  io_uring refused; two par_probe runs with cycles, reps 5, then 10 interleaved pairs; answers
+  equal.
+  - order_by_text_limit10: 1,649.4M -> 1,196.2M Ir (-453M; 2.12x -> 1.54x stock instructions);
+    CPU x1.98 -> x1.59 and x2.07 -> x1.58 stock; cycles 0.800 in the pairs.
+  - Every other read row is identical in Ir.
+  - Missed and stated: at equal Ir the pairs put cycles up on GROUP BY a (1.034), GROUP BY
+    a % 10 (1.047), join_1M_to_pk (1.018) and rowid_lookups (1.016). execute_sorter_compare is
+    called from the hot lane: the layout trap again. Not a kill line.
+  - The pre-rebase run on 05fe3c5b1 agreed (-452M, cycles 0.828).
+- GOLDEN-CHANGE: fts5_title_match_with_limit. Its rows 13-14 (MakeRecord 7 1 4, SorterCompare 1 18
+  4) become row 13, SorterCompare 1 17 7 (int)1: the preflight reads key register 7 instead of a
+  temp record. Every later address and every jump past it moves down one.
+- Keepers: `top_n_limit_rows_match_stock_file_backed_and_in_memory`
+  (bd_orderby_nulls_limit_oracle_probe.rs: 21 bounded shapes, ties that must keep the earlier
+  row, NULLs, mixed storage classes, NOCASE, mixed-direction keys, OFFSET, DISTINCT, an
+  IN-subquery ORDER BY ... LIMIT; ad hoc and prepared; strict file-backed and :memory:, the
+  derived-table shape, which strict refuses, compared in :memory: only; stock live, rows built by a
+  recursive CTE since the bundled library has no generate_series); vdbe unit tests for BINARY /
+  NOCASE / two keys / a sideband-armed key register.
+- Gate: both changes gated together (rch):
+  - First pass on 05fe3c5b1. Reds: the lane brief's known ones; the pre-existing
+    without_rowid_secondary_suffix_order_matches_stock; four test-file reds of this round, all
+    fixed (three GROUP BY goldens, TN1's keeper, bd-36aed's strict-off list).
+  - On the fixed tree:
+    - clippy -D warnings types / vdbe / core, all targets: clean;
+    - fsqlite crate suite: 126 binaries, 1,098 passed, 0 failed;
+    - 18 fsqlite-e2e oracle targets: 117 passed, 2 failed, both outer_join_oracle_e2e reds
+      fixed on main by 49cadfad1;
+    - goldens: 8 / 8.
+  - After the rebase onto 0dd0e7102:
+    - clippy vdbe / core, all targets: clean;
+    - vdbe and core lib, goldens, both keepers, create_index_sorted_bulk_build_oracle,
+      bd_r39kx_eqp_access_path_wording_oracle: 5,465 passed, 3 failed (the known count(*)
+      IN-list test and the t6741 pair);
+    - outer_join_oracle_e2e: 13 / 13.
+  - After the rebase onto 5ee2326ea, whose codegen.rs change is in its tests:
+    - clippy types / vdbe: clean;
+    - vdbe lib: 1,256 / 0;
+    - goldens: 8 / 8.
+- Retry condition: none for the preflight. What is left on the row is Column b (record parse 91,
+  the text value 71, set_reg 85 per row) and the scan.
+
+## 2026-11-17 - FIX (landed as 08f77992c; measured like a lever): a GROUP BY key whose group mixes 3 and 3.0 prints the row stock's bare columns come from (bd-36aed v2)
+
+- Target: bd-36aed, a correctness bug. The VDBE sorted GROUP BY copied each row's keys into the
+  previous-key registers, so a group holding 3 and 3.0 (or -0.0 and 0) printed its last row's
+  spelling; stock prints the first row's, or the row the last builtin min()/max() picks.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs` only (codegen_select_group_by_aggregate pass 2: the
+  key copy at a group's first row; for a key whose spellings can differ beside a builtin,
+  non-DISTINCT min()/max(), OP_CollSeq tracking with the FILTER magnet in bytecode). Keeper
+  `mixed_integer_real_group_by_key_spelling_matches_stock_on_a_strict_file_database`. Goldens
+  select_grouped_aggregate, aggregate_group_by_filtered and aggregate_group_by_joined
+  hand-updated (GOLDEN-CHANGE: the same-group Goto lands one instruction later, after the
+  first-row Copy; round 5 had updated the first two without the disassembler's trailing pad and
+  missed the third, which the family test reaches only after the second passes).
+- v1 (engine half included) was REJECTED on 2026-11-16 (entry below). v2 is the codegen half.
+- Prediction (bd-36aed, 2026-11-16 04:25Z): the four repeating-group rows -90 to -130M Ir; GROUP BY
+  id within 0.3%; non-GROUP BY rows within 0.1%.
+- Result (base 05fe3c5b1 sha256 18bd46e290c9ce36, v2 e3b16dd912606561; two runs, 10 pairs):
+  GROUP BY a -123.5M (-5.0%, cycles 0.962; group_by_1000_groups CPU x0.96 -> x0.91 stock), a with
+  sum(c) -122.0M (0.975), a % 10 -122.1M (0.959), id % 100000 -109.9M (0.974); GROUP BY id and
+  every non-GROUP BY row identical in Ir. Inside the prediction.
+- Not covered, documented in the keeper and not asserted: a DISTINCT min()/max() beside the key,
+  and a max() beside the key in shapes strict mode refuses (HAVING on max(n), an expression of the
+  key, ORDER BY max(n)), which run on the connection's grouped evaluator and print a tied or later
+  extremum row's spelling with or without this fix. Round 5's keeper had asserted the latter; the
+  first gate pass showed they fail on base too.
+- Gate: both changes gated together (rch):
+  - First pass on 05fe3c5b1. Reds: the lane brief's known ones; the pre-existing
+    without_rowid_secondary_suffix_order_matches_stock; four test-file reds of this round, all
+    fixed (three GROUP BY goldens, TN1's keeper, bd-36aed's strict-off list).
+  - On the fixed tree:
+    - clippy -D warnings types / vdbe / core, all targets: clean;
+    - fsqlite crate suite: 126 binaries, 1,098 passed, 0 failed;
+    - 18 fsqlite-e2e oracle targets: 117 passed, 2 failed, both outer_join_oracle_e2e reds
+      fixed on main by 49cadfad1;
+    - goldens: 8 / 8.
+  - After the rebase onto 0dd0e7102:
+    - clippy vdbe / core, all targets: clean;
+    - vdbe and core lib, goldens, both keepers, create_index_sorted_bulk_build_oracle,
+      bd_r39kx_eqp_access_path_wording_oracle: 5,465 passed, 3 failed (the known count(*)
+      IN-list test and the t6741 pair);
+    - outer_join_oracle_e2e: 13 / 13.
+  - After the rebase onto 5ee2326ea, whose codegen.rs change is in its tests:
+    - clippy types / vdbe: clean;
+    - vdbe lib: 1,256 / 0;
+    - goldens: 8 / 8.
+- Retry condition: the DISTINCT min()/max() case left open in v1's entry; the grouped evaluator's
+  extremum-row spelling (needs its own bead).
+
+## 2026-11-16 - REJECTED on its kill line (a correctness fix's engine half): DISTINCT min()/max() key tracking in execute_agg_step cost rows that run none of it 0.35-0.51% instructions (bd-36aed v1)
+
+- Target: bd-36aed, a correctness bug in the VDBE sorted GROUP BY. A group mixing INTEGER and REAL
+  spellings of one key (3 and 3.0, -0.0 and 0) printed its last row's spelling. Stock prints the
+  row its bare columns come from: the first, or the row the last min()/max() picks. Touched (v1,
+  not landed): crates/fsqlite-vdbe/src/codegen.rs (codegen_select_group_by_aggregate pass 2) and
+  crates/fsqlite-vdbe/src/engine.rs (the CollSeq arm; execute_agg_step's tail; agg_step_with_args
+  returning whether it stepped; a NULL counted as a DISTINCT value for a tracked min/max).
+- Pre-registered on bd-36aed (2026-11-16, before the build): the repeating-group rows -15 to -40M
+  Ir (one Copy fewer per row continuing a group). KILL: any read row up more than 0.3% Ir, any
+  GROUP BY row up more than 2% cycles.
+- Result (thinkstation1, powersave, io_uring refused, serial, stock 3.46.1 live; W5 ceb111983534bd37
+  vs W5 + v1 86cf4f783645d109; answers equal): GROUP BY a -117M Ir (-4.8%, cycles -6.5%),
+  GROUP BY a with sum(c) -117M (-3.0%), a % 10 -118M (-4.6%), id % 100000 -104M (-3.6%), beyond the
+  predicted range. GROUP BY id (every row starts a group, so the same opcodes run) +27.1M (+0.51%).
+  scan_filter_agg (no GROUP BY) +4.5M (+0.35%). Both cross the 0.3% line. Those rows run none of
+  the new bytecode. The change that reaches them is the engine half: execute_agg_step and
+  agg_step_with_args, which the AggStep lane calls on every aggregate row, changed shape.
+- Correctness of v1: on the 20-row CLI probe, all 50 output lines where main differed from stock
+  matched stock 3.46.1 (avg's digit rendering aside).
+- Verdict: v1 REJECTED on its kill line. v2 keeps the codegen half alone (first-row copy; CollSeq
+  tracking for a builtin, non-DISTINCT min()/max(), with the FILTER magnet done in bytecode) and
+  leaves a DISTINCT min()/max() beside a mixed-spelling key on the first row. That remaining
+  divergence is documented in the keeper: `max(DISTINCT n)` over (5.0, 1), (5, 2) gives stock 5,
+  fsqlite 5.0.
+- Retry condition: SQLite's DISTINCT inherit rule (a repeated value jumps over OP_CollSeq and the
+  step, keeping the register) needs the DISTINCT test outside the AggStep (an OP_Found on an
+  ephemeral index before the CollSeq, as stock emits it). Retry it as a codegen change of that
+  shape, never inside execute_agg_step, and set its other-rows line from an A/A of the engine
+  change.
+
 ## 2026-11-16 - WIN (small, maintenance-sized): a WAL-FEC repair job reads the -wal through one descriptor and keeps the sidecar's append descriptor between commits, -9.8 syscalls and ~-11 us kernel time per one-row FULL commit (bd-w4pr1.7, round 4, lever 4b)
 
 - Target: every commit at synchronous=FULL (or EXTRA) on a connection with a caller-owned runtime
