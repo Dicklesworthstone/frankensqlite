@@ -1340,6 +1340,42 @@ fn global_inode_table() -> &'static InodeTable {
 // SHM table — per-process SHM region/lock coalescing
 // ---------------------------------------------------------------------------
 
+/// The open file description to map a `-shm` through: on Linux a second
+/// description of the same inode, so the one every lock is taken on is never
+/// mapped (GH#534, bd-reality-check-1022-llk6g.5).
+///
+/// Our WAL locks are OFD locks (04d6fd0c9), released only when the last
+/// reference to their description goes away, and a mapping is such a
+/// reference. A killed process's mapping can be torn down several ms after
+/// waitpid has returned; meanwhile its WRITE, reader-mark and DMS locks on a
+/// mapped description stayed visible, so the next opener took a dead writer
+/// for a live one (and stock took itself for a second connection, not a
+/// first attacher). A description that only descriptors reference is released
+/// when the dying process closes them, as stock's classic locks are.
+///
+/// Reopening `/proc/self/fd/N` yields a new description of the very inode the
+/// canonical descriptor names, with no path race. Anywhere that is not
+/// available, or names another inode, the canonical descriptor is mapped as
+/// before.
+fn shm_mapping_description(file: &Arc<File>) -> Arc<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let reopened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        if let Ok(reopened) = reopened
+            && let (Ok(mapped), Ok(canonical)) =
+                (inode_key_from_file(&reopened), inode_key_from_file(file))
+            && mapped == canonical
+        {
+            return Arc::new(reopened);
+        }
+    }
+    Arc::clone(file)
+}
+
 #[derive(Debug, Default)]
 struct ShmSlotState {
     shared_holders: HashMap<u64, u32>,
@@ -1348,7 +1384,10 @@ struct ShmSlotState {
 
 #[derive(Debug)]
 struct ShmInfo {
+    /// The canonical descriptor: every `-shm` lock is taken through it.
     file: Arc<File>,
+    /// The descriptor the `-shm` is mapped through ([`shm_mapping_description`]).
+    map_file: Arc<File>,
     regions: HashMap<u32, ShmRegion>,
     /// A short backing or failed allocation must be rechecked before a cached
     /// alias escapes. Failed allocation can extend EOF while leaving holes.
@@ -1368,8 +1407,10 @@ impl ShmInfo {
         // SQLite to coordinate first-opener truncation of `*-shm`.
         let slot_count =
             usize::try_from(WAL_TOTAL_LOCKS.saturating_add(1)).expect("WAL lock count fits usize");
+        let map_file = shm_mapping_description(&file);
         Self {
             file,
+            map_file,
             regions: HashMap::new(),
             backing_check_required: false,
             slots: std::iter::repeat_with(ShmSlotState::default)
@@ -5409,7 +5450,8 @@ impl VfsFile for UnixFile {
         let mut info = shm_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let fd = info.file.as_raw_fd();
+        // Never the locking description (`shm_mapping_description`).
+        let fd = info.map_file.as_raw_fd();
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

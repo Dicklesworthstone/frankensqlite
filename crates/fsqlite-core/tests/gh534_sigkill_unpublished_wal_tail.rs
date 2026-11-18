@@ -186,6 +186,63 @@ fn sigkill_during_a_commit_loop_never_blocks_the_next_commit() {
     });
 }
 
+/// A killed writer's `-shm` locks are gone by the time it is reaped, as a
+/// stock process's are. Our locks are OFD locks, which live as long as their
+/// open file description; the description that was also mapped kept the dead
+/// writer's WRITE, reader-mark and DMS locks for several ms after waitpid
+/// returned (measured 2026-11-16: still held 9 ms after the reap). The next
+/// opener then took the dead writer for a live one and read only the
+/// published prefix, without the durable commit stock reads (the 1-in-100
+/// failure of the test above), and a stock opener took itself for a second
+/// connection instead of the first attacher that rebuilds the index.
+#[test]
+fn a_killed_writers_shm_locks_are_gone_when_it_is_reaped() {
+    let trials: u64 = std::env::var("GH534_TRIALS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40);
+    asupersync::test_utils::run_test(|| async move {
+        let mut held = Vec::new();
+        for trial in 0..trials {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = create(dir.path()).await;
+            let mut writer = ChildProcess::spawn("writer", &db, &[]);
+            writer.witness("committing");
+            std::thread::sleep(Duration::from_millis(1 + (trial * 7_919) % 40));
+            writer.sigkill();
+            // At once: nothing of this process holds a lock on the file.
+            let shm = std::fs::File::open(sidecar(&db, "-shm")).expect("open -shm");
+            for (byte, name) in [(120, "WRITE"), (128, "DMS")] {
+                if let Some(lock_type) = ofd_lock_conflict(&shm, byte) {
+                    held.push(format!("trial {trial}: {name} {lock_type}"));
+                }
+            }
+        }
+        assert!(
+            held.is_empty(),
+            "a reaped writer's -shm locks were still held: {held:?}"
+        );
+    });
+}
+
+/// The type of a lock another open file description holds on `byte`, if any.
+fn ofd_lock_conflict(file: &std::fs::File, byte: i64) -> Option<&'static str> {
+    use nix::libc;
+    let mut probe = libc::flock {
+        l_type: libc::c_short::try_from(libc::F_WRLCK).expect("F_WRLCK fits"),
+        l_whence: libc::c_short::try_from(libc::SEEK_SET).expect("SEEK_SET fits"),
+        l_start: byte,
+        l_len: 1,
+        l_pid: 0,
+    };
+    nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_OFD_GETLK(&mut probe)).expect("F_OFD_GETLK");
+    match i32::from(probe.l_type) {
+        libc::F_UNLCK => None,
+        libc::F_RDLCK => Some("read"),
+        _ => Some("write"),
+    }
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn a_crash_at_any_commit_step_leaves_the_commit_whole_or_absent_like_stock() {
