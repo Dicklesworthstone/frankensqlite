@@ -4801,6 +4801,21 @@ impl PagerBackend {
         }
     }
 
+    /// Epoch of the committed image the pager's cache holds (bd-2mpxx); see
+    /// `SimplePager::page_image_epoch`.
+    #[must_use]
+    pub fn page_image_epoch(&self) -> u64 {
+        match self {
+            Self::Memory(p) => p.page_image_epoch(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.page_image_epoch(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.page_image_epoch(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.page_image_epoch(),
+        }
+    }
+
     /// Returns a string identifying the backend kind for diagnostics.
     #[must_use]
     pub fn kind_str(&self) -> &'static str {
@@ -14912,6 +14927,10 @@ pub struct Connection {
     /// Highest commit sequence reflected in this connection's in-memory
     /// `MemDatabase` image. Used to reload from pager before BEGIN when stale.
     memdb_visible_commit_seq: RefCell<CommitSeq>,
+    /// The pager image epoch (`PagerBackend::page_image_epoch`) the
+    /// `MemDatabase` image was last reloaded at. A moved epoch makes the
+    /// image stale even when the commit sequence did not move (bd-2mpxx).
+    memdb_image_epoch: Cell<u64>,
     /// Whether the connection-local `MemDatabase` currently contains full row
     /// payloads for file-backed tables, not just schema-shaped placeholders.
     memdb_rows_loaded: Cell<bool>,
@@ -16970,6 +16989,7 @@ impl Connection {
             schema_change_conflict_streak: Cell::new(0),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
+            memdb_image_epoch: Cell::new(0),
             // Never hydrate rows — this is the whole point of schema-only.
             memdb_rows_loaded: Cell::new(false),
             memdb_row_hydration_suppressed: Cell::new(0),
@@ -17561,6 +17581,7 @@ impl Connection {
             schema_change_conflict_streak: Cell::new(0),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
+            memdb_image_epoch: Cell::new(0),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
             memdb_row_hydration_suppressed: Cell::new(0),
             memdb_requires_active_txn_reload: Cell::new(false),
@@ -27088,10 +27109,24 @@ impl Connection {
     /// and `align_commit_clock_floor` only ever raises the floor via
     /// `fetch_max`, so this is safe to call unconditionally from cross-process
     /// refresh paths regardless of the previous local value.
+    ///
+    /// Every caller has just reloaded the image from a pager transaction this
+    /// connection's pager began, so the pager's current image epoch is that
+    /// transaction's and is recorded with the sequence (bd-2mpxx).
     #[inline]
     fn set_memdb_visible_commit_seq_from_publication(&self, bound_visible_commit_seq: CommitSeq) {
         *self.memdb_visible_commit_seq.borrow_mut() = bound_visible_commit_seq;
+        self.memdb_image_epoch.set(self.pager.page_image_epoch());
         self.align_commit_clock_floor(bound_visible_commit_seq);
+    }
+
+    /// Whether the pager's committed image moved since the `MemDatabase`
+    /// image was reloaded, whatever the commit sequences say. Another
+    /// process's commit after a WAL reset clears the page cache without
+    /// advancing the visible commit sequence (bd-2mpxx).
+    #[inline]
+    fn memdb_image_epoch_moved(&self) -> bool {
+        self.pager.page_image_epoch() != self.memdb_image_epoch.get()
     }
 
     #[inline]
@@ -28079,7 +28114,8 @@ impl Connection {
         }
 
         if !self.skip_statement_memdb_refresh.get()
-            && bound_visible_commit_seq > memdb_visible_commit_seq
+            && (bound_visible_commit_seq > memdb_visible_commit_seq
+                || self.memdb_image_epoch_moved())
         {
             self.discard_cached_vdbe_engine();
             if hot_path_profile_enabled() {
@@ -28157,6 +28193,7 @@ impl Connection {
             if !self.skip_statement_memdb_refresh.get()
                 && (publication.snapshot.visible_commit_seq
                     > *self.memdb_visible_commit_seq.borrow()
+                    || self.memdb_image_epoch_moved()
                     || (hydrate_rows && !self.memdb_rows_loaded.get()))
             {
                 self.discard_cached_vdbe_engine();
@@ -28251,6 +28288,7 @@ impl Connection {
                     && self.committed_schema_cookie() == self.schema_cookie()
                     && self.pager.published_snapshot().visible_commit_seq
                         <= *self.memdb_visible_commit_seq.borrow()
+                    && !self.memdb_image_epoch_moved()
                 {
                     self.memdb_requires_active_txn_reload.set(false);
                     return Ok(());
@@ -28604,7 +28642,9 @@ impl Connection {
             .bind_pager_publication(cx, "prepared_schema_refresh")
             .await?;
         let bound_visible_commit_seq = publication.snapshot.visible_commit_seq;
-        if bound_visible_commit_seq <= *self.memdb_visible_commit_seq.borrow() {
+        if bound_visible_commit_seq <= *self.memdb_visible_commit_seq.borrow()
+            && !self.memdb_image_epoch_moved()
+        {
             return Ok(PreparedSchemaRefreshResult {
                 outcome: PreparedSchemaRefreshOutcome::Noop,
                 publication,
@@ -28675,6 +28715,12 @@ impl Connection {
         // cross-process commit. See
         // `set_memdb_visible_commit_seq_from_publication` for the contract.
         self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
+        // The schema is unchanged but the rows are not reloaded here, so a
+        // row image hydrated for a prepared fast path is from before this
+        // commit: the next fast path rehydrates it (bd-2mpxx). The schema-only
+        // reload fast path drops the same two promises.
+        self.memdb_rows_loaded.set(false);
+        self.memdb_storage_count_shortcuts_safe.set(false);
         let _ = txn.rollback(cx).await;
         Ok(PreparedSchemaRefreshResult {
             outcome: PreparedSchemaRefreshOutcome::Lightweight,
@@ -64431,7 +64477,8 @@ impl Connection {
         if !is_concurrent
             && !self.skip_statement_memdb_refresh.get()
             && let Some(bound_visible_commit_seq) = txn.published_visible_commit_seq_hint()
-            && bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
+            && (bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
+                || self.memdb_image_epoch_moved())
             && let Err(error) = self
                 .reload_memdb_from_txn_with_mode(
                     cx,
@@ -64848,11 +64895,13 @@ impl Connection {
         // snapshot after any retained-autocommit flush so prepared reads see
         // the same pager/memdb view as ad-hoc SELECT execution.
         let mirror_commit_seq_before_begin = *self.memdb_visible_commit_seq.borrow();
+        let mirror_image_epoch_before_begin = self.memdb_image_epoch.get();
         let prepared_auto_read = self
             .ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, cx, None)
             .await?;
         if staleness_left_to_begin
-            && *self.memdb_visible_commit_seq.borrow() > mirror_commit_seq_before_begin
+            && (*self.memdb_visible_commit_seq.borrow() > mirror_commit_seq_before_begin
+                || self.memdb_image_epoch.get() != mirror_image_epoch_before_begin)
         {
             // The staleness refresh's reload published the schema cookie it
             // read, which concurrent commits validate their schema snapshot
@@ -79861,7 +79910,9 @@ impl Connection {
         {
             let hydrate_rows = self.should_eagerly_hydrate_memdb_rows();
             let memdb_rows_need_open_txn_reload = !hydrate_rows && !self.memdb_rows_loaded.get();
-            if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
+            if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
+                || self.memdb_image_epoch_moved()
+            {
                 if let Err(error) = self
                     .reload_memdb_from_txn_with_mode(
                         &cx,
@@ -108685,7 +108736,9 @@ impl Connection {
         // (visible_commit_seq, undo_version) key the prepared indexed-equality
         // caches are scoped by, so drop them explicitly (bd-md5pf).
         self.clear_prepared_indexed_equality_caches();
-        if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
+        if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
+            || self.memdb_image_epoch_moved()
+        {
             self.discard_cached_vdbe_engine();
         }
         let page1 = txn.get_page(cx, PageNumber::ONE).await?;
@@ -109866,7 +109919,9 @@ impl Connection {
             // successful empty/full publication: a corrupt page or cancelled
             // read must leave the required retry armed.
             let force_full_schema_reload = self.force_full_schema_reload_once.get();
-            if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
+            if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
+                || self.memdb_image_epoch_moved()
+            {
                 self.discard_cached_vdbe_engine();
             }
             // Check if the database is empty (page 1 uninitialized).
@@ -109996,7 +110051,8 @@ impl Connection {
                 // cannot survive with a stale in-memory index. The exact local
                 // preservation receipt above already forces this path too.
                 && (self.vtab_instances.borrow().is_empty()
-                    || bound_visible_commit_seq == *self.memdb_visible_commit_seq.borrow())
+                    || (bound_visible_commit_seq == *self.memdb_visible_commit_seq.borrow()
+                        && !self.memdb_image_epoch_moved()))
             {
                 // Autoincrement tables track their next-rowid high-water-mark in
                 // sqlite_sequence. `INSERT` on an AUTOINCREMENT column doesn't bump

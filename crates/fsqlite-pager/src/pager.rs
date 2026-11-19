@@ -18510,6 +18510,18 @@ where
         self.published.read_retry_count()
     }
 
+    /// Epoch of the committed image this pager's page cache holds: it moves
+    /// whenever a refresh (or a recovery or VACUUM) finds the image changed
+    /// and clears the cache. The visible commit sequence alone can stay put
+    /// across such a change: after another process resets the WAL and
+    /// commits, `base + WAL commits` can land at or below the sequence this
+    /// pager already counted (bd-2mpxx). Caches built over the image key on
+    /// both.
+    #[must_use]
+    pub fn page_image_epoch(&self) -> u64 {
+        self.cache.image_epoch()
+    }
+
     /// Returns the database page size.
     #[must_use]
     pub fn page_size(&self) -> PageSize {

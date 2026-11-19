@@ -333,16 +333,17 @@ mod unix_only {
     // WAL restarts and truncations, and must release its mark again so that a
     // stock TRUNCATE checkpoint run between executions completes in full.
 
-    /// The held lookups and the key each runs with. Each runs in a pager
-    /// read transaction, the path this keeper is for. A held rowid lookup
-    /// (`SELECT b FROM k WHERE id = ?1`, the prepared memdb fast path) is left
-    /// out: on main 0dd0e7102 it still answers the pre-UPDATE row after the
-    /// stock UPDATE of step 1 until an fsqlite process commits (reported on
-    /// bd-05xlf, 2026-11-18), with or without bd-05xlf's change.
+    /// The held lookups and the key each runs with: three in a pager read
+    /// transaction and a rowid lookup, which the prepared memdb fast path
+    /// answers from the connection's row mirror. bd-2mpxx: that mirror kept
+    /// the pre-UPDATE row after a stock commit that followed a WAL reset, until
+    /// an fsqlite process committed, because the WAL-derived commit sequence
+    /// did not move.
     const KEY_PROBES: &[(&str, i64)] = &[
         ("SELECT id FROM k WHERE a = ?1", 7),
         ("SELECT b FROM k WHERE a = ?1", 7),
         ("SELECT count(*), max(id) FROM k WHERE a = ?1", 7),
+        ("SELECT b FROM k WHERE id = ?1", 7),
     ];
 
     /// Rows the seed inserts; `a = id % 50`, so key 7 starts with 80 rows and
@@ -526,6 +527,21 @@ mod unix_only {
             ("peer", "UPDATE k SET b = 'peer-upd' WHERE a = 7 AND b LIKE 'bulk-1%';"),
             ("stock", "CREATE INDEX k_ab ON k(a, b);"),
             ("stock", "DROP INDEX k_ab; DELETE FROM k WHERE a = 7 AND id > 4000;"),
+            // bd-2mpxx: a commit and then a TRUNCATE leave no WAL frame at
+            // all; the change lives only in the main file.
+            (
+                "stock",
+                "UPDATE k SET b = 'truncated-away' WHERE id = 7; PRAGMA wal_checkpoint(TRUNCATE);",
+            ),
+            (
+                "stock",
+                "DROP INDEX k_a; PRAGMA wal_checkpoint(TRUNCATE); \
+                 UPDATE k SET b = 'no-index' WHERE id = 7; PRAGMA wal_checkpoint(TRUNCATE);",
+            ),
+            (
+                "stock",
+                "CREATE INDEX k_a ON k(a); PRAGMA wal_checkpoint(TRUNCATE);",
+            ),
         ];
 
         let mut mismatches = Vec::new();

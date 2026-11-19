@@ -3621,6 +3621,14 @@ pub struct ShardedPageCache {
     /// skip the 128-shard mutex walk that previously fired on every
     /// `refresh_committed_state` from `Connection::open_with_env_and_pager`.
     shards_dirty: AtomicBool,
+    /// Counts full [`Self::clear`]s. The pager clears the whole cache only
+    /// when the committed image may have changed under it (another
+    /// connection's or process's commit, a WAL reset, a recovery or VACUUM),
+    /// so a change of this count tells a cache built over the image, such as
+    /// a connection's row mirror, that the image moved even when the commit
+    /// sequence did not (bd-2mpxx: a stock writer's commit after a WAL reset
+    /// can leave the WAL-derived sequence where it was).
+    image_epoch: AtomicU64,
     shard_mask: usize,
     shard_shift: u32,
     /// Per-cache round-robin start for clean overflow-buffer recovery.
@@ -3801,6 +3809,7 @@ impl ShardedPageCache {
             flat_slots: FlatPageSlots::new(flat_capacity),
             shards,
             shards_dirty: AtomicBool::new(false),
+            image_epoch: AtomicU64::new(0),
             shard_mask,
             shard_shift,
             overflow_clean_probe_cursor: AtomicUsize::new(0),
@@ -5132,8 +5141,10 @@ impl ShardedPageCache {
     ///
     /// Unlike fast-path mode transitions, `clear()` preserves the fast-array's
     /// backing allocation so callers can cheaply reuse the same sparse working
-    /// set after an explicit cache flush.
+    /// set after an explicit cache flush. Each clear advances
+    /// [`Self::image_epoch`].
     pub fn clear(&self) {
+        self.image_epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(ref fast) = self.fast_array {
             fast.lock().clear();
         }
@@ -5149,6 +5160,13 @@ impl ShardedPageCache {
             }
         }
         self.clear_eviction_history();
+    }
+
+    /// How many full [`Self::clear`]s this cache has had: an epoch of the
+    /// committed image the cache was filled from (bd-2mpxx).
+    #[must_use]
+    pub fn image_epoch(&self) -> u64 {
+        self.image_epoch.load(Ordering::Acquire)
     }
 
     /// Capture cheap-to-compute cache counters, skipping per-slot iteration.
