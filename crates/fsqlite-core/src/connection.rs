@@ -2755,13 +2755,13 @@ fn record_concurrent_commit_plan_success(plan: &PreparedConcurrentCommit) {
     }
 }
 
-fn record_concurrent_commit_plan_error(error: &FrankenError) {
+fn record_concurrent_commit_plan_error(conn: &Connection, error: &FrankenError) {
     // A rejected transaction attempt counts even when hot-path profiling is
     // off. Autocommit may retry it as a new transaction on a fresh snapshot.
-    if matches!(error, FrankenError::BusySnapshot { .. })
-        && !fsqlite_observability::metrics::metrics_disabled()
-    {
-        fsqlite_observability::metrics::global().conflicts_busy_snapshot_total.inc();
+    // bd-7dxmt: a replayed COMMIT reports one outcome, so its attempts go
+    // through the connection's commit evidence.
+    if matches!(error, FrankenError::BusySnapshot { .. }) {
+        conn.commit_evidence(txn_replay::CommitEvidence::BusySnapshotConflict);
     }
     if !hot_path_profile_enabled() {
         return;
@@ -25858,19 +25858,23 @@ impl Connection {
         if !self.commit_capture_enabled.get() {
             return;
         }
-        self.commit_execution_capture.borrow_mut().record(CommitExecutionRecord {
-            event_id: 0,
-            connection_id: self.pool_metrics.get().map(|metrics| metrics.connection_id),
-            statement_id: self.fallback_statement_id.get(),
-            transaction_id: transaction.id.get(),
-            transaction_epoch: transaction.epoch.get(),
-            session_id,
-            snapshot_seq: snapshot_seq.get(),
-            phase,
-            reason,
-            commit_seq: commit_seq.map(CommitSeq::get),
-            storage_backend: self.pager_backend_label(),
-        });
+        // bd-7dxmt: through the commit evidence, so a replayed COMMIT adds
+        // the rows of the one outcome it reports.
+        self.commit_evidence(txn_replay::CommitEvidence::Execution(
+            CommitExecutionRecord {
+                event_id: 0,
+                connection_id: self.pool_metrics.get().map(|metrics| metrics.connection_id),
+                statement_id: self.fallback_statement_id.get(),
+                transaction_id: transaction.id.get(),
+                transaction_epoch: transaction.epoch.get(),
+                session_id,
+                snapshot_seq: snapshot_seq.get(),
+                phase,
+                reason,
+                commit_seq: commit_seq.map(CommitSeq::get),
+                storage_backend: self.pager_backend_label(),
+            },
+        ));
     }
 
     fn record_commit_validation_rejection(
@@ -80729,7 +80733,7 @@ impl Connection {
             session_id,
             pending_conflict_pages,
         ) {
-            record_concurrent_commit_plan_error(&error);
+            record_concurrent_commit_plan_error(self, &error);
             let reason = match &error {
                 FrankenError::BusySnapshot { .. } => "pending_page_conflict",
                 FrankenError::Busy => "pending_page_lock_busy",
@@ -80755,12 +80759,12 @@ impl Connection {
                 let error = FrankenError::BusySnapshot {
                     conflicting_pages: String::new(),
                 };
-                record_concurrent_commit_plan_error(&error);
+                record_concurrent_commit_plan_error(self, &error);
                 self.record_commit_validation_rejection(registry, session_id, "stale_schema_snapshot");
                 return Err(error);
             }
             Err(error) => {
-                record_concurrent_commit_plan_error(&error);
+                record_concurrent_commit_plan_error(self, &error);
                 self.record_commit_validation_rejection(registry, session_id, "schema_validation_error");
                 return Err(error);
             }
@@ -80782,12 +80786,12 @@ impl Connection {
                     let error = FrankenError::BusySnapshot {
                         conflicting_pages: String::new(),
                     };
-                    record_concurrent_commit_plan_error(&error);
+                    record_concurrent_commit_plan_error(self, &error);
                     self.record_commit_validation_rejection(registry, session_id, "stale_schema_change_snapshot");
                     return Err(error);
                 }
                 Err(error) => {
-                    record_concurrent_commit_plan_error(&error);
+                    record_concurrent_commit_plan_error(self, &error);
                     self.record_commit_validation_rejection(registry, session_id, "schema_change_validation_error");
                     return Err(error);
                 }
@@ -80814,6 +80818,13 @@ impl Connection {
         let audit_hash = session_id ^ planned_commit_seq.get();
         let gate_skipped_ssi =
             begin_time_serializable && self.should_skip_ssi_validation(audit_hash);
+        // bd-7dxmt: a replay attempt is internal to one public COMMIT, so its
+        // preparation keeps conflict events out of the shared observer.
+        if self.txn_replay_attempt_in_progress()
+            && let Some(mut handle) = registry.get_mut(session_id)
+        {
+            handle.set_observation_quiet(true);
+        }
 
         let prepare_outcome = if gate_skipped_ssi || !begin_time_serializable {
             prepare_concurrent_commit_fcw_only(
@@ -80854,7 +80865,7 @@ impl Connection {
                             let error = FrankenError::Internal(
                                 "MVCC session missing during commit planning".to_owned(),
                             );
-                            record_concurrent_commit_plan_error(&error);
+                            record_concurrent_commit_plan_error(self, &error);
                             return Err(error);
                         }
                     };
@@ -80974,7 +80985,7 @@ impl Connection {
             };
 
         if let Some(card) = abort_card {
-            self.ssi_evidence_ledger.record_async(card);
+            self.commit_evidence(txn_replay::CommitEvidence::SsiCard(card));
         }
 
         // Feed the real outcome back to the e-process ONLY when full SSI
@@ -80996,7 +81007,7 @@ impl Connection {
                 Err(_) => None,
             };
             if let Some(pivot_detected) = observed_pivot {
-                self.observe_ssi_outcome(pivot_detected);
+                self.commit_evidence(txn_replay::CommitEvidence::SsiOutcome(pivot_detected));
             }
         }
 
@@ -81035,7 +81046,7 @@ impl Connection {
             }
             Err((err, fcw_result)) => {
                 let error = Self::map_mvcc_commit_error(err, fcw_result);
-                record_concurrent_commit_plan_error(&error);
+                record_concurrent_commit_plan_error(self, &error);
                 if let Some(shared_handle) = registry.remove(session_id) {
                     {
                         let mut handle = shared_handle.lock();
@@ -81164,7 +81175,7 @@ impl Connection {
             )
         };
         if let Some(card) = commit_card {
-            self.ssi_evidence_ledger.record_async(card);
+            self.commit_evidence(txn_replay::CommitEvidence::SsiCard(card));
         }
     }
 
@@ -81818,7 +81829,7 @@ impl Connection {
                     }
                     drop(commit_registry_guard.take());
                     if let Some(card) = commit_card {
-                        self.ssi_evidence_ledger.record_async(card);
+                        self.commit_evidence(txn_replay::CommitEvidence::SsiCard(card));
                     }
                     if self.pager.is_memory() {
                         self.finish_commit_clock(committed_seq);
@@ -81864,10 +81875,12 @@ impl Connection {
         // Count once after retry/in-doubt resolution, including a physically
         // committed transaction whose later cleanup reports an error. Explicit
         // read-only COMMIT also completes a transaction; implicit reads do not.
+        // bd-7dxmt: through the commit evidence, so a COMMIT that a replay
+        // carried counts once.
         if let Some(started) = commit_metrics_started {
-            let metrics = fsqlite_observability::metrics::global();
-            metrics.commits_total.inc();
-            metrics.commit_duration_seconds.observe(started.elapsed().as_secs_f64());
+            self.commit_evidence(txn_replay::CommitEvidence::CommitMetrics {
+                seconds: started.elapsed().as_secs_f64(),
+            });
         }
         let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         let commit_handle_finalize_start = hot_path_profile_enabled().then(Instant::now);

@@ -513,6 +513,11 @@ pub struct ConcurrentHandle {
     /// rollback, reuse) drops it through
     /// [`ConcurrentHandle::invalidate_view_parts`].
     view_parts_cache: Option<Arc<HandleViewParts>>,
+    /// bd-7dxmt: this transaction is an internal attempt that its owner will
+    /// report as part of one public outcome (a replayed COMMIT), so commit
+    /// preparation emits none of its conflict events to the shared observer.
+    /// Validation itself is unchanged. Cleared on reuse.
+    observation_quiet: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -665,7 +670,21 @@ impl ConcurrentHandle {
             savepoint_snapshot_dirty: PageSet::default(),
             publication_pending: false,
             view_parts_cache: None,
+            observation_quiet: false,
         }
+    }
+
+    /// bd-7dxmt: mark this transaction as an internal attempt whose conflict
+    /// events stay out of the shared observer (see `observation_quiet`).
+    pub fn set_observation_quiet(&mut self, quiet: bool) {
+        self.observation_quiet = quiet;
+    }
+
+    /// Whether commit preparation keeps this transaction's conflict events
+    /// out of the shared observer.
+    #[must_use]
+    pub const fn observation_quiet(&self) -> bool {
+        self.observation_quiet
     }
 
     /// Reset this handle for a new concurrent transaction while preserving
@@ -701,6 +720,7 @@ impl ConcurrentHandle {
         self.has_out_rw.set(false);
         self.marked_for_abort.set(false);
         self.publication_pending = false;
+        self.observation_quiet = false;
     }
 
     /// Returns the read snapshot for this concurrent transaction.
@@ -3767,8 +3787,9 @@ fn record_prepare_fcw_conflicts(
     commit_index: &CommitIndex,
     lock_table: &InProcessPageLockTable,
     txn: TxnId,
+    quiet: bool,
 ) {
-    if lock_table.observer().is_none() {
+    if quiet || lock_table.observer().is_none() {
         return;
     }
     if let FcwResult::Conflict {
@@ -3802,17 +3823,24 @@ pub fn prepare_concurrent_commit_with_ssi(
     session_id: u64,
     planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
-    let (txn_id, commit_view) = {
+    let (txn_id, commit_view, quiet) = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
         if !handle.is_active() {
             return Err((MvccError::InvalidState, FcwResult::Clean));
         }
+        let quiet = handle.observation_quiet();
 
         // Step 1: First-committer-wins validation.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
-        record_prepare_fcw_conflicts(&fcw_result, commit_index, lock_table, handle.token().id);
+        record_prepare_fcw_conflicts(
+            &fcw_result,
+            commit_index,
+            lock_table,
+            handle.token().id,
+            quiet,
+        );
         let view = if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
@@ -3824,7 +3852,7 @@ pub fn prepare_concurrent_commit_with_ssi(
                 handle.is_marked_for_abort(),
             ))
         };
-        (handle.txn_token().id, view)
+        (handle.txn_token().id, view, quiet)
     };
     let (txn, begin_seq, write_set_pages, held_lock_pages, marked_for_abort) = match commit_view {
         Ok(view) => view,
@@ -3841,7 +3869,7 @@ pub fn prepare_concurrent_commit_with_ssi(
 
     if marked_for_abort {
         // The rejection is real, but this early exit did not discover edges.
-        if lock_table.observer().is_some() {
+        if !quiet && lock_table.observer().is_some() {
             emit_ssi_abort(
                 lock_table.observer(),
                 txn,
@@ -4018,7 +4046,7 @@ pub fn prepare_concurrent_commit_with_ssi(
             .iter()
             .any(|edge| !edge.source_is_active && edge.source_has_in_rw)
         {
-            if lock_table.observer().is_some() {
+            if !quiet && lock_table.observer().is_some() {
                 emit_ssi_abort(
                     lock_table.observer(),
                     txn,
@@ -4165,7 +4193,7 @@ pub fn prepare_concurrent_commit_with_ssi(
                 fsqlite_observability::SsiAbortCategory::MarkedForAbort
             }
         };
-        if lock_table.observer().is_some() {
+        if !quiet && lock_table.observer().is_some() {
             emit_ssi_abort(
                 lock_table.observer(),
                 txn,
@@ -4235,17 +4263,24 @@ pub fn prepare_concurrent_commit_fcw_only(
     session_id: u64,
     planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
-    let (txn_id, commit_view) = {
+    let (txn_id, commit_view, quiet) = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
         if !handle.is_active() {
             return Err((MvccError::InvalidState, FcwResult::Clean));
         }
+        let quiet = handle.observation_quiet();
 
         // FCW (Step 1) — mandatory for MVCC write-write invariants.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
-        record_prepare_fcw_conflicts(&fcw_result, commit_index, lock_table, handle.token().id);
+        record_prepare_fcw_conflicts(
+            &fcw_result,
+            commit_index,
+            lock_table,
+            handle.token().id,
+            quiet,
+        );
         let view = if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
@@ -4257,7 +4292,7 @@ pub fn prepare_concurrent_commit_fcw_only(
                 handle.is_marked_for_abort(),
             ))
         };
-        (handle.txn_token().id, view)
+        (handle.txn_token().id, view, quiet)
     };
     let (txn, begin_seq, write_set_pages, held_lock_pages, marked_for_abort) = match commit_view {
         Ok(view) => view,
@@ -4275,7 +4310,7 @@ pub fn prepare_concurrent_commit_fcw_only(
     if marked_for_abort {
         // FCW-only preparation still honors an existing abort mark. No SSI
         // edge discovery ran here, so report the counts as unmeasured.
-        if lock_table.observer().is_some() {
+        if !quiet && lock_table.observer().is_some() {
             emit_ssi_abort(
                 lock_table.observer(),
                 txn,

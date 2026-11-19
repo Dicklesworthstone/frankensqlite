@@ -1575,3 +1575,464 @@ fn transaction_open_across_an_fsqlite_commit_on_another_table_commits() {
     assert_eq!(stock_h(&run.db), 1);
     assert_eq!(stock_integrity(&run.db), "ok");
 }
+
+/// bd-7dxmt: the child process of the replay-outcome keepers. The counters are
+/// process-wide, so each scenario runs alone in its own process.
+const REPLAY_OUTCOME_ENV: &str = "FSQLITE_REPLAY_OUTCOME_CHILD";
+
+/// What one public COMMIT recorded, as deltas of the process-wide and
+/// connection-local evidence around it, with its wall and CPU cost.
+struct CommitOutcomeEvidence {
+    commit: Result<(), FrankenError>,
+    replay_attempts: u64,
+    replays_committed: u64,
+    busy_snapshot: u64,
+    commits: u64,
+    /// Decision types of the SSI cards it added.
+    cards: Vec<String>,
+    /// commit_events rows it added, retained or not.
+    events_added: u64,
+    /// `phase:reason` of the retained commit_events rows it added.
+    events: Vec<String>,
+    in_transaction_after: bool,
+    wall_ms: u128,
+    cpu_us: u64,
+}
+
+impl CommitOutcomeEvidence {
+    /// One `key=value` line with no spaces inside a value; the parent reads it
+    /// with `outcome_field`.
+    fn line(&self, scenario: &str) -> String {
+        let commit = match &self.commit {
+            Ok(()) => "ok".to_owned(),
+            Err(FrankenError::BusySnapshot { .. }) => "busy_snapshot".to_owned(),
+            Err(error) => format!("error:{}", error.to_string().replace(' ', "_")),
+        };
+        format!(
+            "event=replay_outcome scenario={scenario} commit={commit} replay_attempts={} \
+             replays_committed={} busy_snapshot={} commits={} cards={} card_types={} \
+             events_added={} events={} in_transaction_after={} wall_ms={} cpu_us={}",
+            self.replay_attempts,
+            self.replays_committed,
+            self.busy_snapshot,
+            self.commits,
+            self.cards.len(),
+            self.cards.join(","),
+            self.events_added,
+            self.events.join(","),
+            self.in_transaction_after,
+            self.wall_ms,
+            self.cpu_us,
+        )
+    }
+}
+
+/// CPU time of this process, in ns: every thread's `/proc/self/task/*/schedstat`
+/// (Linux; 0 where it is unavailable). The future may be polled on any thread.
+fn process_cpu_ns() -> u64 {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    tasks
+        .filter_map(Result::ok)
+        .filter_map(|task| std::fs::read_to_string(task.path().join("schedstat")).ok())
+        .filter_map(|text| text.split_whitespace().next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// Counts and evidence before one public COMMIT.
+struct EvidenceBefore {
+    counts: fsqlite_core::connection::TxnReplayCounts,
+    busy_snapshot: u64,
+    commits: u64,
+    /// The ledger's last `decision_epoch` (monotone from 1; these drafts
+    /// carry no decision id).
+    last_card_epoch: u64,
+    last_event_id: u64,
+    cpu_ns: u64,
+    started: Instant,
+}
+
+fn evidence_before(conn: &Connection) -> EvidenceBefore {
+    let metrics = fsqlite_observability::metrics::global();
+    EvidenceBefore {
+        counts: fsqlite_core::connection::txn_replay_counts(),
+        busy_snapshot: metrics.conflicts_busy_snapshot_total.get(),
+        commits: metrics.commits_total.get(),
+        last_card_epoch: conn
+            .ssi_decisions_snapshot()
+            .iter()
+            .map(|card| card.decision_epoch)
+            .max()
+            .unwrap_or(0),
+        last_event_id: conn
+            .commit_execution_snapshot()
+            .events
+            .iter()
+            .map(|event| event.event_id)
+            .max()
+            .unwrap_or(0),
+        cpu_ns: process_cpu_ns(),
+        started: Instant::now(),
+    }
+}
+
+fn evidence_after(
+    conn: &Connection,
+    before: &EvidenceBefore,
+    commit: Result<(), FrankenError>,
+) -> CommitOutcomeEvidence {
+    let wall_ms = before.started.elapsed().as_millis();
+    let cpu_us = process_cpu_ns().saturating_sub(before.cpu_ns) / 1_000;
+    let metrics = fsqlite_observability::metrics::global();
+    let counts = fsqlite_core::connection::txn_replay_counts();
+    let events = conn.commit_execution_snapshot();
+    // Event ids are monotone, so the last one counts the rows this COMMIT
+    // added even when the 64-row ring dropped some of them.
+    let events_added = events
+        .events
+        .iter()
+        .map(|event| event.event_id)
+        .max()
+        .unwrap_or(before.last_event_id)
+        .saturating_sub(before.last_event_id);
+    CommitOutcomeEvidence {
+        events_added,
+        commit,
+        replay_attempts: counts.attempts - before.counts.attempts,
+        replays_committed: counts.committed - before.counts.committed,
+        busy_snapshot: metrics.conflicts_busy_snapshot_total.get() - before.busy_snapshot,
+        commits: metrics.commits_total.get() - before.commits,
+        cards: conn
+            .ssi_decisions_snapshot()
+            .iter()
+            .filter(|card| card.decision_epoch > before.last_card_epoch)
+            .map(|card| format!("{:?}", card.decision_type))
+            .collect(),
+        events: events
+            .events
+            .iter()
+            .filter(|event| event.event_id > before.last_event_id)
+            .map(|event| format!("{}:{}", event.phase, event.reason))
+            .collect(),
+        in_transaction_after: conn.in_transaction(),
+        wall_ms,
+        cpu_us,
+    }
+}
+
+/// An SSI write skew between `first` and `second` on one file: each reads
+/// the table the other updates, and `second` is still open when `first`
+/// commits, so `first`'s COMMIT is refused as the pivot.
+async fn open_write_skew(first: &Connection, second: &Connection) {
+    first.execute("BEGIN").await.expect("first BEGIN");
+    second.execute("BEGIN").await.expect("second BEGIN");
+    first
+        .query("SELECT value FROM b WHERE id = 1")
+        .await
+        .expect("first reads b");
+    second
+        .query("SELECT value FROM a WHERE id = 1")
+        .await
+        .expect("second reads a");
+    first
+        .execute("UPDATE a SET value = 11 WHERE id = 1")
+        .await
+        .expect("first writes a");
+    second
+        .execute("UPDATE b SET value = 21 WHERE id = 1")
+        .await
+        .expect("second writes b");
+}
+
+async fn seed_write_skew(path: &str) {
+    let seed = Connection::open(path).await.expect("seed open");
+    seed.query("PRAGMA journal_mode=WAL").await.expect("WAL");
+    seed.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, value INTEGER)")
+        .await
+        .expect("a");
+    seed.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, value INTEGER)")
+        .await
+        .expect("b");
+    seed.execute("INSERT INTO a VALUES(1, 10)")
+        .await
+        .expect("seed a");
+    seed.execute("INSERT INTO b VALUES(1, 20)")
+        .await
+        .expect("seed b");
+    seed.close().await.expect("seed close");
+}
+
+fn run_replay_outcome_child(scenario: &str) -> String {
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = Command::new(exe)
+        .args([
+            "--exact",
+            "replay_outcome_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(REPLAY_OUTCOME_ENV, scenario)
+        .env("FRANKENSQLITE_METRICS_DISABLE", "0")
+        .output()
+        .expect("spawn the replay-outcome child");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "replay-outcome child {scenario} failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "event=replay_outcome_verified scenario={scenario}"
+        )),
+        "the {scenario} child must run its scenario:\n{stdout}\n{stderr}"
+    );
+    // The evidence lines, for the run log (attempts, wall and CPU per COMMIT).
+    for line in stdout
+        .lines()
+        .filter(|line| line.starts_with("event=replay_outcome"))
+    {
+        println!("{line}");
+    }
+    stdout
+}
+
+/// The child body; a no-op unless the parent set `REPLAY_OUTCOME_ENV`.
+#[test]
+fn replay_outcome_child() {
+    let Ok(scenario) = std::env::var(REPLAY_OUTCOME_ENV) else {
+        return;
+    };
+    assert!(
+        !fsqlite_observability::metrics::metrics_disabled(),
+        "the outcome counts need the metrics registry"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("skew.db");
+    let path = path.to_str().expect("utf8 path").to_owned();
+    asupersync::test_utils::run_test(|| seed_write_skew(&path));
+    let outcome = match scenario.as_str() {
+        "refused" => {
+            let mut outcome = None;
+            asupersync::test_utils::run_test(|| async {
+                let first = Connection::open(&path).await.expect("first open");
+                let second = Connection::open(&path).await.expect("second open");
+                first.set_diagnostic_capture_enabled(true);
+                // The explain-concurrency contract's busy_timeout. The peer
+                // stays open through every replay attempt.
+                first
+                    .execute("PRAGMA busy_timeout=5000")
+                    .await
+                    .expect("busy_timeout");
+                open_write_skew(&first, &second).await;
+                let before = evidence_before(&first);
+                let commit = first.execute("COMMIT").await.map(drop);
+                outcome = Some(evidence_after(&first, &before, commit));
+                second
+                    .execute("COMMIT")
+                    .await
+                    .expect("the survivor commits");
+                first.close().await.expect("first close");
+                second.close().await.expect("second close");
+            });
+            outcome.expect("refused scenario ran")
+        }
+        "peer_rolls_back" => {
+            // The peer runs on its own thread and rolls back while `first`'s
+            // COMMIT is waiting in its replay.
+            let steps = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let peer_steps = std::sync::Arc::clone(&steps);
+            let peer_path = path.clone();
+            // When the peer's ROLLBACK returned: how long after it the replay
+            // noticed is the owner proposal's latency figure (bd-7dxmt).
+            let peer_ended = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+            let peer_ended_at = std::sync::Arc::clone(&peer_ended);
+            let peer = std::thread::spawn(move || {
+                asupersync::test_utils::run_test(|| async move {
+                    let second = Connection::open(&peer_path).await.expect("second open");
+                    peer_steps.wait(); // 1: first has begun and read b
+                    second.execute("BEGIN").await.expect("second BEGIN");
+                    second
+                        .query("SELECT value FROM a WHERE id = 1")
+                        .await
+                        .expect("second reads a");
+                    peer_steps.wait(); // 2
+                    peer_steps.wait(); // 3: first has written a
+                    second
+                        .execute("UPDATE b SET value = 21 WHERE id = 1")
+                        .await
+                        .expect("second writes b");
+                    peer_steps.wait(); // 4: first is about to COMMIT
+                    std::thread::sleep(Duration::from_millis(200));
+                    second.execute("ROLLBACK").await.expect("second rolls back");
+                    *peer_ended_at.lock().expect("peer clock") = Some(Instant::now());
+                    second.close().await.expect("second close");
+                });
+            });
+            let mut outcome = None;
+            let mut commit_returned = None;
+            asupersync::test_utils::run_test(|| async {
+                let first = Connection::open(&path).await.expect("first open");
+                first.set_diagnostic_capture_enabled(true);
+                first
+                    .execute("PRAGMA busy_timeout=5000")
+                    .await
+                    .expect("busy_timeout");
+                first.execute("BEGIN").await.expect("first BEGIN");
+                first
+                    .query("SELECT value FROM b WHERE id = 1")
+                    .await
+                    .expect("first reads b");
+                steps.wait(); // 1
+                steps.wait(); // 2: second has begun and read a
+                first
+                    .execute("UPDATE a SET value = 11 WHERE id = 1")
+                    .await
+                    .expect("first writes a");
+                steps.wait(); // 3
+                steps.wait(); // 4: second has written b
+                let before = evidence_before(&first);
+                let commit = first.execute("COMMIT").await.map(drop);
+                commit_returned = Some(Instant::now());
+                outcome = Some(evidence_after(&first, &before, commit));
+                first.close().await.expect("first close");
+            });
+            peer.join().expect("peer thread");
+            let a: i64 = rusqlite::Connection::open(&path)
+                .expect("verify open")
+                .query_row("SELECT value FROM a WHERE id = 1", [], |row| row.get(0))
+                .expect("a");
+            let peer_ended = peer_ended
+                .lock()
+                .expect("peer clock")
+                .expect("the peer rolled back");
+            let commit_returned = commit_returned.expect("the COMMIT returned");
+            // Signed: the replay may commit before the peer's ROLLBACK call
+            // returns to it.
+            let lag_us = if commit_returned >= peer_ended {
+                i128::try_from(commit_returned.duration_since(peer_ended).as_micros())
+                    .unwrap_or(i128::MAX)
+            } else {
+                -i128::try_from(peer_ended.duration_since(commit_returned).as_micros())
+                    .unwrap_or(i128::MAX)
+            };
+            println!("event=replay_outcome_durable a={a} peer_end_to_commit_us={lag_us}");
+            outcome.expect("peer scenario ran")
+        }
+        other => panic!("unknown replay-outcome scenario {other}"),
+    };
+    println!("{}", outcome.line(&scenario));
+    println!("event=replay_outcome_verified scenario={scenario}");
+}
+
+/// The value of `name` on the child's `event=replay_outcome` line.
+fn outcome_field(stdout: &str, name: &str) -> String {
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("event=replay_outcome scenario="))
+        .expect("outcome line");
+    let prefix = format!("{name}=");
+    line.split(' ')
+        .find_map(|token| token.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {name} in {line}"))
+        .to_owned()
+}
+
+fn outcome_count(stdout: &str, name: &str) -> u64 {
+    outcome_field(stdout, name)
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} is a count: {stdout}"))
+}
+
+/// bd-7dxmt (a): an SSI-refused COMMIT whose replay is refused again N >= 2
+/// times, while the peer stays open, returns 517 and reports ONE outcome: busy
+/// +1, one SSI decision card, one commit_events row (`validation_rejected`),
+/// no commit. Before the fix each internal attempt counted as a public outcome
+/// (the explain-concurrency contract saw 104-106 per COMMIT).
+#[test]
+fn ssi_refused_commit_replayed_and_refused_again_reports_one_outcome() {
+    if std::env::var_os(REPLAY_OUTCOME_ENV).is_some() {
+        return;
+    }
+    let stdout = run_replay_outcome_child("refused");
+    let count = |name| outcome_count(&stdout, name);
+    assert_eq!(
+        outcome_field(&stdout, "commit"),
+        "busy_snapshot",
+        "the COMMIT is refused with BusySnapshot: {stdout}"
+    );
+    assert!(
+        count("replay_attempts") >= 2,
+        "non-vacuity: the replay must be refused again at least twice: {stdout}"
+    );
+    assert_eq!(count("busy_snapshot"), 1, "one public refusal: {stdout}");
+    assert_eq!(count("commits"), 0, "nothing committed: {stdout}");
+    assert_eq!(count("replays_committed"), 0, "{stdout}");
+    assert_eq!(outcome_field(&stdout, "in_transaction_after"), "false");
+    assert_eq!(
+        count("cards"),
+        1,
+        "one SSI decision card for one public COMMIT: {stdout}"
+    );
+    assert!(
+        outcome_field(&stdout, "card_types").starts_with("Abort"),
+        "the card is the refusal: {stdout}"
+    );
+    assert_eq!(
+        count("events_added"),
+        1,
+        "one commit_events row for one public COMMIT: {stdout}"
+    );
+    assert!(
+        outcome_field(&stdout, "events").starts_with("validation_rejected:"),
+        "the row is the refusal: {stdout}"
+    );
+}
+
+/// bd-7dxmt (b): an SSI-refused COMMIT whose peer rolls back while the replay
+/// waits. The replay then commits within busy_timeout: the COMMIT succeeds,
+/// its row is durable, and it reports one outcome, the commit: commits +1,
+/// busy +0 (the attempts before it are internal), and no rejected
+/// commit_events row. A fix that stopped replaying SSI refusals would return
+/// 517 here.
+#[test]
+fn ssi_refused_commit_whose_peer_rolls_back_commits_once_through_its_replay() {
+    if std::env::var_os(REPLAY_OUTCOME_ENV).is_some() {
+        return;
+    }
+    let stdout = run_replay_outcome_child("peer_rolls_back");
+    let count = |name| outcome_count(&stdout, name);
+    assert_eq!(
+        outcome_field(&stdout, "commit"),
+        "ok",
+        "the replay commits within busy_timeout: {stdout}"
+    );
+    assert!(
+        stdout.contains("event=replay_outcome_durable a=11"),
+        "the row is durable: {stdout}"
+    );
+    assert_eq!(
+        count("replays_committed"),
+        1,
+        "non-vacuity: a replay committed: {stdout}"
+    );
+    assert!(
+        count("replay_attempts") >= 2,
+        "non-vacuity: the replay was refused before the peer rolled back: {stdout}"
+    );
+    assert_eq!(count("commits"), 1, "one public commit: {stdout}");
+    assert_eq!(
+        count("busy_snapshot"),
+        0,
+        "the refused attempts are internal: {stdout}"
+    );
+    assert!(
+        !outcome_field(&stdout, "events").contains("validation_rejected"),
+        "the COMMIT reports its commit, not the refusals before it: {stdout}"
+    );
+    assert!(
+        !outcome_field(&stdout, "card_types").contains("Abort"),
+        "no refusal card for a COMMIT that committed: {stdout}"
+    );
+}

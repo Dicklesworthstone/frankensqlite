@@ -55,6 +55,7 @@ const REPLAY_MAX_ROWID_READS: usize = 4096;
 
 static TXN_REPLAY_COMMITTED: AtomicU64 = AtomicU64::new(0);
 static TXN_REPLAY_REFUSED: AtomicU64 = AtomicU64::new(0);
+static TXN_REPLAY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide outcomes of refused plain-BEGIN COMMITs that were replayed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -64,6 +65,9 @@ pub struct TxnReplayCounts {
     /// The replay diverged or ran out of `busy_timeout`, so the COMMIT was
     /// refused after all.
     pub refused: u64,
+    /// Internal replay attempts over all replays: one public COMMIT can make
+    /// many (bd-7dxmt), and reports one outcome.
+    pub attempts: u64,
 }
 
 /// bd-q4o7z: how many refused COMMITs this process replayed, by outcome.
@@ -72,7 +76,26 @@ pub fn txn_replay_counts() -> TxnReplayCounts {
     TxnReplayCounts {
         committed: TXN_REPLAY_COMMITTED.load(AtomicOrdering::Relaxed),
         refused: TXN_REPLAY_REFUSED.load(AtomicOrdering::Relaxed),
+        attempts: TXN_REPLAY_ATTEMPTS.load(AtomicOrdering::Relaxed),
     }
+}
+
+/// bd-7dxmt: what a COMMIT records about its outcome. A lone COMMIT that may
+/// be replayed collects these instead of recording them, so the public COMMIT
+/// reports exactly one outcome however many replay attempts it makes: the
+/// first attempt's if the caller gets its refusal, the committing attempt's
+/// if a replay commits.
+pub(super) enum CommitEvidence {
+    /// `conflicts_busy_snapshot_total` + 1.
+    BusySnapshotConflict,
+    /// One `PRAGMA fsqlite.commit_events` row.
+    Execution(CommitExecutionRecord),
+    /// One SSI decision card.
+    SsiCard(SsiDecisionCardDraft),
+    /// One SSI e-process observation (`true`: a pivot was found).
+    SsiOutcome(bool),
+    /// `commits_total` + 1 and one latency sample.
+    CommitMetrics { seconds: f64 },
 }
 
 /// The forms of a call that holds nothing but the transaction's BEGIN.
@@ -105,6 +128,14 @@ pub(super) struct TxnReplayState {
     /// Bumped by every successful BEGIN, so a call can tell it opened a new
     /// transaction.
     begin_generation: Cell<u64>,
+    /// bd-7dxmt: a lone COMMIT that may be replayed is collecting its commit
+    /// evidence into `evidence` instead of recording it. The outermost call's
+    /// guard records the one outcome when the call ends, however it ends.
+    collecting_evidence: Cell<bool>,
+    evidence: RefCell<Vec<CommitEvidence>>,
+    /// While a replay runs: the first attempt's evidence, which is the outcome
+    /// unless a replay attempt commits or fails for good.
+    evidence_original: RefCell<Option<Vec<CommitEvidence>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,7 +383,10 @@ const fn statement_is_replayable(statement: &Statement) -> bool {
 }
 
 /// Returns `call_depth` to zero when the outermost call ends, however it ends.
-pub(super) struct OutermostCallGuard<'a>(&'a Cell<u32>);
+/// bd-7dxmt: when that call is a lone COMMIT still collecting its evidence
+/// (it was not replayed, its replay stayed refused, or its future was
+/// dropped), this records the call's one outcome.
+pub(super) struct OutermostCallGuard<'a>(&'a Connection);
 
 /// What the outermost public call saw before it ran (see
 /// [`Connection::txn_replay_enter`]); holds the call's depth guard.
@@ -369,7 +403,10 @@ pub(super) struct ReplayCallScope<'a> {
 
 impl Drop for OutermostCallGuard<'_> {
     fn drop(&mut self) {
-        self.0.set(0);
+        self.0.txn_replay.call_depth.set(0);
+        if self.0.txn_replay.collecting_evidence.get() {
+            self.0.finish_commit_evidence();
+        }
     }
 }
 
@@ -502,6 +539,107 @@ impl Connection {
             .set(self.txn_replay.refused_commit_endings.get().wrapping_add(1));
     }
 
+    /// bd-7dxmt: record one piece of commit evidence, or collect it while a
+    /// lone COMMIT that may be replayed is running (see [`CommitEvidence`]).
+    pub(super) fn commit_evidence(&self, item: CommitEvidence) {
+        if self.txn_replay.collecting_evidence.get() {
+            self.txn_replay.evidence.borrow_mut().push(item);
+        } else {
+            self.apply_commit_evidence(item);
+        }
+    }
+
+    fn apply_commit_evidence(&self, item: CommitEvidence) {
+        match item {
+            CommitEvidence::BusySnapshotConflict => {
+                if !fsqlite_observability::metrics::metrics_disabled() {
+                    fsqlite_observability::metrics::global()
+                        .conflicts_busy_snapshot_total
+                        .inc();
+                }
+            }
+            CommitEvidence::Execution(record) => {
+                self.commit_execution_capture.borrow_mut().record(record);
+            }
+            CommitEvidence::SsiCard(card) => self.ssi_evidence_ledger.record_async(card),
+            CommitEvidence::SsiOutcome(pivot_detected) => self.observe_ssi_outcome(pivot_detected),
+            CommitEvidence::CommitMetrics { seconds } => {
+                let metrics = fsqlite_observability::metrics::global();
+                metrics.commits_total.inc();
+                metrics.commit_duration_seconds.observe(seconds);
+            }
+        }
+    }
+
+    fn take_commit_evidence(&self) -> Vec<CommitEvidence> {
+        std::mem::take(&mut *self.txn_replay.evidence.borrow_mut())
+    }
+
+    /// Put an emptied evidence buffer back, keeping its allocation.
+    fn keep_commit_evidence_buffer(&self, mut buffer: Vec<CommitEvidence>) {
+        buffer.clear();
+        let mut slot = self.txn_replay.evidence.borrow_mut();
+        if slot.is_empty() && slot.capacity() < buffer.capacity() {
+            *slot = buffer;
+        }
+    }
+
+    /// bd-7dxmt: a lone COMMIT that may be replayed starts collecting its
+    /// evidence. Out of line, so the per-call enter stays small.
+    #[inline(never)]
+    fn txn_replay_begin_commit_evidence(&self) {
+        self.txn_replay.collecting_evidence.set(true);
+        self.txn_replay.evidence.borrow_mut().clear();
+        drop(self.txn_replay.evidence_original.take());
+    }
+
+    /// End the collection and record `chosen`, the one outcome the public
+    /// COMMIT reports (a replay attempt that committed or failed for good).
+    fn settle_commit_evidence(&self, chosen: Vec<CommitEvidence>) {
+        self.txn_replay.collecting_evidence.set(false);
+        drop(self.txn_replay.evidence_original.take());
+        self.txn_replay.evidence.borrow_mut().clear();
+        for item in chosen {
+            self.apply_commit_evidence(item);
+        }
+    }
+
+    /// The outermost call ended while its lone COMMIT was still collecting:
+    /// a COMMIT that was not replayed (what it collected is its outcome), a
+    /// replay that stayed refused or diverged (the first attempt's refusal
+    /// is), or a dropped future.
+    #[inline(never)]
+    fn finish_commit_evidence(&self) {
+        self.txn_replay.collecting_evidence.set(false);
+        let mut collected = self.take_commit_evidence();
+        if let Some(original) = self.txn_replay.evidence_original.take() {
+            collected.clear();
+            for item in original {
+                self.apply_commit_evidence(item);
+            }
+        } else {
+            self.apply_commit_evidence_draining(&mut collected);
+        }
+        // The buffer keeps its capacity for the next COMMIT: the common
+        // COMMIT that is never replayed allocates nothing.
+        self.keep_commit_evidence_buffer(collected);
+    }
+
+    /// Apply every item of `buffer` in order and leave it empty, with its
+    /// allocation, for the next COMMIT.
+    fn apply_commit_evidence_draining(&self, buffer: &mut Vec<CommitEvidence>) {
+        for item in buffer.drain(..) {
+            self.apply_commit_evidence(item);
+        }
+    }
+
+    /// bd-7dxmt: a replay attempt's commit preparation keeps its conflict
+    /// events out of the shared observer; the public COMMIT reports one
+    /// outcome.
+    pub(super) fn txn_replay_attempt_in_progress(&self) -> bool {
+        self.txn_replay.replaying.get()
+    }
+
     /// The caller read `last_insert_rowid()` through the API.
     pub(super) fn txn_replay_note_rowid_read(&self, value: i64) {
         if self.txn_replay.mode.get() != TxnReplayMode::Recording {
@@ -530,13 +668,16 @@ impl Connection {
             return None;
         }
         self.txn_replay.call_depth.set(1);
-        Some(OutermostCallGuard(&self.txn_replay.call_depth))
+        Some(OutermostCallGuard(self))
     }
 
     /// Start one public SQL call. Only the outermost call records (not one
     /// nested in another, and none during a replay). The call's own future is
     /// awaited by its public method in place, between this and
-    /// [`Self::txn_replay_leave`], so the record never moves it.
+    /// [`Self::txn_replay_leave`], so the record never moves it. Inlined like
+    /// the leave: a prepared bulk insert enters once per row (bd-q4o7z probe
+    /// 5), and the lone-COMMIT evidence setup stays out of line (bd-7dxmt).
+    #[inline]
     pub(super) fn txn_replay_enter(&self, kind: ReplayCallKind, sql: &str) -> ReplayCallScope<'_> {
         let Some(guard) = self.txn_replay_enter_neutral() else {
             return ReplayCallScope {
@@ -557,6 +698,11 @@ impl Connection {
         let lone_commit = recording
             && kind.can_carry_replayed_commit()
             && (kind == ReplayCallKind::CommitTransaction || sql_is_lone(sql, LONE_COMMIT_FORMS));
+        if lone_commit {
+            // bd-7dxmt: the guard records the collected outcome when the
+            // call ends.
+            self.txn_replay_begin_commit_evidence();
+        }
         ReplayCallScope {
             guard: Some(guard),
             kind,
@@ -657,6 +803,12 @@ impl Connection {
                 // The replay runs inside this outermost call: its depth guard
                 // lives until the replay ends.
                 let outermost = scope.guard;
+                // bd-7dxmt: the first attempt's evidence waits for the
+                // replay's outcome; the attempts keep collecting.
+                if self.txn_replay.collecting_evidence.get() {
+                    *self.txn_replay.evidence_original.borrow_mut() =
+                        Some(self.take_commit_evidence());
+                }
                 return ReplayLeave::Replay(Box::pin(async move {
                     let _outermost = outermost;
                     self.replay_refused_transaction(log, commit_call, refusal, started)
@@ -896,6 +1048,12 @@ impl Connection {
     /// Replay the transaction `log` recorded, whose COMMIT (`commit_call`)
     /// was refused with `refusal` and ended the transaction, within
     /// `busy_timeout` of `started`.
+    ///
+    /// bd-7dxmt: the attempts are internal. The first attempt's commit
+    /// evidence waits in `evidence_original`; each attempt's own is collected
+    /// and kept only when the caller gets that attempt's outcome (it
+    /// committed, or failed for good). A replay refused after all reports the
+    /// first attempt's refusal, once, when the outermost call's guard drops.
     async fn replay_refused_transaction(
         &self,
         log: TxnReplayLog,
@@ -927,9 +1085,14 @@ impl Connection {
                     return Err(error);
                 }
             }
-            match self.replay_attempt(&cx, &log, &commit_call).await {
+            TXN_REPLAY_ATTEMPTS.fetch_add(1, AtomicOrdering::Relaxed);
+            self.txn_replay.evidence.borrow_mut().clear();
+            let attempt = self.replay_attempt(&cx, &log, &commit_call).await;
+            let attempt_evidence = self.take_commit_evidence();
+            match attempt {
                 ReplayAttempt::Committed(value) => {
                     TXN_REPLAY_COMMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+                    self.settle_commit_evidence(attempt_evidence);
                     return Ok(value);
                 }
                 ReplayAttempt::Retry(error) => {
@@ -938,11 +1101,15 @@ impl Connection {
                     }
                 }
                 ReplayAttempt::Diverged => break,
-                ReplayAttempt::Failed(error) => return Err(error),
+                ReplayAttempt::Failed(error) => {
+                    self.settle_commit_evidence(attempt_evidence);
+                    return Err(error);
+                }
             }
         }
         TXN_REPLAY_REFUSED.fetch_add(1, AtomicOrdering::Relaxed);
         self.restore_change_counters(refusal_counters);
+        // The outermost call's guard records the first attempt's refusal.
         Err(refusal)
     }
 }
