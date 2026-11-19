@@ -24525,7 +24525,11 @@ impl Connection {
             // rowids. Keep normal fully-hydrated opens unchanged; this bounded
             // path is specifically for schema-only callers handling huge
             // indexes that cannot fit in memory.
-            Some("") => allow_contentless && has_shadow("_docsize"),
+            Some("") => {
+                allow_contentless
+                    && virtual_table_option_value(args, "columnsize").as_deref() != Some("0")
+                    && has_shadow("_docsize")
+            }
             Some(_) => false,
         };
         has_shadow("_data") && projection_is_lazy_capable
@@ -24765,6 +24769,11 @@ impl Connection {
         f: impl std::ops::AsyncFnOnce(&mut Fts5LiveShadowReader) -> Result<R>,
     ) -> Result<R> {
         let (data_root, idx_root, docsize_root, content_root) = {
+            let instances = self.vtab_instances.borrow();
+            let fts5 = instances
+                .get(&table_name.to_ascii_uppercase())
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .ok_or_else(|| FrankenError::Internal(format!("missing FTS5 instance: {table_name}")))?;
             let schema = self.schema.borrow();
             let resolve = |suffix: &str| -> Result<Option<PageNumber>> {
                 let name = format!("{table_name}{suffix}");
@@ -24788,8 +24797,8 @@ impl Connection {
             (
                 data_root,
                 resolve("_idx")?,
-                resolve("_docsize")?,
-                resolve("_content")?,
+                if fts5.config().columnsize_enabled() { resolve("_docsize")? } else { None },
+                if fts5_owns_content_shadow(fts5) { resolve("_content")? } else { None },
             )
         };
         let registry = Arc::clone(&self.collation_registry);
@@ -59864,7 +59873,7 @@ impl Connection {
             return Ok(false);
         }
 
-        let (shadow_rows, live_row_count, is_contentless) = {
+        let (shadow_rows, live_row_count, config, owns_content) = {
             let instances = self.vtab_instances.borrow();
             let key = table_name.to_ascii_uppercase();
             let instance = instances.get(&key).ok_or_else(|| {
@@ -59881,7 +59890,8 @@ impl Connection {
             (
                 fts5.encode_shadow_rows()?,
                 fts5.row_count(),
-                fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless,
+                *fts5.config(),
+                fts5_owns_content_shadow(fts5),
             )
         };
 
@@ -59894,7 +59904,7 @@ impl Connection {
         // tracking, so a latent hydration/encode defect here must fail loudly,
         // never blank the index. (A genuine empty index, e.g. after delete-all,
         // has `live_row_count == 0` and is unaffected.)
-        if is_contentless && live_row_count > 0 {
+        if config.content_mode() == fsqlite_ext_fts5::ContentMode::Contentless && live_row_count > 0 {
             let encoded_segment_leaves = shadow_rows
                 .data
                 .iter()
@@ -59991,7 +60001,7 @@ impl Connection {
         .await?;
 
         let content_name = format!("{table_name}_content");
-        if self.schema_table_exists(&content_name) {
+        if owns_content && self.schema_table_exists(&content_name) {
             self.replace_storage_table_rows(
                 &content_name,
                 shadow_rows.content.into_iter().map(|row| {
@@ -60009,7 +60019,7 @@ impl Connection {
         }
 
         let docsize_name = format!("{table_name}_docsize");
-        if self.schema_table_exists(&docsize_name) {
+        if config.columnsize_enabled() && self.schema_table_exists(&docsize_name) {
             self.replace_storage_table_rows(
                 &docsize_name,
                 shadow_rows.docsize.into_iter().map(|row| {
@@ -60191,7 +60201,7 @@ impl Connection {
             .unwrap_or(0)
             .saturating_add(1);
 
-        let (flush, content_rows) = {
+        let (flush, content_rows, has_docsize) = {
             let instances = self.vtab_instances.borrow();
             let key = table_name.to_ascii_uppercase();
             let fts5 = instances
@@ -60230,7 +60240,7 @@ impl Connection {
                     content_rows.push((rowid, values.to_vec()));
                 }
             }
-            (flush, content_rows)
+            (flush, content_rows, fts5.config().columnsize_enabled())
         };
         let Some(flush) = flush else {
             return Ok(true);
@@ -60263,7 +60273,7 @@ impl Connection {
 
         // Append the new documents' docsize rows (read back on reopen for BM25).
         let docsize_name = format!("{table_name}_docsize");
-        if self.schema_table_exists(&docsize_name) {
+        if has_docsize && self.schema_table_exists(&docsize_name) {
             // Contentless-delete tables carry a per-row `origin` (the 3rd
             // `_docsize` column) identifying the segment a rowid was inserted
             // into, so a later lazy DELETE can tombstone the owning segment
@@ -60745,7 +60755,7 @@ impl Connection {
         // external-content delete-all clears ONLY the index — the documents still
         // live in the content source, so `count(*)`/scans must keep reading them.
         // Capture the current row count now so it can be preserved below.
-        let (column_count, is_contentless, preserved_row_count) = {
+        let (column_count, config, preserved_row_count) = {
             let instances = self.vtab_instances.borrow();
             let Some(fts5) = instances
                 .get(&key)
@@ -60755,10 +60765,11 @@ impl Connection {
             };
             (
                 fts5.columns().len(),
-                fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless,
+                *fts5.config(),
                 fts5.row_count(),
             )
         };
+        let is_contentless = config.content_mode() == fsqlite_ext_fts5::ContentMode::Contentless;
         if !self.schema_table_exists(&format!("{table_name}_data")) {
             return Ok(());
         }
@@ -60826,7 +60837,7 @@ impl Connection {
         // shadow. External-content: the documents still live in the content
         // source and delete-all clears only the index, so the docsize shadow
         // must be preserved (bd-2mzkj: f6f864a7c wrongly wiped it for both).
-        if is_contentless {
+        if is_contentless && config.columnsize_enabled() {
             self.replace_storage_table_rows(
                 &format!("{table_name}_docsize"),
                 std::iter::empty::<(i64, Vec<SqliteValue>)>(),
@@ -85641,6 +85652,23 @@ impl Connection {
             fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)?
         };
 
+        if fsqlite_vdbe::pragma::is_writable_schema_reset(pragma) {
+            let cx = self.op_cx()?;
+            self.flush_retained_autocommit_txn(&cx).await?;
+            // Raw sqlite_schema edits can leave the page-one schema cookie
+            // unchanged. Within a restore the catalog and its backing tables
+            // are still uncommitted, so reparse using that transaction.
+            self.force_full_schema_reload_once.set(true);
+            if self.active_txn.borrow().is_some() {
+                self.memdb_requires_active_txn_reload.set(true);
+                self.refresh_memdb_from_active_txn_if_dirty(&cx).await?;
+            } else {
+                self.reload_memdb_from_pager(&cx).await?;
+            }
+            self.schema_generation.set(self.schema_generation.get().wrapping_add(1));
+            self.clear_compilation_reuse_caches();
+        }
+
         if let Some(prior_journal_mode) = maybe_prior_journal_mode {
             if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref mut mode) = pragma_out {
                 self.normalize_private_memory_journal_mode_output(mode);
@@ -109079,6 +109107,11 @@ impl Connection {
         let column_count = parse_virtual_table_column_infos(args).len();
         let mut shadow: [Vec<(i64, Vec<SqliteValue>)>; 2] = [Vec::new(), Vec::new()];
         for (slot, suffix) in shadow.iter_mut().zip(["_data", "_docsize"]) {
+            if suffix == "_docsize"
+                && virtual_table_option_value(args, "columnsize").as_deref() == Some("0")
+            {
+                continue;
+            }
             let name = format!("{table_name}{suffix}");
             if let Some(table) = schema
                 .iter()
@@ -160383,6 +160416,39 @@ fn virtual_table_shadow_drop_names(table_name: &str, sql: &str) -> Vec<String> {
     let Ok(Statement::CreateVirtualTable(stmt)) = parse_single_statement(sql) else {
         return Vec::new();
     };
+    virtual_table_shadow_names_for_cleanup(table_name, &stmt)
+}
+
+/// Backing tables owned by a built-in virtual table with this definition.
+/// Module options matter: for example, an external-content FTS5 table does
+/// not own a table named `<name>_content`.
+#[must_use]
+pub fn virtual_table_shadow_names(
+    table_name: &str,
+    stmt: &fsqlite_ast::CreateVirtualTableStatement,
+) -> Vec<String> {
+    let mut names = virtual_table_shadow_names_for_cleanup(table_name, stmt);
+    // Stock FTS5 adds a sparse %_content table when this option stores at
+    // least one UNINDEXED column. Older FrankenSQLite files may lack it.
+    // A backup includes it when present; cleanup keeps its existing policy.
+    if stmt.module.eq_ignore_ascii_case("fts5")
+        && virtual_table_option_value(&stmt.args, "content").as_deref() == Some("")
+        && virtual_table_option_value(&stmt.args, "contentless_unindexed").as_deref() == Some("1")
+        && stmt.args.iter().any(|arg| {
+            let mut lexer = fsqlite_parser::Lexer::new(arg);
+            lexer.next_token();
+            matches!(lexer.next_token().kind, fsqlite_parser::TokenKind::Id(word) if word.eq_ignore_ascii_case("unindexed"))
+        })
+    {
+        names.push(format!("{table_name}_content"));
+    }
+    names
+}
+
+fn virtual_table_shadow_names_for_cleanup(
+    table_name: &str,
+    stmt: &fsqlite_ast::CreateVirtualTableStatement,
+) -> Vec<String> {
     let module = stmt.module.to_ascii_lowercase();
     match module.as_str() {
         "fts5" => fts5_shadow_drop_names(table_name, &stmt.args),
@@ -160399,6 +160465,13 @@ fn virtual_table_shadow_drop_names(table_name: &str, sql: &str) -> Vec<String> {
         ],
         _ => Vec::new(),
     }
+}
+
+#[cfg(feature = "ext-fts5")]
+fn fts5_owns_content_shadow(fts5: &Fts5Table) -> bool {
+    !fts5.is_external_content()
+        && (fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Stored
+            || (fts5.config().contentless_unindexed_enabled() && fts5.indexed_columns().contains(&false)))
 }
 
 fn fts5_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
