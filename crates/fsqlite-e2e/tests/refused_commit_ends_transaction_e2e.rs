@@ -49,25 +49,67 @@ const HOLDER_ENV: &str = "FSQLITE_REFUSED_COMMIT_HOLDER";
 const STOCK_HOLDER_ENV: &str = "FSQLITE_REFUSED_COMMIT_STOCK_HOLDER";
 const PEER_ENV: &str = "FSQLITE_OPEN_TRANSACTION_PEER";
 
-struct HolderGuard(Option<Child>);
+/// A child process whose stdout and stderr are drained from the moment it is
+/// spawned (bd-mah07). Read only at the end, a full pipe would block the child
+/// mid-write, holding whatever lock it had, while the parent waits on it.
+struct HolderGuard {
+    child: Option<Child>,
+    drains: Option<(DrainedPipe, DrainedPipe)>,
+}
+
+type DrainedPipe = std::thread::JoinHandle<Vec<u8>>;
+
+fn drain_pipe(pipe: Option<impl std::io::Read + Send + 'static>) -> DrainedPipe {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
 
 impl HolderGuard {
+    fn new(mut child: Child) -> Self {
+        let stdout = drain_pipe(child.stdout.take());
+        let stderr = drain_pipe(child.stderr.take());
+        Self {
+            child: Some(child),
+            drains: Some((stdout, stderr)),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().expect("holder spawned").try_wait()
+    }
+
     fn finish(mut self) -> std::process::Output {
-        self.0
+        let status = self
+            .child
             .take()
             .expect("holder spawned")
-            .wait_with_output()
-            .expect("holder output")
+            .wait()
+            .expect("holder output");
+        let (stdout, stderr) = self.drains.take().expect("holder drains");
+        std::process::Output {
+            status,
+            stdout: stdout.join().expect("holder stdout drain"),
+            stderr: stderr.join().expect("holder stderr drain"),
+        }
     }
 }
 
 impl Drop for HolderGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
             // A failing parent assertion must not leave a writer holding the
             // database until the child's handshake timeout expires.
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some((stdout, stderr)) = self.drains.take() {
+            let _ = stdout.join();
+            let _ = stderr.join();
         }
     }
 }
@@ -402,7 +444,7 @@ fn spawn_holder(db: &Path, dir: &Path, stock: bool) -> HolderGuard {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn holder");
-    HolderGuard(Some(child))
+    HolderGuard::new(child)
 }
 
 /// Negative case: a COMMIT that gets a retryable `Busy` (another process holds
@@ -747,7 +789,7 @@ fn a_busy_commit_behind_a_stock_writer_stays_open_and_a_later_commit_lands_its_r
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn stock peer");
-        *peer_slot = Some(HolderGuard(Some(child)));
+        *peer_slot = Some(HolderGuard::new(child));
         assert!(
             wait_for(&neg_dir.join("committed"), Duration::from_secs(120)),
             "the stock peer never committed"
@@ -1096,7 +1138,7 @@ fn open_transaction_across_peer_commit(
             });
         }
         let before = wal_salts(&db_for_salts);
-        let child = peer_slot.insert(
+        let child = peer_slot.insert(HolderGuard::new(
             Command::new(std::env::current_exe().expect("test binary path"))
                 .args([
                     "--exact",
@@ -1109,7 +1151,7 @@ fn open_transaction_across_peer_commit(
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn peer"),
-        );
+        ));
         let started = Instant::now();
         while !work.join("committed").exists() {
             assert!(
@@ -1160,10 +1202,7 @@ fn open_transaction_across_peer_commit(
         observed,
         rowid_after_commit,
     ) = observed.expect("the parent ran to completion");
-    let output = peer
-        .expect("peer spawned")
-        .wait_with_output()
-        .expect("peer output");
+    let output = peer.expect("peer spawned").finish();
     assert!(
         output.status.success(),
         "peer failed: {}\n{}",
