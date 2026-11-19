@@ -94,6 +94,119 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-18 - FIX (landed as 7214b9c57; a correctness fix measured like a lever, inside its kill line): a held prepared rowid lookup reads another process's commit after a WAL reset; the row mirror is stale when the page cache's image epoch moved, not only when the commit sequence did (bd-2mpxx, read/seek round 8)
+
+- Target: bd-2mpxx. A held prepared rowid lookup kept returning a pre-commit value after a stock process committed
+  and the WAL was reset (TRUNCATE or RESTART). Touched: `crates/fsqlite-pager/src/page_cache.rs`,
+  `crates/fsqlite-pager/src/pager.rs`, `crates/fsqlite-core/src/connection.rs`, and the keeper
+  `crates/fsqlite-core/tests/prepared_statement_cross_process_staleness_oracle.rs`.
+- Cause:
+  - In WAL mode the pager's visible commit sequence is the main file's change counter plus the WAL's commits,
+    clamped never to go backward.
+  - A stock writer does not bump the change counter on a WAL commit. So after a WAL reset plus a commit, the probe can
+    land at or below the count the pager already had.
+  - The refresh clears the page cache (a new WAL generation), so pager reads are current. The commit sequence does
+    not move, though, and the connection's row mirror decided staleness only by commit sequence. The prepared rowid
+    fast path answered from it.
+- Not done, and why: advancing the pager's commit sequence on such a change. The WAL commit path takes
+  certificate-assigned sequences (`record_local_wal_commit_at`). An inflated local counter would stop matching them,
+  and own commits would then look like foreign ones.
+- Fix:
+  - The sharded page cache counts its full clears (`image_epoch`). Full clears happen on a foreign commit or WAL reset
+    seen by a refresh, on recovery, and when a validated image is published, never on an own commit.
+  - The connection records that epoch whenever it reloads the mirror, and every mirror staleness decision also fires
+    when it moved.
+  - The prepared schema refresh's lightweight branch drops `memdb_rows_loaded`, as the schema-only reload does. It
+    advanced the mirror's sequence without reloading rows.
+- Ledger preflight: lever 1 (bd-05xlf, round 7, below) moved the prepared read's staleness check into its begin; the
+  rowid probe was red there and on 0dd0e7102 before it.
+- Prediction (on the bead before the build): select-rowid within +0.2% instructions; select-index and autocommit
+  INSERT within their A/A bands. Kill line: select-rowid worse than +5% instructions, stock live.
+- Result:
+  - Setup: thinkstation1, governor powersave, io_uring refused, prepared-dml-probe at N = 2,000 and 22,000 (per
+    execution = difference / 20,000), 7 interleaved reps, medians. Stock 3.54.1 live. The fsqlite arms read copies of
+    one file built by main, sidecars included.
+  - On the landing base 8705691b2 (load about 2): main (probe sha256 4aeaf74b56524472), its A/A copy, and main +
+    this fix + bd-79p0a (a7aada8d82fe95b5; bd-79p0a changes only aggregate programs, which these rows do not run).
+  - First run on f75c6e50c (load about 10): main ab39c95cf75d6376 against this fix alone, c42c6aba1783d97b.
+  - Answers equal across arms in both runs. Scratchpad of the read/seek lane: `rs8/lk2.out` and `rs8/lk1.out`.
+
+  | row | stock | main | A/A | fix (landing base) | fix alone (f75c6e50c) |
+  |---|---|---|---|---|---|
+  | select-rowid | 4,721 | 8,177 | 8,164 | 8,183 (+0.07%) | 8,176 -> 8,171 (-0.06%) |
+  | select-index | 5,054 | 62,840 | 62,867 | 62,753 (-0.14%) | 62,812 -> 62,750 (-0.10%) |
+  | insert-autocommit | - | 138,947 | 139,217 | 139,054 (+0.08%) | 138,994 -> 139,192 (+0.14%) |
+
+  - The INSERT row is the check that an own commit never moves the epoch. If it did, each autocommit INSERT would
+    reload the mirror.
+  - Keeper green, including an uncommitted copy that ran the scenario 10 times on fresh databases.
+- Retry condition: none. A later change that clears the page cache on an own commit, or that reloads the mirror
+  without `set_memdb_visible_commit_seq_from_publication`, must re-measure the INSERT row against this entry: the
+  first would reload the mirror on every write, the second on every read.
+
+## 2026-11-18 - FIX (landed as a65e4c090; a correctness fix measured like a lever: instructions -21% to -30% and inside its kill lines, cycles up to +23% at 40,000 rows, one prediction line missed): an aggregate over a bound index key and a residual term seeks the key's block as its literal spelling does (bd-79p0a, read/seek round 8)
+
+- Target: bd-79p0a. `SELECT id, b, c, count(*) FROM t WHERE a = ?1 AND n = ?2` (t_ab(a, b), n unindexed) scanned the
+  table in rowid order and took bare columns from the first match by rowid: 27|2|v20|7, where stock answers 357|0|v14|7.
+  There were 52 divergences over the round-7 probe. Touched: `crates/fsqlite-vdbe/src/codegen.rs`; keeper
+  `crates/fsqlite-core/tests/bd_79p0a_bound_key_residual_aggregates.rs`; and
+  `crates/fsqlite/tests/agg_leading_eq_residual_oracle.rs`, whose opcode gate pinned the old literal-only rule
+  ("a parameterized PREFIX must decline") and now requires the seek. Its bound-range-bound decline stays.
+- Cause: the aggregate's equality-prefix residual seek (`aggregate_index_prefix_literal_residual_target`) admitted
+  only literal keys, and no later gate matched the bound form, so it fell to the scan.
+- Fix:
+  - The target (renamed `aggregate_index_prefix_residual_target`) takes a `PrefixProbe`. Its parameter form admits
+    `?NNN` keys when every placeholder in the WHERE is numbered, and is tried after every other aggregate seek.
+  - The emitter checks each bound key's storage class with IsType, as bd-aavtp's whole-WHERE seek does, and scans
+    for any other value. A literal key emits nothing new.
+  - The COUNT(*) yield gate admits the parameter form.
+  - The per-term exactness test is one helper shared with the whole-WHERE seek.
+- Ledger preflight:
+  - L5 v2 (2026-11-15, rejected on the bd_d4rbi keeper): this is the plan difference that rejected it, and its
+    retry condition (a) names this fix.
+  - bd-aavtp's run-time exactness rule is reused as is.
+- Prediction (on the bead before the build):
+  - bound form after the fix within +10% instructions of the literal form;
+  - literal form unchanged within its A/A band;
+  - main's bound form about 2-4x the literal at 400 rows and 50-100x at 40,000.
+- Result:
+  - Setup: one prepared statement in a loop (fsqlite::blocking release-perf, and a C loop over the 3.54.1
+    amalgamation for stock). Each execution its own autocommit transaction, (N2 - N1) differences, 7 interleaved
+    reps, medians. Each arm on its own copy of one database, the bead's schema at 400 and 40,000 rows.
+  - On the landing base 8705691b2: main (loop sha256 5f26a835bda17868), its A/A copy, main + bd-2mpxx + this fix
+    (b198f8edee844b18).
+  - First run on f75c6e50c: main + bd-2mpxx (main's codegen) against + this fix, with the same answers and deltas
+    within 1.2 points of these.
+  - The landed commit differs from the measured fix binary only by clippy's `option_option` fix: a `TermExactness`
+    enum in place of `Option<Option<u16>>`. That code runs once at prepare time, which the per-execution difference
+    cancels.
+  - Scratchpad of the read/seek lane: `rs8/agg_q2landing.out`, `rs8/agg_q1before.out`, `rs8/agg_q1after.out`,
+    driver `rs8/aggloop.py`.
+
+  | rows, statement | stock | main | A/A | fix (landing base) |
+  |---|---|---|---|---|
+  | 400, bare-column, bound | 49.5k | 448.5k | 448.5k | 314.0k (-30.0%; cycles +3%, CPU +5%) |
+  | 400, bare-column, literal | 49.1k | 304.0k | 303.9k | 304.1k |
+  | 400, count(*), bound | 48.0k | 437.3k | 437.2k | 308.6k (-29.4%; cycles +12%) |
+  | 40,000, bare-column, bound | 5.50M | 39.95M | 39.95M | 31.32M (-21.6%; cycles +23%, CPU 2.77 -> 3.44 ms) |
+  | 40,000, bare-column, literal | 5.50M | 30.40M | 30.40M | 30.40M |
+  | 40,000, count(*), bound | 5.46M | 39.50M | 39.50M | 31.14M (-21.2%; cycles +21%) |
+
+  - On f75c6e50c the 400-row cycles were +14% / +15%. The 400-row cycle deltas are inside this host's spread for
+    those rows; the 40,000-row ones are not.
+  - The bound form is +3.2% / +3.0% over the literal: the residual filter reads two parameters per visited row.
+  - The literal rows did not move. The bound answers now equal stock's.
+  - MISSED: main's bound form was 1.45x / 1.30x the literal, not 2-4x / 50-100x. fsqlite's scan costs about 1.0k
+    instructions a row and its seek about 8.4k a visited row, so the 11x fewer rows mostly cancel.
+  - So the fix buys stock's row with the cycles the literal spelling already pays.
+- Not changed: a key bound with another storage class (text '5' on an INTEGER column) still scans in rowid order, as
+  the whole-WHERE seek does; stock converts it and seeks, so bare columns can still differ for such binds.
+- Retry condition / next lever: the per-visited-row cost of the index-to-table seek. About 40% of the literal form at
+  40,000 rows is the table SeekRowid per index entry (`table_move_to` -> `table_seek` -> `table_seek_for_insert`),
+  about 3.5k instructions, against stock's 1.5k for the whole row. The block's rowids are not ascending, so SL1 (v2
+  rejected 2026-11-17; v3 landed as f9c9e9965: a seek that lands on the cursor's current leaf) does not apply as
+  such; a cheaper descent does. Lowering it is what turns this fix's cycle cost into a gain.
+
 ## 2026-11-18 - WIN (drop-in correctness, stock live; not a speed claim): a plain-BEGIN transaction whose COMMIT loses a page conflict is replayed within busy_timeout when nothing it returned would change; 8 CLI writers x 300 'BEGIN; INSERT; COMMIT' on one table commit 2,400 of 2,400 rows as stock does (median 1,888.5 before) (bd-q4o7z, mp lane round 2)
 
 - Target: the .5.4 shape, explicit-same in `mw_conflict.py`. N CLI processes x M
