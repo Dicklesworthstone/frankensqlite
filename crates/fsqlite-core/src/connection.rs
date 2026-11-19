@@ -69385,6 +69385,26 @@ impl Connection {
         Ok(())
     }
 
+    /// The highest AUTOINCREMENT rowid the just-executed program recorded for
+    /// `table_name` beyond the rows it kept (0 when none). The engine stays
+    /// parked in `cached_vdbe_engine` until the next program resets it.
+    fn recorded_autoincrement_high_water(&self, table_name: &str) -> i64 {
+        let Some(root_page) = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .map(|table| table.root_page)
+        else {
+            return 0;
+        };
+        self.cached_vdbe_engine
+            .borrow()
+            .as_ref()
+            .and_then(|engine| engine.autoinc_alloc_high_water().get(&root_page).copied())
+            .unwrap_or(0)
+    }
+
     async fn try_fast_path_autoincrement_sequence_after_insert(
         &self,
         table_name: &str,
@@ -69394,9 +69414,13 @@ impl Connection {
         if affected != 1 {
             return Ok(false);
         }
-        let Some(inserted_rowid) = last_insert_rowid else {
+        let Some(last_rowid) = last_insert_rowid else {
             return Ok(false);
         };
+        // The one row inserted need not carry the statement's highest rowid:
+        // the program also records a rowid an OR IGNORE burned (GH #186) or
+        // an IGNORE discarded (bd-jlbrk).
+        let inserted_rowid = last_rowid.max(self.recorded_autoincrement_high_water(table_name));
 
         self.ensure_sqlite_sequence_table_exists().await?;
         let key = table_name.to_ascii_lowercase();

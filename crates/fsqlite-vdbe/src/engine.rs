@@ -10728,10 +10728,33 @@ impl VdbeEngine {
         Ok(())
     }
 
+    /// bd-jlbrk: stock records an AUTOINCREMENT table's rowid (OP_MemMax) as
+    /// soon as the row has one, before its constraint checks, so a row that
+    /// UNIQUE ... ON CONFLICT IGNORE or OR IGNORE then discards still advances
+    /// sqlite_sequence. A rowid NewRowid allocated is already in the
+    /// high-water (GH #186); this records an explicit one.
+    fn note_ignored_autoincrement_rowid(&mut self, table_cursor: i32, rowid: i64) {
+        let Some(sc) = self.storage_cursors.get(&table_cursor) else {
+            return;
+        };
+        if !matches!(sc.rowid_mode, RowIdMode::AutoIncrement) {
+            return;
+        }
+        let entry = self
+            .autoinc_alloc_high_water
+            .entry(sc.root_page)
+            .or_insert(0);
+        *entry = (*entry).max(rowid);
+    }
+
+    /// Undo the current row's provisional table insert and index entries after
+    /// a secondary-index conflict. Returns the table cursor and rowid of the
+    /// row an INSERT had just written (not an UPDATE's restored row), so the
+    /// IGNORE path can record that rowid for AUTOINCREMENT.
     async fn rollback_pending_insert_after_index_conflict(
         &mut self,
         require_pending_table_insert: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<(i32, i64)>> {
         let entries = self.take_pending_idx_entries();
         for (idx_cid, idx_key) in entries {
             if self.storage_cursor_find_exact_index_key(
@@ -10757,7 +10780,7 @@ impl VdbeEngine {
                     "secondary-index conflict without pending table insert",
                 ));
             }
-            return Ok(());
+            return Ok(None);
         };
         let tsc = self
             .storage_cursors
@@ -10800,14 +10823,17 @@ impl VdbeEngine {
             FrankenError::internal("secondary-index rollback underflowed change counter")
         })?;
         self.sync_storage_table_delete_into_memdb_mirror(rollback_cursor_id, rollback_rowid);
-        if let Some(update_restore) = rollback.update_restore {
+        let removed_insert = if let Some(update_restore) = rollback.update_restore {
             self.restore_pending_update_after_conflict(update_restore)
                 .await?;
-        }
+            None
+        } else {
+            Some((rollback_cursor_id, rollback_rowid))
+        };
         self.last_insert_rowid = rollback.previous_last_insert_rowid;
         self.last_insert_rowid_valid = rollback.previous_last_insert_rowid_valid;
         self.last_insert_cursor_id = None;
-        Ok(())
+        Ok(removed_insert)
     }
 
     async fn restore_pending_update_after_conflict(
@@ -14908,18 +14934,27 @@ impl VdbeEngine {
                                             // insert, roll back any already-inserted
                                             // index entries, and skip remaining indexes.
                                             4 => {
-                                                if let Err(error) = lean_future(|| {
+                                                let removed = match lean_future(|| {
                                                     self.rollback_pending_insert_after_index_conflict(
                                                         true,
                                                     )
                                                 })
                                                 .await
                                                 {
-                                                    if sideband_active {
-                                                        self.make_record_lookaside
-                                                            .replace_cleared_buf(key_blob);
+                                                    Ok(removed) => removed,
+                                                    Err(error) => {
+                                                        if sideband_active {
+                                                            self.make_record_lookaside
+                                                                .replace_cleared_buf(key_blob);
+                                                        }
+                                                        return Err(error);
                                                     }
-                                                    return Err(error);
+                                                };
+                                                if let Some((table_cursor, rowid)) = removed {
+                                                    self.note_ignored_autoincrement_rowid(
+                                                        table_cursor,
+                                                        rowid,
+                                                    );
                                                 }
                                                 self.set_conflict_skip_idx(true);
                                                 if sideband_active {

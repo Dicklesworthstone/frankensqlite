@@ -576,15 +576,17 @@ impl IndexSchema {
     /// bd-a506j F1b: table-qualified key label for constraint-error messages —
     /// each key column carries the `table.` prefix, matching stock SQLite's
     /// "UNIQUE constraint failed: t.a, t.b" (not "t.a, b"). Single-column keys
-    /// render "t.a" exactly as before.
+    /// render "t.a" exactly as before. An index with an expression term is
+    /// named instead, as stock's sqlite3UniqueConstraint names it: "UNIQUE
+    /// constraint failed: index 'i'" (bd-jlbrk). A COLLATE or DESC on a plain
+    /// column is not an expression term.
     #[must_use]
     pub fn key_label_qualified(&self, table: &str) -> String {
-        let cols = if self.key_expressions.is_empty() {
-            &self.columns
-        } else {
-            &self.key_expressions
-        };
-        cols.iter()
+        if !self.key_expressions.is_empty() {
+            return format!("index '{}'", self.name);
+        }
+        self.columns
+            .iter()
             .map(|c| format!("{table}.{c}"))
             .collect::<Vec<_>>()
             .join(", ")
