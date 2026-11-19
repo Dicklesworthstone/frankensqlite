@@ -56,6 +56,9 @@ struct ChildReport {
     /// bd-q4o7z: refused COMMITs this fsqlite writer replayed, as
     /// `(committed, refused after all)`.
     replays: (u64, u64),
+    /// bd-q4o7z: `(seq, ids)` of every committed transaction of the rowid
+    /// shapes, with every id the application received inside it.
+    committed_ids: Vec<(usize, Vec<i64>)>,
 }
 
 #[derive(Debug)]
@@ -79,6 +82,12 @@ struct ShapeResult {
     replayed: u64,
     /// bd-q4o7z: refused COMMITs whose replay diverged or ran out of time.
     replay_refused: u64,
+    /// bd-q4o7z: `(worker, seq, ids)` of every committed transaction of the
+    /// rowid shapes, with every id the application received inside it.
+    committed_ids: Vec<(i64, i64, Vec<i64>)>,
+    /// `SELECT *` of `sqlite_master` and of every table, read by stock, in
+    /// rowid order, keyed by table name in name order.
+    tables: Vec<(String, Vec<Vec<rusqlite::types::Value>>)>,
 }
 
 const FLOOR_CERTIFIED_MARKER: &str = "VNXJD FLOOR-CERTIFIED";
@@ -163,13 +172,57 @@ fn parse_report(stdout: &str) -> Option<ChildReport> {
             };
             (field("committed="), field("refused="))
         });
+    let committed_ids = events(stdout, "event=mp_busy_committed_id ")
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let seq = fields
+                .next()
+                .expect("committed id seq")
+                .parse()
+                .expect("seq");
+            let ids = fields.map(|id| id.parse().expect("id")).collect();
+            (seq, ids)
+        })
+        .collect();
     Some(ChildReport {
         committed,
         committed_seqs,
         lost_seqs,
         errors,
         replays,
+        committed_ids,
     })
+}
+
+/// `SELECT *` of `sqlite_master` and of every table, in rowid order.
+fn table_snapshot(conn: &rusqlite::Connection) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let mut names: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("prepare table names")
+        .query_map([], |row| row.get(0))
+        .expect("table names")
+        .collect::<rusqlite::Result<_>>()
+        .expect("table names");
+    names.insert(0, "sqlite_master".to_owned());
+    names
+        .into_iter()
+        .map(|name| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM \"{name}\" ORDER BY rowid"))
+                .expect("prepare table rows");
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect()
+                })
+                .expect("table rows")
+                .collect::<rusqlite::Result<_>>()
+                .expect("table rows");
+            (name, rows)
+        })
+        .collect()
 }
 
 fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -> ShapeResult {
@@ -225,6 +278,7 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
     let mut errors = Vec::new();
     let mut floor_certified = 0;
     let (mut replayed, mut replay_refused) = (0, 0);
+    let mut committed_ids = Vec::new();
     for (worker, drain) in draining {
         let output = drain.join().expect("drain thread").expect("writer output");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -255,10 +309,17 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
                 .into_iter()
                 .map(|(seq, how)| (worker, i64::try_from(seq).expect("seq"), how)),
         );
+        committed_ids.extend(
+            report
+                .committed_ids
+                .into_iter()
+                .map(|(seq, ids)| (worker, i64::try_from(seq).expect("seq"), ids)),
+        );
         errors.extend(report.errors);
     }
     committed_rows.sort_unstable();
     lost_rows.sort_unstable();
+    committed_ids.sort_unstable();
     let elapsed = started.elapsed();
     let stock = rusqlite::Connection::open(&db).expect("verify open");
     let final_rows: i64 = stock
@@ -274,6 +335,7 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
     let integrity: String = stock
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("integrity_check");
+    let tables = table_snapshot(&stock);
     let result = ShapeResult {
         committed,
         committed_rows,
@@ -286,6 +348,8 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
         floor_certified,
         replayed,
         replay_refused,
+        committed_ids,
+        tables,
     };
     eprintln!(
         "event=mp_busy_shape backend={backend} workers={workers} rows={rows} busy_timeout_ms={busy_timeout_ms} \
@@ -369,6 +433,89 @@ impl OpenTransactionRows {
     }
 }
 
+/// bd-q4o7z: how many times a rowid-shape writer runs one row's transaction
+/// before it gives up on that row (an error the test reports).
+const ROWID_ATTEMPTS: usize = 1000;
+
+/// bd-q4o7z: one rowid-shape transaction in stock: `BEGIN`, the INSERT, the
+/// id it got (`last_insert_rowid()` through the API and through SQL, or the
+/// INSERT's `RETURNING id`), `COMMIT`. Returns every id it received.
+fn stock_rowid_transaction(
+    conn: &rusqlite::Connection,
+    returning: bool,
+    worker: usize,
+    seq: usize,
+) -> Result<Vec<i64>, String> {
+    conn.execute_batch("BEGIN")
+        .map_err(|error| format!("begin: {error}"))?;
+    let ids = if returning {
+        let id = conn
+            .query_row(
+                &format!("{} RETURNING id", insert_sql(worker, seq)),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("insert: {error}"))?;
+        vec![id]
+    } else {
+        conn.execute(&insert_sql(worker, seq), [])
+            .map_err(|error| format!("insert: {error}"))?;
+        let api = conn.last_insert_rowid();
+        let sql = conn
+            .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
+            .map_err(|error| format!("select: {error}"))?;
+        vec![api, sql]
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|error| format!("commit autocommit_after={}: {error}", conn.is_autocommit()))?;
+    Ok(ids)
+}
+
+/// The one integer a one-row, one-column result holds.
+fn only_integer(rows: &[fsqlite::Row]) -> i64 {
+    match rows {
+        [row] => match row.values() {
+            [fsqlite::SqliteValue::Integer(id)] => *id,
+            other => panic!("expected one integer column, got {other:?}"),
+        },
+        other => panic!("expected one row, got {}", other.len()),
+    }
+}
+
+/// bd-q4o7z: the same transaction in fsqlite, through `execute` and `query`
+/// on one connection. An error comes back with the statement it failed.
+async fn fsqlite_rowid_transaction(
+    conn: &Connection,
+    returning: bool,
+    worker: usize,
+    seq: usize,
+) -> Result<Vec<i64>, (&'static str, fsqlite::FrankenError)> {
+    conn.execute("BEGIN")
+        .await
+        .map_err(|error| ("begin", error))?;
+    let ids = if returning {
+        let rows = conn
+            .query(&format!("{} RETURNING id", insert_sql(worker, seq)))
+            .await
+            .map_err(|error| ("insert", error))?;
+        vec![only_integer(&rows)]
+    } else {
+        conn.execute(&insert_sql(worker, seq))
+            .await
+            .map_err(|error| ("insert", error))?;
+        let api = conn.last_insert_rowid();
+        let rows = conn
+            .query("SELECT last_insert_rowid()")
+            .await
+            .map_err(|error| ("select", error))?;
+        vec![api, only_integer(&rows)]
+    };
+    conn.execute("COMMIT")
+        .await
+        .map_err(|error| ("commit", error))?;
+    Ok(ids)
+}
+
 /// The writer process body; a no-op unless the parent set `CHILD_ENV`.
 #[test]
 fn mp_busy_writer_child() {
@@ -394,6 +541,7 @@ fn mp_busy_writer_child() {
     let mut committed_seqs = Vec::new();
     let mut errors = Vec::new();
     let mut lost_seqs = Vec::new();
+    let mut committed_ids: Vec<(usize, Vec<i64>)> = Vec::new();
     match backend {
         // bd-reality-check-1022-llk6g.5.1: `BEGIN; INSERT; COMMIT` per row,
         // the way a CLI script runs it: every statement runs, an error is
@@ -486,6 +634,85 @@ fn mp_busy_writer_child() {
                 let _ = conn.close().await;
             });
         }
+        // bd-q4o7z: each transaction reads the id of the row it inserted, as
+        // an ORM does, and a failed transaction is rolled back (if it is still
+        // open) and run again, as an application does, until it commits.
+        "stock-explicit-rowid" | "stock-explicit-returning" => {
+            let returning = backend == "stock-explicit-returning";
+            let conn = rusqlite::Connection::open(&db).expect("stock open");
+            conn.busy_timeout(Duration::from_millis(busy_timeout_ms))
+                .expect("stock busy_timeout");
+            std::fs::write(ready_path(&dir, worker), b"").expect("ready");
+            assert!(wait_for(&dir.join("go"), Duration::from_secs(120)), "no go");
+            for seq in 0..rows {
+                for attempt in 1..=ROWID_ATTEMPTS {
+                    match stock_rowid_transaction(&conn, returning, worker, seq) {
+                        Ok(ids) => {
+                            committed += 1;
+                            committed_seqs.push(seq);
+                            committed_ids.push((seq, ids));
+                            break;
+                        }
+                        Err(error) => {
+                            errors.push(error);
+                            if !conn.is_autocommit() {
+                                let _ = conn.execute_batch("ROLLBACK");
+                            }
+                            if attempt == ROWID_ATTEMPTS {
+                                errors.push(format!("seq {seq}: gave up after {attempt} attempts"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "fsqlite-explicit-rowid" | "fsqlite-explicit-returning" => {
+            let returning = backend == "fsqlite-explicit-returning";
+            let (committed, committed_seqs, committed_ids, errors) = (
+                &mut committed,
+                &mut committed_seqs,
+                &mut committed_ids,
+                &mut errors,
+            );
+            asupersync::test_utils::run_test(|| async move {
+                let conn = Connection::open(db.to_str().expect("utf8 path"))
+                    .await
+                    .expect("fsqlite open");
+                conn.execute(&format!("PRAGMA busy_timeout={busy_timeout_ms}"))
+                    .await
+                    .expect("fsqlite busy_timeout");
+                std::fs::write(ready_path(&dir, worker), b"").expect("ready");
+                assert!(wait_for(&dir.join("go"), Duration::from_secs(120)), "no go");
+                for seq in 0..rows {
+                    for attempt in 1..=ROWID_ATTEMPTS {
+                        match fsqlite_rowid_transaction(&conn, returning, worker, seq).await {
+                            Ok(ids) => {
+                                *committed += 1;
+                                committed_seqs.push(seq);
+                                committed_ids.push((seq, ids));
+                                break;
+                            }
+                            Err((stage, error)) => {
+                                errors.push(format!(
+                                    "{stage} code={} autocommit_after={}: {error}",
+                                    error.extended_error_code(),
+                                    !conn.in_transaction()
+                                ));
+                                if conn.in_transaction() {
+                                    let _ = conn.execute("ROLLBACK").await;
+                                }
+                                if attempt == ROWID_ATTEMPTS {
+                                    errors.push(format!(
+                                        "seq {seq}: gave up after {attempt} attempts"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = conn.close().await;
+            });
+        }
         "stock" => {
             let conn = rusqlite::Connection::open(&db).expect("stock open");
             conn.busy_timeout(Duration::from_millis(busy_timeout_ms))
@@ -562,6 +789,10 @@ fn mp_busy_writer_child() {
     }
     for (seq, how) in &lost_seqs {
         println!("event=mp_busy_lost_seq {seq} {how}");
+    }
+    for (seq, ids) in &committed_ids {
+        let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+        println!("event=mp_busy_committed_id {seq} {}", ids.join(" "));
     }
     let replays = fsqlite_core::connection::txn_replay_counts();
     println!(
@@ -881,6 +1112,226 @@ fn cross_process_explicit_writers_on_one_table_commit_every_row_as_stock() {
             frank.replayed > 0,
             "non-vacuity: {backend}'s fsqlite writers replayed no refused COMMIT, so this run \
              did not exercise the replay"
+        );
+        // bd-q4o7z probe 4: the commit order is the rows' id order, so stock
+        // committing the same rows in that order must build this database:
+        // ids 1..N with no gap or duplicate, and every column as committed.
+        let commit_order: Vec<(i64, i64)> = snapshot_table(&frank, "t")
+            .iter()
+            .map(|row| (as_integer(&row[1]), as_integer(&row[2])))
+            .collect();
+        assert_matches_stock_for_committed_set(backend, backend, workers, &frank, &commit_order);
+    }
+}
+
+/// The rows of `table` in a shape's snapshot.
+fn snapshot_table<'a>(result: &'a ShapeResult, table: &str) -> &'a [Vec<rusqlite::types::Value>] {
+    result
+        .tables
+        .iter()
+        .find(|(name, _)| name == table)
+        .map_or_else(
+            || panic!("no table {table} in the snapshot"),
+            |(_, rows)| rows.as_slice(),
+        )
+}
+
+fn as_integer(value: &rusqlite::types::Value) -> i64 {
+    match value {
+        rusqlite::types::Value::Integer(value) => *value,
+        other => panic!("expected an integer, got {other:?}"),
+    }
+}
+
+/// bd-q4o7z probe 4: stock commits the same transactions in the same order
+/// into a freshly seeded database (one `INSERT INTO t(worker, seq)` per
+/// committed row of `commit_order`, ids assigned by stock). That database must
+/// read back exactly like the shape's: `SELECT *` of `sqlite_master` and of
+/// every table, row by row. The shape's own integrity_check, run by stock, is
+/// asserted by its accounting.
+fn assert_matches_stock_for_committed_set(
+    label: &str,
+    backend: &str,
+    workers: usize,
+    frank: &ShapeResult,
+    commit_order: &[(i64, i64)],
+) {
+    let dir = tempfile::tempdir().expect("reference tempdir");
+    let db = dir.path().join("reference.db");
+    seed(&db, backend, workers);
+    let mut stock = rusqlite::Connection::open(&db).expect("reference open");
+    let txn = stock.transaction().expect("reference transaction");
+    for (worker, seq) in commit_order {
+        txn.execute(
+            "INSERT INTO t(worker, seq) VALUES (?1, ?2)",
+            rusqlite::params![worker, seq],
+        )
+        .expect("reference insert");
+    }
+    txn.commit().expect("reference commit");
+    let reference = table_snapshot(&stock);
+    let names = |tables: &[(String, Vec<Vec<rusqlite::types::Value>>)]| {
+        tables
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(&frank.tables),
+        names(&reference),
+        "{label}: the same tables as stock's database for the same committed set"
+    );
+    for ((name, rows), (_, expected)) in frank.tables.iter().zip(&reference) {
+        if let Some(at) =
+            (0..rows.len().max(expected.len())).find(|&at| rows.get(at) != expected.get(at))
+        {
+            panic!(
+                "{label}: {name} differs from stock's database for the same committed set at row \
+                 {at}: {:?}, stock {:?} ({} rows, stock {})",
+                rows.get(at),
+                expected.get(at),
+                rows.len(),
+                expected.len()
+            );
+        }
+    }
+}
+
+/// bd-q4o7z probe 2: the accounting of a rowid shape, whose writers run each
+/// row's transaction until it commits. Returns the refused COMMITs.
+/// - integrity_check is ok;
+/// - every row committed exactly once, both as the writers saw it and in the
+///   table: nothing lost, nothing duplicated;
+/// - every error is a COMMIT refused with BusySnapshot (517) that ended its
+///   transaction;
+/// - every id an application received inside a transaction that committed
+///   (`last_insert_rowid()` through the API and through SQL, or the INSERT's
+///   `RETURNING id`) is the id of that transaction's row in the table;
+/// - stock committing the same rows in the order of those ids builds the same
+///   database (probe 4).
+fn assert_rowid_accounting(
+    label: &str,
+    backend: &str,
+    result: &ShapeResult,
+    workers: usize,
+    rows: usize,
+) -> usize {
+    assert_eq!(result.integrity, "ok", "{label}: integrity_check");
+    let grid: Vec<(i64, i64)> = (0..workers)
+        .flat_map(|worker| (0..rows).map(move |seq| (worker, seq)))
+        .map(|(worker, seq)| {
+            (
+                i64::try_from(worker).expect("worker"),
+                i64::try_from(seq).expect("seq"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        result.durable_rows, grid,
+        "{label}: every row is durable exactly once"
+    );
+    assert_eq!(
+        result.committed_rows, grid,
+        "{label}: every row's transaction committed exactly once"
+    );
+    let refused = result
+        .errors
+        .iter()
+        .filter(|error| error.starts_with(REFUSED_COMMIT_ENDED))
+        .count();
+    let other: Vec<&String> = result
+        .errors
+        .iter()
+        .filter(|error| !error.starts_with(REFUSED_COMMIT_ENDED))
+        .collect();
+    assert!(
+        other.is_empty(),
+        "{label}: every error must be a COMMIT refused with BusySnapshot (517) that ended its \
+         transaction; got {} others, e.g. {:?}",
+        other.len(),
+        other.iter().take(5).collect::<Vec<_>>()
+    );
+    let table_ids: std::collections::BTreeMap<(i64, i64), i64> = snapshot_table(result, "t")
+        .iter()
+        .map(|row| {
+            (
+                (as_integer(&row[1]), as_integer(&row[2])),
+                as_integer(&row[0]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        result.committed_ids.len(),
+        grid.len(),
+        "{label}: every committed transaction reported the ids it received"
+    );
+    for (worker, seq, ids) in &result.committed_ids {
+        let id = table_ids[&(*worker, *seq)];
+        assert!(
+            !ids.is_empty() && ids.iter().all(|seen| *seen == id),
+            "{label}: writer {worker} row {seq} received ids {ids:?} inside the transaction that \
+             committed it, but the row's id in the table is {id}"
+        );
+    }
+    let mut by_id: Vec<(i64, (i64, i64))> = result
+        .committed_ids
+        .iter()
+        .map(|(worker, seq, ids)| (ids[0], (*worker, *seq)))
+        .collect();
+    by_id.sort_unstable();
+    let commit_order: Vec<(i64, i64)> = by_id.into_iter().map(|(_, row)| row).collect();
+    assert_matches_stock_for_committed_set(label, backend, workers, result, &commit_order);
+    eprintln!(
+        "event=mp_busy_rowid_accounting label={label} committed={} refused={refused} \
+         replayed={} replay_refused={}",
+        result.committed, result.replayed, result.replay_refused
+    );
+    refused
+}
+
+/// bd-q4o7z probes 2 and 4: processes on ONE table whose transactions read
+/// the id of the row they inserted, as an ORM does: `BEGIN; INSERT;` then
+/// `last_insert_rowid()` through the API and through SQL (one arm), or
+/// `INSERT ... RETURNING id` (the other), then `COMMIT`. A failed transaction
+/// is rolled back if still open and run again until it commits.
+///
+/// A refused COMMIT's replay must not hand a transaction a different id than
+/// the one its application already received: when a peer took that rowid,
+/// the replay diverges and the COMMIT is refused with BusySnapshot. So every
+/// error is such a refusal, every row commits exactly once, and every id an
+/// application received in a transaction that committed is that row's id in
+/// the table. Stock committing the same rows in the order of those ids builds
+/// the same database. Stock runs the same shape first as the oracle and
+/// passes the same accounting with no error.
+///
+/// Non-vacuity: some COMMIT was refused after its replay diverged, so the
+/// replay met transactions whose rowid a peer had taken.
+#[test]
+fn cross_process_writers_reading_their_rowid_commit_each_row_once_under_the_id_they_saw() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    let _one_at_a_time = one_parent_test_at_a_time();
+    let (workers, rows) = (8, 300);
+    for (stock_backend, backend) in [
+        ("stock-explicit-rowid", "fsqlite-explicit-rowid"),
+        ("stock-explicit-returning", "fsqlite-explicit-returning"),
+    ] {
+        let stock = stock_oracle(stock_backend, workers, rows);
+        let stock_refused =
+            assert_rowid_accounting(stock_backend, stock_backend, &stock, workers, rows);
+        assert_eq!(
+            stock_refused, 0,
+            "{stock_backend}: the oracle refused a COMMIT"
+        );
+
+        let frank = run_shape(backend, workers, rows, 5000);
+        let refused = assert_rowid_accounting(backend, backend, &frank, workers, rows);
+        assert!(
+            refused > 0 && frank.replay_refused > 0,
+            "non-vacuity: {backend} had {refused} refused COMMITs and {} diverged replays, so no \
+             replay met a transaction whose rowid a peer had taken",
+            frank.replay_refused
         );
     }
 }
