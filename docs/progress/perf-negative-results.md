@@ -94,6 +94,61 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - REJECTED (tmpfs scorecard row 9-13% slower, predicted 25% faster; CPU at N=8 +28%): a page-conflict retry whose backoff stops growing at 2 ms while a held lock keeps the 50 ms ceiling (bd-1qmz4, multi-process lane round 3)
+
+- Target: the scorecard's `multiproc_8x500` (8 CLI processes x 500 autocommit INSERTs into one WAL
+  database, tmpfs), x8.7-8.9 stock on thinkstation1 today.
+  - Touched, not kept: `crates/fsqlite-core/src/connection.rs` and `connection/txn_replay.rs`.
+  - The change: `BeginBusyRetryHandoff::next_wait_after` capped the sleep at 2 ms when the
+    retried attempt had failed with BusySnapshot or WriteConflict. It applied to the two
+    autocommit statement retries and to the bd-q4o7z replay loop.
+  - Busy, BusyRecovery and DatabaseLocked kept the 50 us -> 50 ms schedule.
+  - Patch: scratchpad `mp3/cap_v1.patch` (sha256 7fb726317ef093ec), with a unit keeper for the
+    capped schedule.
+- Ledger preflight:
+  - lever 1 below, the polling VFS lock wait, REJECTED on explicit refusals;
+  - bd-9kvey's 50 us base with the 50 ms ceiling;
+  - the 2026-05 fences on in-process concurrent backoff tweaks.
+- Mechanism it targeted, from round 1's gdb census:
+  - each writer runs one escalating sequence: 0.7, 1.5, 3.1, 6.1, 12.6, 25.5 ms, then 49.9 ms
+    x6-9;
+  - that is 0.3-0.5 s of a 0.5-0.65 s life, after BusySnapshot refusals under the writer lock.
+- Prediction (on bd-1qmz4 before code): scorecard row -25% (band -15% to -45%); N=8 -20%,
+  N=16 -30%; CPU at N=8 +5-15%. Kill lines: under 10% gain, CPU at N=8 +25%, explicit-rowid
+  committed median 5% below base, A/A outside +-5%.
+- Result:
+  - Setup: release-perf CLIs, base a3d329d47 code (9b643f143363bd3b) against base + the cap
+    (227f7392e256193c); stock sqlite3 3.46.1 live; arms rotated; thinkstation1, powersave.
+    Scratchpad: `mp3/ab_cap1.txt`, `mp3/ab_cap1_tmpfs.json`, `mp3/ab_cap1_disk.json`.
+  - Scorecard row (`mp1_scrow.py`, 15 reps):
+    - base 0.834 s (x8.76), cap 0.908 s (x9.53), A/A copy of base 0.831 s;
+    - rerun: base 0.860 s (x8.93), cap 0.976 s (x10.13), A/A copy of the cap 0.941 s.
+  - Scaled probe, tmpfs, 4,000 rows, 3 reps (wall per txn; CPU per txn):
+
+    | N | base | cap |
+    |---|---|---|
+    | 1 | 118.0 us; CPU 118.5 us | 119.7 us; CPU 119.0 us |
+    | 2 | 144.4 us | 133.6 us |
+    | 4 | 165.7 us | 173.9 us |
+    | 8 | 209.7 us; CPU 231.3 us | 210.5 us; CPU 295.3 us (+28%) |
+    | 16 | 293.0 us | 279.3 us |
+
+  - Disk NORMAL, N=8: wall unchanged (257.7 -> 257.1 us), CPU +35%.
+  - explicit-same 8 x 300 (replayed blind INSERTs): 2,400 in every rep for both; wall 658 ->
+    712 ms.
+  - explicit-rowid 8 x 300 (CLI-style, reads `last_insert_rowid()`): committed median 1,741 ->
+    1,696 (-2.6%).
+  - auto-same: unchanged.
+  - Integrity ok everywhere.
+- Why: a loser that comes back in 2 ms instead of 25-50 ms takes RESERVED and is refused again
+  under the lock. The holder it waited for had just committed to the same rightmost leaf. So
+  sooner returns add refused holds and CPU rather than throughput.
+  - The long sleeps were thinning the race.
+  - That is the same lesson as lever 1, at the connection's retry instead of the VFS lock wait.
+- Retry condition: only together with lead (b), a commit that refuses before taking RESERVED
+  when the shared WAL-index already shows a peer frame for one of its pages. A sooner return is
+  only cheap once a doomed attempt stops costing a lock hold. Not as a standalone patch.
+
 ## 2026-11-18 - FIX (landed as 7214b9c57; a correctness fix measured like a lever, inside its kill line): a held prepared rowid lookup reads another process's commit after a WAL reset; the row mirror is stale when the page cache's image epoch moved, not only when the commit sequence did (bd-2mpxx, read/seek round 8)
 
 - Target: bd-2mpxx. A held prepared rowid lookup kept returning a pre-commit value after a stock process committed
