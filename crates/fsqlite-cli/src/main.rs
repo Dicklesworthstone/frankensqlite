@@ -5936,11 +5936,172 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
             let logical =
                 "SELECT rowid FROM docs WHERE typeof(tag)='integer' AND tag=17 AND cost=X'00FF'";
             assert_eq!(
+                native.query_row(logical).await.unwrap().get(0),
+                Some(&fsqlite::SqliteValue::Integer(10))
+            );
+            assert_eq!(
                 stock
                     .query_row(logical, [], |r| r.get::<_, i64>(0))
                     .unwrap(),
                 10
             );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn test_fts5_contentless_unindexed_cross_engine_writes() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("typed.db");
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            db.execute_batch(
+                "CREATE VIRTUAL TABLE d USING fts5(title, tag UNINDEXED, content='', body,
+                    cost UNINDEXED, contentless_unindexed=1, contentless_delete=1);
+                 INSERT INTO d(rowid,title,tag,body,cost) VALUES
+                    (10,'needle',17,'hay',X'00FF'),(20,'needle',NULL,'other',NULL);
+                 INSERT INTO d(title,tag,body,cost) VALUES('extra',1.25,'another','original');",
+            )
+            .await
+            .unwrap();
+            let hit = "SELECT rowid FROM d WHERE d MATCH 'needle' AND title IS NULL AND body IS NULL
+                       AND typeof(tag)='integer' AND tag=17 AND typeof(cost)='blob' AND cost=X'00FF'";
+            let missing =
+                "SELECT rowid FROM d WHERE d MATCH 'needle' AND tag IS NULL AND cost IS NULL";
+            for (sql, id) in [(hit, 10), (missing, 20)] {
+                assert_eq!(
+                    db.query_row(sql).await.unwrap().get(0),
+                    Some(&fsqlite::SqliteValue::Integer(id))
+                );
+            }
+            drop(db);
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            for (sql, id) in [(hit, 10), (missing, 20)] {
+                assert_eq!(
+                    stock.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(),
+                    id
+                );
+            }
+            stock
+                .execute_batch("UPDATE d SET cost=X'FF00' WHERE rowid=21")
+                .unwrap();
+            drop(stock);
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            db.execute_batch(
+                "CREATE TEMP TABLE d_content(id INTEGER PRIMARY KEY,c1,c3);
+                 INSERT INTO temp.d_content VALUES(21,'temporary','decoy');",
+            )
+            .await
+            .unwrap();
+            let edited = "SELECT rowid FROM d WHERE d MATCH 'extra' AND typeof(tag)='real' AND tag=1.25 AND cost=X'FF00'";
+            assert_eq!(
+                db.query_row(edited).await.unwrap().get(0),
+                Some(&fsqlite::SqliteValue::Integer(21))
+            );
+            db.execute_batch(
+                "BEGIN;
+                 UPDATE d SET cost='transient' WHERE rowid=21;
+                 ROLLBACK;",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                db.query_row(edited).await.unwrap().get(0),
+                Some(&fsqlite::SqliteValue::Integer(21))
+            );
+            db.execute_batch(
+                "UPDATE d SET cost='committed' WHERE rowid=21;
+                 UPDATE d SET rowid=rowid+100,title='fresh',body='word' WHERE rowid=10;
+                 DELETE FROM d WHERE rowid=20;
+                 INSERT INTO d(d) VALUES('optimize');",
+            )
+            .await
+            .unwrap();
+            assert!(
+                db.execute("UPDATE d SET rowid=21,title='bad',body='bad' WHERE rowid=110")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                db.query_row("SELECT id FROM temp.d_content WHERE c1='temporary' AND c3='decoy'")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&fsqlite::SqliteValue::Integer(21))
+            );
+            drop(db);
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            for (query, id) in [
+                (
+                    "SELECT rowid FROM d WHERE d MATCH 'extra' AND tag=1.25 AND cost='committed'",
+                    21,
+                ),
+                (
+                    "SELECT rowid FROM d WHERE d MATCH 'fresh' AND tag=17 AND cost=X'00FF'",
+                    110,
+                ),
+                ("SELECT count(*) FROM d WHERE d MATCH 'needle'", 0),
+                ("SELECT count(*) FROM d_content WHERE id=20", 0),
+                ("SELECT count(*) FROM d_content WHERE id=10", 0),
+            ] {
+                assert_eq!(
+                    stock.query_row(query, [], |r| r.get::<_, i64>(0)).unwrap(),
+                    id,
+                    "{query}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn test_fts5_sparse_insert_with_no_terms_or_docsize() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("no-terms.db");
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            db.execute_batch(
+                "CREATE VIRTUAL TABLE s USING fts5(label UNINDEXED, w, content='',
+                    columnsize=0, contentless_unindexed=1);
+                 INSERT INTO s(label) VALUES(X'00FF');
+                 INSERT INTO s(w,label) VALUES('needle',NULL);",
+            )
+            .await
+            .unwrap();
+            assert!(
+                db.execute("INSERT OR REPLACE INTO s(rowid,w,label) VALUES(1,'wrong',7)")
+                    .await
+                    .is_err()
+            );
+            db.execute("UPDATE s SET label=17 WHERE rowid=2")
+                .await
+                .unwrap();
+            db.execute_batch(
+                "INSERT INTO s(rowid,w,label) VALUES(3,'removed',99);
+                              INSERT INTO s(s,rowid,w) VALUES('delete',3,'removed');
+                              CREATE VIRTUAL TABLE a USING fts5(k UNINDEXED,content='',
+                                  contentless_unindexed=1,contentless_delete=1);
+                              INSERT INTO a(k) VALUES(3),(4);
+                              DELETE FROM a WHERE rowid=1;",
+            )
+            .await
+            .unwrap();
+            drop(db);
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            for (sql, expected) in [
+                ("SELECT rowid FROM s WHERE label=X'00FF'", 1),
+                ("SELECT rowid FROM s WHERE s MATCH 'needle' AND label=17", 2),
+                ("SELECT count(*) FROM s WHERE s MATCH 'wrong'", 0),
+                ("SELECT count(*) FROM s WHERE s MATCH 'removed'", 0),
+                ("SELECT count(*) FROM s_content WHERE id=3", 0),
+                ("SELECT rowid FROM a WHERE k=4", 2),
+                ("SELECT count(*) FROM a", 1),
+            ] {
+                assert_eq!(
+                    stock.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(),
+                    expected
+                );
+            }
         });
     }
 

@@ -1235,7 +1235,7 @@ FTS5 provides full-text indexing with BM25 ranking:
 - **Query syntax:** Boolean operators (`AND`, `OR`, `NOT`), phrase matching (`"exact phrase"`), prefix queries (`prefix*`), column filters (`title: search_term`), NEAR queries (`NEAR(a b, 10)`). Column-qualified `MATCH` honors the column restriction (the earlier defect in [#249](https://github.com/Dicklesworthstone/frankensqlite/issues/249) is fixed and regression-kept).
 - **Ranking:** BM25 by default, configurable via auxiliary functions
 - **Auxiliary functions:** `highlight()` wraps matches in markup, `snippet()` extracts context around matches
-- **Content modes:** Regular (FTS5 stores a copy), external content (references an existing table), contentless (index-only, no original text stored). The contentless `delete-all` control command is supported ([#253](https://github.com/Dicklesworthstone/frankensqlite/issues/253) fixed); stored-content tables reject it, matching stock SQLite.
+- **Content modes.** Regular tables store a copy of the content. External-content tables read from an existing table. Contentless tables keep only the index by default. With `content='', contentless_unindexed=1`, columns declared `UNINDEXED` retain their SQLite values and storage classes across reopen. Indexed columns return `NULL` and remain searchable with `MATCH`. Contentless tables support the `delete-all` command. Both engines reject that command on stored-content tables. [Issue #253](https://github.com/Dicklesworthstone/frankensqlite/issues/253)
 - **Index structure:** A B-tree of terms mapping to document/position lists, with incremental merge for write performance
 
 Upgrading from 0.1.x with a `porter`-tokenized table requires an FTS rebuild;

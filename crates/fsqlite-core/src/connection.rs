@@ -13828,10 +13828,11 @@ struct PreparedDirectInsertAppendHint {
 async fn random_unused_direct_insert_rowid<P: PageReader + PageWriter>(
     cursor: &mut fsqlite_btree::BtCursor<P>,
     cx: &Cx,
+    reserved: impl Fn(i64) -> bool,
 ) -> Result<i64> {
     for _ in 0..fsqlite_vdbe::engine::RANDOM_ROWID_ATTEMPTS {
         let candidate = fsqlite_vdbe::engine::random_rowid_candidate();
-        if !cursor.table_move_to(cx, candidate).await?.is_found() {
+        if !reserved(candidate) && !cursor.table_move_to(cx, candidate).await?.is_found() {
             return Ok(candidate);
         }
     }
@@ -23933,9 +23934,22 @@ impl Connection {
                     .map(Fts5Table::is_lazy_on_disk)
             };
             if let Some(is_lazy) = lazy_fts5 {
-                if let Some(content) = self.fts5_external_content(&src.table_name) {
+                let stored = self.fts5_stored_unindexed_columns(&src.table_name);
+                let content = if stored.is_empty() {
+                    self.fts5_external_content(&src.table_name)
+                } else {
+                    // A legacy file may lack the sparse table altogether. Its
+                    // index still answers postings-only MATCH queries.
+                    if plan.idx_num != 1 || plan.residual_where.is_some()
+                        || !fts5_match_reads_only_postings(select, src)
+                    {
+                        self.fts5_sparse_content_root(&src.table_name, &stored)?;
+                    }
+                    Some(Fts5ContentSource::sparse(&src.table_name, num_cols, &stored))
+                };
+                if let Some(content) = content {
                     return self
-                        .scan_external_content_fts5_rows(src, plan, is_lazy, &content, select)
+                        .scan_fts5_rows_with_content(src, plan, is_lazy, &content, select)
                         .await;
                 }
                 if is_lazy {
@@ -24152,7 +24166,10 @@ impl Connection {
         // An external-content table has its content table's rows, which the
         // normal scan reads there (GH#211).
         #[cfg(feature = "ext-fts5")]
-        if self.fts5_external_content(&name.name).is_some() {
+        if self.fts5_external_content(&name.name).is_some()
+            || (!self.fts5_stored_unindexed_columns(&name.name).is_empty()
+                && self.schema_table_exists(&format!("{}_content", name.name)))
+        {
             return Ok(None);
         }
         #[cfg(feature = "ext-fts5")]
@@ -24774,15 +24791,11 @@ impl Connection {
                 .get(&table_name.to_ascii_uppercase())
                 .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
                 .ok_or_else(|| FrankenError::Internal(format!("missing FTS5 instance: {table_name}")))?;
-            let schema = self.schema.borrow();
             let resolve = |suffix: &str| -> Result<Option<PageNumber>> {
                 let name = format!("{table_name}{suffix}");
-                match schema
-                    .iter()
-                    .find(|candidate| candidate.name.eq_ignore_ascii_case(&name))
-                {
-                    Some(table) if table.root_page > 0 => Ok(Some(page_number_from_schema_root(
-                        table.root_page,
+                match self.fts5_pager_shadow_layout(&name) {
+                    Some((root_page, _)) if root_page > 0 => Ok(Some(page_number_from_schema_root(
+                        root_page,
                         &name,
                         "fts5 lazy shadow",
                     )?)),
@@ -24798,7 +24811,7 @@ impl Connection {
                 data_root,
                 resolve("_idx")?,
                 if fts5.config().columnsize_enabled() { resolve("_docsize")? } else { None },
-                if fts5_owns_content_shadow(fts5) { resolve("_content")? } else { None },
+                if fts5_stores_full_content(fts5) { resolve("_content")? } else { None },
             )
         };
         let registry = Arc::clone(&self.collation_registry);
@@ -24939,7 +24952,7 @@ impl Connection {
             })?;
         let root = page_number_from_schema_root(root_page, &docsize_name, "fts5 docsize shadow")?;
         // An external-content table never gets here: its scan reads the
-        // content table (scan_external_content_fts5_rows).
+        // content table (scan_fts5_rows_with_content).
         let col_count = src.col_names.len();
 
         self.with_integrity_txn(async |cx, txn| {
@@ -24967,7 +24980,7 @@ impl Connection {
     /// columns. `None` for an internal-content (`_content`-backed) or
     /// contentless (`content=''`) table, which has no content table to read.
     #[cfg(feature = "ext-fts5")]
-    fn fts5_external_content(&self, table_name: &str) -> Option<Fts5ExternalContent> {
+    fn fts5_external_content(&self, table_name: &str) -> Option<Fts5ContentSource> {
         let columns = {
             let instances = self.vtab_instances.borrow();
             let fts5 = instances
@@ -24988,13 +25001,45 @@ impl Connection {
         let content_rowid = virtual_table_option_value(&create_stmt.args, "content_rowid")
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "rowid".to_owned());
-        Some(Fts5ExternalContent::new(&content, &content_rowid, &columns))
+        Some(Fts5ContentSource::external(&content, &content_rowid, &columns))
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn fts5_stored_unindexed_columns(&self, table_name: &str) -> Vec<usize> {
+        let instances = self.vtab_instances.borrow();
+        let Some(fts5) = instances
+            .get(&table_name.to_ascii_uppercase())
+            .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            .filter(|fts5| fts5.config().contentless_unindexed_enabled())
+        else {
+            return Vec::new();
+        };
+        fts5.indexed_columns().iter().enumerate()
+            .filter_map(|(idx, indexed)| (!indexed).then_some(idx))
+            .collect()
+    }
+
+    // Older native files could lack this shadow or have an ordinary table at
+    // its name. Never apply FTS5 row mutations to an incompatible table.
+    #[cfg(feature = "ext-fts5")]
+    fn fts5_sparse_content_root(&self, table_name: &str, stored: &[usize]) -> Result<PageNumber> {
+        let name = format!("{table_name}_content");
+        if !self.original_ddl_sql.borrow().get(&name.to_ascii_lowercase())
+            .is_some_and(|sql| ddl_matches_fts5_content_shadow(sql, Some(stored)))
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("FTS5 table {table_name} requires a sparse content table {name} with its declared unindexed columns"),
+            });
+        }
+        let (root_page, _) = self.fts5_pager_shadow_layout(&name)
+            .ok_or_else(|| FrankenError::NoSuchTable { name: name.clone() })?;
+        page_number_from_schema_root(root_page, &name, "fts5 sparse content")
     }
 
     /// Whether the table or view an external-content FTS5 table names as its
     /// content still exists (a RENAME of it does not follow into the option).
     #[cfg(feature = "ext-fts5")]
-    fn fts5_content_source_exists(&self, content: &Fts5ExternalContent) -> bool {
+    fn fts5_content_source_exists(&self, content: &Fts5ContentSource) -> bool {
         self.schema_table_exists(&content.name)
             || self
                 .views
@@ -25003,7 +25048,7 @@ impl Connection {
                 .any(|view| view.name.eq_ignore_ascii_case(&content.name))
     }
 
-    /// Run an [`Fts5ExternalContent`] statement: each row is a content rowid
+    /// Run an [`Fts5ContentSource`] statement: each row is a content rowid
     /// and the FTS5 columns' values.
     #[cfg(feature = "ext-fts5")]
     async fn query_fts5_external_content(
@@ -25038,7 +25083,7 @@ impl Connection {
     #[cfg(feature = "ext-fts5")]
     async fn fts5_external_content_rows(
         &self,
-        content: &Fts5ExternalContent,
+        content: &Fts5ContentSource,
         rowids: &[i64],
     ) -> Result<HashMap<i64, Vec<SqliteValue>>> {
         const POINT_LOOKUPS: usize = 64;
@@ -25073,12 +25118,12 @@ impl Connection {
     /// and a MATCH looks each hit up there by `content_rowid`: the values,
     /// and their types, are the content table's, read by column name.
     #[cfg(feature = "ext-fts5")]
-    async fn scan_external_content_fts5_rows(
+    async fn scan_fts5_rows_with_content(
         &self,
         src: &JoinTableSource,
         plan: &LiveVtabScanPlan,
         is_lazy: bool,
-        content: &Fts5ExternalContent,
+        content: &Fts5ContentSource,
         select: &SelectStatement,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let rows = match plan.idx_num {
@@ -36516,7 +36561,7 @@ impl Connection {
                 match hint.last_rowid.checked_add(1) {
                     Some(rowid) => (rowid, true, true),
                     None => (
-                        random_unused_direct_insert_rowid(cursor, execution_cx).await?,
+                        random_unused_direct_insert_rowid(cursor, execution_cx, |_| false).await?,
                         false,
                         false,
                     ),
@@ -36527,7 +36572,7 @@ impl Connection {
                 match cursor.rowid(execution_cx).await?.checked_add(1) {
                     Some(rowid) => (rowid, true, false),
                     None => (
-                        random_unused_direct_insert_rowid(cursor, execution_cx).await?,
+                        random_unused_direct_insert_rowid(cursor, execution_cx, |_| false).await?,
                         false,
                         false,
                     ),
@@ -59021,6 +59066,81 @@ impl Connection {
         Ok(replaced)
     }
 
+    /// The sparse shadow has a real INTEGER PRIMARY KEY. Resolve its rowids
+    /// (including earlier rows of the same VALUES list) before changing postings.
+    #[cfg(feature = "ext-fts5")]
+    async fn prepare_fts5_sparse_insert(
+        &self,
+        table_name: &str,
+        stored: &[usize],
+        rows: &[LiveVtabInsertRow],
+        replace: bool,
+        updating: &[i64],
+    ) -> Result<Vec<LiveVtabInsertRow>> {
+        let root = self.fts5_sparse_content_root(table_name, stored)?;
+        let replace = replace && self.vtab_instances.borrow().get(&table_name.to_ascii_uppercase())
+            .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            .is_some_and(|fts5| fts5.config().contentless_delete_enabled());
+        self.with_integrity_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+            let mut max = if cursor.last(cx).await? {
+                Some(cursor.rowid(cx).await?)
+            } else {
+                None
+            };
+            let mut seen = HashSet::with_capacity(rows.len());
+            let mut vacated = HashSet::with_capacity(updating.len());
+            let mut result = Vec::with_capacity(rows.len());
+            for (idx, row) in rows.iter().enumerate() {
+                if let Some(old) = updating.get(idx) {
+                    seen.remove(old);
+                    vacated.insert(*old);
+                }
+                let requested = row.explicit_rowid.as_ref()
+                    .map(Self::coerce_insert_rowid_value)
+                    .transpose()?.flatten();
+                let rowid = if let Some(id) = requested {
+                    id
+                } else if let Some(next) = max.unwrap_or(0).checked_add(1) {
+                    next
+                } else {
+                    random_unused_direct_insert_rowid(&mut cursor, cx, |id| seen.contains(&id)).await?
+                };
+                let duplicate = !seen.insert(rowid);
+                if !replace && (duplicate
+                    || (!vacated.contains(&rowid) && cursor.table_move_to(cx, rowid).await?.is_found()))
+                {
+                    return Err(FrankenError::PrimaryKeyViolation { columns: String::new() });
+                }
+                max = max.max(Some(rowid));
+                result.push(LiveVtabInsertRow {
+                    explicit_rowid: Some(SqliteValue::Integer(rowid)),
+                    values: row.values.clone(),
+                });
+            }
+            Ok(result)
+        }).await
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    async fn persist_fts5_sparse_values(
+        &self,
+        table_name: &str,
+        stored: &[usize],
+        rows: &[LiveVtabInsertRow],
+        rowids: &[i64],
+    ) -> Result<()> {
+        let records = rowids.iter().zip(rows).map(|(&rowid, row)| {
+            // INTEGER PRIMARY KEY is encoded in the b-tree key. Its record
+            // slot is NULL, exactly as it is in a stock-created content row.
+            let mut record = Vec::with_capacity(stored.len() + 1);
+            record.push(SqliteValue::Null);
+            record.extend(stored.iter().map(|&idx| row.values[idx].clone()));
+            (rowid, record)
+        });
+        self.upsert_storage_table_rows(&format!("{table_name}_content"), records).await
+    }
+
     async fn execute_live_vtab_insert_rows(
         &self,
         table_name: &str,
@@ -59028,6 +59148,17 @@ impl Connection {
         replace: bool,
     ) -> Result<Vec<i64>> {
         let cx = self.op_cx()?;
+        #[cfg(feature = "ext-fts5")]
+        let stored = self.fts5_stored_unindexed_columns(table_name);
+        #[cfg(feature = "ext-fts5")]
+        let sparse_rows;
+        #[cfg(feature = "ext-fts5")]
+        let rows = if stored.is_empty() {
+            rows
+        } else {
+            sparse_rows = self.prepare_fts5_sparse_insert(table_name, &stored, rows, replace, &[]).await?;
+            &sparse_rows
+        };
         #[cfg(feature = "ext-fts5")]
         if replace {
             let replaced = self.fts5_rowids_replaced_durably(table_name, rows).await?;
@@ -59144,6 +59275,9 @@ impl Connection {
             .persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids, replace)
             .await?
         {
+            if !stored.is_empty() {
+                self.persist_fts5_sparse_values(table_name, &stored, rows, &inserted_rowids).await?;
+            }
             if let Some(new_row_count) = lazy_contentless_new_rows {
                 let mut instances = self.vtab_instances.borrow_mut();
                 let fts5 = instances
@@ -59257,6 +59391,8 @@ impl Connection {
         // must be assigned — a full-row replace). Without this guard frank would
         // delete the old row and insert a partial one, corrupting the index.
         #[cfg(feature = "ext-fts5")]
+        let mut update_sparse_only = false;
+        #[cfg(feature = "ext-fts5")]
         {
             let key = table_name.to_ascii_uppercase();
             let contentless = {
@@ -59271,15 +59407,12 @@ impl Connection {
                         (
                             fts5.config().contentless_delete_enabled(),
                             fts5.columns().to_vec(),
+                            fts5.indexed_columns().to_vec(),
+                            fts5.config().contentless_unindexed_enabled(),
                         )
                     })
             };
-            if let Some((delete_enabled, columns)) = contentless {
-                if !delete_enabled {
-                    return Err(FrankenError::function_error(format!(
-                        "cannot UPDATE contentless fts5 table: {table_name}"
-                    )));
-                }
+            if let Some((delete_enabled, columns, indexed, stores_unindexed)) = contentless {
                 let mut assigned: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 for assignment in &update.assignments {
@@ -59292,10 +59425,15 @@ impl Connection {
                         }
                     }
                 }
-                if columns
-                    .iter()
-                    .any(|col| !assigned.contains(&col.to_ascii_lowercase()))
-                {
+                let required: HashSet<String> = columns.iter().zip(indexed)
+                    .filter(|(_, indexed)| !stores_unindexed || *indexed)
+                    .map(|(name, _)| name.to_ascii_lowercase()).collect();
+                update_sparse_only = stores_unindexed && assigned.iter().all(|name|
+                    columns.iter().any(|col| col.eq_ignore_ascii_case(name)) && !required.contains(name));
+                if !delete_enabled && !update_sparse_only {
+                    return Err(FrankenError::function_error(format!("cannot UPDATE contentless fts5 table: {table_name}")));
+                }
+                if !update_sparse_only && !required.is_subset(&assigned) {
                     return Err(FrankenError::function_error(format!(
                         "cannot UPDATE a subset of columns on fts5 contentless-delete table: {table_name}"
                     )));
@@ -59303,66 +59441,56 @@ impl Connection {
             }
         }
 
-        // Enumerate the affected rowids via the live scan the user sees (same
-        // table + predicate as the NEW-image collection below, so the two lists
-        // align positionally). An empty/no-WHERE update touches every row.
-        let rowid_select = Self::build_single_table_select(
-            &update.table,
-            vec![ResultColumn::Expr {
-                expr: Expr::Column(
-                    fsqlite_ast::ColumnRef::bare("rowid"),
-                    fsqlite_ast::Span::new(0, 0),
-                ),
-                alias: None,
-            }],
-            update.where_clause.as_ref(),
-            &[],
-            None,
-        );
-        let matched = self
-            .execute_statement(&Statement::Select(rowid_select), params)
-            .await?;
-        let mut old_rowids: Vec<i64> = Vec::with_capacity(matched.len());
-        for row in &matched {
-            match row.values().first() {
-                Some(SqliteValue::Integer(rowid)) => old_rowids.push(*rowid),
-                _ => {
-                    return Err(FrankenError::Internal(format!(
-                        "live virtual-table UPDATE on {table_name} produced a row without an integer rowid",
-                    )));
-                }
-            }
-        }
-        if old_rowids.is_empty() {
+        // Take the rowid and its new values from the same scan. A second
+        // evaluation of a volatile WHERE clause may select different rows.
+        let mut destinations = HashMap::new();
+        #[cfg(feature = "ext-fts5")]
+        let stored = self.fts5_stored_unindexed_columns(&table_name);
+        #[cfg(feature = "ext-fts5")]
+        let moves_rowid = !stored.is_empty() && self.hidden_rowid_update_target(
+            &table_name, self.targets_shadowed_main(&update.table.name), &update.assignments,
+        ).is_some();
+        #[cfg(not(feature = "ext-fts5"))]
+        let moves_rowid = false;
+        let images = if moves_rowid {
+            self.collect_projected_update_rows(update, params, true, Some(&mut destinations)).await?
+        } else {
+            self.collect_update_trigger_rows_with_rowids(update, params).await?
+        };
+        if images.is_empty() {
             return Ok(0);
         }
-
-        // Recompute the post-SET NEW row images (column order), same scan order.
-        let trigger_rows = self.collect_update_trigger_rows(update, params).await?;
-        if trigger_rows.len() != old_rowids.len() {
-            return Err(FrankenError::Internal(format!(
-                "live virtual-table UPDATE on {table_name}: rowid/new-image count mismatch ({} vs {})",
-                old_rowids.len(),
-                trigger_rows.len(),
-            )));
+        let mut old_rowids = Vec::with_capacity(images.len());
+        let mut new_rows = Vec::with_capacity(images.len());
+        for (rowid, _, values) in images {
+            let rowid = rowid.ok_or_else(|| FrankenError::Internal(format!(
+                "live virtual-table UPDATE on {table_name} produced a row without a rowid"
+            )))?;
+            old_rowids.push(rowid);
+            new_rows.push(LiveVtabInsertRow {
+                explicit_rowid: Some(SqliteValue::Integer(destinations.remove(&rowid).unwrap_or(rowid))),
+                values,
+            });
         }
-        let new_rows: Vec<LiveVtabInsertRow> = old_rowids
-            .iter()
-            .zip(trigger_rows)
-            .map(|(rowid, (_old, new_values))| LiveVtabInsertRow {
-                explicit_rowid: Some(SqliteValue::Integer(*rowid)),
-                values: new_values,
-            })
-            .collect();
 
         // FTS5's incremental shadow-storage path applies tombstones and new
         // postings together with the module changes. Keep that specialized
         // persistence path until it can consume an update delta directly.
         #[cfg(feature = "ext-fts5")]
         if self.is_live_fts5_instance(&table_name) {
+            if update_sparse_only {
+                self.fts5_sparse_content_root(&table_name, &stored)?;
+                self.persist_fts5_sparse_values(&table_name, &stored, &new_rows, &old_rowids).await?;
+                return Ok(old_rowids.len());
+            }
+            let replace = moves_rowid && update.or_conflict == Some(fsqlite_ast::ConflictAction::Replace);
+            if moves_rowid {
+                // Check every destination before retiring any old postings.
+                self.prepare_fts5_sparse_insert(&table_name, &stored, &new_rows, replace, &old_rowids).await?;
+            }
             self.execute_live_vtab_delete_rowids(&table_name, &old_rowids)
                 .await?;
-            self.execute_live_vtab_insert_rows(&table_name, &new_rows, false)
+            self.execute_live_vtab_insert_rows(&table_name, &new_rows, replace)
                 .await?;
             return Ok(old_rowids.len());
         }
@@ -59446,6 +59574,9 @@ impl Connection {
                     .persist_rootpage_zero_fts5_contentless_incremental_delete(table_name, rowids)
                     .await?
             {
+                if !self.fts5_stored_unindexed_columns(table_name).is_empty() {
+                    self.delete_storage_table_rows(&format!("{table_name}_content"), rowids).await?;
+                }
                 return Ok(deleted);
             }
             if is_lazy {
@@ -59472,6 +59603,9 @@ impl Connection {
             )?;
             self.persist_rootpage_zero_fts5_deleted_rowids(table_name)
                 .await?;
+            if !self.fts5_stored_unindexed_columns(table_name).is_empty() {
+                self.delete_storage_table_rows(&format!("{table_name}_content"), rowids).await?;
+            }
             return Ok(deleted);
         }
         #[cfg(feature = "ext-rtree")]
@@ -59559,6 +59693,31 @@ impl Connection {
                 expected: "non-NULL FTS5 delete rowid".to_owned(),
                 actual: "null".to_owned(),
             })?;
+        let table_name = insert.table.name.as_str();
+        let stored = self.fts5_stored_unindexed_columns(table_name);
+        if !stored.is_empty() {
+            self.fts5_sparse_content_root(table_name, &stored)?;
+            let cx = self.op_cx()?;
+            self.with_active_live_vtab_instance(&cx, table_name, "xBegin", |instance| {
+                self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)
+            })?;
+            self.promote_lazy_fts5_table(table_name).await?;
+            self.with_active_live_vtab_instance(&cx, table_name, "delete", |instance| {
+                let fts5 = instance.as_any_mut().downcast_mut::<Fts5Table>()
+                    .ok_or_else(|| FrankenError::internal("missing FTS5 instance for delete command"))?;
+                if fts5.config().contentless_delete_enabled() {
+                    return Err(FrankenError::function_error("'delete' may not be used with a contentless_delete=1 table"));
+                }
+                // The special 'delete' command is valid on a plain contentless
+                // table even though SQL DELETE is forbidden for that table.
+                fts5.ensure_shadow_rows_materializable_for_mutation()?;
+                fts5.delete_document(rowid);
+                Ok(())
+            })?;
+            self.persist_rootpage_zero_fts5_deleted_rowids(table_name).await?;
+            self.delete_storage_table_rows(&format!("{table_name}_content"), &[rowid]).await?;
+            return Ok(Some(1));
+        }
         let affected = self
             .execute_live_vtab_delete_rowids(&insert.table.name, &[rowid])
             .await?;
@@ -59873,7 +60032,7 @@ impl Connection {
             return Ok(false);
         }
 
-        let (shadow_rows, live_row_count, config, owns_content) = {
+        let (shadow_rows, live_row_count, config, owns_content, all_unindexed) = {
             let instances = self.vtab_instances.borrow();
             let key = table_name.to_ascii_uppercase();
             let instance = instances.get(&key).ok_or_else(|| {
@@ -59891,7 +60050,8 @@ impl Connection {
                 fts5.encode_shadow_rows()?,
                 fts5.row_count(),
                 *fts5.config(),
-                fts5_owns_content_shadow(fts5),
+                fts5_stores_full_content(fts5),
+                fts5.config().contentless_unindexed_enabled() && !fts5.indexed_columns().contains(&true),
             )
         };
 
@@ -59910,7 +60070,16 @@ impl Connection {
                 .iter()
                 .filter(|row| row.id != FTS5_AVERAGES_ROWID && row.id != FTS5_STRUCTURE_ROWID)
                 .count();
-            if encoded_segment_leaves == 0 {
+            // Every value in an all-UNINDEXED table lives in its sparse
+            // shadow. No term can be indexed. Still refuse to clear a
+            // pre-existing segment, even on a file declaring that layout.
+            let empty_by_declaration = if encoded_segment_leaves == 0 && all_unindexed {
+                self.with_lazy_fts5_reader(table_name, async |reader| {
+                    let Some(block) = reader.read_data_block(FTS5_STRUCTURE_ROWID).await? else { return Ok(false) };
+                    Ok(Fts5StructureRecord::decode(&block)?.segment_count() == 0)
+                }).await?
+            } else { false };
+            if encoded_segment_leaves == 0 && !empty_by_declaration {
                 return Err(FrankenError::Internal(format!(
                     "refusing to persist an empty FTS5 index for contentless table `{table_name}` \
                      with {live_row_count} live rows (bd-dqcf5): the full re-encode dropped every \
@@ -60141,7 +60310,11 @@ impl Connection {
         // just reset by 'delete-all'): the full encode lays down the first
         // segment plus the config/idx/docsize shadows. Once a segment exists,
         // every later INSERT appends incrementally.
-        let Some(mut structure) = structure.filter(|s| s.segment_count() > 0) else {
+        // A sparse table may hold rows before it has any indexed terms.
+        // Append to its initialized metadata even for the first such row:
+        // the delta records docsize and averages without creating a segment.
+        let sparse = !self.fts5_stored_unindexed_columns(table_name).is_empty();
+        let Some(mut structure) = structure.filter(|s| sparse || s.segment_count() > 0) else {
             // A lazy table with zero live segments has an EMPTY on-disk corpus
             // (e.g. after 'delete-all' marks it lazy with doc_count 0), so the
             // in-memory index holds the entire corpus — the full re-encode is
@@ -60844,6 +61017,11 @@ impl Connection {
             )
             .await?;
         }
+        let stored = self.fts5_stored_unindexed_columns(table_name);
+        if !stored.is_empty() {
+            self.fts5_sparse_content_root(table_name, &stored)?;
+            self.replace_storage_table_rows(&format!("{table_name}_content"), std::iter::empty()).await?;
+        }
 
         // Reset the in-memory index so a later MATCH re-reads the now-empty
         // on-disk structure. Contentless zeroes the doc count (every document was
@@ -60978,18 +61156,28 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
+    fn fts5_pager_shadow_layout(&self, name: &str) -> Option<(i32, bool)> {
+        // These b-trees belong to this pager. A TEMP table can have the same
+        // SQL name but its root belongs to the connection's memory database.
+        let key = name.to_ascii_lowercase();
+        if let Some(table) = self.shadowed_main_tables.borrow().get(&key) {
+            return Some((table.root_page, table.without_rowid));
+        }
+        if self.temp_table_names.borrow().contains(&key) {
+            return None;
+        }
+        self.schema.borrow().iter()
+            .find(|table| table.name.eq_ignore_ascii_case(name))
+            .map(|table| (table.root_page, table.without_rowid))
+    }
+
+    #[cfg(feature = "ext-fts5")]
     async fn replace_storage_table_rows<I>(&self, table_name: &str, rows: I) -> Result<()>
     where
         I: IntoIterator<Item = (i64, Vec<SqliteValue>)>,
     {
-        let (root_page, without_rowid) = {
-            let schema = self.schema.borrow();
-            let table = schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
-            (table.root_page, table.without_rowid)
-        };
+        let (root_page, without_rowid) = self.fts5_pager_shadow_layout(table_name)
+            .ok_or_else(|| FrankenError::NoSuchTable { name: table_name.to_owned() })?;
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         let rows = rows.into_iter().collect::<Vec<_>>();
 
@@ -61242,14 +61430,8 @@ impl Connection {
         if rowids.is_empty() {
             return Ok(());
         }
-        let root_page = {
-            let schema = self.schema.borrow();
-            schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .map(|table| table.root_page)
-                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
-        };
+        let (root_page, _) = self.fts5_pager_shadow_layout(table_name)
+            .ok_or_else(|| FrankenError::NoSuchTable { name: table_name.to_owned() })?;
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         self.with_pager_write_txn(async |cx, txn| {
             let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
@@ -61396,14 +61578,8 @@ impl Connection {
     where
         I: IntoIterator<Item = (i64, Vec<SqliteValue>)>,
     {
-        let root_page = {
-            let schema = self.schema.borrow();
-            schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .map(|table| table.root_page)
-                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
-        };
+        let (root_page, _) = self.fts5_pager_shadow_layout(table_name)
+            .ok_or_else(|| FrankenError::NoSuchTable { name: table_name.to_owned() })?;
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         let rows = rows.into_iter().collect::<Vec<_>>();
 
@@ -61935,7 +62111,7 @@ impl Connection {
         };
         if update.from.is_some() {
             return self
-                .collect_update_from_trigger_rows_with_rowids(update, params, is_rowid_table)
+                .collect_projected_update_rows(update, params, is_rowid_table, None)
                 .await;
         }
         let projected_columns = if is_rowid_table {
@@ -62123,11 +62299,12 @@ impl Connection {
     /// SELECT instead of being evaluated against the target row alone. A target
     /// row several FROM rows match is updated once, from its LAST match, as in
     /// stock and in `materialize_update_from_replay_locators`.
-    async fn collect_update_from_trigger_rows_with_rowids(
+    async fn collect_projected_update_rows(
         &self,
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
         is_rowid_table: bool,
+        mut destinations: Option<&mut HashMap<i64, i64>>,
     ) -> Result<Vec<(Option<i64>, Vec<SqliteValue>, Vec<SqliteValue>)>> {
         let table_name = &update.table.name.name;
         let (column_names, set_target_shape) = {
@@ -62206,6 +62383,12 @@ impl Connection {
                     set_target_shape.snapshot_index(&column_names, column_name)?
                 {
                     new_values[target_index] = value.clone();
+                } else if let (Some(old), Some(moved)) = (row_rowid, destinations.as_deref_mut()) {
+                    let new = Self::coerce_insert_rowid_value(value)?.ok_or_else(|| FrankenError::TypeMismatch {
+                        expected: "integer rowid".to_owned(),
+                        actual: "null".to_owned(),
+                    })?;
+                    moved.insert(old, new);
                 }
             }
             match position_by_key.entry(key) {
@@ -70835,10 +71018,8 @@ impl Connection {
                     == Some(0)
             {
                 let ddl_map = self.original_ddl_sql.borrow();
-                let sql_opt = ddl_map.get(&obj_name.to_ascii_lowercase()).cloned();
-                drop(ddl_map);
-                sql_opt.as_deref().map_or_else(Vec::new, |sql| {
-                    virtual_table_shadow_drop_names(obj_name, sql)
+                ddl_map.get(&obj_name.to_ascii_lowercase()).map_or_else(Vec::new, |sql| {
+                    virtual_table_shadow_drop_names(obj_name, sql, &ddl_map)
                 })
             } else {
                 Vec::new()
@@ -72809,6 +72990,10 @@ impl Connection {
         // Reject a rename whose new shadow names would collide with an
         // existing table.
         self.preflight_fts5_shadow_table_names(new_name, &args)?;
+        let stored = fts5_sparse_columns(&args);
+        if !stored.is_empty() {
+            self.fts5_sparse_content_root(old_name, &stored)?;
+        }
 
         // Old shadow names and new shadow defs are built by the same helpers,
         // in the same order and with the same conditional inclusion, so they
@@ -79539,7 +79724,7 @@ impl Connection {
                 if !is_virtual_table_sql(sql) {
                     return None;
                 }
-                virtual_table_shadow_drop_names(&table.name, sql)
+                virtual_table_shadow_drop_names(&table.name, sql, &ddl_cache)
                     .iter()
                     .any(|shadow| shadow.eq_ignore_ascii_case(table_name))
                     .then(|| table.name.clone())
@@ -83195,7 +83380,9 @@ impl Connection {
             // `content=''` == contentless. `Some("")` is an EMPTY value, distinct
             // from `None` (default; the vtab OWNS a real corpus shadow) and from
             // `Some("src")` (external content living in another table).
-            if virtual_table_option_value(&stmt.args, "content").as_deref() != Some("") {
+            if virtual_table_option_value(&stmt.args, "content").as_deref() != Some("")
+                || !fts5_sparse_columns(&stmt.args).is_empty()
+            {
                 continue;
             }
             // Resolve the vtab's actual (case-preserving) catalog name so the
@@ -160412,11 +160599,22 @@ fn is_virtual_table_sql(sql: &str) -> bool {
         .starts_with("CREATE VIRTUAL TABLE")
 }
 
-fn virtual_table_shadow_drop_names(table_name: &str, sql: &str) -> Vec<String> {
+fn virtual_table_shadow_drop_names(table_name: &str, sql: &str, ddl: &HashMap<String, String>) -> Vec<String> {
     let Ok(Statement::CreateVirtualTable(stmt)) = parse_single_statement(sql) else {
         return Vec::new();
     };
-    virtual_table_shadow_names_for_cleanup(table_name, &stmt)
+    let mut names = virtual_table_shadow_names(table_name, &stmt);
+    if stmt.module.eq_ignore_ascii_case("fts5") {
+        let stored = fts5_sparse_columns(&stmt.args);
+        if !stored.is_empty() {
+            let content = format!("{table_name}_content");
+            if !ddl.get(&content.to_ascii_lowercase())
+                .is_some_and(|sql| ddl_matches_fts5_content_shadow(sql, Some(&stored))) {
+                names.retain(|name| !name.eq_ignore_ascii_case(&content));
+            }
+        }
+    }
+    names
 }
 
 /// Backing tables owned by a built-in virtual table with this definition.
@@ -160424,28 +160622,6 @@ fn virtual_table_shadow_drop_names(table_name: &str, sql: &str) -> Vec<String> {
 /// not own a table named `<name>_content`.
 #[must_use]
 pub fn virtual_table_shadow_names(
-    table_name: &str,
-    stmt: &fsqlite_ast::CreateVirtualTableStatement,
-) -> Vec<String> {
-    let mut names = virtual_table_shadow_names_for_cleanup(table_name, stmt);
-    // Stock FTS5 adds a sparse %_content table when this option stores at
-    // least one UNINDEXED column. Older FrankenSQLite files may lack it.
-    // A backup includes it when present; cleanup keeps its existing policy.
-    if stmt.module.eq_ignore_ascii_case("fts5")
-        && virtual_table_option_value(&stmt.args, "content").as_deref() == Some("")
-        && virtual_table_option_value(&stmt.args, "contentless_unindexed").as_deref() == Some("1")
-        && stmt.args.iter().any(|arg| {
-            let mut lexer = fsqlite_parser::Lexer::new(arg);
-            lexer.next_token();
-            matches!(lexer.next_token().kind, fsqlite_parser::TokenKind::Id(word) if word.eq_ignore_ascii_case("unindexed"))
-        })
-    {
-        names.push(format!("{table_name}_content"));
-    }
-    names
-}
-
-fn virtual_table_shadow_names_for_cleanup(
     table_name: &str,
     stmt: &fsqlite_ast::CreateVirtualTableStatement,
 ) -> Vec<String> {
@@ -160468,10 +160644,32 @@ fn virtual_table_shadow_names_for_cleanup(
 }
 
 #[cfg(feature = "ext-fts5")]
-fn fts5_owns_content_shadow(fts5: &Fts5Table) -> bool {
-    !fts5.is_external_content()
-        && (fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Stored
-            || (fts5.config().contentless_unindexed_enabled() && fts5.indexed_columns().contains(&false)))
+fn fts5_stores_full_content(fts5: &Fts5Table) -> bool {
+    !fts5.is_external_content() && fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Stored
+}
+
+/// Physical cN columns retain their ordinal in the FTS5 declaration, with
+/// holes for indexed fields. Option assignments do not count as columns.
+fn fts5_sparse_columns(args: &[String]) -> Vec<usize> {
+    use fsqlite_parser::TokenKind;
+    if virtual_table_option_value(args, "content").as_deref() != Some("")
+        || virtual_table_option_value(args, "contentless_unindexed").as_deref() != Some("1")
+    {
+        return Vec::new();
+    }
+    args.iter()
+        .filter_map(|arg| {
+            let mut lexer = fsqlite_parser::Lexer::new(arg);
+            lexer.next_token();
+            match lexer.next_token().kind {
+                TokenKind::Eq => None,
+                TokenKind::Id(word) => Some(word.eq_ignore_ascii_case("unindexed")),
+                _ => Some(false),
+            }
+        })
+        .enumerate()
+        .filter_map(|(idx, stored)| stored.then_some(idx))
+        .collect()
 }
 
 fn fts5_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
@@ -160480,7 +160678,7 @@ fn fts5_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
         format!("{table_name}_idx"),
         format!("{table_name}_config"),
     ];
-    if virtual_table_option_value(args, "content").is_none() {
+    if virtual_table_option_value(args, "content").is_none() || !fts5_sparse_columns(args).is_empty() {
         names.push(format!("{table_name}_content"));
     }
     if !matches!(
@@ -160525,9 +160723,15 @@ fn fts5_shadow_table_defs(
         },
     ];
 
-    if virtual_table_option_value(args, "content").is_none() {
+    let full_content = virtual_table_option_value(args, "content").is_none();
+    let stored_columns = if full_content {
+        (0..fts_columns.len()).collect()
+    } else {
+        fts5_sparse_columns(args)
+    };
+    if full_content || !stored_columns.is_empty() {
         let content_name = format!("{table_name}_content");
-        let content_columns = (0..fts_columns.len())
+        let content_columns = stored_columns.into_iter()
             .map(|idx| format!("c{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
@@ -160597,7 +160801,7 @@ fn fts4_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
 /// values from its content table or view: by name, with stock's full-scan and
 /// lookup statements (`fts5_storage.c`).
 #[cfg(feature = "ext-fts5")]
-struct Fts5ExternalContent {
+struct Fts5ContentSource {
     /// The content table or view, as the `content=` option names it.
     name: String,
     /// `SELECT T.<content_rowid>, T.<column>... FROM <content> AS T`.
@@ -160607,8 +160811,8 @@ struct Fts5ExternalContent {
 }
 
 #[cfg(feature = "ext-fts5")]
-impl Fts5ExternalContent {
-    fn new(content: &str, content_rowid: &str, columns: &[String]) -> Self {
+impl Fts5ContentSource {
+    fn external(content: &str, content_rowid: &str, columns: &[String]) -> Self {
         // A rowid name stays bare so it names the rowid of any table.
         let rowid = if ["rowid", "oid", "_rowid_"]
             .iter()
@@ -160618,12 +160822,37 @@ impl Fts5ExternalContent {
         } else {
             format!("T.{}", quote_identifier(content_rowid))
         };
+        let projection = columns.iter().map(|name| format!("T.{}", quote_identifier(name)));
+        Self::from_projection(content, None, rowid, projection)
+    }
+
+    fn sparse(table_name: &str, column_count: usize, stored: &[usize]) -> Self {
+        let projection = (0..column_count).map(|idx| {
+            if stored.binary_search(&idx).is_ok() {
+                format!("T.c{idx}")
+            } else {
+                "NULL".to_owned()
+            }
+        });
+        Self::from_projection(&format!("{table_name}_content"), Some("main"), "T.id".to_owned(), projection)
+    }
+
+    fn from_projection(
+        content: &str,
+        schema: Option<&str>,
+        rowid: String,
+        columns: impl IntoIterator<Item = String>,
+    ) -> Self {
         let mut select = format!("SELECT {rowid}");
         for column in columns {
-            select.push_str(", T.");
-            select.push_str(&quote_identifier(column));
+            select.push_str(", ");
+            select.push_str(&column);
         }
         select.push_str(" FROM ");
+        if let Some(schema) = schema {
+            select.push_str(schema);
+            select.push('.');
+        }
         select.push_str(&quote_identifier(content));
         select.push_str(" AS T");
         Self {
@@ -160672,6 +160901,10 @@ fn virtual_table_option_value(args: &[String], option: &str) -> Option<String> {
 /// canonical fts5 shadow, we preserve (never drop). A destructive reclaim must
 /// bias toward leaving a user's table alone.
 fn ddl_matches_fts5_internal_content_shadow(sql: &str) -> bool {
+    ddl_matches_fts5_content_shadow(sql, None)
+}
+
+fn ddl_matches_fts5_content_shadow(sql: &str, stored: Option<&[usize]>) -> bool {
     let Ok(Statement::CreateTable(stmt)) = parse_single_statement(sql) else {
         return false;
     };
@@ -160685,11 +160918,21 @@ fn ddl_matches_fts5_internal_content_shadow(sql: &str) -> bool {
     else {
         return false;
     };
-    if !constraints.is_empty() || columns.len() < 2 {
+    if !constraints.is_empty()
+        || columns.len() < 2
+        || stored.is_some_and(|indices| indices.len() + 1 != columns.len())
+    {
         return false;
     }
     // Column 0 must be the rowid-alias `id INTEGER PRIMARY KEY`.
     let id_col = &columns[0];
+    if stored.is_some() && !matches!(id_col.constraints.as_slice(), [constraint]
+        if matches!(constraint.kind, ColumnConstraintKind::PrimaryKey {
+            direction: None, conflict: None, autoincrement: false,
+        }))
+    {
+        return false;
+    }
     let id_ok = id_col.name.eq_ignore_ascii_case("id")
         && id_col
             .type_name
@@ -160706,7 +160949,8 @@ fn ddl_matches_fts5_internal_content_shadow(sql: &str) -> bool {
     // table's declared column types (the hazard fixture uses `c0 TEXT, c1 TEXT`)
     // fail here, so the user table is preserved.
     columns[1..].iter().enumerate().all(|(idx, col)| {
-        col.name.eq_ignore_ascii_case(&format!("c{idx}"))
+        let ordinal = stored.map_or(idx, |indices| indices[idx]);
+        col.name.eq_ignore_ascii_case(&format!("c{ordinal}"))
             && col.type_name.is_none()
             && col.constraints.is_empty()
     })
