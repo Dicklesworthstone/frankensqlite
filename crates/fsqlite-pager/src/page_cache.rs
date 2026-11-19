@@ -6502,7 +6502,15 @@ mod tests {
             "a spawned writeback must not inherit the parent OS-thread inline-I/O permission"
         );
         let observed_budget = file.native_budget();
-        assert_eq!(observed_budget.poll_quota, 97);
+        // bd-5lvnd: the child inherits the caller's quota of 97 exactly. The
+        // write is read during its first poll, and asupersync 0.6.2's
+        // production scheduler spends one poll of a finite quota before each
+        // poll of a task (CHANGELOG v0.6.2 "the production runtime enforces
+        // explicit poll quotas", asupersync-r017wv; `consume_budget_poll`,
+        // runtime/scheduler/three_lane.rs). So the writeback observes
+        // 97 - 1. A lost inheritance reads u32::MAX, and an extra poll before
+        // the write reads 95.
+        assert_eq!(observed_budget.poll_quota, 97 - 1);
         assert_eq!(observed_budget.cost_quota, Some(1_234));
         assert_eq!(observed_budget.priority, u8::MAX);
         assert_eq!(file.bytes(), vec![0xD7; page_size.as_usize()]);
