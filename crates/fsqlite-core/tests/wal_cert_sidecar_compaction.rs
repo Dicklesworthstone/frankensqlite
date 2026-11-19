@@ -332,6 +332,22 @@ fn peer_reader_never_sees_a_compaction_as_corruption() {
             }
             assert!(started.elapsed() < Duration::from_secs(60), "peer never became ready");
         }
+        // bd-mah07: after READY the peer's stdout is drained on its own thread
+        // while the parent runs its cycles. Read only afterwards, the reader's
+        // log could fill the pipe and stop it mid-read, holding its snapshot.
+        let report_reader = std::thread::spawn(move || {
+            let mut report = None;
+            loop {
+                let mut line = String::new();
+                if peer_stdout.read_line(&mut line).expect("read peer report") == 0 {
+                    break;
+                }
+                if let Some(at) = line.find(DONE) {
+                    report = Some(line[at + DONE.len()..].trim().to_owned());
+                }
+            }
+            report
+        });
 
         let mut resets = 0;
         for cycle in 0..40 {
@@ -345,16 +361,7 @@ fn peer_reader_never_sees_a_compaction_as_corruption() {
             }
         }
         drop(peer_stdin);
-        let mut report = None;
-        loop {
-            let mut line = String::new();
-            if peer_stdout.read_line(&mut line).expect("read peer report") == 0 {
-                break;
-            }
-            if let Some(at) = line.find(DONE) {
-                report = Some(line[at + DONE.len()..].trim().to_owned());
-            }
-        }
+        let report = report_reader.join().expect("peer report reader");
         let status = peer.wait().expect("wait for peer");
         let report = report.unwrap_or_else(|| panic!("peer exited ({status}) without a report"));
         let mut fields = report.splitn(3, ' ');

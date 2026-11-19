@@ -1915,14 +1915,41 @@ fn concurrent_implicit_rowid_append_with_autocheckpoint_and_large_rows_bd_ujp0h_
 
 const STRUCTURAL_SPLIT_CASE_DIR: &str = "FSQLITE_STRUCTURAL_SPLIT_CASE_DIR";
 
-struct StructuralSplitPeer(Option<std::process::Child>);
+/// The split peer, with its stdout and stderr drained from spawn (bd-mah07).
+/// Read only in `finish`, a full pipe could stop the peer before its handshake
+/// or inside its COMMIT, holding WAL WRITE, while the parent waited on it.
+struct StructuralSplitPeer {
+    child: Option<std::process::Child>,
+    drains: Option<(SplitPeerPipe, SplitPeerPipe)>,
+}
+
+type SplitPeerPipe = thread::JoinHandle<Vec<u8>>;
+
+fn drain_split_peer_pipe(pipe: Option<impl std::io::Read + Send + 'static>) -> SplitPeerPipe {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
 
 impl StructuralSplitPeer {
+    fn new(mut child: std::process::Child) -> Self {
+        let stdout = drain_split_peer_pipe(child.stdout.take());
+        let stderr = drain_split_peer_pipe(child.stderr.take());
+        Self {
+            child: Some(child),
+            drains: Some((stdout, stderr)),
+        }
+    }
+
     fn wait_for(&mut self, path: &std::path::Path) {
         let started = std::time::Instant::now();
         while !path.exists() {
             assert!(
-                self.0
+                self.child
                     .as_mut()
                     .expect("split peer spawned")
                     .try_wait()
@@ -1941,12 +1968,18 @@ impl StructuralSplitPeer {
     }
 
     fn finish(mut self) {
-        let output = self
-            .0
+        let status = self
+            .child
             .take()
             .expect("split peer spawned")
-            .wait_with_output()
+            .wait()
             .expect("split peer output");
+        let (stdout, stderr) = self.drains.take().expect("split peer drains");
+        let output = std::process::Output {
+            status,
+            stdout: stdout.join().expect("split peer stdout drain"),
+            stderr: stderr.join().expect("split peer stderr drain"),
+        };
         assert!(
             output.status.success(),
             "split peer failed: stdout={} stderr={}",
@@ -1958,9 +1991,13 @@ impl StructuralSplitPeer {
 
 impl Drop for StructuralSplitPeer {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some((stdout, stderr)) = self.drains.take() {
+            let _ = stdout.join();
+            let _ = stderr.join();
         }
     }
 }
@@ -2070,7 +2107,7 @@ fn cross_process_right_edge_split_conflicts_with_old_leaf_append_bd_73pfl() {
         assert_eq!(right_leaf[0], 0x0d);
         assert_eq!(u16::from_be_bytes([right_leaf[3], right_leaf[4]]), 1);
 
-        let mut peer = StructuralSplitPeer(Some(
+        let mut peer = StructuralSplitPeer::new(
             std::process::Command::new(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
@@ -2083,7 +2120,7 @@ fn cross_process_right_edge_split_conflicts_with_old_leaf_append_bd_73pfl() {
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .expect("spawn independent small appender"),
-        ));
+        );
         peer.wait_for(&dir.path().join("small-staged"));
 
         let mut split_verdict = None;

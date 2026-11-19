@@ -1534,10 +1534,13 @@ fn run_immediate(backend: &str) -> [(bool, Duration, String); 2] {
     let db = dir.path().join("imm.db");
     seed(&db, backend, 2);
     let exe = std::env::current_exe().expect("test binary path");
-    let children: Vec<Child> = ["a", "b"]
+    // bd-mah07: each role's pipes are drained from spawn (wait_with_output on
+    // its own thread). Reaped in turn, role b could block in a full pipe,
+    // holding its lock, while the parent still waited on role a.
+    let children: Vec<std::thread::JoinHandle<std::io::Result<std::process::Output>>> = ["a", "b"]
         .iter()
         .map(|role| {
-            Command::new(&exe)
+            let child = Command::new(&exe)
                 .args([
                     "--exact",
                     "mp_immediate_child",
@@ -1551,7 +1554,8 @@ fn run_immediate(backend: &str) -> [(bool, Duration, String); 2] {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .expect("spawn role")
+                .expect("spawn role");
+            std::thread::spawn(move || child.wait_with_output())
         })
         .collect();
     for role in ["a", "b"] {
@@ -1567,8 +1571,8 @@ fn run_immediate(backend: &str) -> [(bool, Duration, String); 2] {
     let reports: Vec<_> = children
         .into_iter()
         .zip(["a", "b"])
-        .map(|(child, role)| {
-            let output = child.wait_with_output().expect("role output");
+        .map(|(reaper, role)| {
+            let output = reaper.join().expect("role reaper").expect("role output");
             let stdout = String::from_utf8_lossy(&output.stdout);
             parse_immediate(&stdout).unwrap_or_else(|| {
                 panic!(
