@@ -806,20 +806,22 @@ fn default_parallel_workers() -> usize {
 pub const MAX_TRIGGER_PROGRAM_DEPTH: usize = 50;
 
 /// Maximum number of views one statement may expand inside each other
-/// (bd-5haia).
+/// (bd-5haia, bd-lpsil).
 ///
-/// `SELECT * FROM v999` over the chain `v0 <- v1 <- ... <- v999` nests 1000
-/// views and is accepted; one more level fails with the typed
-/// [`FrankenError::ViewNestingTooDeep`]. Stock SQLite has no dedicated view
-/// limit; 1000 matches its other nesting limits (`SQLITE_MAX_EXPR_DEPTH`,
-/// `SQLITE_MAX_TRIGGER_DEPTH`).
+/// `SELECT * FROM v998` over the chain `v0 <- v1 <- ... <- v998` nests 999
+/// views and is accepted; the 1000th view fails with the typed
+/// [`FrankenError::ViewNestingTooDeep`], as in stock. SQLite counts each view
+/// whose columns it resolves inside another one and refuses with "VIEWs
+/// and/or subqueries nested too deep" once that count reaches
+/// `SQLITE_MAX_EXPR_DEPTH` (1000), so 999 nested views is the deepest chain
+/// it answers. A derived table between two views is no level there or here.
 ///
 /// Materialization itself no longer recurses per view level (see
 /// `Connection::plan_view_materialization`). The name and metadata resolvers
 /// still expand a chain recursively, continuing on heap-allocated stack
 /// segments once the thread's own stack runs low
 /// (`with_view_expansion_stack`); this cap bounds how far they expand.
-pub const MAX_VIEW_NESTING_DEPTH: usize = 1000;
+pub const MAX_VIEW_NESTING_DEPTH: usize = 999;
 
 /// Native stack that must still be free *after* the projected cost of the one
 /// additional trigger/FK-action level being admitted (GH#414).

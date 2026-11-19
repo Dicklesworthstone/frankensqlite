@@ -308,8 +308,8 @@ pub enum FrankenError {
     TriggerRecursionDepthExceeded,
 
     /// A statement expands views nested more deeply than the engine's view
-    /// nesting limit.
-    #[error("too many levels of view nesting (max {max})")]
+    /// nesting limit, `max` views. The text is stock SQLite's.
+    #[error("VIEWs and/or subqueries nested too deep")]
     ViewNestingTooDeep { max: usize },
 
     /// Too many attached databases.
@@ -1529,12 +1529,12 @@ mod tests {
             "too many levels of trigger recursion"
         );
         assert_eq!(
-            FrankenError::ViewNestingTooDeep { max: 1000 }.error_code(),
+            FrankenError::ViewNestingTooDeep { max: 999 }.error_code(),
             ErrorCode::Error
         );
         assert_eq!(
-            FrankenError::ViewNestingTooDeep { max: 1000 }.to_string(),
-            "too many levels of view nesting (max 1000)"
+            FrankenError::ViewNestingTooDeep { max: 999 }.to_string(),
+            "VIEWs and/or subqueries nested too deep"
         );
         assert_eq!(
             FrankenError::TooManyAttached { max: 1 }.error_code(),

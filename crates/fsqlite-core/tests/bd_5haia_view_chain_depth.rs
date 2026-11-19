@@ -3,12 +3,14 @@
 //! `CREATE VIEW v0 AS SELECT 1 AS x; CREATE VIEW v1 AS SELECT x FROM v0; ...;
 //! SELECT * FROM vN` used to re-enter statement execution once per view level,
 //! so the native stack grew with the chain and the process aborted with a
-//! stack overflow at depth 8 on a 2 MiB thread. Stock SQLite expands such
-//! chains without a fixed limit.
+//! stack overflow at depth 8 on a 2 MiB thread.
 //!
 //! The engine now accepts chains nesting up to `MAX_VIEW_NESTING_DEPTH`
-//! (1000) views on that stack and refuses deeper ones with the typed
-//! `FrankenError::ViewNestingTooDeep`.
+//! (999) views on that stack and refuses deeper ones with the typed
+//! `FrankenError::ViewNestingTooDeep`. That is stock SQLite 3.54.1's
+//! boundary (bd-lpsil): it answers 999 nested views and refuses the 1000th
+//! with "VIEWs and/or subqueries nested too deep", the text the typed error
+//! carries. The boundary tests check both sides against live stock.
 //!
 //! Every workload here runs on a dedicated 2 MiB thread inside a helper
 //! process (this test binary, re-invoked on one test). A stack overflow aborts
@@ -410,10 +412,12 @@ fn bd_5haia_view_chain_with_schema_qualified_columns_matches_stock_on_2mib_stack
     });
 }
 
-/// The deepest chain the engine accepts: `SELECT * FROM v999` over
-/// `v0 <- ... <- v999` nests exactly `MAX_VIEW_NESTING_DEPTH` views. It must
-/// work on the same 2 MiB stack and agree with stock SQLite, so the limit is
-/// a real supported depth rather than a refusal standing in for one.
+/// The deepest chain the engine accepts: `SELECT * FROM v998` over
+/// `v0 <- ... <- v998` nests exactly `MAX_VIEW_NESTING_DEPTH` (999) views,
+/// the deepest chain stock SQLite answers. It must work on the same 2 MiB
+/// stack and agree with stock, so the limit is a real supported depth rather
+/// than a refusal standing in for one; a limit one view deeper than stock's
+/// fails here, where stock refuses.
 #[test]
 fn bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack() {
     const NAME: &str = "bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack";
@@ -440,10 +444,31 @@ fn bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack() {
     });
 }
 
+/// The message stock SQLite refuses `sql` with. Panics if stock answers.
+fn stock_refusal(conn: &rusqlite::Connection, sql: &str) -> String {
+    let error = match conn.prepare(sql) {
+        Err(error) => error,
+        Ok(mut statement) => match statement
+            .query([])
+            .and_then(|mut rows| rows.next().map(|_| ()))
+        {
+            Err(error) => error,
+            Ok(()) => panic!("stock SQLite answered `{sql}`, which it must refuse"),
+        },
+    };
+    match error {
+        rusqlite::Error::SqliteFailure(_, Some(message)) => message,
+        other => panic!("stock SQLite refused `{sql}` without a message: {other:?}"),
+    }
+}
+
 /// One view more than the limit fails with the typed error, wherever the
-/// chain is read from, and leaves the connection usable. Stock SQLite has no
-/// dedicated view-nesting limit and returns `1` here; refusing past
-/// `MAX_VIEW_NESTING_DEPTH` is this engine's deliberate bound.
+/// chain is read from, and leaves the connection usable. Stock SQLite 3.54.1
+/// refuses the same four statements, and the typed error's text is stock's
+/// (bd-lpsil); a limit one view shallower than stock's fails here, where
+/// stock answers. Stock caches a view's column names once it has resolved
+/// them, after which it would answer this chain too, so every refusal is
+/// checked before anything on the chain is answered.
 #[test]
 fn bd_5haia_view_chain_beyond_nesting_limit_is_a_typed_error_on_2mib_stack() {
     const NAME: &str = "bd_5haia_view_chain_beyond_nesting_limit_is_a_typed_error_on_2mib_stack";
@@ -453,10 +478,14 @@ fn bd_5haia_view_chain_beyond_nesting_limit_is_a_typed_error_on_2mib_stack() {
     }
     on_small_stack(|runtime, conn| {
         let top = MAX_VIEW_NESTING_DEPTH;
+        let stock = rusqlite::Connection::open_in_memory().expect("open stock SQLite");
         for statement in bead_chain("v", top) {
             runtime
                 .block_on(conn.execute(&statement))
                 .unwrap_or_else(|error| panic!("fsqlite failed `{statement}`: {error:?}"));
+            stock
+                .execute_batch(&statement)
+                .unwrap_or_else(|error| panic!("stock SQLite failed `{statement}`: {error}"));
         }
         for query in [
             format!("SELECT * FROM v{top};"),
@@ -464,6 +493,7 @@ fn bd_5haia_view_chain_beyond_nesting_limit_is_a_typed_error_on_2mib_stack() {
             format!("SELECT * FROM (SELECT x FROM v{top});"),
             format!("SELECT 1 WHERE EXISTS (SELECT 1 FROM v{top});"),
         ] {
+            let stock_message = stock_refusal(&stock, &query);
             let error = runtime
                 .block_on(conn.query(&query))
                 .expect_err("a chain one view past the limit must be refused");
@@ -476,13 +506,20 @@ fn bd_5haia_view_chain_beyond_nesting_limit_is_a_typed_error_on_2mib_stack() {
             );
             assert_eq!(
                 error.to_string(),
-                format!("too many levels of view nesting (max {MAX_VIEW_NESTING_DEPTH})")
+                stock_message,
+                "`{query}`: the refusal must carry stock's text"
             );
         }
         // The refusal leaves no materialized state behind: the chain one
-        // level shallower still reads, and so does an unrelated statement.
+        // level shallower still reads, as in stock, and so does an unrelated
+        // statement.
+        let shallower = format!("SELECT * FROM v{};", top - 1);
         assert_eq!(
-            frank_rows(runtime, conn, &format!("SELECT * FROM v{};", top - 1)),
+            frank_rows(runtime, conn, &shallower),
+            stock_rows(&stock, &shallower)
+        );
+        assert_eq!(
+            frank_rows(runtime, conn, &shallower),
             vec![vec!["int:1".to_owned()]]
         );
         assert_eq!(
