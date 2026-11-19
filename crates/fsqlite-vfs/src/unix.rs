@@ -12760,6 +12760,25 @@ mod tests {
                     SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
                 )
                 .unwrap();
+            // A callsite's interest is process-global. In a parallel run,
+            // another test can hit the conflict callsite first, with no
+            // subscriber alive, and cache it as "never" while this test
+            // installs its own, so the asserted event is never delivered.
+            // Hit the callsite once so it is registered, then rebuild every
+            // callsite's interest under this subscriber, and assert on the
+            // attempt after that.
+            let warm_up = peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            );
+            assert!(
+                matches!(warm_up, Err(FrankenError::Busy)),
+                "the warm-up attempt must answer Busy, got {warm_up:?}"
+            );
+            tracing::callsite::rebuild_interest_cache();
+            events.0.lock().unwrap().clear();
             let busy = peer.shm_lock(
                 &cx,
                 WAL_WRITE_LOCK,
