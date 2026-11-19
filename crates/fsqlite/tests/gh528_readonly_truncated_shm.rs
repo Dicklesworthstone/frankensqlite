@@ -687,3 +687,58 @@ fn immutable_open_takes_no_locks_and_creates_no_sidecar() {
         holder.execute_batch("ROLLBACK").unwrap();
     });
 }
+
+/// bd-j2dtf item 3, negative: under `immutable=1` a table that exists only in
+/// the WAL does not exist. Stock reads an immutable file's main file alone and
+/// answers "no such table: t", so fsqlite must too, and neither writes a file.
+/// An implementation that reads the WAL would find the table. Control: stock's
+/// plain `mode=ro` open of the same family does see it.
+#[test]
+fn immutable_open_does_not_see_a_table_that_exists_only_in_the_wal() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("source.db");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE m(x); INSERT INTO m VALUES (1);",
+            )
+            .unwrap();
+        writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO t VALUES (1, 'wal-only');",
+            )
+            .unwrap();
+        let stock_arm = copy_family(&db, &dir.path().join("stock"));
+        let frank_arm = copy_family(&db, &dir.path().join("frank"));
+        let control_arm = copy_family(&db, &dir.path().join("control"));
+        let (stock_before, frank_before) = (family(&stock_arm), family(&frank_arm));
+
+        assert_eq!(
+            stock_read(&control_arm, "mode=ro"),
+            Ok(vec![(1, "wal-only".to_owned())]),
+            "control: a plain read-only open sees the table the WAL created"
+        );
+        let stock = stock_read(&stock_arm, "immutable=1");
+        let frank = frank_read(&frank_arm, "immutable=1").await;
+        let stock_error = stock.expect_err("stock: immutable=1 ignores the WAL");
+        assert!(
+            stock_error.contains("no such table"),
+            "stock: {stock_error}"
+        );
+        let frank_error =
+            frank.expect_err("fsqlite must not see a table that exists only in the WAL");
+        assert!(
+            frank_error.contains("no such table"),
+            "fsqlite must answer as stock does ({stock_error}), got: {frank_error}"
+        );
+        assert_eq!(family(&stock_arm), stock_before, "stock writes nothing");
+        assert_eq!(family(&frank_arm), frank_before, "fsqlite writes nothing");
+        drop(writer);
+    });
+}
