@@ -90493,6 +90493,7 @@ impl Connection {
             self.apply_shadowed_main_substitution(&mut schema, &mut canonical_select);
             Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
+            elide_redundant_comparison_collations(&mut canonical_select, &schema);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
                 .await
         } else {
@@ -90503,6 +90504,7 @@ impl Connection {
             // substitution) — see the comment above `needs_owned_schema`.
             let schema = self.schema.borrow();
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
+            elide_redundant_comparison_collations(&mut canonical_select, &schema);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
                 .await
         }?;
@@ -90568,14 +90570,11 @@ impl Connection {
             }
             // The planner's access-path summary does not retain the effective
             // collation selected by an explicit COLLATE on either comparison
-            // operand. A directive based only on the bare column/index
-            // metadata can therefore probe under BINARY for a NOCASE
-            // predicate (or vice versa). Decline conservatively; ordinary
-            // codegen still has the full expression and can select a sound
-            // path or scan.
-            if select_where_contains_explicit_collate(canonical_select) {
-                return false;
-            }
+            // operand, so the comparisons of the index's leading column are
+            // checked below against its key collation (bd-73em1). A COLLATE
+            // naming the column's own collation is already gone
+            // (`elide_redundant_comparison_collations`).
+            let explicit_collate = select_where_contains_explicit_collate(canonical_select);
             let Some(index_name) = directive.index_name.as_deref() else {
                 return false;
             };
@@ -90607,22 +90606,51 @@ impl Connection {
                         .iter()
                         .find(|column| column.name.eq_ignore_ascii_case(column_name))
                 });
+                let Some(column) = leading_column else {
+                    return false;
+                };
+                let declared = column.collation.as_deref();
+                // The collation each comparison of the leading column uses:
+                // its explicit COLLATE, else the column's declared one. The
+                // probe holds the rows they match only when every one is the
+                // key's collation; any COLLATE this cannot place declines.
+                let comparisons = if explicit_collate {
+                    let Some(where_clause) = select_where_clause(canonical_select) else {
+                        return false;
+                    };
+                    let Ok(collations) =
+                        leading_column_comparison_collations(where_clause, &column.name)
+                    else {
+                        return false;
+                    };
+                    collations
+                        .into_iter()
+                        .map(|collation| collation.or(declared))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let effective: Vec<Option<&str>> = if comparisons.is_empty() {
+                    vec![declared]
+                } else {
+                    comparisons
+                };
                 return match directive.access_kind {
-                    PlannerSelectAccessKind::IndexEquality => {
-                        leading_column.is_some_and(|column| {
-                            planner_collations_equivalent(
-                                index.key_term_collation(0),
-                                column.collation.as_deref(),
-                            )
-                        })
-                    }
-                    PlannerSelectAccessKind::IndexRange => leading_column.is_some_and(|column| {
-                        planner_collation_is_binary(index.key_term_collation(0))
-                            && planner_collation_is_binary(column.collation.as_deref())
+                    PlannerSelectAccessKind::IndexEquality => effective.iter().all(|collation| {
+                        planner_collations_equivalent(index.key_term_collation(0), *collation)
                     }),
+                    PlannerSelectAccessKind::IndexRange => {
+                        planner_collation_is_binary(index.key_term_collation(0))
+                            && effective
+                                .iter()
+                                .all(|collation| planner_collation_is_binary(*collation))
+                    }
                     PlannerSelectAccessKind::FullTableScan
                     | PlannerSelectAccessKind::RowidLookup => true,
                 };
+            }
+            if explicit_collate {
+                return false;
             }
             // Expression-index directives omit the source predicate from the
             // lowering contract, so the VDBE cannot re-check it after probing.
@@ -148297,13 +148325,288 @@ fn planner_collations_equivalent(left: Option<&str>, right: Option<&str>) -> boo
 }
 
 fn select_where_contains_explicit_collate(select: &SelectStatement) -> bool {
-    matches!(
-        &select.body.select,
+    select_where_clause(select).is_some_and(expr_contains_explicit_collate)
+}
+
+fn select_where_clause(select: &SelectStatement) -> Option<&Expr> {
+    match &select.body.select {
         SelectCore::Select {
             where_clause: Some(where_clause),
             ..
-        } if expr_contains_explicit_collate(where_clause)
-    )
+        } => Some(where_clause),
+        _ => None,
+    }
+}
+
+/// bd-73em1: the collation of each top-level AND conjunct of `where_clause`
+/// that compares the column named `column` (`=`, `<`, `<=`, `>`, `>=`, `IS`,
+/// `BETWEEN`, an IN list): an explicit COLLATE on its left operand, else on
+/// its right one, as stock picks it, or `None` for the column's declared
+/// collation. BETWEEN takes the column's COLLATE, else each bound's, which
+/// must agree; an IN list takes its left operand's only. `Err(())` when an
+/// explicit COLLATE may reach the column through any other shape (OR, NOT, a
+/// function argument, ...), where this cannot tell which collation a probe of
+/// the column would need.
+fn leading_column_comparison_collations<'a>(
+    where_clause: &'a Expr,
+    column: &str,
+) -> std::result::Result<Vec<Option<&'a str>>, ()> {
+    let mut conjuncts = Vec::new();
+    flatten_and_terms(where_clause, &mut conjuncts);
+    let is_column = |expr: &Expr| {
+        matches!(
+            strip_collate_wrappers(expr),
+            Expr::Column(col_ref, _) if col_ref.column.eq_ignore_ascii_case(column)
+        )
+    };
+    let mut collations = Vec::new();
+    for term in conjuncts {
+        match term {
+            Expr::BinaryOp {
+                left,
+                op:
+                    BinaryOp::Eq
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Is,
+                right,
+                ..
+            } if is_column(left) || is_column(right) => {
+                collations.push(extract_collation(left).or_else(|| extract_collation(right)));
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } if is_column(expr) => {
+                let lower = extract_collation(expr).or_else(|| extract_collation(low));
+                let upper = extract_collation(expr).or_else(|| extract_collation(high));
+                if !planner_collations_equivalent(lower, upper) {
+                    return Err(());
+                }
+                collations.push(lower);
+            }
+            Expr::In {
+                expr,
+                set: InSet::List(_),
+                ..
+            } if is_column(expr) => collations.push(extract_collation(expr)),
+            other => {
+                if expr_contains_explicit_collate(other) && expr_may_name_column(other, column) {
+                    return Err(());
+                }
+            }
+        }
+    }
+    Ok(collations)
+}
+
+/// Whether `expr` may read the column named `column`: `false` only when every
+/// node is one this walks and none names it.
+fn expr_may_name_column(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::Literal(..) | Expr::Placeholder(..) | Expr::BoundOuterValue { .. } => false,
+        Expr::Column(col_ref, _) => col_ref.column.eq_ignore_ascii_case(column),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_may_name_column(left, column) || expr_may_name_column(right, column)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_may_name_column(expr, column),
+        Expr::Between {
+            expr, low, high, ..
+        } => [expr, low, high]
+            .into_iter()
+            .any(|part| expr_may_name_column(part, column)),
+        Expr::In {
+            expr,
+            set: InSet::List(items),
+            ..
+        } => {
+            expr_may_name_column(expr, column)
+                || items.iter().any(|item| expr_may_name_column(item, column))
+        }
+        _ => true,
+    }
+}
+
+/// bd-73em1: drop each explicit COLLATE that names the collation its
+/// comparison already uses, so `w = 'x' COLLATE NOCASE` over a NOCASE column
+/// plans and seeks exactly as `w = 'x'` does. The index seek paths take no
+/// COLLATE-wrapped operand.
+///
+/// Only the top-level AND conjuncts of a single-table SELECT's WHERE change,
+/// and only those comparing a column of that table with a literal or a bind
+/// parameter: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`, `BETWEEN` and
+/// an IN list. SQLite takes a comparison's collation from an explicit COLLATE
+/// on its left operand, else on its right one, else from the column; when
+/// that explicit collation is the column's own, the bare comparison uses the
+/// same one. An IN list compares under its left operand's collation only, so
+/// a COLLATE on an item never decides it. A COLLATE deeper in an operand
+/// still decides there and stays, as does every COLLATE of a statement with a
+/// WITH clause, where the name may be a CTE rather than the schema's table.
+fn elide_redundant_comparison_collations(select: &mut SelectStatement, schema: &[TableSchema]) {
+    if select.with.is_some() {
+        return;
+    }
+    let SelectCore::Select {
+        from: Some(from),
+        where_clause: Some(where_clause),
+        ..
+    } = &mut select.body.select
+    else {
+        return;
+    };
+    if !from.joins.is_empty() {
+        return;
+    }
+    let TableOrSubquery::Table { name, alias, .. } = &from.source else {
+        return;
+    };
+    // A schema-qualified name may name another table than the first one
+    // `schema` lists under that name.
+    if name.schema.is_some() {
+        return;
+    }
+    let Some(table) = schema
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+    else {
+        return;
+    };
+    elide_conjunct_collations(where_clause, table, alias.as_deref());
+}
+
+fn elide_conjunct_collations(expr: &mut Expr, table: &TableSchema, alias: Option<&str>) {
+    // The column of `table` that `expr` names under COLLATE wrappers.
+    let column_of = |expr: &Expr| {
+        let Expr::Column(col_ref, _) = strip_collate_wrappers(expr) else {
+            return None;
+        };
+        if col_ref.table.as_deref().is_some_and(|qualifier| {
+            !qualifier.eq_ignore_ascii_case(&table.name)
+                && alias.is_none_or(|alias| !qualifier.eq_ignore_ascii_case(alias))
+        }) {
+            return None;
+        }
+        table
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&col_ref.column))
+    };
+    // A literal or a bind parameter under COLLATE wrappers only.
+    let is_constant = |expr: &Expr| {
+        matches!(
+            strip_collate_wrappers(expr),
+            Expr::Literal(..) | Expr::Placeholder(..)
+        )
+    };
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } => {
+            elide_conjunct_collations(left, table, alias);
+            elide_conjunct_collations(right, table, alias);
+        }
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::Is
+                | BinaryOp::IsNot,
+            right,
+            ..
+        } => {
+            let column = if is_constant(right) {
+                column_of(left)
+            } else if is_constant(left) {
+                column_of(right)
+            } else {
+                None
+            };
+            let Some(column) = column else {
+                return;
+            };
+            let declared = column.collation.as_deref();
+            let explicit = top_collation(left).or_else(|| top_collation(right));
+            if explicit
+                .is_some_and(|explicit| planner_collations_equivalent(Some(explicit), declared))
+            {
+                strip_top_collations(left);
+                strip_top_collations(right);
+            }
+        }
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            ..
+        } => {
+            if !is_constant(low) || !is_constant(high) {
+                return;
+            }
+            let Some(column) = column_of(operand) else {
+                return;
+            };
+            let declared = column.collation.as_deref();
+            let lower = top_collation(operand).or_else(|| top_collation(low));
+            let upper = top_collation(operand).or_else(|| top_collation(high));
+            let keeps = |collation: Option<&str>| {
+                collation
+                    .is_none_or(|collation| planner_collations_equivalent(Some(collation), declared))
+            };
+            if keeps(lower) && keeps(upper) {
+                strip_top_collations(operand);
+                strip_top_collations(low);
+                strip_top_collations(high);
+            }
+        }
+        Expr::In {
+            expr: operand,
+            set: InSet::List(items),
+            ..
+        } => {
+            if !items.iter().all(is_constant) {
+                return;
+            }
+            let Some(column) = column_of(operand) else {
+                return;
+            };
+            let declared = column.collation.as_deref();
+            if top_collation(operand)
+                .is_none_or(|explicit| planner_collations_equivalent(Some(explicit), declared))
+            {
+                strip_top_collations(operand);
+                items.iter_mut().for_each(strip_top_collations);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The collation an operand's outermost COLLATE names, if it has one.
+fn top_collation(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Collate { collation, .. } => Some(collation.as_str()),
+        _ => None,
+    }
+}
+
+/// Replace `expr` by the operand under its COLLATE wrappers.
+fn strip_top_collations(expr: &mut Expr) {
+    while let Expr::Collate { expr: inner, .. } = expr {
+        let operand = std::mem::replace(inner.as_mut(), Expr::Literal(Literal::Null, Span::ZERO));
+        *expr = operand;
+    }
 }
 
 fn expr_contains_explicit_collate(expr: &Expr) -> bool {

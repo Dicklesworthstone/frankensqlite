@@ -4814,12 +4814,22 @@ pub fn codegen_select(
                                         table_alias,
                                         label,
                                     )
+                                    .or_else(|| {
+                                        extract_collated_eq_conjunct_target(
+                                            where_clause.as_deref(),
+                                            table,
+                                            table_alias,
+                                            label,
+                                            idx_schema,
+                                        )
+                                    })
                             {
                                 // bd-kwaam (#377): the directive's key column matched one
                                 // conjunct of a larger AND-tree. Lower through the same seek
                                 // emitter with the FULL WHERE re-applied per row
                                 // (`residual_filter = true`), so the remaining conjuncts
-                                // stay enforced.
+                                // stay enforced. bd-73em1: so does a conjunct whose explicit
+                                // COLLATE names the key's collation.
                                 log_planner_select_directive_outcome(
                                     directive,
                                     "honored",
@@ -40740,6 +40750,53 @@ fn extract_labeled_eq_conjunct_target<'a>(
         }
     }
     None
+}
+
+/// bd-73em1: the `<directive-key-column> = <constant>` conjunct whose
+/// comparison carries an explicit COLLATE naming `index`'s first key
+/// collation, as its seek key without the COLLATE, which changes no value.
+/// `w = 'abc' COLLATE NOCASE` probes `ON t(w COLLATE NOCASE)` over a BINARY
+/// `w`: SQLite compares under the explicit COLLATE (the left operand's, else
+/// the right one's; [`index_equality_term_uses_key_collation`]), so the run
+/// of keys equal under the key's collation is exactly the rows the term
+/// matches. [`extract_labeled_eq_conjunct_target`] takes no COLLATE-wrapped
+/// operand. The caller re-applies the full WHERE to each row it seeks.
+fn extract_collated_eq_conjunct_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    key_label: &str,
+    index: &IndexSchema,
+) -> Option<&'a Expr> {
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_clause?, &mut conjuncts);
+    conjuncts.into_iter().find_map(|term| {
+        let Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Eq,
+            right,
+            ..
+        } = term
+        else {
+            return None;
+        };
+        if extract_collation(left)
+            .or_else(|| extract_collation(right))
+            .is_none()
+            || !index_equality_term_uses_key_collation(term, table, table_alias, index, 0)
+        {
+            return None;
+        }
+        [(left, right), (right, left)]
+            .into_iter()
+            .find_map(|(column, value)| {
+                let col_name = column_name(strip_collate_wrappers(column), table, table_alias)?;
+                let value = strip_collate_wrappers(value);
+                (col_name.eq_ignore_ascii_case(key_label)
+                    && is_exact_equality_seek_value(value, table, &col_name))
+                .then_some(value)
+            })
+    })
 }
 
 /// Complete, binary-collated UNIQUE secondary keys can be probed without a
