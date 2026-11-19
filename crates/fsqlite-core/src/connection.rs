@@ -78506,11 +78506,25 @@ impl Connection {
             return Ok(false);
         }
         let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
+        // bd-90jrv: NEW.x / OLD.x over a view carries the view column's
+        // collation, the one stock's sqlite3ResultSetOfSelect finds for it
+        // (`None` for BINARY). Kept empty, all BINARY, when the view's result
+        // columns do not line up with its column names.
+        let column_collations = self
+            .view_index_of(view_name)
+            .and_then(|index| {
+                let views = self.views.borrow();
+                let view = views.get(index)?;
+                let collations = select_result_collations(&view.query, &self.schema.borrow());
+                (collations.len() == column_names.len()
+                    && collations.iter().any(Option::is_some))
+                .then_some(collations)
+            })
+            .unwrap_or_default();
         let base_frame = TriggerFrame {
             table_name: view_name.to_owned(),
             column_names: column_names.to_vec(),
-            // bd-90jrv: a view column's collation is not tracked here yet.
-            column_collations: Vec::new(),
+            column_collations,
             rowid_alias_col_idx: None,
             old_row: old_values.map(<[SqliteValue]>::to_vec),
             new_row: new_values.map(<[SqliteValue]>::to_vec),
@@ -107596,6 +107610,13 @@ impl Connection {
         // so bind slots must follow SQL order before codegen reorders emission.
         // Keep the caller's AST and original SQL intact for public metadata.
         let mut canonical_update = canonicalize_update_placeholders(update)?;
+        if canonical_update.from.is_none() {
+            self.elide_redundant_dml_collations(
+                &canonical_update.table,
+                canonical_update.with.is_some(),
+                canonical_update.where_clause.as_mut(),
+            );
+        }
         let update = &canonical_update;
         // Direct DML on the schema table with writable_schema OFF is rejected
         // with SQLITE_ERROR here — the resolve below would otherwise raise the
@@ -107669,11 +107690,47 @@ impl Connection {
         self.route_temp_roots_in_program(program, &temp_roots)
     }
 
+    /// bd-90jrv: `elide_redundant_comparison_collations` for the WHERE clause
+    /// of a single-table UPDATE or DELETE on `target`. The trigger binder
+    /// writes `NEW.k = k` as `?1 COLLATE BINARY = k`, which takes the index
+    /// on a BINARY `k` only once the COLLATE naming its own collation is
+    /// gone. A WITH clause, a qualified or TEMP-shadowed target, and a WHERE
+    /// with no COLLATE keep theirs.
+    fn elide_redundant_dml_collations(
+        &self,
+        target: &fsqlite_ast::QualifiedTableRef,
+        has_with: bool,
+        where_clause: Option<&mut Expr>,
+    ) {
+        let Some(where_clause) = where_clause else {
+            return;
+        };
+        if has_with
+            || target.name.schema.is_some()
+            || !expr_contains_explicit_collate(where_clause)
+            || self.targets_shadowed_main(&target.name)
+        {
+            return;
+        }
+        let schema = self.schema.borrow();
+        if let Some(table) = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&target.name.name))
+        {
+            elide_conjunct_collations(where_clause, table, target.alias.as_deref());
+        }
+    }
+
     /// Compile a DELETE through the VDBE codegen.
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
         // DELETE shares UPDATE's index-probe emission order: a later indexed
         // conjunct must retain its own bind slot rather than use the first one.
         let mut canonical_delete = canonicalize_delete_placeholders(delete)?;
+        self.elide_redundant_dml_collations(
+            &canonical_delete.table,
+            canonical_delete.with.is_some(),
+            canonical_delete.where_clause.as_mut(),
+        );
         let delete = &canonical_delete;
         // GH #284: reject direct DML on the schema table with writable_schema
         // OFF (SQLITE_ERROR), rather than the generic "no such table" the
@@ -163796,6 +163853,15 @@ fn bind_trigger_columns_in_select_statement(select: &mut SelectStatement, frame:
         .chain(select.body.compounds.iter().map(|(_, core)| core))
         .any(|core| matches!(core, SelectCore::Select { from: Some(_), .. }));
 
+    // bd-90jrv: a compound SELECT sorts and compares by the leftmost arm
+    // whose column has a collation (stock's multiSelectCollSeq), so a bound
+    // NEW/OLD result column keeps its column's.
+    if !select.body.compounds.is_empty() {
+        wrap_trigger_result_column_collations(&mut select.body.select, frame);
+        for (_, core) in &mut select.body.compounds {
+            wrap_trigger_result_column_collations(core, frame);
+        }
+    }
     bind_trigger_columns_in_select_core(&mut select.body.select, frame);
     for (_, core) in &mut select.body.compounds {
         bind_trigger_columns_in_select_core(core, frame);
@@ -164281,6 +164347,35 @@ fn trigger_pseudo_column_collation(
     Some(collation.to_owned())
 }
 
+/// bd-90jrv: whether `operand` names, directly or through CAST or unary `+`,
+/// a BINARY OLD/NEW column (not the rowid) that the binder will replace with
+/// a value. Stock's sqlite3ExprCollSeq gives such a reference the default
+/// BINARY sequence as its declared collation, so on the deciding side it
+/// beats a NOCASE column opposite. The rowid and the INTEGER PRIMARY KEY
+/// resolve to column -1 there and carry none.
+fn trigger_pseudo_column_is_binary(
+    operand: &Expr,
+    frame: &TriggerFrame,
+    prefix_only: bool,
+    trigger_table_name_shadowed: bool,
+) -> bool {
+    let Expr::Column(col_ref, _) = declared_collation_source(operand) else {
+        return false;
+    };
+    let table_prefix = col_ref.table.as_deref();
+    frame.column_index(&col_ref.column).is_some()
+        && frame.declared_collation(&col_ref.column).is_none()
+        && !frame.names_rowid(&col_ref.column)
+        && trigger_binder_may_bind_prefix(
+            table_prefix,
+            frame,
+            prefix_only,
+            trigger_table_name_shadowed,
+        )
+        && frame.references_pseudo_column(table_prefix, &col_ref.column)
+        && frame.lookup_value(table_prefix, &col_ref.column).is_some()
+}
+
 /// The expression whose declared (column) collation `expr` carries: through
 /// CAST and unary `+`, as stock's sqlite3ExprCollSeq walks.
 fn declared_collation_source(expr: &Expr) -> &Expr {
@@ -164312,22 +164407,43 @@ fn may_carry_declared_collation(expr: &Expr) -> bool {
 /// declared collation wins stock's precedence (an explicit COLLATE on either
 /// side, then the left operand's declared collation, then the right's) in
 /// an explicit COLLATE of that name. The wrapper only applies where no
-/// explicit COLLATE competes, so it yields exactly stock's choice. BINARY is
-/// never wrapped: the value compares BINARY unless the other operand is a
-/// column with its own collation, and an explicit BINARY on a probe value
-/// would cost that column's index seek.
+/// explicit COLLATE competes, so it yields exactly stock's choice. A BINARY
+/// reference is wrapped only where its BINARY decides against an opposite
+/// operand that may carry a collation of its own (a column, a bound outer
+/// value, a subquery): elsewhere the bare value compares BINARY already.
+/// Where that opposite column is BINARY too, the wrapper names its own
+/// collation, and `elide_redundant_comparison_collations` drops it again
+/// before planning so the column's index still serves the probe.
 fn wrap_trigger_operand_collations(
     expr: &mut Expr,
     frame: &TriggerFrame,
     prefix_only: bool,
     trigger_table_name_shadowed: bool,
 ) {
-    // Every column BINARY (make_trigger_frame keeps no list): nothing to wrap.
-    if frame.column_collations.is_empty() {
-        return;
-    }
+    // Every column BINARY (make_trigger_frame keeps no list): only a BINARY
+    // wrapper can apply, and only against an opposite operand that may carry
+    // a collation. Each arm tests that first, a match on the operand's kind,
+    // so a body bound per row pays the walks below only where it can matter.
+    let all_binary = frame.column_collations.is_empty();
     let collation_of = |operand: &Expr| {
+        if all_binary {
+            return None;
+        }
         trigger_pseudo_column_collation(operand, frame, prefix_only, trigger_table_name_shadowed)
+    };
+    // The collation `operand` decides with: its own non-BINARY one, or BINARY
+    // where an opposite operand may carry another (`opposite_may_carry`).
+    let deciding_collation = |operand: &Expr, opposite_may_carry: bool| {
+        collation_of(operand).or_else(|| {
+            (opposite_may_carry
+                && trigger_pseudo_column_is_binary(
+                    operand,
+                    frame,
+                    prefix_only,
+                    trigger_table_name_shadowed,
+                ))
+            .then(|| "BINARY".to_owned())
+        })
     };
     let explicit = |operand: &Expr| first_explicit_collation_name(operand).is_some();
     match expr {
@@ -164345,10 +164461,13 @@ fn wrap_trigger_operand_collations(
             right,
             ..
         } => {
-            if explicit(left) || explicit(right) {
+            if (all_binary && !may_carry_declared_collation(right))
+                || explicit(left)
+                || explicit(right)
+            {
                 return;
             }
-            if let Some(collation) = collation_of(left) {
+            if let Some(collation) = deciding_collation(left, may_carry_declared_collation(right)) {
                 wrap_in_trigger_collation(left, collation);
             } else if !may_carry_declared_collation(left)
                 && let Some(collation) = collation_of(right)
@@ -164360,6 +164479,15 @@ fn wrap_trigger_operand_collations(
         Expr::In {
             expr: operand, set, ..
         } => {
+            // A subquery's or table's column may carry a collation; an IN
+            // list's values may where one is a column.
+            let opposite_may_carry = match set {
+                InSet::List(values) => values.iter().any(may_carry_declared_collation),
+                InSet::Subquery(_) | InSet::Table(_) => true,
+            };
+            if all_binary && !opposite_may_carry {
+                return;
+            }
             let right_explicit = match set {
                 InSet::List(values) => values.iter().any(&explicit),
                 InSet::Subquery(select) => match &select.body.select {
@@ -164370,11 +164498,20 @@ fn wrap_trigger_operand_collations(
                 },
                 InSet::Table(_) => false,
             };
-            if !explicit(operand)
-                && !right_explicit
-                && let Some(collation) = collation_of(operand)
-            {
+            if explicit(operand) || right_explicit {
+                return;
+            }
+            if let Some(collation) = collation_of(operand) {
                 wrap_in_trigger_collation(operand, collation);
+            } else if opposite_may_carry
+                && trigger_pseudo_column_is_binary(
+                    operand,
+                    frame,
+                    prefix_only,
+                    trigger_table_name_shadowed,
+                )
+            {
+                wrap_in_trigger_collation(operand, "BINARY".to_owned());
             }
         }
         Expr::Between {
@@ -164383,10 +164520,19 @@ fn wrap_trigger_operand_collations(
             high,
             ..
         } => {
-            if explicit(operand) || explicit(low) || explicit(high) {
+            if (all_binary
+                && !may_carry_declared_collation(low)
+                && !may_carry_declared_collation(high))
+                || explicit(operand)
+                || explicit(low)
+                || explicit(high)
+            {
                 return;
             }
-            if let Some(collation) = collation_of(operand) {
+            if let Some(collation) = deciding_collation(
+                operand,
+                may_carry_declared_collation(low) || may_carry_declared_collation(high),
+            ) {
                 wrap_in_trigger_collation(operand, collation);
             } else if !may_carry_declared_collation(operand) {
                 for bound in [low, high] {
@@ -164401,10 +164547,21 @@ fn wrap_trigger_operand_collations(
             whens,
             ..
         } => {
-            if explicit(base) || whens.iter().any(|(value, _)| explicit(value)) {
+            if (all_binary
+                && !whens
+                    .iter()
+                    .any(|(value, _)| may_carry_declared_collation(value)))
+                || explicit(base)
+                || whens.iter().any(|(value, _)| explicit(value))
+            {
                 return;
             }
-            if let Some(collation) = collation_of(base) {
+            if let Some(collation) = deciding_collation(
+                base,
+                whens
+                    .iter()
+                    .any(|(value, _)| may_carry_declared_collation(value)),
+            ) {
                 wrap_in_trigger_collation(base, collation);
             } else if !may_carry_declared_collation(base) {
                 for (value, _) in whens {
@@ -164426,20 +164583,59 @@ fn wrap_trigger_operand_collations(
             || (args.len() >= 2
                 && (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max"))) =>
         {
-            for arg in args.iter_mut() {
+            // The argument that decides, and the collation it decides with.
+            let decision = args.iter().enumerate().find_map(|(index, arg)| {
                 if explicit(arg) {
-                    return;
+                    return Some(None);
                 }
                 if let Some(collation) = collation_of(arg) {
-                    wrap_in_trigger_collation(arg, collation);
-                    return;
+                    return Some(Some((index, collation)));
                 }
-                if may_carry_declared_collation(arg) {
-                    return;
+                if trigger_pseudo_column_is_binary(
+                    arg,
+                    frame,
+                    prefix_only,
+                    trigger_table_name_shadowed,
+                ) {
+                    return Some(
+                        args[index + 1..]
+                            .iter()
+                            .any(may_carry_declared_collation)
+                            .then(|| (index, "BINARY".to_owned())),
+                    );
                 }
+                may_carry_declared_collation(arg).then_some(None)
+            });
+            if let Some(Some((index, collation))) = decision {
+                wrap_in_trigger_collation(&mut args[index], collation);
             }
         }
         _ => {}
+    }
+}
+
+/// bd-90jrv: wrap each result column of `core` that is a bound OLD/NEW
+/// reference to a non-BINARY column in that collation, which a compound
+/// SELECT takes for its ORDER BY and its set comparisons.
+fn wrap_trigger_result_column_collations(core: &mut SelectCore, frame: &TriggerFrame) {
+    let SelectCore::Select { columns, from, .. } = core else {
+        return;
+    };
+    let prefix_only = from.is_some();
+    let trigger_table_name_shadowed = from.as_ref().is_some_and(|from_clause| {
+        from_clause_has_visible_source_named(from_clause, &frame.table_name)
+    });
+    for column in columns {
+        if let ResultColumn::Expr { expr, .. } = column
+            && let Some(collation) = trigger_pseudo_column_collation(
+                expr,
+                frame,
+                prefix_only,
+                trigger_table_name_shadowed,
+            )
+        {
+            wrap_in_trigger_collation(expr, collation);
+        }
     }
 }
 
