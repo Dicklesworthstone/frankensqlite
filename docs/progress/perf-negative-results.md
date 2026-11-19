@@ -34290,3 +34290,52 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   text), where memchr2's per-call setup is amortized. Measure on such a
   corpus, not on small keyed documents. The real lever is a single-pass
   parser that keeps number spans (bd-oahj7).
+
+## 2026-11-19 — Bounding the COMMIT's db-file handle wait with a per-wait expiry timer (bd-dd5bh v3)
+
+- Context: a correctness fix, not a speed lever. On main a group-commit
+  flush waits for the shared db-file handle (`shared_db_file_write`,
+  `crates/fsqlite-pager/src/pager.rs`) with no bound, so a COMMIT can run
+  past its `busy_timeout`. The parent reproduces this in the cross-process
+  churn shape (two fresh-connection fsqlite loops beside a truncating stock
+  writer): 2 of 100 loops at 8,519 and 6,235 ms. The trace shows the WAL
+  WRITE retries ending inside the 5 s budget, then 3.9 s with no log line
+  before "physical writer flush failed". The fix had a cost guard (probe 4):
+  uncontended autocommit instructions:u within +0.5%.
+- Candidate v3 (never on main; the cross-process lane's scratch
+  `saved/worktree_dd5_final.diff`): `shared_db_file_write_within_budget`
+  polls the fair acquisition first. Only once that has suspended does it read
+  `budget.remaining()` (arming the statement's busy clock) and register an
+  `asupersync::time::sleep(wall_now(), remaining)` expiry, answering `Busy`
+  if the expiry fires first. A request that never reached the append lock
+  releases its obligation without a restore. Earlier variants: v1 (a
+  `try_write` fast path) took the handle ahead of a queued holder and stalled
+  6 of 60 churn loops for 7-15 s; v2 armed the busy clock on every COMMIT and
+  raised instructions.
+- Result: rejected on probe 4. autocommit2000 (2000 autocommit INSERTs, WAL,
+  synchronous=NORMAL), instructions:u, layout-averaged (bd-es2im: K=6
+  shuffled relinks per arm, both arms built in one rch job on vmi1152480,
+  measured on thinkstation1 with governor powersave, stock sqlite3 3.46.1
+  live, answers equal stock's):
+  - R_L 1.0265 (null 1.0134) and 1.0258 (null 0.9899) in two runs;
+  - the earlier direct A/B, with an A/A null within 0.1%: +3.1% and +2.5%;
+  - txn10 was noise-dominated: 1.0087 and 0.9847.
+  The cheapest runs are equal (min 354.9M parent, 354.3M lever) while the
+  median moves (p50 364.0M to 375.8M). So the fixed path cost is near zero,
+  and the lever adds timing-dependent work in more of the runs: about 4,700
+  instructions per commit on average.
+- Lead, not proven: the expiry timer registered each time the handle
+  acquisition suspends. The CLI has no ambient timer driver, so asupersync
+  0.6.2 routes it to its process-global fallback timer: a wheel insert plus a
+  pump-thread unpark, then a cancel when the lock arrives. perf record is
+  capped at 4 kHz here and could not attribute it; gdb on the out-of-line
+  `Sleep::poll_inner` saw 0 hits (inlined); strace -c did not separate the
+  arms.
+- Retry condition: a v4 that registers no timer on any path an uncontended
+  autocommit takes. For example, arm a deadline only after the wait has
+  already lasted a threshold, or reuse a deadline the caller already holds.
+  First name the added instructions by function with callgrind on an
+  uncontended autocommit (v3 against main). Then judge v4 on the same
+  probe 4 (+0.5%, layout-averaged) and probe 3 (no wait past busy_timeout
+  + 1 s in 60 churn loops). If no construction keeps the uncontended path
+  instruction-neutral, bounding the wait is a design question for the owner.
