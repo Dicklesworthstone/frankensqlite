@@ -94,6 +94,23 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - REJECTED on its instruction clause, worse than v1 (11 of 14 rows over +0.3% Ir, join +2.18%): Concat and Affinity run by an out-of-line handler the synchronous lane asks after its match declines an opcode (bd-w4pr1.13, bulk-write round 10, lever LA v2)
+
+- Target and kill line: as LA v1 (entry below). Touched (not landed; patch `scratchpad/r10/la_v2_on_1b789b749.diff`
+  of the bulk-write lane): `crates/fsqlite-vdbe/src/engine.rs` (`try_execute_row_body_opcode_sync`, `#[inline(never)]`,
+  called in `run_hot_opcodes_sync` when `try_execute_hot_opcode_sync` returns false; the lane's match as on main).
+- Prediction (bd-w4pr1.13, before the build): scan rows +0.0..+0.8% Ir (one decline a scanned row), bulk -280M to
+  -330M Ir.
+- Result (bd-es2im lines; base main 1b789b749, one valid run: instruction counts do not depend on layout): join
+  +2.18% Ir, scan_filter_agg +1.27%, order_by_text_limit10 +1.02%, delete +0.89%, gb_id +0.76%, group_by_1000 +0.64%,
+  gb_a_mod10 +0.58%, gb_id_mod100k +0.50%, rowid_lookups +0.39%, window_sum_over +0.36%; bulk Ir -3.15% (v1 -4.5%),
+  cpu 0.960 WIN; focused benches faster at every size. The call on every declined opcode costs each scanned row
+  (its Next declines to the async lane) and bulk's Insert, three to four times v1's arm cost.
+- Retry condition: both placements cost scan rows; LA waits for a synchronous lane whose scan rows leave it less
+  often than once a row, or for an owner decision on the 0.3% instruction guard against v1's trade (bulk task-clock
+  -3.2..-4.5%, memory_script -2..-3%, join -2..-4%, all replicated layout-averaged WINs, for +0.27..+0.37% Ir on four
+  rows).
+
 ## 2026-11-19 - METHOD (measurement only) and RE-JUDGE: cycles and time lines are judged over six linker-shuffled layouts of each arm; of four vetoes, SC8 v2's flips to a pass, TN1's GROUP BY cost is not a cost, AF and D stay rejected (bd-es2im)
 
 - Defect: one unrelated change moved the same rows -5.3%..+6.4% in cycles at identical instructions (TN1-out
