@@ -146535,6 +146535,11 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> Result<SqliteValue>
                 Ok(SqliteValue::Float((sum + err) / count as f64))
             }
         }
+        // Stock's minmaxStep keeps the first of equal extrema (8 before 8.0)
+        // and replaces only on a strictly smaller / greater value.
+        // `Iterator::min_by` keeps the first minimum; `Iterator::max_by` keeps
+        // the last maximum, so max folds explicitly (bd-uy8iy, as
+        // compute_aggregate_ext_collated does for a collation).
         "min" => Ok(values
             .iter()
             .filter(|v| !matches!(v, SqliteValue::Null))
@@ -146543,7 +146548,13 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> Result<SqliteValue>
         "max" => Ok(values
             .iter()
             .filter(|v| !matches!(v, SqliteValue::Null))
-            .max_by(|a, b| cmp_sqlite_values(a, b))
+            .reduce(|best, v| {
+                if cmp_sqlite_values(v, best) == std::cmp::Ordering::Greater {
+                    v
+                } else {
+                    best
+                }
+            })
             .map_or(SqliteValue::Null, |v| (*v).clone())),
         "group_concat" | "string_agg" => {
             let parts: Vec<String> = values
