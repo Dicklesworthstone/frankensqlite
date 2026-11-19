@@ -15304,6 +15304,9 @@ pub struct Connection {
     /// Connection-local prepared statement template cache keyed by raw SQL.
     /// Avoids rebuilding the prepared wrapper for repeated `prepare()` calls.
     prepared_cache: RefCell<LruCache<u64, Arc<PreparedCacheEntry>>>,
+    /// bd-fpr5g lever 3a: trigger body statements bound once for every
+    /// firing row of the same frame shape (`Connection::trigger_body_template`).
+    trigger_body_templates: RefCell<Vec<Rc<TriggerBodyTemplate>>>,
     /// Bounded statement-reuse trace buffer keyed by cache kind + statement
     /// fingerprint. Records per-lane reuse distance observations so compile
     /// governance can distinguish same-lane reuse from cross-lane churn.
@@ -17151,6 +17154,7 @@ impl Connection {
             returning_first_row_columns: RefCell::new(None),
             returning_fold_spared_target: RefCell::new(None),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
+            trigger_body_templates: RefCell::new(Vec::new()),
             statement_reuse_trace: RefCell::new(StatementReuseTraceState::default()),
             planner_directive_cache: RefCell::new(
                 LruCache::new(default_statement_cache_capacity()),
@@ -17758,6 +17762,7 @@ impl Connection {
             returning_first_row_columns: RefCell::new(None),
             returning_fold_spared_target: RefCell::new(None),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
+            trigger_body_templates: RefCell::new(Vec::new()),
             statement_reuse_trace: RefCell::new(StatementReuseTraceState::default()),
             planner_directive_cache: RefCell::new(
                 LruCache::new(default_statement_cache_capacity()),
@@ -77737,20 +77742,106 @@ impl Connection {
         }
     }
 
-    /// Run one trigger body statement bound by [`bind_trigger_body_statement`];
-    /// `params` are the values of the OLD/NEW parameters it binds.
+    /// Body statement `index` of `trigger` bound for `frame`, with this row's
+    /// parameter values.
+    ///
+    /// bd-fpr5g lever 3a: a parameter-bound INSERT, UPDATE or DELETE is bound
+    /// once per frame shape and kept in `trigger_body_templates`; later rows
+    /// read only their parameter values. A statement bound with literals (a
+    /// RAISE SELECT, a rewritable subquery) binds again for every row.
+    ///
+    /// bd-nn29x: a non-default `OR` clause on the statement that fired this
+    /// trigger replaces the conflict clause of every INSERT / UPDATE in the
+    /// body (stock `codeTriggerProgram`: `eOrconf = orconf == OE_Default ?
+    /// pStep->orconf : orconf`). The firing statement's clause is current
+    /// here: each body statement restores it when it finishes.
+    fn bound_trigger_body_statement(
+        &self,
+        trigger: &Arc<TriggerDef>,
+        index: usize,
+        stmt: &Statement,
+        frame: &TriggerFrame,
+        pin_main_relations: bool,
+    ) -> (BoundTriggerStatement, Vec<SqliteValue>) {
+        let conflict = self.dml_conflict_clause.get();
+        if matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            let schema_generation = self.schema_generation();
+            let cached = self
+                .trigger_body_templates
+                .borrow()
+                .iter()
+                .find(|template| {
+                    template.fits(
+                        trigger,
+                        index,
+                        pin_main_relations,
+                        conflict,
+                        schema_generation,
+                        frame,
+                    )
+                })
+                .cloned();
+            match cached {
+                Some(template) => {
+                    if let Some(params) = template.params(frame) {
+                        return (BoundTriggerStatement::Template(template), params);
+                    }
+                }
+                None if !statement_contains_rewritable_subquery(stmt) => {
+                    let mut statement = stmt.clone();
+                    if pin_main_relations {
+                        qualify_persistent_trigger_statement(&mut statement);
+                    }
+                    let (keys, params) = collect_trigger_bound_params_with_keys(true, || {
+                        bind_trigger_columns_in_statement(&mut statement, frame);
+                    });
+                    apply_trigger_conflict_override(&mut statement, conflict);
+                    let template = Rc::new(TriggerBodyTemplate {
+                        trigger: Arc::clone(trigger),
+                        index,
+                        pin_main_relations,
+                        conflict,
+                        schema_generation,
+                        table_name: frame.table_name.clone(),
+                        column_count: frame.column_names.len(),
+                        column_collations: frame.column_collations.clone(),
+                        rowid_alias_col_idx: frame.rowid_alias_col_idx,
+                        rows: TriggerBodyTemplate::frame_rows(frame),
+                        statement,
+                        keys,
+                    });
+                    let mut templates = self.trigger_body_templates.borrow_mut();
+                    templates.retain(|kept| kept.schema_generation == schema_generation);
+                    if templates.len() >= TRIGGER_BODY_TEMPLATE_LIMIT {
+                        templates.clear();
+                    }
+                    templates.push(Rc::clone(&template));
+                    return (BoundTriggerStatement::Template(template), params);
+                }
+                None => {}
+            }
+        }
+        let (mut statement, params) = bind_trigger_body_statement(stmt, frame, pin_main_relations);
+        apply_trigger_conflict_override(&mut statement, conflict);
+        (BoundTriggerStatement::Owned(Box::new(statement)), params)
+    }
+
+    /// Run one trigger body statement bound by
+    /// [`Self::bound_trigger_body_statement`]; `params` are the values of the
+    /// OLD/NEW parameters it binds.
+    ///
+    /// `statement` already carries the firing statement's conflict override
+    /// (bd-nn29x): the caller applies [`apply_trigger_conflict_override`], or
+    /// takes a [`TriggerBodyTemplate`] that applied it when it bound.
     async fn execute_bound_trigger_statement(
         &self,
-        mut statement: Statement,
+        statement: &Statement,
         params: &[SqliteValue],
     ) -> Result<TriggerStatementOutcome> {
-        // bd-nn29x: a non-default `OR` clause on the statement that fired this
-        // trigger replaces the conflict clause of every INSERT / UPDATE in the
-        // body (stock `codeTriggerProgram`: `eOrconf = orconf == OE_Default ?
-        // pStep->orconf : orconf`). The firing statement's clause is current
-        // here: each body statement restores it when it finishes.
-        apply_trigger_conflict_override(&mut statement, self.dml_conflict_clause.get());
-        if let Some((directive, predicate)) = trigger_statement_raise_directive(&statement) {
+        if let Some((directive, predicate)) = trigger_statement_raise_directive(statement) {
             // GH#305: evaluate the RAISE predicate with the connection-aware
             // evaluator (parity with trigger WHEN predicates in
             // `trigger_when_matches`) so scalar subqueries work.
@@ -77776,10 +77867,10 @@ impl Connection {
         // CASE, ...): the first row's leftmost marker names the RAISE stock
         // reaches first. We must NOT fall through to execute_statement because
         // the general execution path cannot evaluate Expr::Raise as a value.
-        if statement_is_raise_select(&statement) {
-            if trigger_statement_raise_directive(&statement).is_none()
+        if statement_is_raise_select(statement) {
+            if trigger_statement_raise_directive(statement).is_none()
                 && let Some((mut directives, probe, marker_positions)) =
-                    trigger_raise_select_marker_probe(&statement)
+                    trigger_raise_select_marker_probe(statement)
             {
                 let rows = self
                     .execute_statement(&Statement::Select(probe), None)
@@ -77804,7 +77895,7 @@ impl Connection {
             return Ok(TriggerStatementOutcome::Continue);
         }
         if matches!(
-            &statement,
+            statement,
             Statement::Begin(_)
                 | Statement::Commit
                 | Statement::Rollback(_)
@@ -77823,7 +77914,7 @@ impl Connection {
         // fail closed here: mutating the attached-database registry while a
         // recursive program is executing would change the identity of the
         // shared recursive-program budget mid-program.
-        if matches!(&statement, Statement::Attach(_) | Statement::Detach(_)) {
+        if matches!(statement, Statement::Attach(_) | Statement::Detach(_)) {
             return Err(FrankenError::ParseError {
                 offset: 0,
                 detail: "ATTACH and DETACH statements are not allowed inside trigger bodies"
@@ -77857,13 +77948,13 @@ impl Connection {
         // later statement of the same body sees an earlier one's values, as in
         // stock (OP_ResetCount after each step, frame restore at the end).
         let counts_changes = matches!(
-            &statement,
+            statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
         let previous_total_changes = self.total_changes.get();
         let previous_trigger_step_changes = self.trigger_step_changes.get();
         let result = self
-            .execute_statement(&statement, (!params.is_empty()).then_some(params))
+            .execute_statement(statement, (!params.is_empty()).then_some(params))
             .await;
         if counts_changes {
             let step_total_delta = self
@@ -77969,11 +78060,16 @@ impl Connection {
             // Execute each statement in the trigger body, in one change-tracking
             // frame (see TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
-            for stmt in &trigger.body {
-                let (bound_stmt, bound_params) =
-                    bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
+            for (index, stmt) in trigger.body.iter().enumerate() {
+                let (bound_stmt, bound_params) = self.bound_trigger_body_statement(
+                    &trigger,
+                    index,
+                    stmt,
+                    &base_frame,
+                    pin_main_relations,
+                );
                 match self
-                    .execute_bound_trigger_statement(bound_stmt, &bound_params)
+                    .execute_bound_trigger_statement(bound_stmt.statement(), &bound_params)
                     .await
                     .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
@@ -78055,11 +78151,16 @@ impl Connection {
             // Execute each statement in the trigger body, in one change-tracking
             // frame (see TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
-            for stmt in &trigger.body {
-                let (bound_stmt, bound_params) =
-                    bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
+            for (index, stmt) in trigger.body.iter().enumerate() {
+                let (bound_stmt, bound_params) = self.bound_trigger_body_statement(
+                    &trigger,
+                    index,
+                    stmt,
+                    &base_frame,
+                    pin_main_relations,
+                );
                 match self
-                    .execute_bound_trigger_statement(bound_stmt, &bound_params)
+                    .execute_bound_trigger_statement(bound_stmt.statement(), &bound_params)
                     .await
                     .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
@@ -78583,11 +78684,16 @@ impl Connection {
             // One change-tracking frame for the whole trigger body (see
             // TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
-            for stmt in &trigger.body {
-                let (bound_stmt, bound_params) =
-                    bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
+            for (index, stmt) in trigger.body.iter().enumerate() {
+                let (bound_stmt, bound_params) = self.bound_trigger_body_statement(
+                    &trigger,
+                    index,
+                    stmt,
+                    &base_frame,
+                    pin_main_relations,
+                );
                 match self
-                    .execute_bound_trigger_statement(bound_stmt, &bound_params)
+                    .execute_bound_trigger_statement(bound_stmt.statement(), &bound_params)
                     .await
                     .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
@@ -164198,6 +164304,15 @@ thread_local! {
 /// OLD/NEW reference becomes a parameter or only those inside an EXISTS
 /// subquery entered through [`TriggerWhenSubqueryScope`].
 fn collect_trigger_bound_params(everywhere: bool, bind: impl FnOnce()) -> Vec<SqliteValue> {
+    collect_trigger_bound_params_with_keys(everywhere, bind).1
+}
+
+/// [`collect_trigger_bound_params`], also returning the lowercased
+/// `(qualifier, column)` reference each parameter binds, in parameter order.
+fn collect_trigger_bound_params_with_keys(
+    everywhere: bool,
+    bind: impl FnOnce(),
+) -> (Vec<(Option<String>, String)>, Vec<SqliteValue>) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -164214,12 +164329,12 @@ fn collect_trigger_bound_params(everywhere: bool, bind: impl FnOnce()) -> Vec<Sq
     });
     let reset = Reset;
     bind();
-    let values = TRIGGER_BOUND_PARAMS
+    let collected = TRIGGER_BOUND_PARAMS
         .with(|cell| cell.borrow_mut().take())
-        .map(|params| params.values)
+        .map(|params| (params.keys, params.values))
         .unwrap_or_default();
     drop(reset);
-    values
+    collected
 }
 
 /// Marks the binder as inside a parameterized EXISTS subquery for its lifetime.
@@ -164321,6 +164436,93 @@ fn bind_trigger_body_statement(
     let params =
         collect_trigger_bound_params(true, || bind_trigger_columns_in_statement(&mut bound, frame));
     (bound, params)
+}
+
+/// bd-fpr5g lever 3a: a parameter-bound trigger body statement, bound once
+/// for every firing row whose frame has the same shape.
+///
+/// Binding rewrites each OLD/NEW reference into a `?N` parameter. Which
+/// references it rewrites, and how, depends on the frame's shape (its table,
+/// columns and collations, and which rows and rowids it has), never on the
+/// row's values. So the bound statement is the same for every such row, and
+/// only the parameter values change: `keys` names the reference each `?N`
+/// takes, in order, and `TriggerFrame::lookup_value` reads it as the binder
+/// does.
+struct TriggerBodyTemplate {
+    trigger: Arc<TriggerDef>,
+    index: usize,
+    pin_main_relations: bool,
+    conflict: Option<fsqlite_ast::ConflictAction>,
+    schema_generation: u64,
+    table_name: String,
+    column_count: usize,
+    column_collations: Vec<Option<String>>,
+    rowid_alias_col_idx: Option<usize>,
+    rows: [bool; 4],
+    /// The bound statement, with the firing statement's conflict override.
+    statement: Statement,
+    keys: Vec<(Option<String>, String)>,
+}
+
+impl TriggerBodyTemplate {
+    /// Which of OLD, NEW and their rowids `frame` has.
+    fn frame_rows(frame: &TriggerFrame) -> [bool; 4] {
+        [
+            frame.old_row.is_some(),
+            frame.new_row.is_some(),
+            frame.old_rowid.is_some(),
+            frame.new_rowid.is_some(),
+        ]
+    }
+
+    fn fits(
+        &self,
+        trigger: &Arc<TriggerDef>,
+        index: usize,
+        pin_main_relations: bool,
+        conflict: Option<fsqlite_ast::ConflictAction>,
+        schema_generation: u64,
+        frame: &TriggerFrame,
+    ) -> bool {
+        Arc::ptr_eq(&self.trigger, trigger)
+            && self.index == index
+            && self.pin_main_relations == pin_main_relations
+            && self.conflict == conflict
+            && self.schema_generation == schema_generation
+            && self.rows == Self::frame_rows(frame)
+            && self.column_count == frame.column_names.len()
+            && self.rowid_alias_col_idx == frame.rowid_alias_col_idx
+            && self.table_name == frame.table_name
+            && self.column_collations == frame.column_collations
+    }
+
+    /// This row's parameter values, or `None` when a reference the template
+    /// binds does not resolve in `frame`.
+    fn params(&self, frame: &TriggerFrame) -> Option<Vec<SqliteValue>> {
+        self.keys
+            .iter()
+            .map(|(prefix, column)| frame.lookup_value(prefix.as_deref(), column))
+            .collect()
+    }
+}
+
+/// Templates kept per connection before the cache starts over.
+const TRIGGER_BODY_TEMPLATE_LIMIT: usize = 256;
+
+/// A bound trigger body statement: a shared template's, or one bound for this
+/// row alone.
+enum BoundTriggerStatement {
+    Template(Rc<TriggerBodyTemplate>),
+    Owned(Box<Statement>),
+}
+
+impl BoundTriggerStatement {
+    fn statement(&self) -> &Statement {
+        match self {
+            Self::Template(template) => &template.statement,
+            Self::Owned(statement) => statement,
+        }
+    }
 }
 
 /// Walk the AND / OR / NOT skeleton of a WHEN clause: EXISTS leaves bind with

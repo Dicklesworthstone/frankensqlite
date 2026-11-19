@@ -353,3 +353,78 @@ fn recursive_triggers_off_stops_only_self_reentry() {
         assert_script_matches_stock(SCRIPT, "recursive_triggers").await;
     });
 }
+
+/// Lever 3a binds a parameter-bound body statement once, and reuses it while
+/// the trigger, the statement, the firing statement's conflict override, the
+/// schema and the frame's shape stay the same. Each of those changes between
+/// firings here, and every result is stock's.
+/// - Multi-row firings under OR IGNORE and then OR REPLACE: the override goes
+///   into the bound statement, so a template must not cross from one to the
+///   other.
+/// - A plain INSERT whose body collides fails as a whole, as in stock. The
+///   `!` statements must fail on both engines.
+/// - A new column (a new frame), a dropped and recreated trigger of the same
+///   name (a new body), and a renamed column the body reads.
+#[test]
+fn bound_trigger_bodies_follow_conflict_overrides_and_schema_changes() {
+    const SCRIPT: &[&str] = &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)",
+        "CREATE TABLE lg(k INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE src(id INTEGER PRIMARY KEY, a TEXT)",
+        "INSERT INTO src VALUES (1, 'a'), (4, 'b'), (7, 'c'), (10, 'd'), (13, 'e')",
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+           INSERT INTO lg VALUES (NEW.id % 3, NEW.a); \
+           UPDATE lg SET v = v || '+' WHERE k = NEW.id % 3; END",
+        "INSERT OR IGNORE INTO t SELECT id, a FROM src WHERE id < 8",
+        "SELECT * FROM lg ORDER BY k",
+        "DELETE FROM t",
+        "INSERT OR REPLACE INTO t SELECT id, a FROM src",
+        "SELECT * FROM lg ORDER BY k",
+        "!INSERT INTO t VALUES (16, 'f')",
+        "SELECT * FROM t ORDER BY id",
+        "ALTER TABLE t ADD COLUMN b TEXT DEFAULT 'z'",
+        "INSERT INTO t VALUES (17, 'g', 'h')",
+        "DROP TRIGGER tr",
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+           INSERT INTO lg VALUES (NEW.id + 100, NEW.b); END",
+        "INSERT INTO t VALUES (18, 'i', 'j')",
+        "INSERT INTO t (id, a) VALUES (19, 'k')",
+        "ALTER TABLE t RENAME COLUMN b TO bb",
+        "INSERT INTO t VALUES (20, 'l', 'm')",
+        "SELECT * FROM lg ORDER BY k",
+        "SELECT * FROM t ORDER BY id",
+    ];
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let conn = Connection::open(&database_path(&dir, file_backed))
+                .await
+                .unwrap();
+            for sql in SCRIPT {
+                if let Some(failing) = sql.strip_prefix('!') {
+                    assert!(
+                        stock.execute_batch(failing).is_err(),
+                        "stock must refuse `{failing}`"
+                    );
+                    assert!(
+                        conn.execute(failing).await.is_err(),
+                        "file_backed={file_backed}: fsqlite must refuse `{failing}`"
+                    );
+                } else if sql.starts_with("SELECT") {
+                    assert_eq!(
+                        fsqlite_rows(&conn, sql).await,
+                        stock_rows(&stock, sql),
+                        "file_backed={file_backed}: {sql}"
+                    );
+                } else {
+                    stock.execute_batch(sql).unwrap();
+                    conn.execute(sql)
+                        .await
+                        .unwrap_or_else(|e| panic!("file_backed={file_backed}: {sql}: {e}"));
+                }
+            }
+        }
+    });
+}
