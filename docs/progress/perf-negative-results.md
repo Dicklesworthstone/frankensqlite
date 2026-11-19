@@ -94,6 +94,77 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - REJECTED again, by its layout-averaged landing run (scan_filter_agg cycles a replicated LOSE at identical Ir; join and memory_script replicated WINs): the table seek cache keeps eight leaves, scanned in place (bd-w4pr1.12, read-loop round 9, lever SC8 v2)
+
+- Lever, target, prediction and kill lines: the 2026-11-18 SC8 v2 entry (ledger 9ce1f49d7), which rejected it on
+  its single-layout third kill line at parent 5afb99152. The bulk-write lane's layout-averaged re-judge at 5afb99152
+  (bd-es2im entry) turned that veto into a pass; a single-layout four-arm run at 9ce1f49d7 passed too (join -463.3 /
+  -463.4M Ir, CPU pair 0.821 / 0.812).
+- Gate of the SC8 v2 tree (9ce1f49d7 + diff cb739f4beca55950): clippy btree / vdbe / core clean; 52 test binaries,
+  6,223 passed, 0 failed; fsqlite-e2e 15 targets, 103 passed; fsqlite crate in 7 batches of 19 targets (one
+  unbatched step spends its whole test timeout building the crate's 124 test targets), 124 binaries, 1,099 passed,
+  0 failed.
+- Landing run (bd-es2im step 5; lines declared on the bead before the measurement): parent cac612a6c against
+  parent + SC8 v2, K=6 relinks of each arm (built on vmi1153651; parent sources equal git file by file; every ELF
+  matches its manifest and stock's smoke output), two runs each with its own Q group, stock sqlite3 3.46.1 live,
+  thinkstation1. join_1M_to_pk_1000 cpu 0.857 / 0.852 and cycles 0.846 / 0.851 WIN (Ir 0.888); memory_script_200k
+  cpu 0.933 / 0.926 WIN (Ir 0.940); scan_filter_agg cycles 1.044 (T 2.02%) / 1.039 (T 2.29%) LOSE at Ir 1.0000; every
+  other row TIE. Kill line "any row with a replicated cycles or cpu LOSE" fires: not landed.
+- What the loss is not: no function among scan_filter_agg's 40 hottest changed size between the arms (the 57
+  size-changed symbols are seek / insert / delete / bulk-load / cursor-open code). The per-layout medians repeat run
+  to run (parent 424 / 388 / 389 / 390 / 388 / 407M cycles, lever 410 / 401 / 391 / 412 / 404 / 414M), while on the
+  unshuffled links the lever is faster (388 against 407M) at equal L1-dcache misses. Candidate, named in the bd-es2im
+  entry: SC8 grows BtCursor's in-struct seek-cache array from 4 to 8 slots, a data-layout change that code shuffling
+  does not randomize.
+- Retry condition (coordinator decision, bd-w4pr1.12 2026-11-19): one priced retry, SC8 v3, with BtCursor's
+  in-struct footprint unchanged (the slot array out of line, allocated on first use beyond slot 0), judged
+  layout-averaged at its exact landing commit under the same four lines. If scan_filter_agg still loses with the
+  footprint unchanged, the footprint hypothesis is refuted and SC8 is rejected with no further retry from this lane.
+
+## 2026-11-19 - REJECTED on its kill lines 2 and 3 (memory_script_200k +1.74% Ir; group_by_1000_groups cycles): a seek-cache hit on a resident cached leaf other than the cursor's own is answered without a wait (bd-w4pr1.12, read-loop round 8, lever SL2 v1)
+
+- Target: join_1M_to_pk_1000 after SC8 v2, the 405k cached-leaf hits at about 1,556 Ir each through
+  CursorBackend::table_move_to.
+- Touched (not landed; patch `scratchpad rl8/sc8v2_sl2v2_full.patch`, which includes SC8 v2):
+  `crates/fsqlite-btree/src/cursor.rs` (try_table_seek_within_leaf takes the first admitting slot and answers a
+  non-current leaf the reader holds resident; load_page's decode moves into stack_entry_for_page; keeper
+  test_try_table_seek_within_leaf_answers_resident_cached_leaves with three negatives).
+- Prediction and kill lines (bd-w4pr1.12, 2026-11-18, before the build): join -250 to -400M Ir; kill: join under
+  150M or CPU not lower in each run; any row +0.5% Ir; a row's cycles pair median above the A/A arm's highest in
+  both runs.
+- Result (four arms on parent 9ce1f49d7, sl2 against sc8v2, stock live, two runs of 7 reps): join -186.4 /
+  -186.1M Ir, CPU pair 0.938 / 0.947 (line 1 passes); memory_script_200k +1.738% / +1.748% Ir (line 2 fails);
+  line 3 fired on group_by_1000_groups (single layout).
+- Why (callgrind of memory_script_200k, sc8v2 -> sl2: 3,268.97M -> 3,325.74M): on the script's :memory: join,
+  about 81k probes whose first admitting slot names a non-current leaf pay is_dirty and a resident lookup
+  (TransactionKind::get_resident_page +35.0M, 94,027 -> 175,022 calls). That lookup answers NotResident there, so
+  the fast path never lands one of them (stack_entry_for_page runs exactly as often as load_page, 94,023), and
+  the general path loads the page as before; try_table_seek_within_leaf's first-slot scan adds +13.4M over 200k
+  probes. About +540 Ir per declined probe.
+- Retry condition: PARKED behind SC8 v3 (its decline path scans SC8's other slots, which main does not have). SL2
+  v2 declines a non-current cached leaf without a resident lookup when that lookup cannot answer (for example a
+  per-slot record that the leaf's last resident lookup failed, or the reader saying it holds no resident images),
+  adds no instructions to memory_script_200k (instruction line, single ELF), and is judged on the same four arms and
+  lines, every cycles or time line layout-averaged (bd-es2im). If SC8 v3 is rejected, the retry condition becomes
+  "a landed multi-slot cursor cache".
+
+## 2026-11-19 - NOT ATTEMPTED (scoped): the :memory: time-travel capture without its page copies (bd-w4pr1.12, read-loop round 8, queue item c)
+
+- Target: memory_script_200k's CREATE TABLE u, 17.2M Ir and 3,069 page faults against stock's ~0, all in
+  capture_time_travel_image's read of every page (1,502 TransactionKind::get_page, 10.1M Ir; callgrind of
+  statements 1-3 on a7c78382f).
+- Where it goes: every read misses the page cache (the 200k-row INSERT committed on the retained autocommit path),
+  so each page is read from the MemoryFile into a pool buffer and inserted in the cache (in-flight read claim and
+  finish, 3.3M Ir), then copied again for the snapshot (malloc + memcpy): two copies per page, the 3,069 faults.
+- Why no cheap lever: the first copy fills the cache that the next statements scan, so a capture that reads
+  around the cache (the existing read_page_copy_uncached) moves that copy to the next reader. Only the second copy
+  is removable, and that needs the cache to hand out its buffer as an immutable shared image without copying
+  (CachedPage::shared_page() copies; MemoryFile keeps the database in one Vec<u8>): a PageData / page-cache
+  representation change. Its ceiling is about 1.5k faults and 2-3 ms, at most 1% of memory_script_200k, whose
+  own A/A CPU pair medians move 0.983-1.015.
+- Retry condition: the page cache holding committed images as shared immutable (copy-on-write) buffers, or a
+  workload where :memory: DDL / COMMIT captures are a measured share of CPU (several percent of a row).
+
 ## 2026-11-19 - REJECTED on its declared kill line (gh19 still red; its close drops from over 600 s to 39.7 s against a 30 s wait): WAL-FEC encodes a large repair group with asupersync's inactivation solver instead of the dense page-width SystematicEncoder (bd-mcpbv item 2, gh19, multi-process lane round 6)
 
 - Target: wal_reset_with_foreign_reader::gh19_public_native_full_commits_grow_shared_segments_before_stock_refresh.
