@@ -94,6 +94,64 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - WIN (landed as 3dc23aad9; a little beyond its prediction): firing a trigger clones neither its definition nor its OLD/NEW frame (bd-fpr5g, SQL lane round 5, lever 2)
+
+- Target: the per-firing copies of the trigger machinery. Callgrind on trig_src_2000 (release-perf,
+  LTO off) put TriggerDef clone and drop at 28.4M of 431M (about 14.8k per inserted row):
+  fire_*_triggers collected the matching definitions with `.cloned()`. TriggerFrame clone, drop
+  and the guard's pop added 12.3M (about 6k per row): the base frame was cloned per trigger to
+  stamp its name, and that copy cloned again onto trigger_frame_stack, which is read only for its
+  depth and the recursive_triggers name check.
+- Ledger preflight: no entry on trigger definitions or frames. Lever 1 (the 2026-11-18 entry
+  below) was this bead's first.
+- Change (connection.rs): the trigger list (its TxnRestorableCell, and the savepoint
+  SchemaSnapshot) holds `Arc<TriggerDef>`. The two ALTER RENAME rewrites edit through
+  Arc::make_mut, which copies only a definition a snapshot still shares. trigger_frame_stack holds
+  trigger names. TriggerFrame lost its trigger_name, and the fire loops use the base frame.
+- Prediction (posted before code): -300M to -450M on each 20,000-row trigger row; notrig_cte
+  within 0.5%. Kill line: trig_src gains less than 150M, any non-trigger row worse than 1%, or any
+  answer differs.
+- Measured: release-perf CLIs as shipped. Base: lever 1 on 895ee627a, sha256 07d8430d4c3df48d.
+  Lever: lever 2 on dc7142eec, the same code, sha256 2617db8caf19c7e3. Conditions: :memory:,
+  instructions:u and task-clock, medians of 5, stock 3.54.1 live, answers equal, thinkstation1,
+  powersave. A/A arm of the base (3 reps): trig_cte 0.9923, the other rows within 0.1%.
+
+  | row | base | lever | lever / base | x stock, instructions | x stock, CPU |
+  |---|---|---|---|---|---|
+  | trig_cte | 3,622.1M | 3,166.6M | 0.874 | 15.0 -> 13.1 | 28.8 -> 25.3 |
+  | trig_src | 3,644.5M | 3,156.9M | 0.866 | 13.3 -> 11.5 | 23.3 -> 20.6 |
+  | trig_values | 3,690.3M | 3,219.9M | 0.873 | 3.09 -> 2.69 | 5.54 -> 4.95 |
+  | notrig_cte | 293.9M | 293.9M | 1.000 | | |
+
+  -455M to -488M: a little beyond the predicted range, in the good direction.
+- Landing binary (78a37df18: lever 2 with bd-uy8iy and bd-jlbrk on 5a62e9606, sha256
+  959dee25d140b27e) against lever 1's landing binary (07d8430d4c3df48d), 5 reps, answers equal.
+  trig_cte went from 3,600.0M to 3,166.7M (0.880): x14.9 -> x13.1 stock in instructions and
+  x26.1 -> x23.0 in CPU. trig_src 0.871, trig_values 0.869, notrig_cte 0.999.
+- Keepers: crates/fsqlite-core/tests/bd_fpr5g_trigger_body_cache_under_cte.rs gained two tests,
+  stock live on :memory: and a file. One renames a trigger's table and column, then rolls the
+  rename back with the transaction or to a savepoint, or commits it. The other checks
+  recursive_triggers: OFF stops only self re-entry while a sibling fires, and ON recurses until
+  WHEN stops it. Also held: the bead's trigger keepers, gh448's change counters (file-backed:
+  minutes on a fast worker; it ran over an hour on vmi1293453 and was cancelled there), and the lib
+  tests matching "trigger" (142 passed, 0 failed).
+- Gate (rch, on 78a37df18 with bd-uy8iy and bd-jlbrk):
+  - cargo check --all-targets of vdbe and core at each intermediate commit;
+  - clippy -D warnings, vdbe and core, all targets: clean;
+  - 18 keeper targets: 116 passed, 0 failed;
+  - 19 AUTOINCREMENT / UNIQUE / conflict / conformance targets: 1,760 passed, 1 failed. The
+    failure is indexed_group_by_predicates_match_sqlite_without_table_scans, a known red on main;
+  - vdbe lib and goldens: 1,265 passed, with no .snap change;
+  - core lib: 4,202 passed, 0 failed;
+  - the fsqlite crate, its lib and 123 targets: 1,099 passed, 0 failed;
+  - 6 e2e targets: 57 passed, 0 failed.
+  After the rebase onto 1292d7b3c (main's pager, VFS, connection.rs and CLI changes): clippy
+  clean, 12 keeper and conflict targets 68 passed with 0 failed, and the core lib tests matching
+  "trigger" 142 passed. It was pushed onto 8affa342a with the same diff.
+- Retry condition: none for this lever. Left on the row, in bd-fpr5g's order: the body bound
+  per row (about 17k), the dispatcher around each body statement (about 30k of its 56k) and the
+  outer row-by-row replay (about 49k).
+
 ## 2026-11-19 - REJECTED on its instruction clause, worse than v1 (11 of 14 rows over +0.3% Ir, join +2.18%): Concat and Affinity run by an out-of-line handler the synchronous lane asks after its match declines an opcode (bd-w4pr1.13, bulk-write round 10, lever LA v2)
 
 - Target and kill line: as LA v1 (entry below). Touched (not landed; patch `scratchpad/r10/la_v2_on_1b789b749.diff`
