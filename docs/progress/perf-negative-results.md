@@ -94,6 +94,73 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - METHOD (measurement only) and RE-JUDGE: cycles and time lines are judged over six linker-shuffled layouts of each arm; of four vetoes, SC8 v2's flips to a pass, TN1's GROUP BY cost is not a cost, AF and D stay rejected (bd-es2im)
+
+- Defect: one unrelated change moved the same rows -5.3%..+6.4% in cycles at identical instructions (TN1-out
+  entry); SC8 v2 was vetoed on scan_filter_agg / gb_id cycles at identical Ir; AF and D on bulk task-clock swings
+  of -34..+22 ms between runs. A single build is a single code placement.
+- Method: `scripts/layout_shuffle_relink.sh`, `scripts/layout_shuffle_pair.sh` (one rch --job per parent/lever
+  pair): build the release-perf CLI once with `-C save-temps --print link-args`, replay the captured cc + rust-lld
+  command unchanged (it must equal cargo's ELF byte for byte), relink K=6 times with
+  `-Wl,--shuffle-sections=.text*=<seed>`. Every workspace source is touched before the parent build and its
+  per-file sha256 list is compared with git (a stale artifact once built D's parent from AF's patched sources: the
+  sync gives a changed file its older local mtime and cargo keeps the newer artifact). Every ELF matches its worker
+  manifest and gives stock's output on a smoke script. No fn_align, no alignment flags (owner decision, bead).
+- Validation (SC8 v2's parent 5afb99152): the six layouts reproduce the band at identical Ir (scan_filter_agg
+  cycles 0.976..1.055 and 0.984..1.066 in two runs, gb_id 0.969..1.032 and 0.963..1.034, bulk 0.963..1.017); a
+  layout's position repeats run to run (rank correlation +0.94 scan_filter_agg, +0.83 gb_id); one ELF re-run stays
+  inside +-2.5%. The unshuffled link sits at 0.966..1.018 of the shuffled median, on the fast side on 9 of 14 rows:
+  the averaged statistic describes random placements, not the shipped one (the bead's NO-CLAIM).
+- Lines (declared on the bead before any lever was judged; three defect fixes published there with their evidence
+  before the runs they apply to): per row and metric, M = median over 6 layouts of each layout's median over reps
+  (read rows 7, delete / update 7, bulk 5, memory_script 5); SE = 1.2533 * sqrt((sd_P^2 + sd_L^2) / 6) from MAD
+  spreads; T = max(1%, 2 SE); WIN / LOSE beyond T only when two independent runs agree. Each run carries Q, the
+  parent's six ELFs again: 168 null comparisons over six runs had median |z| 0.52, 6.5% beyond 2 (normal 4.6%) and
+  1.8% beyond 3.1 (a heavy tail), so one run decides nothing and an "any |z| > 3.1 voids the run" rule voided half
+  the runs and was dropped. Instruction lines unchanged.
+- Re-judge, stock sqlite3 3.46.1 live in every run (thinkstation1, powersave, load 2-10):
+
+  | lever (vetoed by) | layout-averaged, replicated | verdict |
+  |---|---|---|
+  | SC8 v2 (scan_filter_agg / gb_id cycles at equal Ir) | scan_filter_agg 0.991 / 1.005, gb_id 0.994 / 0.996, no row LOSE; join cpu 0.834 / 0.845 WIN, memory_script 0.934 / 0.927 WIN | REJECTED -> passes all its kill lines (the serial lane's lever; not landed here) |
+  | TN1's GROUP BY cost (+3.4 / +4.7% cycles) | every GROUP BY row TIE in three runs (gb_a_sum_c 1.018 / 1.005 / 1.013, gb_a_mod10 1.007 / 0.990 / 0.996); order_by 0.810 / 0.806 / 0.785 WIN | the cost was placement |
+  | AF (bulk task-clock +22 ms, cycles +97.8M) | bulk cpu 1.019 / 0.983, cycles 0.993 / 0.979 TIE; no row LOSE | stays REJECTED: Ir -78.6M, time gain unresolved |
+  | D (bulk task-clock not down) | bulk cpu 0.986 / 0.997, cycles 0.994 / 1.002 TIE (Ir -0.44 / -0.49%); no row LOSE | stays REJECTED: no cost, gain unresolved |
+
+  Integrity split (AGENTS.md gate-change rule): two of four verdicts change (SC8 v2 LOSE -> WIN, TN1's cost LOSE ->
+  TIE), two do not (AF, D). Not every veto flipped to a win.
+- Cost: a pair of arms is one rch --job (a 15-25 min build, 6 relinks, ~1.6 GB of ELFs back); a judgement run is 17
+  min (13 rows, 18 fsqlite arms and stock). Bulk's T was 1.0..2.7%: a lever must move bulk by about 2% before its
+  time can be a replicated WIN.
+- Retry condition: none for the method. A row whose spread makes T larger than a lever's claimed effect cannot
+  carry that claim; a lever that changes a data structure (SC8 v2's slot array) is not randomized by code shuffling.
+
+## 2026-11-19 - REJECTED on its instruction clause (scan rows +0.31..+0.37% Ir against 0.3%; bulk task-clock a replicated layout-averaged WIN, -3.2..-4.5%): Concat and Affinity as arms of the synchronous lane's match (bd-w4pr1.13, bulk-write round 10, lever LA v1)
+
+- Target: the INSERT ... SELECT row body, which left `run_hot_opcodes_sync` three times a row (Concat, Affinity,
+  Insert; `execute_program_body` self 631M over 3.0M dispatches on the bulk row, callgrind of main c216c0852).
+  Touched (not landed; patch `scratchpad/r10/la_v1_on_314ae60b9.diff` of the bulk-write lane, `git diff` sha256
+  a70624847be57cd4): `crates/fsqlite-vdbe/src/engine.rs` (`execute_concat` / `execute_affinity` out of line, the
+  main loop's two arm bodies moved unchanged; two arms in `try_execute_hot_opcode_sync`; test
+  `test_concat_and_affinity_run_on_the_synchronous_lane`).
+- Ledger preflight: the 2026-05-24 Concat and Affinity hot-dispatch promotions (rejected: "not as a standalone
+  patch"; retry on a real workload profile plus the focused criterion benches same-worker); lever AF's retry
+  condition named this; lever S's note that a larger lane loop costs DML scans.
+- Prediction (bd-w4pr1.13, before code): bulk -150M to -300M Ir, task-clock -1.5..-3.5%; memory_script -25M to
+  -60M; update -0.5M to -3M; delete within 0.5M; read rows within 0.1% Ir. Kill: bulk under 100M, bulk task-clock not
+  a replicated WIN, any replicated LOSE, any row +0.3% Ir, a focused bench 5% slower at any size.
+- Result (bd-es2im lines, two valid runs, stock sqlite3 3.46.1 live, thinkstation1; base main 314ae60b9, both
+  arms built behind the stale-artifact guard): bulk Ir -4.5% / -4.65% (-317M / -327M, beyond the prediction), cpu
+  0.956 / 0.968 and cycles 0.955 / 0.964 WIN (stock 4,177.4M); memory_script Ir -1.85%, cpu 0.980 / 0.971 WIN;
+  join_1M_to_pk_1000 cpu 0.977 / 0.957 WIN at equal Ir; update Ir -0.93%; no replicated LOSE. Focused benches
+  (hz4, base -> lever): affinity -3.0 / -16.9 / -36.5%, concat -8.0 / -16.7 / about -19% (64 / 256 / 1024 ops).
+  Killed: scan_filter_agg Ir +0.31%, group_by_1000_groups +0.31 / +0.27%, gb_id_mod100k +0.32%, delete +0.36 /
+  +0.37%: about 4 instructions per scanned row, as two more arms in the lane's match change its code for every
+  opcode a scan runs (lever S's arms cost +19 a row).
+- Retry condition: v2, the same bodies asked only when the lane's match declines an opcode, keeps that match as on
+  main; it is judged on the same lines. If it also costs scan rows over 0.3% Ir, the cost is structural: then a
+  lane that leaves a scanned row less often, or an owner decision on the 0.3% guard.
+
 ## 2026-11-19 - REJECTED (tmpfs scorecard row 9-13% slower, predicted 25% faster; CPU at N=8 +28%): a page-conflict retry whose backoff stops growing at 2 ms while a held lock keeps the 50 ms ceiling (bd-1qmz4, multi-process lane round 3)
 
 - Target: the scorecard's `multiproc_8x500` (8 CLI processes x 500 autocommit INSERTs into one WAL
