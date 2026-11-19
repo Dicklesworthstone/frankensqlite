@@ -2036,3 +2036,339 @@ fn ssi_refused_commit_whose_peer_rolls_back_commits_once_through_its_replay() {
         "no refusal card for a COMMIT that committed: {stdout}"
     );
 }
+
+/// bd-29qkj: the child process of the replay-contention keepers.
+const REPLAY_CONTENTION_ENV: &str = "FSQLITE_REPLAY_CONTENTION_CHILD";
+
+/// The shared conflict log's length (every event, all connections).
+async fn conflict_log_len(monitor: &Connection) -> usize {
+    monitor
+        .query("PRAGMA fsqlite.conflict_log;")
+        .await
+        .expect("conflict log")
+        .len()
+}
+
+/// The shared conflict log's page-lock contention events from entry `from`
+/// on, as `requester:holder` transaction ids.
+async fn contention_events_since(monitor: &Connection, from: usize) -> Vec<String> {
+    let rows = monitor
+        .query("PRAGMA fsqlite.conflict_log;")
+        .await
+        .expect("conflict log");
+    rows[from.min(rows.len())..]
+        .iter()
+        .filter_map(|row| match row.values().get(2) {
+            Some(fsqlite::SqliteValue::Text(event)) if event.contains("PageLockContention") => {
+                Some(format!(
+                    "{}:{}",
+                    event_txn(event, "requester"),
+                    event_txn(event, "holder")
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `name: TxnId(N)` in a conflict-log event.
+fn event_txn(event: &str, name: &str) -> u64 {
+    let key = format!("{name}: TxnId(");
+    let at = event
+        .find(&key)
+        .unwrap_or_else(|| panic!("no {name} in {event}"))
+        + key.len();
+    event[at..]
+        .split(')')
+        .next()
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} id in {event}"))
+}
+
+/// The transaction id of `conn`'s last COMMIT, from its commit_events rows
+/// (commit capture must be on). This is the id conflict events name.
+fn committed_txn_id(conn: &Connection) -> u64 {
+    conn.commit_execution_snapshot()
+        .events
+        .last()
+        .map(|event| event.transaction_id)
+        .expect("the COMMIT recorded its commit_events rows")
+}
+
+fn run_replay_contention_child(scenario: &str) -> String {
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = Command::new(exe)
+        .args([
+            "--exact",
+            "replay_contention_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(REPLAY_CONTENTION_ENV, scenario)
+        .output()
+        .expect("spawn the replay-contention child");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "replay-contention child {scenario} failed:\n{stdout}\n{stderr}"
+    );
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with(&format!("event=replay_contention scenario={scenario} ")))
+        .unwrap_or_else(|| panic!("the {scenario} child must report:\n{stdout}\n{stderr}"))
+        .to_owned();
+    println!("{line}");
+    line
+}
+
+fn contention_field<'a>(line: &'a str, name: &str) -> &'a str {
+    let prefix = format!("{name}=");
+    line.split(' ')
+        .find_map(|token| token.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {name} in {line}"))
+}
+
+fn contention_count(line: &str, name: &str) -> u64 {
+    contention_field(line, name)
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} is a count: {line}"))
+}
+
+/// The shape-2 replay (bd-29qkj step 1): an SSI write skew with the peer open
+/// whose transaction also updates `u`, while a third connection takes `u`'s
+/// page after the first refusal and keeps its transaction open. Every replay
+/// attempt that starts after that waits on the third connection's lock.
+fn third_holds_page_scenario(path: &str) -> String {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let attempts_at_hold = Arc::new(AtomicU64::new(u64::MAX));
+    let third_txn = Arc::new(AtomicU64::new(0));
+    let attempts_before = fsqlite_core::connection::txn_replay_counts().attempts;
+    let third = {
+        let path = path.to_owned();
+        let stop = Arc::clone(&stop);
+        let attempts_at_hold = Arc::clone(&attempts_at_hold);
+        let third_txn = Arc::clone(&third_txn);
+        std::thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async move {
+                let conn = Connection::open(&path).await.expect("third open");
+                conn.set_diagnostic_capture_enabled(true);
+                while fsqlite_core::connection::txn_replay_counts().attempts == attempts_before {
+                    std::thread::sleep(Duration::from_micros(20));
+                }
+                loop {
+                    conn.execute("BEGIN").await.expect("third BEGIN");
+                    if conn
+                        .execute("UPDATE u SET value = value + 100 WHERE id = 1")
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    let _ = conn.execute("ROLLBACK").await;
+                }
+                attempts_at_hold.store(
+                    fsqlite_core::connection::txn_replay_counts().attempts,
+                    Ordering::Release,
+                );
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // Committing names the third connection's transaction id.
+                conn.execute("COMMIT").await.expect("third commits");
+                third_txn.store(committed_txn_id(&conn), Ordering::Release);
+                conn.close().await.expect("third close");
+            });
+        })
+    };
+    let mut measured = None;
+    asupersync::test_utils::run_test(|| async {
+        let monitor = Connection::open(path).await.expect("monitor open");
+        let first = Connection::open(path).await.expect("first open");
+        let second = Connection::open(path).await.expect("second open");
+        first
+            .execute("PRAGMA busy_timeout=2000")
+            .await
+            .expect("busy_timeout");
+        open_write_skew(&first, &second).await;
+        first
+            .execute("UPDATE u SET value = value + 1 WHERE id = 1")
+            .await
+            .expect("first writes u");
+        let log_from = conflict_log_len(&monitor).await;
+        let commit = first.execute("COMMIT").await;
+        let attempts_after = fsqlite_core::connection::txn_replay_counts().attempts;
+        let events = contention_events_since(&monitor, log_from).await;
+        stop.store(true, Ordering::Release);
+        let commit = match commit {
+            Ok(_) => "ok".to_owned(),
+            Err(FrankenError::BusySnapshot { .. }) => "busy_snapshot".to_owned(),
+            Err(error) => format!("error:{}", error.to_string().replace(' ', "_")),
+        };
+        measured = Some((commit, attempts_after, events));
+        second
+            .execute("COMMIT")
+            .await
+            .expect("the survivor commits");
+        first.close().await.expect("first close");
+        second.close().await.expect("second close");
+        monitor.close().await.expect("monitor close");
+    });
+    third.join().expect("third thread");
+    let (commit, attempts_after, events) = measured.expect("the COMMIT ran");
+    format!(
+        "commit={commit} attempts={} attempts_after_hold={} third_txn={} \
+         contention_events={} events={}",
+        attempts_after - attempts_before,
+        attempts_after.saturating_sub(attempts_at_hold.load(Ordering::Acquire)),
+        third_txn.load(Ordering::Acquire),
+        events.len(),
+        events.join(","),
+    )
+}
+
+/// The negative: a plain statement (no replay) contending on a held page.
+fn plain_contention_scenario(path: &str) -> String {
+    let mut report = String::new();
+    asupersync::test_utils::run_test(|| async {
+        let monitor = Connection::open(path).await.expect("monitor open");
+        let holder = Connection::open(path).await.expect("holder open");
+        let requester = Connection::open(path).await.expect("requester open");
+        holder.set_diagnostic_capture_enabled(true);
+        requester
+            .execute("PRAGMA busy_timeout=0")
+            .await
+            .expect("busy_timeout");
+        holder.execute("BEGIN").await.expect("holder BEGIN");
+        holder
+            .execute("UPDATE u SET value = value + 1 WHERE id = 1")
+            .await
+            .expect("holder writes u");
+        requester.execute("BEGIN").await.expect("requester BEGIN");
+        let log_from = conflict_log_len(&monitor).await;
+        let denied = requester
+            .execute("UPDATE u SET value = value + 2 WHERE id = 1")
+            .await
+            .is_err();
+        let events = contention_events_since(&monitor, log_from).await;
+        if requester.in_transaction() {
+            requester
+                .execute("ROLLBACK")
+                .await
+                .expect("requester rolls back");
+        }
+        // Committing names the holder's transaction id.
+        holder.execute("COMMIT").await.expect("holder commits");
+        report = format!(
+            "denied={denied} holder_txn={} contention_events={} events={}",
+            committed_txn_id(&holder),
+            events.len(),
+            events.join(","),
+        );
+        requester.close().await.expect("requester close");
+        holder.close().await.expect("holder close");
+        monitor.close().await.expect("monitor close");
+    });
+    report
+}
+
+/// The child body; a no-op unless the parent set `REPLAY_CONTENTION_ENV`.
+#[test]
+fn replay_contention_child() {
+    let Ok(scenario) = std::env::var(REPLAY_CONTENTION_ENV) else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("contention.db");
+    let path = path.to_str().expect("utf8 path").to_owned();
+    asupersync::test_utils::run_test(|| async {
+        seed_write_skew(&path).await;
+        let seed = Connection::open(&path).await.expect("seed open");
+        seed.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, value INTEGER)")
+            .await
+            .expect("u");
+        seed.execute("INSERT INTO u VALUES(1, 30)")
+            .await
+            .expect("seed u");
+        seed.close().await.expect("seed close");
+    });
+    let report = match scenario.as_str() {
+        "third_holds_page" => third_holds_page_scenario(&path),
+        "plain_contention" => plain_contention_scenario(&path),
+        other => panic!("unknown replay-contention scenario {other}"),
+    };
+    println!("event=replay_contention scenario={scenario} {report}");
+}
+
+/// bd-29qkj: a refused COMMIT whose replay attempts each wait on a page lock
+/// held by a third connection publishes none of those attempts' contention
+/// to the shared conflict log; the caller-visible attempt raised none
+/// either. Only the third connection's own waits may appear. Before the fix
+/// (and with the attempts not quiet) each attempt that met the lock added an
+/// event whose requester is the attempt.
+#[test]
+fn replayed_commit_publishes_no_page_lock_contention_from_its_internal_attempts() {
+    if std::env::var_os(REPLAY_CONTENTION_ENV).is_some() {
+        return;
+    }
+    let line = run_replay_contention_child("third_holds_page");
+    let third_txn = contention_count(&line, "third_txn");
+    assert_ne!(
+        third_txn, 0,
+        "the third connection must hold u's page: {line}"
+    );
+    // Non-vacuity: a replay attempt that meets the third connection's lock
+    // waits on it for the rest of busy_timeout. Without that wait the replay
+    // cycles about 25 attempts per second (50 in 2 s in bd-29qkj step 1), so
+    // a handful of attempts means an attempt waited on the held page.
+    assert!(
+        contention_count(&line, "attempts") <= 5,
+        "non-vacuity: a replay attempt must wait on the third connection's lock: {line}"
+    );
+    assert_eq!(
+        contention_field(&line, "commit"),
+        "busy_snapshot",
+        "the peer stays open, so the COMMIT is refused at busy_timeout: {line}"
+    );
+    let events = contention_field(&line, "events");
+    for event in events.split(',').filter(|event| !event.is_empty()) {
+        let requester: u64 = event
+            .split(':')
+            .next()
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(|| panic!("bad event {event} in {line}"));
+        assert_eq!(
+            requester, third_txn,
+            "only the third connection's own waits are public; {event} is a replay attempt's: {line}"
+        );
+    }
+}
+
+/// The negative: a statement that contends on a held page with no replay
+/// still logs exactly one event naming its requester and the holder. A fix
+/// that silenced page-lock contention everywhere fails here.
+#[test]
+fn plain_statement_contending_on_a_held_page_still_logs_its_contention() {
+    if std::env::var_os(REPLAY_CONTENTION_ENV).is_some() {
+        return;
+    }
+    let line = run_replay_contention_child("plain_contention");
+    assert_eq!(contention_field(&line, "denied"), "true", "{line}");
+    assert_eq!(contention_count(&line, "contention_events"), 1, "{line}");
+    let event = contention_field(&line, "events");
+    let (requester, holder) = event
+        .split_once(':')
+        .unwrap_or_else(|| panic!("bad event {event} in {line}"));
+    assert_eq!(
+        holder,
+        contention_count(&line, "holder_txn").to_string(),
+        "the event names the holder: {line}"
+    );
+    assert_ne!(
+        requester, holder,
+        "the requester is the other transaction: {line}"
+    );
+}

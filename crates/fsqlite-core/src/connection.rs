@@ -80818,13 +80818,8 @@ impl Connection {
         let audit_hash = session_id ^ planned_commit_seq.get();
         let gate_skipped_ssi =
             begin_time_serializable && self.should_skip_ssi_validation(audit_hash);
-        // bd-7dxmt: a replay attempt is internal to one public COMMIT, so its
-        // preparation keeps conflict events out of the shared observer.
-        if self.txn_replay_attempt_in_progress()
-            && let Some(mut handle) = registry.get_mut(session_id)
-        {
-            handle.set_observation_quiet(true);
-        }
+        // A replay attempt's handle is already quiet from its BEGIN
+        // (bd-7dxmt, bd-29qkj): its preparation publishes no conflict events.
 
         let prepare_outcome = if gate_skipped_ssi || !begin_time_serializable {
             prepare_concurrent_commit_fcw_only(

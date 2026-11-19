@@ -513,10 +513,11 @@ pub struct ConcurrentHandle {
     /// rollback, reuse) drops it through
     /// [`ConcurrentHandle::invalidate_view_parts`].
     view_parts_cache: Option<Arc<HandleViewParts>>,
-    /// bd-7dxmt: this transaction is an internal attempt that its owner will
-    /// report as part of one public outcome (a replayed COMMIT), so commit
-    /// preparation emits none of its conflict events to the shared observer.
-    /// Validation itself is unchanged. Cleared on reuse.
+    /// bd-7dxmt / bd-29qkj: this transaction is an internal attempt that its
+    /// owner will report as part of one public outcome (a replayed COMMIT).
+    /// None of its conflict events reach the shared observer: neither commit
+    /// preparation's nor its statements' page-lock contention. Validation and
+    /// lock acquisition are unchanged. Cleared on reuse.
     observation_quiet: bool,
 }
 
@@ -680,8 +681,8 @@ impl ConcurrentHandle {
         self.observation_quiet = quiet;
     }
 
-    /// Whether commit preparation keeps this transaction's conflict events
-    /// out of the shared observer.
+    /// Whether this transaction's conflict events stay out of the shared
+    /// observer (commit preparation and page-lock contention alike).
     #[must_use]
     pub const fn observation_quiet(&self) -> bool {
         self.observation_quiet
@@ -1919,7 +1920,11 @@ pub fn concurrent_prepare_write_page(
     let already_tracked = handle.tracks_write_conflict_page(page);
     if !holds_lock {
         let txn_id = handle.txn_token().id;
-        if lock_table.try_acquire(page, txn_id).is_err() {
+        // bd-29qkj: a replay attempt's contention is not public evidence.
+        if lock_table
+            .try_acquire_observed(page, txn_id, !handle.observation_quiet())
+            .is_err()
+        {
             handle.remove_page_state_if_empty(page);
             return Err(MvccError::Busy);
         }
@@ -2115,7 +2120,10 @@ pub fn concurrent_track_write_conflict_page(
     }
 
     let txn_id = handle.txn_token().id;
-    if lock_table.try_acquire(page, txn_id).is_err() {
+    if lock_table
+        .try_acquire_observed(page, txn_id, !handle.observation_quiet())
+        .is_err()
+    {
         handle.remove_page_state_if_empty(page);
         return Err(MvccError::Busy);
     }
@@ -2170,7 +2178,10 @@ pub fn concurrent_free_page(
 
     let txn_id = handle.txn_token().id;
     let already_tracked = handle.tracks_write_conflict_page(page);
-    if lock_table.try_acquire(page, txn_id).is_err() {
+    if lock_table
+        .try_acquire_observed(page, txn_id, !handle.observation_quiet())
+        .is_err()
+    {
         handle.remove_page_state_if_empty(page);
         return Err(MvccError::Busy);
     }
@@ -4805,9 +4816,13 @@ pub fn concurrent_rollback_to_savepoint(
     }
     let txn_id = handle.txn_token().id;
     let mut reacquired_pages = Vec::new();
+    let observe = !handle.observation_quiet();
     for &page in savepoint.page_states_snapshot.keys() {
         if !handle.page_state(page).is_some_and(|state| state.held_lock) {
-            if lock_table.try_acquire(page, txn_id).is_err() {
+            if lock_table
+                .try_acquire_observed(page, txn_id, observe)
+                .is_err()
+            {
                 for reacquired in reacquired_pages {
                     lock_table.release(reacquired, txn_id);
                 }

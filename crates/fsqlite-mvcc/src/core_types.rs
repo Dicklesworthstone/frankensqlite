@@ -997,7 +997,23 @@ impl InProcessPageLockTable {
     /// For pages above `FAST_LOCK_ARRAY_SIZE`, a rolling rebuild (§5.6.3.1)
     /// checks the draining table first. A lock in the draining table is still
     /// valid and blocks new acquisitions by other transactions.
+    #[inline]
     pub fn try_acquire(&self, page: PageNumber, txn: TxnId) -> Result<(), TxnId> {
+        self.try_acquire_observed(page, txn, true)
+    }
+
+    /// [`Self::try_acquire`], publishing a contention event to the observer
+    /// only when `observe` is set. bd-29qkj: a commit replay's internal
+    /// attempt contends exactly as any transaction does, but its contention
+    /// is not public evidence; the public COMMIT reports its caller-visible
+    /// attempt only. The acquisition and its result do not depend on
+    /// `observe`.
+    pub fn try_acquire_observed(
+        &self,
+        page: PageNumber,
+        txn: TxnId,
+        observe: bool,
+    ) -> Result<(), TxnId> {
         let pgno = page.get() as usize;
 
         // Step 0: During rebuilds, only sharded pages can exist in draining.
@@ -1016,12 +1032,14 @@ impl InProcessPageLockTable {
                         drop(draining_guard);
                         return Ok(()); // already held by this txn in draining table
                     }
-                    crate::observability::emit_page_lock_contention(
-                        &self.observer,
-                        page,
-                        txn,
-                        holder,
-                    );
+                    if observe {
+                        crate::observability::emit_page_lock_contention(
+                            &self.observer,
+                            page,
+                            txn,
+                            holder,
+                        );
+                    }
                     return Err(holder);
                 }
             }
@@ -1047,12 +1065,14 @@ impl InProcessPageLockTable {
                     // so TxnId::new is guaranteed to succeed.
                     let holder =
                         TxnId::new(current).expect("page lock slot held non-zero non-TxnId");
-                    crate::observability::emit_page_lock_contention(
-                        &self.observer,
-                        page,
-                        txn,
-                        holder,
-                    );
+                    if observe {
+                        crate::observability::emit_page_lock_contention(
+                            &self.observer,
+                            page,
+                            txn,
+                            holder,
+                        );
+                    }
                     return Err(holder);
                 }
             }
@@ -1068,12 +1088,14 @@ impl InProcessPageLockTable {
             match self.fc_shards[shard_idx].try_acquire(page, txn) {
                 Ok(()) => Ok(()),
                 Err(holder) => {
-                    crate::observability::emit_page_lock_contention(
-                        &self.observer,
-                        page,
-                        txn,
-                        holder,
-                    );
+                    if observe {
+                        crate::observability::emit_page_lock_contention(
+                            &self.observer,
+                            page,
+                            txn,
+                            holder,
+                        );
+                    }
                     Err(holder)
                 }
             }
@@ -1086,7 +1108,14 @@ impl InProcessPageLockTable {
                 if holder == txn {
                     return Ok(()); // already held by this txn
                 }
-                crate::observability::emit_page_lock_contention(&self.observer, page, txn, holder);
+                if observe {
+                    crate::observability::emit_page_lock_contention(
+                        &self.observer,
+                        page,
+                        txn,
+                        holder,
+                    );
+                }
                 return Err(holder);
             }
             map.insert(page, txn);

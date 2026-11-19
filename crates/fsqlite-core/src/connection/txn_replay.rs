@@ -633,11 +633,19 @@ impl Connection {
         }
     }
 
-    /// bd-7dxmt: a replay attempt's commit preparation keeps its conflict
-    /// events out of the shared observer; the public COMMIT reports one
-    /// outcome.
-    pub(super) fn txn_replay_attempt_in_progress(&self) -> bool {
-        self.txn_replay.replaying.get()
+    /// bd-7dxmt / bd-29qkj: a replay attempt is internal to one public COMMIT,
+    /// so none of its conflict events reach the shared observer: neither its
+    /// commit preparation's nor its statements' page-lock contention. Set on
+    /// the attempt's own transaction right after its BEGIN; the next BEGIN's
+    /// handle reset clears it.
+    fn txn_replay_quiet_attempt(&self) {
+        let Some(session_id) = *self.concurrent_session_id.borrow() else {
+            return;
+        };
+        let registry = lock_unpoisoned(&self.concurrent_registry);
+        if let Some(mut handle) = registry.get_mut(session_id) {
+            handle.set_observation_quiet(true);
+        }
     }
 
     /// The caller read `last_insert_rowid()` through the API.
@@ -1007,6 +1015,7 @@ impl Connection {
             self.replay_rollback(cx).await;
             return ReplayAttempt::Diverged;
         }
+        self.txn_replay_quiet_attempt();
         for (index, entry) in log.entries.iter().enumerate() {
             if !self.replay_rowid_reads_match(log, index) {
                 self.replay_rollback(cx).await;
