@@ -3154,7 +3154,10 @@ impl UnixFile {
         regions: &HashMap<u32, ShmRegion>,
         file: &File,
     ) {
-        warn!(
+        // bd-cdgfp: a Busy slot attempt is routine contention that its caller
+        // retries inside the busy budget, so this is a DEBUG event. At WARN,
+        // every retry of a contended COMMIT wrote a line.
+        tracing::debug!(
             slot,
             lock_byte = wal_lock_byte(slot),
             requested_mode,
@@ -12702,6 +12705,96 @@ mod tests {
         reader.shm_unmap(&cx, true).unwrap();
         writer.close(&cx).unwrap();
         reader.close(&cx).unwrap();
+    }
+
+    /// bd-cdgfp: a Busy SHM slot attempt is routine contention, retried by its
+    /// caller inside the busy budget, so its conflict line is a DEBUG event.
+    /// Red on main, where every such retry logged at WARN. Negative: the
+    /// conflict line itself is still emitted (lowered, not removed), and the
+    /// attempt still answers Busy.
+    #[test]
+    fn bd_cdgfp_busy_shm_slot_conflict_logs_at_debug_not_warn() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Events(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), message.0));
+            }
+        }
+
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        let busy = tracing::subscriber::with_default(subscriber, || {
+            let cx = Cx::new();
+            let vfs = UnixVfs::new();
+            let (_dir, path) = make_temp_path("bd_cdgfp_conflict.db");
+            let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            writer.write(&cx, b"x", 0).unwrap();
+            let _w_region = writer.shm_map(&cx, 0, 32768, true).unwrap();
+            let _p_region = peer.shm_map(&cx, 0, 32768, true).unwrap();
+            writer
+                .shm_lock(
+                    &cx,
+                    WAL_WRITE_LOCK,
+                    1,
+                    SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+                )
+                .unwrap();
+            let busy = peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            );
+            writer
+                .shm_lock(
+                    &cx,
+                    WAL_WRITE_LOCK,
+                    1,
+                    SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+                )
+                .unwrap();
+            busy
+        });
+        assert!(
+            matches!(busy, Err(FrankenError::Busy)),
+            "the contended slot attempt must still answer Busy, got {busy:?}"
+        );
+        let events = events.0.lock().unwrap().clone();
+        let conflicts: Vec<_> = events
+            .iter()
+            .filter(|(_, message)| message.contains("legacy shm lock protocol conflict"))
+            .collect();
+        assert!(
+            !conflicts.is_empty(),
+            "negative: the conflict must still be logged, at DEBUG; events: {events:?}"
+        );
+        assert!(
+            conflicts
+                .iter()
+                .all(|(level, _)| *level == tracing::Level::DEBUG),
+            "a routine Busy retry must not log above DEBUG: {conflicts:?}"
+        );
     }
 
     #[test]
