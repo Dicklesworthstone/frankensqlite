@@ -94,6 +94,41 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - REJECTED in all three constructions (plain programs' instructions do not stay unchanged): the synchronous lane chosen per program, so that only a program with a Concat or an Affinity runs them on it (bd-w4pr1.13, bulk-write round 11, lever LA v3)
+
+- Target and kill lines: as LA v1 (entry below), plus the coordinator's line: rows whose programs contain neither
+  opcode keep their instructions exactly. Touched (not landed; patches `scratchpad/r11/la3_on_1292d7b3c.diff`,
+  `la3b_on_1292d7b3c.diff`, `la3c_on_1292d7b3c.diff` of the bulk-write lane): `crates/fsqlite-vdbe/src/engine.rs`,
+  `crates/fsqlite-vdbe/src/lib.rs` (`HotLane` precomputed in `ProgramBuilder::finish`; the main loop's Concat and
+  Affinity bodies moved into out-of-line `execute_concat` / `execute_affinity`).
+- Static check, declared before each build: today's `run_hot_opcodes_sync` (98,414 B on 1292d7b3c) keeps its size and
+  its address-masked instruction sequence (`scratchpad/r11/fn_same.py`; controls: two builds of the parent match,
+  v3b's lane does not).
+- v3 (`run_hot_opcodes_sync<const ROW_BODY: bool>`, two instances, picked once per statement through a function
+  pointer): the `false` instance is 53,351 B. Seven helpers the single lane inlines today
+  (`try_column_to_reg_in_place`, `try_column_to_reg_direct_local`, `try_sorter_column_to_reg`,
+  `execute_vcolumn_hot`, `execute_vnext_hot`, `take_reg_with_subtype`, `CursorBackend::try_next_within_leaf`) have
+  two lane callers and went out of line. One layout-averaged run (stock live): plain rows +0.95%
+  (rowid_lookups_200k) to +9.3% (gb_a_sum_c) Ir; six rows LOSE in cycles in that run; bulk -119.4M Ir (-1.69%),
+  cpu TIE.
+- v3b (v3 with `#[inline(always)]` on those seven): the `false` instance is 58,356 B. Two more helpers went out of
+  line (`try_read_column_in_place`, `BtCursor::try_advance_next_within_leaf` in three instances). Not run.
+- v3c (today's single lane, wrapped by an out-of-line `run_row_body_lane` that runs Concat and Affinity between
+  its turns, the wrapper or the lane picked per statement through a function pointer): `run_hot_opcodes_sync` is
+  99,914 B from unchanged source, and its call sites changed (`pool_return_reusable` 34 -> 38, `drop_glue<SqliteValue>`
+  6 -> 7, one `set_register_subtype` inlined). One informational run (base 1292d7b3c, stock live, null 1.0000 on
+  every read row): plain rows -0.33% (order_by_text_limit10) to +0.31% (delete_14pct_300k) Ir; bulk -103.6M Ir
+  (-1.47%; predicted -150M to -230M), cpu 0.983 WIN; memory_script -18.0M (predicted -25M to -50M); update +0.17%
+  (predicted -0.2% to -1.0%).
+- Why: with codegen-units=1 and fat LTO, the lane's machine code depends on the engine's whole call graph, not only on
+  its source. A second instance, a second caller, a taken address or a main-loop arm moved out of line each changed
+  what LLVM inlined into the lane. No construction found leaves today's lane byte-identical and adds no instruction
+  per lane entry: selecting by a branch costs every lane entry, and every other selection changes the lane.
+- Retry condition: an owner decision that plain rows are judged by a band (for example the 0.3% instruction guard
+  and the layout-averaged cycles lines) instead of exactly. v3c is then the starting point (the smallest
+  perturbation, +3 KB .text), with its gains re-predicted from the run above. Otherwise, a synchronous lane that
+  row-body programs need not leave for the statement loop at all.
+
 ## 2026-11-19 - FIX (landed as 0a2ada09a; a regression of the bd-q4o7z landing, judged against its 2% kill line): the commit replay's per-call hook no longer builds a future, and a prepared execute skips the nested wrapper; the one-writer prepared insert's excess drops from +3.7% to +1.84% Ir per row (bd-q4o7z probe 5, multi-process lane rounds 3-4)
 
 - Target: bd-q4o7z probe 5, the recording cost on mt-mvcc-bench at 1/8/32 writers.
