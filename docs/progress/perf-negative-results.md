@@ -94,6 +94,72 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - FIX (landed as 0a2ada09a; a regression of the bd-q4o7z landing, judged against its 2% kill line): the commit replay's per-call hook no longer builds a future, and a prepared execute skips the nested wrapper; the one-writer prepared insert's excess drops from +3.7% to +1.84% Ir per row (bd-q4o7z probe 5, multi-process lane rounds 3-4)
+
+- Target: bd-q4o7z probe 5, the recording cost on mt-mvcc-bench at 1/8/32 writers.
+  - The default bulk shape is 1,000 rows per BEGIN CONCURRENT transaction through one prepared
+    INSERT. It never records, so the whole cost is the hook.
+  - Touched: `crates/fsqlite-core/src/connection.rs`, with its 16 public wrappers and the bodies of
+    `PreparedStatement::execute{,_with_params}`. Also `connection/txn_replay.rs`
+    (`txn_replay_leave`, `ReplayLeave`).
+- Cause:
+  - Each row went through two enter/leave pairs: `PreparedStatement::execute_with_params`, and the
+    nested `Connection::execute_prepared_with_params`. The nested one never records, because it
+    always runs inside the outer call.
+  - Each pair awaited an async `txn_replay_leave`. Its state machine, about 330 bytes, was built
+    and polled once per call.
+- Attribution: callgrind, collection toggled on the per-row poll
+  `PreparedStatement::execute_with_params::{closure#0}`, 4,000 rows, symbolized release-perf.
+  - The isolating base is the same tree with a3d329d47 reverted, as an uncommitted scratch build.
+  - v1 (synchronous leave only), on 74bd92b09: +250.8 Ir per row over 6,774.7.
+    - outer wrapper +93;
+    - nested wrapper inlined into the reprepare closure +81;
+    - two out-of-line `txn_replay_leave::<usize>` calls +73.
+  - This change, as landed on bfadb3374 together with bd-7dxmt (d46a7cd1f): +125.1 Ir per row over
+    6,785.4 (+1.84%).
+    - The nested wrapper is skipped, and the leave's non-recording path is inlined.
+    - What remains is the outer wrapper's enter/leave logic, inlined into the per-row closure
+      (+106), and the extra future layer's drop glue (+27).
+    - An earlier bd-7dxmt draft put the commit evidence in the per-call scope. Enter and leave then
+      stopped inlining (+51 Ir per row), so the landed bd-7dxmt keeps that state in
+      TxnReplayState.
+- Ledger preflight: round 2's bd-q4o7z entry. Its v1, an awaited enter/leave around a moved body,
+  cost +1% CPU. v2 then measured only the CLI per-transaction count (+0.9%), never a prepared bulk
+  path.
+- Result: mt-mvcc-bench fsqlite p50 throughput of the landing binary, against the isolating base,
+  with A/A arms. Each line gives the two land arms (the same ELF twice), then the base's own A/A
+  arm.
+  - 1 writer, 12 reps: 0.998 / 0.978; base A/A 1.004.
+    - Paired per rep: 0.996 / 0.976 (mean -1.4%); base A/A 0.9965.
+    - Stock inside each binary pairs at 1.019 / 1.010 / 0.988.
+  - 8 writers, 5 reps: 1.024 / 0.980; base A/A 1.001.
+  - 32 writers, 5 reps: 0.976 / 0.964; base A/A 0.997.
+    - Paired: 0.985 / 0.992.
+    - In the previous run of the earlier landing binary, the base's A/A arm itself read 0.962.
+    - Rows failed in every arm at 32 writers, the base included (28,000-56,000 per arm over 5
+      reps, out of 352,000 per rep). That happened before a3d329d47 too.
+  - Verdict:
+    - The exact instruction excess is +1.84%, under the 2% line.
+    - Time is inside the A/A band at 1 and 8 writers.
+    - 32 writers is not decidable at this rep count.
+  - ELF sha256, self-reported in-process: landing 1ed49967ee43bbb7, isolating base
+    81863b48bc76e560.
+- Setup:
+  - release-perf, symbolized, mt-mvcc-bench;
+  - stock SQLite live in every invocation;
+  - thinkstation1, powersave, TMPDIR on tmpfs;
+  - A/A arms of both binaries. Scratchpad: `mp3/bench_land3_*.txt`.
+  - The bench reports citable=false for every arm under bd-uh1fv's standing policy, so these are
+    internal A/B numbers.
+- Time is placement-bound here:
+  - In the earlier landing binary's 1-writer run, stock's own p50 inside that binary was 0.93 of
+    the base binary's. Stock's code is identical in both, so that is code placement (bd-es2im's
+    METHOD entry), not this change.
+  - The instruction count above is the exact measure.
+- Retry condition: fold the `_unrecorded` body into the public method, so the hot call has one
+  future layer. Worth doing if a later shape shows the outer wrapper above 1% of a
+  prepared-statement profile, or if probe 5 needs the last 1.8%.
+
 ## 2026-11-19 - WIN (landed as 3dc23aad9; a little beyond its prediction): firing a trigger clones neither its definition nor its OLD/NEW frame (bd-fpr5g, SQL lane round 5, lever 2)
 
 - Target: the per-firing copies of the trigger machinery. Callgrind on trig_src_2000 (release-perf,
