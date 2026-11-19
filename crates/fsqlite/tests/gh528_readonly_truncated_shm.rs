@@ -176,6 +176,13 @@ fn family(db: &Path) -> BTreeMap<String, Vec<u8>> {
 /// returned writer stays attached: closing the last stock connection would
 /// checkpoint the WAL away, so copies are taken while it is open.
 fn stock_fixture(dir: &Path) -> (rusqlite::Connection, PathBuf) {
+    let (writer, db, _) = stock_fixture_with_stale_shm(dir);
+    (writer, db)
+}
+
+/// [`stock_fixture`], plus the writer's `-shm` as it stood 10 commits before
+/// the end: a valid index that misses the WAL's last 10 frames.
+fn stock_fixture_with_stale_shm(dir: &Path) -> (rusqlite::Connection, PathBuf, Vec<u8>) {
     let db = dir.join("source.db");
     let writer = rusqlite::Connection::open(&db).unwrap();
     writer
@@ -184,6 +191,7 @@ fn stock_fixture(dir: &Path) -> (rusqlite::Connection, PathBuf) {
              CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL);",
         )
         .unwrap();
+    let mut stale_shm = Vec::new();
     for (id, v) in expected_rows() {
         writer
             .execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, v])
@@ -193,8 +201,11 @@ fn stock_fixture(dir: &Path) -> (rusqlite::Connection, PathBuf) {
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
                 .unwrap();
         }
+        if id == ROWS - 10 {
+            stale_shm = std::fs::read(sidecar(&db, "-shm")).unwrap();
+        }
     }
-    (writer, db)
+    (writer, db, stale_shm)
 }
 
 fn copy_family(source: &Path, to: &Path) -> PathBuf {
@@ -352,8 +363,28 @@ enum ReadOnlyShape {
     ShmZeroFilled,
     /// A valid index the reader may not write (GH#535's comment).
     ShmValidReadOnly,
+    /// The 3-byte marker, unwritable.
+    ShmThreeBytesReadOnly,
+    /// The uninitialized region, unwritable.
+    ShmZeroFilledReadOnly,
+    /// A valid index from 10 commits ago, unwritable: trusting it would miss
+    /// the WAL's last 10 frames.
+    ShmStaleReadOnly,
     /// `immutable=1`: no locks, no `-wal`, no `-shm`.
     Immutable,
+}
+
+impl ReadOnlyShape {
+    /// The `-shm` neither engine may write.
+    fn shm_unwritable(self) -> bool {
+        matches!(
+            self,
+            Self::ShmValidReadOnly
+                | Self::ShmThreeBytesReadOnly
+                | Self::ShmZeroFilledReadOnly
+                | Self::ShmStaleReadOnly
+        )
+    }
 }
 
 /// bd-j2dtf: a read-only open beside a live stock process's answer for the
@@ -362,18 +393,27 @@ enum ReadOnlyShape {
 /// `-shm`, reads every row and leaves the main file and the WAL unchanged.
 /// FrankenSQLite must give the same rows and the same rebuilt index.
 /// `immutable=1` (bd-j2dtf item 3) must read what stock reads, the main file
-/// alone, and write nothing. A read-only `-shm` is not implemented yet
-/// (bd-j2dtf item 2): there FrankenSQLite may refuse, but it may never answer
-/// differently from stock or write anything.
+/// alone, and write nothing.
+///
+/// bd-j2dtf item 2: over a `-shm` neither engine may write (0444, or chattr
+/// +i where the process is root), valid, 3-byte, zero-filled or stale, with
+/// no live connection on the copy, stock reads the WAL through a private
+/// heap index (`walBeginShmUnreliable`) and writes nothing. FrankenSQLite
+/// must read the same 30 rows and write nothing. The stale shape is the
+/// negative a naive "map it read-only and trust it" fails: its index misses
+/// the last 10 frames, so that reader returns 20 rows.
 #[test]
 fn read_only_opens_match_a_live_stock_process() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
-        let (writer, source) = stock_fixture(dir.path());
+        let (writer, source, stale_shm) = stock_fixture_with_stale_shm(dir.path());
         for shape in [
             ReadOnlyShape::ShmThreeBytes,
             ReadOnlyShape::ShmZeroFilled,
             ReadOnlyShape::ShmValidReadOnly,
+            ReadOnlyShape::ShmThreeBytesReadOnly,
+            ReadOnlyShape::ShmZeroFilledReadOnly,
+            ReadOnlyShape::ShmStaleReadOnly,
             ReadOnlyShape::Immutable,
         ] {
             let context = format!("{shape:?}");
@@ -384,7 +424,7 @@ fn read_only_opens_match_a_live_stock_process() {
             for db in &arms {
                 let shm = sidecar(db, "-shm");
                 match shape {
-                    ReadOnlyShape::ShmThreeBytes => {
+                    ReadOnlyShape::ShmThreeBytes | ReadOnlyShape::ShmThreeBytesReadOnly => {
                         std::fs::OpenOptions::new()
                             .write(true)
                             .open(&shm)
@@ -392,14 +432,16 @@ fn read_only_opens_match_a_live_stock_process() {
                             .set_len(3)
                             .unwrap();
                     }
-                    ReadOnlyShape::ShmZeroFilled => {
+                    ReadOnlyShape::ShmZeroFilled | ReadOnlyShape::ShmZeroFilledReadOnly => {
                         std::fs::write(&shm, vec![0_u8; SHM_REGION]).unwrap();
                     }
-                    ReadOnlyShape::ShmValidReadOnly => {
-                        std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o444))
-                            .unwrap();
+                    ReadOnlyShape::ShmStaleReadOnly => {
+                        std::fs::write(&shm, &stale_shm).unwrap();
                     }
-                    ReadOnlyShape::Immutable => {}
+                    ReadOnlyShape::ShmValidReadOnly | ReadOnlyShape::Immutable => {}
+                }
+                if shape.shm_unwritable() {
+                    std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o444)).unwrap();
                 }
             }
             // The 0444 shape needs a `-shm` neither engine can write. Root
@@ -410,9 +452,7 @@ fn read_only_opens_match_a_live_stock_process() {
                 .iter()
                 .map(|db| sidecar(db, "-shm"))
                 .collect::<Vec<_>>();
-            let _immutable = if shape == ReadOnlyShape::ShmValidReadOnly
-                && shms.iter().any(|shm| writable(shm))
-            {
+            let _immutable = if shape.shm_unwritable() && shms.iter().any(|shm| writable(shm)) {
                 match ImmutableFiles::set(&shms) {
                     Some(guard) if !shms.iter().any(|shm| writable(shm)) => {
                         eprintln!(
@@ -508,12 +548,17 @@ fn read_only_opens_match_a_live_stock_process() {
                         "{context}: fsqlite rebuilds the index stock rebuilds"
                     );
                 }
-                ReadOnlyShape::ShmValidReadOnly => {
+                ReadOnlyShape::ShmValidReadOnly
+                | ReadOnlyShape::ShmThreeBytesReadOnly
+                | ReadOnlyShape::ShmZeroFilledReadOnly
+                | ReadOnlyShape::ShmStaleReadOnly => {
                     assert_eq!(stock_after, before, "{context}: stock writes nothing");
                     assert_eq!(frank_after, before, "{context}: fsqlite must write nothing");
-                    if let Ok(rows) = frank {
-                        assert_eq!(rows, stock_rows, "{context}: never a different answer");
-                    }
+                    assert_eq!(
+                        frank,
+                        Ok(stock_rows),
+                        "{context}: fsqlite reads what stock reads through a private index"
+                    );
                 }
                 ReadOnlyShape::Immutable => {
                     assert_eq!(stock_after, before, "{context}: stock writes nothing");

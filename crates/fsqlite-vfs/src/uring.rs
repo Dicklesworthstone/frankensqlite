@@ -1399,6 +1399,14 @@ impl Vfs for IoUringVfs {
         self.unix.probe_foreign_wal_participation(cx, path)
     }
 
+    fn probe_foreign_shm_attachment(
+        &self,
+        cx: &Cx,
+        path: &Path,
+    ) -> Result<crate::traits::ForeignWalParticipation> {
+        self.unix.probe_foreign_shm_attachment(cx, path)
+    }
+
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
         self.unix.full_pathname(cx, path)
     }
@@ -1610,6 +1618,14 @@ impl VfsFile for IoUringFile {
 
     fn wal_reader_slot_release(&mut self, cx: &Cx, slot: u32) -> Result<()> {
         self.inner.wal_reader_slot_release(cx, slot)
+    }
+
+    fn wal_private_reader_claim_acquire(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_private_reader_claim_acquire(cx)
+    }
+
+    fn wal_private_reader_claim_release(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_private_reader_claim_release(cx)
     }
 
     fn wal_checkpoint_backfill_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {

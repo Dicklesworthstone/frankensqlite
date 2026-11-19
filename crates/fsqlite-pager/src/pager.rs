@@ -4441,6 +4441,9 @@ enum MaintenanceFence {
 enum WalReaderWindow {
     Registered(u32),
     Native(NativeReaderAttempt),
+    /// bd-j2dtf item 2: stock's private-index reader claim,
+    /// `WAL_READ_LOCK(0)` SHARED on a read-only `-shm` descriptor.
+    PrivateIndex,
 }
 
 struct CheckpointCleanup {
@@ -15741,7 +15744,17 @@ where
             if inner.journal_mode == JournalMode::Wal && active_transactions_before_begin == 0
                 && admission.external_lock.native_reader.is_none()
             {
-                register_wal_reader_slot(&mut inner, cx, wal_conflict_snapshot.as_ref()).await?;
+                let private_index = with_wal_backend_read(&self.wal_backend, cx, |wal, _| {
+                    Box::pin(async move { Ok(wal.reads_through_private_index()) })
+                })
+                .await?;
+                register_wal_reader_slot(
+                    &mut inner,
+                    cx,
+                    wal_conflict_snapshot.as_ref(),
+                    private_index,
+                )
+                .await?;
             }
 
             inner.active_transactions =
@@ -27224,10 +27237,16 @@ fn wal_reader_mark_for_snapshot(snapshot: Option<&traits::WalPublicationSnapshot
 /// through. Registration errors propagate for both access modes: a read-only
 /// snapshot also needs checkpoint protection, and silently proceeding without
 /// a reader slot would let a peer backfill or reset underneath that snapshot.
+///
+/// bd-j2dtf item 2: with `private_index` (the connection reads the WAL
+/// through its own index over a `-shm` it may not write), the window takes
+/// stock's `walBeginShmUnreliable` claim instead: `WAL_READ_LOCK(0)` SHARED
+/// on a read-only `-shm` descriptor. Nothing is published, mapped or created.
 async fn register_wal_reader_slot<F: VfsFile>(
     inner: &mut PagerInner<F>,
     cx: &Cx,
     snapshot: Option<&traits::WalPublicationSnapshot>,
+    private_index: bool,
 ) -> Result<()> {
     let mx_frame = wal_reader_mark_for_snapshot(snapshot);
     let acquired = {
@@ -27244,24 +27263,36 @@ async fn register_wal_reader_slot<F: VfsFile>(
                 db_file.wal_reader_slot_release(cx, *stale)?;
                 inner.wal_reader = None;
             }
+            Some(WalReaderWindow::PrivateIndex) => {
+                db_file.wal_private_reader_claim_release(cx)?;
+                inner.wal_reader = None;
+            }
             None => {}
         }
-        db_file.wal_reader_slot_acquire(cx, mx_frame)
-    };
-    match acquired {
-        Ok(slot) => {
-            inner.wal_reader = slot.map(WalReaderWindow::Registered);
-            tracing::debug!(
-                target: "fsqlite::wal::checkpoint_coordination",
-                trace_id = cx.trace_id(),
-                mx_frame,
-                reader_slot = ?slot,
-                "registered WAL read snapshot with the cross-process reader table"
-            );
-            Ok(())
+        if private_index {
+            db_file
+                .wal_private_reader_claim_acquire(cx)
+                .map(|()| Some(WalReaderWindow::PrivateIndex))
+        } else {
+            db_file
+                .wal_reader_slot_acquire(cx, mx_frame)
+                .map(|slot| slot.map(WalReaderWindow::Registered))
         }
-        Err(error) => Err(error),
-    }
+    };
+    let window = acquired?;
+    tracing::debug!(
+        target: "fsqlite::wal::checkpoint_coordination",
+        trace_id = cx.trace_id(),
+        mx_frame,
+        reader_slot = ?window.as_ref().and_then(|window| match window {
+            WalReaderWindow::Registered(slot) => Some(*slot),
+            WalReaderWindow::Native(_) | WalReaderWindow::PrivateIndex => None,
+        }),
+        private_index,
+        "registered WAL read snapshot with the cross-process reader table"
+    );
+    inner.wal_reader = window;
+    Ok(())
 }
 
 /// GH#399: release the reader slot held for the active-transaction window
@@ -27299,6 +27330,7 @@ fn release_wal_reader_claim<F: VfsFile>(
     match &mut inner.wal_reader {
         Some(WalReaderWindow::Registered(slot)) => file.wal_reader_slot_release(cx, *slot)?,
         Some(WalReaderWindow::Native(reader)) => reader.restore_claim(file, cx)?,
+        Some(WalReaderWindow::PrivateIndex) => file.wal_private_reader_claim_release(cx)?,
         None => return Ok(()),
     }
     inner.wal_reader = None;

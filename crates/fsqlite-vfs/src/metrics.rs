@@ -557,6 +557,14 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         self.inner.wal_reader_slot_release(cx, slot)
     }
 
+    fn wal_private_reader_claim_acquire(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_private_reader_claim_acquire(cx)
+    }
+
+    fn wal_private_reader_claim_release(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_private_reader_claim_release(cx)
+    }
+
     fn wal_checkpoint_backfill_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
         self.inner.wal_checkpoint_backfill_gate_acquire(cx)
     }

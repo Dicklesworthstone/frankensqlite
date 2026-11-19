@@ -387,6 +387,10 @@ pub struct WalBackendAdapter<F: VfsFile> {
     pending_checkpoint_reset: Option<PendingCheckpointReset<F>>,
     /// Mapping capability for this pager's exact native main-file attachment.
     wal_index_shm_source: Option<Arc<WalIndexShmSource<F>>>,
+    /// bd-j2dtf item 2: a read-only connection over a `-shm` it may not write
+    /// reads the WAL through this adapter's own index, with stock's
+    /// `WAL_READ_LOCK(0)` claim instead of a published reader slot.
+    private_index: bool,
     /// Shared publication remains owned after the physical append succeeds.
     native_publication: Option<SharedWalIndexAppendPlan>,
     /// Exact reader token and bounds; its physical owner lives in the pager.
@@ -643,6 +647,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             pending_append_attempt: None,
             pending_checkpoint_reset: None,
             wal_index_shm_source: None,
+            private_index: false,
             native_publication: None,
             native_read_binding: None,
             native_recovery_requested: None,
@@ -681,6 +686,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             pending_append_attempt: None,
             pending_checkpoint_reset: None,
             wal_index_shm_source: None,
+            private_index: false,
             native_publication: None,
             native_read_binding: None,
             native_recovery_requested: None,
@@ -731,6 +737,19 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 .is_some_and(|snapshot| snapshot.last_commit_frame.is_none())
     }
 
+    /// bd-j2dtf item 2: read the WAL through this adapter's own index, as
+    /// stock's `walBeginShmUnreliable` does, instead of a shared `-shm`.
+    /// Exclusive with [`Self::attach_wal_index_shm_source`].
+    pub fn use_private_index(&mut self) -> Result<()> {
+        if self.wal_index_shm_source.is_some() {
+            return Err(FrankenError::internal(
+                "a WAL adapter with a shared -shm source cannot use a private index",
+            ));
+        }
+        self.private_index = true;
+        Ok(())
+    }
+
     /// Attach publication to the pager's exact main-file SHM capability.
     ///
     /// This performs no mapping, reader admission, recovery, or publication.
@@ -746,6 +765,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     ) -> Result<()> {
         if self.has_pending_publication() || self.wal_index_shm_source.is_some() {
             return Err(FrankenError::BusyRecovery);
+        }
+        if self.private_index {
+            return Err(FrankenError::internal(
+                "a private-index WAL adapter cannot attach a shared -shm source",
+            ));
         }
         self.wal_index_shm_source = Some(source);
         Ok(())
@@ -2497,6 +2521,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
     fn native_reader_required(&self) -> bool {
         self.wal_index_shm_source.is_some()
+    }
+
+    fn reads_through_private_index(&self) -> bool {
+        self.private_index
     }
 
     fn native_read_binding(&self) -> Option<WalNativeReadBinding> {
@@ -6680,6 +6708,10 @@ where
 
     fn native_reader_required(&self) -> bool {
         self.inner.native_reader_required()
+    }
+
+    fn reads_through_private_index(&self) -> bool {
+        self.inner.reads_through_private_index()
     }
 
     fn native_read_binding(&self) -> Option<WalNativeReadBinding> {

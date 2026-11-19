@@ -5725,10 +5725,14 @@ where
     }
 }
 
+/// `private_index`: read the WAL through this adapter's own index instead of
+/// the shared `-shm` (bd-j2dtf item 2; see
+/// [`read_only_shm_needs_private_index`]).
 fn install_opened_wal_backend_bare<V>(
     pager: &Arc<SimplePager<V>>,
     cx: &Cx,
     wal: WalFile<V::File>,
+    private_index: bool,
 ) -> Result<()>
 where
     V: Vfs + Send + Sync + 'static,
@@ -5749,10 +5753,16 @@ where
     let adapter = {
         let mut adapter = adapter;
         if !pager.vfs_handle().is_memory() {
-            adapter.attach_wal_index_shm_source(pager.wal_index_shm_source()?)?;
+            if private_index {
+                adapter.use_private_index()?;
+            } else {
+                adapter.attach_wal_index_shm_source(pager.wal_index_shm_source()?)?;
+            }
         }
         adapter
     };
+    #[cfg(not(all(feature = "native", unix)))]
+    let _ = private_index;
     match pager.set_wal_backend_owned(adapter) {
         Ok(()) => Ok(()),
         Err((err, adapter)) => {
@@ -5868,6 +5878,35 @@ where
     install_opened_wal_backend(pager, cx, state.0, wal_path, wal, true)
 }
 
+/// bd-j2dtf item 2: whether a read-only connection must read the WAL through
+/// a private index, as stock does over a `-shm` it may not write.
+///
+/// Stock's `unixOpenSharedMemory` falls back to a read-only `-shm`. With no
+/// connection holding its dead-man-switch byte, `unixLockSharedMemory` answers
+/// SQLITE_READONLY_CANTINIT and the WAL is read through a heap index
+/// (`walBeginShmUnreliable`): nothing in the `-shm` is written or locked. A
+/// writable or missing `-shm` keeps the shared index. A held dead-man switch
+/// (stock then maps the `-shm` read-only) or an unanswerable probe keeps the
+/// shared path, which refuses rather than guesses.
+fn read_only_shm_needs_private_index<V: Vfs>(vfs: &V, cx: &Cx, wal_path: &Path) -> Result<bool> {
+    if !cfg!(all(feature = "native", unix)) || vfs.is_memory() {
+        return Ok(false);
+    }
+    let Some(db_path) = wal_path.to_str().and_then(|path| path.strip_suffix("-wal")) else {
+        return Ok(false);
+    };
+    let shm_path = PathBuf::from(format!("{db_path}-shm"));
+    if !vfs.access(cx, &shm_path, AccessFlags::EXISTS)?
+        || vfs.access(cx, &shm_path, AccessFlags::READWRITE)?
+    {
+        return Ok(false);
+    }
+    Ok(matches!(
+        vfs.probe_foreign_shm_attachment(cx, Path::new(db_path))?,
+        fsqlite_vfs::ForeignWalParticipation::NoParticipant
+    ))
+}
+
 async fn install_existing_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: V,
@@ -5910,6 +5949,7 @@ where
     // table (unix.rs). All subsequent connections that clone this fd via the
     // fast path inherit the read-only fd and fail with EBADF on WAL writes
     // (pwrite on a read-only fd returns EBADF on Linux).
+    let private_index = allow_readonly && read_only_shm_needs_private_index(&vfs, cx, wal_path)?;
     let (mut file, _) = match vfs.open(
         cx,
         Some(wal_path),
@@ -5933,7 +5973,7 @@ where
             // commits that later land in that WAL, instead of never installing
             // a WAL backend and missing every one of them.
             let wal = WalFile::open_headerless(file, pager.page_size().get());
-            install_opened_wal_backend_bare(pager, cx, wal)?;
+            install_opened_wal_backend_bare(pager, cx, wal, private_index)?;
             return Ok(true);
         }
         let _ = file.close(cx);
@@ -5954,7 +5994,7 @@ where
 
     let wal = WalFile::open(cx, file).await?;
     if allow_readonly {
-        install_opened_wal_backend_bare(pager, cx, wal).inspect_err(|error| {
+        install_opened_wal_backend_bare(pager, cx, wal, private_index).inspect_err(|error| {
             if matches!(error, FrankenError::BusyRecovery) {
                 tracing::warn!(
                     target: "fsqlite.core.readonly_wal_install",

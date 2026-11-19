@@ -849,6 +849,24 @@ pub trait Vfs: Send + Sync {
         Ok(ForeignWalParticipation::Unknown)
     }
 
+    /// bd-j2dtf: whether another connection holds the `-shm` dead-man-switch
+    /// byte of the WAL-mode database at `path`, taking and waiting for no lock.
+    ///
+    /// Stock's read-only connection over a `-shm` it may not write asks exactly
+    /// this (`unixLockSharedMemory`): with no holder it cannot initialize the
+    /// index and reads the WAL through a private one instead. Unlike
+    /// [`Self::probe_foreign_wal_participation`] it consults only the `-shm`,
+    /// so a caller that already opened the main file still gets an answer.
+    /// `Unknown` when this process maps the `-shm` itself or the VFS cannot
+    /// probe.
+    fn probe_foreign_shm_attachment(
+        &self,
+        _cx: &Cx,
+        _path: &Path,
+    ) -> Result<ForeignWalParticipation> {
+        Ok(ForeignWalParticipation::Unknown)
+    }
+
     /// Resolve a potentially relative path into an absolute path.
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf>;
 
@@ -1722,6 +1740,24 @@ pub trait VfsFile: Send + Sync {
 
     /// Release a reader slot returned by [`Self::wal_reader_slot_acquire`].
     fn wal_reader_slot_release(&mut self, _cx: &Cx, _slot: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// bd-j2dtf item 2: the reader claim of a connection that reads the WAL
+    /// through a private index because it may not write the `-shm` (stock's
+    /// `walBeginShmUnreliable`). `WAL_READ_LOCK(0)` is taken SHARED on an
+    /// `O_RDONLY` `-shm` descriptor, so a writer cannot checkpoint past this
+    /// reader. Nothing is created, mapped, published or written, and no
+    /// dead-man-switch claim is taken: a DMS claim would tell a later stock
+    /// opener that a stale index is live. `Busy` when a checkpointer holds the
+    /// lock exclusively for the whole busy budget.
+    fn wal_private_reader_claim_acquire(&mut self, _cx: &Cx) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
+    /// Release the claim taken by [`Self::wal_private_reader_claim_acquire`].
+    /// A no-op when none is held.
+    fn wal_private_reader_claim_release(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
 

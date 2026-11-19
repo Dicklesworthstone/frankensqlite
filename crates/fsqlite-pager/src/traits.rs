@@ -397,6 +397,14 @@ pub trait WalBackend: Send + Sync {
         false
     }
 
+    /// bd-j2dtf item 2: whether this backend reads the WAL through its own
+    /// index because the connection may not write the `-shm`. Its read
+    /// windows then hold stock's `WAL_READ_LOCK(0)` claim on a read-only
+    /// `-shm` descriptor instead of publishing a reader slot.
+    fn reads_through_private_index(&self) -> bool {
+        false
+    }
+
     /// The exact native reader binding currently protecting the pinned image.
     fn native_read_binding(&self) -> Option<WalNativeReadBinding> {
         None

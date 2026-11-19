@@ -2201,6 +2201,7 @@ impl Vfs for UnixVfs {
             shm_path,
             shm_info: None,
             shm_dms_lifetime_claim: false,
+            private_reader_shm: None,
             busy_timeout_ms: 0,
         };
 
@@ -2263,6 +2264,20 @@ impl Vfs for UnixVfs {
         path: &Path,
     ) -> Result<ForeignWalParticipation> {
         Ok(probe_foreign_wal_participation(path))
+    }
+
+    fn probe_foreign_shm_attachment(
+        &self,
+        _cx: &Cx,
+        path: &Path,
+    ) -> Result<ForeignWalParticipation> {
+        Ok(
+            match global_shm_table().probe_unregistered_dms(&sqlite_shm_path(path)) {
+                PeerLockProbe::Locked => ForeignWalParticipation::Participant,
+                PeerLockProbe::Unlocked => ForeignWalParticipation::NoParticipant,
+                PeerLockProbe::Unknown => ForeignWalParticipation::Unknown,
+            },
+        )
     }
 
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
@@ -2410,6 +2425,11 @@ pub struct UnixFile {
     /// One DMS SHARED claim for this attachment, independent of compatibility
     /// helper nesting. Retained through failed unmap/close and deferred cleanup.
     shm_dms_lifetime_claim: bool,
+    /// bd-j2dtf item 2: the `O_RDONLY` `-shm` descriptor whose open file
+    /// description holds `WAL_READ_LOCK(0)` SHARED for a private-index
+    /// reader. Never registered in the shared SHM table; dropping it releases
+    /// the claim.
+    private_reader_shm: Option<File>,
     /// Busy timeout for cross-process lock contention (milliseconds).
     /// Native main-file refusals retry outside the inode mutex. Process-local
     /// ownership conflicts remain nonblocking so the owning task can run.
@@ -3872,6 +3892,7 @@ impl UnixFile {
             shm_path: self.shm_path.clone(),
             shm_info: Some(Arc::clone(shm_info)),
             shm_dms_lifetime_claim: false,
+            private_reader_shm: None,
             busy_timeout_ms: self.busy_timeout_ms,
         };
         let acquire = {
@@ -3919,6 +3940,7 @@ impl UnixFile {
             shm_path: std::mem::take(&mut self.shm_path),
             shm_info: self.shm_info.take(),
             shm_dms_lifetime_claim: self.shm_dms_lifetime_claim,
+            private_reader_shm: self.private_reader_shm.take(),
             busy_timeout_ms: self.busy_timeout_ms,
         };
 
@@ -3962,6 +3984,7 @@ impl UnixFile {
             shm_path: self.shm_path.clone(),
             shm_info: None,
             shm_dms_lifetime_claim: false,
+            private_reader_shm: None,
             busy_timeout_ms: 0,
         })
     }
@@ -5717,6 +5740,54 @@ impl VfsFile for UnixFile {
         checkpoint_or_abort(cx)?;
         let lock_slot = wal_reader_lock_slot(slot)?;
         self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+    }
+
+    fn wal_private_reader_claim_acquire(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        if self.private_reader_shm.is_some() {
+            return Err(FrankenError::internal(
+                "private-index WAL reader claim is already held",
+            ));
+        }
+        let lock_byte = wal_lock_byte(wal_reader_lock_slot(0)?)
+            .ok_or_else(|| FrankenError::internal("WAL_READ_LOCK(0) has no lock byte"))?;
+        // Stock's unixOpenSharedMemory read-only fallback: never create the
+        // file, never ask for write access.
+        let shm = OpenOptions::new().read(true).open(&self.shm_path)?;
+        // The same busy budget as a shared reader slot (walTryBeginRead).
+        let budget = Duration::from_millis(self.busy_timeout_ms.max(WAL_READER_SLOT_MIN_BUDGET_MS));
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            checkpoint_or_abort(cx)?;
+            if posix_lock(&shm, libc::F_RDLCK, lock_byte, 1)? {
+                self.private_reader_shm = Some(shm);
+                return Ok(());
+            }
+            let remaining = budget.saturating_sub(started.elapsed());
+            let remaining = cx
+                .busy_wait_budget()
+                .map_or(remaining, |shared| remaining.min(shared.remaining()));
+            if remaining.is_zero() {
+                return Err(FrankenError::Busy);
+            }
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(WAL_READER_SLOT_MAX_BACKOFF);
+        }
+    }
+
+    fn wal_private_reader_claim_release(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let Some(shm) = self.private_reader_shm.as_ref() else {
+            return Ok(());
+        };
+        let lock_byte = wal_lock_byte(wal_reader_lock_slot(0)?)
+            .ok_or_else(|| FrankenError::internal("WAL_READ_LOCK(0) has no lock byte"))?;
+        // Unlock before the descriptor closes; a failed unlock keeps the
+        // descriptor (and so the claim) for the retry.
+        posix_unlock(shm, lock_byte, 1)?;
+        self.private_reader_shm = None;
+        Ok(())
     }
 
     fn wal_checkpoint_backfill_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
