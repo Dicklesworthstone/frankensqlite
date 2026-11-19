@@ -94,6 +94,29 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - REJECTED on its kill line (delete_14pct_300k task-clock a replicated LOSE at unchanged Ir), with bulk -62M Ir and its time TIE as predicted: an appended row raises the rowid floor without building the bump's future (bd-w4pr1.13, bulk-write round 11, lever FB)
+
+- Target: the explicit-rowid floor bump on bulk_insert_1M_one_txn, 175 Ir a row (callgrind on 1292d7b3c:
+  `bump_concurrent_storage_rowid_floor::{closure#0}` 71 self, of which ~50 are the async fn's entry, exit and argument
+  moves into its state; `ensure_table_floor` 104). Every bulk row is an append; no other scorecard row calls it
+  (memory_script runs on `:memory:`; UPDATE, DELETE and CREATE INDEX make no call). Touched (not landed; patch
+  `scratchpad/r11/fb1_on_cac612a6c.diff` of the bulk-write lane): `crates/fsqlite-vdbe/src/engine.rs` (a synchronous
+  `try_bump_concurrent_storage_rowid_floor_after_append` for a row the cursor just inserted as its rightmost, the
+  async bump kept for every other row; the floor value is the same at every call site;
+  `test_explicit_rowid_inserts_claim_their_table_for_the_session` pins it).
+- Prediction (bd-w4pr1.13, before the build): bulk -40M to -60M Ir, task-clock -0.3% to -0.9% (a TIE, landing as
+  maintenance); every other row within +-0.3% Ir. Kill lines: bulk Ir down less than 30M, any row's Ir up more than
+  0.3%, any row a replicated LOSE in cpu or cycles.
+- Result (bd-es2im lines; base cac612a6c, two valid runs, stock live; .text +1,024 B; `run_hot_opcodes_sync`
+  instruction-identical): bulk Ir -63.1M / -61.6M (0.991), cpu and cycles TIE both runs (x-stock task-clock 2.015x ->
+  2.025x and 1.993x -> 1.992x, instructions 1.684x -> 1.669x); every other row's Ir unchanged (read rows within +-8k,
+  memory_script +0.05%); delete_14pct_300k task-clock 1.020 / 1.018 LOSE / LOSE (T 1.57% / 1.46%) at Ir 1.0000, a
+  row whose code path the lever does not touch.
+- Retry condition: with the explicit-rowid floor's other 104 Ir (the allocator's per-row lock and table lookup) in
+  the same lever, so that bulk's time can clear T; or after an owner decision on how the bd-es2im lines treat a
+  replicated time LOSE on a row whose instructions do not move (third such kill: SC8 v2 scan_filter_agg, BR
+  gb_a_sum_c, this one; the null group reruns the parent's same six ELFs, so it does not sample a second relink set).
+
 ## 2026-11-19 - REJECTED on two kill lines (bulk task-clock a TIE then a WIN, not a replicated WIN; gb_a_sum_c cycles a replicated LOSE at -0.01% Ir), with bulk -33M..-43M Ir and its cycles a replicated WIN: the page cache's budget check counts the overflow shards without locking them (bd-w4pr1.13, bulk-write round 11, lever BR)
 
 - Target: `ShardedPageCache::budget_resident_pages` on bulk_insert_1M_one_txn. Callgrind on 1292d7b3c: 22,324 calls,
