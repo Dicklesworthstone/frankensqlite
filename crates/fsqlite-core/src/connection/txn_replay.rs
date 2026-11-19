@@ -388,6 +388,14 @@ impl Drop for ReplayingGuard<'_> {
     }
 }
 
+/// What [`Connection::txn_replay_leave`] hands back to the public method: the
+/// call's result, or the replay of the transaction its refused COMMIT ended,
+/// which the method awaits.
+pub(super) enum ReplayLeave<'a, T> {
+    Done(Result<T>),
+    Replay(Pin<Box<dyn Future<Output = Result<T>> + 'a>>),
+}
+
 enum ReplayAttempt {
     Committed(ReplayValue),
     /// A transient failure: roll back and try again within the budget.
@@ -566,34 +574,68 @@ impl Connection {
     }
 
     /// Finish a public SQL call started with [`Self::txn_replay_enter`]:
-    /// record it while a plain-BEGIN transaction is open, and replay the
-    /// transaction when this call is its COMMIT and the COMMIT was refused.
-    pub(super) async fn txn_replay_leave<T: ReplayOutput>(
-        &self,
-        scope: ReplayCallScope<'_>,
+    /// record it while a plain-BEGIN transaction is open, and hand back the
+    /// replay of the transaction when this call is its COMMIT and the COMMIT
+    /// was refused.
+    ///
+    /// It is synchronous, so a call that records nothing (any call outside
+    /// a plain-BEGIN transaction, a nested call, a `BEGIN CONCURRENT`
+    /// transaction's calls) adds no future of its own: awaiting an async
+    /// leave after every call cost 6.5% of a one-writer bulk insert through
+    /// a prepared statement (mt-mvcc-bench, bd-q4o7z probe 5). The call that
+    /// records nothing returns from this inlined part; recording is out of
+    /// line.
+    #[inline]
+    pub(super) fn txn_replay_leave<'a, T: ReplayOutput + 'a>(
+        &'a self,
+        scope: ReplayCallScope<'a>,
         sql: &str,
         params: &[SqliteValue],
         result: Result<T>,
-    ) -> Result<T> {
+    ) -> ReplayLeave<'a, T> {
         if scope.guard.is_none() {
-            return result;
+            return ReplayLeave::Done(result);
         }
+        if !scope.recording {
+            if self.txn_replay.begin_generation.get() != scope.generation
+                || self.txn_replay.mode.get() != TxnReplayMode::Idle
+            {
+                self.txn_replay_leave_unrecorded_call(scope.kind, scope.generation, sql);
+            }
+            return ReplayLeave::Done(result);
+        }
+        self.txn_replay_leave_recording_call(scope, sql, params, result)
+    }
+
+    /// [`Self::txn_replay_leave`] for a call that did not record, when a
+    /// transaction began inside it or the record is not idle.
+    #[inline(never)]
+    fn txn_replay_leave_unrecorded_call(&self, kind: ReplayCallKind, generation: u64, sql: &str) {
+        if self.txn_replay.begin_generation.get() != generation
+            && kind != ReplayCallKind::BeginTransaction
+            && !sql_is_lone(sql, LONE_BEGIN_FORMS)
+        {
+            // The transaction began inside a call that also ran other
+            // statements, which the record does not hold.
+            self.txn_replay_poison();
+        }
+        if self.txn_replay.mode.get() != TxnReplayMode::Idle && !self.in_transaction.get() {
+            self.txn_replay_reset();
+        }
+    }
+
+    /// [`Self::txn_replay_leave`] for a call made while the transaction
+    /// records.
+    #[inline(never)]
+    fn txn_replay_leave_recording_call<'a, T: ReplayOutput + 'a>(
+        &'a self,
+        scope: ReplayCallScope<'a>,
+        sql: &str,
+        params: &[SqliteValue],
+        result: Result<T>,
+    ) -> ReplayLeave<'a, T> {
         let kind = scope.kind;
         let generation = scope.generation;
-        if !scope.recording {
-            if self.txn_replay.begin_generation.get() != generation
-                && kind != ReplayCallKind::BeginTransaction
-                && !sql_is_lone(sql, LONE_BEGIN_FORMS)
-            {
-                // The transaction began inside a call that also ran other
-                // statements, which the record does not hold.
-                self.txn_replay_poison();
-            }
-            if self.txn_replay.mode.get() != TxnReplayMode::Idle && !self.in_transaction.get() {
-                self.txn_replay_reset();
-            }
-            return result;
-        }
         let refusals = scope.refusals;
         let vtab_writes = scope.vtab_writes;
 
@@ -612,23 +654,31 @@ impl Connection {
                     params: params.to_vec(),
                 };
                 let started = scope.started.unwrap_or_else(Instant::now);
-                let replayed: Pin<Box<dyn Future<Output = Result<ReplayValue>> + '_>> =
-                    Box::pin(self.replay_refused_transaction(log, commit_call, refusal, started));
-                return replayed.await.and_then(|value| {
-                    T::from_value(value).ok_or_else(|| {
-                        FrankenError::internal("a replayed COMMIT returned another kind of value")
-                    })
-                });
+                // The replay runs inside this outermost call: its depth guard
+                // lives until the replay ends.
+                let outermost = scope.guard;
+                return ReplayLeave::Replay(Box::pin(async move {
+                    let _outermost = outermost;
+                    self.replay_refused_transaction(log, commit_call, refusal, started)
+                        .await
+                        .and_then(|value| {
+                            T::from_value(value).ok_or_else(|| {
+                                FrankenError::internal(
+                                    "a replayed COMMIT returned another kind of value",
+                                )
+                            })
+                        })
+                }));
             }
             if !self.in_transaction.get() {
                 self.txn_replay_reset();
             }
-            return result;
+            return ReplayLeave::Done(result);
         }
 
         if !self.in_transaction.get() {
             self.txn_replay_reset();
-            return result;
+            return ReplayLeave::Done(result);
         }
         if self.txn_replay.begin_generation.get() != generation
             || fsqlite_func::vtab::virtual_table_write_count() != vtab_writes
@@ -636,10 +686,10 @@ impl Connection {
             // A new transaction began inside this call, or the call wrote
             // through a virtual table.
             self.txn_replay_poison();
-            return result;
+            return ReplayLeave::Done(result);
         }
         if self.txn_replay.mode.get() != TxnReplayMode::Recording {
-            return result;
+            return ReplayLeave::Done(result);
         }
         let recorded = match T::outcome(&result) {
             Some(outcome) => {
@@ -667,7 +717,7 @@ impl Connection {
         if !recorded {
             self.txn_replay_poison();
         }
-        result
+        ReplayLeave::Done(result)
     }
 
     /// The record of the transaction a refused COMMIT just ended, if it may

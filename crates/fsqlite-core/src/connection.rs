@@ -38,7 +38,7 @@ mod pragma_maintenance;
 mod qualified_column_binding;
 mod txn_replay;
 
-use txn_replay::{ReplayCallKind, TxnReplayState};
+use txn_replay::{ReplayCallKind, ReplayLeave, TxnReplayState};
 pub use txn_replay::{TxnReplayCounts, txn_replay_counts};
 
 /// Required mirror refreshes and optional prepared-read acceleration have
@@ -10471,9 +10471,13 @@ impl PreparedStatement<'_> {
             .conn
             .txn_replay_enter(ReplayCallKind::PreparedQuery, &self.original_sql);
         let result = self.query_unrecorded().await;
-        self.conn
+        match self
+            .conn
             .txn_replay_leave(replay, &self.original_sql, &[], result)
-            .await
+        {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn query_unrecorded(&self) -> Result<Vec<Row>> {
@@ -10493,9 +10497,13 @@ impl PreparedStatement<'_> {
             .conn
             .txn_replay_enter(ReplayCallKind::PreparedQueryWithParams, &self.original_sql);
         let result = self.query_with_params_unrecorded(params).await;
-        self.conn
+        match self
+            .conn
             .txn_replay_leave(replay, &self.original_sql, params, result)
-            .await
+        {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn query_with_params_unrecorded(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
@@ -10561,9 +10569,13 @@ impl PreparedStatement<'_> {
             .conn
             .txn_replay_enter(ReplayCallKind::PreparedQueryRow, &self.original_sql);
         let result = self.query_row_internal(None).await;
-        self.conn
+        match self
+            .conn
             .txn_replay_leave(replay, &self.original_sql, &[], result)
-            .await
+        {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     /// Execute as a query with parameters and return exactly one row.
@@ -10573,9 +10585,13 @@ impl PreparedStatement<'_> {
             &self.original_sql,
         );
         let result = self.query_row_internal(Some(params)).await;
-        self.conn
+        match self
+            .conn
             .txn_replay_leave(replay, &self.original_sql, params, result)
-            .await
+        {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn query_row_internal(&self, params: Option<&[SqliteValue]>) -> Result<Row> {
@@ -10652,20 +10668,28 @@ impl PreparedStatement<'_> {
             .conn
             .txn_replay_enter(ReplayCallKind::PreparedExecute, &self.original_sql);
         let result = self.execute_unrecorded().await;
-        self.conn
+        match self
+            .conn
             .txn_replay_leave(replay, &self.original_sql, &[], result)
-            .await
+        {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn execute_unrecorded(&self) -> Result<usize> {
+        // bd-q4o7z: this call is the outermost one, so the inner calls go
+        // straight to their unrecorded bodies (a nested call never records).
         if self.dml_dispatch.is_some() {
             return self
                 .with_same_connection_schema_reprepare(async |stmt| {
-                    stmt.conn.execute_prepared(stmt).await
+                    stmt.conn
+                        .execute_prepared_with_params_unrecorded(stmt, &[])
+                        .await
                 })
                 .await;
         }
-        Ok(self.query().await?.len())
+        Ok(self.query_unrecorded().await?.len())
     }
 
     /// Execute with bound SQL parameters and return affected/output row count.
@@ -10680,20 +10704,29 @@ impl PreparedStatement<'_> {
             &self.original_sql,
         );
         let result = self.execute_with_params_unrecorded(params).await;
-        self.conn
+        match self
+            .conn
             .txn_replay_leave(replay, &self.original_sql, params, result)
-            .await
+        {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn execute_with_params_unrecorded(&self, params: &[SqliteValue]) -> Result<usize> {
+        // bd-q4o7z: as in `execute_unrecorded`, the inner calls skip their
+        // replay wrappers (about 80 instructions per row of a prepared bulk
+        // INSERT, mt-mvcc-bench probe 5).
         if self.dml_dispatch.is_some() {
             return self
                 .with_same_connection_schema_reprepare(async |stmt| {
-                    stmt.conn.execute_prepared_with_params(stmt, params).await
+                    stmt.conn
+                        .execute_prepared_with_params_unrecorded(stmt, params)
+                        .await
                 })
                 .await;
         }
-        Ok(self.query_with_params(params).await?.len())
+        Ok(self.query_with_params_unrecorded(params).await?.len())
     }
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
@@ -30579,7 +30612,10 @@ impl Connection {
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
         let replay = self.txn_replay_enter(ReplayCallKind::Query, sql);
         let result = self.query_unrecorded(sql).await;
-        self.txn_replay_leave(replay, sql, &[], result).await
+        match self.txn_replay_leave(replay, sql, &[], result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn query_unrecorded(&self, sql: &str) -> Result<Vec<Row>> {
@@ -30795,7 +30831,10 @@ impl Connection {
     pub async fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
         let replay = self.txn_replay_enter(ReplayCallKind::QueryWithParams, sql);
         let result = self.query_with_params_unrecorded(sql, params).await;
-        self.txn_replay_leave(replay, sql, params, result).await
+        match self.txn_replay_leave(replay, sql, params, result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn query_with_params_unrecorded(
@@ -30962,7 +31001,10 @@ impl Connection {
     pub async fn query_row(&self, sql: &str) -> Result<Row> {
         let replay = self.txn_replay_enter(ReplayCallKind::QueryRow, sql);
         let result = self.query_row_unrecorded(sql).await;
-        self.txn_replay_leave(replay, sql, &[], result).await
+        match self.txn_replay_leave(replay, sql, &[], result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn query_row_unrecorded(&self, sql: &str) -> Result<Row> {
@@ -31018,7 +31060,10 @@ impl Connection {
     pub async fn query_row_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Row> {
         let replay = self.txn_replay_enter(ReplayCallKind::QueryRowWithParams, sql);
         let result = self.query_row_with_params_unrecorded(sql, params).await;
-        self.txn_replay_leave(replay, sql, params, result).await
+        match self.txn_replay_leave(replay, sql, params, result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn query_row_with_params_unrecorded(
@@ -31081,7 +31126,10 @@ impl Connection {
     pub async fn execute(&self, sql: &str) -> Result<usize> {
         let replay = self.txn_replay_enter(ReplayCallKind::Execute, sql);
         let result = self.execute_unrecorded(sql).await;
-        self.txn_replay_leave(replay, sql, &[], result).await
+        match self.txn_replay_leave(replay, sql, &[], result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn execute_unrecorded(&self, sql: &str) -> Result<usize> {
@@ -31259,7 +31307,10 @@ impl Connection {
     pub async fn execute_batch(&self, sql: &str) -> Result<()> {
         let replay = self.txn_replay_enter(ReplayCallKind::ExecuteBatch, sql);
         let result = self.execute_batch_unrecorded(sql).await;
-        self.txn_replay_leave(replay, sql, &[], result).await
+        match self.txn_replay_leave(replay, sql, &[], result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn execute_batch_unrecorded(&self, sql: &str) -> Result<()> {
@@ -31279,7 +31330,10 @@ impl Connection {
     pub async fn begin_transaction(&self) -> Result<()> {
         let replay = self.txn_replay_enter(ReplayCallKind::BeginTransaction, "");
         let result = self.begin_transaction_unrecorded().await;
-        self.txn_replay_leave(replay, "", &[], result).await
+        match self.txn_replay_leave(replay, "", &[], result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn begin_transaction_unrecorded(&self) -> Result<()> {
@@ -31295,7 +31349,10 @@ impl Connection {
     pub async fn commit_transaction(&self) -> Result<()> {
         let replay = self.txn_replay_enter(ReplayCallKind::CommitTransaction, "");
         let result = self.commit_transaction_unrecorded().await;
-        self.txn_replay_leave(replay, "", &[], result).await
+        match self.txn_replay_leave(replay, "", &[], result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn commit_transaction_unrecorded(&self) -> Result<()> {
@@ -31379,7 +31436,10 @@ impl Connection {
     pub async fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
         let replay = self.txn_replay_enter(ReplayCallKind::ExecuteWithParams, sql);
         let result = self.execute_with_params_unrecorded(sql, params).await;
-        self.txn_replay_leave(replay, sql, params, result).await
+        match self.txn_replay_leave(replay, sql, params, result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn execute_with_params_unrecorded(
@@ -31623,8 +31683,10 @@ impl Connection {
         let result = self
             .execute_prepared_with_params_unrecorded(stmt, params)
             .await;
-        self.txn_replay_leave(replay, &stmt.original_sql, params, result)
-            .await
+        match self.txn_replay_leave(replay, &stmt.original_sql, params, result) {
+            ReplayLeave::Done(result) => result,
+            ReplayLeave::Replay(replayed) => replayed.await,
+        }
     }
 
     async fn execute_prepared_with_params_unrecorded(
