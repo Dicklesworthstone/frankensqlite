@@ -21790,6 +21790,20 @@ impl Connection {
         }
     }
 
+    /// bd-u608s: stock names a missing target table as the statement wrote it,
+    /// schema qualifier and all (`no such table: main.x`, `aux.x`, `MAIN.x`).
+    /// The lookups behind INSERT, UPDATE, DELETE and DROP TABLE report the bare
+    /// name, so put back the qualifier `statement` wrote. An error about any
+    /// other table passes unchanged.
+    fn qualify_missing_target_table(error: FrankenError, statement: &Statement) -> FrankenError {
+        if let Some(target) = statement_target_table(statement)
+            && let Some(schema) = target.schema.as_deref()
+        {
+            return qualify_missing_table_error(error, &target.name, schema);
+        }
+        error
+    }
+
     /// Convert `attached_target_schema`'s generic Internal "no such database: X"
     /// (raised when a statement is qualified by an UNKNOWN attached schema) into
     /// SQLite's per-statement message: a CREATE-family statement reports
@@ -30213,7 +30227,14 @@ impl Connection {
             FSQLITE_PREPARED_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
         }
         record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, lookup_start);
-        let prepared = self.prepare_uncached(sql).await?;
+        // bd-u608s: a prepare that fails on a missing target names it as the
+        // statement wrote it. Parsed again only on that error path.
+        let prepared = self.prepare_uncached(sql).await.map_err(|error| {
+            match parse_single_statement(sql) {
+                Ok(statement) => Self::qualify_missing_target_table(error, &statement),
+                Err(_) => error,
+            }
+        })?;
         let cache_insert_start = profile_enabled.then(Instant::now);
         // User module metadata callbacks may re-register a callable while
         // uncached preparation is in progress, advancing the registry
@@ -42625,7 +42646,8 @@ impl Connection {
                     .await
                 })
             })
-            .await;
+            .await
+            .map_err(|error| Self::qualify_missing_target_table(error, statement));
         }
 
         lean_future(|| {
@@ -42638,6 +42660,7 @@ impl Connection {
             )
         })
         .await
+        .map_err(|error| Self::qualify_missing_target_table(error, statement))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -77951,7 +77974,8 @@ impl Connection {
                     bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
-                    .await?
+                    .await
+                    .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(true),
@@ -78036,7 +78060,8 @@ impl Connection {
                     bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
-                    .await?
+                    .await
+                    .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(()),
@@ -78563,7 +78588,8 @@ impl Connection {
                     bind_trigger_body_statement(stmt, &base_frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
-                    .await?
+                    .await
+                    .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(true),
@@ -147663,6 +147689,67 @@ fn empty_column_defaults_arc() -> Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>> 
     use std::sync::OnceLock;
     static EMPTY: OnceLock<Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>> = OnceLock::new();
     Arc::clone(EMPTY.get_or_init(|| Arc::new(HbHashMap::new())))
+}
+
+/// bd-u608s: the table `statement` writes or drops, as written.
+fn statement_target_table(statement: &Statement) -> Option<&QualifiedName> {
+    match statement {
+        Statement::Insert(insert) => Some(&insert.table),
+        Statement::Update(update) => Some(&update.table.name),
+        Statement::Delete(delete) => Some(&delete.table.name),
+        Statement::Drop(drop_stmt) if matches!(drop_stmt.object_type, DropObjectType::Table) => {
+            Some(&drop_stmt.name)
+        }
+        _ => None,
+    }
+}
+
+/// bd-u608s: a persistent trigger's body is fixed to the trigger's schema, so
+/// stock names a missing unqualified INSERT / UPDATE / DELETE target of it
+/// `main.x`. A TEMP trigger's body is not fixed, and an error about any other
+/// table (one raised deeper, by a trigger the body fires) passes unchanged.
+fn trigger_body_missing_table_error(
+    error: FrankenError,
+    trigger: &TriggerDef,
+    statement: &Statement,
+) -> FrankenError {
+    if trigger.temporary {
+        return error;
+    }
+    match statement_target_table(statement) {
+        Some(target) if target.schema.is_none() => {
+            qualify_missing_table_error(error, &target.name, "main")
+        }
+        _ => error,
+    }
+}
+
+/// bd-u608s: `error` with a "no such table" for `table` naming it
+/// `<schema>.<table>`, as stock does when the statement wrote that qualifier;
+/// any other error unchanged. The name may come bare or already qualified:
+/// an attached schema's statement runs on its own connection as
+/// `main.<table>`. Both of the engine's spellings of the error are covered:
+/// the typed one and codegen's message.
+fn qualify_missing_table_error(error: FrankenError, table: &str, schema: &str) -> FrankenError {
+    let names_table = |name: &str| {
+        name.eq_ignore_ascii_case(table)
+            || name
+                .rsplit_once('.')
+                .is_some_and(|(_, bare)| bare.eq_ignore_ascii_case(table))
+    };
+    match error {
+        FrankenError::NoSuchTable { name } if names_table(&name) => FrankenError::NoSuchTable {
+            name: format!("{schema}.{table}"),
+        },
+        FrankenError::FunctionError(message)
+            if message
+                .strip_prefix("no such table: ")
+                .is_some_and(names_table) =>
+        {
+            FrankenError::FunctionError(format!("no such table: {schema}.{table}"))
+        }
+        error => error,
+    }
 }
 
 pub(crate) fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
@@ -277930,9 +278017,9 @@ mod pager_routing_tests {
                 .await
                 .expect_err("missing attached target should not silently succeed on zero rows");
             // Stock reports a missing INSERT target as "no such table", not an
-            // internal error.
+            // internal error, and names it as written: `aux.missing` (bd-u608s).
             assert!(
-                matches!(&err, FrankenError::NoSuchTable { name } if name == "missing"),
+                matches!(&err, FrankenError::NoSuchTable { name } if name == "aux.missing"),
                 "{err:?}"
             );
         });
