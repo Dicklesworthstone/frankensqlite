@@ -253,6 +253,13 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
     which needs recovery to accept groups that do not end at a commit frame.
   Either combines with this lever. Release builds would cut the two encodes from about 54 s each (this bead's
   2026-10-11 numbers) to about 1.3 s each (estimated as test profile / 15).
+- Retried 2026-11-19 under the second condition, and landed (bd-mcpbv item 2, the commit that adds this line):
+  - bounded RaptorQ source blocks inside the commit's one group (OTI z > 1, at most 256 frames per block), so
+    recovery's commit-frame rule is unchanged;
+  - with this lever's inactivation-solver encode per block;
+  - gh19 green 3 of 3 on each of two workers.
+  - Measured release on ovh-a corrects the /15 estimate above: main's close of one 4,335-frame commit at 512 B takes
+    35.1 to 35.3 s; with the blocks it takes 0.17 to 0.19 s.
 
 ## 2026-11-19 - REJECTED in all three constructions (plain programs' instructions do not stay unchanged): the synchronous lane chosen per program, so that only a program with a Concat or an Affinity runs them on it (bd-w4pr1.13, bulk-write round 11, lever LA v3)
 

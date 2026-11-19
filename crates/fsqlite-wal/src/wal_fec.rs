@@ -49,10 +49,70 @@ pub const MAX_RAPTORQ_REPAIR_SYMBOLS: u8 = u8::MAX;
 pub const WAL_FEC_PRAGMA_HEADER_MAGIC: [u8; 8] = *b"FSQLWFCP";
 /// Current `.wal-fec` configuration header version.
 pub const WAL_FEC_PRAGMA_HEADER_VERSION: u32 = 1;
-/// Largest RaptorQ source block (RFC 6330 K'max). A WAL-FEC group is one
-/// commit, so a commit of more frames has no repair group; the RaptorQ
-/// encoder and decoder panic beyond this size.
+/// Largest repair group, in frames (RFC 6330 K'max).
+///
+/// A WAL-FEC group is one commit, so a commit of more frames has no repair
+/// group. New groups split into source blocks of at most
+/// [`WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS`]; a one-block group of this size (as
+/// earlier sidecars hold) is still read, and the RaptorQ encoder and decoder
+/// panic beyond it.
 pub const WAL_FEC_MAX_SOURCE_SYMBOLS: u32 = 56_403;
+
+/// The most source frames one RaptorQ source block of a repair group holds.
+///
+/// bd-mcpbv item 2: a commit of K frames is one group (its commit frame is
+/// still the group's only commit point) with Z = ceil(K / this) source blocks
+/// (`Oti::z`), each encoded and decoded on its own. Encode cost grows about
+/// 3.2x per doubling of a block's K, so a bounded block makes a commit's
+/// encode cost linear in its frames. At most 256 blocks cover
+/// [`WAL_FEC_MAX_SOURCE_SYMBOLS`].
+pub const WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS: u32 = 256;
+
+/// RFC 6330 numbers source blocks with 8 bits.
+pub const WAL_FEC_MAX_SOURCE_BLOCKS: u32 = 256;
+
+/// RFC 6330's FEC payload ID: the source block number above a 24-bit ESI.
+const WAL_FEC_BLOCK_ESI_BITS: u32 = 24;
+
+/// One RaptorQ source block of a repair group: `k` source frames starting at
+/// group index `first`, with source block number `sbn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalFecSourceBlock {
+    pub sbn: u32,
+    pub first: u32,
+    pub k: u32,
+}
+
+impl WalFecSourceBlock {
+    /// A symbol's ESI as the sidecar carries it: the block number above the
+    /// block-local ESI. For a one-block group this is the local ESI itself.
+    #[must_use]
+    pub const fn packed_esi(&self, local_esi: u32) -> u32 {
+        (self.sbn << WAL_FEC_BLOCK_ESI_BITS) | local_esi
+    }
+
+    /// The `j`th repair symbol's packed ESI (local ESI `k + j`).
+    #[must_use]
+    pub const fn repair_esi(&self, j: u32) -> u32 {
+        self.packed_esi(self.k + j)
+    }
+}
+
+/// How many source blocks a new repair group of `k_source` frames gets.
+#[must_use]
+pub const fn wal_fec_source_block_count(k_source: u32) -> u32 {
+    let blocks = k_source.div_ceil(WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS);
+    if blocks == 0 { 1 } else { blocks }
+}
+
+/// Split a packed ESI into (source block number, block-local ESI).
+#[must_use]
+pub const fn wal_fec_unpack_esi(esi: u32) -> (u32, u32) {
+    (
+        esi >> WAL_FEC_BLOCK_ESI_BITS,
+        esi & ((1 << WAL_FEC_BLOCK_ESI_BITS) - 1),
+    )
+}
 
 const LENGTH_PREFIX_BYTES: usize = 4;
 const META_FIXED_PREFIX_BYTES: usize = 8 + 4 + (8 * 4) + 22 + 16;
@@ -274,6 +334,72 @@ impl WalFecGroupMeta {
         meta.validate_invariants()?;
         meta.checksum = meta.compute_checksum();
         Ok(meta)
+    }
+
+    /// The group's RaptorQ source blocks, by RFC 6330's Partition[K, Z]: the
+    /// first `K mod Z` blocks hold ceil(K / Z) frames, the rest floor(K / Z).
+    /// A one-block group (every group written before bd-mcpbv item 2, and
+    /// every commit of at most [`WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS`] frames) is
+    /// the single block (0, 0, K). Call on validated metadata.
+    #[must_use]
+    pub fn source_blocks(&self) -> Vec<WalFecSourceBlock> {
+        (0..self.oti.z.max(1))
+            .filter_map(|sbn| self.source_block(sbn))
+            .collect()
+    }
+
+    /// Partition[K, Z]: (blocks of ceil(K/Z) frames, ceil(K/Z), floor(K/Z)).
+    const fn source_partition(&self) -> (u32, u32, u32) {
+        let z = if self.oti.z == 0 { 1 } else { self.oti.z };
+        let long = self.k_source.div_ceil(z);
+        let short = self.k_source / z;
+        (self.k_source - short * z, long, short)
+    }
+
+    /// Source block `sbn`, if the group has it.
+    #[must_use]
+    pub const fn source_block(&self, sbn: u32) -> Option<WalFecSourceBlock> {
+        let (long_blocks, long, short) = self.source_partition();
+        let z = if self.oti.z == 0 { 1 } else { self.oti.z };
+        if sbn >= z {
+            return None;
+        }
+        let (first, k) = if sbn < long_blocks {
+            (sbn * long, long)
+        } else {
+            (long_blocks * long + (sbn - long_blocks) * short, short)
+        };
+        Some(WalFecSourceBlock { sbn, first, k })
+    }
+
+    /// The source block holding group source index `index`, with the
+    /// index's block-local ESI.
+    #[must_use]
+    pub const fn source_block_of(&self, index: u32) -> Option<(WalFecSourceBlock, u32)> {
+        if index >= self.k_source {
+            return None;
+        }
+        let (long_blocks, long, short) = self.source_partition();
+        let long_span = long_blocks * long;
+        let sbn = if index < long_span {
+            index / long
+        } else if short == 0 {
+            return None;
+        } else {
+            long_blocks + (index - long_span) / short
+        };
+        match self.source_block(sbn) {
+            Some(block) => Some((block, index - block.first)),
+            None => None,
+        }
+    }
+
+    /// Repair symbols the group carries: `r_repair` per source block. Call on
+    /// validated metadata (the product is checked there).
+    #[must_use]
+    pub const fn repair_symbol_count(&self) -> u32 {
+        let z = if self.oti.z == 0 { 1 } else { self.oti.z };
+        self.r_repair.saturating_mul(z)
     }
 
     /// Return `(wal_salt1, wal_salt2, end_frame_no)`.
@@ -600,6 +726,37 @@ impl WalFecGroupMeta {
                 ),
             });
         }
+        // bd-mcpbv item 2: Z source blocks, each with at least one frame.
+        if self.oti.z == 0 || self.oti.z > WAL_FEC_MAX_SOURCE_BLOCKS || self.oti.z > self.k_source {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "OTI.z {} must be 1..={} and at most k_source {}",
+                    self.oti.z, WAL_FEC_MAX_SOURCE_BLOCKS, self.k_source
+                ),
+            });
+        }
+        if self.r_repair.checked_mul(self.oti.z).is_none() {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "r_repair {} times OTI.z {} overflows",
+                    self.r_repair, self.oti.z
+                ),
+            });
+        }
+        // Every block-local ESI (largest block's k plus r_repair) fits the
+        // 24 bits below the source block number.
+        let largest_block = self.k_source.div_ceil(self.oti.z);
+        if largest_block
+            .checked_add(self.r_repair)
+            .is_none_or(|end| end > 1 << WAL_FEC_BLOCK_ESI_BITS)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "source block of {largest_block} frames with {} repair symbols exceeds the 24-bit ESI space",
+                    self.r_repair
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -622,20 +779,34 @@ impl WalFecGroupRecord {
     }
 
     fn validate_layout(&self) -> Result<()> {
-        let expected_repair =
-            usize::try_from(self.meta.r_repair).map_err(|_| FrankenError::WalCorrupt {
-                detail: format!("r_repair {} does not fit in usize", self.meta.r_repair),
-            })?;
+        let expected_repair = usize::try_from(self.meta.repair_symbol_count()).map_err(|_| {
+            FrankenError::WalCorrupt {
+                detail: format!(
+                    "repair symbol count {} does not fit in usize",
+                    self.meta.repair_symbol_count()
+                ),
+            }
+        })?;
         if self.repair_symbols.len() != expected_repair {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
-                    "repair symbol count {} must equal r_repair {}",
+                    "repair symbol count {} must equal r_repair {} per source block, {} blocks",
                     self.repair_symbols.len(),
-                    self.meta.r_repair
+                    self.meta.r_repair,
+                    self.meta.oti.z
                 ),
             });
         }
-        for (index, symbol) in self.repair_symbols.iter().enumerate() {
+        // Block by block, r_repair symbols each, in local-ESI order (one block:
+        // ESIs k_source.. as before bd-mcpbv item 2).
+        let expected_esis = self
+            .meta
+            .source_blocks()
+            .into_iter()
+            .flat_map(|block| (0..self.meta.r_repair).map(move |j| block.repair_esi(j)));
+        for ((index, symbol), expected_esi) in
+            self.repair_symbols.iter().enumerate().zip(expected_esis)
+        {
             if symbol.object_id != self.meta.object_id {
                 return Err(FrankenError::WalCorrupt {
                     detail: format!(
@@ -649,15 +820,6 @@ impl WalFecGroupRecord {
                     detail: format!("repair symbol {index} OTI mismatch"),
                 });
             }
-            let expected_esi = self
-                .meta
-                .k_source
-                .checked_add(u32::try_from(index).map_err(|_| FrankenError::WalCorrupt {
-                    detail: format!("repair symbol index {index} does not fit in u32"),
-                })?)
-                .ok_or_else(|| FrankenError::WalCorrupt {
-                    detail: "repair ESI overflow".to_owned(),
-                })?;
             if symbol.esi != expected_esi {
                 return Err(FrankenError::WalCorrupt {
                     detail: format!(
@@ -2732,7 +2894,9 @@ fn process_committed_wal_range(
                 f: u64::from(k_source) * u64::from(range.header.page_size),
                 al: 1,
                 t: range.header.page_size,
-                z: 1,
+                // bd-mcpbv item 2: bounded source blocks; one block for a
+                // commit of at most WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS frames.
+                z: wal_fec_source_block_count(k_source),
                 n: 1,
             },
             object_id: ObjectId::derive_from_canonical_bytes(&identity),
@@ -3159,40 +3323,19 @@ fn generate_wal_fec_repair_symbols_inner(
         detail: format!("r_repair {} does not fit in usize", meta.r_repair),
     })?;
 
-    // Derive a deterministic group-level seed for the SystematicEncoder from
-    // the group metadata (object_id, salts, frame range, k, r).
-    let encoder_seed = derive_repair_seed(meta, 0);
     let singular = || FrankenError::WalCorrupt {
         detail: "RaptorQ constraint matrix singular during encoding".to_owned(),
     };
-    let k = source_pages.len();
-    let encoder = if k.saturating_mul(4) <= symbol_len {
-        let first_esi = meta.k_source;
-        let repair_count = u32::try_from(r_repair).map_err(|_| FrankenError::WalCorrupt {
-            detail: format!("r_repair {r_repair} does not fit in u32"),
-        })?;
-        let esis = first_esi..first_esi.checked_add(repair_count).ok_or_else(|| {
-            FrankenError::WalCorrupt {
-                detail: "repair symbol ESI overflow".to_owned(),
-            }
-        })?;
-        WalFecRepairEncoder::Coefficients(
-            cached_wal_fec_repair_coefficients(k, encoder_seed, esis).ok_or_else(singular)?,
-        )
-    } else {
-        WalFecRepairEncoder::Systematic(Box::new(
-            asupersync::raptorq::systematic::SystematicEncoder::new(
-                source_pages,
-                symbol_len,
-                encoder_seed,
-            )
-            .ok_or_else(singular)?,
-        ))
-    };
+    let repair_count = u32::try_from(r_repair).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("r_repair {r_repair} does not fit in u32"),
+    })?;
+    let blocks = meta.source_blocks();
+    let mut symbols = Vec::with_capacity(r_repair.saturating_mul(blocks.len()));
 
-    let mut symbols = Vec::with_capacity(r_repair);
-
-    for repair_index in 0..r_repair {
+    // bd-mcpbv item 2: each source block is its own RaptorQ block, with its
+    // own seed and `r_repair` repair symbols (local ESIs k_b..k_b + r). A
+    // one-block group is block 0: seed, ESIs and bytes as before.
+    for block in blocks {
         if let Some(cx) = cx
             && cx.checkpoint().is_err()
         {
@@ -3203,57 +3346,168 @@ fn generate_wal_fec_repair_symbols_inner(
         {
             return Ok(None);
         }
-
-        let esi = meta
-            .k_source
-            .checked_add(
-                u32::try_from(repair_index).map_err(|_| FrankenError::WalCorrupt {
-                    detail: format!("repair_index {repair_index} does not fit in u32"),
-                })?,
-            )
-            .ok_or_else(|| FrankenError::WalCorrupt {
-                detail: "repair symbol ESI overflow".to_owned(),
-            })?;
-
-        let payload = match &encoder {
-            WalFecRepairEncoder::Systematic(encoder) => encoder.repair_symbol(esi),
-            WalFecRepairEncoder::Coefficients(rows) => {
-                let mut payload = vec![0_u8; symbol_len];
-                for (page, &coefficient) in source_pages.iter().zip(&rows[repair_index]) {
-                    if coefficient != 0 {
-                        asupersync::raptorq::gf256::gf256_addmul_slice(
-                            &mut payload,
-                            page,
-                            asupersync::raptorq::gf256::Gf256::new(coefficient),
-                        );
-                    }
+        let first = usize::try_from(block.first).map_err(|_| FrankenError::WalCorrupt {
+            detail: format!("source block start {} does not fit in usize", block.first),
+        })?;
+        let k = usize::try_from(block.k).map_err(|_| FrankenError::WalCorrupt {
+            detail: format!("source block k {} does not fit in usize", block.k),
+        })?;
+        let block_pages =
+            source_pages
+                .get(first..first + k)
+                .ok_or_else(|| FrankenError::WalCorrupt {
+                    detail: format!(
+                        "source block {} ({}..{}) exceeds the group's {} pages",
+                        block.sbn,
+                        first,
+                        first + k,
+                        source_pages.len()
+                    ),
+                })?;
+        // A deterministic block-level seed for the encoder from the group
+        // metadata (object_id, salts, frame range, k, r) and the block number.
+        let encoder_seed = derive_repair_seed(meta, block.sbn);
+        let encoder = if k.saturating_mul(4) <= symbol_len {
+            let esis = block.k..block.k.checked_add(repair_count).ok_or_else(|| {
+                FrankenError::WalCorrupt {
+                    detail: "repair symbol ESI overflow".to_owned(),
                 }
-                payload
-            }
+            })?;
+            WalFecRepairEncoder::Coefficients(
+                cached_wal_fec_repair_coefficients(k, encoder_seed, esis).ok_or_else(singular)?,
+            )
+        } else {
+            WalFecRepairEncoder::Intermediate(Box::new(
+                WalFecIntermediateSymbols::solve(block_pages, symbol_len, encoder_seed)
+                    .ok_or_else(singular)?,
+            ))
         };
 
-        if per_symbol_delay > Duration::ZERO {
-            thread::sleep(per_symbol_delay);
-        }
+        for repair_index in 0..repair_count {
+            if let Some(cx) = cx
+                && cx.checkpoint().is_err()
+            {
+                return Ok(None);
+            }
+            if let Some(flag) = cancel_flag
+                && flag.load(Ordering::SeqCst)
+            {
+                return Ok(None);
+            }
+            let local_esi =
+                block
+                    .k
+                    .checked_add(repair_index)
+                    .ok_or_else(|| FrankenError::WalCorrupt {
+                        detail: "repair symbol ESI overflow".to_owned(),
+                    })?;
+            let payload = match &encoder {
+                WalFecRepairEncoder::Intermediate(intermediate) => intermediate
+                    .repair_symbol(local_esi, symbol_len)
+                    .ok_or_else(|| FrankenError::WalCorrupt {
+                        detail: format!("no RFC 6330 repair equation for ESI {local_esi}"),
+                    })?,
+                WalFecRepairEncoder::Coefficients(rows) => {
+                    let row =
+                        usize::try_from(repair_index).map_err(|_| FrankenError::WalCorrupt {
+                            detail: format!("repair index {repair_index} does not fit in usize"),
+                        })?;
+                    let mut payload = vec![0_u8; symbol_len];
+                    for (page, &coefficient) in block_pages.iter().zip(&rows[row]) {
+                        if coefficient != 0 {
+                            asupersync::raptorq::gf256::gf256_addmul_slice(
+                                &mut payload,
+                                page,
+                                asupersync::raptorq::gf256::Gf256::new(coefficient),
+                            );
+                        }
+                    }
+                    payload
+                }
+            };
 
-        symbols.push(SymbolRecord::new(
-            meta.object_id,
-            meta.oti,
-            esi,
-            payload,
-            SymbolRecordFlags::empty(),
-        ));
+            if per_symbol_delay > Duration::ZERO {
+                thread::sleep(per_symbol_delay);
+            }
+
+            symbols.push(SymbolRecord::new(
+                meta.object_id,
+                meta.oti,
+                block.repair_esi(repair_index),
+                payload,
+                SymbolRecordFlags::empty(),
+            ));
+        }
     }
 
     Ok(Some(symbols))
 }
 
-/// How a group's repair symbols are computed. Both produce identical bytes.
+/// How a group's repair symbols are computed. Both produce the bytes
+/// asupersync's page-width `SystematicEncoder` would.
 enum WalFecRepairEncoder {
-    /// Page-width systematic encoder, for groups with many source pages.
-    Systematic(Box<asupersync::raptorq::systematic::SystematicEncoder>),
+    /// Intermediate symbols from the inactivation solver, for groups with
+    /// many source pages.
+    Intermediate(Box<WalFecIntermediateSymbols>),
     /// One row of GF(256) source-page coefficients per repair symbol.
     Coefficients(Vec<Vec<u8>>),
+}
+
+/// A group's RaptorQ intermediate symbols, solved by asupersync's
+/// `InactivationDecoder` from the K source pages (bd-mcpbv item 2).
+///
+/// `SystematicEncoder::new` solves the constraint matrix by dense
+/// elimination whose pivot search rescans every row and column at each step,
+/// cubic in K: a 4,300-frame commit took 54 s in a release build, and close
+/// waited for it. A systematic block's intermediate symbols are the unique
+/// solution of that system, so the inactivation solver WAL-FEC recovery
+/// already uses (`wal_fec_raptorq_decode`) yields the same symbols in about
+/// linear time. Each repair symbol is then the sum over its RFC 6330
+/// equation, the equation recovery decodes with: the bytes are the page-width
+/// encoder's, which `test_coefficient_repair_symbols_match_systematic_encoder`
+/// pins.
+struct WalFecIntermediateSymbols {
+    decoder: asupersync::raptorq::decoder::InactivationDecoder,
+    intermediate: Vec<Vec<u8>>,
+}
+
+impl WalFecIntermediateSymbols {
+    /// `None` when K is unsupported or the system is singular.
+    fn solve(source_pages: &[Vec<u8>], symbol_len: usize, seed: u64) -> Option<Self> {
+        let decoder = asupersync::raptorq::decoder::InactivationDecoder::try_new(
+            source_pages.len(),
+            symbol_len,
+            seed,
+        )
+        .ok()?;
+        let mut received = decoder.constraint_symbols();
+        received.reserve(source_pages.len());
+        for (esi, page) in source_pages.iter().enumerate() {
+            received.push(asupersync::raptorq::decoder::ReceivedSymbol::source(
+                u32::try_from(esi).ok()?,
+                page.clone(),
+            ));
+        }
+        let intermediate = decoder.decode(&received).ok()?.intermediate;
+        Some(Self {
+            decoder,
+            intermediate,
+        })
+    }
+
+    /// Repair symbol `esi`, or `None` when it has no RFC 6330 equation.
+    fn repair_symbol(&self, esi: u32, symbol_len: usize) -> Option<Vec<u8>> {
+        let (columns, coefficients) = self.decoder.repair_equation_rfc6330(esi)?;
+        let mut payload = vec![0_u8; symbol_len];
+        for (column, coefficient) in columns.into_iter().zip(coefficients) {
+            asupersync::raptorq::gf256::gf256_addmul_slice(
+                &mut payload,
+                self.intermediate.get(column)?,
+                coefficient,
+            );
+        }
+        Some(payload)
+    }
 }
 
 /// The coefficient of every source page in each repair symbol of `esis`.
@@ -3422,15 +3676,42 @@ pub fn wal_fec_raptorq_decode(
     meta: &WalFecGroupMeta,
     symbols: &[(u32, Vec<u8>)],
 ) -> Result<Vec<Vec<u8>>> {
-    let k = usize::try_from(meta.k_source).map_err(|_| FrankenError::WalCorrupt {
-        detail: format!("k_source {} does not fit in usize", meta.k_source),
-    })?;
     let symbol_size = usize::try_from(meta.oti.t).map_err(|_| FrankenError::WalCorrupt {
         detail: format!("OTI symbol size {} does not fit in usize", meta.oti.t),
     })?;
+    // bd-mcpbv item 2: each source block is its own RaptorQ block, decoded
+    // with its own K and seed from the symbols whose packed ESI names it. A
+    // one-block group is the whole group, with block-local ESIs equal to the
+    // ESIs, as before.
+    let mut pages = Vec::new();
+    for block in meta.source_blocks() {
+        let block_symbols: Vec<(u32, &[u8])> = symbols
+            .iter()
+            .filter_map(|(esi, data)| {
+                let (sbn, local_esi) = wal_fec_unpack_esi(*esi);
+                (sbn == block.sbn).then_some((local_esi, data.as_slice()))
+            })
+            .collect();
+        pages.extend(wal_fec_raptorq_decode_block(
+            usize::try_from(block.k).map_err(|_| FrankenError::WalCorrupt {
+                detail: format!("source block k {} does not fit in usize", block.k),
+            })?,
+            symbol_size,
+            // Must use the same seed as the encoder.
+            derive_repair_seed(meta, block.sbn),
+            &block_symbols,
+        )?);
+    }
+    Ok(pages)
+}
 
-    // Must use the same seed as the encoder.
-    let encoder_seed = derive_repair_seed(meta, 0);
+/// Decode one RaptorQ source block of `k` symbols from `(local ESI, data)`.
+fn wal_fec_raptorq_decode_block(
+    k: usize,
+    symbol_size: usize,
+    encoder_seed: u64,
+    symbols: &[(u32, &[u8])],
+) -> Result<Vec<Vec<u8>>> {
     // `new` panics on an unsupported K; sidecar metadata is untrusted input.
     let decoder =
         asupersync::raptorq::decoder::InactivationDecoder::try_new(k, symbol_size, encoder_seed)
@@ -3455,12 +3736,12 @@ pub fn wal_fec_raptorq_decode(
     };
 
     // Convert caller-provided (esi, data) pairs into ReceivedSymbol entries.
-    for &(esi, ref data) in symbols {
+    for &(esi, data) in symbols {
         let esi_usize = esi as usize;
         if esi_usize < k {
             received.push(asupersync::raptorq::decoder::ReceivedSymbol::source(
                 esi,
-                data.clone(),
+                data.to_vec(),
             ));
         } else {
             esi.checked_add(repair_padding_delta)
@@ -3474,7 +3755,7 @@ pub fn wal_fec_raptorq_decode(
                 esi,
                 cols,
                 coefs,
-                data.clone(),
+                data.to_vec(),
             ));
         }
     }
@@ -3890,9 +4171,13 @@ fn scan_wal_fec_groups_from(
                 break;
             }
         };
+        // r_repair per source block (bd-mcpbv item 2).
         let r_repair_usize =
-            usize::try_from(meta.r_repair).map_err(|_| FrankenError::WalCorrupt {
-                detail: format!("r_repair {} does not fit in usize", meta.r_repair),
+            usize::try_from(meta.repair_symbol_count()).map_err(|_| FrankenError::WalCorrupt {
+                detail: format!(
+                    "repair symbol count {} does not fit in usize",
+                    meta.repair_symbol_count()
+                ),
             })?;
 
         // Guard against a corrupt (maliciously large) r_repair before allocating.
@@ -3912,7 +4197,7 @@ fn scan_wal_fec_groups_from(
 
         let mut repair_symbols = Vec::with_capacity(r_repair_usize);
 
-        for _ in 0..meta.r_repair {
+        for _ in 0..meta.repair_symbol_count() {
             let Some(symbol_bytes) = read_length_prefixed(bytes, &mut cursor)? else {
                 truncated_tail = true;
                 warn!(
@@ -4301,6 +4586,20 @@ where
         stats.content_witness = build_content_witness(meta, &frame_payload_by_no, None);
         return Ok(insufficient_symbols_outcome(meta, group_id, stats));
     }
+    // bd-mcpbv item 2: each source block decodes on its own, so each needs its
+    // own k symbols. A block past its repair budget refuses the group exactly
+    // as an over-budget one-block group does.
+    if let Some(short_block) = block_short_of_symbols(meta, &source_collection.available_symbols) {
+        error!(
+            bead_id = BD_1HI_11_BEAD_ID,
+            group_id = %group_id,
+            source_block = short_block.sbn,
+            required_symbols = short_block.k,
+            "insufficient symbols for a wal-fec source block; truncating before group"
+        );
+        stats.content_witness = build_content_witness(meta, &frame_payload_by_no, None);
+        return Ok(insufficient_symbols_outcome(meta, group_id, stats));
+    }
 
     if stats.validated_source_symbols == meta.k_source {
         stats.decode_succeeded = true;
@@ -4363,6 +4662,30 @@ where
         decoded_pages,
         stats,
     ))
+}
+
+/// The first source block with fewer than its `k` symbols in `symbols`
+/// (packed ESIs), if any.
+fn block_short_of_symbols(
+    meta: &WalFecGroupMeta,
+    symbols: &[(u32, Vec<u8>)],
+) -> Option<WalFecSourceBlock> {
+    let blocks = meta.source_blocks();
+    let mut counts = vec![0_u32; blocks.len()];
+    for (esi, _) in symbols {
+        let (sbn, _) = wal_fec_unpack_esi(*esi);
+        if let Some(count) = usize::try_from(sbn)
+            .ok()
+            .and_then(|sbn| counts.get_mut(sbn))
+        {
+            *count = count.saturating_add(1);
+        }
+    }
+    blocks
+        .into_iter()
+        .zip(counts)
+        .find(|(block, count)| *count < block.k)
+        .map(|(block, _)| block)
 }
 
 fn finalize_decoded_success_outcome(
@@ -4542,8 +4865,12 @@ fn collect_valid_source_symbols(
     let mut available_symbols: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut source_pages = vec![None; k_required];
     let mut validated_source_symbols = 0_u32;
-
     for source_esi in 0..meta.k_source {
+        // bd-mcpbv item 2: a source symbol carries its block's packed ESI (the
+        // group index itself for a one-block group).
+        let packed_esi = meta
+            .source_block_of(source_esi)
+            .map_or(source_esi, |(block, local)| block.packed_esi(local));
         let index = usize::try_from(source_esi).map_err(|_| FrankenError::WalCorrupt {
             detail: format!("source ESI {source_esi} does not fit in usize"),
         })?;
@@ -4592,7 +4919,7 @@ fn collect_valid_source_symbols(
         }
         let payload_vec = payload.to_vec();
         source_pages[index] = Some(payload_vec.clone());
-        available_symbols.push((source_esi, payload_vec));
+        available_symbols.push((packed_esi, payload_vec));
         validated_source_symbols = validated_source_symbols.saturating_add(1);
     }
 
@@ -4735,11 +5062,16 @@ fn repair_symbol_matches_meta(meta: &WalFecGroupMeta, symbol: &SymbolRecord) -> 
     if symbol.object_id != meta.object_id || symbol.oti != meta.oti {
         return false;
     }
-    let repair_start = meta.k_source;
-    let Some(repair_end) = meta.k_source.checked_add(meta.r_repair) else {
+    // bd-mcpbv item 2: a repair symbol of block `sbn` has local ESI
+    // k_b..k_b + r_repair. One block: ESIs k_source..k_source + r_repair.
+    let (sbn, local_esi) = wal_fec_unpack_esi(symbol.esi);
+    let Some(block) = meta.source_block(sbn) else {
         return false;
     };
-    symbol.esi >= repair_start && symbol.esi < repair_end
+    let Some(repair_end) = block.k.checked_add(meta.r_repair) else {
+        return false;
+    };
+    local_esi >= block.k && local_esi < repair_end
 }
 
 fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGroupRecord>> {
@@ -4766,7 +5098,8 @@ fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGr
         let mut corruption_observations = 0_u32;
 
         let mut truncated_tail = false;
-        for _ in 0..meta.r_repair {
+        // r_repair per source block (bd-mcpbv item 2).
+        for _ in 0..meta.repair_symbol_count() {
             let Some(symbol_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {
                 truncated_tail = true;
                 break;
@@ -5223,7 +5556,10 @@ mod tests {
 
     /// bd-wqmil: the coefficient path must emit exactly the page-width
     /// encoder's repair symbols (the decoder and existing sidecars depend on
-    /// them), on both sides of the path-selection threshold.
+    /// them), on both sides of the path-selection threshold. bd-mcpbv item 2:
+    /// above the threshold (k * 4 > symbol size: 129, 200, 300 and 513 here)
+    /// the symbols come from the inactivation solver's intermediate symbols,
+    /// and must still be the page-width encoder's.
     #[test]
     fn test_coefficient_repair_symbols_match_systematic_encoder() {
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
@@ -5244,6 +5580,8 @@ mod tests {
             (128, 512, 2),
             (129, 512, 2),
             (200, 512, 3),
+            (300, 512, 2),
+            (513, 1024, 3),
         ] {
             let mut init = make_test_init(k);
             init.page_size = page_size;
@@ -5253,6 +5591,9 @@ mod tests {
             let pages: Vec<Vec<u8>> = (0..k)
                 .map(|_| (0..page_size).map(|_| next_byte()).collect())
                 .collect();
+            // The seed does not cover the page hashes, so the changed-source
+            // negative below keeps this group's seed.
+            let mut changed_init = init.clone();
             init.source_page_xxh3_128 = build_source_page_hashes(&pages);
             let meta = WalFecGroupMeta::from_init(init).expect("meta");
             let encoder = asupersync::raptorq::systematic::SystematicEncoder::new(
@@ -5272,7 +5613,157 @@ mod tests {
                     "k={k} page_size={page_size} esi={esi}"
                 );
             }
+            // The negative: a repair symbol depends on its sources, so one
+            // changed source byte must change it (a path that ignored the
+            // pages, or reused another group's symbols, fails here).
+            let mut changed = pages.clone();
+            changed[pages.len() / 2][0] ^= 0x5A;
+            changed_init.source_page_xxh3_128 = build_source_page_hashes(&changed);
+            let changed_meta = WalFecGroupMeta::from_init(changed_init).expect("changed meta");
+            assert_eq!(
+                derive_repair_seed(&changed_meta, 0),
+                derive_repair_seed(&meta, 0),
+                "the negative keeps the seed"
+            );
+            let changed_symbols = generate_wal_fec_repair_symbols(&changed_meta, &changed)
+                .expect("changed repair symbols");
+            assert!(
+                symbols
+                    .iter()
+                    .zip(&changed_symbols)
+                    .any(|(a, b)| a.symbol_data != b.symbol_data),
+                "k={k} page_size={page_size}: changed sources must change the repair symbols"
+            );
         }
+    }
+
+    /// bd-mcpbv item 2: a commit of more than WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS
+    /// frames is split into RFC 6330 Partition[K, Z] source blocks, and each
+    /// block is a standard RaptorQ block of its own (the page-width encoder
+    /// over that block alone, with the block's seed and local ESIs).
+    #[test]
+    fn test_bounded_source_blocks_are_standard_raptorq_blocks() {
+        for k in [1_u32, 255, 256, 257, 600, 4100, WAL_FEC_MAX_SOURCE_SYMBOLS] {
+            let z = wal_fec_source_block_count(k);
+            assert!(z <= WAL_FEC_MAX_SOURCE_BLOCKS, "k={k}");
+            let mut init = make_test_init(k);
+            init.oti.z = z;
+            let meta = WalFecGroupMeta::from_init(init).expect("meta");
+            let blocks = meta.source_blocks();
+            assert_eq!(blocks.len(), usize::try_from(z).unwrap());
+            let mut next = 0;
+            for (sbn, block) in blocks.iter().enumerate() {
+                assert_eq!(block.sbn, u32::try_from(sbn).unwrap());
+                assert_eq!(block.first, next, "k={k}: blocks are contiguous");
+                assert!((1..=WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS).contains(&block.k));
+                assert!(
+                    blocks[0].k - block.k <= 1,
+                    "k={k}: sizes differ by at most one"
+                );
+                next += block.k;
+            }
+            assert_eq!(next, k, "k={k}: blocks cover the group");
+            for index in 0..k {
+                let (block, local) = meta.source_block_of(index).expect("index in a block");
+                assert_eq!(blocks[usize::try_from(block.sbn).unwrap()], block);
+                assert_eq!(block.first + local, index);
+                assert!(local < block.k);
+            }
+            assert!(meta.source_block_of(k).is_none());
+            assert!(meta.source_block(z).is_none());
+            if z == 1 {
+                assert_eq!(blocks[0].repair_esi(0), k, "one block keeps plain ESIs");
+            }
+        }
+        // Metadata outside the representation is refused.
+        for z in [0, 4, WAL_FEC_MAX_SOURCE_BLOCKS + 1] {
+            let mut init = make_test_init(3);
+            init.oti.z = z;
+            assert!(WalFecGroupMeta::from_init(init).is_err(), "z={z} for k=3");
+        }
+
+        let (k, page_size) = (600_u32, 512_u32);
+        let symbol_len = usize::try_from(page_size).unwrap();
+        let mut init = make_test_init(k);
+        init.page_size = page_size;
+        init.oti.f = u64::from(k) * u64::from(page_size);
+        init.oti.t = page_size;
+        init.oti.z = wal_fec_source_block_count(k);
+        let pages: Vec<Vec<u8>> = (0..k)
+            .map(|i| {
+                (0..page_size)
+                    .map(|b| u8::try_from((i * 31 + b * 7) % 251).unwrap())
+                    .collect()
+            })
+            .collect();
+        init.source_page_xxh3_128 = build_source_page_hashes(&pages);
+        let meta = WalFecGroupMeta::from_init(init).expect("meta");
+        assert_eq!(meta.oti.z, 3);
+        let symbols = generate_wal_fec_repair_symbols(&meta, &pages).expect("repair symbols");
+        assert_eq!(symbols.len(), 3 * usize::try_from(meta.r_repair).unwrap());
+        assert!(WalFecGroupRecord::new(meta.clone(), symbols.clone()).is_ok());
+        for block in meta.source_blocks() {
+            let first = usize::try_from(block.first).unwrap();
+            let block_pages = &pages[first..first + usize::try_from(block.k).unwrap()];
+            let encoder = asupersync::raptorq::systematic::SystematicEncoder::new(
+                block_pages,
+                symbol_len,
+                derive_repair_seed(&meta, block.sbn),
+            )
+            .expect("page-width encoder");
+            for j in 0..meta.r_repair {
+                let symbol = symbols
+                    .iter()
+                    .find(|symbol| symbol.esi == block.repair_esi(j))
+                    .expect("the block's repair symbol");
+                assert_eq!(
+                    symbol.symbol_data,
+                    encoder.repair_symbol(block.k + j),
+                    "block {} repair {j}",
+                    block.sbn
+                );
+            }
+        }
+        // The layout binds each symbol to its block: reordering is refused.
+        let mut swapped = symbols.clone();
+        swapped.swap(0, 2);
+        assert!(WalFecGroupRecord::new(meta.clone(), swapped).is_err());
+
+        // Decode: each block loses r of its frames and is rebuilt from its own
+        // repairs; one more loss in a single block is not decodable.
+        let blocks = meta.source_blocks();
+        let lost = |index: u32| {
+            blocks
+                .iter()
+                .any(|block| index >= block.first && index - block.first < meta.r_repair)
+        };
+        let mut available: Vec<(u32, Vec<u8>)> = (0..k)
+            .filter(|index| !lost(*index))
+            .map(|index| {
+                let (block, local) = meta.source_block_of(index).expect("block");
+                (
+                    block.packed_esi(local),
+                    pages[usize::try_from(index).unwrap()].clone(),
+                )
+            })
+            .collect();
+        available.extend(
+            symbols
+                .iter()
+                .map(|symbol| (symbol.esi, symbol.symbol_data.clone())),
+        );
+        assert_eq!(
+            wal_fec_raptorq_decode(&meta, &available).expect("decode"),
+            pages
+        );
+        let (block_one, _) = meta.source_block_of(blocks[1].first).expect("block 1");
+        let one_more = available
+            .iter()
+            .position(|(esi, _)| *esi == block_one.packed_esi(meta.r_repair))
+            .expect("a surviving block 1 source");
+        available.remove(one_more);
+        assert!(block_short_of_symbols(&meta, &available).is_some_and(|block| block.sbn == 1));
+        assert!(wal_fec_raptorq_decode(&meta, &available).is_err());
     }
 
     /// bd-w4pr1.7 round 3: the coefficient cache serves groups whose seeds

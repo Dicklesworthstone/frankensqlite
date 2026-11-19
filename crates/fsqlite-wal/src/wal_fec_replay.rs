@@ -475,8 +475,10 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         let meta = &group.meta;
         let source_pages = usize::try_from(meta.k_source)
             .map_err(|_| corrupt("FEC source count exceeds address space"))?;
+        // The repair bound counts every block's symbols (bd-mcpbv item 2).
         if source_pages > limits.max_source_pages
-            || usize::try_from(meta.r_repair).unwrap_or(usize::MAX) > limits.max_repair_symbols
+            || usize::try_from(meta.repair_symbol_count()).unwrap_or(usize::MAX)
+                > limits.max_repair_symbols
         {
             stop = Some(WalFecReplayStop {
                 frame_no: damaged_frame_no,
@@ -843,18 +845,21 @@ fn find_recovery_group(
         }
         if matches
             && (usize::try_from(meta.k_source).unwrap_or(usize::MAX) > limits.max_source_pages
-                || usize::try_from(meta.r_repair).unwrap_or(usize::MAX) > limits.max_repair_symbols)
+                || usize::try_from(meta.repair_symbol_count()).unwrap_or(usize::MAX)
+                    > limits.max_repair_symbols)
         {
             return Err(Stop::ResourceLimit);
         }
         // Every iteration consumes at least a length prefix. A forged count
         // cannot spin past the admitted input size.
-        if u64::from(meta.r_repair) > u64::try_from((bytes.len() - cursor) / 4).unwrap_or(0) {
+        // r_repair per source block (bd-mcpbv item 2).
+        let repair_count = meta.repair_symbol_count();
+        if u64::from(repair_count) > u64::try_from((bytes.len() - cursor) / 4).unwrap_or(0) {
             return Err(Stop::UnusableSidecar);
         }
         let mut repair_symbols = Vec::new();
         let mut corruption_observations = 0_u32;
-        for _ in 0..meta.r_repair {
+        for _ in 0..repair_count {
             let payload = read_length_prefixed(bytes, &mut cursor)
                 .map_err(|_| Stop::UnusableSidecar)?
                 .ok_or(Stop::UnusableSidecar)?;
@@ -941,7 +946,9 @@ mod tests {
                 f: u64::from(count) * u64::from(PAGE_SIZE_U32),
                 al: 1,
                 t: PAGE_SIZE_U32,
-                z: 1,
+                // As the commit pipeline writes it: one source block up to
+                // WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS frames (bd-mcpbv item 2).
+                z: crate::wal_fec::wal_fec_source_block_count(count),
                 n: 1,
             },
             object_id: ObjectId::derive_from_canonical_bytes(&[tag]),
@@ -1058,6 +1065,146 @@ mod tests {
             result.complete_image().is_err(),
             "fallback is not complete recovery"
         );
+    }
+
+    /// Admits the 600-frame groups below, which the default limits refuse.
+    fn large_commit_limits() -> WalFecReplayLimits {
+        WalFecReplayLimits {
+            max_source_pages: 1024,
+            ..WalFecReplayLimits::default()
+        }
+    }
+
+    /// The byte length of a group record's first `records` length-prefixed
+    /// records (the metadata, then the repair symbols in block order).
+    fn prefix_of_records(record: &[u8], records: usize) -> usize {
+        let mut cursor = 0;
+        for _ in 0..records {
+            let len = u32::from_le_bytes(record[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4 + usize::try_from(len).unwrap();
+        }
+        cursor
+    }
+
+    #[test]
+    fn large_commit_repairs_damage_in_two_source_blocks_byte_identically() {
+        // bd-mcpbv item 2 keeper (a): a 600-frame commit (> K_max) is one group
+        // of three 200-frame source blocks, each with its own r = 2. Block 0
+        // holds frames 3..=202, block 1 203..=402, block 2 403..=602.
+        for magic in [WAL_MAGIC_LE, WAL_MAGIC_BE] {
+            let mut wal = header(magic).to_bytes().unwrap().to_vec();
+            let mut sidecar = append_group(&mut wal, 2, 2, 50);
+            sidecar.extend(append_group(&mut wal, 600, 2, 51));
+            append_group(&mut wal, 2, 2, 52); // Later healthy commit has no sidecar entry.
+            let groups =
+                crate::wal_fec::scan_wal_fec_bytes(std::path::Path::new("snapshot-only"), &sidecar)
+                    .unwrap()
+                    .groups;
+            assert_eq!(groups[1].meta.oti.z, 3);
+            assert_eq!(groups[1].repair_symbols.len(), 6);
+            let expected = wal.clone();
+            // Two frames in block 0 (its whole budget) and one in block 2.
+            for frame in [10, 202, 450] {
+                corrupt_payload(&mut wal, frame);
+            }
+            let result = recover_wal_fec_image(&wal, &sidecar, large_commit_limits()).unwrap();
+            assert_eq!(result.committed_frames(), 604);
+            assert_eq!(result.repaired_frame_nos(), &[10, 202, 450]);
+            assert!(result.decode_proofs()[0].decode_attempted);
+            assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn one_block_past_its_budget_refuses_the_group_like_an_over_budget_group() {
+        // bd-mcpbv item 2 keeper (b), the negative. Three damaged frames in
+        // block 1 (203..=402) exceed its r = 2, although the group as a whole
+        // still holds 597 + 6 >= 600 symbols, so a group-wide count would admit
+        // it. The refusal must match today's over-budget one-block group (the
+        // 200-frame case): no decode, no partial or wrong repair.
+        let limits = large_commit_limits();
+        for (count, damaged) in [(600_u32, [210_u32, 300, 402]), (200, [10, 100, 202])] {
+            let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+            append_group(&mut wal, 2, 2, 53);
+            let accepted = wal.clone();
+            let sidecar = append_group(&mut wal, count, 2, 54);
+            for frame in damaged {
+                corrupt_payload(&mut wal, frame);
+            }
+            let result = recover_wal_fec_image(&wal, &sidecar, limits).unwrap();
+            assert_eq!(result.committed_frames(), 2, "{count} frames");
+            assert_eq!(result.replayable_prefix(), accepted);
+            assert!(result.repaired_frame_nos().is_empty());
+            assert_eq!(
+                result.stop().unwrap().reason,
+                WalFecReplayStopReason::Decode(WalFecRecoveryFallbackReason::InsufficientSymbols)
+            );
+            assert!(
+                !result.decode_proofs()[0].decode_attempted,
+                "refused before any decode"
+            );
+            assert!(result.complete_image().is_err());
+        }
+        // Control: the same number of damaged frames, one per block, repairs.
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_group(&mut wal, 2, 2, 53);
+        let sidecar = append_group(&mut wal, 600, 2, 54);
+        let expected = wal.clone();
+        for frame in [100, 300, 500] {
+            corrupt_payload(&mut wal, frame);
+        }
+        let result = recover_wal_fec_image(&wal, &sidecar, limits).unwrap();
+        assert_eq!(result.repaired_frame_nos(), &[100, 300, 500]);
+        assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+    }
+
+    #[test]
+    fn crash_before_a_large_commit_frame_is_durable_leaves_no_trace() {
+        // bd-mcpbv item 2 keeper (c). A large commit's blocks reach the sidecar
+        // as one appended record; a crash mid-append leaves that record torn
+        // after some blocks. With the commit frame itself torn in the WAL,
+        // recovery keeps only the previous transaction, as stock does, with or
+        // without damage inside the lost transaction.
+        let limits = large_commit_limits();
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 2, 2, 55);
+        let accepted = wal.clone();
+        let large = append_group(&mut wal, 600, 2, 56);
+        // The commit frame (602) is torn: its last bytes never reached disk.
+        let torn = &wal[..wal.len() - 100];
+        // The metadata and block 0's symbols; and two blocks; and the metadata alone.
+        for records in [3, 5, 1] {
+            let mut crashed_sidecar = sidecar.clone();
+            crashed_sidecar.extend_from_slice(&large[..prefix_of_records(&large, records)]);
+            let scan = crate::wal_fec::scan_wal_fec_bytes(
+                std::path::Path::new("snapshot-only"),
+                &crashed_sidecar,
+            )
+            .unwrap();
+            assert!(scan.truncated_tail, "{records} records");
+            assert_eq!(
+                scan.groups.len(),
+                1,
+                "only the durable previous group remains"
+            );
+            for damaged in [None, Some(10_u32)] {
+                let mut crashed_wal = torn.to_vec();
+                if let Some(frame) = damaged {
+                    corrupt_payload(&mut crashed_wal, frame);
+                }
+                let result = recover_wal_fec_image(&crashed_wal, &crashed_sidecar, limits).unwrap();
+                assert_eq!(
+                    result.committed_frames(),
+                    2,
+                    "{records} records, damage {damaged:?}"
+                );
+                assert_eq!(result.replayable_prefix(), accepted);
+                assert!(result.repaired_frame_nos().is_empty());
+                if let Ok(image) = result.complete_image() {
+                    assert_eq!(image.as_ref(), accepted);
+                }
+            }
+        }
     }
 
     #[test]
