@@ -10609,6 +10609,14 @@ impl<F: VfsFile> PagerInner<F> {
     /// the next refresh must be a full one.
     fn note_own_wal_commit_first_seq(&mut self, first_commit_seq: CommitSeq) {
         if first_commit_seq.get() > self.commit_seq.get().saturating_add(1) {
+            // bd-kcf1h: the keeper of the row mirror after such a commit counts this event to
+            // show the commit really jumped.
+            tracing::debug!(
+                target: "fsqlite_pager::own_commit_jump",
+                first_commit_seq = first_commit_seq.get(),
+                commit_seq = self.commit_seq.get(),
+                "own WAL commit jumped past peer commits"
+            );
             self.committed_state_behind_peer_commit = Some(first_commit_seq);
         }
     }
