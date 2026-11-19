@@ -50,6 +50,16 @@ pub struct Transaction<'a> {
 }
 
 impl<'a> Transaction<'a> {
+    /// Open a scoped `BEGIN DEFERRED` transaction. Reads share one snapshot
+    /// without reserving a writer. A caller that already owns a transaction
+    /// receives [`FrankenError::NestedTransaction`].
+    pub async fn begin_deferred(conn: &'a Connection) -> Result<Self, FrankenError> {
+        Self::new_with_begin(conn, async {
+            conn.execute("BEGIN DEFERRED").await.map(|_| ())
+        })
+        .await
+    }
+
     async fn new(conn: &'a Connection) -> Result<Self, FrankenError> {
         Self::new_with_begin(conn, conn.begin_transaction()).await
     }

@@ -2628,13 +2628,13 @@ where
         SELECT name \
         FROM sqlite_schema \
         WHERE type IN ('table', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
         ORDER BY name";
     let filtered_sql = "\
         SELECT name \
         FROM sqlite_schema \
         WHERE type IN ('table', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
           AND name LIKE ?1 \
         ORDER BY name";
 
@@ -2673,7 +2673,7 @@ where
         FROM sqlite_schema \
         WHERE sql IS NOT NULL \
           AND type IN ('table', 'index', 'trigger', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
         ORDER BY CASE type \
             WHEN 'table' THEN 0 \
             WHEN 'index' THEN 1 \
@@ -2686,7 +2686,7 @@ where
         FROM sqlite_schema \
         WHERE sql IS NOT NULL \
           AND type IN ('table', 'index', 'trigger', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
           AND (name LIKE ?1 OR tbl_name LIKE ?1) \
         ORDER BY CASE type \
             WHEN 'table' THEN 0 \
@@ -2725,19 +2725,43 @@ async fn write_dump<W>(
 where
     W: Write,
 {
+    // Pin catalog, rows, sequence counters and schema objects to one snapshot.
+    // If the shell is already in a transaction, its uncommitted view is the
+    // one to dump and the caller retains ownership of it.
+    let snapshot = match fsqlite::compat::Transaction::begin_deferred(connection).await {
+        Ok(transaction) => Some(transaction),
+        Err(FrankenError::NestedTransaction) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let contents = write_dump_contents(connection, filter, colorize_sql, out).await;
+    if let Some(mut snapshot) = snapshot {
+        let release = snapshot.rollback().await.map_err(|error| error.to_string());
+        contents.and(release)?;
+    } else {
+        contents?;
+    }
+    write_sql_statement(out, "COMMIT;", colorize_sql).map_err(|error| error.to_string())
+}
+
+async fn write_dump_contents<W: Write>(
+    connection: &Connection,
+    filter: Option<&str>,
+    colorize_sql: bool,
+    out: &mut W,
+) -> Result<(), String> {
     let table_sql = "\
         SELECT name, sql \
         FROM sqlite_schema \
         WHERE type = 'table' \
           AND sql IS NOT NULL \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
         ORDER BY name";
     let filtered_table_sql = "\
         SELECT name, sql \
         FROM sqlite_schema \
         WHERE type = 'table' \
           AND sql IS NOT NULL \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
           AND name LIKE ?1 \
         ORDER BY name";
     let object_sql = "\
@@ -2745,7 +2769,7 @@ where
         FROM sqlite_schema \
         WHERE sql IS NOT NULL \
           AND type IN ('index', 'trigger', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
         ORDER BY CASE type \
             WHEN 'index' THEN 0 \
             WHEN 'trigger' THEN 1 \
@@ -2757,7 +2781,7 @@ where
         FROM sqlite_schema \
         WHERE sql IS NOT NULL \
           AND type IN ('index', 'trigger', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
           AND (name LIKE ?1 OR tbl_name LIKE ?1) \
         ORDER BY CASE type \
             WHEN 'index' THEN 0 \
@@ -2839,7 +2863,6 @@ where
         write_sql_statement(out, statement, colorize_sql).map_err(|error| error.to_string())?;
     }
 
-    write_sql_statement(out, "COMMIT;", colorize_sql).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -5689,6 +5712,183 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
             assert!(
                 stdout.contains("COMMIT;"),
                 "expected transaction trailer in dump, got: {stdout}",
+            );
+        });
+    }
+
+    #[test]
+    fn test_catalog_commands_preserve_user_names_starting_with_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(":memory:").await.unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sqlite3_notes(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+                 INSERT INTO sqlite3_notes VALUES(7,'saved');
+                 CREATE INDEX sqliteX_tag ON sqlite3_notes(v);
+                 CREATE VIEW SQLiteView AS SELECT v FROM sqlite3_notes;
+                 CREATE TABLE ordinary(v);",
+            )
+            .await
+            .unwrap();
+
+            for filter in [None, Some("sqlite%")] {
+                let mut output = Vec::new();
+                super::write_tables(&conn, filter, &mut output)
+                    .await
+                    .unwrap();
+                let tables: Vec<_> = std::str::from_utf8(&output)
+                    .unwrap()
+                    .split_whitespace()
+                    .collect();
+                assert!(tables.contains(&"sqlite3_notes"));
+                assert!(tables.contains(&"SQLiteView"));
+                assert!(!tables.contains(&"sqlite_sequence"));
+                assert_eq!(tables.contains(&"ordinary"), filter.is_none());
+
+                output.clear();
+                super::write_schema(&conn, filter, false, &mut output)
+                    .await
+                    .unwrap();
+                let schema = std::str::from_utf8(&output).unwrap();
+                for name in ["sqlite3_notes", "sqliteX_tag", "SQLiteView"] {
+                    assert!(schema.contains(name), "{schema}");
+                }
+                assert!(!schema.contains("sqlite_sequence"));
+
+                output.clear();
+                super::write_dump(&conn, filter, false, &mut output)
+                    .await
+                    .unwrap();
+                let restored = rusqlite::Connection::open_in_memory().unwrap();
+                restored
+                    .execute_batch(std::str::from_utf8(&output).unwrap())
+                    .unwrap();
+                let result: (String, i64, i64) = restored
+                    .query_row(
+                        "SELECT v, (SELECT count(*) FROM SQLiteView),
+                           (SELECT seq FROM sqlite_sequence WHERE name='sqlite3_notes')
+                         FROM sqlite3_notes INDEXED BY sqliteX_tag WHERE id=7",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(result, (String::from("saved"), 1, 7));
+            }
+        });
+    }
+
+    #[test]
+    fn test_dump_keeps_one_snapshot_while_a_wal_writer_commits() {
+        struct DumpOutput {
+            sql: Vec<u8>,
+            writer: Option<rusqlite::Connection>,
+        }
+
+        impl io::Write for DumpOutput {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.sql.extend_from_slice(buf);
+                if self.sql.ends_with(b"INSERT INTO \"a_head\" VALUES(0);\n")
+                    && let Some(writer) = self.writer.take()
+                {
+                    writer
+                        .execute_batch(
+                            "BEGIN; UPDATE a_head SET v=1; UPDATE z_tail SET v=1;
+                             CREATE INDEX after_dump_started ON z_tail(v); COMMIT;",
+                        )
+                        .map_err(io::Error::other)?;
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("concurrent.db");
+            let writer = rusqlite::Connection::open(&path).expect("stock writer");
+            writer
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     CREATE TABLE a_head(v); CREATE TABLE z_tail(v);
+                     INSERT INTO a_head VALUES(0); INSERT INTO z_tail VALUES(0);",
+                )
+                .expect("create source");
+            let reader = fsqlite::Connection::open(path.to_str().unwrap())
+                .await
+                .expect("dump reader");
+            let mut output = DumpOutput {
+                sql: Vec::new(),
+                writer: Some(writer),
+            };
+            super::write_dump(&reader, None, false, &mut output)
+                .await
+                .expect("dump beside stock writer");
+            assert!(output.writer.is_none(), "the writer must run during output");
+            let read = |db: &rusqlite::Connection| -> (i64, i64, i64) {
+                db.query_row(
+                    "SELECT (SELECT v FROM a_head), (SELECT v FROM z_tail),
+                     (SELECT count(*) FROM sqlite_schema WHERE name='after_dump_started')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("inspect generations and index")
+            };
+            assert_eq!(read(&rusqlite::Connection::open(&path).unwrap()), (1, 1, 1));
+            let restored = rusqlite::Connection::open_in_memory().unwrap();
+            restored
+                .execute_batch(std::str::from_utf8(&output.sql).unwrap())
+                .expect("restore dump");
+            assert_eq!(read(&restored), (0, 0, 0));
+            assert!(!reader.in_transaction());
+        });
+    }
+
+    #[test]
+    fn test_dump_releases_only_its_own_transaction_on_success_and_error() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(v)").await.unwrap();
+            let mut full_output: &mut [u8] = &mut [];
+            assert!(
+                super::write_dump(&conn, None, false, &mut full_output)
+                    .await
+                    .is_err()
+            );
+            assert!(!conn.in_transaction());
+            conn.execute_batch("BEGIN; INSERT INTO t VALUES(41); SAVEPOINT caller;")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(42)").await.unwrap();
+            let mut dump = Vec::new();
+            super::write_dump(&conn, Some("t"), false, &mut dump)
+                .await
+                .unwrap();
+            let restored = rusqlite::Connection::open_in_memory().unwrap();
+            restored
+                .execute_batch(std::str::from_utf8(&dump).unwrap())
+                .unwrap();
+            assert_eq!(
+                restored
+                    .query_row("SELECT sum(v) FROM t", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                83
+            );
+            assert!(
+                super::write_dump(&conn, None, false, &mut full_output)
+                    .await
+                    .is_err()
+            );
+            conn.execute_batch("ROLLBACK TO caller; RELEASE caller; ROLLBACK;")
+                .await
+                .expect("caller still owns its savepoint and transaction");
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM t")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&fsqlite::SqliteValue::Integer(0))
             );
         });
     }
