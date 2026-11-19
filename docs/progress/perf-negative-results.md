@@ -94,6 +94,28 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - REJECTED on two kill lines (bulk task-clock a TIE then a WIN, not a replicated WIN; gb_a_sum_c cycles a replicated LOSE at -0.01% Ir), with bulk -33M..-43M Ir and its cycles a replicated WIN: the page cache's budget check counts the overflow shards without locking them (bd-w4pr1.13, bulk-write round 11, lever BR)
+
+- Target: `ShardedPageCache::budget_resident_pages` on bulk_insert_1M_one_txn. Callgrind on 1292d7b3c: 22,324 calls,
+  33.46M Ir, 1,499 a call. Once an overflow insert sets `shards_dirty` (cleared only by a full clear), every count
+  locks all 128 shards, and a trim counts up to three times. Every other scorecard row counts on the flat path
+  (~23 Ir a call): rowid_lookups_200k 563,074 calls, the 1M-row scans 21,817, update / delete 6,285. Touched (not
+  landed; patch `scratchpad/r11/br2_on_cac612a6c.diff` of the bulk-write lane): `crates/fsqlite-pager/src/page_cache.rs`
+  (`PageCacheShard` keeps a cache-wide `Arc<AtomicUsize>` in its mutators, a new `take` replaces the direct
+  `shard.pages.remove` in `take_clean_buffer_at`, and the count reads flat + that counter; a unit test holds the
+  counter equal to the locked sum through every way a shard gains or loses a page; 162 page_cache tests pass).
+- Prediction (bd-w4pr1.13, before the build): bulk -33.0M to -33.6M Ir, cycles -0.8% to -1.6%; every other row within
+  +-0.1% Ir. Kill lines: bulk Ir down less than 25M, bulk task-clock not a replicated WIN, any row a replicated LOSE
+  in cpu or cycles, any row's Ir up more than 0.3%.
+- Result (bd-es2im lines; base cac612a6c, two valid runs, stock live; .text +192 B): bulk Ir -43.1M / -32.9M, cycles
+  0.980 / 0.968 WIN / WIN, task-clock 0.995 TIE (T 2.49%) / 0.964 WIN; gb_a_sum_c cycles 1.027 / 1.016 LOSE / LOSE
+  (T 1.06% / 1.00%) at Ir 0.9999; rowid_lookups_200k Ir -10.3M (-0.38%, outside the +-0.1% predicted: its 563k
+  flat-path counts lost ~18 Ir each); every other row Ir -0.03%..+0.02%, cpu and cycles TIE.
+- Retry condition: as part of a page-cache lever that also removes the trim's other costs, judged on bulk and the read
+  rows together: the clean-buffer search that finds nothing when every page is dirty (bulk: ~13.2M Ir, all 128
+  shards locked again per trim) and the eviction search the read rows pay per admitted page (rowid_lookups_200k
+  412M Ir, 15.3% of the row; count_star 22.8%).
+
 ## 2026-11-19 - REJECTED again, by its layout-averaged landing run (scan_filter_agg cycles a replicated LOSE at identical Ir; join and memory_script replicated WINs): the table seek cache keeps eight leaves, scanned in place (bd-w4pr1.12, read-loop round 9, lever SC8 v2)
 
 - Lever, target, prediction and kill lines: the 2026-11-18 SC8 v2 entry (ledger 9ce1f49d7), which rejected it on
