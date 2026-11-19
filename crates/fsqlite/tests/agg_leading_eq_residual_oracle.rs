@@ -4,8 +4,9 @@
 //! residual equality/range/OR/multi-term predicates (including a rowid residual), a multi-column
 //! equality prefix, NULL trailing composite-index terms, absent keys
 //! (→ COUNT=0 / SUM=NULL), COALESCE, and both aggregates. The residual filter enforces the WHOLE
-//! predicate, so nothing is dropped. Opcode gate: an all-literal WHERE SeekGEs the index; a WHERE with
-//! a bound parameter in the literal prefix declines, while a parameterized residual remains seekable.
+//! predicate, so nothing is dropped. Opcode gate: an all-literal WHERE SeekGEs the index, and so does a
+//! bound parameter in the prefix (bd-79p0a); a bound range bound declines, while a parameterized
+//! residual remains seekable.
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -187,11 +188,14 @@ fn agg_leading_eq_residual_matches_sqlite() {
             has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x = ?", "SeekGE").await,
             "leading eq (literal) + parameterized residual must still seek the prefix"
         );
-        // A bound parameter in the PREFIX / range bound (the probe) declines — the probe must be a literal.
+        // bd-79p0a: a bound key in the PREFIX seeks as its literal spelling does. The connection
+        // numbers every parameter (`?NNN`), so the probe takes no anonymous slot from the residual,
+        // and the seek checks the bound value's storage class at run time, scanning for any other.
         assert!(
-            !has_op(&f, "SELECT COUNT(*) FROM t WHERE a = ? AND x = 5", "SeekGE").await,
-            "a parameterized PREFIX must decline (probe must be a literal)"
+            has_op(&f, "SELECT COUNT(*) FROM t WHERE a = ? AND x = 5", "SeekGE").await,
+            "a parameterized PREFIX must seek the prefix as the literal spelling does (bd-79p0a)"
         );
+        // A bound range bound still declines: the range seek takes literal bounds only.
         assert!(
             !has_op(&f, "SELECT COUNT(*) FROM t WHERE a > ? AND x = 5", "SeekGE").await,
             "a parameterized range bound must decline (bound must be a literal)"

@@ -3355,11 +3355,13 @@ pub fn codegen_select(
                     None,
                 )
                 .is_some()
-                || aggregate_index_prefix_literal_residual_target(
+                // bd-79p0a: a bound key yields too; `codegen_select_aggregate` takes it last.
+                || aggregate_index_prefix_residual_target(
                     where_clause.as_deref(),
                     table,
                     table_alias,
                     PrefixIndexShape::AnyPrefix,
+                    PrefixProbe::LiteralOrNumberedParameter,
                 )
                 .is_some()
                 || extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
@@ -3498,7 +3500,7 @@ pub fn codegen_select(
     // emits an IndexEquality directive for the `col=lit` conjunct which bypasses on the residual it
     // cannot enforce (or emits none), reaching the heuristic chain below — where `index_eq_target`'s bare-`Eq`
     // detection misses the conjunction and the query full-scans. Detect the exact eq-literal prefix (via
-    // the residual-safe `aggregate_index_prefix_literal_residual_target`, which requires ≥1 residual
+    // the residual-safe `aggregate_index_prefix_residual_target`, which requires ≥1 residual
     // conjunct so pure `col=lit` still routes through the directive) and seek the `col=lit` block,
     // filtering the FULL WHERE per row (`codegen_select_index_equality_scan` with `residual_filter =
     // true`, so its fast path narrows to the exact matches). Dispatched as a heuristic fallback (AFTER
@@ -3534,11 +3536,12 @@ pub fn codegen_select(
         }) {
         None
     } else {
-        aggregate_index_prefix_literal_residual_target(
+        aggregate_index_prefix_residual_target(
             where_clause.as_deref(),
             table,
             table_alias,
             PrefixIndexShape::SingleColumn,
+            PrefixProbe::Literal,
         )
         .filter(|(_idx, prefix)| prefix.len() == 1)
         .map(|(idx, prefix)| (idx, prefix[0]))
@@ -3566,11 +3569,12 @@ pub fn codegen_select(
     } else {
         rowid_range_residual.and_then(|range| {
             let bounds = IndexEqRowidBounds::from_range(&range)?;
-            let (idx, prefix) = aggregate_index_prefix_literal_residual_target(
+            let (idx, prefix) = aggregate_index_prefix_residual_target(
                 where_clause.as_deref(),
                 table,
                 table_alias,
                 PrefixIndexShape::SingleColumn,
+                PrefixProbe::Literal,
             )?;
             (prefix.len() == 1).then(|| (idx, prefix[0], bounds))
         })
@@ -21492,7 +21496,7 @@ fn aggregate_index_range_seek_target<'t, 'e>(
     None
 }
 
-/// Which indexes [`aggregate_index_prefix_literal_residual_target`] may return.
+/// Which indexes [`aggregate_index_prefix_residual_target`] may return.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrefixIndexShape {
     /// Any index with a non-empty equality prefix.
@@ -21504,31 +21508,106 @@ enum PrefixIndexShape {
     FullKey,
 }
 
+/// How the keys of an [`aggregate_index_prefix_residual_target`] prefix may
+/// be spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixProbe {
+    /// Integer and text literals only: the seek is exact at compile time.
+    Literal,
+    /// Literals or numbered parameters (`?NNN`, the spelling the connection
+    /// gives every bind parameter). A parameter's seek is exact once its value
+    /// holds the storage class [`index_prefix_term_exactness`] names; the
+    /// caller checks that at run time and scans for any other value
+    /// (bd-79p0a).
+    LiteralOrNumberedParameter,
+}
+
+/// Whether a seek on one index key term with a given key visits exactly the
+/// entries `column = key` matches (see [`index_prefix_term_exactness`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TermExactness {
+    /// Exact at compile time: an INTEGER literal on INTEGER affinity, or a
+    /// TEXT literal on TEXT whose column and key term collate BINARY, so no
+    /// affinity conversion or collation can make the index order disagree
+    /// with the comparison.
+    Static,
+    /// A bound parameter, exact on the same terms once its value holds the
+    /// storage class this `IsType` mask names (bd-aavtp).
+    Runtime(u16),
+    /// Neither: a seek with this key could miss a matching row.
+    Inexact,
+}
+
+impl TermExactness {
+    /// The `IsType` mask a run-time exact key is checked against.
+    const fn runtime_mask(self) -> Option<u16> {
+        match self {
+            Self::Runtime(mask) => Some(mask),
+            Self::Static | Self::Inexact => None,
+        }
+    }
+}
+
+/// How exact a seek on key term `term` of `index` with `probe` as its key
+/// is; see [`TermExactness`].
+fn index_prefix_term_exactness(
+    index: &IndexSchema,
+    table: &TableSchema,
+    term: usize,
+    probe: &Expr,
+) -> TermExactness {
+    let Some(column) = index
+        .columns
+        .get(term)
+        .and_then(|name| table.column_index(name))
+        .and_then(|ci| table.columns.get(ci))
+    else {
+        return TermExactness::Inexact;
+    };
+    let binary =
+        |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+    let text_exact = column.affinity == 'B'
+        && binary(index.key_term_collation(term))
+        && binary(column.collation.as_deref());
+    match probe {
+        Expr::Literal(Literal::Integer(_), _) if column.affinity == 'D' => TermExactness::Static,
+        Expr::Literal(Literal::String(_), _) if text_exact => TermExactness::Static,
+        bound if is_placeholder_bound(bound) => match column.affinity {
+            'D' => TermExactness::Runtime(0x01_u16),
+            'B' if text_exact => TermExactness::Runtime(0x04_u16),
+            _ => TermExactness::Inexact,
+        },
+        _ => TermExactness::Inexact,
+    }
+}
+
 /// The index and equality prefix a
-/// `COUNT(*)/SUM(...) WHERE a = <literal> AND <residual>` aggregate can seek:
-/// pin the leading key column(s) with an integer- or text-literal equality,
-/// walk that block, and apply the FULL WHERE as a residual filter per row.
-/// Gated tight so it is byte-exact and safe: (1) each literal's storage class
-/// exactly matches its indexed column's affinity and text probes use BINARY
-/// collation, so the seek cannot miss a scan match; (2) the literal probe
-/// consumes no placeholders, so bound parameters in the residual keep the
-/// same numbering as the scan path; (3) there is at least one residual
-/// conjunct beyond the prefix (otherwise the exact eq-seek already handles
-/// it). `shape` lets callers that depend on rowid ordering skip indexes whose
-/// block is not in rowid order (see [`PrefixIndexShape`]).
-/// The residual filter enforces the whole predicate, so a dropped-predicate
-/// class of bug cannot occur.
-fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
+/// `COUNT(*)/SUM(...) WHERE a = <key> AND <residual>` aggregate can seek:
+/// pin the leading key column(s) with an equality, walk that block, and apply
+/// the FULL WHERE as a residual filter per row. Gated tight so it is
+/// byte-exact and safe: (1) each key is exact for its key term (see
+/// [`index_prefix_term_exactness`]; `probe` says whether a bound parameter
+/// may be a key), so the seek cannot miss a scan match; (2) the probe
+/// consumes no anonymous or named placeholder slot: a literal consumes none,
+/// and a parameter key is admitted only when every placeholder in the WHERE
+/// is numbered, so the residual filter reads the same slots as the scan path;
+/// (3) there is at least one residual conjunct beyond the prefix (otherwise
+/// the exact eq-seek already handles it). `shape` lets callers that depend on
+/// rowid ordering skip indexes whose block is not in rowid order (see
+/// [`PrefixIndexShape`]). The residual filter enforces the whole predicate,
+/// so a dropped-predicate class of bug cannot occur.
+fn aggregate_index_prefix_residual_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
     shape: PrefixIndexShape,
+    probe: PrefixProbe,
 ) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
     let where_expr = where_clause?;
-    // A bound parameter is allowed only in the RESIDUAL: the prefix is required to be an integer/text
-    // LITERAL below, so the probe emits no placeholders and the residual filter numbers `?` exactly as
-    // the scan path does (bd-agg-param-residual).
-    if table.without_rowid {
+    if table.without_rowid
+        || (probe == PrefixProbe::LiteralOrNumberedParameter
+            && expr_contains_non_numbered_placeholder(where_expr))
+    {
         return None;
     }
     let mut conjuncts = Vec::new();
@@ -21556,30 +21635,18 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
             continue;
         }
         // The seek probe must land on a SUPERSET of the matching rows (the residual filter re-applies
-        // the whole WHERE and narrows to exact). An integer literal vs an INTEGER column, or a text
-        // literal vs a TEXT column indexed BINARY, both seek without an affinity/collation miss.
+        // the whole WHERE and narrows to exact).
         let exact = prefix.iter().enumerate().all(|(i, e)| {
-            let column = index
-                .columns
-                .get(i)
-                .and_then(|name| table.column_index(name))
-                .and_then(|ci| table.columns.get(ci));
-            match e {
-                Expr::Literal(Literal::Integer(_), _) => {
-                    column.is_some_and(|column| column.affinity == 'D')
+            match index_prefix_term_exactness(index, table, i, e) {
+                TermExactness::Static => true,
+                TermExactness::Runtime(_) => {
+                    probe == PrefixProbe::LiteralOrNumberedParameter
+                        && matches!(
+                            e,
+                            Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+                        )
                 }
-                Expr::Literal(Literal::String(_), _) => {
-                    column.is_some_and(|column| {
-                        column.affinity == 'B'
-                            && column
-                                .collation
-                                .as_deref()
-                                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-                    }) && index
-                        .key_term_collation(i)
-                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-                }
-                _ => false,
+                TermExactness::Inexact => false,
             }
         });
         if !exact {
@@ -22943,11 +23010,12 @@ fn codegen_select_aggregate(
         && index_range_seek.is_none()
         && composite_prefix_range_seek.is_none()
     {
-        aggregate_index_prefix_literal_residual_target(
+        aggregate_index_prefix_residual_target(
             where_clause,
             table,
             table_alias,
             PrefixIndexShape::AnyPrefix,
+            PrefixProbe::Literal,
         )
     } else {
         None
@@ -22999,6 +23067,37 @@ fn codegen_select_aggregate(
         None
     };
 
+    // bd-79p0a: the same equality-prefix seek when the caller binds the key,
+    // `WHERE a = ?1 AND <residual>`. The literal-only gate above declined it,
+    // and the aggregate scanned in rowid order: slower than the literal
+    // spelling's seek, and a bare column took another row than stock's, which
+    // seeks. Taken last, so no shape that another seek serves changes. The
+    // emitter checks each parameter's storage class at run time and scans for
+    // any value the seek would not be exact for.
+    let index_prefix_residual_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_range_seek.is_none()
+        && index_in_seek.is_none()
+        && index_const_in_seek.is_none()
+        && index_range_seek.is_none()
+        && composite_prefix_range_seek.is_none()
+        && index_prefix_residual_seek.is_none()
+        && rowid_in_seek.is_none()
+        && rowid_eq_residual_seek.is_none()
+    {
+        aggregate_index_prefix_residual_target(
+            where_clause,
+            table,
+            table_alias,
+            PrefixIndexShape::AnyPrefix,
+            PrefixProbe::LiteralOrNumberedParameter,
+        )
+    } else {
+        index_prefix_residual_seek
+    };
+
     // bd-z3a05: `SUM(c) WHERE a = <lit> AND id < <int>` took `rowid_range_seek`,
     // which walks the rowid slice (usually most of the table) and filters on `a`.
     // When literal equalities pin every key column of an index, that index
@@ -23010,11 +23109,12 @@ fn codegen_select_aggregate(
     // set and declined, so taking it over here changes no other choice.
     let index_prefix_rowid_bounded = rowid_range_seek.as_ref().and_then(|(range, _)| {
         let bounds = IndexEqRowidBounds::from_range(range)?;
-        let (idx, prefix) = aggregate_index_prefix_literal_residual_target(
+        let (idx, prefix) = aggregate_index_prefix_residual_target(
             where_clause,
             table,
             table_alias,
             PrefixIndexShape::FullKey,
+            PrefixProbe::Literal,
         )?;
         Some((idx, prefix, bounds))
     });
@@ -23189,42 +23289,20 @@ fn codegen_select_aggregate(
         // GH#444: a string literal against a TEXT column is exact on the same terms as the single-column
         // seek (GH#409) — no affinity conversion is implied, and BINARY on both the index term and the
         // column makes the index order the comparison order — so it qualifies per term too.
-        // bd-aavtp: a key known only at run time (a parameter or a constant expression) is exact on
-        // the same terms once its value holds the storage class the column's affinity leaves
-        // unconverted, as for the single-column seek (bd-ry6x7). `Some(None)` is a term exact at
-        // compile time, `Some(Some(mask))` one `IsType` checks at run time, `None` neither.
-        let term_exactness: Vec<Option<Option<u16>>> = prefix_exprs
+        // bd-aavtp: a key known only at run time (a bound parameter) is exact on the same terms
+        // once its value holds the storage class the column's affinity leaves unconverted, as for
+        // the single-column seek (bd-ry6x7). See `index_prefix_term_exactness`.
+        let term_exactness: Vec<TermExactness> = prefix_exprs
             .iter()
             .enumerate()
-            .map(|(i, e)| {
-                let column = idx_schema
-                    .columns
-                    .get(i)
-                    .and_then(|name| table.column_index(name))
-                    .and_then(|ci| table.columns.get(ci))?;
-                let binary = |collation: Option<&str>| {
-                    collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-                };
-                let text_exact = column.affinity == 'B'
-                    && binary(idx_schema.key_term_collation(i))
-                    && binary(column.collation.as_deref());
-                match e {
-                    Expr::Literal(Literal::Integer(_), _) => {
-                        (column.affinity == 'D').then_some(None)
-                    }
-                    Expr::Literal(Literal::String(_), _) => text_exact.then_some(None),
-                    bound if is_placeholder_bound(bound) => match column.affinity {
-                        'D' => Some(Some(0x01_u16)),
-                        'B' if text_exact => Some(Some(0x04_u16)),
-                        _ => None,
-                    },
-                    _ => None,
-                }
-            })
+            .map(|(i, e)| index_prefix_term_exactness(idx_schema, table, i, e))
             .collect();
-        let exact_seek = term_exactness.iter().all(|term| matches!(term, Some(None)));
-        let runtime_exact_check = (!exact_seek && term_exactness.iter().all(Option::is_some))
-            .then(|| b.emit_label());
+        let exact_seek = term_exactness
+            .iter()
+            .all(|term| *term == TermExactness::Static);
+        let runtime_exact_check = (!exact_seek
+            && !term_exactness.contains(&TermExactness::Inexact))
+        .then(|| b.emit_label());
         let seek_miss_label = if exact_seek {
             finalize_label
         } else if let Some(check) = runtime_exact_check {
@@ -23375,11 +23453,11 @@ fn codegen_select_aggregate(
             // its column's affinity leaves unconverted; any other key falls through to the scan.
             b.resolve_label(check);
             for (offset, term) in term_exactness.iter().enumerate() {
-                if let Some(Some(mask)) = term {
+                if let TermExactness::Runtime(mask) = *term {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     let reg = probe_key_regs + offset as i32;
                     let next_term = b.emit_label();
-                    b.emit_jump_to_label(Opcode::IsType, -1, reg, next_term, P4::None, *mask);
+                    b.emit_jump_to_label(Opcode::IsType, -1, reg, next_term, P4::None, mask);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, scan_fallback, P4::None, 0);
                     b.resolve_label(next_term);
                 }
@@ -24085,13 +24163,31 @@ fn codegen_select_aggregate(
         let prefix_len = prefix_exprs.len() as i32;
         let rowid_floor = rowid_bounds.and_then(|bounds| bounds.lower);
         let probe_field_count = prefix_len + i32::from(rowid_floor.is_some());
+        // bd-79p0a: the storage class each bound key must hold for the seek to be exact; a
+        // literal key needs none. Any other value scans below, as the eq-seek does (bd-aavtp).
+        let runtime_masks: Vec<Option<u16>> = prefix_exprs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| index_prefix_term_exactness(idx_schema, table, i, e).runtime_mask())
+            .collect();
+        let scan_fallback = runtime_masks
+            .iter()
+            .any(Option::is_some)
+            .then(|| b.emit_label());
 
         let probe_key_regs = b.alloc_regs(probe_field_count);
-        for (i, expr) in prefix_exprs.iter().enumerate() {
+        for (i, (expr, mask)) in prefix_exprs.iter().zip(&runtime_masks).enumerate() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let reg = probe_key_regs + i as i32;
             emit_expr(b, expr, reg, None);
+            // `col = NULL` matches no row, whatever spells the key.
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+            if let (Some(mask), Some(scan)) = (*mask, scan_fallback) {
+                let exact = b.emit_label();
+                b.emit_jump_to_label(Opcode::IsType, -1, reg, exact, P4::None, mask);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, scan, P4::None, 0);
+                b.resolve_label(exact);
+            }
         }
         // A true partial record is the floor of the entire prefix block. A
         // synthetic `i64::MIN` next term would sort after NULL on an ASC
@@ -24223,7 +24319,14 @@ fn codegen_select_aggregate(
         b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         b.resolve_label(duplicate_run_done);
-        skip_scan = true;
+        if let Some(scan) = scan_fallback {
+            // The block was walked; only a key the seek is not exact for reaches the scan, which
+            // reads the same `?NNN` slots (the target admits no other placeholder).
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+            b.resolve_label(scan);
+        } else {
+            skip_scan = true;
+        }
     } else if let Some((values, has_residual)) = rowid_in_seek {
         // bd-agg-rowid-in [+ residual]: SeekRowid per distinct listed value, accumulating each hit into the
         // aggregate. A miss skips to the next value; an all-miss leaves the accumulators Null (the
@@ -59657,11 +59760,12 @@ mod tests {
              should prove partial-index coverage"
         );
         assert!(
-            aggregate_index_prefix_literal_residual_target(
+            aggregate_index_prefix_residual_target(
                 Some(&function_where),
                 &function_table,
                 None,
                 PrefixIndexShape::AnyPrefix,
+                PrefixProbe::Literal,
             )
             .is_some(),
             "fixture must exercise the partial-index equality-prefix residual heuristic"
@@ -59688,11 +59792,12 @@ mod tests {
                 "any scalar replacement must decline a function-bearing partial-index proof"
             );
             assert!(
-                aggregate_index_prefix_literal_residual_target(
+                aggregate_index_prefix_residual_target(
                     Some(&function_where),
                     &function_table,
                     None,
                     PrefixIndexShape::AnyPrefix,
+                    PrefixProbe::Literal,
                 )
                 .is_none(),
                 "a scalar replacement must keep the function-bearing partial index \
@@ -59708,11 +59813,12 @@ mod tests {
                 "an unrelated scalar replacement must not disable a function-free partial predicate"
             );
             assert!(
-                aggregate_index_prefix_literal_residual_target(
+                aggregate_index_prefix_residual_target(
                     Some(&plain_where),
                     &plain_table,
                     None,
                     PrefixIndexShape::AnyPrefix,
+                    PrefixProbe::Literal,
                 )
                 .is_some(),
                 "the function-free partial index must remain eligible for the residual heuristic"
