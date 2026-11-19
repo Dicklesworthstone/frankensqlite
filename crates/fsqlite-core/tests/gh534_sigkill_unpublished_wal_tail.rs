@@ -16,8 +16,11 @@
 //! - a writer that is alive between its WAL sync and its publication is never
 //!   mistaken for a dead one: readers keep the published prefix meanwhile;
 //! - a recovery that dies partway is redone by the next opener;
-//! - a transaction whose snapshot predates the dead writer's commit is
-//!   refused at once with a retryable `BusySnapshot`, and its retry commits.
+//! - a transaction whose snapshot predates the dead writer's commit ends on
+//!   top of it, with the dead writer's rows intact, as stock's application
+//!   retry leaves them: one that returned nothing is replayed inside COMMIT
+//!   (bd-q4o7z, a3d329d47); one that read is refused at once with a retryable
+//!   `BusySnapshot`, and its retry commits (bd-c7onh).
 //!
 //! The writers are child processes killed for real (SIGKILL), or stopped at a
 //! named commit step by the `fault-injection` crash points, which abort the
@@ -389,48 +392,152 @@ fn a_recovery_that_dies_partway_is_redone_by_the_next_opener() {
     });
 }
 
+/// Every `items` id, in order.
 #[cfg(feature = "fault-injection")]
-#[test]
-fn a_transaction_begun_before_the_crash_gets_a_prompt_retryable_conflict() {
-    asupersync::test_utils::run_test(|| async {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = create(dir.path()).await;
-        let mut writer = ChildProcess::spawn(
-            "writer",
-            &db,
-            &[
-                (CRASH_POINT_ENV, SYNC_BEFORE_PUBLISH),
-                (CRASH_AFTER_ENV, "3"),
-                (CRASH_ACTION_ENV, "pause"),
-            ],
+async fn ids(conn: &Connection) -> Vec<i64> {
+    conn.query("SELECT id FROM items ORDER BY id")
+        .await
+        .expect("ids")
+        .iter()
+        .map(|row| match row.values() {
+            [SqliteValue::Integer(id)] => *id,
+            other => panic!("unexpected id row {other:?}"),
+        })
+        .collect()
+}
+
+/// Every `items` id as stock reads a copy of the files (see
+/// [`stock_count_of_copy`], which also checks stock's integrity).
+#[cfg(feature = "fault-injection")]
+fn stock_ids_of_copy(db: &Path, into: &Path) -> Vec<i64> {
+    stock_count_of_copy(db, into);
+    let stock = rusqlite::Connection::open(into.join("b.db")).expect("stock open copy");
+    let mut ids = stock
+        .prepare("SELECT id FROM items ORDER BY id")
+        .expect("stock prepare");
+    ids.query_map([], |row| row.get(0))
+        .expect("stock ids")
+        .map(|id| id.expect("stock id"))
+        .collect()
+}
+
+/// How a transaction begun before the dead writer's crash ends.
+#[cfg(feature = "fault-injection")]
+struct BegunBeforeTheCrash {
+    commit: Result<usize, FrankenError>,
+    commit_took: Duration,
+    rows: Vec<i64>,
+    stock_rows: Vec<i64>,
+}
+
+/// The writer's third commit (id 4) is durable in the WAL but never
+/// published. A transaction binds its snapshot on the published prefix
+/// (ids 1-3), INSERTs 500 and, with `read`, reads the table; then the writer
+/// is SIGKILLed and the transaction COMMITs. A refused COMMIT is retried as
+/// an application would: ROLLBACK, then the same transaction again. The rows
+/// are what fsqlite and stock (from a copy of the files) read at the end.
+#[cfg(feature = "fault-injection")]
+async fn begun_before_the_crash(read: bool) -> BegunBeforeTheCrash {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = create(dir.path()).await;
+    let mut writer = ChildProcess::spawn(
+        "writer",
+        &db,
+        &[
+            (CRASH_POINT_ENV, SYNC_BEFORE_PUBLISH),
+            (CRASH_AFTER_ENV, "3"),
+            (CRASH_ACTION_ENV, "pause"),
+        ],
+    );
+    writer.wait_paused();
+    // Bind a snapshot while the writer is alive and holds WRITE.
+    let conn = open(&db).await;
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute("INSERT INTO items VALUES (500)")
+        .await
+        .expect("insert on the published prefix");
+    if read {
+        assert_eq!(
+            ids(&conn).await,
+            [1, 2, 3, 500],
+            "the snapshot predates the writer's durable commit"
         );
-        writer.wait_paused();
-        // Bind a snapshot while the writer is alive and holds WRITE.
-        let conn = open(&db).await;
-        conn.execute("BEGIN").await.expect("begin");
-        conn.execute("INSERT INTO items VALUES (500)")
-            .await
-            .expect("insert on the published prefix");
-        writer.sigkill();
-        let started = Instant::now();
-        let error = conn
-            .execute("COMMIT")
-            .await
-            .expect_err("the snapshot predates a durable commit");
-        let took = started.elapsed();
-        assert!(
-            matches!(error, FrankenError::BusySnapshot { .. }),
-            "refused with {error:?}"
-        );
-        assert!(took < Duration::from_secs(1), "refused after {took:?}");
+    }
+    writer.sigkill();
+    let started = Instant::now();
+    let commit = conn.execute("COMMIT").await;
+    let commit_took = started.elapsed();
+    if commit.is_err() {
         let _ = conn.execute("ROLLBACK").await;
         let (result, took) = commit_one(&conn, 500).await;
         result.expect("the retried transaction commits");
         assert!(took < PROMPT, "retry took {took:?}");
-        assert_eq!(count(&conn).await.expect("count"), 5, "1 + 3 + 1");
-        assert_eq!(integrity(&conn).await, "ok");
-        conn.close_without_checkpoint().await.expect("close");
-        assert_eq!(stock_count_of_copy(&db, &dir.path().join("stock")), 5);
+    }
+    let rows = ids(&conn).await;
+    assert_eq!(integrity(&conn).await, "ok");
+    conn.close_without_checkpoint().await.expect("close");
+    let stock_rows = stock_ids_of_copy(&db, &dir.path().join("stock"));
+    BegunBeforeTheCrash {
+        commit,
+        commit_took,
+        rows,
+        stock_rows,
+    }
+}
+
+/// bd-q4o7z's COMMIT replay (a3d329d47) re-runs a transaction that returned
+/// nothing on a fresh snapshot within busy_timeout, as the application's
+/// retry would. So a write-only transaction whose snapshot predates the dead
+/// writer's durable commit commits at once on top of it (bd-c7onh). Stock
+/// refuses the same interleaving with SQLITE_BUSY_SNAPSHOT and the
+/// application retries: the rows end the same. A lost update (the dead
+/// writer's row 4 missing, or its pages overwritten from the stale snapshot)
+/// fails the row check.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_write_only_transaction_begun_before_the_crash_is_replayed_on_top_of_it() {
+    asupersync::test_utils::run_test(|| async {
+        let outcome = begun_before_the_crash(false).await;
+        if let Err(error) = &outcome.commit {
+            panic!("the replayed COMMIT was refused: {error:?}");
+        }
+        assert!(
+            outcome.commit_took < PROMPT,
+            "the replayed COMMIT took {:?}",
+            outcome.commit_took
+        );
+        assert_eq!(outcome.rows, [1, 2, 3, 4, 500], "1, the dead writer's 2-4, and 500");
+        assert_eq!(outcome.stock_rows, outcome.rows, "stock reads the same rows");
+    });
+}
+
+/// A transaction that returned rows is not replayed (what it returned could
+/// change), so its COMMIT is refused at once with a retryable `BusySnapshot`,
+/// and its retry commits on top of the dead writer's commit.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_transaction_that_read_before_the_crash_gets_a_prompt_retryable_conflict() {
+    asupersync::test_utils::run_test(|| async {
+        let outcome = begun_before_the_crash(true).await;
+        let error = outcome
+            .commit
+            .as_ref()
+            .expect_err("the snapshot predates a durable commit");
+        assert!(
+            matches!(error, FrankenError::BusySnapshot { .. }),
+            "refused with {error:?}"
+        );
+        assert!(
+            outcome.commit_took < Duration::from_secs(1),
+            "refused after {:?}",
+            outcome.commit_took
+        );
+        assert_eq!(
+            outcome.rows,
+            [1, 2, 3, 4, 500],
+            "1, the dead writer's 2-4, and the retry's 500"
+        );
+        assert_eq!(outcome.stock_rows, outcome.rows, "stock reads the same rows");
     });
 }
 
