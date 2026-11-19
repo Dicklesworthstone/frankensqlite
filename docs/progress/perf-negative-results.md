@@ -94,6 +94,34 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - REJECTED on its first kill line (rowid_lookups_200k -259M Ir against the 279M that means tracker work under 170 per miss), every other line passing: the eviction trackers' access trace forgets a page in O(1) per removed entry (bd-s3fifo-forget-trace-cost-hv2rd, bulk-write round 12, lever S3F)
+
+- Target: `S3FifoEvictionTracker::forget` on every page-cache eviction. Callgrind on main (cac612a6c's ELF;
+  page_cache.rs unchanged to 5c7963d88): 1,589 per eviction, 297.9M of rowid_lookups_200k (11.06%, 187,524
+  evictions), 11.26M of count_star (16.4%), 11.27M of join_1M_to_pk_1000; 79% of the clean-buffer take's 2,017 per
+  eviction (the flat-tier search is the other ~430). The trackers record on admission only, never on a hit.
+  This is the fourth try; the bar is the 2026-11-14 entry's retry condition (under 170 per miss, an
+  open-addressing table keyed by page, no sweep). Touched (not landed; patch
+  `scratchpad/r12/s3fifo2_on_5c7963d88.diff` of the bulk-write lane): `crates/fsqlite-pager/src/page_cache.rs`
+  (`AccessTrace` shared by the S3-FIFO and ARC trackers: a slab of nodes in a recording-order list, each chained
+  to its page's next entry; a linear-probing table, power of two at least twice the bound, page -> oldest and
+  newest node, backward-shift removal; the ring-compaction helpers and their two tests replaced by a keeper that
+  drives both trackers beside the old ring over 40,000 generated steps at bounds 64..8,192 and checks lengths,
+  forgotten pages, whole sequences and chosen victims, and a test of `forget` keeping a history past 4,096).
+- Prediction (bead, before the build): rowid -270M to -290M, count_star and join -9.5M to -11M, each 1M-row scan
+  -9.5M to -11M. Kill lines: rowid down less than 279M (tracker work per miss at or above 170), count_star or join
+  down less than 9M, any row's Ir up more than 0.3%, a keeper or an answer failing.
+- Result, stock 3.46.1 live (thinkstation1): single ELF, rowid 2,699.4M -> 2,440.4M (-259.0M; 4.87x -> 4.40x stock),
+  count_star 59.6M -> 49.8M (-16.4%), join -9.2M. Layout-averaged, two valid runs: rowid cpu 0.964 / 0.965 and
+  cycles 0.940 / 0.939, replicated WINs (x-stock cpu 1.800x -> 1.735x); every other row TIE, no replicated LOSE;
+  the scans -9.35M..-11.1M Ir each. Callgrind of the lever on rowid: about 290 tracker instructions per miss
+  (`AccessTrace::record` 64 a call, two calls a miss; the tracker wrapper and its lock ~19 a call; `forget` 123,
+  of which the table removal 25), against l1's 354 and the old ~1,659.
+- Retry condition: tracker work per miss under 170 by callgrind, or a coordinator / owner decision that the bar
+  (set for lazy deletion, whose cost lands on hits) does not apply to a tracker that records only on admission.
+  For the first: fold a miss's second record (the read right after its admission) into the tail node as a
+  count, so a page read once is one node; estimated 180-200 a miss, so measure that alone first.
+
 ## 2026-11-19 - REJECTED on its kill line (delete_14pct_300k task-clock a replicated LOSE at unchanged Ir), with bulk -62M Ir and its time TIE as predicted: an appended row raises the rowid floor without building the bump's future (bd-w4pr1.13, bulk-write round 11, lever FB)
 
 - Target: the explicit-rowid floor bump on bulk_insert_1M_one_txn, 175 Ir a row (callgrind on 1292d7b3c:
@@ -291,10 +319,9 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   its source. A second instance, a second caller, a taken address or a main-loop arm moved out of line each changed
   what LLVM inlined into the lane. No construction found leaves today's lane byte-identical and adds no instruction
   per lane entry: selecting by a branch costs every lane entry, and every other selection changes the lane.
-- Retry condition: an owner decision that plain rows are judged by a band (for example the 0.3% instruction guard
-  and the layout-averaged cycles lines) instead of exactly. v3c is then the starting point (the smallest
-  perturbation, +3 KB .text), with its gains re-predicted from the run above. Otherwise, a synchronous lane that
-  row-body programs need not leave for the statement loop at all.
+- Retry condition: a construction whose plain-row lane is byte-identical to main's (compare the lane's machine
+  code, not only instruction counts) and that meets its predicted bulk gain. A band for plain rows was proposed
+  and declined (bd-w4pr1.13, 2026-11-19).
 
 ## 2026-11-19 - FIX (landed as 0a2ada09a; a regression of the bd-q4o7z landing, judged against its 2% kill line): the commit replay's per-call hook no longer builds a future, and a prepared execute skips the nested wrapper; the one-writer prepared insert's excess drops from +3.7% to +1.84% Ir per row (bd-q4o7z probe 5, multi-process lane rounds 3-4)
 
