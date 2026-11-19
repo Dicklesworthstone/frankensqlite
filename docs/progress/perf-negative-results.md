@@ -94,6 +94,50 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - REJECTED on its declared kill line (gh19 still red; its close drops from over 600 s to 39.7 s against a 30 s wait): WAL-FEC encodes a large repair group with asupersync's inactivation solver instead of the dense page-width SystematicEncoder (bd-mcpbv item 2, gh19, multi-process lane round 6)
+
+- Target: wal_reset_with_foreign_reader::gh19_public_native_full_commits_grow_shared_segments_before_stock_refresh.
+  - It fails "segment-writer reader failed to exit within 30 seconds".
+  - The segment writer makes two commits of about 4,100 frames at 512-byte pages, and its close drains the WAL-FEC
+    queue.
+  - Each commit is one repair group. Recovery depends on that: a group must start right after the committed frames
+    and end at a commit frame.
+  - A group with k * 4 > symbol size goes through `SystematicEncoder::new`, whose `ConstraintMatrix::solve` is a
+    dense elimination cubic in L.
+  - The test profile builds asupersync at opt-level 0.
+- Lever: for such a group, feed `InactivationDecoder` the constraint symbols plus the K source pages. Each repair
+  symbol is then the sum over `repair_equation_rfc6330(esi)` of coefficient times intermediate symbol: the
+  equations WAL-FEC recovery already decodes with.
+  - Byte-identical to the page-width encoder. `test_coefficient_repair_symbols_match_systematic_encoder` now covers
+    K = 129, 200, 300 and 513 on this path, with a changed-source negative.
+  - fsqlite-wal lib and tests: 15 targets, 1,309 passed.
+- Ledger preflight: no earlier entry covers WAL-FEC encode cost. bd-w4pr1.7 round 3 (the coefficient cache) is the
+  small-K path and is kept.
+- Result (rch, test profile):
+  - Encode alone, solve and two repair symbols, 512-byte symbols:
+    - K=513: 0.6 s (dense 1.4 s);
+    - K=1,025: 1.9 s (dense 8.8 s);
+    - K=2,050: 5.7 s;
+    - K=4,100: 19.5 s.
+    - It grows about 3.2x per doubling, so it is not linear.
+  - gh19's writer close, measured with the wait widened to 600 s in a scratch copy of the test (never committed):
+    - main (d1aad9457): over 600 s, no exit;
+    - with the lever: 39.7 s.
+  - The unchanged test still fails 2 of 2 with the lever (rch, two workers). Kill line: "gh19 not green 3 of 3".
+  - The CLI runs no WAL-FEC pipeline: no `-wal-fec` sidecar after a bulk insert, and the scorecard's bulk row
+    takes about 1 s. So no CLI row can show this change.
+- Not tried, because each is a gate change or a decision above this lever:
+  - raptorq_repair_symbols=0 or another runtime in the test;
+  - asupersync's opt-level 0 in [profile.dev.package.asupersync] (86220d567, no stated reason);
+  - bounding close to the in-flight encode (it breaks the close-drains contract and its keeper).
+- Retry condition, either of these:
+  - with the encode of a connection's independent repair groups run in parallel, so gh19's close waits for about
+    one encode instead of two (about 20 s in the test profile);
+  - or with bounded groups: a large commit split into several RaptorQ source blocks (OTI z > 1) or several groups,
+    which needs recovery to accept groups that do not end at a commit frame.
+  Either combines with this lever. Release builds would cut the two encodes from about 54 s each (this bead's
+  2026-10-11 numbers) to about 1.3 s each (estimated as test profile / 15).
+
 ## 2026-11-19 - REJECTED in all three constructions (plain programs' instructions do not stay unchanged): the synchronous lane chosen per program, so that only a program with a Concat or an Affinity runs them on it (bd-w4pr1.13, bulk-write round 11, lever LA v3)
 
 - Target and kill lines: as LA v1 (entry below), plus the coordinator's line: rows whose programs contain neither
