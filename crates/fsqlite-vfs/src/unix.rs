@@ -12587,8 +12587,37 @@ mod tests {
         assert!(!inode.lock().unwrap().has_lock_claims());
     }
 
+    /// bd-crqlt: the deferred-cleanup queue is process-wide, and every
+    /// `UnixVfs::open` first runs `retry_deferred_unix_cleanups`, which takes
+    /// the whole queue, closes each owner without the mutex and re-queues the
+    /// failures. An `open` in a parallel test therefore hides this test's
+    /// owner while the test looks for it. The body runs in a child process of
+    /// this test binary, filtered to this test alone, so no other test opens
+    /// a file meanwhile.
     #[test]
     fn shm_mapping_drop_retains_failed_main_lifetime_cleanup_for_exact_retry() {
+        const CHILD_ENV: &str = "FSQLITE_BD_CRQLT_CHILD";
+        const TEST: &str =
+            "unix::tests::shm_mapping_drop_retains_failed_main_lifetime_cleanup_for_exact_retry";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            shm_mapping_drop_cleanup_retry_body();
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run the isolated cleanup-retry child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated cleanup-retry child failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn shm_mapping_drop_cleanup_retry_body() {
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("shm-mapping-cleanup-retry.db");
