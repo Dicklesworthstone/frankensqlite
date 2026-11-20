@@ -94,6 +94,38 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-19 - WIN (landed as 2f4aac8bb): a grouped built-in aggregate of a plain column reads the group's values in place (bd-w4pr1.12, read-loop round 8, lever GB1)
+
+- Target: GROUP BY id over a derived table. The connection's grouped evaluator collected a (value, ORDER BY keys)
+  entry per row for sum(n): a 72 MB block and 1M value clones (DHAT, a7c78382f); 94,624 page faults against
+  stock's 700.
+- Touched: `crates/fsqlite-core/src/connection.rs` (execute_group_by_join_select_inner's catch-all aggregate
+  branch); `crates/fsqlite-core/tests/aggregate_edge_oracle.rs` (keeper `derived_table_column_aggregates`).
+- Change: a built-in aggregate of a plain column, with no DISTINCT and no in-aggregate ORDER BY, collects
+  references to the FILTER-kept rows' non-NULL values. It ends in the same compute call, so no result changes.
+  Recorded before the build as a deviation from the predicted design (stepping an accumulator).
+- Prediction (2026-11-18, before code): GROUP BY id -17k to -19k faults, CPU -35 to -70 ms, Ir -40 to -150M.
+  Kill: GROUP BY id CPU not 25 ms lower in each of two runs; any row +0.5% Ir; a row's cycles pair median above
+  its A/A arm's highest pair ratio in both runs; an aggregate / derived-table / FILTER / DISTINCT / group_concat
+  oracle red.
+- Result (parent 9ce1f49d7, CLI sha256 efaff92a36e9e388, against ac6ac78bb06d734c, an A/A arm; stock sqlite3
+  3.46.1 live; thinkstation1; two runs of 7 interleaved reps; single layout, as predeclared): gb_id Ir 5,278.3M
+  -> 5,154.5M (-123.8M; x3.68 -> x3.59 stock); page faults 94,703 -> 77,131 (stock 698); CPU paired difference
+  -57.0 / -78.0 ms, single-layout (x5.19 -> x4.84 and x5.44 -> x4.83 stock). Every other row within +0.013% Ir;
+  line 3 pass.
+- Planted mutants (rch, rc 101): M1 (no NULL filter) fails "aggregates of a derived column with a NULL row"; M2
+  (unfiltered rows) fails "FILTER keeps only its rows".
+- Gate (fd9074201 + diff 721f804b2bc08815): clippy btree / vdbe / core clean; 70 test binaries (libs, goldens, 46
+  seek / join and 19 aggregate / derived-table / FILTER / DISTINCT / group_concat / JSON-aggregate oracles), 6,274
+  passed, 1 failed; fsqlite-e2e 23 targets, 155 passed; fsqlite crate in 7 batches of 19, 124 binaries, 1,100
+  passed, 0 failed. The one red is bd-gazf2's :memory: GROUP BY order
+  (bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans), which fails
+  identically on the parent cac612a6c without GB1 (line 225, file=false, fsqlite NULL,a,z against stock z,a,NULL).
+- The landed parent (20fa52bc6) was not measured on its own; the commits after 9ce1f49d7 do not touch this function
+  or what it calls. The instruction and page-fault figures are exact, the CPU figures single-layout (predeclared).
+- Retry condition: none for this shape. Left on GROUP BY id: the derived table's projection copies (96 MB + 24 MB
+  in execute_join_select: stream the derived table's rows instead) and the sorter's rows.
+
 ## 2026-11-19 - REJECTED on its first kill line (rowid_lookups_200k -259M Ir against the 279M that means tracker work under 170 per miss), every other line passing: the eviction trackers' access trace forgets a page in O(1) per removed entry (bd-s3fifo-forget-trace-cost-hv2rd, bulk-write round 12, lever S3F)
 
 - Target: `S3FifoEvictionTracker::forget` on every page-cache eviction. Callgrind on main (cac612a6c's ELF;
