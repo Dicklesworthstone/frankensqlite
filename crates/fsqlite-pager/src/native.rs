@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::sync_primitives::{RwLock, RwLockReadGuard};
-use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, TxnToken};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, SecureDeleteMode, TxnToken};
 use fsqlite_vfs::{VfsFile, VfsWriteCompletion};
 use fsqlite_wal::native_commit::durable::{
     DurableCommitAcknowledgement, NativeCommitAttempt, NativeObjectCodec,
@@ -110,6 +110,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePager<S, M, C> {
             mode, snapshot, dirty: Vec::new(), savepoints: Vec::new(),
             was_writer: false, owns_slot: true, acknowledgement: None,
             cursor_cache_reuse_disabled: false,
+            secure_delete_mode: SecureDeleteMode::Off,
         })
     }
 
@@ -298,6 +299,7 @@ pub struct NativeTransaction<S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     /// Once a savepoint rolls back, keep cache reuse fenced until this handle
     /// retires; releasing the savepoint does not retire those cursor images.
     cursor_cache_reuse_disabled: bool,
+    secure_delete_mode: SecureDeleteMode,
 }
 
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeTransaction<S, M, C> {
@@ -397,6 +399,11 @@ where
     M: VfsFile + Send + Sync,
     C: NativeObjectCodec + Send + Sync,
 {
+    fn secure_delete_mode(&self) -> SecureDeleteMode { self.secure_delete_mode }
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.secure_delete_mode = mode;
+    }
+
     async fn get_page<'a>(&'a self, cx: &'a Cx, page_no: PageNumber) -> Result<PageData> {
         self.active()?;
         let store = self.shared.read()?;

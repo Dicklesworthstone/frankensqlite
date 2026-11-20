@@ -25,7 +25,7 @@ use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{
     BTreePageHeader, CommitSeq, DATABASE_HEADER_MAGIC, DATABASE_HEADER_SIZE, DatabaseHeader,
     FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber, PageNumberBuildHasher,
-    PageSize,
+    PageSize, SecureDeleteMode,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::{
@@ -11685,6 +11685,7 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     write_pages_sorted: &mut Vec<PageNumber>,
     committed_db_size: u32,
     pending_free_pages: &[PageNumber],
+    zeroed_freelist_trunks: &PagePageSet,
     phase_a_undo: Option<&PhaseAWriteSetUndo>,
 ) -> Result<Vec<PageNumber>> {
     if committed_db_size == 0 {
@@ -11748,15 +11749,36 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         let mut leaf_index = trunk_pages.len();
 
         for (idx, trunk_pg) in trunk_pages.iter().enumerate() {
+            let pg = PageNumber::new(*trunk_pg)
+                .expect("normalized freelist contains only valid page numbers");
             let next = trunk_pages.get(idx + 1).copied().unwrap_or(0);
             let remaining = durable_freelist.len().saturating_sub(leaf_index);
             let take = remaining.min(max_leaf_entries);
 
             let mut buf =
                 acquire_page_buf_with_clean_cache_recovery(pool, cache, "freelist_trunk_stage")?;
-            // Zero the entire page to avoid leaking stale data from the
-            // pool in the unused tail of the trunk page.
-            buf.fill(0);
+            let zeroed = zeroed_freelist_trunks.contains(&pg);
+            let reserved = commit_reserved_per_page(write_set, inner.reserved_per_page);
+            if zeroed && reserved == 0 {
+                buf.fill(0);
+            } else {
+                // A freelist trunk only overwrites its metadata. Preserve the
+                // old tail under OFF/FAST, including when an overflow page is
+                // chosen. ON already staged a complete zero image. Never use
+                // uninitialized pool bytes as the source of a trunk's tail.
+                if let Some(staged) = write_set.get(&pg) {
+                    buf.copy_from_slice(staged.as_page_bytes());
+                } else {
+                    let original = inner
+                        .read_committed_page_copy(cx, cache, wal_backend, pg)
+                        .await?;
+                    buf.copy_from_slice(&original);
+                }
+                if zeroed {
+                    let usable = buf.len() - usize::from(reserved);
+                    buf[..usable].fill(0);
+                }
+            }
             buf[0..4].copy_from_slice(&next.to_be_bytes());
             buf[4..8].copy_from_slice(&(take as u32).to_be_bytes());
 
@@ -11767,12 +11789,10 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
             }
             leaf_index += take;
 
-            if let Some(pg) = PageNumber::new(*trunk_pg) {
-                if let Some(undo) = phase_a_undo {
-                    undo.capture(write_set, pg);
-                }
-                insert_staged_page(write_set, write_pages_sorted, pg, StagedPage::from_buf(buf));
+            if let Some(undo) = phase_a_undo {
+                undo.capture(write_set, pg);
             }
+            insert_staged_page(write_set, write_pages_sorted, pg, StagedPage::from_buf(buf));
         }
     }
 
@@ -15561,12 +15581,15 @@ where
                     freed_pages: Vec::new(),
                     freed_pages_index: PagePageSet::default(),
                     freed_page_bounds: None,
+                    zeroed_freelist_trunks: PagePageSet::default(),
                     allocated_from_freelist: Vec::new(),
                     allocated_from_durable_freelist: HashSet::new(),
                     allocated_from_eof: Vec::new(),
                     savepoint_quarantined_allocations: Vec::new(),
                     reclaimed_abandoned_reservations: Vec::new(),
                     writes_observed: false,
+                    secure_delete_mode: SecureDeleteMode::Off,
+                    secure_delete_zero_page: None,
                     mode,
                     is_writer: eager_writer,
                     committed: false,
@@ -15817,12 +15840,15 @@ where
                 freed_pages: Vec::new(),
                 freed_pages_index: PagePageSet::default(),
                 freed_page_bounds: None,
+                zeroed_freelist_trunks: PagePageSet::default(),
                 allocated_from_freelist: Vec::new(),
                 allocated_from_durable_freelist: HashSet::new(),
                 allocated_from_eof: Vec::new(),
                 savepoint_quarantined_allocations: Vec::new(),
                 reclaimed_abandoned_reservations: Vec::new(),
                 writes_observed: false,
+                secure_delete_mode: SecureDeleteMode::Off,
+                secure_delete_zero_page: None,
                 mode,
                 is_writer: eager_writer,
                 committed: false,
@@ -21707,6 +21733,7 @@ struct SavepointSnapshot {
     write_set: PagePageMap<PageData>,
     accounted_write_pages: PagePageSet,
     freed_pages: Vec<PageNumber>,
+    zeroed_freelist_trunks: PagePageSet,
     freelist: Vec<PageNumber>,
     allocated_from_freelist: Vec<PageNumber>,
     allocated_from_eof: Vec<PageNumber>,
@@ -21718,7 +21745,10 @@ enum SavepointUndo {
         before: Option<PageData>,
         accounted: bool,
     },
-    FreedPages(Vec<PageNumber>),
+    FreedPages {
+        pages: Vec<PageNumber>,
+        zeroed_trunks: PagePageSet,
+    },
     Freelist(Vec<PageNumber>),
 }
 
@@ -22132,6 +22162,10 @@ where
     /// past the bounds pre-filter's usefulness.
     freed_pages_index: PagePageSet,
     freed_page_bounds: Option<(PageNumber, PageNumber)>,
+    /// FAST may discard a cleared B-tree root's dirty image when freeing it.
+    /// Retain only its page number so a future trunk keeps the clearing;
+    /// ordinary freelist leaves need neither a page buffer nor a write.
+    zeroed_freelist_trunks: PagePageSet,
     allocated_from_freelist: Vec<PageNumber>,
     /// bd-r82et: the subset of `allocated_from_freelist` pops that were on
     /// the pager's durable-freelist view (`PagerInner::durable_freelist_view`)
@@ -22171,6 +22205,11 @@ where
     /// txn progress UPDATE land on disk). Turns that class of bug into a
     /// retryable error instead of silent data loss.
     writes_observed: bool,
+    /// Connection-local policy, carried across retained transaction reuse.
+    secure_delete_mode: SecureDeleteMode,
+    /// Pages without a reserved trailer share one immutable zero image. A large
+    /// DROP must not retain a buffer-pool page for every freed overflow page.
+    secure_delete_zero_page: Option<PageData>,
     mode: TransactionMode,
     is_writer: bool,
     committed: bool,
@@ -23353,7 +23392,10 @@ where
         {
             self.savepoint_journal
                 .undo
-                .push(SavepointUndo::FreedPages(self.freed_pages.clone()));
+                .push(SavepointUndo::FreedPages {
+                    pages: self.freed_pages.clone(),
+                    zeroed_trunks: self.zeroed_freelist_trunks.clone(),
+                });
             self.savepoint_journal.freed_pages_captured = true;
         }
     }
@@ -23386,6 +23428,7 @@ where
                 .collect(),
             accounted_write_pages: self.accounted_write_pages.clone(),
             freed_pages: self.freed_pages.clone(),
+            zeroed_freelist_trunks: self.zeroed_freelist_trunks.clone(),
             freelist: if self.mode == TransactionMode::Concurrent {
                 Vec::new()
             } else {
@@ -23420,8 +23463,9 @@ where
                         snapshot.accounted_write_pages.remove(page_no);
                     }
                 }
-                SavepointUndo::FreedPages(pages) => {
+                SavepointUndo::FreedPages { pages, zeroed_trunks } => {
                     snapshot.freed_pages.clone_from(pages);
+                    snapshot.zeroed_freelist_trunks.clone_from(zeroed_trunks);
                 }
                 SavepointUndo::Freelist(pages) => {
                     snapshot.freelist.clone_from(pages);
@@ -23482,6 +23526,7 @@ where
         self.freed_pages.clear();
         self.freed_pages_index.clear();
         self.freed_page_bounds = None;
+        self.zeroed_freelist_trunks.clear();
     }
 
     fn restore_pending_freed_pages(&mut self, pending_freed: Vec<PageNumber>) {
@@ -23511,6 +23556,7 @@ where
             self.journal_freed_pages_before_mutation();
             self.freed_pages.swap_remove(pos);
             self.freed_pages_index.remove(&page_no);
+            self.zeroed_freelist_trunks.remove(&page_no);
             if self.freed_pages.is_empty() {
                 self.freed_page_bounds = None;
             }
@@ -27422,6 +27468,21 @@ where
     V: Vfs + Send,
     V::File: Send + Sync + 'static,
 {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.secure_delete_mode = mode;
+    }
+
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        if self.secure_delete_mode.scrubs_cells() && self.contains_freed_page(page_no) {
+            self.journal_freed_pages_before_mutation();
+            self.zeroed_freelist_trunks.insert(page_no);
+        }
+    }
+
     fn get_page<'a>(
         &'a self,
         cx: &'a Cx,
@@ -28129,28 +28190,58 @@ where
                 );
                 return Ok(());
             }
-            self.journal_page_before_mutation(page_no);
-            if !self.contains_freed_page(page_no) {
-                self.journal_freed_pages_before_mutation();
-                self.freed_pages.push(page_no);
-                self.freed_pages_index.insert(page_no);
-                self.note_freed_page_bound(page_no);
-            } else if rh4_trace_enabled()
-                && !self.freed_pages.contains(&page_no)
-            {
-                // bd-84rh4 free-tracking probe: the dedup guard skipped this
-                // free because freed_pages_index/bounds say the page is already
-                // freed, but it is NOT actually in freed_pages — a stale-index
-                // GHOST. The free is silently lost -> the page orphans as
-                // "never used". Gated on RH4_TRACE; inert in prod/CI.
-                eprintln!(
-                    "RH4FREEGHOST page={} index_says_freed_but_absent_from_freed_pages freed_len={} bounds={:?}",
-                    page_no.get(),
-                    self.freed_pages.len(),
-                    self.freed_page_bounds.map(|(l, h)| (l.get(), h.get())),
-                );
+            if self.contains_freed_page(page_no) {
+                if rh4_trace_enabled() && !self.freed_pages.contains(&page_no) {
+                    // Preserve the allocator's stale-index diagnostic on the
+                    // duplicate-free fast path.
+                    eprintln!(
+                        "RH4FREEGHOST page={} index_says_freed_but_absent_from_freed_pages freed_len={} bounds={:?}",
+                        page_no.get(),
+                        self.freed_pages.len(),
+                        self.freed_page_bounds.map(|(l, h)| (l.get(), h.get())),
+                    );
+                }
+                // Changing the policy affects subsequent deletions. A repeated
+                // free must neither undo an ON scrub nor retroactively scrub a
+                // page originally freed under OFF/FAST.
+                return Ok(());
             }
-            if self.write_set.remove(&page_no).is_some() {
+            if self.secure_delete_mode.scrubs_freed_pages() {
+                // Stage through the ordinary write path before marking the page
+                // free. Admission and savepoint before-images then have exactly
+                // the same failure/rollback semantics as a live page write.
+                // Retain this image through commit: merely dirtying and then
+                // removing it would leave the old bytes in a freelist leaf.
+                let reserved = {
+                    let inner = self.inner.lock()
+                        .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                    commit_reserved_per_page(&self.write_set, inner.reserved_per_page)
+                };
+                let page_size = self.page_size();
+                let cleared = if reserved == 0 {
+                    self.secure_delete_zero_page
+                        .get_or_insert_with(|| {
+                            PageData::from_shared(Arc::from(vec![0_u8; page_size.as_usize()]))
+                        })
+                        .clone()
+                } else {
+                    // Reserved trailer bytes belong to file-format extensions,
+                    // not the deleted record. SQLite clears only usableSize.
+                    let mut page = self.get_page(cx, page_no).await?;
+                    let usable = page_size.usable(reserved) as usize;
+                    page.as_bytes_mut()[..usable].fill(0);
+                    page
+                };
+                self.write_page_data(cx, page_no, cleared).await?;
+            }
+            self.journal_page_before_mutation(page_no);
+            self.journal_freed_pages_before_mutation();
+            self.freed_pages.push(page_no);
+            self.freed_pages_index.insert(page_no);
+            self.note_freed_page_bound(page_no);
+            if !self.secure_delete_mode.scrubs_freed_pages()
+                && self.write_set.remove(&page_no).is_some()
+            {
                 remove_page_sorted(&mut self.write_pages_sorted, page_no);
                 self.remove_staged_write_set_page(page_no);
             }
@@ -28584,8 +28675,6 @@ where
                 let wal_page1_plan =
                     self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
                 pending_freed = std::mem::take(&mut self.freed_pages);
-                self.freed_pages_index.clear();
-                self.freed_page_bounds = None;
                 if self.journal_mode == JournalMode::Wal {
                     let staged_page_high_water =
                         self.staged_page_high_water(self.snapshot_db_size());
@@ -28593,7 +28682,10 @@ where
                         .allocated_from_freelist
                         .iter()
                         .chain(&self.allocated_from_eof)
-                        .filter(|page| self.write_set.contains_key(*page))
+                        .filter(|page| {
+                            self.write_set.contains_key(*page)
+                                && !self.freed_pages_index.contains(*page)
+                        })
                         .copied()
                         .collect();
                     let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
@@ -28616,6 +28708,8 @@ where
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
+                self.freed_pages_index.clear();
+                self.freed_page_bounds = None;
                 if dw8oe_trace_enabled() {
                     let inrange = pending_free_pages
                         .iter()
@@ -28663,6 +28757,7 @@ where
                         &mut self.write_pages_sorted,
                         committed_db_size,
                         &pending_free_pages,
+                        &self.zeroed_freelist_trunks,
                         wal_attempt.as_ref().map(|attempt| &attempt.phase_a_undo),
                     )
                     .await
@@ -29227,6 +29322,7 @@ where
                 self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.reset_current_write_set_accounting();
+                self.clear_freed_pages();
                 self.clear_savepoints();
                 self.savepoint_quarantined_allocations.clear();
                 self.finished = true;
@@ -29473,8 +29569,6 @@ where
             let mut pending_free_pages = pending_returned_pages.clone();
             pending_free_pages.extend(self.freed_pages.iter().copied());
             let mut pending_freed: Vec<PageNumber> = std::mem::take(&mut self.freed_pages);
-            self.freed_pages_index.clear();
-            self.freed_page_bounds = None;
             let mut wal_publication_authorization = None;
             let mut wal_attempt: Option<Arc<PendingGroupCommitTxnAttempt<V::File>>> = None;
             // bd-gh302/bd-0shxy: exact durable-freelist content this commit
@@ -29496,7 +29590,10 @@ where
                         .allocated_from_freelist
                         .iter()
                         .chain(&self.allocated_from_eof)
-                        .filter(|page| self.write_set.contains_key(*page))
+                        .filter(|page| {
+                            self.write_set.contains_key(*page)
+                                && !self.freed_pages_index.contains(*page)
+                        })
                         .copied()
                         .collect();
                     let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
@@ -29519,6 +29616,8 @@ where
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
+                self.freed_pages_index.clear();
+                self.freed_page_bounds = None;
                 if dw8oe_trace_enabled() {
                     let inrange = pending_free_pages
                         .iter()
@@ -29566,6 +29665,7 @@ where
                         &mut self.write_pages_sorted,
                         committed_db_size,
                         &pending_free_pages,
+                        &self.zeroed_freelist_trunks,
                         wal_attempt.as_ref().map(|attempt| &attempt.phase_a_undo),
                     )
                     .await
@@ -30572,6 +30672,7 @@ where
         self.allocated_from_eof = snapshot.allocated_from_eof;
         self.freed_pages = snapshot.freed_pages;
         self.freed_pages_index = restored_freed_index;
+        self.zeroed_freelist_trunks = snapshot.zeroed_freelist_trunks;
         self.refresh_freed_page_bounds();
         // #70 ghost-commit guard: rollback-to-savepoint replaces write_set
         // with the snapshot. If the snapshot is empty, no writes are pending
@@ -37761,6 +37862,293 @@ mod tests {
                 p1.get(),
                 p2.get()
             );
+        });
+    }
+
+    #[test]
+    fn secure_delete_scrubs_freelist_leaves_only_when_on() {
+        asupersync::test_utils::run_test(|| async {
+            for retained in [false, true] {
+                for mode in [SecureDeleteMode::Off, SecureDeleteMode::On, SecureDeleteMode::Fast] {
+                    let (pager, _) = test_pager().await;
+                    let cx = Cx::new();
+                    let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    let mut pages = Vec::new();
+                    for marker in [0xA1, 0xB2, 0xC3] {
+                        let page = seed.allocate_page(&cx).await.unwrap();
+                        seed.write_page(&cx, page, &vec![marker; PageSize::DEFAULT.as_usize()])
+                            .await
+                            .unwrap();
+                        pages.push(page);
+                    }
+                    seed.commit(&cx).await.unwrap();
+
+                    let mut delete = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    delete.set_secure_delete_mode(mode);
+                    for &page in &pages {
+                        delete.free_page(&cx, page).await.unwrap();
+                    }
+                    // ON must retain the zero images for the real commit path;
+                    // FAST/OFF must not stage additional freelist-leaf writes.
+                    assert_eq!(delete.write_set.len(), if mode == SecureDeleteMode::On { 3 } else { 0 });
+                    if retained {
+                        assert!(delete.commit_and_retain(&cx).await.unwrap());
+                        assert_eq!(delete.secure_delete_mode(), mode);
+                        delete.rollback(&cx).await.unwrap();
+                    } else {
+                        delete.commit(&cx).await.unwrap();
+                    }
+
+                    let read = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                    assert_eq!(read.secure_delete_mode(), SecureDeleteMode::Off);
+                    assert_eq!(read.live_freelist_pages().len(), 3);
+                    // The highest page becomes the freelist trunk. Inspect the
+                    // other two, whose old bytes survive unless ON scrubbed them.
+                    for (&page, marker) in pages[..2].iter().zip([0xA1, 0xB2]) {
+                        let bytes = read.get_page(&cx, page).await.unwrap();
+                        let expected = if mode == SecureDeleteMode::On { 0 } else { marker };
+                        assert!(bytes.as_bytes().iter().all(|&byte| byte == expected), "{mode:?}, retained={retained}, page={page}");
+                    }
+                    let trunk = read.get_page(&cx, pages[2]).await.unwrap();
+                    let expected = if mode == SecureDeleteMode::On { 0 } else { 0xC3 };
+                    assert!(trunk.as_bytes()[16..].iter().all(|&byte| byte == expected));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn secure_delete_duplicate_free_preserves_the_original_policy() {
+        asupersync::test_utils::run_test(|| async {
+            let modes = [SecureDeleteMode::Off, SecureDeleteMode::On, SecureDeleteMode::Fast];
+            for original_mode in modes {
+                for subsequent_mode in modes {
+                    let (pager, _) = test_pager().await;
+                    let cx = Cx::new();
+                    let original = vec![0xD7; PageSize::DEFAULT.as_usize()];
+                    let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    let leaf = seed.allocate_page(&cx).await.unwrap();
+                    let trunk = seed.allocate_page(&cx).await.unwrap();
+                    seed.write_page(&cx, leaf, &original).await.unwrap();
+                    seed.write_page(&cx, trunk, &original).await.unwrap();
+                    seed.commit(&cx).await.unwrap();
+
+                    let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    txn.set_secure_delete_mode(original_mode);
+                    txn.free_page(&cx, leaf).await.unwrap();
+                    txn.set_secure_delete_mode(subsequent_mode);
+                    txn.free_page(&cx, leaf).await.unwrap();
+                    assert_eq!(txn.freed_pages, vec![leaf]);
+                    assert_eq!(txn.write_set.contains_key(&leaf), original_mode.scrubs_freed_pages());
+                    txn.free_page(&cx, trunk).await.unwrap();
+                    txn.commit(&cx).await.unwrap();
+
+                    let read = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                    let bytes = read.get_page(&cx, leaf).await.unwrap();
+                    let expected = if original_mode.scrubs_freed_pages() { 0 } else { 0xD7 };
+                    assert!(bytes.as_bytes().iter().all(|&byte| byte == expected),
+                        "original={original_mode:?}, subsequent={subsequent_mode:?}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn secure_delete_fast_trunk_hints_do_not_write_freelist_leaves() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let original = vec![0xC6; PageSize::DEFAULT.as_usize()];
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let leaf = seed.allocate_page(&cx).await.unwrap();
+            let trunk = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, leaf, &original).await.unwrap();
+            seed.write_page(&cx, trunk, &original).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.set_secure_delete_mode(SecureDeleteMode::Fast);
+            for page in [leaf, trunk] {
+                txn.free_page(&cx, page).await.unwrap();
+                txn.note_freed_page_zeroed(page);
+            }
+            assert!(txn.write_set.is_empty());
+            assert_eq!(txn.zeroed_freelist_trunks.len(), 2);
+            // A later PRAGMA must not revoke a clearing already performed.
+            txn.set_secure_delete_mode(SecureDeleteMode::Off);
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            assert!(txn.zeroed_freelist_trunks.is_empty());
+            assert_eq!(txn.get_page(&cx, leaf).await.unwrap().as_bytes(), original);
+            let trunk_bytes = txn.get_page(&cx, trunk).await.unwrap();
+            assert!(trunk_bytes.as_bytes()[12..].iter().all(|&byte| byte == 0));
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn secure_delete_fast_trunk_hints_follow_savepoints_and_page_rewrites() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let original = vec![0xB5; PageSize::DEFAULT.as_usize()];
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, page, &original).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.set_secure_delete_mode(SecureDeleteMode::Fast);
+            txn.free_page(&cx, page).await.unwrap();
+            txn.savepoint(&cx, "before_hint").unwrap();
+            txn.note_freed_page_zeroed(page);
+            assert!(txn.zeroed_freelist_trunks.contains(&page));
+            txn.rollback_to_savepoint(&cx, "before_hint").unwrap();
+            assert!(txn.contains_freed_page(page));
+            assert!(txn.zeroed_freelist_trunks.is_empty());
+            txn.release_savepoint(&cx, "before_hint").unwrap();
+
+            txn.note_freed_page_zeroed(page);
+            txn.write_page(&cx, page, &original).await.unwrap();
+            assert!(!txn.contains_freed_page(page));
+            assert!(txn.zeroed_freelist_trunks.is_empty());
+            txn.free_page(&cx, page).await.unwrap();
+            txn.commit(&cx).await.unwrap();
+
+            let read = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let trunk = read.get_page(&cx, page).await.unwrap();
+            assert!(trunk.as_bytes()[8..].iter().all(|&byte| byte == 0xB5));
+        });
+    }
+
+    #[test]
+    fn secure_delete_allocated_then_freed_pages_remain_free_after_wal_commit() {
+        asupersync::test_utils::run_test(|| async {
+            for mode in [SecureDeleteMode::Off, SecureDeleteMode::On, SecureDeleteMode::Fast] {
+                let (pager, _) = wal_pager().await;
+                let cx = Cx::new();
+                let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                txn.set_secure_delete_mode(mode);
+                let first = txn.allocate_page(&cx).await.unwrap();
+                let second = txn.allocate_page(&cx).await.unwrap();
+                let live = txn.allocate_page(&cx).await.unwrap();
+                for page in [first, second, live] {
+                    txn.write_page(&cx, page, &sample_page(0x6D)).await.unwrap();
+                }
+                txn.free_page(&cx, first).await.unwrap();
+                txn.free_page(&cx, second).await.unwrap();
+                // OFF/FAST must synthesize a trunk even though its discarded
+                // write never reached either the WAL or the physical DB file.
+                txn.commit(&cx).await.unwrap();
+
+                let read = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                let free = read.live_freelist_pages();
+                assert!(free.contains(&first));
+                assert!(free.contains(&second));
+                assert!(!free.contains(&live));
+                if mode.scrubs_freed_pages() {
+                    assert!(read.get_page(&cx, first).await.unwrap().as_bytes().iter().all(|&byte| byte == 0));
+                }
+                assert_eq!(read.get_page(&cx, live).await.unwrap().as_bytes(), sample_page(0x6D));
+            }
+        });
+    }
+
+    #[test]
+    fn secure_delete_preserves_reserved_page_trailers() {
+        asupersync::test_utils::run_test(|| async {
+            for mode in [SecureDeleteMode::On, SecureDeleteMode::Fast] {
+                let (pager, _) = test_pager().await;
+                let cx = Cx::new();
+                let original = vec![0xE3; PageSize::DEFAULT.as_usize()];
+                let usable = original.len() - 16;
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let leaf = seed.allocate_page(&cx).await.unwrap();
+                let trunk = seed.allocate_page(&cx).await.unwrap();
+                for page in [leaf, trunk] {
+                    seed.write_page(&cx, page, &original).await.unwrap();
+                }
+                seed.commit(&cx).await.unwrap();
+
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let mut header = txn.get_page(&cx, PageNumber::ONE).await.unwrap();
+                header.as_bytes_mut()[20] = 16;
+                txn.write_page_data(&cx, PageNumber::ONE, header).await.unwrap();
+                txn.set_secure_delete_mode(mode);
+                txn.free_page(&cx, leaf).await.unwrap();
+                txn.free_page(&cx, trunk).await.unwrap();
+                txn.note_freed_page_zeroed(trunk);
+                txn.commit(&cx).await.unwrap();
+
+                let read = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                let leaf_bytes = read.get_page(&cx, leaf).await.unwrap();
+                let expected = if mode.scrubs_freed_pages() { 0 } else { 0xE3 };
+                assert!(leaf_bytes.as_bytes()[..usable].iter().all(|&byte| byte == expected));
+                assert!(leaf_bytes.as_bytes()[usable..].iter().all(|&byte| byte == 0xE3));
+                let trunk_bytes = read.get_page(&cx, trunk).await.unwrap();
+                assert!(trunk_bytes.as_bytes()[12..usable].iter().all(|&byte| byte == 0));
+                assert!(trunk_bytes.as_bytes()[usable..].iter().all(|&byte| byte == 0xE3));
+            }
+        });
+    }
+
+    #[test]
+    fn secure_delete_free_is_rolled_back_with_its_savepoint() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let original = sample_page(0xA7);
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, page, &original).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.savepoint(&cx, "before_delete").unwrap();
+            txn.set_secure_delete_mode(SecureDeleteMode::On);
+            txn.free_page(&cx, page).await.unwrap();
+            assert!(matches!(txn.get_page(&cx, page).await, Err(FrankenError::DatabaseCorrupt { .. })));
+            txn.rollback_to_savepoint(&cx, "before_delete").unwrap();
+            assert_eq!(txn.secure_delete_mode(), SecureDeleteMode::On);
+            assert!(!txn.contains_freed_page(page));
+            assert_eq!(txn.get_page(&cx, page).await.unwrap().as_bytes(), original);
+            txn.release_savepoint(&cx, "before_delete").unwrap();
+            txn.commit(&cx).await.unwrap();
+
+            let read = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(read.get_page(&cx, page).await.unwrap().as_bytes(), original);
+            assert!(read.live_freelist_pages().is_empty());
+        });
+    }
+
+    #[test]
+    fn secure_delete_page_admission_failure_does_not_free_the_page() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let original = sample_page(0xD4);
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let first = seed.allocate_page(&cx).await.unwrap();
+            let second = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, first, &original).await.unwrap();
+            seed.write_page(&cx, second, &original).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+            pager.set_write_set_page_limit(1).unwrap();
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.set_secure_delete_mode(SecureDeleteMode::On);
+            txn.free_page(&cx, first).await.unwrap();
+            assert!(matches!(
+                txn.free_page(&cx, second).await,
+                Err(FrankenError::OutOfRange { .. })
+            ));
+            assert!(txn.contains_freed_page(first));
+            assert!(!txn.contains_freed_page(second));
+            assert_eq!(txn.get_page(&cx, second).await.unwrap().as_bytes(), original);
+            txn.rollback(&cx).await.unwrap();
+
+            let read = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(read.get_page(&cx, first).await.unwrap().as_bytes(), original);
+            assert_eq!(read.get_page(&cx, second).await.unwrap().as_bytes(), original);
         });
     }
 
@@ -60240,6 +60628,7 @@ mod tests {
                     &mut txn.write_pages_sorted,
                     committed_db_size,
                     &pending_freed,
+                    &txn.zeroed_freelist_trunks,
                     None,
                 )
                 .await
@@ -60311,6 +60700,7 @@ mod tests {
                     &mut txn.write_pages_sorted,
                     committed_db_size,
                     &pending_freed,
+                    &txn.zeroed_freelist_trunks,
                     None,
                 )
                 .await

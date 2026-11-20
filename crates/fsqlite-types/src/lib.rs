@@ -86,6 +86,35 @@ pub fn lean_future<F: Future>(make: impl FnOnce() -> F) -> F {
     make()
 }
 
+/// How deleted content is scrubbed from the current database page image.
+///
+/// This is SQLite's `PRAGMA secure_delete` policy. Historical WAL frames,
+/// snapshots and external backups are outside the policy's scope.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SecureDeleteMode {
+    /// Leave deleted content in unused page space.
+    #[default]
+    Off,
+    /// Scrub deleted cells and pages returned to the freelist.
+    On,
+    /// Scrub cells in modified B-tree pages, without writing freelist leaves.
+    Fast,
+}
+
+impl SecureDeleteMode {
+    /// Whether a modified B-tree page must erase the removed cell bytes.
+    #[must_use]
+    pub const fn scrubs_cells(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether returning a page to the freelist must also erase its image.
+    #[must_use]
+    pub const fn scrubs_freed_pages(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
 /// A page number in the database file.
 ///
 /// Page numbers are 1-based (page 0 does not exist). Page 1 is the database

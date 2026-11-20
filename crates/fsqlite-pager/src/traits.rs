@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::pager::{RollbackCleanup, SimpleTransaction};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, SecureDeleteMode};
 #[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::IoUringVfs;
 #[cfg(all(feature = "native", unix))]
@@ -1292,6 +1292,21 @@ impl PagerCommitState {
 ///
 /// This trait is sealed — only this crate can implement it.
 pub trait TransactionHandle: sealed::Sealed + Send {
+    /// Scrubbing policy for subsequent mutations on this handle.
+    /// Read-only snapshot handles need no policy and retain the default.
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        SecureDeleteMode::Off
+    }
+
+    /// Apply the connection-local policy without changing shared pager state.
+    /// Like SQLite's PRAGMA, this setting is not undone by a savepoint rollback.
+    fn set_secure_delete_mode(&mut self, _mode: SecureDeleteMode) {}
+
+    /// Remember that a freed page's contents were already cleared by its
+    /// B-tree owner. FAST preserves that clearing if the page becomes a
+    /// freelist trunk, without writing it when it remains a freelist leaf.
+    fn note_freed_page_zeroed(&mut self, _page_no: PageNumber) {}
+
     /// Read a page, resolving through the MVCC version chain.
     ///
     /// Resolution order: local write-set → version chain → on-disk.
@@ -1771,6 +1786,7 @@ impl MvccPager for MockMvccPager {
                 committed: false,
                 next_page: 2,
                 savepoint_names: Vec::new(),
+                secure_delete_mode: SecureDeleteMode::Off,
             })
         }
     }
@@ -1806,11 +1822,20 @@ pub struct MockTransaction {
     committed: bool,
     next_page: u32,
     savepoint_names: Vec<String>,
+    secure_delete_mode: SecureDeleteMode,
 }
 
 impl sealed::Sealed for MockTransaction {}
 
 impl TransactionHandle for MockTransaction {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.secure_delete_mode = mode;
+    }
+
     fn get_page<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -1935,6 +1960,7 @@ impl MvccPager for MemoryMockMvccPager {
                 next_page: 2,
                 pages: HashMap::new(),
                 savepoints: Vec::new(),
+                secure_delete_mode: SecureDeleteMode::Off,
             })
         }
     }
@@ -1979,11 +2005,20 @@ pub struct MemoryMockTransaction {
     next_page: u32,
     pages: HashMap<PageNumber, PageData>,
     savepoints: Vec<MemoryMockSavepoint>,
+    secure_delete_mode: SecureDeleteMode,
 }
 
 impl sealed::Sealed for MemoryMockTransaction {}
 
 impl TransactionHandle for MemoryMockTransaction {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.secure_delete_mode = mode;
+    }
+
     fn get_page<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -2378,6 +2413,18 @@ impl From<MemoryMockTransaction> for TransactionKind {
 impl sealed::Sealed for TransactionKind {}
 
 impl TransactionHandle for TransactionKind {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        dispatch_transaction_kind!(self, txn => txn.secure_delete_mode())
+    }
+
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        dispatch_transaction_kind!(self, txn => txn.set_secure_delete_mode(mode));
+    }
+
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        dispatch_transaction_kind!(self, txn => txn.note_freed_page_zeroed(page_no));
+    }
+
     // These TransactionKind dispatch sites show up in self-time profiles.
     // Routing them through `with_handle` / `with_handle_mut` coerces the
     // concrete `&SimpleTransaction<V>` into `&dyn TransactionHandle` inside the

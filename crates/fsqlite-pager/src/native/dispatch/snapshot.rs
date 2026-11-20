@@ -6,7 +6,7 @@
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, WitnessKey};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, SecureDeleteMode, WitnessKey};
 use fsqlite_vfs::VfsFile;
 use fsqlite_wal::native_commit::durable::{DurableCommitAcknowledgement, NativeObjectCodec};
 use fsqlite_wal::native_pages::{MAX_NATIVE_SAVEPOINTS, NativePageSnapshot};
@@ -240,6 +240,16 @@ impl From<NativeSnapshotTransaction> for TransactionKind {
 // Keep the same private dispatch surface as live native transactions. The
 // only additional implementation is this sealed, intrinsically read-only one.
 impl ErasedNativeTransaction for NativeSnapshotTransaction {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        TransactionHandle::secure_delete_mode(self)
+    }
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        TransactionHandle::set_secure_delete_mode(self, mode);
+    }
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        TransactionHandle::note_freed_page_zeroed(self, page_no);
+    }
+
     fn get_page<'a>(&'a self, cx: &'a Cx, page: PageNumber) -> NativeFuture<'a, PageData> {
         Box::pin(TransactionHandle::get_page(self, cx, page))
     }

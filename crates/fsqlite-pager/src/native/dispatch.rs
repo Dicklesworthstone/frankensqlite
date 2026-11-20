@@ -17,7 +17,7 @@ use std::pin::Pin;
 
 use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, WitnessKey};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, SecureDeleteMode, WitnessKey};
 use fsqlite_vfs::VfsFile;
 use fsqlite_wal::native_commit::durable::{DurableCommitAcknowledgement, NativeObjectCodec};
 
@@ -30,6 +30,9 @@ use crate::traits::{PagerCommitState, TransactionHandle, TransactionKind, Transa
 type NativeFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
 
 trait ErasedNativeTransaction: Send {
+    fn secure_delete_mode(&self) -> SecureDeleteMode;
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode);
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber);
     fn get_page<'a>(&'a self, cx: &'a Cx, page: PageNumber) -> NativeFuture<'a, PageData>;
     fn write_page<'a>(&'a mut self, cx: &'a Cx, page: PageNumber, data: &'a [u8]) -> NativeFuture<'a, ()>;
     fn write_page_data<'a>(&'a mut self, cx: &'a Cx, page: PageNumber, data: PageData) -> NativeFuture<'a, ()>;
@@ -77,6 +80,16 @@ where
     M: VfsFile,
     C: NativeObjectCodec + Send + Sync,
 {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        TransactionHandle::secure_delete_mode(self)
+    }
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        TransactionHandle::set_secure_delete_mode(self, mode);
+    }
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        TransactionHandle::note_freed_page_zeroed(self, page_no);
+    }
+
     fn get_page<'a>(&'a self, cx: &'a Cx, page: PageNumber) -> NativeFuture<'a, PageData> {
         Box::pin(TransactionHandle::get_page(self, cx, page))
     }
@@ -244,6 +257,14 @@ impl NativeTransactionDispatch {
 impl sealed::Sealed for NativeTransactionDispatch {}
 
 impl TransactionHandle for NativeTransactionDispatch {
+    fn secure_delete_mode(&self) -> SecureDeleteMode { self.inner.secure_delete_mode() }
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.inner.set_secure_delete_mode(mode);
+    }
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        self.inner.note_freed_page_zeroed(page_no);
+    }
+
     async fn get_page<'a>(&'a self, cx: &'a Cx, page: PageNumber) -> Result<PageData> {
         self.inner.get_page(cx, page).await
     }

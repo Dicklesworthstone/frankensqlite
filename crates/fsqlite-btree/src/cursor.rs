@@ -39,7 +39,9 @@ use fsqlite_types::serial_type::{
 };
 use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::value::binary_text_cmp;
-use fsqlite_types::{PageData, PageNumber, SqliteValue, TextEncoding, WitnessKey};
+use fsqlite_types::{
+    PageData, PageNumber, SecureDeleteMode, SqliteValue, TextEncoding, WitnessKey,
+};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -368,6 +370,12 @@ pub trait PageReader {
 
 /// Trait for writing pages (needed for insert/delete).
 pub trait PageWriter: PageReader {
+    /// Whether discarded cell bytes must be overwritten on pages we already
+    /// write. Full-page erasure on free is the pager's responsibility.
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        SecureDeleteMode::Off
+    }
+
     /// Write raw data to a page.
     fn write_page<'a>(
         &'a mut self,
@@ -430,6 +438,11 @@ pub trait PageWriter: PageReader {
         cx: &'a Cx,
         page_no: PageNumber,
     ) -> impl Future<Output = Result<()>> + 'a;
+    /// Record a cleared image for an already-freed page, without requiring an
+    /// additional page write. The pager uses zeroed bytes if this page becomes
+    /// a freelist trunk; an unwritten freelist leaf needs no I/O in FAST mode.
+    fn note_freed_page_zeroed(&mut self, _page_no: PageNumber) {}
+
     /// Drop a just-freed page's cached buffer from the page pool.
     ///
     /// Default is a no-op. The teardown path
@@ -567,6 +580,10 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
 }
 
 impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.txn.secure_delete_mode()
+    }
+
     fn write_page<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -621,6 +638,10 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
         self.txn.free_page(cx, page_no)
     }
 
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        self.txn.note_freed_page_zeroed(page_no);
+    }
+
     fn forget_page(&mut self, page_no: PageNumber) {
         self.txn.forget_cached_page(page_no);
     }
@@ -646,6 +667,7 @@ pub struct MemPageStore {
     >,
     page_size: u32,
     page_slots: Vec<u8>,
+    secure_delete_mode: SecureDeleteMode,
 }
 
 impl MemPageStore {
@@ -659,7 +681,13 @@ impl MemPageStore {
             )),
             page_size,
             page_slots: Vec::new(),
+            secure_delete_mode: SecureDeleteMode::Off,
         }
+    }
+
+    /// Select the cell-erasure policy for cursors backed by this store.
+    pub fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.secure_delete_mode = mode;
     }
 
     /// Iterate over all `(page_number, page_bytes)` entries in the store.
@@ -807,6 +835,10 @@ impl PageReader for MemPageStore {
 
 #[allow(clippy::manual_async_fn)]
 impl PageWriter for MemPageStore {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
     fn write_page<'a>(
         &'a mut self,
         _cx: &'a Cx,
@@ -1813,6 +1845,7 @@ pub struct TableLeafDeleteRun {
     entry: StackEntry,
     tree_depth: usize,
     dirty: bool,
+    secure_delete_mode: SecureDeleteMode,
     compact_cell_area: bool,
     profile_delete_leaf_run: bool,
     deleted_cell_indices: SmallVec<[u16; 16]>,
@@ -1824,6 +1857,13 @@ impl TableLeafDeleteRun {
     #[must_use]
     pub const fn leaf_page(&self) -> PageNumber {
         self.entry.page_no
+    }
+
+    /// The erasure policy selected when this run began. A caller retaining a
+    /// run across statements must flush it before appending under another mode.
+    #[must_use]
+    pub const fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
     }
 
     pub fn max_rowid(&self) -> Result<i64> {
@@ -6923,6 +6963,15 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             self.pager.free_page(cx, current_page).await?;
+            if current_page == self.root_page
+                && self.pager.secure_delete_mode() == SecureDeleteMode::Fast
+            {
+                // DROP first clears its root, then releases it. FAST preserves
+                // that cleared image only when freelist metadata already
+                // requires writing the page; freed children and overflow pages
+                // are not cleared. Keep just the hint across batched teardown.
+                self.pager.note_freed_page_zeroed(current_page);
+            }
             // bd-pirr5 (GH#371): drop the just-freed page's buffer from the pool
             // so tearing down a large (e.g. WITHOUT ROWID) table does not retain
             // the whole b-tree in the page cache and exhaust the buffer pool.
@@ -9505,6 +9554,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         let old_overflow = cell_ref.overflow_page;
         ptrs.remove(cell_idx_usize);
+        let scrub_cells = self.pager.secure_delete_mode().scrubs_cells();
 
         // Defragment.
         let mut new_content_offset = self.usable_size as usize;
@@ -9579,6 +9629,9 @@ impl<P: PageWriter> BtCursor<P> {
             {
                 let page_bytes = page_data.as_bytes_mut();
                 page_bytes[new_content_offset..new_end].copy_from_slice(&new_cell);
+                if scrub_cells {
+                    page_bytes[ptr_array_end_with_new..new_content_offset].fill(0);
+                }
                 header.write(page_bytes, header_offset);
                 cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
             }
@@ -9607,6 +9660,9 @@ impl<P: PageWriter> BtCursor<P> {
             })?;
         {
             let page_bytes = page_data.as_bytes_mut();
+            if scrub_cells {
+                page_bytes[ptr_array_end..new_content_offset].fill(0);
+            }
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }
@@ -9948,6 +10004,7 @@ impl<P: PageWriter> BtCursor<P> {
         let mut new_header = header;
         new_header.cell_count -= 1;
         new_header.cell_content_offset = cell_content_offset;
+        let scrub_cells = self.pager.secure_delete_mode().scrubs_cells();
 
         // The cells below the removed one move up by its size. Their pointers
         // follow it in the array (the order descends), so each moves one slot
@@ -9964,6 +10021,12 @@ impl<P: PageWriter> BtCursor<P> {
             let (slots, _) = moved.as_chunks_mut::<2>();
             for (slot, &ptr) in slots.iter_mut().zip(&ptrs[delete_idx + 1..]) {
                 *slot = (ptr + pointer_shift).to_be_bytes();
+            }
+            if scrub_cells {
+                // Compaction leaves copies of moved cells as well as the
+                // removed cell in the newly freed interval. Existing unused
+                // space needs no additional per-row work.
+                page[content_offset..new_content_offset].fill(0);
             }
         };
         let Some(image) =
@@ -10062,6 +10125,7 @@ impl<P: PageWriter> BtCursor<P> {
         // SQLite-compatible shape over a fragile micro-optimization.
         let ptr_array_end =
             header_offset + usize::from(header.page_type.header_size()) + (ptrs.len() - 1) * 2;
+        let scrub_cells = self.pager.secure_delete_mode().scrubs_cells();
 
         // Every check that can refuse the delete runs before any page byte
         // changes: the compact branches only plan the move, which may then be
@@ -10352,6 +10416,9 @@ impl<P: PageWriter> BtCursor<P> {
 
                 header.write(page_bytes, header_offset);
                 cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+                if scrub_cells {
+                    page_bytes[ptr_array_end..new_content_offset].fill(0);
+                }
             }
             self.defrag_cells_scratch = cells_to_move;
             TableLeafDeleteRewrite::Rebuilt(page_data)
@@ -10370,6 +10437,9 @@ impl<P: PageWriter> BtCursor<P> {
                     }
                     header.write(page_bytes, header_offset);
                     cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+                    if scrub_cells {
+                        page_bytes[old_content_offset..new_content_offset].fill(0);
+                    }
                 };
                 if let Some(rewritten) =
                     self.try_rewrite_top_page_in_staged_image(depth, leaf_page_no, &mut move_cells)
@@ -10570,8 +10640,10 @@ impl<P: PageWriter> BtCursor<P> {
                 return Err(err);
             }
 
-            // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
-            if new_content_offset > ptr_array_end {
+            // Both secure modes erase the removed key and the stale copies
+            // left behind by compaction on this already-modified page.
+            if self.pager.secure_delete_mode().scrubs_cells() && new_content_offset > ptr_array_end
+            {
                 page_bytes[ptr_array_end..new_content_offset].fill(0);
             }
 
@@ -12644,6 +12716,7 @@ impl<P: PageWriter> BtCursor<P> {
             entry: entry.clone(),
             tree_depth,
             dirty: false,
+            secure_delete_mode: self.pager.secure_delete_mode(),
             compact_cell_area: TableLeafDeleteRun::has_compact_cell_area_for_entry(
                 entry,
                 self.usable_size,
@@ -12694,7 +12767,16 @@ impl<P: PageWriter> BtCursor<P> {
         if run.is_dirty() {
             let materialize_start = instrumentation::profile_start();
             let leaf_page = run.leaf_page();
+            let erase_start = run
+                .secure_delete_mode()
+                .scrubs_cells()
+                .then(|| run.entry.header.content_offset(self.usable_size));
             run.materialize_deletions(self.usable_size)?;
+            if let Some(erase_start) = erase_start {
+                let content_offset = run.entry.header.content_offset(self.usable_size);
+                run.entry.page_data.as_bytes_mut()[erase_start..content_offset].fill(0);
+                run.entry.mutation_counter = run.entry.page_data.image_token();
+            }
             instrumentation::record_delete_leaf_run_materialize(materialize_start);
             let write_start = instrumentation::profile_start();
             self.pager
@@ -14359,6 +14441,10 @@ mod tests {
 
     #[allow(clippy::manual_async_fn)]
     impl PageWriter for ImageKeepingStore {
+        fn secure_delete_mode(&self) -> SecureDeleteMode {
+            self.inner.secure_delete_mode()
+        }
+
         fn write_page<'a>(
             &'a mut self,
             cx: &'a Cx,
@@ -19589,6 +19675,242 @@ mod tests {
 
             assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
             assert_eq!(cursor.payload(&cx).await.unwrap(), b"after-split");
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_table_cells_in_all_compaction_paths() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-table-cell-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                for page_size in [4_096, 8_192] {
+                    for disturbed in [false, true] {
+                        let mut store = MemPageStore::with_empty_table(pn(2), page_size);
+                        store.set_secure_delete_mode(mode);
+                        let mut cursor = BtCursor::new(store, pn(2), page_size, true);
+                        // The last inserted cell is physically lowest. In the
+                        // disturbed case it is in the middle of the rowid order,
+                        // exercising both small-page and rebuilt-page deletes.
+                        let order = if disturbed {
+                            [10, 30, 20]
+                        } else {
+                            [10, 20, 30]
+                        };
+                        let target = order[2];
+                        for rowid in order {
+                            let payload = if rowid == target { MARKER } else { b"survivor" };
+                            cursor.table_insert(&cx, rowid, payload).await.unwrap();
+                        }
+                        assert!(cursor.table_move_to(&cx, target).await.unwrap().is_found());
+                        cursor.delete(&cx).await.unwrap();
+                        let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                        assert_eq!(
+                            page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                            mode == SecureDeleteMode::Off,
+                            "mode={mode:?}, page_size={page_size}, disturbed={disturbed}"
+                        );
+                        let expected: BTreeMap<_, _> = order
+                            .into_iter()
+                            .filter(|rowid| *rowid != target)
+                            .map(|rowid| (rowid, b"survivor".to_vec()))
+                            .collect();
+                        assert_eq!(scan_table_rows(&mut cursor).await, expected);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_synchronous_staged_delete() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-staged-cell-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let mut store = MemPageStore::with_empty_table(pn(2), USABLE);
+                store.set_secure_delete_mode(mode);
+                let mut cursor =
+                    BtCursor::new(ImageKeepingStore::new(store, false), pn(2), USABLE, true);
+                let mut payload = MARKER.to_vec();
+                payload.extend_from_slice(&[b'x'; 96]);
+                cursor.table_insert(&cx, 1, b"before").await.unwrap();
+                cursor.table_insert(&cx, 2, &payload).await.unwrap();
+                cursor.table_insert(&cx, 3, b"after").await.unwrap();
+                assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+                assert!(cursor.try_delete_table_leaf_cell_in_staged_image());
+                let page = cursor.pager.page_bytes(2).unwrap();
+                assert_eq!(
+                    page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                    mode == SecureDeleteMode::Off,
+                    "mode={mode:?}"
+                );
+                assert_eq!(
+                    scan_table_rows(&mut cursor).await,
+                    BTreeMap::from([(1, b"before".to_vec()), (3, b"after".to_vec())])
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_batched_leaf_deletes() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-batched-cell-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                for (delete_count, disturbed) in [(1, false), (8, false), (8, true)] {
+                    let mut store = MemPageStore::with_empty_table(pn(2), USABLE);
+                    store.set_secure_delete_mode(mode);
+                    let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                    let target = if disturbed { 10 } else { 20 };
+                    for rowid in (1..=20).filter(|rowid| *rowid != target) {
+                        cursor.table_insert(&cx, rowid, b"survivor").await.unwrap();
+                    }
+                    cursor.table_insert(&cx, target, MARKER).await.unwrap();
+                    assert!(cursor.table_move_to(&cx, target).await.unwrap().is_found());
+                    let mut run = cursor
+                        .table_leaf_delete_run_current(target)
+                        .unwrap()
+                        .unwrap();
+                    let deleted: Vec<_> = std::iter::once(target).chain(1..delete_count).collect();
+                    for rowid in &deleted {
+                        assert!(run.delete_rowid(&cx, *rowid, USABLE).unwrap());
+                    }
+                    cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
+                    let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                    assert_eq!(
+                        page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                        mode == SecureDeleteMode::Off,
+                        "mode={mode:?}, delete_count={delete_count}, disturbed={disturbed}"
+                    );
+                    let expected: BTreeMap<_, _> = (1..=20)
+                        .filter(|rowid| !deleted.contains(rowid))
+                        .map(|rowid| (rowid, b"survivor".to_vec()))
+                        .collect();
+                    assert_eq!(scan_table_rows(&mut cursor).await, expected);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_batched_deletes_keep_the_original_policy() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-policy-switch-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for (original, current) in [
+                (SecureDeleteMode::On, SecureDeleteMode::Off),
+                (SecureDeleteMode::Fast, SecureDeleteMode::Off),
+                (SecureDeleteMode::Off, SecureDeleteMode::On),
+            ] {
+                let mut store = MemPageStore::with_empty_table(pn(2), USABLE);
+                store.set_secure_delete_mode(original);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                cursor.table_insert(&cx, 1, b"survivor").await.unwrap();
+                cursor.table_insert(&cx, 2, MARKER).await.unwrap();
+                assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+                let mut run = cursor.table_leaf_delete_run_current(2).unwrap().unwrap();
+                assert_eq!(run.secure_delete_mode(), original);
+                assert!(run.delete_rowid(&cx, 2, USABLE).unwrap());
+
+                cursor.pager.set_secure_delete_mode(current);
+                cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
+
+                let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                assert_eq!(
+                    page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                    original == SecureDeleteMode::Off,
+                    "original={original:?}, current={current:?}"
+                );
+                assert_eq!(
+                    scan_table_rows(&mut cursor).await,
+                    BTreeMap::from([(1, b"survivor".to_vec())])
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_index_leaf_cells_only_when_enabled() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-index-leaf-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let mut store = MemPageStore::with_empty_index(pn(2), USABLE);
+                store.set_secure_delete_mode(mode);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+                cursor.index_insert(&cx, b"alpha").await.unwrap();
+                cursor.index_insert(&cx, MARKER).await.unwrap();
+                assert!(cursor.index_move_to(&cx, MARKER).await.unwrap().is_found());
+                cursor.delete(&cx).await.unwrap();
+                let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                assert_eq!(
+                    page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                    mode == SecureDeleteMode::Off,
+                    "mode={mode:?}"
+                );
+                assert!(cursor.first(&cx).await.unwrap());
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"alpha");
+                assert!(!cursor.next(&cx).await.unwrap());
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_replaced_interior_index_cell() {
+        run_async(async {
+            const MARKER: &[u8] = b"middle-private-index-cell-bd-i2u1c-marker";
+            let cx = Cx::new();
+            let mut old_key = MARKER.to_vec();
+            old_key.extend_from_slice(&[b'x'; 96]);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let mut store = MemPageStore::new(USABLE);
+                store.set_secure_delete_mode(mode);
+                store.pages.insert(
+                    2,
+                    build_interior_index(&[(pn(3), b"alpha"), (pn(4), &old_key)], pn(5)),
+                );
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+                assert!(
+                    cursor
+                        .index_move_to(&cx, &old_key)
+                        .await
+                        .unwrap()
+                        .is_found()
+                );
+                assert!(!cursor.replace_interior_cell(&cx, b"middle").await.unwrap());
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"middle");
+                let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                assert_eq!(
+                    page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                    mode == SecureDeleteMode::Off,
+                    "mode={mode:?}"
+                );
+                let header = cell::parse_page_header(&page, pn(2)).unwrap();
+                assert_eq!(header.cell_count, 2);
+                assert_eq!(header.right_child, Some(pn(5)));
+            }
         });
     }
 
