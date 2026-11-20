@@ -207,3 +207,69 @@ fn grouped_and_filter_and_affinity() {
         .await;
     });
 }
+
+/// Five groups over x: NULLs, a real, a text value and a group that sums to
+/// NULL, so the derived tables below carry NULL, integer, real and text rows.
+const W: &[&str] = &[
+    "CREATE TABLE w(id INTEGER PRIMARY KEY, g INT, x)",
+    "INSERT INTO w VALUES (1,1,3),(2,1,NULL),(3,1,3),(4,2,NULL),(5,3,2.5),(6,3,7),\
+     (7,4,'x'),(8,5,-4),(9,5,NULL)",
+];
+
+/// bd-w4pr1.12 (lever GB1): built-in aggregates of a derived table's plain
+/// column read the group's values in place. NULL rows stay out of count, sum,
+/// total, avg, min, max and group_concat; FILTER keeps only its rows; DISTINCT,
+/// in-aggregate ORDER BY and expression arguments keep the collecting path.
+#[test]
+fn derived_table_column_aggregates() {
+    asupersync::test_utils::run_test(|| async {
+        agree(
+            W,
+            "SELECT count(*), count(n), sum(n), total(n), avg(n), min(n), max(n) \
+             FROM (SELECT g, sum(x) n FROM w GROUP BY g)",
+            "aggregates of a derived column with a NULL row",
+        )
+        .await;
+        agree(
+            W,
+            "SELECT group_concat(m), group_concat(m, '-'), min(m), max(m), count(m) \
+             FROM (SELECT g, max(x) m FROM w GROUP BY g ORDER BY g)",
+            "mixed storage classes and separators",
+        )
+        .await;
+        agree(
+            W,
+            "SELECT sum(n) FILTER (WHERE g > 1), count(n) FILTER (WHERE n < 7), \
+             avg(n) FILTER (WHERE g <> 3) FROM (SELECT g, sum(x) n FROM w GROUP BY g)",
+            "FILTER keeps only its rows",
+        )
+        .await;
+        agree(
+            W,
+            "SELECT sum(DISTINCT c), count(DISTINCT c), sum(c + 1), max(c * 2) \
+             FROM (SELECT g, count(x) c FROM w GROUP BY g)",
+            "DISTINCT and expression arguments",
+        )
+        .await;
+        agree(
+            W,
+            "SELECT group_concat(m ORDER BY g DESC), group_concat(m, ';' ORDER BY m) \
+             FROM (SELECT g, max(x) m FROM w GROUP BY g)",
+            "in-aggregate ORDER BY",
+        )
+        .await;
+        agree(
+            W,
+            "SELECT g % 2 k, count(n), sum(n), avg(n), min(n) \
+             FROM (SELECT g, sum(x) n FROM w GROUP BY g) GROUP BY k ORDER BY k",
+            "grouped aggregates over a derived table",
+        )
+        .await;
+        agree(
+            W,
+            "SELECT count(*), sum(n) FROM (SELECT id g, count(*) n FROM w GROUP BY id)",
+            "the GROUP BY id row's shape",
+        )
+        .await;
+    });
+}

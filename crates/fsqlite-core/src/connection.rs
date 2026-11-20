@@ -91935,87 +91935,111 @@ impl Connection {
                                 SqliteValue::Text(result.into())
                             });
                         } else {
-                            let mut entries: Vec<(SqliteValue, Vec<SqliteValue>)> =
-                                Vec::with_capacity(filtered_rows.len());
-                            for row in &filtered_rows {
-                                let value = if let Some(idx) = *arg_col {
-                                    row.get(idx).cloned().unwrap_or(SqliteValue::Null)
-                                } else if let Some(expr) = arg_expr {
-                                    self.eval_row_expr_allowing_subqueries_with_using(
-                                        expr, row, &col_map, using_skip,
-                                    )
-                                    .await?
-                                } else {
-                                    return Err(FrankenError::NotImplemented(format!(
-                                        "aggregate {name} requires an argument"
-                                    )));
-                                };
-                                let mut keys = Vec::with_capacity(order_by.len());
-                                for term in order_by {
-                                    keys.push(
+                            // bd-w4pr1.12 (lever GB1): a built-in aggregate of a
+                            // plain column, with no DISTINCT and no ORDER BY,
+                            // reads the group's values where they are. Every
+                            // other shape first collects (value, ORDER BY keys)
+                            // entries, as before. Both end in the same compute
+                            // over the non-NULL values.
+                            let in_place_column = (*arg_col).filter(|_| {
+                                !*distinct
+                                    && order_by.is_empty()
+                                    && is_agg_fn(name)
+                                    && !self.aggregate_was_custom_registered(name, 1)
+                            });
+                            let mut owned_values: Vec<SqliteValue> = Vec::new();
+                            if in_place_column.is_none() {
+                                let mut entries: Vec<(SqliteValue, Vec<SqliteValue>)> =
+                                    Vec::with_capacity(filtered_rows.len());
+                                for row in &filtered_rows {
+                                    let value = if let Some(idx) = *arg_col {
+                                        row.get(idx).cloned().unwrap_or(SqliteValue::Null)
+                                    } else if let Some(expr) = arg_expr {
                                         self.eval_row_expr_allowing_subqueries_with_using(
-                                            &term.expr, row, &col_map, using_skip,
+                                            expr, row, &col_map, using_skip,
                                         )
-                                        .await?,
+                                        .await?
+                                    } else {
+                                        return Err(FrankenError::NotImplemented(format!(
+                                            "aggregate {name} requires an argument"
+                                        )));
+                                    };
+                                    let mut keys = Vec::with_capacity(order_by.len());
+                                    for term in order_by {
+                                        keys.push(
+                                            self.eval_row_expr_allowing_subqueries_with_using(
+                                                &term.expr, row, &col_map, using_skip,
+                                            )
+                                            .await?,
+                                        );
+                                    }
+                                    entries.push((value, keys));
+                                }
+                                if *distinct {
+                                    retain_first_distinct(
+                                        &mut entries,
+                                        |(value, _)| value,
+                                        collation.as_deref(),
+                                        &coll_snap,
                                     );
                                 }
-                                entries.push((value, keys));
-                            }
-                            if *distinct {
-                                retain_first_distinct(
-                                    &mut entries,
-                                    |(value, _)| value,
-                                    collation.as_deref(),
-                                    &coll_snap,
-                                );
-                            }
-                            if !order_by.is_empty() {
-                                let order_collations = order_by
-                                    .iter()
-                                    .map(|term| join_expr_effective_collation(&term.expr, &col_map))
-                                    .collect::<Vec<_>>();
-                                entries.sort_by(|left, right| {
-                                    cmp_in_aggregate_order_keys(
-                                        order_by,
-                                        &order_collations,
-                                        &left.1,
-                                        &right.1,
-                                        &coll_snap,
-                                    )
-                                });
-                            }
-                            let mut owned_values: Vec<SqliteValue> =
-                                entries.into_iter().map(|(value, _)| value).collect();
-                            if let Some(result) =
-                                self.compute_unary_aggregate_with_registry(name, &owned_values)?
-                            {
-                                values.push(result);
-                            } else {
+                                if !order_by.is_empty() {
+                                    let order_collations = order_by
+                                        .iter()
+                                        .map(|term| {
+                                            join_expr_effective_collation(&term.expr, &col_map)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    entries.sort_by(|left, right| {
+                                        cmp_in_aggregate_order_keys(
+                                            order_by,
+                                            &order_collations,
+                                            &left.1,
+                                            &right.1,
+                                            &coll_snap,
+                                        )
+                                    });
+                                }
+                                owned_values =
+                                    entries.into_iter().map(|(value, _)| value).collect();
+                                if let Some(result) =
+                                    self.compute_unary_aggregate_with_registry(name, &owned_values)?
+                                {
+                                    values.push(result);
+                                    continue;
+                                }
                                 owned_values.retain(|value| !value.is_null());
-                                let agg_values: Vec<&SqliteValue> = owned_values.iter().collect();
-                                let evaluated_separator = match separator.clone() {
-                                    Some(sep) => Some(sep),
-                                    None => match (separator_expr.as_ref(), group_rows.first()) {
-                                        (Some(expr), Some(r)) => {
-                                            let value = self
-                                                .eval_row_expr_allowing_subqueries_with_using(
-                                                    expr, r, &col_map, using_skip,
-                                                )
-                                                .await?;
-                                            (!matches!(value, SqliteValue::Null))
-                                                .then(|| sqlite_value_to_text(&value))
-                                        }
-                                        _ => None,
-                                    },
-                                };
-                                values.push(compute_aggregate_ext_collated(
-                                    name,
-                                    &agg_values,
-                                    evaluated_separator.as_deref(),
-                                    collation.as_deref(),
-                                    &self.collation_registry,
-                                )?);
                             }
+                            let agg_values: Vec<&SqliteValue> = match in_place_column {
+                                Some(idx) => filtered_rows
+                                    .iter()
+                                    .filter_map(|row| row.get(idx))
+                                    .filter(|value| !value.is_null())
+                                    .collect(),
+                                None => owned_values.iter().collect(),
+                            };
+                            let evaluated_separator = match separator.clone() {
+                                Some(sep) => Some(sep),
+                                None => match (separator_expr.as_ref(), group_rows.first()) {
+                                    (Some(expr), Some(r)) => {
+                                        let value = self
+                                            .eval_row_expr_allowing_subqueries_with_using(
+                                                expr, r, &col_map, using_skip,
+                                            )
+                                            .await?;
+                                        (!matches!(value, SqliteValue::Null))
+                                            .then(|| sqlite_value_to_text(&value))
+                                    }
+                                    _ => None,
+                                },
+                            };
+                            values.push(compute_aggregate_ext_collated(
+                                name,
+                                &agg_values,
+                                evaluated_separator.as_deref(),
+                                collation.as_deref(),
+                                &self.collation_registry,
+                            )?);
                         }
                     }
                 }
