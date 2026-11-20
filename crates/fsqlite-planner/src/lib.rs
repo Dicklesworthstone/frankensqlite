@@ -2284,6 +2284,18 @@ impl NormalizedColumnComparison {
     }
 }
 
+/// Whether membership implies a non-NULL left operand for partial-index selection.
+///
+/// SQLite folds a literal empty list to a constant. A table or subquery may
+/// be empty at execution, making `NULL NOT IN` that set true.
+#[must_use]
+pub fn membership_proves_non_null_lhs(set: &InSet, negated: bool) -> bool {
+    match set {
+        InSet::List(items) => !items.is_empty(),
+        InSet::Subquery(_) | InSet::Table(_) => !negated,
+    }
+}
+
 fn expr_guarantees_non_null(
     expr: &Expr,
     predicate_column: &WhereColumn,
@@ -2323,13 +2335,7 @@ fn expr_guarantees_non_null(
             not,
             ..
         } => {
-            // SQLite makes `NULL NOT IN` true when the RHS is empty. A
-            // subquery/table may be empty at execution, and an explicit empty
-            // list is empty by construction, so those negative forms do not
-            // prove the left operand non-NULL. A non-empty literal list does:
-            // with a NULL left operand its result is NULL, never true.
-            let proves_non_null = !*not || matches!(set, InSet::List(items) if !items.is_empty());
-            proves_non_null
+            membership_proves_non_null_lhs(set, *not)
                 && extract_where_column(inner).is_some_and(|column| {
                     where_columns_match_partial_index(
                         &column,
@@ -8799,8 +8805,8 @@ mod tests {
     fn test_partial_index_expr_guarantees_non_null_for_matching_column() {
         // expr_guarantees_non_null reports whether a WHERE expression can be
         // true only when the target column is non-NULL. Explicit IS NOT NULL,
-        // comparisons, positive IN, and non-empty literal NOT IN can qualify;
-        // empty or runtime-sized NOT IN right-hand sides, function-backed
+        // comparisons, IN with a non-empty list or a subquery, and non-empty
+        // literal NOT IN can qualify. Empty lists, runtime-sized NOT IN, function-backed
         // pattern operators, IS NULL, and predicates on another column do not.
         let pcol = WhereColumn {
             table: None,
@@ -8905,8 +8911,20 @@ mod tests {
             "a table-form NOT IN RHS may be empty at execution"
         );
         assert!(
-            expr_guarantees_non_null(&in_expr(InSet::List(Vec::new()), false), &pcol, "t", true),
-            "positive IN can only be true for a non-NULL left operand"
+            !expr_guarantees_non_null(&in_expr(InSet::List(Vec::new()), false), &pcol, "t", true),
+            "SQLite folds an explicit empty IN list to false before choosing indexes"
+        );
+        assert!(
+            expr_guarantees_non_null(
+                &in_expr(
+                    InSet::List(vec![Expr::Literal(Literal::Integer(9), Span::ZERO)]),
+                    false,
+                ),
+                &pcol,
+                "t",
+                true,
+            ),
+            "a non-empty positive IN list excludes a NULL left operand"
         );
 
         // An IS NOT NULL on a DIFFERENT column does not help.

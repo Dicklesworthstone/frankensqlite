@@ -206,7 +206,7 @@ use fsqlite_parser::{Parser, StatementParseScratch, parse_statements_with_scratc
 use fsqlite_planner::{
     AccessPathKind as PlannerAccessPathKind, IndexInfo as PlannerIndexInfo, PlannerFeatureFlags,
     StatsSource as PlannerStatsSource, TableStats as PlannerTableStats, WhereTermKind,
-    best_access_path_with_hints, classify_where_term, decompose_where,
+    best_access_path_with_hints, classify_where_term, decompose_where, membership_proves_non_null_lhs,
 };
 use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_types::cx::{BusyWaitBudget, CancelReason, Cx};
@@ -55437,7 +55437,10 @@ impl Connection {
     /// Split `expr` into its AND-conjuncts, descending through the left/right
     /// children of every top-level `AND`. Mirrors SQLite's WHERE-term
     /// decomposition used when checking partial-index usability.
-    fn collect_and_conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+    fn collect_where_conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        // COLLATE on a WHERE/ON result does not change its truth value.
+        // Keep COLLATE on the operands of comparisons: it can change membership.
+        let expr = strip_collate_wrappers(expr);
         if let Expr::BinaryOp {
             left,
             op: BinaryOp::And,
@@ -55445,8 +55448,8 @@ impl Connection {
             ..
         } = expr
         {
-            Self::collect_and_conjuncts(left, out);
-            Self::collect_and_conjuncts(right, out);
+            Self::collect_where_conjuncts(left, out);
+            Self::collect_where_conjuncts(right, out);
         } else {
             out.push(expr);
         }
@@ -55551,15 +55554,11 @@ impl Connection {
         }
     }
 
-    /// The comparison operator expressing `a OP b` as `b OP' a`, if `OP`
-    /// commutes. Equality-shaped operators keep their operator; ordered
-    /// comparisons flip direction.
+    /// Operators for which SQLite generates a commuted index constraint.
     const fn commuted_comparison_op(op: BinaryOp) -> Option<BinaryOp> {
         match op {
             BinaryOp::Eq => Some(BinaryOp::Eq),
-            BinaryOp::Ne => Some(BinaryOp::Ne),
             BinaryOp::Is => Some(BinaryOp::Is),
-            BinaryOp::IsNot => Some(BinaryOp::IsNot),
             BinaryOp::Lt => Some(BinaryOp::Gt),
             BinaryOp::Le => Some(BinaryOp::Ge),
             BinaryOp::Gt => Some(BinaryOp::Lt),
@@ -55573,7 +55572,7 @@ impl Connection {
     /// written in either operand order (`0 < b` covers `b > 0`), matching
     /// SQLite's `exprCommute` normalization. This is deliberately NOT logical
     /// implication: `b > 5` never covers `b > 0`.
-    fn normalized_conjuncts_equivalent(a: &Expr, b: &Expr) -> bool {
+    fn normalized_conjuncts_equivalent(a: &Expr, b: &Expr, table: &TableSchema) -> bool {
         if a == b {
             return true;
         }
@@ -55596,7 +55595,19 @@ impl Connection {
             && la.as_ref() == rb.as_ref()
             && ra.as_ref() == lb.as_ref()
         {
-            return true;
+            // x IS TRUE tests truthiness. TRUE IS x compares values.
+            let boolean_literal = |expr: &Expr| {
+                matches!(strip_collate_wrappers(expr), Expr::Literal(Literal::True | Literal::False, _))
+            };
+            if *oa == BinaryOp::Is && (boolean_literal(ra) || boolean_literal(rb)) {
+                return false;
+            }
+            // SQLite gives the left operand precedence among competing explicit
+            // collations, then among declared column collations. Swapping a
+            // BINARY and a NOCASE column can change the rows in the index.
+            let query = index_comparison_collation(la, ra, table).unwrap_or("BINARY");
+            let predicate = index_comparison_collation(lb, rb, table).unwrap_or("BINARY");
+            return query.eq_ignore_ascii_case(predicate);
         }
         false
     }
@@ -55639,13 +55650,10 @@ impl Connection {
             Expr::IsNull {
                 expr, not: true, ..
             } => expr.as_ref() == col,
-            // NULL propagates through IN / BETWEEN on `col`, so any of
-            // these (negated or not) is NULL — never true — when `col` is NULL.
-            // LIKE-family operators are replaceable functions, which SQLite
-            // does not use for this implication or LEFT-join strength reduction.
-            Expr::In { expr, .. } | Expr::Between { expr, .. } => {
-                expr.as_ref() == col
+            Expr::In { expr, set, not, .. } => {
+                expr.as_ref() == col && membership_proves_non_null_lhs(set, *not)
             }
+            Expr::Between { expr, .. } => expr.as_ref() == col,
             _ => false,
         }
     }
@@ -55758,8 +55766,12 @@ impl Connection {
     /// match, an OR whose either branch is covered, or a null-rejecting term
     /// covering an `IS NOT NULL`. This is still NOT full arithmetic implication —
     /// `b > 5` does not cover `b > 0`, exactly as C SQLite rejects it.
-    fn query_term_implies_predicate(query_term: &Expr, predicate: &Expr) -> bool {
-        if Self::normalized_conjuncts_equivalent(query_term, predicate) {
+    fn query_term_implies_predicate(
+        query_term: &Expr,
+        predicate: &Expr,
+        table: &TableSchema,
+    ) -> bool {
+        if Self::normalized_conjuncts_equivalent(query_term, predicate, table) {
             return true;
         }
         match predicate {
@@ -55769,8 +55781,8 @@ impl Connection {
                 right,
                 ..
             } => {
-                Self::query_term_implies_predicate(query_term, left)
-                    || Self::query_term_implies_predicate(query_term, right)
+                Self::query_term_implies_predicate(query_term, left, table)
+                    || Self::query_term_implies_predicate(query_term, right, table)
             }
             Expr::IsNull {
                 expr, not: true, ..
@@ -55792,6 +55804,7 @@ impl Connection {
         predicate: &Expr,
         query_conjuncts: &[&Expr],
         targets: &[&str],
+        table: &TableSchema,
     ) -> bool {
         let mut normalized_query: Vec<Expr> = query_conjuncts
             .iter()
@@ -55808,10 +55821,6 @@ impl Connection {
         // not. Keep the original term for exact predicate matching, and never
         // apply this deduction inside OR or to a replaced LIKE/GLOB function.
         if !self.like_or_glob_overridden.get() {
-            let schema = self.schema.borrow();
-            let table = targets.first().and_then(|name| {
-                schema.iter().find(|table| table.name.eq_ignore_ascii_case(name))
-            });
             let range_covers: Vec<Expr> = normalized_query.iter().filter_map(|term| {
                 Self::like_prefix_non_null_column(term, table).map(|column| Expr::IsNull {
                     expr: Box::new(column.clone()), not: true, span: Span::ZERO,
@@ -55820,19 +55829,16 @@ impl Connection {
             normalized_query.extend(range_covers);
         }
 
-        let mut predicate_conjuncts: Vec<&Expr> = Vec::new();
-        Self::collect_and_conjuncts(predicate, &mut predicate_conjuncts);
-
-        predicate_conjuncts.iter().all(|predicate_conjunct| {
-            let mut normalized_predicate = (*predicate_conjunct).clone();
+        decompose_where(predicate).into_iter().all(|predicate_conjunct| {
+            let mut normalized_predicate = predicate_conjunct.clone();
             Self::normalize_partial_predicate_columns(&mut normalized_predicate, targets);
             normalized_query.iter().any(|query_conjunct| {
-                Self::query_term_implies_predicate(query_conjunct, &normalized_predicate)
+                Self::query_term_implies_predicate(query_conjunct, &normalized_predicate, table)
             })
         })
     }
 
-    fn like_prefix_non_null_column<'a>(term: &'a Expr, table: Option<&TableSchema>) -> Option<&'a Expr> {
+    fn like_prefix_non_null_column<'a>(term: &'a Expr, table: &TableSchema) -> Option<&'a Expr> {
         let Expr::Like { expr, pattern, escape, not: false, op, .. } = term else {
             return None;
         };
@@ -55855,9 +55861,9 @@ impl Connection {
         if first == '\0' {
             return None;
         }
-        let has_text_affinity = table.is_some_and(|table| table.columns.iter().any(|info| {
+        let has_text_affinity = table.columns.iter().any(|info| {
             info.name.eq_ignore_ascii_case(&column.column) && info.affinity == 'B'
-        }));
+        });
         if !has_text_affinity && (first == '-' || first.is_ascii_digit()) {
             return None;
         }
@@ -55892,7 +55898,7 @@ impl Connection {
             // to `regular_conjuncts` (any outer-join right table).
             let mut regular_conjuncts: Vec<&Expr> = Vec::new();
             if let Some(where_expr) = where_clause {
-                Self::collect_and_conjuncts(where_expr, &mut regular_conjuncts);
+                Self::collect_where_conjuncts(where_expr, &mut regular_conjuncts);
             }
             let source_count = from.joins.len() + 1;
             let mut outer_on_for_source: Vec<Vec<&Expr>> = vec![Vec::new(); source_count];
@@ -55900,7 +55906,7 @@ impl Connection {
             for (i, join) in from.joins.iter().enumerate() {
                 let mut on_conjuncts: Vec<&Expr> = Vec::new();
                 if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
-                    Self::collect_and_conjuncts(on_expr, &mut on_conjuncts);
+                    Self::collect_where_conjuncts(on_expr, &mut on_conjuncts);
                 }
                 match join.join_type.kind {
                     fsqlite_ast::JoinKind::Inner | fsqlite_ast::JoinKind::Cross => {
@@ -55987,7 +55993,7 @@ impl Connection {
                             self.forced_partial_cover_or_err(
                                 predicate,
                                 available,
-                                name.name.as_str(),
+                                &self.schema.borrow()[ti],
                                 alias.as_deref(),
                             )?;
                         }
@@ -56052,14 +56058,14 @@ impl Connection {
         &self,
         predicate: &Expr,
         available: &[&Expr],
-        name: &str,
+        table: &TableSchema,
         alias: Option<&str>,
     ) -> Result<()> {
-        let mut targets: Vec<&str> = vec![name];
+        let mut targets: Vec<&str> = vec![&table.name];
         if let Some(alias) = alias {
             targets.push(alias);
         }
-        if self.forced_partial_index_predicate_covered(predicate, available, &targets) {
+        if self.forced_partial_index_predicate_covered(predicate, available, &targets, table) {
             Ok(())
         } else {
             Err(FrankenError::FunctionError("no query solution".to_owned()))
@@ -56086,12 +56092,12 @@ impl Connection {
         if let Some(predicate) = &partial_predicate {
             let mut available: Vec<&Expr> = Vec::new();
             if let Some(where_expr) = where_clause {
-                Self::collect_and_conjuncts(where_expr, &mut available);
+                Self::collect_where_conjuncts(where_expr, &mut available);
             }
             self.forced_partial_cover_or_err(
                 predicate,
                 &available,
-                table.name.name.as_str(),
+                &self.schema.borrow()[ti],
                 table.alias.as_deref(),
             )?;
         }

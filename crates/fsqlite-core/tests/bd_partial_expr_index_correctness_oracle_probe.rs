@@ -63,6 +63,169 @@ async fn ex(f: &Connection, r: &rusqlite::Connection, sql: &str) {
 }
 
 #[test]
+fn forced_partial_index_respects_comparison_collation() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("collations.db");
+        for filename in [":memory:", file.to_str().unwrap()] {
+            let f = Connection::open(filename).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT COLLATE NOCASE,
+                                c TEXT COLLATE NOCASE, dirty INTEGER DEFAULT 0)",
+                "INSERT INTO t(id,a,b,c) VALUES(1,'A','a','A'),(2,'b','b','b'),(3,'x','y','z')",
+                "CREATE INDEX ab ON t(id) WHERE a=b",
+                "CREATE INDEX bc ON t(id) WHERE b=c",
+                "CREATE INDEX explicit_pair ON t(id) WHERE a COLLATE NOCASE=b COLLATE BINARY",
+                "CREATE INDEX different ON t(id) WHERE b!=c",
+                "CREATE INDEX distinct_pair ON t(id) WHERE b IS NOT c",
+                "CREATE INDEX truthy ON t(id) WHERE id IS TRUE",
+            ] {
+                r.execute_batch(sql).unwrap();
+                f.execute(sql).await.unwrap();
+            }
+
+            // Stock rejects the write before touching any rows, even though the
+            // unforced predicate really does match both 1 ('A'/'a') and 2.
+            for sql in [
+                "UPDATE t INDEXED BY ab SET dirty=1 WHERE b=a",
+                "DELETE FROM t INDEXED BY explicit_pair WHERE b COLLATE BINARY=a COLLATE NOCASE",
+            ] {
+                let oracle = r.execute(sql, []).unwrap_err();
+                assert!(oracle.to_string().contains("no query solution"), "{sql}: {oracle}");
+                let err = f.execute(sql).await.unwrap_err();
+                assert!(err.to_string().contains("no query solution"), "{sql}: {err}");
+                let err = f.prepare(sql).await.expect_err("invalid write prepared");
+                assert!(err.to_string().contains("no query solution"), "{sql}: {err}");
+            }
+            for sql in [
+                "SELECT id FROM t AS q INDEXED BY ab WHERE q.b=q.a",
+                "EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY ab WHERE b=a",
+                "EXPLAIN QUERY PLAN UPDATE t INDEXED BY ab SET dirty=2 WHERE b=a",
+                "SELECT id FROM t INDEXED BY different WHERE c!=b",
+                "SELECT id FROM t INDEXED BY distinct_pair WHERE c IS NOT b",
+                "SELECT id FROM t INDEXED BY truthy WHERE TRUE IS id",
+            ] {
+                let oracle = r.prepare(sql).unwrap_err();
+                assert!(oracle.to_string().contains("no query solution"), "{sql}: {oracle}");
+                let err = f.query(sql).await.unwrap_err();
+                assert!(err.to_string().contains("no query solution"), "{sql}: {err}");
+            }
+            for (sql, ids) in [
+                ("SELECT id FROM t WHERE b=a ORDER BY id", vec![1, 2]),
+                ("SELECT id FROM t AS q INDEXED BY ab WHERE q.a=q.b ORDER BY id", vec![2]),
+                ("SELECT id FROM t INDEXED BY bc WHERE c=b ORDER BY id", vec![1, 2]),
+                ("SELECT id FROM t INDEXED BY ab WHERE (a=b) COLLATE RTRIM ORDER BY id", vec![2]),
+                ("SELECT id FROM t INDEXED BY ab WHERE (a=b AND dirty=0) COLLATE RTRIM ORDER BY id", vec![2]),
+                ("SELECT id FROM t INDEXED BY explicit_pair WHERE a COLLATE NOCASE=b COLLATE BINARY ORDER BY id", vec![1, 2]),
+                ("SELECT id FROM t INDEXED BY truthy WHERE id IS TRUE ORDER BY id", vec![1, 2, 3]),
+                ("SELECT id FROM t WHERE dirty=0 ORDER BY id", vec![1, 2, 3]),
+            ] {
+                let expected: Vec<Vec<String>> = ids.iter()
+                    .map(|id| vec![format!("int:{id}")])
+                    .collect();
+                assert_eq!(rq(&r, sql), expected, "stock: {sql}");
+                assert_eq!(fq(&f, sql).await, expected, "{filename}: {sql}");
+            }
+            let lookup = "SELECT id FROM t INDEXED BY bc WHERE (c=b) COLLATE RTRIM AND id>=?1 ORDER BY id";
+            let plan = f.prepare(lookup).await.unwrap();
+            let mut stock_plan = r.prepare(lookup).unwrap();
+            for (floor, ids) in [(1, vec![1, 2]), (2, vec![2]), (3, vec![])] {
+                let stock_ids = stock_plan.query_map([floor], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(stock_ids, ids);
+                let rows = plan.query_with_params(&[SqliteValue::Integer(floor)]).await.unwrap();
+                assert_eq!(rows.len(), ids.len());
+                for (row, id) in rows.iter().zip(ids) {
+                    assert_eq!(row.values(), &[SqliteValue::Integer(id)]);
+                }
+            }
+            drop(plan);
+            let update = "UPDATE t INDEXED BY bc SET dirty=1 WHERE (c=b) COLLATE RTRIM";
+            assert_eq!(r.execute(update, []).unwrap(), 2);
+            assert_eq!(f.execute(update).await.unwrap(), 2);
+            f.close().await.unwrap();
+            if filename != ":memory:" {
+                let reopened = rusqlite::Connection::open(filename).unwrap();
+                let sql = "SELECT id FROM t WHERE dirty=1 ORDER BY id";
+                assert_eq!(rq(&reopened, sql), vec![vec!["int:1"], vec!["int:2"]]);
+            }
+        }
+    });
+}
+
+#[test]
+fn forced_partial_index_membership_with_an_empty_set() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("membership.db");
+        for filename in [":memory:", path.to_str().unwrap()] {
+            let f = Connection::open(filename).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, k TEXT)",
+                "INSERT INTO t VALUES (1,NULL,'x'),(2,5,'y'),(3,9,'x')",
+                "CREATE INDEX present ON t(k) WHERE a IS NOT NULL",
+                "CREATE TABLE excluded(val INTEGER)",
+            ] {
+                r.execute_batch(sql).unwrap();
+                f.execute(sql).await.unwrap();
+            }
+            for predicate in ["a IN ()", "a NOT IN ()", "a NOT IN excluded",
+                              "a NOT IN (SELECT val FROM excluded)"] {
+                let delete = format!("DELETE FROM t INDEXED BY present WHERE {predicate}");
+                let stock = r.execute(&delete, []).unwrap_err();
+                assert!(stock.to_string().contains("no query solution"), "{delete}: {stock}");
+                let err = f.execute(&delete).await.unwrap_err();
+                assert!(err.to_string().contains("no query solution"), "{delete}: {err}");
+            }
+            let all = "SELECT id FROM t WHERE a NOT IN excluded ORDER BY id";
+            let expected = vec![vec!["int:1"], vec!["int:2"], vec!["int:3"]];
+            assert_eq!(rq(&r, all), expected);
+            assert_eq!(fq(&f, all).await, expected);
+
+            for (membership, uses_partial) in [("IN ()", false), ("IN (9)", true), ("NOT IN ()", false)] {
+                let eqp = format!("EXPLAIN QUERY PLAN SELECT id FROM t WHERE k='x' AND a {membership}");
+                for plan in [rq(&r, &eqp), fq(&f, &eqp).await] {
+                    assert_eq!(plan.iter().flatten().any(|s| s.contains("present")),
+                               uses_partial, "{filename}: {eqp}: {plan:?}");
+                }
+            }
+
+            // The same prepared IN-subquery can run when the set is empty
+            // and after it is populated. Neither case can return a NULL lhs.
+            let lookup = "SELECT id FROM t INDEXED BY present WHERE a IN excluded";
+            let plan = f.prepare(lookup).await.unwrap();
+            assert!(rq(&r, lookup).is_empty());
+            assert!(plan.query().await.unwrap().is_empty());
+            r.execute("INSERT INTO excluded VALUES(5)", []).unwrap();
+            f.execute("INSERT INTO excluded VALUES(5)").await.unwrap();
+            assert_eq!(rq(&r, lookup), vec![vec!["int:2"]]);
+            let rows = plan.query().await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values(), &[SqliteValue::Integer(2)]);
+            drop(plan);
+            for sql in [
+                "SELECT id FROM t INDEXED BY present WHERE a NOT IN (5,7)",
+                "SELECT id FROM t INDEXED BY present WHERE a IS NOT NULL AND a NOT IN excluded",
+            ] {
+                assert_eq!(rq(&r, sql), vec![vec!["int:3"]]);
+                assert_eq!(fq(&f, sql).await, vec![vec!["int:3"]]);
+            }
+            let delete = "DELETE FROM t INDEXED BY present WHERE a NOT IN (5,7)";
+            assert_eq!(r.execute(delete, []).unwrap(), 1);
+            assert_eq!(f.execute(delete).await.unwrap(), 1);
+            let remaining = "SELECT id FROM t ORDER BY id";
+            assert_eq!(rq(&r, remaining), vec![vec!["int:1"], vec!["int:2"]]);
+            assert_eq!(fq(&f, remaining).await, rq(&r, remaining));
+            f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
 fn bd_81jud_partial_index_must_cover_the_query() {
     asupersync::test_utils::run_test(|| async {
         let directory = tempfile::tempdir().unwrap();
