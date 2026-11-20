@@ -1156,7 +1156,6 @@ dependencies = [
 name = "fsqlite-c-api"
 version = "0.5.0"
 dependencies = [
- "asupersync",
  "fsqlite",
  "fsqlite-ast",
  "fsqlite-error",

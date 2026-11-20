@@ -75,7 +75,10 @@ pub use types::{FromSql, ToSql};
 /// the same purpose). A rusqlite application's own `cargo test` builds this
 /// crate at opt-level 0, where one statement can need about 2 MiB of stack:
 /// as much as Rust gives every spawned and test thread (bd-w4pr1.28).
-fn block_on<F: Future>(future: F) -> F::Output {
+///
+/// It is public for other synchronous boundaries over [`crate::Connection`],
+/// such as the C ABI shim (bd-zqr9h).
+pub fn block_on<F: Future>(future: F) -> F::Output {
     stacker::maybe_grow(
         BLOCKING_CALL_STACK_RED_ZONE_BYTES,
         BLOCKING_CALL_STACK_SEGMENT_BYTES,

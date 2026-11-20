@@ -26,24 +26,14 @@ use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsqlite::Connection;
+// The C ABI is a hard synchronous boundary: `extern "C"` functions cannot be
+// `async`, and a C caller has no `Cx` to hand down, so the shim drives each
+// engine future itself. It uses the driver of `fsqlite::blocking`, which polls
+// the future on the calling thread and parks only while it is pending, instead
+// of entering a thread-local asupersync runtime for every call (bd-zqr9h).
+use fsqlite::blocking::block_on;
 use fsqlite_ast::Statement;
 use fsqlite_error::{ErrorCode, FrankenError};
-
-/// Drive an engine future to completion on this shim's own runtime.
-///
-/// The C ABI is a hard synchronous boundary — `extern "C"` functions cannot be
-/// `async`, and a C caller has no `Cx` to hand down. So unlike the rest of the
-/// workspace (where AGENTS.md forbids building a runtime), this crate MUST own
-/// one: it is the consumer on behalf of the C caller.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    thread_local! {
-        static RUNTIME: asupersync::runtime::Runtime =
-            asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build fsqlite-c-api runtime");
-    }
-    RUNTIME.with(|runtime| runtime.block_on(future))
-}
 use fsqlite_parser::{Parser, parse_first_statement_with_tail};
 use fsqlite_types::SmallText;
 use fsqlite_types::value::SqliteValue;
@@ -1763,6 +1753,62 @@ mod tests {
             let db = open_memory();
             let rc = sqlite3_close(db);
             assert_eq!(rc, SQLITE_OK);
+        }
+    }
+
+    /// bd-zqr9h: a write against a RESERVED lock held by another handle waits
+    /// for busy_timeout and then returns SQLITE_BUSY, returns SQLITE_BUSY at
+    /// once at busy_timeout 0, and succeeds once the holder commits. The
+    /// engine's busy wait sleeps on a timer, so this also checks that the
+    /// shim's driver is woken for timers.
+    #[test]
+    fn test_busy_timeout_waits_then_returns_busy() {
+        unsafe fn exec(db: *mut Sqlite3, sql: &str) -> c_int {
+            let sql = CString::new(sql).unwrap();
+            sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut())
+        }
+        unsafe {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = CString::new(dir.path().join("busy.db").to_str().unwrap()).unwrap();
+            let mut holder: *mut Sqlite3 = ptr::null_mut();
+            let mut writer: *mut Sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut holder), SQLITE_OK);
+            assert_eq!(
+                exec(holder, "PRAGMA journal_mode=WAL; CREATE TABLE t(x);"),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut writer), SQLITE_OK);
+            assert_eq!(exec(holder, "BEGIN IMMEDIATE;"), SQLITE_OK);
+            assert_eq!(exec(holder, "INSERT INTO t VALUES (1);"), SQLITE_OK);
+            for (timeout_ms, at_least, below) in [
+                (
+                    300_u64,
+                    std::time::Duration::from_millis(250),
+                    std::time::Duration::from_secs(5),
+                ),
+                (
+                    0,
+                    std::time::Duration::ZERO,
+                    std::time::Duration::from_millis(250),
+                ),
+            ] {
+                assert_eq!(
+                    exec(writer, &format!("PRAGMA busy_timeout={timeout_ms};")),
+                    SQLITE_OK
+                );
+                let started = std::time::Instant::now();
+                let rc = exec(writer, "INSERT INTO t VALUES (2);");
+                let waited = started.elapsed();
+                assert_eq!(rc, SQLITE_BUSY, "busy_timeout={timeout_ms}");
+                assert!(
+                    waited >= at_least && waited < below,
+                    "busy_timeout={timeout_ms} waited {waited:?}"
+                );
+            }
+            assert_eq!(exec(holder, "COMMIT;"), SQLITE_OK);
+            assert_eq!(exec(writer, "INSERT INTO t VALUES (2);"), SQLITE_OK);
+            assert_eq!(sqlite3_close(writer), SQLITE_OK);
+            assert_eq!(sqlite3_close(holder), SQLITE_OK);
         }
     }
 
