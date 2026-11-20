@@ -94,6 +94,31 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-20 - REJECTED on its first kill line (bulk -151M Ir against 170M, the low end of its band; the in-place update cost 91 a row, not 10-25): an append to the cached rightmost leaf updates the cursor's stack entry in place instead of rebuilding it (bd-w4pr1.13, bulk-write round 13, lever SR)
+
+- Target: the stack rebuild after every append in `try_append_on_cached_rightmost_leaf` (`crates/fsqlite-btree/src/
+  cursor.rs`): a clone of the leaf's whole cell-pointer array, `stack.clear()` dropping the previous entry, and a new
+  entry, ~230 a row by callgrind of the 100k bulk row (clear 9.5M, clone 8.4M, push 3.1M, grow 2.1M). Preflight: the
+  2026-11-14 V2 entry (buffer reuse, rejected) asked for a change that removes the rebuild itself. Touched (not
+  landed; patch `scratchpad/r13/sr1_on_cf0c8483e.diff` of the bulk-write lane): a `place_stack_on_appended_leaf`
+  helper for both rebuild sites: when the stack was the cached leaf alone at the image the append started from
+  (same page and image token, read before the append), the entry takes the new pointer, image, header, counter and
+  index in place; otherwise the rebuild as before. A btree test checks the stack against the cache after every
+  append across splits and forced rebuilds; fsqlite-btree lib 564 passed, clippy clean.
+- Prediction (bd-w4pr1.13, before the build): bulk_insert_1M_one_txn -170M to -220M Ir, memory_script -30M to -45M.
+  Kill lines at the low ends: bulk down less than 170M, memory_script less than 30M, any row up 0.3%, a replicated
+  time LOSE.
+- Result, both arms in one job on vmi1227854 (P sha256 27c4e3ca3dc2422a, L 5e5c1af9fa35b765), stock 3.46.1 live,
+  single ELF: bulk 7,030.7M -> 6,879.6M by min (-151.1M; -160.6M by median; 1.683x -> 1.647x stock),
+  memory_script -30.4M, delete and update unchanged; answers equal stock's. Single-ELF bulk cycles:u -6.1%,
+  task-clock median 897.9 -> 861.7 ms (not layout-averaged; not run after the kill). Callgrind of both arms on the
+  100k row: 710.2M -> 695.3M (149 a row); the removed calls were 23.1M and the outlined helper costs 9.06M (91 a
+  row: the page handle's clone and the old one's drop, the pointer push, the header and counters), where 10-25
+  was predicted.
+- Retry condition: V2's first clause, a stack entry that shares the rightmost-leaf cache's pointers and page
+  handle (one copy maintained per append, not two), or a cursor that defers the stack until a read needs it;
+  either removes the 91 too. Measure that shape alone by callgrind first.
+
 ## 2026-11-20 - WIN (landed as c03a452df; inside its prediction): a trigger body statement is bound once per frame shape, not once per row (bd-fpr5g, SQL lane rounds 6-8, lever 3a)
 
 - Target: bd-fpr5g's script, an AFTER INSERT trigger with a WHEN guard and an INSERT and an UPDATE in its
