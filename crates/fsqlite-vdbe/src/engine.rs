@@ -5234,14 +5234,16 @@ impl CursorBackend {
         }
     }
 
-    /// The current row's rowid and where its payload lies on the leaf page,
-    /// for a table-leaf cell stored whole on its leaf; `None` otherwise.
+    /// The current row's rowid, where its payload lies on the leaf page and
+    /// those payload bytes, for a table-leaf cell stored whole on its leaf;
+    /// `None` otherwise.
     #[inline]
-    fn current_local_table_row_span(&self) -> Result<Option<(i64, std::ops::Range<usize>)>> {
+    #[allow(clippy::type_complexity)]
+    fn current_local_table_row(&self) -> Result<Option<(i64, std::ops::Range<usize>, &[u8])>> {
         match self {
-            Self::Mem(c) => c.current_local_table_row_span(),
-            Self::Txn(c) => c.current_local_table_row_span(),
-            Self::TimeTravel(c) => c.current_local_table_row_span(),
+            Self::Mem(c) => c.current_local_table_row(),
+            Self::Txn(c) => c.current_local_table_row(),
+            Self::TimeTravel(c) => c.current_local_table_row(),
         }
     }
 
@@ -23896,12 +23898,13 @@ fn try_read_column_in_place(
         return Ok(None);
     };
     let view = &mut cursor.page_row;
+    // A row new to this view takes its record bytes from the same cursor
+    // call that locates it, and the column below is read from those bytes;
+    // a row parsed before asks the page for them again.
+    let mut fresh_record: Option<&[u8]> = None;
     if view.stamp != Some(stamp) {
         view.stamp = None;
-        let Some((rowid, payload)) = cursor.cursor.current_local_table_row_span()? else {
-            return Ok(None);
-        };
-        let Some(bytes) = cursor.cursor.current_page_span(payload.clone()) else {
+        let Some((rowid, payload, bytes)) = cursor.cursor.current_local_table_row()? else {
             return Ok(None);
         };
         if !view.layout.parse(bytes) {
@@ -23911,6 +23914,7 @@ fn try_read_column_in_place(
         view.payload = payload;
         view.includes_rowid_alias = None;
         view.stamp = Some(stamp);
+        fresh_record = Some(bytes);
     }
 
     let ipk_col_idx = cursor.ipk_col_idx;
@@ -23927,7 +23931,9 @@ fn try_read_column_in_place(
             if let Some(slot) = rowid_slot {
                 // A short record whose slot holds an integer stores the alias
                 // exactly when that integer is the row's rowid.
-                let Some(bytes) = cursor.cursor.current_page_span(view.payload.clone()) else {
+                let Some(bytes) =
+                    fresh_record.or_else(|| cursor.cursor.current_page_span(view.payload.clone()))
+                else {
                     return Ok(None);
                 };
                 if column_payload_end(&slot).is_none_or(|end| end > bytes.len()) {
@@ -23957,7 +23963,9 @@ fn try_read_column_in_place(
     let Some(col) = view.layout.column_offset(payload_idx) else {
         return Ok(None);
     };
-    let Some(record) = cursor.cursor.current_page_span(view.payload.clone()) else {
+    let Some(record) =
+        fresh_record.or_else(|| cursor.cursor.current_page_span(view.payload.clone()))
+    else {
         return Ok(None);
     };
     // The column's own bytes. A record cut short of them is malformed, which
@@ -27774,6 +27782,101 @@ mod tests {
             assert!(!run_async(sc.cursor.next(&sc.cx)).expect("cursor should reach EOF"));
         }
         assert!(!engine.try_column_to_reg_in_place(0, 0, 1).unwrap());
+    }
+
+    /// bd-w4pr1.13.4 (lever CL1): a column read on a row new to the in-place
+    /// view takes its record from the same cursor call that locates the row,
+    /// and a read of a row parsed before asks the page for it again. Both
+    /// give, for every column of every row (a short record among them), what
+    /// the copying lane gives; a column the in-place lane declines leaves the
+    /// target register as it was.
+    #[test]
+    fn test_in_place_column_lane_reads_new_and_parsed_rows_like_the_copying_lane() {
+        let rows: Vec<(i64, Vec<SqliteValue>)> = vec![
+            (
+                1,
+                vec![
+                    SqliteValue::Integer(41),
+                    SqliteValue::Text("short".into()),
+                    SqliteValue::Float(1.5),
+                    SqliteValue::Null,
+                    SqliteValue::Integer(-3),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    SqliteValue::Integer(-7),
+                    SqliteValue::Text(String::new().into()),
+                    SqliteValue::Float(-0.25),
+                    SqliteValue::Text("x".into()),
+                    SqliteValue::Integer(i64::MAX),
+                ],
+            ),
+            (3, vec![SqliteValue::Null, SqliteValue::Text("abc".into())]),
+            (
+                5,
+                vec![
+                    SqliteValue::Integer(0),
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1 << 40),
+                    SqliteValue::Text("tail".into()),
+                    SqliteValue::Float(3.0),
+                ],
+            ),
+        ];
+        let mut db = MemDatabase::new();
+        let root = db.create_table(5);
+        {
+            let table = db.get_table_mut(root).expect("table should exist");
+            for (rowid, values) in &rows {
+                table.insert(*rowid, values.clone());
+            }
+        }
+        let mut engine = VdbeEngine::new(4);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(
+            run_async(engine.open_storage_cursor(0, root, false))
+                .expect("storage cursor open should not error")
+        );
+        engine.cursor_root_pages.insert(0, root);
+
+        let mut served = [0_usize; 2];
+        for column in 0..5 {
+            {
+                let sc = engine.storage_cursors.get_mut(&0).unwrap();
+                assert!(run_async(sc.cursor.first(&sc.cx)).expect("cursor should rewind"));
+            }
+            for (index, (rowid, _)) in rows.iter().enumerate() {
+                // Pass 0 reads a row new to the view, pass 1 the parsed row.
+                for (pass, count) in served.iter_mut().enumerate() {
+                    engine.set_reg_int(1, 777);
+                    let in_place = engine.try_column_to_reg_in_place(0, column, 1).unwrap();
+                    let got = engine.get_reg(1).clone();
+                    let copied = engine.try_column_to_reg_direct_local(0, column, 2).unwrap();
+                    let want = engine.get_reg(2).clone();
+                    if in_place {
+                        *count += 1;
+                        assert!(copied, "row {rowid} column {column} pass {pass}");
+                        assert_eq!(got, want, "row {rowid} column {column} pass {pass}");
+                    } else {
+                        assert_eq!(
+                            got,
+                            SqliteValue::Integer(777),
+                            "row {rowid} column {column} pass {pass}"
+                        );
+                    }
+                }
+                if index + 1 < rows.len() {
+                    let sc = engine.storage_cursors.get_mut(&0).unwrap();
+                    assert!(run_async(sc.cursor.next(&sc.cx)).expect("cursor should advance"));
+                }
+            }
+        }
+        assert!(served[0] >= 12, "new-row reads served: {}", served[0]);
+        assert_eq!(served[0], served[1]);
     }
 
     /// Hold [`RecordColumnTable::parse`] to the decode scratch's header

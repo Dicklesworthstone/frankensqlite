@@ -12986,6 +12986,26 @@ impl<P: PageWriter> BtCursor<P> {
         self.local_leaf_table_cell_span(top, top.cell_idx)
     }
 
+    /// [`Self::current_local_table_row_span`] together with the payload bytes
+    /// [`Self::current_page_span`] would return for that span: what a column
+    /// read on a row new to it needs, in one call. `None` in the same cases as
+    /// either of the two.
+    #[allow(clippy::type_complexity)]
+    pub fn current_local_table_row(&self) -> Result<Option<(i64, std::ops::Range<usize>, &[u8])>> {
+        if self.at_eof {
+            return Ok(None);
+        }
+        let Some(top) = self.stack.last() else {
+            return Ok(None);
+        };
+        Ok(self
+            .local_leaf_table_cell_span(top, top.cell_idx)?
+            .and_then(|(rowid, payload)| {
+                let bytes = top.usable_bytes().get(payload.clone())?;
+                Some((rowid, payload, bytes))
+            }))
+    }
+
     /// Bytes `span` of the page the cursor stands on, or `None` when the
     /// cursor is not on a page or the page is shorter than that.
     #[must_use]
