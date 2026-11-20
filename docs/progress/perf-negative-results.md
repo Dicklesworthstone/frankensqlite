@@ -94,6 +94,60 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-20 - WIN (landed as c03a452df; inside its prediction): a trigger body statement is bound once per frame shape, not once per row (bd-fpr5g, SQL lane rounds 6-8, lever 3a)
+
+- Target: bd-fpr5g's script, an AFTER INSERT trigger with a WHEN guard and an INSERT and an UPDATE in its
+  body, over 20,000 rows. Per firing row, `bind_trigger_body_statement` cloned each body statement and
+  rewrote its NEW/OLD references into `?N` parameters: about 8.8k instructions per statement, 17.7k per
+  firing (callgrind, symbolized main 3816d43a6).
+- Ledger preflight: levers 1 and 2 (the 2026-11-18 and 2026-11-19 entries) were this bead's earlier WINs;
+  no entry covers trigger body binding.
+- Change (connection.rs): a per-connection cache of `TriggerBodyTemplate`s, keyed on the trigger's Arc (by
+  pointer), the statement index, main-relation pinning, the firing statement's conflict override, the
+  schema generation and the frame shape. Each holds the bound statement and the binder's recipe
+  (`TriggerBoundParams` keys). Later rows read their values through `TriggerFrame::lookup_value` and run the
+  cached statement through the unchanged `execute_bound_trigger_statement` tail. Only parameter-bound
+  INSERT / UPDATE / DELETE statements are cached.
+- Prediction (posted before the build): -230M to -320M instructions on each trigger row. Kill lines: trig_cte
+  gains less than 150M (at or below the band's low end, per the 2026-11-19 rule); any answer differs; any
+  keeper goes red; any non-trigger row worse than +0.5%.
+- Measured at the landing commit (scratchpad r8). Arms: parent 142d00570 and lever acf5feef1 (the same code
+  as c03a452df), built in one rch job on vmi1227854; cargo-link sha256 2f23857fd759f517 (parent) and
+  e55b12a5f9e6444a (lever). The parent's 1,930 sources equal git, and the lever ELF alone carries the
+  template symbols. thinkstation1, powersave, stock 3.54.1 live, answers equal everywhere.
+
+  | row | Ir lever / parent | x stock, Ir | x stock, cycles | x stock, cpu |
+  |---|---|---|---|---|
+  | trig_cte (the bead's script) | 0.895 (-335M) | 13.2 -> 11.8 | 31.7 -> 28.5 | 26.4 -> 23.8 |
+  | trig_src | 0.899 (-321M) | 11.5 -> 10.4 | 27.9 -> 24.7 | 24.6 -> 21.7 |
+  | trig_values | 0.894 (-344M) | 2.72 -> 2.43 | 5.64 -> 5.02 | 5.41 -> 4.84 |
+  | notrig_cte, ctl_insert_txn, ctl_select | 1.0000 to 1.0007 | | | |
+
+  - Layout-averaged time lines (bd-es2im), two valid runs, each with its own Q group: every trigger row is a
+    replicated WIN on cycles and cpu (0.881 to 0.903); every control is a replicated TIE.
+  - CLI scorecard Ir guard (7 reps, stock 3.46.1 live): 11 rows pass, the largest +0.17%. count_star is
+    undecidable (its A/A moved 0.62%; lever 0.9994). The four file-backed rows went to the coordinator's
+    2026-11-20 rule: 21 interleaved reps x 3 arms (parent, an A/A copy of its ELF, lever) x 2 runs,
+    T = max(0.5%, 2 x 1.2533 x sqrt((sd_P^2 + sd_L^2) / 21)). All four are TIE: txn_1000x10_rows
+    R 1.0102 / 1.0046 (T 2.56% / 4.02%), create_index 1.0003 / 1.0001 (0.50% / 1.18%), delete 1.0003 /
+    0.9896 (4.15% / 4.30%), multiproc 1.0000 / 0.9918 (3.57% / 3.00%).
+  - Integrity check (gate-fix step b), on this pair: under the posted 7-rep rule, txn passes and the other
+    three rows are undecidable; under the corrected rule, 4 TIE and 0 OVER. On round 7's pair the posted rule
+    read txn as OVER at +0.73%, with a per-arm spread of 6.7% to 8.4%.
+- Gate: g34 on cd852b5cc (the same diff on 7c6942608 + bd-u608s): clippy clean; 19 trigger / RETURNING /
+  conflict / error-message keeper targets rc 0; core lib rc 0; the fsqlite crate in 7 batches of 19, 125
+  binaries, 1,100 passed, 0 failed; e2e red only on bd-mc5pp's storm test, identical on the parent. The
+  rebase onto 142d00570 and b81a6da26 crossed GB1 (a disjoint grouped-aggregate region of connection.rs),
+  VFS commits and beads only.
+- Lesson: file-backed Ir rows (txn_1000x10_rows, create_index, delete, multiproc_8x500) vary 3% to 13% run to
+  run, even on the main thread alone. Single-draw A/A tests on 2 or 7 reps cannot resolve a 0.5% line; they
+  need the noise-aware rule above, or a deterministic Ir harness. Callgrind is not one here: two parent runs
+  differed 3x.
+- Retry condition: none for this lever. Left on the row, in bd-fpr5g's order: the dispatcher around each body
+  statement (about 30k of its 56k), which needs a kernel-level UPDATE / DELETE replay path (lever 3b), and the
+  outer row-by-row replay (about 49k). The bead's script is still 11.8x stock in instructions, against its 5x
+  target.
+
 ## 2026-11-19 - WIN (landed as 2f4aac8bb): a grouped built-in aggregate of a plain column reads the group's values in place (bd-w4pr1.12, read-loop round 8, lever GB1)
 
 - Target: GROUP BY id over a derived table. The connection's grouped evaluator collected a (value, ORDER BY keys)
