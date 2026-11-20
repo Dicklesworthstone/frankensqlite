@@ -1300,6 +1300,7 @@ impl IoUringVfs {
     fn wrap_unix_file(
         &self,
         file: UnixFile,
+        open_flags: VfsOpenFlags,
         out_flags: VfsOpenFlags,
     ) -> (IoUringFile, VfsOpenFlags) {
         (
@@ -1307,6 +1308,7 @@ impl IoUringVfs {
                 inner: file,
                 runtime: Arc::clone(&self.runtime),
                 hot_reads: AtomicU8::new(HOT_READS_UNPROBED),
+                writes_inline: open_flags.contains(VfsOpenFlags::WAL),
             },
             out_flags,
         )
@@ -1326,6 +1328,12 @@ pub struct IoUringFile {
     runtime: Arc<IoUringRuntime>,
     /// One of the `HOT_READS_*` routes.
     hot_reads: AtomicU8,
+    /// bd-2sf0f: a file opened with `VfsOpenFlags::WAL` (the WAL and its
+    /// `-wal-cert` sidecars) takes every write through the Unix file's pwrite
+    /// path. A COMMIT's own WAL or certificate write never waits on a ring
+    /// request the kernel may hold without completing it, and holds RESERVED
+    /// and WAL WRITE meanwhile. Its reads stay on io_uring.
+    writes_inline: bool,
 }
 
 impl Vfs for IoUringVfs {
@@ -1342,7 +1350,7 @@ impl Vfs for IoUringVfs {
         flags: VfsOpenFlags,
     ) -> Result<(Self::File, VfsOpenFlags)> {
         let (file, out_flags) = self.unix.open(cx, path, flags)?;
-        Ok(self.wrap_unix_file(file, out_flags))
+        Ok(self.wrap_unix_file(file, flags, out_flags))
     }
 
     fn open_with_expected_identity(
@@ -1355,7 +1363,7 @@ impl Vfs for IoUringVfs {
         let (file, out_flags) =
             self.unix
                 .open_with_expected_identity(cx, path, flags, expected_identity)?;
-        Ok(self.wrap_unix_file(file, out_flags))
+        Ok(self.wrap_unix_file(file, flags, out_flags))
     }
 
     fn open_reserved_with_expected_identity(
@@ -1368,7 +1376,7 @@ impl Vfs for IoUringVfs {
         let (file, out_flags) =
             self.unix
                 .open_reserved_with_expected_identity(cx, path, flags, expected_identity)?;
-        Ok(self.wrap_unix_file(file, out_flags))
+        Ok(self.wrap_unix_file(file, flags, out_flags))
     }
 
     fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
@@ -1865,6 +1873,9 @@ impl IoUringFile {
         if buf.is_empty() {
             return Ok(());
         }
+        if self.writes_inline {
+            return self.inner.write(cx, buf, offset).await;
+        }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
             return self.inner.write(cx, buf, offset).await;
@@ -1996,6 +2007,9 @@ impl IoUringFile {
             completion.complete_success();
             return Ok(());
         }
+        if self.writes_inline {
+            return self.inner.write_tracked(cx, buf, offset, completion).await;
+        }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
             return self.inner.write_tracked(cx, buf, offset, completion).await;
@@ -2122,6 +2136,9 @@ impl IoUringFile {
         if buf.is_empty() {
             return Ok(());
         }
+        if self.writes_inline {
+            return self.inner.write_owned(cx, buf, offset).await;
+        }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
             return self.inner.write_owned(cx, buf, offset).await;
@@ -2148,6 +2165,12 @@ impl IoUringFile {
         if buf.is_empty() {
             completion.complete_success();
             return Ok(());
+        }
+        if self.writes_inline {
+            return self
+                .inner
+                .write_owned_tracked(cx, buf, offset, completion)
+                .await;
         }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
@@ -2447,6 +2470,56 @@ mod tests {
         #[cfg(feature = "linux-asupersync-uring")]
         FORCE_RING_READS.store(true, Ordering::Release);
         IoUringTestGuard { _lock: lock }
+    }
+
+    /// bd-2sf0f: a file opened with `VfsOpenFlags::WAL` (the WAL and its
+    /// `-wal-cert` sidecars) writes through the Unix pwrite path, so its
+    /// writes add no io_uring submission, and the bytes land. Negative: a
+    /// main-file write through the same runtime still goes through the ring.
+    /// Red on main, where the WAL writes are ring submissions.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn bd_2sf0f_wal_writes_take_the_pwrite_path_and_main_file_writes_the_ring() {
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        assert!(vfs.is_available(), "requires io_uring: {}", vfs.status());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (wal, _) = vfs
+            .open(
+                &cx,
+                Some(&dir.path().join("t.db-wal")),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+            )
+            .expect("open wal");
+        let (main, _) = vfs
+            .open(
+                &cx,
+                Some(&dir.path().join("t.db")),
+                open_flags_create_unlocked(),
+            )
+            .expect("open main");
+        let submitted = || vfs.runtime.submitted_requests.load(Ordering::Acquire);
+        let before = submitted();
+        block_on_test(&cx, wal.write(&cx, &[0x5A; 4096], 0)).expect("wal write");
+        block_on_test(&cx, wal.write_owned(&cx, vec![0x5B; 156], 4096)).expect("wal write");
+        assert_eq!(
+            submitted(),
+            before,
+            "a WAL-flagged file's writes must not be io_uring submissions"
+        );
+        let mut back = vec![0_u8; 4096 + 156];
+        let n = block_on_test(&cx, wal.read(&cx, &mut back, 0)).expect("read back");
+        assert_eq!(n, back.len());
+        assert!(back[..4096].iter().all(|byte| *byte == 0x5A));
+        assert!(back[4096..].iter().all(|byte| *byte == 0x5B));
+
+        let before_main = submitted();
+        block_on_test(&cx, main.write(&cx, &[0xAB; 4096], 0)).expect("main write");
+        assert!(
+            submitted() > before_main,
+            "negative: a main-file write still goes through the ring"
+        );
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
@@ -3692,10 +3765,17 @@ mod tests {
         // `block_on_test` attaches a native `Cx`, the WAL's retained canonical fd is
         // multiplexed through io_uring (3d1dc5c9d) rather than falling back, so the
         // ops record io_uring latency samples.
+        // bd-2sf0f: WAL-flagged files now write through the Unix pwrite path (the
+        // coordinator-approved lever), so the write records no io_uring sample; the
+        // read still goes through the ring on the retained canonical fd.
         let snapshot = io_uring_latency_snapshot();
+        assert_eq!(
+            snapshot.write_samples_total, 0,
+            "a WAL write must take the pwrite path, not the ring"
+        );
         assert!(
-            snapshot.write_samples_total >= 1 && snapshot.read_samples_total >= 1,
-            "wal I/O should multiplex the canonical fd through io_uring and record latency samples"
+            snapshot.read_samples_total >= 1,
+            "wal reads should multiplex the canonical fd through io_uring and record latency samples"
         );
     }
 
