@@ -94,6 +94,32 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-20 - WIN (landed as 009856eb4; inside its prediction, on instructions): a column read on a new row takes its record bytes from the one cursor call that locates the row (bd-w4pr1.13.4, read-loop round 10, lever CL1)
+
+- Target: the in-place Column lane (`try_read_column_in_place`). On a row new to its view it asked the cursor
+  three times for the same bytes: the row span, then the page span to parse the header, then the page span again
+  for the value. Each call pays CursorBackend's three-way match, the EOF check and the stack top, about 34
+  instructions; the join row's two column reads cost 136 a row in those calls (callgrind on main).
+- Touched: `crates/fsqlite-btree/src/cursor.rs` (`BtCursor::current_local_table_row` returns the rowid, payload
+  range and record bytes from one call); `crates/fsqlite-vdbe/src/engine.rs` (the lane parses a new row and its
+  short-record rowid-alias check from those bytes; keeper
+  `test_in_place_column_lane_reads_new_and_parsed_rows_like_the_copying_lane`).
+- Prediction (on the bead, before the build): join_1M_to_pk_1000 -80 to -120M Ir, scan_filter_agg -35 to -60M.
+  Kill: the join under 60M, scan_filter_agg under 25M, or any row above +0.5% Ir.
+- Result (parent 75b68af7a against parent + this change, one layout_shuffle_pair job, K=6 relinks per arm, two
+  judgement runs; stock sqlite3 3.46.1 live; thinkstation1; answers equal stock on every row): join -101.4M
+  (4,125.1M -> 4,023.7M; x2.40 -> x2.34 stock); scan_filter_agg -45.5M (1,271.4M -> 1,225.8M; x2.55 -> x2.46
+  stock). Every row that reads a column falls 20-51M, and no row rises. Time (layout-averaged): every row a
+  replicated TIE, so it lands on instructions, not on time.
+- Planted mutant (rch, rc 101): `current_local_table_row` returning the record bytes shifted by one fails the
+  keeper and the existing lane test.
+- Gate (75b68af7a + diff d5a9807e7ce5a05e, byte-identical after the rebase; the commits between touch neither
+  file): btree and vdbe libs 1,821 passed; clippy clean; 58 test binaries, 6,251 passed, 0 failed; fsqlite-e2e 21
+  binaries, 145 passed; fsqlite crate in 7 batches of 19, 125 binaries, 1,100 passed, 0 failed; rustfmt and ubs
+  clean.
+- Retry condition: none for this shape. Left on the join row is the rest of the per-row cursor and record cost (x2.34
+  stock): attribute it before a next lever.
+
 ## 2026-11-20 - REJECTED on its first kill line (bulk -151M Ir against 170M, the low end of its band; the in-place update cost 91 a row, not 10-25): an append to the cached rightmost leaf updates the cursor's stack entry in place instead of rebuilding it (bd-w4pr1.13, bulk-write round 13, lever SR)
 
 - Target: the stack rebuild after every append in `try_append_on_cached_rightmost_leaf` (`crates/fsqlite-btree/src/
