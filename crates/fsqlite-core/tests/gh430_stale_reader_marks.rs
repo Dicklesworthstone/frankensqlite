@@ -7,9 +7,11 @@
 //! Expected, matching stock SQLite:
 //! - the WAL-index-recovery read-only open rebuilds the index (resetting the
 //!   marks) and reads every committed row;
-//! - a plain read-only open, which may not rebuild it, fails fast with a
-//!   non-retryable read-only error (SQLITE_READONLY_RECOVERY) instead of a
-//!   busy that callers spin on.
+//! - bd-tv006: with nothing holding the files, a plain read-only open is
+//!   stock's first attacher. It rebuilds the index (resetting the marks) and
+//!   reads every committed row, promptly, as stock 3.54.1 does on its own copy
+//!   of the same files in this test. Before bd-tv006 the plain open failed
+//!   fast with a non-retryable read-only error; stock never refuses this shape.
 //!
 //! GH#431 (same admission path): the initialized, empty index stock SQLite
 //! writes beside a settled, frame-free WAL (`szPage = 0`, zero salts, valid
@@ -84,41 +86,88 @@ fn stale_reader_marks_recover_or_fail_fast_instead_of_busy_forever() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("gh430.db").to_str().expect("utf-8").to_owned();
         let mx_frame = stage_stale_reader_marks(&path).await;
+        let stale_shm = std::fs::read(shm_path(Path::new(&path))).expect("read the staged -shm");
 
-        // Plain read-only: may not rebuild the index, so it must fail fast and
-        // non-retryably rather than returning BusyRecovery forever.
+        // Stock, on its own copy of the same three files (its own inodes, so
+        // its POSIX locks never meet this process's), as the first attacher.
+        let stock_path = dir.path().join("gh430-stock.db");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::copy(format!("{path}{suffix}"), format!("{}{suffix}", stock_path.display()))
+                .expect("copy the family for stock");
+        }
+        let stock = rusqlite::Connection::open_with_flags(
+            format!("file:{}?mode=ro", stock_path.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .expect("stock read-only open");
+        let stock_rows: i64 = stock
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .expect("stock reads the stale family");
+        drop(stock);
+        assert_eq!(stock_rows, ROWS, "stock's first attacher reads every row");
+        let stock_shm = std::fs::read(shm_path(&stock_path)).expect("read stock's -shm");
+        assert_ne!(stock_shm, stale_shm, "stock rebuilt the stale index");
+        assert_marks_reset(&stock_shm, "stock");
+
+        // Plain read-only, nothing holding the files: stock's first attacher,
+        // so it rebuilds the index and reads every row, promptly, never
+        // returning BusyRecovery forever.
         let started = std::time::Instant::now();
-        let plain = match Connection::open_schema_only(path.clone()).await {
-            Ok(conn) => count_rows(&conn).await,
-            Err(error) => Err(error),
-        };
-        let error = plain.expect_err("a stale index cannot be read without rebuilding it");
-        assert!(
-            matches!(error, FrankenError::ReadOnly),
-            "expected a read-only (recovery needed) error, got {error:?}"
-        );
-        assert!(!error.is_transient(), "the condition never clears; do not invite retries");
+        let plain = Connection::open_schema_only(path.clone())
+            .await
+            .expect("a plain read-only first attacher opens the stale family");
+        assert_eq!(count_rows(&plain).await.expect("plain read-only first attacher reads"), ROWS);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "the plain open must not spin until a busy timeout"
         );
+        drop(plain);
+        let bytes = std::fs::read(shm_path(Path::new(&path))).expect("read -shm");
+        assert_ne!(bytes, stale_shm, "the plain first attacher rebuilt the stale index");
+        assert!(word(&bytes, MX_FRAME_OFFSET) >= mx_frame);
+        assert_marks_reset(&bytes, "plain read-only first attacher");
 
-        // WAL-index-recovery read-only: rebuilds the index and sees every row.
+        // WAL-index-recovery read-only: also rebuilds and sees every row.
+        stage_stale_marks_again(&path, mx_frame);
         let recovering = Connection::open_schema_only_with_wal_index_recovery(path.clone())
             .await
             .expect("recovery-mode open succeeds");
         assert_eq!(count_rows(&recovering).await.expect("read after recovery"), ROWS);
         drop(recovering);
-
-        // The rebuild reset the marks like stock recovery, so the header and
-        // marks agree again and a plain read-only open now works too.
         let bytes = std::fs::read(shm_path(Path::new(&path))).expect("read -shm");
         assert!(word(&bytes, MX_FRAME_OFFSET) >= mx_frame);
+        assert_marks_reset(&bytes, "WAL-index-recovery open");
+
+        // The header and marks agree again, so a plain read-only open works.
         let plain = Connection::open_schema_only(path.clone())
             .await
             .expect("plain read-only open after the rebuild");
         assert_eq!(count_rows(&plain).await.expect("plain read after rebuild"), ROWS);
     });
+}
+
+/// Every in-use reader mark is at or below the header's `mxFrame` again, as
+/// stock's recovery leaves them (unused marks are 0xffffffff).
+fn assert_marks_reset(shm: &[u8], context: &str) {
+    let mx_frame = word(shm, MX_FRAME_OFFSET);
+    for slot in 1..5 {
+        let mark = word(shm, read_mark_offset(slot));
+        assert!(
+            mark == u32::MAX || mark <= mx_frame,
+            "{context}: reader mark {slot} is {mark}, above mxFrame {mx_frame}"
+        );
+    }
+}
+
+/// Raise reader marks 1 and 2 above `mx_frame` again on the rebuilt `-shm`.
+fn stage_stale_marks_again(path: &str, mx_frame: u32) {
+    let shm = shm_path(Path::new(path));
+    let mut bytes = std::fs::read(&shm).expect("read -shm");
+    for (slot, mark) in [(1, mx_frame + 13), (2, mx_frame + 12)] {
+        let offset = read_mark_offset(slot);
+        bytes[offset..offset + 4].copy_from_slice(&mark.to_ne_bytes());
+    }
+    std::fs::write(&shm, &bytes).expect("rewrite -shm");
 }
 
 /// The 48-byte WAL-index header stock SQLite 3.51 writes beside a header-only

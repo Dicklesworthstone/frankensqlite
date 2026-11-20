@@ -5349,6 +5349,11 @@ pub struct WalIndexShmSource<F: VfsFile> {
     db_file: SharedDbFile<F>,
     cleanup_queue: Weak<GroupCommitQueue>,
     can_publish_reader_marks: bool,
+    /// bd-tv006: whether this source's pager may rebuild the shared index. A
+    /// writable pager may; so may a read-only one opened as stock's first
+    /// attacher (`PagerAccessMode::ReadOnlyWithWalIndexRecovery`), which still
+    /// publishes no reader marks.
+    may_rebuild_index: bool,
 }
 
 impl<F: VfsFile> WalIndexShmSource<F> {
@@ -5374,10 +5379,10 @@ impl<F: VfsFile> WalIndexShmSource<F> {
     }
 
     /// Whether this source belongs to a pager that may rebuild the shared
-    /// index (it publishes reader marks only when it is not read-only).
+    /// index: a writable pager, or a read-only first attacher (bd-tv006).
     #[must_use]
     pub const fn may_rebuild_shared_index(&self) -> bool {
-        self.can_publish_reader_marks
+        self.may_rebuild_index
     }
 
     /// Map a 32 KiB WAL-index region and release the file guard before returning.
@@ -7894,6 +7899,11 @@ enum PagerAccessMode {
     Writable,
     ReadOnly,
     ReadOnlyWithWalIndexRecovery,
+    /// `readonly_shm=1` (bd-tv006): read-only, and the `-shm` is never
+    /// written. The WAL is read through a private index, as stock's
+    /// never-write mode reads it, and the shared index is never rebuilt or
+    /// created.
+    ReadOnlyShm,
     /// `immutable=1`: the main file is the whole database (bd-j2dtf).
     Immutable,
 }
@@ -7902,6 +7912,12 @@ impl PagerAccessMode {
     #[must_use]
     const fn is_readonly(self) -> bool {
         !matches!(self, Self::Writable)
+    }
+
+    /// bd-tv006: whether a pager in this mode may rebuild the shared WAL index.
+    #[must_use]
+    const fn may_rebuild_wal_index(self) -> bool {
+        matches!(self, Self::Writable | Self::ReadOnlyWithWalIndexRecovery)
     }
 }
 
@@ -16630,18 +16646,80 @@ where
 
     /// Obtain a WAL-index mapping source bound to the existing main-file handle.
     pub fn wal_index_shm_source(&self) -> Result<Arc<WalIndexShmSource<V::File>>> {
-        let (db_file, can_publish_reader_marks) = {
+        let (db_file, can_publish_reader_marks, may_rebuild_index) = {
             let inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-            (Arc::clone(&inner.db_file), !inner.access_mode.is_readonly())
+            (
+                Arc::clone(&inner.db_file),
+                !inner.access_mode.is_readonly(),
+                inner.access_mode.may_rebuild_wal_index(),
+            )
         };
         Ok(Arc::new(WalIndexShmSource {
             db_file,
             cleanup_queue: Arc::downgrade(&self.group_commit_queue),
             can_publish_reader_marks,
+            may_rebuild_index,
         }))
+    }
+
+    /// bd-tv006: a plain read-only pager opened as stock's first attacher (no
+    /// connection in any process holds the `-shm` dead-man-switch byte, and the
+    /// `-shm` is writable or creatable) rebuilds a stale, invalid or missing
+    /// index from the WAL, as stock's first attacher does, instead of trusting
+    /// it. Call before the WAL backend is installed, so its index source is
+    /// made with the rebuild right. Other access modes are left as they are.
+    pub fn rebuild_wal_index_as_first_attacher(&self) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        if inner.access_mode == PagerAccessMode::ReadOnly {
+            inner.access_mode = PagerAccessMode::ReadOnlyWithWalIndexRecovery;
+        }
+        Ok(())
+    }
+
+    /// bd-tv006: `readonly_shm=1` on (`true`) or off for this read-only
+    /// pager. With it on, the `-shm` is never written: the WAL is read
+    /// through a private index (as stock's never-write mode reads it), and
+    /// the shared index is never rebuilt or created. Call before the WAL
+    /// backend is installed. An immutable pager reads no WAL, so it is left
+    /// as it is; a pager that may write the database or rebuild the index
+    /// cannot keep the promise and refuses.
+    pub fn set_reads_shm_readonly(&self, readonly_shm: bool) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        inner.access_mode = match (inner.access_mode, readonly_shm) {
+            (PagerAccessMode::ReadOnly | PagerAccessMode::ReadOnlyShm, true) => {
+                PagerAccessMode::ReadOnlyShm
+            }
+            (PagerAccessMode::ReadOnly | PagerAccessMode::ReadOnlyShm, false) => {
+                PagerAccessMode::ReadOnly
+            }
+            (PagerAccessMode::Immutable, _) => PagerAccessMode::Immutable,
+            (mode, false) => mode,
+            (PagerAccessMode::Writable | PagerAccessMode::ReadOnlyWithWalIndexRecovery, true) => {
+                return Err(FrankenError::internal(
+                    "readonly_shm=1 needs a plain read-only pager",
+                ));
+            }
+        };
+        Ok(())
+    }
+
+    /// Whether [`Self::set_reads_shm_readonly`] turned `readonly_shm=1` on.
+    #[must_use]
+    pub fn reads_shm_readonly(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .access_mode
+            == PagerAccessMode::ReadOnlyShm
     }
 
     /// Map the separate MVCC companion through the admitted main-file handle.
@@ -19283,6 +19361,7 @@ where
             db_file: Arc::clone(&inner.db_file),
             cleanup_queue: Arc::downgrade(&self.group_commit_queue),
             can_publish_reader_marks: !inner.access_mode.is_readonly(),
+            may_rebuild_index: inner.access_mode.may_rebuild_wal_index(),
         };
         let observed_wal_identity = observed.map(|observed| observed.wal_identity);
         match source.acquire_reader_into(cx, external_lock, true).await? {
@@ -19340,6 +19419,7 @@ where
             db_file: Arc::clone(&inner.db_file),
             cleanup_queue: Arc::downgrade(&self.group_commit_queue),
             can_publish_reader_marks: false,
+            may_rebuild_index: false,
         };
         let region = match source.map_region(cx, 0, false).await {
             Ok(region) => region,
@@ -19388,7 +19468,13 @@ where
                 traits::WalNativeReadOutcome::Ready => return Ok(()),
                 traits::WalNativeReadOutcome::RecoveryRequired(reason) => reason,
             };
-            let read_only = inner.access_mode == PagerAccessMode::ReadOnly;
+            // bd-tv006: a `readonly_shm=1` pager reads through a private
+            // index, so it does not reach here; if it did, it is read-only
+            // and rebuilds nothing.
+            let read_only = matches!(
+                inner.access_mode,
+                PagerAccessMode::ReadOnly | PagerAccessMode::ReadOnlyShm
+            );
             // A stale-marks index never clears for a pager that may not
             // rebuild it; answer like SQLITE_READONLY_RECOVERY instead of a
             // retryable busy that callers spin on forever (GH#430).
@@ -19403,10 +19489,20 @@ where
             // a 3-byte `-shm` to 32768 bytes, read every row and leave the
             // WAL unchanged. A plain read-only pager therefore rebuilds an
             // EXISTING index found uninitialized, under every recovery fence.
-            // It never creates a missing `-shm` and never rewrites an
-            // initialized one: an initialized index that fails validation
-            // needs the explicit WAL-index recovery mode (GH#535).
-            let uninitialized_only = read_only
+            //
+            // bd-tv006: stock's first attacher (it takes the dead-man-switch
+            // byte exclusively because no connection is attached) rebuilds
+            // the index from the WAL whether or not its connection is
+            // read-only, so it never reads a stale, invalid or missing index.
+            // A read-only open in that position (no live holder in any
+            // process, a writable or creatable `-shm`, not `readonly_shm=1`)
+            // is therefore opened in `ReadOnlyWithWalIndexRecovery`, which
+            // rebuilds like a writer; see `rebuild_wal_index_as_first_attacher`.
+            // A plain read-only pager is one that is not in that position: a
+            // live peer maintains the index, so nothing is rewritten, as in
+            // stock. An unwritable `-shm` and `readonly_shm=1` read through
+            // the private index (bd-j2dtf item 2) and never write it.
+            let uninitialized_only = inner.access_mode == PagerAccessMode::ReadOnly
                 && matches!(
                     reason,
                     traits::WalNativeRecoveryReason::SharedIndexUnavailable

@@ -139,22 +139,6 @@ fn file_family_bytes(db: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .collect()
 }
 
-async fn assert_plain_read_only_refuses_recovery(db: &Path, context: &str) {
-    let before = file_family_bytes(db);
-    let error = plain_read_only_rows(db)
-        .await
-        .expect_err("a plain read-only open refuses to rewrite this index");
-    assert!(
-        matches!(error, FrankenError::BusyRecovery),
-        "{context}: expected a recovery refusal, got {error:?}"
-    );
-    assert_eq!(
-        file_family_bytes(db),
-        before,
-        "{context}: read-only refusal must leave the whole file family unchanged"
-    );
-}
-
 async fn write_rows(db: &Path, settle: bool) {
     let conn = Connection::open(db.to_str().expect("utf-8 path"))
         .await
@@ -484,22 +468,35 @@ fn plain_read_only_open_rebuilds_an_interrupted_reconstruction() {
     });
 }
 
+/// bd-tv006 (option (a), stock's rule): a plain read-only open that is the
+/// first attacher (no connection holds the dead-man-switch byte) over a
+/// writable `-shm` rebuilds an initialized-but-invalid index from the WAL and
+/// reads every row, as stock's mode=ro first attacher does; it creates a
+/// missing `-shm` in a writable directory, as stock creates it. Until
+/// bd-tv006 this test pinned the old rule (refuse, never create).
 #[test]
-fn plain_read_only_open_never_rewrites_an_initialized_index_or_creates_shm() {
+fn plain_read_only_first_attacher_rebuilds_an_invalid_index_and_creates_a_missing_shm() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Initialized but invalid: both copies agree on an mxFrame that their
-        // checksum does not cover. Only a connection allowed to rewrite a
-        // live-looking index may repair it. (Stock's mode=ro first attacher
-        // rewrites it and reads every row; bd-j2dtf records the divergence.
-        // This refusal predates GH#535 and is kept.)
+        // checksum does not cover.
         let db = dir.path().join("initialized.db");
         let wal = stage_wal_frames(&db).await;
         for offset in MX_FRAME_OFFSETS {
             store_shm(&db, offset, &(wal_frames(&wal) + 7).to_ne_bytes());
         }
-        assert_plain_read_only_refuses_recovery(&db, "initialized invalid index").await;
+        assert_eq!(
+            plain_read_only_rows(&db)
+                .await
+                .expect("a plain read-only first attacher rebuilds the invalid index"),
+            expected_rows()
+        );
+        assert_rebuilt_index(&db, &wal, "plain read-only first attacher");
+        // The explicit recovery mode still rebuilds it too.
+        for offset in MX_FRAME_OFFSETS {
+            store_shm(&db, offset, &(wal_frames(&wal) + 7).to_ne_bytes());
+        }
         let recovering =
             Connection::open_schema_only_with_wal_index_recovery(db.to_str().expect("utf-8"))
                 .await
@@ -511,17 +508,21 @@ fn plain_read_only_open_never_rewrites_an_initialized_index_or_creates_shm() {
             .expect("close explicit recovery connection");
         assert_rebuilt_index(&db, &wal, "explicit recovery");
 
-        // Missing: read-only opens create no sidecar, and never read wrong rows.
+        // Missing, in a writable directory: created and built from the WAL.
         let db = dir.path().join("missing.db");
-        stage_wal_frames(&db).await;
+        let wal = stage_wal_frames(&db).await;
         std::fs::remove_file(sidecar(&db, "-shm")).expect("remove -shm");
-        if let Ok(rows) = plain_read_only_rows(&db).await {
-            assert_eq!(rows, expected_rows());
-        }
-        assert!(
-            !sidecar(&db, "-shm").exists(),
-            "a read-only open created -shm"
+        assert_eq!(
+            plain_read_only_rows(&db)
+                .await
+                .expect("a plain read-only first attacher creates and builds -shm"),
+            expected_rows()
         );
+        assert!(
+            sidecar(&db, "-shm").exists(),
+            "the read-only first attacher creates -shm, as stock does"
+        );
+        assert_rebuilt_index(&db, &wal, "-shm created by a plain read-only open");
     });
 }
 

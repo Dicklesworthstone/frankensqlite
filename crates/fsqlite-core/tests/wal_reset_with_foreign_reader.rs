@@ -975,48 +975,74 @@ fn gh19_public_existing_writable_open_recovers_missing_invalid_and_stale_shm() {
     });
 }
 
+/// bd-tv006: no connection holds these target copies (the seed's stock
+/// connection is on its own inode), so a plain read-only open is stock's first
+/// attacher. Stock 3.54.1, run on its own copy of each family here, reads all
+/// of it and rebuilds a missing, invalid or stale index (creating a missing
+/// `-shm`); fsqlite must do the same and leave the main file and WAL
+/// untouched. A valid index is used as it is. Before bd-tv006 the missing,
+/// invalid and stale kinds answered `BusyRecovery`, which stock never does.
 #[cfg(all(unix, feature = "native"))]
 #[test]
-fn gh19_public_readonly_schema_open_requires_valid_shm_without_storage_mutation() {
+fn gh19_public_readonly_schema_open_matches_stock_without_storage_mutation() {
+    use fsqlite_wal::wal_index::parse_shm_header;
     asupersync::test_utils::run_test(|| async {
         let directory = tempfile::tempdir().unwrap();
         let seed = public_bootstrap_seed(directory.path());
+        // The index fields the WAL determines, for comparing two rebuilds.
+        let rebuilt = |shm: &[u8], context: &str| {
+            let (header, _) = parse_shm_header(shm)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{context}: the -shm has no valid header"));
+            (header.mx_frame, header.a_salt, header.n_page)
+        };
         for kind in ["valid", "missing", "invalid", "stale"] {
             let path = directory.path().join(format!("readonly-{kind}.db"));
             let shared_before = copy_public_bootstrap_seed(&seed, &path, kind);
-            let result = Connection::open_schema_only(path.to_str().unwrap()).await;
-            if kind == "valid" {
-                let connection = result.expect("read-only public open uses an existing stock reader mark");
-                assert_eq!(
-                    scalar_i64(&connection.query("SELECT sum(n) FROM t").await.unwrap()),
-                    30
-                );
-                let error = connection.execute("INSERT INTO t VALUES(30)").await.unwrap_err();
-                assert!(matches!(error, fsqlite_error::FrankenError::ReadOnly), "{error}");
-                connection.close_without_checkpoint().await.unwrap();
-            } else {
-                let error = match result {
-                    Ok(connection) => {
-                        connection.close_without_checkpoint().await.unwrap();
-                        panic!("read-only public open must refuse {kind} native index");
-                    }
-                    Err(error) => error,
-                };
-                assert!(
-                    matches!(error, fsqlite_error::FrankenError::BusyRecovery),
-                    "read-only {kind} refuses required recovery explicitly: {error}"
-                );
+
+            let stock_path = directory.path().join(format!("readonly-{kind}-stock.db"));
+            let _ = copy_public_bootstrap_seed(&seed, &stock_path, kind);
+            let stock = rusqlite::Connection::open_with_flags(
+                format!("file:{}?mode=ro", stock_path.display()),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .unwrap();
+            let stock_sum: i64 = stock
+                .query_row("SELECT sum(n) FROM t", [], |row| row.get(0))
+                .unwrap_or_else(|error| panic!("{kind}: stock reads: {error}"));
+            drop(stock);
+            assert_eq!(stock_sum, 30, "{kind}: stock reads the complete WAL");
+
+            let connection = Connection::open_schema_only(path.to_str().unwrap())
+                .await
+                .unwrap_or_else(|error| panic!("{kind}: read-only first attacher opens: {error}"));
+            assert_eq!(
+                scalar_i64(&connection.query("SELECT sum(n) FROM t").await.unwrap()),
+                30,
+                "{kind}: fsqlite reads what stock reads"
+            );
+            let error = connection.execute("INSERT INTO t VALUES(30)").await.unwrap_err();
+            assert!(matches!(error, fsqlite_error::FrankenError::ReadOnly), "{error}");
+            connection.close_without_checkpoint().await.unwrap();
+
+            // The explicit close has completed before these descriptor opens;
+            // no live target lock ledger is invalidated.
+            for (db, engine) in [(&path, "fsqlite"), (&stock_path, "stock")] {
+                assert_eq!(std::fs::read(db).unwrap(), seed.main, "{kind}: {engine} preserves the main image");
+                assert_eq!(std::fs::read(sidecar(db, "-wal")).unwrap(), seed.wal,
+                    "{kind}: {engine} preserves the committed WAL");
             }
-            // Constructor refusal or explicit close has completed before these
-            // descriptor opens; no live target lock ledger is invalidated.
-            assert_eq!(std::fs::read(&path).unwrap(), seed.main, "{kind}: main image preserved");
-            assert_eq!(std::fs::read(sidecar(&path, "-wal")).unwrap(), seed.wal,
-                "{kind}: committed WAL preserved");
-            if let Some(shared_before) = shared_before {
-                assert_eq!(std::fs::read(sidecar(&path, "-shm")).unwrap(), shared_before,
-                    "{kind}: readonly admission never repairs or changes shared metadata");
+            let shared_after = std::fs::read(sidecar(&path, "-shm"))
+                .unwrap_or_else(|error| panic!("{kind}: fsqlite leaves a -shm, as stock does: {error}"));
+            let stock_after = std::fs::read(sidecar(&stock_path, "-shm")).unwrap();
+            if kind == "valid" {
+                assert_eq!(Some(&shared_after), shared_before.as_ref(),
+                    "valid: a current index is used, not rewritten");
             } else {
-                assert!(!sidecar(&path, "-shm").exists(), "readonly refusal never creates SHM");
+                assert_ne!(Some(&stock_after), shared_before.as_ref(), "{kind}: stock rebuilds the index");
+                assert_ne!(Some(&shared_after), shared_before.as_ref(), "{kind}: fsqlite rebuilds the index");
+                assert_eq!(rebuilt(&shared_after, kind), rebuilt(&stock_after, kind),
+                    "{kind}: fsqlite rebuilds the index stock rebuilds");
             }
         }
     });
@@ -1130,9 +1156,46 @@ fn cass_gh477_explicit_index_recovery_preserves_database_and_wal() {
             let shm_before = fingerprint("-shm");
             let started = std::time::Instant::now();
             let strict = Connection::open_schema_only(path.to_str().unwrap()).await;
-            assert!(started.elapsed() < std::time::Duration::from_secs(5), "strict refusal must be prompt");
-            assert!(matches!(strict, Err(fsqlite_error::FrankenError::BusyRecovery)));
-            assert_eq!(fingerprint("-shm"), shm_before, "strict readonly refusal is byte neutral");
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "a strict open must be prompt");
+            if writer {
+                // A live stock writer holds the files: not the first attacher,
+                // so nothing is rewritten and the stale index is refused.
+                assert!(matches!(strict, Err(fsqlite_error::FrankenError::BusyRecovery)));
+                assert_eq!(fingerprint("-shm"), shm_before, "strict readonly refusal is byte neutral");
+            } else {
+                // bd-tv006: nothing holds the files, so the strict read-only
+                // open is stock's first attacher. It rebuilds the stale index
+                // and reads the current generation, as stock 3.54.1 does on
+                // its own copy of the same family below.
+                let connection = strict.expect("a strict read-only first attacher rebuilds the stale index");
+                assert_eq!(scalar_i64(&connection.query("SELECT sum(n) FROM t").await.unwrap()), 30);
+                assert!(matches!(connection.execute("INSERT INTO t VALUES(99)").await,
+                    Err(fsqlite_error::FrankenError::ReadOnly)));
+                connection.close_without_checkpoint().await.unwrap();
+                assert_ne!(fingerprint("-shm").0, shm_before.0, "the first attacher rebuilt the derived index");
+                assert_eq!(fingerprint(""), main_before, "main bytes and mtime preserved");
+                assert_eq!(fingerprint("-wal"), wal_before, "WAL bytes and mtime preserved");
+                // Stock, on its own copy of the family as it stood before.
+                let stock_path = directory.path().join(format!("generation-{writer}-{header_only}-stock.db"));
+                for (suffix, bytes) in [("", &main_before.0), ("-wal", &wal_before.0), ("-shm", &shm_before.0)] {
+                    std::fs::write(sidecar(&stock_path, suffix), bytes).unwrap();
+                }
+                let stock = rusqlite::Connection::open_with_flags(
+                    format!("file:{}?mode=ro", stock_path.display()),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                )
+                .unwrap();
+                let stock_sum: i64 = stock.query_row("SELECT sum(n) FROM t", [], |row| row.get(0)).unwrap();
+                drop(stock);
+                assert_eq!(stock_sum, 30, "stock's first attacher reads the current generation");
+                assert_ne!(std::fs::read(sidecar(&stock_path, "-shm")).unwrap(), shm_before.0,
+                    "stock's first attacher rebuilds the stale index too");
+                assert_eq!(std::fs::read(&stock_path).unwrap(), main_before.0, "stock preserves the main image");
+                assert_eq!(std::fs::read(sidecar(&stock_path, "-wal")).unwrap(), wal_before.0,
+                    "stock preserves the WAL");
+                // Stale again, for the explicit recovery mode below.
+                std::fs::write(sidecar(&path, "-shm"), &shm_before.0).unwrap();
+            }
             let started = std::time::Instant::now();
             let result = Connection::open_schema_only_with_wal_index_recovery(path.to_str().unwrap()).await;
             if writer {

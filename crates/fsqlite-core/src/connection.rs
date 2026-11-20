@@ -4056,6 +4056,9 @@ pub struct ConnectionEnv {
     /// memory bound, not a bound on how much of the database a build may
     /// rewrite.
     schema_only_write_set_page_limit: Option<usize>,
+    /// bd-tv006: the URI parameter `readonly_shm=1` on a read-only open. The
+    /// connection never writes the `-shm`, as stock's never-write mode.
+    readonly_shm: bool,
 }
 
 impl ConnectionEnv {
@@ -4070,6 +4073,7 @@ impl ConnectionEnv {
             memory_vfs_config: None,
             strict_multi_process: false,
             schema_only_write_set_page_limit: None,
+            readonly_shm: false,
         }
     }
 
@@ -4229,6 +4233,22 @@ impl ConnectionEnv {
         self.page_buffer_max
     }
 
+    /// bd-tv006: open read-only connections with `readonly_shm=1` semantics:
+    /// the `-shm` is never written, created or rebuilt, and the WAL is read
+    /// through a private index, as stock reads in its never-write mode.
+    /// Writable opens ignore it. The compat URI layer serves a writable
+    /// `readonly_shm=1` open of a WAL database read-only, as stock answers
+    /// that connection's writes with `SQLITE_READONLY`.
+    pub fn set_readonly_shm(&mut self, readonly_shm: bool) {
+        self.readonly_shm = readonly_shm;
+    }
+
+    /// Whether [`Self::set_readonly_shm`] asked for `readonly_shm=1`.
+    #[must_use]
+    pub const fn readonly_shm(&self) -> bool {
+        self.readonly_shm
+    }
+
     /// Override the MemoryVfs growth policy used for `:memory:` databases and
     /// imported SQLite images.
     ///
@@ -4254,6 +4274,7 @@ impl Default for ConnectionEnv {
             memory_vfs_config: None,
             strict_multi_process: false,
             schema_only_write_set_page_limit: None,
+            readonly_shm: false,
         }
     }
 }
@@ -5303,6 +5324,19 @@ impl PagerBackend {
         }
     }
 
+    /// bd-tv006: `readonly_shm=1` for this read-only pager.
+    fn set_reads_shm_readonly(&self, readonly_shm: bool) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.set_reads_shm_readonly(readonly_shm),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.set_reads_shm_readonly(readonly_shm),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.set_reads_shm_readonly(readonly_shm),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.set_reads_shm_readonly(readonly_shm),
+        }
+    }
+
     async fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         match self {
             Self::Memory(p) => p.set_journal_mode(cx, mode).await,
@@ -5890,7 +5924,12 @@ where
 /// writable or missing `-shm` keeps the shared index. A held dead-man switch
 /// (stock then maps the `-shm` read-only) or an unanswerable probe keeps the
 /// shared path, which refuses rather than guesses.
-fn read_only_shm_needs_private_index<V: Vfs>(vfs: &V, cx: &Cx, wal_path: &Path) -> Result<bool> {
+fn read_only_shm_needs_private_index<V: Vfs>(
+    vfs: &V,
+    cx: &Cx,
+    wal_path: &Path,
+    readonly_shm: bool,
+) -> Result<bool> {
     if !cfg!(all(feature = "native", unix)) || vfs.is_memory() {
         return Ok(false);
     }
@@ -5898,9 +5937,58 @@ fn read_only_shm_needs_private_index<V: Vfs>(vfs: &V, cx: &Cx, wal_path: &Path) 
         return Ok(false);
     };
     let shm_path = PathBuf::from(format!("{db_path}-shm"));
-    if !vfs.access(cx, &shm_path, AccessFlags::EXISTS)?
-        || vfs.access(cx, &shm_path, AccessFlags::READWRITE)?
-    {
+    let shm_exists = vfs.access(cx, &shm_path, AccessFlags::EXISTS)?;
+    // bd-tv006: `readonly_shm=1` never writes the `-shm`. Stock opens it
+    // read-only and, as here, reads the WAL without writing it; with no
+    // `-shm` at all it answers SQLITE_CANTOPEN.
+    if readonly_shm {
+        if !shm_exists {
+            return Err(FrankenError::CannotOpen {
+                path: PathBuf::from(db_path),
+            });
+        }
+        return Ok(true);
+    }
+    if !shm_exists || vfs.access(cx, &shm_path, AccessFlags::READWRITE)? {
+        return Ok(false);
+    }
+    Ok(matches!(
+        vfs.probe_foreign_shm_attachment(cx, Path::new(db_path))?,
+        fsqlite_vfs::ForeignWalParticipation::NoParticipant
+    ))
+}
+
+/// bd-tv006: whether a read-only open is stock's first attacher, the
+/// connection that takes the `-shm` dead-man-switch byte exclusively because no
+/// connection in any process is attached, over a `-shm` it may write or create.
+/// Stock's first attacher truncates the `-shm` and rebuilds the index from the
+/// WAL, read-only connection or not, so a stale, invalid or missing index is
+/// never read. With a live holder (or an unanswerable probe) the index is
+/// maintained by that peer and is not rewritten.
+fn read_only_open_is_first_attacher<V: Vfs>(vfs: &V, cx: &Cx, wal_path: &Path) -> Result<bool> {
+    if !cfg!(all(feature = "native", unix)) || vfs.is_memory() {
+        return Ok(false);
+    }
+    let Some(db_path) = wal_path.to_str().and_then(|path| path.strip_suffix("-wal")) else {
+        return Ok(false);
+    };
+    let shm_path = PathBuf::from(format!("{db_path}-shm"));
+    if !vfs.access(cx, &shm_path, AccessFlags::EXISTS)? {
+        // A live connection always holds a `-shm`; a missing one is created
+        // in a directory this process may write, as stock creates it.
+        return match Path::new(db_path).parent() {
+            Some(dir) => {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                vfs.access(cx, dir, AccessFlags::READWRITE)
+            }
+            None => Ok(false),
+        };
+    }
+    if !vfs.access(cx, &shm_path, AccessFlags::READWRITE)? {
         return Ok(false);
     }
     Ok(matches!(
@@ -5951,7 +6039,17 @@ where
     // table (unix.rs). All subsequent connections that clone this fd via the
     // fast path inherit the read-only fd and fail with EBADF on WAL writes
     // (pwrite on a read-only fd returns EBADF on Linux).
-    let private_index = allow_readonly && read_only_shm_needs_private_index(&vfs, cx, wal_path)?;
+    let readonly_shm = allow_readonly && pager.reads_shm_readonly();
+    let private_index =
+        allow_readonly && read_only_shm_needs_private_index(&vfs, cx, wal_path, readonly_shm)?;
+    // bd-tv006: before the backend (and its index source) is installed.
+    if allow_readonly
+        && !private_index
+        && !readonly_shm
+        && read_only_open_is_first_attacher(&vfs, cx, wal_path)?
+    {
+        pager.rebuild_wal_index_as_first_attacher()?;
+    }
     let (mut file, _) = match vfs.open(
         cx,
         Some(wal_path),
@@ -17208,6 +17306,8 @@ impl Connection {
             if writable {
                 conn.apply_current_journal_mode_to_pager().await?;
             } else {
+                // bd-tv006: before the WAL backend is installed, which reads it.
+                conn.pager.set_reads_shm_readonly(env.readonly_shm())?;
                 conn.apply_current_journal_mode_to_pager_readonly().await?;
             }
             conn.apply_current_synchronous_to_pager()?;

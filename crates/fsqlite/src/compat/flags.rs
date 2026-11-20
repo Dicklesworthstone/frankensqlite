@@ -177,6 +177,8 @@ struct ResolvedOpen<'a> {
     /// `immutable=1` (bd-j2dtf): read-only whatever `mode` says, with no
     /// locks and no WAL, as stock opens an immutable file.
     immutable: bool,
+    /// `readonly_shm=1` (bd-tv006): the connection never writes the `-shm`.
+    readonly_shm: bool,
 }
 
 fn uri_error(detail: impl Into<String>) -> FrankenError {
@@ -266,6 +268,7 @@ struct ResolvedQuery {
     disposition: OpenDisposition,
     memory: bool,
     immutable: bool,
+    readonly_shm: bool,
 }
 
 fn resolve_uri_query(
@@ -275,6 +278,7 @@ fn resolve_uri_query(
 ) -> Result<ResolvedQuery, FrankenError> {
     let mut memory = false;
     let mut immutable = None;
+    let mut readonly_shm = None;
     for parameter in query.split('&').filter(|parameter| !parameter.is_empty()) {
         let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         let key = decode_uri_component(key)?;
@@ -310,6 +314,10 @@ fn resolve_uri_query(
             "immutable" => {
                 immutable.get_or_insert_with(|| stock_uri_boolean(&value));
             }
+            // bd-tv006: read like immutable (first match, sqlite3GetBoolean).
+            "readonly_shm" => {
+                readonly_shm.get_or_insert_with(|| stock_uri_boolean(&value));
+            }
             "nolock" if disabled_uri_boolean(&value) => {}
             "nolock" | "vfs" | "modeof" | "psow" => {
                 return Err(FrankenError::NotImplemented(format!(
@@ -329,6 +337,7 @@ fn resolve_uri_query(
         disposition,
         memory,
         immutable: immutable.unwrap_or(false),
+        readonly_shm: readonly_shm.unwrap_or(false),
     })
 }
 
@@ -358,6 +367,7 @@ fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, Franke
             path: Cow::Borrowed(path),
             disposition,
             immutable: false,
+            readonly_shm: false,
         });
     };
 
@@ -382,6 +392,7 @@ fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, Franke
         disposition,
         memory,
         immutable,
+        readonly_shm,
     } = resolve_uri_query(
         query,
         disposition,
@@ -420,7 +431,28 @@ fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, Franke
         path: filename,
         disposition,
         immutable,
+        readonly_shm,
     })
+}
+
+/// bd-tv006: whether stock reads the database at `path` in WAL mode: its
+/// header's read version (byte 19) is 2 (`lockBtree`), or a `-wal` sidecar
+/// exists beside a non-empty database file (`pagerOpenWalIfPresent`). A file
+/// that does not exist or cannot be read is not.
+fn opens_in_wal_mode(path: &str) -> bool {
+    use std::io::Read as _;
+    if path == ":memory:" {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; 20];
+    if file.read_exact(&mut header).is_ok() && header[19] == 2 {
+        return true;
+    }
+    file.metadata().is_ok_and(|metadata| metadata.len() > 0)
+        && std::path::Path::new(&format!("{path}-wal")).exists()
 }
 
 async fn open_read_only_connection_with_env(
@@ -499,7 +531,27 @@ pub async fn open_with_flags_with_env(
         return Connection::open_immutable_with_env(path, env).await;
     }
     match resolved.disposition {
-        OpenDisposition::ReadOnly => open_read_only_connection_with_env(path, env).await,
+        OpenDisposition::ReadOnly => {
+            let mut env = env;
+            env.set_readonly_shm(resolved.readonly_shm);
+            open_read_only_connection_with_env(path, env).await
+        }
+        // bd-tv006: stock honours `readonly_shm=1` on a read-write connection
+        // too. Its unix VFS opens the `-shm` read-only whatever the
+        // connection's mode, so over a WAL database it reads (through a
+        // private index when no peer is attached), every write answers
+        // SQLITE_READONLY and nothing is written; a missing `-shm` answers
+        // SQLITE_CANTOPEN. A rollback-journal database never maps the `-shm`
+        // and reads and writes as usual (3.54.1, pinned live). The WAL case is
+        // therefore served by a read-only connection, whose writes answer
+        // `ReadOnly` as stock's do.
+        OpenDisposition::WriteExisting | OpenDisposition::WriteCreate
+            if resolved.readonly_shm && opens_in_wal_mode(path) =>
+        {
+            let mut env = env;
+            env.set_readonly_shm(true);
+            open_read_only_connection_with_env(path, env).await
+        }
         OpenDisposition::WriteExisting => {
             if path == ":memory:" {
                 Connection::open_with_env(path, env).await

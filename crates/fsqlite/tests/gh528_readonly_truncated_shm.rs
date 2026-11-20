@@ -217,7 +217,17 @@ fn copy_family(source: &Path, to: &Path) -> PathBuf {
     db
 }
 
-/// Child: a stock SQLite read through `file:<db>?<query>`, as witness lines.
+/// bd-tv006: set, the stock child opens read-write and, after its read,
+/// tries [`insert_next_row`]'s row.
+const STOCK_WRITE_ENV: &str = "FSQLITE_BD_TV006_STOCK_WRITE";
+
+/// The row a read-write arm tries to add after its read.
+fn insert_next_row() -> (i64, String) {
+    (ROWS + 1, format!("issue-{}", ROWS + 1))
+}
+
+/// Child: a stock SQLite read through `file:<db>?<query>`, as witness lines;
+/// with [`STOCK_WRITE_ENV`], a read-write open that then tries an INSERT.
 #[test]
 fn bd_j2dtf_stock_child() {
     let (Some(db), Some(query)) = (
@@ -226,22 +236,37 @@ fn bd_j2dtf_stock_child() {
     ) else {
         return;
     };
+    let write = std::env::var_os(STOCK_WRITE_ENV).is_some();
     let uri = format!("file:{}?{}", db.to_str().unwrap(), query.to_str().unwrap());
-    let read = || -> rusqlite::Result<Rows> {
+    let access = if write {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    let read = || -> rusqlite::Result<(Rows, Option<rusqlite::Result<usize>>)> {
         let conn = rusqlite::Connection::open_with_flags(
             &uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            access | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         let rows = conn
             .prepare("SELECT id, v FROM t ORDER BY id")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Rows>>()?;
-        Ok(rows)
+        let insert = write.then(|| {
+            let (id, v) = insert_next_row();
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, v])
+        });
+        Ok((rows, insert))
     };
     match read() {
-        Ok(rows) => {
+        Ok((rows, insert)) => {
             for (id, v) in rows {
                 println!("{STOCK_WITNESS}row {id} {v}");
+            }
+            match insert {
+                Some(Ok(_)) => println!("{STOCK_WITNESS}write ok"),
+                Some(Err(error)) => println!("{STOCK_WITNESS}write error {error}"),
+                None => {}
             }
             println!("{STOCK_WITNESS}ok");
         }
@@ -251,7 +276,28 @@ fn bd_j2dtf_stock_child() {
 
 /// The stock arm: a separate process, so its POSIX locks are its own.
 fn stock_read(db: &Path, query: &str) -> Result<Rows, String> {
-    let output = Command::new(std::env::current_exe().unwrap())
+    let (rows, write) = stock_child(db, query, false)?;
+    assert!(write.is_none(), "a read-only stock arm writes nothing");
+    Ok(rows)
+}
+
+/// [`stock_read`] on a read-write connection that tries [`insert_next_row`]
+/// after its read: the rows, and the INSERT's answer.
+fn stock_read_then_write(db: &Path, query: &str) -> Result<(Rows, Result<(), String>), String> {
+    let (rows, write) = stock_child(db, query, true)?;
+    Ok((
+        rows,
+        write.expect("the read-write stock arm tried its INSERT"),
+    ))
+}
+
+fn stock_child(
+    db: &Path,
+    query: &str,
+    write: bool,
+) -> Result<(Rows, Option<Result<(), String>>), String> {
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
         .args([
             STOCK_CHILD_TEST,
             "--exact",
@@ -259,12 +305,15 @@ fn stock_read(db: &Path, query: &str) -> Result<Rows, String> {
             "--test-threads=1",
         ])
         .env(STOCK_DB_ENV, db)
-        .env(STOCK_QUERY_ENV, query)
-        .output()
-        .expect("run the stock child");
+        .env(STOCK_QUERY_ENV, query);
+    if write {
+        child.env(STOCK_WRITE_ENV, "1");
+    }
+    let output = child.output().expect("run the stock child");
     assert!(output.status.success(), "stock child failed: {output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     let mut rows = Vec::new();
+    let mut insert = None;
     for line in stdout.lines() {
         // The harness's `test ... ` banner may precede the first witness.
         let Some((_, witness)) = line.split_once(STOCK_WITNESS) else {
@@ -273,8 +322,12 @@ fn stock_read(db: &Path, query: &str) -> Result<Rows, String> {
         if let Some(row) = witness.strip_prefix("row ") {
             let (id, v) = row.split_once(' ').unwrap();
             rows.push((id.parse().unwrap(), v.to_owned()));
+        } else if witness == "write ok" {
+            insert = Some(Ok(()));
+        } else if let Some(error) = witness.strip_prefix("write error ") {
+            insert = Some(Err(error.to_owned()));
         } else if witness == "ok" {
-            return Ok(rows);
+            return Ok((rows, insert));
         } else if let Some(error) = witness.strip_prefix("error ") {
             return Err(error.to_owned());
         }
@@ -304,6 +357,30 @@ async fn frank_read(db: &Path, query: &str) -> Result<Rows, String> {
         });
     conn.close().await.map_err(|error| error.to_string())?;
     rows
+}
+
+/// [`frank_read`] on a read-write compat open that tries [`insert_next_row`]
+/// after its read, as [`stock_read_then_write`].
+async fn frank_read_then_write(
+    db: &Path,
+    query: &str,
+) -> Result<(Rows, Result<(), String>), String> {
+    let uri = format!("file:{}?{query}", db.to_str().unwrap());
+    let conn = open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let rows = frank_rows(&conn, "read-write arm").await;
+    let (id, v) = insert_next_row();
+    let insert = conn
+        .execute(&format!("INSERT INTO t VALUES ({id}, '{v}')"))
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    conn.close().await.map_err(|error| error.to_string())?;
+    Ok((rows, insert))
 }
 
 /// The parts of a rebuilt `-shm` that the WAL determines: both header
@@ -739,6 +816,464 @@ fn immutable_open_does_not_see_a_table_that_exists_only_in_the_wal() {
         );
         assert_eq!(family(&stock_arm), stock_before, "stock writes nothing");
         assert_eq!(family(&frank_arm), frank_before, "fsqlite writes nothing");
+        drop(writer);
+    });
+}
+
+const HOLDER_CHILD_TEST: &str = "bd_tv006_stock_holder_child";
+const HOLDER_DB_ENV: &str = "FSQLITE_BD_TV006_HOLDER_DB";
+
+/// Child: a stock SQLite connection that attaches to `db` (it reads, so it
+/// maps the `-shm` and holds its dead-man-switch byte), says `<db>.held`, and
+/// stays attached until `<db>.release` appears.
+#[test]
+fn bd_tv006_stock_holder_child() {
+    let Some(db) = std::env::var_os(HOLDER_DB_ENV) else {
+        return;
+    };
+    let db = PathBuf::from(db);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, ROWS, "the holder reads every row");
+    std::fs::write(sidecar(&db, ".held"), b"").unwrap();
+    let started = std::time::Instant::now();
+    while !sidecar(&db, ".release").exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(120),
+            "the holder was never released"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    drop(conn);
+}
+
+/// A live stock peer in its own process, so its POSIX locks are its own.
+struct StockHolder {
+    child: Option<std::process::Child>,
+    db: PathBuf,
+}
+
+impl StockHolder {
+    fn attach(db: &Path) -> Self {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                HOLDER_CHILD_TEST,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(HOLDER_DB_ENV, db)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stock holder");
+        let mut holder = Self {
+            child: Some(child),
+            db: db.to_path_buf(),
+        };
+        let started = std::time::Instant::now();
+        while !sidecar(db, ".held").exists() {
+            let exited = holder
+                .child
+                .as_mut()
+                .expect("holder spawned")
+                .try_wait()
+                .expect("holder status");
+            assert!(exited.is_none(), "the stock holder exited before attaching");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "the stock holder never attached"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        holder
+    }
+}
+
+impl Drop for StockHolder {
+    fn drop(&mut self) {
+        let _ = std::fs::write(sidecar(&self.db, ".release"), b"");
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The shapes of [`bd_tv006_first_attacher_rebuilds_like_stock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstAttachShape {
+    /// A valid index from 10 commits ago, writable, no live connection: stock's
+    /// first attacher rebuilds it. Trusting it reads 20 of the 30 rows.
+    StaleNoLivePeer,
+    /// The same stale `-shm`, but a live stock connection attached first (it
+    /// rebuilt the index as the first attacher): nothing is rewritten.
+    StaleLivePeer,
+    /// No `-shm`, in a writable directory: stock creates and builds it.
+    Missing,
+    /// Both header copies agree but their checksum is wrong: stock rebuilds.
+    InvalidChecksum,
+    /// `readonly_shm=1` over a 3-byte `-shm`: read without writing anything.
+    ReadonlyShmShort,
+    /// Negative: `readonly_shm=1` over the stale index still reads every row
+    /// (a private index) and writes nothing.
+    ReadonlyShmStale,
+    /// Negative: a valid, current index with no live connection is used, not
+    /// rewritten.
+    ValidCurrentNoLivePeer,
+}
+
+/// bd-tv006: a read-only open that is stock's first attacher (no connection
+/// attached, a `-shm` it may write or create) rebuilds the WAL index as stock
+/// does instead of trusting it, compared with a live stock 3.54.1 process on
+/// its own copy of each file family: the same rows, the main file and WAL
+/// unchanged, and where stock rebuilt or created the `-shm`, the same rebuilt
+/// index. `readonly_shm=1` reads every row and writes nothing. Red on main:
+/// the stale index read 20 of 30 rows; a missing or invalid `-shm` answered
+/// `BusyRecovery`; `readonly_shm=1` was ignored and a 3-byte `-shm` was
+/// rewritten. The unwritable shapes stay in
+/// [`read_only_opens_match_a_live_stock_process`].
+#[test]
+fn bd_tv006_first_attacher_rebuilds_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (writer, source, stale_shm) = stock_fixture_with_stale_shm(dir.path());
+        for shape in [
+            FirstAttachShape::StaleNoLivePeer,
+            FirstAttachShape::StaleLivePeer,
+            FirstAttachShape::Missing,
+            FirstAttachShape::InvalidChecksum,
+            FirstAttachShape::ReadonlyShmShort,
+            FirstAttachShape::ReadonlyShmStale,
+            FirstAttachShape::ValidCurrentNoLivePeer,
+        ] {
+            let context = format!("{shape:?}");
+            let arms = [
+                copy_family(&source, &dir.path().join(format!("tv006-{shape:?}-stock"))),
+                copy_family(&source, &dir.path().join(format!("tv006-{shape:?}-frank"))),
+            ];
+            let mut peers = Vec::new();
+            for db in &arms {
+                let shm = sidecar(db, "-shm");
+                match shape {
+                    FirstAttachShape::StaleNoLivePeer
+                    | FirstAttachShape::StaleLivePeer
+                    | FirstAttachShape::ReadonlyShmStale => {
+                        std::fs::write(&shm, &stale_shm).unwrap()
+                    }
+                    FirstAttachShape::Missing => std::fs::remove_file(&shm).unwrap(),
+                    FirstAttachShape::InvalidChecksum => {
+                        let mut bytes = std::fs::read(&shm).unwrap();
+                        // Both 48-byte header copies keep agreeing; their
+                        // checksum (aCksum, bytes 40..48 of each) is wrong.
+                        bytes[40] ^= 0x5a;
+                        bytes[48 + 40] ^= 0x5a;
+                        std::fs::write(&shm, bytes).unwrap();
+                    }
+                    FirstAttachShape::ReadonlyShmShort => {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&shm)
+                            .unwrap()
+                            .set_len(3)
+                            .unwrap();
+                    }
+                    FirstAttachShape::ValidCurrentNoLivePeer => {}
+                }
+                if shape == FirstAttachShape::StaleLivePeer {
+                    peers.push(StockHolder::attach(db));
+                }
+            }
+            let query = match shape {
+                FirstAttachShape::ReadonlyShmShort | FirstAttachShape::ReadonlyShmStale => {
+                    "mode=ro&readonly_shm=1"
+                }
+                _ => "mode=ro",
+            };
+            let [stock_db, frank_db] = &arms;
+            let stock_before = family(stock_db);
+            let frank_before = family(frank_db);
+            assert_eq!(frank_before, stock_before, "{context}: identical copies");
+
+            let stock = stock_read(stock_db, query);
+            let stock_after = family(stock_db);
+            let frank = frank_read(frank_db, query).await;
+            let frank_after = family(frank_db);
+            eprintln!(
+                "event=bd_tv006_first_attach shape={shape:?} stock={:?} frank={:?}",
+                stock.as_ref().map(Vec::len),
+                frank.as_ref().map(Vec::len)
+            );
+
+            // The oracle's own answer, so a changed stock cannot pass silently.
+            assert_eq!(
+                stock,
+                Ok(expected_rows()),
+                "{context}: stock reads every row"
+            );
+            assert_eq!(
+                frank,
+                Ok(expected_rows()),
+                "{context}: fsqlite reads what stock reads"
+            );
+            for suffix in ["", "-wal"] {
+                assert_eq!(
+                    stock_after.get(suffix),
+                    stock_before.get(suffix),
+                    "{context}: stock leaves {suffix:?} unchanged"
+                );
+                assert_eq!(
+                    frank_after.get(suffix),
+                    frank_before.get(suffix),
+                    "{context}: fsqlite must leave {suffix:?} unchanged"
+                );
+            }
+            assert_eq!(
+                frank_after.keys().collect::<Vec<_>>(),
+                stock_after.keys().collect::<Vec<_>>(),
+                "{context}: the same files exist after the open"
+            );
+            match shape {
+                FirstAttachShape::StaleNoLivePeer
+                | FirstAttachShape::Missing
+                | FirstAttachShape::InvalidChecksum => {
+                    assert_ne!(
+                        stock_after.get("-shm"),
+                        stock_before.get("-shm"),
+                        "{context}: stock rebuilds or creates the -shm"
+                    );
+                    assert_eq!(
+                        rebuilt_index(&frank_after["-shm"], &format!("{context} fsqlite")),
+                        rebuilt_index(&stock_after["-shm"], &format!("{context} stock")),
+                        "{context}: fsqlite rebuilds the index stock rebuilds"
+                    );
+                }
+                FirstAttachShape::StaleLivePeer | FirstAttachShape::ValidCurrentNoLivePeer => {
+                    assert_eq!(
+                        frank_after, frank_before,
+                        "{context}: fsqlite must not rewrite a live or current index"
+                    );
+                }
+                FirstAttachShape::ReadonlyShmShort | FirstAttachShape::ReadonlyShmStale => {
+                    assert_eq!(stock_after, stock_before, "{context}: stock writes nothing");
+                    assert_eq!(
+                        frank_after, frank_before,
+                        "{context}: readonly_shm=1 must write nothing"
+                    );
+                }
+            }
+            drop(peers);
+        }
+        drop(writer);
+    });
+}
+
+/// A rollback-journal database holding rows 1..=ROWS, with no `-wal` and no
+/// `-shm`.
+fn rollback_fixture(dir: &Path) -> PathBuf {
+    let db = dir.join("rollback.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+        .unwrap();
+    for (id, v) in expected_rows() {
+        conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![id, v])
+            .unwrap();
+    }
+    drop(conn);
+    assert!(
+        !sidecar(&db, "-wal").exists() && !sidecar(&db, "-shm").exists(),
+        "the rollback fixture has no WAL sidecars"
+    );
+    db
+}
+
+/// The shapes of [`bd_tv006_readonly_shm_refusals_and_writes_match_stock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadonlyShmShape {
+    /// `mode=ro&readonly_shm=1` with no `-shm`: stock answers
+    /// `SQLITE_CANTOPEN`.
+    MissingShmReadOnly,
+    /// A read-write `readonly_shm=1` connection over the stale index with no
+    /// live connection: stock reads every row (through a private index), its
+    /// INSERT answers `SQLITE_READONLY`, and nothing is written.
+    StaleIndexReadWrite,
+    /// A read-write `readonly_shm=1` connection with no `-shm`:
+    /// `SQLITE_CANTOPEN`, and nothing is written.
+    MissingShmReadWrite,
+    /// A rollback-journal database: `readonly_shm=1` changes nothing, and the
+    /// INSERT commits.
+    RollbackJournalReadWrite,
+}
+
+/// The rows a read read, and its INSERT's answer when it tried one.
+type ReadThenWrite = Result<(Rows, Option<Result<(), String>>), String>;
+
+/// bd-tv006: `readonly_shm=1` where stock refuses or writes, beside a live
+/// stock 3.54.1 process on its own copy of each family. Stock applies the
+/// parameter to read-write connections too: over a WAL database it reads,
+/// answers its INSERT with `SQLITE_READONLY` and writes nothing; with no
+/// `-shm` it answers `SQLITE_CANTOPEN`; over a rollback-journal database it reads and
+/// writes as without it. Red before the fix: the read-write pairing was
+/// refused as not implemented, and a read-only open with no `-shm` answered
+/// `BusyRecovery`.
+#[test]
+fn bd_tv006_readonly_shm_refusals_and_writes_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (writer, source, stale_shm) = stock_fixture_with_stale_shm(dir.path());
+        let rollback = rollback_fixture(dir.path());
+        let rows_in = |db: &Path| -> i64 {
+            rusqlite::Connection::open(db)
+                .unwrap()
+                .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+                .unwrap()
+        };
+        for shape in [
+            ReadonlyShmShape::MissingShmReadOnly,
+            ReadonlyShmShape::StaleIndexReadWrite,
+            ReadonlyShmShape::MissingShmReadWrite,
+            ReadonlyShmShape::RollbackJournalReadWrite,
+        ] {
+            let context = format!("{shape:?}");
+            let copy = |arm: &str| -> PathBuf {
+                let to = dir.path().join(format!("tv006-rs-{shape:?}-{arm}"));
+                if shape == ReadonlyShmShape::RollbackJournalReadWrite {
+                    std::fs::create_dir_all(&to).unwrap();
+                    let db = to.join("copy.db");
+                    std::fs::copy(&rollback, &db).unwrap();
+                    db
+                } else {
+                    copy_family(&source, &to)
+                }
+            };
+            let [stock_db, frank_db] = [copy("stock"), copy("frank")];
+            for db in [&stock_db, &frank_db] {
+                let shm = sidecar(db, "-shm");
+                match shape {
+                    ReadonlyShmShape::MissingShmReadOnly
+                    | ReadonlyShmShape::MissingShmReadWrite => std::fs::remove_file(&shm).unwrap(),
+                    ReadonlyShmShape::StaleIndexReadWrite => {
+                        std::fs::write(&shm, &stale_shm).unwrap()
+                    }
+                    ReadonlyShmShape::RollbackJournalReadWrite => {}
+                }
+            }
+            let stock_before = family(&stock_db);
+            let frank_before = family(&frank_db);
+            assert_eq!(frank_before, stock_before, "{context}: identical copies");
+
+            let (stock, frank): (ReadThenWrite, ReadThenWrite) =
+                if shape == ReadonlyShmShape::MissingShmReadOnly {
+                    let query = "mode=ro&readonly_shm=1";
+                    (
+                        stock_read(&stock_db, query).map(|rows| (rows, None)),
+                        frank_read(&frank_db, query).await.map(|rows| (rows, None)),
+                    )
+                } else {
+                    let query = "readonly_shm=1";
+                    (
+                        stock_read_then_write(&stock_db, query)
+                            .map(|(rows, insert)| (rows, Some(insert))),
+                        frank_read_then_write(&frank_db, query)
+                            .await
+                            .map(|(rows, insert)| (rows, Some(insert))),
+                    )
+                };
+            let stock_after = family(&stock_db);
+            let frank_after = family(&frank_db);
+            eprintln!(
+                "event=bd_tv006_readonly_shm shape={shape:?} stock={:?} frank={:?}",
+                stock
+                    .as_ref()
+                    .map(|(rows, insert)| (rows.len(), insert.clone())),
+                frank
+                    .as_ref()
+                    .map(|(rows, insert)| (rows.len(), insert.clone()))
+            );
+
+            match shape {
+                ReadonlyShmShape::MissingShmReadOnly | ReadonlyShmShape::MissingShmReadWrite => {
+                    for (arm, answer) in [("stock", &stock), ("fsqlite", &frank)] {
+                        let error = answer.as_ref().err().unwrap_or_else(|| {
+                            panic!("{context}: {arm} must refuse, read {answer:?}")
+                        });
+                        assert!(
+                            error.starts_with("unable to open database file"),
+                            "{context}: {arm} answers SQLITE_CANTOPEN, got {error}"
+                        );
+                    }
+                    assert_eq!(stock_after, stock_before, "{context}: stock writes nothing");
+                    assert_eq!(
+                        frank_after, frank_before,
+                        "{context}: fsqlite must write nothing"
+                    );
+                }
+                ReadonlyShmShape::StaleIndexReadWrite => {
+                    let refused = Ok((
+                        expected_rows(),
+                        Some(Err("attempt to write a readonly database".to_owned())),
+                    ));
+                    assert_eq!(
+                        stock, refused,
+                        "{context}: stock reads, then refuses the write"
+                    );
+                    assert_eq!(
+                        frank, refused,
+                        "{context}: fsqlite answers what stock answers"
+                    );
+                    assert_eq!(stock_after, stock_before, "{context}: stock writes nothing");
+                    assert_eq!(
+                        frank_after, frank_before,
+                        "{context}: readonly_shm=1 must write nothing"
+                    );
+                }
+                ReadonlyShmShape::RollbackJournalReadWrite => {
+                    let committed = Ok((expected_rows(), Some(Ok(()))));
+                    assert_eq!(stock, committed, "{context}: stock reads and writes");
+                    assert_eq!(
+                        frank, committed,
+                        "{context}: fsqlite answers what stock answers"
+                    );
+                    assert_eq!(
+                        rows_in(&stock_db),
+                        ROWS + 1,
+                        "{context}: stock's row commits"
+                    );
+                    assert_eq!(
+                        rows_in(&frank_db),
+                        ROWS + 1,
+                        "{context}: fsqlite's row commits"
+                    );
+                    // The parameter changes nothing here: each engine leaves
+                    // the files it leaves without it.
+                    let control_stock = copy("stock-control");
+                    let control_frank = copy("frank-control");
+                    assert_eq!(
+                        stock_read_then_write(&control_stock, "").map(|(rows, _)| rows.len()),
+                        Ok(expected_rows().len()),
+                        "{context}: the stock control reads"
+                    );
+                    assert_eq!(
+                        frank_read_then_write(&control_frank, "")
+                            .await
+                            .map(|(rows, _)| rows.len()),
+                        Ok(expected_rows().len()),
+                        "{context}: the fsqlite control reads"
+                    );
+                    assert_eq!(
+                        stock_after.keys().collect::<Vec<_>>(),
+                        family(&control_stock).keys().collect::<Vec<_>>(),
+                        "{context}: stock leaves the files its control leaves"
+                    );
+                    assert_eq!(
+                        frank_after.keys().collect::<Vec<_>>(),
+                        family(&control_frank).keys().collect::<Vec<_>>(),
+                        "{context}: fsqlite leaves the files its control leaves"
+                    );
+                }
+            }
+        }
         drop(writer);
     });
 }
