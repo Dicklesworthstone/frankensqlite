@@ -24,6 +24,11 @@ Run it in its own memory-capped cgroup. A runaway build (an old release grew to
 The first arm is the baseline for ratios (time_arm / time_baseline; >1 means
 slower than the baseline). Repeat the stock arm last to see host drift (an A/A
 check). The run is resumable: arms already present in --out are skipped.
+
+Every connection runs SESSION first: synchronous=NORMAL and secure_delete off
+(Debian's sqlite3 defaults them to FULL and on). Before anything is measured,
+the settings in PARITY_SETTINGS are read back from every arm in each shape the
+rows run in, and the run stops if any arm differs or secure_delete is not 0.
 This is a diagnostic, not release evidence: see bd-uh1fv for the citable
 gauntlet requirements.
 """
@@ -38,8 +43,17 @@ import subprocess
 import threading
 import time
 
-PRE = "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\n"
+# Every connection runs SESSION first (bd-w4pr1.13, 2026-11-20), so both arms do the same work:
+# - secure_delete off, upstream's default. Debian's sqlite3 is compiled with SQLITE_SECURE_DELETE, so
+#   its arm zeroed freed content while fsqlite's did not (bd-i2u1c).
+# - synchronous=NORMAL on the connections that skip PRE too (the reads, the in-memory script and the
+#   multi-process writers). Stock defaults to FULL (a WAL sync at every commit) and fsqlite to NORMAL.
+SESSION = "PRAGMA synchronous=NORMAL;\nPRAGMA secure_delete=0;\n"
+PRE = "PRAGMA journal_mode=WAL;\n" + SESSION
 N = 1_000_000
+# The settings every arm must run with alike, read back from each arm in each shape its rows run in.
+PARITY_SETTINGS = ("synchronous", "secure_delete", "journal_mode", "cache_size", "page_size",
+                   "temp_store", "wal_autocheckpoint")
 
 BASE_SETUP = PRE + f"""
 CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL);
@@ -81,7 +95,7 @@ MUTS = {
     "update_10pct_300k": "UPDATE m SET a = a + 1 WHERE id % 10 = 0;\nSELECT sum(a) FROM m;",
     "delete_14pct_300k": "DELETE FROM m WHERE id % 7 = 0;\nSELECT count(*) FROM m;",
 }
-MEM_SCRIPT = """
+MEM_SCRIPT = SESSION + """
 CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL);
 INSERT INTO t SELECT value, (value*7919)%1000, 'row-'||value, value*1.5 FROM generate_series(1,200000);
 CREATE TABLE u(a INTEGER PRIMARY KEY, name TEXT);
@@ -185,7 +199,7 @@ def multiproc(binp, work, tag, timeout, nproc=8, nrows=500):
     t0 = time.perf_counter()
     procs = []
     for k in range(nproc):
-        body = ["PRAGMA busy_timeout=10000;"]
+        body = ["PRAGMA busy_timeout=10000;", SESSION.strip()]
         body += [f"INSERT INTO e0(w,s) VALUES({k},'w{k}-{i}');" for i in range(nrows)]
         p = spawn(binp, db, None)
         p.stdin.write(("\n".join(body) + "\n").encode())
@@ -217,6 +231,46 @@ def provenance(binp):
             "loadavg_start": os.getloadavg()[0]}
 
 
+def effective_settings(binp, work, tag, timeout):
+    """The PARITY_SETTINGS an arm runs with, read back by query in each shape its rows run in:
+    `file_pre` (a new file database with PRE first: the bulk load, the mutations, autocommit and
+    the transactions), `file_reads` (that WAL file again with SESSION only: the reads and the
+    multi-process writers) and `memory` (:memory: with SESSION: the in-memory script)."""
+    queries = "".join(f"SELECT '#{name}';\nPRAGMA {name};\n" for name in PARITY_SETTINGS)
+    db = os.path.join(work, f"{tag}_settings_{time.time_ns()}.db")
+    shapes = {
+        "file_pre": (db, PRE + "CREATE TABLE s0(x);\n" + queries),
+        "file_reads": (db, SESSION + queries),
+        "memory": (":memory:", SESSION + queries),
+    }
+    out = {}
+    for shape, (path, script) in shapes.items():
+        got, key = {}, None
+        for line in run(binp, path, script, timeout)["out"].splitlines():
+            line = line.strip()
+            if line.startswith("#"):
+                key = line[1:]
+                got[key] = None
+            elif key is not None and got[key] is None:
+                got[key] = line
+        out[shape] = got
+    return out
+
+
+def parity_mismatches(settings):
+    """Every arm must report the same value of each PARITY_SETTINGS entry in each shape, and
+    secure_delete must read 0 everywhere. Returns the mismatches as text lines."""
+    bad = []
+    labels = list(settings)
+    for shape in ("file_pre", "file_reads", "memory"):
+        for name in PARITY_SETTINGS:
+            values = {label: settings[label].get(shape, {}).get(name) for label in labels}
+            distinct = set(values.values())
+            if len(distinct) > 1 or None in distinct or (name == "secure_delete" and distinct != {"0"}):
+                bad.append(f"{shape} {name}: " + ", ".join(f"{k}={v}" for k, v in values.items()))
+    return bad
+
+
 def measure(label, binp, work, reps, timeout):
     tag = re.sub(r"[^A-Za-z0-9]", "_", label)
     res = {"_provenance": provenance(binp)}
@@ -233,7 +287,8 @@ def measure(label, binp, work, reps, timeout):
         if extra["rc"] != 0 or extra["timeout"]:
             res["_setup_error"] = extra["err"] or "timeout"
         for name, q in READS.items():
-            res[name] = summarize([run(binp, base, q + "\n", timeout) for _ in range(reps)])
+            res[name] = summarize([run(binp, base, SESSION + q + "\n", timeout)
+                                   for _ in range(reps)])
     for name, q in MUTS.items():
         runs = []
         for _ in range(reps):
@@ -293,11 +348,29 @@ def main():
     results.setdefault("_host", {"node": platform.node(), "cpus": os.cpu_count(),
                                  "kernel": platform.release(), "started": time.time()})
     host = results.pop("_host")
+    # Read every arm of this invocation live; an arm resumed from --out brings the settings it was
+    # measured with, and one measured before the readback existed cannot be compared.
+    settings = {}
+    for arm in args.arms:
+        label, binp = arm.split("=", 1)
+        settings[label] = effective_settings(binp, args.work, re.sub(r"[^A-Za-z0-9]", "_", label),
+                                             args.timeout)
+    for label, res in results.items():
+        if label not in settings:
+            if "_settings" not in res:
+                raise SystemExit(f"{args.out}: arm {label} has no settings readback; start a new --out")
+            settings[label] = res["_settings"]
+    mismatches = parity_mismatches(settings)
+    if mismatches:
+        print("the arms run with different settings; nothing measured:", *mismatches, sep="\n  ",
+              flush=True)
+        raise SystemExit(2)
     for arm in args.arms:
         label, binp = arm.split("=", 1)
         if label in results:
             continue
         results[label] = measure(label, binp, args.work, args.reps, args.timeout)
+        results[label]["_settings"] = settings[label]
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(dict(results, _host=host), fh, indent=1)
         print(label, "done", flush=True)
