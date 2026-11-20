@@ -9603,6 +9603,9 @@ impl<P: PageWriter> BtCursor<P> {
             ptrs[i] = new_content_offset as u16;
         }
 
+        header.first_freeblock = 0;
+        header.fragmented_free_bytes = 0;
+
         // Check if new cell fits.
         let ptr_array_end_with_new = ptr_array_end + 2;
         let fits = ptr_array_end_with_new
@@ -20985,6 +20988,262 @@ mod tests {
                 "the late row's cell is the lowest on the page"
             );
             assert_each_delete_closes_exactly_its_own_gap(&disturbed, &rows).await;
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_erases_compacted_table_cells_without_extra_writes() {
+        run_async(async {
+            let cx = Cx::new();
+            let marker = b"private-cell-marker-erase-me";
+            let payload = marker.repeat(8);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let secure_delete = mode.scrubs_cells();
+                // Descending pointers, the small-page physical-neighbour
+                // path, and the larger-page general compactor.
+                for (usable, late_insert) in [(4096, false), (4096, true), (8192, true)] {
+                    let mut store =
+                        ImageKeepingStore::new(MemPageStore::with_empty_table(pn(2), usable), true);
+                    store.inner.set_secure_delete_mode(mode);
+                    let mut cursor = BtCursor::new(store, pn(2), usable, true);
+                    let order = if late_insert {
+                        [1, 3, 4, 2]
+                    } else {
+                        [1, 2, 3, 4]
+                    };
+                    let removed = if late_insert { 2 } else { 4 };
+                    for rowid in order {
+                        cursor
+                            .table_insert(
+                                &cx,
+                                rowid,
+                                if rowid == removed {
+                                    &payload
+                                } else {
+                                    b"survivor"
+                                },
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    assert!(cursor.table_move_to(&cx, removed).await.unwrap().is_found());
+                    let writes = cursor.pager.page_writes;
+                    cursor.delete(&cx).await.unwrap();
+                    assert_eq!(cursor.pager.page_writes, writes + 1);
+                    let page = cursor.pager.page_bytes(2).unwrap();
+                    assert_eq!(
+                        page.windows(marker.len()).any(|bytes| bytes == marker),
+                        !secure_delete,
+                        "mode={mode:?}, usable={usable}, late={late_insert}"
+                    );
+                    for rowid in [1, 2, 3, 4] {
+                        let found = cursor.table_move_to(&cx, rowid).await.unwrap().is_found();
+                        assert_eq!(found, rowid != removed);
+                        if found {
+                            assert_eq!(cursor.payload(&cx).await.unwrap(), b"survivor");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_erases_staged_cell_and_shorter_replacement() {
+        run_async(async {
+            let cx = Cx::new();
+            let marker = b"private-staged-marker-erase-me";
+            let payload = marker.repeat(8);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let secure_delete = mode.scrubs_cells();
+                let mut store =
+                    ImageKeepingStore::new(MemPageStore::with_empty_table(pn(2), USABLE), false);
+                store.inner.set_secure_delete_mode(mode);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                cursor.table_insert(&cx, 1, b"before").await.unwrap();
+                cursor.table_insert(&cx, 2, &payload).await.unwrap();
+                cursor.table_insert(&cx, 3, b"after").await.unwrap();
+                assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+                let writes = cursor.pager.page_writes;
+                let changes = cursor.pager.in_place_changes;
+                assert!(cursor.try_delete_table_leaf_cell_in_staged_image());
+                assert_eq!(cursor.pager.page_writes, writes);
+                assert_eq!(cursor.pager.in_place_changes, changes + 1);
+                let page = cursor.pager.page_bytes(2).unwrap();
+                assert_eq!(
+                    page.windows(marker.len()).any(|bytes| bytes == marker),
+                    !secure_delete
+                );
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"after");
+
+                // A shorter UPDATE removes and reinserts a cell. The new
+                // payload must not hide a surviving old payload in the gap.
+                cursor.table_insert(&cx, 4, &payload).await.unwrap();
+                assert!(cursor.table_move_to(&cx, 4).await.unwrap().is_found());
+                assert!(
+                    !cursor
+                        .table_overwrite_current_payload_same_size_no_overflow(
+                            &cx,
+                            4,
+                            b"replacement",
+                        )
+                        .await
+                        .unwrap()
+                );
+                cursor.delete(&cx).await.unwrap();
+                cursor.table_insert(&cx, 4, b"replacement").await.unwrap();
+                assert!(cursor.table_move_to(&cx, 4).await.unwrap().is_found());
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"replacement");
+                let page = cursor.pager.page_bytes(2).unwrap();
+                assert_eq!(
+                    page.windows(marker.len()).any(|bytes| bytes == marker),
+                    !secure_delete
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_erases_batched_cells_on_every_materializer() {
+        run_async(async {
+            let cx = Cx::new();
+            let marker = b"private-batch-marker-erase-me";
+            let payload = marker.repeat(4);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let secure_delete = mode.scrubs_cells();
+                for late_insert in [false, true] {
+                    for deleted in [&[16_i64][..], &[2, 4, 6, 8, 10, 12, 14, 16][..]] {
+                        let mut store = ImageKeepingStore::new(
+                            MemPageStore::with_empty_table(pn(2), USABLE),
+                            false,
+                        );
+                        store.inner.set_secure_delete_mode(mode);
+                        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                        let mut order: Vec<i64> = (1..=16).collect();
+                        if late_insert {
+                            order.swap(14, 15);
+                        }
+                        for rowid in order {
+                            cursor
+                                .table_insert(
+                                    &cx,
+                                    rowid,
+                                    if deleted.contains(&rowid) {
+                                        &payload
+                                    } else {
+                                        b"survivor"
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        assert!(
+                            cursor
+                                .table_move_to(&cx, deleted[0])
+                                .await
+                                .unwrap()
+                                .is_found()
+                        );
+                        let mut run = cursor
+                            .table_leaf_delete_run_current(deleted[0])
+                            .unwrap()
+                            .unwrap();
+                        for &rowid in deleted {
+                            assert!(run.delete_rowid(&cx, rowid, USABLE).unwrap());
+                        }
+                        let writes = cursor.pager.page_writes;
+                        cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
+                        assert_eq!(cursor.pager.page_writes, writes + 1);
+                        let page = cursor.pager.page_bytes(2).unwrap();
+                        assert_eq!(
+                            page.windows(marker.len()).any(|bytes| bytes == marker),
+                            !secure_delete,
+                            "mode={mode:?}, late={late_insert}, deleted={deleted:?}"
+                        );
+                        for rowid in 1..=16 {
+                            let found = cursor.table_move_to(&cx, rowid).await.unwrap().is_found();
+                            assert_eq!(found, !deleted.contains(&rowid));
+                            if found {
+                                assert_eq!(cursor.payload(&cx).await.unwrap(), b"survivor");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_replacement_compacts_fragmented_index_separator() {
+        run_async(async {
+            let cx = Cx::new();
+            let marker = b"private-index-separator-erase-me";
+            let payload = marker.repeat(8);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let secure_delete = mode.scrubs_cells();
+                let mut pages = MemPageStore::new(USABLE);
+                pages.set_secure_delete_mode(mode);
+                let mut page = build_interior_index(&[(pn(3), &payload)], pn(4));
+                let mut header = cell::parse_page_header(&page, pn(2)).unwrap();
+                let old_offset = header.content_offset(USABLE);
+                // Model an imported interior page with a 16-byte freeblock
+                // and three fragmented bytes after its sole live cell. A
+                // full compaction must retire both pieces of free metadata.
+                let new_offset = old_offset - 19;
+                page.copy_within(old_offset..USABLE as usize, new_offset);
+                header.cell_content_offset = u32::try_from(new_offset).unwrap();
+                header.first_freeblock = u16::try_from(USABLE - 16).unwrap();
+                header.fragmented_free_bytes = 3;
+                let freeblock = usize::from(header.first_freeblock);
+                page[freeblock..freeblock + 2].copy_from_slice(&0_u16.to_be_bytes());
+                page[freeblock + 2..freeblock + 4].copy_from_slice(&16_u16.to_be_bytes());
+                header.write(&mut page, 0);
+                cell::write_cell_pointers(
+                    &mut page,
+                    0,
+                    &header,
+                    &[u16::try_from(new_offset).unwrap()],
+                );
+                pages.pages.insert(2, page);
+                let store = ImageKeepingStore::new(pages, false);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+                let entry = cursor.load_page(&cx, pn(2)).await.unwrap();
+                cursor.stack.push(entry);
+                cursor.at_eof = false;
+                assert!(
+                    !cursor
+                        .replace_interior_cell(&cx, b"replacement")
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(cursor.pager.page_writes, 1);
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"replacement");
+                let page = cursor.pager.page_bytes(2).unwrap();
+                let header = cell::parse_page_header(&page, pn(2)).unwrap();
+                assert_eq!(header.first_freeblock, 0);
+                assert_eq!(header.fragmented_free_bytes, 0);
+                assert_eq!(
+                    page.windows(marker.len()).any(|bytes| bytes == marker),
+                    !secure_delete
+                );
+            }
         });
     }
 
