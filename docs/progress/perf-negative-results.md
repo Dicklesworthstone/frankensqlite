@@ -126,6 +126,26 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
 - Retry condition: none for this shape. Left on GROUP BY id: the derived table's projection copies (96 MB + 24 MB
   in execute_join_select: stream the derived table's rows instead) and the sorter's rows.
 
+## 2026-11-20 - REJECTED on its time kill line (update_10pct_300k cycles a replicated LOSE at unchanged Ir), every instruction line passing and rowid_lookups_200k's cpu and cycles replicated WINs: S3F v2, a miss's second record folded into the tail node (bd-s3fifo-forget-trace-cost-hv2rd, bulk-write round 13)
+
+- Target and construction: as S3F v1 (entry below), plus a per-node count, so the read right after an admission adds
+  to the newest node and a page read once is one node; a full history drops one entry from the oldest node. Kill
+  lines at or below the low end of each band (coordinator's rule, 2026-11-19). Touched (not landed; patch
+  `scratchpad/r13/s3fifo3_on_06963bd47.diff` of the bulk-write lane): `crates/fsqlite-pager/src/page_cache.rs`.
+  Keepers as v1, a third of the generated records doubled; fsqlite-pager lib 1,116 passed, clippy clean.
+- Prediction (bead, before the build): tracker work about 222 a miss (195-245); rowid -266M to -277M, count_star
+  -10.1M to -10.45M, join -9.5M to -9.85M. Kill lines: rowid down less than 265M, count_star less than 10.0M, join
+  less than 9.4M, any row's Ir up more than 0.3%, a replicated time LOSE on any row, a keeper or answer failing.
+- Result, both arms in one job on vmi1227854 (P sha256 db608b401c1d76a1, L 26d4e46bed10c461), stock 3.46.1 live:
+  single ELF rowid 2,699.4M -> 2,430.6M (-268.8M; 4.87x -> 4.38x stock, about 238 a miss), count_star -10.2M
+  (-17.1%), join -10.2M; layout-averaged, two valid runs: rowid cpu 0.955 / 0.952 and cycles 0.942 / 0.939
+  replicated WINs (x-stock cpu 1.800x -> 1.718x), each 1M-row scan -9.6M..-10.6M Ir, no row's Ir up;
+  update_10pct_300k cycles 1.040 / 1.025 LOSE / LOSE (T 1.05% / 1.70%) at Ir 0.9998 / 0.9996, where v1 was TIE.
+- Retry condition: the same construction re-judged after the coordinator settles whether replicated time verdicts
+  at unchanged Ir on rows a lever barely touches come from build-to-build data or heap layout, which a
+  same-build layout A/A (bd-8oo13) does not sample: the fourth such kill (SC8 v2, BR, FB, this one). The tracker's
+  memory went from 16 KB to about 176 KB per cache, a heap-layout change.
+
 ## 2026-11-19 - REJECTED on its first kill line (rowid_lookups_200k -259M Ir against the 279M that means tracker work under 170 per miss), every other line passing: the eviction trackers' access trace forgets a page in O(1) per removed entry (bd-s3fifo-forget-trace-cost-hv2rd, bulk-write round 12, lever S3F)
 
 - Target: `S3FifoEvictionTracker::forget` on every page-cache eviction. Callgrind on main (cac612a6c's ELF;
@@ -176,6 +196,7 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   the same lever, so that bulk's time can clear T; or after an owner decision on how the bd-es2im lines treat a
   replicated time LOSE on a row whose instructions do not move (third such kill: SC8 v2 scan_filter_agg, BR
   gb_a_sum_c, this one; the null group reruns the parent's same six ELFs, so it does not sample a second relink set).
+- bd-8oo13 (2026-11-19): layout A/A on one build, 0 replicated false verdicts in 56 tests; this rejection stands.
 
 ## 2026-11-19 - REJECTED on two kill lines (bulk task-clock a TIE then a WIN, not a replicated WIN; gb_a_sum_c cycles a replicated LOSE at -0.01% Ir), with bulk -33M..-43M Ir and its cycles a replicated WIN: the page cache's budget check counts the overflow shards without locking them (bd-w4pr1.13, bulk-write round 11, lever BR)
 
@@ -198,6 +219,7 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   rows together: the clean-buffer search that finds nothing when every page is dirty (bulk: ~13.2M Ir, all 128
   shards locked again per trim) and the eviction search the read rows pay per admitted page (rowid_lookups_200k
   412M Ir, 15.3% of the row; count_star 22.8%).
+- bd-8oo13 (2026-11-19): layout A/A on one build, 0 replicated false verdicts in 56 tests; this rejection stands.
 
 ## 2026-11-19 - REJECTED again, by its layout-averaged landing run (scan_filter_agg cycles a replicated LOSE at identical Ir; join and memory_script replicated WINs): the table seek cache keeps eight leaves, scanned in place (bd-w4pr1.12, read-loop round 9, lever SC8 v2)
 
@@ -225,6 +247,7 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   in-struct footprint unchanged (the slot array out of line, allocated on first use beyond slot 0), judged
   layout-averaged at its exact landing commit under the same four lines. If scan_filter_agg still loses with the
   footprint unchanged, the footprint hypothesis is refuted and SC8 is rejected with no further retry from this lane.
+- bd-8oo13 (2026-11-19): layout A/A on one build, 0 replicated false verdicts in 56 tests; this rejection stands.
 
 ## 2026-11-19 - REJECTED on its kill lines 2 and 3 (memory_script_200k +1.74% Ir; group_by_1000_groups cycles): a seek-cache hit on a resident cached leaf other than the cursor's own is answered without a wait (bd-w4pr1.12, read-loop round 8, lever SL2 v1)
 
