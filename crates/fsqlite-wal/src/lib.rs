@@ -138,11 +138,16 @@ pub use telemetry::{
     NoOpWalObserver, WalTelemetryEvent, WalTelemetryObserver, WalTelemetryRingBuffer,
     WalTelemetrySnapshot, wal_telemetry_snapshot,
 };
-pub use wal::{WalFile, WalGenerationIdentity};
+pub use wal::{WalFile, WalGenerationIdentity, WalScanStopKind};
 #[cfg(target_arch = "wasm32")]
 pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 2;
 #[cfg(target_arch = "wasm32")]
 pub const MAX_RAPTORQ_REPAIR_SYMBOLS: u8 = u8::MAX;
+#[cfg(not(target_arch = "wasm32"))]
+pub use wal_fec::replay::{
+    WalFecLiveRepairReport, WalFecReplayLimits, WalFecReplayStop, WalFecReplayStopReason,
+    repair_wal_file_in_place_with_fec, wal_fec_sidecar_covers_frame,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use wal_fec::{
     DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS, WAL_FEC_GROUP_META_MAGIC,

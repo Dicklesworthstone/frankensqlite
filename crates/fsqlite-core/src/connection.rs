@@ -5862,6 +5862,142 @@ async fn open_valid_wal_for_install<V: Vfs>(
     Ok(None)
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn wal_needs_live_fec_repair<V>(
+    wal: &WalFile<V::File>,
+    vfs: &V,
+    pager: &Arc<SimplePager<V>>,
+    wal_path: &Path,
+) -> bool
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    if vfs.is_memory() || pager.is_readonly() {
+        return false;
+    }
+    let Some(stop) = wal.last_scan_stop() else {
+        return false;
+    };
+    let sidecar_path = fsqlite_wal::wal_fec_path_for_wal(wal_path);
+    if !sidecar_path.is_file() {
+        return false;
+    }
+    match stop {
+        fsqlite_wal::WalScanStopKind::FrameDamage { .. } => true,
+        fsqlite_wal::WalScanStopKind::SaltMismatch { frame_no } => {
+            fsqlite_wal::wal_fec_sidecar_covers_frame(&sidecar_path, wal.header(), frame_no)
+        }
+    }
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+fn wal_needs_live_fec_repair<V>(
+    _wal: &WalFile<V::File>,
+    _vfs: &V,
+    _pager: &Arc<SimplePager<V>>,
+    _wal_path: &Path,
+) -> bool
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    false
+}
+
+/// After live in-place WAL-FEC repair mutates damaged WAL frames under the
+/// exclusive maintenance fence, invalidate any existing `-shm` header so the
+/// subsequent native snapshot refresh rebuilds the shared WAL index from the
+/// healed WAL frames (bd-1hi.11). Never creates a new `-shm` file.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
+async fn invalidate_stale_shm_after_wal_fec_repair<V>(
+    pager: &Arc<SimplePager<V>>,
+    vfs: &V,
+    cx: &Cx,
+    wal_path: &Path,
+) where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    if vfs.is_memory() {
+        return;
+    }
+    let Some(db_path) = wal_path.to_str().and_then(|path| path.strip_suffix("-wal")) else {
+        return;
+    };
+    let shm_path = PathBuf::from(format!("{db_path}-shm"));
+    if !vfs.access(cx, &shm_path, AccessFlags::EXISTS).unwrap_or(false) {
+        return;
+    }
+    if let Ok(source) = pager.wal_index_shm_source()
+        && let Ok(region_zero) = source.map_region(cx, 0, false).await
+        && let Err(error) = fsqlite_wal::wal_index::invalidate_shared_wal_index_header(&region_zero)
+    {
+        tracing::warn!(
+            target: "fsqlite.wal.fec_live_recovery",
+            wal_path = %wal_path.display(),
+            %error,
+            "failed to invalidate stale -shm header after live WAL-FEC repair"
+        );
+    }
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "native", unix)))]
+async fn invalidate_stale_shm_after_wal_fec_repair<V>(
+    _pager: &Arc<SimplePager<V>>,
+    _vfs: &V,
+    _cx: &Cx,
+    _wal_path: &Path,
+) where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+async fn repair_opened_wal_under_maintenance_fence<V>(
+    pager: &Arc<SimplePager<V>>,
+    vfs: &V,
+    cx: &Cx,
+    wal_path: &Path,
+    wal: &mut WalFile<V::File>,
+) -> Result<()>
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    if !wal_needs_live_fec_repair(wal, vfs, pager, wal_path) {
+        return Ok(());
+    }
+    let report = fsqlite_wal::repair_wal_file_in_place_with_fec(
+        cx,
+        wal,
+        wal_path,
+        pager.db_path(),
+        fsqlite_wal::WalFecReplayLimits::default(),
+    )
+    .await?;
+    if report.wrote_wal_bytes {
+        invalidate_stale_shm_after_wal_fec_repair(pager, vfs, cx, wal_path).await;
+    }
+    Ok(())
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+async fn repair_opened_wal_under_maintenance_fence<V>(
+    _pager: &Arc<SimplePager<V>>,
+    _vfs: &V,
+    _cx: &Cx,
+    _wal_path: &Path,
+    _wal: &mut WalFile<V::File>,
+) -> Result<()>
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    Ok(())
+}
+
 pub(crate) async fn install_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: V,
@@ -5873,7 +6009,13 @@ where
     V::File: Send + Sync + 'static,
 {
     if let Some(wal) = open_valid_wal_for_install(&vfs, cx, wal_path).await? {
-        return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
+        if wal_needs_live_fec_repair(&wal, &vfs, pager, wal_path) {
+            // Re-inspect and heal under the exclusive whole-image maintenance
+            // fence so no concurrent writer or checkpoint can race the repair.
+            let _ = wal.close(cx);
+        } else {
+            return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
+        }
     }
     // bd-reality-check-1022-llk6g.5.6: in a database that is already in WAL
     // mode, a WAL shorter than its header beside a `-shm` has no frames, as
@@ -5889,11 +6031,25 @@ where
     {
         return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
     }
-    let mut state = (vfs, wal_path.to_path_buf(), pager.page_size().get());
+    let mut state = (
+        vfs,
+        wal_path.to_path_buf(),
+        pager.page_size().get(),
+        Arc::clone(pager),
+    );
     let wal = pager
-        .with_wal_initialization(cx, &mut state, |cx, (vfs, path, page_size)| {
+        .with_wal_initialization(cx, &mut state, |cx, (vfs, path, page_size, pager)| {
             Box::pin(async move {
-                if let Some(wal) = open_valid_wal_for_install(vfs, cx, path).await? {
+                if let Some(mut wal) = open_valid_wal_for_install(vfs, cx, path).await? {
+                    if let Err(error) =
+                        repair_opened_wal_under_maintenance_fence(pager, vfs, cx, path, &mut wal)
+                            .await
+                    {
+                        let cleanup_cx = cx.create_child();
+                        let _cleanup_mask = cleanup_cx.masked();
+                        let _ = wal.close(&cleanup_cx);
+                        return Err(error);
+                    }
                     return Ok(wal);
                 }
                 let create_flags =
@@ -6108,6 +6264,33 @@ where
                 );
             }
         })?;
+    } else if wal_needs_live_fec_repair(&wal, &vfs, pager, wal_path) {
+        let _ = wal.close(cx);
+        let mut state = (vfs, wal_path.to_path_buf(), Arc::clone(pager));
+        let repaired_wal = pager
+            .with_wal_initialization(cx, &mut state, |cx, (vfs, path, pager)| {
+                Box::pin(async move {
+                    let Some(mut wal) = open_valid_wal_for_install(vfs, cx, path).await? else {
+                        return Ok(None);
+                    };
+                    if let Err(error) =
+                        repair_opened_wal_under_maintenance_fence(pager, vfs, cx, path, &mut wal)
+                            .await
+                    {
+                        let cleanup_cx = cx.create_child();
+                        let _cleanup_mask = cleanup_cx.masked();
+                        let _ = wal.close(&cleanup_cx);
+                        return Err(error);
+                    }
+                    Ok(Some(wal))
+                })
+            })
+            .await?;
+        if let Some(wal) = repaired_wal {
+            install_opened_wal_backend(pager, cx, state.0, wal_path, wal, false)?;
+        } else {
+            return Ok(false);
+        }
     } else {
         install_opened_wal_backend(pager, cx, vfs, wal_path, wal, false)?;
     }
