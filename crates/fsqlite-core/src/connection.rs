@@ -46937,7 +46937,25 @@ impl Connection {
                         where_clause,
                     } = &mut upsert.action
                     {
+                        // bd-4l4y3: the existing row, then `excluded`.
+                        let target = TableOrSubquery::Table {
+                            name: insert.table.clone(),
+                            alias: insert.alias.clone(),
+                            index_hint: None,
+                            time_travel: None,
+                        };
+                        let excluded = TableOrSubquery::Table {
+                            name: insert.table.clone(),
+                            alias: Some("excluded".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        };
+                        let set_scope = row_value_set_scope(target, Some(excluded), None);
                         for assignment in assignments {
+                            // bd-4l4y3: `SET (n, c) = (SELECT ...)` assigns a
+                            // row value here as in UPDATE.
+                            self.lower_row_value_set_subquery(assignment, &set_scope, params)
+                                .await?;
                             rewrite_dml_in_expr(
                                 &mut assignment.value,
                                 self,
@@ -47000,7 +47018,19 @@ impl Connection {
                 // also forces eager IN rewrite so the attached-child execution
                 // path receives only local literals instead of outer-table
                 // references it cannot resolve.
+                // bd-4l4y3: what a SET source's correlated names see: the
+                // target, then the UPDATE's FROM.
+                let set_scope = row_value_set_scope(
+                    dml_target_source(&update.table),
+                    None,
+                    update.from.as_ref(),
+                );
                 for assignment in &mut update.assignments {
+                    // bd-4l4y3: a FROM-less or uncorrelated source becomes the
+                    // row value it assigns; a `*`, compound or VALUES source
+                    // needs no column-by-column projection then.
+                    self.lower_row_value_set_subquery(assignment, &set_scope, params)
+                        .await?;
                     // bd-22jvi: a row-value SET whose RHS is directly a
                     // multi-column subquery — `SET (a, b) = (SELECT a, b FROM
                     // ...)` — accepts a row value, so the uncorrelated-subquery
@@ -82817,6 +82847,114 @@ impl Connection {
     /// compiles the LIMIT 1 and stops at its first row (bd-9gl3w). bd-b887p:
     /// shared by the per-row probes and the folds of uncorrelated EXISTS;
     /// bd-wp9s1: and of scalar subqueries.
+    /// bd-4l4y3: the value of a `SET (c1, ..., cn) = (subquery)` assignment,
+    /// in an UPDATE or an upsert's DO UPDATE, as the row value it assigns.
+    /// Stock assigns the subquery's first row, NULLs when it has none, after
+    /// checking its width against the targets once its names resolve ("2
+    /// columns assigned 3 values").
+    ///
+    /// - A FROM-less `SELECT e1, ..., en` (no WHERE, GROUP BY, HAVING, ORDER
+    ///   BY, LIMIT, WITH, compound, aggregate or window function) is the row
+    ///   value `(e1, ..., en)`, which may read the row or `excluded`.
+    /// - An uncorrelated subquery of any shape (`*`, a compound, VALUES) runs
+    ///   here, once per execution, as the rewrite folds a scalar subquery: the
+    ///   row value of its first row.
+    ///
+    /// Any other subquery (a correlated one with a FROM, or one with a
+    /// placeholder while preparing) is left for the UPDATE lowering, which
+    /// projects it column by column; its names are resolved first against
+    /// `scope`, the FROM items the assignment sees, so a name nothing
+    /// supplies is stock's "no such column" rather than a NULL.
+    async fn lower_row_value_set_subquery(
+        &self,
+        assignment: &mut fsqlite_ast::Assignment,
+        scope: &FromClause,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<()> {
+        let fsqlite_ast::AssignmentTarget::ColumnList(targets) = &assignment.target else {
+            return Ok(());
+        };
+        let Expr::Subquery(subquery, span) = &assignment.value else {
+            return Ok(());
+        };
+        let span = *span;
+        if let Some(values) = self.fromless_single_row_values(subquery) {
+            assignment.value = Expr::RowValue(values, span);
+            return Ok(());
+        }
+        if rewrite_probe_is_correlated(self, subquery)
+            || (params.is_none() && select_contains_any_placeholder(subquery))
+        {
+            let check = select_of_result_exprs(
+                vec![Expr::Exists {
+                    subquery: subquery.clone(),
+                    not: false,
+                    span,
+                }],
+                Some(scope.clone()),
+            );
+            return self.validate_select_column_references(&check);
+        }
+        let mut probe = (**subquery).clone();
+        self.limit_probe_to_its_first_row(&mut probe);
+        let rows = Box::pin(self.execute_statement(&Statement::Select(probe), params)).await?;
+        let width = self.select_result_column_count(subquery, &[], &mut Vec::new());
+        if width != targets.len() {
+            return Err(FrankenError::FunctionError(format!(
+                "{} columns assigned {width} values",
+                targets.len()
+            )));
+        }
+        let first = rows.into_iter().next();
+        let values = (0..width)
+            .map(|index| {
+                let value = first
+                    .as_ref()
+                    .and_then(|row| row.values.get(index))
+                    .map_or(Literal::Null, sqlite_value_to_literal);
+                Expr::Literal(value, span)
+            })
+            .collect();
+        assignment.value = Expr::RowValue(values, span);
+        Ok(())
+    }
+
+    /// The result expressions of a FROM-less single-row `SELECT e1, ..., en`
+    /// that is exactly the row value `(e1, ..., en)` (bd-4l4y3).
+    fn fromless_single_row_values(&self, select: &SelectStatement) -> Option<Vec<Expr>> {
+        if select.with.is_some()
+            || !select.body.compounds.is_empty()
+            || !select.order_by.is_empty()
+            || select.limit.is_some()
+            || has_window_functions(select)
+            || self.has_implicit_aggregation_with_registry(select)
+        {
+            return None;
+        }
+        let SelectCore::Select {
+            columns,
+            from: None,
+            where_clause: None,
+            group_by,
+            having: None,
+            windows,
+            ..
+        } = &select.body.select
+        else {
+            return None;
+        };
+        if !group_by.is_empty() || !windows.is_empty() {
+            return None;
+        }
+        columns
+            .iter()
+            .map(|column| match column {
+                ResultColumn::Expr { expr, .. } => Some(expr.clone()),
+                ResultColumn::Star | ResultColumn::TableStar(_) => None,
+            })
+            .collect()
+    }
+
     fn limit_probe_to_its_first_row(&self, probe: &mut SelectStatement) {
         if probe.limit.is_some() {
             return;
@@ -169812,6 +169950,34 @@ fn dml_where_select(
 }
 
 /// A DML target as the FROM item its expressions resolve against.
+/// bd-4l4y3: the FROM items a row-value SET source's correlated names see:
+/// the DML target, an upsert's `excluded` row, an UPDATE's own FROM, joined
+/// as stock lists them.
+fn row_value_set_scope(
+    target: TableOrSubquery,
+    excluded: Option<TableOrSubquery>,
+    update_from: Option<&FromClause>,
+) -> FromClause {
+    let cross = |table: TableOrSubquery| fsqlite_ast::JoinClause {
+        join_type: fsqlite_ast::JoinType {
+            natural: false,
+            kind: fsqlite_ast::JoinKind::Cross,
+        },
+        table,
+        constraint: None,
+    };
+    let mut from = FromClause {
+        source: target,
+        joins: Vec::new(),
+    };
+    from.joins.extend(excluded.map(&cross));
+    if let Some(update_from) = update_from {
+        from.joins.push(cross(update_from.source.clone()));
+        from.joins.extend(update_from.joins.iter().cloned());
+    }
+    from
+}
+
 fn dml_target_source(table: &fsqlite_ast::QualifiedTableRef) -> TableOrSubquery {
     TableOrSubquery::Table {
         name: table.name.clone(),
