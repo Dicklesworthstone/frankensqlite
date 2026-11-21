@@ -214,10 +214,19 @@ uses the production SDK/worker, a transactional IndexedDB model, and Node's
 SQLite reference engine; run it with an ESM TypeScript resolver honoring the
 workspace's `@frankensqlite/worker` alias. It is not a WASM certificate.
 
-The browser storage test saves checkpoint bytes in a dedicated Chromium
-worker, terminates that worker, and reads the same revision and bytes from
-a fresh worker for each snapshot backend. Exercising SQL through the built
-WASM package and qualifying a release have separate gates.
+To run the public SDK and worker against a built WASM core on both backends,
+set `FSQLITE_WASM_BROWSER_MODULE` to the web-target JavaScript binding. Its
+matching `_bg.wasm` file must be alongside it. Use the worker feature set
+documented in `crates/fsqlite-wasm/README.md`.
+
+```sh
+FSQLITE_WASM_BROWSER_MODULE=/path/to/frankensqlite_wasm.js \
+  node --test packages/worker/tests/snapshot-store.browser.test.mjs
+```
+
+The SQL cases checkpoint a row, insert another, then terminate the page and
+worker. A fresh worker must recover the acknowledged revision and only the
+checkpointed row, and pass `PRAGMA integrity_check`.
 
 ## Transactions and connection ownership
 

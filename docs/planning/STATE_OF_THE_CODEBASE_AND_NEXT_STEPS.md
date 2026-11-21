@@ -52,13 +52,14 @@ all three boundaries, both before and after reopen. The current row remained
 `fsqlite_queue`, `fsqlite_lease` and `fsqlite_worker_ranges` all reported
 an unregistered module (`bd-6hdwo.11`).
 
-For V26, the browser worker now supports explicit whole-database checkpoints
-on OPFS and IndexedDB. Chromium 143 saved bytes in one dedicated worker and
-reopened the same revision and all bytes in a fresh worker for each backend.
-Both storage and Web Lock suites passed (28 tests). The SDK's 45 OPFS
-checkpoint cases also passed using Node SQLite and storage models. Page-level
-durability through a real WASM VFS remains open on `bd-2ua2e` and its
-implementation dependencies.
+For V26, a named browser database failed at first open because the worker
+passed its storage name to the WASM pager as a file path. The worker now
+opens an in-memory SQL handle and uses the name for checkpoint storage.
+In Chromium 143 the public SDK checkpointed SQL rows through the real WASM
+core on both OPFS and IndexedDB. Fresh workers recovered the acknowledged
+revision and rows, discarded a later uncheckpointed insert, and passed
+`integrity_check`. All 30 browser storage and Web Lock cases passed with
+the WASM module supplied. Page-level durability remains open on `bd-2ua2e`.
 
 Two public entry points still expose significant limits. FTS5 and R-tree
 virtual tables could be created, while FTS3 creation reported an unregistered

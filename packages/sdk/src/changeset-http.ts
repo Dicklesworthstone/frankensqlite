@@ -448,7 +448,7 @@ function createHttpExchange<I, M, R>(
   url: string | URL,
   options: ExchangeOptions<M>,
   format: WireFormat,
-  encodeInput: (input: I) => { readonly wire: Uint8Array; readonly meta: M },
+  encodeInput: (input: I) => { readonly wire: Uint8Array<ArrayBuffer>; readonly meta: M },
   validateReceipt: (value: unknown, meta: M) => R,
   maximumReceipt: number,
 ): (input: I, controls?: ChangesetDeliveryOptions) => Promise<R> {

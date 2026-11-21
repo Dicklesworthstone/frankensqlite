@@ -126,7 +126,7 @@ function receipt(value: unknown, m: BootstrapManifest, orderedSourceId: string |
 function json(bytes: Uint8Array): unknown {
   try { return JSON.parse(utf8.decode(bytes)); } catch { return fail("PROTOCOL", "Invalid bootstrap HTTP JSON or UTF-8"); }
 }
-function encode(info: BootstrapHttpRequestInfo, bytes: Uint8Array): Uint8Array {
+function encode(info: BootstrapHttpRequestInfo, bytes: Uint8Array): Uint8Array<ArrayBuffer> {
   const meta = encoder.encode(JSON.stringify({ protocol: BOOTSTRAP_HTTP_PROTOCOL, ...info }));
   if (meta.length > MAX_METADATA) fail("LIMIT", "Bootstrap HTTP metadata exceeds 128 KiB");
   const wire = new Uint8Array(8 + meta.length + bytes.length);

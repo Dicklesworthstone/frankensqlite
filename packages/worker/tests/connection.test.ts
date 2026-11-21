@@ -97,10 +97,11 @@ class FakeDatabase implements CoreDatabaseHandle {
   async execute(sql: string): Promise<number> {
     await Promise.resolve();
     if (sql === "FAIL") {
-      throw Object.assign(new Error("async execute failed"), {
+      throw {
+        message: "async execute failed",
         code: "SQLITE_ERROR",
         sqliteCode: 1,
-      });
+      };
     }
     return 1;
   }
@@ -166,6 +167,7 @@ describe("WorkerConnectionHost", () => {
     if (response.kind === "ready") {
       expect(response.data.persistence).toBe("memory");
       expect(response.data.path).toBe("demo");
+      expect(FakeDatabase.lastCreated?.path).toBe(":memory:");
     }
   });
 

@@ -58,7 +58,6 @@ import {
 import {
   assertSupportedPersistenceMode,
   createReadyResult,
-  resolveDatabasePath,
   resolvePersistenceMode,
   UnsupportedPersistenceModeError,
 } from "./vfs-init";
@@ -564,17 +563,19 @@ export class WorkerConnectionHost {
       stagedDb =
         image !== undefined
           ? await core.FrankenDB.import(image)
-          : await core.FrankenDB.create(resolveDatabasePath(config));
+          : await core.FrankenDB.create(":memory:");
       if (stagedDb === this.#db) {
         // A loader may not transfer the live handle back as a new allocation.
         // In particular, never close that alias while cleaning up a candidate.
         stagedDb = null;
         throw new Error("Database initialization must return a separately owned handle");
       }
-      const path = isSnapshotPersistenceMode(ready.persistence)
+      const corePath = isSnapshotPersistenceMode(ready.persistence)
         ? ready.path
         : stagedDb.path || ready.path;
-      if (typeof path !== "string") throw new Error("Invalid initialized database path");
+      if (typeof corePath !== "string") throw new Error("Invalid initialized database path");
+      // Fresh databases live in WASM memory. Their public name identifies the worker session.
+      const path = image === undefined && corePath === ":memory:" ? ready.path : corePath;
       this.#assertSession();
       stagedLease?.assertHeld();
 
@@ -1099,11 +1100,9 @@ export function serializeFrankenError(error: unknown, depth = 0): SerializedFran
   const serialized: SerializedFrankenError = {
     code,
     message:
-      error instanceof Error
-        ? error.message
-        : typeof error === "string"
-          ? error
-          : "Unknown FrankenSQLite worker error",
+      typeof error === "string"
+        ? error
+        : (extractStringProperty(error, "message") ?? "Unknown FrankenSQLite worker error"),
   };
   if (error instanceof RequestAdmissionError && error.batchIndex !== undefined) {
     serialized.batchIndex = error.batchIndex;

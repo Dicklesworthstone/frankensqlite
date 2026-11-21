@@ -200,8 +200,12 @@ function owned(value: Uint8Array, maximum: number): Uint8Array {
   if (length > maximum) fail("LIMIT", "Journal input exceeds the byte limit");
   return new Uint8Array(new Uint8Array(buffer, offset, length));
 }
+function hasArrayBuffer(bytes: Uint8Array): bytes is Uint8Array<ArrayBuffer> {
+  return bytes.buffer instanceof ArrayBuffer;
+}
 async function hash(bytes: Uint8Array): Promise<string> {
   if (!globalThis.crypto?.subtle) fail("INPUT", "Rebase journals require Web Crypto SHA-256");
+  if (!hasArrayBuffer(bytes)) fail("INPUT", "Rebase journals require non-shared bytes");
   const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   return Array.from(sum, (b) => b.toString(16).padStart(2, "0")).join("");
 }

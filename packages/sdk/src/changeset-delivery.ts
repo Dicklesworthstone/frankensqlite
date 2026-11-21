@@ -145,7 +145,7 @@ function bound(value: unknown, fallback: number, maximum: number): number {
   return n;
 }
 /** Intrinsic access avoids subclass getters/iterators bypassing the copy budget. */
-function ownBytes(value: unknown, maximum: number): Uint8Array {
+function ownBytes(value: unknown, maximum: number): Uint8Array<ArrayBuffer> {
   if (!(value instanceof Uint8Array)) input("A changeset Uint8Array is required");
   const proto = Object.getPrototypeOf(Uint8Array.prototype) as object;
   const get = (key: string): unknown =>
@@ -163,7 +163,7 @@ function ownBytes(value: unknown, maximum: number): Uint8Array {
   // Constructing this view rejects detached buffers, even when length is zero.
   return new Uint8Array(new Uint8Array(buffer, offset, length));
 }
-async function hash(bytes: Uint8Array): Promise<string> {
+async function hash(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   if (globalThis.crypto?.subtle === undefined)
     input("Changeset delivery requires Web Crypto SHA-256");
   const result = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
@@ -501,10 +501,10 @@ function verifyReceipt(
 /** Own the complete source response before hashing yields to adapter code. */
 function captureBatchPayloads(
   value: unknown, expected: readonly OutboxDelivery[], maximum: number,
-): readonly { delivery: OutboxDelivery; changeset: Uint8Array | null }[] {
+): readonly { delivery: OutboxDelivery; changeset: Uint8Array<ArrayBuffer> | null }[] {
   if (!Array.isArray(value) || value.length !== expected.length)
     input("Source did not return the complete batch read");
-  const captured: { delivery: OutboxDelivery; changeset: Uint8Array | null }[] = [];
+  const captured: { delivery: OutboxDelivery; changeset: Uint8Array<ArrayBuffer> | null }[] = [];
   let remaining = maximum;
   for (let i = 0; i < expected.length; i++) {
     const entry = Object.getOwnPropertyDescriptor(value, String(i));
@@ -514,7 +514,7 @@ function captureBatchPayloads(
     if (!sameDelivery(expected[i]!, delivery))
       input("Outbox delivery changed between selection and batch read");
     const data = field(entry.value, "changeset");
-    let changeset: Uint8Array | null = null;
+    let changeset: Uint8Array<ArrayBuffer> | null = null;
     if (delivery.acknowledged) {
       if (data !== null) input("An acknowledged outbox entry retained unexpected payload bytes");
     } else {

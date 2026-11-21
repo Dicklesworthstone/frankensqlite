@@ -195,7 +195,7 @@ function captureManifest(value: unknown): BootstrapManifest {
     sha256: digest(data(value, "sha256")),
   });
 }
-function owned(value: unknown, maximum: number): Uint8Array {
+function owned(value: unknown, maximum: number): Uint8Array<ArrayBuffer> {
   if (!(value instanceof Uint8Array)) fail("INPUT", "Bootstrap chunks must be Uint8Array values");
   const proto = Object.getPrototypeOf(Uint8Array.prototype) as object;
   const get = (key: string): unknown =>
@@ -211,7 +211,7 @@ function owned(value: unknown, maximum: number): Uint8Array {
   if (length > maximum) fail("LIMIT", "Bootstrap chunk exceeds the byte budget");
   return new Uint8Array(new Uint8Array(buffer, offset, length));
 }
-async function hash(bytes: Uint8Array): Promise<string> {
+async function hash(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   if (!globalThis.crypto?.subtle) fail("INPUT", "Bootstrap requires Web Crypto SHA-256");
   const result = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
   return Array.from(result, (b) => b.toString(16).padStart(2, "0")).join("");

@@ -4,13 +4,14 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { resolve, sep } from "node:path";
+import { basename, dirname, resolve, sep } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const { chromium } = await import(process.env.FSQLITE_PLAYWRIGHT_MODULE ?? "@playwright/test");
 const { default: ts } = await import(process.env.FSQLITE_TYPESCRIPT_MODULE ?? "typescript");
 const root = fileURLToPath(new URL("../../../", import.meta.url));
+const wasmModule = process.env.FSQLITE_WASM_BROWSER_MODULE;
 let server;
 let browser;
 let context;
@@ -51,10 +52,24 @@ export async function raw(name, mutate) {
 `;
 
 before(async () => {
+  const wasmAssets = new Map();
+  if (wasmModule) {
+    const binary = basename(wasmModule, ".js") + "_bg.wasm";
+    wasmAssets.set("/wasm/core.js", ["text/javascript", await readFile(wasmModule)]);
+    wasmAssets.set("/wasm/" + binary, [
+      "application/wasm", await readFile(resolve(dirname(wasmModule), binary)),
+    ]);
+  }
   server = createServer(async (request, response) => {
     try {
       const pathname = new URL(request.url, "http://localhost").pathname;
       response.setHeader("Cache-Control", "no-store");
+      const asset = wasmAssets.get(pathname);
+      if (asset) {
+        response.setHeader("Content-Type", asset[0]);
+        response.end(asset[1]);
+        return;
+      }
       if (pathname === "/") {
         response.setHeader("Content-Type", "text/html");
         response.end("<!doctype html><title>Snapshot storage verification</title>");
@@ -78,7 +93,9 @@ before(async () => {
             module: ts.ModuleKind.ESNext,
             verbatimModuleSyntax: true,
           },
-        }).outputText;
+        }).outputText
+          .replaceAll('"@frankensqlite/worker"', '"/packages/worker/src/index.ts"')
+          .replaceAll('"@frankensqlite/core"', '"/wasm/core.js"');
       }
       response.end(source);
     } catch (error) {
@@ -104,14 +121,58 @@ after(async () => {
   if (server) await new Promise((yes) => server.close(yes));
 });
 
-async function run(body) {
+async function run(body, arg) {
   const page = await context.newPage();
   try {
     await page.goto(url);
-    return await page.evaluate(body);
+    return await page.evaluate(body, arg);
   } finally {
     await page.close();
   }
+}
+
+for (const persistence of ["indexeddb-snapshot", "opfs-snapshot"]) {
+  test(`SDK reopens checkpointed WASM SQL rows with ${persistence}`, {
+    skip: wasmModule ? false : "Set FSQLITE_WASM_BROWSER_MODULE to a web-target WASM binding",
+  }, async () => {
+    const config = { dbName: crypto.randomUUID(), persistence };
+    const saved = await run(async (config) => {
+      const { FrankenDB } = await import("/packages/sdk/src/database.ts");
+      const worker = new Worker("/packages/worker/src/worker.ts", { type: "module" });
+      const db = await FrankenDB.open({ ...config, worker });
+      await db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)");
+      await db.execute("INSERT INTO t VALUES (1)");
+      const receipt = await db.checkpoint();
+      await db.execute("INSERT INTO t VALUES (2)");
+      const live = (await db.query("SELECT id FROM t ORDER BY id")).rowArrays;
+      let sqlError;
+      try {
+        await db.query("SELECT * FROM missing_checkpoint_table");
+      } catch (error) {
+        sqlError = error.message;
+      }
+      return { path: db.path, receipt, live, sqlError };
+    }, config);
+    assert.equal(saved.path, config.dbName);
+    assert.equal(saved.receipt.parentRevision, null);
+    assert.equal(typeof saved.receipt.revision, "string");
+    assert.deepEqual(saved.live, [[1], [2]]);
+    assert.match(saved.sqlError, /missing_checkpoint_table/i);
+
+    const reopened = await run(async (config) => {
+      const { FrankenDB } = await import("/packages/sdk/src/database.ts");
+      const worker = new Worker("/packages/worker/src/worker.ts", { type: "module" });
+      const db = await FrankenDB.open({ ...config, worker });
+      const rows = (await db.query("SELECT id FROM t ORDER BY id")).rowArrays;
+      const integrity = (await db.query("PRAGMA integrity_check")).rowArrays;
+      const revision = db.snapshotRevision;
+      await db.close();
+      return { rows, integrity, revision };
+    }, config);
+    assert.equal(reopened.revision, saved.receipt.revision);
+    assert.deepEqual(reopened.rows, [[1]]);
+    assert.deepEqual(reopened.integrity, [["ok"]]);
+  });
 }
 
 async function inFreshWorker(body, arg) {

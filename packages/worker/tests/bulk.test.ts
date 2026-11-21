@@ -258,8 +258,11 @@ describe("atomic bulk execution", () => {
 
   it("binds null, bigint and blobs without string interpolation or stale binds", async () => {
     const f = await fixture();
-    const sets: SqlScalar[][] = [[null, 9007199254740993n, Uint8Array.of(0, 255)], []];
+    const sets: SqlScalar[][] = [[null], [9007199254740993n], [Uint8Array.of(0, 255)], [null]];
     expect((await f.run(sets)).kind).toBe("execute-many-result");
+    expect(f.bindings).toEqual(sets);
+    const incomplete = error(await f.run([[]]));
+    expect(incomplete.cause?.code).toBe("ERR_FSQLITE_BINDING_ARITY");
     expect(f.bindings).toEqual(sets);
   });
 
@@ -350,10 +353,10 @@ describe("atomic bulk execution", () => {
     const f = await fixture({ row: 0, free: true, rollback: true, close: true });
     const failure = error(await f.run());
     expect(failure.cause?.message).toBe("constraint failed");
-    expect(failure.cleanupErrors?.map((item) => item.message)).toEqual([
-      "free failed",
-      "rollback failed",
-      "close failed",
+    expect(failure.cleanupErrors).toMatchObject([
+      { message: "free failed" },
+      { message: "rollback failed" },
+      { code: "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE", cause: { message: "close failed" } },
     ]);
     expect(f.events.at(-1)).toBe("database.free");
   });

@@ -97,11 +97,11 @@ function fixture() {
         FrankenDB: {
           async create() {
             await step("create");
-            return db;
+            return { ...db };
           },
           async import() {
             await step("import");
-            return db;
+            return { ...db };
           },
         },
       };
@@ -210,7 +210,6 @@ describe("worker request ownership", () => {
     await f.init();
     const gate = f.block("execute");
     const execute = f.host.handle({ kind: "execute", requestId: 2, sql: "FAIL" });
-    const rejection = execute.catch((error: unknown) => error);
     await gate.started;
     const query = f.host.handle({ kind: "query", requestId: 3, sql: "SELECT 1" });
     const failure = new Error("error getter failed");
@@ -219,7 +218,11 @@ describe("worker request ownership", () => {
         throw failure;
       },
     });
-    expect(await rejection).toBe(failure);
+    expect(await execute).toMatchObject({
+      kind: "error",
+      requestId: 2,
+      error: { code: "ERR_FSQLITE_WORKER", message: failure.message },
+    });
     expect((await query).kind).toBe("query-result");
     expect(f.events).toEqual(["execute:start", "query:start", "query:end"]);
   });
@@ -232,14 +235,15 @@ describe("worker request ownership", () => {
     await gate.started;
     const init = f.host.handle({ kind: "init", requestId: 3, config: {} });
     gate.resolve();
-    await Promise.all([query, init]);
+    expect((await query).kind).toBe("query-result");
+    expect((await init).kind).toBe("ready");
     expect(f.events).toEqual([
       "query:start",
       "query:end",
-      "database:close",
-      "database:free",
       "create:start",
       "create:end",
+      "database:close",
+      "database:free",
     ]);
   });
 

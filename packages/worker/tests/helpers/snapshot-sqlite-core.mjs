@@ -119,7 +119,8 @@ export function sqliteSnapshotWorker(hooks = {}) {
       async load() {
         return {
           FrankenDB: {
-            async create() {
+            async create(path) {
+              if (path !== ":memory:") throw new Error("The WASM core requires an in-memory path");
               creates++;
               return open();
             },
