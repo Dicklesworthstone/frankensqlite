@@ -40,8 +40,11 @@ use fsqlite_vdbe::temp_store::{
     EffectiveTempStore, TempFileBackend, TempFileHandle, TempStoreMode, TempStoreRuntime,
     TempStoreStats, map_io_error_for_temp_store,
 };
-use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::{Vfs, VfsFile};
+#[cfg(unix)]
+use fsqlite_vfs::{UnixFile as NativeFile, UnixVfs as NativeVfs};
+#[cfg(windows)]
+use fsqlite_vfs::{WindowsFile as NativeFile, WindowsVfs as NativeVfs};
 use tempfile::TempDir;
 
 fn sqlite_val_from_rusqlite(val: rusqlite::types::Value) -> SqliteValue {
@@ -94,7 +97,7 @@ fn synchronous_spill_io_preserves_offset_eof_and_cancellation() {
     let path = dir.path().join("offset.tmp");
     let cx = Cx::new();
     let flags = VfsOpenFlags::TEMP_DB | VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE;
-    let (mut file, _) = UnixVfs::new().open(&cx, Some(&path), flags).unwrap();
+    let (mut file, _) = NativeVfs::new().open(&cx, Some(&path), flags).unwrap();
     let payload = vec![0xa5; 65_537];
     file.write_at_sync(&cx, &payload, 7).unwrap();
     let mut actual = vec![0xff; payload.len() + 16];
@@ -146,7 +149,7 @@ fn large_sorter_spill_builds_a_stock_readable_index() {
     });
 }
 
-/// Inspecting real-UnixVfs backend that records every physical file created in
+/// Inspecting native VFS backend that records every physical file created in
 /// `dir`, verifies the file exists on disk while open, captures raw bytes
 /// written (for optional zero-plaintext inspection), and can inject disk-full
 /// or I/O write faults deterministically.
@@ -154,7 +157,7 @@ struct ObservingVfsTempBackend {
     dir: PathBuf,
     files_created: AtomicU64,
     files_seen_on_disk: AtomicU64,
-    bytes_written: AtomicU64,
+    attempted_write_bytes: Arc<AtomicU64>,
     fail_after_bytes: Option<u64>,
     fail_with_disk_full: bool,
     capture_raw_bytes: bool,
@@ -167,7 +170,7 @@ impl ObservingVfsTempBackend {
             dir,
             files_created: AtomicU64::new(0),
             files_seen_on_disk: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
+            attempted_write_bytes: Arc::new(AtomicU64::new(0)),
             fail_after_bytes: None,
             fail_with_disk_full: false,
             capture_raw_bytes: false,
@@ -180,7 +183,7 @@ impl ObservingVfsTempBackend {
             dir,
             files_created: AtomicU64::new(0),
             files_seen_on_disk: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
+            attempted_write_bytes: Arc::new(AtomicU64::new(0)),
             fail_after_bytes: Some(fail_after_bytes),
             fail_with_disk_full: disk_full,
             capture_raw_bytes: false,
@@ -190,8 +193,8 @@ impl ObservingVfsTempBackend {
 }
 
 struct ObservingVfsTempHandle {
-    file: Mutex<Option<fsqlite_vfs::UnixFile>>,
-    bytes_written_global: Arc<AtomicU64>,
+    file: Mutex<Option<NativeFile>>,
+    attempted_write_bytes: Arc<AtomicU64>,
     fail_after_bytes: Option<u64>,
     fail_with_disk_full: bool,
     capture_raw_bytes: bool,
@@ -204,14 +207,18 @@ impl TempFileHandle for ObservingVfsTempHandle {
             return Err(FrankenError::Abort);
         }
         let next = self
-            .bytes_written_global
+            .attempted_write_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed)
             .saturating_add(data.len() as u64);
         if let Some(limit) = self.fail_after_bytes
             && next >= limit
         {
             return if self.fail_with_disk_full {
-                Err(map_io_error_for_temp_store(std::io::Error::from_raw_os_error(28)))
+                #[cfg(unix)]
+                let disk_full = std::io::Error::from_raw_os_error(nix::libc::ENOSPC);
+                #[cfg(windows)]
+                let disk_full = std::io::Error::from_raw_os_error(112); // ERROR_DISK_FULL
+                Err(map_io_error_for_temp_store(disk_full))
             } else {
                 Err(FrankenError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -307,7 +314,7 @@ impl TempFileBackend for ObservingVfsTempBackend {
         if cx.is_cancel_requested() {
             return Err(FrankenError::Abort);
         }
-        let vfs = UnixVfs::new();
+        let vfs = NativeVfs::new();
         let seq = self.files_created.fetch_add(1, Ordering::Relaxed);
         let mut rng = [0u8; 8];
         vfs.randomness(cx, &mut rng);
@@ -326,15 +333,30 @@ impl TempFileBackend for ObservingVfsTempBackend {
         }
         Ok(Box::new(ObservingVfsTempHandle {
             file: Mutex::new(Some(file)),
-            bytes_written_global: Arc::new(AtomicU64::new(
-                self.bytes_written.load(Ordering::Relaxed),
-            )),
+            attempted_write_bytes: Arc::clone(&self.attempted_write_bytes),
             fail_after_bytes: self.fail_after_bytes,
             fail_with_disk_full: self.fail_with_disk_full,
             capture_raw_bytes: self.capture_raw_bytes,
             captured_bytes: Arc::clone(&self.captured_bytes),
         }))
     }
+}
+
+#[test]
+fn disk_full_fault_budget_spans_separate_spill_files() {
+    let dir = TempDir::new().unwrap();
+    let backend = ObservingVfsTempBackend::with_fault(dir.path().to_owned(), 8, true);
+    let cx = Cx::new();
+    let first = backend.create_temp_file(&cx, "first").unwrap();
+    let second = backend.create_temp_file(&cx, "second").unwrap();
+    first.write_at(&cx, 0, &[1; 4]).unwrap();
+    second.write_at(&cx, 0, &[2; 3]).unwrap();
+    assert!(matches!(second.write_at(&cx, 3, &[3]), Err(FrankenError::DatabaseFull)));
+    assert_eq!(first.file_size(&cx).unwrap(), 4);
+    assert_eq!(second.file_size(&cx).unwrap(), 3);
+    first.close(&cx).unwrap();
+    second.close(&cx).unwrap();
+    assert!(count_dir_entries(dir.path()).is_empty());
 }
 
 /// Negative-control backend representing an inert / file-incapable runtime.
