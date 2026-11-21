@@ -192,9 +192,21 @@ test("bookmark: valid ranges preserve rebase semantics and return both snapshot 
   } finally { db.close(); }
 });
 
+test("bookmark: safe absolute positions beyond the retention limit reach history lookup", async () => {
+  const { db, host, journal } = fixture();
+  try {
+    const origin = await journal.bookmark();
+    for (const position of [100_001, Number.MAX_SAFE_INTEGER]) {
+      const before = host.admissions;
+      await assert.rejects(journal.rebase(EMPTY, { after: { ...origin, position } }), code("MISSING"));
+      assert.equal(host.admissions, before + 1);
+    }
+  } finally { db.close(); }
+});
+
 for (const [field, value] of [
   ["format", "future"], ["journalId", ""], ["journalId", "\ud800"], ["position", -1],
-  ["position", 1.5], ["position", 100001], ["position", NaN], ["position", 1n],
+  ["position", 1.5], ["position", Number.MAX_SAFE_INTEGER + 1], ["position", NaN], ["position", 1n],
   ["sha256", "a".repeat(63)], ["sha256", "A".repeat(64)], ["sha256", null],
 ]) {
   test(`bookmark: invalid ${field} ${String(value)} rejects before SQL admission`, async () => {

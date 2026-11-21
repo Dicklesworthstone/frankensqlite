@@ -61,6 +61,15 @@ revision and rows, discarded a later uncheckpointed insert, and passed
 `integrity_check`. All 30 browser storage and Web Lock cases passed with
 the WASM module supplied. Page-level durability remains open on `bd-2ua2e`.
 
+The SDK rebase journal now reports cancellation and deadline expiry during
+history writes with the journal error code and the original changeset error
+as its cause. Interrupting a row-conflict rollback retains the row-level error.
+The application row, receipt and history stayed consistent in all three cases
+(`bd-9mx3k`). Across 124 SDK and worker Node test files, 4,795 of 4,796 tests
+passed with zero skipped. The four-worker, 128-job reference SQLite test still
+intermittently reaches its five-second writer admission timeout under load
+(`bd-q1qg2`). Both package builds, typechecks and all 140 Vitest cases passed.
+
 Two public entry points still expose significant limits. FTS5 and R-tree
 virtual tables could be created, while FTS3 creation reported an unregistered
 module (`bd-26rjq`). A new database opened with `PRAGMA key` retained its

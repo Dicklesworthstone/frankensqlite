@@ -8,8 +8,8 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { decodeChangeset, decodePatchset, decodeRebaseInfo, encodeChangeset, encodePatchset, encodeRebaseInfo } from "../src/changeset-codec.ts";
 import { ChangesetRebaser, createChangesetRebaseInfo, rebaseChangeset } from "../src/changeset-rebase.ts";
-import { applyChangeset, applyPatchset } from "../src/changeset-apply.ts";
-import { ChangesetRebaseJournal, REBASE_JOURNAL_ENTRIES_TABLE as ENTRIES, REBASE_JOURNAL_HEADS_TABLE as HEADS } from "../src/changeset-rebase-journal.ts";
+import { applyChangeset, applyPatchset, ChangesetApplyError } from "../src/changeset-apply.ts";
+import { ChangesetRebaseJournal, RebaseJournalError, REBASE_JOURNAL_ENTRIES_TABLE as ENTRIES, REBASE_JOURNAL_HEADS_TABLE as HEADS } from "../src/changeset-rebase-journal.ts";
 import { CHANGESET_DELIVERY_PROTOCOL, ChangesetReceiver } from "../src/changeset-delivery.ts";
 
 const oraclePath = fileURLToPath(new URL("./helpers/rebase-oracle.py", import.meta.url));
@@ -623,7 +623,14 @@ for (const step of [ENTRIES, HEADS]) {
     const { db, host } = opened(), controller = new AbortController();
     const adapter = intercepted(host, (sql) => { if (sql.startsWith(step === ENTRIES ? "INSERT OR ABORT" : "UPDATE OR ABORT") && sql.includes(step)) controller.abort(); });
     try {
-      await assert.rejects(journal(adapter).apply(remoteFirst(), journalOptions("cut", { onConflict: () => "replace", signal: controller.signal })), { code: "ERR_FSQLITE_REBASE_JOURNAL_CANCELLED" });
+      await assert.rejects(journal(adapter).apply(remoteFirst(), journalOptions("cut", { onConflict: () => "replace", signal: controller.signal })), (error) => {
+        assert.ok(error instanceof RebaseJournalError);
+        assert.equal(error.code, "ERR_FSQLITE_REBASE_JOURNAL_CANCELLED");
+        assert.ok(error.cause instanceof ChangesetApplyError);
+        assert.equal(error.cause.code, "ERR_FSQLITE_CHANGESET_CANCELLED");
+        assert.equal(error.cause.cause, controller.signal.reason);
+        return true;
+      });
       assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 0);
       assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
     } finally { db.close(); }
@@ -638,6 +645,27 @@ for (const step of [ENTRIES, HEADS]) {
     } finally { db.close(); }
   });
 }
+
+test("journal deadline during the head write preserves its cause and rolls back", async (t) => {
+  const { db, host } = opened();
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const adapter = intercepted(host, (sql) => {
+    if (sql.startsWith("UPDATE OR ABORT") && sql.includes(HEADS)) now = 20;
+  });
+  try {
+    await assert.rejects(journal(adapter).apply(remoteFirst(), journalOptions("deadline", { timeoutMs: 10, onConflict: () => "replace" })), (error) => {
+      assert.ok(error instanceof RebaseJournalError);
+      assert.equal(error.code, "ERR_FSQLITE_REBASE_JOURNAL_TIMEOUT");
+      assert.ok(error.cause instanceof ChangesetApplyError);
+      assert.equal(error.cause.code, "ERR_FSQLITE_CHANGESET_TIMEOUT");
+      return true;
+    });
+    assert.equal(journalCount(db), 0);
+    assert.equal(inboxCount(db), 0);
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+  } finally { db.close(); }
+});
 
 test("journal child application remains provisional until outer COMMIT", async () => {
   const { db, host } = opened();

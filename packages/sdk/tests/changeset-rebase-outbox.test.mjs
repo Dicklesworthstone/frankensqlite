@@ -164,7 +164,7 @@ test('caller mutation during asynchronous admission cannot change tables or a pi
 
 for (const options of [undefined,null,{}, {tables:[]},{tables:['t','T']},{tables:['sqlite_schema']},
   {tables:['__fsqlite_changeset_outbox']},{tables:[42]},{tables:['a\0b']},{tables:['a'.repeat(1025)]},
-  {...opts,after:0},{...opts,through:-1},{...opts,through:100001},{...opts,through:{position:0}},
+  {...opts,after:0},{...opts,through:-1},{...opts,through:Number.MAX_SAFE_INTEGER+1},{...opts,through:{position:0}},
   {...opts,maxEntries:0},{...opts,maxPayloadBytes:0},{...opts,timeoutMs:0},{...opts,signal:{}}])
   test(`invalid publication options reject before transaction admission: ${JSON.stringify(options)?.slice(0,70)}`, async()=>{
     let entered=0;

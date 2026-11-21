@@ -4,7 +4,7 @@ import type {
   ChangesetExecutor,
   ChangesetTarget,
 } from "./changeset-apply";
-import { applyChangeset, CHANGESET_RECEIPTS_TABLE } from "./changeset-apply";
+import { applyChangeset, ChangesetApplyError, CHANGESET_RECEIPTS_TABLE } from "./changeset-apply";
 import type { ChangesetLimits, ChangesetValue } from "./changeset-codec";
 import { decodeChangeset, decodeRebaseInfo, resolveChangesetLimits } from "./changeset-codec";
 import { ChangesetRebaser } from "./changeset-rebase";
@@ -108,8 +108,9 @@ export class RebaseJournalError extends Error {
       | "ERR_FSQLITE_REBASE_JOURNAL_CANCELLED"
       | "ERR_FSQLITE_REBASE_JOURNAL_TIMEOUT",
     message: string,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = "RebaseJournalError";
   }
 }
@@ -809,21 +810,35 @@ export class ChangesetRebaseJournal {
       ...(foreignKeys === undefined ? {} : { foreignKeys }),
       ...(constraintConflicts === undefined ? {} : { constraintConflicts }),
       onRebase: async (tx, info) => {
-        await ensure(tx, op, false);
-        const head = await this.#head(tx, op, false);
-        const floor = await historyFloor(tx, op, this.#id);
-        if (!before || head.position !== before.position || head.byteLength !== before.byteLength ||
-            JSON.stringify(floor) !== JSON.stringify(beforeFloor)) fail("CORRUPT", "Journal history changed during application");
-        if (head.position === MAX_POSITION || head.position - floor.position >= this.#maxEntries || info.length > this.#maxBytes - head.byteLength) fail("LIMIT", "Rebase journal is full; application must roll back");
-        const sha256 = await hash(info);
-        op.checkpoint();
-        const next = head.position + 1;
-        // An empty decision is still an ordered application. Spell its BLOB
-        // explicitly: some SQLite adapters bind a zero-length view as NULL.
-        const params: ChangesetValue[] = [this.#id, BigInt(next), deliveryId, messageSha256, BigInt(wire.length), sha256, BigInt(info.length)];
-        if (info.length !== 0) params.push(info);
-        await write(tx, op, `INSERT OR ABORT INTO ${ENTRIES} VALUES (?,?,?,?,?,?,?,${info.length === 0 ? "zeroblob(0)" : "?"})`, params);
-        await write(tx, op, `UPDATE OR ABORT ${HEADS} SET position=?, byte_length=? WHERE journal_id=? AND position=? AND byte_length=?`, [BigInt(next), BigInt(head.byteLength + info.length), this.#id, BigInt(head.position), BigInt(head.byteLength)]);
+        try {
+          await ensure(tx, op, false);
+          const head = await this.#head(tx, op, false);
+          const floor = await historyFloor(tx, op, this.#id);
+          if (!before || head.position !== before.position || head.byteLength !== before.byteLength ||
+              JSON.stringify(floor) !== JSON.stringify(beforeFloor)) fail("CORRUPT", "Journal history changed during application");
+          if (head.position === MAX_POSITION || head.position - floor.position >= this.#maxEntries || info.length > this.#maxBytes - head.byteLength) fail("LIMIT", "Rebase journal is full; application must roll back");
+          const sha256 = await hash(info);
+          op.checkpoint();
+          const next = head.position + 1;
+          // An empty decision is still an ordered application. Spell its BLOB
+          // explicitly: some SQLite adapters bind a zero-length view as NULL.
+          const params: ChangesetValue[] = [this.#id, BigInt(next), deliveryId, messageSha256, BigInt(wire.length), sha256, BigInt(info.length)];
+          if (info.length !== 0) params.push(info);
+          await write(tx, op, `INSERT OR ABORT INTO ${ENTRIES} VALUES (?,?,?,?,?,?,?,${info.length === 0 ? "zeroblob(0)" : "?"})`, params);
+          await write(tx, op, `UPDATE OR ABORT ${HEADS} SET position=?, byte_length=? WHERE journal_id=? AND position=? AND byte_length=?`, [BigInt(next), BigInt(head.byteLength + info.length), this.#id, BigInt(head.position), BigInt(head.byteLength)]);
+        } catch (cause) {
+          // The scoped executor can detect interruption before the journal's
+          // post-write check. Preserve which operation was interrupted.
+          if (cause instanceof ChangesetApplyError) {
+            if (cause.code === "ERR_FSQLITE_CHANGESET_CANCELLED") {
+              throw new RebaseJournalError("ERR_FSQLITE_REBASE_JOURNAL_CANCELLED", cause.message, { cause });
+            }
+            if (cause.code === "ERR_FSQLITE_CHANGESET_TIMEOUT") {
+              throw new RebaseJournalError("ERR_FSQLITE_REBASE_JOURNAL_TIMEOUT", cause.message, { cause });
+            }
+          }
+          throw cause;
+        }
       },
     };
     if (onConflict !== undefined) applyOptions.onConflict = onConflict;

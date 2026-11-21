@@ -421,7 +421,7 @@ for (const location of ["envelope accessor", "field accessor", "inherited fields
     };
     await assert.rejects(
       FrankenDB.open({ worker, preparedStatementLimits: requested }),
-      policyFailure,
+      location === "envelope accessor" ? { code: "ERR_FSQLITE_WORKER_RESPONSE" } : policyFailure,
     );
     assert.equal(getters, 0);
     assert.equal(terminations, 1);

@@ -391,18 +391,29 @@ test("iterator and statement cleanup failures do not mask the primary SQL error"
       throw new Error("source close failed");
     },
   };
+  let terminal;
   await assert.rejects(f.db.executeStream(INSERT, iterator, { batchSize: 1 }), (e) => {
-    assert.equal(e.phase, "execute");
-    assert.equal(e.rowIndex, 1);
-    assert.match(e.cause.cause.message, /UNIQUE/);
-    assert.deepEqual(
-      e.cleanupErrors.map((x) => x.message),
-      ["source close failed", "finalize failed"],
-    );
+    assert.ok(e instanceof AggregateError);
+    terminal = e;
+    const stream = e.cause;
+    assert.equal(e.errors[0], stream);
+    assert.ok(stream instanceof FrankenStreamError);
+    assert.equal(stream.phase, "execute");
+    assert.equal(stream.rowIndex, 1);
+    assert.match(stream.cause.cause.message, /UNIQUE/);
+    assert.equal(stream.cleanupErrors.length, 2);
+    assert.equal(stream.cleanupErrors[0].message, "source close failed");
+    assert.equal(stream.cleanupErrors[1].cause.message, "finalize failed");
+    assert.equal(e.errors[1].code, "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE");
     return true;
   });
-  assert.deepEqual(await f.read(), []);
-  await f.db.close();
+  const reopened = new DatabaseSync(f.handles[0].path);
+  try {
+    assert.deepEqual(reopened.prepare("SELECT * FROM t").all(), []);
+  } finally {
+    reopened.close();
+  }
+  await assert.rejects(f.db.close(), (error) => error === terminal);
 });
 
 test("malformed iterator results close once, finalize and roll back", async () => {

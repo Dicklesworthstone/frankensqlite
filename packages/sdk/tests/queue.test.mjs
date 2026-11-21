@@ -725,13 +725,19 @@ test(
       }),
       q = f.queue;
     const close = q.close();
-    await assert.rejects(close, /close failed/);
+    let terminal;
+    await assert.rejects(close, (error) => {
+      assert.equal(error.code, "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE");
+      assert.equal(error.cause.message, failure.message);
+      terminal = error;
+      return true;
+    });
     assert.equal(q.close(), close);
     assert.equal(accounting(q).state, "closed");
     assert.equal(f.worker.terminateCount, 1);
     await assert.rejects(
       q.transaction(() => 1),
-      isCode("ERR_FSQLITE_JOB_QUEUE_CLOSED"),
+      (error) => error === terminal,
     );
   },
 );
