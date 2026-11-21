@@ -76,7 +76,7 @@ export class FrankenWorkerClient {
   readonly #failureListeners = new Set<(error: Error) => void>();
   #closing = false;
   #disposed = false;
-  #cleanupFailure: { error: unknown } | null = null;
+  #cleanupFailure: { error: unknown; reportedByInit?: AggregateError } | null = null;
   #closePromise: Promise<void> | null = null;
   #resultEncoding: ResultEncoding = "structured-clone";
   #snapshotOwnership: SnapshotOwnership | null = null;
@@ -165,10 +165,10 @@ export class FrankenWorkerClient {
     this.#terminalError ??= error;
     this.#rejectPending(this.#terminalError, this.#hostTerminal);
     this.#notifyFailure(this.#terminalError);
-    if (!this.#hostTerminal && !this.#closing) {
-      // The channel cannot acknowledge a close. Run normal cleanup so that an
-      // otherwise live worker releases its exclusive snapshot lock. Callers
-      // can still await the same close promise for the original failure.
+    if (!this.#closing && (!this.#hostTerminal || this.#remoteTransportFailure)) {
+      // A receiver that delivered its fatal notice can still acknowledge the
+      // fence after active SQL drains. A broken channel goes straight to
+      // disposal. Either way, an idle client has no pending caller to do it.
       void this.close().catch(() => {});
     }
   }
@@ -613,10 +613,15 @@ export class FrankenWorkerClient {
     this.dispose();
   }
 
-  dispose(reason?: Error, { reportPreviousFailure = false } = {}): void {
-    if (this.#disposed && !reportPreviousFailure) return;
+  dispose(reason?: Error, failedOpen?: { cause: unknown }): void {
+    if (this.#disposed && !failedOpen) return;
     this.#disposeWorker(reason);
-    if (this.#cleanupFailure !== null) throw this.#cleanupFailure.error;
+    const failure = this.#cleanupFailure;
+    if (failure === null) return;
+    // open() must see a prior cleanup fault unless its init already joined
+    // the fence and is delivering that same fault to the caller.
+    if (failure.reportedByInit && failedOpen?.cause === failure.reportedByInit) return;
+    throw failure.error;
   }
 
   #disposeAfterFailure(cause: unknown, message: string): never {
@@ -806,12 +811,17 @@ export class FrankenWorkerClient {
         try {
           await this.close();
         } catch (cleanup: unknown) {
-          if (cleanup !== error)
-            throw new AggregateError(
+          if (cleanup !== error) {
+            const failure = new AggregateError(
               [error, cleanup],
               "Worker operation response and transport cleanup both failed",
               { cause: error },
             );
+            if (request.kind === "init" && this.#cleanupFailure !== null) {
+              this.#cleanupFailure.reportedByInit = failure;
+            }
+            throw failure;
+          }
         }
       }
       throw error;

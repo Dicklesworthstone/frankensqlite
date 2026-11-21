@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -17,9 +17,24 @@ console.log("Packed consumer", consumer);
 const packs = JSON.parse(npm(["pack", "--json", "--ignore-scripts", "--pack-destination", consumer,
   "--workspace", "@frankensqlite/worker", "--workspace", "@frankensqlite/sdk"], root));
 assert.equal(packs.length, 2);
+const archives = packs.map(pack => join(consumer, pack.filename));
+for (const pack of packs) {
+  const name = pack.name.split("/")[1];
+  const source = join(root, "packages", name);
+  const staged = join(consumer, "incremental", name);
+  const output = join(staged, "dist/npm");
+  await cp(join(source, "dist/npm"), output, { recursive: true });
+  await copyFile(join(source, "package.json"), join(staged, "package.json"));
+  await mkdir(join(output, "previous-build"));
+  await writeFile(join(output, "retired-entry.js"), "export default 0;");
+  await writeFile(join(output, "previous-build", "old.d.ts"), "export {};");
+  const [incremental] = JSON.parse(npm(["pack", "--dry-run", "--json", "--ignore-scripts"], staged));
+  const outputs = ({ files }) => files.map(f => f.path).filter(path => path.startsWith("dist/npm/")).sort();
+  assert.deepEqual(outputs(incremental), outputs(pack), `${pack.name} packed stale build output`);
+}
 await writeFile(join(consumer, "package.json"), JSON.stringify({ private: true }));
 npm(["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund",
-  ...(core ? [resolve(core)] : ["--legacy-peer-deps"]), ...packs.map(p => join(consumer, p.filename))], consumer);
+  ...(core ? [resolve(core)] : ["--legacy-peer-deps"]), ...archives], consumer);
 
 for (const [extension, load, resolveEntry] of [
   ["mjs", "await import", "import.meta.resolve"],
@@ -107,3 +122,4 @@ if (core) {
     } finally { await browser.close(); }
   } finally { await server.close(); }
 }
+console.log("Tested package archives", ...archives);

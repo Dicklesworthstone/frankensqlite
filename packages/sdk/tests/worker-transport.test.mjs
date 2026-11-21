@@ -252,6 +252,26 @@ test(
 );
 
 test(
+  "worker transport: idle receiver failure closes its host and exits without another database call",
+  limits,
+  async (t) => {
+    const f = await thread(t);
+    const db = await FrankenDB.open({ worker: f.worker });
+    await db.execute("CREATE TABLE items(id INTEGER PRIMARY KEY)");
+    await db.execute("INSERT INTO items VALUES(3)");
+    f.decode();
+    await f.until((message) => message.kind === "worker-fatal" && !message.audit);
+    await f.until((message) => message.fixture === "exit");
+    assert.equal(f.terminated, 1);
+    assert.equal(f.wrappers.size, 0);
+    assert.equal(f.messages.filter((message) => message.kind === "close-result" && !message.audit).length, 1);
+    await assert.rejects(db.query("SELECT * FROM items"), code("ERR_FSQLITE_WORKER_TRANSPORT"));
+    await db.close();
+    disk(db.path, [3]);
+  },
+);
+
+test(
   "worker transport: receiver decode fault fences queued writes and close waits for active SQL",
   limits,
   async (t) => {

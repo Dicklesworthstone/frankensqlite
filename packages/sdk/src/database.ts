@@ -299,8 +299,7 @@ export class FrankenDB {
       );
     } catch (error: unknown) {
       try {
-        // A channel fault can finish cleanup before its rejected init reaches open().
-        client.dispose(undefined, { reportPreviousFailure: true });
+        client.dispose(undefined, { cause: error });
       } catch (cleanupError: unknown) {
         throw new AggregateError(
           [error, cleanupError], "FrankenSQLite initialization and worker cleanup both failed",

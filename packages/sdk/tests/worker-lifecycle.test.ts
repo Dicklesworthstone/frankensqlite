@@ -273,6 +273,43 @@ describe("worker client terminal lifecycle", () => {
     expect(worker.terminateCount).toBe(1);
   });
 
+  it.each([false, true])("reports open cleanup errors once (close fails: %s)", async (failClose) => {
+    const worker = new ControlledWorker();
+    const cleanup = new Error("terminate failed");
+    worker.onTerminate = () => {
+      throw cleanup;
+    };
+    worker.onPost = (request) => {
+      if (request.kind !== "close") return;
+      const requestId = request.requestId;
+      worker.reply(
+        failClose
+          ? { kind: "error", requestId, error: { code: "SQLITE_IOERR", message: "host close failed" } }
+          : { kind: "close-result", requestId },
+      );
+    };
+    const opening = FrankenDB.open({ worker });
+    worker.reply({
+      kind: "worker-fatal",
+      error: { code: "ERR_FSQLITE_WORKER_TRANSPORT", message: "lost init response" },
+    });
+    const failure = (await opening.catch((error: unknown) => error)) as AggregateError;
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.cause).toMatchObject({ code: "ERR_FSQLITE_WORKER_TRANSPORT" });
+    expect(failure.errors).toHaveLength(2);
+    expect(failure.errors[0]).toBe(failure.cause);
+    if (failClose) {
+      expect(failure.errors[1]).toBeInstanceOf(AggregateError);
+      expect(failure.errors[1].errors).toEqual([
+        expect.objectContaining({ code: "SQLITE_IOERR" }),
+        cleanup,
+      ]);
+    } else {
+      expect(failure.errors[1]).toBe(cleanup);
+    }
+    expect(worker.terminateCount).toBe(1);
+  });
+
   it("preserves both close and cleanup failures", async () => {
     const { worker, client } = fixture();
     const cleanupError = new Error("terminate failed");
