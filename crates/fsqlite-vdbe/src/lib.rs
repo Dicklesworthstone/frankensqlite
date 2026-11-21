@@ -2122,6 +2122,57 @@ pub mod pragma {
         PragmaOutput::Int(HARD_HEAP_LIMIT.load(Ordering::Relaxed))
     }
 
+    /// Current process-global soft heap limit in bytes (`0` = unlimited).
+    #[must_use]
+    pub fn soft_heap_limit() -> i64 {
+        SOFT_HEAP_LIMIT.load(Ordering::Relaxed)
+    }
+
+    /// Current process-global hard heap limit in bytes (`0` = unlimited).
+    #[must_use]
+    pub fn hard_heap_limit() -> i64 {
+        HARD_HEAP_LIMIT.load(Ordering::Relaxed)
+    }
+
+    /// Compute the active temporary-storage spill budget in bytes from
+    /// connection pragmas (`temp.cache_size`, `cache_size`, `page_size`) and
+    /// process-global heap limits (`soft_heap_limit`, `hard_heap_limit`).
+    ///
+    /// Rules (mirroring SQLite's cache-size byte algebra):
+    /// 1. When `temp_cache_size != 0`, it governs the base temporary budget
+    ///    (`N > 0` => `N * page_size` bytes; `N < 0` => `|N| * 1024` bytes).
+    /// 2. Otherwise `cache_size` governs the base budget using the same rule
+    ///    (with `0` clamped to 1 page).
+    /// 3. Positive `soft_heap_limit` and `hard_heap_limit` clamp the budget down
+    ///    so spills begin before heap ceilings are crossed.
+    #[must_use]
+    pub fn effective_temp_budget_bytes(
+        temp_cache_size: i64,
+        cache_size: i64,
+        page_size: u32,
+    ) -> usize {
+        let page_bytes = u64::from(page_size.max(512));
+        let active_setting = if temp_cache_size != 0 {
+            temp_cache_size
+        } else {
+            cache_size
+        };
+        let mut budget_u64 = match active_setting.cmp(&0) {
+            std::cmp::Ordering::Less => active_setting.unsigned_abs().saturating_mul(1024),
+            std::cmp::Ordering::Greater => active_setting.unsigned_abs().saturating_mul(page_bytes),
+            std::cmp::Ordering::Equal => page_bytes,
+        };
+        let soft = soft_heap_limit();
+        if soft > 0 {
+            budget_u64 = budget_u64.min(soft.unsigned_abs());
+        }
+        let hard = hard_heap_limit();
+        if hard > 0 {
+            budget_u64 = budget_u64.min(hard.unsigned_abs());
+        }
+        usize::try_from(budget_u64.max(1)).unwrap_or(usize::MAX)
+    }
+
     /// Test-only: reset the process-global heap limits to `0/0` so unit tests that
     /// exercise the lower-only hard-limit semantics can replay C SQLite's
     /// fresh-process oracle scenarios from a known state (the hard limit cannot be
@@ -3049,6 +3100,610 @@ pub mod pragma {
             Some(false)
         } else {
             None
+        }
+    }
+}
+
+/// Live `PRAGMA temp_store` policy, VFS-backed temporary file abstraction, and
+/// observable resource telemetry (bd-dwjnq.5 / bd-dwjnq.6).
+pub mod temp_store {
+    use std::fmt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+
+    use fsqlite_error::{FrankenError, Result};
+    use fsqlite_types::cx::Cx;
+
+    /// Canonical `PRAGMA temp_store` integer values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[repr(i64)]
+    pub enum TempStoreMode {
+        /// `0` / `DEFAULT`: resolves to compile-time default (`FILE` on native,
+        /// `MEMORY` on wasm32).
+        #[default]
+        Default = 0,
+        /// `1` / `FILE`: prefer temporary VFS files when exceeding the byte budget.
+        File = 1,
+        /// `2` / `MEMORY`: keep all temporary structures strictly in memory.
+        Memory = 2,
+    }
+
+    impl TempStoreMode {
+        #[must_use]
+        pub const fn from_pragma_i64(value: i64) -> Self {
+            match value {
+                1 => Self::File,
+                2 => Self::Memory,
+                _ => Self::Default,
+            }
+        }
+
+        #[must_use]
+        pub const fn as_pragma_i64(self) -> i64 {
+            self as i64
+        }
+    }
+
+    /// Resolved runtime temporary storage behavior after considering mode and
+    /// platform/backend capability.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EffectiveTempStore {
+        /// Spill temporary runs, ephemeral B-trees, and TEMP tables to VFS temp files.
+        File,
+        /// Keep all temporary data in memory (never create temp files).
+        Memory,
+    }
+
+    impl EffectiveTempStore {
+        /// Resolve effective mode from `PRAGMA temp_store` and whether the
+        /// active backend/platform permits real temporary files.
+        #[must_use]
+        pub const fn resolve(mode: TempStoreMode, backend_supports_file: bool) -> Self {
+            match mode {
+                TempStoreMode::Memory => Self::Memory,
+                TempStoreMode::File => {
+                    if backend_supports_file {
+                        Self::File
+                    } else {
+                        Self::Memory
+                    }
+                }
+                TempStoreMode::Default => {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = backend_supports_file;
+                        Self::Memory
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if backend_supports_file {
+                            Self::File
+                        } else {
+                            Self::Memory
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Map an OS/VFS I/O error from a temporary spill file into a canonical
+    /// `FrankenError`, preserving `SQLITE_FULL` for disk-full / quota conditions.
+    #[must_use]
+    pub fn map_io_error_for_temp_store(err: std::io::Error) -> FrankenError {
+        if err.kind() == std::io::ErrorKind::StorageFull {
+            return FrankenError::DatabaseFull;
+        }
+        #[cfg(unix)]
+        if matches!(err.raw_os_error(), Some(28 | 122)) {
+            // ENOSPC (28) / EDQUOT (122) on Linux/POSIX.
+            return FrankenError::DatabaseFull;
+        }
+        #[cfg(windows)]
+        if matches!(err.raw_os_error(), Some(39 | 112)) {
+            // ERROR_HANDLE_DISK_FULL (39) / ERROR_DISK_FULL (112).
+            return FrankenError::DatabaseFull;
+        }
+        FrankenError::Io(err)
+    }
+
+    /// An open, connection-private temporary file handle backed by the VFS.
+    ///
+    /// Implementations must enforce delete-on-close semantics so dropping or
+    /// closing the handle leaves zero residual files on disk.
+    pub trait TempFileHandle: Send + Sync {
+        /// Write `data` starting at byte `offset`.
+        fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()>;
+
+        /// Read up to `buf.len()` bytes starting at byte `offset`, returning
+        /// the number of bytes read (`0` at EOF).
+        fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize>;
+
+        /// Current file size in bytes.
+        fn file_size(&self, cx: &Cx) -> Result<u64>;
+
+        /// Truncate the file to `size` bytes.
+        fn truncate(&self, cx: &Cx, size: u64) -> Result<()>;
+
+        /// Close and unlink the temporary file. Idempotent.
+        fn close(&self, cx: &Cx) -> Result<()>;
+    }
+
+    /// Factory for opening VFS-backed temporary files for sorters, ephemeral
+    /// B-trees, and spilled TEMP tables.
+    pub trait TempFileBackend: Send + Sync {
+        /// Create a new private, delete-on-close temporary file.
+        fn create_temp_file(&self, cx: &Cx, purpose: &str) -> Result<Box<dyn TempFileHandle>>;
+
+        /// Whether this backend can create file-backed temporary storage.
+        fn supports_file_storage(&self) -> bool {
+            true
+        }
+    }
+
+    /// Snapshot of live temporary-storage execution metrics for a connection.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct TempStoreStatsSnapshot {
+        pub configured_mode: i64,
+        pub effective_mode_is_file: bool,
+        pub budget_bytes: usize,
+        pub sorter_memory_bytes_peak: u64,
+        pub sorter_spill_runs: u64,
+        pub sorter_spill_bytes: u64,
+        pub temp_table_spill_events: u64,
+        pub temp_table_spill_bytes: u64,
+        pub temp_index_spill_events: u64,
+        pub temp_index_spill_bytes: u64,
+        pub temp_files_opened: u64,
+        pub temp_files_closed: u64,
+        pub active_temp_files: u64,
+        pub memory_only_allocations: u64,
+    }
+
+    /// Atomic live counters shared across a connection's temporary structures.
+    #[derive(Debug)]
+    pub struct TempStoreStats {
+        configured_mode: AtomicI64,
+        effective_mode_is_file: AtomicBool,
+        budget_bytes: AtomicUsize,
+        sorter_memory_bytes_peak: AtomicU64,
+        sorter_spill_runs: AtomicU64,
+        sorter_spill_bytes: AtomicU64,
+        temp_table_spill_events: AtomicU64,
+        temp_table_spill_bytes: AtomicU64,
+        temp_index_spill_events: AtomicU64,
+        temp_index_spill_bytes: AtomicU64,
+        temp_files_opened: AtomicU64,
+        temp_files_closed: AtomicU64,
+        active_temp_files: AtomicU64,
+        memory_only_allocations: AtomicU64,
+    }
+
+    impl Default for TempStoreStats {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl TempStoreStats {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                configured_mode: AtomicI64::new(TempStoreMode::Default.as_pragma_i64()),
+                effective_mode_is_file: AtomicBool::new(!cfg!(target_arch = "wasm32")),
+                budget_bytes: AtomicUsize::new(0),
+                sorter_memory_bytes_peak: AtomicU64::new(0),
+                sorter_spill_runs: AtomicU64::new(0),
+                sorter_spill_bytes: AtomicU64::new(0),
+                temp_table_spill_events: AtomicU64::new(0),
+                temp_table_spill_bytes: AtomicU64::new(0),
+                temp_index_spill_events: AtomicU64::new(0),
+                temp_index_spill_bytes: AtomicU64::new(0),
+                temp_files_opened: AtomicU64::new(0),
+                temp_files_closed: AtomicU64::new(0),
+                active_temp_files: AtomicU64::new(0),
+                memory_only_allocations: AtomicU64::new(0),
+            }
+        }
+
+        pub fn update_policy(
+            &self,
+            mode: TempStoreMode,
+            effective: EffectiveTempStore,
+            budget_bytes: usize,
+        ) {
+            self.configured_mode
+                .store(mode.as_pragma_i64(), Ordering::Relaxed);
+            self.effective_mode_is_file.store(
+                matches!(effective, EffectiveTempStore::File),
+                Ordering::Relaxed,
+            );
+            self.budget_bytes.store(budget_bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_sorter_memory(&self, bytes: u64) {
+            self.sorter_memory_bytes_peak
+                .fetch_max(bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_sorter_spill(&self, bytes: u64) {
+            self.sorter_spill_runs.fetch_add(1, Ordering::Relaxed);
+            self.sorter_spill_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_temp_table_spill(&self, bytes: u64) {
+            self.temp_table_spill_events.fetch_add(1, Ordering::Relaxed);
+            self.temp_table_spill_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_temp_index_spill(&self, bytes: u64) {
+            self.temp_index_spill_events.fetch_add(1, Ordering::Relaxed);
+            self.temp_index_spill_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_memory_only_allocation(&self) {
+            self.memory_only_allocations.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_file_opened(&self) {
+            self.temp_files_opened.fetch_add(1, Ordering::Relaxed);
+            self.active_temp_files.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_file_closed(&self) {
+            self.temp_files_closed.fetch_add(1, Ordering::Relaxed);
+            let _ = self
+                .active_temp_files
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(1))
+                });
+        }
+
+        #[must_use]
+        pub fn snapshot(&self) -> TempStoreStatsSnapshot {
+            TempStoreStatsSnapshot {
+                configured_mode: self.configured_mode.load(Ordering::Relaxed),
+                effective_mode_is_file: self.effective_mode_is_file.load(Ordering::Relaxed),
+                budget_bytes: self.budget_bytes.load(Ordering::Relaxed),
+                sorter_memory_bytes_peak: self.sorter_memory_bytes_peak.load(Ordering::Relaxed),
+                sorter_spill_runs: self.sorter_spill_runs.load(Ordering::Relaxed),
+                sorter_spill_bytes: self.sorter_spill_bytes.load(Ordering::Relaxed),
+                temp_table_spill_events: self.temp_table_spill_events.load(Ordering::Relaxed),
+                temp_table_spill_bytes: self.temp_table_spill_bytes.load(Ordering::Relaxed),
+                temp_index_spill_events: self.temp_index_spill_events.load(Ordering::Relaxed),
+                temp_index_spill_bytes: self.temp_index_spill_bytes.load(Ordering::Relaxed),
+                temp_files_opened: self.temp_files_opened.load(Ordering::Relaxed),
+                temp_files_closed: self.temp_files_closed.load(Ordering::Relaxed),
+                active_temp_files: self.active_temp_files.load(Ordering::Relaxed),
+                memory_only_allocations: self.memory_only_allocations.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    /// RAII wrapper around a [`TempFileHandle`] that enforces cancellation
+    /// checks and guarantees exactly-once close/unlink accounting.
+    pub struct TrackedTempFile {
+        inner: Box<dyn TempFileHandle>,
+        stats: Arc<TempStoreStats>,
+        closed: AtomicBool,
+    }
+
+    impl fmt::Debug for TrackedTempFile {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TrackedTempFile")
+                .field("closed", &self.closed.load(Ordering::Relaxed))
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl TrackedTempFile {
+        fn new(inner: Box<dyn TempFileHandle>, stats: Arc<TempStoreStats>) -> Self {
+            stats.record_file_opened();
+            Self {
+                inner,
+                stats,
+                closed: AtomicBool::new(false),
+            }
+        }
+
+        pub fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            self.inner.write_at(cx, offset, data)
+        }
+
+        pub fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            self.inner.read_at(cx, offset, buf)
+        }
+
+        pub fn read_exact_at(&self, cx: &Cx, mut offset: u64, mut buf: &mut [u8]) -> Result<()> {
+            while !buf.is_empty() {
+                let n = self.read_at(cx, offset, buf)?;
+                if n == 0 {
+                    return Err(FrankenError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF reading temporary spill file",
+                    )));
+                }
+                offset = offset.saturating_add(n as u64);
+                buf = &mut buf[n..];
+            }
+            Ok(())
+        }
+
+        pub fn file_size(&self, cx: &Cx) -> Result<u64> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            self.inner.file_size(cx)
+        }
+
+        pub fn truncate(&self, cx: &Cx, size: u64) -> Result<()> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            self.inner.truncate(cx, size)
+        }
+
+        pub fn close_with_cx(&self, cx: &Cx) -> Result<()> {
+            if !self.closed.swap(true, Ordering::AcqRel) {
+                let res = self.inner.close(cx);
+                self.stats.record_file_closed();
+                return res;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for TrackedTempFile {
+        fn drop(&mut self) {
+            if !self.closed.swap(true, Ordering::AcqRel) {
+                let cx = Cx::new();
+                let _ = self.inner.close(&cx);
+                self.stats.record_file_closed();
+            }
+        }
+    }
+
+    /// Live runtime policy passed from `Connection` into `VdbeEngine`,
+    /// `SorterCursor`, `TempSpillPageStore`, and `TEMP`/ephemeral `MemTable`s.
+    #[derive(Clone)]
+    pub struct TempStoreRuntime {
+        mode: TempStoreMode,
+        effective_mode: EffectiveTempStore,
+        budget_bytes: usize,
+        hard_heap_limit_bytes: Option<usize>,
+        backend: Option<Arc<dyn TempFileBackend>>,
+        stats: Arc<TempStoreStats>,
+    }
+
+    impl fmt::Debug for TempStoreRuntime {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TempStoreRuntime")
+                .field("mode", &self.mode)
+                .field("effective_mode", &self.effective_mode)
+                .field("budget_bytes", &self.budget_bytes)
+                .field("hard_heap_limit_bytes", &self.hard_heap_limit_bytes)
+                .field("has_backend", &self.backend.is_some())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Default for TempStoreRuntime {
+        fn default() -> Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            let backend: Option<Arc<dyn TempFileBackend>> = Some(Arc::new(OsTempFileBackend));
+            #[cfg(target_arch = "wasm32")]
+            let backend: Option<Arc<dyn TempFileBackend>> = None;
+            Self::new(
+                TempStoreMode::Default,
+                100 * 1024 * 1024,
+                None,
+                backend,
+                Arc::new(TempStoreStats::new()),
+            )
+        }
+    }
+
+    impl TempStoreRuntime {
+        #[must_use]
+        pub fn new(
+            mode: TempStoreMode,
+            budget_bytes: usize,
+            hard_heap_limit_bytes: Option<usize>,
+            backend: Option<Arc<dyn TempFileBackend>>,
+            stats: Arc<TempStoreStats>,
+        ) -> Self {
+            let backend_supports_file = backend
+                .as_ref()
+                .is_some_and(|b| b.supports_file_storage());
+            let effective_mode = EffectiveTempStore::resolve(mode, backend_supports_file);
+            let effective_budget = budget_bytes.max(1);
+            stats.update_policy(mode, effective_mode, effective_budget);
+            Self {
+                mode,
+                effective_mode,
+                budget_bytes: effective_budget,
+                hard_heap_limit_bytes,
+                backend,
+                stats,
+            }
+        }
+
+        #[must_use]
+        pub const fn mode(&self) -> TempStoreMode {
+            self.mode
+        }
+
+        #[must_use]
+        pub const fn effective_mode(&self) -> EffectiveTempStore {
+            self.effective_mode
+        }
+
+        #[must_use]
+        pub const fn is_file_backed(&self) -> bool {
+            matches!(self.effective_mode, EffectiveTempStore::File)
+        }
+
+        #[must_use]
+        pub const fn budget_bytes(&self) -> usize {
+            self.budget_bytes
+        }
+
+        #[must_use]
+        pub const fn hard_heap_limit_bytes(&self) -> Option<usize> {
+            self.hard_heap_limit_bytes
+        }
+
+        #[must_use]
+        pub fn stats(&self) -> &Arc<TempStoreStats> {
+            &self.stats
+        }
+
+        /// Enforce `hard_heap_limit` when operating in memory-only mode.
+        pub fn check_memory_limit(&self, current_bytes: usize) -> Result<()> {
+            if let Some(limit) = self.hard_heap_limit_bytes
+                && limit > 0
+                && current_bytes > limit
+            {
+                return Err(FrankenError::OutOfMemory);
+            }
+            Ok(())
+        }
+
+        /// Open a tracked VFS-backed temporary file under this runtime.
+        pub fn create_temp_file(&self, cx: &Cx, purpose: &str) -> Result<Arc<TrackedTempFile>> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let Some(backend) = self.backend.as_ref() else {
+                return Err(FrankenError::internal(
+                    "temporary file spill requested without an active TempFileBackend",
+                ));
+            };
+            let handle = backend.create_temp_file(cx, purpose)?;
+            Ok(Arc::new(TrackedTempFile::new(
+                handle,
+                Arc::clone(&self.stats),
+            )))
+        }
+    }
+
+    /// Fallback OS temporary-file backend used by standalone `fsqlite-vdbe`
+    /// unit tests that do not construct a `Connection`-owned `VfsTempFileBackend`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Debug, Default)]
+    pub struct OsTempFileBackend;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct OsTempFileHandle {
+        file: std::sync::Mutex<Option<tempfile::NamedTempFile>>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl TempFileHandle for OsTempFileHandle {
+        fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+            use std::io::{Seek, SeekFrom, Write};
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let mut guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tmp) = guard.as_mut() else {
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "temporary spill file already closed",
+                )));
+            };
+            let file = tmp.as_file_mut();
+            file.seek(SeekFrom::Start(offset))
+                .map_err(map_io_error_for_temp_store)?;
+            file.write_all(data).map_err(map_io_error_for_temp_store)?;
+            Ok(())
+        }
+
+        fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            use std::io::{Read, Seek, SeekFrom};
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let mut guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tmp) = guard.as_mut() else {
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "temporary spill file already closed",
+                )));
+            };
+            let file = tmp.as_file_mut();
+            file.seek(SeekFrom::Start(offset))
+                .map_err(map_io_error_for_temp_store)?;
+            file.read(buf).map_err(map_io_error_for_temp_store)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tmp) = guard.as_ref() else {
+                return Ok(0);
+            };
+            tmp.as_file()
+                .metadata()
+                .map(|m| m.len())
+                .map_err(map_io_error_for_temp_store)
+        }
+
+        fn truncate(&self, cx: &Cx, size: u64) -> Result<()> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let mut guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tmp) = guard.as_mut() else {
+                return Ok(());
+            };
+            tmp.as_file_mut()
+                .set_len(size)
+                .map_err(map_io_error_for_temp_store)
+        }
+
+        fn close(&self, _cx: &Cx) -> Result<()> {
+            let mut guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = guard.take();
+            Ok(())
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl TempFileBackend for OsTempFileBackend {
+        fn create_temp_file(&self, cx: &Cx, _purpose: &str) -> Result<Box<dyn TempFileHandle>> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let tmp = tempfile::NamedTempFile::new().map_err(map_io_error_for_temp_store)?;
+            Ok(Box::new(OsTempFileHandle {
+                file: std::sync::Mutex::new(Some(tmp)),
+            }))
         }
     }
 }
