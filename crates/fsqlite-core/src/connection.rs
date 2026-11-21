@@ -25817,11 +25817,24 @@ impl Connection {
         &self,
         preserve_prior_changes_on_constraint_violation: bool,
         error: &FrankenError,
+        previous_changes: usize,
         previous_total_changes: usize,
         previous_trigger_step_changes: usize,
         previous_last_insert_rowid: i64,
     ) -> bool {
         let error_state = self.take_table_program_error_state();
+        // bd-rwo47: stock raises this error while it prepares the statement,
+        // so there the statement never runs and changes(), total_changes()
+        // and last_insert_rowid() keep their values. It sets changes() to 0
+        // only when a statement that ran fails.
+        if error_is_prepare_time(error) {
+            self.restore_change_tracking_state(
+                previous_changes,
+                previous_total_changes,
+                previous_last_insert_rowid,
+            );
+            return false;
+        }
         // bd-c1vth: trigger steps that completed during the failed statement
         // stay counted, as in stock; the statement's own rows do not.
         let previous_total_changes = previous_total_changes.saturating_add(
@@ -36069,6 +36082,7 @@ impl Connection {
             }
         }
 
+        let previous_changes = self.last_changes.get();
         let previous_total_changes = self.total_changes.get();
         let previous_trigger_step_changes = self.trigger_step_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
@@ -36115,6 +36129,7 @@ impl Connection {
                 preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
                     preserve_prior_changes_on_constraint_violation,
                     &error,
+                    previous_changes,
                     previous_total_changes,
                     previous_trigger_step_changes,
                     previous_last_insert_rowid,
@@ -42537,6 +42552,7 @@ impl Connection {
             schema_change_boundary,
             was_auto,
         } = self.plan_statement_execution(statement.as_ref()).await?;
+        let previous_changes = self.last_changes.get();
         let previous_total_changes = self.total_changes.get();
         let previous_trigger_step_changes = self.trigger_step_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
@@ -42613,6 +42629,7 @@ impl Connection {
                     preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
                         statement_preserves_prior_changes_on_constraint(statement.as_ref()),
                         &error,
+                        previous_changes,
                         previous_total_changes,
                         previous_trigger_step_changes,
                         previous_last_insert_rowid,
@@ -169377,6 +169394,76 @@ fn error_is_conflict_resolvable(error: &FrankenError) -> bool {
             | FrankenError::TriggerRaise(_)
             | FrankenError::RaiseFail(_)
     ) && error_is_constraint_violation(error)
+}
+
+/// bd-rwo47: whether stock raises `error` only while it prepares a statement:
+/// a missing or ambiguous name, a syntax error, a wrong arity, a misplaced
+/// aggregate or a limit on nesting. A statement that fails with one never
+/// runs in stock, so it leaves changes() as the previous statement set it.
+/// fsqlite resolves some names only as a statement runs, which is why the
+/// error, and not where fsqlite raised it, decides.
+fn error_is_prepare_time(error: &FrankenError) -> bool {
+    /// Stock's prepare-time messages that reach fsqlite as a FunctionError.
+    const PREPARE_TIME_MESSAGES: &[&str] = &[
+        "no such table: ",
+        "no such column: ",
+        "no such function: ",
+        "no such index: ",
+        "no such collation sequence: ",
+        "wrong number of arguments to function ",
+        "ambiguous column name: ",
+        "near \"",
+        "incomplete input",
+        "unrecognized token: ",
+        "circular reference: ",
+        "misuse of aggregate",
+        "misuse of window function",
+        "aggregate functions are not allowed in ",
+        "sub-select returns ",
+        "row value misused",
+        "cannot modify ",
+        "cannot UPDATE generated column",
+        "qualified table names are not allowed on INSERT, UPDATE, and DELETE",
+        "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+        "multiple recursive references: ",
+        "multiple references to recursive table: ",
+        "recursive reference in a subquery: ",
+        "VIEWs and/or subqueries nested too deep",
+    ];
+    match error {
+        FrankenError::SyntaxError { .. }
+        | FrankenError::ParseError { .. }
+        | FrankenError::NoSuchTable { .. }
+        | FrankenError::NoSuchColumn { .. }
+        | FrankenError::NoSuchIndex { .. }
+        | FrankenError::AmbiguousColumn { .. }
+        | FrankenError::ViewNestingTooDeep { .. }
+        | FrankenError::ExpressionTooDeep { .. }
+        | FrankenError::TooManyColumns { .. } => true,
+        FrankenError::FunctionError(message) => {
+            PREPARE_TIME_MESSAGES
+                .iter()
+                .any(|prefix| message.starts_with(prefix))
+                // "table t has 2 columns but 3 values were supplied" and
+                // "table t has no column named x".
+                || (message.starts_with("table ")
+                    && (message.contains(" columns but ") || message.contains(" has no column named ")))
+                // "3 values for 2 columns".
+                || message
+                    .split_once(" values for ")
+                    .is_some_and(|(values, rest)| {
+                        values.bytes().all(|byte| byte.is_ascii_digit())
+                            && rest.strip_suffix(" columns").is_some_and(|columns| {
+                                columns.bytes().all(|byte| byte.is_ascii_digit())
+                            })
+                    })
+        }
+        // An UPDATE's SET calling an unknown function reaches here as
+        // "internal error: no such function: NOFUNC/1"; stock refuses it at
+        // prepare as "no such function: nofunc".
+        FrankenError::Internal(message) => message.starts_with("no such function: "),
+        _ => false,
+    }
 }
 
 /// bd-nn29x: does a statement that failed with `error` keep the rows it

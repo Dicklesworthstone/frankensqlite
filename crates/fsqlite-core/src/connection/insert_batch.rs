@@ -310,6 +310,7 @@ impl Connection {
                 self.flush_pending_direct_write_runs(&plan.cx).await?;
             }
             self.clear_prepared_direct_insert_append_hint();
+            let previous_changes = self.last_changes.get();
             let previous_total = self.total_changes.get();
             let previous_trigger_steps = self.trigger_step_changes.get();
             let previous_rowid = self.current_last_insert_rowid();
@@ -334,6 +335,7 @@ impl Connection {
                     self.restore_failed_statement_tracking(
                         statement_preserves_prior_changes_on_constraint(&plan.statement),
                         &error,
+                        previous_changes,
                         previous_total,
                         previous_trigger_steps,
                         previous_rowid,
