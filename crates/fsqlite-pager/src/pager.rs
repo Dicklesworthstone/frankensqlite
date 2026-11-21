@@ -21545,6 +21545,77 @@ where
         self.cache.clear();
     }
 
+    /// Configure ordinary database file memory-mapping (`PRAGMA mmap_size`,
+    /// `bd-dwjnq.3`). Passing `0` immediately releases any active OS mapping.
+    pub async fn set_mmap_size(
+        &self,
+        cx: &Cx,
+        limit_bytes: u64,
+    ) -> Result<fsqlite_vfs::VfsMmapStatus> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        let file = shared_db_file_read(&db_file, cx).await?;
+        file.set_mmap_size(cx, limit_bytes)
+    }
+
+    /// Observe live ordinary database file memory-mapping status (`bd-dwjnq.3`).
+    #[must_use]
+    pub fn mmap_status(&self) -> fsqlite_vfs::VfsMmapStatus {
+        let Ok(db_file) = self.inner.lock().map(|inner| Arc::clone(&inner.db_file)) else {
+            return fsqlite_vfs::VfsMmapStatus::default();
+        };
+        let Ok(file) = db_file.try_read() else {
+            return fsqlite_vfs::VfsMmapStatus::default();
+        };
+        file.mmap_status()
+    }
+
+    /// Observe live ordinary database file memory-mapping status, waiting
+    /// asynchronously if `db_file` is transiently write-locked.
+    pub async fn mmap_status_async(&self, cx: &Cx) -> Result<fsqlite_vfs::VfsMmapStatus> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        let file = shared_db_file_read(&db_file, cx).await?;
+        Ok(file.mmap_status())
+    }
+
+    /// Synchronously release any active ordinary database file mmap during
+    /// connection close/teardown, independent of caller `Cx` cancellation
+    /// (`bd-dwjnq.3`).
+    pub fn unmap_mmap_for_close(&self) {
+        let Ok(db_file) = self.inner.lock().map(|inner| Arc::clone(&inner.db_file)) else {
+            return;
+        };
+        if let Ok(file) = db_file.try_read() {
+            let cx = Cx::new();
+            let _ = file.set_mmap_size(&cx, 0);
+        }
+    }
+
+    /// Inject deterministic `mmap` admission failures for fallback testing (`bd-dwjnq.3`).
+    #[doc(hidden)]
+    pub fn inject_mmap_failure(&self, remaining_failures: u64) -> Result<()> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        let file = db_file.try_read().map_err(|_| FrankenError::Busy)?;
+        file.inject_mmap_failure(remaining_failures)
+    }
+
     /// Open an existing encrypted database in locked mode without parsing its
     /// ciphertext page 1 header yet. The caller must invoke
     /// [`Self::unlock_with_cipher`] after `PRAGMA key` unwraps the DEK.
@@ -31104,7 +31175,10 @@ where
     /// snapshot. Every lock is tried, never waited for: contention declines.
     fn snapshot_page_reader(&self) -> Option<crate::snapshot_reader::SnapshotPageReader> {
         if self.journal_mode != JournalMode::Wal
-            || self.mode != TransactionMode::ReadOnly
+            || !matches!(
+                self.mode,
+                TransactionMode::ReadOnly | TransactionMode::Concurrent | TransactionMode::Deferred
+            )
             || self.is_writer
             || self.writes_observed
             || self.finished
@@ -31131,14 +31205,20 @@ where
         if frames.publication != captured {
             return None;
         }
-        let db_file = self.db_file.try_read().ok()?.positional_reader()?;
-        Some(crate::snapshot_reader::SnapshotPageReader::new_with_cipher(
-            db_file,
-            Some(frames),
-            self.pool.page_size(),
-            self.published_db_size.get(),
-            self.page_cipher.clone(),
-        ))
+        let (db_file, db_mmap) = {
+            let guard = self.db_file.try_read().ok()?;
+            (guard.positional_reader()?, guard.read_only_mmap_view())
+        };
+        Some(
+            crate::snapshot_reader::SnapshotPageReader::new_with_cipher_and_mmap(
+                db_file,
+                Some(frames),
+                self.pool.page_size(),
+                self.published_db_size.get(),
+                self.page_cipher.clone(),
+                db_mmap,
+            ),
+        )
     }
 
     fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> {
