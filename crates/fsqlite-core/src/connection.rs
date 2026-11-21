@@ -19798,8 +19798,10 @@ impl Connection {
             .collect()
     }
 
+    /// A partial index's stored predicate, parsed, with its row-value
+    /// comparisons expanded as every reader of it expands them (bd-65jog).
     fn parse_partial_index_predicate_for_integrity(index: &IndexSchema) -> Result<Option<Expr>> {
-        index
+        let predicate = index
             .where_clause
             .as_deref()
             .map(fsqlite_parser::expr::parse_expr)
@@ -19809,7 +19811,11 @@ impl Connection {
                     "index `{}` has an invalid partial index predicate: {err}",
                     index.name
                 ),
-            })
+            })?;
+        Ok(predicate.map(|mut predicate| {
+            fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+            predicate
+        }))
     }
 
     // ---------------------------------------------------------------------------
@@ -45587,9 +45593,12 @@ impl Connection {
                     // instead of raising the scalar "returns N columns - expected
                     // 1" arity error. Grant the exemption only when the value IS
                     // the subquery, mirroring the row-value comparison sites.
+                    // bd-65jog: a one-column list too, so `SET (n) = (SELECT 1,
+                    // 2)` reaches codegen's check and stock's "1 columns
+                    // assigned 2 values".
                     let row_value_ctx = matches!(
                         &assignment.target,
-                        fsqlite_ast::AssignmentTarget::ColumnList(names) if names.len() > 1
+                        fsqlite_ast::AssignmentTarget::ColumnList(_)
                     ) && matches!(&assignment.value, Expr::Subquery(_, _));
                     {
                         let _row_value_guard = BoolCellRestoreGuard::new(
@@ -56189,14 +56198,22 @@ impl Connection {
         visible_name: &str,
         table: &TableSchema,
     ) -> bool {
-        let mut normalized_query: Vec<Expr> = query_conjuncts
-            .iter()
-            .map(|conjunct| {
-                let mut owned = (*conjunct).clone();
-                Self::normalize_partial_predicate_columns(&mut owned, &[visible_name]);
-                owned
-            })
-            .collect();
+        // bd-65jog: the predicate arrives expanded
+        // (`parse_partial_index_predicate_for_integrity`), and so may the
+        // statement, so each query conjunct, bound to the visible source, is
+        // expanded the same way and contributes its terms. Stock's
+        // sqlite3ExprImpliesExpr compares a row-value predicate term whole, so
+        // it refuses INDEXED BY for the scalar spelling `a = 'x' AND n = 2` of a
+        // `(a, n) = ('x', 2)` predicate. That cannot be told apart here once the
+        // statement is expanded, so both spellings are accepted (the rows are
+        // the same; bd-wpfqs).
+        let mut normalized_query: Vec<Expr> = Vec::with_capacity(query_conjuncts.len());
+        for conjunct in query_conjuncts {
+            let mut owned = (*conjunct).clone();
+            Self::normalize_partial_predicate_columns(&mut owned, &[visible_name]);
+            fsqlite_ast::row_value::lower_row_values_in_expr(&mut owned);
+            normalized_query.extend(decompose_where(&owned).into_iter().cloned());
+        }
 
         // SQLite's LIKE/GLOB prefix optimization contributes virtual range
         // terms even when the chosen partial index is on another column.
@@ -62527,7 +62544,15 @@ impl Connection {
             }
 
             let sql = format!("SELECT {trimmed}");
-            let statement = parse_single_statement(&sql)?;
+            let mut statement = parse_single_statement(&sql)?;
+            // bd-65jog: stock takes a row-value DEFAULT as a constant at CREATE
+            // TABLE and applies its misuse rules where the default is used;
+            // its comparisons are expanded as codegen's DEFAULT path does.
+            if fsqlite_ast::row_value::check_statement_row_values(&statement)
+                .map_err(|misused| FrankenError::FunctionError(misused.to_string()))?
+            {
+                fsqlite_ast::row_value::lower_row_values_in_statement(&mut statement);
+            }
             if let Statement::Select(select) = &statement
                 && select.with.is_none()
                 && select.order_by.is_empty()
@@ -74199,7 +74224,7 @@ impl Connection {
         }
 
         if let Some(predicate_sql) = index.where_clause.as_deref() {
-            let predicate = fsqlite_parser::expr::parse_expr(predicate_sql).map_err(|error| {
+            let mut predicate = fsqlite_parser::expr::parse_expr(predicate_sql).map_err(|error| {
                 FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "index `{}` on table `{}` has invalid partial predicate: {error}",
@@ -74207,6 +74232,8 @@ impl Connection {
                     ),
                 }
             })?;
+            // bd-65jog: read as every consumer reads it, row values expanded.
+            fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
             if index_expr_uses_collation_dependency(self, &predicate, table, collation) {
                 return Ok(true);
             }
@@ -74280,6 +74307,11 @@ impl Connection {
         } else {
             Vec::new()
         };
+        // bd-65jog: the stored predicate keeps its text as written, so its row
+        // values are lowered after parsing here, as the DML maintenance and
+        // planner readers do. Unlowered, the CREATE INDEX backfill left an
+        // existing row matching `(a, n) = ('x', 2)` out of the index, and
+        // integrity_check reported it missing (stock: ok).
         let where_expr = index
             .where_clause
             .as_deref()
@@ -74290,7 +74322,11 @@ impl Connection {
                     "index `{}` on table `{}` has an invalid partial predicate: {e}",
                     index.name, table.name
                 ),
-            })?;
+            })?
+            .map(|mut predicate| {
+                fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+                predicate
+            });
 
         let collation_registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
         for collation in index.key_collations.iter().flatten() {
@@ -90419,7 +90455,13 @@ impl Connection {
                 // the query, so fail closed by omitting that index rather than
                 // silently treating it as an unrestricted one.
                 let partial_where = match index.where_clause.as_deref() {
-                    Some(sql) => Some(fsqlite_parser::expr::parse_expr(sql).ok()?),
+                    Some(sql) => {
+                        let mut predicate = fsqlite_parser::expr::parse_expr(sql).ok()?;
+                        // bd-65jog: expanded as the statement's WHERE is, so
+                        // that WHERE can imply a row-value predicate.
+                        fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+                        Some(predicate)
+                    }
                     None => None,
                 };
                 let rows_per_key = stat1
@@ -123728,9 +123770,11 @@ fn resolve_subquery_star_columns(select: &SelectStatement, schema: &[TableSchema
     basic
 }
 
+/// The operator as stock's column-count error names it (sqlite3SelectOpName).
 fn compound_op_error_name(op: CompoundOp) -> &'static str {
     match op {
-        CompoundOp::Union | CompoundOp::UnionAll => "UNION",
+        CompoundOp::Union => "UNION",
+        CompoundOp::UnionAll => "UNION ALL",
         CompoundOp::Intersect => "INTERSECT",
         CompoundOp::Except => "EXCEPT",
     }
@@ -148320,12 +148364,22 @@ fn add_column_default_is_null_literal(dv: &DefaultValue) -> bool {
 fn default_expr_is_self_contained(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_, _) => true,
+        // bd-65jog: a row value of constants is constant to stock
+        // (sqlite3ExprIsConstantOrFunction); its misuse rules apply where the
+        // default is used, not here.
+        Expr::RowValue(items, _) => items.iter().all(default_expr_is_self_contained),
+        // A row-value IN list is a VALUES subquery to stock
+        // (sqlite3ExprListToValues), so not constant.
+        Expr::In { expr: inner, set: InSet::List(_), .. }
+            if matches!(inner.as_ref(), Expr::RowValue(..)) =>
+        {
+            false
+        }
         Expr::BoundOuterValue { .. }
         | Expr::Column(_, _)
         | Expr::Exists { .. }
         | Expr::Subquery(_, _)
         | Expr::Raise { .. }
-        | Expr::RowValue(_, _)
         | Expr::Placeholder(_, _) => false,
         Expr::BinaryOp { left, right, .. } => {
             default_expr_is_self_contained(left) && default_expr_is_self_contained(right)
@@ -150035,9 +150089,11 @@ fn planner_expression_index_residuals_match(
     let Some(predicate_sql) = index.where_clause.as_deref() else {
         return residuals.is_empty();
     };
-    let Ok(predicate) = fsqlite_parser::expr::parse_expr(predicate_sql) else {
+    let Ok(mut predicate) = fsqlite_parser::expr::parse_expr(predicate_sql) else {
         return false;
     };
+    // bd-65jog: expanded as the statement's residuals are.
+    fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
     let predicate_terms = decompose_where(&predicate);
 
     predicate_terms.iter().all(|predicate_term| {
@@ -157979,7 +158035,17 @@ impl<'a> SelectStructureResolver<'a> {
                     && let Some(right_width) = right_width
                     && width != right_width
                 {
-                    let (op, _) = &select.body.compounds[index];
+                    let (op, right_core) = &select.body.compounds[index];
+                    // bd-65jog: stock names the arm on the right of the
+                    // mismatch (sqlite3SelectWrongNumTermsError): a one-row
+                    // VALUES there keeps its VALUES flag. A multi-row VALUES
+                    // is a co-routine to stock by then and is named by its
+                    // operator, like a SELECT.
+                    if matches!(right_core, SelectCore::Values(rows) if rows.len() == 1) {
+                        return Err(FrankenError::FunctionError(
+                            "all VALUES must have the same number of terms".to_owned(),
+                        ));
+                    }
                     // Stock SQLite reports this as a bare SQLITE_ERROR message with no
                     // byte-offset prefix (same class as the VALUES-arity fix); ParseError's
                     // Display would prepend "SQL error at offset 0: ". Emit verbatim.
@@ -158652,6 +158718,59 @@ impl<'a> SelectStructureResolver<'a> {
         }
     }
 
+    /// `sqlite3ExprVectorSize` of a comparison or simple-CASE operand: a row
+    /// value's length, a subquery's column count in the visible CTE scope,
+    /// else 1.
+    fn operand_vector_width(&self, operand: &Expr) -> usize {
+        match operand {
+            Expr::RowValue(values, _) => values.len(),
+            Expr::Subquery(sub, _) => self.connection.select_result_column_count(
+                sub,
+                &self.visible_ctes(),
+                &mut Vec::new(),
+            ),
+            _ => 1,
+        }
+    }
+
+    /// bd-65jog: two row values of one size compare element by element (and
+    /// stock's WHERE analysis splits them so), so an element that is a
+    /// multi-column subquery facing a row value keeps its width, as an
+    /// immediate comparison operand does. Nested row values pair again.
+    fn validate_row_value_pairs(
+        &mut self,
+        left: &'a [Expr],
+        right: &'a [Expr],
+        named_windows: &'a [fsqlite_ast::WindowDef],
+    ) -> Result<()> {
+        for (left, right) in left.iter().zip(right) {
+            if let (Expr::RowValue(lefts, _), Expr::RowValue(rights, _)) = (left, right)
+                && lefts.len() == rights.len()
+            {
+                self.validate_row_value_pairs(lefts, rights, named_windows)?;
+                continue;
+            }
+            let left_faces_row_value =
+                matches!(left, Expr::Subquery(..)) && self.operand_vector_width(right) > 1;
+            let right_faces_row_value =
+                matches!(right, Expr::Subquery(..)) && self.operand_vector_width(left) > 1;
+            let connection = self.connection;
+            {
+                let _row_value_guard = BoolCellRestoreGuard::new(
+                    &connection.scalar_subquery_row_value_context,
+                    left_faces_row_value,
+                );
+                self.validate_expr(left, named_windows)?;
+            }
+            let _row_value_guard = BoolCellRestoreGuard::new(
+                &connection.scalar_subquery_row_value_context,
+                right_faces_row_value,
+            );
+            self.validate_expr(right, named_windows)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn validate_expr(
         &mut self,
@@ -158721,6 +158840,12 @@ impl<'a> SelectStructureResolver<'a> {
                         || (right_multicol_sub && operand_width(left) == 1)
                     {
                         return Err(FrankenError::FunctionError("row value misused".to_owned()));
+                    }
+                    if let (Expr::RowValue(lefts, _), Expr::RowValue(rights, _)) =
+                        (left.as_ref(), right.as_ref())
+                        && lefts.len() == rights.len()
+                    {
+                        return self.validate_row_value_pairs(lefts, rights, named_windows);
                     }
                 }
                 let left_faces_row_value =
@@ -158834,11 +158959,32 @@ impl<'a> SelectStructureResolver<'a> {
                 else_expr,
                 ..
             } => {
+                // bd-65jog: a simple CASE whose operand and WHENs have one
+                // size above 1 compares them as `=` does, so a multi-column
+                // subquery there keeps its width.
+                let row_value_case = operand.as_deref().is_some_and(|operand| {
+                    let width = self.operand_vector_width(operand);
+                    width > 1
+                        && whens
+                            .iter()
+                            .all(|(condition, _)| self.operand_vector_width(condition) == width)
+                });
+                let connection = self.connection;
                 if let Some(operand) = operand {
+                    let _row_value_guard = BoolCellRestoreGuard::new(
+                        &connection.scalar_subquery_row_value_context,
+                        row_value_case && matches!(operand.as_ref(), Expr::Subquery(..)),
+                    );
                     self.validate_expr(operand, named_windows)?;
                 }
                 for (condition, value) in whens {
-                    self.validate_expr(condition, named_windows)?;
+                    {
+                        let _row_value_guard = BoolCellRestoreGuard::new(
+                            &connection.scalar_subquery_row_value_context,
+                            row_value_case && matches!(condition, Expr::Subquery(..)),
+                        );
+                        self.validate_expr(condition, named_windows)?;
+                    }
                     self.validate_expr(value, named_windows)?;
                 }
                 if let Some(else_expr) = else_expr {

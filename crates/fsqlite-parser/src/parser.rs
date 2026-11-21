@@ -1786,6 +1786,25 @@ impl Parser {
         };
         self.expect_token(&TokenKind::Eq)?;
         let value = self.parse_expr()?;
+        // bd-65jog: stock checks `SET (a, b) = <source>` as it parses it
+        // (sqlite3ExprListAppendVector), so a source that is not a subquery
+        // must give one value per column before any name resolves, in UPDATE,
+        // in an upsert and in a trigger body at CREATE TRIGGER. A subquery's
+        // width is checked after its names resolve, at codegen.
+        if let AssignmentTarget::ColumnList(columns) = &target
+            && !matches!(value, Expr::Subquery(..))
+        {
+            let values = match &value {
+                Expr::RowValue(items, _) => items.len(),
+                _ => 1,
+            };
+            if values != columns.len() {
+                return Err(self.err_semantic(format!(
+                    "{} columns assigned {values} values",
+                    columns.len()
+                )));
+            }
+        }
         Ok(Assignment { target, value })
     }
 
@@ -11571,6 +11590,40 @@ mod tests {
             }
         } else {
             unreachable!("expected Select");
+        }
+    }
+
+    /// bd-65jog: stock's parser checks a column list's source size.
+    #[test]
+    fn set_column_list_source_size_is_checked_while_parsing() {
+        for (sql, message) in [
+            (
+                "UPDATE t SET (a, b) = (1, 2, 3)",
+                "2 columns assigned 3 values",
+            ),
+            ("UPDATE t SET (a, b) = 1", "2 columns assigned 1 values"),
+            ("UPDATE t SET (a) = (1, 2)", "1 columns assigned 2 values"),
+            (
+                "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET (a, b) = (1, 2, 3)",
+                "2 columns assigned 3 values",
+            ),
+            (
+                "CREATE TRIGGER r AFTER INSERT ON t BEGIN UPDATE t SET (a, b, c) = (1, 2); END",
+                "3 columns assigned 2 values",
+            ),
+        ] {
+            let error = parse_first_statement_with_tail(sql).expect_err(sql);
+            assert_eq!(error.kind, ParseErrorKind::Semantic, "`{sql}`");
+            assert_eq!(error.message, message, "`{sql}`");
+        }
+        // A subquery's width is not known here; matching sizes parse.
+        for sql in [
+            "UPDATE t SET (a, b) = (SELECT 1, 2, 3)",
+            "UPDATE t SET (a, b) = (1, 2)",
+            "UPDATE t SET (a) = 5",
+            "UPDATE t SET a = (1, 2)",
+        ] {
+            parse_one(sql);
         }
     }
 }

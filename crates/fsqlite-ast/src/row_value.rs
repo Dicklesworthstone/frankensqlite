@@ -8,7 +8,10 @@
 //! - `(a, b) <> (c, d)` to `a <> c OR b <> d`;
 //! - `IS` and `IS NOT` the same way, with `IS` / `IS NOT` per element;
 //! - `<`, `<=`, `>` and `>=` lexicographically: `a < c OR (a = c AND b <= d)`;
-//! - `BETWEEN` to two such comparisons.
+//! - `BETWEEN` to two such comparisons;
+//! - a simple `CASE v WHEN w THEN ...` whose operand and WHENs are row values
+//!   of one size to `CASE WHEN v = w THEN ...`, each WHEN compared element by
+//!   element as stock's `codeVectorCompare` compares it (bd-65jog).
 //!
 //! A row-value subquery `(SELECT x, y ...)` becomes one scalar subquery per
 //! column, each reading the same first row. The rewrite reaches every
@@ -25,10 +28,17 @@
 //!   `SET` value for one column, a `VALUES` item, an element of another row
 //!   value, and so on.
 //!
+//! One position takes more: stock's WHERE analysis (`exprAnalyze` in where.c)
+//! splits a top-level AND conjunct `X = Y` or `X IS Y` of a WHERE or ON clause,
+//! whose operands are row values of one size and not both subqueries, into
+//! one term per element, splits those terms again, and never codes the
+//! original. An element of such a comparison may itself be a row value:
+//! `((a, b), c) = ((1, 2), 3)` is accepted there and misuse everywhere else.
+//!
 //! Some row values are left as they are, for the paths that handle them: the
-//! left side of `IN` and the list rows beside it, `SET (a, b) = (...)`, the
-//! operand of a simple `CASE`, and a comparison with a subquery whose width
-//! is not known from its text (`SELECT *`, a compound, `VALUES`).
+//! left side of `IN` and the list rows beside it, `SET (a, b) = (...)`, and a
+//! comparison or simple `CASE` with a subquery whose width is not known from
+//! its text (`SELECT *`, a compound, `VALUES`).
 
 use std::fmt;
 
@@ -159,6 +169,26 @@ fn equal_vector_sizes(sizes: &[Option<usize>]) -> Option<bool> {
     Some(first > 1)
 }
 
+/// Whether a simple CASE with this operand and these WHENs compares row
+/// values: the operand's size is known and above 1, and every WHEN has it.
+fn case_operand_lowers(operand: &Expr, whens: &[(Expr, Expr)]) -> bool {
+    let Some(size) = vector_size(operand) else {
+        return false;
+    };
+    size > 1
+        && whens
+            .iter()
+            .all(|(when, _)| vector_size(when) == Some(size))
+}
+
+/// Whether stock's WHERE analysis splits `left OP right`, for OP `=` or `IS`,
+/// into one term per element: both sizes known, equal and above 1, and not
+/// both subqueries (`exprAnalyze`, where.c).
+fn splits_into_terms(left: &Expr, right: &Expr) -> bool {
+    equal_vector_sizes(&[vector_size(left), vector_size(right)]) == Some(true)
+        && !(matches!(left, Expr::Subquery(..)) && matches!(right, Expr::Subquery(..)))
+}
+
 // ---------------------------------------------------------------------------
 // Check: SQLite's misuse rules, and whether anything needs the rewrite.
 // ---------------------------------------------------------------------------
@@ -234,7 +264,9 @@ fn check_scalar(expr: &Expr) -> Check {
                 for (when, _) in whens {
                     sizes_agree(operand_size, vector_size(when))?;
                 }
-                // A row-value operand is left to the paths after this one.
+                // A row-value operand whose WHENs all have its size is
+                // rewritten to a searched CASE (bd-65jog).
+                changed |= case_operand_lowers(operand, whens);
                 let scalar_operand = operand_size == Some(1);
                 changed |= if scalar_operand {
                     check_scalar(operand)?
@@ -306,6 +338,38 @@ fn check_scalar(expr: &Expr) -> Check {
         | Expr::Column(..)
         | Expr::Raise { .. }
         | Expr::Placeholder(..) => Ok(false),
+    }
+}
+
+/// `expr` is a WHERE or ON clause. Each top-level AND conjunct that stock's
+/// WHERE analysis splits (see [`splits_into_terms`]) is checked as its element
+/// terms, each one again as a conjunct, so an element may be a row value; any
+/// other conjunct stands where one value is expected.
+fn check_where(expr: &Expr) -> Check {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } => Ok(check_where(left)? | check_where(right)?),
+        Expr::BinaryOp {
+            left,
+            op: op @ (BinaryOp::Eq | BinaryOp::Is),
+            right,
+            span,
+        } if splits_into_terms(left, right) => {
+            let (Some(lefts), Some(rights)) = (vector_elements(left), vector_elements(right))
+            else {
+                return check_scalar(expr);
+            };
+            for (left, right) in lefts.into_iter().zip(rights) {
+                check_where(&binary(left, *op, right, *span))?;
+            }
+            // The comparison itself is rewritten.
+            Ok(true)
+        }
+        other => check_scalar(other),
     }
 }
 
@@ -397,7 +461,7 @@ fn check_from(from: &FromClause) -> Check {
     for join in &from.joins {
         changed |= check_source(&join.table)?;
         if let Some(JoinConstraint::On(expr)) = &join.constraint {
-            changed |= check_scalar(expr)?;
+            changed |= check_where(expr)?;
         }
     }
     Ok(changed)
@@ -420,7 +484,7 @@ fn check_core(core: &SelectCore) -> Check {
                 changed |= check_from(from)?;
             }
             if let Some(expr) = where_clause {
-                changed |= check_scalar(expr)?;
+                changed |= check_where(expr)?;
             }
             for expr in group_by {
                 changed |= check_scalar(expr)?;
@@ -511,7 +575,7 @@ fn check_update(update: &UpdateStatement) -> Check {
         changed |= check_from(from)?;
     }
     if let Some(expr) = &update.where_clause {
-        changed |= check_scalar(expr)?;
+        changed |= check_where(expr)?;
     }
     changed |= check_result_columns(&update.returning)?;
     changed |= check_ordering(&update.order_by)?;
@@ -521,7 +585,7 @@ fn check_update(update: &UpdateStatement) -> Check {
 fn check_delete(delete: &DeleteStatement) -> Check {
     let mut changed = check_with(delete.with.as_ref())?;
     if let Some(expr) = &delete.where_clause {
-        changed |= check_scalar(expr)?;
+        changed |= check_where(expr)?;
     }
     changed |= check_result_columns(&delete.returning)?;
     changed |= check_ordering(&delete.order_by)?;
@@ -620,8 +684,8 @@ fn expand_order(
     )
 }
 
-/// The rewrite of one node, when it is a row-value comparison or BETWEEN
-/// whose operand sizes are known and agree.
+/// The rewrite of one node, when it is a row-value comparison, BETWEEN or
+/// simple CASE whose operand sizes are known and agree.
 fn lowered_node(expr: &Expr) -> Option<Expr> {
     match expr {
         Expr::BinaryOp {
@@ -660,6 +724,30 @@ fn lowered_node(expr: &Expr) -> Option<Expr> {
             let high = expand_comparison(&operand, high_op, &vector_elements(high)?, *span)?;
             Some(binary(low, combine, high, *span))
         }
+        // CASE v WHEN w THEN r ... END is CASE WHEN v = w THEN r ... END; the
+        // `=` is then lowered element by element below. The operand is
+        // evaluated once per WHEN, not once, which only a non-deterministic
+        // operand can tell apart (the order comparisons above repeat their
+        // operands the same way).
+        Expr::Case {
+            operand: Some(operand),
+            whens,
+            else_expr,
+            span,
+        } if case_operand_lowers(operand, whens) => Some(Expr::Case {
+            operand: None,
+            whens: whens
+                .iter()
+                .map(|(when, then)| {
+                    (
+                        binary((**operand).clone(), BinaryOp::Eq, when.clone(), *span),
+                        then.clone(),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr.clone(),
+            span: *span,
+        }),
         _ => None,
     }
 }
@@ -1166,5 +1254,63 @@ mod tests {
         assert_eq!(check_scalar(&expr), Ok(true));
         lower_row_values_in_expr(&mut expr);
         assert_eq!(check_scalar(&expr), Ok(false));
+    }
+
+    #[test]
+    fn a_simple_case_over_row_values_is_a_searched_case() {
+        let case = |operand: Expr, when: Expr| Expr::Case {
+            operand: Some(Box::new(operand)),
+            whens: vec![(when, int(1))],
+            else_expr: Some(Box::new(int(0))),
+            span: Span::ZERO,
+        };
+        let pair = || row(vec![col("a"), col("n")]);
+        assert_eq!(
+            lowered(case(pair(), row(vec![int(1), int(2)]))),
+            Ok(Expr::Case {
+                operand: None,
+                whens: vec![(
+                    cmp(
+                        cmp(col("a"), BinaryOp::Eq, int(1)),
+                        BinaryOp::And,
+                        cmp(col("n"), BinaryOp::Eq, int(2)),
+                    ),
+                    int(1),
+                )],
+                else_expr: Some(Box::new(int(0))),
+                span: Span::ZERO,
+            })
+        );
+        // The sizes must still agree, and a scalar CASE is no rewrite.
+        assert_eq!(lowered(case(pair(), int(1))), Err(RowValueMisused));
+        assert_eq!(lowered(case(int(1), pair())), Err(RowValueMisused));
+        assert_eq!(check_scalar(&case(col("a"), int(1))), Ok(false));
+    }
+
+    #[test]
+    fn where_conjuncts_may_compare_nested_row_values() {
+        let nested = |first: Expr| row(vec![row(vec![first, col("n")]), int(1)]);
+        let eq = || cmp(nested(col("a")), BinaryOp::Eq, nested(int(5)));
+        // A WHERE conjunct, alone or under AND, splits into element terms.
+        assert_eq!(check_where(&eq()), Ok(true));
+        let conjunction = cmp(cmp(col("n"), BinaryOp::Gt, int(0)), BinaryOp::And, eq());
+        assert_eq!(check_where(&conjunction), Ok(true));
+        let mut lowered_where = conjunction;
+        lower_row_values_in_expr(&mut lowered_where);
+        assert_eq!(check_scalar(&lowered_where), Ok(false));
+        // Anywhere else a nested row value is misuse: as one value, under OR,
+        // and with an order comparison.
+        assert_eq!(check_scalar(&eq()), Err(RowValueMisused));
+        assert_eq!(
+            check_where(&cmp(eq(), BinaryOp::Or, int(1))),
+            Err(RowValueMisused)
+        );
+        assert_eq!(
+            check_where(&cmp(nested(col("a")), BinaryOp::Lt, nested(int(5)))),
+            Err(RowValueMisused)
+        );
+        // An element pair whose sizes differ is misuse even in a conjunct.
+        let uneven = cmp(nested(col("a")), BinaryOp::Eq, row(vec![col("a"), int(1)]));
+        assert_eq!(check_where(&uneven), Err(RowValueMisused));
     }
 }

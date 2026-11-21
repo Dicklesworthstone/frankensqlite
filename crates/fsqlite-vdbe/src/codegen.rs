@@ -1077,8 +1077,7 @@ pub fn bind_explicit_index(
     }
 
     if let Some(predicate) = stmt.where_clause.as_ref() {
-        validate_explicit_index_expr_shape(predicate, "partial-index predicate")?;
-        validate_single_table_expr_columns(predicate, table, None)?;
+        validate_partial_index_predicate(predicate, table)?;
     }
 
     let all_terms_are_simple = simple_columns.len() == stmt.columns.len();
@@ -1162,6 +1161,89 @@ fn validate_explicit_index_collation(
 
 fn malformed_explicit_index_expr(context: &str, detail: &str) -> CodegenError {
     CodegenError::Unsupported(format!("malformed CREATE INDEX {context}: {detail}"))
+}
+
+/// A partial index's WHERE. bd-65jog: its row-value comparisons are checked
+/// against stock's misuse rules and expanded, as every reader of the stored
+/// text expands them (`parse_default_expr`), and the expanded predicate is
+/// what must have an index expression's shape. A row value that survives the
+/// expansion stands beside `IN`: stock turns a row-value IN list into a VALUES
+/// subquery (sqlite3ExprListToValues) and refuses it as one.
+fn validate_partial_index_predicate(
+    predicate: &Expr,
+    table: &TableSchema,
+) -> Result<(), CodegenError> {
+    let mut lowered = predicate.clone();
+    fsqlite_ast::row_value::check_and_lower_row_values_in_expr(&mut lowered)
+        .map_err(|misused| CodegenError::SqlError(misused.to_string()))?;
+    if expr_contains_row_value(&lowered) {
+        return Err(CodegenError::SqlError(
+            "subqueries prohibited in partial index WHERE clauses".to_owned(),
+        ));
+    }
+    validate_explicit_index_expr_shape(&lowered, "partial-index predicate")?;
+    validate_single_table_expr_columns(&lowered, table, None)
+}
+
+/// Whether a row value appears in `expr` outside its subqueries.
+fn expr_contains_row_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::RowValue(..) => true,
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => expr_contains_row_value(left) || expr_contains_row_value(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => expr_contains_row_value(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_row_value(expr)
+                || expr_contains_row_value(low)
+                || expr_contains_row_value(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_row_value(expr)
+                || matches!(set, InSet::List(items) if items.iter().any(expr_contains_row_value))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_row_value(expr)
+                || expr_contains_row_value(pattern)
+                || escape.as_deref().is_some_and(expr_contains_row_value)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_contains_row_value)
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_row_value(when_expr) || expr_contains_row_value(then_expr)
+                })
+                || else_expr.as_deref().is_some_and(expr_contains_row_value)
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            matches!(args, FunctionArgs::List(items) if items.iter().any(expr_contains_row_value))
+                || filter.as_deref().is_some_and(expr_contains_row_value)
+        }
+        Expr::Subquery(..)
+        | Expr::Exists { .. }
+        | Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(..)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(..) => false,
+    }
 }
 
 fn validate_explicit_index_expr_shape(expr: &Expr, context: &str) -> Result<(), CodegenError> {
@@ -1439,7 +1521,7 @@ fn upsert_target_matches_index_predicate(
     let Some(target_predicate) = target.where_clause.as_ref() else {
         return false;
     };
-    let Ok(index_predicate) = parse_sql_expr(index_predicate_sql) else {
+    let Some(index_predicate) = parse_default_expr(index_predicate_sql) else {
         return false;
     };
     expressions_match_table_locally(target_predicate, &index_predicate, table, None)
@@ -1547,15 +1629,33 @@ fn emit_upsert_assignments(
                     excluded_hidden_rowid_reg,
                 );
             }
+            // bd-65jog: `SET (v) = <scalar>` is `SET v = <scalar>`, as in UPDATE.
+            AssignmentTarget::ColumnList(columns)
+                if columns.len() == 1 && !matches!(assign.value, Expr::RowValue(..)) =>
+            {
+                let dest_reg =
+                    update_target_reg(table, &columns[0], target_regs, hidden_rowid_target_reg)?;
+                emit_upsert_expr(
+                    b,
+                    &assign.value,
+                    dest_reg,
+                    existing_ctx,
+                    excluded_ctx,
+                    table,
+                    existing_hidden_rowid_reg,
+                    excluded_hidden_rowid_reg,
+                );
+            }
             AssignmentTarget::ColumnList(columns) => {
                 let Expr::RowValue(values, _) = &assign.value else {
                     return Err(CodegenError::Unsupported(
                         "multi-column SET requires a row-value expression".to_owned(),
                     ));
                 };
+                // The parser already refuses this (bd-65jog); stock's text.
                 if columns.len() != values.len() {
-                    return Err(CodegenError::Unsupported(format!(
-                        "multi-column SET arity mismatch: {} targets, {} values",
+                    return Err(CodegenError::SqlError(format!(
+                        "{} columns assigned {} values",
                         columns.len(),
                         values.len()
                     )));
@@ -21853,7 +21953,7 @@ fn index_partial_predicate_is_covered_by_query_conjuncts(
     let Some(predicate_sql) = index.where_clause.as_deref() else {
         return true;
     };
-    let Ok(predicate) = parse_sql_expr(predicate_sql) else {
+    let Some(predicate) = parse_default_expr(predicate_sql) else {
         return false;
     };
     if !use_builtin_scalar_function_semantics() && expr_contains_function_call(&predicate) {
@@ -30868,9 +30968,10 @@ fn emit_update_assignments(
             AssignmentTarget::ColumnList(names) => match &assignment.value {
                 // `SET (a, b) = (e1, e2)` — parenthesized row-value of scalars.
                 Expr::RowValue(values, _) => {
+                    // The parser already refuses this (bd-65jog); stock's text.
                     if names.len() != values.len() {
-                        return Err(CodegenError::Unsupported(format!(
-                            "multi-column SET arity mismatch: {} targets, {} values",
+                        return Err(CodegenError::SqlError(format!(
+                            "{} columns assigned {} values",
                             names.len(),
                             values.len()
                         )));
@@ -30895,11 +30996,12 @@ fn emit_update_assignments(
                                 .to_owned(),
                         )
                     })?;
+                    // bd-65jog: stock checks a subquery's width here, after
+                    // its names resolve, with the parser's text.
                     if names.len() != arity {
-                        return Err(CodegenError::Unsupported(format!(
-                            "multi-column SET arity mismatch: {} targets, {} subquery columns",
-                            names.len(),
-                            arity
+                        return Err(CodegenError::SqlError(format!(
+                            "{} columns assigned {arity} values",
+                            names.len()
                         )));
                     }
                     for (col_pos, name) in names.iter().enumerate() {
@@ -30923,10 +31025,14 @@ fn emit_update_assignments(
                         update_target_reg(table, &names[0], col_regs, hidden_rowid_reg)?;
                     emit_expr(b, scalar, target_reg, Some(scan));
                 }
+                // The parser refuses any other source whose size differs, so a
+                // scalar here is a one-column subquery the DML rewrite pass
+                // folded to its value (bd-65jog): stock reports its width.
                 _ => {
-                    return Err(CodegenError::Unsupported(
-                        "multi-column SET requires a row-value or subquery expression".to_owned(),
-                    ));
+                    return Err(CodegenError::SqlError(format!(
+                        "{} columns assigned 1 values",
+                        names.len()
+                    )));
                 }
             },
         }
@@ -35640,13 +35746,15 @@ fn emit_default_value(
             Ok(())
         }
         Some(dv) => {
-            let expr = parse_column_default_value_expr(dv).ok_or_else(|| {
-                CodegenError::Unsupported(format!(
-                    "failed to parse DEFAULT expression `{}` for column `{}`",
-                    dv.trim(),
-                    col.name
-                ))
-            })?;
+            let expr = parse_column_default_value_expr(dv)
+                .map_err(|misused| CodegenError::SqlError(misused.to_string()))?
+                .ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "failed to parse DEFAULT expression `{}` for column `{}`",
+                        dv.trim(),
+                        col.name
+                    ))
+                })?;
             if !default_expr_is_self_contained(&expr) {
                 return Err(CodegenError::Unsupported(format!(
                     "DEFAULT expression `{}` for column `{}` is not self-contained",
@@ -35660,10 +35768,12 @@ fn emit_default_value(
     }
 }
 
-/// Parse a schema expression's SQL text (a column DEFAULT, a CHECK
-/// constraint, a generated column) into an expression AST, with its
+/// Parse a schema expression's SQL text (a CHECK constraint, a generated
+/// column, a partial index's WHERE) into an expression AST, with its
 /// row-value comparisons expanded into scalar ones (bd-s7gqh): codegen reads
-/// a row value as NULL, so `CHECK ((x, y) <> (0, 0))` passed every row.
+/// a row value as NULL, so `CHECK ((x, y) <> (0, 0))` passed every row. A
+/// partial index's WHERE is expanded wherever it is read, so a statement's
+/// expanded WHERE can imply it (bd-65jog).
 fn parse_default_expr(default_sql: &str) -> Option<Expr> {
     let trimmed = default_sql.trim();
     if trimmed.is_empty() {
@@ -35679,16 +35789,31 @@ fn parse_default_expr(default_sql: &str) -> Option<Expr> {
 /// `"fallback"`, `[fallback]`) can only come from stock's `DEFAULT id`
 /// production, which makes it the string 'fallback' (read as an expression it
 /// would be a column reference); a parenthesized one (`DEFAULT ("x")`) stays an
-/// expression.
-fn parse_column_default_value_expr(default_sql: &str) -> Option<Expr> {
-    match parse_default_expr(default_sql)? {
-        Expr::Column(column_ref, span)
-            if column_ref.table.is_none() && !default_sql.trim().starts_with('(') =>
-        {
-            Some(Expr::Literal(Literal::String(column_ref.column.to_string()), span))
-        }
-        expr => Some(expr),
+/// expression. `Ok(None)` when the text does not parse.
+///
+/// # Errors
+///
+/// bd-65jog: stock takes a row-value DEFAULT as a constant at CREATE TABLE
+/// and applies its misuse rules where the default is used, so a default whose
+/// row values are misused (`((1, 2))`, a pair against a triple, a row value
+/// nested in another) is `RowValueMisused` here, not merely left unexpanded.
+fn parse_column_default_value_expr(
+    default_sql: &str,
+) -> Result<Option<Expr>, fsqlite_ast::row_value::RowValueMisused> {
+    let trimmed = default_sql.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
     }
+    let Ok(mut expr) = parse_sql_expr(trimmed) else {
+        return Ok(None);
+    };
+    fsqlite_ast::row_value::check_and_lower_row_values_in_expr(&mut expr)?;
+    Ok(Some(match expr {
+        Expr::Column(column_ref, span) if column_ref.table.is_none() && !trimmed.starts_with('(') => {
+            Expr::Literal(Literal::String(column_ref.column.to_string()), span)
+        }
+        expr => expr,
+    }))
 }
 
 fn default_expr_is_self_contained(expr: &Expr) -> bool {
@@ -41033,7 +41158,7 @@ fn expression_index_residuals_match(
     let Some(predicate_sql) = index.where_clause.as_deref() else {
         return residuals.is_empty();
     };
-    let Ok(predicate) = parse_sql_expr(predicate_sql) else {
+    let Some(predicate) = parse_default_expr(predicate_sql) else {
         return false;
     };
     let mut predicate_terms = Vec::new();
@@ -68276,8 +68401,9 @@ mod tests {
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
 
+        // bd-65jog: stock's text, as a statement error.
         match codegen_insert(&mut b, &stmt, &schema, &ctx) {
-            Err(CodegenError::Unsupported(msg)) if msg.contains("arity mismatch") => Ok(()),
+            Err(CodegenError::SqlError(msg)) if msg == "2 columns assigned 1 values" => Ok(()),
             other => Err(format!("expected column-list arity error, got {other:?}")),
         }
     }

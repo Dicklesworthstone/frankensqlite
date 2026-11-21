@@ -1517,14 +1517,19 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size).await?;
 
             // Parse the partial index WHERE clause (if any) so we can skip
-            // rows that don't satisfy the predicate.
+            // rows that don't satisfy the predicate. bd-65jog: its row-value
+            // comparisons are expanded, as every reader of it expands them.
             let partial_predicate = index
                 .where_clause
                 .as_deref()
                 .map(fsqlite_parser::expr::parse_expr)
                 .transpose()
                 .ok()
-                .flatten();
+                .flatten()
+                .map(|mut predicate| {
+                    fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+                    predicate
+                });
 
             // Populate the index B-tree from table rows.
             {
