@@ -216,10 +216,9 @@ async fn compare(file_backed: bool, strict: bool) -> (Vec<String>, usize) {
 /// `m` and `w` hold the same rows in opposite rowid order and `mi` holds
 /// `w`'s rows under an index on the key, which the plan walks instead of
 /// sorting. On a file database with parity-cert strict on, each statement of
-/// the first list runs the GROUP BY program (strict refuses the grouped
-/// evaluator; a HAVING is the control that it does) and must answer as stock,
-/// ad hoc and prepared. The second list holds shapes strict mode refuses there
-/// (a HAVING, typeof() of the key, a DESC order), compared with strict off.
+/// the first list runs the GROUP BY program and must answer as stock, ad hoc
+/// and prepared. Arithmetic on the aggregate in HAVING exercises the strict
+/// fallback refusal. The second list compares ordinary execution with stock.
 const MIXED_SPELLING_SCHEMA: &str = "\
 CREATE TABLE m(id INTEGER PRIMARY KEY, a, b, n INTEGER);\
 INSERT INTO m VALUES (1, 3, 1, 10), (2, 3.0, 1.0, 5), (3, 3, 1, 7), (4, 5.0, 2, 1), \
@@ -235,6 +234,7 @@ CREATE INDEX mi_a ON mi(a);";
 
 /// `@T@` is replaced by `m` and by `w`.
 const MIXED_SPELLING_STRICT: &[&str] = &[
+    "SELECT a, count(*) FROM @T@ GROUP BY a HAVING count(*) > 1 ORDER BY a",
     "SELECT a, count(*) FROM @T@ GROUP BY a ORDER BY a",
     "SELECT a, count(*), sum(n) FROM @T@ GROUP BY a",
     "SELECT a, max(n) FROM @T@ GROUP BY a ORDER BY a",
@@ -258,11 +258,12 @@ const MIXED_SPELLING_STRICT: &[&str] = &[
 /// `@T@` is replaced by `m` and by `w`.
 ///
 /// Not covered, and not claimed: a max() beside the key in a shape strict
-/// mode refuses (`... HAVING max(n) > 2`, `SELECT a + 0, max(n) ... GROUP BY
-/// a`, `... ORDER BY max(n), a`). Those run on the connection's grouped
+/// mode refuses (`SELECT a + 0, max(n) ... GROUP BY a`,
+/// `... ORDER BY max(n), a`). Those run on the connection's grouped
 /// evaluator, which prints a tied or later extremum row's spelling (8.0 where
 /// stock prints 8), the same with or without the fix to the program.
 const MIXED_SPELLING_STRICT_OFF: &[&str] = &[
+    "SELECT a, count(*) FROM @T@ GROUP BY a HAVING count(*) + 0 > 1 ORDER BY a",
     "SELECT a, count(*) FROM @T@ GROUP BY a HAVING count(*) > 1 ORDER BY a",
     "SELECT typeof(a), a, count(*) FROM @T@ GROUP BY a ORDER BY a",
     "SELECT a, total(n), count(n) FROM @T@ GROUP BY a ORDER BY a DESC",
@@ -281,12 +282,15 @@ fn mixed_integer_real_group_by_key_spelling_matches_stock_on_a_strict_file_datab
         f.execute("PRAGMA fsqlite.parity_cert_strict = ON")
             .await
             .unwrap();
+        let error = f
+            .query("SELECT a, count(*) FROM m GROUP BY a HAVING count(*) + 0 > 1")
+            .await
+            .expect_err("arithmetic on the aggregate needs the grouped evaluator");
         assert!(
-            f.query("SELECT a, count(*) FROM m GROUP BY a HAVING count(*) > 1")
-                .await
-                .is_err(),
-            "strict mode must refuse the grouped evaluator, which a HAVING takes; otherwise \
-             the strict list need not run the GROUP BY program"
+            error
+                .to_string()
+                .contains("decision_reason=group_by_fallback"),
+            "{error}"
         );
         let mut diffs = Vec::new();
         let mut statements = 0usize;

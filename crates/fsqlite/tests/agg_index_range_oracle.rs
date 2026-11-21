@@ -230,7 +230,7 @@ fn grouped_index_range_matches_sqlite() {
         // `:memory:` connection groups through its in-memory mirror.
         for path in [":memory:", file.to_str().unwrap()] {
             let (f, r) = seeded(path, &["CREATE INDEX idx_ax ON t(a, x);"]).await;
-            // A HAVING keeps the grouped evaluator (bd-w4pr1.13.32): before strict mode.
+            // HAVING references a count absent from the result columns.
             let having = "SELECT x, sum(a) FROM t WHERE a >= -100 AND a <= 100 AND x <> 5 \
                       GROUP BY x HAVING count(*) > 2";
             // Ad hoc: until bd-ro43z a prepared HAVING on a file ran the substrate.
@@ -250,10 +250,12 @@ fn grouped_index_range_matches_sqlite() {
                 f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
                     .await
                     .unwrap();
+                let error = f.query(having).await.expect_err("unprojected HAVING count");
                 assert!(
-                    f.query(having).await.is_err(),
-                    "strict mode must refuse the grouped evaluator, which a HAVING still takes \
-                     (bd-w4pr1.13.32); otherwise the rows below need not come from the program"
+                    error
+                        .to_string()
+                        .contains("decision_reason=group_by_fallback"),
+                    "{error}"
                 );
             }
             let cases: &[(&str, &[i64])] = &[
@@ -418,10 +420,16 @@ fn grouped_index_order_streams_and_matches_sqlite() {
                     .await
                     .unwrap();
                 let having = "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1";
+                let fallback = "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) + 0 > 1";
+                let expected = sqlite_rows(&r, having, &[]);
+                assert_eq!(expected, sqlite_rows(&r, fallback, &[]));
+                assert_eq!(frank_rows(&f, having, &[]).await, expected);
+                let error = f.query(fallback).await.expect_err("HAVING arithmetic");
                 assert!(
-                    f.query(having).await.is_err(),
-                    "strict mode must refuse the grouped evaluator, which a HAVING still takes \
-                     (bd-w4pr1.13.32); otherwise the rows below need not come from the program"
+                    error
+                        .to_string()
+                        .contains("decision_reason=group_by_fallback"),
+                    "{error}"
                 );
             }
             for &(sql, params) in streamed {
@@ -574,12 +582,14 @@ fn grouped_desc_index_keys_stream_in_index_order() {
                 r.execute_batch(stmt).unwrap();
             }
             if path == ":memory:" {
-                // A HAVING runs on the in-memory path, which loads the mirror's
+                // Arithmetic on the HAVING aggregate loads the mirror's
                 // rows. The shapes below then meet the mirror's grouped
                 // evaluator, which orders groups by key whatever the index
                 // (bd-gazf2), and not only the storage substrate a mirror
                 // whose rows are not loaded hands them to.
                 for sql in [
+                    "SELECT k, count(*) FROM c GROUP BY k HAVING count(*) + 0 > 0",
+                    "SELECT a, count(*) FROM p GROUP BY a HAVING count(*) + 0 > 0",
                     "SELECT k, count(*) FROM c GROUP BY k HAVING count(*) > 0",
                     "SELECT a, count(*) FROM p GROUP BY a HAVING count(*) > 0",
                 ] {
