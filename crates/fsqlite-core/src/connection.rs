@@ -15410,6 +15410,10 @@ pub struct Connection {
     /// bd-fpr5g lever 3a: trigger body statements bound once for every
     /// firing row of the same frame shape (`Connection::trigger_body_template`).
     trigger_body_templates: RefCell<Vec<Rc<TriggerBodyTemplate>>>,
+    /// bd-w78tx: the triggers whose relations
+    /// `Connection::validate_dml_trigger_relations` found, for one schema
+    /// generation.
+    trigger_relation_checks: RefCell<TriggerRelationChecks>,
     /// Bounded statement-reuse trace buffer keyed by cache kind + statement
     /// fingerprint. Records per-lane reuse distance observations so compile
     /// governance can distinguish same-lane reuse from cross-lane churn.
@@ -17258,6 +17262,7 @@ impl Connection {
             returning_fold_spared_target: RefCell::new(None),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             trigger_body_templates: RefCell::new(Vec::new()),
+            trigger_relation_checks: RefCell::new(TriggerRelationChecks::default()),
             statement_reuse_trace: RefCell::new(StatementReuseTraceState::default()),
             planner_directive_cache: RefCell::new(
                 LruCache::new(default_statement_cache_capacity()),
@@ -17868,6 +17873,7 @@ impl Connection {
             returning_fold_spared_target: RefCell::new(None),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             trigger_body_templates: RefCell::new(Vec::new()),
+            trigger_relation_checks: RefCell::new(TriggerRelationChecks::default()),
             statement_reuse_trace: RefCell::new(StatementReuseTraceState::default()),
             planner_directive_cache: RefCell::new(
                 LruCache::new(default_statement_cache_capacity()),
@@ -30474,6 +30480,9 @@ impl Connection {
                 continue;
             }
             structure_result?;
+            // bd-w78tx: preparing a DML statement compiles its triggers in
+            // stock, which refuses one that names a missing relation.
+            self.validate_dml_trigger_relations(statement_snapshot.as_ref())?;
             let statement_result = {
                 let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                     .then(|| {
@@ -42808,6 +42817,9 @@ impl Connection {
             statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         ) {
+            // bd-w78tx: stock refuses a statement whose triggers name a
+            // missing relation before it changes any row.
+            self.validate_dml_trigger_relations(statement)?;
             let preserve_constraint_failure_rows =
                 statement_preserves_prior_changes_on_constraint(statement);
             return lean_future(|| {
@@ -77771,6 +77783,141 @@ impl Connection {
             && (!self.shadowed_main_tables.borrow().is_empty()
                 || !self.temp_table_names.borrow().is_empty()
                 || self.views.borrow().iter().any(|view| view.temporary))
+    }
+
+    /// bd-w78tx: stock compiles every trigger a DML statement can fire while
+    /// it prepares the statement, whatever the trigger's WHEN clause, and
+    /// refuses the statement when the WHEN or the body of one of them names a
+    /// relation that does not exist ("no such table: main.missing"). So a
+    /// broken trigger refuses every statement that could fire it, before any
+    /// row changes, and not only the rows it would fire for.
+    ///
+    /// The triggers are checked in stock's coding order: the BEFORE triggers,
+    /// the UPDATE triggers an upsert's DO UPDATE can fire, the DELETE
+    /// triggers a REPLACE fires under recursive_triggers, then the INSTEAD OF
+    /// and AFTER triggers, each group newest first; a trigger's WHEN before
+    /// its body. A persistent trigger resolves in MAIN only, as stock's does,
+    /// so it does not see TEMP objects either.
+    fn validate_dml_trigger_relations(&self, statement: &Statement) -> Result<()> {
+        use fsqlite_ast::{TriggerEvent, TriggerTiming};
+        let target = match statement {
+            Statement::Insert(insert) => &insert.table,
+            Statement::Update(update) => &update.table.name,
+            Statement::Delete(delete) => &delete.table.name,
+            _ => return Ok(()),
+        };
+        // An attached schema's statement runs on that schema's connection,
+        // with its triggers.
+        if target.schema.as_deref().is_some_and(|schema| {
+            !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+        }) {
+            return Ok(());
+        }
+        let ordered = {
+            let triggers = self.triggers.borrow();
+            if !triggers
+                .iter()
+                .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&target.name))
+            {
+                return Ok(());
+            }
+            let event = match statement {
+                Statement::Update(update) => {
+                    TriggerEvent::Update(Self::assignment_target_column_names(&update.assignments))
+                }
+                Statement::Delete(_) => TriggerEvent::Delete,
+                _ => TriggerEvent::Insert,
+            };
+            let upsert_updates: Vec<TriggerEvent> = match statement {
+                Statement::Insert(insert) => insert
+                    .upsert
+                    .iter()
+                    .filter_map(|clause| match &clause.action {
+                        fsqlite_ast::UpsertAction::Update { assignments, .. } => Some(
+                            TriggerEvent::Update(Self::assignment_target_column_names(assignments)),
+                        ),
+                        fsqlite_ast::UpsertAction::Nothing => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            // A REPLACE deletes the conflicting rows, and fires their DELETE
+            // triggers, only under recursive_triggers; stock compiles them
+            // only then.
+            let replace_deletes = matches!(
+                statement,
+                Statement::Insert(insert)
+                    if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+            ) && self.pragma_state.borrow().recursive_triggers;
+            let delete = TriggerEvent::Delete;
+            let mut groups = vec![(TriggerTiming::Before, &event)];
+            for update in &upsert_updates {
+                groups.push((TriggerTiming::Before, update));
+                groups.push((TriggerTiming::After, update));
+            }
+            if replace_deletes {
+                groups.push((TriggerTiming::Before, &delete));
+                groups.push((TriggerTiming::After, &delete));
+            }
+            groups.push((TriggerTiming::InsteadOf, &event));
+            groups.push((TriggerTiming::After, &event));
+            let mut ordered: Vec<Arc<TriggerDef>> = Vec::new();
+            for (timing, event) in groups {
+                for trigger in triggers.iter().rev() {
+                    if trigger.table_name.eq_ignore_ascii_case(&target.name)
+                        && trigger.timing == timing
+                        && trigger_event_matches(&trigger.event, event)
+                        && !ordered.iter().any(|seen| Arc::ptr_eq(seen, trigger))
+                    {
+                        ordered.push(Arc::clone(trigger));
+                    }
+                }
+            }
+            ordered
+        };
+        let schema_generation = self.schema_generation();
+        for trigger in &ordered {
+            let key = Arc::as_ptr(trigger).addr();
+            if !trigger.temporary {
+                let checks = self.trigger_relation_checks.borrow();
+                if checks.schema_generation == schema_generation && checks.validated.contains(&key)
+                {
+                    continue;
+                }
+            }
+            self.validate_trigger_relations(trigger)?;
+            if !trigger.temporary {
+                let mut checks = self.trigger_relation_checks.borrow_mut();
+                if checks.schema_generation != schema_generation {
+                    checks.schema_generation = schema_generation;
+                    checks.validated.clear();
+                }
+                checks.validated.insert(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// bd-w78tx: every relation one trigger's WHEN and body name, resolved
+    /// as stock resolves them when it compiles the trigger.
+    fn validate_trigger_relations(&self, trigger: &TriggerDef) -> Result<()> {
+        let mut resolver = if trigger.temporary {
+            SelectRelationResolver::new(self)
+        } else {
+            SelectRelationResolver::for_persistent_owner(
+                self,
+                "main".to_owned(),
+                HashSet::new(),
+                Rc::new(RefCell::new(SelectViewValidationState::default())),
+            )
+        };
+        if let Some(when) = &trigger.when_clause {
+            resolver.validate_expr(when)?;
+        }
+        for statement in &trigger.body {
+            resolver.validate_trigger_body_statement(statement)?;
+        }
+        Ok(())
     }
 
     fn has_matching_triggers(
@@ -154400,6 +154547,85 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         result
     }
 
+    /// bd-w78tx: the relations one trigger body statement names, in stock's
+    /// order: a DML statement's target, then its WITH, sources and
+    /// expressions.
+    fn validate_trigger_body_statement(&mut self, statement: &'select Statement) -> Result<()> {
+        let (target, with) = match statement {
+            Statement::Select(select) => return self.validate_select(select),
+            Statement::Insert(insert) => (&insert.table, insert.with.as_ref()),
+            Statement::Update(update) => (&update.table.name, update.with.as_ref()),
+            Statement::Delete(delete) => (&delete.table.name, delete.with.as_ref()),
+            _ => return Ok(()),
+        };
+        self.validate_catalog_relation(target)?;
+        let scope_depth = self.scopes.len();
+        if let Some(with) = with {
+            self.scopes.push(&with.ctes);
+        }
+        let result: Result<()> = (|| {
+            let (order_by, limit) = match statement {
+                Statement::Insert(insert) => {
+                    match &insert.source {
+                        InsertSource::Values(rows) => {
+                            for expr in rows.iter().flatten() {
+                                self.validate_expr(expr)?;
+                            }
+                        }
+                        InsertSource::Select(select) => self.validate_select(select)?,
+                        InsertSource::DefaultValues => {}
+                    }
+                    for clause in &insert.upsert {
+                        if let fsqlite_ast::UpsertAction::Update {
+                            assignments,
+                            where_clause,
+                        } = &clause.action
+                        {
+                            for assignment in assignments {
+                                self.validate_expr(&assignment.value)?;
+                            }
+                            if let Some(where_clause) = where_clause {
+                                self.validate_expr(where_clause)?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                Statement::Update(update) => {
+                    if let Some(from) = &update.from {
+                        self.validate_from_sources(from)?;
+                    }
+                    for assignment in &update.assignments {
+                        self.validate_expr(&assignment.value)?;
+                    }
+                    if let Some(where_clause) = &update.where_clause {
+                        self.validate_expr(where_clause)?;
+                    }
+                    (&update.order_by, &update.limit)
+                }
+                Statement::Delete(delete) => {
+                    if let Some(where_clause) = &delete.where_clause {
+                        self.validate_expr(where_clause)?;
+                    }
+                    (&delete.order_by, &delete.limit)
+                }
+                _ => return Ok(()),
+            };
+            for term in order_by {
+                self.validate_expr(&term.expr)?;
+            }
+            if let Some(limit) = limit {
+                self.validate_expr(&limit.limit)?;
+                if let Some(offset) = &limit.offset {
+                    self.validate_expr(offset)?;
+                }
+            }
+            Ok(())
+        })();
+        self.scopes.truncate(scope_depth);
+        result
+    }
+
     fn validate_named_window_definition_legality(&self, core: &SelectCore) -> Result<()> {
         let SelectCore::Select { windows, .. } = core else {
             return Ok(());
@@ -164749,6 +164975,19 @@ fn bind_trigger_body_statement(
     let params =
         collect_trigger_bound_params(true, || bind_trigger_columns_in_statement(&mut bound, frame));
     (bound, params)
+}
+
+/// bd-w78tx: the persistent triggers `Connection::validate_dml_trigger_relations`
+/// has found every relation of, by the address of their definition, valid for
+/// one schema generation. A schema change can drop or create any relation a
+/// trigger names, so a new generation forgets them all. A persistent trigger
+/// resolves in MAIN only; a TEMP trigger's names also reach attached schemas,
+/// which ATTACH and DETACH change without a new generation, so TEMP triggers
+/// are checked every time.
+#[derive(Debug, Default)]
+struct TriggerRelationChecks {
+    schema_generation: u64,
+    validated: HashSet<usize>,
 }
 
 /// bd-fpr5g lever 3a: a parameter-bound trigger body statement, bound once
