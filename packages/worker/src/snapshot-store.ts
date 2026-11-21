@@ -417,7 +417,7 @@ function validRevision(value: unknown): value is string {
   );
 }
 
-async function checksum(bytes: Uint8Array): Promise<string> {
+async function checksum(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   return [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
