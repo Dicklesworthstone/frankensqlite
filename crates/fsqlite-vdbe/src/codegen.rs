@@ -26617,7 +26617,14 @@ fn codegen_select_group_by_aggregate(
         parse_group_by_output(columns, table, group_by)?;
 
     // Collect aggregates from the HAVING clause that are not in the SELECT list.
-    if let Some(having_expr) = having {
+    if let Some(having_expr) = having
+        && !having_reads_grouped_output(
+            having_expr, columns, group_by, table, table_alias.unwrap_or(&table.name),
+        )
+    {
+        // A HAVING supplied entirely by finalized outputs needs no extra
+        // accumulator. Re-collecting a qualified spelling of the same call
+        // can step its volatile arguments a second time.
         collect_having_aggregates(having_expr, table, &mut agg_columns, &mut output_cols);
     }
 
@@ -37270,37 +37277,38 @@ pub fn grouped_having_is_supported(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> bool {
-    fn supported(
-        expr: &Expr, columns: &[ResultColumn], keys: &[Expr], table: &TableSchema, source: &str,
-    ) -> bool {
-        match expr {
-            Expr::Literal(..) | Expr::Placeholder(..) => {
-                !expr_contains_non_numbered_placeholder(expr)
-            }
-            Expr::Column(..) => {
-                keys.iter().any(|key| {
-                    key == expr || bound_expressions_match(expr, source, key, source, table)
-                }) && projected_having_slot(expr, columns, table, source).is_some()
-            }
-            Expr::FunctionCall { name, args, over, .. } => {
-                over.is_none()
-                    && is_aggregate_function_call(name, args)
-                    && projected_having_slot(expr, columns, table, source).is_some()
-            }
-            Expr::IsNull { expr, .. } => supported(expr, columns, keys, table, source),
-            Expr::BinaryOp {
-                left,
-                op: BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt
-                    | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Is | BinaryOp::IsNot,
-                right,
-                ..
-            } => supported(left, columns, keys, table, source)
-                && supported(right, columns, keys, table, source),
-            _ => false,
-        }
-    }
     let resolved = rewrite_having_select_aliases(having, columns, table);
-    supported(&resolved, columns, group_by, table, table_alias.unwrap_or(&table.name))
+    having_reads_grouped_output(
+        &resolved, columns, group_by, table, table_alias.unwrap_or(&table.name),
+    )
+}
+
+fn having_reads_grouped_output(
+    expr: &Expr, columns: &[ResultColumn], keys: &[Expr], table: &TableSchema, source: &str,
+) -> bool {
+    let supplied = |operand| having_reads_grouped_output(operand, columns, keys, table, source);
+    match expr {
+        Expr::Literal(..) | Expr::Placeholder(..) => !expr_contains_non_numbered_placeholder(expr),
+        Expr::Column(..) => {
+            keys.iter().any(|key| {
+                key == expr || bound_expressions_match(expr, source, key, source, table)
+            }) && projected_having_slot(expr, columns, table, source).is_some()
+        }
+        Expr::FunctionCall { name, args, over, .. } => {
+            over.is_none()
+                && is_aggregate_function_call(name, args)
+                && projected_having_slot(expr, columns, table, source).is_some()
+        }
+        Expr::IsNull { expr, .. } => supplied(expr),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt
+                | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Is | BinaryOp::IsNot,
+            right,
+            ..
+        } => supplied(left) && supplied(right),
+        _ => false,
+    }
 }
 
 // A star expands to a variable number of registers. Two anonymous parameters

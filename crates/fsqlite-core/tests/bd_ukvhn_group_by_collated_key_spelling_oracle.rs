@@ -447,6 +447,22 @@ fn grouped_queries_use_each_tracked_argument_once() {
                     }
                 }
             }
+            if path != ":memory:" {
+                db.execute("PRAGMA fsqlite.parity_cert_strict=ON").await.unwrap();
+                let sql = "SELECT k, sum(next_value()+k) FROM t AS src GROUP BY k
+                           HAVING sum(next_value()+src.K) IS NOT NULL";
+                for prepared in [false, true] {
+                    calls.store(0, Ordering::Relaxed);
+                    let rows = if prepared {
+                        db.prepare(sql).await.unwrap().query().await.unwrap()
+                    } else {
+                        db.query(sql).await.unwrap()
+                    };
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(tag_f(&rows[0].values()[1]), "real:5");
+                    assert_eq!(calls.load(Ordering::Relaxed), 2, "prepared={prepared}");
+                }
+            }
             db.close().await.unwrap();
         }
     });
@@ -482,6 +498,12 @@ fn compiled_grouped_aggregates_share_only_identical_calls() {
                 "{sql}"
             );
         }
+        let sql = "EXPLAIN SELECT k,sum(random()+k) FROM g AS src GROUP BY k
+                   HAVING sum(random()+src.K) IS NOT NULL";
+        let stock_steps = steps(&rq(&stock, sql).unwrap());
+        assert_eq!(stock_steps, 1);
+        assert_eq!(steps(&tag_rows(&db.query(sql).await.unwrap())), stock_steps);
+
         let sql = "SELECT max(?), max(?) FROM g GROUP BY k";
         let params = [SqliteValue::Integer(3), SqliteValue::Integer(7)];
         let expected = stock
