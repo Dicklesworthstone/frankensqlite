@@ -153053,21 +153053,10 @@ thread_local! {
         std::cell::RefCell::new(Some(MemDatabase::new()));
 }
 
-/// Poll an immediate-ready VFS file I/O future (`UnixFile`/`WindowsFile`
-/// perform synchronous OS I/O inside their `async fn` bodies and resolve on
-/// the first poll without suspending).
-#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-fn poll_vfs_io_ready<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    let waker = std::task::Waker::noop();
-    let mut task_cx = std::task::Context::from_waker(waker);
-    let mut pinned = std::pin::pin!(fut);
-    match pinned.as_mut().poll(&mut task_cx) {
-        std::task::Poll::Ready(result) => result,
-        std::task::Poll::Pending => Err(FrankenError::internal(
-            "synchronous VFS temp file I/O unexpectedly returned Pending",
-        )),
-    }
-}
+#[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
+type NativeTempFile = fsqlite_vfs::UnixFile;
+#[cfg(all(feature = "native", windows))]
+type NativeTempFile = fsqlite_vfs::WindowsFile;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn map_vfs_temp_error(err: FrankenError) -> FrankenError {
@@ -153091,24 +153080,24 @@ struct VfsTempFileBackend {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-struct VfsTempFileHandle<F: VfsFile> {
-    file: Mutex<Option<F>>,
+struct VfsTempFileHandle {
+    file: Mutex<Option<NativeTempFile>>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-impl<F: VfsFile> TempFileHandle for VfsTempFileHandle<F> {
+impl TempFileHandle for VfsTempFileHandle {
     fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
         if cx.is_cancel_requested() {
             return Err(FrankenError::Abort);
         }
-        let mut guard = lock_unpoisoned(&self.file);
-        let Some(file) = guard.as_mut() else {
+        let guard = lock_unpoisoned(&self.file);
+        let Some(file) = guard.as_ref() else {
             return Err(FrankenError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "VFS temporary file already closed",
             )));
         };
-        poll_vfs_io_ready(file.write(cx, data, offset)).map_err(map_vfs_temp_error)
+        file.write_at_sync(cx, data, offset).map_err(map_vfs_temp_error)
     }
 
     fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -153122,7 +153111,7 @@ impl<F: VfsFile> TempFileHandle for VfsTempFileHandle<F> {
                 "VFS temporary file already closed",
             )));
         };
-        poll_vfs_io_ready(file.read(cx, buf, offset)).map_err(map_vfs_temp_error)
+        file.read_at_sync(cx, buf, offset).map_err(map_vfs_temp_error)
     }
 
     fn file_size(&self, cx: &Cx) -> Result<u64> {
@@ -153157,7 +153146,7 @@ impl<F: VfsFile> TempFileHandle for VfsTempFileHandle<F> {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-impl<F: VfsFile> Drop for VfsTempFileHandle<F> {
+impl Drop for VfsTempFileHandle {
     fn drop(&mut self) {
         let mut guard = lock_unpoisoned(&self.file);
         if let Some(mut file) = guard.take() {

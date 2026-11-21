@@ -96,8 +96,7 @@ fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> std::io::R
     })
 }
 
-fn read_owned_at(file: &File, len: usize, offset: u64) -> std::io::Result<(Vec<u8>, usize)> {
-    let mut data = vec![0_u8; len];
+fn read_into_at(file: &File, data: &mut [u8], offset: u64) -> std::io::Result<usize> {
     let mut total = 0_usize;
     while total < data.len() {
         let current = blocking_io_offset(offset, total, "read")?;
@@ -108,6 +107,13 @@ fn read_owned_at(file: &File, len: usize, offset: u64) -> std::io::Result<(Vec<u
             Err(error) => return Err(error),
         }
     }
+    data[total..].fill(0);
+    Ok(total)
+}
+
+fn read_owned_at(file: &File, len: usize, offset: u64) -> std::io::Result<(Vec<u8>, usize)> {
+    let mut data = vec![0_u8; len];
+    let total = read_into_at(file, &mut data, offset)?;
     Ok((data, total))
 }
 
@@ -1619,6 +1625,21 @@ pub struct WindowsFile {
 }
 
 impl WindowsFile {
+    /// Synchronous positional read for callers such as the sorter that cannot suspend.
+    pub fn read_at_sync(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        checkpoint_or_abort(cx)?;
+        let total = read_into_at(self.file_ref()?, buf, offset)?;
+        checkpoint_or_abort(cx)?;
+        Ok(total)
+    }
+
+    /// Synchronous positional write that retries interrupted and partial writes.
+    pub fn write_at_sync(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        write_owned_at(self.file_ref()?, buf, offset)?;
+        checkpoint_or_abort(cx)
+    }
+
     fn is_closed(&self) -> bool {
         self.file.is_none() && self.os_locks.is_none()
     }

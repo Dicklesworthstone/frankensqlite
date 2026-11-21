@@ -88,14 +88,62 @@ fn count_dir_entries(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn poll_ready<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    let mut pinned = std::pin::pin!(fut);
-    match pinned.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(res) => res,
-        std::task::Poll::Pending => panic!("unexpected Pending from synchronous UnixVfs"),
-    }
+#[test]
+fn synchronous_spill_io_preserves_offset_eof_and_cancellation() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("offset.tmp");
+    let cx = Cx::new();
+    let flags = VfsOpenFlags::TEMP_DB | VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE;
+    let (mut file, _) = UnixVfs::new().open(&cx, Some(&path), flags).unwrap();
+    let payload = vec![0xa5; 65_537];
+    file.write_at_sync(&cx, &payload, 7).unwrap();
+    let mut actual = vec![0xff; payload.len() + 16];
+    assert_eq!(file.read_at_sync(&cx, &mut actual, 0).unwrap(), 7 + payload.len());
+    assert_eq!(&actual[..7], &[0; 7]);
+    assert_eq!(&actual[7..7 + payload.len()], payload);
+    assert_eq!(&actual[7 + payload.len()..], &[0; 9]);
+    let cancelled = Cx::new();
+    cancelled.cancel();
+    assert!(matches!(file.write_at_sync(&cancelled, &[0], 7), Err(FrankenError::Abort)));
+    assert!(matches!(file.read_at_sync(&cancelled, &mut actual, 7), Err(FrankenError::Abort)));
+    file.close(&cx).unwrap();
+    assert_eq!(&fs::read(path).unwrap()[7..], payload);
+}
+
+#[test]
+fn large_sorter_spill_builds_a_stock_readable_index() {
+    const SETUP: &str = "PRAGMA temp_store=FILE; PRAGMA temp.cache_size=1;
+        CREATE TABLE s(id INTEGER PRIMARY KEY, v BLOB);
+        INSERT INTO s VALUES(1,zeroblob(1048577)),(2,x'11'),(3,x'01');";
+    const INDEX: &str = "CREATE INDEX s_v ON s(v)";
+    const READ: &str = "SELECT id,length(v) FROM s INDEXED BY s_v ORDER BY v";
+    run_test(|| async {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("large-spill.db");
+        let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(SETUP).await.unwrap();
+        stock.execute_batch(SETUP).unwrap();
+        let before = conn.temp_store_stats();
+        stock.execute_batch(INDEX).unwrap();
+        conn.execute(INDEX).await.unwrap();
+        let after = conn.temp_store_stats();
+        assert!(after.sorter_spill_runs > before.sorter_spill_runs);
+        assert!(after.sorter_spill_bytes - before.sorter_spill_bytes > 1_048_576);
+        assert_eq!(after.active_temp_files, 0);
+        let expected = rusqlite_query(&stock, READ);
+        assert_eq!(expected.len(), 3);
+        assert_eq!(fsqlite_query(&conn, READ).await, expected);
+        conn.close().await.unwrap();
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(rusqlite_query(&reopened, READ), expected);
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    });
 }
 
 /// Inspecting real-UnixVfs backend that records every physical file created in
@@ -187,7 +235,7 @@ impl TempFileHandle for ObservingVfsTempHandle {
                 "observing temp file already closed",
             )));
         };
-        poll_ready(file.write(cx, data, offset))
+        file.write_at_sync(cx, data, offset)
     }
 
     fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -204,7 +252,7 @@ impl TempFileHandle for ObservingVfsTempHandle {
                 "observing temp file already closed",
             )));
         };
-        poll_ready(file.read(cx, buf, offset))
+        file.read_at_sync(cx, buf, offset)
     }
 
     fn file_size(&self, cx: &Cx) -> Result<u64> {

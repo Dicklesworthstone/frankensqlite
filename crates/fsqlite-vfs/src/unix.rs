@@ -2702,6 +2702,39 @@ pub struct UnixFile {
 }
 
 impl UnixFile {
+    /// Synchronous positional read for callers such as the sorter that cannot suspend.
+    pub fn read_at_sync(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if let Some(total) = self.try_read_via_mmap(cx, buf, offset)? {
+            return Ok(total);
+        }
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "read")?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))?;
+        let total = read_full_at(|chunk, off| file.read_at(chunk, off), buf, offset, "read")?;
+        buf[total..].fill(0);
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            checkpoint_or_abort_if_cancel_published(cx)?;
+        } else {
+            checkpoint_or_abort(cx)?;
+        }
+        Ok(total)
+    }
+
+    /// Synchronous positional write that retries interrupted and partial writes.
+    pub fn write_at_sync(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "write")?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))?;
+        write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write")?;
+        checkpoint_or_abort(cx)
+    }
+
     /// Attempt to satisfy a read directly from the active read-only database
     /// memory mapping (`PRAGMA mmap_size`). Returns `Ok(None)` immediately when
     /// mapping is disabled (`limit == 0`) or falls back cleanly when the range
@@ -4522,6 +4555,9 @@ impl VfsFile for UnixFile {
     }
 
     async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            return self.read_at_sync(cx, buf, offset);
+        }
         if let Some(total) = self.try_read_via_mmap(cx, buf, offset)? {
             return Ok(total);
         }
@@ -4532,20 +4568,6 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
-        // A bounded pread directly into the caller's buffer costs ~1.5us
-        // where the blocking-pool round-trip costs ~14us. Semantics preserved
-        // exactly: EINTR retried in place, zero-filled tail on short read,
-        // actual total returned.
-        if buf.len() <= INLINE_IO_MAX_BYTES {
-            let total = read_full_at(|chunk, off| file.read_at(chunk, off), buf, offset, "read")?;
-            buf[total..].fill(0);
-            // bd-w4pr1.13.18: the full checkpoint above ran a pread ago, and
-            // nothing waited since. Only a cancellation published meanwhile
-            // can be new; a deadline or budget that ran out during the pread
-            // is seen at the caller's next checkpoint.
-            checkpoint_or_abort_if_cancel_published(cx)?;
-            return Ok(total);
-        }
         let requested = buf.len();
         let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
             .await
@@ -4556,6 +4578,9 @@ impl VfsFile for UnixFile {
     }
 
     async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            return self.write_at_sync(cx, buf, offset);
+        }
         checkpoint_or_abort(cx)?;
         checked_io_range(offset, buf.len(), "write")?;
         let file = Arc::clone(
@@ -4563,10 +4588,6 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
-        if buf.len() <= INLINE_IO_MAX_BYTES {
-            write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write")?;
-            return checkpoint_or_abort(cx);
-        }
         let data = buf.to_vec();
         spawn_blocking_io(move || write_owned_at(file, data, offset))
             .await
