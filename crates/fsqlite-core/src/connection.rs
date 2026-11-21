@@ -31402,8 +31402,7 @@ impl Connection {
     }
 
     /// `select_uses_builtin_minmax_bare_tracking` for a grouped evaluator that
-    /// knows its GROUP BY keys' collations: `variant_group_keys` marks each
-    /// key whose collation admits several spellings in one group (bd-ukvhn).
+    /// knows which equal GROUP BY keys can differ in spelling or storage class.
     fn select_uses_builtin_minmax_bare_tracking_with_keys(
         &self,
         select: &SelectStatement,
@@ -93070,6 +93069,18 @@ impl Connection {
         if !group_by_exprs.iter().all(plain_clause) {
             return Ok(None);
         }
+        // Table functions can return both INTEGER and REAL for the same group.
+        // The streaming accumulator keeps its first row for a projected key.
+        if !group_by.is_empty()
+            && self
+                .select_uses_builtin_minmax_bare_tracking_with_keys(
+                    select,
+                    &vec![true; group_by.len()],
+                )
+                .is_some()
+        {
+            return Ok(None);
+        }
 
         // A WHERE or GROUP BY term may read any column; otherwise only the
         // aggregates' columns are fetched.
@@ -93717,32 +93728,37 @@ impl Connection {
         } else {
             select
         };
-        // bd-ukvhn: a key with a non-BINARY collation reads its spelling from
-        // the same row as the bare columns.
-        let variant_group_keys: Vec<bool> = group_collations
-            .iter()
-            .map(|collation| group_key_collation_varies_spelling(collation.as_deref()))
-            .collect();
         // bd-5i14u: each group's bare-column row, by index. The rows stay in
         // scan order, which every other aggregate steps over.
         let mut bare_row_indices: Vec<Option<usize>> = vec![None; groups.len()];
-        if let Some(tracking) = self
-            .select_uses_builtin_minmax_bare_tracking_with_keys(tracking_source, &variant_group_keys)
-        {
-            for ((_key, group_rows), bare_row_index) in groups.iter().zip(&mut bare_row_indices) {
-                *bare_row_index = self
-                    .join_minmax_bare_extremum_index(
-                        &tracking, group_rows, &col_map, using_skip, &coll_snap,
-                    )
-                    .await?;
-            }
-        }
+        // A key supplied by a derived table or a table function can mix 1 and
+        // 1.0 even under BINARY. Its declared affinity cannot rule that out.
+        let variant_group_keys = vec![true; group_by_exprs.len()];
+        let tracking =
+            self.select_uses_builtin_minmax_bare_tracking_with_keys(tracking_source, &variant_group_keys);
+        let tracked_outputs: Vec<bool> = expanded_columns
+            .iter()
+            .map(|column| {
+                tracking
+                    .as_ref()
+                    .is_some_and(|tracked| column_matches_tracked_minmax(column, tracked))
+            })
+            .collect();
 
         // Step 6: Build result rows from groups.
         let empty_group_row = vec![SqliteValue::Null; col_map.len()];
         let mut result = Vec::with_capacity(groups.len());
         let mut result_group_indices = Vec::with_capacity(groups.len());
         for (group_index, (_key, group_rows)) in groups.iter().enumerate() {
+            let tracked_value = if let Some(tracking) = &tracking {
+                let (index, value) = self
+                    .join_minmax_bare_extremum(tracking, group_rows, &col_map, using_skip, &coll_snap)
+                    .await?;
+                bare_row_indices[group_index] = index;
+                Some(value)
+            } else {
+                None
+            };
             let bare_row = bare_row_indices[group_index].and_then(|index| group_rows.get(index));
             let representative_row = bare_row
                 .or_else(|| group_rows.first())
@@ -93753,7 +93769,19 @@ impl Connection {
                 Vec::new()
             };
             let mut values = Vec::with_capacity(result_descriptors.len());
-            for (desc, owned_plan) in result_descriptors.iter().zip(&result_owned_plans) {
+            for ((desc, owned_plan), &tracked) in result_descriptors
+                .iter()
+                .zip(&result_owned_plans)
+                .zip(&tracked_outputs)
+            {
+                // The same aggregate selected the representative row. Reusing its
+                // value also evaluates volatile arguments and FILTERs only once.
+                if tracked
+                    && let Some(value) = &tracked_value
+                {
+                    values.push(value.clone());
+                    continue;
+                }
                 match desc {
                     GroupByColumn::Plain(expr) => {
                         let owned_bound;
@@ -94304,14 +94332,14 @@ impl Connection {
     /// argument row supplies the bare columns until the first non-NULL value
     /// appears, so an all-NULL group reports its last such row. `None` when
     /// the FILTER rejects every row (stock keeps the group's first row).
-    async fn join_minmax_bare_extremum_index(
+    async fn join_minmax_bare_extremum(
         &self,
         tracking: &(bool, Expr, Option<Expr>, bool),
         group_rows: &[Vec<SqliteValue>],
         col_map: &[(String, String, bool)],
         using_skip: Option<&HashSet<usize>>,
         coll_snap: &CollationRegistry,
-    ) -> Result<Option<usize>> {
+    ) -> Result<(Option<usize>, SqliteValue)> {
         let (is_max, arg, filter, is_distinct) = tracking;
         let collation = join_expr_effective_collation(arg, col_map);
         let mut best: Option<SqliteValue> = None;
@@ -94385,7 +94413,7 @@ impl Connection {
                 bare_row = Some(index);
             }
         }
-        Ok(bare_row)
+        Ok((bare_row, best.unwrap_or(SqliteValue::Null)))
     }
 
     /// Stable-reorder the materialized rows of a GROUP BY + JOIN so that, within
@@ -99691,11 +99719,27 @@ impl Connection {
         // extremum row, the streaming fast paths (which take an arbitrary row for
         // bare columns) cannot express it. Disqualify them so the row-grouping
         // loop below applies the extremum-row sourcing.
-        // bd-ukvhn: a key with a non-BINARY collation reads its spelling from
-        // the same row as the bare columns.
-        let variant_group_keys: Vec<bool> = group_collations
+        // Use the same storage-affinity rule as the VDBE GROUP BY program.
+        // Untyped keys can mix INTEGER and REAL even with BINARY collation.
+        let variant_group_keys: Vec<bool> = group_by_exprs
             .iter()
-            .map(|collation| group_key_collation_varies_spelling(collation.as_deref()))
+            .zip(&group_collations)
+            .map(|(key, collation)| {
+                if group_key_collation_varies_spelling(collation.as_deref()) {
+                    return true;
+                }
+                let Expr::Column(reference, _) = key else {
+                    return true;
+                };
+                table_schema
+                    .columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(&reference.column))
+                    .is_none_or(|column| {
+                        column.generated_expr.is_some()
+                            || !matches!(column.affinity.to_ascii_uppercase(), 'B' | 'C' | 'D')
+                    })
+            })
             .collect();
         let minmax_bare_tracking =
             self.select_uses_builtin_minmax_bare_tracking_with_keys(select, &variant_group_keys);
@@ -99837,14 +99881,13 @@ impl Connection {
             // argument or FILTER again while computing the aggregate would
             // duplicate UDF side effects and could choose a bare row that does
             // not correspond to the reported value.
-            let minmax_cache = if let Some((
+            let minmax_cache = if let Some(tracking @ (
                 is_max,
                 tracked_arg,
                 tracked_filter,
                 tracked_distinct,
             )) = &minmax_bare_tracking
             {
-                let expected_name = if *is_max { "max" } else { "min" };
                 // bd-89z48: the tracked argument's EFFECTIVE collation — an
                 // explicit `COLLATE` wrapper (`max(name COLLATE NOCASE)`) OR the
                 // column's declared collation (`name TEXT COLLATE NOCASE`), both
@@ -99860,19 +99903,20 @@ impl Connection {
                     .enumerate()
                     .find_map(|(index, descriptor)| match descriptor {
                         GroupByColumn::Agg {
-                            name,
                             arg_col,
                             arg_expr,
                             filter,
                             collation,
                             ..
-                        } if name == expected_name => Some((
-                            index,
-                            *arg_col,
-                            arg_expr.as_deref(),
-                            filter.as_deref(),
-                            collation.as_deref(),
-                        )),
+                        } if column_matches_tracked_minmax(&expanded_columns[index], tracking) => {
+                            Some((
+                                index,
+                                *arg_col,
+                                arg_expr.as_deref(),
+                                filter.as_deref(),
+                                collation.as_deref(),
+                            ))
+                        }
                         GroupByColumn::Plain(_) | GroupByColumn::Agg { .. } => None,
                     })
                     // bd-0174u / bd-3radn M5: when the tracked min()/max() is
@@ -116663,6 +116707,21 @@ fn group_key_collation_varies_spelling(collation: Option<&str>) -> bool {
     collation.is_some_and(|name| !name.eq_ignore_ascii_case("binary"))
 }
 
+fn column_matches_tracked_minmax(
+    column: &ResultColumn,
+    (is_max, arg, tracked_filter, tracked_distinct): &(bool, Expr, Option<Expr>, bool),
+) -> bool {
+    matches!(column, ResultColumn::Expr {
+        expr: Expr::FunctionCall {
+            name, args: FunctionArgs::List(args), distinct, filter, order_by, over: None, ..
+        }, ..
+    } if name.eq_ignore_ascii_case(if *is_max { "max" } else { "min" })
+        && args.as_slice() == std::slice::from_ref(arg)
+        && filter.as_deref() == tracked_filter.as_ref()
+        && distinct == tracked_distinct
+        && order_by.is_empty())
+}
+
 /// Traversal state for [`select_minmax_bare_tracking_walk`].
 #[derive(Default)]
 struct MinMaxBareTrackingWalk {
@@ -116692,10 +116751,8 @@ struct MinMaxBareTrackingWalk {
     /// Result-column aliases a bare name resolves to (set only while walking
     /// HAVING): the name stands for the aliased result expression.
     result_aliases: Vec<(String, Expr)>,
-    /// bd-ukvhn: per GROUP BY key, whether its collation lets one group hold
-    /// several spellings (NOCASE, RTRIM, any non-BINARY collation). SQLite
-    /// copies such a key with the bare columns, so it reads from the same
-    /// row and counts as a bare column here.
+    /// Equal keys can have different storage classes or collated spellings.
+    /// SQLite copies their original values alongside the bare columns.
     variant_group_keys: Vec<bool>,
 }
 
