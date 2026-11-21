@@ -73,7 +73,9 @@ async fn assert_scalar(queries: &[&str], label: &str) {
             (Ok(a), Err(e)) => {
                 mismatches.push(format!("CSQL_ERR: {q}\n  frank: {a:?}\n  csql: ERROR({e})"))
             }
-            (Err(_), Err(_)) => {}
+            (Err(a), Err(b)) => mismatches.push(format!(
+                "BOTH_ERR: {q}\n  frank: ERROR({a})\n  csql: ERROR({b})"
+            )),
         }
     }
     eprintln!(
@@ -87,6 +89,47 @@ async fn assert_scalar(queries: &[&str], label: &str) {
         mismatches.len(),
         mismatches.join("\n")
     );
+}
+
+/// Stock reads indexes backfilled and maintained by FrankenSQLite.
+#[test]
+fn hour_24_expression_indexes_match_stock_table_scans_after_reopen() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE events(id INTEGER PRIMARY KEY, stamp TEXT);
+                 INSERT INTO events VALUES (1,'2024-12-31 23:59'),(2,'2024-12-31 24:00');",
+            )
+            .unwrap();
+        let writer = Connection::open(path.to_str().unwrap()).await.unwrap();
+        writer
+            .execute_batch(
+                "CREATE INDEX by_day ON events(date(stamp));
+                 CREATE INDEX by_time ON events(datetime(stamp));
+                 INSERT INTO events VALUES (3,'2025-01-01 00:00'),(4,'2024-12-31 24:01');",
+            )
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        for (index, predicate) in [
+            ("by_day", "date(stamp)='2025-01-01'"),
+            ("by_time", "datetime(stamp)='2025-01-01 00:00:00'"),
+        ] {
+            for access in ["NOT INDEXED".to_owned(), format!("INDEXED BY {index}")] {
+                let sql = format!("SELECT id FROM events {access} WHERE {predicate} ORDER BY id");
+                assert_eq!(sqlite_rows(&reader, &sql).unwrap(), [["2"], ["3"]], "{sql}");
+            }
+        }
+        assert_eq!(
+            sqlite_rows(&reader, "PRAGMA integrity_check").unwrap(),
+            [["'ok'"]]
+        );
+    });
 }
 
 /// date.c parseYyyyMmDd / parseHhMmSs / parseTimezone: separators, hour 24,

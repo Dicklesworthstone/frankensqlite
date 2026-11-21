@@ -329,10 +329,6 @@ fn parse_timestring(s: &str) -> Option<ParsedTimeValue> {
 
     // Special values are exact (apart from ASCII case): unlike numeric input,
     // SQLite does not ignore surrounding whitespace around these keywords.
-    // C SQLite (date.c:451) captures time once per sqlite3_step() via the VFS
-    // and caches it; we use SystemTime::now() which gives per-call resolution.
-    // A future refinement (Track: Cx time source) could freeze time at
-    // statement start for full C SQLite compatibility.
     if s.eq_ignore_ascii_case("now")
         || s.eq_ignore_ascii_case("subsec")
         || s.eq_ignore_ascii_case("subsecond")
