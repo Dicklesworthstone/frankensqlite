@@ -816,6 +816,11 @@ pub const MAX_TRIGGER_PROGRAM_DEPTH: usize = 50;
 /// `SQLITE_MAX_EXPR_DEPTH` (1000), so 999 nested views is the deepest chain
 /// it answers. A derived table between two views is no level there or here.
 ///
+/// bd-6tmuj: each CTE expansion is a level too, in stock and here. A flat
+/// chain of 999 CTEs answers and 1000 are refused, and a view read through a
+/// WITH costs two levels (the view and the CTE), so a chain of such views is
+/// refused at 500. The resolvers count views plus CTEs against this cap.
+///
 /// Materialization itself no longer recurses per view level (see
 /// `Connection::plan_view_materialization`). The name and metadata resolvers
 /// still expand a chain recursively, continuing on heap-allocated stack
@@ -57015,9 +57020,11 @@ impl Connection {
         }
 
         active_ctes.push(cte.name.clone());
-        let column_names = Self::deduplicate_relation_column_names(
-            self.select_result_column_names(&cte.query, visible_ctes, active_ctes),
-        );
+        // bd-6tmuj: a chain of CTEs recurses here once per level.
+        let column_names =
+            Self::deduplicate_relation_column_names(with_view_expansion_stack(|| {
+                self.select_result_column_names(&cte.query, visible_ctes, active_ctes)
+            }));
         active_ctes.pop();
         if column_names.is_empty() {
             vec!["_c0".to_owned()]
@@ -113119,7 +113126,9 @@ impl<'a> CteResultMetadataResolver<'a> {
             return cte_conservative_result_metadata(cte);
         }
 
-        let mut metadata = self.resolve_select(&cte.query, outer_lookup);
+        // bd-6tmuj: a chain of CTEs recurses here once per level.
+        let mut metadata =
+            with_view_expansion_stack(|| self.resolve_select(&cte.query, outer_lookup));
         self.active.remove(&key);
         if !cte.columns.is_empty() {
             metadata.names.clone_from(&cte.columns);
@@ -154697,7 +154706,21 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             return Ok(());
         }
         self.visits.insert(key, CteCollationVisit::Active);
-        self.validate_select(&cte.query)?;
+        // bd-6tmuj: a CTE expansion is a nesting level, as a view's is, and
+        // a chain of them recurses here once per level.
+        {
+            let mut state = self.column_view_state.borrow_mut();
+            state.relation_cte_depth += 1;
+            if self.active_views.len() + state.relation_cte_depth > MAX_VIEW_NESTING_DEPTH {
+                state.relation_cte_depth -= 1;
+                return Err(FrankenError::ViewNestingTooDeep {
+                    max: MAX_VIEW_NESTING_DEPTH,
+                });
+            }
+        }
+        let result = with_view_expansion_stack(|| self.validate_select(&cte.query));
+        self.column_view_state.borrow_mut().relation_cte_depth -= 1;
+        result?;
         self.visits.insert(key, CteCollationVisit::Done);
         Ok(())
     }
@@ -154868,7 +154891,10 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         // bd-5haia: `active_views` holds exactly this view and the views
         // expanding around it. This pass runs before a statement executes, so
         // the cap fires here first for every statement that reads views.
-        if self.active_views.len() > MAX_VIEW_NESTING_DEPTH {
+        // bd-6tmuj: the CTEs expanding around it are levels too.
+        if self.active_views.len() + self.column_view_state.borrow().relation_cte_depth
+            > MAX_VIEW_NESTING_DEPTH
+        {
             self.active_views.remove(&view_key);
             return Err(FrankenError::ViewNestingTooDeep {
                 max: MAX_VIEW_NESTING_DEPTH,
@@ -155667,6 +155693,29 @@ struct SelectViewValidationState {
     /// Stored views whose column metadata is being computed, for the
     /// circularity and nesting checks of that walk (same keys as above).
     metadata_active: HashSet<String>,
+    /// bd-6tmuj: CTE bodies the name resolver is validating inside one
+    /// another, across every resolver that shares this state. SQLite counts
+    /// each CTE expansion as a nesting level beside each view, so a chain of
+    /// CTEs, or of views reached through WITH, is refused at the same
+    /// [`MAX_VIEW_NESTING_DEPTH`] as a chain of views.
+    cte_depth: usize,
+    /// The same count for the metadata walk.
+    metadata_cte_depth: usize,
+    /// The same count for the relation resolver (`SelectRelationResolver`),
+    /// whose view count is its own `active_views`.
+    relation_cte_depth: usize,
+}
+
+impl SelectViewValidationState {
+    /// Views and CTEs the name resolver is expanding inside each other.
+    fn nesting(&self) -> usize {
+        self.active.len() + self.cte_depth
+    }
+
+    /// Views and CTEs the metadata walk is expanding inside each other.
+    fn metadata_nesting(&self) -> usize {
+        self.metadata_active.len() + self.metadata_cte_depth
+    }
 }
 
 /// Non-executing lexical column resolver used before scalar/vector subquery
@@ -156066,11 +156115,23 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
         if self.validated_ctes.contains(&validation_key) {
             return Ok(());
         }
+        // bd-6tmuj: a CTE expansion is a nesting level, as a view's is.
+        {
+            let mut state = self.view_state.borrow_mut();
+            state.cte_depth += 1;
+            if state.nesting() > MAX_VIEW_NESTING_DEPTH {
+                state.cte_depth -= 1;
+                return Err(FrankenError::ViewNestingTooDeep {
+                    max: MAX_VIEW_NESTING_DEPTH,
+                });
+            }
+        }
         self.active_ctes.insert(key);
         let hidden_scopes = self.cte_scopes.split_off(scope_index + 1);
-        let result = self.validate_select(&cte.query);
+        let result = with_view_expansion_stack(|| self.validate_select(&cte.query));
         self.cte_scopes.extend(hidden_scopes);
         self.active_ctes.remove(&key);
+        self.view_state.borrow_mut().cte_depth -= 1;
         if result.is_ok() {
             self.validated_ctes.insert(validation_key);
         }
@@ -156204,8 +156265,8 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 )));
             }
             // bd-5haia: `active` is this view plus the views expanding
-            // around it in this resolver.
-            if state.active.len() > MAX_VIEW_NESTING_DEPTH {
+            // around it in this resolver; bd-6tmuj adds the CTEs between them.
+            if state.nesting() > MAX_VIEW_NESTING_DEPTH {
                 state.active.remove(&view_key);
                 return Err(FrankenError::ViewNestingTooDeep {
                     max: MAX_VIEW_NESTING_DEPTH,
@@ -156417,7 +156478,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                     view.name
                 )));
             }
-            if state.metadata_active.len() > MAX_VIEW_NESTING_DEPTH {
+            if state.metadata_nesting() > MAX_VIEW_NESTING_DEPTH {
                 state.metadata_active.remove(&metadata_key);
                 return Err(FrankenError::ViewNestingTooDeep {
                     max: MAX_VIEW_NESTING_DEPTH,
@@ -156832,10 +156893,26 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 width_is_exact: false,
             });
         }
+        // bd-6tmuj: a CTE expansion is a nesting level, as a view's is; a
+        // flat chain of CTEs recursed here once per level until the process
+        // overflowed its stack at about 2,000.
+        {
+            let mut state = self.view_state.borrow_mut();
+            state.metadata_cte_depth += 1;
+            if state.metadata_nesting() > MAX_VIEW_NESTING_DEPTH {
+                state.metadata_cte_depth -= 1;
+                self.metadata_active_ctes.remove(&key);
+                return Err(FrankenError::ViewNestingTooDeep {
+                    max: MAX_VIEW_NESTING_DEPTH,
+                });
+            }
+        }
         let hidden_scopes = self.cte_scopes.split_off(scope_index + 1);
-        let names_result = self.metadata_select_column_names(&cte.query);
+        let names_result =
+            with_view_expansion_stack(|| self.metadata_select_column_names(&cte.query));
         self.cte_scopes.extend(hidden_scopes);
         self.metadata_active_ctes.remove(&key);
+        self.view_state.borrow_mut().metadata_cte_depth -= 1;
         let mut metadata = names_result?;
         let mut names = metadata.names;
         if !cte.columns.is_empty() && metadata.width_is_exact && names.len() != cte.columns.len() {
@@ -158345,7 +158422,9 @@ impl<'a> SelectStructureResolver<'a> {
         self.visits.insert(key, CteCollationVisit::Active);
         // bd-r9dhv: a CTE body is not correlated to the query that names it.
         let enclosing_selects = std::mem::take(&mut self.enclosing_selects);
-        let body = self.validate_select(&cte.query);
+        // bd-6tmuj: a chain of CTEs recurses here once per level; the
+        // resolvers before this one bound the depth at stock's limit.
+        let body = with_view_expansion_stack(|| self.validate_select(&cte.query));
         self.enclosing_selects = enclosing_selects;
         body?;
         if !self.view_definition_mode && !cte.columns.is_empty() {
@@ -158695,8 +158774,12 @@ impl<'a, 'r> CteCollationResolver<'a, 'r> {
             return Ok(());
         }
         self.visits.insert(key, CteCollationVisit::Active);
-        validate_select_result_collation_metadata(self.connection, &cte.query, self.registry)?;
-        self.validate_select(&cte.query)?;
+        // bd-6tmuj: a chain of CTEs recurses here once per level; the
+        // resolvers before this one bound the depth at stock's limit.
+        with_view_expansion_stack(|| {
+            validate_select_result_collation_metadata(self.connection, &cte.query, self.registry)
+        })?;
+        with_view_expansion_stack(|| self.validate_select(&cte.query))?;
         validate_select_collation_consumers_body(
             self.connection,
             &cte.query,

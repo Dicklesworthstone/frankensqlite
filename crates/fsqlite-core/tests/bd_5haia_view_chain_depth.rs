@@ -12,6 +12,12 @@
 //! with "VIEWs and/or subqueries nested too deep", the text the typed error
 //! carries. The boundary tests check both sides against live stock.
 //!
+//! bd-6tmuj: stock counts each CTE expansion as a level too. The `bd_6tmuj_*`
+//! tests pin a flat CTE chain at 999 / 1000, a chain of views read through
+//! WITH at 499 / 500 (two levels each), and an alternating chain at 665 /
+//! 666, against live stock; flat chains of 2,028 and 5,000 CTEs, which
+//! aborted the process, must be refused with stock's text.
+//!
 //! Every workload here runs on a dedicated 2 MiB thread inside a helper
 //! process (this test binary, re-invoked on one test). A stack overflow aborts
 //! the helper, not the test runner, and the parent test fails with the
@@ -439,6 +445,8 @@ fn bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack() {
             format!("SELECT * FROM v{top};"),
             format!("SELECT n FROM w{top};"),
             format!("SELECT (SELECT n FROM w{top}) + (SELECT x FROM v{top});"),
+            // bd-6tmuj: a derived table over a view chain is no level.
+            format!("SELECT x FROM (SELECT x FROM v{top});"),
         ];
         assert_matches_stock(runtime, conn, &setup, &queries);
     });
@@ -526,5 +534,202 @@ fn bd_5haia_view_chain_beyond_nesting_limit_is_a_typed_error_on_2mib_stack() {
             frank_rows(runtime, conn, "SELECT 41 + 1;"),
             vec![vec!["int:42".to_owned()]]
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// bd-6tmuj: stock SQLite counts each CTE expansion as a nesting level beside
+// each view. One WITH holding a flat chain of CTEs answers 999 of them and
+// refuses 1000; a view read through a WITH costs two levels, so a chain of
+// such views is refused at 500. The flat chain used to recurse once per CTE
+// in the resolvers and abort the process with a stack overflow at about
+// 2,000 on the CLI's main-thread stack, sooner on a 2 MiB thread.
+// ---------------------------------------------------------------------------
+
+/// `WITH c0 AS (SELECT 1 AS x), ci AS (SELECT x FROM c{i-1}), ...` up to
+/// `c{depth}`, with no consuming SELECT.
+fn flat_cte_chain(depth: usize) -> String {
+    let mut ctes = vec!["c0 AS (SELECT 1 AS x)".to_owned()];
+    ctes.extend((1..=depth).map(|level| format!("c{level} AS (SELECT x FROM c{})", level - 1)));
+    format!("WITH {}", ctes.join(", "))
+}
+
+/// Views `{prefix}0 AS SELECT 1 AS x` and, above it, each view reading the
+/// one below through `WITH c AS (SELECT x FROM ...) SELECT x FROM c` when
+/// `through_with(level)` holds, else directly.
+fn view_chain(prefix: &str, depth: usize, through_with: impl Fn(usize) -> bool) -> Vec<String> {
+    let mut setup = vec![format!("CREATE VIEW {prefix}0 AS SELECT 1 AS x;")];
+    setup.extend((1..=depth).map(|level| {
+        let below = format!("{prefix}{}", level - 1);
+        if through_with(level) {
+            format!(
+                "CREATE VIEW {prefix}{level} AS WITH c AS (SELECT x FROM {below}) SELECT x FROM c;"
+            )
+        } else {
+            format!("CREATE VIEW {prefix}{level} AS SELECT x FROM {below};")
+        }
+    }));
+    setup
+}
+
+/// `sql` is refused by stock and by fsqlite, directly and prepared, with the
+/// typed ViewNestingTooDeep carrying stock's text.
+fn assert_refused_like_stock(
+    runtime: &asupersync::runtime::Runtime,
+    conn: &Connection,
+    stock: &rusqlite::Connection,
+    sql: &str,
+) {
+    let stock_message = stock_refusal(stock, sql);
+    let direct = runtime
+        .block_on(conn.query(sql))
+        .expect_err("fsqlite must refuse what stock refuses");
+    let prepared = match runtime.block_on(conn.prepare(sql)) {
+        Err(error) => error,
+        Ok(statement) => runtime
+            .block_on(statement.query())
+            .expect_err("fsqlite must refuse the prepared statement too"),
+    };
+    for (mode, error) in [("direct", direct), ("prepared", prepared)] {
+        assert!(
+            matches!(
+                error,
+                FrankenError::ViewNestingTooDeep { max } if max == MAX_VIEW_NESTING_DEPTH
+            ),
+            "{mode}: must fail with ViewNestingTooDeep, got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            stock_message,
+            "{mode}: the refusal must carry stock's text"
+        );
+    }
+}
+
+fn apply_to_both(
+    runtime: &asupersync::runtime::Runtime,
+    conn: &Connection,
+    stock: &rusqlite::Connection,
+    setup: &[String],
+) {
+    for statement in setup {
+        runtime
+            .block_on(conn.execute(statement))
+            .unwrap_or_else(|error| panic!("fsqlite failed `{statement}`: {error:?}"));
+        stock
+            .execute_batch(statement)
+            .unwrap_or_else(|error| panic!("stock SQLite failed `{statement}`: {error}"));
+    }
+}
+
+/// 999 chained CTEs answer, as in stock, also read through a scalar
+/// subquery, which is no level; 1000 are refused with stock's text, read
+/// either way.
+#[test]
+fn bd_6tmuj_flat_cte_chain_at_the_nesting_limit_matches_stock_on_2mib_stack() {
+    const NAME: &str = "bd_6tmuj_flat_cte_chain_at_the_nesting_limit_matches_stock_on_2mib_stack";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+    on_small_stack(|runtime, conn| {
+        let stock = rusqlite::Connection::open_in_memory().expect("open stock SQLite");
+        let top = MAX_VIEW_NESTING_DEPTH - 1;
+        let answered = [
+            format!("{} SELECT x FROM c{top};", flat_cte_chain(top)),
+            format!("{} SELECT (SELECT x FROM c{top});", flat_cte_chain(top)),
+        ];
+        for query in &answered {
+            let expected = stock_rows(&stock, query);
+            assert_eq!(
+                expected,
+                vec![vec!["int:1".to_owned()]],
+                "stock on `{query}`"
+            );
+            assert_eq!(frank_rows(runtime, conn, query), expected);
+        }
+        let deeper = top + 1;
+        for refused in [
+            format!("{} SELECT x FROM c{deeper};", flat_cte_chain(deeper)),
+            format!(
+                "{} SELECT (SELECT x FROM c{deeper});",
+                flat_cte_chain(deeper)
+            ),
+        ] {
+            assert_refused_like_stock(runtime, conn, &stock, &refused);
+        }
+        assert_eq!(
+            frank_rows(runtime, conn, "SELECT 41 + 1;"),
+            vec![vec!["int:42".to_owned()]]
+        );
+    });
+}
+
+/// The chains that aborted the process are refused, not a crash.
+#[test]
+fn bd_6tmuj_flat_cte_chains_far_past_the_limit_are_refused_on_2mib_stack() {
+    const NAME: &str = "bd_6tmuj_flat_cte_chains_far_past_the_limit_are_refused_on_2mib_stack";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+    on_small_stack(|runtime, conn| {
+        let stock = rusqlite::Connection::open_in_memory().expect("open stock SQLite");
+        for depth in [2_028, 5_000] {
+            let query = format!("{} SELECT x FROM c{depth};", flat_cte_chain(depth));
+            assert_refused_like_stock(runtime, conn, &stock, &query);
+        }
+        assert_eq!(
+            frank_rows(runtime, conn, "SELECT 41 + 1;"),
+            vec![vec!["int:42".to_owned()]]
+        );
+    });
+}
+
+/// Each view read through a WITH is two levels: 499 such views over v0 are
+/// 999 levels and answer, 500 are refused, as in stock. Stock caches a
+/// view's column names once resolved, so the refusal is checked first.
+#[test]
+fn bd_6tmuj_view_chain_through_with_matches_stock_on_2mib_stack() {
+    const NAME: &str = "bd_6tmuj_view_chain_through_with_matches_stock_on_2mib_stack";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+    on_small_stack(|runtime, conn| {
+        let stock = rusqlite::Connection::open_in_memory().expect("open stock SQLite");
+        let top = MAX_VIEW_NESTING_DEPTH.div_ceil(2);
+        apply_to_both(runtime, conn, &stock, &view_chain("v", top, |_| true));
+        assert_refused_like_stock(runtime, conn, &stock, &format!("SELECT x FROM v{top};"));
+        let answered = format!("SELECT x FROM v{};", top - 1);
+        let expected = stock_rows(&stock, &answered);
+        assert_eq!(expected, vec![vec!["int:1".to_owned()]]);
+        assert_eq!(frank_rows(runtime, conn, &answered), expected);
+    });
+}
+
+/// Views alternating through a WITH (odd levels) and directly (even ones):
+/// 665 over v0 are 999 levels and answer, 666 are refused, as in stock.
+#[test]
+fn bd_6tmuj_alternating_view_chain_matches_stock_on_2mib_stack() {
+    const NAME: &str = "bd_6tmuj_alternating_view_chain_matches_stock_on_2mib_stack";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+    on_small_stack(|runtime, conn| {
+        let stock = rusqlite::Connection::open_in_memory().expect("open stock SQLite");
+        let top = 666;
+        apply_to_both(
+            runtime,
+            conn,
+            &stock,
+            &view_chain("v", top, |level| level % 2 == 1),
+        );
+        assert_refused_like_stock(runtime, conn, &stock, &format!("SELECT x FROM v{top};"));
+        let answered = format!("SELECT x FROM v{};", top - 1);
+        let expected = stock_rows(&stock, &answered);
+        assert_eq!(expected, vec![vec!["int:1".to_owned()]]);
+        assert_eq!(frank_rows(runtime, conn, &answered), expected);
     });
 }
