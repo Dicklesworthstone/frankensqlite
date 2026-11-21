@@ -2913,7 +2913,7 @@ mod tests {
         let vfs = MemoryVfs::new();
         let cx = Cx::new();
         let mem_wal_path = Path::new("unit_gate_pos.wal");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(
                 &cx,
                 Some(mem_wal_path),
@@ -2960,7 +2960,7 @@ mod tests {
         corrupt_payload(&mut unrecoverable, 3);
         corrupt_payload(&mut unrecoverable, 4);
         let mem_neg_path = Path::new("unit_gate_neg.wal");
-        let (mut neg_file, _) = vfs
+        let (neg_file, _) = vfs
             .open(
                 &cx,
                 Some(mem_neg_path),
@@ -3039,7 +3039,7 @@ mod tests {
         let vfs = MemoryVfs::new();
         let cx = Cx::new();
         let mem_path = Path::new("prop_struct_mixed.wal");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(
                 &cx,
                 Some(mem_path),
