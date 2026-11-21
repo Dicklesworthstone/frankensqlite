@@ -44662,7 +44662,11 @@ impl Connection {
                 validate_limit_offset_lossless(select)?;
                 // Time-travel: intercept FOR SYSTEM_TIME AS OF queries and
                 // execute against a historical MemDatabase snapshot (#23).
-                if let Some(target) = extract_temporal_clause(select) {
+                // A temporal clause belongs to its SELECT core. Let the
+                // compound dispatcher enter and restore each arm's snapshot.
+                if select.body.compounds.is_empty()
+                    && let Some(target) = extract_temporal_clause(select)
+                {
                     self.log_mem_execution_fallback("select", "time_travel_snapshot")?;
                     return boxed_future(|| {
                         self.execute_time_travel_select(select, params, &target)
@@ -82508,19 +82512,14 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        // bd-wiffk: the evaluators below answer one SELECT core, so a
-        // compound lost every arm after its first (and an aggregate arm all
-        // of them): `WITH c AS (...) INSERT INTO t SELECT x FROM c UNION ALL
-        // SELECT 7` wrote one row. A compound runs arm by arm, as the
-        // dispatcher runs one.
+        // These evaluators consume one SELECT core. The compound executor
+        // combines every arm and applies ORDER BY and LIMIT to the result.
         if !select.body.compounds.is_empty() {
             return Box::pin(self.execute_compound_select(select, params)).await;
         }
         let bound = bind_placeholders_in_select_for_fallback(select, params)?;
         let cx = self.op_cx_after_background_status();
-        let implicit_agg = select.body.compounds.is_empty()
-            && self.has_implicit_aggregation_with_registry(select)
-            && !has_group_by(select);
+        let implicit_agg = self.has_implicit_aggregation_with_registry(select) && !has_group_by(select);
         let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
         if self.select_requires_grouped_window_pipeline(select) {
             self.execute_group_by_window_select(&cx, &bound, None).await

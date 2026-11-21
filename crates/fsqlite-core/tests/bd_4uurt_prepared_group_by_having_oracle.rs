@@ -12,9 +12,9 @@
 //! Direct queries formerly used the interpreted path even for simple
 //! predicates. Strict file queries also exercise the compiled path directly.
 //!
-//! Every statement runs on bundled SQLite 3.54.1 and on fsqlite, on `:memory:`
-//! and on a file, executed directly and prepared. Each statement's rows must
-//! equal stock's, and are pinned to stock's.
+//! The general matrix covers memory and file databases. A separate strict
+//! file matrix checks nullable keys and projected aggregates. Both compare
+//! the direct and prepared results with bundled SQLite 3.54.1.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;

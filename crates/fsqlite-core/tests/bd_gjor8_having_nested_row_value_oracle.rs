@@ -15,9 +15,9 @@
 //! Every statement runs on bundled SQLite 3.54.1 and on fsqlite, on `:memory:`
 //! and on a file, executed directly and prepared. Each statement's rows, or
 //! its error text, must equal stock's, and is pinned to stock's so the
-//! comparison cannot pass vacuously. (A HAVING runs fsqlite's grouped
-//! fallback on both, which strict mode refuses, so the file run is not
-//! strict.)
+//! comparison cannot pass vacuously. This suite includes expressions that
+//! use the grouped fallback. The bd-4uurt oracle separately exercises the
+//! compiled HAVING predicates under strict file-backed execution.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;

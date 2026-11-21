@@ -129,6 +129,56 @@ async fn snapshot_exists(conn: &Connection, seq: u64) -> bool {
 }
 
 #[test]
+fn compound_arms_read_their_own_snapshot_and_restore_live_state() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t(x)").await.unwrap();
+        stock.execute_batch("CREATE TABLE t(x)").unwrap();
+        let mut snapshots = Vec::new();
+        for (index, value) in [11, 22].into_iter().enumerate() {
+            let insert = format!("INSERT INTO t VALUES ({value})");
+            for sql in ["BEGIN", &insert, "COMMIT"] {
+                conn.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            let frozen = format!("snapshot{index}");
+            stock.execute_batch(&format!("CREATE TABLE {frozen} AS SELECT x FROM t")).unwrap();
+            let expected = render_stock(&stock, &format!("SELECT x FROM {frozen} ORDER BY x")).unwrap();
+            let mut found = None;
+            for seq in 1..64 {
+                let source = format!("t FOR SYSTEM_TIME AS OF COMMITSEQ {seq}");
+                if let Ok(rows) = conn.query(&format!("SELECT x FROM {source} ORDER BY x")).await
+                    && render_fsqlite(&rows) == expected
+                {
+                    found = Some(source);
+                    break;
+                }
+            }
+            snapshots.push(found.expect("committed snapshot with the stock rows"));
+        }
+        for sql in [
+            "SELECT x FROM snapshot0 UNION ALL SELECT 99 ORDER BY 1",
+            "SELECT x FROM snapshot0 UNION ALL SELECT x FROM snapshot1 ORDER BY 1",
+            "SELECT x FROM snapshot1 EXCEPT SELECT x FROM snapshot0",
+            "SELECT x FROM snapshot0 UNION ALL SELECT x FROM t ORDER BY 1 DESC LIMIT 2 OFFSET 1",
+            "SELECT x FROM t UNION ALL SELECT x FROM snapshot0 ORDER BY 1",
+        ] {
+            let expected = render_stock(&stock, sql).unwrap();
+            let temporal = sql.replace("snapshot0", &snapshots[0]).replace("snapshot1", &snapshots[1]);
+            let direct = conn.query(&temporal).await.unwrap();
+            assert_eq!(render_fsqlite(&direct), expected, "direct {temporal}");
+            let prepared = conn.prepare(&temporal).await.unwrap().query().await.unwrap();
+            assert_eq!(render_fsqlite(&prepared), expected, "prepared {temporal}");
+        }
+        let missing = format!("SELECT x FROM {} UNION ALL SELECT x FROM t FOR SYSTEM_TIME AS OF COMMITSEQ 999999", snapshots[0]);
+        assert!(conn.query(&missing).await.unwrap_err().to_string().contains("999999"));
+        assert_eq!(render_fsqlite(&conn.query("SELECT x FROM t ORDER BY x").await.unwrap()), vec!["i:11", "i:22"]);
+        conn.close().await.unwrap();
+    });
+}
+
+#[test]
 fn historical_queries_match_stock_frozen_at_each_commit() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.expect("open :memory:");
