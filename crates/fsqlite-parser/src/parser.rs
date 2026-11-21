@@ -2772,7 +2772,8 @@ impl Parser {
         self.expect_kw(&TokenKind::KwPragma)?;
         let name = self.parse_qualified_name()?;
         let preserve_numeric_spelling = name.name.eq_ignore_ascii_case("cache_size")
-            || name.name.eq_ignore_ascii_case("default_cache_size");
+            || name.name.eq_ignore_ascii_case("default_cache_size")
+            || name.name.eq_ignore_ascii_case("secure_delete");
         let value = if self.eat(&TokenKind::Eq) || self.eat(&TokenKind::EqEq) {
             Some(PragmaValue::Assign(
                 self.parse_pragma_value_expr(preserve_numeric_spelling)?,

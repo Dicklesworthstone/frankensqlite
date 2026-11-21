@@ -1827,8 +1827,11 @@ pub mod pragma {
         /// Set/readback surface only.
         pub locking_mode: String,
         /// `PRAGMA secure_delete` tri-state: 0 = OFF, 1 = ON, 2 = FAST (default 0).
-        /// Set/readback surface only.
+        /// The connection applies this erasure policy to pager transactions.
         pub secure_delete: i64,
+        /// TEMP has its own erasure policy once its database is opened. An
+        /// unqualified assignment affects it only after that initialization.
+        pub temp_secure_delete: Option<i64>,
         /// `PRAGMA threads` auxiliary worker-thread limit (default 0). Advisory:
         /// FrankenSQLite does not spawn SQLite-style sort helper threads, so this
         /// is a stored limit clamped to the stock maximum (8).
@@ -1879,6 +1882,7 @@ pub mod pragma {
                 reverse_unordered_selects: false,
                 locking_mode: "normal".to_owned(),
                 secure_delete: 0,
+                temp_secure_delete: None,
                 threads: 0,
                 cache_spill_pages: 1,
                 cache_spill_enabled: true,
@@ -2018,7 +2022,7 @@ pub mod pragma {
             return apply_locking_mode(state, stmt);
         }
         if name.eq_ignore_ascii_case("secure_delete") {
-            return apply_secure_delete(state, stmt);
+            return Ok(apply_secure_delete(state, stmt));
         }
         if name.eq_ignore_ascii_case("threads") {
             return apply_threads(state, stmt);
@@ -2138,41 +2142,60 @@ pub mod pragma {
         }
     }
 
-    /// `PRAGMA secure_delete [= OFF|ON|FAST|0|1|2]`. Tri-state: 0 = OFF, 1 = ON,
+    /// `PRAGMA secure_delete [= OFF|ON|FAST|0|1]`. Tri-state: 0 = OFF, 1 = ON,
     /// 2 = FAST. C SQLite reports the integer on readback and echoes the new value
-    /// on assignment. This is the set/readback surface only; the actual
-    /// zero-on-delete storage semantics are tracked separately. (GH #277)
+    /// on assignment. Only the FAST keyword selects mode 2; other arguments use
+    /// SQLite's boolean PRAGMA conversion. The connection applies the policy to
+    /// the pager and propagates unqualified assignments to attached databases.
     fn apply_secure_delete(
         state: &mut ConnectionPragmaState,
         stmt: &PragmaStatement,
-    ) -> Result<PragmaOutput> {
+    ) -> PragmaOutput {
+        let is_temp = stmt
+            .name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"));
+        if is_temp {
+            state.temp_secure_delete.get_or_insert(0);
+        }
         match &stmt.value {
-            None => Ok(PragmaOutput::Int(state.secure_delete)),
+            None => PragmaOutput::Int(if is_temp {
+                state.temp_secure_delete.unwrap_or(0)
+            } else {
+                state.secure_delete
+            }),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
-                let value = parse_secure_delete_value(expr)?;
-                state.secure_delete = value;
-                Ok(PragmaOutput::Int(value))
+                let value = parse_secure_delete_value(expr);
+                if is_temp {
+                    state.temp_secure_delete = Some(value);
+                } else {
+                    state.secure_delete = value;
+                    if stmt.name.schema.is_none() && state.temp_secure_delete.is_some() {
+                        state.temp_secure_delete = Some(value);
+                    }
+                }
+                PragmaOutput::Int(value)
             }
         }
     }
 
-    fn parse_secure_delete_value(expr: &Expr) -> Result<i64> {
-        if let Expr::Literal(Literal::Integer(n), _) = expr {
-            return match *n {
-                0..=2 => Ok(*n),
-                _ => Err(FrankenError::OutOfRange {
-                    what: "secure_delete".to_owned(),
-                    value: n.to_string(),
-                }),
-            };
+    fn parse_secure_delete_value(expr: &Expr) -> i64 {
+        let text = match expr {
+            Expr::Literal(Literal::True, _) => return 1,
+            Expr::Literal(Literal::False, _) => return 0,
+            _ => cache_pragma_argument_text(expr),
+        };
+        if text.eq_ignore_ascii_case("fast") {
+            return 2;
         }
-        if let Ok(text) = parse_text_expr(expr)
-            && text.eq_ignore_ascii_case("fast")
-        {
-            return Ok(2);
-        }
-        // OFF/ON/TRUE/FALSE map to 0/1.
-        Ok(i64::from(parse_bool(expr)?))
+        i64::from(
+            text.eq_ignore_ascii_case("on")
+                || text.eq_ignore_ascii_case("yes")
+                || text.eq_ignore_ascii_case("true")
+                || (text.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                    && parse_cache_pragma_int32(expr) != 0),
+        )
     }
 
     /// `PRAGMA threads [= N]`. A bare query reports the current limit; an
@@ -4271,7 +4294,46 @@ mod tests {
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = ON"), Int(1));
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = FAST"), Int(2));
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = OFF"), Int(0));
-        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = 2"), Int(2));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = 2"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = -1"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = yes"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = bogus"), Int(0));
+    }
+
+    #[test]
+    fn test_connection_pragma_secure_delete_numeric_spelling() {
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+        // Stock SQLite uses the integer prefix of the original token. Parsing
+        // and formatting a float first would silently turn requested ON into OFF.
+        for (sql, expected) in [
+            ("PRAGMA secure_delete=1e-300", 1),
+            ("PRAGMA secure_delete=1e309", 1),
+            ("PRAGMA secure_delete=+1e-300", 1),
+            ("PRAGMA secure_delete=-1e-300", 0),
+            ("PRAGMA secure_delete=0x80000000", 0),
+            ("PRAGMA secure_delete(1e-300)", 1),
+        ] {
+            assert_eq!(apply_sql(&mut state, sql), Int(expected), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_connection_pragma_secure_delete_temp_scope() {
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete=FAST"), Int(2));
+        // An unopened TEMP database does not inherit an earlier assignment.
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA main.secure_delete"), Int(2));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete=ON"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA main.secure_delete=OFF"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete=FAST"), Int(2));
+        assert_eq!(apply_sql(&mut state, "PRAGMA main.secure_delete"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete=ON"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete"), Int(1));
     }
 
     #[test]
