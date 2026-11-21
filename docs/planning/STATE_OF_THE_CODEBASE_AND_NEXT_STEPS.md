@@ -13,6 +13,14 @@ commit sequences in one query and restoration of the live view afterward
 (Linux RCH `30097323753219011`, `bd-wiffk`, `bd-cglsc`). Durable history
 across file reopen remains open on `bd-cd7jt`.
 
+With file-backed temporary storage and a one-page cache, the previous CLI
+failed to create an index on a 1,048,577-byte BLOB. On `269f4b0ac`
+(Linux CLI build `30097323753219225`), FrankenSQLite built the index on
+files created by each engine. Fresh FrankenSQLite and SQLite 3.54.1
+processes read all three rows in index order and passed `integrity_check`
+on both files. Both readers also recovered every byte of a separate
+1,048,577-byte mixed-byte BLOB through the index (`bd-46l13`).
+
 ## Compatibility and concurrent writers, 2026-11-20
 
 Two Linux CLI processes opened the same WAL database with the default settings.
