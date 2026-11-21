@@ -1160,7 +1160,7 @@ impl Drop for StackEntry {
 // ---------------------------------------------------------------------------
 
 const CURSOR_STACK_INLINE_DEPTH: usize = 4;
-const TABLE_SEEK_CACHE_SLOTS: usize = 4;
+const TABLE_SEEK_CACHE_SLOTS: usize = 8;
 const CELL_SLOT_CACHE_ENTRIES: usize = 64;
 
 type CursorStack = SmallVec<[StackEntry; CURSOR_STACK_INLINE_DEPTH]>;
@@ -1499,6 +1499,121 @@ struct TableSeekCacheEntry {
     /// the root then finds, and a slot that passes is still searched.
     first_rowid: i64,
     last_rowid: i64,
+}
+
+/// The table seek cache's `TABLE_SEEK_CACHE_SLOTS` slots, newest first
+/// (bd-w4pr1.12, lever SC8 v4). Slot 0 lives in the cursor; slots 1.. live
+/// in one allocation made the first time a landing needs a second slot. The
+/// cursor so holds one slot and a pointer, no more than the four inline
+/// slots it held before, and a cursor that never seeks across leaves
+/// allocates nothing. Filled slots are always a prefix.
+///
+/// Slots 1.. are read and moved as one slice ([`Self::rest`],
+/// [`Self::push_front`]'s rotate), not slot by slot through the box: SC8 v3
+/// did that and paid about 259 instructions a missed probe for it (219 in
+/// its per-slot push_front, 73 in the per-slot scan; callgrind of
+/// rowid_lookups_200k).
+#[derive(Debug, Clone, Default)]
+struct TableSeekCache {
+    first: Option<TableSeekCacheEntry>,
+    rest: Option<Box<[Option<TableSeekCacheEntry>; TABLE_SEEK_CACHE_SLOTS - 1]>>,
+}
+
+impl TableSeekCache {
+    /// Slots 1.., in order; empty before they are allocated.
+    #[inline]
+    fn rest(&self) -> &[Option<TableSeekCacheEntry>] {
+        self.rest.as_deref().map_or(&[], |rest| rest.as_slice())
+    }
+
+    /// Slot `slot`, `None` when it is empty or out of range.
+    #[inline]
+    fn get(&self, slot: usize) -> Option<TableSeekCacheEntry> {
+        if slot == 0 {
+            self.first
+        } else {
+            self.rest().get(slot - 1).copied().flatten()
+        }
+    }
+
+    /// Empty every slot; an allocation made for slots 1.. is kept.
+    fn clear(&mut self) {
+        self.first = None;
+        if let Some(rest) = self.rest.as_mut() {
+            rest.fill(None);
+        }
+    }
+
+    /// The slots in order, newest first.
+    fn iter(&self) -> impl Iterator<Item = Option<TableSeekCacheEntry>> + '_ {
+        (0..TABLE_SEEK_CACHE_SLOTS).map(|slot| self.get(slot))
+    }
+
+    /// The allocated slots in order, for tests that age the cached bounds.
+    #[cfg(test)]
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Option<TableSeekCacheEntry>> {
+        std::iter::once(&mut self.first)
+            .chain(self.rest.iter_mut().flat_map(|rest| rest.iter_mut()))
+    }
+
+    /// The slot a landing on `page_no` takes the place of: the one that
+    /// already names the leaf, else the first empty one, else the last
+    /// (least recent) one.
+    #[inline]
+    fn landing_slot(&self, page_no: PageNumber) -> usize {
+        let gives_way = |slot: &Option<TableSeekCacheEntry>| {
+            slot.is_none_or(|cached| cached.page_no == page_no)
+        };
+        if gives_way(&self.first) {
+            return 0;
+        }
+        self.rest.as_deref().map_or(1, |rest| {
+            rest.iter()
+                .position(gives_way)
+                .map_or(TABLE_SEEK_CACHE_SLOTS - 1, |idx| idx + 1)
+        })
+    }
+
+    /// Slots `0..end` move down one place (slot `end`'s entry is dropped)
+    /// and `entry` takes slot 0: slots 1..=end rotate as one slice.
+    #[inline]
+    fn push_front(&mut self, end: usize, entry: TableSeekCacheEntry) {
+        debug_assert!(end < TABLE_SEEK_CACHE_SLOTS);
+        if end > 0 {
+            let rest = self
+                .rest
+                .get_or_insert_with(|| Box::new([None; TABLE_SEEK_CACHE_SLOTS - 1]));
+            rest[..end].rotate_right(1);
+            rest[0] = self.first;
+        }
+        self.first = Some(entry);
+    }
+}
+
+/// Equal when every slot holds the same entry, whether or not slots 1.. are
+/// allocated.
+impl PartialEq for TableSeekCache {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl std::ops::Index<usize> for TableSeekCache {
+    type Output = Option<TableSeekCacheEntry>;
+
+    #[inline]
+    fn index(&self, slot: usize) -> &Self::Output {
+        const EMPTY: &Option<TableSeekCacheEntry> = &None;
+        if slot == 0 {
+            &self.first
+        } else {
+            assert!(
+                slot < TABLE_SEEK_CACHE_SLOTS,
+                "seek-cache slot {slot} out of range"
+            );
+            self.rest.as_ref().map_or(EMPTY, |rest| &rest[slot - 1])
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2675,12 +2790,12 @@ pub struct BtCursor<P> {
     /// Whether the last `index_insert` seek ran past the last cell of the
     /// rightmost leaf, i.e. the key sorts after every key already stored.
     last_index_insert_past_rightmost: bool,
-    /// Four-entry LRU of table-seek leaf anchors.
+    /// `TABLE_SEEK_CACHE_SLOTS`-entry LRU of table-seek leaf anchors.
     ///
     /// Each slot remembers the rowid probe plus the leaf page/cell position
     /// where that seek landed. Later seeks probe cached leaves before they
     /// fall back to a full root-to-leaf descent.
-    seek_cache: [Option<TableSeekCacheEntry>; TABLE_SEEK_CACHE_SLOTS],
+    seek_cache: TableSeekCache,
     /// Monotonic epoch for the current row image visible through this cursor.
     ///
     /// `(page_no, cell_idx)` already identifies logical movement. This epoch
@@ -2712,7 +2827,7 @@ impl<P> BtCursor<P> {
         self.stack.clear();
         self.rightmost_leaf_cache = None;
         self.last_known_depth = None;
-        self.seek_cache.fill(None);
+        self.seek_cache.clear();
         self.clear_cell_slot_caches();
         self.bump_row_image_epoch();
     }
@@ -2787,7 +2902,7 @@ impl<P> BtCursor<P> {
     }
 
     fn clear_seek_cache(&mut self) {
-        self.seek_cache.fill(None);
+        self.seek_cache.clear();
     }
 
     fn clear_rightmost_leaf_cache(&mut self) {
@@ -2864,26 +2979,40 @@ impl<P> BtCursor<P> {
         {
             TABLE_SEEK_MRU_SHORT_CIRCUIT_HITS_FOR_BENCH
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.seek_cache[0] = Some(entry);
+            self.seek_cache.first = Some(entry);
             return;
         }
 
-        let mut refreshed = [None; TABLE_SEEK_CACHE_SLOTS];
-        refreshed[0] = Some(entry);
+        // The landing takes the front. The slot that already names its leaf
+        // gives way, or else the first empty slot, or else the last (least
+        // recent) one; the slots before it move down one. Filled slots are
+        // always a prefix, so this is the order a rebuild would give, without
+        // copying the slots.
+        let end = self.seek_cache.landing_slot(page_no);
+        self.seek_cache.push_front(end, entry);
+    }
 
-        let mut next_slot = 1usize;
-        for existing in self.seek_cache.into_iter().flatten() {
-            if existing.page_no == page_no {
-                continue;
-            }
-            if next_slot >= TABLE_SEEK_CACHE_SLOTS {
-                break;
-            }
-            refreshed[next_slot] = Some(existing);
-            next_slot += 1;
+    /// The first seek-cache slot at or after `from` whose landing admits
+    /// `target_rowid`: [`Self::try_table_seek_cache`]'s filter. A landing
+    /// on a leaf's first cell admits no smaller rowid, and no slot admits a
+    /// rowid outside the bounds its leaf held (bd-w4pr1.13.13). Slot 0 is
+    /// read in the cursor and slots 1.. as one slice.
+    #[inline]
+    fn next_table_seek_slot(&self, target_rowid: i64, from: usize) -> Option<usize> {
+        let admits = |cached: &TableSeekCacheEntry| {
+            !(target_rowid < cached.rowid && cached.cell_idx == 0)
+                && target_rowid >= cached.first_rowid
+                && target_rowid <= cached.last_rowid
+        };
+        if from == 0 && self.seek_cache.first.as_ref().is_some_and(admits) {
+            return Some(0);
         }
-
-        self.seek_cache = refreshed;
+        self.seek_cache
+            .rest()
+            .iter()
+            .enumerate()
+            .skip(from.saturating_sub(1))
+            .find_map(|(idx, slot)| slot.as_ref().is_some_and(admits).then_some(idx + 1))
     }
 }
 
@@ -3260,7 +3389,7 @@ impl<P: PageReader> BtCursor<P> {
             last_known_depth: None,
             decoded_pages: DecodedPageMemo::default(),
             last_index_insert_past_rightmost: false,
-            seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
+            seek_cache: TableSeekCache::default(),
             row_image_epoch: 0,
         }
     }
@@ -4815,22 +4944,15 @@ impl<P: PageReader> BtCursor<P> {
     ) -> Result<Option<SeekResult>> {
         observe_cursor_cancellation(cx)?;
 
-        for slot_idx in 0..TABLE_SEEK_CACHE_SLOTS {
+        // Only the slots whose landing admits the target are visited; the
+        // scan for them is synchronous and reads the slots in place, so a
+        // probe no slot admits costs one pass and copies nothing.
+        let mut next_slot = 0;
+        while let Some(slot_idx) = self.next_table_seek_slot(target_rowid, next_slot) {
+            next_slot = slot_idx + 1;
             let Some(cached) = self.seek_cache[slot_idx] else {
                 continue;
             };
-
-            // If the cached landing point was the first cell on this leaf,
-            // any smaller rowid must belong to an earlier leaf.
-            if target_rowid < cached.rowid && cached.cell_idx == 0 {
-                continue;
-            }
-            // A landing below is an exact match or a gap strictly inside the
-            // leaf, so a target outside the rowids the leaf held cannot land
-            // here: skip the slot instead of loading its page to find out.
-            if target_rowid < cached.first_rowid || target_rowid > cached.last_rowid {
-                continue;
-            }
 
             // NOTE (bd-kwei8): this fast path deliberately rebuilds the stack
             // as JUST the landing leaf — no root-to-leaf path. That is fine
@@ -4943,11 +5065,12 @@ impl<P: PageReader> BtCursor<P> {
         page_no: PageNumber,
         cell_idx: u16,
     ) {
-        match self.seek_cache.get_mut(slot_idx) {
-            Some(Some(cached)) if cached.page_no == page_no => {
+        match self.seek_cache.get(slot_idx) {
+            Some(mut cached) if cached.page_no == page_no => {
+                // The slot's old entry is the one push_front drops.
                 cached.rowid = rowid;
                 cached.cell_idx = cell_idx;
-                self.seek_cache[..=slot_idx].rotate_right(1);
+                self.seek_cache.push_front(slot_idx, cached);
             }
             _ => self.remember_table_landing(rowid, page_no, cell_idx),
         }
@@ -16624,87 +16747,116 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_table_seek_cache_uses_four_slot_lru() {
-        run_async(async {
-            let mut store = MemPageStore::new(USABLE);
+    /// Page of leaf `i` in [`seek_cache_slots_tree`].
+    fn seek_cache_leaf_page(i: usize) -> PageNumber {
+        pn(u32::try_from(3 + i).unwrap())
+    }
+
+    /// First rowid of leaf `i` in [`seek_cache_slots_tree`]; the leaf also
+    /// holds that rowid + 5 and + 10, and the next leaf starts 20 above it.
+    fn seek_cache_leaf_first(i: usize) -> i64 {
+        i64::try_from(20 * i + 10).unwrap()
+    }
+
+    /// `leaves` table leaves under root page 2, leaf `i` on page `3 + i`, so a
+    /// test can use more leaves than the seek cache has slots whatever
+    /// `TABLE_SEEK_CACHE_SLOTS` is.
+    fn seek_cache_slots_tree(leaves: usize) -> MemPageStore {
+        let mut store = MemPageStore::new(USABLE);
+        let children: Vec<(PageNumber, i64)> = (0..leaves - 1)
+            .map(|i| (seek_cache_leaf_page(i), seek_cache_leaf_first(i) + 10))
+            .collect();
+        store.pages.insert(
+            2,
+            build_interior_table(&children, seek_cache_leaf_page(leaves - 1)),
+        );
+        for i in 0..leaves {
+            let first = seek_cache_leaf_first(i);
             store.pages.insert(
-                2,
-                build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
+                u32::try_from(3 + i).unwrap(),
+                build_leaf_table(&[(first, b"a"), (first + 5, b"b"), (first + 10, b"c")]),
             );
-            store
-                .pages
-                .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
-            store
-                .pages
-                .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
-            store
-                .pages
-                .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
-            store
-                .pages
-                .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
-            store
-                .pages
-                .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
+        }
+        store
+    }
 
+    #[test]
+    fn test_table_seek_cache_is_an_lru_of_its_slots() {
+        run_async(async {
+            let slots = TABLE_SEEK_CACHE_SLOTS;
+            let page = seek_cache_leaf_page;
+            let first = seek_cache_leaf_first;
+            let cached = |cursor: &BtCursor<SeekProbeStore>| -> Vec<PageNumber> {
+                cursor
+                    .seek_cache
+                    .iter()
+                    .flatten()
+                    .map(|entry| entry.page_no)
+                    .collect()
+            };
             let cx = Cx::new();
-            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+            let mut cursor = BtCursor::new(
+                SeekProbeStore::new(seek_cache_slots_tree(slots + 1)),
+                pn(2),
+                USABLE,
+                true,
+            );
 
-            for rowid in [10_i64, 30, 50, 70] {
-                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            // Landing on the first `slots` leaves fills the cache, newest first.
+            for i in 0..slots {
+                assert!(
+                    cursor
+                        .table_move_to(&cx, first(i))
+                        .await
+                        .unwrap()
+                        .is_found()
+                );
             }
+            let mut expected: Vec<PageNumber> = (0..slots).rev().map(page).collect();
+            assert_eq!(cached(&cursor), expected);
 
-            let cache_pages: Vec<PageNumber> = cursor
-                .seek_cache
-                .iter()
-                .flatten()
-                .map(|entry| entry.page_no)
-                .collect();
-            assert_eq!(cache_pages, vec![pn(6), pn(5), pn(4), pn(3)]);
-
+            // A gap inside the least recent leaf reads only that leaf and
+            // moves it to the front.
             cursor.pager.clear_reads();
-            let result = cursor.table_move_to(&cx, 15).await.unwrap();
+            let result = cursor.table_move_to(&cx, first(0) + 3).await.unwrap();
             assert!(!result.is_found());
-            assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
-            let cache_pages: Vec<PageNumber> = cursor
-                .seek_cache
-                .iter()
-                .flatten()
-                .map(|entry| entry.page_no)
-                .collect();
-            assert_eq!(cache_pages, vec![pn(3), pn(6), pn(5), pn(4)]);
+            assert_eq!(cursor.pager.read_pages(), vec![page(0)]);
+            expected.pop();
+            expected.insert(0, page(0));
+            assert_eq!(cached(&cursor), expected);
 
+            // bd-w4pr1.13.13: no cached leaf can hold the last leaf's first
+            // rowid, so none is loaded on the way to the root. The new landing
+            // takes the front and the least recent slot (leaf 1) goes.
             cursor.pager.clear_reads();
-            assert!(cursor.table_move_to(&cx, 90).await.unwrap().is_found());
-            // bd-w4pr1.13.13: none of the four cached leaves can hold 90, so
-            // none is loaded on the way to the root (was 6, 5, 4, 2, 7).
-            assert_eq!(cursor.pager.read_pages(), vec![pn(2), pn(7)]);
-            let cache_pages: Vec<PageNumber> = cursor
-                .seek_cache
-                .iter()
-                .flatten()
-                .map(|entry| entry.page_no)
-                .collect();
-            assert_eq!(cache_pages, vec![pn(7), pn(3), pn(6), pn(5)]);
+            assert!(
+                cursor
+                    .table_move_to(&cx, first(slots))
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert_eq!(cursor.pager.read_pages(), vec![pn(2), page(slots)]);
+            expected.pop();
+            expected.insert(0, page(slots));
+            assert_eq!(cached(&cursor), expected);
+            assert!(!expected.contains(&page(1)));
 
+            // The evicted leaf is found through the root again; leaf 0, which
+            // holds the rowids below it, is not loaded for it.
             cursor.pager.clear_reads();
-            let result = cursor.table_move_to(&cx, 35).await.unwrap();
+            let result = cursor.table_move_to(&cx, first(1) + 3).await.unwrap();
             assert!(!result.is_found());
-            // Leaf 3 holds 10..=20 and is not loaded for 35 (was 3, 2, 4).
-            assert_eq!(cursor.pager.read_pages(), vec![pn(2), pn(4)]);
-            let cache_pages: Vec<PageNumber> = cursor
-                .seek_cache
-                .iter()
-                .flatten()
-                .map(|entry| entry.page_no)
-                .collect();
-            assert_eq!(cache_pages, vec![pn(4), pn(7), pn(3), pn(6)]);
+            assert_eq!(cursor.pager.read_pages(), vec![pn(2), page(1)]);
+            expected.pop();
+            expected.insert(0, page(1));
+            assert_eq!(cached(&cursor), expected);
 
+            // A leaf still cached is read alone.
             cursor.pager.clear_reads();
-            let result = cursor.table_move_to(&cx, 12).await.unwrap();
+            let result = cursor.table_move_to(&cx, first(0) + 7).await.unwrap();
             assert!(!result.is_found());
-            assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+            assert_eq!(cursor.pager.read_pages(), vec![page(0)]);
         });
     }
 
@@ -16746,7 +16898,6 @@ mod tests {
                     .iter()
                     .flatten()
                     .find(|entry| entry.page_no == pn(page))
-                    .copied()
                     .unwrap()
             };
 
@@ -16793,58 +16944,106 @@ mod tests {
         });
     }
 
+    /// bd-w4pr1.12 (lever SC8): the seek cache takes no more room in the
+    /// cursor than the four inline slots it replaced (eight inline slots
+    /// would), and only a second leaf allocates the out-of-line slots: seeks
+    /// that stay on one leaf allocate nothing.
+    #[test]
+    fn test_table_seek_cache_keeps_the_cursor_footprint() {
+        let four_inline = std::mem::size_of::<[Option<TableSeekCacheEntry>; 4]>();
+        let cache = std::mem::size_of::<TableSeekCache>();
+        eprintln!(
+            "SC8 sizes: BtCursor<MemPageStore> {} B, TableSeekCache {cache} B, four inline slots {four_inline} B",
+            std::mem::size_of::<BtCursor<MemPageStore>>()
+        );
+        assert!(
+            cache <= four_inline,
+            "the seek cache holds {cache} B in the cursor, more than four inline slots' {four_inline} B"
+        );
+
+        run_async(async {
+            let first = seek_cache_leaf_first;
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(
+                SeekProbeStore::new(seek_cache_slots_tree(3)),
+                pn(2),
+                USABLE,
+                true,
+            );
+            for target in [first(0), first(0) + 5, first(0) + 10, first(0) + 5] {
+                assert!(cursor.table_move_to(&cx, target).await.unwrap().is_found());
+            }
+            assert!(cursor.seek_cache.first.is_some());
+            assert!(cursor.seek_cache.rest.is_none());
+            assert!(
+                cursor
+                    .table_move_to(&cx, first(1))
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert!(cursor.seek_cache.rest.is_some());
+            let pages: Vec<PageNumber> = cursor
+                .seek_cache
+                .iter()
+                .flatten()
+                .map(|entry| entry.page_no)
+                .collect();
+            assert_eq!(
+                pages,
+                vec![seek_cache_leaf_page(1), seek_cache_leaf_page(0)]
+            );
+            // Clearing keeps the allocation and empties every slot.
+            cursor.clear_seek_cache();
+            assert!(cursor.seek_cache.iter().all(|slot| slot.is_none()));
+            assert!(cursor.seek_cache.rest.is_some());
+        });
+    }
+
     /// bd-w4pr1.13.13: a cached leaf is loaded only when the target can be on
     /// it. Random probes over more leaves than the cache has slots used to
     /// load every cached leaf before descending from the root.
     #[test]
     fn test_table_seek_cache_loads_only_a_leaf_that_can_hold_the_target() {
         run_async(async {
-            let mut store = MemPageStore::new(USABLE);
-            store.pages.insert(
-                2,
-                build_interior_table(
-                    &[
-                        (pn(3), 20),
-                        (pn(4), 40),
-                        (pn(5), 60),
-                        (pn(6), 80),
-                        (pn(7), 100),
-                    ],
-                    pn(8),
-                ),
-            );
-            for (page, first) in [
-                (3_u32, 10_i64),
-                (4, 30),
-                (5, 50),
-                (6, 70),
-                (7, 90),
-                (8, 110),
-            ] {
-                store.pages.insert(
-                    page,
-                    build_leaf_table(&[(first, b"a"), (first + 5, b"b"), (first + 10, b"c")]),
-                );
-            }
-
+            let slots = TABLE_SEEK_CACHE_SLOTS;
+            let page = seek_cache_leaf_page;
+            let first = seek_cache_leaf_first;
             let cx = Cx::new();
-            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
-            // Leaves 3, 4, 5 and 6 fill the four slots; 6 is the most recent.
-            for rowid in [10_i64, 30, 50, 70] {
-                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            let mut cursor = BtCursor::new(
+                SeekProbeStore::new(seek_cache_slots_tree(slots + 2)),
+                pn(2),
+                USABLE,
+                true,
+            );
+            // The first `slots` leaves fill the slots; the last two are not
+            // cached.
+            for i in 0..slots {
+                assert!(
+                    cursor
+                        .table_move_to(&cx, first(i))
+                        .await
+                        .unwrap()
+                        .is_found()
+                );
             }
 
             // (target, found, pages read). A cached leaf is the only page read
             // for a key or a gap inside it, whichever slot it is in and
-            // wherever in the leaf the earlier seek landed.
-            for (target, found, reads) in [
-                (20_i64, true, vec![pn(3)]),
-                (40, true, vec![pn(4)]),
-                (12, false, vec![pn(3)]),
-                (55, true, vec![pn(5)]),
-                (79, false, vec![pn(6)]),
-                (35, true, vec![pn(4)]),
-            ] {
+            // wherever in the leaf the earlier seek landed: each leaf's last
+            // key, a gap in every leaf but the last going down, and the middle
+            // key of every leaf but the first going up. No two probes in a row
+            // share a leaf (a seek on the cursor's own leaf reads no page).
+            let cached_probes: Vec<(i64, bool, Vec<PageNumber>)> = (0..slots)
+                .map(|i| (first(i) + 10, true, vec![page(i)]))
+                .chain(
+                    (0..slots - 1)
+                        .rev()
+                        .map(|i| (first(i) + 2, false, vec![page(i)])),
+                )
+                .chain((1..slots).map(|i| (first(i) + 5, true, vec![page(i)])))
+                .collect();
+            for (target, found, reads) in cached_probes {
                 cursor.pager.clear_reads();
                 let result = cursor.table_move_to(&cx, target).await.unwrap();
                 assert_eq!(result.is_found(), found, "target {target}");
@@ -16855,18 +17054,25 @@ mod tests {
             // nothing else: below every cached leaf, between two of them, on
             // a leaf that is not cached, and past the last one.
             for (target, found, leaf) in [
-                (5_i64, false, pn(3)),
-                (25, false, pn(4)),
-                (100, true, pn(7)),
-                (95, true, pn(7)),
-                (110, true, pn(8)),
-                (500, false, pn(8)),
+                (5_i64, false, page(0)),
+                (first(1) - 5, false, page(1)),
+                (first(slots) + 10, true, page(slots)),
+                (first(slots) + 5, true, page(slots)),
+                (first(slots + 1), true, page(slots + 1)),
+                (first(slots + 1) + 400, false, page(slots + 1)),
             ] {
-                // Refill the slots with leaves 3 to 6 so the target's own
-                // leaf is not among them (25 lands on leaf 4 through the
-                // root: the gap before its first key is not a landing).
-                for rowid in [10_i64, 30, 50, 70] {
-                    assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+                // Refill the slots with the first `slots` leaves so the
+                // target's own leaf is not among them (first(1) - 5 lands on
+                // leaf 1 through the root: the gap before its first key is not
+                // a landing).
+                for i in 0..slots {
+                    assert!(
+                        cursor
+                            .table_move_to(&cx, first(i))
+                            .await
+                            .unwrap()
+                            .is_found()
+                    );
                 }
                 cursor.pager.clear_reads();
                 let result = cursor.table_move_to(&cx, target).await.unwrap();
