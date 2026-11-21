@@ -79524,109 +79524,225 @@ impl Connection {
     /// and AFTER triggers, each group newest first; a trigger's WHEN before
     /// its body. A persistent trigger resolves in MAIN only, as stock's does,
     /// so it does not see TEMP objects either.
+    ///
+    /// bd-nf30k: stock compiles each of those triggers whole, so it also
+    /// refuses the statement for a name a trigger resolves to nothing (a
+    /// column, `NEW.x` or `OLD.x`, a function or its arity, an INSERT's
+    /// column or value count, a misplaced aggregate), and it compiles the
+    /// programs those compile in turn: the triggers each body statement
+    /// fires, and with foreign_keys on, the ON DELETE / ON UPDATE actions a
+    /// DELETE or UPDATE takes on child tables, with the child triggers they
+    /// fire. Each program is compiled once per statement, so a recursive
+    /// trigger or a self-referencing foreign key ends.
     fn validate_dml_trigger_relations(&self, statement: &Statement) -> Result<()> {
-        use fsqlite_ast::{TriggerEvent, TriggerTiming};
+        if self.triggers.borrow().is_empty() {
+            return Ok(());
+        }
         let target = match statement {
             Statement::Insert(insert) => &insert.table,
             Statement::Update(update) => &update.table.name,
             Statement::Delete(delete) => &delete.table.name,
             _ => return Ok(()),
         };
-        // An attached schema's statement runs on that schema's connection,
-        // with its triggers.
-        if target.schema.as_deref().is_some_and(|schema| {
-            !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
-        }) {
+        let target_has_triggers = self
+            .triggers
+            .borrow()
+            .iter()
+            .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&target.name));
+        // Only a DELETE or an UPDATE of a parent takes foreign-key actions.
+        let takes_fk_actions = matches!(statement, Statement::Update(_) | Statement::Delete(_))
+            && self.fk_cascade_propagation_enabled()
+            && self.table_is_foreign_key_parent(&target.name);
+        if !target_has_triggers && !takes_fk_actions {
             return Ok(());
         }
-        let ordered = {
-            let triggers = self.triggers.borrow();
-            if !triggers
-                .iter()
-                .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&target.name))
-            {
-                return Ok(());
-            }
-            let event = match statement {
-                Statement::Update(update) => {
-                    TriggerEvent::Update(Self::assignment_target_column_names(&update.assignments))
-                }
-                Statement::Delete(_) => TriggerEvent::Delete,
-                _ => TriggerEvent::Insert,
-            };
-            let upsert_updates: Vec<TriggerEvent> = match statement {
-                Statement::Insert(insert) => insert
-                    .upsert
-                    .iter()
-                    .filter_map(|clause| match &clause.action {
-                        fsqlite_ast::UpsertAction::Update { assignments, .. } => Some(
-                            TriggerEvent::Update(Self::assignment_target_column_names(assignments)),
-                        ),
-                        fsqlite_ast::UpsertAction::Nothing => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            // A REPLACE deletes the conflicting rows, and fires their DELETE
-            // triggers, only under recursive_triggers; stock compiles them
-            // only then.
-            let replace_deletes = matches!(
-                statement,
-                Statement::Insert(insert)
-                    if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
-            ) && self.pragma_state.borrow().recursive_triggers;
-            let delete = TriggerEvent::Delete;
-            let mut groups = vec![(TriggerTiming::Before, &event)];
-            for update in &upsert_updates {
-                groups.push((TriggerTiming::Before, update));
-                groups.push((TriggerTiming::After, update));
-            }
-            if replace_deletes {
-                groups.push((TriggerTiming::Before, &delete));
-                groups.push((TriggerTiming::After, &delete));
-            }
-            groups.push((TriggerTiming::InsteadOf, &event));
-            groups.push((TriggerTiming::After, &event));
-            let mut ordered: Vec<Arc<TriggerDef>> = Vec::new();
-            for (timing, event) in groups {
-                for trigger in triggers.iter().rev() {
-                    if trigger.table_name.eq_ignore_ascii_case(&target.name)
-                        && trigger.timing == timing
-                        && trigger_event_matches(&trigger.event, event)
-                        && !ordered.iter().any(|seen| Arc::ptr_eq(seen, trigger))
-                    {
-                        ordered.push(Arc::clone(trigger));
-                    }
-                }
-            }
-            ordered
+        let recursive_triggers = self.pragma_state.borrow().recursive_triggers;
+        let Some(firing) = DmlTriggerFiring::of(statement, recursive_triggers) else {
+            return Ok(());
         };
-        let schema_generation = self.schema_generation();
-        for trigger in &ordered {
-            let key = Arc::as_ptr(trigger).addr();
-            if !trigger.temporary {
-                let checks = self.trigger_relation_checks.borrow();
-                if checks.schema_generation == schema_generation && checks.validated.contains(&key)
+        let mut compiled = TriggerProgramsCompiled::default();
+        // A trigger resolves outside its caller's WITH, as when it fires: a
+        // CTE the statement materialized must not stand in for a table the
+        // trigger names.
+        let _trigger_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
+        self.with_fallback_function_registry(|| {
+            self.validate_firing_trigger_programs(&firing, recursive_triggers, &mut compiled)
+        })
+    }
+
+    /// The triggers one row change fires, and the foreign-key actions it
+    /// takes with the triggers those fire, in stock's coding order: the
+    /// BEFORE triggers (with an upsert's and a REPLACE's), the actions, then
+    /// the INSTEAD OF and AFTER triggers (bd-w78tx, bd-nf30k).
+    fn validate_firing_trigger_programs(
+        &self,
+        firing: &DmlTriggerFiring,
+        recursive_triggers: bool,
+        compiled: &mut TriggerProgramsCompiled,
+    ) -> Result<()> {
+        use fsqlite_ast::{TriggerEvent, TriggerTiming};
+        let delete = TriggerEvent::Delete;
+        let mut before_groups = vec![(TriggerTiming::Before, &firing.event)];
+        for update in &firing.upsert_updates {
+            before_groups.push((TriggerTiming::Before, update));
+            before_groups.push((TriggerTiming::After, update));
+        }
+        if firing.replace_deletes {
+            before_groups.push((TriggerTiming::Before, &delete));
+            before_groups.push((TriggerTiming::After, &delete));
+        }
+        let after_groups = [
+            (TriggerTiming::InsteadOf, &firing.event),
+            (TriggerTiming::After, &firing.event),
+        ];
+        let before = self.triggers_in_groups(&firing.table, &before_groups);
+        let after = self.triggers_in_groups(&firing.table, &after_groups);
+        let fk_actions = if self.fk_cascade_propagation_enabled() {
+            self.foreign_key_action_firings(&firing.table, &firing.event, compiled)
+        } else {
+            Vec::new()
+        };
+        for trigger in &before {
+            self.validate_trigger_program(trigger, recursive_triggers, compiled)?;
+        }
+        for action in &fk_actions {
+            self.validate_firing_trigger_programs(action, recursive_triggers, compiled)?;
+        }
+        for trigger in &after {
+            self.validate_trigger_program(trigger, recursive_triggers, compiled)?;
+        }
+        Ok(())
+    }
+
+    /// The triggers on `table` of each (timing, event) group in turn, each
+    /// group newest first, each trigger once.
+    fn triggers_in_groups(
+        &self,
+        table: &str,
+        groups: &[(fsqlite_ast::TriggerTiming, &fsqlite_ast::TriggerEvent)],
+    ) -> Vec<Arc<TriggerDef>> {
+        let triggers = self.triggers.borrow();
+        let mut ordered: Vec<Arc<TriggerDef>> = Vec::new();
+        for (timing, event) in groups {
+            for trigger in triggers.iter().rev() {
+                if trigger.table_name.eq_ignore_ascii_case(table)
+                    && trigger.timing == *timing
+                    && trigger_event_matches(&trigger.event, event)
+                    && !ordered.iter().any(|seen| Arc::ptr_eq(seen, trigger))
+                {
+                    ordered.push(Arc::clone(trigger));
+                }
+            }
+        }
+        ordered
+    }
+
+    /// bd-nf30k: the child-row changes the foreign-key actions of one row
+    /// change of `table` make, each action once per statement. ON DELETE
+    /// CASCADE deletes child rows; ON DELETE SET NULL / SET DEFAULT, and ON
+    /// UPDATE CASCADE / SET NULL / SET DEFAULT when the UPDATE assigns a
+    /// parent key column, update the child key. Stock codes each action as a
+    /// trigger program whose statement fires the child's triggers.
+    fn foreign_key_action_firings(
+        &self,
+        table: &str,
+        event: &fsqlite_ast::TriggerEvent,
+        compiled: &mut TriggerProgramsCompiled,
+    ) -> Vec<DmlTriggerFiring> {
+        use fsqlite_ast::TriggerEvent;
+        let (is_delete, assigned) = match event {
+            TriggerEvent::Delete => (true, &[][..]),
+            TriggerEvent::Update(columns) => (false, columns.as_slice()),
+            TriggerEvent::Insert => return Vec::new(),
+        };
+        let schema = self.schema.borrow();
+        let parent = schema
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(table));
+        let mut firings = Vec::new();
+        for child in schema.iter() {
+            for (index, fk) in child.foreign_keys.iter().enumerate() {
+                let action = if is_delete { fk.on_delete } else { fk.on_update };
+                if !fk.parent_table.eq_ignore_ascii_case(table)
+                    || !matches!(
+                        action,
+                        FkActionType::Cascade | FkActionType::SetNull | FkActionType::SetDefault
+                    )
+                    || (!is_delete && !foreign_key_parent_key_assigned(fk, parent, assigned))
+                    || !compiled.fk_actions.insert((
+                        child.name.to_ascii_lowercase(),
+                        index,
+                        is_delete,
+                    ))
                 {
                     continue;
                 }
+                let event = if is_delete && matches!(action, FkActionType::Cascade) {
+                    TriggerEvent::Delete
+                } else {
+                    TriggerEvent::Update(
+                        fk.child_columns
+                            .iter()
+                            .filter_map(|&column| child.columns.get(column))
+                            .map(|column| column.name.clone())
+                            .collect(),
+                    )
+                };
+                firings.push(DmlTriggerFiring {
+                    table: child.name.clone(),
+                    event,
+                    upsert_updates: Vec::new(),
+                    replace_deletes: false,
+                });
             }
-            self.validate_trigger_relations(trigger)?;
-            if !trigger.temporary {
-                let mut checks = self.trigger_relation_checks.borrow_mut();
-                if checks.schema_generation != schema_generation {
-                    checks.schema_generation = schema_generation;
-                    checks.validated.clear();
-                }
-                checks.validated.insert(key);
+        }
+        firings
+    }
+
+    /// Compile-check one trigger, once per statement, and a persistent one
+    /// once per schema generation.
+    fn validate_trigger_program(
+        &self,
+        trigger: &Arc<TriggerDef>,
+        recursive_triggers: bool,
+        compiled: &mut TriggerProgramsCompiled,
+    ) -> Result<()> {
+        let key = Arc::as_ptr(trigger).addr();
+        if !compiled.triggers.insert(key) {
+            return Ok(());
+        }
+        let schema_generation = self.schema_generation();
+        if !trigger.temporary {
+            let checks = self.trigger_relation_checks.borrow();
+            if checks.schema_generation == schema_generation && checks.validated.contains(&key) {
+                return Ok(());
             }
+        }
+        self.validate_trigger_relations(trigger, recursive_triggers, compiled)?;
+        if !trigger.temporary {
+            let mut checks = self.trigger_relation_checks.borrow_mut();
+            if checks.schema_generation != schema_generation {
+                checks.schema_generation = schema_generation;
+                checks.validated.clear();
+            }
+            checks.validated.insert(key);
         }
         Ok(())
     }
 
     /// bd-w78tx: every relation one trigger's WHEN and body name, resolved
     /// as stock resolves them when it compiles the trigger.
-    fn validate_trigger_relations(&self, trigger: &TriggerDef) -> Result<()> {
+    ///
+    /// bd-nf30k: and, part by part as stock compiles them, the names each
+    /// resolves to, with NEW and OLD bound as firing binds them (a name left
+    /// unbound, `NEW.zz`, is stock's "no such column: NEW.zz"), and the
+    /// triggers and foreign-key actions each body statement fires.
+    fn validate_trigger_relations(
+        &self,
+        trigger: &TriggerDef,
+        recursive_triggers: bool,
+        compiled: &mut TriggerProgramsCompiled,
+    ) -> Result<()> {
         let mut resolver = if trigger.temporary {
             SelectRelationResolver::new(self)
         } else {
@@ -79637,13 +79753,312 @@ impl Connection {
                 Rc::new(RefCell::new(SelectViewValidationState::default())),
             )
         };
+        let frame = self.trigger_compile_frame(trigger);
         if let Some(when) = &trigger.when_clause {
             resolver.validate_expr(when)?;
+            if let Some(frame) = &frame {
+                let mut bound = when.clone();
+                bind_trigger_columns_in_expr(&mut bound, frame);
+                let select =
+                    select_of_result_exprs(vec![bound], Some(compile_check_empty_source()));
+                self.trigger_names_result(trigger, self.validate_trigger_select_names(&select))?;
+            }
         }
         for statement in &trigger.body {
             resolver.validate_trigger_body_statement(statement)?;
+            if let Some(frame) = &frame {
+                let (bound, _) = bind_trigger_body_statement(statement, frame, !trigger.temporary);
+                self.trigger_names_result(trigger, self.validate_trigger_statement_names(&bound))?;
+            }
+            if let Some(firing) = DmlTriggerFiring::of(statement, recursive_triggers) {
+                self.validate_firing_trigger_programs(&firing, recursive_triggers, compiled)?;
+            }
         }
         Ok(())
+    }
+
+    /// A name check's outcome for `trigger`, except a missing column the
+    /// trigger spells in double quotes: stock reads a double-quoted name that
+    /// resolves to nothing as a string (SQLITE_DQS). fsqlite's retry for that
+    /// (bd-jcjkf) rewrites the text of the statement being run, never a
+    /// trigger's, so this check does not refuse for one.
+    fn trigger_names_result(&self, trigger: &TriggerDef, result: Result<()>) -> Result<()> {
+        let Err(error) = &result else {
+            return Ok(());
+        };
+        let missing = match error {
+            FrankenError::NoSuchColumn { name } => Some(name.clone()),
+            other => Self::dqs_missing_column_name(other),
+        };
+        if let Some(missing) = missing
+            && !missing.contains('.')
+            && Self::double_quoted_identifier_tokens(&trigger.create_sql)
+                .iter()
+                .any(|(_, _, name)| name.eq_ignore_ascii_case(&missing))
+        {
+            return Ok(());
+        }
+        result
+    }
+
+    /// bd-nf30k: a frame for binding `trigger`'s WHEN and body as firing
+    /// binds them, its NEW and OLD rows (those the event has) all NULL.
+    /// `None` when the trigger's table or view is gone.
+    fn trigger_compile_frame(&self, trigger: &TriggerDef) -> Option<TriggerFrame> {
+        use fsqlite_ast::TriggerEvent;
+        let (column_names, rowid_alias_col_idx, has_rowid) =
+            if trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf {
+                (self.view_trigger_column_names(&trigger.table_name).ok()?, None, false)
+            } else {
+                let key = trigger.table_name.to_ascii_lowercase();
+                let shadowed = self.shadowed_main_tables.borrow();
+                let schema = self.schema.borrow();
+                let table = shadowed
+                    .get(&key)
+                    .filter(|_| !trigger.temporary)
+                    .or_else(|| schema.get(self.schema_index_of(&trigger.table_name)?))?;
+                (
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect::<Vec<_>>(),
+                    self.rowid_alias_columns.borrow().get(&key).copied(),
+                    !table.without_rowid,
+                )
+            };
+        let width = column_names.len();
+        let has_old = matches!(trigger.event, TriggerEvent::Update(_) | TriggerEvent::Delete);
+        let has_new = matches!(trigger.event, TriggerEvent::Update(_) | TriggerEvent::Insert);
+        Some(TriggerFrame {
+            table_name: trigger.table_name.clone(),
+            column_names,
+            column_collations: Vec::new(),
+            rowid_alias_col_idx,
+            old_row: has_old.then(|| vec![SqliteValue::Null; width]),
+            new_row: has_new.then(|| vec![SqliteValue::Null; width]),
+            old_rowid: (has_old && has_rowid).then_some(0),
+            new_rowid: (has_new && has_rowid).then_some(0),
+        })
+    }
+
+    /// bd-nf30k: the names one bound trigger body statement resolves, as
+    /// stock checks them when it compiles the statement. An UPDATE's or a
+    /// DELETE's expressions are checked as a SELECT from its target (and an
+    /// UPDATE's FROM); an INSERT's columns and value counts against its
+    /// target table, then its VALUES or SELECT.
+    fn validate_trigger_statement_names(&self, statement: &Statement) -> Result<()> {
+        match statement {
+            Statement::Select(select) => {
+                self.validate_select_ordinals_and_hints(select)?;
+                self.validate_trigger_select_names(select)
+            }
+            Statement::Insert(insert) => self.validate_trigger_insert_names(insert),
+            Statement::Update(update) => {
+                if with_defines_relation(update.with.as_ref(), &update.table.name) {
+                    return Ok(());
+                }
+                let mut from = FromClause {
+                    source: dml_target_source(&update.table),
+                    joins: Vec::new(),
+                };
+                if let Some(update_from) = &update.from {
+                    // `FROM target, <the UPDATE's FROM>`, as stock joins them.
+                    from.joins.push(fsqlite_ast::JoinClause {
+                        join_type: fsqlite_ast::JoinType {
+                            natural: false,
+                            kind: fsqlite_ast::JoinKind::Cross,
+                        },
+                        table: update_from.source.clone(),
+                        constraint: None,
+                    });
+                    from.joins.extend(update_from.joins.iter().cloned());
+                }
+                let columns = self.dml_target_column_names(&update.table.name);
+                for assignment in &update.assignments {
+                    // A row-value SET supplies one value per target; a
+                    // subquery source is checked whole, as EXISTS reads it.
+                    let values = match (&assignment.target, &assignment.value) {
+                        (
+                            fsqlite_ast::AssignmentTarget::ColumnList(_),
+                            Expr::RowValue(values, _),
+                        ) => values.clone(),
+                        (
+                            fsqlite_ast::AssignmentTarget::ColumnList(_),
+                            Expr::Subquery(query, span),
+                        ) => vec![Expr::Exists {
+                            subquery: query.clone(),
+                            not: false,
+                            span: *span,
+                        }],
+                        _ => vec![assignment.value.clone()],
+                    };
+                    let mut select = select_of_result_exprs(values, Some(from.clone()));
+                    select.with.clone_from(&update.with);
+                    self.validate_trigger_select_names(&select)?;
+                    if let Some(columns) = &columns {
+                        for name in Self::assignment_target_column_names(std::slice::from_ref(
+                            assignment,
+                        )) {
+                            if !columns.iter().any(|column| column.eq_ignore_ascii_case(&name))
+                                && !is_rowid_alias(&name)
+                            {
+                                return Err(FrankenError::FunctionError(format!(
+                                    "no such column: {name}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                let mut select = dml_where_select(
+                    from,
+                    update.where_clause.as_ref(),
+                    &update.order_by,
+                    update.limit.as_ref(),
+                );
+                select.with.clone_from(&update.with);
+                self.validate_trigger_select_names(&select)
+            }
+            Statement::Delete(delete) => {
+                if with_defines_relation(delete.with.as_ref(), &delete.table.name) {
+                    return Ok(());
+                }
+                let mut select = dml_where_select(
+                    FromClause {
+                        source: dml_target_source(&delete.table),
+                        joins: Vec::new(),
+                    },
+                    delete.where_clause.as_ref(),
+                    &delete.order_by,
+                    delete.limit.as_ref(),
+                );
+                select.with.clone_from(&delete.with);
+                self.validate_trigger_select_names(&select)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// bd-nf30k: an INSERT's column list against its target table, then its
+    /// VALUES rows or SELECT, then the number of values each row supplies,
+    /// in stock's order and with its messages. A view or virtual target,
+    /// whose columns stock resolves otherwise, is checked for its source only.
+    fn validate_trigger_insert_names(&self, insert: &fsqlite_ast::InsertStatement) -> Result<()> {
+        if with_defines_relation(insert.with.as_ref(), &insert.table) {
+            return Ok(());
+        }
+        let target = self.dml_target_column_info(&insert.table);
+        if let Some((columns, _)) = &target {
+            for name in &insert.columns {
+                if !columns.iter().any(|column| column.eq_ignore_ascii_case(name))
+                    && !is_rowid_alias(name)
+                {
+                    return Err(FrankenError::FunctionError(format!(
+                        "table {} has no column named {name}",
+                        insert.table.name
+                    )));
+                }
+            }
+        }
+        let supplied = match &insert.source {
+            InsertSource::Values(rows) => {
+                for row in rows {
+                    let mut select =
+                        select_of_result_exprs(row.clone(), Some(compile_check_empty_source()));
+                    select.with.clone_from(&insert.with);
+                    self.validate_trigger_select_names(&select)?;
+                }
+                let width = rows.first().map(Vec::len);
+                width.filter(|width| rows.iter().all(|row| row.len() == *width))
+            }
+            InsertSource::Select(select) => {
+                let scoped = insert_source_select_for_validation(insert, select);
+                self.validate_select_ordinals_and_hints(&scoped)?;
+                self.validate_trigger_select_names(&scoped)?;
+                select_exact_result_width(select)
+            }
+            InsertSource::DefaultValues => None,
+        };
+        if let (Some((_, insertable)), Some(supplied)) = (&target, supplied) {
+            let expected = if insert.columns.is_empty() {
+                *insertable
+            } else {
+                insert.columns.len()
+            };
+            if supplied != expected {
+                return Err(FrankenError::FunctionError(if insert.columns.is_empty() {
+                    format!(
+                        "table {} has {expected} columns but {supplied} values were supplied",
+                        insert.table.name
+                    )
+                } else {
+                    format!("{supplied} values for {expected} columns")
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// The semantic checks a SELECT gets at prepare, and its aggregate and
+    /// window placement (bd-nf30k). The full column-reference resolver runs
+    /// whatever the shape: a statement's own simple shapes have their columns
+    /// resolved when they execute, which a trigger's never may.
+    fn validate_trigger_select_names(&self, select: &SelectStatement) -> Result<()> {
+        self.validate_select_column_references(select)?;
+        // A trigger's text has not had its row values expanded.
+        self.validate_statement_select_semantics(
+            &Statement::Select(select.clone()),
+            RowValueSpelling::AsWritten,
+        )?;
+        validate_aggregate_window_misuse(select)
+    }
+
+    /// The column names of a DML target table, honoring a MAIN qualifier;
+    /// `None` for a view, a virtual table (whose hidden columns stock also
+    /// resolves) or a missing table.
+    fn dml_target_column_names(&self, name: &QualifiedName) -> Option<Vec<String>> {
+        self.dml_target_column_info(name)
+            .map(|(columns, _)| columns)
+    }
+
+    /// A DML target table's column names and how many of them an INSERT
+    /// without a column list supplies (the ones not generated), as
+    /// [`Self::dml_target_column_names`] finds them.
+    fn dml_target_column_info(&self, name: &QualifiedName) -> Option<(Vec<String>, usize)> {
+        if self.table_name_is_virtual(&name.name) {
+            return None;
+        }
+        let key = name.name.to_ascii_lowercase();
+        let main = name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
+        let shadowed = self.shadowed_main_tables.borrow();
+        let schema = self.schema.borrow();
+        let table = match shadowed.get(&key).filter(|_| main) {
+            Some(table) => table,
+            None => {
+                let index = self.schema_index_of(&name.name)?;
+                if self.materialized_temp_root_pages.borrow().contains(&schema.get(index)?.root_page)
+                {
+                    return None;
+                }
+                schema.get(index)?
+            }
+        };
+        let insertable = table
+            .columns
+            .iter()
+            .filter(|column| column.generated_expr.is_none())
+            .count();
+        Some((
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            insertable,
+        ))
     }
 
     fn has_matching_triggers(
@@ -167935,6 +168350,208 @@ struct TriggerRelationChecks {
     validated: HashSet<usize>,
 }
 
+/// bd-nf30k: the row changes one INSERT, UPDATE or DELETE makes to a table,
+/// as the triggers and foreign-key actions they can fire see them.
+struct DmlTriggerFiring {
+    table: String,
+    event: fsqlite_ast::TriggerEvent,
+    /// The UPDATE triggers an upsert's DO UPDATE can fire.
+    upsert_updates: Vec<fsqlite_ast::TriggerEvent>,
+    /// A REPLACE deletes the conflicting rows, and fires their DELETE
+    /// triggers, only under recursive_triggers; stock compiles them only then.
+    replace_deletes: bool,
+}
+
+impl DmlTriggerFiring {
+    /// `None` for a statement that is no INSERT, UPDATE or DELETE, or whose
+    /// target is in an attached schema: that one runs on the schema's own
+    /// connection, with its triggers.
+    fn of(statement: &Statement, recursive_triggers: bool) -> Option<Self> {
+        use fsqlite_ast::TriggerEvent;
+        let (target, event) = match statement {
+            Statement::Insert(insert) => (&insert.table, TriggerEvent::Insert),
+            Statement::Update(update) => (
+                &update.table.name,
+                TriggerEvent::Update(Connection::assignment_target_column_names(
+                    &update.assignments,
+                )),
+            ),
+            Statement::Delete(delete) => (&delete.table.name, TriggerEvent::Delete),
+            _ => return None,
+        };
+        if target.schema.as_deref().is_some_and(|schema| {
+            !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+        }) {
+            return None;
+        }
+        let (upsert_updates, replace_deletes) = match statement {
+            Statement::Insert(insert) => (
+                insert
+                    .upsert
+                    .iter()
+                    .filter_map(|clause| match &clause.action {
+                        fsqlite_ast::UpsertAction::Update { assignments, .. } => {
+                            Some(TriggerEvent::Update(
+                                Connection::assignment_target_column_names(assignments),
+                            ))
+                        }
+                        fsqlite_ast::UpsertAction::Nothing => None,
+                    })
+                    .collect(),
+                recursive_triggers
+                    && insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace),
+            ),
+            _ => (Vec::new(), false),
+        };
+        Some(Self {
+            table: target.name.clone(),
+            event,
+            upsert_updates,
+            replace_deletes,
+        })
+    }
+}
+
+/// bd-nf30k: the programs one statement's compile check has compiled, each
+/// once, as stock codes each trigger and foreign-key action program once per
+/// statement: the triggers by the address of their definition, the actions
+/// by child table, constraint index and whether it is the ON DELETE one.
+#[derive(Default)]
+struct TriggerProgramsCompiled {
+    triggers: HashSet<usize>,
+    fk_actions: HashSet<(String, usize, bool)>,
+}
+
+/// Whether an UPDATE assigning `assigned` changes the parent key `fk`
+/// references: its named parent columns, or the parent's PRIMARY KEY (its
+/// rowid when it has none) when the constraint names none.
+fn foreign_key_parent_key_assigned(
+    fk: &FkDef,
+    parent: Option<&TableSchema>,
+    assigned: &[String],
+) -> bool {
+    let assigns = |name: &str| assigned.iter().any(|column| column.eq_ignore_ascii_case(name));
+    if !fk.parent_columns.is_empty() {
+        return fk.parent_columns.iter().any(|column| assigns(column));
+    }
+    let Some(parent) = parent else {
+        return true;
+    };
+    let mut key_columns = parent
+        .columns
+        .iter()
+        .filter(|column| column.is_ipk)
+        .map(|column| column.name.as_str())
+        .chain(
+            parent
+                .primary_key_constraints
+                .iter()
+                .flat_map(|constraint| constraint.iter().map(String::as_str)),
+        )
+        .peekable();
+    if key_columns.peek().is_none() {
+        return assigned.iter().any(|column| is_rowid_alias(column));
+    }
+    key_columns.any(assigns) || assigned.iter().any(|column| is_rowid_alias(column))
+}
+
+/// `SELECT <exprs> [FROM <from>]`, the shape a trigger body statement's
+/// expressions are checked in (bd-nf30k).
+fn select_of_result_exprs(exprs: Vec<Expr>, from: Option<FromClause>) -> SelectStatement {
+    SelectStatement {
+        with: None,
+        body: SelectBody {
+            select: SelectCore::Select {
+                distinct: fsqlite_ast::Distinctness::All,
+                columns: exprs
+                    .into_iter()
+                    .map(|expr| ResultColumn::Expr { expr, alias: None })
+                    .collect(),
+                from,
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            compounds: Vec::new(),
+        },
+        order_by: Vec::new(),
+        limit: None,
+    }
+}
+
+/// `FROM (SELECT NULL)`, a source with no column a statement can name, for
+/// checking expressions that have none (a VALUES row, a WHEN): the semantic
+/// validator resolves column names only in a query with a FROM (bd-nf30k).
+fn compile_check_empty_source() -> FromClause {
+    FromClause {
+        source: TableOrSubquery::Subquery {
+            query: Box::new(select_of_result_exprs(
+                vec![Expr::Literal(Literal::Null, Span::ZERO)],
+                None,
+            )),
+            alias: None,
+        },
+        joins: Vec::new(),
+    }
+}
+
+/// `SELECT 1 FROM <from> WHERE ... ORDER BY ... LIMIT ...`: an UPDATE's or a
+/// DELETE's row filter as a query (bd-nf30k).
+fn dml_where_select(
+    from: FromClause,
+    where_clause: Option<&Expr>,
+    order_by: &[fsqlite_ast::OrderingTerm],
+    limit: Option<&fsqlite_ast::LimitClause>,
+) -> SelectStatement {
+    let mut select = select_of_result_exprs(
+        vec![Expr::Literal(Literal::Integer(1), Span::ZERO)],
+        Some(from),
+    );
+    if let SelectCore::Select {
+        where_clause: slot, ..
+    } = &mut select.body.select
+    {
+        *slot = where_clause.cloned().map(Box::new);
+    }
+    select.order_by = order_by.to_vec();
+    select.limit = limit.cloned();
+    select
+}
+
+/// A DML target as the FROM item its expressions resolve against.
+fn dml_target_source(table: &fsqlite_ast::QualifiedTableRef) -> TableOrSubquery {
+    TableOrSubquery::Table {
+        name: table.name.clone(),
+        alias: table.alias.clone(),
+        index_hint: table.index_hint.clone(),
+        time_travel: None,
+    }
+}
+
+/// Whether `with` defines a CTE an unqualified `name` would read, so a query
+/// over `name` would not read the DML target.
+fn with_defines_relation(with: Option<&fsqlite_ast::WithClause>, name: &QualifiedName) -> bool {
+    name.schema.is_none()
+        && with.is_some_and(|with| {
+            with.ctes
+                .iter()
+                .any(|cte| cte.name.eq_ignore_ascii_case(&name.name))
+        })
+}
+
+/// The number of values each row of `select` supplies, when its result list
+/// names every column (no `*`).
+fn select_exact_result_width(select: &SelectStatement) -> Option<usize> {
+    match &select.body.select {
+        SelectCore::Values(rows) => rows.first().map(Vec::len),
+        SelectCore::Select { columns, .. } => columns
+            .iter()
+            .all(|column| matches!(column, ResultColumn::Expr { .. }))
+            .then_some(columns.len()),
+    }
+}
+
 /// bd-fpr5g lever 3a: a parameter-bound trigger body statement, bound once
 /// for every firing row whose frame has the same shape.
 ///
@@ -203495,10 +204112,9 @@ mod tests {
                 .execute("INSERT INTO t VALUES (1);")
                 .await
                 .expect_err("invalid trigger WHEN clause should abort the statement");
-            assert!(
-                matches!(err, FrankenError::Internal(ref msg) if msg.contains("missing")),
-                "expected missing-column error, got {err:?}"
-            );
+            // bd-nf30k: the WHEN compiles at prepare, as stock's does, and
+            // fails with stock's text (3.54.1: "no such column: NEW.missing").
+            assert_eq!(err.to_string(), "no such column: NEW.missing");
 
             let rows = conn.query("SELECT COUNT(*) FROM t;").await.unwrap();
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
