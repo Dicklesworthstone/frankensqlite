@@ -1353,6 +1353,12 @@ All aggregate functions also work as window functions when used with an `OVER` c
 | `strftime(format, time, modifier...)` | Custom formatting |
 | `timediff(a, b)` | Difference between two timestamps |
 
+As in SQLite 3.54.1, `datetime('2024-12-31 24:00')` returns
+`2025-01-01 00:00:00`, and `datetime('2024-12-31 24:01')` returns NULL.
+Earlier FrankenSQLite builds could store incorrect date or datetime index
+entries for these inputs. After upgrading, run `REINDEX index_name;` on each
+affected expression index, then run `PRAGMA integrity_check;`.
+
 ### Math Functions
 
 `acos`, `asin`, `atan`, `atan2`, `ceil`, `cos`, `degrees`, `exp`, `floor`, `ln`, `log`, `log2`, `mod`, `pi`, `pow`, `radians`, `sin`, `sqrt`, `tan`, `trunc`.

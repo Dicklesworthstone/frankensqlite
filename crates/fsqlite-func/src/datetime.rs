@@ -281,10 +281,14 @@ fn day_of_year(y: i64, m: i64, d: i64) -> i64 {
 /// A time string parsed the way date.c's `parseDateOrTime` leaves its
 /// `DateTime`: the Julian day plus the state stock keeps beside it.
 #[derive(Clone, Copy)]
-struct ParsedTimestring {
+struct ParsedTimeValue {
     jdn: f64,
-    /// `isUtc`: the value is 'now'/'subsec' or the text carried `Z` or a
-    /// `±HH:MM` offset, so a later 'utc' modifier leaves it alone.
+    raw_numeric: bool,
+    /// Local clock on the default date for a time-only input. Period and weekday
+    /// modifiers can use these fields before an offset has been materialized.
+    bare_local_jdn: Option<f64>,
+    /// Whether a later 'utc' modifier leaves the value alone. A nonzero
+    /// offset on a time-only input is still pending at this point in SQLite.
     is_utc: bool,
     /// The `Y-M-D` fields as written (`validYMD`), which stock prints without
     /// normalizing while no modifier recomputes them.
@@ -296,20 +300,29 @@ struct ParsedTimestring {
     n_floor: i64,
 }
 
-impl ParsedTimestring {
+impl ParsedTimeValue {
     fn julian_day(jdn: f64, is_utc: bool) -> Self {
         Self {
             jdn,
+            raw_numeric: false,
+            bare_local_jdn: None,
             is_utc,
             ymd: None,
             hms: None,
             n_floor: 0,
         }
     }
+
+    fn raw_number(jdn: f64) -> Self {
+        Self {
+            raw_numeric: true,
+            ..Self::julian_day(jdn, false)
+        }
+    }
 }
 
 /// Parse a SQLite time string into a JDN.
-fn parse_timestring(s: &str) -> Option<ParsedTimestring> {
+fn parse_timestring(s: &str) -> Option<ParsedTimeValue> {
     // sqlite3_value_text() exposes a NUL-terminated C string to date.c. Bytes
     // after the first embedded NUL are therefore not part of the time value.
     let s = sqlite_c_string_str(s);
@@ -324,17 +337,16 @@ fn parse_timestring(s: &str) -> Option<ParsedTimestring> {
         || s.eq_ignore_ascii_case("subsec")
         || s.eq_ignore_ascii_case("subsecond")
     {
-        return Some(ParsedTimestring::julian_day(current_time_jdn(), true));
+        return Some(ParsedTimeValue::julian_day(current_time_jdn(), true));
     }
 
     // Try as a Julian Day Number (bare float).
     // Reject non-finite values (NaN/Inf) — sqlite3AtoF doesn't recognize them.
     let numeric = s.trim_matches(|c: char| c.is_ascii_whitespace());
     if let Ok(jdn) = numeric.parse::<f64>()
-        && jdn >= 0.0
         && jdn.is_finite()
     {
-        return Some(ParsedTimestring::julian_day(jdn, false));
+        return Some(ParsedTimeValue::raw_number(jdn));
     }
 
     parse_yyyy_mm_dd(s.as_bytes()).or_else(|| parse_bare_time(s.as_bytes()))
@@ -388,12 +400,12 @@ fn sqlite_value_datetime_text(value: &SqliteValue) -> Option<Cow<'_, str>> {
 /// date.c `parseYyyyMmDd`: `[-]YYYY-MM-DD` (a leading '-' makes the year
 /// BCE), then any run of spaces and `T`s, then either nothing or a time that
 /// [`parse_hh_mm_ss`] accepts.
-fn parse_yyyy_mm_dd(s: &[u8]) -> Option<ParsedTimestring> {
+fn parse_yyyy_mm_dd(s: &[u8]) -> Option<ParsedTimeValue> {
     let (negative, s) = match s {
         [b'-', rest @ ..] => (true, rest),
         _ => (false, s),
     };
-    let (y, s) = get_digits(s, 4, 0, 9999, Some(b'-'))?;
+    let (year, s) = get_digits(s, 4, 0, 9999, Some(b'-'))?;
     let (m, s) = get_digits(s, 2, 1, 12, Some(b'-'))?;
     let (d, s) = get_digits(s, 2, 1, 31, None)?;
     let separator = s
@@ -401,44 +413,52 @@ fn parse_yyyy_mm_dd(s: &[u8]) -> Option<ParsedTimestring> {
         .take_while(|&&b| is_sqlite_space(b) || b == b'T')
         .count();
     let s = &s[separator..];
-    let y = if negative { -y } else { y };
+    let y = if negative { -year } else { year };
     let n_floor = compute_floor(y, m, d);
     if s.is_empty() {
-        return Some(ParsedTimestring {
-            jdn: ymd_to_jdn(y, m, d),
-            is_utc: false,
+        return Some(ParsedTimeValue {
             ymd: Some((y, m, d)),
-            hms: None,
             n_floor,
+            ..ParsedTimeValue::julian_day(ymd_to_jdn(y, m, d), false)
         });
     }
     let time = parse_hh_mm_ss(s)?;
     let hms = time.hms;
-    let jdn = ymdhms_to_jdn(y, m, d, hms.hour, hms.minute, hms.second, hms.fraction)
-        - time.tz_minutes as f64 / 1440.0;
+    let offset = time.tz_minutes as f64 / 1440.0;
+    if hms.hour == 24 {
+        // Stock advances the written calendar before applying its year sign
+        // and timezone. Thus -0001-12-31 24:00 becomes -0002-01-01.
+        let (next_year, month, day) = jdn_to_ymd(ymd_to_jdn(year, m, d) + 1.0);
+        if next_year > 9999 {
+            return None;
+        }
+        let year = if negative { -next_year } else { next_year };
+        return Some(ParsedTimeValue::julian_day(
+            ymd_to_jdn(year, month, day) - offset,
+            time.has_tz,
+        ));
+    }
+    let jdn = ymdhms_to_jdn(y, m, d, hms.hour, hms.minute, hms.second, hms.fraction) - offset;
     // A non-zero offset makes stock recompute every field from the Julian day.
     let as_written = time.tz_minutes == 0;
-    Some(ParsedTimestring {
-        jdn,
-        is_utc: time.has_tz,
+    Some(ParsedTimeValue {
         ymd: as_written.then_some((y, m, d)),
         hms: as_written.then_some(hms),
         n_floor,
+        ..ParsedTimeValue::julian_day(jdn, time.has_tz)
     })
 }
 
 /// A time with no date, which date.c places on 2000-01-01.
-fn parse_bare_time(s: &[u8]) -> Option<ParsedTimestring> {
+fn parse_bare_time(s: &[u8]) -> Option<ParsedTimeValue> {
     let time = parse_hh_mm_ss(s)?;
     let hms = time.hms;
-    let jdn = ymdhms_to_jdn(2000, 1, 1, hms.hour, hms.minute, hms.second, hms.fraction)
-        - time.tz_minutes as f64 / 1440.0;
-    Some(ParsedTimestring {
-        jdn,
-        is_utc: time.has_tz,
-        ymd: None,
-        hms: (time.tz_minutes == 0).then_some(hms),
-        n_floor: 0,
+    let local_jdn = ymdhms_to_jdn(2000, 1, 1, hms.hour, hms.minute, hms.second, hms.fraction);
+    let jdn = local_jdn - time.tz_minutes as f64 / 1440.0;
+    Some(ParsedTimeValue {
+        bare_local_jdn: Some(local_jdn),
+        hms: (time.tz_minutes == 0 && hms.hour != 24).then_some(hms),
+        ..ParsedTimeValue::julian_day(jdn, time.has_tz && time.tz_minutes == 0)
     })
 }
 
@@ -479,6 +499,9 @@ fn parse_hh_mm_ss(s: &[u8]) -> Option<ParsedHms> {
             }
             s = &s[1 + count..];
         }
+    }
+    if hour == 24 && (minute != 0 || second != 0 || fraction != 0.0) {
+        return None;
     }
     let (tz_minutes, has_tz) = parse_timezone(s)?;
     Some(ParsedHms {
@@ -780,7 +803,11 @@ fn apply_modifiers(start: &ParsedTimeValue, modifiers: &[String]) -> Option<Modi
         if m_lower == "utc" && is_utc {
             continue;
         }
-        let written_ymd = fields_kept.then_some(start.unmodified_ymd).flatten();
+        let bare_local = fields_kept.then_some(start.bare_local_jdn).flatten();
+        let written_ymd = fields_kept
+            .then_some(start.ymd)
+            .flatten()
+            .or_else(|| bare_local.map(|_| (2000, 1, 1)));
         fields_kept = false;
         // 'ceiling' is the default day-of-month-overflow behavior (roll forward
         // into the next month); it merely clears any pending floor adjustment.
@@ -847,6 +874,9 @@ fn apply_modifiers(start: &ParsedTimeValue, modifiers: &[String]) -> Option<Modi
         // ('start of ...', 'weekday N', ...) keep it, as in date.c.
         if m_lower.starts_with(|c: char| c == '+' || c == '-' || c.is_ascii_digit()) {
             n_floor = 0;
+        }
+        if m_lower.starts_with("weekday ") {
+            j = bare_local.unwrap_or(j);
         }
         j = apply_modifier(j, m, written_ymd)?;
     }
@@ -1657,31 +1687,6 @@ fn sqlite_value_is_keyword(value: &SqliteValue, keyword: &str) -> bool {
     bytes.eq_ignore_ascii_case(keyword.as_bytes())
 }
 
-#[derive(Clone, Copy)]
-struct ParsedTimeValue {
-    jdn: f64,
-    raw_numeric: bool,
-    /// date.c `isUtc` before any modifier.
-    is_utc: bool,
-    /// date.c `nFloor` before any modifier.
-    n_floor: i64,
-    unmodified_ymd: Option<(i64, i64, i64)>,
-    unmodified_hms: Option<UnmodifiedHms>,
-}
-
-impl ParsedTimeValue {
-    fn raw_number(jdn: f64) -> Self {
-        Self {
-            jdn,
-            raw_numeric: true,
-            is_utc: false,
-            n_floor: 0,
-            unmodified_ymd: None,
-            unmodified_hms: None,
-        }
-    }
-}
-
 fn parse_time_value(value: &SqliteValue) -> Option<ParsedTimeValue> {
     match value {
         SqliteValue::Null => None,
@@ -1690,21 +1695,7 @@ fn parse_time_value(value: &SqliteValue) -> Option<ParsedTimeValue> {
         SqliteValue::Float(_) => None,
         SqliteValue::Text(_) | SqliteValue::Blob(_) => {
             let text = sqlite_value_datetime_text(value)?;
-            let numeric = text.trim_matches(|c: char| c.is_ascii_whitespace());
-            if let Ok(number) = numeric.parse::<f64>()
-                && number.is_finite()
-            {
-                return Some(ParsedTimeValue::raw_number(number));
-            }
-            let parsed = parse_timestring(text.as_ref())?;
-            Some(ParsedTimeValue {
-                jdn: parsed.jdn,
-                raw_numeric: false,
-                is_utc: parsed.is_utc,
-                n_floor: parsed.n_floor,
-                unmodified_ymd: parsed.ymd,
-                unmodified_hms: parsed.hms,
-            })
+            parse_timestring(text.as_ref())
         }
     }
 }
@@ -1722,14 +1713,7 @@ fn parse_args(args: &[SqliteValue]) -> Option<ParsedDateTimeArgs> {
         sqlite_value_is_keyword(value, "subsec") || sqlite_value_is_keyword(value, "subsecond")
     });
     let parsed = match args.first() {
-        None => ParsedTimeValue {
-            jdn: current_time_jdn(),
-            raw_numeric: false,
-            is_utc: true,
-            n_floor: 0,
-            unmodified_ymd: None,
-            unmodified_hms: None,
-        },
+        None => ParsedTimeValue::julian_day(current_time_jdn(), true),
         Some(value) => parse_time_value(value)?,
     };
 
@@ -1770,15 +1754,15 @@ fn parse_args(args: &[SqliteValue]) -> Option<ParsedDateTimeArgs> {
     }
     // date.c isDate: with no modifier at all, a day of month past 28 is
     // normalized (`2023-02-31` -> `2023-03-03`); otherwise fields that no
-    // modifier recomputed are printed as written (`2024-01-01 24:00`).
+    // modifier recomputed are printed as written.
     let unmodified_ymd = parsed
-        .unmodified_ymd
+        .ymd
         .filter(|&(_, _, d)| fields_kept && (!modifiers.is_empty() || d <= 28));
     Some(ParsedDateTimeArgs {
         jdn,
         subsec: first_position_subsec || modifier_subsec,
         unmodified_ymd,
-        unmodified_hms: parsed.unmodified_hms.filter(|_| fields_kept),
+        unmodified_hms: parsed.hms.filter(|_| fields_kept),
     })
 }
 
@@ -2968,7 +2952,7 @@ mod tests {
 
     #[test]
     fn test_time_string_grammar_matches_date_c() {
-        // Each expectation is SQLite 3.53.2 output.
+        // SQLite 3.54.1 accepts hour 24 only for midnight on the following day.
         let dtime = |value: &str| match DateTimeFunc.invoke(&[text(value)]).unwrap() {
             SqliteValue::Text(t) => Some(t.to_string()),
             _ => None,
@@ -2984,10 +2968,13 @@ mod tests {
             ("2024-01-01T", Some("2024-01-01 00:00:00")),
             ("2024-01-01\u{b}", Some("2024-01-01 00:00:00")),
             ("12:00 -05:30", Some("2000-01-01 17:30:00")),
-            // Hour 24 is accepted, and fields no modifier touched print as written.
-            ("2024-01-01 24:00", Some("2024-01-01 24:00:00")),
-            ("2024-01-31 24:00", Some("2024-02-01 24:00:00")),
-            ("24:00", Some("2000-01-02 24:00:00")),
+            ("2024-01-01 24:00", Some("2024-01-02 00:00:00")),
+            ("2024-01-31 24:00", Some("2024-02-01 00:00:00")),
+            ("24:00", Some("2000-01-02 00:00:00")),
+            ("24:00:00.000", Some("2000-01-02 00:00:00")),
+            ("24:00:00.0001", None),
+            ("24:01", None),
+            ("24:00:01", None),
             ("2024-01-01 24:00+01:00", Some("2024-01-01 23:00:00")),
             ("2024-01-01 25:00", None),
             ("2024-01-01 12:00+01:0", None),
@@ -3028,7 +3015,7 @@ mod tests {
             ("2024-06-15 12:00+00:00", "2024-06-15 12:00:00"),
             ("2024-06-15 12:00-00:00", "2024-06-15 12:00:00"),
             ("2024-06-15 12:00+02:00", "2024-06-15 10:00:00"),
-            ("2024-01-01 24:00Z", "2024-01-01 24:00:00"),
+            ("2024-01-01 24:00Z", "2024-01-02 00:00:00"),
         ] {
             assert_text(
                 &DateTimeFunc
@@ -3887,21 +3874,21 @@ mod tests {
     }
 
     #[test]
-    fn test_hour_24_start_of_uses_written_ymd_until_recomputed_bd_a20bp() {
+    fn test_hour_24_start_of_uses_next_calendar_day() {
         let cases = [
-            (&["2024-01-31 24:00", "start of day"][..], "2024-01-31"),
-            (&["2024-01-31 24:00", "start of month"][..], "2024-01-01"),
+            (&["2024-01-31 24:00", "start of day"][..], "2024-02-01"),
+            (&["2024-01-31 24:00", "start of month"][..], "2024-02-01"),
             (&["2024-01-31 24:00", "start of year"][..], "2024-01-01"),
-            (&["2024-12-31 24:00", "start of day"][..], "2024-12-31"),
-            (&["2024-12-31 24:00", "start of month"][..], "2024-12-01"),
-            (&["2024-12-31 24:00", "start of year"][..], "2024-01-01"),
+            (&["2024-12-31 24:00", "start of day"][..], "2025-01-01"),
+            (&["2024-12-31 24:00", "start of month"][..], "2025-01-01"),
+            (&["2024-12-31 24:00", "start of year"][..], "2025-01-01"),
             (
                 &["2024-01-31 24:00", "subsec", "start of month"][..],
-                "2024-01-01",
+                "2024-02-01",
             ),
             (
                 &["2024-01-31 24:00Z", "utc", "start of month"][..],
-                "2024-01-01",
+                "2024-02-01",
             ),
             (
                 &["2024-01-31 24:00", "+0 days", "start of day"][..],
