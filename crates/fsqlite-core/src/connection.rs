@@ -16908,24 +16908,11 @@ impl<'a> MaterializedBindingsVisibilityGuard<'a> {
         occupied_names: &mut HashSet<String>,
         reserved_sql: &str,
     ) -> String {
-        // Replay reparses these identifiers and semantic lookup keys reserve
-        // NUL as a namespace separator. Use ordinary SQL identifiers, checking
-        // both tables and views so a user-defined name cannot capture a read.
-        let base = format!("__fsqlite_materialized_{root_page}");
-        let mut suffix = 0usize;
-        loop {
-            let candidate = if suffix == 0 {
-                base.clone()
-            } else {
-                format!("{base}_{suffix}")
-            };
-            if !reserved_sql.contains(candidate.as_str())
-                && occupied_names.insert(candidate.clone())
-            {
-                return candidate;
-            }
-            suffix = suffix.saturating_add(1);
-        }
+        fresh_private_relation_name(
+            &format!("__fsqlite_materialized_{root_page}"),
+            occupied_names,
+            reserved_sql,
+        )
     }
 
     fn for_insert_target(conn: &'a Connection, insert: &mut fsqlite_ast::InsertStatement) -> Self {
@@ -32060,7 +32047,10 @@ impl Connection {
             // precedence). The rewritten statement is still validated below for any
             // post-rewrite-only semantics.
             let structure_result = self.with_fallback_function_registry(|| {
-                self.validate_statement_select_structure(statement_snapshot.as_ref())
+                self.validate_statement_select_structure(
+                    statement_snapshot.as_ref(),
+                    self.entry_row_value_spelling(),
+                )
             });
             if self.function_registry_generation() != snapshot_generation {
                 if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
@@ -32101,7 +32091,10 @@ impl Connection {
                 }
                 rewrite_result.and_then(|statement| {
                     self.with_fallback_function_registry(|| {
-                        self.validate_statement_select_semantics(&statement)?;
+                        self.validate_statement_select_semantics(
+                            &statement,
+                            RowValueSpelling::Expanded,
+                        )?;
                         self.validate_deferred_select_names(&statement)
                     })?;
                     Ok(statement)
@@ -43658,7 +43651,10 @@ impl Connection {
             }
             relation_result?;
             let semantics_result = self.with_fallback_function_registry(|| {
-                self.validate_statement_select_semantics(statement_snapshot.as_ref())
+                self.validate_statement_select_semantics(
+                    statement_snapshot.as_ref(),
+                    self.entry_row_value_spelling(),
+                )
             });
             if self.function_registry_generation() == snapshot_generation {
                 semantics_result?;
@@ -44014,8 +44010,10 @@ impl Connection {
                 )
             });
         if !select_structure_validated {
+            // A statement the engine runs on the way (a subquery, a body) may
+            // already have its row values expanded.
             self.with_fallback_function_registry(|| {
-                self.validate_statement_select_structure(statement)
+                self.validate_statement_select_structure(statement, RowValueSpelling::Expanded)
             })?;
         }
         let statement_kind = match &statement {
@@ -56583,9 +56581,25 @@ impl Connection {
         })
     }
 
-    fn validate_statement_select_structure(&self, statement: &Statement) -> Result<()> {
+    /// bd-wpfqs: a statement the caller runs reaches validation with its row
+    /// values as written (its rewrite expands them later); one the engine
+    /// runs while it executes another (a subquery, a CTE body) may arrive
+    /// expanded.
+    fn entry_row_value_spelling(&self) -> RowValueSpelling {
+        if self.statement_exec_depth.get() == 0 {
+            RowValueSpelling::AsWritten
+        } else {
+            RowValueSpelling::Expanded
+        }
+    }
+
+    fn validate_statement_select_structure(
+        &self,
+        statement: &Statement,
+        spelling: RowValueSpelling,
+    ) -> Result<()> {
         self.validate_statement_select_relations(statement)?;
-        self.validate_statement_select_semantics(statement)
+        self.validate_statement_select_semantics(statement, spelling)
     }
 
     /// Fail closed (bd-dk9ra): a table that is virtual per its schema DDL, still
@@ -56650,7 +56664,13 @@ impl Connection {
         }
     }
 
-    fn validate_statement_select_semantics(&self, statement: &Statement) -> Result<()> {
+    /// `spelling`: whether the statement's row values are still as written,
+    /// for the forced partial index check (bd-wpfqs).
+    fn validate_statement_select_semantics(
+        &self,
+        statement: &Statement,
+        spelling: RowValueSpelling,
+    ) -> Result<()> {
         match statement {
             Statement::Select(select) => {
                 // bd-k66zh: stock rejects an owned subquery aggregate call in
@@ -56672,7 +56692,7 @@ impl Connection {
                     SubqueryCollationUse::Scalar,
                     &collation_registry,
                 )?;
-                self.validate_select_index_hints(select)
+                self.validate_select_index_hints(select, spelling)
             }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
@@ -56695,7 +56715,7 @@ impl Connection {
                         SubqueryCollationUse::Scalar,
                         &collation_registry,
                     )?;
-                    self.validate_select_index_hints(select)?;
+                    self.validate_select_index_hints(select, spelling)?;
                 }
                 Ok(())
             }
@@ -56718,7 +56738,7 @@ impl Connection {
                         SubqueryCollationUse::Scalar,
                         &collation_registry,
                     )?;
-                    self.validate_select_index_hints(select)?;
+                    self.validate_select_index_hints(select, spelling)?;
                 }
                 Ok(())
             }
@@ -56752,7 +56772,11 @@ impl Connection {
                 // bd-wlo29 L10: a forced partial INDEXED BY on the UPDATE target
                 // must be covered by the statement WHERE, exactly like a SELECT
                 // source. The schema borrow above is scoped so this can re-borrow.
-                self.validate_dml_target_partial_index(&update.table, update.where_clause.as_ref())
+                self.validate_dml_target_partial_index(
+                    &update.table,
+                    update.where_clause.as_ref(),
+                    spelling,
+                )
             }
             Statement::Delete(delete) => {
                 // bd-wlo29 L10: same forced-partial-index cover check for DELETE.
@@ -56796,10 +56820,13 @@ impl Connection {
                     self.validate_dml_target_partial_index(
                         &delete.table,
                         delete.where_clause.as_ref(),
+                        spelling,
                     )
                 }
             }
-            Statement::Explain { stmt, .. } => self.validate_statement_select_semantics(stmt),
+            Statement::Explain { stmt, .. } => {
+                self.validate_statement_select_semantics(stmt, spelling)
+            }
             _ => Ok(()),
         }
     }
@@ -57232,7 +57259,8 @@ impl Connection {
                 }
             }
         }
-        self.validate_select_index_hints(select)?;
+        // The dispatcher's statement has had its row values expanded.
+        self.validate_select_index_hints(select, RowValueSpelling::Expanded)?;
         Ok(())
     }
 
@@ -57396,6 +57424,10 @@ impl Connection {
             && *oa == commuted
             && la.as_ref() == rb.as_ref()
             && ra.as_ref() == lb.as_ref()
+            // bd-wpfqs: stock does not commute a row-value comparison:
+            // `('x', 2) = (a, n)` does not imply `(a, n) = ('x', 2)`.
+            && !matches!(lb.as_ref(), Expr::RowValue(..))
+            && !matches!(rb.as_ref(), Expr::RowValue(..))
         {
             // x IS TRUE tests truthiness. TRUE IS x compares values.
             if oa.truth_test(ra).is_some() || ob.truth_test(rb).is_some() {
@@ -57605,23 +57637,39 @@ impl Connection {
         query_conjuncts: &[&Expr],
         visible_name: &str,
         table: &TableSchema,
+        spelling: RowValueSpelling,
     ) -> bool {
-        // bd-65jog: the predicate arrives expanded
-        // (`parse_partial_index_predicate_for_integrity`), and so may the
-        // statement, so each query conjunct, bound to the visible source, is
-        // expanded the same way and contributes its terms. Stock's
-        // sqlite3ExprImpliesExpr compares a row-value predicate term whole, so
-        // it refuses INDEXED BY for the scalar spelling `a = 'x' AND n = 2` of a
-        // `(a, n) = ('x', 2)` predicate. That cannot be told apart here once the
-        // statement is expanded, so both spellings are accepted (the rows are
-        // the same; bd-wpfqs).
+        // bd-65jog, bd-wpfqs: each query conjunct, bound to the visible
+        // source, contributes its row-value expansion's terms, as stock's WHERE
+        // analysis adds a vector comparison's terms as virtual ones, so a
+        // scalar predicate term `a = 'x'` is implied by `(a, n) = ('x', 2)`.
+        // Stock's sqlite3ExprImpliesExpr compares a row-value predicate term
+        // whole, so only the same comparison as written implies it, and the
+        // scalar spelling `a = 'x' AND n = 2` refuses INDEXED BY. A statement
+        // that reaches this check already expanded (a deferred prepared
+        // SELECT, a subquery run while the statement is prepared) still shows
+        // the comparison's expansion as one: every term of it carries the
+        // comparison's span. Later passes over an expanded statement (the
+        // dispatcher's, EXPLAIN's) expand the predicate too and accept both
+        // spellings, as the statement as written was checked first.
+        let mut written_query: Vec<Expr> = Vec::with_capacity(query_conjuncts.len());
         let mut normalized_query: Vec<Expr> = Vec::with_capacity(query_conjuncts.len());
         for conjunct in query_conjuncts {
             let mut owned = (*conjunct).clone();
             Self::normalize_partial_predicate_columns(&mut owned, &[visible_name]);
+            if spelling == RowValueSpelling::AsWritten {
+                written_query.extend(decompose_where(&owned).into_iter().cloned());
+            }
             fsqlite_ast::row_value::lower_row_values_in_expr(&mut owned);
             normalized_query.extend(decompose_where(&owned).into_iter().cloned());
         }
+        let expanded_query = normalized_query.clone();
+        normalized_query.extend(written_query.iter().cloned());
+        let mut predicate = predicate.clone();
+        if spelling == RowValueSpelling::Expanded {
+            fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+        }
+        let predicate = &predicate;
 
         // SQLite's LIKE/GLOB prefix optimization contributes virtual range
         // terms even when the chosen partial index is on another column.
@@ -57640,6 +57688,13 @@ impl Connection {
         decompose_where(predicate).into_iter().all(|predicate_conjunct| {
             let mut normalized_predicate = predicate_conjunct.clone();
             Self::normalize_partial_predicate_columns(&mut normalized_predicate, &[&table.name]);
+            let mut expansion = normalized_predicate.clone();
+            fsqlite_ast::row_value::lower_row_values_in_expr(&mut expansion);
+            if spelling == RowValueSpelling::AsWritten && expansion != normalized_predicate {
+                return written_query.iter().any(|query_conjunct| {
+                    Self::query_term_implies_predicate(query_conjunct, &normalized_predicate, table)
+                }) || query_holds_one_expansion(&expanded_query, &expansion);
+            }
             normalized_query.iter().any(|query_conjunct| {
                 Self::query_term_implies_predicate(query_conjunct, &normalized_predicate, table)
             })
@@ -57683,7 +57738,11 @@ impl Connection {
     /// PLAN` (hfdt-3b8zl): the plan surfaces must refuse a missing forced
     /// index exactly like execution would, instead of silently describing a
     /// plan that ignores the hint.
-    fn validate_select_index_hints(&self, select: &SelectStatement) -> Result<()> {
+    fn validate_select_index_hints(
+        &self,
+        select: &SelectStatement,
+        spelling: RowValueSpelling,
+    ) -> Result<()> {
         if let SelectCore::Select {
             from: Some(from),
             where_clause,
@@ -57746,7 +57805,7 @@ impl Connection {
                 // subquery source is validated exactly like a top-level SELECT
                 // (bd-wlo29 L10).
                 if let TableOrSubquery::Subquery { query, .. } = tos {
-                    self.validate_select_index_hints(query)?;
+                    self.validate_select_index_hints(query, spelling)?;
                     continue;
                 }
                 if let TableOrSubquery::Table {
@@ -57803,6 +57862,7 @@ impl Connection {
                                 available,
                                 &self.schema.borrow()[ti],
                                 alias.as_deref(),
+                                spelling,
                             )?;
                         }
                     } else if name.schema.as_deref().is_some_and(|schema| {
@@ -57837,7 +57897,8 @@ impl Connection {
     /// Resolve a forced `INDEXED BY <idx>` against the table at schema index
     /// `ti`. Returns `(index_known, partial_predicate)`: `index_known` is false
     /// when the table has no such index, and `partial_predicate` is `Some` only
-    /// for a partial index whose predicate parsed.
+    /// for a partial index whose predicate parsed. The predicate keeps its
+    /// row values as written (bd-wpfqs).
     fn resolve_forced_index_partial_predicate(&self, ti: usize, idx: &str) -> (bool, Option<Expr>) {
         let schema = self.schema.borrow();
         match schema
@@ -57845,13 +57906,10 @@ impl Connection {
             .and_then(|t| t.indexes.iter().find(|i| i.name.eq_ignore_ascii_case(idx)))
         {
             Some(forced_index) => {
-                let predicate = if forced_index.where_clause.is_some() {
-                    Self::parse_partial_index_predicate_for_integrity(forced_index)
-                        .ok()
-                        .flatten()
-                } else {
-                    None
-                };
+                let predicate = forced_index
+                    .where_clause
+                    .as_deref()
+                    .and_then(|sql| fsqlite_parser::expr::parse_expr(sql).ok());
                 (true, predicate)
             }
             None => (false, None),
@@ -57868,8 +57926,15 @@ impl Connection {
         available: &[&Expr],
         table: &TableSchema,
         alias: Option<&str>,
+        spelling: RowValueSpelling,
     ) -> Result<()> {
-        if self.forced_partial_index_predicate_covered(predicate, available, alias.unwrap_or(&table.name), table) {
+        if self.forced_partial_index_predicate_covered(
+            predicate,
+            available,
+            alias.unwrap_or(&table.name),
+            table,
+            spelling,
+        ) {
             Ok(())
         } else {
             Err(FrankenError::FunctionError("no query solution".to_owned()))
@@ -57885,6 +57950,7 @@ impl Connection {
         &self,
         table: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
+        spelling: RowValueSpelling,
     ) -> Result<()> {
         let Some(fsqlite_ast::IndexHint::IndexedBy(idx)) = &table.index_hint else {
             return Ok(());
@@ -57903,6 +57969,7 @@ impl Connection {
                 &available,
                 &self.schema.borrow()[ti],
                 table.alias.as_deref(),
+                spelling,
             )?;
         }
         Ok(())
@@ -79456,109 +79523,225 @@ impl Connection {
     /// and AFTER triggers, each group newest first; a trigger's WHEN before
     /// its body. A persistent trigger resolves in MAIN only, as stock's does,
     /// so it does not see TEMP objects either.
+    ///
+    /// bd-nf30k: stock compiles each of those triggers whole, so it also
+    /// refuses the statement for a name a trigger resolves to nothing (a
+    /// column, `NEW.x` or `OLD.x`, a function or its arity, an INSERT's
+    /// column or value count, a misplaced aggregate), and it compiles the
+    /// programs those compile in turn: the triggers each body statement
+    /// fires, and with foreign_keys on, the ON DELETE / ON UPDATE actions a
+    /// DELETE or UPDATE takes on child tables, with the child triggers they
+    /// fire. Each program is compiled once per statement, so a recursive
+    /// trigger or a self-referencing foreign key ends.
     fn validate_dml_trigger_relations(&self, statement: &Statement) -> Result<()> {
-        use fsqlite_ast::{TriggerEvent, TriggerTiming};
+        if self.triggers.borrow().is_empty() {
+            return Ok(());
+        }
         let target = match statement {
             Statement::Insert(insert) => &insert.table,
             Statement::Update(update) => &update.table.name,
             Statement::Delete(delete) => &delete.table.name,
             _ => return Ok(()),
         };
-        // An attached schema's statement runs on that schema's connection,
-        // with its triggers.
-        if target.schema.as_deref().is_some_and(|schema| {
-            !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
-        }) {
+        let target_has_triggers = self
+            .triggers
+            .borrow()
+            .iter()
+            .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&target.name));
+        // Only a DELETE or an UPDATE of a parent takes foreign-key actions.
+        let takes_fk_actions = matches!(statement, Statement::Update(_) | Statement::Delete(_))
+            && self.fk_cascade_propagation_enabled()
+            && self.table_is_foreign_key_parent(&target.name);
+        if !target_has_triggers && !takes_fk_actions {
             return Ok(());
         }
-        let ordered = {
-            let triggers = self.triggers.borrow();
-            if !triggers
-                .iter()
-                .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&target.name))
-            {
-                return Ok(());
-            }
-            let event = match statement {
-                Statement::Update(update) => {
-                    TriggerEvent::Update(Self::assignment_target_column_names(&update.assignments))
-                }
-                Statement::Delete(_) => TriggerEvent::Delete,
-                _ => TriggerEvent::Insert,
-            };
-            let upsert_updates: Vec<TriggerEvent> = match statement {
-                Statement::Insert(insert) => insert
-                    .upsert
-                    .iter()
-                    .filter_map(|clause| match &clause.action {
-                        fsqlite_ast::UpsertAction::Update { assignments, .. } => Some(
-                            TriggerEvent::Update(Self::assignment_target_column_names(assignments)),
-                        ),
-                        fsqlite_ast::UpsertAction::Nothing => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            // A REPLACE deletes the conflicting rows, and fires their DELETE
-            // triggers, only under recursive_triggers; stock compiles them
-            // only then.
-            let replace_deletes = matches!(
-                statement,
-                Statement::Insert(insert)
-                    if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
-            ) && self.pragma_state.borrow().recursive_triggers;
-            let delete = TriggerEvent::Delete;
-            let mut groups = vec![(TriggerTiming::Before, &event)];
-            for update in &upsert_updates {
-                groups.push((TriggerTiming::Before, update));
-                groups.push((TriggerTiming::After, update));
-            }
-            if replace_deletes {
-                groups.push((TriggerTiming::Before, &delete));
-                groups.push((TriggerTiming::After, &delete));
-            }
-            groups.push((TriggerTiming::InsteadOf, &event));
-            groups.push((TriggerTiming::After, &event));
-            let mut ordered: Vec<Arc<TriggerDef>> = Vec::new();
-            for (timing, event) in groups {
-                for trigger in triggers.iter().rev() {
-                    if trigger.table_name.eq_ignore_ascii_case(&target.name)
-                        && trigger.timing == timing
-                        && trigger_event_matches(&trigger.event, event)
-                        && !ordered.iter().any(|seen| Arc::ptr_eq(seen, trigger))
-                    {
-                        ordered.push(Arc::clone(trigger));
-                    }
-                }
-            }
-            ordered
+        let recursive_triggers = self.pragma_state.borrow().recursive_triggers;
+        let Some(firing) = DmlTriggerFiring::of(statement, recursive_triggers) else {
+            return Ok(());
         };
-        let schema_generation = self.schema_generation();
-        for trigger in &ordered {
-            let key = Arc::as_ptr(trigger).addr();
-            if !trigger.temporary {
-                let checks = self.trigger_relation_checks.borrow();
-                if checks.schema_generation == schema_generation && checks.validated.contains(&key)
+        let mut compiled = TriggerProgramsCompiled::default();
+        // A trigger resolves outside its caller's WITH, as when it fires: a
+        // CTE the statement materialized must not stand in for a table the
+        // trigger names.
+        let _trigger_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
+        self.with_fallback_function_registry(|| {
+            self.validate_firing_trigger_programs(&firing, recursive_triggers, &mut compiled)
+        })
+    }
+
+    /// The triggers one row change fires, and the foreign-key actions it
+    /// takes with the triggers those fire, in stock's coding order: the
+    /// BEFORE triggers (with an upsert's and a REPLACE's), the actions, then
+    /// the INSTEAD OF and AFTER triggers (bd-w78tx, bd-nf30k).
+    fn validate_firing_trigger_programs(
+        &self,
+        firing: &DmlTriggerFiring,
+        recursive_triggers: bool,
+        compiled: &mut TriggerProgramsCompiled,
+    ) -> Result<()> {
+        use fsqlite_ast::{TriggerEvent, TriggerTiming};
+        let delete = TriggerEvent::Delete;
+        let mut before_groups = vec![(TriggerTiming::Before, &firing.event)];
+        for update in &firing.upsert_updates {
+            before_groups.push((TriggerTiming::Before, update));
+            before_groups.push((TriggerTiming::After, update));
+        }
+        if firing.replace_deletes {
+            before_groups.push((TriggerTiming::Before, &delete));
+            before_groups.push((TriggerTiming::After, &delete));
+        }
+        let after_groups = [
+            (TriggerTiming::InsteadOf, &firing.event),
+            (TriggerTiming::After, &firing.event),
+        ];
+        let before = self.triggers_in_groups(&firing.table, &before_groups);
+        let after = self.triggers_in_groups(&firing.table, &after_groups);
+        let fk_actions = if self.fk_cascade_propagation_enabled() {
+            self.foreign_key_action_firings(&firing.table, &firing.event, compiled)
+        } else {
+            Vec::new()
+        };
+        for trigger in &before {
+            self.validate_trigger_program(trigger, recursive_triggers, compiled)?;
+        }
+        for action in &fk_actions {
+            self.validate_firing_trigger_programs(action, recursive_triggers, compiled)?;
+        }
+        for trigger in &after {
+            self.validate_trigger_program(trigger, recursive_triggers, compiled)?;
+        }
+        Ok(())
+    }
+
+    /// The triggers on `table` of each (timing, event) group in turn, each
+    /// group newest first, each trigger once.
+    fn triggers_in_groups(
+        &self,
+        table: &str,
+        groups: &[(fsqlite_ast::TriggerTiming, &fsqlite_ast::TriggerEvent)],
+    ) -> Vec<Arc<TriggerDef>> {
+        let triggers = self.triggers.borrow();
+        let mut ordered: Vec<Arc<TriggerDef>> = Vec::new();
+        for (timing, event) in groups {
+            for trigger in triggers.iter().rev() {
+                if trigger.table_name.eq_ignore_ascii_case(table)
+                    && trigger.timing == *timing
+                    && trigger_event_matches(&trigger.event, event)
+                    && !ordered.iter().any(|seen| Arc::ptr_eq(seen, trigger))
+                {
+                    ordered.push(Arc::clone(trigger));
+                }
+            }
+        }
+        ordered
+    }
+
+    /// bd-nf30k: the child-row changes the foreign-key actions of one row
+    /// change of `table` make, each action once per statement. ON DELETE
+    /// CASCADE deletes child rows; ON DELETE SET NULL / SET DEFAULT, and ON
+    /// UPDATE CASCADE / SET NULL / SET DEFAULT when the UPDATE assigns a
+    /// parent key column, update the child key. Stock codes each action as a
+    /// trigger program whose statement fires the child's triggers.
+    fn foreign_key_action_firings(
+        &self,
+        table: &str,
+        event: &fsqlite_ast::TriggerEvent,
+        compiled: &mut TriggerProgramsCompiled,
+    ) -> Vec<DmlTriggerFiring> {
+        use fsqlite_ast::TriggerEvent;
+        let (is_delete, assigned) = match event {
+            TriggerEvent::Delete => (true, &[][..]),
+            TriggerEvent::Update(columns) => (false, columns.as_slice()),
+            TriggerEvent::Insert => return Vec::new(),
+        };
+        let schema = self.schema.borrow();
+        let parent = schema
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(table));
+        let mut firings = Vec::new();
+        for child in schema.iter() {
+            for (index, fk) in child.foreign_keys.iter().enumerate() {
+                let action = if is_delete { fk.on_delete } else { fk.on_update };
+                if !fk.parent_table.eq_ignore_ascii_case(table)
+                    || !matches!(
+                        action,
+                        FkActionType::Cascade | FkActionType::SetNull | FkActionType::SetDefault
+                    )
+                    || (!is_delete && !foreign_key_parent_key_assigned(fk, parent, assigned))
+                    || !compiled.fk_actions.insert((
+                        child.name.to_ascii_lowercase(),
+                        index,
+                        is_delete,
+                    ))
                 {
                     continue;
                 }
+                let event = if is_delete && matches!(action, FkActionType::Cascade) {
+                    TriggerEvent::Delete
+                } else {
+                    TriggerEvent::Update(
+                        fk.child_columns
+                            .iter()
+                            .filter_map(|&column| child.columns.get(column))
+                            .map(|column| column.name.clone())
+                            .collect(),
+                    )
+                };
+                firings.push(DmlTriggerFiring {
+                    table: child.name.clone(),
+                    event,
+                    upsert_updates: Vec::new(),
+                    replace_deletes: false,
+                });
             }
-            self.validate_trigger_relations(trigger)?;
-            if !trigger.temporary {
-                let mut checks = self.trigger_relation_checks.borrow_mut();
-                if checks.schema_generation != schema_generation {
-                    checks.schema_generation = schema_generation;
-                    checks.validated.clear();
-                }
-                checks.validated.insert(key);
+        }
+        firings
+    }
+
+    /// Compile-check one trigger, once per statement, and a persistent one
+    /// once per schema generation.
+    fn validate_trigger_program(
+        &self,
+        trigger: &Arc<TriggerDef>,
+        recursive_triggers: bool,
+        compiled: &mut TriggerProgramsCompiled,
+    ) -> Result<()> {
+        let key = Arc::as_ptr(trigger).addr();
+        if !compiled.triggers.insert(key) {
+            return Ok(());
+        }
+        let schema_generation = self.schema_generation();
+        if !trigger.temporary {
+            let checks = self.trigger_relation_checks.borrow();
+            if checks.schema_generation == schema_generation && checks.validated.contains(&key) {
+                return Ok(());
             }
+        }
+        self.validate_trigger_relations(trigger, recursive_triggers, compiled)?;
+        if !trigger.temporary {
+            let mut checks = self.trigger_relation_checks.borrow_mut();
+            if checks.schema_generation != schema_generation {
+                checks.schema_generation = schema_generation;
+                checks.validated.clear();
+            }
+            checks.validated.insert(key);
         }
         Ok(())
     }
 
     /// bd-w78tx: every relation one trigger's WHEN and body name, resolved
     /// as stock resolves them when it compiles the trigger.
-    fn validate_trigger_relations(&self, trigger: &TriggerDef) -> Result<()> {
+    ///
+    /// bd-nf30k: and, part by part as stock compiles them, the names each
+    /// resolves to, with NEW and OLD bound as firing binds them (a name left
+    /// unbound, `NEW.zz`, is stock's "no such column: NEW.zz"), and the
+    /// triggers and foreign-key actions each body statement fires.
+    fn validate_trigger_relations(
+        &self,
+        trigger: &TriggerDef,
+        recursive_triggers: bool,
+        compiled: &mut TriggerProgramsCompiled,
+    ) -> Result<()> {
         let mut resolver = if trigger.temporary {
             SelectRelationResolver::new(self)
         } else {
@@ -79569,13 +79752,312 @@ impl Connection {
                 Rc::new(RefCell::new(SelectViewValidationState::default())),
             )
         };
+        let frame = self.trigger_compile_frame(trigger);
         if let Some(when) = &trigger.when_clause {
             resolver.validate_expr(when)?;
+            if let Some(frame) = &frame {
+                let mut bound = when.clone();
+                bind_trigger_columns_in_expr(&mut bound, frame);
+                let select =
+                    select_of_result_exprs(vec![bound], Some(compile_check_empty_source()));
+                self.trigger_names_result(trigger, self.validate_trigger_select_names(&select))?;
+            }
         }
         for statement in &trigger.body {
             resolver.validate_trigger_body_statement(statement)?;
+            if let Some(frame) = &frame {
+                let (bound, _) = bind_trigger_body_statement(statement, frame, !trigger.temporary);
+                self.trigger_names_result(trigger, self.validate_trigger_statement_names(&bound))?;
+            }
+            if let Some(firing) = DmlTriggerFiring::of(statement, recursive_triggers) {
+                self.validate_firing_trigger_programs(&firing, recursive_triggers, compiled)?;
+            }
         }
         Ok(())
+    }
+
+    /// A name check's outcome for `trigger`, except a missing column the
+    /// trigger spells in double quotes: stock reads a double-quoted name that
+    /// resolves to nothing as a string (SQLITE_DQS). fsqlite's retry for that
+    /// (bd-jcjkf) rewrites the text of the statement being run, never a
+    /// trigger's, so this check does not refuse for one.
+    fn trigger_names_result(&self, trigger: &TriggerDef, result: Result<()>) -> Result<()> {
+        let Err(error) = &result else {
+            return Ok(());
+        };
+        let missing = match error {
+            FrankenError::NoSuchColumn { name } => Some(name.clone()),
+            other => Self::dqs_missing_column_name(other),
+        };
+        if let Some(missing) = missing
+            && !missing.contains('.')
+            && Self::double_quoted_identifier_tokens(&trigger.create_sql)
+                .iter()
+                .any(|(_, _, name)| name.eq_ignore_ascii_case(&missing))
+        {
+            return Ok(());
+        }
+        result
+    }
+
+    /// bd-nf30k: a frame for binding `trigger`'s WHEN and body as firing
+    /// binds them, its NEW and OLD rows (those the event has) all NULL.
+    /// `None` when the trigger's table or view is gone.
+    fn trigger_compile_frame(&self, trigger: &TriggerDef) -> Option<TriggerFrame> {
+        use fsqlite_ast::TriggerEvent;
+        let (column_names, rowid_alias_col_idx, has_rowid) =
+            if trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf {
+                (self.view_trigger_column_names(&trigger.table_name).ok()?, None, false)
+            } else {
+                let key = trigger.table_name.to_ascii_lowercase();
+                let shadowed = self.shadowed_main_tables.borrow();
+                let schema = self.schema.borrow();
+                let table = shadowed
+                    .get(&key)
+                    .filter(|_| !trigger.temporary)
+                    .or_else(|| schema.get(self.schema_index_of(&trigger.table_name)?))?;
+                (
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect::<Vec<_>>(),
+                    self.rowid_alias_columns.borrow().get(&key).copied(),
+                    !table.without_rowid,
+                )
+            };
+        let width = column_names.len();
+        let has_old = matches!(trigger.event, TriggerEvent::Update(_) | TriggerEvent::Delete);
+        let has_new = matches!(trigger.event, TriggerEvent::Update(_) | TriggerEvent::Insert);
+        Some(TriggerFrame {
+            table_name: trigger.table_name.clone(),
+            column_names,
+            column_collations: Vec::new(),
+            rowid_alias_col_idx,
+            old_row: has_old.then(|| vec![SqliteValue::Null; width]),
+            new_row: has_new.then(|| vec![SqliteValue::Null; width]),
+            old_rowid: (has_old && has_rowid).then_some(0),
+            new_rowid: (has_new && has_rowid).then_some(0),
+        })
+    }
+
+    /// bd-nf30k: the names one bound trigger body statement resolves, as
+    /// stock checks them when it compiles the statement. An UPDATE's or a
+    /// DELETE's expressions are checked as a SELECT from its target (and an
+    /// UPDATE's FROM); an INSERT's columns and value counts against its
+    /// target table, then its VALUES or SELECT.
+    fn validate_trigger_statement_names(&self, statement: &Statement) -> Result<()> {
+        match statement {
+            Statement::Select(select) => {
+                self.validate_select_ordinals_and_hints(select)?;
+                self.validate_trigger_select_names(select)
+            }
+            Statement::Insert(insert) => self.validate_trigger_insert_names(insert),
+            Statement::Update(update) => {
+                if with_defines_relation(update.with.as_ref(), &update.table.name) {
+                    return Ok(());
+                }
+                let mut from = FromClause {
+                    source: dml_target_source(&update.table),
+                    joins: Vec::new(),
+                };
+                if let Some(update_from) = &update.from {
+                    // `FROM target, <the UPDATE's FROM>`, as stock joins them.
+                    from.joins.push(fsqlite_ast::JoinClause {
+                        join_type: fsqlite_ast::JoinType {
+                            natural: false,
+                            kind: fsqlite_ast::JoinKind::Cross,
+                        },
+                        table: update_from.source.clone(),
+                        constraint: None,
+                    });
+                    from.joins.extend(update_from.joins.iter().cloned());
+                }
+                let columns = self.dml_target_column_names(&update.table.name);
+                for assignment in &update.assignments {
+                    // A row-value SET supplies one value per target; a
+                    // subquery source is checked whole, as EXISTS reads it.
+                    let values = match (&assignment.target, &assignment.value) {
+                        (
+                            fsqlite_ast::AssignmentTarget::ColumnList(_),
+                            Expr::RowValue(values, _),
+                        ) => values.clone(),
+                        (
+                            fsqlite_ast::AssignmentTarget::ColumnList(_),
+                            Expr::Subquery(query, span),
+                        ) => vec![Expr::Exists {
+                            subquery: query.clone(),
+                            not: false,
+                            span: *span,
+                        }],
+                        _ => vec![assignment.value.clone()],
+                    };
+                    let mut select = select_of_result_exprs(values, Some(from.clone()));
+                    select.with.clone_from(&update.with);
+                    self.validate_trigger_select_names(&select)?;
+                    if let Some(columns) = &columns {
+                        for name in Self::assignment_target_column_names(std::slice::from_ref(
+                            assignment,
+                        )) {
+                            if !columns.iter().any(|column| column.eq_ignore_ascii_case(&name))
+                                && !is_rowid_alias(&name)
+                            {
+                                return Err(FrankenError::FunctionError(format!(
+                                    "no such column: {name}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                let mut select = dml_where_select(
+                    from,
+                    update.where_clause.as_ref(),
+                    &update.order_by,
+                    update.limit.as_ref(),
+                );
+                select.with.clone_from(&update.with);
+                self.validate_trigger_select_names(&select)
+            }
+            Statement::Delete(delete) => {
+                if with_defines_relation(delete.with.as_ref(), &delete.table.name) {
+                    return Ok(());
+                }
+                let mut select = dml_where_select(
+                    FromClause {
+                        source: dml_target_source(&delete.table),
+                        joins: Vec::new(),
+                    },
+                    delete.where_clause.as_ref(),
+                    &delete.order_by,
+                    delete.limit.as_ref(),
+                );
+                select.with.clone_from(&delete.with);
+                self.validate_trigger_select_names(&select)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// bd-nf30k: an INSERT's column list against its target table, then its
+    /// VALUES rows or SELECT, then the number of values each row supplies,
+    /// in stock's order and with its messages. A view or virtual target,
+    /// whose columns stock resolves otherwise, is checked for its source only.
+    fn validate_trigger_insert_names(&self, insert: &fsqlite_ast::InsertStatement) -> Result<()> {
+        if with_defines_relation(insert.with.as_ref(), &insert.table) {
+            return Ok(());
+        }
+        let target = self.dml_target_column_info(&insert.table);
+        if let Some((columns, _)) = &target {
+            for name in &insert.columns {
+                if !columns.iter().any(|column| column.eq_ignore_ascii_case(name))
+                    && !is_rowid_alias(name)
+                {
+                    return Err(FrankenError::FunctionError(format!(
+                        "table {} has no column named {name}",
+                        insert.table.name
+                    )));
+                }
+            }
+        }
+        let supplied = match &insert.source {
+            InsertSource::Values(rows) => {
+                for row in rows {
+                    let mut select =
+                        select_of_result_exprs(row.clone(), Some(compile_check_empty_source()));
+                    select.with.clone_from(&insert.with);
+                    self.validate_trigger_select_names(&select)?;
+                }
+                let width = rows.first().map(Vec::len);
+                width.filter(|width| rows.iter().all(|row| row.len() == *width))
+            }
+            InsertSource::Select(select) => {
+                let scoped = insert_source_select_for_validation(insert, select);
+                self.validate_select_ordinals_and_hints(&scoped)?;
+                self.validate_trigger_select_names(&scoped)?;
+                select_exact_result_width(select)
+            }
+            InsertSource::DefaultValues => None,
+        };
+        if let (Some((_, insertable)), Some(supplied)) = (&target, supplied) {
+            let expected = if insert.columns.is_empty() {
+                *insertable
+            } else {
+                insert.columns.len()
+            };
+            if supplied != expected {
+                return Err(FrankenError::FunctionError(if insert.columns.is_empty() {
+                    format!(
+                        "table {} has {expected} columns but {supplied} values were supplied",
+                        insert.table.name
+                    )
+                } else {
+                    format!("{supplied} values for {expected} columns")
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// The semantic checks a SELECT gets at prepare, and its aggregate and
+    /// window placement (bd-nf30k). The full column-reference resolver runs
+    /// whatever the shape: a statement's own simple shapes have their columns
+    /// resolved when they execute, which a trigger's never may.
+    fn validate_trigger_select_names(&self, select: &SelectStatement) -> Result<()> {
+        self.validate_select_column_references(select)?;
+        // A trigger's text has not had its row values expanded.
+        self.validate_statement_select_semantics(
+            &Statement::Select(select.clone()),
+            RowValueSpelling::AsWritten,
+        )?;
+        validate_aggregate_window_misuse(select)
+    }
+
+    /// The column names of a DML target table, honoring a MAIN qualifier;
+    /// `None` for a view, a virtual table (whose hidden columns stock also
+    /// resolves) or a missing table.
+    fn dml_target_column_names(&self, name: &QualifiedName) -> Option<Vec<String>> {
+        self.dml_target_column_info(name)
+            .map(|(columns, _)| columns)
+    }
+
+    /// A DML target table's column names and how many of them an INSERT
+    /// without a column list supplies (the ones not generated), as
+    /// [`Self::dml_target_column_names`] finds them.
+    fn dml_target_column_info(&self, name: &QualifiedName) -> Option<(Vec<String>, usize)> {
+        if self.table_name_is_virtual(&name.name) {
+            return None;
+        }
+        let key = name.name.to_ascii_lowercase();
+        let main = name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
+        let shadowed = self.shadowed_main_tables.borrow();
+        let schema = self.schema.borrow();
+        let table = match shadowed.get(&key).filter(|_| main) {
+            Some(table) => table,
+            None => {
+                let index = self.schema_index_of(&name.name)?;
+                if self.materialized_temp_root_pages.borrow().contains(&schema.get(index)?.root_page)
+                {
+                    return None;
+                }
+                schema.get(index)?
+            }
+        };
+        let insertable = table
+            .columns
+            .iter()
+            .filter(|column| column.generated_expr.is_none())
+            .count();
+        Some((
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            insertable,
+        ))
     }
 
     fn has_matching_triggers(
@@ -103931,6 +104413,160 @@ impl Connection {
 
     /// Materialize CTEs as temporary in-memory tables, execute the main query
     /// with `with` stripped, then clean up the temporary tables.
+    /// Every table and view name, lowercased: the names a private relation
+    /// name must avoid.
+    fn occupied_relation_names(&self) -> HashSet<String> {
+        self.schema
+            .borrow()
+            .iter()
+            .map(|table| table.name.to_ascii_lowercase())
+            .chain(
+                self.views
+                    .borrow()
+                    .iter()
+                    .map(|view| view.name.to_ascii_lowercase()),
+            )
+            .collect()
+    }
+
+    /// [`privatize_ctes_bound_elsewhere`] for a SELECT's own WITH, which
+    /// every schema-qualified relation of the statement is kept from.
+    /// `None`, with nothing cloned, when no CTE shares such a name.
+    fn privatize_select_ctes_bound_elsewhere(
+        &self,
+        select: &SelectStatement,
+    ) -> Option<SelectStatement> {
+        let mut bound_elsewhere = BTreeSet::new();
+        let _ = visit_select_qualified_names(select, &mut |name| {
+            collect_schema_qualified_relation_name(&mut bound_elsewhere, name);
+            Ok(())
+        });
+        if !with_names_any(select.with.as_ref()?, &bound_elsewhere) {
+            return None;
+        }
+        let reserved_sql = select.to_string().to_ascii_lowercase();
+        let mut select = select.clone();
+        let mut with = select.with.take()?;
+        let renamed = privatize_ctes_bound_elsewhere(
+            &mut with,
+            &bound_elsewhere,
+            &mut self.occupied_relation_names(),
+            &reserved_sql,
+            |name, private_name| {
+                subst_cte_refs_in_select(
+                    &mut select,
+                    name,
+                    CteSourceSubstitution::Materialized(private_name),
+                    &mut 0,
+                );
+            },
+        );
+        select.with = Some(with);
+        renamed.then_some(select)
+    }
+
+    /// [`privatize_ctes_bound_elsewhere`] for a DELETE's WITH, which the
+    /// target and every schema-qualified relation are kept from.
+    fn privatize_delete_ctes_bound_elsewhere(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+    ) -> Option<fsqlite_ast::DeleteStatement> {
+        let with = delete.with.as_ref()?;
+        let mut bound_elsewhere = BTreeSet::from([delete.table.name.name.to_ascii_lowercase()]);
+        let mut collect = |name: &QualifiedName| {
+            collect_schema_qualified_relation_name(&mut bound_elsewhere, name);
+            Ok(())
+        };
+        for cte in &with.ctes {
+            let _ = visit_select_qualified_names(&cte.query, &mut collect);
+        }
+        let _ = visit_delete_qualified_names(delete, &mut collect);
+        if !with_names_any(with, &bound_elsewhere) {
+            return None;
+        }
+        let reserved_sql = delete.to_string().to_ascii_lowercase();
+        let mut delete = delete.clone();
+        let mut with = delete.with.take()?;
+        let renamed = privatize_ctes_bound_elsewhere(
+            &mut with,
+            &bound_elsewhere,
+            &mut self.occupied_relation_names(),
+            &reserved_sql,
+            |name, private_name| rebind_materialized_delete_reads(&mut delete, name, private_name),
+        );
+        delete.with = Some(with);
+        renamed.then_some(delete)
+    }
+
+    /// [`privatize_ctes_bound_elsewhere`] for an UPDATE's WITH, which the
+    /// target and every schema-qualified relation are kept from.
+    fn privatize_update_ctes_bound_elsewhere(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+    ) -> Option<fsqlite_ast::UpdateStatement> {
+        let with = update.with.as_ref()?;
+        let mut bound_elsewhere = BTreeSet::from([update.table.name.name.to_ascii_lowercase()]);
+        let mut collect = |name: &QualifiedName| {
+            collect_schema_qualified_relation_name(&mut bound_elsewhere, name);
+            Ok(())
+        };
+        for cte in &with.ctes {
+            let _ = visit_select_qualified_names(&cte.query, &mut collect);
+        }
+        let _ = visit_update_qualified_names(update, &mut collect);
+        if !with_names_any(with, &bound_elsewhere) {
+            return None;
+        }
+        let reserved_sql = update.to_string().to_ascii_lowercase();
+        let mut update = update.clone();
+        let mut with = update.with.take()?;
+        let renamed = privatize_ctes_bound_elsewhere(
+            &mut with,
+            &bound_elsewhere,
+            &mut self.occupied_relation_names(),
+            &reserved_sql,
+            |name, private_name| rebind_materialized_update_reads(&mut update, name, private_name),
+        );
+        update.with = Some(with);
+        renamed.then_some(update)
+    }
+
+    /// [`privatize_ctes_bound_elsewhere`] for an INSERT's WITH, which the
+    /// target and every schema-qualified relation are kept from.
+    fn privatize_insert_ctes_bound_elsewhere(&self, insert: &mut fsqlite_ast::InsertStatement) {
+        let Some(with) = insert.with.take() else {
+            return;
+        };
+        let mut bound_elsewhere = BTreeSet::from([insert.table.name.to_ascii_lowercase()]);
+        let mut collect = |name: &QualifiedName| {
+            collect_schema_qualified_relation_name(&mut bound_elsewhere, name);
+            Ok(())
+        };
+        for cte in &with.ctes {
+            let _ = visit_select_qualified_names(&cte.query, &mut collect);
+        }
+        visit_insert_qualified_name_sites_mut(insert, &mut |name, _| {
+            let _ = collect(name);
+        });
+        let names_a_cte = with_names_any(&with, &bound_elsewhere);
+        insert.with = Some(with);
+        if !names_a_cte {
+            return;
+        }
+        let reserved_sql = insert.to_string().to_ascii_lowercase();
+        let Some(mut with) = insert.with.take() else {
+            return;
+        };
+        privatize_ctes_bound_elsewhere(
+            &mut with,
+            &bound_elsewhere,
+            &mut self.occupied_relation_names(),
+            &reserved_sql,
+            |name, private_name| rebind_materialized_insert_reads(insert, name, private_name),
+        );
+        insert.with = Some(with);
+    }
+
     async fn execute_with_ctes(
         &self,
         select: &SelectStatement,
@@ -103944,6 +104580,17 @@ impl Connection {
             &numbered
         } else {
             select
+        };
+        // bd-mm6ec: a CTE that a schema-qualified relation of the statement
+        // names is materialized under a private name, so the qualified name
+        // still reaches the catalog's table.
+        let privatized;
+        let select = match self.privatize_select_ctes_bound_elsewhere(select) {
+            Some(renamed) => {
+                privatized = renamed;
+                &privatized
+            }
+            None => select,
         };
         // bd-gh-cte-materialization-hints-sn0yh / GH#204: a NOT MATERIALIZED
         // non-recursive CTE must be inlined at each reference so its body
@@ -105521,6 +106168,16 @@ impl Connection {
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-mm6ec: a CTE named like the target or a qualified relation is
+        // materialized under a private name.
+        let privatized;
+        let delete = match self.privatize_delete_ctes_bound_elsewhere(delete) {
+            Some(renamed) => {
+                privatized = renamed;
+                &privatized
+            }
+            None => delete,
+        };
         if let Some(target_schema) = self.attached_target_schema(&delete.table.name)? {
             self.prepare_attached_target_write_in_explicit_transaction(
                 "DELETE",
@@ -105577,6 +106234,16 @@ impl Connection {
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-mm6ec: a CTE named like the target or a qualified relation is
+        // materialized under a private name.
+        let privatized;
+        let update = match self.privatize_update_ctes_bound_elsewhere(update) {
+            Some(renamed) => {
+                privatized = renamed;
+                &privatized
+            }
+            None => update,
+        };
         if let Some(target_schema) = self.attached_target_schema(&update.table.name)? {
             self.prepare_attached_target_write_in_explicit_transaction(
                 "UPDATE",
@@ -105674,6 +106341,9 @@ impl Connection {
             &mut BindParamState::default(),
             &original_params,
         )?;
+        // bd-mm6ec: a CTE named like the target or a qualified relation is
+        // materialized under a private name.
+        self.privatize_insert_ctes_bound_elsewhere(&mut bound_insert);
         let insert = &bound_insert;
         let params = None;
         if let Some(target_schema) = self.attached_target_schema(&insert.table)? {
@@ -105821,43 +106491,8 @@ impl Connection {
         for cte_index in materialization_order {
             let cte = &ctes[cte_index];
             let cte_name = &cte.name;
-            // The anchor position — the CTE's first/main SELECT core — must not
-            // reference the CTE itself: a self-reference there has no base case and
-            // is SQLite's "circular reference: NAME" (for both WITH and WITH
-            // RECURSIVE), distinct from a valid recursive CTE whose recursive term
-            // lives in a later compound (UNION) arm. Without this, a bare self-ref
-            // `c AS (SELECT * FROM c)` (no compound) would fall through to normal
-            // materialization and mis-report "no such table: c".
-            // bd-errmsg-parity-batch3-3brmm.
-            //
-            // bd-gxbof: stock resolves the body with the CTE's own name bound
-            // to the CTE, so every reference the body's own WITHs do not
-            // shadow is circular, wherever it sits: a FROM item, a derived
-            // table, a scalar, EXISTS or IN subquery, or a nested CTE body the
-            // body reads. A body whose WITH defines the name reads that nested
-            // CTE instead (`WITH c AS (WITH c AS (SELECT 1 AS x) SELECT x
-            // FROM c) ...` is 1). Only a recursive arm's own FROM items bind
-            // to the recursive table, so a body that may recurse (a UNION or
-            // UNION ALL compound) is checked in its anchor, which stock
-            // resolves under the body's WITH.
-            let body_may_recurse = cte
-                .query
-                .body
-                .compounds
-                .last()
-                .is_some_and(|(op, _)| matches!(op, CompoundOp::Union | CompoundOp::UnionAll));
-            let reads_itself = if body_may_recurse {
-                select_contains_relation_reference(
-                    &recursive_cte_anchor_select(&cte.query),
-                    &mut CteReference(cte_name),
-                )
-            } else {
-                select_contains_relation_reference(&cte.query, &mut CteReference(cte_name))
-            };
-            if reads_itself {
-                return Err(FrankenError::FunctionError(format!(
-                    "circular reference: {cte_name}"
-                )));
+            if let Some(refusal) = cte_self_reference_error(cte) {
+                return Err(FrankenError::FunctionError(refusal));
             }
             let has_self_ref = is_recursive
                 && cte
@@ -110121,7 +110756,9 @@ impl Connection {
         // surfaces must refuse exactly like executing the statement would
         // instead of silently describing a plan that ignores the hint.
         match stmt {
-            Statement::Select(select) => self.validate_select_index_hints(select)?,
+            Statement::Select(select) => {
+                self.validate_select_index_hints(select, RowValueSpelling::Expanded)?;
+            }
             Statement::Update(update) if query_plan => {
                 // EQP renders UPDATE/DELETE from a synthetic summary rather than
                 // the compiled program. try_compile_statement catches an unknown
@@ -124646,6 +125283,136 @@ fn recursive_cte_anchor_select(body: &SelectStatement) -> SelectStatement {
     }
 }
 
+/// Stock's refusal of `cte` for how its body reads the CTE itself, as
+/// select.c's withExpand applies its rules, or `None`.
+///
+/// The recursive arms are the trailing compound arms joined by the body's
+/// last operator (UNION or UNION ALL) whose own FROM items name the CTE, from
+/// the last arm back to the first that does not. Each names it once ("multiple
+/// references to recursive table: NAME" otherwise), and only there: any other
+/// reference in a recursive arm, in a subquery, a derived table or an
+/// expression, is "multiple recursive references: NAME" (bd-tmbbn).
+///
+/// The rest of the body (all of it when no arm recurses) has no base case to
+/// read, so any reference there is "circular reference: NAME": the anchor's,
+/// an arm's before the recursive ones, a derived table's in an arm that has
+/// no FROM reference of its own (bd-tmbbn), for WITH and WITH RECURSIVE
+/// alike. Without this, a bare self-ref `c AS (SELECT * FROM c)` (no
+/// compound) would fall through to normal materialization and mis-report "no
+/// such table: c". bd-errmsg-parity-batch3-3brmm.
+///
+/// bd-gxbof: stock resolves the body with the CTE's own name bound to the
+/// CTE, so every reference the body's own WITHs do not shadow counts,
+/// wherever it sits: a FROM item, a derived table, a scalar, EXISTS or IN
+/// subquery, or a nested CTE body the body reads. A body whose WITH defines
+/// the name reads that nested CTE instead (`WITH c AS (WITH c AS (SELECT 1
+/// AS x) SELECT x FROM c) ...` is 1); only a recursive arm's own FROM items
+/// still bind to the recursive table there.
+fn cte_self_reference_error(cte: &fsqlite_ast::Cte) -> Option<String> {
+    let name = &cte.name;
+    let body = &cte.query;
+    let compounds = &body.body.compounds;
+    let last_op = compounds.last().map(|(op, _)| *op);
+    let mut first_recursive = compounds.len();
+    if matches!(last_op, Some(CompoundOp::Union | CompoundOp::UnionAll)) {
+        for (index, (op, core)) in compounds.iter().enumerate().rev() {
+            if Some(*op) != last_op {
+                break;
+            }
+            match select_core_direct_references(core, name) {
+                0 => break,
+                1 => first_recursive = index,
+                _ => return Some(format!("multiple references to recursive table: {name}")),
+            }
+        }
+    }
+    let recursive = first_recursive < compounds.len();
+    let base = if recursive {
+        SelectStatement {
+            with: body.with.clone(),
+            body: SelectBody {
+                select: body.body.select.clone(),
+                compounds: compounds[..first_recursive].to_vec(),
+            },
+            order_by: Vec::new(),
+            limit: None,
+        }
+    } else {
+        body.clone()
+    };
+    if select_contains_relation_reference(&base, &mut CteReference(name)) {
+        return Some(format!("circular reference: {name}"));
+    }
+    if !recursive || select_with_defines(body, name) {
+        return None;
+    }
+    let mut rest = SelectStatement {
+        with: None,
+        body: SelectBody {
+            select: SelectCore::Values(Vec::new().into()),
+            compounds: compounds[first_recursive..].to_vec(),
+        },
+        order_by: body.order_by.clone(),
+        limit: body.limit.clone(),
+    };
+    for (_, core) in &mut rest.body.compounds {
+        hide_select_core_direct_references(core, name);
+    }
+    select_contains_relation_reference(&rest, &mut CteReference(name))
+        .then(|| format!("multiple recursive references: {name}"))
+}
+
+/// How many of `core`'s own FROM items, a parenthesized join's included,
+/// name the relation `name` without a schema (bd-tmbbn).
+fn select_core_direct_references(core: &SelectCore, name: &str) -> usize {
+    fn count(from: &FromClause, name: &str) -> usize {
+        std::iter::once(&from.source)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .map(|source| match source {
+                TableOrSubquery::Table {
+                    name: qualified, ..
+                } => usize::from(
+                    qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name),
+                ),
+                TableOrSubquery::ParenJoin(inner) => count(inner, name),
+                TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => 0,
+            })
+            .sum()
+    }
+    match core {
+        SelectCore::Select {
+            from: Some(from), ..
+        } => count(from, name),
+        SelectCore::Select { from: None, .. } | SelectCore::Values(_) => 0,
+    }
+}
+
+/// Rename `core`'s own FROM items that name `name` to a name no reference
+/// matches, so a search finds only its other references (bd-tmbbn).
+fn hide_select_core_direct_references(core: &mut SelectCore, name: &str) {
+    fn hide(from: &mut FromClause, name: &str) {
+        for source in std::iter::once(&mut from.source)
+            .chain(from.joins.iter_mut().map(|join| &mut join.table))
+        {
+            match source {
+                TableOrSubquery::Table {
+                    name: qualified, ..
+                } if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name) => {
+                    "\u{0}".clone_into(&mut qualified.name);
+                }
+                TableOrSubquery::ParenJoin(inner) => hide(inner, name),
+                _ => {}
+            }
+        }
+    }
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = core
+    {
+        hide(from, name);
+    }
+}
+
 /// The body's WITH as a recursive arm of `cte` reads it (bd-gxbof).
 ///
 /// Stock binds a recursive arm's own FROM references to the CTE's name to the
@@ -124936,6 +125703,187 @@ fn rebind_materialized_insert_reads(
         if let ResultColumn::Expr { expr, .. } = column {
             subst_cte_refs_in_expr(expr, name, body, &mut rebound);
         }
+    }
+}
+
+/// [`rebind_materialized_insert_reads`] for an UPDATE (bd-mm6ec): every read
+/// of the CTE `name` follows it to `private_name`; the target keeps its name.
+fn rebind_materialized_update_reads(
+    update: &mut fsqlite_ast::UpdateStatement,
+    name: &str,
+    private_name: &str,
+) {
+    let body = CteSourceSubstitution::Materialized(private_name);
+    let mut rebound = 0;
+    for assignment in &mut update.assignments {
+        subst_cte_refs_in_expr(&mut assignment.value, name, body, &mut rebound);
+    }
+    if let Some(from) = &mut update.from {
+        subst_cte_refs_in_from(from, name, body, &mut rebound);
+    }
+    if let Some(predicate) = &mut update.where_clause {
+        subst_cte_refs_in_expr(predicate, name, body, &mut rebound);
+    }
+    rebind_materialized_dml_tail_reads(
+        &mut update.returning,
+        &mut update.order_by,
+        update.limit.as_mut(),
+        name,
+        body,
+    );
+}
+
+/// [`rebind_materialized_insert_reads`] for a DELETE (bd-mm6ec): every read
+/// of the CTE `name` follows it to `private_name`; the target keeps its name.
+fn rebind_materialized_delete_reads(
+    delete: &mut fsqlite_ast::DeleteStatement,
+    name: &str,
+    private_name: &str,
+) {
+    let body = CteSourceSubstitution::Materialized(private_name);
+    if let Some(predicate) = &mut delete.where_clause {
+        subst_cte_refs_in_expr(predicate, name, body, &mut 0);
+    }
+    rebind_materialized_dml_tail_reads(
+        &mut delete.returning,
+        &mut delete.order_by,
+        delete.limit.as_mut(),
+        name,
+        body,
+    );
+}
+
+/// The RETURNING, ORDER BY and LIMIT reads an UPDATE and a DELETE share.
+fn rebind_materialized_dml_tail_reads(
+    returning: &mut [ResultColumn],
+    order_by: &mut [fsqlite_ast::OrderingTerm],
+    limit: Option<&mut fsqlite_ast::LimitClause>,
+    name: &str,
+    body: CteSourceSubstitution<'_>,
+) {
+    let mut rebound = 0;
+    for column in returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            subst_cte_refs_in_expr(expr, name, body, &mut rebound);
+        }
+    }
+    for term in order_by {
+        subst_cte_refs_in_expr(&mut term.expr, name, body, &mut rebound);
+    }
+    if let Some(limit) = limit {
+        subst_cte_refs_in_expr(&mut limit.limit, name, body, &mut rebound);
+        if let Some(offset) = &mut limit.offset {
+            subst_cte_refs_in_expr(offset, name, body, &mut rebound);
+        }
+    }
+}
+
+/// A relation name no statement spells, for a binding that must not capture
+/// a name SQL does spell. Replay reparses these identifiers and semantic
+/// lookup keys reserve NUL as a namespace separator, so the name is an
+/// ordinary identifier: `base`, or `base` with a numeric suffix, absent from
+/// `occupied_names` (lowercased tables and views; the name joins them) and
+/// from the lowercased statement text `reserved_sql`, so neither a
+/// user-defined relation nor a later lexical binding can capture a read.
+fn fresh_private_relation_name(
+    base: &str,
+    occupied_names: &mut HashSet<String>,
+    reserved_sql: &str,
+) -> String {
+    let mut suffix = 0usize;
+    loop {
+        let candidate = if suffix == 0 {
+            base.to_owned()
+        } else {
+            format!("{base}_{suffix}")
+        };
+        if !reserved_sql.contains(candidate.as_str()) && occupied_names.insert(candidate.clone())
+        {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+/// bd-mm6ec: SQLite looks a relation name up among the CTEs in scope only
+/// when it is unqualified and is not the target of an INSERT, UPDATE or
+/// DELETE, so `main.c` names the table c even inside a recursive CTE named
+/// c. fsqlite installs a materialized CTE in front of the catalog, which
+/// codegen searches by bare name, so there the CTE captured those names too:
+/// a recursive arm reading `main.c` read its own working table, an UPDATE's
+/// `IN (SELECT x FROM main.c)` read the CTE, and a DELETE whose target shares
+/// a CTE's name wrote to the CTE's read-only root.
+///
+/// Each CTE of `with` whose name is in `bound_elsewhere` (the bare names of
+/// the statement's qualified relations, and its target) takes a private name,
+/// and the unqualified references that bind to it follow: in its siblings'
+/// bodies, in its own recursive arms, and, through `rebind_consumer`, in the
+/// statement the WITH belongs to, each FROM item keeping its old name as its
+/// alias. Then only a reference to the CTE spells its private name, and the
+/// qualified names and the target reach the catalog's relation.
+///
+/// A WITH the materializer refuses as circular keeps its names, so the
+/// refusal names the CTE as stock's does. Returns whether a CTE was renamed.
+fn privatize_ctes_bound_elsewhere(
+    with: &mut fsqlite_ast::WithClause,
+    bound_elsewhere: &BTreeSet<String>,
+    occupied_names: &mut HashSet<String>,
+    reserved_sql: &str,
+    mut rebind_consumer: impl FnMut(&str, &str),
+) -> bool {
+    if cte_materialization_order(&with.ctes).is_err()
+        || with
+            .ctes
+            .iter()
+            .any(|cte| cte_self_reference_error(cte).is_some())
+    {
+        return false;
+    }
+    let recursive = with.recursive;
+    let mut renamed = false;
+    for index in 0..with.ctes.len() {
+        if !bound_elsewhere.contains(&with.ctes[index].name.to_ascii_lowercase()) {
+            continue;
+        }
+        let name = with.ctes[index].name.clone();
+        let private_name =
+            fresh_private_relation_name("__fsqlite_cte", occupied_names, reserved_sql);
+        let body = CteSourceSubstitution::Materialized(&private_name);
+        let mut rebound = 0;
+        for (other, cte) in with.ctes.iter_mut().enumerate() {
+            if other != index {
+                subst_cte_refs_in_nested_select(&mut cte.query, &name, body, &mut rebound);
+            } else if recursive && select_with_defines(&cte.query, &name) {
+                // bd-gxbof: the anchor and the inner CTEs read the body's own
+                // CTE of the name; the arms read the recursive table.
+                for (_, core) in &mut cte.query.body.compounds {
+                    subst_cte_refs_in_core(core, &name, body, &mut rebound);
+                }
+            } else if recursive {
+                subst_cte_refs_in_select(&mut cte.query, &name, body, &mut rebound);
+            }
+        }
+        rebind_consumer(&name, &private_name);
+        with.ctes[index].name = private_name;
+        renamed = true;
+    }
+    renamed
+}
+
+/// Whether a CTE of `with` is named in `bound_elsewhere` (bd-mm6ec).
+fn with_names_any(with: &fsqlite_ast::WithClause, bound_elsewhere: &BTreeSet<String>) -> bool {
+    with.ctes
+        .iter()
+        .any(|cte| bound_elsewhere.contains(&cte.name.to_ascii_lowercase()))
+}
+
+/// Collect the bare name of every schema-qualified relation `visit` reports.
+fn collect_schema_qualified_relation_name(
+    bound_elsewhere: &mut BTreeSet<String>,
+    name: &QualifiedName,
+) {
+    if name.schema.is_some() {
+        bound_elsewhere.insert(name.name.to_ascii_lowercase());
     }
 }
 
@@ -156635,6 +157583,63 @@ enum TableFunctionCatalogMatch {
     CallableVirtual,
 }
 
+/// bd-wpfqs: whether a statement's row-value comparisons are as written or
+/// already expanded into scalar ones (`rewrite_subquery_statement`). Stock
+/// lets only a row-value comparison as written imply a forced partial index's
+/// row-value predicate term, which an expanded statement can no longer show.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowValueSpelling {
+    AsWritten,
+    Expanded,
+}
+
+/// bd-wpfqs: whether `expanded_query`'s terms hold `expansion` (a row-value
+/// predicate term's expansion, split at AND) as the expansion of the same
+/// row-value comparison: its terms, in order and in a row, from one
+/// comparison, which the expansion marks by giving every node it builds that
+/// comparison's span. A scalar spelling's terms each have their own span,
+/// and a reordered row value expands to its terms in another order.
+fn query_holds_one_expansion(expanded_query: &[Expr], expansion: &Expr) -> bool {
+    let terms = decompose_where(expansion);
+    if terms.is_empty() {
+        return false;
+    }
+    expanded_query.windows(terms.len()).any(|window| {
+        let Some(span) = single_expansion_span(&window[0]) else {
+            return false;
+        };
+        window.iter().zip(&terms).all(|(query_term, term)| {
+            let same_comparison = single_expansion_span(query_term) == Some(span);
+            same_comparison && query_term == *term
+        })
+    })
+}
+
+/// The one span the comparisons of `expr`, and the AND / OR nodes joining
+/// them, all carry, when they carry the same one, as a row-value
+/// comparison's expansion does. The comparisons' operands keep their own.
+fn single_expansion_span(expr: &Expr) -> Option<Span> {
+    fn collect(expr: &Expr, span: &mut Option<Span>) -> bool {
+        let Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span: own,
+            ..
+        } = expr
+        else {
+            return true;
+        };
+        if span.is_some_and(|seen| seen != *own) {
+            return false;
+        }
+        *span = Some(*own);
+        !matches!(op, BinaryOp::And | BinaryOp::Or) || (collect(left, span) && collect(right, span))
+    }
+    let mut span = None;
+    collect(expr, &mut span).then_some(span).flatten()
+}
+
 fn insert_source_select_for_validation<'a>(
     insert: &'a fsqlite_ast::InsertStatement,
     select: &'a SelectStatement,
@@ -157198,40 +158203,11 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
     }
 
     fn validate_relation(&mut self, name: &QualifiedName) -> Result<()> {
-        if let Some(schema_name) = name.schema.as_deref()
-            && let Some(scope) = if schema_name.eq_ignore_ascii_case("main") {
-                Some(PragmaSchemaScope::Main)
-            } else if schema_name.eq_ignore_ascii_case("temp") {
-                Some(PragmaSchemaScope::Temp)
-            } else {
-                None
-            }
-            && self.scopes.iter().rev().any(|ctes| {
-                ctes.iter().any(|cte| {
-                    cte.name.eq_ignore_ascii_case(&name.name)
-                        && !matches!(
-                            self.visits.get(&std::ptr::from_ref(cte)),
-                            Some(CteCollationVisit::Active)
-                        )
-                })
-            })
-            && (self.connection.table_exists_for_scope(&name.name, scope)
-                || self
-                    .connection
-                    .view_index_for_scope(&name.name, scope)
-                    .is_some())
-        {
-            // Materialized CTEs and persistent local relations currently feed
-            // a name-only execution catalog. Unqualified lookup has deterministic
-            // front precedence, but honoring an explicit MAIN/TEMP qualifier
-            // while a same-name CTE is installed would require a namespace in
-            // that storage key. Reject the mixed shape before materialization
-            // instead of silently reading the CTE through a qualified name.
-            return Err(FrankenError::NotImplemented(format!(
-                "qualified relation {schema_name}.{} is not supported while a same-name CTE is active",
-                name.name
-            )));
-        }
+        // A schema-qualified name is never a CTE (`visible_cte`), so it is
+        // checked against the catalog even where a CTE of its name is in
+        // scope. Execution keeps the two apart too: a CTE that such a name
+        // spells is materialized under a private name (bd-mm6ec,
+        // `privatize_ctes_bound_elsewhere`).
         if let Some((scope_index, cte)) = self.visible_cte(name) {
             let hidden_reference_scopes = self.scopes.split_off(scope_index + 1);
             let result = self.validate_cte(cte);
@@ -157248,6 +158224,12 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             Some(CteCollationVisit::Active | CteCollationVisit::Done)
         ) {
             return Ok(());
+        }
+        // bd-tmbbn: stock applies its self-reference rules where it expands
+        // the CTE, before it resolves the body's other names (a compound
+        // ORDER BY term, a LIMIT).
+        if let Some(refusal) = cte_self_reference_error(cte) {
+            return Err(FrankenError::FunctionError(refusal));
         }
         self.visits.insert(key, CteCollationVisit::Active);
         // bd-6tmuj: a CTE expansion is a nesting level, as a view's is, and
@@ -167390,6 +168372,208 @@ fn bind_trigger_body_statement(
 struct TriggerRelationChecks {
     schema_generation: u64,
     validated: HashSet<usize>,
+}
+
+/// bd-nf30k: the row changes one INSERT, UPDATE or DELETE makes to a table,
+/// as the triggers and foreign-key actions they can fire see them.
+struct DmlTriggerFiring {
+    table: String,
+    event: fsqlite_ast::TriggerEvent,
+    /// The UPDATE triggers an upsert's DO UPDATE can fire.
+    upsert_updates: Vec<fsqlite_ast::TriggerEvent>,
+    /// A REPLACE deletes the conflicting rows, and fires their DELETE
+    /// triggers, only under recursive_triggers; stock compiles them only then.
+    replace_deletes: bool,
+}
+
+impl DmlTriggerFiring {
+    /// `None` for a statement that is no INSERT, UPDATE or DELETE, or whose
+    /// target is in an attached schema: that one runs on the schema's own
+    /// connection, with its triggers.
+    fn of(statement: &Statement, recursive_triggers: bool) -> Option<Self> {
+        use fsqlite_ast::TriggerEvent;
+        let (target, event) = match statement {
+            Statement::Insert(insert) => (&insert.table, TriggerEvent::Insert),
+            Statement::Update(update) => (
+                &update.table.name,
+                TriggerEvent::Update(Connection::assignment_target_column_names(
+                    &update.assignments,
+                )),
+            ),
+            Statement::Delete(delete) => (&delete.table.name, TriggerEvent::Delete),
+            _ => return None,
+        };
+        if target.schema.as_deref().is_some_and(|schema| {
+            !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+        }) {
+            return None;
+        }
+        let (upsert_updates, replace_deletes) = match statement {
+            Statement::Insert(insert) => (
+                insert
+                    .upsert
+                    .iter()
+                    .filter_map(|clause| match &clause.action {
+                        fsqlite_ast::UpsertAction::Update { assignments, .. } => {
+                            Some(TriggerEvent::Update(
+                                Connection::assignment_target_column_names(assignments),
+                            ))
+                        }
+                        fsqlite_ast::UpsertAction::Nothing => None,
+                    })
+                    .collect(),
+                recursive_triggers
+                    && insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace),
+            ),
+            _ => (Vec::new(), false),
+        };
+        Some(Self {
+            table: target.name.clone(),
+            event,
+            upsert_updates,
+            replace_deletes,
+        })
+    }
+}
+
+/// bd-nf30k: the programs one statement's compile check has compiled, each
+/// once, as stock codes each trigger and foreign-key action program once per
+/// statement: the triggers by the address of their definition, the actions
+/// by child table, constraint index and whether it is the ON DELETE one.
+#[derive(Default)]
+struct TriggerProgramsCompiled {
+    triggers: HashSet<usize>,
+    fk_actions: HashSet<(String, usize, bool)>,
+}
+
+/// Whether an UPDATE assigning `assigned` changes the parent key `fk`
+/// references: its named parent columns, or the parent's PRIMARY KEY (its
+/// rowid when it has none) when the constraint names none.
+fn foreign_key_parent_key_assigned(
+    fk: &FkDef,
+    parent: Option<&TableSchema>,
+    assigned: &[String],
+) -> bool {
+    let assigns = |name: &str| assigned.iter().any(|column| column.eq_ignore_ascii_case(name));
+    if !fk.parent_columns.is_empty() {
+        return fk.parent_columns.iter().any(|column| assigns(column));
+    }
+    let Some(parent) = parent else {
+        return true;
+    };
+    let mut key_columns = parent
+        .columns
+        .iter()
+        .filter(|column| column.is_ipk)
+        .map(|column| column.name.as_str())
+        .chain(
+            parent
+                .primary_key_constraints
+                .iter()
+                .flat_map(|constraint| constraint.iter().map(String::as_str)),
+        )
+        .peekable();
+    if key_columns.peek().is_none() {
+        return assigned.iter().any(|column| is_rowid_alias(column));
+    }
+    key_columns.any(assigns) || assigned.iter().any(|column| is_rowid_alias(column))
+}
+
+/// `SELECT <exprs> [FROM <from>]`, the shape a trigger body statement's
+/// expressions are checked in (bd-nf30k).
+fn select_of_result_exprs(exprs: Vec<Expr>, from: Option<FromClause>) -> SelectStatement {
+    SelectStatement {
+        with: None,
+        body: SelectBody {
+            select: SelectCore::Select {
+                distinct: fsqlite_ast::Distinctness::All,
+                columns: exprs
+                    .into_iter()
+                    .map(|expr| ResultColumn::Expr { expr, alias: None })
+                    .collect(),
+                from,
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                windows: Vec::new(),
+            },
+            compounds: Vec::new(),
+        },
+        order_by: Vec::new(),
+        limit: None,
+    }
+}
+
+/// `FROM (SELECT NULL)`, a source with no column a statement can name, for
+/// checking expressions that have none (a VALUES row, a WHEN): the semantic
+/// validator resolves column names only in a query with a FROM (bd-nf30k).
+fn compile_check_empty_source() -> FromClause {
+    FromClause {
+        source: TableOrSubquery::Subquery {
+            query: Box::new(select_of_result_exprs(
+                vec![Expr::Literal(Literal::Null, Span::ZERO)],
+                None,
+            )),
+            alias: None,
+        },
+        joins: Vec::new(),
+    }
+}
+
+/// `SELECT 1 FROM <from> WHERE ... ORDER BY ... LIMIT ...`: an UPDATE's or a
+/// DELETE's row filter as a query (bd-nf30k).
+fn dml_where_select(
+    from: FromClause,
+    where_clause: Option<&Expr>,
+    order_by: &[fsqlite_ast::OrderingTerm],
+    limit: Option<&fsqlite_ast::LimitClause>,
+) -> SelectStatement {
+    let mut select = select_of_result_exprs(
+        vec![Expr::Literal(Literal::Integer(1), Span::ZERO)],
+        Some(from),
+    );
+    if let SelectCore::Select {
+        where_clause: slot, ..
+    } = &mut select.body.select
+    {
+        *slot = where_clause.cloned().map(Box::new);
+    }
+    select.order_by = order_by.to_vec();
+    select.limit = limit.cloned();
+    select
+}
+
+/// A DML target as the FROM item its expressions resolve against.
+fn dml_target_source(table: &fsqlite_ast::QualifiedTableRef) -> TableOrSubquery {
+    TableOrSubquery::Table {
+        name: table.name.clone(),
+        alias: table.alias.clone(),
+        index_hint: table.index_hint.clone(),
+        time_travel: None,
+    }
+}
+
+/// Whether `with` defines a CTE an unqualified `name` would read, so a query
+/// over `name` would not read the DML target.
+fn with_defines_relation(with: Option<&fsqlite_ast::WithClause>, name: &QualifiedName) -> bool {
+    name.schema.is_none()
+        && with.is_some_and(|with| {
+            with.ctes
+                .iter()
+                .any(|cte| cte.name.eq_ignore_ascii_case(&name.name))
+        })
+}
+
+/// The number of values each row of `select` supplies, when its result list
+/// names every column (no `*`).
+fn select_exact_result_width(select: &SelectStatement) -> Option<usize> {
+    match &select.body.select {
+        SelectCore::Values(rows) => rows.first().map(Vec::len),
+        SelectCore::Select { columns, .. } => columns
+            .iter()
+            .all(|column| matches!(column, ResultColumn::Expr { .. }))
+            .then_some(columns.len()),
+    }
 }
 
 /// bd-fpr5g lever 3a: a parameter-bound trigger body statement, bound once
@@ -202952,10 +204136,9 @@ mod tests {
                 .execute("INSERT INTO t VALUES (1);")
                 .await
                 .expect_err("invalid trigger WHEN clause should abort the statement");
-            assert!(
-                matches!(err, FrankenError::Internal(ref msg) if msg.contains("missing")),
-                "expected missing-column error, got {err:?}"
-            );
+            // bd-nf30k: the WHEN compiles at prepare, as stock's does, and
+            // fails with stock's text (3.54.1: "no such column: NEW.missing").
+            assert_eq!(err.to_string(), "no such column: NEW.missing");
 
             let rows = conn.query("SELECT COUNT(*) FROM t;").await.unwrap();
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
@@ -297564,13 +298747,16 @@ mod pager_routing_tests {
                 )
                 .unwrap();
             assert_eq!(reference_main_value, 73);
-            let qualified_error = fconn
+            // bd-mm6ec: a qualified name reads the MAIN relation, never the
+            // CTE of its name (this shape was refused, fail closed, before).
+            let qualified_rows = fconn
                 .query("WITH cte_main_shadow(v) AS (VALUES(1)) SELECT v FROM main.cte_main_shadow")
                 .await
-                .expect_err("qualified MAIN/CTE name collision must fail closed");
-            assert!(
-                matches!(qualified_error, FrankenError::NotImplemented(_)),
-                "unexpected qualified MAIN/CTE collision error: {qualified_error}"
+                .expect("qualified MAIN name beside a same-name CTE reads the table");
+            assert_eq!(qualified_rows.len(), 1);
+            assert_eq!(
+                qualified_rows[0].values(),
+                &[SqliteValue::Integer(reference_main_value)]
             );
 
             let reference_main_view_value = rconn
@@ -297581,15 +298767,16 @@ mod pager_routing_tests {
                 )
                 .unwrap();
             assert_eq!(reference_main_view_value, 91);
-            let qualified_view_error = fconn
+            let qualified_view_rows = fconn
                 .query(
                     "WITH cte_main_view_shadow(v) AS (VALUES(1)) SELECT v FROM main.cte_main_view_shadow",
                 )
                 .await
-                .expect_err("qualified MAIN-view/CTE name collision must fail closed");
-            assert!(
-                matches!(qualified_view_error, FrankenError::NotImplemented(_)),
-                "unexpected qualified MAIN-view/CTE collision error: {qualified_view_error}"
+                .expect("qualified MAIN view beside a same-name CTE reads the view");
+            assert_eq!(qualified_view_rows.len(), 1);
+            assert_eq!(
+                qualified_view_rows[0].values(),
+                &[SqliteValue::Integer(reference_main_view_value)]
             );
         });
     }

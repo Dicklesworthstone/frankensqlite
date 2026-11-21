@@ -1081,7 +1081,7 @@ fn dysy4_forward_cte_shadows_outer_table() {
 }
 
 #[test]
-fn dysy4_qualified_cte_collision_keeps_existing_explicit_refusal() {
+fn dysy4_qualified_cte_collision_reads_the_table_like_stock() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
@@ -1089,13 +1089,16 @@ fn dysy4_qualified_cte_collision_keeps_existing_explicit_refusal() {
             f.execute(sql).await.unwrap();
             r.execute_batch(sql).unwrap();
         }
-        // This pre-existing namespace limitation is outside the unqualified
-        // sibling-resolution fix. Do not silently read the CTE as main.a.
+        // A schema-qualified name never names a CTE: q reads the table a, not
+        // the sibling CTE a. fsqlite refused this shape while its catalog
+        // could not keep the two apart (bd-mm6ec); it must never read the
+        // CTE as main.a.
         let sql = "WITH q AS (SELECT v FROM main.a), a(v) AS (VALUES(2)) SELECT v FROM q";
         let stock: i64 = r.query_row(sql, [], |row| row.get(0)).unwrap();
         assert_eq!(stock, 1);
-        let error = f.query(sql).await.expect_err("qualified collision remains unsupported");
-        assert!(matches!(error, fsqlite_error::FrankenError::NotImplemented(_)), "{error}");
+        let got = f.query(sql).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].values(), &[SqliteValue::Integer(stock)]);
         let rows = f.query("SELECT v FROM main.a").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values(), &[SqliteValue::Integer(stock)]);
