@@ -56762,6 +56762,37 @@ impl Connection {
                     )?;
                     self.validate_select_index_hints(select, spelling)?;
                 }
+                // bd-u01ku: VALUES rows, then the upserts, then RETURNING (a
+                // SELECT source's calls are resolved with the SELECT above).
+                let values = match &insert.source {
+                    InsertSource::Values(rows) => rows.iter().flatten().collect::<Vec<_>>(),
+                    InsertSource::Select(_) | InsertSource::DefaultValues => Vec::new(),
+                };
+                let upserts = insert.upsert.iter().flat_map(|upsert| {
+                    let target_where = upsert
+                        .target
+                        .as_ref()
+                        .and_then(|target| target.where_clause.as_ref());
+                    let (assignments, action_where): (&[fsqlite_ast::Assignment], _) =
+                        match &upsert.action {
+                            fsqlite_ast::UpsertAction::Update {
+                                assignments,
+                                where_clause,
+                            } => (assignments.as_slice(), where_clause.as_deref()),
+                            fsqlite_ast::UpsertAction::Nothing => (&[], None),
+                        };
+                    target_where
+                        .into_iter()
+                        .chain(assignments.iter().map(|assignment| &assignment.value))
+                        .chain(action_where)
+                });
+                for expr in values
+                    .into_iter()
+                    .chain(upserts)
+                    .chain(result_column_exprs(&insert.returning))
+                {
+                    validate_function_call_modifiers_in_expr(expr)?;
+                }
                 Ok(())
             }
             Statement::CreateTable(create) => {
@@ -56814,6 +56845,16 @@ impl Connection {
                         Self::validate_update_target_columns(table_schema, &update.assignments)?;
                     }
                 }
+                // bd-u01ku: SET values, then WHERE, then RETURNING.
+                for expr in update
+                    .assignments
+                    .iter()
+                    .map(|assignment| &assignment.value)
+                    .chain(update.where_clause.iter())
+                    .chain(result_column_exprs(&update.returning))
+                {
+                    validate_function_call_modifiers_in_expr(expr)?;
+                }
                 // bd-wlo29 L10: a forced partial INDEXED BY on the UPDATE target
                 // must be covered by the statement WHERE, exactly like a SELECT
                 // source. The schema borrow above is scoped so this can re-borrow.
@@ -56845,6 +56886,14 @@ impl Connection {
                 // parent check wrongly disabled the truncate with fk OFF, so frank
                 // erred on an uncovered forced partial index where stock silently
                 // truncates. Gate the parent check on FK enforcement.
+                // bd-u01ku: WHERE, then RETURNING.
+                for expr in delete
+                    .where_clause
+                    .iter()
+                    .chain(result_column_exprs(&delete.returning))
+                {
+                    validate_function_call_modifiers_in_expr(expr)?;
+                }
                 let uses_truncate_opt = delete.where_clause.is_none()
                     && delete.returning.is_empty()
                     && !(self.fk_enforcement_enabled()
@@ -169887,6 +169936,15 @@ fn foreign_key_parent_key_assigned(
 
 /// `SELECT <exprs> [FROM <from>]`, the shape a trigger body statement's
 /// expressions are checked in (bd-nf30k).
+/// The expressions of a result-column list (a RETURNING clause), `*` and
+/// `t.*` left out.
+fn result_column_exprs(columns: &[ResultColumn]) -> impl Iterator<Item = &Expr> {
+    columns.iter().filter_map(|column| match column {
+        ResultColumn::Expr { expr, .. } => Some(expr),
+        ResultColumn::Star | ResultColumn::TableStar(_) => None,
+    })
+}
+
 fn select_of_result_exprs(exprs: Vec<Expr>, from: Option<FromClause>) -> SelectStatement {
     SelectStatement {
         with: None,
