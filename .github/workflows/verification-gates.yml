@@ -580,6 +580,13 @@ jobs:
           cargo test -p fsqlite-core --test error_message_oracle -- --nocapture
           cargo test -p fsqlite-e2e --test pragma_introspection_oracle_e2e -- --nocapture
 
+      - name: Partial-index planning and stored membership against stock SQLite
+        run: |
+          cargo test --locked -p fsqlite-core \
+            --test bd_partial_expr_index_correctness_oracle_probe \
+            --test indexed_by_partial_predicate_gh173_oracle \
+            --test indexed_by_partial_predicate_wlo29_oracle
+
       # GH#404: fsqlite-written FTS5 %_data must be stock-verifiable (stock
       # `PRAGMA integrity_check` + stock MATCH parity on a multi-leaf corpus).
       # bd-kon3m: the legacy-contentless automerge keeper that sat outside every

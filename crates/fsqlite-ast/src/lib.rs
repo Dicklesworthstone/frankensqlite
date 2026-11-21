@@ -308,6 +308,27 @@ pub enum BinaryOp {
     ShiftRight,
 }
 
+impl BinaryOp {
+    /// The requested truth value for SQLite's postfix IS [NOT] TRUE/FALSE.
+    /// COLLATE preserves the literal's identity. Numeric values and folded
+    /// expressions still use ordinary IS comparison.
+    #[must_use]
+    pub fn truth_test(self, rhs: &Expr) -> Option<bool> {
+        if !matches!(self, Self::Is | Self::IsNot) {
+            return None;
+        }
+        let mut rhs = rhs;
+        while let Expr::Collate { expr, .. } = rhs {
+            rhs = expr;
+        }
+        match rhs {
+            Expr::Literal(Literal::True, _) => Some(true),
+            Expr::Literal(Literal::False, _) => Some(false),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for BinaryOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

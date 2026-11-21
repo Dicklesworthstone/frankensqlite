@@ -21877,8 +21877,7 @@ fn index_partial_predicate_is_covered_by_query_conjuncts(
 /// GH#444: a query conjunct proves a partial-index predicate `x IS NOT NULL`
 /// when it can only be TRUE for a non-NULL `x`. Ordinary comparisons propagate
 /// NULL, so `x = <anything but an explicit NULL>` (and `<`, `<=`, `>`, `>=`,
-/// `<>`) does; `x IS <non-NULL literal>` does too, while `x IS ?` may bind NULL
-/// and stays fail-closed. Mirrors the planner's `direct_comparison_guarantees_non_null`.
+/// `<>`) does. SQLite also recognizes boolean truth tests, bare x and NOT x.
 fn query_conjunct_proves_is_not_null(
     query_conjunct: &Expr,
     predicate_conjunct: &Expr,
@@ -21893,14 +21892,18 @@ fn query_conjunct_proves_is_not_null(
     else {
         return false;
     };
+    let is_operand = |side: &Expr| {
+        expressions_match_table_locally(side, predicate_operand, table, table_alias)
+    };
     let Expr::BinaryOp {
         left, op, right, ..
     } = query_conjunct
     else {
-        return false;
-    };
-    let is_operand = |side: &Expr| {
-        expressions_match_table_locally(side, predicate_operand, table, table_alias)
+        return match query_conjunct {
+            Expr::Column(..) => is_operand(query_conjunct),
+            Expr::UnaryOp { op: fsqlite_ast::UnaryOp::Not, expr, .. } => is_operand(expr),
+            _ => false,
+        };
     };
     match op {
         BinaryOp::Eq
@@ -21913,13 +21916,7 @@ fn query_conjunct_proves_is_not_null(
             (is_operand(left) && !is_explicit_null(right))
                 || (is_operand(right) && !is_explicit_null(left))
         }
-        BinaryOp::Is => {
-            let is_non_null_literal = |side: &Expr| {
-                matches!(side, Expr::Literal(literal, _) if !matches!(literal, Literal::Null))
-            };
-            (is_operand(left) && is_non_null_literal(right))
-                || (is_operand(right) && is_non_null_literal(left))
-        }
+        BinaryOp::Is => op.truth_test(right).is_some() && is_operand(left),
         _ => false,
     }
 }
@@ -38162,7 +38159,8 @@ fn resolve_order_by_output_slot(
             ResultColumn::Expr {
                 expr: output_expr, ..
             } => {
-                if expressions_match_table_locally(order_expr, output_expr, table, table_alias) {
+                let visible = table_alias.unwrap_or(&table.name);
+                if bound_expressions_match(order_expr, visible, output_expr, visible, table) {
                     return Some(slot);
                 }
                 slot += 1;
@@ -38322,7 +38320,8 @@ fn resolve_single_output_order_expr<'a>(
     // was already resolved above and reuses the output, but a separately
     // written `ORDER BY volatile_expr() COLLATE ...` is a distinct expression
     // that SQLite evaluates again.
-    expressions_match_table_locally(order_expr, output_expr, table, table_alias)
+    let visible = table_alias.unwrap_or(&table.name);
+    bound_expressions_match(order_expr, visible, output_expr, visible, table)
         .then_some(output_expr)
 }
 
@@ -38720,11 +38719,17 @@ fn expressions_match_table_locally(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> bool {
-    let mut normalized_query = query.clone();
-    let mut normalized_stored = stored.clone();
-    normalize_table_local_expression(&mut normalized_query, table, table_alias)
-        && normalize_table_local_expression(&mut normalized_stored, table, table_alias)
-        && normalized_query == normalized_stored
+    bound_expressions_match(query, table_alias.unwrap_or(&table.name), stored, &table.name, table)
+}
+
+fn bound_expressions_match(
+    left: &Expr, left_source: &str, right: &Expr, right_source: &str, table: &TableSchema,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    normalize_table_local_expression(&mut left, table, left_source)
+        && normalize_table_local_expression(&mut right, table, right_source)
+        && left == right
 }
 
 /// Canonicalize table-local columns before structural expression matching.
@@ -38737,15 +38742,14 @@ fn expressions_match_table_locally(
 fn normalize_table_local_expression(
     expr: &mut Expr,
     table: &TableSchema,
-    table_alias: Option<&str>,
+    visible_name: &str,
 ) -> bool {
-    let normalize = |expr: &mut Expr| normalize_table_local_expression(expr, table, table_alias);
+    let normalize = |expr: &mut Expr| normalize_table_local_expression(expr, table, visible_name);
     match expr {
         Expr::Literal(..) | Expr::BoundOuterValue { .. } | Expr::Placeholder(..) => true,
         Expr::Column(column, _) => {
             if column.table.as_deref().is_some_and(|qualifier| {
-                !qualifier.eq_ignore_ascii_case(&table.name)
-                    && !table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+                !qualifier.eq_ignore_ascii_case(visible_name)
             }) {
                 return false;
             }
@@ -48405,29 +48409,11 @@ fn emit_is_comparison(
 ///   IS FALSE     → (p3=1, P4::Int(1))      — !truthy, NULL→0
 ///   IS NOT TRUE  → (p3=0, P4::Int(1))      — !truthy, NULL→1
 ///   IS NOT FALSE → (p3=1, P4::None)        — truthy inverted, NULL→1
-fn is_true_false_params(op: fsqlite_ast::BinaryOp, rhs: &Expr) -> Option<(i32, P4)> {
-    let is_not = matches!(op, fsqlite_ast::BinaryOp::IsNot);
-    match rhs {
-        Expr::Literal(Literal::True, _) => {
-            if is_not {
-                // IS NOT TRUE: p3=0, p4=1
-                Some((0, P4::Int(1)))
-            } else {
-                // IS TRUE: p3=0, p4=0
-                Some((0, P4::None))
-            }
-        }
-        Expr::Literal(Literal::False, _) => {
-            if is_not {
-                // IS NOT FALSE: p3=1, p4=0
-                Some((1, P4::None))
-            } else {
-                // IS FALSE: p3=1, p4=1
-                Some((1, P4::Int(1)))
-            }
-        }
-        _ => None,
-    }
+#[must_use]
+pub fn is_true_false_params(op: BinaryOp, rhs: &Expr) -> Option<(i32, P4)> {
+    let expected = op.truth_test(rhs)?;
+    let invert = expected == (op == BinaryOp::IsNot);
+    Some((i32::from(!expected), if invert { P4::Int(1) } else { P4::None }))
 }
 
 /// Emit CASE \[operand\] WHEN ... THEN ... \[ELSE ...\] END.

@@ -1,8 +1,51 @@
 # State Of The Codebase And Next Steps
 
+## Compatibility and concurrent writers, 2026-11-20
+
+Two Linux CLI processes opened the same WAL database with the default settings.
+Both reported `fsqlite.concurrent_mode=1`. Using plain `BEGIN`, each updated a
+different, already populated table and read its own write. Both writes completed
+before either commit. The second writer committed first. Fresh FrankenSQLite
+and stock SQLite 3.54.1 processes read back both values (`11|22`) and reported
+`integrity_check=ok`. This exercises the disjoint-write case in V03–V05.
+Cross-process conflict handling and the many-writer performance gate still
+have their own acceptance on `bd-zywqc.20` and `bd-z4zl7`.
+
+The September GH407 count query now returns the expected integer 1 on both
+engines. A separate wrong-answer path remained in forced partial indexes. An
+alias in a self-join could borrow the other table occurrence's predicate, and
+applying `COLLATE` to the literal in `IS TRUE` could omit rows from a stored
+index. On source `2873c6c0f` with the reviewed fixes, all 18 tests across the
+three partial-index oracle targets passed (RCH `30097323753218207`). The CLI
+from build `30097323753218215` also repaired a previously incomplete index
+with `REINDEX`; stock SQLite recovered the two missing rows. Across 96 further
+memory/file cases, both engines returned the expected rows and agreed on forced
+index admission. Their automatic index choices differed in 28 cases. For
+example, adding `ORDER BY id` to an equality lookup on both columns of a
+partial index produced a table scan where stock used the covering index
+(`bd-81jud`). Other V02 work covers boolean-looking column names (`bd-pud7p`)
+and numeric conversion of underflowing exponents (`bd-ulvzg`).
+
+Several September conclusions have changed. The canonical overlap tests,
+executable Rust/C examples, and dependency and specification repairs have
+recorded passing runs on `bd-6hdwo.1` through `.8`. The pager now enforces
+`cache_size` (`bd-dwjnq.1/.2`). Mapping, temporary storage and worker limits
+retain separate open tasks. The native codec tests passed on `bd-3mgq5.1/.2`;
+native SQL durability still depends on authenticated bootstrap, durable
+publication and public SQL routing (`bd-3mgq5.3` through `.10`).
+
+Two public entry points still expose significant limits. FTS5 and R-tree
+virtual tables could be created, while FTS3 creation reported an unregistered
+module (`bd-26rjq`). A new database opened with `PRAGMA key` retained its
+ordinary SQLite header. Stock SQLite read its row without supplying any key
+(`bd-1vwiy.1`). Applications requiring encryption cannot rely on that pragma.
+The 35-goal checklist and bridge plan below identify the remaining owners.
+The November runs cover Linux compatibility behavior; Windows interoperability,
+crash recovery, release qualification and performance require their named runs.
+
 ## Reality check — 2026-09-04
 
-This section supersedes the historical assessment below for present-day status.
+This section records the September assessment and the work it identified.
 It applies the complete `reality-check-for-project` workflow: documented goals,
 source and shipped behavior, backlog coverage, a bridge plan, ambition rounds,
 and repeated Beads refinement. It is an assessment and implementation backlog,

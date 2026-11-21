@@ -55768,10 +55768,7 @@ impl Connection {
             && ra.as_ref() == lb.as_ref()
         {
             // x IS TRUE tests truthiness. TRUE IS x compares values.
-            let boolean_literal = |expr: &Expr| {
-                matches!(strip_collate_wrappers(expr), Expr::Literal(Literal::True | Literal::False, _))
-            };
-            if *oa == BinaryOp::Is && (boolean_literal(ra) || boolean_literal(rb)) {
+            if oa.truth_test(ra).is_some() || ob.truth_test(rb).is_some() {
                 return false;
             }
             // SQLite gives the left operand precedence among competing explicit
@@ -55792,6 +55789,7 @@ impl Connection {
         match query_term {
             // A bare truthy column reference (`WHERE b`) is false/NULL when NULL.
             Expr::Column(..) => query_term == col,
+            Expr::UnaryOp { op: UnaryOp::Not, expr, .. } => Self::expr_null_propagates_from(expr, col),
             Expr::BinaryOp {
                 left, op, right, ..
             } => match op {
@@ -55809,6 +55807,7 @@ impl Connection {
                     Self::expr_null_propagates_from(left, col)
                         || Self::expr_null_propagates_from(right, col)
                 }
+                BinaryOp::Is if op.truth_test(right).is_some() => Self::expr_null_propagates_from(left, col),
                 // `X OR Y` is NULL — never true — when `col` is NULL only if BOTH
                 // arms are themselves null-rejecting on `col` (bd-vi8lh (b)):
                 // `b = 1 OR b = 5` rejects, but `b = 1 OR j = 9` does not.
@@ -55885,8 +55884,7 @@ impl Connection {
         match expr {
             Expr::Column(col, _) => {
                 if col.table.as_deref().is_some_and(|q| {
-                    q.eq_ignore_ascii_case(table)
-                        || alias.is_some_and(|a| q.eq_ignore_ascii_case(a))
+                    q.eq_ignore_ascii_case(alias.unwrap_or(table))
                 }) {
                     out.push(expr);
                 }
@@ -55966,7 +55964,7 @@ impl Connection {
     /// Whether a forced partial index is usable: every conjunct of its partial
     /// `predicate` must be *implied* by some conjunct among `query_conjuncts`
     /// (the WHERE / join-ON terms the join tree exposes to this table), after
-    /// normalizing column qualifiers that name the forced table (`targets`).
+    /// binding query qualifiers to the visible source and schema qualifiers to the table.
     /// Mirrors SQLite's `whereUsablePartialIndex` / `sqlite3ExprImpliesExpr`:
     /// an `exprCompare`/commute match, an OR whose either branch is covered, or
     /// a null-rejecting comparison covering an `IS NOT NULL` — but NOT full
@@ -55975,14 +55973,14 @@ impl Connection {
         &self,
         predicate: &Expr,
         query_conjuncts: &[&Expr],
-        targets: &[&str],
+        visible_name: &str,
         table: &TableSchema,
     ) -> bool {
         let mut normalized_query: Vec<Expr> = query_conjuncts
             .iter()
             .map(|conjunct| {
                 let mut owned = (*conjunct).clone();
-                Self::normalize_partial_predicate_columns(&mut owned, targets);
+                Self::normalize_partial_predicate_columns(&mut owned, &[visible_name]);
                 owned
             })
             .collect();
@@ -56003,7 +56001,7 @@ impl Connection {
 
         decompose_where(predicate).into_iter().all(|predicate_conjunct| {
             let mut normalized_predicate = predicate_conjunct.clone();
-            Self::normalize_partial_predicate_columns(&mut normalized_predicate, targets);
+            Self::normalize_partial_predicate_columns(&mut normalized_predicate, &[&table.name]);
             normalized_query.iter().any(|query_conjunct| {
                 Self::query_term_implies_predicate(query_conjunct, &normalized_predicate, table)
             })
@@ -56233,11 +56231,7 @@ impl Connection {
         table: &TableSchema,
         alias: Option<&str>,
     ) -> Result<()> {
-        let mut targets: Vec<&str> = vec![&table.name];
-        if let Some(alias) = alias {
-            targets.push(alias);
-        }
-        if self.forced_partial_index_predicate_covered(predicate, available, &targets, table) {
+        if self.forced_partial_index_predicate_covered(predicate, available, alias.unwrap_or(&table.name), table) {
             Ok(())
         } else {
             Err(FrankenError::FunctionError("no query solution".to_owned()))
@@ -94985,15 +94979,11 @@ impl Connection {
                 // loop. Admit its lazy IN memo without evaluating either side
                 // early or changing NULL/affinity/collation semantics.
                 Expr::BinaryOp {
-                    op: BinaryOp::Is | BinaryOp::IsNot,
+                    op,
                     left,
                     right,
                     ..
-                } if matches!(
-                    right.as_ref(),
-                    Expr::Literal(Literal::True | Literal::False, _)
-                ) =>
-                {
+                } if op.truth_test(right).is_some() => {
                     pending.push(left.as_ref());
                 }
                 Expr::UnaryOp {
@@ -96020,28 +96010,11 @@ impl Connection {
                     left, op, right, ..
                 } => {
                     // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE
-                    if matches!(op, BinaryOp::Is | BinaryOp::IsNot)
-                        && let Expr::Literal(lit, _) = right.as_ref()
-                        && matches!(lit, Literal::True | Literal::False)
-                    {
+                    if let Some(expected) = op.truth_test(right) {
                         let lv = self
                             .eval_expr_with_subqueries(left, row, col_map, params)
                             .await?;
-                        let truthy = if lv.is_null() {
-                            None
-                        } else {
-                            Some(is_sqlite_truthy(&lv))
-                        };
-                        let is_true_test = matches!(lit, Literal::True);
-                        let is_not = matches!(op, BinaryOp::IsNot);
-                        let result = match truthy {
-                            Some(t) => {
-                                let keep = is_true_test != is_not;
-                                i64::from(if keep { t } else { !t })
-                            }
-                            None => i64::from(is_not),
-                        };
-                        return Ok(SqliteValue::Integer(result));
+                        return Ok(sqlite_truth_test_result(&lv, expected, *op));
                     }
                     // AND/OR are associative under SQLite three-valued logic.
                     // Nested `Box::pin(async { eval(left).await; eval(right).await })`
@@ -145290,27 +145263,9 @@ fn evaluate_having_predicate(
     )?))
 }
 
-/// Check if `op` IS/IS NOT with `rhs` TRUE/FALSE should use `IsTrue`.
-/// Returns `(p3, p4)` for the `IsTrue` opcode.
-fn is_true_false_params_core(op: BinaryOp, rhs: &Expr) -> Option<(i32, P4)> {
-    let is_not = matches!(op, BinaryOp::IsNot);
-    match rhs {
-        Expr::Literal(Literal::True, _) => {
-            if is_not {
-                Some((0, P4::Int(1)))
-            } else {
-                Some((0, P4::None))
-            }
-        }
-        Expr::Literal(Literal::False, _) => {
-            if is_not {
-                Some((1, P4::None))
-            } else {
-                Some((1, P4::Int(1)))
-            }
-        }
-        _ => None,
-    }
+fn sqlite_truth_test_result(value: &SqliteValue, expected: bool, op: BinaryOp) -> SqliteValue {
+    let matches = !value.is_null() && is_sqlite_truthy(value) == expected;
+    SqliteValue::Integer(i64::from(matches != (op == BinaryOp::IsNot)))
 }
 
 /// Evaluate a HAVING expression to a `SqliteValue`.
@@ -145411,6 +145366,9 @@ fn evaluate_having_value(
             left, op, right, ..
         } => {
             let lv = evaluate_having_value(left, values, columns, group_rows, col_map)?;
+            if let Some(expected) = op.truth_test(right) {
+                return Ok(sqlite_truth_test_result(&lv, expected, *op));
+            }
             let rv = evaluate_having_value(right, values, columns, group_rows, col_map)?;
             let is_null_op = matches!(lv, SqliteValue::Null) || matches!(rv, SqliteValue::Null);
             let comparison = || compare_join_expr_values(left, &lv, right, &rv, col_map);
@@ -152779,13 +152737,7 @@ fn index_expr_uses_collation_dependency(
             left, op, right, ..
         } => {
             let consumes = binary_op_consumes_collation(*op)
-                && !matches!(
-                    (*op, right.as_ref()),
-                    (
-                        BinaryOp::Is | BinaryOp::IsNot,
-                        Expr::Literal(Literal::True | Literal::False, _)
-                    )
-                )
+                && op.truth_test(right).is_none()
                 && index_comparison_uses_collation(left, right, table, target);
             consumes
                 || index_expr_uses_collation_dependency(connection, left, table, target)
@@ -152959,13 +152911,7 @@ fn validate_index_expr_inherited_collation_consumers(
                     | BinaryOp::Ge
                     | BinaryOp::Is
                     | BinaryOp::IsNot
-            ) && !matches!(
-                (*op, right.as_ref()),
-                (
-                    BinaryOp::Is | BinaryOp::IsNot,
-                    Expr::Literal(Literal::True | Literal::False, _)
-                )
-            ) {
+            ) && op.truth_test(right).is_none() {
                 validate_index_binary_comparison_collation(left, right, table, registry)?;
             }
             validate_index_expr_inherited_collation_consumers(connection, left, table, registry)?;
@@ -153257,7 +153203,7 @@ fn validate_expr_collation_consumers(
         Expr::BinaryOp {
             left, op, right, ..
         } => {
-            if binary_op_consumes_collation(*op) {
+            if binary_op_consumes_collation(*op) && op.truth_test(right).is_none() {
                 validate_direct_subquery_collation_consumers(connection, left, registry)?;
                 validate_direct_subquery_collation_consumers(connection, right, registry)?;
                 validate_binary_comparison_collation(left, right, registry)?;
@@ -162762,7 +162708,7 @@ fn emit_binary_expr(
         }
         BinaryOp::Is | BinaryOp::IsNot => {
             // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE → IsTrue opcode.
-            if let Some((p3, p4)) = is_true_false_params_core(op, right) {
+            if let Some((p3, p4)) = fsqlite_vdbe::codegen::is_true_false_params(op, right) {
                 builder.emit_op(Opcode::IsTrue, left_reg, target_reg, p3, p4, 0);
                 builder.free_temp(right_reg);
                 builder.free_temp(left_reg);
@@ -170264,26 +170210,9 @@ fn eval_recursive_cte_direct_expr_sync(
         Expr::BinaryOp {
             left, op, right, ..
         } => {
-            if matches!(op, BinaryOp::Is | BinaryOp::IsNot)
-                && let Expr::Literal(lit, _) = right.as_ref()
-                && matches!(lit, Literal::True | Literal::False)
-            {
+            if let Some(expected) = op.truth_test(right) {
                 let lv = eval_recursive_cte_direct_expr_sync(left, row, col_map, params)?;
-                let truthy = if lv.is_null() {
-                    None
-                } else {
-                    Some(is_sqlite_truthy(&lv))
-                };
-                let is_true_test = matches!(lit, Literal::True);
-                let is_not = matches!(op, BinaryOp::IsNot);
-                let result = match truthy {
-                    Some(t) => {
-                        let keep = is_true_test != is_not;
-                        i64::from(if keep { t } else { !t })
-                    }
-                    None => i64::from(is_not),
-                };
-                return Ok(SqliteValue::Integer(result));
+                return Ok(sqlite_truth_test_result(&lv, expected, *op));
             }
             let l = eval_recursive_cte_direct_expr_sync(left, row, col_map, params)?;
             let r = eval_recursive_cte_direct_expr_sync(right, row, col_map, params)?;
@@ -170617,28 +170546,9 @@ pub(crate) fn eval_join_expr(
             left, op, right, ..
         } => {
             // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE
-            if matches!(op, BinaryOp::Is | BinaryOp::IsNot)
-                && let Expr::Literal(lit, _) = right.as_ref()
-                && matches!(lit, Literal::True | Literal::False)
-            {
+            if let Some(expected) = op.truth_test(right) {
                 let lv = eval_join_expr(left, row, col_map)?;
-                let truthy = if lv.is_null() {
-                    None
-                } else {
-                    Some(is_sqlite_truthy(&lv))
-                };
-                let is_true_test = matches!(lit, Literal::True);
-                let is_not = matches!(op, BinaryOp::IsNot);
-                let result = match truthy {
-                    Some(t) => {
-                        // IS TRUE / IS NOT FALSE → keep truthiness
-                        // IS FALSE / IS NOT TRUE → invert truthiness
-                        let keep = is_true_test != is_not;
-                        i64::from(if keep { t } else { !t })
-                    }
-                    None => i64::from(is_not),
-                };
-                return Ok(SqliteValue::Integer(result));
+                return Ok(sqlite_truth_test_result(&lv, expected, *op));
             }
             // bd-t7oeo: row-value comparison in the interpreted (FROM-less /
             // CTE-routed) evaluator. A comparison whose operand is a row value —

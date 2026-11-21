@@ -33,33 +33,256 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 }
 
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
-    match conn.query(sql).await {
-        Ok(rows) => rows
-            .iter()
-            .map(|r| r.values().iter().map(tag_f).collect())
-            .collect(),
-        Err(_) => vec![vec!["ERR".to_owned()]],
-    }
+    conn.query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .iter()
+        .map(|r| r.values().iter().map(tag_f).collect())
+        .collect()
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else {
-        return vec![vec!["ERR".to_owned()]];
-    };
+    let mut st = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let n = st.column_count();
-    match st.query_map([], |row| {
+    st.query_map([], |row| {
         Ok((0..n)
             .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
             .collect::<Vec<_>>())
-    }) {
-        Ok(rows) => rows
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
-        Err(_) => vec![vec!["ERR".to_owned()]],
-    }
+    })
+    .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 async fn ex(f: &Connection, r: &rusqlite::Connection, sql: &str) {
-    let _ = f.execute(sql).await;
-    let _ = r.execute(sql, []);
+    f.execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    r.execute(sql, []).unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+#[test]
+fn forced_partial_index_binds_the_visible_self_join_source() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aliases.db");
+        for filename in [":memory:", path.to_str().unwrap()] {
+            let f = Connection::open(filename).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)",
+                "INSERT INTO t VALUES(1,0),(2,1),(3,2)",
+                "CREATE INDEX pos ON t(id) WHERE t.a>0",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            for join in ["JOIN", "LEFT JOIN"] {
+                for (source, valid) in [("x", true), ("t", false)] {
+                    let sql = format!(
+                        "SELECT x.id FROM t AS x INDEXED BY pos {join} t ON t.id=2
+                                       WHERE {source}.a>0 ORDER BY x.id"
+                    );
+                    if valid {
+                        let expected = vec![vec!["int:2"], vec!["int:3"]];
+                        assert_eq!(rq(&r, &sql), expected);
+                        assert_eq!(fq(&f, &sql).await, expected);
+                        let prepared = f.prepare(&sql).await.unwrap();
+                        let ids: Vec<_> = prepared
+                            .query()
+                            .await
+                            .unwrap()
+                            .iter()
+                            .map(|row| row.values()[0].clone())
+                            .collect();
+                        assert_eq!(ids, [SqliteValue::Integer(2), SqliteValue::Integer(3)]);
+                    } else {
+                        assert!(
+                            r.prepare(&sql)
+                                .unwrap_err()
+                                .to_string()
+                                .contains("no query solution")
+                        );
+                        assert!(
+                            f.prepare(&sql)
+                                .await
+                                .unwrap_err()
+                                .to_string()
+                                .contains("no query solution"),
+                            "{sql}"
+                        );
+                        assert!(
+                            f.query(&sql)
+                                .await
+                                .unwrap_err()
+                                .to_string()
+                                .contains("no query solution"),
+                            "{sql}"
+                        );
+                    }
+                }
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn collated_boolean_truth_tests_preserve_rows_and_index_membership() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truth.db");
+        for filename in [":memory:", path.to_str().unwrap()] {
+            let f = Connection::open(filename).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY,a,k,marked INTEGER DEFAULT 0)",
+                "INSERT INTO t(id,a,k) VALUES (1,NULL,1),(2,0,1),(3,1,1),(4,2,1),(5,'no',1),(6,'2x',1)",
+                "CREATE INDEX present ON t(k) WHERE a IS NOT NULL",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            for (predicate, ids) in [
+                ("a IS (TRUE COLLATE NOCASE)", vec![3, 4, 6]),
+                ("a IS ((FALSE COLLATE RTRIM) COLLATE NOCASE)", vec![2, 5]),
+                ("a IS NOT (TRUE COLLATE RTRIM)", vec![1, 2, 5]),
+                ("a IS NOT (FALSE COLLATE NOCASE)", vec![1, 3, 4, 6]),
+                ("(TRUE COLLATE NOCASE) IS a", vec![3]),
+                ("a IS (1 COLLATE NOCASE)", vec![3]),
+            ] {
+                let sql = format!("SELECT id FROM t WHERE {predicate} ORDER BY id");
+                let expected: Vec<_> = ids.iter().map(|id| vec![format!("int:{id}")]).collect();
+                assert_eq!(rq(&r, &sql), expected, "stock: {sql}");
+                assert_eq!(fq(&f, &sql).await, expected, "{filename}: {sql}");
+                let prepared = f.prepare(&sql).await.unwrap();
+                let got: Vec<_> = prepared
+                    .query()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values()[0].clone())
+                    .collect();
+                assert_eq!(
+                    got,
+                    ids.into_iter()
+                        .map(SqliteValue::Integer)
+                        .collect::<Vec<_>>()
+                );
+            }
+            for (pred, valid) in [
+                ("a IS (TRUE COLLATE NOCASE)", true),
+                ("a IS FALSE", true),
+                ("a", true),
+                ("NOT a", true),
+                ("a IS NOT TRUE", false),
+                ("TRUE IS a", false),
+                ("a IS 1", false),
+            ] {
+                let sql =
+                    format!("SELECT id FROM t INDEXED BY present WHERE k=1 AND {pred} ORDER BY id");
+                if valid {
+                    assert_eq!(fq(&f, &sql).await, rq(&r, &sql));
+                } else {
+                    assert!(
+                        r.prepare(&sql)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("no query solution")
+                    );
+                    assert!(
+                        f.prepare(&sql)
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("no query solution"),
+                        "{sql}"
+                    );
+                }
+                let eqp = format!("EXPLAIN QUERY PLAN SELECT id FROM t WHERE k=1 AND {pred}");
+                for plan in [rq(&r, &eqp), fq(&f, &eqp).await] {
+                    assert_eq!(
+                        plan.iter().flatten().any(|s| s.contains("present")),
+                        valid,
+                        "{eqp}: {plan:?}"
+                    );
+                }
+            }
+            for (sql, expected) in [
+                (
+                    "SELECT 2 IS (TRUE COLLATE nocase), 2 IS (+TRUE), 2 IS (1=1), NULL IS NOT (FALSE COLLATE rtrim)",
+                    vec![vec!["int:1", "int:0", "int:0", "int:1"]],
+                ),
+                (
+                    "SELECT 2 IS (TRUE COLLATE absent_collation)",
+                    vec![vec!["int:1"]],
+                ),
+                (
+                    "SELECT k FROM t GROUP BY k HAVING count(*) IS (TRUE COLLATE rtrim)",
+                    vec![vec!["int:1"]],
+                ),
+                (
+                    "SELECT x.id FROM t AS x JOIN t AS y ON y.id=3 WHERE x.a IS (TRUE COLLATE nocase) ORDER BY x.id",
+                    vec![vec!["int:3"], vec!["int:4"], vec!["int:6"]],
+                ),
+            ] {
+                assert_eq!(rq(&r, sql), expected, "{sql}");
+                assert_eq!(fq(&f, sql).await, expected, "{sql}");
+            }
+            for sql in [
+                "SELECT (2 IS (TRUE COLLATE absent_collation))=1",
+                "SELECT 'a' COLLATE absent_collation = 'A'",
+            ] {
+                assert!(
+                    r.prepare(sql)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("no such collation sequence")
+                );
+                assert!(
+                    f.query(sql)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("no such collation sequence"),
+                    "{sql}"
+                );
+            }
+            let bound = "SELECT id FROM t WHERE a IS (?1 COLLATE nocase) ORDER BY id";
+            let plan = f.prepare(bound).await.unwrap();
+            for (param, id) in [(SqliteValue::Integer(1), 3), (SqliteValue::Null, 1)] {
+                let rows = plan.query_with_params(&[param]).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(id));
+            }
+            drop(plan);
+            let create = "CREATE INDEX truth ON t(id) WHERE a IS (TRUE COLLATE NOCASE)";
+            ex(&f, &r, create).await;
+            let sql = "UPDATE t SET marked=1 WHERE a IS (TRUE COLLATE NOCASE)";
+            assert_eq!(r.execute(sql, []).unwrap(), 3);
+            assert_eq!(f.execute(sql).await.unwrap(), 3);
+            let move_row = "UPDATE t SET a='text' WHERE id=4";
+            assert_eq!(r.execute(move_row, []).unwrap(), 1);
+            assert_eq!(f.execute(move_row).await.unwrap(), 1);
+            f.close().await.unwrap();
+            if filename != ":memory:" {
+                let reopened = rusqlite::Connection::open(filename).unwrap();
+                assert_eq!(
+                    rq(&reopened, "PRAGMA integrity_check"),
+                    vec![vec!["text:ok"]]
+                );
+                assert_eq!(
+                    rq(
+                        &reopened,
+                        "SELECT id FROM t INDEXED BY truth WHERE a IS (TRUE COLLATE NOCASE) ORDER BY id"
+                    ),
+                    vec![vec!["int:3"], vec!["int:6"]]
+                );
+                assert_eq!(
+                    rq(&reopened, "SELECT id FROM t WHERE marked=1 ORDER BY id"),
+                    vec![vec!["int:3"], vec!["int:4"], vec!["int:6"]]
+                );
+            }
+        }
+    });
 }
 
 #[test]
