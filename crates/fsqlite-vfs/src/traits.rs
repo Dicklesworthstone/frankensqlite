@@ -1889,6 +1889,7 @@ impl VfsMmapStatus {
 }
 
 /// Shared atomic telemetry backing [`VfsMmapStatus`] and [`ReadOnlyMmapView`].
+#[cfg(unix)]
 #[derive(Debug, Default)]
 pub(crate) struct VfsMmapCounters {
     pub(crate) mmap_read_hits: AtomicU64,
