@@ -55,7 +55,7 @@ written; this is where their scope is recorded.
 | Removing or adding single arms of `try_execute_hot_opcode` | 2026-05-23..25 (55 entries), 2026-07-16 `NotNull` | removal slower every time; one promotion mixed | a bytecode-executing workload, profile-attributed self time, original and candidate interleaved in one invocation (2026-07-10 LEDGER-INTEGRITY CORRECTION) |
 | Shrinking the statement future by boxing cold branches | 2026-08-11 bd-uzq54 | rejected | allocation-count and CPU-sample evidence that generator size is on the hot path |
 | Register file without Arc | 2026-08-17 bd-i9sov | NO-GO: atomics ~24 ns per row; infeasible in safe Rust | atomics above 10% of execute_body on a new shape and a safe design |
-| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim on 2026-11-21 (bd-zqr9h L1, c0e568aaf), and the shim's per-step `SELECT changes();` is gone (bd-zqr9h L2, f16f01ccb) |
+| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim on 2026-11-21 (bd-zqr9h L1, c0e568aaf), and the shim's per-step `SELECT changes();` is gone (bd-zqr9h L2, f16f01ccb), as are `fsqlite::blocking`'s per-call `SELECT changes()` / `SELECT total_changes()` (bd-e64z4, ad5f63595) |
 | B-tree cell-parse micro-levers | 2026-05-20 | 4-6 ns per cell, no lever | not from a cold read; whole-workload attribution |
 | Narrow aggregate lanes (FastSumState, direct REAL accumulator, IntDivide) | 2026-05-05, 2026-05-06 | rejected, each helped one group size and hurt another | aggregate dispatch dominates a row and every group size improves; hash aggregation (bd-w4pr1.13.8) is a different change |
 | Thinning sorter rows | 2026-10-27 GH#504, 2026-05-06 | no measurable change (2026-10-27); the 2026-05-06 sweep was abandoned unmeasured | together with a change that removes per-row dispatch or decode cost |
@@ -93,6 +93,23 @@ count moves by up to +-3k on autocommit and +-3-6k on a one-row write between ru
 Every entry from here on ends with a retry condition a later agent can grep and test: a profile
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
+
+## 2026-11-21 - MAINTENANCE (landed as ad5f63595; inside its prediction): fsqlite::blocking changes() / total_changes() read the connection's counters instead of running a SELECT per call (bd-e64z4, part 1)
+
+- Target: `crates/fsqlite/src/blocking.rs`. `Connection::changes()` and `total_changes()` ran `SELECT changes()` /
+  `SELECT total_changes()` through block_on on every call, about 52k user instructions each. They now read
+  `Connection::last_change_count()` / `total_change_count()`, the fsqlite-core accessors bd-zqr9h L2 added.
+- Keeper: `blocking::tests::changes_and_total_changes_match_stock`. The C API differential's 19 statements run through
+  execute_batch on stock (rusqlite's bundled 3.54.1) and on fsqlite::blocking. The outcome and both counters must be
+  equal after each one: prepare-time errors (bd-rwo47), a UNIQUE failure mid-UPDATE, an UPDATE of no rows, DDL, SELECT.
+- Prediction (bead, before the build): -99% to -99.99% per changes() + total_changes() pair; GAIN kill under -90%.
+- Result: example driver `crates/fsqlite/examples/r10_changes.rs` (scratch only). Per iteration = (Ir(N_hi) - Ir(N_lo))
+  / (N_hi - N_lo), perf stat instructions:u, 7 rotated reps on thinkstation1. Arms came from one rch job on vmi1227854:
+  main 11cc30b26 (129fac924fd1e0a9) and the change (53e7272dcbad7317). Stock is rusqlite's bundled SQLite 3.54.1 in
+  the same binary, live in the same run. main 103,144 -> 10.0 (-99.99%); stock 78.0, so 0.13x stock on this pair of
+  accessor calls. A microbench of two calls, not a workload result.
+- Retry condition: none for these two calls; the per-call statement is gone. The blocking API's remaining
+  per-statement cost is its prepare / execute path, a different lever measured on a statement workload.
 
 ## 2026-11-21 - MAINTENANCE (landed as f16f01ccb; inside its prediction, on instructions; every row still a loss to stock 3.54.1): the C API reads sqlite3_changes from the connection's counter instead of running `SELECT changes();` after every step, and exports sqlite3_total_changes (bd-zqr9h, lever L2)
 
