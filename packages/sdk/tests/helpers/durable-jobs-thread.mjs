@@ -2,20 +2,37 @@
 // Not a FrankenSQLite engine substitute or a browser-persistence adapter.
 
 import { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
 import { parentPort, workerData } from "node:worker_threads";
 import { DurableJobWorker } from "../../src/durable-job-worker.ts";
 import { DurableJobQueue } from "../../src/durable-jobs.ts";
 
 const sql = new DatabaseSync(workerData.path);
-sql.exec("PRAGMA busy_timeout = 5000");
 let tail = Promise.resolve();
+async function beginWriter() {
+  // Stock's blocking busy handler can miss the gaps between hundreds of
+  // short transactions. Give waiting connections a chance at each release.
+  const deadline = performance.now() + 5000;
+  sql.exec("PRAGMA busy_timeout = 0");
+  for (;;) {
+    try {
+      sql.exec("BEGIN IMMEDIATE");
+      return;
+    } catch (error) {
+      if (error.errcode !== 5 || sql.isTransaction) throw error;
+      await delay(1);
+      if (performance.now() >= deadline) throw error;
+    }
+  }
+}
 const database = {
   transaction(work) {
     // Serialize transactions on THIS connection, not across worker connections
     // or application handlers. Heartbeats and completion share this owner.
     const pending = tail.then(async () => {
-      sql.exec("BEGIN IMMEDIATE");
+      await beginWriter();
       try {
+        sql.exec("PRAGMA busy_timeout = 5000");
         const result = await work({
           execute: async (statement, params = []) =>
             Number(sql.prepare(statement).run(...params).changes),

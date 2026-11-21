@@ -186,11 +186,17 @@ test("managed runners on four connections drain 128 jobs with atomic unique effe
     128,
   );
   for (const { stats } of results) {
+    assert.ok(stats.completed > 0, "each competing runner must commit a job");
     assert.equal(stats.activeJobs, 0);
     assert.equal(stats.pendingClaims, 0);
     assert.equal(stats.state, "stopped");
     assert.equal(stats.lostLeases, 0);
   }
+  assert.deepEqual(
+    sql.prepare("SELECT owner, COUNT(*) AS n FROM effects GROUP BY owner ORDER BY owner").all()
+      .map(({ owner, n }) => [owner, n]),
+    results.map(({ stats }, i) => [`worker-${i}`, stats.completed]),
+  );
   assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM effects").get().n, 128);
   assert.equal(sql.prepare(`SELECT SUM(attempts) AS n FROM ${DURABLE_JOBS_TABLE}`).get().n, 128);
   assert.equal((await queue.stats()).completed, 128);
@@ -201,6 +207,47 @@ test("managed runners on four connections drain 128 jobs with atomic unique effe
       .map((row) => row.integrity_check),
     ["ok"],
   );
+});
+
+test("a held writer exhausts admission before any job or effect changes", { timeout: 15_000 }, async (t) => {
+  const { sql, queue, start } = await fixture(t);
+  await queue.enqueue({ id: "one", payload: "one" });
+  const barrier = new SharedArrayBuffer(4);
+  const worker = start("managed-consume", "blocked", barrier);
+  await worker.ready;
+  sql.exec("BEGIN IMMEDIATE");
+  try {
+    const started = performance.now();
+    Atomics.store(new Int32Array(barrier), 0, 1);
+    Atomics.notify(new Int32Array(barrier), 0);
+    await assert.rejects(worker.result, (error) => {
+      assert.equal(error.phase, "reap");
+      assert.equal(error.cause.errcode, 5);
+      return true;
+    });
+    assert.ok(performance.now() - started >= 5000);
+  } finally {
+    sql.exec("ROLLBACK");
+  }
+  assert.equal((await queue.get("one")).attempts, 0);
+  assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM effects").get().n, 0);
+});
+
+test("a SQL failure after writer admission leaves the original effect and lease intact", async (t) => {
+  const { sql, queue, start } = await fixture(t);
+  sql.exec("INSERT INTO effects VALUES ('one','original')");
+  await queue.enqueue({ id: "one", payload: "one" });
+  const worker = start("managed-consume", "contender");
+  await assert.rejects(worker.result, (error) => {
+    assert.equal(error.phase, "complete");
+    assert.match(error.cause.message, /UNIQUE constraint failed/);
+    return true;
+  });
+  const job = await queue.get("one");
+  assert.equal(job.state, "leased");
+  assert.equal(job.attempts, 1);
+  assert.equal(sql.prepare("SELECT owner FROM effects WHERE job_id='one'").get().owner, "original");
+  assert.equal(sql.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
 });
 
 for (const mode of ["managed-hold-claim", "managed-hold-effects"]) {

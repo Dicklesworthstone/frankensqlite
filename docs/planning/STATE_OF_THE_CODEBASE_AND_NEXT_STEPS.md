@@ -65,10 +65,14 @@ The SDK rebase journal now reports cancellation and deadline expiry during
 history writes with the journal error code and the original changeset error
 as its cause. Interrupting a row-conflict rollback retains the row-level error.
 The application row, receipt and history stayed consistent in all three cases
-(`bd-9mx3k`). Across 124 SDK and worker Node test files, 4,795 of 4,796 tests
-passed with zero skipped. The four-worker, 128-job reference SQLite test still
-intermittently reaches its five-second writer admission timeout under load
-(`bd-q1qg2`). Both package builds, typechecks and all 140 Vitest cases passed.
+(`bd-9mx3k`). The four-worker reference SQLite test exposed an admission
+problem. One connection acquired 260 transactions while three peers waited
+2.7 seconds each. In other runs a peer exhausted its five-second budget.
+The adapter now yields on an unsuccessful `BEGIN IMMEDIATE` within the same
+budget. All four workers committed jobs, and SQLite counted 128 unique effects
+and 128 attempts. A held writer still timed out, and a failed effect kept its
+original row and lease (`bd-q1qg2`). Both package builds, both typechecks and
+all 140 Vitest cases passed.
 
 Two public entry points still expose significant limits. FTS5 and R-tree
 virtual tables could be created, while FTS3 creation reported an unregistered
