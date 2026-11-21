@@ -373,6 +373,91 @@ fn check_where(expr: &Expr) -> Check {
     }
 }
 
+/// `expr` is a HAVING clause over the GROUP BY terms `group_by` (bd-gjor8).
+/// Stock's havingToWhere moves each top-level AND conjunct that reads only
+/// GROUP BY terms (no aggregate, no other column) into WHERE, where its
+/// row-value comparisons split as a WHERE term's do (see [`check_where`]);
+/// every other conjunct stands where one value is expected.
+fn check_having(expr: &Expr, group_by: &[Expr]) -> Check {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } => Ok(check_having(left, group_by)? | check_having(right, group_by)?),
+        conjunct if reads_only_group_by_terms(conjunct, group_by) => check_where(conjunct),
+        other => check_scalar(other),
+    }
+}
+
+/// Whether `expr` is built from GROUP BY terms and constants only, as stock's
+/// sqlite3ExprIsConstantOrGroupBy reads it; an aggregate, a subquery and any
+/// other column are not. This crate has no function registry, so an
+/// aggregate is a call with aggregate syntax (`*`, DISTINCT, ORDER BY,
+/// FILTER, OVER) or one of the built-in aggregates.
+fn reads_only_group_by_terms(expr: &Expr, group_by: &[Expr]) -> bool {
+    if group_by.iter().any(|term| term == expr) {
+        return true;
+    }
+    match expr {
+        Expr::Literal(..) | Expr::Placeholder(..) => true,
+        Expr::FunctionCall {
+            name,
+            args: FunctionArgs::List(args),
+            distinct: false,
+            order_by,
+            filter: None,
+            over: None,
+            ..
+        } if order_by.is_empty() && !is_builtin_aggregate(name, args.len()) => args
+            .iter()
+            .all(|arg| reads_only_group_by_terms(arg, group_by)),
+        Expr::BinaryOp { left, right, .. } => {
+            reads_only_group_by_terms(left, group_by) && reads_only_group_by_terms(right, group_by)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => reads_only_group_by_terms(expr, group_by),
+        Expr::Between {
+            expr, low, high, ..
+        } => [expr, low, high]
+            .into_iter()
+            .all(|operand| reads_only_group_by_terms(operand, group_by)),
+        Expr::RowValue(items, _) => items
+            .iter()
+            .all(|item| reads_only_group_by_terms(item, group_by)),
+        _ => false,
+    }
+}
+
+/// SQLite's built-in aggregate functions; `min` and `max` are aggregates
+/// with one argument and scalars with more.
+fn is_builtin_aggregate(name: &str, arg_count: usize) -> bool {
+    const AGGREGATES: &[&str] = &[
+        "avg",
+        "count",
+        "group_concat",
+        "json_group_array",
+        "json_group_object",
+        "jsonb_group_array",
+        "jsonb_group_object",
+        "median",
+        "percentile",
+        "percentile_cont",
+        "percentile_disc",
+        "string_agg",
+        "sum",
+        "total",
+    ];
+    AGGREGATES
+        .iter()
+        .any(|aggregate| name.eq_ignore_ascii_case(aggregate))
+        || (arg_count == 1
+            && (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")))
+}
+
 /// `expr` may be a row value: each element of one takes one value.
 fn check_vector(expr: &Expr) -> Check {
     match expr {
@@ -490,7 +575,7 @@ fn check_core(core: &SelectCore) -> Check {
                 changed |= check_scalar(expr)?;
             }
             if let Some(expr) = having {
-                changed |= check_scalar(expr)?;
+                changed |= check_having(expr, group_by)?;
             }
             for window in windows {
                 changed |= check_window(&window.spec)?;
