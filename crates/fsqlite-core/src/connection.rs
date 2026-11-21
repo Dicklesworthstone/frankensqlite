@@ -93723,7 +93723,6 @@ impl Connection {
         };
         // bd-5i14u: each group's bare-column row, by index. The rows stay in
         // scan order, which every other aggregate steps over.
-        let mut bare_row_indices: Vec<Option<usize>> = vec![None; groups.len()];
         // A key supplied by a derived table or a table function can mix 1 and
         // 1.0 even under BINARY. Its declared affinity cannot rule that out.
         let variant_group_keys = vec![true; group_by_exprs.len()];
@@ -93742,17 +93741,18 @@ impl Connection {
         let empty_group_row = vec![SqliteValue::Null; col_map.len()];
         let mut result = Vec::with_capacity(groups.len());
         let mut result_group_indices = Vec::with_capacity(groups.len());
+        let mut result_extrema = Vec::new();
         for (group_index, (_key, group_rows)) in groups.iter().enumerate() {
-            let tracked_value = if let Some(tracking) = &tracking {
+            let (bare_index, tracked_value) = if let Some(tracking) = &tracking {
                 let (index, value) = self
                     .join_minmax_bare_extremum(tracking, group_rows, &col_map, using_skip, &coll_snap)
                     .await?;
-                bare_row_indices[group_index] = index;
-                Some(value)
+                (index, Some(value))
             } else {
-                None
+                (None, None)
             };
-            let bare_row = bare_row_indices[group_index].and_then(|index| group_rows.get(index));
+            let cached = tracking.as_ref().zip(tracked_value.as_ref());
+            let bare_row = bare_index.and_then(|index| group_rows.get(index));
             let representative_row = bare_row
                 .or_else(|| group_rows.first())
                 .unwrap_or(&empty_group_row);
@@ -93811,7 +93811,7 @@ impl Connection {
                                 expr
                             };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            let rows = GroupRows::with_bare_row(&refs, bare_row);
+                            let rows = GroupRows::with_bare_row(&refs, bare_row, cached);
                             self.with_fallback_function_registry(|| {
                                 eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
@@ -94173,7 +94173,7 @@ impl Connection {
                     effective_having,
                     &values,
                     &expanded_columns,
-                    &GroupRows::with_bare_row(&group_row_refs, bare_row),
+                    &GroupRows::with_bare_row(&group_row_refs, bare_row, cached),
                     &col_map,
                 )? {
                     continue;
@@ -94181,6 +94181,11 @@ impl Connection {
             }
             result.push(Row { values });
             result_group_indices.push(group_index);
+            if !select.order_by.is_empty()
+                && let Some(value) = tracked_value
+            {
+                result_extrema.push((bare_index, value));
+            }
         }
 
         // Step 7: ORDER BY and LIMIT.
@@ -94214,8 +94219,9 @@ impl Connection {
                 // already-built result set.
                 for (result_index, &group_index) in result_group_indices.iter().enumerate() {
                     let group_rows = &groups[group_index].1;
-                    let bare_row =
-                        bare_row_indices[group_index].and_then(|index| group_rows.get(index));
+                    let extremum = result_extrema.get(result_index);
+                    let bare_row = extremum.and_then(|(index, _)| index.and_then(|i| group_rows.get(i)));
+                    let cached = tracking.as_ref().zip(extremum.map(|(_, value)| value));
                     let representative_row = bare_row
                         .or_else(|| group_rows.first())
                         .unwrap_or(&empty_group_row);
@@ -94250,7 +94256,7 @@ impl Connection {
                                 expr
                             };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            let rows = GroupRows::with_bare_row(&refs, bare_row);
+                            let rows = GroupRows::with_bare_row(&refs, bare_row, cached);
                             self.with_fallback_function_registry(|| {
                                 eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
@@ -99862,13 +99868,13 @@ impl Connection {
         let empty_group_row = vec![SqliteValue::Null; col_map.len()];
         let mut result = Vec::with_capacity(groups.len());
         let mut result_group_indices = Vec::with_capacity(groups.len());
-        let mut result_representative_indices = Vec::with_capacity(groups.len());
+        let mut result_extrema = Vec::new();
         for (group_index, (_key, group_rows)) in groups.iter().enumerate() {
             let mut values = Vec::with_capacity(result_descriptors.len());
             // bd-xplxa: representative row for bare (non-aggregate) columns — the
             // min/max extremum row when that tracking pattern applies, otherwise
             // the first row of the group (an arbitrary but stable choice). Cache
-            // the contributing min/max values here: evaluating a complex
+            // the selected min/max value here: evaluating a complex
             // argument or FILTER again while computing the aggregate would
             // duplicate UDF side effects and could choose a bare row that does
             // not correspond to the reported value.
@@ -99889,7 +99895,7 @@ impl Connection {
                 // left a declared-NOCASE column's row on BINARY while its value
                 // used NOCASE (the `Z2` vs `Z1` hybrid).
                 let fallback_collation = join_expr_effective_collation(tracked_arg, &col_map);
-                let (descriptor_index, arg_col, arg_expr, filter, collation) = result_descriptors
+                let (arg_col, arg_expr, filter, collation) = result_descriptors
                     .iter()
                     .enumerate()
                     .find_map(|(index, descriptor)| match descriptor {
@@ -99901,7 +99907,6 @@ impl Connection {
                             ..
                         } if column_matches_tracked_minmax(&expanded_columns[index], tracking) => {
                             Some((
-                                index,
                                 *arg_col,
                                 arg_expr.as_deref(),
                                 filter.as_deref(),
@@ -99922,7 +99927,6 @@ impl Connection {
                     // expression against that representative row.
                     .unwrap_or({
                         (
-                            usize::MAX,
                             None,
                             Some(tracked_arg),
                             tracked_filter.as_ref(),
@@ -99930,11 +99934,10 @@ impl Connection {
                         )
                     });
 
-                let mut best_index: Option<usize> = None;
+                let mut best: Option<SqliteValue> = None;
                 let mut seen_distinct: Vec<SqliteValue> = Vec::new();
                 let mut reg_hit = false;
                 let mut bare_row: Option<&Vec<SqliteValue>> = None;
-                let mut aggregate_values = Vec::with_capacity(group_rows.len());
                 for (row_idx, row) in group_rows.iter().enumerate() {
                     if filter.is_some() {
                         reg_hit = row_idx > 0;
@@ -99981,12 +99984,12 @@ impl Connection {
                         seen_distinct.push(value.clone());
                     }
                     if value.is_null() {
-                        reg_hit = best_index.is_some();
+                        reg_hit = best.is_some();
                     } else {
-                        let replace = best_index.is_none_or(|best_idx| {
+                        let replace = best.as_ref().is_none_or(|previous| {
                             let ordering = cmp_sqlite_values_collated_snapshot(
                                 &value,
-                                &aggregate_values[best_idx],
+                                previous,
                                 collation,
                                 &coll_snap,
                             );
@@ -99996,9 +99999,8 @@ impl Connection {
                                 ordering == std::cmp::Ordering::Less
                             }
                         });
-                        aggregate_values.push(value);
                         if replace {
-                            best_index = Some(aggregate_values.len() - 1);
+                            best = Some(value);
                             reg_hit = false;
                         } else {
                             reg_hit = true;
@@ -100009,17 +100011,19 @@ impl Connection {
                     }
                 }
                 Some((
-                    descriptor_index,
                     bare_row.or_else(|| group_rows.first()),
-                    aggregate_values,
+                    best.unwrap_or(SqliteValue::Null),
                 ))
             } else {
                 None
             };
             let repr_row = minmax_cache
                 .as_ref()
-                .and_then(|(_, row, _)| *row)
+                .and_then(|(row, _)| *row)
                 .or_else(|| group_rows.first());
+            let cached = minmax_bare_tracking
+                .as_ref()
+                .zip(minmax_cache.as_ref().map(|(_, value)| value));
             let representative_index = repr_row.and_then(|representative| {
                 group_rows
                     .iter()
@@ -100045,7 +100049,7 @@ impl Connection {
                             // (extremum) row, while its aggregates step over
                             // the group in scan order.
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            let rows = GroupRows::with_bare_row(&refs, repr_row);
+                            let rows = GroupRows::with_bare_row(&refs, repr_row, cached);
                             self.with_fallback_function_registry(|| {
                                 eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
@@ -100144,38 +100148,10 @@ impl Connection {
                             values.push(result);
                             continue;
                         }
-                        if let Some((cached_index, _, cached_values)) = &minmax_cache
-                            && descriptor_index == *cached_index
+                        if let Some((tracking, value)) = cached
+                            && column_matches_tracked_minmax(&expanded_columns[descriptor_index], tracking)
                         {
-                            let aggregate_values: std::borrow::Cow<'_, [SqliteValue]> = if *distinct
-                            {
-                                let mut owned_values = cached_values.clone();
-                                let mut refs: Vec<&SqliteValue> = owned_values.iter().collect();
-                                dedup_values_collated(
-                                    &mut refs,
-                                    collation.as_deref(),
-                                    &self.collation_registry,
-                                );
-                                owned_values = refs.into_iter().cloned().collect();
-                                std::borrow::Cow::Owned(owned_values)
-                            } else {
-                                std::borrow::Cow::Borrowed(cached_values.as_slice())
-                            };
-                            let agg_values: Vec<&SqliteValue> = aggregate_values.iter().collect();
-                            if let Some(result) = self.compute_unary_aggregate_with_registry(
-                                name,
-                                aggregate_values.as_ref(),
-                            )? {
-                                values.push(result);
-                            } else {
-                                values.push(compute_aggregate_ext_collated(
-                                    name,
-                                    &agg_values,
-                                    None,
-                                    collation.as_deref(),
-                                    &self.collation_registry,
-                                )?);
-                            }
+                            values.push(value.clone());
                             continue;
                         }
 
@@ -100397,7 +100373,7 @@ impl Connection {
                     effective_having,
                     &values,
                     &expanded_columns,
-                    &GroupRows::with_bare_row(&group_row_refs, repr_row),
+                    &GroupRows::with_bare_row(&group_row_refs, repr_row, cached),
                     &col_map,
                 )? {
                     continue;
@@ -100405,7 +100381,11 @@ impl Connection {
             }
             result.push(Row { values });
             result_group_indices.push(group_index);
-            result_representative_indices.push(representative_index);
+            if !select.order_by.is_empty()
+                && let Some((_, value)) = minmax_cache
+            {
+                result_extrema.push((representative_index, value));
+            }
         }
 
         // Post-process: ORDER BY (with support for expressions not in SELECT).
@@ -100432,8 +100412,10 @@ impl Connection {
                 // hidden ORDER BY keys.
                 for (result_index, &group_index) in result_group_indices.iter().enumerate() {
                     let group_rows = &groups[group_index].1;
-                    let representative_row = result_representative_indices[result_index]
-                        .and_then(|index| group_rows.get(index))
+                    let extremum = result_extrema.get(result_index);
+                    let cached = minmax_bare_tracking.as_ref().zip(extremum.map(|(_, value)| value));
+                    let bare_row = extremum.and_then(|(index, _)| index.and_then(|i| group_rows.get(i)));
+                    let representative_row = bare_row
                         .unwrap_or(&empty_group_row);
                     let mut extra_values = Vec::with_capacity(extra_order_terms.len());
                     for (_term_idx, expr) in &extra_order_terms {
@@ -100451,9 +100433,7 @@ impl Connection {
                             // bare leaves nested in the aggregate expression
                             // read the min()/max() extremum row.
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            let bare_row = result_representative_indices[result_index]
-                                .and_then(|index| group_rows.get(index));
-                            let rows = GroupRows::with_bare_row(&refs, bare_row);
+                            let rows = GroupRows::with_bare_row(&refs, bare_row, cached);
                             self.with_fallback_function_registry(|| {
                                 eval_group_agg_join_expr(effective, &rows, &col_map)
                             })?
@@ -116700,12 +116680,19 @@ fn group_key_collation_varies_spelling(collation: Option<&str>) -> bool {
 
 fn column_matches_tracked_minmax(
     column: &ResultColumn,
-    (is_max, arg, tracked_filter, tracked_distinct): &(bool, Expr, Option<Expr>, bool),
+    tracking: &TrackedMinMax,
 ) -> bool {
-    matches!(column, ResultColumn::Expr {
-        expr: Expr::FunctionCall {
-            name, args: FunctionArgs::List(args), distinct, filter, order_by, over: None, ..
-        }, ..
+    matches!(column, ResultColumn::Expr { expr, .. } if expr_matches_tracked_minmax(expr, tracking))
+}
+
+type TrackedMinMax = (bool, Expr, Option<Expr>, bool);
+
+fn expr_matches_tracked_minmax(
+    expr: &Expr,
+    (is_max, arg, tracked_filter, tracked_distinct): &TrackedMinMax,
+) -> bool {
+    matches!(expr, Expr::FunctionCall {
+        name, args: FunctionArgs::List(args), distinct, filter, order_by, over: None, ..
     } if name.eq_ignore_ascii_case(if *is_max { "max" } else { "min" })
         && args.as_slice() == std::slice::from_ref(arg)
         && filter.as_deref() == tracked_filter.as_ref()
@@ -137967,6 +137954,7 @@ fn eval_json_aggregate_arg(
 struct GroupRows<'a> {
     rows: &'a [&'a Vec<SqliteValue>],
     bare: Option<&'a Vec<SqliteValue>>,
+    extremum: Option<(&'a TrackedMinMax, &'a SqliteValue)>,
 }
 
 impl<'a> GroupRows<'a> {
@@ -137975,14 +137963,20 @@ impl<'a> GroupRows<'a> {
         Self {
             rows,
             bare: rows.first().copied(),
+            extremum: None,
         }
     }
 
     /// Bare columns read `bare`, or the first row when it is `None`.
-    fn with_bare_row(rows: &'a [&'a Vec<SqliteValue>], bare: Option<&'a Vec<SqliteValue>>) -> Self {
+    fn with_bare_row(
+        rows: &'a [&'a Vec<SqliteValue>],
+        bare: Option<&'a Vec<SqliteValue>>,
+        extremum: Option<(&'a TrackedMinMax, &'a SqliteValue)>,
+    ) -> Self {
         Self {
             rows,
             bare: bare.or_else(|| rows.first().copied()),
+            extremum,
         }
     }
 
@@ -138009,6 +138003,11 @@ fn eval_group_agg_join_expr(
     group_rows: &GroupRows<'_>,
     col_map: &[(String, String, bool)],
 ) -> Result<SqliteValue> {
+    if let Some((tracked, value)) = group_rows.extremum
+        && expr_matches_tracked_minmax(expr, tracked)
+    {
+        return Ok(value.clone());
+    }
     match expr {
         // bd-cnwdm: JSON1 aggregates computed directly (NULL-preserving for
         // json_group_array; two-argument key/value pairs for json_group_object).

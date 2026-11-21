@@ -385,7 +385,7 @@ fn mixed_numeric_group_keys_follow_the_extremum_row() {
 }
 
 #[test]
-fn grouped_join_uses_each_tracked_argument_once() {
+fn grouped_queries_use_each_tracked_argument_once() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -405,18 +405,48 @@ fn grouped_join_uses_each_tracked_argument_once() {
     }
 
     asupersync::test_utils::run_test(|| async {
-        let db = Connection::open(":memory:").await.unwrap();
-        db.execute_batch("CREATE TABLE t(k); INSERT INTO t VALUES(1),(1.0); CREATE TABLE u(n); INSERT INTO u VALUES(2);")
-            .await.unwrap();
-        let calls = Arc::new(AtomicI64::new(0));
-        db.register_nondeterministic_scalar_function(NextValue(Arc::clone(&calls)));
-        let rows = db
-            .query("SELECT k, max(next_value()), max(next_value()) FROM t CROSS JOIN u GROUP BY k")
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("volatile.db");
+        for path in [":memory:", file.to_str().unwrap()] {
+            let db = Connection::open(path).await.unwrap();
+            db.execute_batch(
+                "CREATE TABLE t(k); INSERT INTO t VALUES(1),(1.0);
+                 CREATE TABLE u(n); INSERT INTO u VALUES(2);",
+            )
             .await
             .unwrap();
-        assert_eq!(tag_rows(&rows), vec![vec!["real:1", "int:2", "int:2"]]);
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        db.close().await.unwrap();
+            let calls = Arc::new(AtomicI64::new(0));
+            db.register_nondeterministic_scalar_function(NextValue(Arc::clone(&calls)));
+            for source in ["t", "t CROSS JOIN u"] {
+                for template in [
+                    "SELECT k,max(next_value()),max(next_value()) FROM @SOURCE@ GROUP BY k",
+                    "SELECT k,max(next_value())+0,max(next_value()) FROM @SOURCE@ GROUP BY k",
+                    "SELECT k,max(next_value())+0,count(*) FROM @SOURCE@ GROUP BY k
+                     HAVING max(next_value())=2 ORDER BY max(next_value())+1",
+                ] {
+                    let sql = template.replace("@SOURCE@", source);
+                    for prepared in [false, true] {
+                        calls.store(0, Ordering::Relaxed);
+                        let rows = if prepared {
+                            db.prepare(&sql).await.unwrap().query().await.unwrap()
+                        } else {
+                            db.query(&sql).await.unwrap()
+                        };
+                        assert_eq!(
+                            tag_rows(&rows),
+                            vec![vec!["real:1", "int:2", "int:2"]],
+                            "{path}, prepared={prepared}: {sql}"
+                        );
+                        assert_eq!(
+                            calls.load(Ordering::Relaxed),
+                            2,
+                            "{path}, prepared={prepared}: {sql}"
+                        );
+                    }
+                }
+            }
+            db.close().await.unwrap();
+        }
     });
 }
 
