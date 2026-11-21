@@ -57,9 +57,12 @@ mod encrypt_stub {
     use fsqlite_error::Result;
     use fsqlite_types::cx::Cx;
 
-    /// Zero-sized cipher stub when the `encryption` feature is disabled.
+    /// Cipher stub when the `encryption` feature is disabled.
     #[derive(Debug, Clone, Default)]
-    pub struct ActivePageCipher;
+    pub struct ActivePageCipher {
+        /// Database page size in bytes (mirrors the `encryption` struct).
+        pub page_size: usize,
+    }
 
     /// Zero-sized cipher slot stub when the `encryption` feature is disabled.
     #[derive(Debug, Clone, Default)]
