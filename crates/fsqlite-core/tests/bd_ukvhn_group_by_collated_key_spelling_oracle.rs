@@ -343,6 +343,84 @@ fn mixed_integer_real_group_by_key_spelling_matches_stock_on_a_strict_file_datab
 }
 
 #[test]
+#[cfg(feature = "ext-json")]
+fn mixed_numeric_group_keys_follow_the_extremum_row() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "CREATE TABLE data(k, score); INSERT INTO data VALUES(1,0),(1.0,1);";
+        stock.execute_batch(setup).unwrap();
+        let path = dir.path().join("groups.db");
+        for db in [":memory:", path.to_str().unwrap()] {
+            let frank = Connection::open(db).await.unwrap();
+            frank.execute_batch(setup).await.unwrap();
+            for sql in [
+                "SELECT a.value, max(a.type='real') FROM json_each('[1,1.0]') a, json_each('[0]') b GROUP BY a.value",
+                "SELECT a.value, min(a.type='real') FROM json_each('[1.0,1]') a, json_each('[0]') b GROUP BY a.value",
+                "SELECT a.value, count(*) FROM json_each('[1,1.0]') a, json_each('[0]') b GROUP BY a.value",
+                "SELECT a.value, max(a.type='real') FROM json_each('[1,1.0]') a GROUP BY a.value",
+                "SELECT typeof(k), quote(k), max(score) FROM data GROUP BY k",
+                "SELECT typeof(k), max(score) FROM data GROUP BY k HAVING typeof(k)='real'",
+                "SELECT k, max(score), max(-score) FROM data GROUP BY k",
+                "SELECT k, max(-score), max(score) FROM data GROUP BY k",
+                "SELECT typeof(k), quote(k), max(score) FROM data CROSS JOIN json_each('[0]') GROUP BY k",
+                "SELECT k, count(*) FROM data CROSS JOIN json_each('[0]') GROUP BY k",
+                "SELECT k, max(score) FROM data CROSS JOIN json_each('[0]') WHERE 0 GROUP BY k",
+                "SELECT k, max(score) FILTER (WHERE score=0) FROM data CROSS JOIN json_each('[0]') GROUP BY k",
+                "SELECT k, max(DISTINCT score) FROM data CROSS JOIN json_each('[0]') GROUP BY k",
+            ] {
+                let expected = rq(&stock, sql).unwrap();
+                let direct = frank.query(sql).await.unwrap();
+                assert_eq!(tag_rows(&direct), expected, "{db}, ad hoc: {sql}");
+                let prepared = frank.prepare(sql).await.unwrap();
+                assert_eq!(
+                    tag_rows(&prepared.query().await.unwrap()),
+                    expected,
+                    "{db}, prepared: {sql}"
+                );
+            }
+            frank.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn grouped_join_uses_each_tracked_argument_once() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    struct NextValue(Arc<AtomicI64>);
+    impl fsqlite_func::ScalarFunction for NextValue {
+        fn name(&self) -> &str {
+            "next_value"
+        }
+        fn num_args(&self) -> i32 {
+            0
+        }
+        fn invoke(&self, _: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+            Ok(SqliteValue::Integer(
+                self.0.fetch_add(1, Ordering::Relaxed) + 1,
+            ))
+        }
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        let db = Connection::open(":memory:").await.unwrap();
+        db.execute_batch("CREATE TABLE t(k); INSERT INTO t VALUES(1),(1.0); CREATE TABLE u(n); INSERT INTO u VALUES(2);")
+            .await.unwrap();
+        let calls = Arc::new(AtomicI64::new(0));
+        db.register_nondeterministic_scalar_function(NextValue(Arc::clone(&calls)));
+        let rows = db
+            .query("SELECT k, max(next_value()), max(next_value()) FROM t CROSS JOIN u GROUP BY k")
+            .await
+            .unwrap();
+        assert_eq!(tag_rows(&rows), vec![vec!["real:1", "int:2", "int:2"]]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        db.close().await.unwrap();
+    });
+}
+
+#[test]
 fn collated_group_by_key_spelling_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         let mut diffs = Vec::new();
