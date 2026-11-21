@@ -47669,10 +47669,9 @@ impl Connection {
         } else {
             select_stmt.clone()
         };
-        if self.skip_statement_memdb_refresh.get() && effective_select.with.is_none() {
-            return Box::pin(self.execute_select_via_memdb_fallback(&effective_select, params))
-                .await;
-        }
+        // The dispatcher honors skip_statement_memdb_refresh itself. Keep
+        // its full SELECT semantics even when attached CTE execution has
+        // installed temporary roots and suppressed refreshes.
         self.execute_statement(&Statement::Select(effective_select), params)
             .await
     }
@@ -106402,15 +106401,14 @@ impl Connection {
             .await?;
         let mut stripped = insert.clone();
         stripped.with = None;
-        // Route through the interpreted INSERT fallback instead of the
-        // full dispatch. The VDBE codegen's find_table cannot locate
-        // CTE temp tables that are only in the connection's live schema,
-        // causing "no such table" errors. The interpreted fallback
-        // materializes the SELECT source rows (which CAN find the temp
-        // table via the connection's schema) and inserts them row-by-row.
+        // bd-wiffk: use the same complete SELECT execution as ordinary
+        // INSERT ... SELECT. A direct MemDatabase join/group executor only
+        // evaluates one SELECT core, losing compound arms and their final
+        // ORDER BY/LIMIT/OFFSET. Keep the materialized CTE roots alive through
+        // source evaluation and row replay.
         if let InsertSource::Select(ref select_stmt) = stripped.source {
             let source_rows = self
-                .execute_select_via_memdb_fallback(select_stmt, params)
+                .materialize_insert_select_source_rows(&stripped, select_stmt, params)
                 .await?;
             // The source is now owned. Restore the caller's normal policy
             // before trigger replay so each row does not reload every table.

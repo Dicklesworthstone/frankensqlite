@@ -37299,7 +37299,8 @@ fn having_reads_grouped_output(
                 && is_aggregate_function_call(name, args)
                 && projected_having_slot(expr, columns, table, source).is_some()
         }
-        Expr::IsNull { expr, .. } => supplied(expr),
+        Expr::Collate { expr, .. } | Expr::IsNull { expr, .. }
+        | Expr::UnaryOp { op: fsqlite_ast::UnaryOp::Not, expr, .. } => supplied(expr),
         Expr::BinaryOp {
             left,
             op: BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt
@@ -37479,6 +37480,30 @@ fn emit_having_expr(
             }
             // Fallback: emit NULL for unresolved column.
             b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
+        }
+
+        // These wrappers must keep resolving their operands against the
+        // finalized group, not a scan cursor that is no longer positioned.
+        Expr::Collate { expr: inner, .. }
+        | Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Not,
+            expr: inner,
+            ..
+        } => {
+            emit_having_expr(
+                b,
+                inner,
+                dest_reg,
+                output_cols,
+                agg_columns,
+                group_by_keys,
+                projection,
+                scan,
+                out_regs,
+            );
+            if matches!(expr, Expr::UnaryOp { .. }) {
+                b.emit_op(Opcode::Not, dest_reg, dest_reg, 0, P4::None, 0);
+            }
         }
 
         // Binary comparison — evaluate both sides, then compare.
