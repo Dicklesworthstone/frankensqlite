@@ -94,6 +94,40 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-21 - WIN (landed as 4e15416e8; under its prediction on the join and over it on rowid_lookups, inside every kill line): the table seek cache keeps eight leaves, slot 0 in the cursor and slots 1..7 in one array moved as a slice, so BtCursor shrinks by 88 B (bd-w4pr1.12, serial read lane round 12, lever SC8 v4)
+
+- Target: join_1M_to_pk_1000, whose 1M probes into u step across five leaves while the four-slot seek cache
+  missed on every leaf change.
+- History: SC8 v2 (eight inline slots, BtCursor 1,800 B) lost scan_filter_agg cycles at identical Ir (the
+  2026-11-19 entry). SC8 v3 (slots 1..7 boxed, accessed slot by slot) was rejected at rowid_lookups_200k +1.93% Ir
+  (2026-11-21 entry). Callgrind of v3 attributed the cost to its per-slot push_front (219 Ir a missed probe) and
+  per-slot scan (73).
+- Touched: `crates/fsqlite-btree/src/cursor.rs`. `TABLE_SEEK_CACHE_SLOTS` 4 -> 8. `TableSeekCache` holds slot 0
+  inline and slots 1..7 in one `Box<[Option<TableSeekCacheEntry>; 7]>`. `rest()` returns them as a slice.
+  `push_front` is `rest[..end].rotate_right(1); rest[0] = first; first = entry`. `landing_slot` is a slice
+  position. A hit's move to the front is one push_front. Keeper `test_table_seek_cache_keeps_the_cursor_footprint`
+  and the rewritten LRU / loads-only tests. BtCursor<MemPageStore> 1,672 -> 1,584 B.
+- Prediction (bd-w4pr1.12, before the build): join -430 to -465M Ir, rowid_lookups 0 to +4M, memory_script -180 to
+  -240M, every other row within 0.1%. Kill lines: the join at least 300M down; rowid_lookups no more than +0.5% Ir;
+  every other row within 0.5%; no replicated layout-averaged LOSE; answers equal stock; planted mutants fail.
+- Result:
+  - Setup: parent 1eb109005 against parent + v4, one layout_shuffle_pair job (K=6), two judgement runs (both valid).
+    Stock sqlite3 3.46.1 live; thinkstation1. Answers equal stock; parent sources equal git.
+  - Instructions (callgrind, single ELF): join 4,021.5M -> 3,615.7M (-405.8M, under the band; x2.34 -> x2.10 stock);
+    rowid_lookups 2,667.9M -> 2,677.9M (+10.0M, +0.37%, over the band; per missed probe +40 in the eight-slot scan,
+    +30 in the rotate's memmove, -20 in the landing); memory_script ratio 0.942; every other row within +0.11%.
+  - Time (layout-averaged): join cpu 0.852 / 0.828 WIN (x2.15 -> x1.83 stock); memory_script cpu 0.935 / 0.941
+    WIN; every other row a replicated TIE (rowid_lookups LOSE in run 1 only). scan_filter_agg is a TIE in both runs:
+    at a smaller cursor the v2 loss does not appear, which supports the footprint hypothesis.
+- Mutants (rch, rc 101): the last slot cleared after every landing fails both rewritten tests; the old front dropped
+  fails all five seek-cache tests.
+- Gate (b405417ab + diff 496146c312bdccfe; the commits before landing do not touch fsqlite-btree): clippy btree /
+  vdbe / core clean; libs + goldens + hot_arm_stream_reachability 6,045 passed; 46 core seek / join oracles 195
+  passed; 15 e2e oracles 103 passed; fsqlite crate in 7 batches of 19, 124 binaries, 1,103 passed, 0 failed.
+- Retry condition: none for this shape. Left on rowid_lookups_200k: the eight-slot scan's +50 Ir a missed probe (a
+  probe no slot admits); the point-lookup lane owns that row. SL2 v2's retry condition ("a landed multi-slot cursor
+  cache", 2026-11-19 entry) is met by this landing; it returns to the coordinator's queue.
+
 ## 2026-11-21 - MAINTENANCE (landed as c0e568aaf; inside its prediction, on instructions; every row still a loss to stock): the C API drives engine futures with `fsqlite::blocking::block_on` instead of entering a thread-local runtime per call (bd-zqr9h, lever L1)
 
 - Target: `crates/fsqlite-c-api`, every C entry point. Each call entered a thread-local asupersync current_thread
