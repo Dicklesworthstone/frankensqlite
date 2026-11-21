@@ -26774,6 +26774,24 @@ impl Connection {
         }))
     }
 
+    /// Rows changed by the most recent completed INSERT, UPDATE or DELETE.
+    ///
+    /// The value SQL `changes()` returns, as stock's `sqlite3_changes`.
+    /// Reading it runs no statement (bd-zqr9h).
+    #[must_use]
+    pub fn last_change_count(&self) -> usize {
+        self.last_changes.get()
+    }
+
+    /// Rows changed by INSERT, UPDATE and DELETE since the connection opened.
+    ///
+    /// The value SQL `total_changes()` returns, as stock's
+    /// `sqlite3_total_changes`.
+    #[must_use]
+    pub fn total_change_count(&self) -> usize {
+        self.total_changes.get()
+    }
+
     fn reset_statement_change_count(&self) {
         self.last_changes.set(0);
         self.sync_change_tracking_context();

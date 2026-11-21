@@ -143,7 +143,6 @@ pub struct Sqlite3 {
     temporary_path: Option<PathBuf>,
     last_error: Mutex<CString>,
     last_error_code: AtomicI32,
-    last_changes: AtomicI32,
     active_statements: AtomicUsize,
 }
 
@@ -154,7 +153,6 @@ impl Sqlite3 {
             temporary_path,
             last_error: Mutex::new(CString::new(DEFAULT_ERROR_MESSAGE).expect("static")),
             last_error_code: AtomicI32::new(SQLITE_OK),
-            last_changes: AtomicI32::new(0),
             active_statements: AtomicUsize::new(0),
         }
     }
@@ -175,17 +173,6 @@ impl Sqlite3 {
             *guard = c_string_truncate_on_nul(DEFAULT_ERROR_MESSAGE);
         }
         self.last_error_code.store(SQLITE_OK, Ordering::Relaxed);
-    }
-
-    fn refresh_last_changes(&self) {
-        let changes = block_on(self.conn.query_row("SELECT changes();"))
-            .ok()
-            .and_then(|row| match row.get(0) {
-                Some(SqliteValue::Integer(n)) => Some(i64_to_c_int_saturating(*n)),
-                _ => None,
-            })
-            .unwrap_or(0);
-        self.last_changes.store(changes, Ordering::Relaxed);
     }
 
     fn register_statement(&self) {
@@ -334,14 +321,8 @@ fn parse_embedded_vdbe_result_code(err: &FrankenError) -> Option<c_int> {
     code_text.parse::<c_int>().ok()
 }
 
-fn i64_to_c_int_saturating(value: i64) -> c_int {
-    if value < i64::from(c_int::MIN) {
-        c_int::MIN
-    } else if value > i64::from(c_int::MAX) {
-        c_int::MAX
-    } else {
-        value as c_int
-    }
+fn usize_to_c_int_saturating(value: usize) -> c_int {
+    c_int::try_from(value).unwrap_or(c_int::MAX)
 }
 
 fn c_string_truncate_on_nul(value: &str) -> CString {
@@ -578,7 +559,6 @@ unsafe fn execute_exec_batch(
         let trimmed = remaining.trim_start();
         if trimmed.is_empty() {
             handle.clear_error();
-            handle.refresh_last_changes();
             return SQLITE_OK;
         }
         let statement_offset = sql.len().saturating_sub(trimmed.len());
@@ -587,7 +567,6 @@ unsafe fn execute_exec_batch(
             Ok(Some(tail_offset)) => tail_offset,
             Ok(None) => {
                 handle.clear_error();
-                handle.refresh_last_changes();
                 return SQLITE_OK;
             }
             Err(FrankenError::ParseError { offset, detail }) => {
@@ -1070,7 +1049,6 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
         match execute_result {
             Ok(Ok(Some(rows))) => {
                 db.clear_error();
-                db.refresh_last_changes();
                 if s.column_count == 0
                     && let Some(first) = rows.first()
                 {
@@ -1084,7 +1062,6 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             }
             Ok(Ok(None)) => {
                 db.clear_error();
-                db.refresh_last_changes();
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
                 s.active_row = false;
@@ -1093,7 +1070,6 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             }
             Ok(Err(ref e)) if matches!(e, FrankenError::QueryReturnedNoRows) => {
                 db.clear_error();
-                db.refresh_last_changes();
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
                 s.active_row = false;
@@ -1717,7 +1693,12 @@ pub unsafe extern "C" fn sqlite3_errcode(db: *mut Sqlite3) -> c_int {
 
 // ── sqlite3_changes ─────────────────────────────────────────────────
 
-/// Return the number of rows modified by the most recent INSERT/UPDATE/DELETE.
+/// Return the number of rows modified by the most recent completed
+/// INSERT/UPDATE/DELETE.
+///
+/// This is the connection's own counter, read without running a statement
+/// (bd-zqr9h). As in stock, a statement that fails to prepare leaves it
+/// unchanged and one that fails while running leaves 0.
 ///
 /// # Safety
 /// `db` must be a valid handle.
@@ -1726,7 +1707,20 @@ pub unsafe extern "C" fn sqlite3_changes(db: *mut Sqlite3) -> c_int {
     if db.is_null() {
         return 0;
     }
-    (&*db).last_changes.load(Ordering::Relaxed)
+    usize_to_c_int_saturating((&*db).conn.last_change_count())
+}
+
+/// Return the number of rows modified by INSERT/UPDATE/DELETE since the
+/// connection was opened.
+///
+/// # Safety
+/// `db` must be a valid handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_total_changes(db: *mut Sqlite3) -> c_int {
+    if db.is_null() {
+        return 0;
+    }
+    usize_to_c_int_saturating((&*db).conn.total_change_count())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -3011,6 +3005,121 @@ mod tests {
             assert_eq!(sqlite3_changes(db), 0);
 
             sqlite3_close(db);
+        }
+    }
+
+    /// (prepare rc, last step rc or -1, sqlite3_changes, sqlite3_total_changes,
+    /// first column of the first row) after one statement.
+    type ChangeLine = (c_int, c_int, c_int, c_int, Option<i64>);
+
+    /// Run each statement through prepare_v2 / step / finalize, as a C caller
+    /// does, and record its [`ChangeLine`].
+    unsafe fn change_counts_after(db: *mut Sqlite3, statements: &[&str]) -> Vec<ChangeLine> {
+        let mut seen = Vec::with_capacity(statements.len());
+        for sql in statements {
+            let c = CString::new(*sql).unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            let prepare_rc = sqlite3_prepare_v2(db, c.as_ptr(), -1, &mut stmt, ptr::null_mut());
+            let mut step_rc = -1;
+            let mut value = None;
+            if prepare_rc == SQLITE_OK && !stmt.is_null() {
+                loop {
+                    step_rc = sqlite3_step(stmt);
+                    if step_rc != SQLITE_ROW {
+                        break;
+                    }
+                    value.get_or_insert_with(|| sqlite3_column_int64(stmt, 0));
+                }
+                sqlite3_finalize(stmt);
+            }
+            seen.push((
+                prepare_rc,
+                step_rc,
+                sqlite3_changes(db),
+                sqlite3_total_changes(db),
+                value,
+            ));
+        }
+        seen
+    }
+
+    /// bd-zqr9h L2: sqlite3_changes and sqlite3_total_changes read the
+    /// connection's own counters. These are the 19 statements of the bead's
+    /// dlopen differential, run as a C caller runs them; `stock` is stock
+    /// libsqlite3 3.54.1's line for each, through the same calls. A statement
+    /// that fails to prepare keeps the count (#4, #8); one that fails while
+    /// running (a UNIQUE violation part-way through a multi-row UPDATE, #11)
+    /// leaves 0 and adds nothing to the total; a successful UPDATE of no rows
+    /// sets 0 (#13); DDL and SELECT keep the count. The cached count this
+    /// replaces kept 2 after #11, and the shim had no sqlite3_total_changes.
+    ///
+    /// #6 is the one line whose return codes are not stock's. Stock rejects
+    /// `UPDATE w SET (x, nope) = (SELECT 1, 2, 3)` in sqlite3_prepare_v2
+    /// ("no such column: nope"); fsqlite's prepare accepts it and its step
+    /// fails. That prepare acceptance is bd-4l4y3, whose probe owns stock's
+    /// line (prepare 1, no step); this test pins main's return codes there.
+    /// Its counts are stock's: since bd-rwo47 (2a359ad03) a statement that
+    /// fails with a prepare-time error keeps the count wherever fsqlite
+    /// raises the error, so #6 to #9 read 3 as in stock.
+    #[test]
+    fn test_changes_and_total_changes_match_stock() {
+        unsafe {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = CString::new(dir.path().join("changes.db").to_str().unwrap()).unwrap();
+            let mut db: *mut Sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+            let statements = [
+                "CREATE TABLE w(x INTEGER PRIMARY KEY, y UNIQUE)",
+                "INSERT INTO w VALUES (1, 10), (2, 20), (3, 30)",
+                "SELECT count(*) FROM w",
+                "UPDATE nosuch SET x = 1",
+                "SELECT changes()",
+                "UPDATE w SET (x, nope) = (SELECT 1, 2, 3)",
+                "SELECT changes()",
+                "SELEC 1",
+                "SELECT changes()",
+                "UPDATE w SET y = y + 1 WHERE x <= 2",
+                "UPDATE w SET y = 21 WHERE x >= 1",
+                "SELECT changes()",
+                "UPDATE w SET y = y WHERE x = 99",
+                "INSERT INTO w VALUES (4, 40)",
+                "CREATE TABLE z(a)",
+                "SELECT changes()",
+                "DELETE FROM w WHERE x >= 3",
+                "SELECT changes()",
+                "SELECT total_changes()",
+            ];
+            let (ok, err, done) = (SQLITE_OK, SQLITE_ERROR, SQLITE_DONE);
+            let stock = [
+                (ok, done, 0, 0, None),
+                (ok, done, 3, 3, None),
+                (ok, done, 3, 3, Some(3)),
+                (err, -1, 3, 3, None),
+                (ok, done, 3, 3, Some(3)),
+                (err, -1, 3, 3, None),
+                (ok, done, 3, 3, Some(3)),
+                (err, -1, 3, 3, None),
+                (ok, done, 3, 3, Some(3)),
+                (ok, done, 2, 5, None),
+                (ok, SQLITE_CONSTRAINT, 0, 5, None),
+                (ok, done, 0, 5, Some(0)),
+                (ok, done, 0, 5, None),
+                (ok, done, 1, 6, None),
+                (ok, done, 1, 6, None),
+                (ok, done, 1, 6, Some(1)),
+                (ok, done, 2, 8, None),
+                (ok, done, 2, 8, Some(2)),
+                (ok, done, 2, 8, Some(8)),
+            ];
+            // #6: main's return codes (bd-4l4y3), stock's counts.
+            let mut want_lines = stock;
+            want_lines[5] = (ok, err, 3, 3, None);
+            let seen = change_counts_after(db, &statements);
+            assert_eq!(seen.len(), statements.len());
+            for ((sql, want), got) in statements.iter().zip(want_lines).zip(&seen) {
+                assert_eq!(*got, want, "{sql}");
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
 
