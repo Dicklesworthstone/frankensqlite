@@ -15,9 +15,9 @@
 //! Every statement runs on bundled SQLite 3.54.1 and on fsqlite, on `:memory:`
 //! and on a file, executed directly and prepared. Each statement's rows, or
 //! its error text, must equal stock's, and is pinned to stock's so the
-//! comparison cannot pass vacuously. This suite includes expressions that
-//! use the grouped fallback. The bd-4uurt oracle separately exercises the
-//! compiled HAVING predicates under strict file-backed execution.
+//! comparison cannot pass vacuously. The file matrix repeats the comparison
+//! and misuse cases with fallback rejection enabled. Arithmetic and scalar
+//! function arguments additionally exercise the grouped expression evaluator.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -113,16 +113,6 @@ const QUERIES: &[(&str, &str)] = &[
          HAVING count(*) >= 1 AND ((a, b), 1) IS ((2, 2), 1)",
         "rows=[[\"2\", \"2\", \"1\"]]",
     ),
-    // Built from GROUP BY terms: an expression, a scalar function, a
-    // constant (NULL, so no group).
-    (
-        "SELECT a, b, count(*) FROM t GROUP BY a, b HAVING ((a + 1, b), 1) = ((2, 3), 1)",
-        "rows=[[\"1\", \"3\", \"1\"]]",
-    ),
-    (
-        "SELECT a, b, count(*) FROM t GROUP BY a, b HAVING ((abs(a), b), 1) = ((1, 2), 1)",
-        ONE_TWO,
-    ),
     (
         "SELECT a, b, count(*) FROM t GROUP BY a, b HAVING ((a, b), NULL) = ((1, 2), 1)",
         "rows=[]",
@@ -161,19 +151,25 @@ const QUERIES: &[(&str, &str)] = &[
     ),
 ];
 
+const EXPRESSION_QUERIES: &[(&str, &str)] = &[
+    (
+        "SELECT a, b, count(*) FROM t GROUP BY a, b HAVING ((a + 1, b), 1) = ((2, 3), 1)",
+        "rows=[[\"1\", \"3\", \"1\"]]",
+    ),
+    (
+        "SELECT a, b, count(*) FROM t GROUP BY a, b HAVING ((abs(a), b), 1) = ((1, 2), 1)",
+        ONE_TWO,
+    ),
+];
+
 #[test]
 fn having_nested_row_values_over_group_by_terms_match_stock() {
     let stock = rusqlite::Connection::open_in_memory().unwrap();
     for sql in SETUP {
         stock.execute_batch(sql).unwrap();
     }
-    let expected: Vec<String> = QUERIES
-        .iter()
-        .map(|(sql, _)| stock_outcome(&stock, sql))
-        .collect();
-    // Not vacuous: stock gives each pinned outcome.
-    for ((sql, pinned), stock_gave) in QUERIES.iter().zip(&expected) {
-        assert_eq!(stock_gave, pinned, "stock on `{sql}`");
+    for &(sql, pinned) in QUERIES.iter().chain(EXPRESSION_QUERIES) {
+        assert_eq!(stock_outcome(&stock, sql), pinned, "stock on `{sql}`");
     }
     asupersync::test_utils::run_test(|| async {
         for file_backed in [false, true] {
@@ -188,13 +184,26 @@ fn having_nested_row_values_over_group_by_terms_match_stock() {
                 for sql in SETUP {
                     conn.execute(sql).await.unwrap();
                 }
-                for ((sql, _), expected) in QUERIES.iter().zip(&expected) {
+                for &(sql, expected) in QUERIES.iter().chain(EXPRESSION_QUERIES) {
                     let got = fsqlite_outcome(&conn, sql, prepared).await;
                     assert_eq!(
-                        &got, expected,
+                        got, expected,
                         "file_backed={file_backed} prepared={prepared}: `{sql}`"
                     );
                 }
+                if file_backed {
+                    conn.execute("PRAGMA fsqlite.parity_cert_strict=ON")
+                        .await
+                        .unwrap();
+                    for &(sql, expected) in QUERIES {
+                        assert_eq!(
+                            fsqlite_outcome(&conn, sql, prepared).await,
+                            expected,
+                            "strict file prepared={prepared}: `{sql}`"
+                        );
+                    }
+                }
+                conn.close().await.unwrap();
             }
         }
     });
