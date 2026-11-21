@@ -16908,24 +16908,11 @@ impl<'a> MaterializedBindingsVisibilityGuard<'a> {
         occupied_names: &mut HashSet<String>,
         reserved_sql: &str,
     ) -> String {
-        // Replay reparses these identifiers and semantic lookup keys reserve
-        // NUL as a namespace separator. Use ordinary SQL identifiers, checking
-        // both tables and views so a user-defined name cannot capture a read.
-        let base = format!("__fsqlite_materialized_{root_page}");
-        let mut suffix = 0usize;
-        loop {
-            let candidate = if suffix == 0 {
-                base.clone()
-            } else {
-                format!("{base}_{suffix}")
-            };
-            if !reserved_sql.contains(candidate.as_str())
-                && occupied_names.insert(candidate.clone())
-            {
-                return candidate;
-            }
-            suffix = suffix.saturating_add(1);
-        }
+        fresh_private_relation_name(
+            &format!("__fsqlite_materialized_{root_page}"),
+            occupied_names,
+            reserved_sql,
+        )
     }
 
     fn for_insert_target(conn: &'a Connection, insert: &mut fsqlite_ast::InsertStatement) -> Self {
@@ -103917,6 +103904,160 @@ impl Connection {
 
     /// Materialize CTEs as temporary in-memory tables, execute the main query
     /// with `with` stripped, then clean up the temporary tables.
+    /// Every table and view name, lowercased: the names a private relation
+    /// name must avoid.
+    fn occupied_relation_names(&self) -> HashSet<String> {
+        self.schema
+            .borrow()
+            .iter()
+            .map(|table| table.name.to_ascii_lowercase())
+            .chain(
+                self.views
+                    .borrow()
+                    .iter()
+                    .map(|view| view.name.to_ascii_lowercase()),
+            )
+            .collect()
+    }
+
+    /// [`privatize_ctes_bound_elsewhere`] for a SELECT's own WITH, which
+    /// every schema-qualified relation of the statement is kept from.
+    /// `None`, with nothing cloned, when no CTE shares such a name.
+    fn privatize_select_ctes_bound_elsewhere(
+        &self,
+        select: &SelectStatement,
+    ) -> Option<SelectStatement> {
+        let mut bound_elsewhere = BTreeSet::new();
+        let _ = visit_select_qualified_names(select, &mut |name| {
+            collect_schema_qualified_relation_name(&mut bound_elsewhere, name);
+            Ok(())
+        });
+        if !with_names_any(select.with.as_ref()?, &bound_elsewhere) {
+            return None;
+        }
+        let reserved_sql = select.to_string().to_ascii_lowercase();
+        let mut select = select.clone();
+        let mut with = select.with.take()?;
+        let renamed = privatize_ctes_bound_elsewhere(
+            &mut with,
+            &bound_elsewhere,
+            &mut self.occupied_relation_names(),
+            &reserved_sql,
+            |name, private_name| {
+                subst_cte_refs_in_select(
+                    &mut select,
+                    name,
+                    CteSourceSubstitution::Materialized(private_name),
+                    &mut 0,
+                );
+            },
+        );
+        select.with = Some(with);
+        renamed.then_some(select)
+    }
+
+    /// [`privatize_ctes_bound_elsewhere`] for a DELETE's WITH, which the
+    /// target and every schema-qualified relation are kept from.
+    fn privatize_delete_ctes_bound_elsewhere(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+    ) -> Option<fsqlite_ast::DeleteStatement> {
+        let with = delete.with.as_ref()?;
+        let mut bound_elsewhere = BTreeSet::from([delete.table.name.name.to_ascii_lowercase()]);
+        let mut collect = |name: &QualifiedName| {
+            collect_schema_qualified_relation_name(&mut bound_elsewhere, name);
+            Ok(())
+        };
+        for cte in &with.ctes {
+            let _ = visit_select_qualified_names(&cte.query, &mut collect);
+        }
+        let _ = visit_delete_qualified_names(delete, &mut collect);
+        if !with_names_any(with, &bound_elsewhere) {
+            return None;
+        }
+        let reserved_sql = delete.to_string().to_ascii_lowercase();
+        let mut delete = delete.clone();
+        let mut with = delete.with.take()?;
+        let renamed = privatize_ctes_bound_elsewhere(
+            &mut with,
+            &bound_elsewhere,
+            &mut self.occupied_relation_names(),
+            &reserved_sql,
+            |name, private_name| rebind_materialized_delete_reads(&mut delete, name, private_name),
+        );
+        delete.with = Some(with);
+        renamed.then_some(delete)
+    }
+
+    /// [`privatize_ctes_bound_elsewhere`] for an UPDATE's WITH, which the
+    /// target and every schema-qualified relation are kept from.
+    fn privatize_update_ctes_bound_elsewhere(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+    ) -> Option<fsqlite_ast::UpdateStatement> {
+        let with = update.with.as_ref()?;
+        let mut bound_elsewhere = BTreeSet::from([update.table.name.name.to_ascii_lowercase()]);
+        let mut collect = |name: &QualifiedName| {
+            collect_schema_qualified_relation_name(&mut bound_elsewhere, name);
+            Ok(())
+        };
+        for cte in &with.ctes {
+            let _ = visit_select_qualified_names(&cte.query, &mut collect);
+        }
+        let _ = visit_update_qualified_names(update, &mut collect);
+        if !with_names_any(with, &bound_elsewhere) {
+            return None;
+        }
+        let reserved_sql = update.to_string().to_ascii_lowercase();
+        let mut update = update.clone();
+        let mut with = update.with.take()?;
+        let renamed = privatize_ctes_bound_elsewhere(
+            &mut with,
+            &bound_elsewhere,
+            &mut self.occupied_relation_names(),
+            &reserved_sql,
+            |name, private_name| rebind_materialized_update_reads(&mut update, name, private_name),
+        );
+        update.with = Some(with);
+        renamed.then_some(update)
+    }
+
+    /// [`privatize_ctes_bound_elsewhere`] for an INSERT's WITH, which the
+    /// target and every schema-qualified relation are kept from.
+    fn privatize_insert_ctes_bound_elsewhere(&self, insert: &mut fsqlite_ast::InsertStatement) {
+        let Some(with) = insert.with.take() else {
+            return;
+        };
+        let mut bound_elsewhere = BTreeSet::from([insert.table.name.to_ascii_lowercase()]);
+        let mut collect = |name: &QualifiedName| {
+            collect_schema_qualified_relation_name(&mut bound_elsewhere, name);
+            Ok(())
+        };
+        for cte in &with.ctes {
+            let _ = visit_select_qualified_names(&cte.query, &mut collect);
+        }
+        visit_insert_qualified_name_sites_mut(insert, &mut |name, _| {
+            let _ = collect(name);
+        });
+        let names_a_cte = with_names_any(&with, &bound_elsewhere);
+        insert.with = Some(with);
+        if !names_a_cte {
+            return;
+        }
+        let reserved_sql = insert.to_string().to_ascii_lowercase();
+        let Some(mut with) = insert.with.take() else {
+            return;
+        };
+        privatize_ctes_bound_elsewhere(
+            &mut with,
+            &bound_elsewhere,
+            &mut self.occupied_relation_names(),
+            &reserved_sql,
+            |name, private_name| rebind_materialized_insert_reads(insert, name, private_name),
+        );
+        insert.with = Some(with);
+    }
+
     async fn execute_with_ctes(
         &self,
         select: &SelectStatement,
@@ -103930,6 +104071,17 @@ impl Connection {
             &numbered
         } else {
             select
+        };
+        // bd-mm6ec: a CTE that a schema-qualified relation of the statement
+        // names is materialized under a private name, so the qualified name
+        // still reaches the catalog's table.
+        let privatized;
+        let select = match self.privatize_select_ctes_bound_elsewhere(select) {
+            Some(renamed) => {
+                privatized = renamed;
+                &privatized
+            }
+            None => select,
         };
         // bd-gh-cte-materialization-hints-sn0yh / GH#204: a NOT MATERIALIZED
         // non-recursive CTE must be inlined at each reference so its body
@@ -105507,6 +105659,16 @@ impl Connection {
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-mm6ec: a CTE named like the target or a qualified relation is
+        // materialized under a private name.
+        let privatized;
+        let delete = match self.privatize_delete_ctes_bound_elsewhere(delete) {
+            Some(renamed) => {
+                privatized = renamed;
+                &privatized
+            }
+            None => delete,
+        };
         if let Some(target_schema) = self.attached_target_schema(&delete.table.name)? {
             self.prepare_attached_target_write_in_explicit_transaction(
                 "DELETE",
@@ -105563,6 +105725,16 @@ impl Connection {
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-mm6ec: a CTE named like the target or a qualified relation is
+        // materialized under a private name.
+        let privatized;
+        let update = match self.privatize_update_ctes_bound_elsewhere(update) {
+            Some(renamed) => {
+                privatized = renamed;
+                &privatized
+            }
+            None => update,
+        };
         if let Some(target_schema) = self.attached_target_schema(&update.table.name)? {
             self.prepare_attached_target_write_in_explicit_transaction(
                 "UPDATE",
@@ -105660,6 +105832,9 @@ impl Connection {
             &mut BindParamState::default(),
             &original_params,
         )?;
+        // bd-mm6ec: a CTE named like the target or a qualified relation is
+        // materialized under a private name.
+        self.privatize_insert_ctes_bound_elsewhere(&mut bound_insert);
         let insert = &bound_insert;
         let params = None;
         if let Some(target_schema) = self.attached_target_schema(&insert.table)? {
@@ -105807,40 +105982,7 @@ impl Connection {
         for cte_index in materialization_order {
             let cte = &ctes[cte_index];
             let cte_name = &cte.name;
-            // The anchor position — the CTE's first/main SELECT core — must not
-            // reference the CTE itself: a self-reference there has no base case and
-            // is SQLite's "circular reference: NAME" (for both WITH and WITH
-            // RECURSIVE), distinct from a valid recursive CTE whose recursive term
-            // lives in a later compound (UNION) arm. Without this, a bare self-ref
-            // `c AS (SELECT * FROM c)` (no compound) would fall through to normal
-            // materialization and mis-report "no such table: c".
-            // bd-errmsg-parity-batch3-3brmm.
-            //
-            // bd-gxbof: stock resolves the body with the CTE's own name bound
-            // to the CTE, so every reference the body's own WITHs do not
-            // shadow is circular, wherever it sits: a FROM item, a derived
-            // table, a scalar, EXISTS or IN subquery, or a nested CTE body the
-            // body reads. A body whose WITH defines the name reads that nested
-            // CTE instead (`WITH c AS (WITH c AS (SELECT 1 AS x) SELECT x
-            // FROM c) ...` is 1). Only a recursive arm's own FROM items bind
-            // to the recursive table, so a body that may recurse (a UNION or
-            // UNION ALL compound) is checked in its anchor, which stock
-            // resolves under the body's WITH.
-            let body_may_recurse = cte
-                .query
-                .body
-                .compounds
-                .last()
-                .is_some_and(|(op, _)| matches!(op, CompoundOp::Union | CompoundOp::UnionAll));
-            let reads_itself = if body_may_recurse {
-                select_contains_relation_reference(
-                    &recursive_cte_anchor_select(&cte.query),
-                    &mut CteReference(cte_name),
-                )
-            } else {
-                select_contains_relation_reference(&cte.query, &mut CteReference(cte_name))
-            };
-            if reads_itself {
+            if cte_body_reads_itself(cte) {
                 return Err(FrankenError::FunctionError(format!(
                     "circular reference: {cte_name}"
                 )));
@@ -124614,6 +124756,42 @@ fn recursive_cte_anchor_select(body: &SelectStatement) -> SelectStatement {
     }
 }
 
+/// Whether `cte`'s body reads the CTE itself where no base case can feed it,
+/// which is stock's "circular reference: NAME".
+///
+/// The anchor position, the CTE's first SELECT core, must not reference the
+/// CTE itself: a self-reference there has no base case, for both WITH and
+/// WITH RECURSIVE, unlike a valid recursive CTE whose recursive term lives in
+/// a later compound (UNION) arm. Without this, a bare self-ref `c AS (SELECT
+/// * FROM c)` (no compound) would fall through to normal materialization and
+/// mis-report "no such table: c". bd-errmsg-parity-batch3-3brmm.
+///
+/// bd-gxbof: stock resolves the body with the CTE's own name bound to the
+/// CTE, so every reference the body's own WITHs do not shadow is circular,
+/// wherever it sits: a FROM item, a derived table, a scalar, EXISTS or IN
+/// subquery, or a nested CTE body the body reads. A body whose WITH defines
+/// the name reads that nested CTE instead (`WITH c AS (WITH c AS (SELECT 1
+/// AS x) SELECT x FROM c) ...` is 1). Only a recursive arm's own FROM items
+/// bind to the recursive table, so a body that may recurse (a UNION or UNION
+/// ALL compound) is checked in its anchor, which stock resolves under the
+/// body's WITH.
+fn cte_body_reads_itself(cte: &fsqlite_ast::Cte) -> bool {
+    let body_may_recurse = cte
+        .query
+        .body
+        .compounds
+        .last()
+        .is_some_and(|(op, _)| matches!(op, CompoundOp::Union | CompoundOp::UnionAll));
+    if body_may_recurse {
+        select_contains_relation_reference(
+            &recursive_cte_anchor_select(&cte.query),
+            &mut CteReference(&cte.name),
+        )
+    } else {
+        select_contains_relation_reference(&cte.query, &mut CteReference(&cte.name))
+    }
+}
+
 /// The body's WITH as a recursive arm of `cte` reads it (bd-gxbof).
 ///
 /// Stock binds a recursive arm's own FROM references to the CTE's name to the
@@ -124904,6 +125082,184 @@ fn rebind_materialized_insert_reads(
         if let ResultColumn::Expr { expr, .. } = column {
             subst_cte_refs_in_expr(expr, name, body, &mut rebound);
         }
+    }
+}
+
+/// [`rebind_materialized_insert_reads`] for an UPDATE (bd-mm6ec): every read
+/// of the CTE `name` follows it to `private_name`; the target keeps its name.
+fn rebind_materialized_update_reads(
+    update: &mut fsqlite_ast::UpdateStatement,
+    name: &str,
+    private_name: &str,
+) {
+    let body = CteSourceSubstitution::Materialized(private_name);
+    let mut rebound = 0;
+    for assignment in &mut update.assignments {
+        subst_cte_refs_in_expr(&mut assignment.value, name, body, &mut rebound);
+    }
+    if let Some(from) = &mut update.from {
+        subst_cte_refs_in_from(from, name, body, &mut rebound);
+    }
+    if let Some(predicate) = &mut update.where_clause {
+        subst_cte_refs_in_expr(predicate, name, body, &mut rebound);
+    }
+    rebind_materialized_dml_tail_reads(
+        &mut update.returning,
+        &mut update.order_by,
+        update.limit.as_mut(),
+        name,
+        body,
+    );
+}
+
+/// [`rebind_materialized_insert_reads`] for a DELETE (bd-mm6ec): every read
+/// of the CTE `name` follows it to `private_name`; the target keeps its name.
+fn rebind_materialized_delete_reads(
+    delete: &mut fsqlite_ast::DeleteStatement,
+    name: &str,
+    private_name: &str,
+) {
+    let body = CteSourceSubstitution::Materialized(private_name);
+    if let Some(predicate) = &mut delete.where_clause {
+        subst_cte_refs_in_expr(predicate, name, body, &mut 0);
+    }
+    rebind_materialized_dml_tail_reads(
+        &mut delete.returning,
+        &mut delete.order_by,
+        delete.limit.as_mut(),
+        name,
+        body,
+    );
+}
+
+/// The RETURNING, ORDER BY and LIMIT reads an UPDATE and a DELETE share.
+fn rebind_materialized_dml_tail_reads(
+    returning: &mut [ResultColumn],
+    order_by: &mut [fsqlite_ast::OrderingTerm],
+    limit: Option<&mut fsqlite_ast::LimitClause>,
+    name: &str,
+    body: CteSourceSubstitution<'_>,
+) {
+    let mut rebound = 0;
+    for column in returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            subst_cte_refs_in_expr(expr, name, body, &mut rebound);
+        }
+    }
+    for term in order_by {
+        subst_cte_refs_in_expr(&mut term.expr, name, body, &mut rebound);
+    }
+    if let Some(limit) = limit {
+        subst_cte_refs_in_expr(&mut limit.limit, name, body, &mut rebound);
+        if let Some(offset) = &mut limit.offset {
+            subst_cte_refs_in_expr(offset, name, body, &mut rebound);
+        }
+    }
+}
+
+/// A relation name no statement spells, for a binding that must not capture
+/// a name SQL does spell. Replay reparses these identifiers and semantic
+/// lookup keys reserve NUL as a namespace separator, so the name is an
+/// ordinary identifier: `base`, or `base` with a numeric suffix, absent from
+/// `occupied_names` (lowercased tables and views; the name joins them) and
+/// from the lowercased statement text `reserved_sql`, so neither a
+/// user-defined relation nor a later lexical binding can capture a read.
+fn fresh_private_relation_name(
+    base: &str,
+    occupied_names: &mut HashSet<String>,
+    reserved_sql: &str,
+) -> String {
+    let mut suffix = 0usize;
+    loop {
+        let candidate = if suffix == 0 {
+            base.to_owned()
+        } else {
+            format!("{base}_{suffix}")
+        };
+        if !reserved_sql.contains(candidate.as_str()) && occupied_names.insert(candidate.clone())
+        {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+/// bd-mm6ec: SQLite looks a relation name up among the CTEs in scope only
+/// when it is unqualified and is not the target of an INSERT, UPDATE or
+/// DELETE, so `main.c` names the table c even inside a recursive CTE named
+/// c. fsqlite installs a materialized CTE in front of the catalog, which
+/// codegen searches by bare name, so there the CTE captured those names too:
+/// a recursive arm reading `main.c` read its own working table, an UPDATE's
+/// `IN (SELECT x FROM main.c)` read the CTE, and a DELETE whose target shares
+/// a CTE's name wrote to the CTE's read-only root.
+///
+/// Each CTE of `with` whose name is in `bound_elsewhere` (the bare names of
+/// the statement's qualified relations, and its target) takes a private name,
+/// and the unqualified references that bind to it follow: in its siblings'
+/// bodies, in its own recursive arms, and, through `rebind_consumer`, in the
+/// statement the WITH belongs to, each FROM item keeping its old name as its
+/// alias. Then only a reference to the CTE spells its private name, and the
+/// qualified names and the target reach the catalog's relation.
+///
+/// A WITH the materializer refuses as circular keeps its names, so the
+/// refusal names the CTE as stock's does. Returns whether a CTE was renamed.
+fn privatize_ctes_bound_elsewhere(
+    with: &mut fsqlite_ast::WithClause,
+    bound_elsewhere: &BTreeSet<String>,
+    occupied_names: &mut HashSet<String>,
+    reserved_sql: &str,
+    mut rebind_consumer: impl FnMut(&str, &str),
+) -> bool {
+    if cte_materialization_order(&with.ctes).is_err()
+        || with.ctes.iter().any(cte_body_reads_itself)
+    {
+        return false;
+    }
+    let recursive = with.recursive;
+    let mut renamed = false;
+    for index in 0..with.ctes.len() {
+        if !bound_elsewhere.contains(&with.ctes[index].name.to_ascii_lowercase()) {
+            continue;
+        }
+        let name = with.ctes[index].name.clone();
+        let private_name =
+            fresh_private_relation_name("__fsqlite_cte", occupied_names, reserved_sql);
+        let body = CteSourceSubstitution::Materialized(&private_name);
+        let mut rebound = 0;
+        for (other, cte) in with.ctes.iter_mut().enumerate() {
+            if other != index {
+                subst_cte_refs_in_nested_select(&mut cte.query, &name, body, &mut rebound);
+            } else if recursive && select_with_defines(&cte.query, &name) {
+                // bd-gxbof: the anchor and the inner CTEs read the body's own
+                // CTE of the name; the arms read the recursive table.
+                for (_, core) in &mut cte.query.body.compounds {
+                    subst_cte_refs_in_core(core, &name, body, &mut rebound);
+                }
+            } else if recursive {
+                subst_cte_refs_in_select(&mut cte.query, &name, body, &mut rebound);
+            }
+        }
+        rebind_consumer(&name, &private_name);
+        with.ctes[index].name = private_name;
+        renamed = true;
+    }
+    renamed
+}
+
+/// Whether a CTE of `with` is named in `bound_elsewhere` (bd-mm6ec).
+fn with_names_any(with: &fsqlite_ast::WithClause, bound_elsewhere: &BTreeSet<String>) -> bool {
+    with.ctes
+        .iter()
+        .any(|cte| bound_elsewhere.contains(&cte.name.to_ascii_lowercase()))
+}
+
+/// Collect the bare name of every schema-qualified relation `visit` reports.
+fn collect_schema_qualified_relation_name(
+    bound_elsewhere: &mut BTreeSet<String>,
+    name: &QualifiedName,
+) {
+    if name.schema.is_some() {
+        bound_elsewhere.insert(name.name.to_ascii_lowercase());
     }
 }
 
@@ -157174,40 +157530,11 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
     }
 
     fn validate_relation(&mut self, name: &QualifiedName) -> Result<()> {
-        if let Some(schema_name) = name.schema.as_deref()
-            && let Some(scope) = if schema_name.eq_ignore_ascii_case("main") {
-                Some(PragmaSchemaScope::Main)
-            } else if schema_name.eq_ignore_ascii_case("temp") {
-                Some(PragmaSchemaScope::Temp)
-            } else {
-                None
-            }
-            && self.scopes.iter().rev().any(|ctes| {
-                ctes.iter().any(|cte| {
-                    cte.name.eq_ignore_ascii_case(&name.name)
-                        && !matches!(
-                            self.visits.get(&std::ptr::from_ref(cte)),
-                            Some(CteCollationVisit::Active)
-                        )
-                })
-            })
-            && (self.connection.table_exists_for_scope(&name.name, scope)
-                || self
-                    .connection
-                    .view_index_for_scope(&name.name, scope)
-                    .is_some())
-        {
-            // Materialized CTEs and persistent local relations currently feed
-            // a name-only execution catalog. Unqualified lookup has deterministic
-            // front precedence, but honoring an explicit MAIN/TEMP qualifier
-            // while a same-name CTE is installed would require a namespace in
-            // that storage key. Reject the mixed shape before materialization
-            // instead of silently reading the CTE through a qualified name.
-            return Err(FrankenError::NotImplemented(format!(
-                "qualified relation {schema_name}.{} is not supported while a same-name CTE is active",
-                name.name
-            )));
-        }
+        // A schema-qualified name is never a CTE (`visible_cte`), so it is
+        // checked against the catalog even where a CTE of its name is in
+        // scope. Execution keeps the two apart too: a CTE that such a name
+        // spells is materialized under a private name (bd-mm6ec,
+        // `privatize_ctes_bound_elsewhere`).
         if let Some((scope_index, cte)) = self.visible_cte(name) {
             let hidden_reference_scopes = self.scopes.split_off(scope_index + 1);
             let result = self.validate_cte(cte);
@@ -297540,13 +297867,16 @@ mod pager_routing_tests {
                 )
                 .unwrap();
             assert_eq!(reference_main_value, 73);
-            let qualified_error = fconn
+            // bd-mm6ec: a qualified name reads the MAIN relation, never the
+            // CTE of its name (this shape was refused, fail closed, before).
+            let qualified_rows = fconn
                 .query("WITH cte_main_shadow(v) AS (VALUES(1)) SELECT v FROM main.cte_main_shadow")
                 .await
-                .expect_err("qualified MAIN/CTE name collision must fail closed");
-            assert!(
-                matches!(qualified_error, FrankenError::NotImplemented(_)),
-                "unexpected qualified MAIN/CTE collision error: {qualified_error}"
+                .expect("qualified MAIN name beside a same-name CTE reads the table");
+            assert_eq!(qualified_rows.len(), 1);
+            assert_eq!(
+                qualified_rows[0].values(),
+                &[SqliteValue::Integer(reference_main_value)]
             );
 
             let reference_main_view_value = rconn
@@ -297557,15 +297887,16 @@ mod pager_routing_tests {
                 )
                 .unwrap();
             assert_eq!(reference_main_view_value, 91);
-            let qualified_view_error = fconn
+            let qualified_view_rows = fconn
                 .query(
                     "WITH cte_main_view_shadow(v) AS (VALUES(1)) SELECT v FROM main.cte_main_view_shadow",
                 )
                 .await
-                .expect_err("qualified MAIN-view/CTE name collision must fail closed");
-            assert!(
-                matches!(qualified_view_error, FrankenError::NotImplemented(_)),
-                "unexpected qualified MAIN-view/CTE collision error: {qualified_view_error}"
+                .expect("qualified MAIN view beside a same-name CTE reads the view");
+            assert_eq!(qualified_view_rows.len(), 1);
+            assert_eq!(
+                qualified_view_rows[0].values(),
+                &[SqliteValue::Integer(reference_main_view_value)]
             );
         });
     }
