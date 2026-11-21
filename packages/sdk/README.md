@@ -16,6 +16,10 @@ Current behavior:
 
 ## Example
 
+The package exports ES modules and CommonJS with matching TypeScript declarations.
+The default worker factory loads a dedicated browser module worker. Applications
+that bundle their own worker can use the `@frankensqlite/sdk/worker` entry.
+
 ```ts
 import { FrankenDB } from "@frankensqlite/sdk";
 
@@ -459,6 +463,20 @@ message queue before the host receives messages. The byte estimator is explicit
 accounting rather than a JavaScript heap measurement. Stream `maxBatchBytes`
 and request accounting have different envelope allowances; choose stream chunks
 that fit both budgets. Independent connections still execute independently.
+
+## Test the packed SDK
+
+From the workspace root, run `npm run test:packed-sdk` to install the SDK and
+worker archives in a fresh consumer and check ES module, CommonJS and strict
+TypeScript imports. To exercise browser SQL as well, supply a worker-compatible
+core tarball and install Playwright Chromium or set `FSQLITE_CHROMIUM_PATH`.
+
+```bash
+FSQLITE_WASM_CORE_TARBALL=/absolute/path/to/core.tgz npm run test:packed-sdk
+```
+
+The browser test checkpoints a row with the default worker and reopens it with
+the exported SDK worker entry.
 
 ## Manual npm Release
 

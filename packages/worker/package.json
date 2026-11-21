@@ -13,32 +13,32 @@
     "url": "https://github.com/Dicklesworthstone/frankensqlite/issues"
   },
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/npm/index.cjs",
+  "types": "./dist/npm/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "import": { "types": "./dist/npm/index.d.ts", "default": "./dist/npm/index.js" },
+      "require": { "types": "./dist/npm/index.d.cts", "default": "./dist/npm/index.cjs" }
     },
     "./protocol": {
-      "import": "./dist/protocol.js",
-      "types": "./dist/protocol.d.ts"
+      "import": { "types": "./dist/npm/protocol.d.ts", "default": "./dist/npm/protocol.js" },
+      "require": { "types": "./dist/npm/protocol.d.cts", "default": "./dist/npm/protocol.cjs" }
     },
     "./worker": {
-      "import": "./dist/worker.js",
-      "types": "./dist/worker.d.ts"
+      "import": { "types": "./dist/npm/worker.d.ts", "default": "./dist/npm/worker.js" },
+      "require": { "types": "./dist/npm/worker.d.cts", "default": "./dist/npm/worker.cjs" }
     }
   },
   "files": [
-    "dist",
+    "dist/npm",
     "README.md",
     "LICENSE"
   ],
   "peerDependencies": {
-    "@frankensqlite/core": "^0.3.0"
+    "@frankensqlite/core": "^0.3.0 || ^0.5.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json --noEmit && tsdown --config ../../tsdown.config.mts src/index.ts src/protocol.ts src/worker.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "prepack": "npm run typecheck && npm run test && npm run build"

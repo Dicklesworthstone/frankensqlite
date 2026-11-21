@@ -76,6 +76,7 @@ export class FrankenWorkerClient {
   readonly #failureListeners = new Set<(error: Error) => void>();
   #closing = false;
   #disposed = false;
+  #cleanupFailure: { error: unknown } | null = null;
   #closePromise: Promise<void> | null = null;
   #resultEncoding: ResultEncoding = "structured-clone";
   #snapshotOwnership: SnapshotOwnership | null = null;
@@ -180,12 +181,7 @@ export class FrankenWorkerClient {
       this.#worker.addEventListener("error", this.#onError);
       this.#worker.addEventListener("messageerror", this.#onMessageError);
     } catch (cause: unknown) {
-      try {
-        this.dispose();
-      } catch (cleanup: unknown) {
-        throw new AggregateError([cause, cleanup], "Worker setup and cleanup failed", { cause });
-      }
-      throw cause;
+      this.disposeAfterFailure(cause, "Worker setup and cleanup failed");
     }
   }
 
@@ -597,42 +593,45 @@ export class FrankenWorkerClient {
     // Stop admission synchronously. Requests already posted precede close in
     // the worker's FIFO queue and keep their original completion promises.
     this.#closing = true;
-    this.#closePromise = this.#send(
-      {
-        kind: "close",
-        requestId: this.#nextId(),
-      },
-      true,
-    )
-      .then((response) => {
-        ensureKind(response, "close-result");
-      })
-      .then(
-        () => {
-          this.dispose();
-        },
-        (error: unknown) => {
-          try {
-            this.dispose();
-          } catch (cleanupError: unknown) {
-            throw new AggregateError(
-              [error, cleanupError],
-              "FrankenSQLite close and worker cleanup both failed",
-              { cause: error },
-            );
-          }
-          throw error;
-        },
-      );
+    // An application-provided postMessage can call close() before it returns.
+    // Publish the shared promise before entering the transport.
+    let settle!: (result: Promise<void>) => void;
+    this.#closePromise = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    settle(this.#finishClose());
     return this.#closePromise;
   }
 
-  dispose(reason: Error = new Error("FrankenSQLite worker client is disposed")): void {
-    if (this.#disposed) {
-      return;
+  async #finishClose(): Promise<void> {
+    try {
+      const response = await this.#send({ kind: "close", requestId: this.#nextId() }, true);
+      ensureKind(response, "close-result");
+    } catch (error: unknown) {
+      this.disposeAfterFailure(error, "FrankenSQLite close and worker cleanup both failed");
     }
+    this.dispose();
+  }
+
+  dispose(reason?: Error): void {
+    if (this.#disposed) return;
+    this.#disposeWorker(reason);
+    if (this.#cleanupFailure !== null) throw this.#cleanupFailure.error;
+  }
+
+  disposeAfterFailure(cause: unknown, message: string): never {
+    // A transport fault can finish cleanup before its rejected init reaches open().
+    this.#disposeWorker();
+    if (this.#cleanupFailure !== null) {
+      throw new AggregateError([cause, this.#cleanupFailure.error], message, { cause });
+    }
+    throw cause;
+  }
+
+  #disposeWorker(reason?: Error): void {
+    if (this.#disposed) return;
     this.#disposed = true;
-    this.#terminalError ??= reason;
+    this.#terminalError ??= reason ?? new Error("FrankenSQLite worker client is disposed");
     // Settle promises BEFORE detaching listeners, including when cleanup throws.
     this.#rejectPending(this.#terminalError);
     if (!this.#closing) this.#notifyFailure(this.#terminalError);
@@ -650,9 +649,11 @@ export class FrankenWorkerClient {
         errors.push(error);
       }
     }
-    if (errors.length === 1) throw errors[0];
-    if (errors.length > 1) {
-      throw new AggregateError(errors, "FrankenSQLite worker cleanup failed", { cause: errors[0] });
+    if (errors.length > 0) {
+      const error = errors.length === 1
+        ? errors[0]
+        : new AggregateError(errors, "FrankenSQLite worker cleanup failed", { cause: errors[0] });
+      this.#cleanupFailure = { error };
     }
   }
 

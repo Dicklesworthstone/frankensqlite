@@ -13,7 +13,8 @@
   },
   "scripts": {
     "build": "mkdir -p dist/data && cp site/spec-evolution/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html dist/index.html && cp site/spec-evolution/frankentui.css site/spec-evolution/og-image.png site/spec-evolution/twitter-image.png site/spec-evolution/frankensqlite_illustration.webp site/spec-evolution/frankensqlite_diagram.webp site/spec-evolution/_headers site/spec-evolution/_routes.json dist/ && cp site/spec-evolution/data/spec_evolution_v1.sqlite3 site/spec-evolution/data/spec_evolution_v1.sqlite3.config.json dist/data/",
-    "build:wasm-browser": "npm run build --workspace @frankensqlite/worker && npm run build --workspace @frankensqlite/sdk",
+    "build:wasm-browser": "npm run build --workspace @frankensqlite/sdk",
+    "test:packed-sdk": "npm run build:wasm-browser && node packages/sdk/tests/packed-consumer.mjs",
     "typecheck:wasm-browser": "npm run typecheck --workspace @frankensqlite/worker && npm run typecheck --workspace @frankensqlite/sdk",
     "test": "npm run test:wasm-browser",
     "test:wasm-browser": "npm run test --workspace @frankensqlite/worker && npm run test --workspace @frankensqlite/sdk"
@@ -32,7 +33,9 @@
   "homepage": "https://github.com/Dicklesworthstone/frankensqlite#readme",
   "devDependencies": {
     "@playwright/test": "^1.61.0",
+    "tsdown": "0.23.7",
     "typescript": "^6.0.3",
+    "vite": "8.0.16",
     "vitest": "^4.1.9"
   }
 }

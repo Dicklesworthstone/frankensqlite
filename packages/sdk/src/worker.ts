@@ -1,0 +1,1 @@
+import "@frankensqlite/worker/worker";
