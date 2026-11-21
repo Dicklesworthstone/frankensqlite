@@ -1,8 +1,7 @@
 //! bd-4uurt: a prepared statement on a file database runs a GROUP BY with a
-//! HAVING through the VDBE grouping substrate when `having_is_substrate_safe`
-//! accepts it. Its HAVING coder evaluates aggregates, columns, literals,
-//! `IS [NOT] NULL`, comparisons, AND and OR against the group, and codes any
-//! other node as if the group's columns were NULL. So
+//! HAVING through the VDBE grouping substrate when its output registers can
+//! supply the predicate. Previously an IS comparison read columns without a
+//! group context. Thus
 //!
 //! ```sql
 //! SELECT a, b, count(*) FROM t GROUP BY a, b HAVING a IS 2;
@@ -10,8 +9,8 @@
 //!
 //! kept no group where stock SQLite 3.54.1 keeps 2|2|1, and so did `a + 1 =
 //! 2`, `abs(a) = 1`, `NOT (a = 2)`, BETWEEN, IN, CASE, `||`, `a IS TRUE`.
-//! An ad hoc statement, and a `:memory:` database, run every HAVING on the
-//! interpreted path, which answered right.
+//! Direct queries formerly used the interpreted path even for simple
+//! predicates. Strict file queries also exercise the compiled path directly.
 //!
 //! Every statement runs on bundled SQLite 3.54.1 and on fsqlite, on `:memory:`
 //! and on a file, executed directly and prepared. Each statement's rows must
@@ -159,7 +158,70 @@ fn prepared_group_by_having_keeps_stocks_groups() {
                         "file_backed={file_backed} prepared={prepared}: `{sql}`"
                     );
                 }
+                conn.close().await.unwrap();
             }
         }
+    });
+}
+
+#[test]
+fn strict_file_having_uses_finalized_keys_and_aggregates() {
+    const DATA: &str = "INSERT INTO t VALUES (NULL,NULL),(1,0),(2,3),(2,4)";
+    const CREATE: &str = "CREATE TABLE t(k INTEGER,v INTEGER)";
+    let cases: &[(&str, &[Option<i64>])] = &[
+        ("k IS '2'", &[Some(2)]),
+        ("k = '2'", &[Some(2)]),
+        ("k IS NOT 2", &[None, Some(1)]),
+        ("k IS NULL", &[None]),
+        ("k IS NOT NULL", &[Some(1), Some(2)]),
+        ("k IS TRUE", &[Some(1), Some(2)]),
+        ("k IS NOT TRUE", &[None]),
+        ("sum(v) IS 7", &[Some(2)]),
+        ("sum(v) = 7", &[Some(2)]),
+        ("sum(v) IS NOT 7", &[None, Some(1)]),
+        ("sum(v) IS NULL", &[None]),
+        ("sum(v) IS NOT NULL", &[Some(1), Some(2)]),
+        ("k IS sum(v)", &[None]),
+        ("k = sum(v)", &[]),
+        ("kept IS 1 AND count(v) IS 2", &[Some(2)]),
+    ];
+    let stock = rusqlite::Connection::open_in_memory().unwrap();
+    stock.execute_batch(CREATE).unwrap();
+    stock.execute_batch(DATA).unwrap();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict.db");
+        let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+        conn.execute(CREATE).await.unwrap();
+        conn.execute(DATA).await.unwrap();
+        conn.execute("PRAGMA fsqlite.parity_cert_strict=ON")
+            .await
+            .unwrap();
+        assert_eq!(
+            fsqlite_outcome(&conn, "PRAGMA fsqlite.parity_cert_strict", false).await,
+            "rows=[[\"1\"]]"
+        );
+        for &(predicate, keys) in cases {
+            let sql = format!(
+                "SELECT k, sum(v), count(v), count(v) FILTER (WHERE v>3) AS kept FROM t GROUP BY k HAVING {predicate} ORDER BY k"
+            );
+            let expected = stock_outcome(&stock, &sql);
+            let actual_keys = stock
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, Option<i64>>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(actual_keys, keys, "stock on {predicate}");
+            for prepared in [false, true] {
+                assert_eq!(
+                    fsqlite_outcome(&conn, &sql, prepared).await,
+                    expected,
+                    "prepared={prepared}: {sql}"
+                );
+            }
+        }
+        conn.close().await.unwrap();
     });
 }

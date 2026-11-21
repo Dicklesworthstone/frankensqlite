@@ -67,14 +67,13 @@ fn stock_outcome(conn: &rusqlite::Connection, sql: &str) -> String {
 }
 
 /// `sql` on fsqlite, run directly or prepared first: a prepared query is
-/// queried, a prepared INSERT executed. A statement with RETURNING, and DDL
-/// or ATTACH, always run directly.
+/// queried (including INSERT RETURNING), a prepared INSERT executed.
 async fn fsqlite_outcome(conn: &Connection, sql: &str, prepared: bool) -> String {
     let query = sql.starts_with("SELECT") || (sql.starts_with("WITH") && !sql.contains(" INSERT "));
     let dml = sql.contains(" INSERT ") || sql.starts_with("INSERT");
-    let result = if prepared && (query || (dml && !sql.contains("RETURNING"))) {
+    let result = if prepared && (query || dml) {
         match conn.prepare(sql).await {
-            Ok(statement) if query => statement.query().await,
+            Ok(statement) if query || sql.contains("RETURNING") => statement.query().await,
             Ok(statement) => statement.execute().await.map(|_| Vec::new()),
             Err(error) => Err(error),
         }
@@ -95,6 +94,8 @@ async fn fsqlite_outcome(conn: &Connection, sql: &str, prepared: bool) -> String
 
 struct Script {
     name: &'static str,
+    /// Its final SELECT can be repeated by stock SQLite after closing the file.
+    persistent_result: bool,
     setup: &'static [&'static str],
     statements: &'static [(&'static str, &'static str)],
 }
@@ -103,6 +104,7 @@ const NO_ROWS: &str = "rows=[]";
 
 const INSERTS: Script = Script {
     name: "inserts",
+    persistent_result: true,
     setup: &[
         "CREATE TABLE t(x)",
         "CREATE TABLE u(y)",
@@ -198,6 +200,7 @@ const INSERTS: Script = Script {
 
 const ATTACHED: Script = Script {
     name: "attached",
+    persistent_result: false,
     setup: &[
         "ATTACH ':memory:' AS aux",
         "CREATE TABLE aux.w(y)",
@@ -211,6 +214,27 @@ const ATTACHED: Script = Script {
         (
             "WITH c(x) AS (SELECT 1) SELECT y FROM aux.w UNION SELECT x FROM c ORDER BY 1 DESC",
             "rows=[[\"7\"], [\"1\"]]",
+        ),
+    ],
+};
+
+const RECURSIVE: Script = Script {
+    name: "recursive",
+    persistent_result: true,
+    setup: &[
+        "CREATE TABLE dst(x INTEGER UNIQUE)",
+        "CREATE TABLE src(x)",
+        "INSERT INTO src VALUES (8), (10)",
+    ],
+    statements: &[
+        (
+            "WITH RECURSIVE seq(x) AS (VALUES (1) UNION ALL SELECT x+1 FROM seq WHERE x<3) \
+             INSERT INTO dst SELECT x FROM seq UNION ALL SELECT x FROM src ORDER BY 1 DESC LIMIT 3 OFFSET 1",
+            NO_ROWS,
+        ),
+        (
+            "SELECT x FROM dst ORDER BY rowid",
+            "rows=[[\"8\"], [\"3\"], [\"2\"]]",
         ),
     ],
 };
@@ -250,6 +274,16 @@ fn run_script(script: &Script) {
                         script.name
                     );
                 }
+                conn.close().await.unwrap();
+                if file_backed && script.persistent_result {
+                    let reopened = rusqlite::Connection::open(&path).unwrap();
+                    let (sql, pinned) = script.statements.last().unwrap();
+                    assert_eq!(stock_outcome(&reopened, sql), *pinned);
+                    assert_eq!(
+                        stock_outcome(&reopened, "PRAGMA integrity_check"),
+                        "rows=[[\"'ok'\"]]"
+                    );
+                }
             }
         }
     });
@@ -263,4 +297,60 @@ fn with_insert_compound_sources_write_every_arm_like_stock() {
 #[test]
 fn with_select_compound_reading_an_attached_table_answers_every_arm_like_stock() {
     run_script(&ATTACHED);
+}
+
+#[test]
+fn recursive_insert_applies_offset_to_the_whole_compound() {
+    run_script(&RECURSIVE);
+}
+
+#[test]
+fn bound_compound_insert_on_a_stock_file_preserves_the_statement_boundary() {
+    const INSERT: &str = "WITH c(x) AS (SELECT ?) INSERT INTO dst \
+        SELECT x FROM c UNION ALL SELECT ?2 UNION ALL SELECT ? ORDER BY 1 LIMIT ? OFFSET ?";
+    const READ: &str = "SELECT x FROM dst ORDER BY rowid";
+    asupersync::test_utils::run_test(|| async {
+        for prepared in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bound.db");
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock
+                .execute_batch("CREATE TABLE dst(x INTEGER UNIQUE)")
+                .unwrap();
+            stock.execute(INSERT, [11, 3, 9, 2, 1]).unwrap();
+            let expected = stock_outcome(&stock, READ);
+            assert_eq!(expected, "rows=[[\"9\"], [\"11\"]]");
+            assert!(stock.execute(INSERT, [15, 1, 11, 2, 0]).is_err());
+            assert_eq!(stock_outcome(&stock, READ), expected);
+            stock.execute_batch("DELETE FROM dst").unwrap();
+            drop(stock);
+
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for (values, success) in [([11, 3, 9, 2, 1], true), ([15, 1, 11, 2, 0], false)] {
+                let params = values.map(SqliteValue::Integer);
+                let result = if prepared {
+                    conn.prepare(INSERT)
+                        .await
+                        .unwrap()
+                        .execute_with_params(&params)
+                        .await
+                } else {
+                    conn.execute_with_params(INSERT, &params).await
+                };
+                if success {
+                    assert_eq!(result.unwrap(), 2);
+                } else {
+                    assert!(result.is_err(), "late unique violation: {result:?}");
+                }
+                assert_eq!(fsqlite_outcome(&conn, READ, prepared).await, expected);
+            }
+            conn.close().await.unwrap();
+            let reopened = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(stock_outcome(&reopened, READ), expected);
+            assert_eq!(
+                stock_outcome(&reopened, "PRAGMA integrity_check"),
+                "rows=[[\"'ok'\"]]"
+            );
+        }
+    });
 }

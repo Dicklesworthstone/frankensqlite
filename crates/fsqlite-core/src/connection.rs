@@ -27835,16 +27835,7 @@ impl Connection {
             return false;
         };
 
-        // bd-23kpa / bd-w4pr1.13.32: the substrate drops every group when a
-        // HAVING's aggregate sits inside an expression (`count(*) * 2 > 3`)
-        // and keeps failing groups when it is not a result column. Ad hoc
-        // dispatch sends every HAVING to the in-memory path; a prepared
-        // statement, which asks this check at prepare time, ran the substrate
-        // for those shapes too and returned the wrong groups (bd-ro43z).
         if group_by.is_empty()
-            || having
-                .as_deref()
-                .is_some_and(|having| !having_is_substrate_safe(having, columns))
             || !windows.is_empty()
             || !from.joins.is_empty()
             || !Self::select_order_by_matches_group_by_prefix(select, group_by)
@@ -27870,14 +27861,20 @@ impl Connection {
         // all-BINARY case is unaffected, so this adds no fast-path regression.
         {
             let schema = self.schema.borrow();
-            if let Some(table_schema) = schema
+            let Some(table_schema) = schema
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(&table_name.name))
-                && group_by.iter().any(|expr| {
-                    expr_effective_collation_for_table(expr, table_schema)
-                        .is_some_and(|coll| !coll.eq_ignore_ascii_case("BINARY"))
-                })
-            {
+            else {
+                return false;
+            };
+            if having.as_deref().is_some_and(|predicate| {
+                !fsqlite_vdbe::codegen::grouped_having_is_supported(
+                    predicate, columns, group_by, table_schema,
+                )
+            }) || group_by.iter().any(|expr| {
+                expr_effective_collation_for_table(expr, table_schema)
+                    .is_some_and(|coll| !coll.eq_ignore_ascii_case("BINARY"))
+            }) {
                 return false;
             }
         }
@@ -45117,32 +45114,17 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    // bd-23kpa: the substrate drops every group when a HAVING's
-                    // aggregate sits inside an expression (`count(*) * 2 > 3`)
-                    // and keeps failing groups when it is not a result column
-                    // (`SELECT max(id) ... HAVING count(*) > 1`): wrong IN-list
-                    // members, empty derived tables, wrong DELETEs. A HAVING
-                    // takes the in-memory path, which answers it like stock.
-                    let has_having = matches!(
-                        &bound.body.select,
-                        SelectCore::Select {
-                            having: Some(_),
-                            ..
-                        }
-                    );
-                    let substrate_rows = if has_having {
-                        None
-                    } else {
-                        boxed_future(|| {
-                            self.try_execute_group_by_storage_substrate(
-                                cx,
-                                &bound,
-                                None,
-                                "group_by_storage_substrate",
-                            )
-                        })
-                        .await?
-                    };
+                    // Direct and prepared reads use the same grouped-output
+                    // eligibility check before evaluating HAVING in bytecode.
+                    let substrate_rows = boxed_future(|| {
+                        self.try_execute_group_by_storage_substrate(
+                            cx,
+                            &bound,
+                            None,
+                            "group_by_storage_substrate",
+                        )
+                    })
+                    .await?;
                     if let Some(mut rows) = substrate_rows {
                         if distinct {
                             dedup_rows_collated(
@@ -117166,115 +117148,6 @@ fn expr_has_ordered_aggregate(expr: &Expr) -> bool {
         | Expr::Column(_, _)
         | Expr::Raise { .. }
         | Expr::Placeholder(_, _) => false,
-    }
-}
-
-/// bd-ro43z: the HAVING shapes the GROUP BY storage substrate answers like
-/// stock. It drops every group when an aggregate sits inside an expression
-/// (`count(*) * 2 > 3`) and keeps failing groups when an aggregate is not a
-/// result column (`SELECT max(id) ... HAVING count(*) > 1`, bd-23kpa). Safe:
-/// AND, OR and NOT over comparisons whose every operand is either free of
-/// aggregates or exactly a result column's aggregate, or its alias.
-fn having_is_substrate_safe(having: &Expr, columns: &[ResultColumn]) -> bool {
-    // A result column's aggregate, or a bare reference to its alias.
-    let is_result_aggregate = |expr: &Expr| {
-        columns.iter().any(|column| {
-            let ResultColumn::Expr {
-                expr: result,
-                alias,
-            } = column
-            else {
-                return false;
-            };
-            expr_has_aggregate(result)
-                && (result == expr
-                    || matches!(
-                        (expr, alias),
-                        (Expr::Column(col_ref, _), Some(alias))
-                            if col_ref.table.is_none()
-                                && col_ref.column.eq_ignore_ascii_case(alias)
-                    ))
-        })
-    };
-    // No aggregate, and no alias of one either (`total * 2` is one inside an
-    // expression).
-    let free_of_aggregates = |expr: &Expr| {
-        if expr_has_aggregate(expr) {
-            return false;
-        }
-        let mut mentions_alias = false;
-        let _ = visit_expr_column_refs(expr, &mut |col_ref| {
-            if col_ref.table.is_none()
-                && columns.iter().any(|column| {
-                    matches!(column, ResultColumn::Expr { expr: result, alias: Some(alias) }
-                        if expr_has_aggregate(result) && col_ref.column.eq_ignore_ascii_case(alias))
-                })
-            {
-                mentions_alias = true;
-            }
-            Ok(())
-        });
-        !mentions_alias
-    };
-    let operand = |expr: &Expr| {
-        (is_result_aggregate(expr) || free_of_aggregates(expr))
-            && having_operand_is_substrate_coded(expr)
-    };
-    match having {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOp::And | BinaryOp::Or,
-            right,
-            ..
-        } => having_is_substrate_safe(left, columns) && having_is_substrate_safe(right, columns),
-        Expr::BinaryOp {
-            left,
-            op:
-                BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Le
-                | BinaryOp::Gt
-                | BinaryOp::Ge,
-            right,
-            ..
-        } => operand(left) && operand(right),
-        other => free_of_aggregates(other) && having_operand_is_substrate_coded(other),
-    }
-}
-
-/// bd-4uurt: whether the substrate's HAVING coder (codegen's
-/// `emit_having_expr`) evaluates `expr` against the group: a literal or
-/// parameter, a column (a group key, or a bare column it captures), an
-/// aggregate call, `IS [NOT] NULL` of one of those, and comparisons, AND and
-/// OR of them. It codes any other node (`IS`, arithmetic, NOT, a scalar
-/// function, CASE, ...) as if the group's columns were NULL, so `HAVING a IS
-/// 2` or `HAVING a + 1 = 2` kept no group; such a HAVING takes the interpreted
-/// path, as an ad hoc statement's does.
-fn having_operand_is_substrate_coded(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(..) | Expr::Placeholder(..) | Expr::Column(..) => true,
-        Expr::FunctionCall {
-            name, args, over, ..
-        } => {
-            over.is_none() && is_current_aggregate_fn(name, args) && !is_scalar_max_min(name, args)
-        }
-        Expr::IsNull { expr, .. } => having_operand_is_substrate_coded(expr),
-        Expr::BinaryOp {
-            left,
-            op:
-                BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Le
-                | BinaryOp::Gt
-                | BinaryOp::Ge
-                | BinaryOp::And
-                | BinaryOp::Or,
-            right,
-            ..
-        } => having_operand_is_substrate_coded(left) && having_operand_is_substrate_coded(right),
-        _ => false,
     }
 }
 

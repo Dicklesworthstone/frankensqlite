@@ -24737,7 +24737,11 @@ fn codegen_select_aggregate(
             &output_cols,
             &agg_columns,
             &[],
-            table,
+            &[],
+            &ScanCtx {
+                cursor, table, table_alias, schema: Some(schema),
+                register_base: None, secondaries: &[],
+            },
             accum_base,
             output_skip_label,
         );
@@ -27062,15 +27066,15 @@ fn codegen_select_group_by_aggregate(
     // evaluate the expression via emit_expr.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let sorter_base = b.alloc_regs(total_sorter_cols as i32);
+    let scan_ctx = ScanCtx {
+        cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
     {
-        let scan_ctx = ScanCtx {
-            cursor,
-            table,
-            table_alias,
-            schema: Some(schema),
-            register_base: None,
-            secondaries: &[],
-        };
         let mut reg = sorter_base;
         for key in &group_by_keys {
             match key {
@@ -27456,7 +27460,8 @@ fn codegen_select_group_by_aggregate(
             &output_cols,
             &agg_columns,
             &group_by_keys,
-            table,
+            columns,
+            &scan_ctx,
             out_regs,
             having_skip_label,
         );
@@ -27692,7 +27697,8 @@ fn codegen_select_group_by_aggregate(
             &output_cols,
             &agg_columns,
             &group_by_keys,
-            table,
+            columns,
+            &scan_ctx,
             out_regs,
             final_skip,
         );
@@ -37253,6 +37259,58 @@ fn emit_returning_from_regs(
     Ok(())
 }
 
+/// The GROUP BY bytecode evaluates these predicates on finalized output
+/// registers. Both direct and prepared dispatch consult this check before
+/// choosing it over the full expression evaluator.
+#[must_use]
+pub fn grouped_having_is_supported(
+    having: &Expr,
+    columns: &[ResultColumn],
+    group_by: &[Expr],
+    table: &TableSchema,
+) -> bool {
+    fn supported(expr: &Expr, columns: &[ResultColumn], keys: &[Expr]) -> bool {
+        match expr {
+            Expr::Literal(..) | Expr::Placeholder(..) => {
+                !expr_contains_non_numbered_placeholder(expr)
+            }
+            Expr::Column(..) => {
+                keys.contains(expr) && projected_having_slot(expr, columns).is_some()
+            }
+            Expr::FunctionCall { name, args, over, .. } => {
+                over.is_none()
+                    && is_aggregate_function_call(name, args)
+                    && projected_having_slot(expr, columns).is_some()
+            }
+            Expr::IsNull { expr, .. } => supported(expr, columns, keys),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt
+                    | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Is | BinaryOp::IsNot,
+                right,
+                ..
+            } => supported(left, columns, keys) && supported(right, columns, keys),
+            _ => false,
+        }
+    }
+    let resolved = rewrite_having_select_aliases(having, columns, table);
+    supported(&resolved, columns, group_by)
+}
+
+// A star expands to a variable number of registers. Two anonymous parameters
+// in otherwise identical aggregate calls can also have different values.
+fn projected_having_slot(expr: &Expr, columns: &[ResultColumn]) -> Option<usize> {
+    if columns.iter().any(|col| !matches!(col, ResultColumn::Expr { .. }))
+        || expr_contains_non_numbered_placeholder(expr)
+        || expr_contains_nested_subquery(expr)
+    {
+        return None;
+    }
+    columns.iter().position(|col| {
+        matches!(col, ResultColumn::Expr { expr: result, .. } if result == expr)
+    })
+}
+
 /// Emit a HAVING filter for GROUP BY queries.
 ///
 /// Evaluates the HAVING expression against the already-built output row.
@@ -37270,7 +37328,8 @@ fn emit_having_filter(
     output_cols: &[GroupByOutputCol],
     agg_columns: &[AggColumn],
     group_by_keys: &[GroupByKey],
-    table: &TableSchema,
+    projection: &[ResultColumn],
+    scan: &ScanCtx<'_>,
     out_regs: i32,
     skip_label: crate::Label,
 ) {
@@ -37282,7 +37341,8 @@ fn emit_having_filter(
         output_cols,
         agg_columns,
         group_by_keys,
-        table,
+        projection,
+        scan,
         out_regs,
     );
     // If result is falsy (0 or NULL), skip this group's ResultRow.
@@ -37308,9 +37368,19 @@ fn emit_having_expr(
     output_cols: &[GroupByOutputCol],
     agg_columns: &[AggColumn],
     group_by_keys: &[GroupByKey],
-    table: &TableSchema,
+    projection: &[ResultColumn],
+    scan: &ScanCtx<'_>,
     out_regs: i32,
 ) {
+    let table = scan.table;
+    // Read a projected aggregate by its full expression, including FILTER,
+    // DISTINCT and every argument.
+    if matches!(expr, Expr::Column(..) | Expr::FunctionCall { .. })
+        && let Some(slot) = projected_having_slot(expr, projection)
+    {
+        b.emit_op(Opcode::Copy, out_regs + slot as i32, dest_reg, 0, P4::None, 0);
+        return;
+    }
     match expr {
         // Aggregate function call — resolve to the corresponding output register.
         Expr::FunctionCall { name, args, .. } if is_aggregate_function_call(name, args) => {
@@ -37358,7 +37428,7 @@ fn emit_having_expr(
             if let Some(col_idx) = table
                 .columns
                 .iter()
-                .position(|c| c.name == col_name.as_ref())
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
             {
                 // Find the output column whose group key maps to this table column.
                 for (i, oc) in output_cols.iter().enumerate() {
@@ -37405,7 +37475,8 @@ fn emit_having_expr(
                 output_cols,
                 agg_columns,
                 group_by_keys,
-                table,
+                projection,
+                scan,
                 out_regs,
             );
             emit_having_expr(
@@ -37415,7 +37486,8 @@ fn emit_having_expr(
                 output_cols,
                 agg_columns,
                 group_by_keys,
-                table,
+                projection,
+                scan,
                 out_regs,
             );
 
@@ -37425,31 +37497,30 @@ fn emit_having_expr(
                 | fsqlite_ast::BinaryOp::Ge
                 | fsqlite_ast::BinaryOp::Le
                 | fsqlite_ast::BinaryOp::Eq
-                | fsqlite_ast::BinaryOp::Ne => {
+                | fsqlite_ast::BinaryOp::Ne
+                | fsqlite_ast::BinaryOp::Is
+                | fsqlite_ast::BinaryOp::IsNot => {
                     let cmp_opcode = match op {
                         fsqlite_ast::BinaryOp::Gt => Opcode::Gt,
                         fsqlite_ast::BinaryOp::Lt => Opcode::Lt,
                         fsqlite_ast::BinaryOp::Ge => Opcode::Ge,
                         fsqlite_ast::BinaryOp::Le => Opcode::Le,
-                        fsqlite_ast::BinaryOp::Eq => Opcode::Eq,
-                        fsqlite_ast::BinaryOp::Ne => Opcode::Ne,
+                        fsqlite_ast::BinaryOp::Eq | fsqlite_ast::BinaryOp::Is => Opcode::Eq,
+                        fsqlite_ast::BinaryOp::Ne | fsqlite_ast::BinaryOp::IsNot => Opcode::Ne,
                         _ => unreachable!(),
                     };
-                    // SQL three-valued logic: if either operand is NULL, result is NULL.
-                    let null_label = b.emit_label();
-                    let true_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::IsNull, left_reg, 0, null_label, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::IsNull, right_reg, 0, null_label, P4::None, 0);
-                    b.emit_jump_to_label(cmp_opcode, right_reg, left_reg, true_label, P4::None, 0);
-                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(true_label);
-                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(null_label);
-                    b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
+                    if let Some((p3, p4)) = is_true_false_params(*op, right) {
+                        b.emit_op(Opcode::IsTrue, left_reg, dest_reg, p3, p4, 0);
+                    } else {
+                        let null_equal = matches!(op, BinaryOp::Is | BinaryOp::IsNot);
+                        let p4 = comparison_collation_ctx(left, right, Some(scan))
+                            .map_or(P4::None, P4::Collation);
+                        let p5 = comparison_affinity_p5(left, right, Some(scan))
+                            | if null_equal { 0x80 } else { 0 };
+                        emit_register_comparison(
+                            b, cmp_opcode, left_reg, right_reg, dest_reg, p4, p5,
+                        );
+                    }
                 }
                 fsqlite_ast::BinaryOp::And => {
                     b.emit_op(Opcode::And, left_reg, right_reg, dest_reg, P4::None, 0);
@@ -37480,7 +37551,8 @@ fn emit_having_expr(
                 output_cols,
                 agg_columns,
                 group_by_keys,
-                table,
+                projection,
+                scan,
                 out_regs,
             );
             let is_null_lbl = b.emit_label();
@@ -48450,29 +48522,8 @@ fn emit_comparison(
     // Check for COLLATE on either operand, then column-level collation.
     let p4 = comparison_collation_ctx(left, right, ctx).map_or(P4::None, P4::Collation);
 
-    // SQL three-valued logic: if either operand is NULL, the result is NULL.
-    // Check for NULL before the comparison.
-    let null_label = b.emit_label();
-    let true_label = b.emit_label();
-    let done_label = b.emit_label();
-
-    b.emit_jump_to_label(Opcode::IsNull, r_left, 0, null_label, P4::None, 0);
-    b.emit_jump_to_label(Opcode::IsNull, r_right, 0, null_label, P4::None, 0);
-
-    // Compute comparison affinity for TEXT↔numeric coercion (SQLite §4.2).
     let cmp_aff = comparison_affinity_p5(left, right, ctx);
-
-    // Comparison: p1=rhs_reg, p2=jump_target (label), p3=lhs_reg
-    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, p4, cmp_aff);
-    b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-    b.resolve_label(true_label);
-    b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-    b.resolve_label(null_label);
-    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
-    b.resolve_label(done_label);
-
+    emit_register_comparison(b, cmp_opcode, r_left, r_right, reg, p4, cmp_aff);
     b.free_temp(r_right);
     b.free_temp(r_left);
 }
@@ -48501,9 +48552,6 @@ fn emit_is_comparison(
     emit_expr(b, left, r_left, ctx);
     emit_expr(b, right, r_right, ctx);
 
-    let true_label = b.emit_label();
-    let done_label = b.emit_label();
-
     // IS uses Eq with NULLEQ flag (p5=0x80). IS NOT uses Ne with NULLEQ.
     let cmp_and_flag = match op {
         fsqlite_ast::BinaryOp::Is => Some((Opcode::Eq, 0x80_u16)),
@@ -48520,22 +48568,41 @@ fn emit_is_comparison(
     let p4 = comparison_collation_ctx(left, right, ctx).map_or(P4::None, P4::Collation);
 
     let comparison_affinity = comparison_affinity_p5(left, right, ctx);
-    b.emit_jump_to_label(
-        cmp_opcode,
-        r_right,
-        r_left,
-        true_label,
-        p4,
-        nulleq_flag | comparison_affinity,
+    emit_register_comparison(
+        b, cmp_opcode, r_left, r_right, reg, p4, nulleq_flag | comparison_affinity,
     );
+    b.free_temp(r_right);
+    b.free_temp(r_left);
+}
+
+/// Compare evaluated operands from either a scalar expression or a finalized group.
+fn emit_register_comparison(
+    b: &mut ProgramBuilder,
+    cmp_opcode: Opcode,
+    r_left: i32,
+    r_right: i32,
+    reg: i32,
+    p4: P4,
+    p5: u16,
+) {
+    let null_label = (p5 & 0x80 == 0).then(|| b.emit_label());
+    let true_label = b.emit_label();
+    let done_label = b.emit_label();
+    if let Some(null) = null_label {
+        b.emit_jump_to_label(Opcode::IsNull, r_left, 0, null, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IsNull, r_right, 0, null, P4::None, 0);
+    }
+    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, p4, p5);
     b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
     b.resolve_label(true_label);
     b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+    if let Some(null) = null_label {
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+        b.resolve_label(null);
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    }
     b.resolve_label(done_label);
-
-    b.free_temp(r_right);
-    b.free_temp(r_left);
 }
 
 /// Check if a `BinaryOp::Is/IsNot` with `Literal::True/False` should use
