@@ -94,6 +94,43 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-21 - REJECTED on its kill line 3 (rowid_lookups_200k +51.8M Ir, +1.93% against +0.5%), the join -361.0M and its time WIN in both runs: the table seek cache keeps eight leaves with slot 0 in the cursor and slots 1..7 in one box, so BtCursor shrinks by 88 B (bd-w4pr1.12, serial read lane round 11, lever SC8 v3)
+
+- Target: join_1M_to_pk_1000, whose keys step across five leaves while the four-slot seek cache cycles through
+  them. This is the one priced retry of SC8 v2 (2026-11-19 entry): v2's behaviour, eight slots scanned in place,
+  with BtCursor's in-struct footprint at or under the parent's, to test whether v2's scan_filter_agg loss came from
+  its 8-slot inline array.
+- Touched (not landed; patch `scratchpad rl9/sc8v3_v1.patch`): `crates/fsqlite-btree/src/cursor.rs`
+  (`TABLE_SEEK_CACHE_SLOTS` 4 -> 8; `TableSeekCache` holds slot 0 inline and slots 1..7 in a
+  `Box<[Option<TableSeekCacheEntry>; 7]>` made on the first second-leaf landing; get / set / push_front /
+  move_to_front replace the array's rotate; keeper `test_table_seek_cache_keeps_the_cursor_footprint`; the LRU and
+  loads-only tests rewritten for any slot count).
+- Sizes (one print test on rch): `BtCursor<MemPageStore>` 1,672 B on the parent, 1,800 B with v2, 1,584 B with v3.
+- Unit checks (rch, on b12c2739b): clippy clean; fsqlite-btree lib 564 passed, 0 failed. The capacity-minus-one
+  mutant (last slot cleared after every landing) fails both rewritten tests, rc 101.
+- Prediction (on the bead, before the build), single ELF: join -430 to -465M Ir, rowid_lookups_200k within +-0.3%,
+  every other row within 0.1%. Lines: the join a replicated cpu WIN; any replicated cycles or cpu LOSE kills;
+  the join at least 300M down and no other row above +0.5% Ir; answers equal stock.
+- Result (parent 742438e55 against parent + v3, one layout_shuffle_pair job on vmi1227854, K=6 relinks per arm,
+  parent sources equal git file by file, two judgement runs each with its own Q group, stock sqlite3 3.46.1 live,
+  thinkstation1, answers equal stock on every row):
+  - instructions: join 4,023.7M -> 3,662.7M (-361.0M, below the band); rowid_lookups 2,679.4M -> 2,731.2M
+    (+51.8M, +1.93%), which crosses line 3; memory_script ratio 0.945; every other row within +-0.04%;
+  - time: run 2 is void (one null comparison at |z| 4.01). In run 1 and run 2 the join is a WIN (cpu 0.866 /
+    0.857), memory_script a WIN (cpu 0.953 / 0.930) and scan_filter_agg a TIE (cycles 0.992 / 0.995);
+  - vs stock (cpu): join x2.14 / x2.08 -> x1.85 / x1.78; rowid_lookups x1.86 / x1.83 -> x1.84 / x1.88.
+- Why (inferred from the code, not attributed by a profile): rowid_lookups' 200k probes miss every slot and land on
+  new leaves. Each pays next_table_seek_slot's scan through TableSeekCache::get (a branch and a copy out of the box
+  per slot) and push_front's seven get / set pairs through the Option<Box>, where v2 rotated an inline slice:
+  about +259 Ir a probe. The same cost would explain the join's shortfall against v2 (-361M against -463M).
+- Footprint hypothesis: not settled. scan_filter_agg is a TIE at a smaller cursor, but in one valid run and one
+  void run, not a replicated verdict.
+- SL2 v2 (2026-11-19 entry) closes. Its retry condition is now "a landed multi-slot cursor cache".
+- Retry condition: an SC8 v4 that keeps the footprint (all eight slots in one out-of-line array behind one
+  pointer) and scans and rotates that array as a slice, as v2 did. rowid_lookups_200k must stay within +0.5% Ir
+  (single ELF, callgrind-attributed before any time run), judged under the same four lines, with a replacement run
+  for any void run. The coordinator decides whether to price it.
+
 ## 2026-11-20 - WIN (landed as 009856eb4; inside its prediction, on instructions): a column read on a new row takes its record bytes from the one cursor call that locates the row (bd-w4pr1.13.4, read-loop round 10, lever CL1)
 
 - Target: the in-place Column lane (`try_read_column_in_place`). On a row new to its view it asked the cursor
