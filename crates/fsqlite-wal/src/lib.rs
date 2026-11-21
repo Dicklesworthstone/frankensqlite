@@ -139,8 +139,9 @@ pub use telemetry::{
     WalTelemetrySnapshot, wal_telemetry_snapshot,
 };
 pub use wal::{WalFile, WalGenerationIdentity, WalScanStopKind};
+/// WAL-FEC generation is opt-in (bd-71vt5); see the native definition.
 #[cfg(target_arch = "wasm32")]
-pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 2;
+pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 0;
 #[cfg(target_arch = "wasm32")]
 pub const MAX_RAPTORQ_REPAIR_SYMBOLS: u8 = u8::MAX;
 #[cfg(not(target_arch = "wasm32"))]

@@ -14458,6 +14458,11 @@ mod tests {
                 },
             ).unwrap();
             let producer = pipeline.producer().unwrap();
+            // bd-71vt5 (owner decision 2026-11-17, kept 2026-11-21): a new
+            // pipeline starts at the default budget, 0, which wants no repair
+            // and admits every range at once. This test is about admission of
+            // a range that wants repair, so it opts in to the old default, 2.
+            producer.set_repair_symbols(2);
             backend.fec_producer = Some(producer.clone());
 
             vfs.fail_next_wal_sync();
@@ -14531,7 +14536,11 @@ mod tests {
                     queue_capacity: 4, per_symbol_delay: std::time::Duration::ZERO,
                 },
             ).unwrap();
-            backend.fec_producer = Some(pipeline.producer().unwrap());
+            let producer = pipeline.producer().unwrap();
+            // bd-71vt5 (owner decision 2026-11-17, kept 2026-11-21): opt in,
+            // as above; at the default budget 0 nothing is deferred.
+            producer.set_repair_symbols(2);
+            backend.fec_producer = Some(producer);
             pipeline.cancel();
 
             let (p1, p2) = commit_batch_pages();
@@ -14541,6 +14550,53 @@ mod tests {
             assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 2, "the commit still fsyncs");
             assert!(backend.fec_admitted.is_none(), "a deferred range is not admitted");
             assert_eq!(backend.inner.published_snapshot.last_commit_frame, Some(1));
+            let _ = pipeline.shutdown(&cx).await;
+        });
+    }
+
+    /// bd-71vt5 negative control for the two opted-in admission tests above:
+    /// at the default budget, 0, a range wants no repair. It is admitted at
+    /// its fsync without a permit, so a full queue defers nothing and nothing
+    /// is queued.
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[test]
+    fn wal_fec_default_budget_admits_without_queueing() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1).build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let cx = test_cx();
+            let vfs = CheckpointHandoffFaultVfs::new();
+            let wal = make_fault_adapter(&vfs, &cx).wal;
+            let mut backend = PathRefreshingWalBackend::new(
+                vfs.clone(), "test.db", "test.db-wal", PAGE_SIZE, wal, true,
+                #[cfg(any(unix, windows))]
+                None,
+            );
+            let mut pipeline = fsqlite_wal::WalFecRepairPipeline::start(
+                &handle, &cx, fsqlite_wal::WalFecRepairPipelineConfig {
+                    queue_capacity: 1, per_symbol_delay: std::time::Duration::ZERO,
+                },
+            ).unwrap();
+            let producer = pipeline.producer().unwrap();
+            assert_eq!(producer.repair_symbols(), 0, "generation is opt-in");
+            backend.fec_producer = Some(producer.clone());
+            let occupied = producer.try_reserve().unwrap();
+
+            let (p1, p2) = commit_batch_pages();
+            backend.inner.append_frame(&cx, 1, &p1, 0).await.unwrap();
+            backend.inner.append_frame(&cx, 2, &p2, 2).await.unwrap();
+            backend.sync(&cx).expect("a default-budget commit syncs");
+            assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 2);
+            assert_eq!(
+                backend.fec_admitted.map(|(_, end, _)| end),
+                Some(2),
+                "a range that wants no repair is admitted at its fsync, full queue or not"
+            );
+            assert_eq!(pipeline.stats().pending_jobs, 0, "nothing is queued at budget 0");
+            assert_eq!(backend.inner.published_snapshot.last_commit_frame, Some(1));
+            drop(occupied);
+            pipeline.cancel();
             let _ = pipeline.shutdown(&cx).await;
         });
     }

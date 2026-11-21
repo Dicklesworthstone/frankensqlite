@@ -47,6 +47,32 @@ async fn open_wal_db(db: &Path) -> Connection {
     conn
 }
 
+/// bd-71vt5 (owner decision 2026-11-17, kept 2026-11-21 after this recovery
+/// landed): repair-symbol generation is opt-in, and a default database writes
+/// no `.wal-fec`, so there is nothing to heal from. A test of recovery opts its
+/// database in with `PRAGMA raptorq_repair_symbols = N`, which persists N in
+/// the sidecar header, so a reopen keeps generating.
+async fn opt_in(conn: &Connection, repair_symbols: u8) {
+    conn.execute(&format!("PRAGMA raptorq_repair_symbols = {repair_symbols};"))
+        .await
+        .unwrap();
+}
+
+/// One-based frame numbers of the WAL's commit frames (nonzero db-size field).
+fn wal_commit_frames(wal: &Path) -> Vec<u32> {
+    let bytes = fs::read(wal).expect("read wal");
+    let header = WalHeader::from_bytes(&bytes[..WAL_HEADER_SIZE]).expect("parse wal header");
+    let frame_size = WAL_FRAME_HEADER_SIZE + usize::try_from(header.page_size).unwrap();
+    let frames = (bytes.len() - WAL_HEADER_SIZE) / frame_size;
+    (0..frames)
+        .filter(|&idx| {
+            let at = WAL_HEADER_SIZE + idx * frame_size + 4;
+            u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) != 0
+        })
+        .map(|idx| u32::try_from(idx + 1).unwrap())
+        .collect()
+}
+
 /// Flip a byte inside the payload of one-based WAL frame `frame_no`.
 fn corrupt_wal_frame_payload(wal: &Path, frame_no: u32, byte_offset_in_page: usize) {
     let mut file = OpenOptions::new()
@@ -199,6 +225,7 @@ fn test_e2e_bitflip_recovery_multi_group_and_salt_corruption() {
         let sidecar = wal_fec_path_for_wal(&wal);
 
         let conn = open_wal_db(&db).await;
+        opt_in(&conn, 2).await;
         conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, pad BLOB);")
             .await
             .unwrap();
@@ -275,6 +302,7 @@ fn test_e2e_wal_fec_insufficient_symbols_falls_back_cleanly() {
         let sidecar = wal_fec_path_for_wal(&wal);
 
         let conn = open_wal_db(&db).await;
+        opt_in(&conn, 2).await;
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, body BLOB);")
             .await
             .unwrap();
@@ -308,7 +336,7 @@ fn test_e2e_wal_fec_insufficient_symbols_falls_back_cleanly() {
             "last group needs >= 4 frames to exceed R=2"
         );
 
-        // Corrupt 3 distinct frames in group 2 (> default R=2 repair budget).
+        // Corrupt 3 distinct frames in group 2 (> the opted-in R=2 repair budget).
         corrupt_wal_frame_payload(&wal, last_group.meta.start_frame_no, 64);
         corrupt_wal_frame_payload(&wal, last_group.meta.start_frame_no + 1, 64);
         corrupt_wal_frame_payload(&wal, last_group.meta.start_frame_no + 2, 64);
@@ -345,6 +373,7 @@ fn test_e2e_wal_fec_corrupt_sidecar_and_readonly_inert_negative_controls() {
         let sidecar = wal_fec_path_for_wal(&wal);
 
         let conn = open_wal_db(&db).await;
+        opt_in(&conn, 2).await;
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, body BLOB);")
             .await
             .unwrap();
@@ -422,5 +451,90 @@ fn test_e2e_wal_fec_corrupt_sidecar_and_readonly_inert_negative_controls() {
             &[SqliteValue::Text("ok".into())]
         );
         rw_healed.close().await.unwrap();
+    });
+}
+
+/// bd-71vt5 negative control for the opted-in recovery tests above: the same
+/// three commits and the same damage to the first frame of the last commit, on
+/// a default database and on an opted-in one. The default database writes no
+/// `.wal-fec` and no lock file, so reopen cuts the WAL at the damaged frame, as
+/// checksum recovery does, and the last commit's rows are lost. The opted-in
+/// database heals them.
+#[test]
+fn test_e2e_default_database_writes_no_sidecar_and_loses_a_damaged_commit() {
+    run_with_repair_pool(async {
+        for opted_in in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("default_or_opted_in.db");
+            let wal = wal_path(&db);
+            let sidecar = wal_fec_path_for_wal(&wal);
+            let mut lock = sidecar.as_os_str().to_os_string();
+            lock.push(".lock");
+            let lock = PathBuf::from(lock);
+
+            let conn = open_wal_db(&db).await;
+            if opted_in {
+                opt_in(&conn, 2).await;
+            }
+            conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, pad BLOB);")
+                .await
+                .unwrap();
+            for batch in 0..3 {
+                conn.execute("BEGIN;").await.unwrap();
+                for id in batch * 4 + 1..=batch * 4 + 4 {
+                    conn.execute(&format!("INSERT INTO log VALUES ({id}, zeroblob(3000));"))
+                        .await
+                        .unwrap();
+                }
+                conn.execute("COMMIT;").await.unwrap();
+            }
+            conn.close_without_checkpoint().await.unwrap();
+
+            let commits = wal_commit_frames(&wal);
+            assert!(commits.len() >= 4, "opted_in={opted_in}: commit frames {commits:?}");
+            let damaged = commits[commits.len() - 2] + 1;
+            assert!(
+                damaged < commits[commits.len() - 1],
+                "the last commit spans several frames: {commits:?}"
+            );
+            if opted_in {
+                let scan = scan_wal_fec(&sidecar).expect("scan sidecar");
+                assert!(
+                    scan.groups.iter().any(|g| {
+                        g.meta.start_frame_no <= damaged
+                            && damaged < g.meta.start_frame_no + g.meta.k_source
+                    }),
+                    "the opted-in database protects the frame about to be damaged"
+                );
+            } else {
+                assert!(
+                    !sidecar.exists() && !lock.exists(),
+                    "a default database writes no .wal-fec and no lock file"
+                );
+            }
+            corrupt_wal_frame_payload(&wal, damaged, 512);
+            // Remove stale -shm so recovery scans from WAL cleanly.
+            let _ = fs::remove_file(shm_path(&db));
+
+            let reopened = Connection::open(db.to_str().unwrap()).await.unwrap();
+            let expected = if opted_in { 12 } else { 8 };
+            assert_eq!(
+                reopened.query("SELECT COUNT(*) FROM log;").await.unwrap()[0].values(),
+                &[SqliteValue::Integer(expected)],
+                "opted_in={opted_in}"
+            );
+            assert_eq!(
+                reopened.query("PRAGMA integrity_check;").await.unwrap()[0].values(),
+                &[SqliteValue::Text("ok".into())],
+                "opted_in={opted_in}"
+            );
+            reopened.close_without_checkpoint().await.unwrap();
+            if !opted_in {
+                assert!(
+                    !sidecar.exists() && !lock.exists(),
+                    "reopening a default database writes no .wal-fec either"
+                );
+            }
+        }
     });
 }

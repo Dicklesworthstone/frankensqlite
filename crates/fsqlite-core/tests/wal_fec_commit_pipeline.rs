@@ -28,13 +28,33 @@ fn run_without_repair_pool<F: std::future::Future<Output = ()>>(test: F) {
     runtime.block_on(test);
 }
 
+/// bd-71vt5 (owner decision 2026-11-17): WAL-FEC generation is opt-in, and the
+/// opt-in lives in the sidecar's configuration header. `open` opts in a
+/// database whose sidecar does not exist yet (a new one, or one whose sidecar
+/// was lost) with the old default budget, 2, so these tests keep exercising
+/// generation; a reopen keeps whatever the sidecar holds.
 async fn open(db: &Path) -> Connection {
+    let fresh = !wal_fec_path_for_wal(&wal_path(db)).exists();
+    let conn = open_without_opt_in(db).await;
+    if fresh {
+        conn.execute("PRAGMA raptorq_repair_symbols = 2;").await.unwrap();
+    }
+    conn
+}
+
+async fn open_without_opt_in(db: &Path) -> Connection {
     let conn = Connection::open(db.to_str().unwrap()).await.unwrap();
     conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
     conn.execute("PRAGMA synchronous = FULL;").await.unwrap();
     conn.execute("PRAGMA wal_autocheckpoint = 0;").await.unwrap();
     assert!(conn.is_concurrent_mode_default());
     conn
+}
+
+fn sidecar_lock_path(sidecar: &Path) -> PathBuf {
+    let mut path = sidecar.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 fn wal_path(db: &Path) -> PathBuf {
@@ -418,7 +438,7 @@ fn attaching_to_a_fully_backfilled_wal_creates_no_repair_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("backfilled.db");
     run_without_repair_pool(async {
-        let conn = open(&db).await;
+        let conn = open_without_opt_in(&db).await;
         conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
         conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
         // The default close backfills every frame and keeps the WAL.
@@ -426,11 +446,13 @@ fn attaching_to_a_fully_backfilled_wal_creates_no_repair_artifacts() {
     });
     let wal = wal_path(&db);
     let sidecar = wal_fec_path_for_wal(&wal);
-    let mut lock = sidecar.as_os_str().to_os_string();
-    lock.push(".lock");
-    let lock = PathBuf::from(lock);
+    let lock = sidecar_lock_path(&sidecar);
     assert!(fs::metadata(&wal).unwrap().len() > 32, "the WAL keeps its backfilled frames");
     assert!(!sidecar.exists() && !lock.exists(), "a writer without a pool produces no sidecar");
+    // bd-71vt5: the database opts in (as another process would) before the
+    // repair-capable reader attaches, so the reader runs the repair worker.
+    fsqlite_wal::persist_wal_fec_raptorq_repair_symbols(&sidecar, 2).unwrap();
+    assert!(scan_wal_fec(&sidecar).unwrap().groups.is_empty());
     let artifacts = |dir: &Path| {
         let mut names: Vec<(String, Vec<u8>)> = fs::read_dir(dir).unwrap()
             .map(|entry| {
@@ -449,12 +471,10 @@ fn attaching_to_a_fully_backfilled_wal_creates_no_repair_artifacts() {
         reader.close_without_checkpoint().await.unwrap();
     });
     assert!(
-        !sidecar.exists() && !lock.exists(),
-        "attaching to a backfilled WAL created repair artifacts: sidecar {} lock {}",
-        sidecar.exists(),
-        lock.exists()
+        scan_wal_fec(&sidecar).unwrap().groups.is_empty(),
+        "attaching to a backfilled WAL created repair groups"
     );
-    assert_eq!(artifacts(dir.path()), before, "the database and WAL bytes are unchanged");
+    assert_eq!(artifacts(dir.path()), before, "the database, WAL, sidecar and lock bytes are unchanged");
     // Honest counterpart: a session that writes covers the WAL from frame 1.
     run_with_repair_pool(async {
         let writer = open(&db).await;
@@ -732,17 +752,53 @@ fn reopen_reclaims_retired_groups_after_checkpoint_owner_exits() {
     });
 }
 
+/// bd-71vt5: on a runtime with no blocking pool the repair worker cannot run.
+/// A default database works and writes no sidecar; opting in is refused with
+/// an error that names the PRAGMA, and persists nothing; a database opted in
+/// elsewhere is refused at open, not opened without its repair symbols.
 #[test]
-fn runtime_without_blocking_pool_preserves_primary_sql() {
+fn runtime_without_blocking_pool_refuses_the_opt_in_and_preserves_primary_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("no-pool.db");
+    let sidecar = wal_fec_path_for_wal(&wal_path(&db));
     run_without_repair_pool(async {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("no-pool.db");
-        let conn = open(&db).await;
+        let conn = open_without_opt_in(&db).await;
         conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
         conn.execute("INSERT INTO t VALUES (6);").await.unwrap();
+        let refused = conn.execute("PRAGMA raptorq_repair_symbols = 2;").await.unwrap_err();
+        assert!(refused.to_string().contains("raptorq_repair_symbols"), "{refused}");
+        assert_eq!(conn.query("PRAGMA raptorq_repair_symbols;").await.unwrap()[0].values(), &[SqliteValue::Integer(0)]);
         assert_eq!(conn.query("SELECT value FROM t;").await.unwrap()[0].values(), &[SqliteValue::Integer(6)]);
         conn.close_without_checkpoint().await.unwrap();
-        assert!(!wal_fec_path_for_wal(&wal_path(&db)).exists());
+    });
+    assert!(!sidecar.exists() && !sidecar_lock_path(&sidecar).exists(), "nothing persisted for a refused opt-in");
+    fsqlite_wal::persist_wal_fec_raptorq_repair_symbols(&sidecar, 2).unwrap();
+    run_without_repair_pool(async {
+        let refused = match Connection::open(db.to_str().unwrap()).await {
+            Ok(conn) => conn.execute("PRAGMA journal_mode = WAL;").await.unwrap_err(),
+            Err(error) => error,
+        };
+        assert!(refused.to_string().contains("raptorq_repair_symbols"), "{refused}");
+    });
+}
+
+/// bd-71vt5: a default database written at FULL on a runtime that could run
+/// the repair worker generates nothing: no sidecar, no lock file.
+#[test]
+fn default_database_writes_no_repair_artifacts() {
+    run_with_repair_pool(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("default.db");
+        let conn = open_without_opt_in(&db).await;
+        assert_eq!(conn.query("PRAGMA raptorq_repair_symbols;").await.unwrap()[0].values(), &[SqliteValue::Integer(0)]);
+        conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
+        for value in 0..5 {
+            conn.execute(&format!("INSERT INTO t VALUES ({value});")).await.unwrap();
+        }
+        conn.close_without_checkpoint().await.unwrap();
+        let sidecar = wal_fec_path_for_wal(&wal_path(&db));
+        assert!(fs::metadata(wal_path(&db)).unwrap().len() > 32, "the commits are in the WAL");
+        assert!(!sidecar.exists() && !sidecar_lock_path(&sidecar).exists(), "a default database writes no repair artifacts");
     });
 }
 

@@ -4075,6 +4075,53 @@ mod tests {
         assert_eq!(check, "ok");
     }
 
+    /// bd-71vt5 (owner decision 2026-11-17): WAL-FEC generation is opt-in, and
+    /// this API has no runtime to run the repair worker on. A default database
+    /// written at `synchronous = FULL` gets no `-wal-fec` or lock file; opting
+    /// in is refused with an error naming the PRAGMA and persists nothing; a
+    /// database opted in elsewhere is refused at open rather than written
+    /// without its repair symbols.
+    #[test]
+    fn wal_fec_is_off_by_default_and_an_opt_in_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "fec.db");
+        let sidecar = dir.path().join("fec.db-wal-fec");
+        let lock = dir.path().join("fec.db-wal-fec.lock");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; \
+             CREATE TABLE t(x); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);",
+        )
+        .unwrap();
+        let budget: i64 = conn
+            .query_row("PRAGMA raptorq_repair_symbols", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(budget, 0);
+        let refused = conn
+            .execute_batch("PRAGMA raptorq_repair_symbols = 2")
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("raptorq_repair_symbols"),
+            "{refused}"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        drop(conn);
+        assert!(!sidecar.exists() && !lock.exists());
+
+        fsqlite_wal::persist_wal_fec_raptorq_repair_symbols(&sidecar, 2).unwrap();
+        let refused = match Connection::open(&path) {
+            Ok(conn) => conn.execute_batch("PRAGMA journal_mode = WAL").unwrap_err(),
+            Err(error) => error,
+        };
+        assert!(
+            refused.to_string().contains("raptorq_repair_symbols"),
+            "{refused}"
+        );
+    }
+
     /// `u64`/`usize` convert with range checks (rusqlite has them only behind
     /// its `fallible_uint` feature, so there is no stock oracle here).
     #[test]

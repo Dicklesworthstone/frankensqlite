@@ -41,8 +41,14 @@ use crate::checksum::{
 pub const WAL_FEC_GROUP_META_MAGIC: [u8; 8] = *b"FSQLWFEC";
 /// Current [`WalFecGroupMeta`] wire version.
 pub const WAL_FEC_GROUP_META_VERSION: u32 = 1;
-/// Default `PRAGMA raptorq_repair_symbols` value for fresh databases.
-pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 2;
+/// Default `PRAGMA raptorq_repair_symbols` value: 0, no repair symbols.
+///
+/// It applies to a database whose `.wal-fec` holds no configuration header.
+/// Generation is opt-in (`PRAGMA raptorq_repair_symbols = N`): bd-71vt5, owner
+/// decision 2026-11-17, kept on 2026-11-21 after WAL recovery at open began
+/// repairing from the symbols (bd-1hi.11), because generation costs every FULL
+/// commit.
+pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 0;
 /// Maximum accepted `PRAGMA raptorq_repair_symbols` value (`u8` range).
 pub const MAX_RAPTORQ_REPAIR_SYMBOLS: u8 = u8::MAX;
 /// Magic bytes for the optional `.wal-fec` configuration header.

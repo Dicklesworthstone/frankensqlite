@@ -1806,6 +1806,52 @@ mod tests {
         }
     }
 
+    /// bd-71vt5 (owner decision 2026-11-17): WAL-FEC generation is opt-in, and
+    /// the C API has no runtime to run the repair worker on. A default database
+    /// written at `synchronous = FULL` gets no `-wal-fec` or lock file, and
+    /// opting in is refused with an error naming the PRAGMA and persists
+    /// nothing. (The refusal to open a database opted in elsewhere is the same
+    /// fsqlite-core path; fsqlite::blocking's
+    /// wal_fec_is_off_by_default_and_an_opt_in_is_refused covers it.)
+    #[test]
+    fn test_wal_fec_is_off_by_default_and_an_opt_in_is_refused() {
+        unsafe fn exec(db: *mut Sqlite3, sql: &str) -> c_int {
+            let sql = CString::new(sql).unwrap();
+            sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut())
+        }
+        unsafe fn errmsg(db: *mut Sqlite3) -> String {
+            std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+                .to_string_lossy()
+                .into_owned()
+        }
+        unsafe {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("fec.db");
+            let sidecar = dir.path().join("fec.db-wal-fec");
+            let lock = dir.path().join("fec.db-wal-fec.lock");
+            let path = CString::new(db_path.to_str().unwrap()).unwrap();
+            let mut db: *mut Sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                exec(
+                    db,
+                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE t(x); \
+                     INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);"
+                ),
+                SQLITE_OK
+            );
+            assert_ne!(exec(db, "PRAGMA raptorq_repair_symbols = 2;"), SQLITE_OK);
+            assert!(
+                errmsg(db).contains("raptorq_repair_symbols"),
+                "{}",
+                errmsg(db)
+            );
+            assert_eq!(exec(db, "INSERT INTO t VALUES (3);"), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            assert!(!sidecar.exists() && !lock.exists());
+        }
+    }
+
     #[test]
     fn test_c_string_truncate_on_nul_discards_suffix() {
         let value = c_string_truncate_on_nul("alpha\0beta");

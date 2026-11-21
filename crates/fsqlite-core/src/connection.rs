@@ -91014,18 +91014,33 @@ impl Connection {
             let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut next, pragma)?;
             if let fsqlite_vdbe::pragma::PragmaOutput::Int(value) = output {
                 if pragma.value.is_some() {
+                    let budget = next.raptorq_repair_symbols;
                     if !self.pager.is_memory() {
                         if self.pager.is_readonly() || next.query_only {
                             return Err(FrankenError::ReadOnly);
                         }
+                        // bd-71vt5: opting in on a connection that cannot run
+                        // the repair worker is refused before anything persists.
+                        if budget > 0 {
+                            self.wal_fec_worker_runtime(budget)?;
+                        }
                         let sidecar = fsqlite_wal::wal_fec_path_for_wal(&wal_path_for_db_path(&self.path));
-                        fsqlite_wal::persist_wal_fec_raptorq_repair_symbols(&sidecar, next.raptorq_repair_symbols)?;
+                        fsqlite_wal::persist_wal_fec_raptorq_repair_symbols(&sidecar, budget)?;
                     }
-                    self.pragma_state.borrow_mut().raptorq_repair_symbols = next.raptorq_repair_symbols;
+                    self.pragma_state.borrow_mut().raptorq_repair_symbols = budget;
                     if let Some(producer) = self.wal_fec_pipeline.borrow().as_ref().and_then(|pipeline| pipeline.producer()) {
-                        producer.set_repair_symbols(next.raptorq_repair_symbols);
+                        producer.set_repair_symbols(budget);
                     }
-                    tracing::info!(repair_symbols = next.raptorq_repair_symbols, "updated WAL-FEC repair budget");
+                    // An opt-in in WAL mode starts the worker if it was not running.
+                    if budget > 0
+                        && !self.pager.is_memory()
+                        && self.pager.journal_mode() == JournalMode::Wal
+                        && self.wal_fec_pipeline.borrow().is_none()
+                    {
+                        let cx = self.op_cx()?;
+                        self.ensure_wal_fec_pipeline(&cx).await?;
+                    }
+                    tracing::info!(repair_symbols = budget, "updated WAL-FEC repair budget");
                 }
                 return Ok(vec![Row { values: vec![SqliteValue::Integer(value)] }]);
             }
@@ -94306,6 +94321,35 @@ impl Connection {
         }
     }
 
+    /// The runtime that hosts this connection's WAL-FEC repair worker.
+    ///
+    /// bd-71vt5 (owner decision 2026-11-17, kept 2026-11-21): repair-symbol
+    /// generation is opt-in on every API, through
+    /// `PRAGMA raptorq_repair_symbols = N > 0`; an opted-in database's WAL is
+    /// repaired from the symbols at open (bd-1hi.11). The worker needs a
+    /// caller-owned native runtime with a blocking pool. A connection without
+    /// one (`fsqlite::blocking`, the C API, a runtime built without blocking
+    /// threads) refuses an opted-in database instead of silently writing no
+    /// symbols.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn wal_fec_worker_runtime(&self, budget: u8) -> Result<asupersync::runtime::RuntimeHandle> {
+        let refuse = |why: &str| {
+            FrankenError::NotImplemented(format!(
+                "WAL-FEC repair symbols (PRAGMA raptorq_repair_symbols = {budget}) need a caller-owned \
+                 native runtime with a blocking pool, and {why}; use such a runtime, or set \
+                 PRAGMA raptorq_repair_symbols = 0 from one"
+            ))
+        };
+        let Some(runtime) = self._shared_mvcc_state._runtime.native_runtime_handle()
+            .or_else(|| self._ambient_io_runtime_handle.clone()) else {
+            return Err(refuse("this connection has none"));
+        };
+        if runtime.blocking_handle().is_none() {
+            return Err(refuse("this connection's runtime has no blocking pool"));
+        }
+        Ok(runtime)
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     async fn ensure_wal_fec_pipeline(&self, cx: &Cx) -> Result<()> {
         use fsqlite_wal::wal_fec::{WalFecRepairPipeline, WalFecRepairPipelineConfig};
@@ -94324,18 +94368,12 @@ impl Connection {
                     fsqlite_wal::DEFAULT_RAPTORQ_REPAIR_SYMBOLS
                 });
             self.pragma_state.borrow_mut().raptorq_repair_symbols = budget;
-            if self.pager.is_readonly() {
+            // bd-71vt5: a database that has not opted in (budget 0, the
+            // default) starts no worker and touches no sidecar or lock file.
+            if budget == 0 || self.pager.is_readonly() {
                 return Ok(());
             }
-            let Some(runtime) = self._shared_mvcc_state._runtime.native_runtime_handle()
-                .or_else(|| self._ambient_io_runtime_handle.clone()) else {
-                tracing::warn!("WAL-FEC requires a caller-owned native runtime; primary WAL durability is unchanged");
-                return Ok(());
-            };
-            if runtime.blocking_handle().is_none() {
-                tracing::warn!("WAL-FEC requires a caller-owned runtime blocking pool; primary WAL durability is unchanged");
-                return Ok(());
-            }
+            let runtime = self.wal_fec_worker_runtime(budget)?;
             let (region_task, worker_cx) = self._shared_mvcc_state.register_task_in_region(self.runtime_region)?;
             let pipeline = WalFecRepairPipeline::start_scoped(
                 &runtime, &worker_cx, WalFecRepairPipelineConfig::default(), region_task,
@@ -183486,6 +183524,9 @@ mod tests {
             conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
             conn.execute("PRAGMA synchronous = FULL;").await.unwrap();
             conn.execute("PRAGMA wal_autocheckpoint = 0;").await.unwrap();
+            // bd-71vt5: generation is opt-in; nothing runs before it.
+            assert!(conn.wal_fec_pipeline.borrow().is_none());
+            conn.execute("PRAGMA raptorq_repair_symbols = 2;").await.unwrap();
             let shared = Arc::clone(&conn._shared_mvcc_state);
             let region = conn.runtime_region;
             assert!(conn.wal_fec_pipeline.borrow().is_some());
@@ -184146,10 +184187,12 @@ mod tests {
             let db_path = db_path.to_string_lossy().into_owned();
 
             let mut conn = Connection::open(&db_path).await.unwrap();
+            // bd-71vt5: WAL-FEC generation is opt-in.
+            conn.execute("PRAGMA raptorq_repair_symbols = 2").await.unwrap();
             conn.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
             assert!(
                 conn.wal_fec_pipeline.get_mut().is_some(),
-                "a runtime with a blocking pool gives the connection a WAL-FEC pipeline"
+                "an opted-in connection on a runtime with a blocking pool owns a WAL-FEC pipeline"
             );
             conn.execute("BEGIN").await.unwrap();
             conn.execute("INSERT INTO t VALUES (9)").await.unwrap();

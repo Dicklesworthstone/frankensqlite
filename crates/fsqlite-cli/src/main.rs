@@ -4368,9 +4368,10 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
             OsString::from("fsqlite"),
             db.clone().into_os_string(),
             OsString::from("-c"),
+            // bd-71vt5 (owner decision 2026-11-17): generation is opt-in.
             OsString::from(
                 "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; \
-                 PRAGMA wal_autocheckpoint = 0; \
+                 PRAGMA wal_autocheckpoint = 0; PRAGMA raptorq_repair_symbols = 2; \
                  CREATE TABLE t(value INTEGER); INSERT INTO t VALUES (42); \
                  SELECT value FROM t;",
             ),
@@ -4390,11 +4391,11 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
                 .any(|line| line == "42")
         );
 
-        // No repair PRAGMA was written, so a group marker proves this is
-        // generated repair data rather than only a persisted config header.
-        // The shell's awaited close drains the worker before returning here.
+        // The opt-in writes only a configuration header (FSQLWFCP), so a
+        // group marker proves this is generated repair data. The shell's
+        // awaited close drains the worker before returning here.
         let sidecar = fs::read(dir.path().join("shell-fec.db-wal-fec"))
-            .expect("the shipped shell runtime must generate WAL repair symbols");
+            .expect("the shipped shell runtime must generate WAL repair symbols once opted in");
         assert!(sidecar.windows(8).any(|bytes| bytes == b"FSQLWFEC"));
         let stock = rusqlite::Connection::open(&db).expect("stock SQLite open");
         assert_eq!(
@@ -4403,6 +4404,50 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
                 .expect("stock SQLite query"),
             42,
         );
+    }
+
+    /// bd-71vt5 (owner decision 2026-11-17): a default database written by
+    /// the shell at `synchronous = FULL` generates no repair symbols: no
+    /// `-wal-fec`, no `-wal-fec.lock`, though the shell's runtime could run
+    /// the worker.
+    #[test]
+    fn test_shell_default_database_writes_no_wal_fec() {
+        let runtime = super::shell_runtime_builder()
+            .build()
+            .expect("shell runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("shell-default.db");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![
+            OsString::from("fsqlite"),
+            db.clone().into_os_string(),
+            OsString::from("-c"),
+            OsString::from(
+                "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; \
+                 PRAGMA wal_autocheckpoint = 0; \
+                 CREATE TABLE t(value INTEGER); INSERT INTO t VALUES (42); \
+                 SELECT value FROM t;",
+            ),
+        ];
+        let exit_code = runtime.block_on(run_with_shell_options(
+            args,
+            &mut input,
+            &mut out,
+            &mut err,
+            ShellOptions::batch(),
+        ));
+        assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&err));
+        assert!(
+            String::from_utf8_lossy(&out)
+                .lines()
+                .any(|line| line == "42")
+        );
+        // test_shell_runtime_generates_wal_fec_before_exit is the positive
+        // control: the same script on the same runtime, opted in, writes one.
+        assert!(!dir.path().join("shell-default.db-wal-fec").exists());
+        assert!(!dir.path().join("shell-default.db-wal-fec.lock").exists());
     }
 
     #[test]
