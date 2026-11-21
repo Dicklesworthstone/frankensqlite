@@ -111,3 +111,255 @@ fn cte_setops_subquery_match_rusqlite_oracle() {
         );
     });
 }
+
+// bd-wiffk: the INSERT's leading WITH must keep the entire SELECT source,
+// including every compound arm and its final ORDER BY/LIMIT/OFFSET. Compare
+// the written rows as well as the affected-row count; executing successfully
+// is not enough when a SELECT arm can silently disappear.
+struct CteInsertCase {
+    name: &'static str,
+    sql: &'static str,
+    expected: &'static [i64],
+    ordered: bool,
+}
+
+const CTE_INSERT_CASES: &[CteInsertCase] = &[
+    CteInsertCase {
+        name: "union_all",
+        sql: "WITH c(x) AS (SELECT 5) INSERT INTO dst SELECT x FROM c UNION ALL SELECT 7",
+        expected: &[5, 7],
+        ordered: false,
+    },
+    CteInsertCase {
+        name: "union_all_repeated_cte",
+        sql: "WITH c(x) AS (VALUES (5),(5),(9)) INSERT INTO dst \
+              SELECT x FROM c UNION ALL SELECT x+1 FROM c",
+        expected: &[5, 5, 6, 6, 9, 10],
+        ordered: false,
+    },
+    CteInsertCase {
+        name: "union_distinct",
+        sql: "WITH c(x) AS (VALUES (5),(5),(9)) INSERT INTO dst \
+              SELECT x FROM c UNION SELECT 5",
+        expected: &[5, 9],
+        ordered: false,
+    },
+    CteInsertCase {
+        name: "intersect",
+        sql: "WITH c(x) AS (VALUES (5),(7),(9)) INSERT INTO dst \
+              SELECT x FROM c INTERSECT SELECT x FROM src",
+        expected: &[7],
+        ordered: false,
+    },
+    CteInsertCase {
+        name: "except",
+        sql: "WITH c(x) AS (VALUES (5),(7),(9)) INSERT INTO dst \
+              SELECT x FROM c EXCEPT SELECT x FROM src",
+        expected: &[5, 9],
+        ordered: false,
+    },
+    CteInsertCase {
+        name: "real_table_first_arm",
+        sql: "WITH c(x) AS (SELECT 5) INSERT INTO dst \
+              SELECT x FROM src UNION ALL SELECT x FROM c ORDER BY 1 DESC",
+        expected: &[8, 7, 5, 4],
+        ordered: true,
+    },
+    CteInsertCase {
+        name: "fromless_first_arm",
+        sql: "WITH c(x) AS (SELECT 5) INSERT INTO dst \
+              SELECT 7 UNION ALL SELECT x FROM c",
+        expected: &[5, 7],
+        ordered: false,
+    },
+    CteInsertCase {
+        name: "compound_order_limit",
+        sql: "WITH c(x) AS (SELECT 5) INSERT INTO dst \
+              SELECT x FROM c UNION SELECT 10 ORDER BY 1 DESC LIMIT 1",
+        expected: &[10],
+        ordered: true,
+    },
+    CteInsertCase {
+        name: "compound_order_limit_offset",
+        sql: "WITH c(x) AS (VALUES (5),(9),(7)) INSERT INTO dst \
+              SELECT x FROM c UNION ALL SELECT x FROM src \
+              ORDER BY 1 DESC LIMIT 3 OFFSET 1",
+        expected: &[8, 7, 7],
+        ordered: true,
+    },
+    CteInsertCase {
+        name: "simple_order_limit_offset",
+        sql: "WITH c(x) AS (VALUES (9),(5),(7)) INSERT INTO dst \
+              SELECT x FROM c ORDER BY x LIMIT 1 OFFSET 1",
+        expected: &[7],
+        ordered: true,
+    },
+    CteInsertCase {
+        name: "recursive_source",
+        sql: "WITH RECURSIVE c(x) AS \
+              (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<3) INSERT INTO dst \
+              SELECT x FROM c UNION ALL SELECT x+10 FROM c \
+              ORDER BY 1 DESC LIMIT 4 OFFSET 1",
+        expected: &[12, 11, 3, 2],
+        ordered: true,
+    },
+    CteInsertCase {
+        name: "mixed_compound_operators",
+        sql: "WITH c(x) AS (VALUES (5),(7),(9)) INSERT INTO dst \
+              SELECT x FROM c UNION ALL SELECT x FROM src EXCEPT SELECT 7 ORDER BY 1",
+        expected: &[4, 5, 8, 9],
+        ordered: true,
+    },
+    CteInsertCase {
+        name: "zero_limit",
+        sql: "WITH c(x) AS (SELECT 5) INSERT INTO dst \
+              SELECT x FROM c UNION ALL SELECT 7 LIMIT 0",
+        expected: &[],
+        ordered: false,
+    },
+    CteInsertCase {
+        name: "same_name_target",
+        sql: "WITH dst(x) AS (VALUES (5),(7)) INSERT INTO dst \
+              SELECT x FROM dst UNION ALL SELECT 9",
+        expected: &[5, 7, 9],
+        ordered: false,
+    },
+    // Controls: a simple source and a WITH inside the SELECT already work.
+    CteInsertCase {
+        name: "simple_source_control",
+        sql: "WITH c(x) AS (SELECT 5) INSERT INTO dst SELECT x FROM c",
+        expected: &[5],
+        ordered: false,
+    },
+    CteInsertCase {
+        name: "with_inside_select_control",
+        sql: "INSERT INTO dst WITH c(x) AS (SELECT 5) \
+              SELECT x FROM c UNION ALL SELECT 7 ORDER BY 1 DESC LIMIT 1",
+        expected: &[7],
+        ordered: true,
+    },
+    CteInsertCase {
+        name: "nested_source_with",
+        sql: "WITH c(x) AS (SELECT 5) INSERT INTO dst \
+              WITH c(x) AS (SELECT 9) SELECT x FROM c UNION ALL SELECT 7 ORDER BY 1",
+        expected: &[7, 9],
+        ordered: true,
+    },
+];
+
+async fn check_cte_insert_compound_sources(file_backed: bool, prepared: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let frank_path = directory.path().join("frank.db");
+    let stock_path = directory.path().join("stock.db");
+    let f = Connection::open(if file_backed {
+        frank_path.to_str().unwrap()
+    } else {
+        ":memory:"
+    })
+    .await
+    .unwrap();
+    let r = if file_backed {
+        rusqlite::Connection::open(&stock_path)
+    } else {
+        rusqlite::Connection::open_in_memory()
+    }
+    .unwrap();
+    for sql in [
+        "CREATE TABLE dst(x INTEGER)",
+        "CREATE TABLE src(x INTEGER)",
+        "INSERT INTO src VALUES (4),(7),(8)",
+    ] {
+        f.execute(sql).await.unwrap();
+        r.execute(sql, []).unwrap();
+    }
+    for case in CTE_INSERT_CASES {
+        f.execute("DELETE FROM dst").await.unwrap();
+        r.execute("DELETE FROM dst", []).unwrap();
+        let label = format!(
+            "{}, file_backed={file_backed}, prepared={prepared}: {}",
+            case.name, case.sql
+        );
+        let expected_changes = r.execute(case.sql, []).expect("stock INSERT succeeds");
+        assert_eq!(expected_changes, case.expected.len(), "stock fixture: {label}");
+        let actual_changes = if prepared {
+            f.prepare(case.sql).await.unwrap().execute().await
+        } else {
+            f.execute(case.sql).await
+        }
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+        // A source ORDER BY determines insertion order, visible through rowid.
+        // For unordered sources, compare the written rows as a multiset.
+        let query = if case.ordered {
+            "SELECT x FROM dst ORDER BY rowid"
+        } else {
+            "SELECT x FROM dst ORDER BY x"
+        };
+        let expected = rq(&r, query);
+        let pinned: Vec<Vec<String>> = case
+            .expected
+            .iter()
+            .map(|value| vec![format!("int:{value}")])
+            .collect();
+        assert_eq!(expected, pinned, "stock fixture: {label}");
+        assert_eq!(fq(&f, query).await, expected, "written rows: {label}");
+        assert_eq!(actual_changes, expected_changes, "changed rows: {label}");
+        assert_eq!(fq(&f, "SELECT changes()").await, rq(&r, "SELECT changes()"), "{label}");
+    }
+    f.close().await.unwrap();
+}
+
+#[test]
+fn cte_insert_compound_source_memory_direct() {
+    asupersync::test_utils::run_test(|| check_cte_insert_compound_sources(false, false));
+}
+
+#[test]
+fn cte_insert_compound_source_memory_prepared() {
+    asupersync::test_utils::run_test(|| check_cte_insert_compound_sources(false, true));
+}
+
+#[test]
+fn cte_insert_compound_source_file_direct() {
+    asupersync::test_utils::run_test(|| check_cte_insert_compound_sources(true, false));
+}
+
+#[test]
+fn cte_insert_compound_source_file_prepared() {
+    asupersync::test_utils::run_test(|| check_cte_insert_compound_sources(true, true));
+}
+
+#[test]
+fn cte_insert_compound_source_attached_target() {
+    asupersync::test_utils::run_test(|| async {
+        for prepared in [false, true] {
+            let f = Connection::open(":memory:").await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "ATTACH DATABASE ':memory:' AS aux",
+                "CREATE TABLE aux.dst(x INTEGER)",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            // Attached CTE execution installs a snapshot of the CTE rows and
+            // suppresses schema refresh. That scope must retain the same full
+            // SELECT semantics as the ordinary INSERT source materializer.
+            let sql = "WITH c(x) AS (VALUES (5),(9),(7)) INSERT INTO aux.dst \
+                       SELECT x FROM c UNION ALL SELECT 10 \
+                       ORDER BY 1 DESC LIMIT 2 OFFSET 1";
+            let expected_changes = r.execute(sql, []).unwrap();
+            let actual_changes = if prepared {
+                f.prepare(sql).await.unwrap().execute().await
+            } else {
+                f.execute(sql).await
+            }
+            .unwrap();
+            let query = "SELECT x FROM aux.dst ORDER BY rowid";
+            let expected = rq(&r, query);
+            assert_eq!(expected, vec![vec!["int:9"], vec!["int:7"]]);
+            assert_eq!(fq(&f, query).await, expected, "prepared={prepared}");
+            assert_eq!(actual_changes, expected_changes, "prepared={prepared}");
+            f.close().await.unwrap();
+        }
+    });
+}
