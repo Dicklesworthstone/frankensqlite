@@ -450,11 +450,25 @@ fn partial_index_row_value_predicate_matches_stock() {
         "UPDATE t SET a = 'y' WHERE id = 6",
         "DELETE FROM t WHERE id = 1",
         "SELECT id FROM t INDEXED BY t_eq WHERE (a, n) = ('x', 2) ORDER BY id",
-        // Not here: `INDEXED BY t_eq WHERE a = 'x' AND n = 2`, which stock
-        // refuses ("no query solution": its implication test compares the
-        // row-value predicate term whole) and fsqlite answers with the same
-        // rows, because its forced-index check reads the statement already
-        // expanded. A recorded residual on bd-65jog.
+        // bd-wpfqs: stock's implication test compares the row-value predicate
+        // term whole, so the scalar spelling, a reordered or a commuted row
+        // value refuses ("no query solution"), while the row value as written
+        // answers, also with another term beside it and inside a derived
+        // table or an IN subquery.
+        "SELECT id FROM t INDEXED BY t_eq WHERE a = 'x' AND n = 2 ORDER BY id",
+        "SELECT id FROM t INDEXED BY t_eq WHERE n = 2 AND a = 'x' ORDER BY id",
+        "SELECT id FROM t INDEXED BY t_eq WHERE (n, a) = (2, 'x') ORDER BY id",
+        "SELECT id FROM t INDEXED BY t_eq WHERE ('x', 2) = (a, n) ORDER BY id",
+        "SELECT n FROM t INDEXED BY t_lt WHERE a < 'b' OR (a = 'b' AND n < 0) ORDER BY n",
+        "SELECT id FROM t INDEXED BY t_eq WHERE (a, n) = ('x', 2) AND id > 0 ORDER BY id",
+        "SELECT * FROM (SELECT id FROM t INDEXED BY t_eq WHERE (a, n) = ('x', 2)) ORDER BY 1",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM t INDEXED BY t_eq WHERE (a, n) = ('x', 2)) \
+         ORDER BY id",
+        "SELECT * FROM (SELECT id FROM t INDEXED BY t_eq WHERE a = 'x' AND n = 2)",
+        // A scalar predicate term is implied by a row value's expansion.
+        "CREATE INDEX t_sc ON t(n) WHERE a = 'x'",
+        "SELECT id FROM t INDEXED BY t_sc WHERE (a, n) = ('x', 2) ORDER BY id",
+        "DROP INDEX t_sc",
         "SELECT n FROM t INDEXED BY t_lt WHERE (a, n) < ('b', 0) ORDER BY n",
         "PRAGMA integrity_check",
         // Misuse, and a row-value IN list, which stock rewrites to a subquery.
@@ -472,6 +486,28 @@ fn partial_index_row_value_predicate_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         let stock = assert_matches_stock("partial", TABLE, STEPS, VERIFY).await;
         assert_eq!(stock.tables[0], vec![vec!["2"], vec!["8"]]);
+        // Not vacuous (bd-wpfqs): stock refuses the scalar spelling and
+        // answers the row value as written, here and in a derived table.
+        assert!(
+            stock
+                .outcome_of(STEPS, "t_eq WHERE a = 'x' AND n = 2 ORDER BY id")
+                .contains("no query solution")
+        );
+        assert!(
+            stock
+                .outcome_of(STEPS, "t_eq WHERE a = 'x' AND n = 2)")
+                .contains("no query solution")
+        );
+        assert!(
+            stock
+                .outcome_of(STEPS, "t_eq WHERE (a, n) = ('x', 2) AND id > 0")
+                .ends_with("rows=[[\"2\"], [\"8\"]]")
+        );
+        assert!(
+            stock
+                .outcome_of(STEPS, "t_eq WHERE (a, n) = ('x', 2)) ORDER BY 1")
+                .ends_with("rows=[[\"2\"], [\"8\"]]")
+        );
         assert!(
             !stock.outcomes[0].starts_with("error") && !stock.outcomes[1].starts_with("error"),
             "{:?}",

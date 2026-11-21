@@ -32048,7 +32048,10 @@ impl Connection {
             // precedence). The rewritten statement is still validated below for any
             // post-rewrite-only semantics.
             let structure_result = self.with_fallback_function_registry(|| {
-                self.validate_statement_select_structure(statement_snapshot.as_ref())
+                self.validate_statement_select_structure(
+                    statement_snapshot.as_ref(),
+                    self.entry_row_value_spelling(),
+                )
             });
             if self.function_registry_generation() != snapshot_generation {
                 if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
@@ -32089,7 +32092,10 @@ impl Connection {
                 }
                 rewrite_result.and_then(|statement| {
                     self.with_fallback_function_registry(|| {
-                        self.validate_statement_select_semantics(&statement)?;
+                        self.validate_statement_select_semantics(
+                            &statement,
+                            RowValueSpelling::Expanded,
+                        )?;
                         self.validate_deferred_select_names(&statement)
                     })?;
                     Ok(statement)
@@ -43646,7 +43652,10 @@ impl Connection {
             }
             relation_result?;
             let semantics_result = self.with_fallback_function_registry(|| {
-                self.validate_statement_select_semantics(statement_snapshot.as_ref())
+                self.validate_statement_select_semantics(
+                    statement_snapshot.as_ref(),
+                    self.entry_row_value_spelling(),
+                )
             });
             if self.function_registry_generation() == snapshot_generation {
                 semantics_result?;
@@ -44002,8 +44011,10 @@ impl Connection {
                 )
             });
         if !select_structure_validated {
+            // A statement the engine runs on the way (a subquery, a body) may
+            // already have its row values expanded.
             self.with_fallback_function_registry(|| {
-                self.validate_statement_select_structure(statement)
+                self.validate_statement_select_structure(statement, RowValueSpelling::Expanded)
             })?;
         }
         let statement_kind = match &statement {
@@ -56571,9 +56582,25 @@ impl Connection {
         })
     }
 
-    fn validate_statement_select_structure(&self, statement: &Statement) -> Result<()> {
+    /// bd-wpfqs: a statement the caller runs reaches validation with its row
+    /// values as written (its rewrite expands them later); one the engine
+    /// runs while it executes another (a subquery, a CTE body) may arrive
+    /// expanded.
+    fn entry_row_value_spelling(&self) -> RowValueSpelling {
+        if self.statement_exec_depth.get() == 0 {
+            RowValueSpelling::AsWritten
+        } else {
+            RowValueSpelling::Expanded
+        }
+    }
+
+    fn validate_statement_select_structure(
+        &self,
+        statement: &Statement,
+        spelling: RowValueSpelling,
+    ) -> Result<()> {
         self.validate_statement_select_relations(statement)?;
-        self.validate_statement_select_semantics(statement)
+        self.validate_statement_select_semantics(statement, spelling)
     }
 
     /// Fail closed (bd-dk9ra): a table that is virtual per its schema DDL, still
@@ -56638,7 +56665,13 @@ impl Connection {
         }
     }
 
-    fn validate_statement_select_semantics(&self, statement: &Statement) -> Result<()> {
+    /// `spelling`: whether the statement's row values are still as written,
+    /// for the forced partial index check (bd-wpfqs).
+    fn validate_statement_select_semantics(
+        &self,
+        statement: &Statement,
+        spelling: RowValueSpelling,
+    ) -> Result<()> {
         match statement {
             Statement::Select(select) => {
                 // bd-k66zh: stock rejects an owned subquery aggregate call in
@@ -56660,7 +56693,7 @@ impl Connection {
                     SubqueryCollationUse::Scalar,
                     &collation_registry,
                 )?;
-                self.validate_select_index_hints(select)
+                self.validate_select_index_hints(select, spelling)
             }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
@@ -56683,7 +56716,7 @@ impl Connection {
                         SubqueryCollationUse::Scalar,
                         &collation_registry,
                     )?;
-                    self.validate_select_index_hints(select)?;
+                    self.validate_select_index_hints(select, spelling)?;
                 }
                 Ok(())
             }
@@ -56706,7 +56739,7 @@ impl Connection {
                         SubqueryCollationUse::Scalar,
                         &collation_registry,
                     )?;
-                    self.validate_select_index_hints(select)?;
+                    self.validate_select_index_hints(select, spelling)?;
                 }
                 Ok(())
             }
@@ -56740,7 +56773,11 @@ impl Connection {
                 // bd-wlo29 L10: a forced partial INDEXED BY on the UPDATE target
                 // must be covered by the statement WHERE, exactly like a SELECT
                 // source. The schema borrow above is scoped so this can re-borrow.
-                self.validate_dml_target_partial_index(&update.table, update.where_clause.as_ref())
+                self.validate_dml_target_partial_index(
+                    &update.table,
+                    update.where_clause.as_ref(),
+                    spelling,
+                )
             }
             Statement::Delete(delete) => {
                 // bd-wlo29 L10: same forced-partial-index cover check for DELETE.
@@ -56784,10 +56821,13 @@ impl Connection {
                     self.validate_dml_target_partial_index(
                         &delete.table,
                         delete.where_clause.as_ref(),
+                        spelling,
                     )
                 }
             }
-            Statement::Explain { stmt, .. } => self.validate_statement_select_semantics(stmt),
+            Statement::Explain { stmt, .. } => {
+                self.validate_statement_select_semantics(stmt, spelling)
+            }
             _ => Ok(()),
         }
     }
@@ -57220,7 +57260,8 @@ impl Connection {
                 }
             }
         }
-        self.validate_select_index_hints(select)?;
+        // The dispatcher's statement has had its row values expanded.
+        self.validate_select_index_hints(select, RowValueSpelling::Expanded)?;
         Ok(())
     }
 
@@ -57384,6 +57425,10 @@ impl Connection {
             && *oa == commuted
             && la.as_ref() == rb.as_ref()
             && ra.as_ref() == lb.as_ref()
+            // bd-wpfqs: stock does not commute a row-value comparison:
+            // `('x', 2) = (a, n)` does not imply `(a, n) = ('x', 2)`.
+            && !matches!(lb.as_ref(), Expr::RowValue(..))
+            && !matches!(rb.as_ref(), Expr::RowValue(..))
         {
             // x IS TRUE tests truthiness. TRUE IS x compares values.
             if oa.truth_test(ra).is_some() || ob.truth_test(rb).is_some() {
@@ -57593,23 +57638,39 @@ impl Connection {
         query_conjuncts: &[&Expr],
         visible_name: &str,
         table: &TableSchema,
+        spelling: RowValueSpelling,
     ) -> bool {
-        // bd-65jog: the predicate arrives expanded
-        // (`parse_partial_index_predicate_for_integrity`), and so may the
-        // statement, so each query conjunct, bound to the visible source, is
-        // expanded the same way and contributes its terms. Stock's
-        // sqlite3ExprImpliesExpr compares a row-value predicate term whole, so
-        // it refuses INDEXED BY for the scalar spelling `a = 'x' AND n = 2` of a
-        // `(a, n) = ('x', 2)` predicate. That cannot be told apart here once the
-        // statement is expanded, so both spellings are accepted (the rows are
-        // the same; bd-wpfqs).
+        // bd-65jog, bd-wpfqs: each query conjunct, bound to the visible
+        // source, contributes its row-value expansion's terms, as stock's WHERE
+        // analysis adds a vector comparison's terms as virtual ones, so a
+        // scalar predicate term `a = 'x'` is implied by `(a, n) = ('x', 2)`.
+        // Stock's sqlite3ExprImpliesExpr compares a row-value predicate term
+        // whole, so only the same comparison as written implies it, and the
+        // scalar spelling `a = 'x' AND n = 2` refuses INDEXED BY. A statement
+        // that reaches this check already expanded (a deferred prepared
+        // SELECT, a subquery run while the statement is prepared) still shows
+        // the comparison's expansion as one: every term of it carries the
+        // comparison's span. Later passes over an expanded statement (the
+        // dispatcher's, EXPLAIN's) expand the predicate too and accept both
+        // spellings, as the statement as written was checked first.
+        let mut written_query: Vec<Expr> = Vec::with_capacity(query_conjuncts.len());
         let mut normalized_query: Vec<Expr> = Vec::with_capacity(query_conjuncts.len());
         for conjunct in query_conjuncts {
             let mut owned = (*conjunct).clone();
             Self::normalize_partial_predicate_columns(&mut owned, &[visible_name]);
+            if spelling == RowValueSpelling::AsWritten {
+                written_query.extend(decompose_where(&owned).into_iter().cloned());
+            }
             fsqlite_ast::row_value::lower_row_values_in_expr(&mut owned);
             normalized_query.extend(decompose_where(&owned).into_iter().cloned());
         }
+        let expanded_query = normalized_query.clone();
+        normalized_query.extend(written_query.iter().cloned());
+        let mut predicate = predicate.clone();
+        if spelling == RowValueSpelling::Expanded {
+            fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+        }
+        let predicate = &predicate;
 
         // SQLite's LIKE/GLOB prefix optimization contributes virtual range
         // terms even when the chosen partial index is on another column.
@@ -57628,6 +57689,13 @@ impl Connection {
         decompose_where(predicate).into_iter().all(|predicate_conjunct| {
             let mut normalized_predicate = predicate_conjunct.clone();
             Self::normalize_partial_predicate_columns(&mut normalized_predicate, &[&table.name]);
+            let mut expansion = normalized_predicate.clone();
+            fsqlite_ast::row_value::lower_row_values_in_expr(&mut expansion);
+            if spelling == RowValueSpelling::AsWritten && expansion != normalized_predicate {
+                return written_query.iter().any(|query_conjunct| {
+                    Self::query_term_implies_predicate(query_conjunct, &normalized_predicate, table)
+                }) || query_holds_one_expansion(&expanded_query, &expansion);
+            }
             normalized_query.iter().any(|query_conjunct| {
                 Self::query_term_implies_predicate(query_conjunct, &normalized_predicate, table)
             })
@@ -57671,7 +57739,11 @@ impl Connection {
     /// PLAN` (hfdt-3b8zl): the plan surfaces must refuse a missing forced
     /// index exactly like execution would, instead of silently describing a
     /// plan that ignores the hint.
-    fn validate_select_index_hints(&self, select: &SelectStatement) -> Result<()> {
+    fn validate_select_index_hints(
+        &self,
+        select: &SelectStatement,
+        spelling: RowValueSpelling,
+    ) -> Result<()> {
         if let SelectCore::Select {
             from: Some(from),
             where_clause,
@@ -57734,7 +57806,7 @@ impl Connection {
                 // subquery source is validated exactly like a top-level SELECT
                 // (bd-wlo29 L10).
                 if let TableOrSubquery::Subquery { query, .. } = tos {
-                    self.validate_select_index_hints(query)?;
+                    self.validate_select_index_hints(query, spelling)?;
                     continue;
                 }
                 if let TableOrSubquery::Table {
@@ -57791,6 +57863,7 @@ impl Connection {
                                 available,
                                 &self.schema.borrow()[ti],
                                 alias.as_deref(),
+                                spelling,
                             )?;
                         }
                     } else if name.schema.as_deref().is_some_and(|schema| {
@@ -57825,7 +57898,8 @@ impl Connection {
     /// Resolve a forced `INDEXED BY <idx>` against the table at schema index
     /// `ti`. Returns `(index_known, partial_predicate)`: `index_known` is false
     /// when the table has no such index, and `partial_predicate` is `Some` only
-    /// for a partial index whose predicate parsed.
+    /// for a partial index whose predicate parsed. The predicate keeps its
+    /// row values as written (bd-wpfqs).
     fn resolve_forced_index_partial_predicate(&self, ti: usize, idx: &str) -> (bool, Option<Expr>) {
         let schema = self.schema.borrow();
         match schema
@@ -57833,13 +57907,10 @@ impl Connection {
             .and_then(|t| t.indexes.iter().find(|i| i.name.eq_ignore_ascii_case(idx)))
         {
             Some(forced_index) => {
-                let predicate = if forced_index.where_clause.is_some() {
-                    Self::parse_partial_index_predicate_for_integrity(forced_index)
-                        .ok()
-                        .flatten()
-                } else {
-                    None
-                };
+                let predicate = forced_index
+                    .where_clause
+                    .as_deref()
+                    .and_then(|sql| fsqlite_parser::expr::parse_expr(sql).ok());
                 (true, predicate)
             }
             None => (false, None),
@@ -57856,8 +57927,15 @@ impl Connection {
         available: &[&Expr],
         table: &TableSchema,
         alias: Option<&str>,
+        spelling: RowValueSpelling,
     ) -> Result<()> {
-        if self.forced_partial_index_predicate_covered(predicate, available, alias.unwrap_or(&table.name), table) {
+        if self.forced_partial_index_predicate_covered(
+            predicate,
+            available,
+            alias.unwrap_or(&table.name),
+            table,
+            spelling,
+        ) {
             Ok(())
         } else {
             Err(FrankenError::FunctionError("no query solution".to_owned()))
@@ -57873,6 +57951,7 @@ impl Connection {
         &self,
         table: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
+        spelling: RowValueSpelling,
     ) -> Result<()> {
         let Some(fsqlite_ast::IndexHint::IndexedBy(idx)) = &table.index_hint else {
             return Ok(());
@@ -57891,6 +57970,7 @@ impl Connection {
                 &available,
                 &self.schema.borrow()[ti],
                 table.alias.as_deref(),
+                spelling,
             )?;
         }
         Ok(())
@@ -110247,7 +110327,9 @@ impl Connection {
         // surfaces must refuse exactly like executing the statement would
         // instead of silently describing a plan that ignores the hint.
         match stmt {
-            Statement::Select(select) => self.validate_select_index_hints(select)?,
+            Statement::Select(select) => {
+                self.validate_select_index_hints(select, RowValueSpelling::Expanded)?;
+            }
             Statement::Update(update) if query_plan => {
                 // EQP renders UPDATE/DELETE from a synthetic summary rather than
                 // the compiled program. try_compile_statement catches an unknown
@@ -157060,6 +157142,63 @@ enum TableFunctionCatalogMatch {
     Missing,
     Ordinary,
     CallableVirtual,
+}
+
+/// bd-wpfqs: whether a statement's row-value comparisons are as written or
+/// already expanded into scalar ones (`rewrite_subquery_statement`). Stock
+/// lets only a row-value comparison as written imply a forced partial index's
+/// row-value predicate term, which an expanded statement can no longer show.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowValueSpelling {
+    AsWritten,
+    Expanded,
+}
+
+/// bd-wpfqs: whether `expanded_query`'s terms hold `expansion` (a row-value
+/// predicate term's expansion, split at AND) as the expansion of the same
+/// row-value comparison: its terms, in order and in a row, from one
+/// comparison, which the expansion marks by giving every node it builds that
+/// comparison's span. A scalar spelling's terms each have their own span,
+/// and a reordered row value expands to its terms in another order.
+fn query_holds_one_expansion(expanded_query: &[Expr], expansion: &Expr) -> bool {
+    let terms = decompose_where(expansion);
+    if terms.is_empty() {
+        return false;
+    }
+    expanded_query.windows(terms.len()).any(|window| {
+        let Some(span) = single_expansion_span(&window[0]) else {
+            return false;
+        };
+        window.iter().zip(&terms).all(|(query_term, term)| {
+            let same_comparison = single_expansion_span(query_term) == Some(span);
+            same_comparison && query_term == *term
+        })
+    })
+}
+
+/// The one span the comparisons of `expr`, and the AND / OR nodes joining
+/// them, all carry, when they carry the same one, as a row-value
+/// comparison's expansion does. The comparisons' operands keep their own.
+fn single_expansion_span(expr: &Expr) -> Option<Span> {
+    fn collect(expr: &Expr, span: &mut Option<Span>) -> bool {
+        let Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span: own,
+            ..
+        } = expr
+        else {
+            return true;
+        };
+        if span.is_some_and(|seen| seen != *own) {
+            return false;
+        }
+        *span = Some(*own);
+        !matches!(op, BinaryOp::And | BinaryOp::Or) || (collect(left, span) && collect(right, span))
+    }
+    let mut span = None;
+    collect(expr, &mut span).then_some(span).flatten()
 }
 
 fn insert_source_select_for_validation<'a>(
