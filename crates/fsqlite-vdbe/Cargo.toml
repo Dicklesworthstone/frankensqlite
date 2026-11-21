@@ -44,6 +44,9 @@ crossbeam-deque = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# test-internals: asupersync::Cx::for_testing{,_with_budget} for the aggregate
+# boundary keepers' native-runtime and budget signals (bd-w4pr1.12, lever AFC).
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 insta = { workspace = true }
 proptest = { workspace = true }

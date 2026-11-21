@@ -197,8 +197,9 @@ pub struct CompactionReport {
 use fsqlite_pager::persistent_page_map::PersistentPageMap;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_pager::{
-    Argon2Params, ENCRYPTION_RESERVED_BYTES, KeyEnvelope, PageEncryptor, key_envelope_path_for_db,
-    read_key_envelope, remove_key_envelope_if_exists, write_key_envelope_atomic,
+    Argon2Params, DatabaseId, ENCRYPTION_RESERVED_BYTES, KeyEnvelope, PageEncryptor,
+    decrypt_page_after_read, encrypt_page_for_write, key_envelope_path_for_db, read_key_envelope,
+    remove_key_envelope_if_exists, write_key_envelope_atomic,
 };
 use fsqlite_pager::{
     ActivePageCipher, CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
@@ -269,6 +270,10 @@ use fsqlite_vdbe::engine::{
     reset_vdbe_jit_metrics, set_vdbe_jit_cache_capacity, set_vdbe_jit_enabled,
     set_vdbe_jit_hot_threshold, vdbe_jit_cache_capacity, vdbe_jit_enabled, vdbe_jit_hot_threshold,
     vdbe_jit_metrics_snapshot,
+};
+use fsqlite_vdbe::temp_store::{
+    TempFileBackend, TempFileHandle, TempStoreMode, TempStoreRuntime, TempStoreStats,
+    TempStoreStatsSnapshot, map_io_error_for_temp_store,
 };
 use fsqlite_vdbe::{ProgramBuilder, SchemaEvaluationContext, VdbeProgram};
 #[cfg(all(feature = "native", target_os = "linux"))]
@@ -6870,6 +6875,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
                 | "cache_size"
                 | "page_size"
                 | "temp_store"
+                | "temp_store_directory"
                 | "auto_vacuum"
                 | "user_version"
                 | "application_id"
@@ -6909,6 +6915,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     }
     if name_is("temp_store") {
         return &["temp_store"];
+    }
+    if name_is("temp_store_directory") {
+        return &["temp_store_directory"];
     }
     if name_is("auto_vacuum") {
         return &["auto_vacuum"];
@@ -10429,6 +10438,7 @@ impl PreparedStatement<'_> {
             cached,
             Vec::new(),
             self.conn.statement_parallel_workers(),
+            self.conn.build_temp_store_runtime(),
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10608,6 +10618,7 @@ impl PreparedStatement<'_> {
                 max_collected_result_rows,
                 true,
                 cached,
+                self.conn.build_temp_store_runtime(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10663,6 +10674,7 @@ impl PreparedStatement<'_> {
                 max_collected_result_rows,
                 true,
                 cached,
+                self.conn.build_temp_store_runtime(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10804,6 +10816,7 @@ impl PreparedStatement<'_> {
                 cached,
                 Vec::new(),
                 self.conn.statement_parallel_workers(),
+                self.conn.build_temp_store_runtime(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -10864,6 +10877,7 @@ impl PreparedStatement<'_> {
                 cached,
                 Vec::new(),
                 self.conn.statement_parallel_workers(),
+                self.conn.build_temp_store_runtime(),
             )
             .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -15034,6 +15048,11 @@ pub struct Connection {
     /// `TEMP` tables are never written to the main `sqlite_master`, mirroring
     /// the `TriggerDef::temporary` precedent.
     temp_table_names: TxnRestorableCell<HashSet<String>>,
+    /// Whether the connection's `TEMP` database handle has been lazily opened
+    /// (matching SQLite's `db->aDb[1].pBt != 0`: set when a TEMP object is
+    /// created or `sqlite_temp_master` is consulted, cleared when
+    /// `PRAGMA temp_store` resets TEMP storage outside a transaction).
+    temp_db_initialized: Cell<bool>,
     /// Next connection-local TEMP root, allocated downward from
     /// [`TEMP_MEMDB_ROOT_START`] so it cannot collide with ordinary main pager
     /// roots or advance the ordinary MemDatabase root allocator.
@@ -15210,6 +15229,15 @@ pub struct Connection {
     /// keeps every scan on the connection's thread). Controlled by
     /// `PRAGMA fsqlite.parallel_workers`.
     parallel_workers: Cell<usize>,
+    /// Live telemetry counters for `PRAGMA temp_store` temporary file and
+    /// memory allocations (bd-dwjnq.5 / bd-dwjnq.6).
+    temp_store_stats: Arc<TempStoreStats>,
+    /// Optional per-connection directory override for VFS temporary files
+    /// (`PRAGMA temp_store_directory` or `Connection::set_temp_store_directory`).
+    temp_store_directory: RefCell<Option<PathBuf>>,
+    /// Optional caller-injected [`TempFileBackend`] (used by fault-injection
+    /// and custom-VFS tests without mutating process-global state).
+    custom_temp_file_backend: RefCell<Option<Arc<dyn TempFileBackend>>>,
     /// Commit-path safety regime. `Safe` (default) always runs the full
     /// SSI validation. `LabUnsafe` enables the `ssi_e_process_gate` skip
     /// path. Controlled by `PRAGMA fsqlite.write_merge`.
@@ -17503,6 +17531,7 @@ impl Connection {
             schema: TxnRestorableCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: TxnRestorableCell::new(HashSet::new()),
+            temp_db_initialized: Cell::new(false),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
             materialized_temp_root_pages: RefCell::new(HashSet::new()),
             shadowed_main_tables: TxnRestorableCell::new(HashMap::new()),
@@ -17548,6 +17577,9 @@ impl Connection {
             concurrent_mode_default: RefCell::new(true),
             dqs_enabled: Cell::new(true),
             parallel_workers: Cell::new(default_parallel_workers()),
+            temp_store_stats: Arc::new(TempStoreStats::new()),
+            temp_store_directory: RefCell::new(None),
+            custom_temp_file_backend: RefCell::new(None),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -18171,6 +18203,7 @@ impl Connection {
             schema: TxnRestorableCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: TxnRestorableCell::new(HashSet::new()),
+            temp_db_initialized: Cell::new(false),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
             materialized_temp_root_pages: RefCell::new(HashSet::new()),
             shadowed_main_tables: TxnRestorableCell::new(HashMap::new()),
@@ -18216,6 +18249,9 @@ impl Connection {
             concurrent_mode_default: RefCell::new(true),
             dqs_enabled: Cell::new(true),
             parallel_workers: Cell::new(default_parallel_workers()),
+            temp_store_stats: Arc::new(TempStoreStats::new()),
+            temp_store_directory: RefCell::new(None),
+            custom_temp_file_backend: RefCell::new(None),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
             fused_lane_tracing_suppression_warned: Cell::new(false),
@@ -28273,6 +28309,262 @@ impl Connection {
         }
     }
 
+    /// Snapshot live `PRAGMA temp_store` allocation and spill counters for this
+    /// connection (bd-dwjnq.5 / bd-dwjnq.6).
+    #[must_use]
+    pub fn temp_store_stats(&self) -> TempStoreStatsSnapshot {
+        let _ = self.build_temp_store_runtime();
+        self.temp_store_stats.snapshot()
+    }
+
+    /// Configure an explicit directory for VFS-backed temporary spill files on
+    /// this connection (`None` resets to the OS default temporary directory).
+    pub fn set_temp_store_directory(&self, dir: Option<PathBuf>) -> Result<()> {
+        if let Some(ref path) = dir {
+            let meta = std::fs::metadata(path).map_err(|err| {
+                FrankenError::FunctionError(format!(
+                    "temp_store_directory '{}' is not accessible: {err}",
+                    path.display()
+                ))
+            })?;
+            if !meta.is_dir() {
+                return Err(FrankenError::FunctionError(format!(
+                    "temp_store_directory '{}' is not a directory",
+                    path.display()
+                )));
+            }
+        }
+        *self.temp_store_directory.borrow_mut() = dir;
+        Ok(())
+    }
+
+    /// Override the [`TempFileBackend`] used by `PRAGMA temp_store` spill paths
+    /// on this connection (`None` restores the real VFS backend).
+    pub fn set_temp_file_backend(&self, backend: Option<Arc<dyn TempFileBackend>>) {
+        *self.custom_temp_file_backend.borrow_mut() = backend;
+        let _ = self.build_temp_store_runtime();
+    }
+
+    /// Compute the active temporary-storage byte budget from `PRAGMA temp.cache_size`,
+    /// `PRAGMA cache_size`, `PRAGMA soft_heap_limit`, and `PRAGMA hard_heap_limit`.
+    fn temp_store_budget_bytes(&self) -> usize {
+        let state = self.pragma_state.borrow();
+        fsqlite_vdbe::pragma::effective_temp_budget_bytes(
+            state.temp_cache_size,
+            state.cache_size,
+            state.page_size,
+        )
+    }
+
+    /// Construct the active [`TempStoreRuntime`] governing VDBE sorters,
+    /// ephemeral B-trees, and `TEMP` tables for the next operation.
+    fn build_temp_store_runtime(&self) -> TempStoreRuntime {
+        let mode = TempStoreMode::from_pragma_i64(self.pragma_state.borrow().temp_store);
+        let budget_bytes = self.temp_store_budget_bytes();
+        let hard_raw = fsqlite_vdbe::pragma::hard_heap_limit();
+        let hard_heap_limit_bytes =
+            (hard_raw > 0).then(|| usize::try_from(hard_raw).unwrap_or(usize::MAX));
+        let backend: Option<Arc<dyn TempFileBackend>> =
+            if let Some(custom) = self.custom_temp_file_backend.borrow().clone() {
+                Some(custom)
+            } else {
+                let dir = self.temp_store_directory.borrow().clone();
+                let encrypt_temp_files = self.pager.page_cipher_slot().is_enabled();
+                Some(default_vfs_temp_file_backend(dir, encrypt_temp_files))
+            };
+        TempStoreRuntime::new(
+            mode,
+            budget_bytes,
+            hard_heap_limit_bytes,
+            backend,
+            Arc::clone(&self.temp_store_stats),
+        )
+    }
+
+    /// Whether in-memory `MemDatabase` fast paths that bypass VDBE sorting or
+    /// grouping must yield to VDBE so tight `PRAGMA temp_store` budgets,
+    /// custom/fault backends, or spilled `TEMP` tables are honored honestly.
+    fn should_bypass_in_memory_temp_fast_path(&self) -> bool {
+        if self.custom_temp_file_backend.borrow().is_some() {
+            return true;
+        }
+        let state = self.pragma_state.borrow();
+        if state.temp_cache_size != 0 {
+            return true;
+        }
+        if fsqlite_vdbe::pragma::soft_heap_limit() > 0
+            || fsqlite_vdbe::pragma::hard_heap_limit() > 0
+        {
+            return true;
+        }
+        if self.temp_store_budget_bytes() < 2_000 * 1024 {
+            return true;
+        }
+        self.db
+            .borrow()
+            .tables
+            .iter()
+            .any(|(_, table)| table.has_spilled_rows())
+    }
+
+    /// Whether this connection currently owns any open TEMP schema objects
+    /// (TEMP tables, TEMP views, TEMP triggers, or materialized TEMP roots).
+    fn has_open_temp_objects(&self) -> bool {
+        self.temp_db_initialized.get()
+            || !self.temp_table_names.borrow().is_empty()
+            || !self.materialized_temp_root_pages.borrow().is_empty()
+            || self.views.borrow().iter().any(|view| view.temporary)
+            || self.triggers.borrow().iter().any(|trigger| trigger.temporary)
+    }
+
+    /// Atomically close and destroy all connection-local TEMP objects when
+    /// `PRAGMA temp_store` switches storage mode outside a transaction
+    /// (matching stock SQLite's `changeTempStorage` semantics).
+    fn reset_all_temp_objects_for_mode_change(&self) {
+        let temp_names: HashSet<String> = {
+            let mut names = self.temp_table_names.borrow_mut();
+            std::mem::take(&mut *names)
+        };
+        let removed_tables: Vec<TableSchema> = {
+            let mut schema = self.schema.borrow_mut();
+            let mut removed = Vec::new();
+            let mut idx = 0;
+            while idx < schema.len() {
+                if temp_names.contains(&schema[idx].name.to_ascii_lowercase()) {
+                    removed.push(schema.remove(idx));
+                } else {
+                    idx += 1;
+                }
+            }
+            removed
+        };
+        {
+            let mut db = self.db.borrow_mut();
+            for table in &removed_tables {
+                db.destroy_table_without_undo(table.root_page);
+                for index in &table.indexes {
+                    db.destroy_table_without_undo(index.root_page);
+                }
+            }
+            db.commit_undo();
+        }
+        let _ = self.time_travel_materialized.borrow_mut().take();
+        for name_lc in &temp_names {
+            self.rowid_alias_columns.borrow_mut().remove(name_lc);
+            self.temp_sqlite_sequence.borrow_mut().remove(name_lc);
+        }
+        let restored_main: Vec<(String, TableSchema)> = {
+            let mut shadowed = self.shadowed_main_tables.borrow_mut();
+            shadowed.drain().collect()
+        };
+        if !restored_main.is_empty() {
+            let mut schema = self.schema.borrow_mut();
+            let mut aliases = self.rowid_alias_columns.borrow_mut();
+            for (name_lc, main_table) in restored_main {
+                if let Some(ipk_col) = main_table.columns.iter().position(|c| c.is_ipk) {
+                    aliases.insert(name_lc, ipk_col);
+                }
+                schema.push(main_table);
+            }
+        }
+        self.views.borrow_mut().retain(|view| !view.temporary);
+        self.triggers
+            .borrow_mut()
+            .retain(|trigger| !trigger.temporary);
+        self.next_temp_root_page.set(TEMP_MEMDB_ROOT_START);
+        self.temp_db_initialized.set(false);
+        self.rebuild_schema_indices();
+        self.note_temp_schema_change();
+    }
+
+    /// Execute `PRAGMA temp_store [= DEFAULT|FILE|MEMORY|0|1|2]` with canonical
+    /// stock SQLite transition semantics (bd-dwjnq.5).
+    fn execute_pragma_temp_store(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+        result_columns: &[&str],
+    ) -> Result<Vec<Row>> {
+        let prior = self.pragma_state.borrow().temp_store;
+        if pragma.value.is_none() {
+            return Ok(if result_columns.is_empty() {
+                Vec::new()
+            } else {
+                vec![Row {
+                    values: vec![SqliteValue::Integer(prior)],
+                }]
+            });
+        }
+        let mut parsed_state = self.pragma_state.borrow().clone();
+        let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut parsed_state, pragma)?;
+        let requested = parsed_state.temp_store;
+        if requested != prior && self.has_open_temp_objects() {
+            let in_txn_or_active_stmt = self.in_transaction.get()
+                || !self.savepoints.borrow().is_empty()
+                || self.internal_statement_savepoint_depth.get() > 0;
+            if in_txn_or_active_stmt {
+                return Err(FrankenError::FunctionError(
+                    "temporary storage cannot be changed from within a transaction".to_owned(),
+                ));
+            }
+            self.reset_all_temp_objects_for_mode_change();
+        }
+        self.pragma_state.borrow_mut().temp_store = requested;
+        let _ = self.build_temp_store_runtime();
+        if result_columns.is_empty() {
+            Ok(Vec::new())
+        } else if let fsqlite_vdbe::pragma::PragmaOutput::Int(value) = output {
+            Ok(vec![Row {
+                values: vec![SqliteValue::Integer(value)],
+            }])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Execute `PRAGMA temp_store_directory [= 'path']`.
+    fn execute_pragma_temp_store_directory(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+        result_columns: &[&str],
+    ) -> Result<Vec<Row>> {
+        if let Some(value) = pragma.value.as_ref() {
+            let expr = match value {
+                fsqlite_ast::PragmaValue::Assign(expr) | fsqlite_ast::PragmaValue::Call(expr) => {
+                    expr
+                }
+            };
+            let dir_text = match expr {
+                Expr::Literal(Literal::String(text), _) => text.clone(),
+                Expr::Literal(Literal::Null, _) => String::new(),
+                Expr::Column(col, _) if col.table.is_none() => col.column.to_string(),
+                _ => {
+                    return Err(FrankenError::TypeMismatch {
+                        expected: "directory path string".to_owned(),
+                        actual: expr.to_string(),
+                    });
+                }
+            };
+            if dir_text.is_empty() {
+                self.set_temp_store_directory(None)?;
+            } else {
+                self.set_temp_store_directory(Some(PathBuf::from(dir_text)))?;
+            }
+            return Ok(Vec::new());
+        }
+        if result_columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let current = self
+            .temp_store_directory
+            .borrow()
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(vec![Row {
+            values: vec![SqliteValue::Text(current.into())],
+        }])
+    }
+
     fn concurrent_exec_context(&self) -> Result<Option<ConcurrentExecContext>> {
         let Some((session_id, handle)) = self.concurrent_session_handle()? else {
             return Ok(None);
@@ -30569,6 +30861,13 @@ impl Connection {
             #[cfg(not(target_arch = "wasm32"))]
             fsqlite_wal::remove_parallel_wal_coordinator(&db_path);
         }
+
+        // Release any open statement engines and connection-local TEMP tables
+        // before marking closed so every VFS temp spill handle is closed and
+        // unlinked before `close()` / `close_in_place()` returns (bd-dwjnq.5).
+        self.cached_vdbe_engine.get_mut().take();
+        self.db.borrow_mut().tables.clear();
+        self.temp_table_names.borrow_mut().clear();
 
         *self.closed.get_mut() = true;
         emit_compat_trace_event(trace_registration.as_ref(), TraceEvent::Close);
@@ -34343,6 +34642,9 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         allow_file_backed_memdb: bool,
     ) -> bool {
+        if self.should_bypass_in_memory_temp_fast_path() {
+            return false;
+        }
         stmt.db.is_some()
             && self.memdb_rows_loaded.get()
             && (self.pager.is_memory() || allow_file_backed_memdb)
@@ -51232,7 +51534,7 @@ impl Connection {
                     if col_info.unique && !col_info.is_ipk {
                         let new_val = &col_values[i];
                         if !new_val.is_null() {
-                            for mem_row in table.iter_rows() {
+                            for mem_row in table.iter_rows_cow() {
                                 if Some(mem_row.0) == explicit_rowid {
                                     continue; // Replacing this rowid.
                                 }
@@ -51282,7 +51584,7 @@ impl Connection {
                         let new_key: Vec<&SqliteValue> =
                             idx_positions.iter().map(|&pos| &col_values[pos]).collect();
 
-                        for mem_row in table.iter_rows() {
+                        for mem_row in table.iter_rows_cow() {
                             if Some(mem_row.0) == explicit_rowid {
                                 continue;
                             }
@@ -51336,6 +51638,7 @@ impl Connection {
                 }
             }
 
+            let op_cx = self.op_cx()?;
             if let Some(rowid) = explicit_rowid {
                 let exists = db
                     .get_table(root_page)
@@ -51347,7 +51650,7 @@ impl Connection {
                         if let Some(ipk_idx) = ipk_col_idx {
                             col_values[ipk_idx] = SqliteValue::Integer(rowid);
                         }
-                        db.upsert_row(root_page, rowid, col_values);
+                        db.upsert_row_checked(&op_cx, root_page, rowid, col_values)?;
                         self.record_last_insert_rowid(rowid);
                         affected += 1;
                     }
@@ -51356,7 +51659,7 @@ impl Connection {
                             if let Some(ipk_idx) = ipk_col_idx {
                                 col_values[ipk_idx] = SqliteValue::Integer(rowid);
                             }
-                            db.upsert_row(root_page, rowid, col_values);
+                            db.upsert_row_checked(&op_cx, root_page, rowid, col_values)?;
                             self.record_last_insert_rowid(rowid);
                             affected += 1;
                         }
@@ -51371,7 +51674,7 @@ impl Connection {
                         if let Some(ipk_idx) = ipk_col_idx {
                             col_values[ipk_idx] = SqliteValue::Integer(rowid);
                         }
-                        db.upsert_row(root_page, rowid, col_values);
+                        db.upsert_row_checked(&op_cx, root_page, rowid, col_values)?;
                         self.record_last_insert_rowid(rowid);
                         affected += 1;
                     }
@@ -51380,7 +51683,7 @@ impl Connection {
                 // No explicit rowid; auto-allocate.  Conflict on auto-generated
                 // rowid is practically impossible.
                 let new_rowid = db
-                    .insert_auto_row(root_page, col_values, ipk_col_idx)
+                    .insert_auto_row_checked(&op_cx, root_page, col_values, ipk_col_idx)?
                     .ok_or_else(|| {
                         FrankenError::Internal(format!("table not found at root page {root_page}"))
                     })?;
@@ -72591,9 +72894,23 @@ impl Connection {
                 if let Some(table) = removed {
                     // TEMP table and index roots are MemDatabase-only. Release
                     // every one without touching the main pager freelist.
-                    self.db.borrow_mut().destroy_table(table.root_page);
-                    for index in &table.indexes {
-                        self.db.borrow_mut().destroy_table(index.root_page);
+                    // Outside any transaction or savepoint, bypass undo_log so
+                    // any VFS spill file closes and unlinks immediately.
+                    let in_txn_or_savepoint = self.in_transaction.get()
+                        || !self.savepoints.borrow().is_empty()
+                        || self.internal_statement_savepoint_depth.get() > 0;
+                    let mut db = self.db.borrow_mut();
+                    if in_txn_or_savepoint {
+                        db.destroy_table(table.root_page);
+                        for index in &table.indexes {
+                            db.destroy_table(index.root_page);
+                        }
+                    } else {
+                        db.destroy_table_without_undo(table.root_page);
+                        for index in &table.indexes {
+                            db.destroy_table_without_undo(index.root_page);
+                        }
+                        db.commit_undo();
                     }
                 }
                 self.temp_table_names.borrow_mut().remove(&drop_name_lc);
@@ -81263,6 +81580,12 @@ impl Connection {
             // next unused main page would not keep their identities separate.
             let ordinary_next_root = db.next_root_page();
             db.create_table_at(root_page, num_columns);
+            if let Some(table) = db.get_table_mut(root_page) {
+                table.configure_temp_spill(
+                    self.build_temp_store_runtime(),
+                    self.db_text_encoding.get(),
+                );
+            }
             db.set_next_root_page(ordinary_next_root);
             self.next_temp_root_page.set(next_root_page);
             return Ok(root_page);
@@ -81390,6 +81713,7 @@ impl Connection {
     /// triggers — exactly the objects the main catalog excludes. Serves
     /// `temp.sqlite_master` and the `sqlite_temp_master` alias.
     fn build_sqlite_temp_master_rows(&self) -> Vec<Vec<SqliteValue>> {
+        self.temp_db_initialized.set(true);
         let schema = self.schema.borrow();
         let views = self.views.borrow();
         let triggers = self.triggers.borrow();
@@ -87448,6 +87772,12 @@ impl Connection {
                 return Ok(vec![Row { values: vec![SqliteValue::Integer(value)] }]);
             }
         }
+        if pragma_name == "temp_store" {
+            return self.execute_pragma_temp_store(pragma, result_columns);
+        }
+        if pragma_name == "temp_store_directory" {
+            return self.execute_pragma_temp_store_directory(pragma, result_columns);
+        }
         if matches!(pragma_name.as_str(), "cache_size" | "default_cache_size") {
             let mut next_state = self.pragma_state.borrow().clone();
             let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut next_state, pragma)?;
@@ -87495,6 +87825,8 @@ impl Connection {
                     state.cache_size = next_state.cache_size;
                     state.default_cache_size = next_state.default_cache_size;
                 }
+                drop(state);
+                let _ = self.build_temp_store_runtime();
             }
             return if result_columns.is_empty() {
                 Ok(Vec::new())
@@ -91768,6 +92100,7 @@ impl Connection {
         }
         let schema = self.schema.borrow();
         let db = self.db.borrow();
+        let cx = self.root_cx.clone();
         schema
             .iter()
             .filter(|table| {
@@ -91776,9 +92109,11 @@ impl Connection {
             })
             .map(|table| {
                 let rows = db.get_table(table.root_page).map_or_else(Vec::new, |mt| {
-                    mt.iter_rows()
-                        .map(|(rowid, vals)| (rowid, vals.to_vec()))
-                        .collect()
+                    mt.snapshot_all_rows_owned(&cx).unwrap_or_else(|_| {
+                        mt.iter_rows()
+                            .map(|(rowid, vals)| (rowid, vals.to_vec()))
+                            .collect()
+                    })
                 });
                 (table.clone(), rows)
             })
@@ -91825,6 +92160,10 @@ impl Connection {
             }
             new_db.set_next_root_page(ordinary_next_root);
             if let Some(mem_table) = new_db.get_table_mut(temp_schema.root_page) {
+                mem_table.configure_temp_spill(
+                    self.build_temp_store_runtime(),
+                    self.db_text_encoding.get(),
+                );
                 for index in temp_schema.indexes.iter().filter(|index| index.is_unique) {
                     let Some(columns) = index
                         .columns
@@ -91853,7 +92192,7 @@ impl Connection {
                 }
             }
             for (rowid, vals) in rows {
-                new_db.upsert_row(temp_schema.root_page, rowid, vals);
+                let _ = new_db.upsert_row_checked(&self.root_cx, temp_schema.root_page, rowid, vals);
             }
             if materialized {
                 materialized_schemas.push(temp_schema);
@@ -100130,6 +100469,7 @@ impl Connection {
         // CTE shadows that relation. Honor the same scope guard as compiled
         // programs before consulting any cached rowid plan.
         if self.bypass_compiled_cache.get()
+            || self.should_bypass_in_memory_temp_fast_path()
             || self.scalar_function_overridden.get()
             || self.application_function_replaces_builtin("sum", 1)
             || !self.memdb_rows_loaded.get()
@@ -100182,7 +100522,10 @@ impl Connection {
         outputs: &[SimpleStreamingGroupByOutput],
         col_map: &[(String, String, bool)],
     ) -> Result<Option<Vec<Row>>> {
-        if !self.memdb_rows_loaded.get() || !self.memdb_storage_count_shortcuts_safe.get() {
+        if !self.memdb_rows_loaded.get()
+            || !self.memdb_storage_count_shortcuts_safe.get()
+            || self.should_bypass_in_memory_temp_fast_path()
+        {
             return Ok(None);
         }
         let use_hidden_rowid = include_hidden_rowid && projected_source_indices.is_none();
@@ -110166,6 +110509,7 @@ impl Connection {
             cached_engine,
             vtab_instances,
             self.statement_parallel_workers(),
+            self.build_temp_store_runtime(),
         )
         .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
@@ -151654,6 +151998,401 @@ thread_local! {
         std::cell::RefCell::new(Some(MemDatabase::new()));
 }
 
+/// Poll an immediate-ready VFS file I/O future (`UnixFile`/`WindowsFile`
+/// perform synchronous OS I/O inside their `async fn` bodies and resolve on
+/// the first poll without suspending).
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn poll_vfs_io_ready<T>(fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let waker = std::task::Waker::noop();
+    let mut task_cx = std::task::Context::from_waker(waker);
+    let mut pinned = std::pin::pin!(fut);
+    match pinned.as_mut().poll(&mut task_cx) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => Err(FrankenError::internal(
+            "synchronous VFS temp file I/O unexpectedly returned Pending",
+        )),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn map_vfs_temp_error(err: FrankenError) -> FrankenError {
+    match err {
+        FrankenError::Io(io_err) => map_io_error_for_temp_store(io_err),
+        other => other,
+    }
+}
+
+/// Real VFS-backed temporary file backend for `PRAGMA temp_store` (bd-dwjnq.5).
+///
+/// Opens private (`0o600`), exclusive, delete-on-close temporary files through
+/// the platform's real [`Vfs`] (`UnixVfs` / `WindowsVfs`). When the owning
+/// database has page-level encryption enabled, wraps each handle with an
+/// ephemeral per-file XChaCha20-Poly1305 page cipher so zero plaintext bytes
+/// touch disk even under `PRAGMA temp_store = FILE`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+struct VfsTempFileBackend {
+    directory: Option<PathBuf>,
+    encrypt_temp_files: bool,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+struct VfsTempFileHandle<F: VfsFile> {
+    file: Mutex<Option<F>>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+impl<F: VfsFile> TempFileHandle for VfsTempFileHandle<F> {
+    fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let mut guard = lock_unpoisoned(&self.file);
+        let Some(file) = guard.as_mut() else {
+            return Err(FrankenError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "VFS temporary file already closed",
+            )));
+        };
+        poll_vfs_io_ready(file.write(cx, data, offset)).map_err(map_vfs_temp_error)
+    }
+
+    fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let guard = lock_unpoisoned(&self.file);
+        let Some(file) = guard.as_ref() else {
+            return Err(FrankenError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "VFS temporary file already closed",
+            )));
+        };
+        poll_vfs_io_ready(file.read(cx, buf, offset)).map_err(map_vfs_temp_error)
+    }
+
+    fn file_size(&self, cx: &Cx) -> Result<u64> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let guard = lock_unpoisoned(&self.file);
+        let Some(file) = guard.as_ref() else {
+            return Ok(0);
+        };
+        file.file_size(cx).map_err(map_vfs_temp_error)
+    }
+
+    fn truncate(&self, cx: &Cx, size: u64) -> Result<()> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let mut guard = lock_unpoisoned(&self.file);
+        let Some(file) = guard.as_mut() else {
+            return Ok(());
+        };
+        file.truncate(cx, size).map_err(map_vfs_temp_error)
+    }
+
+    fn close(&self, cx: &Cx) -> Result<()> {
+        let mut guard = lock_unpoisoned(&self.file);
+        if let Some(mut file) = guard.take() {
+            return file.close(cx).map_err(map_vfs_temp_error);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+impl<F: VfsFile> Drop for VfsTempFileHandle<F> {
+    fn drop(&mut self) {
+        let mut guard = lock_unpoisoned(&self.file);
+        if let Some(mut file) = guard.take() {
+            let cx = Cx::new();
+            let _ = file.close(&cx);
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+const ENCRYPTED_TEMP_PAGE_SIZE: usize = 4096;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+const ENCRYPTED_TEMP_USABLE_SIZE: usize =
+    ENCRYPTED_TEMP_PAGE_SIZE - (ENCRYPTION_RESERVED_BYTES as usize);
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+struct EncryptedTempState {
+    logical_len: u64,
+    physical_pages: u64,
+}
+
+/// Transparent ephemeral-key XChaCha20-Poly1305 wrapper around a VFS temp file
+/// handle so encrypted databases never spill plaintext to disk even under
+/// `PRAGMA temp_store = FILE`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+struct EncryptedTempFileHandle {
+    inner: Box<dyn TempFileHandle>,
+    cipher: ActivePageCipher,
+    state: Mutex<EncryptedTempState>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+impl EncryptedTempFileHandle {
+    fn new(cx: &Cx, inner: Box<dyn TempFileHandle>) -> Self {
+        let mut dek = [0u8; 32];
+        let mut db_id_bytes = [0u8; 16];
+        #[cfg(unix)]
+        {
+            let vfs = UnixVfs::new();
+            vfs.randomness(cx, &mut dek);
+            vfs.randomness(cx, &mut db_id_bytes);
+        }
+        #[cfg(windows)]
+        {
+            let vfs = fsqlite_vfs::WindowsVfs::new();
+            vfs.randomness(cx, &mut dek);
+            vfs.randomness(cx, &mut db_id_bytes);
+        }
+        let encryptor = Arc::new(PageEncryptor::new(&dek, DatabaseId::from_bytes(db_id_bytes)));
+        dek.fill(0);
+        let cipher = ActivePageCipher::new(encryptor, ENCRYPTED_TEMP_PAGE_SIZE);
+        Self {
+            inner,
+            cipher,
+            state: Mutex::new(EncryptedTempState {
+                logical_len: 0,
+                physical_pages: 0,
+            }),
+        }
+    }
+
+    fn temp_page_no(block_idx: u64) -> Result<u32> {
+        // Start at page 2 so page-1 SQLite header preservation (0..100) is never
+        // applied; every single byte of every temp page is authenticated ciphertext.
+        block_idx
+            .checked_add(2)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(FrankenError::DatabaseFull)
+    }
+
+    fn read_decrypted_block(&self, cx: &Cx, block_idx: u64) -> Result<[u8; ENCRYPTED_TEMP_PAGE_SIZE]> {
+        let phys_offset = block_idx
+            .checked_mul(ENCRYPTED_TEMP_PAGE_SIZE as u64)
+            .ok_or(FrankenError::DatabaseFull)?;
+        let mut buf = [0u8; ENCRYPTED_TEMP_PAGE_SIZE];
+        let mut read_total = 0usize;
+        while read_total < ENCRYPTED_TEMP_PAGE_SIZE {
+            let n = self.inner.read_at(
+                cx,
+                phys_offset.saturating_add(read_total as u64),
+                &mut buf[read_total..],
+            )?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        if read_total == 0 {
+            return Ok([0u8; ENCRYPTED_TEMP_PAGE_SIZE]);
+        }
+        if read_total < ENCRYPTED_TEMP_PAGE_SIZE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "truncated encrypted temp spill block {block_idx}: {read_total} < {ENCRYPTED_TEMP_PAGE_SIZE}"
+                ),
+            });
+        }
+        let pgno = Self::temp_page_no(block_idx)?;
+        decrypt_page_after_read(&self.cipher, pgno, &mut buf)?;
+        Ok(buf)
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+impl TempFileHandle for EncryptedTempFileHandle {
+    fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut state = lock_unpoisoned(&self.state);
+        let usable_u64 = ENCRYPTED_TEMP_USABLE_SIZE as u64;
+        let mut written = 0usize;
+        while written < data.len() {
+            let cur_off = offset.saturating_add(written as u64);
+            let block_idx = cur_off / usable_u64;
+            let in_block = usize::try_from(cur_off % usable_u64).unwrap_or(0);
+            let chunk = (ENCRYPTED_TEMP_USABLE_SIZE - in_block).min(data.len() - written);
+            let mut page = if (in_block != 0 || chunk < ENCRYPTED_TEMP_USABLE_SIZE)
+                && block_idx < state.physical_pages
+            {
+                self.read_decrypted_block(cx, block_idx)?
+            } else {
+                [0u8; ENCRYPTED_TEMP_PAGE_SIZE]
+            };
+            page[in_block..in_block + chunk].copy_from_slice(&data[written..written + chunk]);
+            let pgno = Self::temp_page_no(block_idx)?;
+            let ciphertext = encrypt_page_for_write(&self.cipher, cx, pgno, &page)?;
+            let phys_offset = block_idx
+                .checked_mul(ENCRYPTED_TEMP_PAGE_SIZE as u64)
+                .ok_or(FrankenError::DatabaseFull)?;
+            self.inner.write_at(cx, phys_offset, &ciphertext)?;
+            if block_idx >= state.physical_pages {
+                state.physical_pages = block_idx.saturating_add(1);
+            }
+            written += chunk;
+        }
+        state.logical_len = state.logical_len.max(offset.saturating_add(data.len() as u64));
+        Ok(())
+    }
+
+    fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let state = lock_unpoisoned(&self.state);
+        if offset >= state.logical_len || buf.is_empty() {
+            return Ok(0);
+        }
+        let avail = usize::try_from(state.logical_len - offset).unwrap_or(usize::MAX);
+        let to_read = buf.len().min(avail);
+        let usable_u64 = ENCRYPTED_TEMP_USABLE_SIZE as u64;
+        let mut read_done = 0usize;
+        while read_done < to_read {
+            let cur_off = offset.saturating_add(read_done as u64);
+            let block_idx = cur_off / usable_u64;
+            let in_block = usize::try_from(cur_off % usable_u64).unwrap_or(0);
+            let chunk = (ENCRYPTED_TEMP_USABLE_SIZE - in_block).min(to_read - read_done);
+            if block_idx < state.physical_pages {
+                let page = self.read_decrypted_block(cx, block_idx)?;
+                buf[read_done..read_done + chunk]
+                    .copy_from_slice(&page[in_block..in_block + chunk]);
+            } else {
+                buf[read_done..read_done + chunk].fill(0);
+            }
+            read_done += chunk;
+        }
+        Ok(to_read)
+    }
+
+    fn file_size(&self, cx: &Cx) -> Result<u64> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        Ok(lock_unpoisoned(&self.state).logical_len)
+    }
+
+    fn truncate(&self, cx: &Cx, size: u64) -> Result<()> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let mut state = lock_unpoisoned(&self.state);
+        state.logical_len = size;
+        let pages = size.div_ceil(ENCRYPTED_TEMP_USABLE_SIZE as u64);
+        state.physical_pages = pages;
+        let phys_size = pages
+            .checked_mul(ENCRYPTED_TEMP_PAGE_SIZE as u64)
+            .ok_or(FrankenError::DatabaseFull)?;
+        self.inner.truncate(cx, phys_size)
+    }
+
+    fn close(&self, cx: &Cx) -> Result<()> {
+        self.inner.close(cx)
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+impl TempFileBackend for VfsTempFileBackend {
+    fn create_temp_file(&self, cx: &Cx, purpose: &str) -> Result<Box<dyn TempFileHandle>> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let flags = VfsOpenFlags::TEMP_DB
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::EXCLUSIVE
+            | VfsOpenFlags::DELETEONCLOSE;
+
+        #[cfg(unix)]
+        let raw_handle: Box<dyn TempFileHandle> = {
+            let vfs = UnixVfs::new();
+            let explicit_path = self.directory.as_ref().map(|dir| {
+                let mut rng_buf = [0u8; 16];
+                vfs.randomness(cx, &mut rng_buf);
+                let mut hex = String::with_capacity(32);
+                for b in rng_buf {
+                    let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+                }
+                dir.join(format!("fsqlite_temp_{purpose}_{hex}.tmp"))
+            });
+            let (file, _) = vfs
+                .open(cx, explicit_path.as_deref(), flags)
+                .map_err(map_vfs_temp_error)?;
+            Box::new(VfsTempFileHandle {
+                file: Mutex::new(Some(file)),
+            })
+        };
+
+        #[cfg(windows)]
+        let raw_handle: Box<dyn TempFileHandle> = {
+            let vfs = fsqlite_vfs::WindowsVfs::new();
+            let explicit_path = self.directory.as_ref().map(|dir| {
+                let mut rng_buf = [0u8; 16];
+                vfs.randomness(cx, &mut rng_buf);
+                let mut hex = String::with_capacity(32);
+                for b in rng_buf {
+                    let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+                }
+                dir.join(format!("fsqlite_temp_{purpose}_{hex}.tmp"))
+            });
+            let (file, _) = vfs
+                .open(cx, explicit_path.as_deref(), flags)
+                .map_err(map_vfs_temp_error)?;
+            Box::new(VfsTempFileHandle {
+                file: Mutex::new(Some(file)),
+            })
+        };
+
+        if self.encrypt_temp_files {
+            Ok(Box::new(EncryptedTempFileHandle::new(cx, raw_handle)))
+        } else {
+            Ok(raw_handle)
+        }
+    }
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+struct UnsupportedTempFileBackend;
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+impl TempFileBackend for UnsupportedTempFileBackend {
+    fn create_temp_file(&self, _cx: &Cx, _purpose: &str) -> Result<Box<dyn TempFileHandle>> {
+        Err(FrankenError::Unsupported)
+    }
+
+    fn supports_file_storage(&self) -> bool {
+        false
+    }
+}
+
+fn default_vfs_temp_file_backend(
+    directory: Option<PathBuf>,
+    encrypt_temp_files: bool,
+) -> Arc<dyn TempFileBackend> {
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    {
+        Arc::new(VfsTempFileBackend {
+            directory,
+            encrypt_temp_files,
+        })
+    }
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+    {
+        let _ = (directory, encrypt_temp_files);
+        Arc::new(UnsupportedTempFileBackend)
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn execute_table_program_with_db(
     program: &VdbeProgram,
@@ -151689,6 +152428,7 @@ async fn execute_table_program_with_db(
     cached_engine: Option<Box<VdbeEngine>>,
     vtab_instances: Vec<(i32, Box<dyn ErasedVtabInstance>)>,
     parallel_workers: usize,
+    temp_store_runtime: TempStoreRuntime,
 ) -> (TableProgramExecOutcome, Option<Box<VdbeEngine>>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
@@ -151745,6 +152485,7 @@ async fn execute_table_program_with_db(
     };
     engine.set_retain_storage_cursors_on_close(allow_retained_cursor_reuse);
     engine.set_parallel_workers(parallel_workers);
+    engine.set_temp_store_runtime(temp_store_runtime);
     // bd-i3csr.2: the table-valued-function instances the program's VOpen
     // cursors scan.
     for (cursor_id, instance) in vtab_instances {
@@ -151979,6 +152720,7 @@ async fn execute_table_program_exactly_one_row_with_db(
     max_collected_result_rows: usize,
     prepared_engine_reuse_profile: bool,
     cached_engine: Option<Box<VdbeEngine>>,
+    temp_store_runtime: TempStoreRuntime,
 ) -> (TableProgramSingleRowExecOutcome, Option<Box<VdbeEngine>>) {
     // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
     //
@@ -152024,6 +152766,7 @@ async fn execute_table_program_exactly_one_row_with_db(
             page_size,
         ))
     };
+    engine.set_temp_store_runtime(temp_store_runtime);
     if let Some(params) = params
         && let Err(e) = validate_bound_parameters(program, params)
     {

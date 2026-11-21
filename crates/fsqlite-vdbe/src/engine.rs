@@ -210,6 +210,7 @@ use fsqlite_types::{
     SchemaEpoch, SecureDeleteMode, StrictColumnType, TableId, TextEncoding, WitnessKey,
 };
 
+use crate::temp_store::{TempStoreRuntime, TrackedTempFile};
 use crate::{
     SchemaEvaluationContext, TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage,
@@ -684,14 +685,102 @@ pub struct ReusableTableExecutionState {
 // CREATE TABLE / INSERT / SELECT / UPDATE / DELETE against a lightweight
 // row store without requiring the full B-tree + pager + VFS stack.
 
+/// Location of a spilled `MemRow` record inside its table's VFS temp file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpilledRowSlice {
+    offset: u64,
+    len: u32,
+}
+
+/// Append-only temporary file holding spilled rows for a `TEMP` or ephemeral
+/// `MemTable` when `PRAGMA temp_store` resolves to `FILE` and resident row
+/// bytes cross the configured byte budget (bd-dwjnq.5).
+struct TempTableSpillFile {
+    handle: Arc<TrackedTempFile>,
+    next_offset: u64,
+}
+
+impl std::fmt::Debug for TempTableSpillFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TempTableSpillFile")
+            .field("next_offset", &self.next_offset)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-table spill controller attached only to `TEMP` and ephemeral `MemTable`s.
+#[derive(Debug, Clone)]
+struct TempTableSpillState {
+    runtime: TempStoreRuntime,
+    text_encoding: TextEncoding,
+    file: Arc<Mutex<Option<TempTableSpillFile>>>,
+    resident_bytes: usize,
+    spilled_row_count: usize,
+    recorded_memory_only: bool,
+}
+
+impl TempTableSpillState {
+    fn new(runtime: TempStoreRuntime, text_encoding: TextEncoding) -> Self {
+        Self {
+            runtime,
+            text_encoding,
+            file: Arc::new(Mutex::new(None)),
+            resident_bytes: 0,
+            spilled_row_count: 0,
+            recorded_memory_only: false,
+        }
+    }
+
+    fn read_spilled_values(&self, cx: &Cx, slice: SpilledRowSlice) -> Result<MemRowValues> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let handle = {
+            let guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .map(|file| Arc::clone(&file.handle))
+                .ok_or_else(|| {
+                    FrankenError::internal("spilled TEMP table row missing temp file handle")
+                })?
+        };
+        let mut buf = vec![0u8; slice.len as usize];
+        handle.read_exact_at(cx, slice.offset, &mut buf)?;
+        let mut values = Vec::new();
+        parse_record_into_with_encoding(&buf, &mut values, self.text_encoding).ok_or_else(
+            || FrankenError::DatabaseCorrupt {
+                detail: "malformed spilled TEMP table record".to_owned(),
+            },
+        )?;
+        Ok(values)
+    }
+}
+
+fn estimate_mem_row_values_size(values: &[SqliteValue]) -> usize {
+    let mut size = std::mem::size_of::<MemRow>()
+        .saturating_add(values.len().saturating_mul(std::mem::size_of::<SqliteValue>()));
+    for value in values {
+        match value {
+            SqliteValue::Text(text) => size = size.saturating_add(text.len()),
+            SqliteValue::Blob(bytes) => size = size.saturating_add(bytes.len()),
+            _ => {}
+        }
+    }
+    size
+}
+
 /// A row in an in-memory table: (rowid, column values).
 pub type MemRowValues = Vec<SqliteValue>;
 
-/// A row in an in-memory table: (rowid, column values).
+/// A row in an in-memory table: (rowid, inline values or spilled temp slice).
 #[derive(Debug, Clone, PartialEq)]
 struct MemRow {
     rowid: i64,
     values: MemRowValues,
+    spilled: Option<SpilledRowSlice>,
 }
 
 /// In-memory table storage (Phase 4 backend).
@@ -854,6 +943,9 @@ pub struct MemTable {
     /// Shared collation registry consulted when a UNIQUE constraint uses a
     /// non-builtin collation that cannot be normalized into a byte key.
     collation_registry: Arc<Mutex<CollationRegistry>>,
+    /// Optional VFS temp-file spill controller (attached only to `TEMP` and
+    /// ephemeral tables; `None` for ordinary main-DB mirrors).
+    temp_spill: Option<TempTableSpillState>,
 }
 
 impl MemTable {
@@ -865,7 +957,228 @@ impl MemTable {
             next_rowid: 1,
             unique_constraints: Arc::new(Vec::new()),
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
+            temp_spill: None,
         }
+    }
+
+    /// Attach live `PRAGMA temp_store` runtime policy to a `TEMP` or ephemeral
+    /// table so rows spill to a VFS temp file once resident bytes cross the
+    /// configured budget in `FILE` mode, or enforce `hard_heap_limit` in
+    /// `MEMORY` mode.
+    pub fn configure_temp_spill(
+        &mut self,
+        runtime: TempStoreRuntime,
+        text_encoding: TextEncoding,
+    ) {
+        self.temp_spill = Some(TempTableSpillState::new(runtime, text_encoding));
+    }
+
+    /// Whether any rows in this table currently reside in a spilled temp file.
+    #[must_use]
+    pub fn has_spilled_rows(&self) -> bool {
+        self.temp_spill
+            .as_ref()
+            .is_some_and(|spill| spill.spilled_row_count > 0)
+    }
+
+    /// Read row values at `pos`, transparently loading from the temp spill file
+    /// if the row was evicted from memory.
+    fn read_row_values_at(&self, cx: &Cx, pos: usize) -> Result<Option<Cow<'_, [SqliteValue]>>> {
+        let Some(row) = self.rows.get(pos) else {
+            return Ok(None);
+        };
+        if let Some(slice) = row.spilled {
+            let spill = self.temp_spill.as_ref().ok_or_else(|| {
+                FrankenError::internal("spilled MemRow present without TempTableSpillState")
+            })?;
+            return Ok(Some(Cow::Owned(spill.read_spilled_values(cx, slice)?)));
+        }
+        Ok(Some(Cow::Borrowed(row.values.as_slice())))
+    }
+
+    /// Read row values by `rowid`, transparently loading from the temp spill file
+    /// when spilled.
+    fn read_row_values_by_rowid(
+        &self,
+        cx: &Cx,
+        rowid: i64,
+    ) -> Result<Option<Cow<'_, [SqliteValue]>>> {
+        let Some(pos) = self.find_by_rowid(rowid) else {
+            return Ok(None);
+        };
+        self.read_row_values_at(cx, pos)
+    }
+
+    /// Best-effort synchronous row read for internal non-fallible helpers
+    /// (constraint checks, DDL rewrites, undo capture).
+    fn read_row_values_sync<'a>(&'a self, row: &'a MemRow) -> Cow<'a, [SqliteValue]> {
+        if let Some(slice) = row.spilled
+            && let Some(spill) = self.temp_spill.as_ref()
+            && let Ok(values) = spill.read_spilled_values(&Cx::new(), slice)
+        {
+            return Cow::Owned(values);
+        }
+        Cow::Borrowed(row.values.as_slice())
+    }
+
+    /// Materialize all `(rowid, values)` pairs (inline and spilled) for
+    /// connection-local TEMP table snapshotting across schema reloads.
+    pub fn snapshot_all_rows_owned(&self, cx: &Cx) -> Result<Vec<(i64, MemRowValues)>> {
+        let mut out = Vec::with_capacity(self.rows.len());
+        for (pos, row) in self.rows.iter().enumerate() {
+            if let Some(values) = self.read_row_values_at(cx, pos)? {
+                out.push((row.rowid, values.into_owned()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Insert a row while enforcing this table's attached `TempStoreRuntime`
+    /// policy (spill to VFS temp file in `FILE` mode, hard heap check in
+    /// `MEMORY` mode, `Cx` cancellation check).
+    pub fn insert_checked<V>(&mut self, cx: &Cx, rowid: i64, values: V) -> Result<()>
+    where
+        V: Into<MemRowValues>,
+    {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let values = values.into();
+        let row_bytes = estimate_mem_row_values_size(&values);
+        if let Some(spill) = self.temp_spill.as_mut() {
+            if !spill.runtime.is_file_backed() {
+                if !spill.recorded_memory_only {
+                    spill.recorded_memory_only = true;
+                    spill.runtime.stats().record_memory_only_allocation();
+                }
+                let projected = spill.resident_bytes.saturating_add(row_bytes);
+                spill.runtime.check_memory_limit(projected)?;
+                spill.resident_bytes = projected;
+                self.insert(rowid, values);
+                return Ok(());
+            }
+        }
+        self.insert(rowid, values);
+        let should_spill = if let Some(spill) = self.temp_spill.as_mut() {
+            spill.resident_bytes = spill.resident_bytes.saturating_add(row_bytes);
+            spill.resident_bytes >= spill.runtime.budget_bytes()
+        } else {
+            false
+        };
+        if should_spill {
+            self.spill_resident_rows_to_temp_file(cx)?;
+        }
+        Ok(())
+    }
+
+    /// Flush all inline row payloads in this `TEMP`/ephemeral table into its
+    /// VFS temporary spill file and release their in-memory heap buffers.
+    fn spill_resident_rows_to_temp_file(&mut self, cx: &Cx) -> Result<()> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let (runtime, text_encoding, file_slot) = match self.temp_spill.as_ref() {
+            Some(spill) if spill.runtime.is_file_backed() => (
+                spill.runtime.clone(),
+                spill.text_encoding,
+                Arc::clone(&spill.file),
+            ),
+            _ => return Ok(()),
+        };
+
+        let mut created_new_file = false;
+        let (handle, start_offset) = {
+            let mut guard = file_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_none() {
+                let opened = runtime.create_temp_file(cx, "temp_table")?;
+                *guard = Some(TempTableSpillFile {
+                    handle: opened,
+                    next_offset: 0,
+                });
+                created_new_file = true;
+            }
+            let file = guard.as_ref().expect("temp table spill file initialized");
+            (Arc::clone(&file.handle), file.next_offset)
+        };
+
+        let mut cursor_offset = start_offset;
+        let mut pending_slices: Vec<(usize, SpilledRowSlice)> = Vec::new();
+        let mut write_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut write_buf_offset = start_offset;
+        let mut total_written: u64 = 0;
+
+        let write_result: Result<()> = (|| {
+            for (idx, row) in self.rows.iter().enumerate() {
+                if row.spilled.is_some() {
+                    continue;
+                }
+                if cx.is_cancel_requested() {
+                    return Err(FrankenError::Abort);
+                }
+                let encoded = encode_record_with_encoding(&row.values, text_encoding);
+                let encoded_len = u32::try_from(encoded.len()).map_err(|_| FrankenError::TooBig)?;
+                let row_offset = cursor_offset;
+                write_buf.extend_from_slice(&encoded);
+                cursor_offset = cursor_offset.saturating_add(u64::from(encoded_len));
+                total_written = total_written.saturating_add(u64::from(encoded_len));
+                pending_slices.push((
+                    idx,
+                    SpilledRowSlice {
+                        offset: row_offset,
+                        len: encoded_len,
+                    },
+                ));
+                if write_buf.len() >= 64 * 1024 {
+                    handle.write_at(cx, write_buf_offset, &write_buf)?;
+                    write_buf_offset = write_buf_offset.saturating_add(write_buf.len() as u64);
+                    write_buf.clear();
+                }
+            }
+            if !write_buf.is_empty() {
+                handle.write_at(cx, write_buf_offset, &write_buf)?;
+                write_buf.clear();
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            if created_new_file {
+                let mut guard = file_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = guard.take();
+                drop(guard);
+                let _ = handle.close_with_cx(cx);
+            }
+            return Err(err);
+        }
+        if pending_slices.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut guard = file_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(file) = guard.as_mut() {
+                file.next_offset = cursor_offset;
+            }
+        }
+
+        let spilled_now = pending_slices.len();
+        let rows = self.rows_mut();
+        for (idx, slice) in pending_slices {
+            rows[idx].values = Vec::new();
+            rows[idx].spilled = Some(slice);
+        }
+        if let Some(spill) = self.temp_spill.as_mut() {
+            spill.resident_bytes = 0;
+            spill.spilled_row_count = spill.spilled_row_count.saturating_add(spilled_now);
+            spill.runtime.stats().record_temp_table_spill(total_written);
+        }
+        Ok(())
     }
 
     /// Mutable access to the rows, copying them first if a snapshot shares them.
@@ -977,8 +1290,9 @@ impl MemTable {
         if constraint.index.is_some() {
             let mut seen = HashSet::new();
             for row in self.rows.iter() {
+                let row_values = self.read_row_values_sync(row);
                 if let Some(key) = Self::unique_key_for_constraint(
-                    &row.values,
+                    &row_values,
                     &constraint.columns,
                     &constraint.collations,
                 ) && !seen.insert(key)
@@ -994,10 +1308,12 @@ impl MemTable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (idx, row) in self.rows.iter().enumerate() {
+            let row_values = self.read_row_values_sync(row);
             if self.rows[idx + 1..].iter().any(|other| {
+                let other_values = self.read_row_values_sync(other);
                 Self::unique_constraint_matches_row(
-                    &row.values,
-                    &other.values,
+                    &row_values,
+                    &other_values,
                     &constraint.columns,
                     &constraint.collations,
                     &registry,
@@ -1033,8 +1349,9 @@ impl MemTable {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             });
             for row in self.rows.iter() {
+                let row_values = self.read_row_values_sync(row);
                 if Self::unique_constraint_matches_row(
-                    &row.values,
+                    &row_values,
                     new_values,
                     &constraint.columns,
                     &constraint.collations,
@@ -1073,8 +1390,9 @@ impl MemTable {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                 });
                 self.rows.iter().any(|row| {
+                    let row_values = self.read_row_values_sync(row);
                     Self::unique_constraint_matches_row(
-                        &row.values,
+                        &row_values,
                         new_values,
                         &constraint.columns,
                         &constraint.collations,
@@ -1142,32 +1460,78 @@ impl MemTable {
         }
         let new_keys = self.unique_keys_for_values(&values);
         if self.rows.last().is_none_or(|row| row.rowid < rowid) {
-            self.rows_mut().push(MemRow { rowid, values });
+            self.rows_mut().push(MemRow {
+                rowid,
+                values,
+                spilled: None,
+            });
             self.insert_unique_keys(rowid, &new_keys);
             return;
         }
         // Replace if rowid already exists (UPSERT semantics).
         match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
             Ok(idx) => {
-                let old_values = {
+                let old_was_spilled = self.rows[idx].spilled.is_some();
+                let old_values = self.read_row_values_sync(&self.rows[idx]).into_owned();
+                {
                     let row = &mut self.rows_mut()[idx];
-                    std::mem::replace(&mut row.values, values)
-                };
+                    row.values = values;
+                    row.spilled = None;
+                }
+                if old_was_spilled && let Some(spill) = self.temp_spill.as_mut() {
+                    spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
+                }
                 self.remove_unique_entries(rowid, &old_values);
                 self.insert_unique_keys(rowid, &new_keys);
             }
             Err(idx) => {
-                self.rows_mut().insert(idx, MemRow { rowid, values });
+                self.rows_mut().insert(
+                    idx,
+                    MemRow {
+                        rowid,
+                        values,
+                        spilled: None,
+                    },
+                );
                 self.insert_unique_keys(rowid, &new_keys);
             }
         }
     }
 
+    /// Hydrate any spilled rows inline and detach the VFS spill controller so a
+    /// read-only snapshot (such as `:memory:` time-travel capture) never pins a
+    /// live `TrackedTempFile` handle after the live `TEMP` table is dropped or
+    /// `PRAGMA temp_store` changes mode.
+    fn detach_temp_spill_for_snapshot(&mut self) {
+        if self.has_spilled_rows() {
+            self.hydrate_all_spilled_rows_sync();
+        }
+        self.temp_spill = None;
+    }
+
     /// Delete a row by rowid. Returns true if a row was found and deleted.
     pub fn delete_by_rowid(&mut self, rowid: i64) -> bool {
         if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
+            let old_values = self.read_row_values_sync(&self.rows[idx]).into_owned();
             let row = self.rows_mut().remove(idx);
-            self.remove_unique_entries(row.rowid, &row.values);
+            let now_empty = self.rows.is_empty();
+            if let Some(spill) = self.temp_spill.as_mut() {
+                if row.spilled.is_some() {
+                    spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
+                }
+                if now_empty {
+                    spill.resident_bytes = 0;
+                    spill.spilled_row_count = 0;
+                    if Arc::strong_count(&spill.file) == 1 {
+                        let mut guard = spill
+                            .file
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let _ = guard.take();
+                    }
+                }
+            }
+            self.remove_unique_entries(row.rowid, &old_values);
             true
         } else {
             false
@@ -1180,6 +1544,17 @@ impl MemTable {
         match Arc::get_mut(&mut self.rows) {
             Some(rows) => rows.clear(),
             None => self.rows = Arc::new(Vec::new()),
+        }
+        if let Some(spill) = self.temp_spill.as_mut() {
+            spill.resident_bytes = 0;
+            spill.spilled_row_count = 0;
+            if Arc::strong_count(&spill.file) == 1 {
+                let mut guard = spill
+                    .file
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = guard.take();
+            }
         }
         if self
             .unique_constraints
@@ -1217,6 +1592,7 @@ impl MemTable {
     /// Used after ALTER TABLE ADD COLUMN to make pre-existing rows
     /// visible with the new column's default value.
     pub fn pad_rows_to_column_count(&mut self, target_cols: usize, default_val: &SqliteValue) {
+        self.hydrate_all_spilled_rows_sync();
         self.num_columns = target_cols;
         for row in self.rows_mut() {
             while row.values.len() < target_cols {
@@ -1234,6 +1610,7 @@ impl MemTable {
         column: usize,
         values: impl IntoIterator<Item = (i64, SqliteValue)>,
     ) {
+        self.hydrate_all_spilled_rows_sync();
         for (rowid, value) in values {
             if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid)
                 && let Some(cell) = self.rows_mut()[idx].values.get_mut(column)
@@ -1250,6 +1627,7 @@ impl MemTable {
     /// table's direct UNIQUE-constraint column positions aligned with the
     /// rewritten row image when `ALTER TABLE ... DROP COLUMN` removes a slot.
     fn remove_column_from_rows(&mut self, removed_slot: usize) {
+        self.hydrate_all_spilled_rows_sync();
         self.num_columns = self.num_columns.saturating_sub(1);
         for row in self.rows_mut() {
             if removed_slot < row.values.len() {
@@ -1264,6 +1642,31 @@ impl MemTable {
             }
         }
         self.rebuild_unique_indexes();
+    }
+
+    /// Hydrate any spilled rows back into inline storage before an in-place
+    /// schema rewrite (`ALTER TABLE ADD/DROP COLUMN`).
+    fn hydrate_all_spilled_rows_sync(&mut self) {
+        if !self.has_spilled_rows() {
+            return;
+        }
+        let Some(spill) = self.temp_spill.clone() else {
+            return;
+        };
+        let cx = Cx::new();
+        let mut hydrated_bytes = 0usize;
+        for row in self.rows_mut() {
+            if let Some(slice) = row.spilled.take()
+                && let Ok(values) = spill.read_spilled_values(&cx, slice)
+            {
+                hydrated_bytes = hydrated_bytes.saturating_add(estimate_mem_row_values_size(&values));
+                row.values = values;
+            }
+        }
+        if let Some(state) = self.temp_spill.as_mut() {
+            state.spilled_row_count = 0;
+            state.resident_bytes = state.resident_bytes.saturating_add(hydrated_bytes);
+        }
     }
 
     /// Find a row by rowid. Returns the index.
@@ -1353,6 +1756,14 @@ impl MemTable {
     /// real SQLite format files.
     pub fn iter_rows(&self) -> impl Iterator<Item = (i64, &[SqliteValue])> + '_ {
         self.rows.iter().map(|r| (r.rowid, r.values.as_slice()))
+    }
+
+    /// Iterate all rows as `(rowid, Cow<[SqliteValue]>)`, transparently
+    /// reading spilled `TEMP` rows from their spill file when needed.
+    pub fn iter_rows_cow(&self) -> impl Iterator<Item = (i64, Cow<'_, [SqliteValue]>)> + '_ {
+        self.rows
+            .iter()
+            .map(|r| (r.rowid, self.read_row_values_sync(r)))
     }
 
     /// Insert a row with an explicit rowid (for loading from file).
@@ -1477,19 +1888,30 @@ impl MemTable {
         if self.unique_constraints.iter().all(|constraint| constraint.index.is_none()) {
             return;
         }
+        let spill_ref = self.temp_spill.clone();
+        let rows_ref = Arc::clone(&self.rows);
         let constraints = Arc::make_mut(&mut self.unique_constraints);
         for constraint in constraints.iter_mut() {
             if let Some(index) = constraint.index.as_mut() {
                 index.clear();
             }
         }
-        for row in self.rows.iter() {
+        let cx = Cx::new();
+        for row in rows_ref.iter() {
+            let row_values: Cow<'_, [SqliteValue]> = if let Some(slice) = row.spilled
+                && let Some(spill) = spill_ref.as_ref()
+                && let Ok(values) = spill.read_spilled_values(&cx, slice)
+            {
+                Cow::Owned(values)
+            } else {
+                Cow::Borrowed(row.values.as_slice())
+            };
             for constraint in constraints.iter_mut() {
                 let Some(index) = constraint.index.as_mut() else {
                     continue;
                 };
                 if let Some(key) = Self::unique_key_for_constraint(
-                    &row.values,
+                    &row_values,
                     &constraint.columns,
                     &constraint.collations,
                 ) {
@@ -1775,8 +2197,15 @@ struct SorterCursor {
     cached_row_decode: RowDecodeScratch,
     /// Estimated bytes consumed by `rows` (approximate).
     memory_used: usize,
-    /// Memory limit before spilling to disk (default 100 MiB).
+    /// Memory limit before spilling to disk (governed by `PRAGMA temp_store`
+    /// and active temporary memory budgets).
     spill_threshold: usize,
+    /// Active `PRAGMA temp_store` runtime policy and VFS temp-file backend.
+    temp_store: TempStoreRuntime,
+    /// Caller execution context for cancellation-checked temp file I/O.
+    cx: Cx,
+    /// Whether this sorter has already recorded a memory-only allocation.
+    recorded_memory_only: bool,
     /// Sorted runs that have been spilled to disk.
     spill_runs: Vec<SpillRun>,
     /// Keep only the best N rows during insertion when ORDER BY is paired with
@@ -1864,28 +2293,20 @@ fn bloom_hash(val: &SqliteValue) -> u64 {
 }
 
 /// Approximate page size for spill accounting.
-///
-/// Used only for counting pages written during sorter spill operations.
-/// Ideally this would come from the database's actual page size, but the
-/// sorter runs at the VDBE level where the page size is available via
-/// `self.page_size`. For now, use the default. The spill page count metric
-/// is informational — it does not affect correctness.
-#[cfg(not(target_arch = "wasm32"))]
 const SORTER_SPILL_PAGE_SIZE: usize = fsqlite_types::limits::DEFAULT_PAGE_SIZE as usize;
 
-/// A sorted run that has been flushed to a temporary file.
+/// A sorted run that has been flushed to a tracked VFS temporary file.
 ///
 /// Each run stores length-prefixed serialized records in sorted order.
 /// Format per record: `[u32-le length][serialized record bytes]`.
 #[derive(Debug, Clone)]
 struct SpillRun {
-    /// Path to the temporary file containing serialized sorted records.
-    path: std::path::PathBuf,
+    /// Tracked VFS temporary file handle (delete-on-close).
+    file: Arc<TrackedTempFile>,
     /// Number of records in this run (used for merge accounting).
     #[allow(dead_code)]
     record_count: u64,
-    /// Total bytes written (used for page accounting).
-    #[allow(dead_code)]
+    /// Total bytes written (used for page accounting and bounded read-back).
     bytes_written: u64,
 }
 
@@ -1906,13 +2327,37 @@ impl SorterCursor {
         )
     }
 
+    #[cfg(test)]
     fn with_collation_registry(
+        key_columns: usize,
+        sort_key_orders: Vec<SortKeyOrder>,
+        collations: Vec<Option<String>>,
+        collation_registry: Arc<Mutex<CollationRegistry>>,
+        top_n_limit: Option<usize>,
+        text_encoding: TextEncoding,
+    ) -> Self {
+        Self::with_collation_registry_and_temp_store(
+            key_columns,
+            sort_key_orders,
+            collations,
+            collation_registry,
+            top_n_limit,
+            text_encoding,
+            TempStoreRuntime::default(),
+            Cx::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_collation_registry_and_temp_store(
         key_columns: usize,
         mut sort_key_orders: Vec<SortKeyOrder>,
         collations: Vec<Option<String>>,
         collation_registry: Arc<Mutex<CollationRegistry>>,
         top_n_limit: Option<usize>,
         text_encoding: TextEncoding,
+        temp_store: TempStoreRuntime,
+        cx: Cx,
     ) -> Self {
         let key_columns = key_columns.max(1);
         if sort_key_orders.len() < key_columns {
@@ -1920,6 +2365,11 @@ impl SorterCursor {
         }
         sort_key_orders.truncate(key_columns);
         let runs_allowed = top_n_limit.is_none() && collations.iter().all(Option::is_none);
+        let spill_threshold = if temp_store.is_file_backed() {
+            temp_store.budget_bytes().max(1)
+        } else {
+            usize::MAX
+        };
         Self {
             key_columns,
             sort_key_orders,
@@ -1938,7 +2388,10 @@ impl SorterCursor {
             cached_row_position: None,
             cached_row_decode: RowDecodeScratch::default(),
             memory_used: 0,
-            spill_threshold: SORTER_DEFAULT_SPILL_THRESHOLD,
+            spill_threshold,
+            temp_store,
+            cx,
+            recorded_memory_only: false,
             spill_runs: Vec::new(),
             top_n_limit,
             next_source_sequence: 0,
@@ -2077,6 +2530,9 @@ impl SorterCursor {
 
     /// Insert a row and spill to disk if memory exceeds the threshold.
     fn insert_record(&mut self, values: SorterKeyValues, blob: SorterBlob) -> Result<()> {
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
         if self.top_n_limit == Some(0) {
             return Ok(());
         }
@@ -2089,11 +2545,9 @@ impl SorterCursor {
             // Rejection and replacement begin only once the heap reaches
             // `limit`, and the heap never shrinks afterward. Therefore
             // `len() < limit` proves that the retained prefix is still complete.
-            #[cfg(not(target_arch = "wasm32"))]
-            let can_downgrade_before_discarding = self.rows.len() < limit
+            let can_downgrade_before_discarding = self.temp_store.is_file_backed()
+                && self.rows.len() < limit
                 && self.memory_used.saturating_add(new_row_size) >= self.spill_threshold;
-            #[cfg(target_arch = "wasm32")]
-            let can_downgrade_before_discarding = false;
             if can_downgrade_before_discarding {
                 // The heap may have reordered equal-key rows. Restore scan
                 // order before handing the complete input prefix to the stable
@@ -2114,7 +2568,17 @@ impl SorterCursor {
                 if self.rows.len() < limit {
                     self.rows.push(new_row);
                     self.sift_top_n_heap_up(self.rows.len() - 1, &coll_guard);
-                    self.memory_used += new_row_size;
+                    self.memory_used = self.memory_used.saturating_add(new_row_size);
+                    self.temp_store
+                        .stats()
+                        .record_sorter_memory(self.memory_used as u64);
+                    if !self.temp_store.is_file_backed() {
+                        if !self.recorded_memory_only {
+                            self.recorded_memory_only = true;
+                            self.temp_store.stats().record_memory_only_allocation();
+                        }
+                        self.temp_store.check_memory_limit(self.memory_used)?;
+                    }
                     self.invalidate_output_row_cache();
                     return Ok(());
                 }
@@ -2125,6 +2589,12 @@ impl SorterCursor {
                         Self::estimate_row_size(&removed_row.values, &removed_row.blob);
                     self.memory_used = self.memory_used.saturating_sub(removed_size);
                     self.memory_used = self.memory_used.saturating_add(new_row_size);
+                    self.temp_store
+                        .stats()
+                        .record_sorter_memory(self.memory_used as u64);
+                    if !self.temp_store.is_file_backed() {
+                        self.temp_store.check_memory_limit(self.memory_used)?;
+                    }
                     self.sift_top_n_heap_down(0, &coll_guard);
                     self.invalidate_output_row_cache();
                 }
@@ -2143,7 +2613,13 @@ impl SorterCursor {
         blob: SorterBlob,
         row_size: usize,
     ) -> Result<()> {
-        self.memory_used += row_size;
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        self.memory_used = self.memory_used.saturating_add(row_size);
+        self.temp_store
+            .stats()
+            .record_sorter_memory(self.memory_used as u64);
         self.rows.push(SorterRow {
             values,
             blob,
@@ -2151,7 +2627,13 @@ impl SorterCursor {
         });
         self.invalidate_output_row_cache();
 
-        if self.memory_used >= self.spill_threshold {
+        if !self.temp_store.is_file_backed() {
+            if !self.recorded_memory_only {
+                self.recorded_memory_only = true;
+                self.temp_store.stats().record_memory_only_allocation();
+            }
+            self.temp_store.check_memory_limit(self.memory_used)?;
+        } else if self.memory_used >= self.spill_threshold {
             self.spill_to_disk()?;
         }
         Ok(())
@@ -2163,6 +2645,9 @@ impl SorterCursor {
     /// no top-N bound, so a record that does not join them is a plain append.
     #[inline(never)]
     fn insert_record_with_runs(&mut self, values: SorterKeyValues, blob: SorterBlob) -> Result<()> {
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
         if matches!(self.runs, SorterRuns::Collecting { .. }) {
             match self.collect_record(values, blob) {
                 RunInsert::Taken => {}
@@ -2173,7 +2658,16 @@ impl SorterCursor {
                     return self.push_record(values, blob, row_size);
                 }
             }
-            if self.memory_used >= self.spill_threshold {
+            self.temp_store
+                .stats()
+                .record_sorter_memory(self.memory_used as u64);
+            if !self.temp_store.is_file_backed() {
+                if !self.recorded_memory_only {
+                    self.recorded_memory_only = true;
+                    self.temp_store.stats().record_memory_only_allocation();
+                }
+                self.temp_store.check_memory_limit(self.memory_used)?;
+            } else if self.memory_used >= self.spill_threshold {
                 self.spill_to_disk()?;
             }
             return Ok(());
@@ -2479,11 +2973,15 @@ impl SorterCursor {
         }
     }
 
-    /// Sort the in-memory rows, write them to a temp file, and clear them.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Sort the in-memory rows, write them to a tracked VFS temp file, and clear them.
     fn spill_to_disk(&mut self) -> Result<()> {
-        use std::io::Write;
-
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        if !self.temp_store.is_file_backed() {
+            self.spill_threshold = usize::MAX;
+            return self.temp_store.check_memory_limit(self.memory_used);
+        }
         if self.rows.is_empty() {
             return Ok(());
         }
@@ -2532,76 +3030,67 @@ impl SorterCursor {
         };
         drop(coll_guard);
 
-        // Write to temp file.  We use `keep()` to detach the auto-delete
-        // guard so the file persists until we explicitly remove it in
-        // `sort()` / `reset()`.
-        let tmp = tempfile::NamedTempFile::new()
-            .map_err(|e| FrankenError::internal(format!("sorter spill tempfile: {e}")))?;
-        let (file, path) = tmp
-            .keep()
-            .map_err(|e| FrankenError::internal(format!("sorter spill keep: {e}")))?;
-        let mut writer = std::io::BufWriter::new(file);
-
+        let temp_file = self.temp_store.create_temp_file(&self.cx, "sorter_run")?;
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut flush_offset: u64 = 0;
         let mut record_count: u64 = 0;
         let mut bytes_written: u64 = 0;
-        for (at, row) in self.rows.iter().enumerate() {
-            // Write the raw blob directly instead of re-serializing from
-            // decoded values.  The blob is the original record bytes from
-            // MakeRecord and is identical to what serialize_record would
-            // produce (but without the decode→re-encode round-trip).
-            #[allow(clippy::cast_possible_truncation)]
-            let len_bytes = (row.blob.len() as u32).to_le_bytes();
-            let copies = run_counts.as_ref().map_or(1, |counts| counts[at]);
-            for _ in 0..copies {
-                writer
-                    .write_all(&len_bytes)
-                    .map_err(|e| FrankenError::internal(format!("sorter spill write len: {e}")))?;
-                writer.write_all(&row.blob).map_err(|e| {
-                    FrankenError::internal(format!("sorter spill write data: {e}"))
-                })?;
-                bytes_written += 4 + row.blob.len() as u64;
+
+        let write_result: Result<()> = (|| {
+            for (at, row) in self.rows.iter().enumerate() {
+                if at.trailing_zeros() >= 8 && self.cx.is_cancel_requested() {
+                    return Err(FrankenError::Abort);
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let len_bytes = (row.blob.len() as u32).to_le_bytes();
+                let copies = run_counts.as_ref().map_or(1, |counts| counts[at]);
+                for _ in 0..copies {
+                    buf.extend_from_slice(&len_bytes);
+                    buf.extend_from_slice(&row.blob);
+                    bytes_written = bytes_written.saturating_add(4 + row.blob.len() as u64);
+                    if buf.len() >= 64 * 1024 {
+                        temp_file.write_at(&self.cx, flush_offset, &buf)?;
+                        flush_offset = flush_offset.saturating_add(buf.len() as u64);
+                        buf.clear();
+                    }
+                }
+                record_count = record_count.saturating_add(copies);
             }
-            record_count += copies;
+            if !buf.is_empty() {
+                temp_file.write_at(&self.cx, flush_offset, &buf)?;
+                buf.clear();
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = temp_file.close_with_cx(&self.cx);
+            return Err(err);
         }
-        writer
-            .flush()
-            .map_err(|e| FrankenError::internal(format!("sorter spill flush: {e}")))?;
 
         #[allow(clippy::cast_possible_truncation)]
         let pages = (bytes_written as usize).div_ceil(SORTER_SPILL_PAGE_SIZE);
-        self.spill_pages_total += pages as u64;
+        self.spill_pages_total = self.spill_pages_total.saturating_add(pages as u64);
+        self.temp_store.stats().record_sorter_spill(bytes_written);
 
-        tracing::warn!(
+        tracing::debug!(
             rows = record_count,
             bytes = bytes_written,
             pages,
             run_index = self.spill_runs.len(),
-            "sorter spilling to disk"
+            "sorter spilling run to VFS temp file"
         );
 
         self.spill_runs.push(SpillRun {
-            path,
+            file: temp_file,
             record_count,
             bytes_written,
         });
 
-        self.rows_sorted_total += record_count;
+        self.rows_sorted_total = self.rows_sorted_total.saturating_add(record_count);
         self.rows.clear();
         self.invalidate_output_row_cache();
         self.memory_used = 0;
-        Ok(())
-    }
-
-    /// Browser builds do not have a portable temp-file story yet, so sorter
-    /// spill currently degrades to a pure in-memory sort path.
-    #[cfg(target_arch = "wasm32")]
-    fn spill_to_disk(&mut self) -> Result<()> {
-        self.spill_threshold = usize::MAX;
-        tracing::warn!(
-            rows = self.rows.len(),
-            bytes = self.memory_used,
-            "sorter spill requested on wasm; keeping rows in memory"
-        );
         Ok(())
     }
 
@@ -2773,17 +3262,22 @@ impl SorterCursor {
         }
 
         // Collect all runs: disk runs first, then in-memory remainder.
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
         let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
         for run in &self.spill_runs {
-            run_iters.push(RunIterator::from_file(
-                &run.path,
+            run_iters.push(RunIterator::from_temp_file(
+                Arc::clone(&run.file),
+                self.cx.clone(),
+                run.bytes_written,
                 self.key_columns,
                 self.text_encoding,
-            )?);
+            ));
         }
         if !self.rows.is_empty() {
             let mem_rows = std::mem::take(&mut self.rows);
-            self.rows_sorted_total += mem_rows.len() as u64;
+            self.rows_sorted_total = self.rows_sorted_total.saturating_add(mem_rows.len() as u64);
             run_iters.push(RunIterator::from_memory(mem_rows));
         }
 
@@ -2795,7 +3289,16 @@ impl SorterCursor {
             iter.advance()?;
         }
 
+        let mut merge_steps: usize = 0;
         loop {
+            if merge_steps.trailing_zeros() >= 8 && self.cx.is_cancel_requested() {
+                drop(run_iters);
+                for run in self.spill_runs.drain(..) {
+                    let _ = run.file.close_with_cx(&self.cx);
+                }
+                return Err(FrankenError::Abort);
+            }
+            merge_steps = merge_steps.saturating_add(1);
             // Find the run with the smallest current element.
             let mut best_idx: Option<usize> = None;
             for (i, iter) in run_iters.iter().enumerate() {
@@ -2832,17 +3335,18 @@ impl SorterCursor {
             run_iters[idx].advance()?;
         }
 
+        let merged_run_count = self.spill_runs.len() + 1;
         tracing::debug!(
             rows = merged.len(),
-            runs = self.spill_runs.len() + 1,
+            runs = merged_run_count,
             "sorter merge complete"
         );
 
-        // Clean up temp files.
-        for run in &self.spill_runs {
-            let _ = std::fs::remove_file(&run.path);
+        // Close and unlink all VFS temp run files immediately.
+        drop(run_iters);
+        for run in self.spill_runs.drain(..) {
+            let _ = run.file.close_with_cx(&self.cx);
         }
-        self.spill_runs.clear();
         self.rows = merged;
         drop(coll_guard);
         self.invalidate_output_row_cache();
@@ -2863,11 +3367,10 @@ impl SorterCursor {
         self.invalidate_output_row_cache();
         self.memory_used = 0;
         self.next_source_sequence = 0;
-        // Clean up temp files.
-        for run in &self.spill_runs {
-            let _ = std::fs::remove_file(&run.path);
+        // Close and unlink VFS temp run files.
+        for run in self.spill_runs.drain(..) {
+            let _ = run.file.close_with_cx(&self.cx);
         }
-        self.spill_runs.clear();
     }
 
     fn invalidate_output_row_cache(&mut self) {
@@ -2878,17 +3381,84 @@ impl SorterCursor {
 
 impl Drop for SorterCursor {
     fn drop(&mut self) {
-        for run in &self.spill_runs {
-            let _ = std::fs::remove_file(&run.path);
+        for run in self.spill_runs.drain(..) {
+            let _ = run.file.close_with_cx(&self.cx);
         }
+    }
+}
+
+/// Buffered sequential reader over a [`TrackedTempFile`] sorted run.
+struct TrackedTempRunReader {
+    file: Arc<TrackedTempFile>,
+    cx: Cx,
+    offset: u64,
+    total_len: u64,
+    buf: Vec<u8>,
+    buf_pos: usize,
+    buf_len: usize,
+}
+
+impl TrackedTempRunReader {
+    fn new(file: Arc<TrackedTempFile>, cx: Cx, total_len: u64) -> Self {
+        Self {
+            file,
+            cx,
+            offset: 0,
+            total_len,
+            buf: vec![0u8; 64 * 1024],
+            buf_pos: 0,
+            buf_len: 0,
+        }
+    }
+
+    fn read_exact_or_eof(&mut self, mut dst: &mut [u8]) -> Result<bool> {
+        let mut total_read = 0usize;
+        while !dst.is_empty() {
+            if self.buf_pos < self.buf_len {
+                let avail = self.buf_len - self.buf_pos;
+                let take = avail.min(dst.len());
+                dst[..take].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + take]);
+                self.buf_pos += take;
+                dst = &mut dst[take..];
+                total_read += take;
+                continue;
+            }
+            if self.offset >= self.total_len {
+                if total_read == 0 {
+                    return Ok(false);
+                }
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated sorter spill run",
+                )));
+            }
+            let remaining = (self.total_len - self.offset) as usize;
+            let to_read = remaining.min(self.buf.len());
+            let n = self
+                .file
+                .read_at(&self.cx, self.offset, &mut self.buf[..to_read])?;
+            if n == 0 {
+                if total_read == 0 {
+                    return Ok(false);
+                }
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF reading sorter spill run",
+                )));
+            }
+            self.offset = self.offset.saturating_add(n as u64);
+            self.buf_pos = 0;
+            self.buf_len = n;
+        }
+        Ok(true)
     }
 }
 
 /// Iterator over records in a sorted run (either disk-backed or in-memory).
 enum RunIterator {
-    /// Records read from a temporary file.
+    /// Records read from a tracked VFS temporary file.
     File {
-        reader: std::io::BufReader<std::fs::File>,
+        reader: TrackedTempRunReader,
         current: Option<SorterRow>,
         /// Number of leading sort-key columns to decode from spilled records.
         key_columns: usize,
@@ -2903,19 +3473,19 @@ enum RunIterator {
 }
 
 impl RunIterator {
-    fn from_file(
-        path: &std::path::Path,
+    fn from_temp_file(
+        file: Arc<TrackedTempFile>,
+        cx: Cx,
+        total_len: u64,
         key_columns: usize,
         text_encoding: TextEncoding,
-    ) -> Result<Self> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| FrankenError::internal(format!("sorter run open: {e}")))?;
-        Ok(Self::File {
-            reader: std::io::BufReader::new(file),
+    ) -> Self {
+        Self::File {
+            reader: TrackedTempRunReader::new(file, cx, total_len),
             current: None,
             key_columns,
             text_encoding,
-        })
+        }
     }
 
     fn from_memory(rows: Vec<SorterRow>) -> Self {
@@ -2947,39 +3517,37 @@ impl RunIterator {
                 key_columns,
                 text_encoding,
             } => {
-                use std::io::Read;
                 let mut len_buf = [0u8; 4];
-                match reader.read_exact(&mut len_buf) {
-                    Ok(()) => {
-                        let len = u32::from_le_bytes(len_buf) as usize;
-                        // Read the record straight into the row: a short one
-                        // needs no heap block of its own.
-                        let mut blob = SorterBlob::from_elem(0, len);
-                        reader
-                            .read_exact(&mut blob)
-                            .map_err(|e| FrankenError::internal(format!("sorter run read: {e}")))?;
-                        // Decode only the sort-key prefix — not all columns — and
-                        // under the DB encoding so a spilled UTF-16 key sorts the
-                        // same as the in-memory path (bd-7c6g7 #5).
-                        let values = fsqlite_types::record::parse_record_prefix_with_encoding(
-                            &blob,
-                            *key_columns,
-                            *text_encoding,
-                        )
-                        .ok_or_else(|| FrankenError::internal("sorter run: malformed record"))?;
-                        *current = Some(SorterRow {
-                            values: SorterKeyValues::from_vec(values),
-                            blob,
-                            source_sequence: 0,
-                        });
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        *current = None;
-                    }
-                    Err(e) => {
-                        return Err(FrankenError::internal(format!("sorter run read len: {e}")));
-                    }
+                if !reader.read_exact_or_eof(&mut len_buf)? {
+                    *current = None;
+                    return Ok(());
                 }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                // Read the record straight into the row: a short one
+                // needs no heap block of its own.
+                let mut blob = SorterBlob::from_elem(0, len);
+                if !reader.read_exact_or_eof(&mut blob)? && len > 0 {
+                    return Err(FrankenError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated sorter spill record payload",
+                    )));
+                }
+                // Decode only the sort-key prefix — not all columns — and
+                // under the DB encoding so a spilled UTF-16 key sorts the
+                // same as the in-memory path (bd-7c6g7 #5).
+                let values = fsqlite_types::record::parse_record_prefix_with_encoding(
+                    &blob,
+                    *key_columns,
+                    *text_encoding,
+                )
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "sorter run: malformed record".to_owned(),
+                })?;
+                *current = Some(SorterRow {
+                    values: SorterKeyValues::from_vec(values),
+                    blob,
+                    source_sequence: 0,
+                });
             }
             Self::Memory { rows, current } => {
                 *current = rows.next();
@@ -4991,11 +5559,249 @@ impl PageWriter for TimeTravelPageIo {
 // - `Txn`: backed by SharedTxnPageIo (Phase 5 production path)
 // - `TimeTravel`: backed by TimeTravelPageIo (historical snapshot reads)
 
+/// Page store for ephemeral B-trees (`OpenAutoindex`) governed by live
+/// `PRAGMA temp_store` budgets (bd-dwjnq.5).
+///
+/// Pages stay resident up to `runtime.budget_bytes()`. Once resident bytes
+/// exceed the budget in `FILE` mode, cold pages are evicted LRU-first into a
+/// tracked VFS temp file (`TrackedTempFile`) and read back transparently on
+/// demand. Dropping the store closes and unlinks the temp file automatically.
+#[derive(Debug)]
+struct TempSpillPageStore {
+    resident: HashMap<u32, Vec<u8>>,
+    lru: VecDeque<u32>,
+    spilled_offsets: HashMap<u32, u64>,
+    spill_file: Option<Arc<TrackedTempFile>>,
+    next_spill_offset: u64,
+    next_alloc_pgno: u32,
+    page_size: u32,
+    runtime: TempStoreRuntime,
+    secure_delete_mode: SecureDeleteMode,
+    recorded_memory_only: bool,
+}
+
+impl TempSpillPageStore {
+    #[allow(clippy::cast_possible_truncation)]
+    fn with_empty_index(
+        root_page: PageNumber,
+        page_size: u32,
+        runtime: TempStoreRuntime,
+    ) -> Self {
+        let mut page = vec![0u8; page_size as usize];
+        page[0] = 0x0A; // LeafIndex
+        let content_offset = page_size as u16;
+        page[5..7].copy_from_slice(&content_offset.to_be_bytes());
+        let mut resident = HashMap::new();
+        resident.insert(root_page.get(), page);
+        let mut lru = VecDeque::new();
+        lru.push_back(root_page.get());
+        Self {
+            resident,
+            lru,
+            spilled_offsets: HashMap::new(),
+            spill_file: None,
+            next_spill_offset: 0,
+            next_alloc_pgno: root_page.get().saturating_add(1).max(2),
+            page_size,
+            runtime,
+            secure_delete_mode: SecureDeleteMode::Off,
+            recorded_memory_only: false,
+        }
+    }
+
+    fn touch_lru(&mut self, pgno: u32) {
+        if let Some(pos) = self.lru.iter().position(|&p| p == pgno) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(pgno);
+    }
+
+    fn enforce_budget(&mut self, cx: &Cx, pinned_pgno: u32) -> Result<()> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let page_bytes = self.page_size as usize;
+        if !self.runtime.is_file_backed() {
+            if !self.recorded_memory_only {
+                self.recorded_memory_only = true;
+                self.runtime.stats().record_memory_only_allocation();
+            }
+            let resident_bytes = self.resident.len().saturating_mul(page_bytes);
+            return self.runtime.check_memory_limit(resident_bytes);
+        }
+
+        let budget = self.runtime.budget_bytes();
+        while self.resident.len().saturating_mul(page_bytes) > budget && self.resident.len() > 1 {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let Some(victim_pos) = self.lru.iter().position(|&p| p != pinned_pgno) else {
+                break;
+            };
+            let Some(victim_pgno) = self.lru.remove(victim_pos) else {
+                break;
+            };
+            let Some(victim_bytes) = self.resident.get(&victim_pgno) else {
+                continue;
+            };
+            if self.spill_file.is_none() {
+                let opened = self.runtime.create_temp_file(cx, "temp_btree")?;
+                self.spill_file = Some(opened);
+            }
+            let file = self
+                .spill_file
+                .as_ref()
+                .expect("spill_file initialized above");
+            let offset = if let Some(&existing) = self.spilled_offsets.get(&victim_pgno) {
+                existing
+            } else {
+                let off = self.next_spill_offset;
+                self.next_spill_offset = self
+                    .next_spill_offset
+                    .saturating_add(u64::from(self.page_size));
+                off
+            };
+            file.write_at(cx, offset, victim_bytes)?;
+            self.spilled_offsets.insert(victim_pgno, offset);
+            self.resident.remove(&victim_pgno);
+            self.runtime
+                .stats()
+                .record_temp_index_spill(u64::from(self.page_size));
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl PageReader for TempSpillPageStore {
+    fn read_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + 'a {
+        async move {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let pgno = page_no.get();
+            if let Some(page) = self.resident.get(&pgno) {
+                return Ok(page.clone());
+            }
+            if let Some(&offset) = self.spilled_offsets.get(&pgno) {
+                let file = self.spill_file.as_ref().ok_or_else(|| {
+                    FrankenError::internal("spilled temp B-tree page missing spill file")
+                })?;
+                let mut buf = vec![0u8; self.page_size as usize];
+                file.read_exact_at(cx, offset, &mut buf)?;
+                return Ok(buf);
+            }
+            Err(FrankenError::internal("temp page not found"))
+        }
+    }
+
+    fn read_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl std::future::Future<Output = Result<PageData>> + 'a {
+        async move {
+            let bytes = self.read_page(cx, page_no).await?;
+            Ok(PageData::from_vec(bytes))
+        }
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl PageWriter for TempSpillPageStore {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<()>> + 'a {
+        async move {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let page_size = self.page_size as usize;
+            if data.len() > page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "temp page store refused oversized page write: {} > {}",
+                        data.len(),
+                        page_size
+                    ),
+                });
+            }
+            let pgno = page_no.get();
+            let mut page = vec![0u8; page_size];
+            page[..data.len()].copy_from_slice(data);
+            self.resident.insert(pgno, page);
+            self.touch_lru(pgno);
+            self.enforce_budget(cx, pgno)
+        }
+    }
+
+    fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl std::future::Future<Output = Result<()>> + 'a {
+        async move { self.write_page(cx, page_no, data.as_bytes()).await }
+    }
+
+    fn allocate_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl std::future::Future<Output = Result<PageNumber>> + 'a {
+        async move {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let next = self.next_alloc_pgno;
+            self.next_alloc_pgno = self
+                .next_alloc_pgno
+                .checked_add(1)
+                .ok_or(FrankenError::DatabaseFull)?;
+            let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
+            self.resident.insert(next, vec![0u8; self.page_size as usize]);
+            self.touch_lru(next);
+            self.enforce_budget(cx, next)?;
+            Ok(pgno)
+        }
+    }
+
+    fn free_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl std::future::Future<Output = Result<()>> + 'a {
+        async move {
+            let pgno = page_no.get();
+            self.resident.remove(&pgno);
+            self.spilled_offsets.remove(&pgno);
+            if let Some(pos) = self.lru.iter().position(|&p| p == pgno) {
+                self.lru.remove(pos);
+            }
+            Ok(())
+        }
+    }
+
+    fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+}
+
 /// Backend for a storage cursor, dispatching between in-memory,
-/// transaction-backed, and time-travel page I/O.
+/// spillable temporary B-tree, transaction-backed, and time-travel page I/O.
 enum CursorBackend {
     /// In-memory page store (used by tests and Phase 4 fallback).
     Mem(BtCursor<MemPageStore>),
+    /// Spillable VFS-backed temporary B-tree (`OpenAutoindex` under `PRAGMA temp_store`).
+    Temp(BtCursor<TempSpillPageStore>),
     /// Real pager transaction (Phase 5 production path, bd-2a3y).
     Txn(BtCursor<SharedTxnPageIo>),
     /// Time-travel snapshot (historical reads via MVCC version store).
@@ -5006,6 +5812,7 @@ impl std::fmt::Debug for CursorBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Mem(c) => f.debug_tuple("Mem").field(c).finish(),
+            Self::Temp(c) => f.debug_tuple("Temp").field(c).finish(),
             Self::Txn(c) => f.debug_tuple("Txn").field(c).finish(),
             Self::TimeTravel(c) => f.debug_tuple("TimeTravel").field(c).finish(),
         }
@@ -5038,6 +5845,7 @@ impl CursorBackend {
     fn kind_str(&self) -> &'static str {
         match self {
             Self::Mem(_) => "mem",
+            Self::Temp(_) => "temp",
             Self::Txn(_) => "txn",
             Self::TimeTravel(_) => "time_travel",
         }
@@ -5048,6 +5856,7 @@ impl CursorBackend {
     fn is_table_btree(&self) -> bool {
         match self {
             Self::Mem(c) => c.is_table(),
+            Self::Temp(c) => c.is_table(),
             Self::Txn(c) => c.is_table(),
             Self::TimeTravel(c) => c.is_table(),
         }
@@ -5057,6 +5866,7 @@ impl CursorBackend {
     fn usable_size(&self) -> u32 {
         match self {
             Self::Mem(c) => c.usable_size(),
+            Self::Temp(c) => c.usable_size(),
             Self::Txn(c) => c.usable_size(),
             Self::TimeTravel(c) => c.usable_size(),
         }
@@ -5066,6 +5876,7 @@ impl CursorBackend {
     fn page_size(&self) -> u32 {
         match self {
             Self::Mem(c) => c.page_size(),
+            Self::Temp(c) => c.page_size(),
             Self::Txn(c) => c.page_size(),
             Self::TimeTravel(c) => c.page_size(),
         }
@@ -5075,6 +5886,7 @@ impl CursorBackend {
     fn index_desc_flags(&self) -> &[bool] {
         match self {
             Self::Mem(c) => c.index_desc_flags(),
+            Self::Temp(c) => c.index_desc_flags(),
             Self::Txn(c) => c.index_desc_flags(),
             Self::TimeTravel(c) => c.index_desc_flags(),
         }
@@ -5084,6 +5896,7 @@ impl CursorBackend {
     fn index_collations(&self) -> &[Option<String>] {
         match self {
             Self::Mem(c) => c.index_collations(),
+            Self::Temp(c) => c.index_collations(),
             Self::Txn(c) => c.index_collations(),
             Self::TimeTravel(c) => c.index_collations(),
         }
@@ -5093,6 +5906,7 @@ impl CursorBackend {
     fn collation_registry(&self) -> Arc<Mutex<CollationRegistry>> {
         match self {
             Self::Mem(c) => c.collation_registry(),
+            Self::Temp(c) => c.collation_registry(),
             Self::Txn(c) => c.collation_registry(),
             Self::TimeTravel(c) => c.collation_registry(),
         }
@@ -5104,6 +5918,7 @@ impl CursorBackend {
     async fn first(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.first(cx).await,
+            Self::Temp(c) => c.first(cx).await,
             Self::Txn(c) => c.first(cx).await,
             Self::TimeTravel(c) => c.first(cx).await,
         }
@@ -5112,6 +5927,7 @@ impl CursorBackend {
     async fn last(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.last(cx).await,
+            Self::Temp(c) => c.last(cx).await,
             Self::Txn(c) => c.last(cx).await,
             Self::TimeTravel(c) => c.last(cx).await,
         }
@@ -5120,6 +5936,7 @@ impl CursorBackend {
     async fn next(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.next(cx).await,
+            Self::Temp(c) => c.next(cx).await,
             Self::Txn(c) => c.next(cx).await,
             Self::TimeTravel(c) => c.next(cx).await,
         }
@@ -5131,6 +5948,7 @@ impl CursorBackend {
     fn try_next_within_leaf(&mut self, cx: &Cx) -> Result<Option<bool>> {
         match self {
             Self::Mem(c) => c.try_advance_next_within_leaf(cx),
+            Self::Temp(c) => c.try_advance_next_within_leaf(cx),
             Self::Txn(c) => c.try_advance_next_within_leaf(cx),
             Self::TimeTravel(c) => c.try_advance_next_within_leaf(cx),
         }
@@ -5143,6 +5961,7 @@ impl CursorBackend {
     fn try_table_seek_within_leaf(&mut self, cx: &Cx, rowid: i64) -> Result<Option<SeekResult>> {
         match self {
             Self::Mem(c) => c.try_table_seek_within_leaf(cx, rowid),
+            Self::Temp(c) => c.try_table_seek_within_leaf(cx, rowid),
             Self::Txn(c) => c.try_table_seek_within_leaf(cx, rowid),
             Self::TimeTravel(c) => c.try_table_seek_within_leaf(cx, rowid),
         }
@@ -5153,6 +5972,7 @@ impl CursorBackend {
     async fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
         match self {
             Self::Mem(c) => c.count_all_rows(cx).await,
+            Self::Temp(c) => c.count_all_rows(cx).await,
             Self::Txn(c) => c.count_all_rows(cx).await,
             Self::TimeTravel(c) => c.count_all_rows(cx).await,
         }
@@ -5167,6 +5987,7 @@ impl CursorBackend {
     ) -> Result<u64> {
         match self {
             Self::Mem(c) => c.count_entries_before(cx, bound, inclusive).await,
+            Self::Temp(c) => c.count_entries_before(cx, bound, inclusive).await,
             Self::Txn(c) => c.count_entries_before(cx, bound, inclusive).await,
             Self::TimeTravel(c) => c.count_entries_before(cx, bound, inclusive).await,
         }
@@ -5175,6 +5996,7 @@ impl CursorBackend {
     async fn prev(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.prev(cx).await,
+            Self::Temp(c) => c.prev(cx).await,
             Self::Txn(c) => c.prev(cx).await,
             Self::TimeTravel(c) => c.prev(cx).await,
         }
@@ -5183,6 +6005,7 @@ impl CursorBackend {
     fn eof(&self) -> bool {
         match self {
             Self::Mem(c) => c.eof(),
+            Self::Temp(c) => c.eof(),
             Self::Txn(c) => c.eof(),
             Self::TimeTravel(c) => c.eof(),
         }
@@ -5191,6 +6014,7 @@ impl CursorBackend {
     async fn rowid(&self, cx: &Cx) -> Result<i64> {
         match self {
             Self::Mem(c) => c.rowid(cx).await,
+            Self::Temp(c) => c.rowid(cx).await,
             Self::Txn(c) => c.rowid(cx).await,
             Self::TimeTravel(c) => c.rowid(cx).await,
         }
@@ -5202,6 +6026,7 @@ impl CursorBackend {
     fn try_table_leaf_rowid(&self) -> Result<Option<i64>> {
         match self {
             Self::Mem(c) => c.try_table_leaf_rowid(),
+            Self::Temp(c) => c.try_table_leaf_rowid(),
             Self::Txn(c) => c.try_table_leaf_rowid(),
             Self::TimeTravel(c) => c.try_table_leaf_rowid(),
         }
@@ -5214,6 +6039,7 @@ impl CursorBackend {
     fn try_delete_table_leaf_cell_in_staged_image(&mut self) -> bool {
         match self {
             Self::Mem(c) => c.try_delete_table_leaf_cell_in_staged_image(),
+            Self::Temp(c) => c.try_delete_table_leaf_cell_in_staged_image(),
             Self::Txn(c) => c.try_delete_table_leaf_cell_in_staged_image(),
             Self::TimeTravel(_) => false,
         }
@@ -5225,6 +6051,7 @@ impl CursorBackend {
     fn current_row_has_local_table_payload(&self) -> Result<bool> {
         match self {
             Self::Mem(c) => c.current_row_has_local_table_payload(),
+            Self::Temp(c) => c.current_row_has_local_table_payload(),
             Self::Txn(c) => c.current_row_has_local_table_payload(),
             Self::TimeTravel(c) => c.current_row_has_local_table_payload(),
         }
@@ -5240,6 +6067,7 @@ impl CursorBackend {
     ) -> Result<bool> {
         match self {
             Self::Mem(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
+            Self::Temp(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
             Self::Txn(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
             Self::TimeTravel(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
         }
@@ -5253,6 +6081,7 @@ impl CursorBackend {
     fn current_local_table_row(&self) -> Result<Option<(i64, std::ops::Range<usize>, &[u8])>> {
         match self {
             Self::Mem(c) => c.current_local_table_row(),
+            Self::Temp(c) => c.current_local_table_row(),
             Self::Txn(c) => c.current_local_table_row(),
             Self::TimeTravel(c) => c.current_local_table_row(),
         }
@@ -5263,6 +6092,7 @@ impl CursorBackend {
     fn current_page_span(&self, span: std::ops::Range<usize>) -> Option<&[u8]> {
         match self {
             Self::Mem(c) => c.current_page_span(span),
+            Self::Temp(c) => c.current_page_span(span),
             Self::Txn(c) => c.current_page_span(span),
             Self::TimeTravel(c) => c.current_page_span(span),
         }
@@ -5271,6 +6101,7 @@ impl CursorBackend {
     async fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
         match self {
             Self::Mem(c) => c.payload(cx).await,
+            Self::Temp(c) => c.payload(cx).await,
             Self::Txn(c) => c.payload(cx).await,
             Self::TimeTravel(c) => c.payload(cx).await,
         }
@@ -5279,6 +6110,7 @@ impl CursorBackend {
     async fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
         match self {
             Self::Mem(c) => c.payload_into(cx, buf).await,
+            Self::Temp(c) => c.payload_into(cx, buf).await,
             Self::Txn(c) => c.payload_into(cx, buf).await,
             Self::TimeTravel(c) => c.payload_into(cx, buf).await,
         }
@@ -5292,6 +6124,7 @@ impl CursorBackend {
     ) -> Result<()> {
         match self {
             Self::Mem(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf).await,
+            Self::Temp(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf).await,
             Self::Txn(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf).await,
             Self::TimeTravel(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf).await,
         }
@@ -5303,6 +6136,7 @@ impl CursorBackend {
     ) -> Result<Option<(bool, i64)>> {
         match self {
             Self::Mem(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
+            Self::Temp(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
             Self::Txn(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
             Self::TimeTravel(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
         }
@@ -5315,6 +6149,10 @@ impl CursorBackend {
     ) -> Result<FirstIndexKeyIntegerLocalRunSegment> {
         match self {
             Self::Mem(c) => {
+                c.count_equal_first_index_key_run_integer_local_segment(cx, probe_value)
+                    .await
+            }
+            Self::Temp(c) => {
                 c.count_equal_first_index_key_run_integer_local_segment(cx, probe_value)
                     .await
             }
@@ -5332,6 +6170,7 @@ impl CursorBackend {
     async fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
         match self {
             Self::Mem(c) => c.table_move_to(cx, rowid).await,
+            Self::Temp(c) => c.table_move_to(cx, rowid).await,
             Self::Txn(c) => c.table_move_to(cx, rowid).await,
             Self::TimeTravel(c) => c.table_move_to(cx, rowid).await,
         }
@@ -5340,6 +6179,7 @@ impl CursorBackend {
     async fn table_advance_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
         match self {
             Self::Mem(c) => c.advance_to(cx, rowid).await,
+            Self::Temp(c) => c.advance_to(cx, rowid).await,
             Self::Txn(c) => c.advance_to(cx, rowid).await,
             Self::TimeTravel(c) => c.advance_to(cx, rowid).await,
         }
@@ -5348,6 +6188,7 @@ impl CursorBackend {
     async fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         match self {
             Self::Mem(c) => c.table_insert(cx, rowid, data).await,
+            Self::Temp(c) => c.table_insert(cx, rowid, data).await,
             Self::Txn(c) => c.table_insert(cx, rowid, data).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: table_insert not permitted".to_owned(),
@@ -5363,6 +6204,7 @@ impl CursorBackend {
     ) -> Result<()> {
         match self {
             Self::Mem(c) => c.table_insert_prechecked_absent(cx, rowid, data).await,
+            Self::Temp(c) => c.table_insert_prechecked_absent(cx, rowid, data).await,
             Self::Txn(c) => c.table_insert_prechecked_absent(cx, rowid, data).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: table_insert not permitted".to_owned(),
@@ -5378,6 +6220,10 @@ impl CursorBackend {
     ) -> Result<bool> {
         match self {
             Self::Mem(c) => {
+                c.table_overwrite_current_payload_same_size_no_overflow(cx, rowid, data)
+                    .await
+            }
+            Self::Temp(c) => {
                 c.table_overwrite_current_payload_same_size_no_overflow(cx, rowid, data)
                     .await
             }
@@ -5401,6 +6247,10 @@ impl CursorBackend {
                 c.table_refresh_rightmost_leaf_cache_after_insert(cx, rowid)
                     .await
             }
+            Self::Temp(c) => {
+                c.table_refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                    .await
+            }
             Self::Txn(c) => {
                 c.table_refresh_rightmost_leaf_cache_after_insert(cx, rowid)
                     .await
@@ -5419,6 +6269,7 @@ impl CursorBackend {
     ) -> Result<()> {
         match self {
             Self::Mem(c) => c.table_append_after_last_position(cx, rowid, data).await,
+            Self::Temp(c) => c.table_append_after_last_position(cx, rowid, data).await,
             Self::Txn(c) => c.table_append_after_last_position(cx, rowid, data).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: table_insert not permitted".to_owned(),
@@ -5441,6 +6292,10 @@ impl CursorBackend {
                 c.table_append_after_last_position_with_writer(cx, rowid, payload_len, writer)
                     .await
             }
+            Self::Temp(c) => {
+                c.table_append_after_last_position_with_writer(cx, rowid, payload_len, writer)
+                    .await
+            }
             Self::Txn(c) => {
                 c.table_append_after_last_position_with_writer(cx, rowid, payload_len, writer)
                     .await
@@ -5454,6 +6309,7 @@ impl CursorBackend {
     async fn delete(&mut self, cx: &Cx) -> Result<()> {
         match self {
             Self::Mem(c) => c.delete(cx).await,
+            Self::Temp(c) => c.delete(cx).await,
             Self::Txn(c) => c.delete(cx).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: delete not permitted".to_owned(),
@@ -5465,6 +6321,7 @@ impl CursorBackend {
     async fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult> {
         match self {
             Self::Mem(c) => c.index_move_to(cx, key).await,
+            Self::Temp(c) => c.index_move_to(cx, key).await,
             Self::Txn(c) => c.index_move_to(cx, key).await,
             Self::TimeTravel(c) => c.index_move_to(cx, key).await,
         }
@@ -5473,6 +6330,7 @@ impl CursorBackend {
     async fn index_move_to_upper_bound(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
         match self {
             Self::Mem(c) => c.index_move_to_upper_bound(cx, key).await,
+            Self::Temp(c) => c.index_move_to_upper_bound(cx, key).await,
             Self::Txn(c) => c.index_move_to_upper_bound(cx, key).await,
             Self::TimeTravel(c) => c.index_move_to_upper_bound(cx, key).await,
         }
@@ -5482,6 +6340,7 @@ impl CursorBackend {
     async fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
         match self {
             Self::Mem(c) => c.index_insert(cx, key).await,
+            Self::Temp(c) => c.index_insert(cx, key).await,
             Self::Txn(c) => c.index_insert(cx, key).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: index_insert not permitted".to_owned(),
@@ -5500,6 +6359,10 @@ impl CursorBackend {
     ) -> Result<bool> {
         match self {
             Self::Mem(c) => {
+                c.index_insert_unique_with_rightmost_report(cx, key, n_unique_cols, columns_label)
+                    .await
+            }
+            Self::Temp(c) => {
                 c.index_insert_unique_with_rightmost_report(cx, key, n_unique_cols, columns_label)
                     .await
             }
@@ -5524,6 +6387,10 @@ impl CursorBackend {
                 c.index_append_after_current_rightmost_position(cx, key)
                     .await
             }
+            Self::Temp(c) => {
+                c.index_append_after_current_rightmost_position(cx, key)
+                    .await
+            }
             Self::Txn(c) => {
                 c.index_append_after_current_rightmost_position(cx, key)
                     .await
@@ -5538,6 +6405,7 @@ impl CursorBackend {
     async fn index_root_is_empty_leaf(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.index_root_is_empty_leaf(cx).await,
+            Self::Temp(c) => c.index_root_is_empty_leaf(cx).await,
             Self::Txn(c) => c.index_root_is_empty_leaf(cx).await,
             Self::TimeTravel(_) => Ok(false),
         }
@@ -5550,6 +6418,7 @@ impl CursorBackend {
     {
         match self {
             Self::Mem(c) => c.index_bulk_load_sorted_keys(cx, keys).await,
+            Self::Temp(c) => c.index_bulk_load_sorted_keys(cx, keys).await,
             Self::Txn(c) => c.index_bulk_load_sorted_keys(cx, keys).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: index bulk load not permitted".to_owned(),
@@ -5562,6 +6431,7 @@ impl CursorBackend {
     fn compare_index_records(&self, lhs: &[u8], rhs: &[u8]) -> std::cmp::Ordering {
         match self {
             Self::Mem(c) => c.compare_index_records(lhs, rhs),
+            Self::Temp(c) => c.compare_index_records(lhs, rhs),
             Self::Txn(c) => c.compare_index_records(lhs, rhs),
             Self::TimeTravel(_) => lhs.cmp(rhs),
         }
@@ -5576,6 +6446,7 @@ impl CursorBackend {
     ) -> Option<Ordering> {
         match self {
             Self::Mem(c) => c.compare_index_key_prefixes(lhs, rhs),
+            Self::Temp(c) => c.compare_index_key_prefixes(lhs, rhs),
             Self::Txn(c) => c.compare_index_key_prefixes(lhs, rhs),
             Self::TimeTravel(c) => c.compare_index_key_prefixes(lhs, rhs),
         }
@@ -5586,6 +6457,7 @@ impl CursorBackend {
     fn last_index_insert_was_past_rightmost(&self) -> bool {
         match self {
             Self::Mem(c) => c.last_index_insert_was_past_rightmost(),
+            Self::Temp(c) => c.last_index_insert_was_past_rightmost(),
             Self::Txn(c) => c.last_index_insert_was_past_rightmost(),
             Self::TimeTravel(_) => false,
         }
@@ -5598,6 +6470,7 @@ impl CursorBackend {
     fn clear_position(&mut self) {
         match self {
             Self::Mem(c) => c.invalidate(),
+            Self::Temp(c) => c.invalidate(),
             Self::Txn(c) => c.invalidate(),
             Self::TimeTravel(c) => c.invalidate(),
         }
@@ -5607,6 +6480,7 @@ impl CursorBackend {
     fn position_stamp(&self) -> Option<CursorPositionStamp> {
         match self {
             Self::Mem(c) => c.position_stamp(),
+            Self::Temp(c) => c.position_stamp(),
             Self::Txn(c) => c.position_stamp(),
             Self::TimeTravel(c) => c.position_stamp(),
         }
@@ -5617,6 +6491,7 @@ impl CursorBackend {
     fn row_image_epoch(&self) -> u64 {
         match self {
             Self::Mem(c) => c.row_image_epoch(),
+            Self::Temp(c) => c.row_image_epoch(),
             Self::Txn(c) => c.row_image_epoch(),
             Self::TimeTravel(c) => c.row_image_epoch(),
         }
@@ -6253,7 +7128,8 @@ impl MemDbUndoOp {
                 prev_next_rowid,
             } => {
                 if let Some(table) = db.tables.get_mut(&root_page) {
-                    table.insert(row.rowid, row.values);
+                    let restored_values = table.read_row_values_sync(&row).into_owned();
+                    table.insert(row.rowid, restored_values);
                     table.next_rowid = prev_next_rowid;
                 }
             }
@@ -6309,8 +7185,14 @@ impl MemDatabase {
     /// into it would only pin their memory.
     #[must_use]
     pub fn clone_for_snapshot(&self) -> Self {
+        let mut tables = self.tables.clone();
+        for (_, table) in tables.iter_mut() {
+            if table.temp_spill.is_some() {
+                table.detach_temp_spill_for_snapshot();
+            }
+        }
         Self {
-            tables: self.tables.clone(),
+            tables,
             next_root_page: self.next_root_page,
             undo_enabled: true,
             undo_log: Vec::new(),
@@ -6489,6 +7371,13 @@ impl MemDatabase {
         }
     }
 
+    /// Drop a table immediately without retaining it in `undo_log` (used for
+    /// autocommit `DROP TABLE` on `TEMP` tables and `PRAGMA temp_store` mode
+    /// transitions so any VFS spill file closes and unlinks immediately).
+    pub fn destroy_table_without_undo(&mut self, root_page: i32) {
+        let _ = self.tables.remove(&root_page);
+    }
+
     fn clear_table(&mut self, root_page: i32) {
         // Active-transaction refreshes can clear the schema-only mirror once
         // per trigger query. An already-empty table has nothing to restore;
@@ -6586,7 +7475,7 @@ impl MemDatabase {
                 .rows
                 .binary_search_by_key(&rowid, |r| r.rowid)
                 .ok()
-                .map(|idx| table.rows[idx].values.clone());
+                .map(|idx| table.read_row_values_sync(&table.rows[idx]).into_owned());
             table.insert(rowid, values);
             self.push_undo(MemDbUndoOp::UpsertRow {
                 root_page,
@@ -6595,6 +7484,59 @@ impl MemDatabase {
                 old_values,
             });
         }
+    }
+
+    /// Upsert a row while enforcing any attached `PRAGMA temp_store` budget
+    /// (spilling `TEMP`/ephemeral rows to VFS temp files or checking
+    /// `hard_heap_limit` / `Cx` cancellation).
+    pub fn upsert_row_checked<V>(
+        &mut self,
+        cx: &Cx,
+        root_page: i32,
+        rowid: i64,
+        values: V,
+    ) -> Result<()>
+    where
+        V: Into<MemRowValues>,
+    {
+        let values = values.into();
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            let prev_next_rowid = table.next_rowid;
+            let prev_resident_bytes = table.temp_spill.as_ref().map(|s| s.resident_bytes);
+            let old_values = table
+                .rows
+                .binary_search_by_key(&rowid, |r| r.rowid)
+                .ok()
+                .map(|idx| table.read_row_values_at(cx, idx))
+                .transpose()?
+                .flatten()
+                .map(Cow::into_owned);
+            if let Err(err) = table.insert_checked(cx, rowid, values) {
+                // `insert_checked` may have inserted `rowid` before a spill
+                // write failed (`DatabaseFull`/`Io`/`Abort`). Restore the
+                // table atomically before propagating the error.
+                match old_values {
+                    Some(prev) => table.insert(rowid, prev),
+                    None => {
+                        let _ = table.delete_by_rowid(rowid);
+                    }
+                }
+                table.next_rowid = prev_next_rowid;
+                if let (Some(spill), Some(prev_bytes)) =
+                    (table.temp_spill.as_mut(), prev_resident_bytes)
+                {
+                    spill.resident_bytes = prev_bytes;
+                }
+                return Err(err);
+            }
+            self.push_undo(MemDbUndoOp::UpsertRow {
+                root_page,
+                rowid,
+                prev_next_rowid,
+                old_values,
+            });
+        }
+        Ok(())
     }
 
     /// Remove a column slot from every row in a TEMP table.
@@ -6650,7 +7592,7 @@ impl MemDatabase {
                 .rows
                 .binary_search_by_key(&rowid, |r| r.rowid)
                 .ok()
-                .map(|idx| table.rows[idx].values.clone());
+                .map(|idx| table.read_row_values_sync(&table.rows[idx]).into_owned());
             table.insert(rowid, values);
             self.push_undo(MemDbUndoOp::UpsertRow {
                 root_page,
@@ -6664,17 +7606,83 @@ impl MemDatabase {
         }
     }
 
+    /// Allocate an implicit rowid and insert the row while enforcing any
+    /// attached `PRAGMA temp_store` budget (spill to VFS temp file, hard heap
+    /// check, and `Cx` cancellation).
+    pub fn insert_auto_row_checked<V>(
+        &mut self,
+        cx: &Cx,
+        root_page: i32,
+        values: V,
+        rowid_value_column: Option<usize>,
+    ) -> Result<Option<i64>>
+    where
+        V: Into<MemRowValues>,
+    {
+        let mut values = values.into();
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            let prev_next_rowid = table.next_rowid;
+            let prev_resident_bytes = table.temp_spill.as_ref().map(|s| s.resident_bytes);
+            let rowid = table.alloc_rowid();
+            if let Some(column) = rowid_value_column
+                && let Some(value) = values.get_mut(column)
+            {
+                *value = SqliteValue::Integer(rowid);
+            }
+            let old_values = table
+                .rows
+                .binary_search_by_key(&rowid, |r| r.rowid)
+                .ok()
+                .map(|idx| table.read_row_values_at(cx, idx))
+                .transpose()?
+                .flatten()
+                .map(Cow::into_owned);
+            if let Err(err) = table.insert_checked(cx, rowid, values) {
+                match old_values {
+                    Some(prev) => table.insert(rowid, prev),
+                    None => {
+                        let _ = table.delete_by_rowid(rowid);
+                    }
+                }
+                table.next_rowid = prev_next_rowid;
+                if let (Some(spill), Some(prev_bytes)) =
+                    (table.temp_spill.as_mut(), prev_resident_bytes)
+                {
+                    spill.resident_bytes = prev_bytes;
+                }
+                return Err(err);
+            }
+            self.push_undo(MemDbUndoOp::UpsertRow {
+                root_page,
+                rowid,
+                prev_next_rowid,
+                old_values,
+            });
+            Ok(Some(rowid))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Delete a row by rowid, recording undo information for rollback.
     pub fn delete_rowid(&mut self, root_page: i32, rowid: i64) -> bool {
         if let Some(table) = self.tables.get_mut(&root_page)
             && let Ok(index) = table.rows.binary_search_by_key(&rowid, |r| r.rowid)
         {
             let prev_next_rowid = table.next_rowid;
+            let old_values = table.read_row_values_sync(&table.rows[index]).into_owned();
             let row = table.rows_mut().remove(index);
-            table.remove_unique_entries(row.rowid, &row.values);
+            if row.spilled.is_some() && let Some(spill) = table.temp_spill.as_mut() {
+                spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
+            }
+            table.remove_unique_entries(row.rowid, &old_values);
             self.push_undo(MemDbUndoOp::DeleteRow {
                 root_page,
-                row,
+                row: MemRow {
+                    rowid: row.rowid,
+                    values: old_values,
+                    spilled: None,
+                },
                 prev_next_rowid,
             });
             true
@@ -6688,11 +7696,19 @@ impl MemDatabase {
         if let Some(table) = self.tables.get_mut(&root_page) {
             if index < table.rows.len() {
                 let prev_next_rowid = table.next_rowid;
+                let old_values = table.read_row_values_sync(&table.rows[index]).into_owned();
                 let row = table.rows_mut().remove(index);
-                table.remove_unique_entries(row.rowid, &row.values);
+                if row.spilled.is_some() && let Some(spill) = table.temp_spill.as_mut() {
+                    spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
+                }
+                table.remove_unique_entries(row.rowid, &old_values);
                 self.push_undo(MemDbUndoOp::DeleteRow {
                     root_page,
-                    row,
+                    row: MemRow {
+                        rowid: row.rowid,
+                        values: old_values,
+                        spilled: None,
+                    },
                     prev_next_rowid,
                 });
             }
@@ -8291,6 +9307,14 @@ pub struct VdbeEngine {
     /// [`fsqlite_pager::SnapshotPageReader`] on that many threads when the
     /// transaction offers one. Set per statement by the connection.
     parallel_workers: usize,
+    /// Active `PRAGMA temp_store` policy, byte budget, VFS temp-file backend,
+    /// and live telemetry shared with the owning connection (bd-dwjnq.5).
+    temp_store_runtime: TempStoreRuntime,
+    /// Ephemeral `MemTable` root pages created by `OpenEphemeral` for the
+    /// current statement, keyed by cursor id so `Close`, `reset_for_reuse`,
+    /// and `take_database` destroy them and immediately release any VFS spill
+    /// files.
+    ephemeral_roots_by_cursor: HashMap<i32, i32>,
     /// Result rows accumulated during execution.
     results: ResultRowStorage,
     /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
@@ -9081,6 +10105,8 @@ impl VdbeEngine {
             trace_opcodes: opcode_trace_enabled(),
             collect_vdbe_metrics: false,
             parallel_workers: 1,
+            temp_store_runtime: TempStoreRuntime::default(),
+            ephemeral_roots_by_cursor: HashMap::new(),
             results: Vec::with_capacity(64),
             cursors: CursorSlots::new(),
             sorters: CursorSlots::new(),
@@ -9428,6 +10454,7 @@ impl VdbeEngine {
         self.results.clear();
         // bd-a3g0m: a parked read cursor is closed; never retain it.
         self.drop_parked_read_cursors();
+        self.cleanup_ephemeral_tables();
         self.writable_storage_cursor_opened = false;
         if retain_cursors {
             // Keep cursors + cursor_root_pages + storage_cursors alive.
@@ -9598,6 +10625,33 @@ impl VdbeEngine {
     /// (bd-w4pr1.13.11). 0 and 1 keep every scan on this thread.
     pub fn set_parallel_workers(&mut self, workers: usize) {
         self.parallel_workers = workers.max(1);
+    }
+
+    /// Configure the active `PRAGMA temp_store` runtime policy, byte budget,
+    /// VFS temp-file backend, and live telemetry for this engine (bd-dwjnq.5).
+    pub fn set_temp_store_runtime(&mut self, runtime: TempStoreRuntime) {
+        self.temp_store_runtime = runtime;
+    }
+
+    /// Active temporary-storage runtime policy for this engine.
+    #[must_use]
+    pub fn temp_store_runtime(&self) -> &TempStoreRuntime {
+        &self.temp_store_runtime
+    }
+
+    /// Destroy any statement-scoped `OpenEphemeral` tables so their VFS temp
+    /// spill files are closed and unlinked immediately on cursor close, reset,
+    /// cancellation, or database handoff.
+    fn cleanup_ephemeral_tables(&mut self) {
+        if self.ephemeral_roots_by_cursor.is_empty() {
+            return;
+        }
+        let roots: Vec<i32> = self.ephemeral_roots_by_cursor.drain().map(|(_, rp)| rp).collect();
+        if let Some(db) = self.db.as_mut() {
+            for root_page in roots {
+                db.tables.remove(&root_page);
+            }
+        }
     }
 
     /// A reader of the lent transaction's committed snapshot for threads
@@ -10992,6 +12046,7 @@ impl VdbeEngine {
 
     /// Take ownership of the in-memory database back from the engine.
     pub fn take_database(&mut self) -> Option<MemDatabase> {
+        self.cleanup_ephemeral_tables();
         self.db.take()
     }
 
@@ -12799,12 +13854,24 @@ impl VdbeEngine {
                 }
 
                 Opcode::OpenEphemeral => {
-                    // Ephemeral table: create an in-memory table on-the-fly.
+                    // Ephemeral table: create a statement-local table governed
+                    // by the active `PRAGMA temp_store` policy and budget.
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(cursor_id);
                     let num_cols = op.p2.max(1);
+                    let temp_runtime = self.temp_store_runtime.clone();
+                    let text_encoding = self.text_encoding;
+                    if let Some(old_root) = self.ephemeral_roots_by_cursor.remove(&cursor_id)
+                        && let Some(db) = self.db.as_mut()
+                    {
+                        db.tables.remove(&old_root);
+                    }
                     if let Some(db) = self.db.as_mut() {
                         let root_page = db.create_table(num_cols as usize);
+                        if let Some(table) = db.get_table_mut(root_page) {
+                            table.configure_temp_spill(temp_runtime, text_encoding);
+                        }
+                        self.ephemeral_roots_by_cursor.insert(cursor_id, root_page);
                         self.storage_cursors.remove(&cursor_id);
                         self.cursors
                             .insert(cursor_id, MemCursor::new(root_page, true));
@@ -12813,11 +13880,10 @@ impl VdbeEngine {
                 }
 
                 Opcode::OpenAutoindex => {
-                    // Autoindex: create an ephemeral INDEX B-tree.
-                    // Unlike OpenEphemeral (table B-tree), autoindexes use
-                    // index B-tree semantics (no rowid, key-only cells).
-                    // We create a StorageCursor backed by MemPageStore with
-                    // is_table=false so IdxInsert/IdxGE etc. work correctly.
+                    // Autoindex: create an ephemeral INDEX B-tree governed by
+                    // `PRAGMA temp_store`. In `FILE` mode, back it with
+                    // `TempSpillPageStore` so pages evict LRU-first to a VFS
+                    // temp file once resident bytes exceed `budget_bytes`.
                     let autoindex_page_size = self.page_size.get();
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(cursor_id);
@@ -12828,13 +13894,18 @@ impl VdbeEngine {
                         PageNumber::new(2)
                     };
                     if let Some(root_pgno) = root_pgno {
-                        let store = MemPageStore::with_empty_index(root_pgno, autoindex_page_size);
                         let cx = self.derive_execution_cx();
-                        let mut cursor =
-                            BtCursor::new(store, root_pgno, autoindex_page_size, false);
-                        cursor.set_retain_read_witnesses(false);
+                        let temp_runtime = self.temp_store_runtime.clone();
+                        let use_spillable_temp_btree = temp_runtime.is_file_backed();
+                        // When a tight file-backed budget is active, route keys
+                        // through the spillable B-tree rather than an unbounded
+                        // in-memory MembershipSet or StagedIndexBuild buffer.
+                        let allow_unbounded_in_memory_shortcuts = !use_spillable_temp_btree
+                            || temp_runtime.budget_bytes() >= SORTER_DEFAULT_SPILL_THRESHOLD;
                         let autoindex_collations = extract_collation_names_owned(&op.p4);
-                        let membership_set = if (op.p5 & OPFLAG_MEMBERSHIP_SET) == 0 {
+                        let membership_set = if !allow_unbounded_in_memory_shortcuts
+                            || (op.p5 & OPFLAG_MEMBERSHIP_SET) == 0
+                        {
                             None
                         } else {
                             let text_is_bytewise = matches!(self.text_encoding, TextEncoding::Utf8)
@@ -12849,23 +13920,50 @@ impl VdbeEngine {
                                 text_is_bytewise,
                             }))
                         };
-                        let staged_build = (membership_set.is_none()
+                        let staged_build = (allow_unbounded_in_memory_shortcuts
+                            && membership_set.is_none()
                             && (op.p5 & OPFLAG_STAGED_BUILD) != 0)
                             .then(Box::<StagedIndexBuild>::default);
-                        if !autoindex_collations.is_empty() {
-                            cursor.set_index_collation_context(
-                                autoindex_collations,
-                                Arc::clone(&self.collation_registry),
-                                self.text_encoding,
+                        let backend = if use_spillable_temp_btree {
+                            let store = TempSpillPageStore::with_empty_index(
+                                root_pgno,
+                                autoindex_page_size,
+                                temp_runtime,
                             );
-                        }
+                            let mut cursor =
+                                BtCursor::new(store, root_pgno, autoindex_page_size, false);
+                            cursor.set_retain_read_witnesses(false);
+                            if !autoindex_collations.is_empty() {
+                                cursor.set_index_collation_context(
+                                    autoindex_collations,
+                                    Arc::clone(&self.collation_registry),
+                                    self.text_encoding,
+                                );
+                            }
+                            CursorBackend::Temp(cursor)
+                        } else {
+                            temp_runtime.stats().record_memory_only_allocation();
+                            let store =
+                                MemPageStore::with_empty_index(root_pgno, autoindex_page_size);
+                            let mut cursor =
+                                BtCursor::new(store, root_pgno, autoindex_page_size, false);
+                            cursor.set_retain_read_witnesses(false);
+                            if !autoindex_collations.is_empty() {
+                                cursor.set_index_collation_context(
+                                    autoindex_collations,
+                                    Arc::clone(&self.collation_registry),
+                                    self.text_encoding,
+                                );
+                            }
+                            CursorBackend::Mem(cursor)
+                        };
                         self.cursor_root_pages
                             .insert(cursor_id, root_pgno.get() as i32);
                         self.cursors.remove(&cursor_id);
                         self.storage_cursors.insert(
                             cursor_id,
                             StorageCursor {
-                                cursor: CursorBackend::Mem(cursor),
+                                cursor: backend,
                                 cx,
                                 text_encoding: self.text_encoding,
                                 writable: true,
@@ -12967,15 +14065,18 @@ impl VdbeEngine {
                     } else {
                         Vec::new()
                     };
+                    let sorter_cx = self.derive_execution_cx();
                     self.sorters.insert(
                         cursor_id,
-                        SorterCursor::with_collation_registry(
+                        SorterCursor::with_collation_registry_and_temp_store(
                             key_columns,
                             sort_key_orders,
                             collations,
                             Arc::clone(&self.collation_registry),
                             top_n_limit,
                             self.text_encoding,
+                            self.temp_store_runtime.clone(),
+                            sorter_cx,
                         ),
                     );
                     // A cursor id cannot be both table and sorter cursor.
@@ -12986,6 +14087,11 @@ impl VdbeEngine {
 
                 Opcode::Close => {
                     self.cursors.remove(&op.p1);
+                    if let Some(ephemeral_root) = self.ephemeral_roots_by_cursor.remove(&op.p1)
+                        && let Some(db) = self.db.as_mut()
+                    {
+                        db.tables.remove(&ephemeral_root);
+                    }
                     if self.retain_storage_cursors_on_close {
                         let allocator = self.concurrent_rowid_allocator.clone();
                         let schema_epoch = self.concurrent_rowid_schema_epoch;
@@ -14330,6 +15436,7 @@ impl VdbeEngine {
                             // borrow ends so the connection can run victim FK
                             // and delete-trigger semantics.
                             let mut mem_replace_victims: Vec<(i64, Vec<SqliteValue>)> = Vec::new();
+                            let mem_op_cx = self.derive_execution_cx();
                             if let Some(db) = self.db.as_mut() {
                                 // Check rowid conflict first.
                                 let rowid_conflict = db
@@ -14366,14 +15473,20 @@ impl VdbeEngine {
                                                 // Delete conflicting rows that are not the new rowid
                                                 // (which will be replaced by upsert_row).
                                                 if conflict_rid != rowid {
-                                                    if let Some(old_values) =
-                                                        db.get_table(root).and_then(|t| {
-                                                            t.row_values_by_rowid(conflict_rid)
+                                                    if let Some(old_values) = db
+                                                        .get_table(root)
+                                                        .map(|t| {
+                                                            t.read_row_values_by_rowid(
+                                                                &mem_op_cx,
+                                                                conflict_rid,
+                                                            )
                                                         })
+                                                        .transpose()?
+                                                        .flatten()
                                                     {
                                                         mem_replace_victims.push((
                                                             conflict_rid,
-                                                            old_values.to_vec(),
+                                                            old_values.into_owned(),
                                                         ));
                                                     }
                                                     db.delete_rowid(root, conflict_rid);
@@ -14382,12 +15495,18 @@ impl VdbeEngine {
                                             if rowid_conflict
                                                 && let Some(old_values) = db
                                                     .get_table(root)
-                                                    .and_then(|t| t.row_values_by_rowid(rowid))
+                                                    .map(|t| {
+                                                        t.read_row_values_by_rowid(
+                                                            &mem_op_cx, rowid,
+                                                        )
+                                                    })
+                                                    .transpose()?
+                                                    .flatten()
                                             {
                                                 mem_replace_victims
-                                                    .push((rowid, old_values.to_vec()));
+                                                    .push((rowid, old_values.into_owned()));
                                             }
-                                            db.upsert_row(root, rowid, values);
+                                            db.upsert_row_checked(&mem_op_cx, root, rowid, values)?;
                                             actually_inserted = true;
                                         }
                                         _ => {
@@ -14465,7 +15584,7 @@ impl VdbeEngine {
                                     }
                                 } else {
                                     // No conflict — insert normally
-                                    db.upsert_row(root, rowid, values);
+                                    db.upsert_row_checked(&mem_op_cx, root, rowid, values)?;
                                     actually_inserted = true;
                                 }
                             }
@@ -14592,15 +15711,17 @@ impl VdbeEngine {
                                 .is_some_and(|table| pos < table.rows.len());
                             if can_delete && let Some(db) = self.db.as_mut() {
                                 if is_update
-                                    && let Some(row) = db
-                                        .get_table(root)
-                                        .and_then(|table| table.rows.get(pos))
-                                        .cloned()
+                                    && let Some(table) = db.get_table(root)
+                                    && let Some(row) = table.rows.get(pos)
                                 {
+                                    let restored_values = table
+                                        .read_row_values_at(&self.execution_cx, pos)?
+                                        .map(Cow::into_owned)
+                                        .unwrap_or_default();
                                     update_restore = Some(PendingUpdateRestore::Mem {
                                         root_page: root,
                                         rowid: row.rowid,
-                                        values: row.values,
+                                        values: restored_values,
                                     });
                                 }
                                 db.delete_at(root, pos);
@@ -16049,7 +17170,8 @@ impl VdbeEngine {
                         if let Some(pos) = cursor.position
                             && let Some(db) = self.db.as_ref()
                             && let Some(table) = db.get_table(cursor.root_page)
-                            && let Some(row) = table.rows.get(pos)
+                            && let Some(row_values) =
+                                table.read_row_values_at(&self.execution_cx, pos)?
                         {
                             let n_compare = if op.p5 > 0 {
                                 op.p5 as usize
@@ -16060,7 +17182,7 @@ impl VdbeEngine {
                             let collations = self.index_collations_for_root(cursor.root_page);
                             let coll_guard = self.lock_collation();
                             let cmp = compare_index_prefix_keys(
-                                &row.values,
+                                &row_values,
                                 &probe_fields,
                                 n_compare,
                                 &desc_flags,
@@ -16250,7 +17372,15 @@ impl VdbeEngine {
                     };
 
                     let accum_reg = op.p1;
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    // bd-w4pr1.12 (lever AFC): a per-group boundary, like
+                    // VNext's and AggStep's: a requested cancellation is one
+                    // atomic load before and after the finalize, and the
+                    // statement loop's interval checkpoint (every
+                    // VDBE_EXECUTION_CHECKPOINT_INTERVAL opcodes) covers the
+                    // e-process, native-runtime and deadline / budget planes.
+                    // Two full checkpoints here were ~720 instructions a group
+                    // (GROUP BY id over 1M rows: 722M of 5,024M).
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     let result = match self
                         .cold_state_mut()
                         .and_then(|cold_state| cold_state.aggregates.remove(&accum_reg))
@@ -16267,7 +17397,7 @@ impl VdbeEngine {
                         None => func.finalize(func.initial_state())?,
                     };
 
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(accum_reg, result);
                     if let Some(subtype) = func.result_subtype() {
                         self.set_register_subtype(accum_reg, subtype);
@@ -16352,7 +17482,9 @@ impl VdbeEngine {
                     })?;
 
                     let accum_reg = op.p1;
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    // bd-w4pr1.12 (lever AFC): a per-row boundary, as in
+                    // AggInverse and AggFinal: one atomic load each side.
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     let result = match self
                         .cold_state()
                         .and_then(|cold_state| cold_state.window_contexts.get(&accum_reg))
@@ -16360,7 +17492,7 @@ impl VdbeEngine {
                         Some(ctx) => ctx.func.value(&ctx.state)?,
                         None => func.value(&func.initial_state())?,
                     };
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(op.p3, result);
                     pc += 1;
                 }
@@ -18838,12 +19970,13 @@ impl VdbeEngine {
                         }
                         return Err(FrankenError::UniqueViolation { columns });
                     }
+                    let op_cx = self.derive_execution_cx();
                     let db = self.db.as_mut().ok_or_else(|| {
                         FrankenError::internal(
                             "FusedAppendInsert: TEMP MemDatabase is not attached",
                         )
                     })?;
-                    db.upsert_row(root_page, rowid, values);
+                    db.upsert_row_checked(&op_cx, root_page, rowid, values)?;
 
                     self.changes += 1;
                     self.last_insert_rowid = rowid;
@@ -21141,13 +22274,9 @@ impl VdbeEngine {
             if let Some(pos) = cursor.position
                 && let Some(db) = self.db.as_ref()
                 && let Some(table) = db.get_table(cursor.root_page)
-                && let Some(row) = table.rows.get(pos)
+                && let Some(row_values) = table.read_row_values_at(&self.execution_cx, pos)?
             {
-                let value = row
-                    .values
-                    .get(col_idx)
-                    .cloned()
-                    .unwrap_or(SqliteValue::Null);
+                let value = row_values.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
                 if collect_vdbe_metrics {
                     record_decoded_value_metrics(&value);
                 }
@@ -21885,8 +23014,11 @@ impl VdbeEngine {
         if is_table_btree
             && let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page))
         {
-            for row in table.rows.iter() {
-                let payload = encode_record_with_encoding(&row.values, self.text_encoding);
+            for (pos, row) in table.rows.iter().enumerate() {
+                let row_values = table
+                    .read_row_values_at(&cx, pos)?
+                    .ok_or_else(|| FrankenError::internal("MemTable row disappeared during open"))?;
+                let payload = encode_record_with_encoding(&row_values, self.text_encoding);
                 if let Err(err) = cursor.table_insert(&cx, row.rowid, &payload).await {
                     return if matches!(err, FrankenError::Abort) {
                         Err(err)
@@ -28701,6 +29833,160 @@ mod tests {
             rows_delivered_before_cancellation_is_observed(Opcode::NotNull, true),
             expected
         );
+    }
+
+    /// How [`rows_before_aggregate_signal_is_observed`]'s row handler signals
+    /// the running statement (bd-w4pr1.12, lever AFC).
+    #[derive(Clone, Copy, Debug)]
+    enum AggregateSignal {
+        /// `Cx::cancel_with_reason`: the local flag that the per-group atomic
+        /// load reads.
+        Requested,
+        /// A cancellation published on an attached native context (a runtime
+        /// timeout), which only a full checkpoint consults.
+        NativeTimeout,
+        /// An attached native context whose poll quota is spent: the budget
+        /// plane, which only a full checkpoint consults.
+        NativeBudget,
+    }
+
+    /// Opcodes per group or row in [`rows_before_aggregate_signal_is_observed`].
+    const AGGREGATE_SIGNAL_LOOP_OPS: usize = 4;
+
+    /// Rows a statement delivers when `signal` is raised from its row handler
+    /// at row `at`, and its outcome. Each group of the GROUP BY shape is
+    /// `AddImm / AggFinal count / ResultRow / Goto`, and each row of the
+    /// window shape `AddImm / AggValue row_number / ResultRow / Goto`, so the
+    /// aggregate opcode is the only one that can observe a requested
+    /// cancellation per group. (`AggStep` observes one too, in
+    /// `plain_agg_step`, so a group that steps would not show whether
+    /// `AggFinal` does.)
+    fn rows_before_aggregate_signal_is_observed(
+        window: bool,
+        signal: AggregateSignal,
+        at: usize,
+    ) -> (usize, Result<ExecOutcome>) {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut builder = ProgramBuilder::new();
+        let r_counter = builder.alloc_reg();
+        let r_acc = builder.alloc_reg();
+        let r_out = builder.alloc_reg();
+        builder.emit_op(Opcode::Integer, 0, r_counter, 0, P4::None, 0);
+        let loop_top = builder.emit_op(Opcode::AddImm, r_counter, 1, 0, P4::None, 0);
+        if window {
+            let row_number = P4::FuncName("row_number".to_owned());
+            builder.emit_op(Opcode::AggValue, r_acc, 0, r_out, row_number, 0);
+            builder.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        } else {
+            let count = P4::FuncName("count".to_owned());
+            builder.emit_op(Opcode::AggFinal, r_acc, 0, 0, count, 0);
+            builder.emit_op(Opcode::ResultRow, r_acc, 1, 0, P4::None, 0);
+        }
+        let loop_top = i32::try_from(loop_top).expect("loop address fits i32");
+        builder.emit_op(Opcode::Goto, 0, loop_top, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let cx = Cx::new();
+        cx.transition_to_running();
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        fsqlite_func::register_window_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
+
+        let interval = usize::try_from(VDBE_EXECUTION_CHECKPOINT_INTERVAL).unwrap();
+        let mut rows = 0_usize;
+        let mut handler = |_row: &mut Vec<SqliteValue>| -> Result<()> {
+            rows += 1;
+            if rows == at {
+                match signal {
+                    AggregateSignal::Requested => {
+                        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+                    }
+                    AggregateSignal::NativeTimeout => {
+                        let native = asupersync::Cx::for_testing();
+                        native.set_cancel_reason(asupersync::types::CancelReason::timeout());
+                        cx.set_native_cx(native);
+                    }
+                    AggregateSignal::NativeBudget => {
+                        cx.set_native_cx(asupersync::Cx::for_testing_with_budget(
+                            asupersync::Budget::INFINITE.with_poll_quota(0),
+                        ));
+                    }
+                }
+            }
+            // A statement that never observes the signal would run forever;
+            // fail it instead, well past the next interval checkpoint.
+            if rows > at + 4 * interval {
+                return Err(FrankenError::internal(
+                    "the signal was not observed at a checkpoint",
+                ));
+            }
+            Ok(())
+        };
+        let outcome = run_async(engine.execute_with_borrowed_bindings_and_row_handler(
+            &program,
+            None,
+            &mut handler,
+        ));
+        drop(handler);
+        (rows, outcome)
+    }
+
+    /// bd-w4pr1.12 (lever AFC): AggFinal and AggValue observe a requested
+    /// cancellation with one atomic load each side of the call, so a request
+    /// made at a group is observed at the next group's AggFinal (the next
+    /// row's AggValue), halfway through about 1M groups. A boundary that
+    /// does not look at all leaves the request to the interval checkpoint,
+    /// hundreds of groups later.
+    #[test]
+    fn test_aggregate_boundaries_observe_a_requested_cancellation_at_the_next_group() {
+        for window in [false, true] {
+            let (rows, outcome) = rows_before_aggregate_signal_is_observed(
+                window,
+                AggregateSignal::Requested,
+                500_000,
+            );
+            assert!(
+                matches!(outcome, Err(FrankenError::Abort)),
+                "window={window}: unexpected outcome {outcome:?}"
+            );
+            assert_eq!(rows, 500_000, "window={window}");
+        }
+    }
+
+    /// bd-w4pr1.12 (lever AFC): the native-runtime and budget planes, which
+    /// only a full checkpoint consults, are still enforced on an aggregate
+    /// statement: by the statement loop's interval checkpoint, within
+    /// VDBE_EXECUTION_CHECKPOINT_INTERVAL opcodes of the signal, and the
+    /// statement stops with the cancellation error.
+    #[test]
+    fn test_aggregate_statements_observe_native_timeouts_and_spent_budgets_within_the_interval() {
+        let bound = usize::try_from(VDBE_EXECUTION_CHECKPOINT_INTERVAL).unwrap()
+            / AGGREGATE_SIGNAL_LOOP_OPS
+            + 1;
+        for window in [false, true] {
+            for signal in [
+                AggregateSignal::NativeTimeout,
+                AggregateSignal::NativeBudget,
+            ] {
+                let (rows, outcome) =
+                    rows_before_aggregate_signal_is_observed(window, signal, 500_000);
+                assert!(
+                    matches!(outcome, Err(FrankenError::Abort)),
+                    "window={window} {signal:?}: unexpected outcome {outcome:?}"
+                );
+                assert!(
+                    (500_000..=500_000 + bound).contains(&rows),
+                    "window={window} {signal:?}: {rows} rows, bound {bound} after row 500000"
+                );
+            }
+        }
     }
 
     #[test]
@@ -41063,6 +42349,279 @@ mod tests {
         assert!(sorter.position.is_none(), "position should be None");
         assert!(sorter.spill_runs.is_empty(), "spill_runs should be cleared");
         assert_eq!(sorter.memory_used, 0, "memory_used should be 0");
+    }
+
+    #[test]
+    fn test_temp_store_sorter_btree_and_memtable_policy_and_faults() {
+        use crate::temp_store::{
+            EffectiveTempStore, OsTempFileBackend, TempFileBackend, TempFileHandle, TempStoreMode,
+            TempStoreRuntime, TempStoreStats,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FaultTempBackend {
+            fail_on_write_at_byte: usize,
+            disk_full: bool,
+            bytes_written: AtomicUsize,
+        }
+
+        struct FaultTempHandle {
+            inner: Box<dyn TempFileHandle>,
+            fail_on_write_at_byte: usize,
+            disk_full: bool,
+            bytes_written: Arc<AtomicUsize>,
+        }
+
+        impl TempFileHandle for FaultTempHandle {
+            fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+                let next = self
+                    .bytes_written
+                    .fetch_add(data.len(), Ordering::Relaxed)
+                    .saturating_add(data.len());
+                if next >= self.fail_on_write_at_byte {
+                    return if self.disk_full {
+                        Err(FrankenError::DatabaseFull)
+                    } else {
+                        Err(FrankenError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "injected temp write failure",
+                        )))
+                    };
+                }
+                self.inner.write_at(cx, offset, data)
+            }
+
+            fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                self.inner.read_at(cx, offset, buf)
+            }
+
+            fn file_size(&self, cx: &Cx) -> Result<u64> {
+                self.inner.file_size(cx)
+            }
+
+            fn truncate(&self, cx: &Cx, size: u64) -> Result<()> {
+                self.inner.truncate(cx, size)
+            }
+
+            fn close(&self, cx: &Cx) -> Result<()> {
+                self.inner.close(cx)
+            }
+        }
+
+        impl TempFileBackend for FaultTempBackend {
+            fn create_temp_file(&self, cx: &Cx, purpose: &str) -> Result<Box<dyn TempFileHandle>> {
+                let inner = OsTempFileBackend.create_temp_file(cx, purpose)?;
+                Ok(Box::new(FaultTempHandle {
+                    inner,
+                    fail_on_write_at_byte: self.fail_on_write_at_byte,
+                    disk_full: self.disk_full,
+                    bytes_written: Arc::new(AtomicUsize::new(
+                        self.bytes_written.load(Ordering::Relaxed),
+                    )),
+                }))
+            }
+        }
+
+        // 1. FILE mode spills sorter runs and cleans up every temp handle after merge.
+        let file_stats = Arc::new(TempStoreStats::new());
+        let file_runtime = TempStoreRuntime::new(
+            TempStoreMode::File,
+            128,
+            None,
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&file_stats),
+        );
+        assert_eq!(file_runtime.effective_mode(), EffectiveTempStore::File);
+        let mut sorter = SorterCursor::with_collation_registry_and_temp_store(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            None,
+            TextEncoding::Utf8,
+            file_runtime.clone(),
+            Cx::new(),
+        );
+        for v in (0..40_i64).rev() {
+            let vals = vec![
+                SqliteValue::Integer(v),
+                SqliteValue::Text(SmallText::new(&format!("payload-{v:04}-abcdefgh"))),
+            ];
+            let blob = serialize_record(&vals);
+            sorter.insert_row(vals, blob).expect("file mode insert");
+        }
+        assert!(
+            file_stats.snapshot().sorter_spill_runs >= 1,
+            "FILE mode must spill runs beyond 128-byte budget"
+        );
+        assert!(file_stats.snapshot().active_temp_files >= 1);
+        sorter.sort().expect("file mode merge");
+        let after_merge = file_stats.snapshot();
+        assert_eq!(after_merge.active_temp_files, 0, "all spill handles closed");
+        assert_eq!(after_merge.temp_files_opened, after_merge.temp_files_closed);
+        assert_eq!(sorter.rows.len(), 40);
+        assert_eq!(sorter.rows[0].values[0], SqliteValue::Integer(0));
+        assert_eq!(sorter.rows[39].values[0], SqliteValue::Integer(39));
+
+        // 2. MEMORY mode never opens a temp file and enforces hard_heap_limit -> OutOfMemory.
+        let mem_stats = Arc::new(TempStoreStats::new());
+        let mem_runtime = TempStoreRuntime::new(
+            TempStoreMode::Memory,
+            128,
+            Some(512),
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&mem_stats),
+        );
+        assert_eq!(mem_runtime.effective_mode(), EffectiveTempStore::Memory);
+        let mut mem_sorter = SorterCursor::with_collation_registry_and_temp_store(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            None,
+            TextEncoding::Utf8,
+            mem_runtime,
+            Cx::new(),
+        );
+        let mut hit_oom = false;
+        for v in 0..40_i64 {
+            let vals = vec![
+                SqliteValue::Integer(v),
+                SqliteValue::Text(SmallText::new(&"x".repeat(64))),
+            ];
+            let blob = serialize_record(&vals);
+            match mem_sorter.insert_row(vals, blob) {
+                Ok(()) => {}
+                Err(FrankenError::OutOfMemory) => {
+                    hit_oom = true;
+                    break;
+                }
+                Err(other) => panic!("expected OutOfMemory in MEMORY mode, got {other:?}"),
+            }
+        }
+        assert!(hit_oom, "MEMORY mode must enforce hard_heap_limit");
+        let mem_snap = mem_stats.snapshot();
+        assert_eq!(mem_snap.temp_files_opened, 0);
+        assert_eq!(mem_snap.sorter_spill_runs, 0);
+        assert!(mem_snap.memory_only_allocations >= 1);
+
+        // 3. Disk-full (DatabaseFull) and I/O write failure propagate cleanly with 0 leaked files.
+        for disk_full in [true, false] {
+            let fault_stats = Arc::new(TempStoreStats::new());
+            let fault_runtime = TempStoreRuntime::new(
+                TempStoreMode::File,
+                64,
+                None,
+                Some(Arc::new(FaultTempBackend {
+                    fail_on_write_at_byte: 1,
+                    disk_full,
+                    bytes_written: AtomicUsize::new(0),
+                })),
+                Arc::clone(&fault_stats),
+            );
+            let mut fault_sorter = SorterCursor::with_collation_registry_and_temp_store(
+                1,
+                vec![SortKeyOrder::Asc],
+                Vec::new(),
+                Arc::new(Mutex::new(CollationRegistry::new())),
+                None,
+                TextEncoding::Utf8,
+                fault_runtime,
+                Cx::new(),
+            );
+            let vals = vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text(SmallText::new(&"z".repeat(128))),
+            ];
+            let blob = serialize_record(&vals);
+            let err = fault_sorter
+                .insert_row(vals, blob)
+                .expect_err("injected fault must fail spill");
+            if disk_full {
+                assert!(matches!(err, FrankenError::DatabaseFull), "got {err:?}");
+            } else {
+                assert!(matches!(err, FrankenError::Io(_)), "got {err:?}");
+            }
+            drop(fault_sorter);
+            assert_eq!(
+                fault_stats.snapshot().active_temp_files,
+                0,
+                "fault path must close leaked spill handles"
+            );
+        }
+
+        // 4. Caller Cx cancellation fails with Abort and leaks 0 files.
+        let cancel_stats = Arc::new(TempStoreStats::new());
+        let cancel_runtime = TempStoreRuntime::new(
+            TempStoreMode::File,
+            64,
+            None,
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&cancel_stats),
+        );
+        let cx = Cx::new();
+        cx.cancel();
+        let mut cancel_sorter = SorterCursor::with_collation_registry_and_temp_store(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            None,
+            TextEncoding::Utf8,
+            cancel_runtime,
+            cx,
+        );
+        let vals = vec![SqliteValue::Integer(1)];
+        let blob = serialize_record(&vals);
+        let err = cancel_sorter
+            .insert_row(vals, blob)
+            .expect_err("cancelled cx must abort sorter");
+        assert!(matches!(err, FrankenError::Abort), "got {err:?}");
+        assert_eq!(cancel_stats.snapshot().active_temp_files, 0);
+
+        // 5. MemTable temp spill writes & reads back exact values and closes on drop.
+        let tbl_stats = Arc::new(TempStoreStats::new());
+        let tbl_runtime = TempStoreRuntime::new(
+            TempStoreMode::File,
+            256,
+            None,
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&tbl_stats),
+        );
+        let cx_ok = Cx::new();
+        {
+            let mut table = MemTable::new(2);
+            table.configure_temp_spill(tbl_runtime, TextEncoding::Utf8);
+            for i in 1..=25_i64 {
+                table
+                    .insert_checked(
+                        &cx_ok,
+                        i,
+                        vec![
+                            SqliteValue::Integer(i),
+                            SqliteValue::Text(SmallText::new(&format!("row-payload-{i:04}-xyz"))),
+                        ],
+                    )
+                    .expect("temp table insert");
+            }
+            assert!(table.has_spilled_rows(), "temp table must spill beyond 256B");
+            assert!(tbl_stats.snapshot().temp_table_spill_events >= 1);
+            let read_back = table
+                .read_row_values_by_rowid(&cx_ok, 13)
+                .expect("read spilled row")
+                .expect("row 13 present");
+            assert_eq!(read_back[0], SqliteValue::Integer(13));
+            assert_eq!(
+                read_back[1],
+                SqliteValue::Text(SmallText::new("row-payload-0013-xyz"))
+            );
+        }
+        let tbl_after_drop = tbl_stats.snapshot();
+        assert_eq!(tbl_after_drop.active_temp_files, 0);
+        assert_eq!(
+            tbl_after_drop.temp_files_opened,
+            tbl_after_drop.temp_files_closed
+        );
     }
 
     /// bd-bld9w.4: BINARY collation compares in the DB storage encoding. These

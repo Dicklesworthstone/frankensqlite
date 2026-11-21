@@ -13192,6 +13192,10 @@ struct AtomicPublishedPages {
     slots: Box<[AtomicPublishedPageSlot]>,
     active_indices: Mutex<Vec<usize>>,
     page_count: AtomicUsize,
+    /// Test-only: `active_indices` entries `remove` has compared against the
+    /// removed slot, the operation count its O(1) gate asserts (bd-dti3t).
+    #[cfg(test)]
+    remove_probes: AtomicUsize,
 }
 
 impl AtomicPublishedPages {
@@ -13214,6 +13218,8 @@ impl AtomicPublishedPages {
             slots,
             active_indices: Mutex::new(Vec::new()),
             page_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            remove_probes: AtomicUsize::new(0),
         }
     }
 
@@ -13305,6 +13311,11 @@ impl AtomicPublishedPages {
             .is_some();
         if removed {
             let pos = slot.active_pos.load(AtomicOrdering::Relaxed);
+            #[cfg(test)]
+            self.remove_probes.fetch_add(
+                usize::from(pos < active_indices.len()),
+                AtomicOrdering::Relaxed,
+            );
             if pos < active_indices.len() && active_indices[pos] == idx {
                 // O(1) swap_remove using the stored back-pointer. If the
                 // swapped-in element (formerly the tail) lands at `pos`,
@@ -13316,9 +13327,12 @@ impl AtomicPublishedPages {
                         .active_pos
                         .store(pos, AtomicOrdering::Relaxed);
                 }
-            } else if let Some(fallback_pos) = active_indices
-                .iter()
-                .position(|&active_idx| active_idx == idx)
+            } else if let Some(fallback_pos) =
+                active_indices.iter().position(|&active_idx| {
+                    #[cfg(test)]
+                    self.remove_probes.fetch_add(1, AtomicOrdering::Relaxed);
+                    active_idx == idx
+                })
             {
                 // Defensive fallback: back-pointer was stale (should not
                 // happen, but keep the structure consistent if it ever
@@ -13744,6 +13758,11 @@ impl PublishedPages {
     #[cfg(test)]
     fn atomic_active_slot_count(&self) -> usize {
         self.atomic.active_slot_count()
+    }
+
+    #[cfg(test)]
+    fn atomic_remove_probes(&self) -> usize {
+        self.atomic.remove_probes.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -65665,85 +65684,113 @@ mod tests {
 
     #[test]
     fn test_atomic_published_pages_remove_is_o1_vs_linear_scan() {
-        // Micro-benchmark gate: compares the new O(1) slot.active_pos
-        // back-pointer path in AtomicPublishedPages::remove against a
-        // reference O(n) implementation that simulates the prior
-        // `iter().position()` scan. Both implementations run the same
-        // insert/remove workload over the same input.
-        //
-        // The gate only fails if the O(1) path regresses below the O(n)
-        // reference. On CI the delta is hardware-dependent, so we print
-        // both timings with tracing and use a generous lower bound. The
-        // interesting number — the ratio — is captured in the commit
-        // body.
-        use std::time::Instant;
-
+        // Gate on AtomicPublishedPages::remove's O(1) slot.active_pos
+        // back-pointer path, against the prior `iter().position()` scan.
+        // bd-dti3t: this compared wall-clock times of the two while the rest
+        // of the lib suite ran in parallel, and failed under load (o1=71ms vs
+        // scan=6ms). It now counts operations: `remove` reports each
+        // `active_indices` entry it compares against the removed slot, and an
+        // O(1) remove compares exactly one, whatever the order of removal
+        // and however many pages are live. A stale back-pointer (the
+        // regression this gate exists for) sends `remove` to the fallback
+        // scan, which counts every entry it passes.
         const N: u32 = 4_000;
         let slot_cap = u32::try_from(PublishedPages::new(N).atomic_slot_count())
             .expect("direct slot count fits in u32");
         assert!(
             N <= slot_cap,
-            "N must stay within the direct-slot plane for apples-to-apples timing"
+            "N must stay within the direct-slot plane, where removes use the back-pointer"
         );
         let pages: Vec<PageNumber> = (1..=N).map(|n| PageNumber::new(n).unwrap()).collect();
         let payload = PageData::from_vec(sample_page(0xE4));
+        let n = usize::try_from(N).expect("N fits in usize");
 
-        // Warm caches / allocator before timing (alloc churn otherwise
-        // biases the first run).
-        {
-            let warm = PublishedPages::new(N);
+        // Each removal order moves the tail entry into the removed position
+        // differently; every moved entry's back-pointer must follow it.
+        let reverse: Vec<PageNumber> = pages.iter().rev().copied().collect();
+        // 7919 is prime and coprime with N: a permutation of every page.
+        let strided: Vec<PageNumber> = (0..n).map(|i| pages[(i * 7919) % n]).collect();
+        assert_eq!(
+            strided
+                .iter()
+                .map(|p| p.get())
+                .collect::<std::collections::BTreeSet<u32>>()
+                .len(),
+            n
+        );
+
+        let published = PublishedPages::new(N);
+        for (label, order) in [
+            ("forward", &pages),
+            ("reverse", &reverse),
+            ("strided", &strided),
+        ] {
             for &p in &pages {
-                let _ = warm.insert(p, payload.clone());
+                assert!(published.insert(p, payload.clone()));
             }
-            for &p in &pages {
-                let _ = warm.remove(p);
+            let probes_before = published.atomic_remove_probes();
+            for &p in order {
+                assert!(published.remove(p));
             }
+            assert_eq!(published.atomic_active_slot_count(), 0);
+            assert_eq!(
+                published.atomic_remove_probes() - probes_before,
+                n,
+                "{label}: an O(1) remove compares one active entry per removed page"
+            );
         }
 
-        // Timed run: O(1) back-pointer path (the actual production
-        // implementation after this commit).
-        let published = PublishedPages::new(N);
+        // Interleaved: removes between inserts, and back-pointers rebuilt by
+        // retain(), must keep every later remove at one comparison too.
         for &p in &pages {
             assert!(published.insert(p, payload.clone()));
         }
-        let t0 = Instant::now();
-        for &p in &pages {
+        published.retain(|p| p.get() % 3 != 0);
+        let retained: Vec<PageNumber> = pages
+            .iter()
+            .copied()
+            .filter(|p| p.get() % 3 != 0)
+            .collect();
+        let probes_before = published.atomic_remove_probes();
+        let (first_half, second_half) = retained.split_at(retained.len() / 2);
+        for &p in first_half.iter().rev() {
             assert!(published.remove(p));
         }
-        let o1_elapsed = t0.elapsed();
+        for &p in pages.iter().filter(|p| p.get() % 3 == 0) {
+            assert!(published.insert(p, payload.clone()));
+        }
+        for &p in second_half
+            .iter()
+            .chain(pages.iter().filter(|p| p.get() % 3 == 0))
+        {
+            assert!(published.remove(p));
+        }
         assert_eq!(published.atomic_active_slot_count(), 0);
+        assert_eq!(
+            published.atomic_remove_probes() - probes_before,
+            retained.len() + pages.iter().filter(|p| p.get() % 3 == 0).count(),
+            "interleaved: an O(1) remove compares one active entry per removed page"
+        );
 
-        // Reference run: simulate the old O(n) path with a local
-        // Vec<usize> and iter().position(). This is a pure
-        // data-structure microbenchmark (no slot I/O), so it only
-        // reflects the search cost we removed — it is strictly
-        // conservative toward the O(1) path (which also pays the
-        // per-slot lock cost the reference skips).
-        let mut active_indices: Vec<usize> = (0..N as usize).collect();
-        let t0 = Instant::now();
+        // Reference: the prior `iter().position()` scan, counted the same way
+        // on the forward order, shows the gate's margin (about N^2 / 4).
+        let mut active_indices: Vec<usize> = (0..n).collect();
+        let mut scan_probes = 0_usize;
         for &p in &pages {
-            let idx = (p.get() - 1) as usize;
+            let idx = usize::try_from(p.get() - 1).expect("page index fits in usize");
             let pos = active_indices
                 .iter()
-                .position(|&i| i == idx)
+                .position(|&i| {
+                    scan_probes += 1;
+                    i == idx
+                })
                 .expect("active index must be present");
             active_indices.swap_remove(pos);
         }
-        let linear_elapsed = t0.elapsed();
         assert!(active_indices.is_empty());
-
-        eprintln!(
-            "atomic_published_pages_remove: O(1) back-pointer = {o1_elapsed:?}, \
-             reference O(n) linear scan = {linear_elapsed:?} for N={N}"
-        );
-        // Sanity gate: the O(1) remove must not regress beyond the O(n)
-        // scan on this micro-workload. The scan has zero slot overhead
-        // (just Vec ops), so `linear_elapsed * 4` is still a very loose
-        // upper bound — we mainly care about catching accidental
-        // super-linear regressions.
         assert!(
-            o1_elapsed <= linear_elapsed.saturating_mul(4),
-            "O(1) remove regressed vs pure O(n) reference: o1={o1_elapsed:?} scan={linear_elapsed:?}"
+            scan_probes > n * n / 8,
+            "the reference scan must cost O(N^2) on this order: {scan_probes}"
         );
     }
 
