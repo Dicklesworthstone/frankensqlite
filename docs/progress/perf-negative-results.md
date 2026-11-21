@@ -55,7 +55,7 @@ written; this is where their scope is recorded.
 | Removing or adding single arms of `try_execute_hot_opcode` | 2026-05-23..25 (55 entries), 2026-07-16 `NotNull` | removal slower every time; one promotion mixed | a bytecode-executing workload, profile-attributed self time, original and candidate interleaved in one invocation (2026-07-10 LEDGER-INTEGRITY CORRECTION) |
 | Shrinking the statement future by boxing cold branches | 2026-08-11 bd-uzq54 | rejected | allocation-count and CPU-sample evidence that generator size is on the hot path |
 | Register file without Arc | 2026-08-17 bd-i9sov | NO-GO: atomics ~24 ns per row; infeasible in safe Rust | atomics above 10% of execute_body on a new shape and a safe design |
-| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim on 2026-11-21 (bd-zqr9h L1, c0e568aaf) |
+| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim on 2026-11-21 (bd-zqr9h L1, c0e568aaf), and the shim's per-step `SELECT changes();` is gone (bd-zqr9h L2, f16f01ccb) |
 | B-tree cell-parse micro-levers | 2026-05-20 | 4-6 ns per cell, no lever | not from a cold read; whole-workload attribution |
 | Narrow aggregate lanes (FastSumState, direct REAL accumulator, IntDivide) | 2026-05-05, 2026-05-06 | rejected, each helped one group size and hurt another | aggregate dispatch dominates a row and every group size improves; hash aggregation (bd-w4pr1.13.8) is a different change |
 | Thinning sorter rows | 2026-10-27 GH#504, 2026-05-06 | no measurable change (2026-10-27); the 2026-05-06 sweep was abandoned unmeasured | together with a change that removes per-row dispatch or decode cost |
@@ -93,6 +93,36 @@ count moves by up to +-3k on autocommit and +-3-6k on a one-row write between ru
 Every entry from here on ends with a retry condition a later agent can grep and test: a profile
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
+
+## 2026-11-21 - MAINTENANCE (landed as f16f01ccb; inside its prediction, on instructions; every row still a loss to stock 3.54.1): the C API reads sqlite3_changes from the connection's counter instead of running `SELECT changes();` after every step, and exports sqlite3_total_changes (bd-zqr9h, lever L2)
+
+- Target: `crates/fsqlite-c-api`. After every successful sqlite3_step and every sqlite3_exec statement, the shim ran a
+  second statement, `SELECT changes();`, through block_on to refresh a cached count (refresh_last_changes), about 159k
+  Ir per step under callgrind before L1.
+- Touched: `crates/fsqlite-c-api/src/lib.rs` (the cache and refresh are gone; sqlite3_changes reads the connection's
+  counter; sqlite3_total_changes is new) and `crates/fsqlite-core/src/connection.rs` (public accessors
+  Connection::last_change_count / total_change_count, the values SQL changes() / total_changes() return).
+- Semantics (dlopen differential, 19 statements, stock 3.54.1 live): L2 equals stock on 18 lines. The parent differed
+  on all 19 (no sqlite3_total_changes; after a UNIQUE failure part-way through a multi-row UPDATE it kept the cached 2
+  where stock reads 0). The 19th, `UPDATE w SET (x, nope) = (SELECT 1, 2, 3)`, keeps main's return codes (prepare 0,
+  step 1; stock rejects it at prepare: bd-4l4y3), with stock's counts since bd-rwo47 (2a359ad03). Keeper:
+  test_changes_and_total_changes_match_stock.
+- Prediction (bead, before the build): user instructions -25 to -45% (autocommit INSERT), -25 to -50% (reused INSERT),
+  -40 to -80% (point SELECT); syscalls not higher. Kill: below the low end on any row, a C API test red, an A/A pair
+  off by more than 2%, a differential line not identical to the parent's or stock's.
+- Result (dlopen C driver, per call = (N1300 - N300)/1000, 11 rotated reps, perf stat user instructions on each single
+  ELF; arms built in one rch job on vmi1156319, main 13db363cb 1e656774d0d194f4 and L2 62c314f9f3daa2e5; stock
+  libsqlite3 3.54.1 from scripts/build_stock_sqlite3.sh and main each twice as A/A, live in the same invocation;
+  thinkstation1): autocommit INSERT 298.1k -> 194.7k (-34.7%; x16.6 -> x10.8 stock), syscalls 37.6 -> 29.1; INSERT on
+  a reused statement 269.5k -> 166.4k (-38.3%; x23.9 -> x14.8), 35.6 -> 27.1; point SELECT 117.7k -> 61.7k (-47.5%;
+  x7.4 -> x3.9), 13.0 -> 5.0. A/A: stock exact, main within 0.12%. No time claim (not layout-averaged).
+- Gate (rch, the tree rebased onto 89ae732c9): clippy -D warnings on fsqlite-c-api and fsqlite (all targets) and
+  fsqlite-core --lib clean; fsqlite-c-api 57 passed, 0 failed; the fsqlite crate in 7 batches of 19, 124 binaries,
+  1,103 passed, 0 failed, 24 ignored.
+- Retry condition: none for the per-step refresh. Next on the bead: the shim's double work per statement (prepare_v2
+  prepares a statement only to count its columns and drops it; step executes the SQL text from the start). Same
+  pattern still open: `fsqlite::blocking::Connection::changes()` / `total_changes()` run `SELECT changes()` /
+  `SELECT total_changes()` through block_on per call and could read the same accessors.
 
 ## 2026-11-21 - REJECTED on its regression line (rowid_lookups_200k +47.0M Ir, +1.75% against +0.5%), the join -167.8M: a seek-cache hit on a resident cached leaf other than the cursor's own is answered without a wait, and a per-cursor flag stops asking a reader that holds none (bd-w4pr1.12, serial read lane round 12, lever SL2 v2)
 
