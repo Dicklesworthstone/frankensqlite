@@ -15,15 +15,25 @@ SHA-256, its version output, and host load before and after.
 Run it in its own memory-capped cgroup. A runaway build (an old release grew to
 16 GB here) must not take the calling session with it:
 
+    scripts/build_stock_sqlite3.sh /path/to/stock354
     systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \\
-        python3 -I scripts/user_shape_scorecard.py --work /dev/shm/scorecard \\
+        python3 -I scripts/user_shape_scorecard.py --work /path/to/scratch \\
         --out scorecard.json --md scorecard.md \\
-        sqlite3=/usr/bin/sqlite3 head=target/release-perf/fsqlite \\
-        v0.4.13=/path/to/fsqlite-0.4.13 sqlite3_end=/usr/bin/sqlite3
+        sqlite354=/path/to/stock354/sqlite3 head=target/release-perf/fsqlite \\
+        v0.4.13=/path/to/fsqlite-0.4.13 sqlite354_end=/path/to/stock354/sqlite3
 
 The first arm is the baseline for ratios (time_arm / time_baseline; >1 means
 slower than the baseline). Repeat the stock arm last to see host drift (an A/A
 check). The run is resumable: arms already present in --out are skipped.
+
+The stock arm is SQLite 3.54.1 built from its amalgamation with the system
+build's compile options (scripts/build_stock_sqlite3.sh), not the distribution's
+/usr/bin/sqlite3 (bd-31oat, 2026-11-21). Measured in one invocation on
+thinkstation1, that shell runs 5-17% fewer instructions than Debian's 3.46.1 on
+every row and is more than 5% faster on nine: about half of it is the newer
+version (against the same recipe's 3.46.1) and half the build itself. Name the
+stock version with every ratio; add /usr/bin/sqlite3 as a second arm to compare
+with an older system shell.
 
 Every connection runs SESSION first: synchronous=NORMAL and secure_delete off
 (Debian's sqlite3 defaults them to FULL and on). Before anything is measured,
