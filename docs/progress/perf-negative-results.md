@@ -55,7 +55,7 @@ written; this is where their scope is recorded.
 | Removing or adding single arms of `try_execute_hot_opcode` | 2026-05-23..25 (55 entries), 2026-07-16 `NotNull` | removal slower every time; one promotion mixed | a bytecode-executing workload, profile-attributed self time, original and candidate interleaved in one invocation (2026-07-10 LEDGER-INTEGRITY CORRECTION) |
 | Shrinking the statement future by boxing cold branches | 2026-08-11 bd-uzq54 | rejected | allocation-count and CPU-sample evidence that generator size is on the hot path |
 | Register file without Arc | 2026-08-17 bd-i9sov | NO-GO: atomics ~24 ns per row; infeasible in safe Rust | atomics above 10% of execute_body on a new shape and a safe design |
-| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim still does |
+| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim on 2026-11-21 (bd-zqr9h L1, c0e568aaf) |
 | B-tree cell-parse micro-levers | 2026-05-20 | 4-6 ns per cell, no lever | not from a cold read; whole-workload attribution |
 | Narrow aggregate lanes (FastSumState, direct REAL accumulator, IntDivide) | 2026-05-05, 2026-05-06 | rejected, each helped one group size and hurt another | aggregate dispatch dominates a row and every group size improves; hash aggregation (bd-w4pr1.13.8) is a different change |
 | Thinning sorter rows | 2026-10-27 GH#504, 2026-05-06 | no measurable change (2026-10-27); the 2026-05-06 sweep was abandoned unmeasured | together with a change that removes per-row dispatch or decode cost |
@@ -93,6 +93,41 @@ count moves by up to +-3k on autocommit and +-3-6k on a one-row write between ru
 Every entry from here on ends with a retry condition a later agent can grep and test: a profile
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
+
+## 2026-11-21 - MAINTENANCE (landed as c0e568aaf; inside its prediction, on instructions; every row still a loss to stock): the C API drives engine futures with `fsqlite::blocking::block_on` instead of entering a thread-local runtime per call (bd-zqr9h, lever L1)
+
+- Target: `crates/fsqlite-c-api`, every C entry point. Each call entered a thread-local asupersync current_thread
+  Runtime (`RUNTIME.with(|rt| rt.block_on(f))`), three entries per autocommit INSERT through prepare_v2 / bind /
+  step / finalize, each paying the reactor, timer and scheduler turn (futex, epoll_ctl, epoll_pwait,
+  timerfd_settime, sched_yield). The index row for `block_on` above recorded "the C API shim still does".
+- Touched: `crates/fsqlite-c-api/src/lib.rs` (uses `fsqlite::blocking::block_on`; the asupersync dependency is
+  gone from `crates/fsqlite-c-api/Cargo.toml`), `crates/fsqlite/src/blocking.rs` (`block_on` made public). Keeper
+  `test_busy_timeout_waits_then_returns_busy` (busy_timeout 300 waits, 0 refuses at once, the holder's COMMIT
+  releases), green on the parent and on L1.
+- Prediction (bead, before the build): autocommit INSERT user instructions -30% or more, at least 3 syscalls fewer
+  per call. Kill: under -10%, syscalls not lower, an A/A pair off by more than 2%, any C API test change, a busy
+  semantics change.
+- Result (dlopen C driver, per call = (N1300 - N300)/1000, 11 rotated reps, perf stat user instructions on each
+  single ELF; stock libsqlite3 3.46.1 and the parent cdylib each twice as A/A, live in the same invocation;
+  thinkstation1): autocommit INSERT 433.6k -> 297.5k (-31.4%; x21.6 -> x14.8 stock), syscalls 83.5 -> 37.4;
+  INSERT on a reused statement 362.9k -> 268.5k (-26.0%; x30.1 -> x22.3); point SELECT 244.5k -> 117.8k (-51.8%;
+  x14.2 -> x6.9), syscalls 68.5 -> 13.0. A/A: stock exact, parent within 0.63%. No time claim (not
+  layout-averaged).
+- Side effect: WAL-FEC starts only for a connection with a caller-owned native runtime. The parent shim opened
+  every connection inside its runtime, so C API connections started the repair pipeline; with L1 they do not
+  (gdb: `WalFecRepairPipeline::start_scoped` reached on the parent, never on L1). Part of the INSERT rows' drop is
+  that pipeline's close-time flush (bd-9v52c: sqlite3_close after 1,000 INSERTs, 783.8M Ir on the parent, 2.0M on
+  L1, 38.8k stock), not the runtime entry; the SELECT row writes nothing per call. At `synchronous=FULL` a C API
+  connection no longer writes `-wal-fec`, the default bd-71vt5 sets for every API.
+- Gate (rch, the tree of c0e568aaf; the 17 commits it was rebased over touch neither file): clippy -D warnings on
+  fsqlite-c-api and fsqlite, all targets, clean; fsqlite-c-api 56 passed, 0 failed; the fsqlite crate in 7 batches
+  of 19 (--lib in the first), 125 binaries, 1,103 passed, 0 failed (batch 5 re-run after an rch disk-guardian rc
+  137 before any test ran); rustfmt clean; ubs: no new findings beyond test-code inventory.
+- Retry condition: none for the runtime entry. Next on the bead: L2 (drop the shim's `SELECT changes();` after
+  every step; measured inside its band, -34.6% / -38.4% / -47.5% user instructions against L1, and held by its
+  differential kill line until bd-rwo47's engine fix), then the shim's double work per statement (prepare_v2
+  parses the SQL and prepares a SELECT/INSERT/UPDATE/DELETE only to count its columns, then drops it; step
+  executes the SQL text from the start).
 
 ## 2026-11-21 - REJECTED on its kill line 3 (rowid_lookups_200k +51.8M Ir, +1.93% against +0.5%), the join -361.0M and its time WIN in both runs: the table seek cache keeps eight leaves with slot 0 in the cursor and slots 1..7 in one box, so BtCursor shrinks by 88 B (bd-w4pr1.12, serial read lane round 11, lever SC8 v3)
 
