@@ -105982,10 +105982,8 @@ impl Connection {
         for cte_index in materialization_order {
             let cte = &ctes[cte_index];
             let cte_name = &cte.name;
-            if cte_body_reads_itself(cte) {
-                return Err(FrankenError::FunctionError(format!(
-                    "circular reference: {cte_name}"
-                )));
+            if let Some(refusal) = cte_self_reference_error(cte) {
+                return Err(FrankenError::FunctionError(refusal));
             }
             let has_self_ref = is_recursive
                 && cte
@@ -124756,39 +124754,133 @@ fn recursive_cte_anchor_select(body: &SelectStatement) -> SelectStatement {
     }
 }
 
-/// Whether `cte`'s body reads the CTE itself where no base case can feed it,
-/// which is stock's "circular reference: NAME".
+/// Stock's refusal of `cte` for how its body reads the CTE itself, as
+/// select.c's withExpand applies its rules, or `None`.
 ///
-/// The anchor position, the CTE's first SELECT core, must not reference the
-/// CTE itself: a self-reference there has no base case, for both WITH and
-/// WITH RECURSIVE, unlike a valid recursive CTE whose recursive term lives in
-/// a later compound (UNION) arm. Without this, a bare self-ref `c AS (SELECT
-/// * FROM c)` (no compound) would fall through to normal materialization and
-/// mis-report "no such table: c". bd-errmsg-parity-batch3-3brmm.
+/// The recursive arms are the trailing compound arms joined by the body's
+/// last operator (UNION or UNION ALL) whose own FROM items name the CTE, from
+/// the last arm back to the first that does not. Each names it once ("multiple
+/// references to recursive table: NAME" otherwise), and only there: any other
+/// reference in a recursive arm, in a subquery, a derived table or an
+/// expression, is "multiple recursive references: NAME" (bd-tmbbn).
+///
+/// The rest of the body (all of it when no arm recurses) has no base case to
+/// read, so any reference there is "circular reference: NAME": the anchor's,
+/// an arm's before the recursive ones, a derived table's in an arm that has
+/// no FROM reference of its own (bd-tmbbn), for WITH and WITH RECURSIVE
+/// alike. Without this, a bare self-ref `c AS (SELECT * FROM c)` (no
+/// compound) would fall through to normal materialization and mis-report "no
+/// such table: c". bd-errmsg-parity-batch3-3brmm.
 ///
 /// bd-gxbof: stock resolves the body with the CTE's own name bound to the
-/// CTE, so every reference the body's own WITHs do not shadow is circular,
+/// CTE, so every reference the body's own WITHs do not shadow counts,
 /// wherever it sits: a FROM item, a derived table, a scalar, EXISTS or IN
 /// subquery, or a nested CTE body the body reads. A body whose WITH defines
 /// the name reads that nested CTE instead (`WITH c AS (WITH c AS (SELECT 1
-/// AS x) SELECT x FROM c) ...` is 1). Only a recursive arm's own FROM items
-/// bind to the recursive table, so a body that may recurse (a UNION or UNION
-/// ALL compound) is checked in its anchor, which stock resolves under the
-/// body's WITH.
-fn cte_body_reads_itself(cte: &fsqlite_ast::Cte) -> bool {
-    let body_may_recurse = cte
-        .query
-        .body
-        .compounds
-        .last()
-        .is_some_and(|(op, _)| matches!(op, CompoundOp::Union | CompoundOp::UnionAll));
-    if body_may_recurse {
-        select_contains_relation_reference(
-            &recursive_cte_anchor_select(&cte.query),
-            &mut CteReference(&cte.name),
-        )
+/// AS x) SELECT x FROM c) ...` is 1); only a recursive arm's own FROM items
+/// still bind to the recursive table there.
+fn cte_self_reference_error(cte: &fsqlite_ast::Cte) -> Option<String> {
+    let name = &cte.name;
+    let body = &cte.query;
+    let compounds = &body.body.compounds;
+    let last_op = compounds.last().map(|(op, _)| *op);
+    let mut first_recursive = compounds.len();
+    if matches!(last_op, Some(CompoundOp::Union | CompoundOp::UnionAll)) {
+        for (index, (op, core)) in compounds.iter().enumerate().rev() {
+            if Some(*op) != last_op {
+                break;
+            }
+            match select_core_direct_references(core, name) {
+                0 => break,
+                1 => first_recursive = index,
+                _ => return Some(format!("multiple references to recursive table: {name}")),
+            }
+        }
+    }
+    let recursive = first_recursive < compounds.len();
+    let base = if recursive {
+        SelectStatement {
+            with: body.with.clone(),
+            body: SelectBody {
+                select: body.body.select.clone(),
+                compounds: compounds[..first_recursive].to_vec(),
+            },
+            order_by: Vec::new(),
+            limit: None,
+        }
     } else {
-        select_contains_relation_reference(&cte.query, &mut CteReference(&cte.name))
+        body.clone()
+    };
+    if select_contains_relation_reference(&base, &mut CteReference(name)) {
+        return Some(format!("circular reference: {name}"));
+    }
+    if !recursive || select_with_defines(body, name) {
+        return None;
+    }
+    let mut rest = SelectStatement {
+        with: None,
+        body: SelectBody {
+            select: SelectCore::Values(Vec::new().into()),
+            compounds: compounds[first_recursive..].to_vec(),
+        },
+        order_by: body.order_by.clone(),
+        limit: body.limit.clone(),
+    };
+    for (_, core) in &mut rest.body.compounds {
+        hide_select_core_direct_references(core, name);
+    }
+    select_contains_relation_reference(&rest, &mut CteReference(name))
+        .then(|| format!("multiple recursive references: {name}"))
+}
+
+/// How many of `core`'s own FROM items, a parenthesized join's included,
+/// name the relation `name` without a schema (bd-tmbbn).
+fn select_core_direct_references(core: &SelectCore, name: &str) -> usize {
+    fn count(from: &FromClause, name: &str) -> usize {
+        std::iter::once(&from.source)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .map(|source| match source {
+                TableOrSubquery::Table {
+                    name: qualified, ..
+                } => usize::from(
+                    qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name),
+                ),
+                TableOrSubquery::ParenJoin(inner) => count(inner, name),
+                TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => 0,
+            })
+            .sum()
+    }
+    match core {
+        SelectCore::Select {
+            from: Some(from), ..
+        } => count(from, name),
+        SelectCore::Select { from: None, .. } | SelectCore::Values(_) => 0,
+    }
+}
+
+/// Rename `core`'s own FROM items that name `name` to a name no reference
+/// matches, so a search finds only its other references (bd-tmbbn).
+fn hide_select_core_direct_references(core: &mut SelectCore, name: &str) {
+    fn hide(from: &mut FromClause, name: &str) {
+        for source in std::iter::once(&mut from.source)
+            .chain(from.joins.iter_mut().map(|join| &mut join.table))
+        {
+            match source {
+                TableOrSubquery::Table {
+                    name: qualified, ..
+                } if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name) => {
+                    "\u{0}".clone_into(&mut qualified.name);
+                }
+                TableOrSubquery::ParenJoin(inner) => hide(inner, name),
+                _ => {}
+            }
+        }
+    }
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = core
+    {
+        hide(from, name);
     }
 }
 
@@ -125211,7 +125303,10 @@ fn privatize_ctes_bound_elsewhere(
     mut rebind_consumer: impl FnMut(&str, &str),
 ) -> bool {
     if cte_materialization_order(&with.ctes).is_err()
-        || with.ctes.iter().any(cte_body_reads_itself)
+        || with
+            .ctes
+            .iter()
+            .any(|cte| cte_self_reference_error(cte).is_some())
     {
         return false;
     }
@@ -157551,6 +157646,12 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             Some(CteCollationVisit::Active | CteCollationVisit::Done)
         ) {
             return Ok(());
+        }
+        // bd-tmbbn: stock applies its self-reference rules where it expands
+        // the CTE, before it resolves the body's other names (a compound
+        // ORDER BY term, a LIMIT).
+        if let Some(refusal) = cte_self_reference_error(cte) {
+            return Err(FrankenError::FunctionError(refusal));
         }
         self.visits.insert(key, CteCollationVisit::Active);
         // bd-6tmuj: a CTE expansion is a nesting level, as a view's is, and
