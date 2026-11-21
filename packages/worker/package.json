@@ -17,14 +17,17 @@
   "types": "./dist/npm/index.d.ts",
   "exports": {
     ".": {
+      "browser": "./dist/npm/index.js",
       "import": { "types": "./dist/npm/index.d.ts", "default": "./dist/npm/index.js" },
       "require": { "types": "./dist/npm/index.d.cts", "default": "./dist/npm/index.cjs" }
     },
     "./protocol": {
+      "browser": "./dist/npm/protocol.js",
       "import": { "types": "./dist/npm/protocol.d.ts", "default": "./dist/npm/protocol.js" },
       "require": { "types": "./dist/npm/protocol.d.cts", "default": "./dist/npm/protocol.cjs" }
     },
     "./worker": {
+      "browser": "./dist/npm/worker.js",
       "import": { "types": "./dist/npm/worker.d.ts", "default": "./dist/npm/worker.js" },
       "require": { "types": "./dist/npm/worker.d.cts", "default": "./dist/npm/worker.cjs" }
     }

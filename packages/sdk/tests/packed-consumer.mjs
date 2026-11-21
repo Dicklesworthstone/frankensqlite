@@ -63,13 +63,18 @@ if (core) {
   const { build, preview } = await import("vite");
   const { chromium } = await import("@playwright/test");
   await writeFile(join(consumer, "index.html"), '<script type="module" src="/app.js"></script>');
+  await writeFile(join(consumer, "writer.cjs"), `
+    const { FrankenDB } = require("@frankensqlite/sdk");
+    module.exports = options => FrankenDB.open(options);
+  `);
   await writeFile(join(consumer, "app.js"), `
     import { FrankenDB } from "@frankensqlite/sdk";
     import { createFrankenSqliteWorker } from "@frankensqlite/worker";
     import workerAsset from "@frankensqlite/sdk/worker?worker&url";
+    import openWriter from "./writer.cjs";
     async function reopen() {
       const options = { dbName: "packed", persistence: "indexeddb-snapshot" };
-      const writer = await FrankenDB.open(options);
+      const writer = await openWriter(options);
       try {
         await writer.execute("CREATE TABLE t (n INTEGER)");
         await writer.execute("INSERT INTO t VALUES (?)", [42]);

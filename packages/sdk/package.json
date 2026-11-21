@@ -17,10 +17,12 @@
   "types": "./dist/npm/index.d.ts",
   "exports": {
     ".": {
+      "browser": "./dist/npm/index.js",
       "import": { "types": "./dist/npm/index.d.ts", "default": "./dist/npm/index.js" },
       "require": { "types": "./dist/npm/index.d.cts", "default": "./dist/npm/index.cjs" }
     },
     "./worker": {
+      "browser": "./dist/npm/worker.js",
       "import": { "types": "./dist/npm/worker.d.ts", "default": "./dist/npm/worker.js" },
       "require": { "types": "./dist/npm/worker.d.cts", "default": "./dist/npm/worker.cjs" }
     }
