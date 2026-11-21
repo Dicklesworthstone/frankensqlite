@@ -27835,16 +27835,7 @@ impl Connection {
             return false;
         };
 
-        // bd-23kpa / bd-w4pr1.13.32: the substrate drops every group when a
-        // HAVING's aggregate sits inside an expression (`count(*) * 2 > 3`)
-        // and keeps failing groups when it is not a result column. Ad hoc
-        // dispatch sends every HAVING to the in-memory path; a prepared
-        // statement, which asks this check at prepare time, ran the substrate
-        // for those shapes too and returned the wrong groups (bd-ro43z).
         if group_by.is_empty()
-            || having
-                .as_deref()
-                .is_some_and(|having| !having_is_substrate_safe(having, columns))
             || !windows.is_empty()
             || !from.joins.is_empty()
             || !Self::select_order_by_matches_group_by_prefix(select, group_by)
@@ -27854,6 +27845,7 @@ impl Connection {
 
         let TableOrSubquery::Table {
             name: table_name,
+            alias: table_alias,
             time_travel: None,
             ..
         } = &from.source
@@ -27873,11 +27865,31 @@ impl Connection {
             if let Some(table_schema) = schema
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(&table_name.name))
-                && group_by.iter().any(|expr| {
+            {
+                if group_by.iter().any(|expr| {
                     expr_effective_collation_for_table(expr, table_schema)
                         .is_some_and(|coll| !coll.eq_ignore_ascii_case("BINARY"))
-                })
-            {
+                }) {
+                    return false;
+                }
+                // bd-4uurt / bd-ro43z: direct and prepared queries share
+                // this admission check. A HAVING may read only values the
+                // grouped emitter can resolve from its finalized outputs;
+                // hidden columns and unsupported expressions keep the
+                // connection evaluator that protects bd-23kpa.
+                if having.as_deref().is_some_and(|having| {
+                    !having_is_substrate_safe(
+                        having,
+                        columns,
+                        group_by,
+                        table_schema,
+                        table_name,
+                        table_alias.as_deref(),
+                    )
+                }) {
+                    return false;
+                }
+            } else if having.is_some() {
                 return false;
             }
         }
@@ -45117,32 +45129,18 @@ impl Connection {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    // bd-23kpa: the substrate drops every group when a HAVING's
-                    // aggregate sits inside an expression (`count(*) * 2 > 3`)
-                    // and keeps failing groups when it is not a result column
-                    // (`SELECT max(id) ... HAVING count(*) > 1`): wrong IN-list
-                    // members, empty derived tables, wrong DELETEs. A HAVING
-                    // takes the in-memory path, which answers it like stock.
-                    let has_having = matches!(
-                        &bound.body.select,
-                        SelectCore::Select {
-                            having: Some(_),
-                            ..
-                        }
-                    );
-                    let substrate_rows = if has_having {
-                        None
-                    } else {
-                        boxed_future(|| {
-                            self.try_execute_group_by_storage_substrate(
-                                cx,
-                                &bound,
-                                None,
-                                "group_by_storage_substrate",
-                            )
-                        })
-                        .await?
-                    };
+                    // The substrate shares the prepared path's bounded
+                    // HAVING admission. Unsupported operands still fall
+                    // through to the grouped connection evaluator.
+                    let substrate_rows = boxed_future(|| {
+                        self.try_execute_group_by_storage_substrate(
+                            cx,
+                            &bound,
+                            None,
+                            "group_by_storage_substrate",
+                        )
+                    })
+                    .await?;
                     if let Some(mut rows) = substrate_rows {
                         if distinct {
                             dedup_rows_collated(
@@ -117159,82 +117157,197 @@ fn expr_has_ordered_aggregate(expr: &Expr) -> bool {
     }
 }
 
-/// bd-ro43z: the HAVING shapes the GROUP BY storage substrate answers like
-/// stock. It drops every group when an aggregate sits inside an expression
-/// (`count(*) * 2 > 3`) and keeps failing groups when an aggregate is not a
-/// result column (`SELECT max(id) ... HAVING count(*) > 1`, bd-23kpa). Safe:
-/// AND, OR and NOT over comparisons whose every operand is either free of
-/// aggregates or exactly a result column's aggregate, or its alias.
-fn having_is_substrate_safe(having: &Expr, columns: &[ResultColumn]) -> bool {
-    // A result column's aggregate, or a bare reference to its alias.
-    let is_result_aggregate = |expr: &Expr| {
-        columns.iter().any(|column| {
-            let ResultColumn::Expr {
-                expr: result,
-                alias,
-            } = column
-            else {
-                return false;
+/// bd-4uurt / bd-ro43z: expressions the grouped HAVING emitter can evaluate
+/// from its finalized output registers. Absence of aggregates alone is not
+/// enough: a scalar call or arithmetic expression can still read a column
+/// that the ordinary expression emitter, called without a scan, loses.
+#[allow(clippy::too_many_lines)]
+fn having_is_substrate_safe(
+    having: &Expr,
+    columns: &[ResultColumn],
+    group_by: &[Expr],
+    table: &TableSchema,
+    source_name: &QualifiedName,
+    source_alias: Option<&str>,
+) -> bool {
+    #[derive(PartialEq)]
+    enum AggregateArgument<'a> {
+        NoArguments,
+        Column(usize),
+        Expression(&'a Expr),
+    }
+
+    struct Outputs<'a> {
+        columns: &'a [ResultColumn],
+        group_by: &'a [Expr],
+        table: &'a TableSchema,
+        source_name: &'a QualifiedName,
+        source_alias: Option<&'a str>,
+    }
+
+    impl Outputs<'_> {
+        fn column_index(&self, expr: &Expr, table_label: &str) -> Option<usize> {
+            let expr = match expr {
+                Expr::Collate { expr, .. } => expr.as_ref(),
+                _ => expr,
             };
-            expr_has_aggregate(result)
-                && (result == expr
-                    || matches!(
-                        (expr, alias),
-                        (Expr::Column(col_ref, _), Some(alias))
-                            if col_ref.table.is_none()
-                                && col_ref.column.eq_ignore_ascii_case(alias)
-                    ))
-        })
-    };
-    // No aggregate, and no alias of one either (`total * 2` is one inside an
-    // expression).
-    let free_of_aggregates = |expr: &Expr| {
-        if expr_has_aggregate(expr) {
-            return false;
+            let Expr::Column(column, _) = expr else {
+                return None;
+            };
+            if column.table.as_deref().is_some_and(|name| {
+                !name.eq_ignore_ascii_case(table_label)
+            }) || column.schema.as_deref().is_some_and(|name| {
+                !name.eq_ignore_ascii_case(self.source_name.schema.as_deref().unwrap_or("main"))
+            }) {
+                return None;
+            }
+            self.table.column_index(&column.column)
         }
-        let mut mentions_alias = false;
-        let _ = visit_expr_column_refs(expr, &mut |col_ref| {
-            if col_ref.table.is_none()
-                && columns.iter().any(|column| {
-                    matches!(column, ResultColumn::Expr { expr: result, alias: Some(alias) }
-                        if expr_has_aggregate(result) && col_ref.column.eq_ignore_ascii_case(alias))
+
+        fn projected_key(&self, column: usize) -> bool {
+            // parse_group_by_output resolves these keys without a FROM
+            // alias, and represents IPKs as expressions, not Column keys.
+            !self.table.columns[column].is_ipk
+                && self.group_by.iter().any(|key| {
+                    self.column_index(key, &self.table.name) == Some(column)
+                })
+                && self.columns.iter().any(|result| {
+                    matches!(result, ResultColumn::Expr { expr, .. }
+                        if self.column_index(expr, &self.table.name) == Some(column))
+                })
+        }
+
+        fn aggregate_argument<'a>(&self, args: &'a FunctionArgs) -> Option<AggregateArgument<'a>> {
+            let args = match args {
+                FunctionArgs::Star => return Some(AggregateArgument::NoArguments),
+                FunctionArgs::List(args) if args.is_empty() => {
+                    return Some(AggregateArgument::NoArguments);
+                }
+                FunctionArgs::List(args) if args.len() == 1 => args,
+                FunctionArgs::List(_) => return None,
+            };
+            let arg = &args[0];
+            if expr_has_aggregate(arg) {
+                return None;
+            }
+            // Match the grouped emitter's argument lookup, including its
+            // single COLLATE unwrap. arg_is_rowid has no HAVING lookup yet.
+            let inner = match arg {
+                Expr::Collate { expr, .. } => expr.as_ref(),
+                _ => arg,
+            };
+            if let Expr::Column(column, _) = inner
+                && column.table.as_deref().is_none_or(|name| {
+                    name.eq_ignore_ascii_case(&self.table.name)
                 })
             {
-                mentions_alias = true;
+                if let Some(index) = self.table.column_index(&column.column) {
+                    return (!self.table.columns[index].is_ipk)
+                        .then_some(AggregateArgument::Column(index));
+                }
+                if self.table.resolves_to_hidden_rowid(&column.column) {
+                    return None;
+                }
             }
-            Ok(())
-        });
-        !mentions_alias
-    };
-    let operand = |expr: &Expr| is_result_aggregate(expr) || free_of_aggregates(expr);
-    match having {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOp::And | BinaryOp::Or,
-            right,
-            ..
-        } => having_is_substrate_safe(left, columns) && having_is_substrate_safe(right, columns),
-        Expr::UnaryOp {
-            op: UnaryOp::Not,
-            expr,
-            ..
-        } => having_is_substrate_safe(expr, columns),
-        Expr::BinaryOp {
-            left,
-            op:
-                BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Le
-                | BinaryOp::Gt
-                | BinaryOp::Ge
-                | BinaryOp::Is
-                | BinaryOp::IsNot,
-            right,
-            ..
-        } => operand(left) && operand(right),
-        other => free_of_aggregates(other),
+            Some(AggregateArgument::Expression(arg))
+        }
+
+        fn result_aggregate(&self, expr: &Expr) -> bool {
+            let Expr::FunctionCall {
+                name, args, distinct, order_by, filter, over, ..
+            } = expr else {
+                return false;
+            };
+            if *distinct || !order_by.is_empty() || filter.is_some() || over.is_some()
+                || !is_current_aggregate_fn(name, args) || is_scalar_max_min(name, args)
+            {
+                return false;
+            }
+            let Some(argument) = self.aggregate_argument(args) else {
+                return false;
+            };
+            let mut projected = false;
+            for column in self.columns {
+                let ResultColumn::Expr { expr: result, .. } = column else {
+                    continue;
+                };
+                if !expr_has_aggregate(result) {
+                    continue;
+                }
+                let Expr::FunctionCall { name: other_name, args: other_args, .. } = result else {
+                    // Wrapped output aggregates can introduce hidden slots
+                    // whose complete identity this emitter does not retain.
+                    return false;
+                };
+                if !is_current_aggregate_fn(other_name, other_args)
+                    || is_scalar_max_min(other_name, other_args)
+                {
+                    return false;
+                }
+                projected |= result == expr;
+                let same_name = name.eq_ignore_ascii_case(other_name)
+                    || (name.eq_ignore_ascii_case("group_concat")
+                        && other_name.eq_ignore_ascii_case("string_agg"))
+                    || (name.eq_ignore_ascii_case("string_agg")
+                        && other_name.eq_ignore_ascii_case("group_concat"));
+                if same_name {
+                    let Some(other_argument) = self.aggregate_argument(other_args) else {
+                        return false;
+                    };
+                    // Lookup uses name + first argument, not DISTINCT,
+                    // FILTER, or argument collation. Ambiguous variants
+                    // must keep the connection evaluator.
+                    if argument == other_argument && result != expr {
+                        return false;
+                    }
+                }
+            }
+            projected
+        }
+
+        fn accepts(&self, expr: &Expr, aliases_left: usize) -> bool {
+            match expr {
+                Expr::Literal(_, _) | Expr::Placeholder(_, _) => true,
+                Expr::Column(column, _) => {
+                    let label = self.source_alias.unwrap_or(&self.source_name.name);
+                    if let Some(index) = self.column_index(expr, label) {
+                        return self.projected_key(index);
+                    }
+                    // Real source columns and hidden rowid names outrank
+                    // output aliases, exactly as the codegen alias rewrite.
+                    if column.table.is_some() || column.schema.is_some()
+                        || self.table.column_index(&column.column).is_some()
+                        || self.table.resolves_to_hidden_rowid(&column.column)
+                        || aliases_left == 0
+                    {
+                        return false;
+                    }
+                    self.columns.iter().find_map(|result| match result {
+                        ResultColumn::Expr { expr, alias: Some(alias) }
+                            if alias.eq_ignore_ascii_case(&column.column) => Some(expr),
+                        _ => None,
+                    }).is_some_and(|result| self.accepts(result, aliases_left - 1))
+                }
+                Expr::FunctionCall { .. } => self.result_aggregate(expr),
+                Expr::Collate { expr, .. }
+                | Expr::IsNull { expr, .. }
+                | Expr::UnaryOp { op: UnaryOp::Not, expr, .. } => {
+                    self.accepts(expr, aliases_left)
+                }
+                Expr::BinaryOp {
+                    left,
+                    op: BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne
+                        | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                        | BinaryOp::Is | BinaryOp::IsNot,
+                    right, ..
+                } => self.accepts(left, aliases_left) && self.accepts(right, aliases_left),
+                _ => false,
+            }
+        }
     }
+
+    Outputs { columns, group_by, table, source_name, source_alias }
+        .accepts(having, columns.len())
 }
 
 /// Recursively check whether an expression contains an aggregate function call.
