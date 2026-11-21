@@ -82527,6 +82527,14 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // bd-wiffk: the evaluators below answer one SELECT core, so a
+        // compound lost every arm after its first (and an aggregate arm all
+        // of them): `WITH c AS (...) INSERT INTO t SELECT x FROM c UNION ALL
+        // SELECT 7` wrote one row. A compound runs arm by arm, as the
+        // dispatcher runs one.
+        if !select.body.compounds.is_empty() {
+            return Box::pin(self.execute_compound_select(select, params)).await;
+        }
         let bound = bind_placeholders_in_select_for_fallback(select, params)?;
         let cx = self.op_cx_after_background_status();
         let implicit_agg = select.body.compounds.is_empty()
