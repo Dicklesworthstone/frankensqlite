@@ -7,9 +7,10 @@ message protocol that higher-level SDKs can consume.
 
 Current behavior:
 
-- `memory` persistence works end to end.
-- `opfs` and `indexeddb` are rejected with explicit "not implemented yet"
-  worker errors instead of silently falling back.
+- `memory` is the default. The worker can also save and reopen whole-database
+  checkpoints with `opfs-snapshot` or `indexeddb-snapshot`.
+- The page-level `opfs` and `indexeddb` modes return
+  `ERR_FSQLITE_UNSUPPORTED_PERSISTENCE`.
 
 ## Required Core Build
 

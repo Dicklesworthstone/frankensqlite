@@ -26,6 +26,12 @@ partial index produced a table scan where stock used the covering index
 (`bd-81jud`). Other V02 work covers boolean-looking column names (`bd-pud7p`)
 and numeric conversion of underflowing exponents (`bd-ulvzg`).
 
+The same 96 predicate and storage combinations were exercised with UPDATE
+and DELETE, both with ordinary planning and with `INDEXED BY`. Across 768
+stock and FrankenSQLite invocations, affected rows, indexed-column changes,
+integrity and post-rollback table contents agreed. The 28 automatic index
+choices above still differ.
+
 Several September conclusions have changed. The canonical overlap tests,
 executable Rust/C examples, and dependency and specification repairs have
 recorded passing runs on `bd-6hdwo.1` through `.8`. The pager now enforces
@@ -33,6 +39,26 @@ recorded passing runs on `bd-6hdwo.1` through `.8`. The pager now enforces
 retain separate open tasks. The native codec tests passed on `bd-3mgq5.1/.2`;
 native SQL durability still depends on authenticated bootstrap, durable
 publication and public SQL routing (`bd-3mgq5.3` through `.10`).
+The WAL crate has a storage-backed two-barrier publisher in
+`native_durability.rs`. Its caller must supply verified commit objects and
+own the append lease. The existing publisher is a concrete starting point
+for the native SQL path.
+
+For V20, three successive in-memory commits yielded the expected historical
+states (empty, `before`, `after`), matching stock databases stopped at each
+boundary. The same temporal queries on a file reported a missing snapshot at
+all three boundaries, both before and after reopen. The current row remained
+`after` (`bd-cd7jt`). On a fresh connection, the V24 virtual-table names
+`fsqlite_queue`, `fsqlite_lease` and `fsqlite_worker_ranges` all reported
+an unregistered module (`bd-6hdwo.11`).
+
+For V26, the browser worker now supports explicit whole-database checkpoints
+on OPFS and IndexedDB. Chromium 143 saved bytes in one dedicated worker and
+reopened the same revision and all bytes in a fresh worker for each backend.
+Both storage and Web Lock suites passed (28 tests). The SDK's 45 OPFS
+checkpoint cases also passed using Node SQLite and storage models. Page-level
+durability through a real WASM VFS remains open on `bd-2ua2e` and its
+implementation dependencies.
 
 Two public entry points still expose significant limits. FTS5 and R-tree
 virtual tables could be created, while FTS3 creation reported an unregistered

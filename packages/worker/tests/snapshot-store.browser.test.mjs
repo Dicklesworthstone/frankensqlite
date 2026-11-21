@@ -1,5 +1,5 @@
 // Run with: node --test packages/worker/tests/snapshot-store.browser.test.mjs
-// Uses actual Chromium IndexedDB/Web Crypto, not an in-memory IDB replacement.
+// Uses Chromium's IndexedDB, origin-private filesystem, Web Locks and Web Crypto.
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -18,6 +18,7 @@ let url;
 
 const fixture = `
 export * from "/packages/worker/src/snapshot-store.ts";
+export { OpfsSnapshotStore } from "/packages/worker/src/opfs-snapshot-store.ts";
 export function image(marker = 7, pageSize = 512) {
   const bytes = new Uint8Array(pageSize);
   bytes.set(new TextEncoder().encode("SQLite format 3\\0"));
@@ -94,7 +95,7 @@ before(async () => {
       : {}),
   });
   context = await browser.newContext();
-  console.log(`Browser: ${browser.version()}; real IndexedDB on ${url}`);
+  console.log(`Browser: ${browser.version()}; snapshot storage on ${url}`);
 });
 
 after(async () => {
@@ -111,6 +112,45 @@ async function run(body) {
   } finally {
     await page.close();
   }
+}
+
+async function inFreshWorker(body, arg) {
+  const page = await context.newPage();
+  try {
+    await page.goto(url);
+    const [worker] = await Promise.all([
+      page.waitForEvent("worker"),
+      page.evaluateHandle(() => new Worker("/fixture.js", { type: "module" })),
+    ]);
+    return await worker.evaluate(body, arg);
+  } finally {
+    await page.close();
+  }
+}
+
+for (const backend of ["IndexedDbSnapshotStore", "OpfsSnapshotStore"]) {
+  test(`${backend} reopens the acknowledged bytes in a fresh worker`, async () => {
+    const name = crypto.randomUUID();
+    const saved = await inFreshWorker(async ({ backend, name }) => {
+      const api = await import(self.location.href);
+      const store = await api[backend].open(name);
+      return store.save(api.image(31), null);
+    }, { backend, name });
+
+    const restored = await inFreshWorker(async ({ backend, name }) => {
+      const api = await import(self.location.href);
+      const store = await api[backend].open(name);
+      const head = await store.load();
+      return { revision: head.revision, bytes: Array.from(head.bytes) };
+    }, { backend, name });
+
+    const expected = new Uint8Array(512);
+    expected.set(new TextEncoder().encode("SQLite format 3\0"));
+    expected[16] = 2;
+    expected[100] = 31;
+    assert.equal(restored.revision, saved.revision);
+    assert.deepEqual(Uint8Array.from(restored.bytes), expected);
+  });
 }
 
 test("empty storage, explicit close, and invalid names fail without inventing data", async () => {

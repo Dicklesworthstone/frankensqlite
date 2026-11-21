@@ -7,7 +7,7 @@ export class UnsupportedPersistenceModeError extends Error {
 
   constructor(persistence: PersistenceMode) {
     super(
-      `FrankenSQLite browser persistence mode \`${persistence}\` is not implemented yet; use \`memory\` for now.`,
+      `FrankenSQLite browser persistence mode \`${persistence}\` is not implemented yet. Use \`opfs-snapshot\` or \`indexeddb-snapshot\` for explicit checkpoints, or \`memory\` for a temporary database.`,
     );
     this.name = "UnsupportedPersistenceModeError";
     this.persistence = persistence;

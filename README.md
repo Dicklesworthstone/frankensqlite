@@ -181,9 +181,11 @@ The `crates/fsqlite-wasm/` crate provides experimental WebAssembly support and i
 Two TypeScript packages sit on top of it: `packages/worker` (`@frankensqlite/worker`, the dedicated
 module worker that owns one WASM `FrankenDB` and its message protocol) and `packages/sdk`
 (`@frankensqlite/sdk`, the Promise-based browser client: `FrankenDB.open()`, `execute`, `query`,
-`prepare`, `transaction`, `export`). Only `memory` persistence is implemented; `opfs` and
-`indexeddb` raise explicit errors, and the opt-in `indexeddb-snapshot` mode saves explicit
-whole-database checkpoints rather than per-commit pages.
+`prepare`, `transaction`, `export`). The engine runs in memory. To persist a
+whole-database checkpoint, open a named database with `persistence: "opfs-snapshot"`
+or `"indexeddb-snapshot"` and await `db.checkpoint()` after committing your writes.
+Reopening the same name and backend loads the last stored checkpoint. The
+page-level `opfs` and `indexeddb` modes raise an unsupported-mode error.
 
 ---
 
@@ -3001,7 +3003,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | Cross-process MVCC | No | Shared-memory coordination | No | Yes | No |
 | Embeddable | Yes | Yes | Yes | Yes | Yes |
 | Extensions | Loadable + built-in | Built-in | Built-in + WASM | Built-in | Limited |
-| WASM target | Via Emscripten | Experimental (`fsqlite-wasm` cdylib + npm package; in-memory, no OPFS/IndexedDB persistence yet) | Yes | Yes | Yes |
+| WASM target | Via Emscripten | Experimental (`fsqlite-wasm` cdylib + npm package, in-memory SQL with explicit OPFS or IndexedDB checkpoints) | Yes | Yes | Yes |
 | Async I/O | No | Yes (asupersync + Cx) | Yes | No | Yes (io_uring) |
 
 FrankenSQLite's target combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. The current compatibility runtime covers SQLite databases in UTF-8 and UTF-16le/be encodings; parts of the durability design remain active work, and page encryption plus RaptorQ self-healing are not yet reachable from the public API. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
@@ -3191,11 +3193,9 @@ still serves as an authoritative reference.
   x86_64 and Windows.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
-- **WASM support is experimental.** The `fsqlite-wasm` crate now builds a
-  wasm-bindgen browser package and npm artifact, but browser persistence
-  backends such as OPFS and IndexedDB are still planned work. The current WASM
-  lane is focused on a compact in-memory package, feature-gated diagnostics,
-  and honest size-budget reporting.
+- **WASM support is experimental.** The worker can checkpoint the in-memory
+  database to OPFS or IndexedDB. Writes committed after the last checkpoint
+  stay in memory. Page-level persistence on each SQL commit remains planned.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. Cache eviction and GC mitigate this but introduce background work.
 - **No row-level locking.** Two transactions modifying different rows on the
   same page can still conflict at the page level. The safe write-merge ladder is

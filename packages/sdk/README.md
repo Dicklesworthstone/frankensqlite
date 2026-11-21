@@ -9,8 +9,8 @@ Current behavior:
   runtime through `@frankensqlite/worker`.
 - `execute`, `executeBatch`, `executeMany`, `query`, `prepare`, `export`, and `transaction`
   are exposed as Promise-based APIs.
-- `indexeddb-snapshot` provides opt-in, explicit whole-database checkpoints.
-  It is not a page-level VFS or automatic per-SQL-commit persistence.
+- `opfs-snapshot` and `indexeddb-snapshot` provide explicit whole-database
+  checkpoints. Call `db.checkpoint()` after committing writes you want to keep.
 - `memory` remains the default. Passing `opfs` or `indexeddb` still surfaces
   an explicit error; their page-level storage backends are not implemented.
 
@@ -115,7 +115,8 @@ the batch settles; aborting a finished operation does not affect later work.
 
 ## Explicit browser checkpoints
 
-Use a stable name and explicitly await `checkpoint()` after committing SQL:
+Choose `opfs-snapshot` or `indexeddb-snapshot`, use a stable name and await
+`checkpoint()` after committing SQL.
 
 ```ts
 const db = await FrankenDB.open({
@@ -139,7 +140,9 @@ termination discards writes made since the last successful checkpoint. This
 explicit mode must not be confused with automatic IndexedDB/OPFS page
 persistence or native FrankenSQLite MVCC across browser tabs.
 
-The worker holds its request queue through export, hashing, and an atomic
+The worker holds its request queue through export, hashing and publication.
+With `opfs-snapshot`, a Web Lock protects the revision check and replacement
+of the checkpoint file. With `indexeddb-snapshot`, publication uses an atomic
 IndexedDB compare-and-swap transaction. The SDK resolves only after that
 transaction completes, not when its `put()` request succeeds. Publication
 requests `durability: "strict"` and rejects browsers that do not expose that
@@ -211,10 +214,10 @@ uses the production SDK/worker, a transactional IndexedDB model, and Node's
 SQLite reference engine; run it with an ESM TypeScript resolver honoring the
 workspace's `@frankensqlite/worker` alias. It is not a WASM certificate.
 
-At implementation time, model and reference-SQL tests passed; the actual
-Chromium local test page was blocked by the execution environment's managed
-URL policy. No policy was changed. Real browser/WASM and Rust release gates
-must still be executed before claiming browser persistence certification.
+The browser storage test saves checkpoint bytes in a dedicated Chromium
+worker, terminates that worker, and reads the same revision and bytes from
+a fresh worker for each snapshot backend. Exercising SQL through the built
+WASM package and qualifying a release have separate gates.
 
 ## Transactions and connection ownership
 
