@@ -12491,7 +12491,7 @@ impl VdbeEngine {
                     // Three-valued AND: p3 = p1 AND p2
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = sql_and(a, b);
+                    let result = sql_and(a, b, self.text_encoding);
                     self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
@@ -12500,7 +12500,7 @@ impl VdbeEngine {
                     // Three-valued OR: p3 = p1 OR p2
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = sql_or(a, b);
+                    let result = sql_or(a, b, self.text_encoding);
                     self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
@@ -12511,7 +12511,7 @@ impl VdbeEngine {
                     if a.is_null() {
                         self.set_reg_fast(op.p2, SqliteValue::Null);
                     } else {
-                        self.set_reg_int(op.p2, i64::from(!vdbe_real_is_truthy(a)));
+                        self.set_reg_int(op.p2, i64::from(!a.is_sql_truthy_in(self.text_encoding)));
                     }
                     pc += 1;
                 }
@@ -12524,7 +12524,7 @@ impl VdbeEngine {
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        vdbe_real_is_truthy(val)
+                        val.is_sql_truthy_in(self.text_encoding)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -12540,7 +12540,7 @@ impl VdbeEngine {
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        !vdbe_real_is_truthy(val)
+                        !val.is_sql_truthy_in(self.text_encoding)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -15594,7 +15594,7 @@ impl VdbeEngine {
                     if val.is_null() {
                         self.set_reg(op.p2, SqliteValue::Integer(i64::from(op.p3 ^ p4_val)));
                     } else {
-                        let v = i32::from(vdbe_real_is_truthy(val));
+                        let v = i32::from(val.is_sql_truthy_in(self.text_encoding));
                         self.set_reg(op.p2, SqliteValue::Integer(i64::from((v ^ p4_val) & 1)));
                     }
                     pc += 1;
@@ -18319,7 +18319,7 @@ impl VdbeEngine {
                 let should_jump = if val.is_null() {
                     op.p3 != 0
                 } else {
-                    !vdbe_real_is_truthy(val)
+                    !val.is_sql_truthy_in(self.text_encoding)
                 };
                 if should_jump {
                     #[allow(clippy::cast_sign_loss)]
@@ -18340,7 +18340,7 @@ impl VdbeEngine {
                 if val.is_null() {
                     self.set_reg_int(op.p2, i64::from(op.p3 ^ p4_val));
                 } else {
-                    let v = i32::from(vdbe_real_is_truthy(val));
+                    let v = i32::from(val.is_sql_truthy_in(self.text_encoding));
                     self.set_reg_int(op.p2, i64::from((v ^ p4_val) & 1));
                 }
                 *pc += 1;
@@ -18364,7 +18364,7 @@ impl VdbeEngine {
                 if val.is_null() {
                     self.set_reg_fast(op.p2, SqliteValue::Null);
                 } else {
-                    self.set_reg_int(op.p2, i64::from(!vdbe_real_is_truthy(val)));
+                    self.set_reg_int(op.p2, i64::from(!val.is_sql_truthy_in(self.text_encoding)));
                 }
                 *pc += 1;
                 Ok(true)
@@ -18453,7 +18453,7 @@ impl VdbeEngine {
                 let should_jump = if val.is_null() {
                     op.p3 != 0
                 } else {
-                    vdbe_real_is_truthy(val)
+                    val.is_sql_truthy_in(self.text_encoding)
                 };
                 if should_jump {
                     #[allow(clippy::cast_sign_loss)]
@@ -21983,23 +21983,6 @@ pub(crate) const SQLITE_AFF_MASK: u16 = 0x47;
 pub(crate) const SQLITE_AFF_TEXT: u16 = 0x42; // 'B'
 const SQLITE_AFF_NUMERIC: u16 = 0x43; // 'C'
 
-/// C SQLite OP_If/OP_IfNot truthiness: uses `sqlite3VdbeRealValue() != 0.0`,
-/// which means 0.1, 0.5, -0.1 etc. are all truthy (unlike integer truncation).
-fn vdbe_real_is_truthy(val: &SqliteValue) -> bool {
-    match val {
-        SqliteValue::Null => false,
-        SqliteValue::Integer(n) => *n != 0,
-        SqliteValue::Float(f) => *f != 0.0,
-        SqliteValue::Text(_) | SqliteValue::Blob(_) => {
-            let i = val.to_integer();
-            if i != 0 {
-                return true;
-            }
-            val.to_float() != 0.0
-        }
-    }
-}
-
 /// Apply SQLite comparison affinity coercion (§3.2 of datatype3.html).
 ///
 /// Comparison affinity is applied independently to each operand. TEXT affinity
@@ -24655,18 +24638,18 @@ fn sql_shift_right(val: i64, amount: i64) -> SqliteValue {
 }
 
 /// Three-valued SQL AND.
-fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+fn sql_and(a: &SqliteValue, b: &SqliteValue, encoding: TextEncoding) -> SqliteValue {
     // C SQLite compiles AND/OR using OP_If/OP_IfNot which use
     // sqlite3VdbeRealValue() != 0.0, so 0.5 is truthy.
     let a_val = if a.is_null() {
         None
     } else {
-        Some(vdbe_real_is_truthy(a))
+        Some(a.is_sql_truthy_in(encoding))
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(vdbe_real_is_truthy(b))
+        Some(b.is_sql_truthy_in(encoding))
     };
 
     match (a_val, b_val) {
@@ -24677,16 +24660,16 @@ fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
 }
 
 /// Three-valued SQL OR.
-fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+fn sql_or(a: &SqliteValue, b: &SqliteValue, encoding: TextEncoding) -> SqliteValue {
     let a_val = if a.is_null() {
         None
     } else {
-        Some(vdbe_real_is_truthy(a))
+        Some(a.is_sql_truthy_in(encoding))
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(vdbe_real_is_truthy(b))
+        Some(b.is_sql_truthy_in(encoding))
     };
 
     match (a_val, b_val) {

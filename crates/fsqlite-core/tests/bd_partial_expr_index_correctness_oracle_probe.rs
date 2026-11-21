@@ -286,6 +286,139 @@ fn collated_boolean_truth_tests_preserve_rows_and_index_membership() {
 }
 
 #[test]
+fn blob_truth_uses_the_database_encoding_for_reads_and_persisted_indexes() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for (encoding, underflow, two, expected) in [
+            ("UTF-8", "31652d393939", "32", vec![vec!["int:2"], vec!["int:3"]]),
+            ("UTF-16le", "310065002d00390039003900", "3200", vec![vec!["int:2"]]),
+            ("UTF-16be", "00310065002d003900390039", "0032", vec![vec!["int:2"]]),
+        ] {
+            let path = dir.path().join(format!("{encoding}.db"));
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock
+                .execute_batch(&format!(
+                    "PRAGMA encoding='{encoding}'; CREATE TABLE t(id INTEGER PRIMARY KEY,x);
+                     INSERT INTO t VALUES(1,x'{underflow}'),(2,x'{two}'),(3,x'32'),(4,x''),(5,NULL);
+                     CREATE INDEX stock_truth ON t(id) WHERE x IS TRUE;"
+                ))
+                .unwrap();
+            let scan = "SELECT id FROM t NOT INDEXED WHERE x IS TRUE ORDER BY id";
+            let joined = "SELECT a.id FROM t AS a JOIN t AS b ON b.id=1 WHERE a.x IS TRUE ORDER BY a.id";
+            let truth_ops = "SELECT id, NOT x, x AND id>0, x OR id<0, x IS FALSE,
+                             CASE WHEN x THEN 1 ELSE 0 END, iif(x,10,20)
+                             FROM t NOT INDEXED ORDER BY id";
+            let stock_ops = rq(&stock, truth_ops);
+            assert_eq!(rq(&stock, scan), expected, "{encoding} stock");
+            drop(stock);
+
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let forced = "SELECT id FROM t INDEXED BY stock_truth WHERE x IS TRUE ORDER BY id";
+            for sql in [scan, joined, forced] {
+                assert_eq!(fq(&conn, sql).await, expected, "{encoding} {sql}");
+            }
+            assert_eq!(fq(&conn, truth_ops).await, stock_ops, "{encoding} operators");
+            let bound = conn.prepare("SELECT ?1 IS TRUE").await.unwrap();
+            let rows = bound
+                .query_with_params(&[SqliteValue::Blob(vec![b'2'].into())])
+                .await
+                .unwrap();
+            assert_eq!(
+                rows[0].values(),
+                &[SqliteValue::Integer(i64::from(encoding == "UTF-8"))],
+                "{encoding} bound"
+            );
+            drop(bound);
+            conn.execute("CREATE INDEX frank_truth ON t(id) WHERE x IS TRUE").await.unwrap();
+            conn.execute("REINDEX stock_truth").await.unwrap();
+            let backfilled = rusqlite::Connection::open(&path).unwrap();
+            for index in ["frank_truth", "stock_truth"] {
+                let sql = format!("SELECT id FROM t INDEXED BY {index} WHERE x IS TRUE ORDER BY id");
+                assert_eq!(rq(&backfilled, &sql), expected, "{encoding} backfill {index}");
+            }
+            drop(backfilled);
+            let move_rows = format!(
+                "UPDATE t SET x=CASE id WHEN 2 THEN x'' ELSE x'{two}' END WHERE id IN (2,4)"
+            );
+            let moved = if encoding == "UTF-8" {
+                vec![vec!["int:3"], vec!["int:4"]]
+            } else {
+                vec![vec!["int:4"]]
+            };
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute(&move_rows).await.unwrap();
+            assert_eq!(fq(&conn, forced).await, moved, "{encoding} UPDATE");
+            conn.execute("ROLLBACK").await.unwrap();
+            assert_eq!(fq(&conn, forced).await, expected, "{encoding} ROLLBACK");
+            conn.execute(&move_rows).await.unwrap();
+            conn.close().await.unwrap();
+
+            let reopened = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(rq(&reopened, scan), moved, "{encoding} stock scan");
+            for index in ["frank_truth", "stock_truth"] {
+                let forced = format!("SELECT id FROM t INDEXED BY {index} WHERE x IS TRUE ORDER BY id");
+                assert_eq!(rq(&reopened, &forced), moved, "{encoding} {index}");
+            }
+            assert_eq!(rq(&reopened, "PRAGMA integrity_check"), vec![vec!["text:ok"]]);
+        }
+    });
+}
+
+#[test]
+fn underflowing_exponents_are_false_in_queries_and_stored_predicates() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exponents.db");
+        let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,a)",
+            "INSERT INTO t VALUES(1,'1e-999'),(2,CAST('-9e-500' AS BLOB)),(3,'2e-3'),(4,CAST('6e-1junk' AS BLOB)),(5,NULL),(6,0)",
+            "CREATE INDEX positives ON t(id) WHERE a",
+        ] {
+            ex(&f, &r, sql).await;
+        }
+        let read = "SELECT id FROM t WHERE a ORDER BY id";
+        let joined =
+            "SELECT x.id FROM t AS x JOIN t AS y ON y.id=1 WHERE x.a IS TRUE ORDER BY x.id";
+        for sql in [read, joined] {
+            let expected = vec![vec!["int:3"], vec!["int:4"]];
+            assert_eq!(rq(&r, sql), expected, "{sql}");
+            assert_eq!(fq(&f, sql).await, expected, "{sql}");
+        }
+        let sql = "SELECT ?1 IS TRUE";
+        let plan = f.prepare(sql).await.unwrap();
+        for (s, expected) in [("1e-999", 0), ("-2e-500", 0), ("1e-1", 1)] {
+            assert_eq!(
+                r.query_row(sql, [s], |row| row.get::<_, i64>(0)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                r.query_row(sql, [s.as_bytes()], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                expected
+            );
+            for value in [
+                SqliteValue::Text(s.into()),
+                SqliteValue::Blob(s.as_bytes().into()),
+            ] {
+                let rows = plan.query_with_params(&[value]).await.unwrap();
+                assert_eq!(rows[0].values(), &[SqliteValue::Integer(expected)]);
+            }
+        }
+        drop(plan);
+        ex(&f, &r, "UPDATE t SET a='1e-999' WHERE id=4").await;
+        ex(&f, &r, "UPDATE t SET a=0.25 WHERE id=2").await;
+        f.close().await.unwrap();
+        let disk = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(rq(&disk, "PRAGMA integrity_check"), vec![vec!["text:ok"]]);
+        let forced = "SELECT id FROM t INDEXED BY positives WHERE a ORDER BY id";
+        assert_eq!(rq(&r, forced), vec![vec!["int:2"], vec!["int:3"]]);
+        assert_eq!(rq(&disk, forced), rq(&r, forced));
+    });
+}
+
+#[test]
 fn forced_partial_index_respects_comparison_collation() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();

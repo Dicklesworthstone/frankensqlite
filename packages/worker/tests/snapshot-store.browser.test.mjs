@@ -131,6 +131,37 @@ async function run(body, arg) {
   }
 }
 
+test("SDK binds parameters across recursive and sibling CTEs in the WASM worker", {
+  skip: wasmModule ? false : "Set FSQLITE_WASM_BROWSER_MODULE to a web-target WASM binding",
+}, async () => {
+  const rows = await run(async () => {
+    const { FrankenDB } = await import("/packages/sdk/src/database.ts");
+    const worker = new Worker("/packages/worker/src/worker.ts", { type: "module" });
+    const db = await FrankenDB.open({ worker, persistence: "memory" });
+    try {
+      const batch = [];
+      for (const [low, high] of [[2, 4], [6, 8]]) {
+        const recursive = await db.query(
+          "WITH RECURSIVE ids(n) AS (SELECT :low UNION ALL SELECT n+1 FROM ids WHERE n<:high) SELECT n FROM ids ORDER BY n",
+          { low, high },
+        );
+        const siblings = await db.query(
+          "WITH unused AS (SELECT ?), a(x) AS (SELECT ?), b(y) AS (SELECT ?) SELECT x,y FROM a,b",
+          [-1, low, high],
+        );
+        batch.push([recursive.rowArrays, siblings.rowArrays]);
+      }
+      return batch;
+    } finally {
+      await db.close();
+    }
+  });
+  assert.deepEqual(rows, [
+    [[[2], [3], [4]], [[2, 4]]],
+    [[[6], [7], [8]], [[6, 8]]],
+  ]);
+});
+
 for (const persistence of ["indexeddb-snapshot", "opfs-snapshot"]) {
   test(`SDK reopens checkpointed WASM SQL rows with ${persistence}`, {
     skip: wasmModule ? false : "Set FSQLITE_WASM_BROWSER_MODULE to a web-target WASM binding",

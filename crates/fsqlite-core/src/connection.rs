@@ -21612,12 +21612,8 @@ impl Connection {
         if case_sensitive_like_active() != case_sensitive_like {
             set_case_sensitive_like(case_sensitive_like);
         }
-        // bd-iubwb: project this database's TEXT encoding so `octet_length()`
-        // reports byte lengths in the DB encoding (UTF-16 = two bytes per code
-        // unit) on the interpreted lanes and on FROM-less scalar SELECTs, whose
-        // VDBE engine never adopts an encoding from a table page. The VDBE
-        // engine overrides this only when it has adopted a non-UTF-8 encoding
-        // from an opened cursor, so the two lanes always agree.
+        // Interpreted comparisons, BLOB predicates and scalar functions need
+        // the same database text encoding as the statement's VDBE.
         let db_text_encoding = self.db_text_encoding.get();
         if statement_text_encoding() != db_text_encoding {
             set_statement_text_encoding(db_text_encoding);
@@ -32689,7 +32685,7 @@ impl Connection {
                         Some(&self.collation_registry),
                         &op_cx,
                         stmt.expression_postprocess.as_ref(),
-                        page_size,
+                        (page_size, self.db_text_encoding.get()),
                     )
                 })
                 .await
@@ -33063,7 +33059,7 @@ impl Connection {
                         stmt.func_registry.as_ref(),
                         Some(&self.collation_registry),
                         &op_cx,
-                        page_size,
+                        (page_size, self.db_text_encoding.get()),
                         Some(QUERY_ROW_RESULT_ROW_CAP),
                     )
                     .await
@@ -33091,7 +33087,7 @@ impl Connection {
                     Some(&self.collation_registry),
                     &op_cx,
                     stmt.expression_postprocess.as_ref(),
-                    page_size,
+                    (page_size, self.db_text_encoding.get()),
                 )
                 .await
             };
@@ -43297,7 +43293,7 @@ impl Connection {
                             Some(&self.collation_registry),
                             &op_cx,
                             Some(&postprocess),
-                            page_size,
+                            (page_size, self.db_text_encoding.get()),
                         )
                     })
                     .await?;
@@ -102005,6 +102001,15 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // CTE definitions and the outer query share SQLite's parameter slots.
+        // Assign them before a definition is dropped, duplicated, or executed on its own.
+        let numbered;
+        let select = if select_contains_any_placeholder(select) {
+            numbered = canonicalize_select_placeholders(select)?;
+            &numbered
+        } else {
+            select
+        };
         // bd-gh-cte-materialization-hints-sn0yh / GH#204: a NOT MATERIALIZED
         // non-recursive CTE must be inlined at each reference so its body
         // re-evaluates per use (a materialized CTE is computed once). Rewrite the
@@ -145350,18 +145355,7 @@ fn sqlite_shift(val: i64, shift: i64, is_left: bool) -> i64 {
 /// C SQLite truthiness for `OP_If`/`OP_IfNot` (CASE WHEN, WHERE, HAVING):
 /// uses `sqlite3VdbeRealValue() != 0.0`, so 0.1 and 0.5 are truthy.
 pub(crate) fn is_sqlite_truthy(v: &SqliteValue) -> bool {
-    match v {
-        SqliteValue::Null => false,
-        SqliteValue::Integer(n) => *n != 0,
-        SqliteValue::Float(f) => *f != 0.0,
-        SqliteValue::Text(_) | SqliteValue::Blob(_) => {
-            let i = v.to_integer();
-            if i != 0 {
-                return true;
-            }
-            v.to_float() != 0.0
-        }
-    }
+    v.is_sql_truthy_in(statement_text_encoding())
 }
 
 /// Evaluate a HAVING predicate against a group's computed result values.
@@ -150021,11 +150015,12 @@ async fn execute_program_with_row_cap(
     func_registry: Option<&Arc<FunctionRegistry>>,
     collation_registry: Option<&Arc<Mutex<CollationRegistry>>>,
     execution_cx: &Cx,
-    page_size: PageSize,
+    (page_size, text_encoding): (PageSize, TextEncoding),
     max_collected_result_rows: Option<usize>,
 ) -> Result<Vec<Row>> {
     let mut engine =
         VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size);
+    engine.set_text_encoding(text_encoding);
     if let Some(params) = params {
         validate_bound_parameters(program, params)?;
     }
@@ -150064,7 +150059,7 @@ async fn execute_program_with_postprocess(
     collation_registry: Option<&Arc<Mutex<CollationRegistry>>>,
     execution_cx: &Cx,
     expression_postprocess: Option<&ExpressionPostprocess>,
-    page_size: PageSize,
+    database_format: (PageSize, TextEncoding),
 ) -> Result<Vec<Row>> {
     execute_program_with_postprocess_row_cap(
         program,
@@ -150073,7 +150068,7 @@ async fn execute_program_with_postprocess(
         collation_registry,
         execution_cx,
         expression_postprocess,
-        page_size,
+        database_format,
         None,
     )
     .await
@@ -150087,7 +150082,7 @@ async fn execute_program_with_postprocess_row_cap(
     collation_registry: Option<&Arc<Mutex<CollationRegistry>>>,
     execution_cx: &Cx,
     expression_postprocess: Option<&ExpressionPostprocess>,
-    page_size: PageSize,
+    database_format: (PageSize, TextEncoding),
     max_collected_result_rows: Option<usize>,
 ) -> Result<Vec<Row>> {
     let mut rows = execute_program_with_row_cap(
@@ -150096,7 +150091,7 @@ async fn execute_program_with_postprocess_row_cap(
         func_registry,
         collation_registry,
         execution_cx,
-        page_size,
+        database_format,
         max_collected_result_rows,
     )
     .await?;
@@ -150112,11 +150107,12 @@ async fn execute_program_exactly_one_row_with_row_cap(
     func_registry: Option<&Arc<FunctionRegistry>>,
     collation_registry: Option<&Arc<Mutex<CollationRegistry>>>,
     execution_cx: &Cx,
-    page_size: PageSize,
+    (page_size, text_encoding): (PageSize, TextEncoding),
     max_collected_result_rows: Option<usize>,
 ) -> Result<Row> {
     let mut engine =
         VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size);
+    engine.set_text_encoding(text_encoding);
     if let Some(params) = params {
         validate_bound_parameters(program, params)?;
     }

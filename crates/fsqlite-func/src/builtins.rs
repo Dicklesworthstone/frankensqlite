@@ -512,7 +512,7 @@ impl ScalarFunction for IifFunc {
         // rewritten to that CASE (lazy branches); this covers direct calls.
         let (pairs, rest) = args.as_chunks::<2>();
         for [condition, value] in pairs {
-            if condition.is_sql_truthy() {
+            if condition.is_sql_truthy_in(statement_text_encoding()) {
                 return Ok(value.clone());
             }
         }
@@ -4704,6 +4704,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn registered_if_uses_statement_encoding_for_blob_conditions() {
+        let initial = statement_text_encoding();
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        for (encoding, positive) in [
+            (TextEncoding::Utf16le, [b'2', 0]),
+            (TextEncoding::Utf16be, [0, b'2']),
+        ] {
+            set_statement_text_encoding(encoding);
+            for name in ["if", "iif"] {
+                let function = registry.find_scalar(name, 3).unwrap();
+                for (bytes, expected) in [(positive.as_slice(), 1), (b"2".as_slice(), 0)] {
+                    let args = [
+                        SqliteValue::Blob(Arc::from(bytes)),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(0),
+                    ];
+                    assert_eq!(
+                        function.invoke(&args).unwrap(),
+                        SqliteValue::Integer(expected)
+                    );
+                }
+            }
+        }
+        set_statement_text_encoding(initial);
     }
 
     #[test]

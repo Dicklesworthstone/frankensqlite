@@ -1281,6 +1281,37 @@ impl SqliteValue {
         }
     }
 
+    /// Evaluate a SQL predicate in the database's text encoding. SQLite
+    /// interprets BLOB bytes as text in that encoding for numeric conversion.
+    #[must_use]
+    pub fn is_sql_truthy_in(&self, encoding: TextEncoding) -> bool {
+        let Self::Blob(bytes) = self else {
+            return self.is_sql_truthy();
+        };
+        let (low, high) = match encoding {
+            TextEncoding::Utf8 => return self.is_sql_truthy(),
+            TextEncoding::Utf16le => (0, 1),
+            TextEncoding::Utf16be => (1, 0),
+        };
+        // A numeric prefix contains only ASCII code units. Stop before binary
+        // payload following the number and ignore an incomplete final unit.
+        let mut prefix = smallvec::SmallVec::<[u8; 32]>::new();
+        for pair in bytes.as_chunks::<2>().0 {
+            let ch = pair[low];
+            if pair[high] != 0 {
+                break;
+            }
+            if prefix.is_empty() && matches!(ch, b' ' | b'\t'..=b'\r') {
+                continue;
+            }
+            if !matches!(ch, b'0'..=b'9' | b'.' | b'+' | b'-' | b'e' | b'E') {
+                break;
+            }
+            prefix.push(ch);
+        }
+        parse_float_prefix_bytes(&prefix) != 0.0
+    }
+
     /// Coerce a value for SQLite `sum()` accumulation.
     ///
     /// `sum()` keeps integer accumulation only for INTEGER values and text that

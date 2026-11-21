@@ -84,6 +84,44 @@ const T: &[&str] = &[
 ];
 
 #[test]
+fn cte_parameters_keep_their_statement_wide_slots() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "WITH RECURSIVE ids(n) AS (SELECT :low UNION ALL SELECT n+1 FROM ids WHERE n<:high)
+             SELECT n FROM ids ORDER BY n",
+            "WITH RECURSIVE ids(n) AS (SELECT ? UNION ALL SELECT n+1 FROM ids WHERE n<?)
+             SELECT n FROM ids ORDER BY n",
+            "WITH a(x) AS (SELECT :low), b(y) AS (SELECT :high)
+             SELECT x+y+:low FROM a,b",
+            "WITH a(x) AS NOT MATERIALIZED (SELECT ?), b(y) AS (SELECT ?)
+             SELECT p.x+q.x+y FROM a AS p,a AS q,b",
+            "WITH unused(x) AS (SELECT ?), b(y) AS MATERIALIZED (SELECT ?) SELECT y FROM b",
+            "WITH a(x) AS (SELECT ?2), b(y) AS (SELECT ?1) SELECT 10*x+y FROM a,b",
+        ] {
+            let prepared = frank.prepare(sql).await.unwrap();
+            let mut oracle = stock.prepare(sql).unwrap();
+            for args in [[2_i64, 4_i64], [6, 9]] {
+                let expected = oracle
+                    .query_map(args, |row| row.get(0).map(SqliteValue::Integer))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let values = args.map(SqliteValue::Integer);
+                for rows in [
+                    frank.query_with_params(sql, &values).await.unwrap(),
+                    prepared.query_with_params(&values).await.unwrap(),
+                ] {
+                    let actual: Vec<_> = rows.iter().map(|row| row.values()[0].clone()).collect();
+                    assert_eq!(actual, expected, "{sql}: {args:?}");
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn gh418_sudoku_repeated_on_same_connection_keeps_materialized_roots_live() {
     asupersync::test_utils::run_test(|| async {
         let sql = r"

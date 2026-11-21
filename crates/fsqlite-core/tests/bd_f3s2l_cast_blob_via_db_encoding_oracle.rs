@@ -140,6 +140,7 @@ fn numeric_cases(encoding: &str) -> Vec<(&'static str, String, &'static str)> {
         _ => ("3132".into(), "332E35".into()),
     };
     vec![
+        ("text_12", twelve.clone(), "TEXT"),
         ("int_12", twelve.clone(), "INTEGER"),
         ("real_3_5", three_five, "REAL"),
         ("int_from_realblob", twelve, "REAL"),
@@ -188,7 +189,7 @@ async fn run_numeric_pair(encoding: &str) {
     conn.execute(create).await.expect("frank create");
     conn.execute(&insert_blobs).await.expect("frank insert");
 
-    for (idx, (label, _hex, ty)) in cases.iter().enumerate() {
+    for (idx, (label, hex, ty)) in cases.iter().enumerate() {
         let q = format!("SELECT CAST(v AS {ty}) FROM b WHERE rowid = {}", idx + 1);
         let stock_val: String = stock
             .query_row(&q, [], |r| match r.get_ref(0).unwrap() {
@@ -209,6 +210,22 @@ async fn run_numeric_pair(encoding: &str) {
             frank_val, stock_val,
             "[{encoding}/{label}] bd-f3s2l: CAST(blob AS {ty}) must parse via DB encoding like stock"
         );
+        // These programs open no cursor from which the VM could learn the encoding.
+        let literal = format!("SELECT CAST(X'{hex}' AS {ty})");
+        let literal_rows = conn.query(&literal).await.unwrap();
+        assert_eq!(literal_rows.len(), 1);
+        assert_eq!(frank_scalar(&literal_rows[0]), stock_val, "{encoding} {literal}");
+
+        let bytes: Vec<u8> = stock
+            .query_row(&format!("SELECT X'{hex}'"), [], |row| row.get(0))
+            .unwrap();
+        let bound = [SqliteValue::Blob(bytes.into())];
+        let stmt = conn.prepare(&format!("SELECT CAST(?1 AS {ty})")).await.unwrap();
+        let all = stmt.query_with_params(&bound).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(frank_scalar(&all[0]), stock_val, "{encoding}/{label} prepared");
+        let one = stmt.query_row_with_params(&bound).await.unwrap();
+        assert_eq!(frank_scalar(&one), stock_val, "{encoding}/{label} query_row");
     }
     conn.close().await.expect("frank close");
 }

@@ -32,6 +32,28 @@ stock and FrankenSQLite invocations, affected rows, indexed-column changes,
 integrity and post-rollback table contents agreed. The 28 automatic index
 choices above still differ.
 
+Stock SQLite also exposed a stored-index defect in UTF-16 databases. A BLOB
+predicate could select different rows after reopen depending on which engine
+created the index. The VM and interpreted paths now evaluate numeric truth
+using the database encoding, including underflowing exponents. Cursorless
+prepared expressions receive that encoding too. In native builds
+`30097323753218307` and `30097323753218334`, both engines agreed on scans, forced index reads,
+rollback, and reopen for 12 combinations of encoding, creator, and writer.
+`REINDEX` repaired indexes made by the preceding implementation in both
+UTF-16 byte orders. Stock SQLite then returned the expected rows and passed
+`integrity_check` (`bd-384bo`, `bd-ulvzg`).
+
+Numbering parameters before rewriting a WITH statement fixed named recursive
+queries and sibling CTEs that previously reused another definition's value.
+Six query shapes with changing bindings passed against bundled SQLite on
+direct and retained prepared statements. The WASM built from the integrated
+source (`30097323753218341`) passed 28 comparisons, including a bound query
+where an inner WITH shadows the outer CTE name. All 31 browser tests passed
+with the module supplied. The integrated native build also passed all eight
+cases across the recursive and nested-name targets. Workspace checking and
+strict Clippy matched all 2,983 files in their remote source receipts
+(`30097323753218325` and `30097323753218326`, `bd-3iai6`).
+
 Several September conclusions have changed. The canonical overlap tests,
 executable Rust/C examples, and dependency and specification repairs have
 recorded passing runs on `bd-6hdwo.1` through `.8`. The pager now enforces
@@ -73,6 +95,8 @@ budget. All four workers committed jobs, and SQLite counted 128 unique effects
 and 128 attempts. A held writer still timed out, and a failed effect kept its
 original row and lease (`bd-q1qg2`). Both package builds, both typechecks and
 all 140 Vitest cases passed.
+Across all 124 SDK and worker Node test files, 4,799 cases passed with zero
+skips using the corrected WASM core and the four-connection admission guard.
 
 Two public entry points still expose significant limits. FTS5 and R-tree
 virtual tables could be created, while FTS3 creation reported an unregistered

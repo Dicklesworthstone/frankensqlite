@@ -567,6 +567,7 @@ jobs:
           cargo test -p fsqlite-core --test cast_affinity_oracle -- --nocapture
           cargo test -p fsqlite-core --test window_function_oracle -- --nocapture
           cargo test -p fsqlite-core --test recursive_cte_oracle -- --nocapture
+          cargo test --locked -p fsqlite-core --test bd_f3s2l_cast_blob_via_db_encoding_oracle -- --nocapture
           cargo test -p fsqlite-core --test foreign_key_oracle -- --nocapture
           cargo test -p fsqlite-core --test collation_oracle -- --nocapture
           cargo test -p fsqlite-core --test aggregate_edge_oracle -- --nocapture
