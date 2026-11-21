@@ -207,7 +207,7 @@ use fsqlite_types::value::{
 };
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, RowId, RowIdMode,
-    SchemaEpoch, StrictColumnType, TableId, TextEncoding, WitnessKey,
+    SchemaEpoch, SecureDeleteMode, StrictColumnType, TableId, TextEncoding, WitnessKey,
 };
 
 use crate::{
@@ -4460,6 +4460,17 @@ impl PageReader for SharedTxnPageIo {
 }
 
 impl PageWriter for SharedTxnPageIo {
+    // bd-i2u1c: the shared transaction carries the connection's
+    // `PRAGMA secure_delete` policy; without these two the VDBE's cursors
+    // saw the trait's OFF default whatever the transaction was set to.
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.txn.borrow().secure_delete_mode()
+    }
+
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        self.txn.borrow_mut().note_freed_page_zeroed(page_no);
+    }
+
     async fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         let page_size = self.txn.borrow().page_size().as_usize();
         let page_data = normalize_owned_page_data(page_size, data)?;

@@ -28991,7 +28991,10 @@ impl Connection {
         // identity (extended code SQLITE_BUSY_RECOVERY = 261) instead of
         // collapsing every exhaustion to plain `Busy` (5).
         let mut last_was_recovery = match pager.begin(cx, mode).await {
-            Ok(txn) => return Ok(txn),
+            Ok(mut txn) => {
+                self.apply_secure_delete_policy(&mut txn);
+                return Ok(txn);
+            }
             Err(FrankenError::BusyRecovery) => true,
             Err(FrankenError::Busy) => false,
             Err(err) => return Err(err),
@@ -29022,7 +29025,10 @@ impl Connection {
             }
             cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             match pager.begin(cx, mode).await {
-                Ok(txn) => return Ok(txn),
+                Ok(mut txn) => {
+                    self.apply_secure_delete_policy(&mut txn);
+                    return Ok(txn);
+                }
                 Err(FrankenError::BusyRecovery) => last_was_recovery = true,
                 Err(FrankenError::Busy) => last_was_recovery = false,
                 Err(err) => return Err(err),
@@ -86680,6 +86686,9 @@ impl Connection {
             let mut state = self.pragma_state.borrow_mut();
             fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)?
         };
+        if pragma_name == "secure_delete" && pragma.value.is_some() {
+            self.apply_secure_delete_policy_to_held_txns();
+        }
 
         if fsqlite_vdbe::pragma::is_writable_schema_reset(pragma) {
             let cx = self.op_cx()?;
@@ -90027,6 +90036,41 @@ impl Connection {
                 .await?;
             self.pager.set_rollback_cleanup(cleanup)?;
             Ok(())
+        }
+    }
+
+    /// bd-i2u1c: the storage policy for this connection's `PRAGMA
+    /// secure_delete` (0 = OFF, 1 = ON, 2 = FAST).
+    fn secure_delete_policy(&self) -> fsqlite_types::SecureDeleteMode {
+        match self.pragma_state.borrow().secure_delete {
+            1 => fsqlite_types::SecureDeleteMode::On,
+            2 => fsqlite_types::SecureDeleteMode::Fast,
+            _ => fsqlite_types::SecureDeleteMode::Off,
+        }
+    }
+
+    /// bd-i2u1c: hand the connection's secure_delete policy to a transaction.
+    /// The policy is per transaction handle, so the shared pager is untouched.
+    fn apply_secure_delete_policy(&self, txn: &mut TransactionKind) {
+        txn.set_secure_delete_mode(self.secure_delete_policy());
+    }
+
+    /// bd-i2u1c: stock applies a changed `PRAGMA secure_delete` to the very
+    /// next deletion, inside an open transaction too. Every transaction this
+    /// connection holds (the active one, and the parked autocommit write
+    /// transactions a later statement reuses without a new begin) takes the
+    /// new policy; transactions begun later take it in
+    /// `begin_pager_txn_with_busy_timeout`.
+    fn apply_secure_delete_policy_to_held_txns(&self) {
+        let mode = self.secure_delete_policy();
+        for slot in [
+            &self.active_txn,
+            &self.cached_write_txn,
+            &self.retained_autocommit_txn,
+        ] {
+            if let Some(txn) = slot.borrow_mut().as_mut() {
+                txn.set_secure_delete_mode(mode);
+            }
         }
     }
 
