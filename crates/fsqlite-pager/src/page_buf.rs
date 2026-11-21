@@ -1024,6 +1024,40 @@ mod tests {
 
     #[test]
     fn test_reset_global_pool_metrics() {
+        // bd-dti3t: the counters are process-wide, and every pool acquire in
+        // a parallel test of this binary bumps them, so one landing between
+        // the reset and the snapshot failed this test. The body runs in a
+        // child process of this test binary, filtered to this test alone.
+        const CHILD_ENV: &str = "FSQLITE_BD_DTI3T_POOL_METRICS_CHILD";
+        const TEST: &str = "page_buf::tests::test_reset_global_pool_metrics";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            reset_global_pool_metrics_body();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run the isolated pool-metrics child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated pool-metrics child failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn reset_global_pool_metrics_body() {
+        // Non-vacuity: in the child nothing else touches the counters, so a
+        // reset that did nothing would read 0 too. Make both nonzero first.
+        let pool = PageBufPool::new(PageSize::DEFAULT, 2);
+        drop(pool.acquire().unwrap());
+        let _again = pool.acquire().unwrap();
+        let primed = page_buffer_pool_metrics_snapshot();
+        assert!(primed.page_buffer_pool_hits >= 1, "{primed:?}");
+        assert!(primed.page_buffer_pool_misses >= 1, "{primed:?}");
+
         reset_page_buffer_pool_metrics();
         let before = page_buffer_pool_metrics_snapshot();
         assert_eq!(before.page_buffer_pool_hits, 0);

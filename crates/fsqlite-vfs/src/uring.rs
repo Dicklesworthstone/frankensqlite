@@ -251,6 +251,10 @@ fn enforce_conformal_breach_policy(
     conformal_upper_bound_us: u64,
     disable_reason: &'static str,
 ) {
+    #[cfg(test)]
+    if runtime.latency_policy_suspended.load(Ordering::Acquire) {
+        return;
+    }
     runtime.disable(disable_reason);
     info!(
         operation,
@@ -479,6 +483,12 @@ struct IoUringRuntime {
     read_buffers: Mutex<Vec<Vec<u8>>>,
     #[cfg(test)]
     driver_wait: Duration,
+    /// Test-only: the conformal latency policy still records this runtime's
+    /// samples but does not disable it (bd-dti3t). The policy's sample window
+    /// is process-wide, so in a test binary the other tests' samples decide
+    /// whether this runtime's next write breaches it.
+    #[cfg(test)]
+    latency_policy_suspended: AtomicBool,
     /// io-wq worker limits registered on `ring`; `None` when uncapped.
     iowq_max_workers: Option<[u32; 2]>,
     initial_status: String,
@@ -604,6 +614,8 @@ impl IoUringRuntime {
                 read_buffers: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 driver_wait: IO_URING_DRIVER_WAIT,
+                #[cfg(test)]
+                latency_policy_suspended: AtomicBool::new(false),
                 iowq_max_workers,
                 initial_status,
                 disabled: AtomicBool::new(forced_failure),
@@ -2992,6 +3004,13 @@ mod tests {
         let cx = Cx::new();
         let vfs = IoUringVfs::new();
         assert!(vfs.is_available(), "requires io_uring: {}", vfs.status());
+        // bd-dti3t: the conformal latency policy's window is process-wide.
+        // With the other tests' samples in it (or only this test's first
+        // write), one of the writes below could "breach" it and disable the
+        // ring, so the reads went to the Unix path and the pool stayed empty.
+        vfs.runtime
+            .latency_policy_suspended
+            .store(true, Ordering::Release);
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut full, _) = vfs
             .open(
@@ -3016,7 +3035,8 @@ mod tests {
         assert!(page.iter().all(|byte| *byte == 0xAB));
         assert!(
             !full.runtime.read_buffers.lock().unwrap().is_empty(),
-            "a completed io_uring read must return its buffer to the pool"
+            "a completed io_uring read must return its buffer to the pool: {}",
+            full.runtime.status()
         );
 
         // The pooled 4096-byte buffer serves a 14-byte request: an uncut
@@ -3033,6 +3053,11 @@ mod tests {
         assert!(
             short_page[100..].iter().all(|byte| *byte == 0),
             "bytes past EOF must be zero, not a recycled buffer's stale 0xAB"
+        );
+        assert!(
+            vfs.is_available(),
+            "every read above must have gone through the ring: {}",
+            vfs.status()
         );
         full.close(&cx).expect("close full");
         short.close(&cx).expect("close short");
