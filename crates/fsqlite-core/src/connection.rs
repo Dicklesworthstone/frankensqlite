@@ -117194,7 +117194,10 @@ fn having_is_substrate_safe(having: &Expr, columns: &[ResultColumn]) -> bool {
         });
         !mentions_alias
     };
-    let operand = |expr: &Expr| is_result_aggregate(expr) || free_of_aggregates(expr);
+    let operand = |expr: &Expr| {
+        (is_result_aggregate(expr) || free_of_aggregates(expr))
+            && having_operand_is_substrate_coded(expr)
+    };
     match having {
         Expr::BinaryOp {
             left,
@@ -117202,11 +117205,39 @@ fn having_is_substrate_safe(having: &Expr, columns: &[ResultColumn]) -> bool {
             right,
             ..
         } => having_is_substrate_safe(left, columns) && having_is_substrate_safe(right, columns),
-        Expr::UnaryOp {
-            op: UnaryOp::Not,
-            expr,
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge,
+            right,
             ..
-        } => having_is_substrate_safe(expr, columns),
+        } => operand(left) && operand(right),
+        other => free_of_aggregates(other) && having_operand_is_substrate_coded(other),
+    }
+}
+
+/// bd-4uurt: whether the substrate's HAVING coder (codegen's
+/// `emit_having_expr`) evaluates `expr` against the group: a literal or
+/// parameter, a column (a group key, or a bare column it captures), an
+/// aggregate call, `IS [NOT] NULL` of one of those, and comparisons, AND and
+/// OR of them. It codes any other node (`IS`, arithmetic, NOT, a scalar
+/// function, CASE, ...) as if the group's columns were NULL, so `HAVING a IS
+/// 2` or `HAVING a + 1 = 2` kept no group; such a HAVING takes the interpreted
+/// path, as an ad hoc statement's does.
+fn having_operand_is_substrate_coded(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(..) | Expr::Placeholder(..) | Expr::Column(..) => true,
+        Expr::FunctionCall {
+            name, args, over, ..
+        } => {
+            over.is_none() && is_current_aggregate_fn(name, args) && !is_scalar_max_min(name, args)
+        }
+        Expr::IsNull { expr, .. } => having_operand_is_substrate_coded(expr),
         Expr::BinaryOp {
             left,
             op:
@@ -117216,12 +117247,12 @@ fn having_is_substrate_safe(having: &Expr, columns: &[ResultColumn]) -> bool {
                 | BinaryOp::Le
                 | BinaryOp::Gt
                 | BinaryOp::Ge
-                | BinaryOp::Is
-                | BinaryOp::IsNot,
+                | BinaryOp::And
+                | BinaryOp::Or,
             right,
             ..
-        } => operand(left) && operand(right),
-        other => free_of_aggregates(other),
+        } => having_operand_is_substrate_coded(left) && having_operand_is_substrate_coded(right),
+        _ => false,
     }
 }
 
