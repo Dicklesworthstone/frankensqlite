@@ -217,6 +217,36 @@ pub struct TransactionFrameBatch {
     /// can have popped it and its absence from the current durable freelist
     /// is expected, not evidence of a conflict.
     pub consumed_durable_freelist_pages: Vec<u32>,
+    /// bd-1epn5: the routes this transaction's right-edge appends rely on.
+    /// Their parents are checked against committed WAL frames newer than
+    /// `conflict_snapshot` like `conflict_pages`, but a parent that changed
+    /// conflicts only if the route no longer leads to the leaf. They are not
+    /// write intent, so batches of one group-commit epoch never conflict on
+    /// them.
+    pub route_dependencies: Vec<TransactionRouteDependency>,
+}
+
+/// bd-1epn5: a right-edge append's dependency on the route to its leaf.
+///
+/// The transaction stored keys past the last cell of `leaf`, which its
+/// snapshot showed as `parent`'s right child. Those keys belong on `leaf` only
+/// while the tree routes them there. A peer can cap the leaf without writing
+/// it: a quick balance gives `parent` a divider equal to the leaf's largest
+/// key and a new right child, and stock SQLite's quick balance commits only
+/// the parent and the new leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionRouteDependency {
+    /// The leaf's parent in the submitting transaction's snapshot.
+    pub parent: u32,
+    /// The table leaf the transaction appended past its last cell.
+    pub leaf: u32,
+    /// The largest rowid the transaction staged on `leaf`.
+    pub key: i64,
+    /// The topmost ancestor of `parent` among the pages the snapshot read,
+    /// from which the route is derived again. `None` when the snapshot did
+    /// not keep every page it read, so the route cannot be trusted to start
+    /// at the table's root; a changed parent then always conflicts.
+    pub top: Option<u32>,
 }
 
 /// WAL conflict horizon captured by a submitting transaction.
@@ -275,7 +305,18 @@ impl TransactionFrameBatch {
             freed_pages: Vec::new(),
             consumed_freelist_pages: Vec::new(),
             consumed_durable_freelist_pages: Vec::new(),
+            route_dependencies: Vec::new(),
         }
+    }
+
+    /// Attach the routes the batch's right-edge appends rely on (bd-1epn5).
+    #[must_use]
+    pub fn with_route_dependencies(
+        mut self,
+        route_dependencies: Vec<TransactionRouteDependency>,
+    ) -> Self {
+        self.route_dependencies = route_dependencies;
+        self
     }
 
     /// Attach the durable-freelist publication this batch carries plus the

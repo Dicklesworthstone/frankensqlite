@@ -73,7 +73,11 @@ struct ShapeResult {
     final_rows: i64,
     /// `(worker, seq)` of every durable row, read by stock.
     durable_rows: Vec<(i64, i64)>,
+    /// Stock's `PRAGMA integrity_check`.
     integrity: String,
+    /// bd-1epn5: fsqlite's `PRAGMA integrity_check` of a copy of the database
+    /// family the writers left, taken before stock opens it.
+    fsqlite_integrity: String,
     /// Writer stderr lines where the pager certified the durable db_size floor
     /// for a non-growing commit (`VNXJD FLOOR-CERTIFIED`, traced with
     /// `DW8OE_TRACE` in the own-table fsqlite shape).
@@ -225,6 +229,40 @@ fn table_snapshot(conn: &rusqlite::Connection) -> Vec<(String, Vec<Vec<rusqlite:
         .collect()
 }
 
+/// bd-1epn5: fsqlite's `PRAGMA integrity_check` of the database family at
+/// `db` (main file, -wal and -shm, as the writers left them), its lines
+/// joined with newlines. It runs on a copy in `scratch`: fsqlite and stock in
+/// one process do not exclude each other through POSIX locks, so either one's
+/// close could otherwise checkpoint and reset the WAL under the other.
+fn fsqlite_integrity_of_copy(db: &Path, scratch: &Path) -> String {
+    std::fs::create_dir_all(scratch).expect("integrity scratch dir");
+    let copy = scratch.join("mp.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", db.display()));
+        if from.exists() {
+            std::fs::copy(&from, PathBuf::from(format!("{}{suffix}", copy.display())))
+                .expect("copy the database family");
+        }
+    }
+    fsqlite_e2e::block_on(async {
+        let conn = Connection::open(copy.to_str().expect("utf8 path"))
+            .await
+            .expect("fsqlite integrity open");
+        let lines: Vec<String> = conn
+            .query("PRAGMA integrity_check")
+            .await
+            .expect("fsqlite integrity_check")
+            .iter()
+            .map(|row| match row.values() {
+                [fsqlite::SqliteValue::Text(line)] => line.to_string(),
+                other => panic!("integrity_check row {other:?}"),
+            })
+            .collect();
+        conn.close().await.expect("fsqlite integrity close");
+        lines.join("\n")
+    })
+}
+
 fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -> ShapeResult {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("mp.db");
@@ -321,6 +359,7 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
     lost_rows.sort_unstable();
     committed_ids.sort_unstable();
     let elapsed = started.elapsed();
+    let fsqlite_integrity = fsqlite_integrity_of_copy(&db, &dir.path().join("fsqlite-check"));
     let stock = rusqlite::Connection::open(&db).expect("verify open");
     let final_rows: i64 = stock
         .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
@@ -345,6 +384,7 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
         final_rows,
         durable_rows,
         integrity,
+        fsqlite_integrity,
         floor_certified,
         replayed,
         replay_refused,
@@ -353,13 +393,14 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
     };
     eprintln!(
         "event=mp_busy_shape backend={backend} workers={workers} rows={rows} busy_timeout_ms={busy_timeout_ms} \
-         committed={} errors={} elapsed_ms={} final_rows={} integrity={} floor_certified={} \
-         replayed={} replay_refused={} sample_errors={:?}",
+         committed={} errors={} elapsed_ms={} final_rows={} integrity={} fsqlite_integrity={} \
+         floor_certified={} replayed={} replay_refused={} sample_errors={:?}",
         result.committed,
         result.errors.len(),
         result.elapsed.as_millis(),
         result.final_rows,
         result.integrity,
+        result.fsqlite_integrity,
         result.floor_certified,
         result.replayed,
         result.replay_refused,
@@ -808,6 +849,10 @@ fn mp_busy_writer_child() {
 fn assert_all_committed(label: &str, result: &ShapeResult, expected: usize) {
     assert_eq!(result.integrity, "ok", "{label}: integrity_check");
     assert_eq!(
+        result.fsqlite_integrity, "ok",
+        "{label}: fsqlite integrity_check"
+    );
+    assert_eq!(
         usize::try_from(result.final_rows).expect("row count"),
         result.committed,
         "{label}: every reported commit is durable and nothing else is"
@@ -957,6 +1002,10 @@ fn assert_explicit_accounting<'a>(
     open_at_close: OpenAtClose,
 ) -> Vec<&'a String> {
     assert_eq!(frank.integrity, "ok", "{label}: integrity_check");
+    assert_eq!(
+        frank.fsqlite_integrity, "ok",
+        "{label}: fsqlite integrity_check"
+    );
     assert_eq!(
         frank.durable_rows, frank.committed_rows,
         "{label}: the durable rows are exactly the rows a successful COMMIT made durable"
@@ -1217,6 +1266,10 @@ fn assert_rowid_accounting(
     rows: usize,
 ) -> usize {
     assert_eq!(result.integrity, "ok", "{label}: integrity_check");
+    assert_eq!(
+        result.fsqlite_integrity, "ok",
+        "{label}: fsqlite integrity_check"
+    );
     let grid: Vec<(i64, i64)> = (0..workers)
         .flat_map(|worker| (0..rows).map(move |seq| (worker, seq)))
         .map(|(worker, seq)| {
@@ -1657,6 +1710,7 @@ fn cross_process_writers_without_busy_timeout_stay_consistent() {
     // success is exactly what is durable.
     let frank = run_shape("fsqlite", 4, 100, 0);
     assert_eq!(frank.integrity, "ok", "integrity_check");
+    assert_eq!(frank.fsqlite_integrity, "ok", "fsqlite integrity_check");
     assert_eq!(
         usize::try_from(frank.final_rows).expect("row count"),
         frank.committed,

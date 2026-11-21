@@ -46,6 +46,17 @@
 //!
 //! The in-process arms run the same steps on two connections of one process,
 //! then threads writing one table, each followed by a stock `integrity_check`.
+//!
+//! bd-1epn5: the splitter can also be a stock process. Stock's quick balance
+//! never writes the old leaf, so no restaging on fsqlite's side can surface
+//! it; the appender must notice that the route to its leaf changed. On main
+//! a12e944af both stock-splitter arms committed both rows and stock reported
+//! "Tree 2 page 11 cell 76: Rowid 422 out of order". The fix makes the leaf's
+//! parent a route dependency of the append: a parent changed after the
+//! snapshot refuses the COMMIT only when the current tree no longer routes the
+//! appended key to the leaf. The middle-split arm is the other side: a stock
+//! split under the same parent that leaves the leaf the right edge is no
+//! conflict.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -137,6 +148,35 @@ impl Order {
             "splitter-first" => Self::SplitterFirst,
             "appender-first" => Self::AppenderFirst,
             other => panic!("unknown order {other}"),
+        }
+    }
+}
+
+/// The engine of the splitter's process. The appender is always fsqlite: it
+/// is the side whose stale snapshot can append past a new divider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    Fsqlite,
+    /// bd-1epn5: stock's quick balance (`balance_quick`) moves the right edge
+    /// off the leaf without staging the leaf at all: its commit carries the
+    /// parent and the new leaf only, so no claim of the old leaf ever reaches
+    /// the WAL for the appender to see.
+    Stock,
+}
+
+impl Engine {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Fsqlite => "fsqlite",
+            Self::Stock => "stock",
+        }
+    }
+
+    fn parse(name: &str) -> Self {
+        match name {
+            "fsqlite" => Self::Fsqlite,
+            "stock" => Self::Stock,
+            other => panic!("unknown engine {other}"),
         }
     }
 }
@@ -355,9 +395,18 @@ async fn transaction<F: std::future::Future<Output = ()>>(
     role: Role,
     before_commit: impl FnOnce() -> F,
 ) -> Outcome {
+    transaction_with_insert(conn, &insert_sql(role), before_commit).await
+}
+
+/// [`transaction`] with the INSERT `insert`.
+async fn transaction_with_insert<F: std::future::Future<Output = ()>>(
+    conn: &Connection,
+    insert: &str,
+    before_commit: impl FnOnce() -> F,
+) -> Outcome {
     conn.execute("BEGIN").await.expect("BEGIN");
     let insert_error = conn
-        .execute(&insert_sql(role))
+        .execute(insert)
         .await
         .err()
         .map(|error| error.to_string());
@@ -373,6 +422,29 @@ async fn transaction<F: std::future::Future<Output = ()>>(
         rowid,
         commit_error,
         in_transaction_after_commit: conn.in_transaction(),
+    }
+}
+
+/// [`transaction`] on a stock connection: BEGIN; the role's INSERT;
+/// `last_insert_rowid()`; COMMIT.
+fn stock_transaction(conn: &rusqlite::Connection, role: Role) -> Outcome {
+    conn.execute_batch("BEGIN").expect("stock BEGIN");
+    let insert_error = conn
+        .execute(&insert_sql(role), [])
+        .err()
+        .map(|error| error.to_string());
+    let rowid = conn
+        .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
+        .expect("stock last_insert_rowid");
+    let commit_error = conn.execute_batch("COMMIT").err().map(|error| {
+        let code = error.sqlite_error().map_or(-1, |error| error.extended_code);
+        (code, error.to_string())
+    });
+    Outcome {
+        insert_error,
+        rowid,
+        commit_error,
+        in_transaction_after_commit: !conn.is_autocommit(),
     }
 }
 
@@ -394,18 +466,40 @@ fn wait_for(path: &Path) {
 /// and create `ready-<role>`. On `go`, the second committer (warm: after a
 /// commit to `side`) begins and inserts, then creates `held`. The first
 /// committer waits for `held`, runs its whole transaction, and creates
-/// `first-done`; the second then commits.
+/// `first-done`; the second then commits. A stock splitter is always the
+/// first committer.
 #[test]
 fn split_claim_child() {
     let Ok(spec) = std::env::var(CHILD_ENV) else {
         return;
     };
     let fields: Vec<&str> = spec.split('|').collect();
-    let [role, order, wal, db, dir] = fields[..] else {
+    let [role, order, wal, db, dir, splitter_engine] = fields[..] else {
         panic!("malformed child spec {spec}");
     };
     let (role, order, wal) = (Role::parse(role), Order::parse(order), WalState::parse(wal));
     let (db, dir) = (db.to_owned(), PathBuf::from(dir));
+    if role == Role::Splitter && Engine::parse(splitter_engine) == Engine::Stock {
+        assert_eq!(
+            order,
+            Order::SplitterFirst,
+            "a stock splitter commits first"
+        );
+        let conn = rusqlite::Connection::open(&db).expect("stock child open");
+        conn.busy_timeout(Duration::from_millis(2000))
+            .expect("stock busy_timeout");
+        std::fs::write(dir.join(format!("ready-{}", role.name())), b"").expect("ready");
+        wait_for(&dir.join("go"));
+        wait_for(&dir.join("held"));
+        let outcome = stock_transaction(&conn, role);
+        std::fs::write(dir.join("first-done"), b"").expect("first-done");
+        // Stay open until the appender has exited, so this close is never the
+        // last one (which would checkpoint and reset the WAL under it).
+        wait_for(&dir.join("appender-exited"));
+        drop(conn);
+        println!("event=split_claim_outcome {}", outcome.encode());
+        return;
+    }
     let outcome = fsqlite_e2e::block_on(async move {
         let conn = Connection::open(&db).await.expect("child open");
         conn.execute("PRAGMA busy_timeout=2000")
@@ -580,8 +674,13 @@ fn assert_raced(label: &str, db: &Path, fixture: &Fixture, appender: &Outcome, s
     }
 }
 
-fn cross_process_case(wal: WalState, order: Order) {
-    let label = format!("cross-process {} {}", wal.name(), order.name());
+fn cross_process_case(wal: WalState, order: Order, splitter_engine: Engine) {
+    let label = format!(
+        "cross-process {} {} {}-splitter",
+        wal.name(),
+        order.name(),
+        splitter_engine.name()
+    );
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("split.db");
     let fixture = fsqlite_e2e::block_on(build_fixture(&db));
@@ -599,12 +698,13 @@ fn cross_process_case(wal: WalState, order: Order) {
                 .env(
                     CHILD_ENV,
                     format!(
-                        "{}|{}|{}|{}|{}",
+                        "{}|{}|{}|{}|{}|{}",
                         role.name(),
                         order.name(),
                         wal.name(),
                         db.display(),
-                        dir.path().display()
+                        dir.path().display(),
+                        splitter_engine.name()
                     ),
                 )
                 .stdout(Stdio::piped())
@@ -630,7 +730,10 @@ fn cross_process_case(wal: WalState, order: Order) {
         let output = drain.join().expect("drain thread").expect("child output");
         let outcome = child_outcome(&output, role);
         match role {
-            Role::Appender => appender = Some(outcome),
+            Role::Appender => {
+                appender = Some(outcome);
+                std::fs::write(dir.path().join("appender-exited"), b"").expect("appender-exited");
+            }
             Role::Splitter => splitter = Some(outcome),
         }
     }
@@ -674,7 +777,7 @@ fn cross_process_split_claim_warm_splitter_first() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
-    cross_process_case(WalState::Warm, Order::SplitterFirst);
+    cross_process_case(WalState::Warm, Order::SplitterFirst, Engine::Fsqlite);
 }
 
 #[test]
@@ -682,7 +785,7 @@ fn cross_process_split_claim_warm_appender_first() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
-    cross_process_case(WalState::Warm, Order::AppenderFirst);
+    cross_process_case(WalState::Warm, Order::AppenderFirst, Engine::Fsqlite);
 }
 
 #[test]
@@ -690,7 +793,7 @@ fn cross_process_split_claim_cold_splitter_first() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
-    cross_process_case(WalState::Cold, Order::SplitterFirst);
+    cross_process_case(WalState::Cold, Order::SplitterFirst, Engine::Fsqlite);
 }
 
 #[test]
@@ -698,7 +801,203 @@ fn cross_process_split_claim_cold_appender_first() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return;
     }
-    cross_process_case(WalState::Cold, Order::AppenderFirst);
+    cross_process_case(WalState::Cold, Order::AppenderFirst, Engine::Fsqlite);
+}
+
+/// bd-1epn5: the splitter is a stock process. Its quick balance commits the
+/// root (the new divider and right child) and the new leaf, and never the old
+/// right-edge leaf, so the old leaf has no frame for the fsqlite appender's
+/// first-committer-wins check to find. The appender's insert depended on the
+/// root routing its rowid to that leaf, so its COMMIT must still be refused.
+#[test]
+fn cross_process_split_claim_warm_stock_splitter_first() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    cross_process_case(WalState::Warm, Order::SplitterFirst, Engine::Stock);
+}
+
+#[test]
+fn cross_process_split_claim_cold_stock_splitter_first() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    cross_process_case(WalState::Cold, Order::SplitterFirst, Engine::Stock);
+}
+
+const MIDDLE_SPLIT_CHILD_ENV: &str = "FSQLITE_MIDDLE_SPLIT_CHILD";
+/// The middle-split fixture's 1000-byte rows: four fill a 4 KiB leaf.
+const MIDDLE_SPLIT_SEED_IDS: std::ops::RangeInclusive<i64> = 10..=140;
+const MIDDLE_SPLIT_APPEND: &str = "INSERT INTO g(payload) VALUES (zeroblob(16))";
+
+/// The `(left child, divider)` cells and the right child of the table
+/// interior page `page_no` in the main database file. Dividers here are below
+/// 128, one-byte varints.
+fn interior_shape(db: &Path, page_no: u32) -> (Vec<(u32, u8)>, u32) {
+    let data = std::fs::read(db).expect("read database file");
+    let start = (usize::try_from(page_no).expect("page") - 1) * 4096;
+    let page = &data[start..start + 4096];
+    assert_eq!(page[0], 0x05, "page {page_no} is a table interior page");
+    let cells = (0..be16(page, 3))
+        .map(|index| {
+            let cell = be16(page, 12 + 2 * index);
+            let child = u32::from_be_bytes(page[cell..cell + 4].try_into().expect("child"));
+            assert!(page[cell + 4] < 0x80, "a one-byte divider");
+            (child, page[cell + 4])
+        })
+        .collect();
+    (
+        cells,
+        u32::from_be_bytes(page[8..12].try_into().expect("right child")),
+    )
+}
+
+/// The fsqlite appender of
+/// [`cross_process_middle_split_keeps_a_right_edge_append_bd_1epn5`]: it
+/// appends a 16-byte row, creates `staged`, commits once `commit` exists, and
+/// prints its outcome.
+#[test]
+fn middle_split_appender_child() {
+    let Ok(spec) = std::env::var(MIDDLE_SPLIT_CHILD_ENV) else {
+        return;
+    };
+    let (db, dir) = spec.split_once('|').expect("db|dir");
+    let (db, dir) = (db.to_owned(), PathBuf::from(dir));
+    let outcome = fsqlite_e2e::block_on(async move {
+        let conn = Connection::open(&db).await.expect("appender open");
+        conn.execute("PRAGMA busy_timeout=2000")
+            .await
+            .expect("busy_timeout");
+        let outcome = transaction_with_insert(&conn, MIDDLE_SPLIT_APPEND, || async {
+            std::fs::write(dir.join("staged"), b"").expect("staged");
+            wait_for(&dir.join("commit"));
+        })
+        .await;
+        conn.close().await.expect("appender close");
+        outcome
+    });
+    println!("event=middle_split_outcome {}", outcome.encode());
+}
+
+/// bd-1epn5, the other side of the fix: a changed parent alone is no
+/// conflict. The root has four leaves, A B C and the right edge L. An fsqlite
+/// process appends a row to L and holds its transaction; a stock process
+/// inserts into the full leaf B, whose split rebalances A B C and rewrites
+/// the root, but leaves L as the root's right child and leaves L's bytes
+/// alone. The append's route to L still holds, so it commits: stock's commit
+/// touched no page the append wrote, and nothing moved L's keys.
+#[test]
+fn cross_process_middle_split_keeps_a_right_edge_append_bd_1epn5() {
+    if std::env::var_os(CHILD_ENV).is_some() || std::env::var_os(MIDDLE_SPLIT_CHILD_ENV).is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("middle.db");
+    let stock = rusqlite::Connection::open(&db).expect("stock open");
+    stock
+        .execute_batch(
+            "PRAGMA page_size=4096; PRAGMA journal_mode=WAL;
+             CREATE TABLE g(id INTEGER PRIMARY KEY, payload BLOB);",
+        )
+        .expect("schema");
+    for id in MIDDLE_SPLIT_SEED_IDS.step_by(10) {
+        stock
+            .execute(
+                "INSERT INTO g(id, payload) VALUES (?1, zeroblob(1000))",
+                [id],
+            )
+            .expect("seed row");
+    }
+    stock
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("seed checkpoint");
+    let (seed_cells, edge) = interior_shape(&db, 2);
+    assert_eq!(
+        seed_cells
+            .iter()
+            .map(|(_, divider)| *divider)
+            .collect::<Vec<_>>(),
+        vec![40, 80, 120],
+        "fixture: leaves A B C of four rows and the right edge L"
+    );
+
+    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "middle_split_appender_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            MIDDLE_SPLIT_CHILD_ENV,
+            format!("{}|{}", db.display(), dir.path().display()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn appender");
+    let started = Instant::now();
+    while !dir.path().join("staged").exists() {
+        assert!(
+            child.try_wait().expect("appender status").is_none(),
+            "the appender exited before staging its row"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the appender never staged its row"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    stock
+        .execute_batch("BEGIN; INSERT INTO g(id, payload) VALUES (55, zeroblob(1000)); COMMIT;")
+        .expect("stock splits the middle leaf B");
+    std::fs::write(dir.path().join("commit"), b"").expect("commit");
+    let output = child.wait_with_output().expect("appender output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let marker = "event=middle_split_outcome ";
+    let appender = stdout
+        .lines()
+        .find_map(|line| {
+            line.find(marker)
+                .map(|at| Outcome::decode(&line[at + marker.len()..]))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the appender produced no outcome (status {:?}):\n{stdout}\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    eprintln!("event=middle_split_case appender={}", appender.encode());
+    assert!(
+        appender.committed() && appender.rowid == 141,
+        "the right-edge append commits after a split that left its route alone: {appender:?}"
+    );
+
+    let integrity: String = stock
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("integrity_check");
+    assert_eq!(integrity, "ok", "stock integrity_check");
+    let ids: Vec<i64> = stock
+        .prepare("SELECT id FROM g ORDER BY id")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("ids")
+        .collect::<rusqlite::Result<_>>()
+        .expect("ids");
+    let mut expected: Vec<i64> = MIDDLE_SPLIT_SEED_IDS.step_by(10).collect();
+    expected.extend([55, 141]);
+    expected.sort_unstable();
+    assert_eq!(ids, expected, "both commits are durable");
+    stock
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("verification checkpoint");
+    let (cells, right_child) = interior_shape(&db, 2);
+    assert!(
+        cells.len() > seed_cells.len() && right_child == edge,
+        "non-vacuity: the split rewrote the root ({seed_cells:?} -> {cells:?}) and L ({edge}) \
+         stayed its right child ({right_child})"
+    );
 }
 
 /// The same steps on two connections of one process. The in-process page

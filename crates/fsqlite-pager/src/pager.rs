@@ -107,7 +107,8 @@ use fsqlite_wal::{
     ParallelWalLaneStager, ParallelWalOperatingMode, ParallelWalPendingPublication,
     ParallelWalShadowVerdict, ParallelWalVisibilitySnapshot, RecoveryFence, SubmitOutcome,
     TransactionConflictPageBaseline, TransactionConflictSnapshot, TransactionFrameBatch,
-    TransactionFrameBatchContext, WalFile, WalGenerationIdentity, commit_phase_timing_enabled,
+    TransactionFrameBatchContext, TransactionRouteDependency, WalFile, WalGenerationIdentity,
+    commit_phase_timing_enabled,
     detailed_consolidation_metrics_enabled, parallel_wal_fallback_reason_name,
     parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
     resolve_parallel_wal_control_surface_from_env,
@@ -12206,12 +12207,162 @@ impl Drop for HeldAppendGate<'_> {
     }
 }
 
+/// The b-tree page header's offset in `page_no`'s image: page 1 carries the
+/// 100-byte database header first.
+const fn btree_header_offset(page_no: PageNumber) -> usize {
+    if page_no.get() == 1 {
+        DATABASE_HEADER_SIZE
+    } else {
+        0
+    }
+}
+
+/// The largest rowid on a table leaf image (its last cell, in cell-pointer
+/// order). `None` when the image is not a table leaf, holds no cell, or is
+/// malformed.
+fn table_leaf_max_rowid(page_no: PageNumber, image: &[u8]) -> Option<i64> {
+    let header = btree_header_offset(page_no);
+    if *image.get(header)? != 0x0D {
+        return None;
+    }
+    let cells = usize::from(u16::from_be_bytes([
+        *image.get(header + 3)?,
+        *image.get(header + 4)?,
+    ]));
+    let last_pointer = header + 8 + 2 * cells.checked_sub(1)?;
+    let cell = usize::from(u16::from_be_bytes([
+        *image.get(last_pointer)?,
+        *image.get(last_pointer + 1)?,
+    ]));
+    let cell = image.get(cell..)?;
+    let (_, payload_len_bytes) = fsqlite_types::serial_type::read_varint(cell)?;
+    let (rowid, _) = fsqlite_types::serial_type::read_varint(cell.get(payload_len_bytes..)?)?;
+    Some(i64::from_ne_bytes(rowid.to_ne_bytes()))
+}
+
+/// The `(left child, divider rowid)` cells, in cell-pointer order, and the
+/// right child of a table interior image. `None` for any other image or a
+/// malformed one.
+fn table_interior_cells(page_no: PageNumber, image: &[u8]) -> Option<(Vec<(u32, i64)>, u32)> {
+    let header = btree_header_offset(page_no);
+    if *image.get(header)? != 0x05 {
+        return None;
+    }
+    let cell_count = usize::from(u16::from_be_bytes([
+        *image.get(header + 3)?,
+        *image.get(header + 4)?,
+    ]));
+    let right_child = u32::from_be_bytes(image.get(header + 8..header + 12)?.try_into().ok()?);
+    let mut cells = Vec::with_capacity(cell_count);
+    for index in 0..cell_count {
+        let pointer = header + 12 + 2 * index;
+        let cell = usize::from(u16::from_be_bytes([
+            *image.get(pointer)?,
+            *image.get(pointer + 1)?,
+        ]));
+        let child = u32::from_be_bytes(image.get(cell..cell + 4)?.try_into().ok()?);
+        let (divider, _) = fsqlite_types::serial_type::read_varint(image.get(cell + 4..)?)?;
+        cells.push((child, i64::from_ne_bytes(divider.to_ne_bytes())));
+    }
+    Some((cells, right_child))
+}
+
+/// The right child of a table interior image, `None` for any other image.
+fn table_interior_right_child(page_no: PageNumber, image: &[u8]) -> Option<u32> {
+    let header = btree_header_offset(page_no);
+    if *image.get(header)? != 0x05 {
+        return None;
+    }
+    Some(u32::from_be_bytes(image.get(header + 8..header + 12)?.try_into().ok()?))
+}
+
+/// Whether a table interior image points at `child`, through its right child
+/// or a cell. `false` for any other image. Allocation-free: commit
+/// preparation runs it over pages a transaction read.
+fn table_interior_points_at(page_no: PageNumber, image: &[u8], child: u32) -> bool {
+    let header = btree_header_offset(page_no);
+    if image.get(header) != Some(&0x05) {
+        return false;
+    }
+    let child_bytes = child.to_be_bytes();
+    if image
+        .get(header + 8..header + 12)
+        .is_some_and(|right_child| right_child == child_bytes)
+    {
+        return true;
+    }
+    let Some(&[high, low]) = image.get(header + 3..header + 5) else {
+        return false;
+    };
+    (0..usize::from(u16::from_be_bytes([high, low]))).any(|index| {
+        let pointer = header + 12 + 2 * index;
+        image
+            .get(pointer..pointer + 2)
+            .map(|bytes| usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+            .and_then(|cell| image.get(cell..cell + 4))
+            .is_some_and(|cell_child| cell_child == child_bytes)
+    })
+}
+
+/// The child of a table interior image that holds `key`: the left child of
+/// the first cell whose divider is at least `key`, else the right child.
+fn table_interior_child_for_key(page_no: PageNumber, image: &[u8], key: i64) -> Option<u32> {
+    let (cells, right_child) = table_interior_cells(page_no, image)?;
+    Some(
+        cells
+            .into_iter()
+            .find(|&(_, divider)| divider >= key)
+            .map_or(right_child, |(child, _)| child),
+    )
+}
+
+/// bd-1epn5: whether the current durable tree still routes `route.key` to
+/// `route.leaf`, derived from `route.top` with the images the append gate
+/// sees (the appended WAL tail, then the main file). `false` when the route
+/// cannot be derived: no trusted top, a page that is no longer a table
+/// interior page, or a descent that ends elsewhere.
+async fn right_edge_route_holds<F: VfsFile>(
+    cx: &Cx,
+    wal: &mut dyn WalBackend,
+    db_file: &SharedDbFile<F>,
+    page_cipher: &PageCipherSlot,
+    page_size: usize,
+    route: TransactionRouteDependency,
+) -> Result<bool> {
+    let Some(mut page_no) = route.top else {
+        return Ok(false);
+    };
+    for _ in 0..64 {
+        if page_no == route.leaf {
+            return Ok(true);
+        }
+        let Some(page) = PageNumber::new(page_no) else {
+            return Ok(false);
+        };
+        let Some(image) =
+            read_durable_page_under_gate(cx, wal, db_file, page_cipher, page_size, page_no)
+                .await?
+        else {
+            return Ok(false);
+        };
+        let Some(child) = table_interior_child_for_key(page, &image, route.key) else {
+            return Ok(false);
+        };
+        page_no = child;
+    }
+    Ok(false)
+}
+
+/// The pages of `batches` committed by others after each batch's snapshot,
+/// and the route dependencies (bd-1epn5) whose parent was: those conflict
+/// only if [`right_edge_route_holds`] fails for them.
 async fn conflicting_pages_since_batch_snapshots(
     cx: &Cx,
     wal: &mut dyn WalBackend,
     batches: &[TransactionFrameBatch],
-) -> Result<Vec<u32>> {
+) -> Result<(Vec<u32>, Vec<TransactionRouteDependency>)> {
     let mut conflicts = Vec::<u32>::new();
+    let mut changed_routes = Vec::<TransactionRouteDependency>::new();
     for batch in batches {
         let Some(snapshot) = batch.conflict_snapshot else {
             if dk9ra_trace_enabled() {
@@ -12242,19 +12393,45 @@ async fn conflicting_pages_since_batch_snapshots(
                 batch.conflict_pages.len()
             );
         }
+        // A route parent the batch also writes is already a conflict page.
+        let route_parents: Vec<u32> = batch
+            .route_dependencies
+            .iter()
+            .map(|route| route.parent)
+            .filter(|parent| !batch.conflict_pages.contains(parent))
+            .collect();
+        let candidates = if route_parents.is_empty() {
+            std::borrow::Cow::Borrowed(batch.conflict_pages.as_slice())
+        } else {
+            let mut candidates = batch.conflict_pages.clone();
+            candidates.extend(route_parents.iter().copied());
+            std::borrow::Cow::Owned(candidates)
+        };
         let batch_conflicts = wal
             .conflicting_pages_since_snapshot(
                 cx,
                 snapshot,
-                &batch.conflict_pages,
+                &candidates,
                 &batch.conflict_page_baselines,
             )
             .await?;
-        conflicts.extend(batch_conflicts);
+        for page in batch_conflicts {
+            if route_parents.contains(&page) {
+                changed_routes.extend(
+                    batch
+                        .route_dependencies
+                        .iter()
+                        .filter(|route| route.parent == page)
+                        .copied(),
+                );
+            } else {
+                conflicts.push(page);
+            }
+        }
     }
     conflicts.sort_unstable();
     conflicts.dedup();
-    Ok(conflicts)
+    Ok((conflicts, changed_routes))
 }
 
 /// Read one page's CURRENT durable image while the append gate is held:
@@ -24795,6 +24972,98 @@ where
         pages
     }
 
+    /// bd-1epn5: the routes this transaction's right-edge appends rely on.
+    ///
+    /// A staged table leaf whose largest rowid grew past its snapshot image's
+    /// largest rowid took keys beyond the leaf's old last cell. They belong on
+    /// that leaf only while the tree routes them there. When the leaf is its
+    /// parent's right child, another writer can cap it without writing it: a
+    /// quick balance adds a parent divider equal to the leaf's largest key
+    /// and hangs a new right child off the parent. fsqlite's own quick balance
+    /// restages the leaf (bd-73pfl), so the leaf's frame shows it; stock
+    /// SQLite's `balance_quick` commits only the parent and the new leaf.
+    /// Committing the stale leaf then stores keys past the divider ("Rowid N
+    /// out of order", one rowid on two leaves).
+    ///
+    /// The parent and every ancestor above it are found among the pages this
+    /// snapshot read: the descent that chose the leaf read them. The flusher
+    /// checks the parent for frames newer than the snapshot and, when it
+    /// changed, derives the route to the largest staged key again from the
+    /// topmost of those ancestors (bd-1epn5). Nothing is staged for the
+    /// parent, and no in-process conflict surface sees it.
+    fn right_edge_append_routes(&self) -> Vec<TransactionRouteDependency> {
+        let txn_read_cache = self.txn_read_cache.borrow();
+        let grown_leaves: Vec<(u32, i64)> = self
+            .write_pages_sorted
+            .iter()
+            .filter_map(|page_no| {
+                let baseline_max = txn_read_cache
+                    .get(page_no)
+                    .and_then(|baseline| table_leaf_max_rowid(*page_no, baseline.as_bytes()))?;
+                let staged_max = self
+                    .write_set
+                    .get(page_no)
+                    .and_then(|staged| table_leaf_max_rowid(*page_no, staged.as_page_bytes()))?;
+                (staged_max > baseline_max).then_some((page_no.get(), staged_max))
+            })
+            .collect();
+        if grown_leaves.is_empty() {
+            return Vec::new();
+        }
+        // The interior table page of the snapshot whose right child is
+        // `child` (a page has one parent in a consistent snapshot). Only the
+        // right-child pointer is compared, so no cell is read.
+        let right_parent_of = |child: u32| {
+            txn_read_cache.iter().find_map(|(page_no, image)| {
+                (table_interior_right_child(*page_no, image.as_bytes()) == Some(child))
+                    .then_some(page_no.get())
+            })
+        };
+        // The interior table page of the snapshot, not on `path`, that points
+        // at `child` through a cell.
+        let cell_parent_of = |child: u32, path: &[u32]| {
+            txn_read_cache.iter().find_map(|(page_no, image)| {
+                (!path.contains(&page_no.get())
+                    && table_interior_points_at(*page_no, image.as_bytes(), child))
+                .then_some(page_no.get())
+            })
+        };
+        let complete = !self.txn_read_cache_incomplete.get();
+        grown_leaves
+            .into_iter()
+            .filter_map(|(leaf, key)| {
+                let parent = right_parent_of(leaf)?;
+                // Up the right spine first; cells are read only where the
+                // spine ends, and only on pages off the path, which an
+                // append's descent rarely read. The bound (b-trees are a few
+                // dozen levels deep) only guards a malformed snapshot.
+                let mut top = None;
+                if complete {
+                    let mut path = vec![parent];
+                    let mut current = parent;
+                    for _ in 0..64 {
+                        match right_parent_of(current).or_else(|| cell_parent_of(current, &path)) {
+                            Some(above) => {
+                                path.push(above);
+                                current = above;
+                            }
+                            None => {
+                                top = Some(current);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Some(TransactionRouteDependency {
+                    parent,
+                    leaf,
+                    key,
+                    top,
+                })
+            })
+            .collect()
+    }
+
     /// Capture exact, snapshot-bound full-page images for conflict candidates.
     ///
     /// The transaction read cache is the only safe source here: it is pinned
@@ -24822,6 +25091,29 @@ where
                     })
             })
             .collect()
+    }
+
+    /// [`Self::conflict_page_baselines`] of the conflict pages and of the
+    /// route parents (bd-1epn5) that are not among them: the flusher checks
+    /// both against a replaced WAL generation.
+    fn cross_process_conflict_page_baselines(
+        &self,
+        conflict_pages: &[PageNumber],
+        routes: &[TransactionRouteDependency],
+    ) -> Vec<TransactionConflictPageBaseline> {
+        if routes.is_empty() {
+            return self.conflict_page_baselines(conflict_pages);
+        }
+        let mut pages = conflict_pages.to_vec();
+        pages.extend(
+            routes
+                .iter()
+                .filter_map(|route| PageNumber::new(route.parent))
+                .filter(|parent| !conflict_pages.contains(parent)),
+        );
+        pages.sort_unstable();
+        pages.dedup();
+        self.conflict_page_baselines(&pages)
     }
 
     /// Whether another same-process transaction on this file could join a
@@ -25843,6 +26135,7 @@ where
             conflict_pages,
             conflict_snapshot,
             &[],
+            Vec::new(),
             None,
             Vec::new(),
             Vec::new(),
@@ -25874,6 +26167,8 @@ where
         conflict_pages: &[PageNumber],
         conflict_snapshot: Option<traits::WalPublicationSnapshot>,
         conflict_page_baselines: &[TransactionConflictPageBaseline],
+        // bd-1epn5: the routes this commit's right-edge appends rely on.
+        route_dependencies: Vec<TransactionRouteDependency>,
         // bd-gh302/bd-0shxy: exact durable-freelist content this commit's
         // page-1/trunk frames publish (None when no freelist metadata is
         // serialized), plus the transaction's own freed and consumed
@@ -25996,7 +26291,8 @@ where
             conflict_snapshot,
             conflict_page_baselines,
             allocation_base_db_size,
-        );
+        )
+        .with_route_dependencies(route_dependencies);
         let carries_freelist_publication = published_durable_freelist.is_some();
         let batch = batch.with_freelist_publication(
             published_durable_freelist,
@@ -26834,9 +27130,48 @@ where
                                 wal.preflight_native_append(cx).await?;
                                 let t_append_conflict_check_start =
                                     detailed_metrics.then(Instant::now);
-                                let stale_conflict_pages =
+                                let (mut stale_conflict_pages, changed_routes) =
                                     conflicting_pages_since_batch_snapshots(cx, wal, &batches)
                                         .await?;
+                                // bd-1epn5: a right-edge append whose leaf's
+                                // parent changed conflicts unless the route
+                                // to its largest key still ends at the leaf.
+                                if !changed_routes.is_empty() {
+                                    let page_size = batches
+                                        .iter()
+                                        .flat_map(|batch| batch.frames.iter())
+                                        .map(|frame| frame.page_data.len())
+                                        .next();
+                                    let page_cipher = {
+                                        let inner = inner_arc.lock().map_err(|_| {
+                                            FrankenError::internal(
+                                                "SimpleTransaction lock poisoned",
+                                            )
+                                        })?;
+                                        inner.page_cipher.clone()
+                                    };
+                                    for route in changed_routes {
+                                        let holds = match page_size {
+                                            Some(page_size) => {
+                                                right_edge_route_holds(
+                                                    cx,
+                                                    wal,
+                                                    &db_file,
+                                                    &page_cipher,
+                                                    page_size,
+                                                    route,
+                                                )
+                                                .await?
+                                            }
+                                            None => false,
+                                        };
+                                        if !holds {
+                                            stale_conflict_pages.push(route.parent);
+                                        }
+                                    }
+                                    stale_conflict_pages.sort_unstable();
+                                    stale_conflict_pages.dedup();
+                                }
                                 append_conflict_check_us =
                                     elapsed_profile_us(t_append_conflict_check_start);
                                 if !stale_conflict_pages.is_empty() {
@@ -29956,8 +30291,16 @@ where
                     Vec::new()
                 };
             }
-            let cross_process_conflict_page_baselines =
-                self.conflict_page_baselines(&cross_process_conflict_pages);
+            let right_edge_routes = if self.journal_mode == JournalMode::Wal {
+                self.right_edge_append_routes()
+            } else {
+                Vec::new()
+            };
+            let cross_process_conflict_page_baselines = self
+                .cross_process_conflict_page_baselines(
+                    &cross_process_conflict_pages,
+                    &right_edge_routes,
+                );
             let wal_current_db_size = inner.db_size;
             let wal_sync_policy = inner.wal_commit_sync_policy;
 
@@ -29991,6 +30334,7 @@ where
                     &cross_process_conflict_pages,
                     self.wal_conflict_snapshot,
                     &cross_process_conflict_page_baselines,
+                    right_edge_routes,
                     published_durable_freelist.take(),
                     pending_free_pages.iter().map(|page| page.get()).collect(),
                     self.allocated_from_freelist
@@ -30864,8 +31208,16 @@ where
                 } else {
                     Vec::new()
                 };
-                let cross_process_conflict_page_baselines =
-                    self.conflict_page_baselines(&cross_process_conflict_pages);
+                let right_edge_routes = if self.journal_mode == JournalMode::Wal {
+                    self.right_edge_append_routes()
+                } else {
+                    Vec::new()
+                };
+                let cross_process_conflict_page_baselines = self
+                    .cross_process_conflict_page_baselines(
+                        &cross_process_conflict_pages,
+                        &right_edge_routes,
+                    );
                 let wal_current_db_size = inner.db_size;
                 let wal_sync_policy = inner.wal_commit_sync_policy;
 
@@ -30884,6 +31236,7 @@ where
                         &cross_process_conflict_pages,
                         self.wal_conflict_snapshot,
                         &cross_process_conflict_page_baselines,
+                        right_edge_routes,
                         published_durable_freelist.take(),
                         pending_free_pages.iter().map(|page| page.get()).collect(),
                         self.allocated_from_freelist
@@ -61525,6 +61878,194 @@ mod tests {
                 "bead_id={BEAD_ID} case=data_page_remains_cross_process_conflict"
             );
         });
+    }
+
+    /// bd-1epn5: a table leaf image holding `rowids` (each < 128) with empty
+    /// records, cells packed at the end of the page in rowid order.
+    fn bd_1epn5_table_leaf(rowids: &[i64]) -> Vec<u8> {
+        let ps = PageSize::DEFAULT.as_usize();
+        let mut page = vec![0_u8; ps];
+        page[0] = 0x0D;
+        page[3..5].copy_from_slice(&u16::try_from(rowids.len()).unwrap().to_be_bytes());
+        let mut content = ps;
+        for (index, rowid) in rowids.iter().enumerate() {
+            // Payload length 1, the one-byte rowid, a one-byte record header.
+            let cell = [1_u8, u8::try_from(*rowid).unwrap(), 1];
+            content -= cell.len();
+            page[content..content + cell.len()].copy_from_slice(&cell);
+            let pointer = 8 + 2 * index;
+            page[pointer..pointer + 2].copy_from_slice(&u16::try_from(content).unwrap().to_be_bytes());
+        }
+        page[5..7].copy_from_slice(&u16::try_from(content).unwrap().to_be_bytes());
+        page
+    }
+
+    /// bd-1epn5: a table interior image with `(left child, divider)` cells
+    /// (dividers < 128) and `right_child`.
+    fn bd_1epn5_table_interior(cells: &[(PageNumber, i64)], right_child: PageNumber) -> Vec<u8> {
+        let ps = PageSize::DEFAULT.as_usize();
+        let mut page = vec![0_u8; ps];
+        page[0] = 0x05;
+        page[3..5].copy_from_slice(&u16::try_from(cells.len()).unwrap().to_be_bytes());
+        page[8..12].copy_from_slice(&right_child.get().to_be_bytes());
+        let mut content = ps;
+        for (index, (child, divider)) in cells.iter().enumerate() {
+            let mut cell = child.get().to_be_bytes().to_vec();
+            cell.push(u8::try_from(*divider).unwrap());
+            content -= cell.len();
+            page[content..content + cell.len()].copy_from_slice(&cell);
+            let pointer = 12 + 2 * index;
+            page[pointer..pointer + 2].copy_from_slice(&u16::try_from(content).unwrap().to_be_bytes());
+        }
+        page[5..7].copy_from_slice(&u16::try_from(content).unwrap().to_be_bytes());
+        page
+    }
+
+    /// bd-1epn5: the route dependencies of a concurrent transaction that read
+    /// `read` and then staged `image` over `leaf`, with its cross-process
+    /// conflict pages.
+    async fn bd_1epn5_routes_after_write(
+        pager: &SimplePager<MemoryVfs>,
+        cx: &Cx,
+        read: &[PageNumber],
+        leaf: PageNumber,
+        image: &[u8],
+    ) -> (Vec<TransactionRouteDependency>, Vec<PageNumber>) {
+        let mut txn = pager.begin(cx, TransactionMode::Concurrent).await.unwrap();
+        for page in read {
+            txn.get_page(cx, *page).await.unwrap();
+        }
+        txn.write_page(cx, leaf, image).await.unwrap();
+        let conflict_pages = {
+            let inner = txn.inner.lock().unwrap();
+            let committed_db_size = txn.committed_db_size_with_inner(&inner);
+            let freelist_dirty = txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            let wal_page1_plan = txn.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+            txn.predicted_conflict_pages_for_wal_commit_with_inner(&inner, wal_page1_plan, &[])
+        };
+        let routes = txn.right_edge_append_routes();
+        txn.rollback(cx).await.unwrap();
+        (routes, conflict_pages)
+    }
+
+    /// bd-1epn5: a stock quick balance caps a right-edge leaf by writing only
+    /// its parent and a new leaf. A transaction that appended past the leaf's
+    /// last cell must carry the route to that leaf: its parent, its largest
+    /// staged key, and the topmost ancestor it read. The route adds nothing to
+    /// the write-intent conflict pages. An insert that keeps the leaf's
+    /// largest rowid, or an append to a leaf that is not its parent's right
+    /// child (a divider already bounds it), has no route.
+    #[test]
+    fn test_right_edge_append_records_the_route_to_its_leaf_bd_1epn5() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let root = seed.allocate_page(&cx).await.unwrap();
+            let parent = seed.allocate_page(&cx).await.unwrap();
+            let middle = seed.allocate_page(&cx).await.unwrap();
+            let right = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, middle, &bd_1epn5_table_leaf(&[1, 2]))
+                .await
+                .unwrap();
+            seed.write_page(&cx, right, &bd_1epn5_table_leaf(&[20, 30]))
+                .await
+                .unwrap();
+            seed.write_page(&cx, parent, &bd_1epn5_table_interior(&[(middle, 10)], right))
+                .await
+                .unwrap();
+            seed.write_page(&cx, root, &bd_1epn5_table_interior(&[], parent))
+                .await
+                .unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            let route = |top: PageNumber| TransactionRouteDependency {
+                parent: parent.get(),
+                leaf: right.get(),
+                key: 31,
+                top: Some(top.get()),
+            };
+            let (routes, conflicts) = bd_1epn5_routes_after_write(
+                &pager,
+                &cx,
+                &[root, parent, right],
+                right,
+                &bd_1epn5_table_leaf(&[20, 30, 31]),
+            )
+            .await;
+            assert_eq!(
+                (routes, conflicts),
+                (vec![route(root)], vec![right]),
+                "bd-1epn5 case=right_edge_append_records_route_from_root"
+            );
+
+            let (routes, _) = bd_1epn5_routes_after_write(
+                &pager,
+                &cx,
+                &[parent, right],
+                right,
+                &bd_1epn5_table_leaf(&[20, 30, 31]),
+            )
+            .await;
+            assert_eq!(
+                routes,
+                vec![route(parent)],
+                "bd-1epn5 case=route_top_is_the_topmost_page_read"
+            );
+
+            let (routes, _) = bd_1epn5_routes_after_write(
+                &pager,
+                &cx,
+                &[root, parent, right],
+                right,
+                &bd_1epn5_table_leaf(&[20, 25, 30]),
+            )
+            .await;
+            assert!(
+                routes.is_empty(),
+                "bd-1epn5 case=insert_below_leaf_max_has_no_route {routes:?}"
+            );
+
+            let (routes, _) = bd_1epn5_routes_after_write(
+                &pager,
+                &cx,
+                &[root, parent, middle],
+                middle,
+                &bd_1epn5_table_leaf(&[1, 2, 7]),
+            )
+            .await;
+            assert!(
+                routes.is_empty(),
+                "bd-1epn5 case=append_to_left_child_has_no_route {routes:?}"
+            );
+        });
+    }
+
+    /// bd-1epn5: the flusher derives a changed route again with
+    /// `table_interior_child_for_key`. Before a quick balance the parent
+    /// sends every key past its last divider to the right-edge leaf; after
+    /// stock's quick balance (divider 30 for the leaf, a new right child) a
+    /// key past 30 goes to the new leaf, so the appender's route fails.
+    #[test]
+    fn test_table_interior_child_for_key_follows_dividers_bd_1epn5() {
+        let (middle, right, fresh) = (
+            PageNumber::new(3).unwrap(),
+            PageNumber::new(4).unwrap(),
+            PageNumber::new(5).unwrap(),
+        );
+        let page = PageNumber::new(2).unwrap();
+        let before = bd_1epn5_table_interior(&[(middle, 10)], right);
+        assert_eq!(table_interior_child_for_key(page, &before, 10), Some(middle.get()));
+        assert_eq!(table_interior_child_for_key(page, &before, 11), Some(right.get()));
+        assert_eq!(table_interior_child_for_key(page, &before, 31), Some(right.get()));
+        let capped = bd_1epn5_table_interior(&[(middle, 10), (right, 30)], fresh);
+        assert_eq!(table_interior_child_for_key(page, &capped, 30), Some(right.get()));
+        assert_eq!(table_interior_child_for_key(page, &capped, 31), Some(fresh.get()));
+        assert_eq!(
+            table_interior_child_for_key(page, &bd_1epn5_table_leaf(&[1]), 1),
+            None,
+            "a leaf image has no child"
+        );
     }
 
     /// bd-db300.3.7 / bd-db300.3.6: two logically disjoint concurrent growth
