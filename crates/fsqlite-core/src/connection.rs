@@ -100176,11 +100176,6 @@ impl Connection {
             let cached = minmax_bare_tracking
                 .as_ref()
                 .zip(minmax_cache.as_ref().map(|(_, value)| value));
-            let representative_index = repr_row.and_then(|representative| {
-                group_rows
-                    .iter()
-                    .position(|row| std::ptr::eq(row, representative))
-            });
             let representative_row = repr_row.unwrap_or(&empty_group_row);
             for (descriptor_index, desc) in result_descriptors.iter().enumerate() {
                 match desc {
@@ -100534,8 +100529,11 @@ impl Connection {
             result.push(Row { values });
             result_group_indices.push(group_index);
             if !select.order_by.is_empty()
-                && let Some((_, value)) = minmax_cache
+                && let Some((row, value)) = minmax_cache
             {
+                let representative_index = row.and_then(|representative| {
+                    group_rows.iter().position(|row| std::ptr::eq(row, representative))
+                });
                 result_extrema.push((representative_index, value));
             }
         }
@@ -100568,6 +100566,7 @@ impl Connection {
                     let cached = minmax_bare_tracking.as_ref().zip(extremum.map(|(_, value)| value));
                     let bare_row = extremum.and_then(|(index, _)| index.and_then(|i| group_rows.get(i)));
                     let representative_row = bare_row
+                        .or_else(|| group_rows.first())
                         .unwrap_or(&empty_group_row);
                     let mut extra_values = Vec::with_capacity(extra_order_terms.len());
                     for (_term_idx, expr) in &extra_order_terms {
@@ -149192,26 +149191,6 @@ fn retain_first_distinct<T>(
     }
     let mut keep = keep.into_iter();
     items.retain(|_| keep.next().unwrap_or(false));
-}
-
-/// Collation-aware duplicate removal, preserving first-occurrence order.
-/// When a collation is specified (e.g. `NOCASE`), text values are compared
-/// through the collation registry so that `'Alice'` and `'alice'` are treated
-/// as equal.
-fn dedup_values_collated(
-    values: &mut Vec<&SqliteValue>,
-    collation: Option<&str>,
-    collation_registry: &Mutex<CollationRegistry>,
-) {
-    if collation.is_none() {
-        // BINARY comparison never calls into the registry, so holding its
-        // lock cannot reenter application code.
-        let registry = lock_unpoisoned(collation_registry);
-        retain_first_distinct(values, |value| *value, None, &registry);
-        return;
-    }
-    let snap = lock_unpoisoned(collation_registry).clone();
-    retain_first_distinct(values, |value| *value, collation, &snap);
 }
 
 /// Extended aggregate computation with optional collation for MIN/MAX.

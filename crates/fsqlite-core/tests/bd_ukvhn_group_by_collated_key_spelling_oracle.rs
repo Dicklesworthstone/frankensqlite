@@ -113,6 +113,8 @@ const STATEMENTS: &[&str] = &[
     "SELECT @T@.s, max(j.x) FROM @T@ JOIN j ON j.k = @T@.s GROUP BY @T@.s ORDER BY 2",
     // Without a min()/max(), or with two, the key keeps the first row.
     "SELECT s, count(*) FROM @T@ GROUP BY s ORDER BY s",
+    "SELECT s, count(*) FROM @T@ GROUP BY s ORDER BY n + 0 DESC",
+    "SELECT s, count(*) FROM @T@ GROUP BY s ORDER BY (SELECT @T@.n) DESC",
     "SELECT s, sum(n) FROM @T@ GROUP BY s ORDER BY s",
     "SELECT s, b FROM @T@ GROUP BY s ORDER BY s",
     "SELECT s, n FROM @T@ GROUP BY s ORDER BY s",
