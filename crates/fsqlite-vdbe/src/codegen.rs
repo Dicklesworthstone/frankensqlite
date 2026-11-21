@@ -37268,38 +37268,46 @@ pub fn grouped_having_is_supported(
     columns: &[ResultColumn],
     group_by: &[Expr],
     table: &TableSchema,
+    table_alias: Option<&str>,
 ) -> bool {
-    fn supported(expr: &Expr, columns: &[ResultColumn], keys: &[Expr]) -> bool {
+    fn supported(
+        expr: &Expr, columns: &[ResultColumn], keys: &[Expr], table: &TableSchema, source: &str,
+    ) -> bool {
         match expr {
             Expr::Literal(..) | Expr::Placeholder(..) => {
                 !expr_contains_non_numbered_placeholder(expr)
             }
             Expr::Column(..) => {
-                keys.contains(expr) && projected_having_slot(expr, columns).is_some()
+                keys.iter().any(|key| {
+                    key == expr || bound_expressions_match(expr, source, key, source, table)
+                }) && projected_having_slot(expr, columns, table, source).is_some()
             }
             Expr::FunctionCall { name, args, over, .. } => {
                 over.is_none()
                     && is_aggregate_function_call(name, args)
-                    && projected_having_slot(expr, columns).is_some()
+                    && projected_having_slot(expr, columns, table, source).is_some()
             }
-            Expr::IsNull { expr, .. } => supported(expr, columns, keys),
+            Expr::IsNull { expr, .. } => supported(expr, columns, keys, table, source),
             Expr::BinaryOp {
                 left,
                 op: BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt
                     | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Is | BinaryOp::IsNot,
                 right,
                 ..
-            } => supported(left, columns, keys) && supported(right, columns, keys),
+            } => supported(left, columns, keys, table, source)
+                && supported(right, columns, keys, table, source),
             _ => false,
         }
     }
     let resolved = rewrite_having_select_aliases(having, columns, table);
-    supported(&resolved, columns, group_by)
+    supported(&resolved, columns, group_by, table, table_alias.unwrap_or(&table.name))
 }
 
 // A star expands to a variable number of registers. Two anonymous parameters
 // in otherwise identical aggregate calls can also have different values.
-fn projected_having_slot(expr: &Expr, columns: &[ResultColumn]) -> Option<usize> {
+fn projected_having_slot(
+    expr: &Expr, columns: &[ResultColumn], table: &TableSchema, source: &str,
+) -> Option<usize> {
     if columns.iter().any(|col| !matches!(col, ResultColumn::Expr { .. }))
         || expr_contains_non_numbered_placeholder(expr)
         || expr_contains_nested_subquery(expr)
@@ -37307,7 +37315,8 @@ fn projected_having_slot(expr: &Expr, columns: &[ResultColumn]) -> Option<usize>
         return None;
     }
     columns.iter().position(|col| {
-        matches!(col, ResultColumn::Expr { expr: result, .. } if result == expr)
+        matches!(col, ResultColumn::Expr { expr: result, .. }
+            if result == expr || bound_expressions_match(expr, source, result, source, table))
     })
 }
 
@@ -37376,7 +37385,9 @@ fn emit_having_expr(
     // Read a projected aggregate by its full expression, including FILTER,
     // DISTINCT and every argument.
     if matches!(expr, Expr::Column(..) | Expr::FunctionCall { .. })
-        && let Some(slot) = projected_having_slot(expr, projection)
+        && let Some(slot) = projected_having_slot(
+            expr, projection, table, scan.table_alias.unwrap_or(&table.name),
+        )
     {
         b.emit_op(Opcode::Copy, out_regs + slot as i32, dest_reg, 0, P4::None, 0);
         return;

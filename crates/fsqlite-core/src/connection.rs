@@ -27845,6 +27845,7 @@ impl Connection {
 
         let TableOrSubquery::Table {
             name: table_name,
+            alias: table_alias,
             time_travel: None,
             ..
         } = &from.source
@@ -27869,7 +27870,7 @@ impl Connection {
             };
             if having.as_deref().is_some_and(|predicate| {
                 !fsqlite_vdbe::codegen::grouped_having_is_supported(
-                    predicate, columns, group_by, table_schema,
+                    predicate, columns, group_by, table_schema, table_alias.as_deref(),
                 )
             }) || group_by.iter().any(|expr| {
                 expr_effective_collation_for_table(expr, table_schema)

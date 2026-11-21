@@ -171,6 +171,8 @@ fn strict_file_having_uses_finalized_keys_and_aggregates() {
     let cases: &[(&str, &[Option<i64>])] = &[
         ("k IS '2'", &[Some(2)]),
         ("k = '2'", &[Some(2)]),
+        ("src.K IS '2'", &[Some(2)]),
+        ("sum(src.V) IS 7", &[Some(2)]),
         ("k IS NOT 2", &[None, Some(1)]),
         ("k IS NULL", &[None]),
         ("k IS NOT NULL", &[Some(1), Some(2)]),
@@ -203,7 +205,7 @@ fn strict_file_having_uses_finalized_keys_and_aggregates() {
         );
         for &(predicate, keys) in cases {
             let sql = format!(
-                "SELECT k, sum(v), count(v), count(v) FILTER (WHERE v>3) AS kept FROM t GROUP BY k HAVING {predicate} ORDER BY k"
+                "SELECT k, sum(v), count(v), count(v) FILTER (WHERE v>3) AS kept FROM t AS src GROUP BY k HAVING {predicate} ORDER BY k"
             );
             let expected = stock_outcome(&stock, &sql);
             let actual_keys = stock
