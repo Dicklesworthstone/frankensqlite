@@ -189,6 +189,79 @@ fn sigkill_during_a_commit_loop_never_blocks_the_next_commit() {
     });
 }
 
+/// Seed a WAL database at `dir/name` with `items(1)` and close it WITH its
+/// checkpoint so the next writer starts a fresh WAL generation.
+async fn init_checkpointed_db(dir: &Path, name: &str) -> PathBuf {
+    let db = dir.join(name);
+    let conn = open(&db).await;
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("create");
+    conn.execute("INSERT INTO items VALUES (1)")
+        .await
+        .expect("seed");
+    conn.close().await.expect("close with checkpoint");
+    db
+}
+
+/// GH#534 downstream multi-database shape: two WAL databases are initialized
+/// and closed with checkpoints, a writer holds both open while committing to
+/// the second and is SIGKILLed within its first few milliseconds, and the
+/// reopening process opens both databases and must commit immediately on top
+/// of exactly the rows stock SQLite sees.
+#[test]
+fn sigkill_with_peer_database_after_checkpointed_close_recovers() {
+    let trials: u64 = std::env::var("GH534_TRIALS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    asupersync::test_utils::run_test(|| async move {
+        for trial in 0..trials {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let peer = init_checkpointed_db(dir.path(), "peer.db").await;
+            let db = init_checkpointed_db(dir.path(), "b.db").await;
+            let mut writer = ChildProcess::spawn("peer_writer", &db, &[]);
+            writer.witness("committing");
+            std::thread::sleep(Duration::from_millis(1 + trial % 8));
+            writer.sigkill();
+            let stock_rows = stock_count_of_copy(&db, &dir.path().join("stock"));
+            assert!(
+                stock_rows >= 1,
+                "peer trial {trial}: stock reads {stock_rows} rows"
+            );
+            let _peer_conn = open(&peer).await;
+            assert_next_writer_commits_on_top(&db, stock_rows, &format!("peer-db trial {trial}"))
+                .await;
+        }
+    });
+}
+
+/// GH#534 deterministic stale-SHM construction: commit row 1, preserve the
+/// `-shm` image, commit row 2, then restore the earlier `-shm` so both index
+/// header copies are valid and equal at the older `mxFrame` while row 2's
+/// valid commit frame sits past `mxFrame` in the WAL. Reopening must adopt
+/// row 2 and allow an immediate commit without `BusyRecovery`.
+#[test]
+fn stale_shm_snapshot_recovers_unpublished_committed_tail() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create(dir.path()).await;
+        let shm_path = sidecar(&db, "-shm");
+        let stale_shm_bytes = std::fs::read(&shm_path).expect("read initial -shm");
+
+        let writer = open(&db).await;
+        let (res, _) = commit_one(&writer, 2).await;
+        res.expect("commit row 2");
+        writer.close_without_checkpoint().await.expect("close");
+
+        std::fs::write(&shm_path, &stale_shm_bytes).expect("restore stale -shm");
+
+        let stock_rows = stock_count_of_copy(&db, &dir.path().join("stock"));
+        assert_eq!(stock_rows, 2, "stock recovers committed row 2 past mxFrame");
+        assert_next_writer_commits_on_top(&db, stock_rows, "stale-shm").await;
+    });
+}
+
 /// A killed writer's `-shm` locks are gone by the time it is reaped, as a
 /// stock process's are. Our locks are OFD locks, which live as long as their
 /// open file description; the description that was also mapped kept the dead
@@ -570,6 +643,18 @@ fn gh534_child_process() {
                 }
                 witness("done", &(last - 1).to_string());
                 expect_line("exit");
+            }
+            "peer_writer" => {
+                let _peer_conn = open(&db.with_file_name("peer.db")).await;
+                let conn = open(&db).await;
+                witness("committing", "");
+                for id in 2..=i64::MAX {
+                    conn.execute("BEGIN").await.expect("begin");
+                    conn.execute(&format!("INSERT INTO items VALUES ({id})"))
+                        .await
+                        .expect("insert");
+                    conn.execute("COMMIT").await.expect("commit");
+                }
             }
             "survivor" => {
                 let conn = open(&db).await;
