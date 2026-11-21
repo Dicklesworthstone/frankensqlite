@@ -228,7 +228,7 @@ fn eval_case(
         // Searched CASE: evaluate each WHEN as a boolean.
         for (when_expr, then_expr) in when_clauses {
             let when_val = eval_rebase_expr(when_expr, row)?;
-            if sqlite_value_is_truthy(&when_val) {
+            if when_val.is_sql_truthy() {
                 return eval_rebase_expr(then_expr, row);
             }
         }
@@ -244,17 +244,6 @@ fn eval_case(
 /// numeric comparison rather than rounding integers through `f64`.
 fn sqlite_values_equal(a: &SqliteValue, b: &SqliteValue) -> bool {
     a.unique_eq(b)
-}
-
-/// SQLite boolean conversion tests the numeric value against zero. It does
-/// not truncate fractional values (`sqlite3VdbeBooleanValue`).
-#[allow(clippy::float_cmp)]
-fn sqlite_value_is_truthy(v: &SqliteValue) -> bool {
-    match v {
-        SqliteValue::Null => false,
-        SqliteValue::Integer(value) => *value != 0,
-        value => value.to_float() != 0.0,
-    }
 }
 
 /// Concatenate two values as text (SQLite `||` operator).
@@ -307,7 +296,7 @@ fn eval_unary_op(op: RebaseUnaryOp, v: SqliteValue) -> SqliteValue {
             if matches!(v, SqliteValue::Null) {
                 SqliteValue::Null
             } else {
-                SqliteValue::Integer(i64::from(!sqlite_value_is_truthy(&v)))
+                SqliteValue::Integer(i64::from(!v.is_sql_truthy()))
             }
         }
     }
@@ -568,7 +557,7 @@ fn apply_collation(val: SqliteValue, collation: Collation) -> SqliteValue {
 fn row_participates(index_def: &IndexDef, row: &[SqliteValue]) -> Result<bool, IndexRegenError> {
     if let Some(ref predicate) = index_def.where_predicate {
         let result = eval_rebase_expr(predicate, row)?;
-        Ok(sqlite_value_is_truthy(&result))
+        Ok(result.is_sql_truthy())
     } else {
         Ok(true)
     }

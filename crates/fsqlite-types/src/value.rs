@@ -1271,6 +1271,16 @@ impl SqliteValue {
         }
     }
 
+    /// Whether this value satisfies a SQL boolean predicate. NULL is false here.
+    /// TEXT and BLOB use the real numeric prefix, including its exponent.
+    #[must_use]
+    pub fn is_sql_truthy(&self) -> bool {
+        match self {
+            Self::Integer(n) => *n != 0,
+            value => value.to_float() != 0.0,
+        }
+    }
+
     /// Coerce a value for SQLite `sum()` accumulation.
     ///
     /// `sum()` keeps integer accumulation only for INTEGER values and text that

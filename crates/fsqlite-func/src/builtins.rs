@@ -505,19 +505,6 @@ impl ScalarFunction for IfnullFunc {
 
 pub struct IifFunc;
 
-/// C SQLite tests a CASE/IIF condition with sqlite3VdbeRealValue != 0.0, so
-/// 0.5 is truthy (non-zero real).
-fn iif_condition_is_true(cond: &SqliteValue) -> bool {
-    match cond {
-        SqliteValue::Null => false,
-        SqliteValue::Integer(n) => *n != 0,
-        SqliteValue::Float(f) => *f != 0.0,
-        SqliteValue::Text(_) | SqliteValue::Blob(_) => {
-            cond.to_integer() != 0 || cond.to_float() != 0.0
-        }
-    }
-}
-
 impl ScalarFunction for IifFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         // iif(c1, v1 [, c2, v2 ...] [, else]) is CASE WHEN c1 THEN v1 ... ELSE
@@ -525,7 +512,7 @@ impl ScalarFunction for IifFunc {
         // rewritten to that CASE (lazy branches); this covers direct calls.
         let (pairs, rest) = args.as_chunks::<2>();
         for [condition, value] in pairs {
-            if iif_condition_is_true(condition) {
+            if condition.is_sql_truthy() {
                 return Ok(value.clone());
             }
         }
@@ -4695,6 +4682,28 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Text(SmallText::from_string("yes")));
+    }
+
+    #[test]
+    fn test_iif_registered_exponent_truth() {
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        for name in ["iif", "if"] {
+            let function = registry.find_scalar(name, 3).unwrap();
+            for (prefix, expected) in [("1e-999", 0), ("-3e-999", 0), ("-3e-1", 1)] {
+                for condition in [
+                    SqliteValue::Text(SmallText::from_string(prefix)),
+                    SqliteValue::Blob(Arc::from(prefix.as_bytes())),
+                ] {
+                    let args = [condition, SqliteValue::Integer(1), SqliteValue::Integer(0)];
+                    assert_eq!(
+                        function.invoke(&args).unwrap(),
+                        SqliteValue::Integer(expected),
+                        "{name}({prefix:?}, 1, 0)"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
