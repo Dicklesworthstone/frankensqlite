@@ -15,9 +15,10 @@
 //! for the whole process ([`parallel_helper_budget`]), taken without waiting:
 //! a walk gets what is left, and with nothing left the serial path runs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::thread::ThreadId;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::{SnapshotPageBuf, SnapshotPageReader};
@@ -214,6 +215,41 @@ pub enum WalkRecord {
     Serial(SerialReason),
 }
 
+/// Detailed execution telemetry captured for the last [`ParallelWalk::run`]
+/// that executed in parallel on the current thread (bd-dwjnq.7 / bd-dwjnq.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkTelemetry {
+    /// Total workers granted (caller thread + auxiliary helpers).
+    pub workers_granted: usize,
+    /// Auxiliary helper threads granted beyond the caller thread.
+    pub auxiliary_granted: usize,
+    /// OS thread identity of the caller that initiated the walk.
+    pub caller_thread_id: ThreadId,
+    /// Distinct OS thread identities that processed at least one subtree run.
+    pub worker_thread_ids: Vec<ThreadId>,
+    /// Peak number of threads simultaneously walking subtrees during this walk.
+    pub peak_simultaneous_workers: usize,
+    /// Peak number of auxiliary (non-caller) threads simultaneously walking
+    /// subtrees during this walk.
+    pub peak_simultaneous_auxiliary: usize,
+    /// Whether the walk observed `stop()` and exited early before completing
+    /// every subtree run.
+    pub cancelled: bool,
+}
+
+impl WalkTelemetry {
+    /// Distinct OS thread identities of auxiliary (non-caller) workers that
+    /// processed at least one subtree run during this walk.
+    #[must_use]
+    pub fn auxiliary_thread_ids(&self) -> Vec<ThreadId> {
+        self.worker_thread_ids
+            .iter()
+            .copied()
+            .filter(|&id| id != self.caller_thread_id)
+            .collect()
+    }
+}
+
 /// Threads walking one split b-tree.
 pub struct ParallelWalk<'a> {
     /// Pages of the snapshot.
@@ -228,6 +264,7 @@ pub struct ParallelWalk<'a> {
 
 thread_local! {
     static LAST_WALK: Cell<Option<WalkRecord>> = const { Cell::new(None) };
+    static LAST_WALK_TELEMETRY: RefCell<Option<WalkTelemetry>> = const { RefCell::new(None) };
 }
 
 /// What the last [`ParallelWalk::run`] on this thread did, taken (so a
@@ -237,8 +274,27 @@ pub fn take_last_parallel_walk() -> Option<WalkRecord> {
     LAST_WALK.with(Cell::take)
 }
 
+/// Detailed telemetry from the last parallel [`ParallelWalk::run`] on this
+/// thread, taken (so a second call is `None`). `None` when no walk ran in
+/// parallel (including serial fallback).
+#[must_use]
+pub fn take_last_parallel_walk_telemetry() -> Option<WalkTelemetry> {
+    LAST_WALK_TELEMETRY.with(|slot| slot.borrow_mut().take())
+}
+
 fn record_walk(record: WalkRecord) {
     LAST_WALK.with(|last| last.set(Some(record)));
+    if matches!(record, WalkRecord::Serial(_)) {
+        LAST_WALK_TELEMETRY.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+fn record_walk_telemetry(telemetry: WalkTelemetry) {
+    LAST_WALK_TELEMETRY.with(|slot| {
+        *slot.borrow_mut() = Some(telemetry);
+    });
 }
 
 /// Helper threads (beyond each walking statement's own) the process runs for
@@ -251,6 +307,12 @@ pub fn parallel_helper_budget() -> usize {
 
 static HELPERS_IN_USE: AtomicUsize = AtomicUsize::new(0);
 static HELPERS_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+/// Helper threads currently granted across the process.
+#[must_use]
+pub fn parallel_helpers_in_use() -> usize {
+    HELPERS_IN_USE.load(Ordering::Acquire)
+}
 
 /// The most helper threads granted at once since the process started.
 #[must_use]
@@ -327,16 +389,49 @@ impl ParallelWalk<'_> {
             return Ok(WalkOutcome::Serial(SerialReason::BudgetExhausted));
         }
         let workers = helpers.0 + 1;
+        let auxiliary_granted = helpers.0;
+        let caller_thread_id = std::thread::current().id();
         let subtrees = &split.subtrees;
         let runs = subtrees.len().min(workers.saturating_mul(8)).max(1);
         let next_run = AtomicUsize::new(0);
         let halt = AtomicBool::new(false);
+        let stopped_by_cancel = AtomicBool::new(false);
         let finished: Mutex<Vec<(usize, S, u64)>> = Mutex::new(Vec::with_capacity(runs));
         let first_error: Mutex<Option<FrankenError>> = Mutex::new(None);
         let threads_used = AtomicUsize::new(0);
-        let stop = || halt.load(Ordering::Relaxed) || (self.stop)();
+        let active_workers = AtomicUsize::new(0);
+        let peak_workers = AtomicUsize::new(0);
+        let active_aux = AtomicUsize::new(0);
+        let peak_aux = AtomicUsize::new(0);
+        let seen_ids: Mutex<Vec<ThreadId>> = Mutex::new(Vec::with_capacity(workers));
+        let stop = || {
+            if halt.load(Ordering::Relaxed) {
+                return true;
+            }
+            if (self.stop)() {
+                stopped_by_cancel.store(true, Ordering::Relaxed);
+                halt.store(true, Ordering::Relaxed);
+                return true;
+            }
+            false
+        };
+
+        struct ActiveGuard<'b> {
+            workers: &'b AtomicUsize,
+            aux: Option<&'b AtomicUsize>,
+        }
+        impl Drop for ActiveGuard<'_> {
+            fn drop(&mut self) {
+                self.workers.fetch_sub(1, Ordering::AcqRel);
+                if let Some(aux) = self.aux {
+                    aux.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
 
         let work = || {
+            let this_id = std::thread::current().id();
+            let is_aux = this_id != caller_thread_id;
             let mut scratch = new_scratch();
             let mut buf = self.reader.new_buffer();
             let mut stack = Vec::new();
@@ -350,6 +445,19 @@ impl ParallelWalk<'_> {
                     break;
                 }
                 used = true;
+                let now_workers = active_workers.fetch_add(1, Ordering::AcqRel) + 1;
+                peak_workers.fetch_max(now_workers, Ordering::Relaxed);
+                let aux_counter = if is_aux {
+                    let now_aux = active_aux.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak_aux.fetch_max(now_aux, Ordering::Relaxed);
+                    Some(&active_aux)
+                } else {
+                    None
+                };
+                let _guard = ActiveGuard {
+                    workers: &active_workers,
+                    aux: aux_counter,
+                };
                 let begin = run * subtrees.len() / runs;
                 let end = (run + 1) * subtrees.len() / runs;
                 let mut state = new_state();
@@ -392,6 +500,10 @@ impl ParallelWalk<'_> {
             }
             if used {
                 threads_used.fetch_add(1, Ordering::Relaxed);
+                seen_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(this_id);
             }
         };
 
@@ -410,9 +522,21 @@ impl ParallelWalk<'_> {
         });
         drop(helpers);
 
+        let worker_thread_ids = seen_ids
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         record_walk(WalkRecord::Ran {
             workers,
             threads: threads_used.load(Ordering::Relaxed),
+        });
+        record_walk_telemetry(WalkTelemetry {
+            workers_granted: workers,
+            auxiliary_granted,
+            caller_thread_id,
+            worker_thread_ids,
+            peak_simultaneous_workers: peak_workers.load(Ordering::Relaxed),
+            peak_simultaneous_auxiliary: peak_aux.load(Ordering::Relaxed),
+            cancelled: stopped_by_cancel.load(Ordering::Relaxed),
         });
         if let Some(error) = first_error
             .into_inner()
@@ -480,4 +604,58 @@ pub fn count_entries_parallel(
         total += split.cells_above + runs.iter().map(|(_, interior)| *interior).sum::<u64>();
     }
     Ok(Some(i64::try_from(total).unwrap_or(i64::MAX)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bd_dwjnq_7_walk_telemetry_filters_caller_and_drains_helper_grants() {
+        let caller = std::thread::current().id();
+        let aux = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("spawn helper thread for id");
+        assert_ne!(caller, aux);
+
+        let telemetry = WalkTelemetry {
+            workers_granted: 2,
+            auxiliary_granted: 1,
+            caller_thread_id: caller,
+            worker_thread_ids: vec![caller, aux],
+            peak_simultaneous_workers: 2,
+            peak_simultaneous_auxiliary: 1,
+            cancelled: false,
+        };
+        assert_eq!(telemetry.auxiliary_thread_ids(), vec![aux]);
+
+        record_walk_telemetry(telemetry.clone());
+        assert_eq!(take_last_parallel_walk_telemetry(), Some(telemetry));
+        assert_eq!(take_last_parallel_walk_telemetry(), None);
+
+        // Recording a Serial fallback must clear any previous parallel telemetry.
+        record_walk_telemetry(WalkTelemetry {
+            workers_granted: 2,
+            auxiliary_granted: 1,
+            caller_thread_id: caller,
+            worker_thread_ids: vec![caller, aux],
+            peak_simultaneous_workers: 2,
+            peak_simultaneous_auxiliary: 1,
+            cancelled: false,
+        });
+        record_walk(WalkRecord::Serial(SerialReason::SmallTree));
+        assert_eq!(
+            take_last_parallel_walk(),
+            Some(WalkRecord::Serial(SerialReason::SmallTree))
+        );
+        assert_eq!(take_last_parallel_walk_telemetry(), None);
+
+        // HelperGrant RAII acquisition and drain.
+        let before = parallel_helpers_in_use();
+        let grant = HelperGrant::take(1);
+        assert_eq!(grant.0, 1.min(parallel_helper_budget()));
+        assert_eq!(parallel_helpers_in_use(), before + grant.0);
+        drop(grant);
+        assert_eq!(parallel_helpers_in_use(), before);
+    }
 }

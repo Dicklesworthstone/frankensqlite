@@ -86639,6 +86639,7 @@ impl Connection {
             return Ok(Vec::new());
         }
 
+        let threads_set_count_before = self.pragma_state.borrow().threads_set_count;
         let mut pragma_out = {
             let mut state = self.pragma_state.borrow_mut();
             fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)?
@@ -86725,6 +86726,23 @@ impl Connection {
                     let ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
                     let cx = self.op_cx()?;
                     self.pager.set_vfs_busy_timeout_ms(&cx, ms).await;
+                }
+                "threads" => {
+                    // bd-dwjnq.7: bind explicit non-negative `PRAGMA threads = N`
+                    // (0..=8) to live auxiliary execution. `N` counts auxiliary
+                    // helper threads separately from the caller thread, so total
+                    // scan workers = `1 + N` (`threads = 0` -> 1 worker = serial,
+                    // 0 auxiliary threads). Negative assignments leave the
+                    // current limit unchanged and do not bump `threads_set_count`.
+                    let (threads, set_count) = {
+                        let state = self.pragma_state.borrow();
+                        (state.threads, state.threads_set_count)
+                    };
+                    if set_count > threads_set_count_before {
+                        let aux = usize::try_from(threads.max(0)).unwrap_or(0);
+                        self.parallel_workers
+                            .set(1_usize.saturating_add(aux).min(MAX_PARALLEL_WORKERS));
+                    }
                 }
                 _ => {}
             }
@@ -86887,11 +86905,12 @@ impl Connection {
                     }])
                 }
             }
-            // bd-w4pr1.13.11: threads one scan of an autocommit read may use,
-            // this connection's own included; 0 and 1 keep every scan serial,
-            // larger values are capped at MAX_PARALLEL_WORKERS. Echoes the
-            // effective value. `PRAGMA threads` keeps stock's meaning (sorter
-            // helper threads, capped at 8, GH#279).
+            // bd-w4pr1.13.11 / bd-dwjnq.7: total threads one scan of an
+            // autocommit read may use, this connection's own included; 0 and 1
+            // keep every scan serial, larger values are capped at
+            // MAX_PARALLEL_WORKERS. Echoes the effective value. Standard
+            // `PRAGMA threads = N` (0..=8, GH#279) sets this to `1 + N`
+            // (caller + up to `N` auxiliary helpers; `threads = 0` -> 1 = serial).
             "fsqlite.parallel_workers" | "parallel_workers" => {
                 if let Some(ref val) = pragma.value {
                     let raw = parse_pragma_nonnegative_usize(val, "fsqlite.parallel_workers")?;

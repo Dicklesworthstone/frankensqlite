@@ -1832,10 +1832,19 @@ pub mod pragma {
         /// TEMP has its own erasure policy once its database is opened. An
         /// unqualified assignment affects it only after that initialization.
         pub temp_secure_delete: Option<i64>,
-        /// `PRAGMA threads` auxiliary worker-thread limit (default 0). Advisory:
-        /// FrankenSQLite does not spawn SQLite-style sort helper threads, so this
-        /// is a stored limit clamped to the stock maximum (8).
+        /// `PRAGMA threads` auxiliary worker-thread limit (default 0, clamped
+        /// to stock `SQLITE_MAX_WORKER_THREADS = 8`). An explicit non-negative
+        /// assignment binds the connection's live auxiliary execution limit
+        /// (`threads = 0` forces serial execution with 0 auxiliary helpers;
+        /// `threads = N` admits up to `N` auxiliary helpers alongside the
+        /// caller thread, subject to tree size and process helper budget).
+        /// (GH #279, bd-dwjnq.7)
         pub threads: i64,
+        /// Monotonic count of explicit non-negative `PRAGMA threads = N`
+        /// assignments applied to this state, allowing `Connection` to
+        /// distinguish an explicit `PRAGMA threads = 0` from an unchanged
+        /// negative query like `PRAGMA threads = -1`.
+        pub threads_set_count: u64,
         /// `PRAGMA cache_spill` page threshold (C SQLite's `szSpill`). Default
         /// `1`. A bare query reports `0` when spilling is disabled, otherwise
         /// `max(cache_pages, cache_spill_pages)` where `cache_pages` is derived
@@ -1884,6 +1893,7 @@ pub mod pragma {
                 secure_delete: 0,
                 temp_secure_delete: None,
                 threads: 0,
+                threads_set_count: 0,
                 cache_spill_pages: 1,
                 cache_spill_enabled: true,
             }
@@ -2200,8 +2210,10 @@ pub mod pragma {
 
     /// `PRAGMA threads [= N]`. A bare query reports the current limit; an
     /// assignment with a non-negative N clamps to the stock maximum (8), stores
-    /// it, and echoes the effective value. A negative argument leaves the limit
-    /// unchanged and just reports it, matching C SQLite. (GH #279)
+    /// it, increments `threads_set_count` so `Connection` binds live auxiliary
+    /// execution, and echoes the effective value. A negative argument leaves
+    /// the limit unchanged and just reports it, matching C SQLite.
+    /// (GH #279, bd-dwjnq.7)
     fn apply_threads(
         state: &mut ConnectionPragmaState,
         stmt: &PragmaStatement,
@@ -2214,6 +2226,7 @@ pub mod pragma {
                 let n = parse_integer_expr(expr)?;
                 if n >= 0 {
                     state.threads = n.min(MAX_WORKER_THREADS);
+                    state.threads_set_count = state.threads_set_count.saturating_add(1);
                 }
                 Ok(PragmaOutput::Int(state.threads))
             }
@@ -4526,17 +4539,27 @@ mod tests {
 
     #[test]
     fn test_connection_pragma_threads_readback() {
-        // GH #279: threads reports the stored limit; a set clamps to 8; a
-        // negative argument leaves the limit unchanged.
+        // GH #279 & bd-dwjnq.7: threads reports the stored limit; non-negative
+        // sets clamp to 8 and bump `threads_set_count` so Connection binds live
+        // auxiliary workers; negative arguments and bare queries leave both
+        // `threads` and `threads_set_count` unchanged.
         use pragma::PragmaOutput::Int;
         let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(state.threads_set_count, 0);
         assert_eq!(apply_sql(&mut state, "PRAGMA threads"), Int(0));
+        assert_eq!(state.threads_set_count, 0);
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads = 0"), Int(0));
+        assert_eq!(state.threads_set_count, 1);
         assert_eq!(apply_sql(&mut state, "PRAGMA threads = 4"), Int(4));
+        assert_eq!(state.threads_set_count, 2);
         assert_eq!(apply_sql(&mut state, "PRAGMA threads"), Int(4));
+        assert_eq!(state.threads_set_count, 2);
         // Clamps to the stock maximum of 8.
         assert_eq!(apply_sql(&mut state, "PRAGMA threads = 100"), Int(8));
-        // A negative argument leaves the current limit unchanged.
+        assert_eq!(state.threads_set_count, 3);
+        // A negative argument leaves the current limit and set count unchanged.
         assert_eq!(apply_sql(&mut state, "PRAGMA threads = -1"), Int(8));
+        assert_eq!(state.threads_set_count, 3);
     }
 
     #[test]
