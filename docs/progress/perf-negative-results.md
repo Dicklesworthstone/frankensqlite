@@ -94,6 +94,45 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-21 - WIN (landed as f921f63c4; inside its prediction): AggFinal and AggValue observe a requested cancellation with one atomic load, not two full checkpoints, per group; gb_id -724.0M Ir (bd-w4pr1.12, serial read lane round 12, lever AFC)
+
+- Target: gb_id (`SELECT count(*), sum(n) FROM (SELECT id g, count(*) n FROM t GROUP BY id)`). Callgrind on
+  742438e55: Cx::checkpoint 732.4M inclusive, 722.1M of it in 2,000,245 calls from execute_program_body (361 Ir
+  each). Those were AggFinal's two full checkpoints, before and after finalize, over 1M groups.
+- Touched: `crates/fsqlite-vdbe/src/engine.rs`. AggFinal's and AggValue's four observe_execution_cancellation calls
+  become observe_requested_execution_cancellation, the per-row boundary rule of VNext (bd-i3csr.2), AggStep and
+  AggInverse. Keepers on hand-built programs (a GROUP BY shape and a window shape, about 1M groups):
+  `test_aggregate_boundaries_observe_a_requested_cancellation_at_the_next_group` and
+  `test_aggregate_statements_observe_native_timeouts_and_spent_budgets_within_the_interval`.
+  `crates/fsqlite-vdbe/Cargo.toml`: asupersync test-internals as a dev-dependency.
+- Behaviour bounds (on the bead before the build):
+  - a requested cancellation is still observed at the same sites;
+  - the e-process, native-runtime and deadline / budget planes are observed at the statement loop's interval
+    checkpoint, at most 4096 opcodes later;
+  - Cx::checkpoint consumes no budget and does not yield;
+  - fsqlite has no progress handler.
+- Prediction: gb_id -690 to -725M Ir, gb_id_mod100k -68 to -73M, every other row within +-0.05%. Kill: gb_id under
+  500M; any row beyond +-0.5% Ir; a replicated layout-averaged LOSE; a mutant passing.
+- Result:
+  - Setup: parent b2f988834 against parent + AFC, one layout_shuffle_pair job (K=6), two judgement runs (both valid).
+    Stock sqlite3 3.46.1 live; ratios against 3.54.1 from one extra invocation. Answers equal stock.
+  - Instructions (callgrind, single ELF): gb_id 5,023.9M -> 4,299.9M (-724.0M); gb_id_mod100k -72.4M; window_sum_over
+    +0.002%; every other row within +-0.06%.
+  - vs stock 3.54.1: gb_id Ir x3.89 -> x3.25, cpu x4.78 -> x3.67; gb_id_mod100k Ir x1.11 -> x1.07.
+  - Time (layout-averaged): gb_id cpu 0.759 / 0.767 and cycles 0.675 / 0.676 WIN; gb_id_mod100k cpu 0.963 / 0.952
+    WIN; every other row a replicated TIE.
+- Mutant (rch, rc 101): the four atomic loads removed. The requested-cancellation keeper then delivers 500,736 rows
+  against 500,000.
+- Gate (3678e7153 + diff 50e29ff110609d91; the commits up to the landing touch neither the changed sites nor the
+  cancellation helpers): clippy vdbe / core clean; libs + goldens 5,473 passed; 22 core aggregate oracles 48 passed;
+  18 window / aggregate-misuse oracles 68 passed; 16 e2e oracles 86 passed; fsqlite crate in 7 batches, 124
+  binaries, 1,103 passed, 0 failed.
+- Retry condition: none for this shape. Left on gb_id (x3.25 Ir against 3.54.1), on the AFC build:
+  - the inner GROUP BY program, 3,587M: its sorter (330.6M in execute_sorter_insert) for a GROUP BY on the rowid
+    alias, which stock walks in rowid order without one;
+  - the outer evaluator's derived-table copy (355.1M in execute_join_select) and the drop of the 1M-row
+    materialization (242.4M): the derived-table streaming lever.
+
 ## 2026-11-21 - FIX (landed as e1605fc92; a correctness fix measured like a lever, inside its regression lines): PRAGMA secure_delete reaches the storage policies, so ON and FAST erase removed content as stock does (bd-i2u1c, bulk-write round 15)
 
 - Target: drop-in and security. 588b17d07 added OFF / ON / FAST policies to the pager and b-tree, but nothing
