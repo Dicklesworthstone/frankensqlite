@@ -181,7 +181,7 @@ export class FrankenWorkerClient {
       this.#worker.addEventListener("error", this.#onError);
       this.#worker.addEventListener("messageerror", this.#onMessageError);
     } catch (cause: unknown) {
-      this.disposeAfterFailure(cause, "Worker setup and cleanup failed");
+      this.#disposeAfterFailure(cause, "Worker setup and cleanup failed");
     }
   }
 
@@ -608,19 +608,18 @@ export class FrankenWorkerClient {
       const response = await this.#send({ kind: "close", requestId: this.#nextId() }, true);
       ensureKind(response, "close-result");
     } catch (error: unknown) {
-      this.disposeAfterFailure(error, "FrankenSQLite close and worker cleanup both failed");
+      this.#disposeAfterFailure(error, "FrankenSQLite close and worker cleanup both failed");
     }
     this.dispose();
   }
 
-  dispose(reason?: Error): void {
-    if (this.#disposed) return;
+  dispose(reason?: Error, { reportPreviousFailure = false } = {}): void {
+    if (this.#disposed && !reportPreviousFailure) return;
     this.#disposeWorker(reason);
     if (this.#cleanupFailure !== null) throw this.#cleanupFailure.error;
   }
 
-  disposeAfterFailure(cause: unknown, message: string): never {
-    // A transport fault can finish cleanup before its rejected init reaches open().
+  #disposeAfterFailure(cause: unknown, message: string): never {
     this.#disposeWorker();
     if (this.#cleanupFailure !== null) {
       throw new AggregateError([cause, this.#cleanupFailure.error], message, { cause });

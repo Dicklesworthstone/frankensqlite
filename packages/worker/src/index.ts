@@ -56,9 +56,10 @@ export interface FrankenSqliteWorkerOptions {
 }
 
 export function createFrankenSqliteWorker(options: FrankenSqliteWorkerOptions = {}): Worker {
+  const workerUrl = options.workerUrl;
   const name = options.name ?? "frankensqlite-worker";
-  if (options.workerUrl !== undefined) {
-    return new Worker(options.workerUrl, { name, type: "module" });
+  if (workerUrl != null) {
+    return new Worker(workerUrl, { name, type: "module" });
   }
   // Bundlers discover the worker module graph from this literal constructor.
   return new Worker(new URL("./worker.js", import.meta.url), { name, type: "module" });

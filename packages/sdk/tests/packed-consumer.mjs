@@ -65,6 +65,8 @@ if (core) {
   await writeFile(join(consumer, "index.html"), '<script type="module" src="/app.js"></script>');
   await writeFile(join(consumer, "app.js"), `
     import { FrankenDB } from "@frankensqlite/sdk";
+    import { createFrankenSqliteWorker } from "@frankensqlite/worker";
+    import workerAsset from "@frankensqlite/sdk/worker?worker&url";
     async function reopen() {
       const options = { dbName: "packed", persistence: "indexeddb-snapshot" };
       const writer = await FrankenDB.open(options);
@@ -73,7 +75,13 @@ if (core) {
         await writer.execute("INSERT INTO t VALUES (?)", [42]);
         await writer.checkpoint();
       } finally { await writer.close(); }
-      const worker = new Worker(new URL("@frankensqlite/sdk/worker", import.meta.url), { type: "module" });
+      let reads = 0;
+      const worker = createFrankenSqliteWorker({
+        get workerUrl() {
+          if (++reads > 1) throw new Error("workerUrl was read twice");
+          return new URL(workerAsset, location.href);
+        },
+      });
       const reader = await FrankenDB.open({ ...options, worker });
       try { return (await reader.query("SELECT n FROM t")).rows; }
       finally { await reader.close(); }

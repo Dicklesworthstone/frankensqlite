@@ -298,9 +298,16 @@ export class FrankenDB {
         recovery === 1,
       );
     } catch (error: unknown) {
-      return client.disposeAfterFailure(
-        error, "FrankenSQLite initialization and worker cleanup both failed",
-      );
+      try {
+        // A channel fault can finish cleanup before its rejected init reaches open().
+        client.dispose(undefined, { reportPreviousFailure: true });
+      } catch (cleanupError: unknown) {
+        throw new AggregateError(
+          [error, cleanupError], "FrankenSQLite initialization and worker cleanup both failed",
+          { cause: error },
+        );
+      }
+      throw error;
     }
   }
 
