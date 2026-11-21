@@ -26,7 +26,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
@@ -48,8 +48,8 @@ use crate::shm::{
     wal_read_lock_slot,
 };
 use crate::traits::{
-    FileIdentity, ForeignWalParticipation, SyncKind, Vfs, VfsFile, VfsWriteCompletion,
-    VfsWriteCompletionSource,
+    FileIdentity, ForeignWalParticipation, MAX_MMAP_SIZE, ReadOnlyMmapView, SyncKind, Vfs, VfsFile,
+    VfsMmapCounters, VfsMmapStatus, VfsWriteCompletion, VfsWriteCompletionSource,
 };
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
@@ -2203,6 +2203,7 @@ impl Vfs for UnixVfs {
             shm_dms_lifetime_claim: false,
             private_reader_shm: None,
             busy_timeout_ms: 0,
+            mmap: UnixMmapController::new(),
         };
 
         Ok((unix_file, out_flags))
@@ -2390,6 +2391,268 @@ enum WalLifetimeClaim {
     Held,
 }
 
+#[derive(Debug, Default)]
+struct UnixMmapInner {
+    view: Option<ReadOnlyMmapView>,
+    next_generation: u64,
+    mapping_failed: bool,
+}
+
+/// Ordinary database file read-mapping controller for [`UnixFile`] (`bd-dwjnq.3`).
+///
+/// Explicitly distinct from WAL `-shm` mappings. Maintains a bounded read-only
+/// `PROT_READ | MAP_SHARED` prefix up to `min(file_len, configured_limit_bytes)`
+/// and degrades cleanly to `pread` on growth failure, past-limit reads, or
+/// disabled mode (`configured_limit_bytes == 0`, which costs a single relaxed
+/// atomic load on the read hot path).
+#[derive(Debug)]
+struct UnixMmapController {
+    configured_limit_bytes: AtomicU64,
+    inject_failures: AtomicU64,
+    counters: Arc<VfsMmapCounters>,
+    inner: RwLock<UnixMmapInner>,
+}
+
+impl UnixMmapController {
+    fn new() -> Self {
+        Self {
+            configured_limit_bytes: AtomicU64::new(0),
+            inject_failures: AtomicU64::new(0),
+            counters: Arc::new(VfsMmapCounters::default()),
+            inner: RwLock::new(UnixMmapInner::default()),
+        }
+    }
+
+    #[inline]
+    fn configured_limit_bytes(&self) -> u64 {
+        self.configured_limit_bytes.load(Ordering::Acquire)
+    }
+
+    fn status_locked(&self, limit: u64, inner: &UnixMmapInner) -> VfsMmapStatus {
+        VfsMmapStatus {
+            supported: true,
+            configured_limit_bytes: limit,
+            mapped_bytes: inner.view.as_ref().map_or(0, |v| v.len() as u64),
+            mapping_generation: inner.view.as_ref().map_or(0, ReadOnlyMmapView::generation),
+            mmap_read_hits: self.counters.mmap_read_hits.load(Ordering::Relaxed),
+            pread_fallbacks: self.counters.pread_fallbacks.load(Ordering::Relaxed),
+            map_attempts: self.counters.map_attempts.load(Ordering::Relaxed),
+            map_failures: self.counters.map_failures.load(Ordering::Relaxed),
+            unmap_count: self.counters.unmap_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn status(&self) -> VfsMmapStatus {
+        let limit = self.configured_limit_bytes();
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.status_locked(limit, &inner)
+    }
+
+    fn read_only_view(&self) -> Option<ReadOnlyMmapView> {
+        if self.configured_limit_bytes() == 0 {
+            return None;
+        }
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .view
+            .clone()
+    }
+
+    fn inject_failure(&self, remaining_failures: u64) {
+        self.inject_failures
+            .store(remaining_failures, Ordering::Release);
+    }
+
+    fn consume_injected_failure(&self) -> bool {
+        self.inject_failures
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                cur.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn remap_locked(
+        &self,
+        file: &Arc<File>,
+        target_len: usize,
+        inner: &mut UnixMmapInner,
+        clear_existing_on_failure: bool,
+    ) {
+        if target_len == 0 {
+            let _ = inner.view.take();
+            return;
+        }
+        self.counters.map_attempts.fetch_add(1, Ordering::Relaxed);
+        if self.consume_injected_failure() {
+            self.counters.map_failures.fetch_add(1, Ordering::Relaxed);
+            inner.mapping_failed = true;
+            if clear_existing_on_failure {
+                let _ = inner.view.take();
+            }
+            return;
+        }
+        let generation = inner.next_generation.saturating_add(1);
+        // Drop any previous mapping before creating a replacement when explicitly
+        // resizing/shrinking so peak VMA residency remains tightly bounded.
+        if clear_existing_on_failure {
+            let _ = inner.view.take();
+        }
+        match ReadOnlyMmapView::map_unix_prefix(
+            Arc::clone(file),
+            target_len,
+            generation,
+            Arc::clone(&self.counters),
+        ) {
+            Ok(view) => {
+                inner.next_generation = generation;
+                inner.mapping_failed = false;
+                inner.view = Some(view);
+            }
+            Err(error) => {
+                warn!(
+                    target_len,
+                    %error,
+                    "database file mmap failed; falling back to pread"
+                );
+                self.counters.map_failures.fetch_add(1, Ordering::Relaxed);
+                inner.mapping_failed = true;
+                if clear_existing_on_failure {
+                    let _ = inner.view.take();
+                }
+            }
+        }
+    }
+
+    fn configure(&self, file: &Arc<File>, raw_limit_bytes: u64) -> VfsMmapStatus {
+        let limit = raw_limit_bytes.min(MAX_MMAP_SIZE);
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.configured_limit_bytes.store(limit, Ordering::Release);
+        inner.mapping_failed = false;
+        if limit == 0 {
+            let _ = inner.view.take();
+            return self.status_locked(0, &inner);
+        }
+        let file_len = file.metadata().map_or(0, |meta| meta.len());
+        let target_u64 = file_len.min(limit);
+        if target_u64 == 0 {
+            let _ = inner.view.take();
+            return self.status_locked(limit, &inner);
+        }
+        let Ok(target_len) = usize::try_from(target_u64) else {
+            self.counters.map_attempts.fetch_add(1, Ordering::Relaxed);
+            self.counters.map_failures.fetch_add(1, Ordering::Relaxed);
+            inner.mapping_failed = true;
+            let _ = inner.view.take();
+            return self.status_locked(limit, &inner);
+        };
+        if inner.view.as_ref().is_some_and(|v| v.len() == target_len) {
+            return self.status_locked(limit, &inner);
+        }
+        self.remap_locked(file, target_len, &mut inner, true);
+        self.status_locked(limit, &inner)
+    }
+
+    fn try_read(&self, file: &Arc<File>, buf: &mut [u8], offset: u64) -> Option<usize> {
+        let limit = self.configured_limit_bytes();
+        if limit == 0 || buf.is_empty() {
+            return None;
+        }
+        let (needs_growth_check, current_len) = {
+            let inner = self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(view) = inner.view.as_ref() {
+                if view.read_exact_at(offset, buf) {
+                    return Some(buf.len());
+                }
+                (
+                    !inner.mapping_failed && (view.len() as u64) < limit,
+                    view.len() as u64,
+                )
+            } else {
+                (!inner.mapping_failed, 0)
+            }
+        };
+
+        if needs_growth_check {
+            let live_len = file.metadata().map_or(0, |meta| meta.len());
+            let target_u64 = live_len.min(limit);
+            if target_u64 > current_len {
+                let mut inner = self
+                    .inner
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let live_limit = self.configured_limit_bytes();
+                let refreshed_target = live_len.min(live_limit);
+                let locked_len = inner.view.as_ref().map_or(0, |v| v.len() as u64);
+                if live_limit > 0
+                    && !inner.mapping_failed
+                    && refreshed_target > locked_len
+                    && let Ok(target_len) = usize::try_from(refreshed_target)
+                {
+                    self.remap_locked(file, target_len, &mut inner, false);
+                }
+                if let Some(view) = inner.view.as_ref()
+                    && view.read_exact_at(offset, buf)
+                {
+                    return Some(buf.len());
+                }
+            }
+        }
+
+        self.counters
+            .pread_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn prepare_for_truncate(&self) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = inner.view.take();
+    }
+
+    fn refresh_after_truncate(&self, file: &Arc<File>, new_size: u64) {
+        let limit = self.configured_limit_bytes();
+        if limit == 0 || new_size == 0 {
+            return;
+        }
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.mapping_failed {
+            return;
+        }
+        let target_u64 = new_size.min(limit);
+        if let Ok(target_len) = usize::try_from(target_u64)
+            && target_len > 0
+        {
+            self.remap_locked(file, target_len, &mut inner, true);
+        }
+    }
+
+    fn unmap_all(&self) {
+        self.configured_limit_bytes.store(0, Ordering::Release);
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = inner.view.take();
+        inner.mapping_failed = false;
+    }
+}
+
 /// A file handle opened by [`UnixVfs`].
 #[derive(Debug)]
 #[allow(
@@ -2434,9 +2697,40 @@ pub struct UnixFile {
     /// Native main-file refusals retry outside the inode mutex. Process-local
     /// ownership conflicts remain nonblocking so the owning task can run.
     busy_timeout_ms: u64,
+    /// Ordinary database read-only mapping controller (`PRAGMA mmap_size`, `bd-dwjnq.3`).
+    mmap: UnixMmapController,
 }
 
 impl UnixFile {
+    /// Attempt to satisfy a read directly from the active read-only database
+    /// memory mapping (`PRAGMA mmap_size`). Returns `Ok(None)` immediately when
+    /// mapping is disabled (`limit == 0`) or falls back cleanly when the range
+    /// lies outside the mapped prefix.
+    pub(crate) fn try_read_via_mmap(
+        &self,
+        cx: &Cx,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<Option<usize>> {
+        if self.mmap.configured_limit_bytes() == 0 {
+            return Ok(None);
+        }
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "read")?;
+        if self.closed {
+            return Err(FrankenError::internal("unix file is closed"));
+        }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))?;
+        if let Some(total) = self.mmap.try_read(file, buf, offset) {
+            checkpoint_or_abort_if_cancel_published(cx)?;
+            return Ok(Some(total));
+        }
+        Ok(None)
+    }
+
     /// bd-j2dtf: an `immutable=1` open takes no locks at all, as stock's
     /// immutable files do (opened like a temp file: `noLock`, no WAL).
     fn takes_no_locks(&self) -> bool {
@@ -3897,6 +4191,7 @@ impl UnixFile {
             shm_dms_lifetime_claim: false,
             private_reader_shm: None,
             busy_timeout_ms: self.busy_timeout_ms,
+            mmap: UnixMmapController::new(),
         };
         let acquire = {
             let mut info = shm_info
@@ -3945,6 +4240,7 @@ impl UnixFile {
             shm_dms_lifetime_claim: self.shm_dms_lifetime_claim,
             private_reader_shm: self.private_reader_shm.take(),
             busy_timeout_ms: self.busy_timeout_ms,
+            mmap: UnixMmapController::new(),
         };
 
         self.lock_level = LockLevel::None;
@@ -3989,6 +4285,7 @@ impl UnixFile {
             shm_dms_lifetime_claim: false,
             private_reader_shm: None,
             busy_timeout_ms: 0,
+            mmap: UnixMmapController::new(),
         })
     }
 }
@@ -4169,6 +4466,10 @@ impl VfsFile for UnixFile {
             info.n_ref = info.n_ref.saturating_sub(1);
         }
 
+        // Unmap any active ordinary database file mapping before closing so the
+        // OS VMA lifetime is strictly bounded by handle lifetime (bd-dwjnq.3).
+        self.mmap.unmap_all();
+
         if self.delete_on_close {
             drop(fs::remove_file(&self.path));
         }
@@ -4221,6 +4522,9 @@ impl VfsFile for UnixFile {
     }
 
     async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if let Some(total) = self.try_read_via_mmap(cx, buf, offset)? {
+            return Ok(total);
+        }
         checkpoint_or_abort(cx)?;
         checked_io_range(offset, buf.len(), "read")?;
         let file = Arc::clone(
@@ -4437,7 +4741,13 @@ impl VfsFile for UnixFile {
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
+        // Unmap before shrinking the file so no active mapping extends past
+        // the truncated EOF (preventing SIGBUS on subsequent reads).
+        self.mmap.prepare_for_truncate();
         self.file_ref().set_len(size).map_err(FrankenError::Io)?;
+        if let Some(file) = self.file.as_ref() {
+            self.mmap.refresh_after_truncate(file, size);
+        }
         Ok(())
     }
 
@@ -5892,6 +6202,38 @@ impl VfsFile for UnixFile {
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.busy_timeout_ms = ms;
     }
+
+    fn set_mmap_size(&self, cx: &Cx, limit_bytes: u64) -> Result<VfsMmapStatus> {
+        // Disabling mmap (0) is a resource teardown that must always release
+        // the OS VMA even if the caller's Cx is already cancelled (e.g., during
+        // Connection::close_in_place after releasing the runtime region).
+        if limit_bytes == 0 || self.closed {
+            self.mmap.unmap_all();
+            return Ok(self.mmap.status());
+        }
+        checkpoint_or_abort(cx)?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))?;
+        Ok(self.mmap.configure(file, limit_bytes))
+    }
+
+    fn mmap_status(&self) -> VfsMmapStatus {
+        self.mmap.status()
+    }
+
+    fn read_only_mmap_view(&self) -> Option<ReadOnlyMmapView> {
+        if self.closed {
+            return None;
+        }
+        self.mmap.read_only_view()
+    }
+
+    fn inject_mmap_failure(&self, remaining_failures: u64) -> Result<()> {
+        self.mmap.inject_failure(remaining_failures);
+        Ok(())
+    }
 }
 
 /// Smallest busy budget for reader-slot acquisition, even when the handle has
@@ -6026,6 +6368,7 @@ impl UnixFile {
 
 impl Drop for UnixFile {
     fn drop(&mut self) {
+        self.mmap.unmap_all();
         if !self.closed {
             let cx = Cx::new();
             if let Err(error) = self.close(&cx) {
@@ -13233,5 +13576,94 @@ mod tests {
         let mut buf = vec![0_u8; 4096];
         assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 4096);
         assert_eq!(buf, payload);
+    }
+
+    #[test]
+    fn test_unix_file_mmap_admission_growth_truncate_fault_and_close() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("mmap-lifecycle.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        // Default is disabled (`configured_limit_bytes == 0`, `mapped_bytes == 0`).
+        let initial = file.mmap_status();
+        assert!(initial.supported);
+        assert_eq!(initial.configured_limit_bytes, 0);
+        assert_eq!(initial.mapped_bytes, 0);
+
+        // Write 3 x 4096-byte pages with distinct patterns.
+        let p0 = vec![0x11_u8; 4096];
+        let p1 = vec![0x22_u8; 4096];
+        let p2 = vec![0x33_u8; 4096];
+        file.write(&cx, &p0, 0).unwrap();
+        file.write(&cx, &p1, 4096).unwrap();
+        file.write(&cx, &p2, 8192).unwrap();
+
+        // Small cap (4096): maps only the first 4096 bytes; page 0 hits mmap,
+        // page 1 falls back cleanly to pread.
+        let s_small = file.set_mmap_size(&cx, 4096).unwrap();
+        assert_eq!(s_small.configured_limit_bytes, 4096);
+        assert_eq!(s_small.mapped_bytes, 4096);
+        assert!(s_small.is_active());
+
+        let mut buf = vec![0_u8; 4096];
+        assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 4096);
+        assert_eq!(buf, p0);
+        assert_eq!(file.mmap_status().mmap_read_hits, 1);
+
+        assert_eq!(file.read(&cx, &mut buf, 4096).unwrap(), 4096);
+        assert_eq!(buf, p1);
+        assert_eq!(file.mmap_status().pread_fallbacks, 1);
+
+        // Large cap (65536): maps full 12288-byte file, then grows dynamically to 16384.
+        let s_large = file.set_mmap_size(&cx, 65_536).unwrap();
+        assert_eq!(s_large.mapped_bytes, 12_288);
+        assert!(s_large.unmap_count >= 1);
+        let p3 = vec![0x44_u8; 4096];
+        file.write(&cx, &p3, 12_288).unwrap();
+        assert_eq!(file.read(&cx, &mut buf, 12_288).unwrap(), 4096);
+        assert_eq!(buf, p3);
+        let s_grown = file.mmap_status();
+        assert_eq!(s_grown.mapped_bytes, 16_384);
+        assert!(s_grown.mmap_read_hits >= 2);
+
+        // Concurrent ReadOnlyMmapView serves page 2 cleanly.
+        let view = file.read_only_mmap_view().expect("active mmap view");
+        assert_eq!(view.len(), 16_384);
+        let mut view_buf = vec![0_u8; 4096];
+        assert!(view.read_exact_at(8192, &mut view_buf));
+        assert_eq!(view_buf, p2);
+        drop(view);
+
+        // Truncate shrinks mapping BEFORE set_len (no SIGBUS) and remaps to 8192.
+        file.truncate(&cx, 8192).unwrap();
+        let s_trunc = file.mmap_status();
+        assert_eq!(s_trunc.mapped_bytes, 8192);
+        assert_eq!(file.read(&cx, &mut buf, 4096).unwrap(), 4096);
+        assert_eq!(buf, p1);
+
+        // Unmap via 0, then verify mapping failure injection degrades cleanly
+        // to pread without error.
+        let s_zero = file.set_mmap_size(&cx, 0).unwrap();
+        assert_eq!(s_zero.mapped_bytes, 0);
+        assert_eq!(s_zero.configured_limit_bytes, 0);
+        file.inject_mmap_failure(1).unwrap();
+        let s_fail = file.set_mmap_size(&cx, 32_768).unwrap();
+        assert_eq!(s_fail.mapped_bytes, 0);
+        assert!(s_fail.map_failures >= 1);
+        let fallbacks_before = s_fail.pread_fallbacks;
+        assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 4096);
+        assert_eq!(buf, p0);
+        assert!(file.mmap_status().pread_fallbacks > fallbacks_before);
+
+        // Re-enable and then close: mapping must unmap before close returns.
+        let s_re = file.set_mmap_size(&cx, 32_768).unwrap();
+        assert_eq!(s_re.mapped_bytes, 8192);
+        let unmaps_before = s_re.unmap_count;
+        file.close(&cx).unwrap();
+        let s_closed = file.mmap_status();
+        assert_eq!(s_closed.mapped_bytes, 0);
+        assert_eq!(s_closed.configured_limit_bytes, 0);
+        assert!(s_closed.unmap_count > unmaps_before);
     }
 }

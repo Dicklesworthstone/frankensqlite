@@ -2586,11 +2586,12 @@ pub mod pragma {
         state: &mut ConnectionPragmaState,
         stmt: &PragmaStatement,
     ) -> Result<PragmaOutput> {
+        const MAX_MMAP_SIZE_I64: i64 = 0x7fff_0000;
         match &stmt.value {
             None => Ok(PragmaOutput::Int(state.mmap_size)),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
                 let val = parse_integer_expr(expr)?;
-                state.mmap_size = val.max(0);
+                state.mmap_size = val.clamp(0, MAX_MMAP_SIZE_I64);
                 Ok(PragmaOutput::Int(state.mmap_size))
             }
         }

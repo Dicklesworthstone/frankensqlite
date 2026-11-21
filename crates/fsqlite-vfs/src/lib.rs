@@ -706,11 +706,12 @@ pub use namespace::{
 };
 pub use shm::ShmRegion;
 pub use traits::{
-    FileIdentity, ForeignWalParticipation, PrivateDatabaseCleanupDurability,
+    FileIdentity, ForeignWalParticipation, MAX_MMAP_SIZE, PrivateDatabaseCleanupDurability,
     PrivateDatabaseCleanupEntryReceipt, PrivateDatabaseCleanupEntryState,
     PrivateDatabaseCleanupFailure, PrivateDatabaseCleanupFailureStage,
-    PrivateDatabaseCleanupOutcome, SyncKind, Vfs, VfsFile, VfsWriteCompletion,
-    VfsWriteCompletionState, VfsWriteCompletionWait,
+    PrivateDatabaseCleanupOutcome, ReadOnlyMmapView, SyncKind, Vfs, VfsFile, VfsMmapStatus,
+    VfsWriteCompletion, VfsWriteCompletionState, VfsWriteCompletionWait,
+    active_database_mmap_count,
 };
 #[cfg(all(feature = "native", unix))]
 pub use unix::{UnixFile, UnixVfs};

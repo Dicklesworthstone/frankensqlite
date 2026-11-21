@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
+use fsqlite_vfs::ReadOnlyMmapView;
 
 use crate::traits::WalPublicationSnapshot;
 use crate::{PageCipherSlot, decrypt_page_after_read};
@@ -58,6 +59,8 @@ pub struct SnapshotPageReader {
 #[derive(Debug)]
 struct SnapshotPages {
     db_file: Arc<File>,
+    /// Optional bounded read-only OS mapping captured from `PRAGMA mmap_size`.
+    db_mmap: Option<ReadOnlyMmapView>,
     /// `None` when the snapshot sees no committed WAL frame.
     wal: Option<WalSnapshotFrames>,
     page_size: usize,
@@ -95,16 +98,38 @@ impl SnapshotPageReader {
         db_size: u32,
         page_cipher: PageCipherSlot,
     ) -> Self {
+        Self::new_with_cipher_and_mmap(db_file, wal, page_size, db_size, page_cipher, None)
+    }
+
+    /// A reader of an optionally encrypted committed WAL snapshot that serves
+    /// database-file pages through `db_mmap` when covered and falls back
+    /// cleanly to `pread` otherwise (`bd-dwjnq.3`).
+    #[must_use]
+    pub fn new_with_cipher_and_mmap(
+        db_file: Arc<File>,
+        wal: Option<WalSnapshotFrames>,
+        page_size: usize,
+        db_size: u32,
+        page_cipher: PageCipherSlot,
+        db_mmap: Option<ReadOnlyMmapView>,
+    ) -> Self {
         let wal = wal.filter(|frames| frames.publication.last_commit_frame.is_some());
         Self {
             inner: Arc::new(SnapshotPages {
                 db_file,
+                db_mmap,
                 wal,
                 page_size,
                 db_size,
                 page_cipher,
             }),
         }
+    }
+
+    /// Mapped byte prefix captured by this snapshot reader (`0` when unmapped).
+    #[must_use]
+    pub fn mapped_bytes(&self) -> usize {
+        self.inner.db_mmap.as_ref().map_or(0, ReadOnlyMmapView::len)
     }
 
     /// Page size of the database in bytes.
@@ -194,7 +219,16 @@ impl SnapshotPageReader {
         }
         let offset = u64::from(pgno - 1) * page_size as u64;
         let page = &mut buf.bytes[..page_size];
-        let read = pread_full(&pages.db_file, page, offset)?;
+        let read = if let Some(mmap) = &pages.db_mmap {
+            if mmap.read_exact_at(offset, page) {
+                page_size
+            } else {
+                mmap.record_pread_fallback();
+                pread_full(&pages.db_file, page, offset)?
+            }
+        } else {
+            pread_full(&pages.db_file, page, offset)?
+        };
         if let Some(active) = pages.page_cipher.get() {
             if read < page_size {
                 return Err(FrankenError::DatabaseCorrupt {

@@ -5262,6 +5262,78 @@ impl PagerBackend {
         }
     }
 
+    /// Configure ordinary database file memory-mapping (`PRAGMA mmap_size`,
+    /// `bd-dwjnq.3`).
+    async fn set_mmap_size(
+        &self,
+        cx: &Cx,
+        limit_bytes: u64,
+    ) -> Result<fsqlite_vfs::VfsMmapStatus> {
+        match self {
+            Self::Memory(p) => p.set_mmap_size(cx, limit_bytes).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.set_mmap_size(cx, limit_bytes).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.set_mmap_size(cx, limit_bytes).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.set_mmap_size(cx, limit_bytes).await,
+        }
+    }
+
+    /// Observe live ordinary database file memory-mapping status (`bd-dwjnq.3`).
+    #[must_use]
+    fn mmap_status(&self) -> fsqlite_vfs::VfsMmapStatus {
+        match self {
+            Self::Memory(p) => p.mmap_status(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.mmap_status(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.mmap_status(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.mmap_status(),
+        }
+    }
+
+    /// Observe live ordinary database file memory-mapping status asynchronously.
+    async fn mmap_status_async(&self, cx: &Cx) -> Result<fsqlite_vfs::VfsMmapStatus> {
+        match self {
+            Self::Memory(p) => p.mmap_status_async(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.mmap_status_async(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.mmap_status_async(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.mmap_status_async(cx).await,
+        }
+    }
+
+    /// Synchronously release any active database file mmap during connection
+    /// teardown (`bd-dwjnq.3`).
+    fn unmap_mmap_for_close(&self) {
+        match self {
+            Self::Memory(p) => p.unmap_mmap_for_close(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.unmap_mmap_for_close(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.unmap_mmap_for_close(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.unmap_mmap_for_close(),
+        }
+    }
+
+    /// Inject deterministic `mmap` admission failures for fallback testing (`bd-dwjnq.3`).
+    fn inject_mmap_failure(&self, remaining_failures: u64) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.inject_mmap_failure(remaining_failures),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.inject_mmap_failure(remaining_failures),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.inject_mmap_failure(remaining_failures),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.inject_mmap_failure(remaining_failures),
+        }
+    }
+
     /// Open an existing encrypted database in locked mode without parsing
     /// ciphertext page 1 yet.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -28583,6 +28655,78 @@ impl Connection {
         }])
     }
 
+    /// Observe live ordinary database file memory-mapping admission, mapped
+    /// bytes, hit/fallback counts, and unmap lifecycle (`PRAGMA mmap_size`,
+    /// `bd-dwjnq.3`).
+    ///
+    /// Explicitly distinct from WAL `-shm` mappings. Unsupported backends
+    /// (such as `:memory:`, Windows without native database file-mapping, or
+    /// WASM) report `supported == false`, `configured_limit_bytes == 0`, and
+    /// `mapped_bytes == 0`.
+    #[must_use]
+    pub fn mmap_status(&self) -> fsqlite_vfs::VfsMmapStatus {
+        self.pager.mmap_status()
+    }
+
+    /// Return a shareable read-only snapshot page reader for the currently
+    /// pinned read-only WAL transaction, if eligible (`bd-w4pr1.13.11`,
+    /// `bd-dwjnq.3`).
+    ///
+    /// When `PRAGMA mmap_size > 0` is active on a supported backend, the
+    /// returned reader shares the bounded read-only OS mapping safely across
+    /// threads for the lifetime of the pinned snapshot.
+    #[must_use]
+    pub fn active_snapshot_page_reader(&self) -> Option<fsqlite_pager::SnapshotPageReader> {
+        self.active_txn
+            .borrow()
+            .as_ref()
+            .and_then(TransactionHandle::snapshot_page_reader)
+    }
+
+    /// Inject deterministic `mmap` admission failures so fallback behavior
+    /// (`pread` degradation without error) can be verified through public SQL
+    /// workloads (`bd-dwjnq.3`).
+    #[doc(hidden)]
+    pub fn inject_mmap_failure(&self, remaining_failures: u64) -> Result<()> {
+        self.pager.inject_mmap_failure(remaining_failures)
+    }
+
+    /// Execute `PRAGMA mmap_size [= N]` by driving real VFS database file
+    /// mapping admission (`bd-dwjnq.3`).
+    ///
+    /// Negative values reset to default (`0`, unmapping any active VMA).
+    /// Positive values clamp to [`fsqlite_vfs::MAX_MMAP_SIZE`] (`0x7fff_0000`,
+    /// matching stock SQLite 3.46.1). Unsupported backends (`:memory:`, etc.)
+    /// always report `0` so readback never implies an active mapping.
+    async fn execute_pragma_mmap_size(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+        result_columns: &[&str],
+    ) -> Result<Vec<Row>> {
+        let cx = self.op_cx()?;
+        let status = if pragma.value.is_some() {
+            let mut parsed_state = self.pragma_state.borrow().clone();
+            let _ = fsqlite_vdbe::pragma::apply_connection_pragma(&mut parsed_state, pragma)?;
+            let requested = u64::try_from(parsed_state.mmap_size).unwrap_or(0);
+            self.pager.set_mmap_size(&cx, requested).await?
+        } else {
+            self.pager.mmap_status_async(&cx).await?
+        };
+        let effective = if status.supported {
+            i64::try_from(status.configured_limit_bytes).unwrap_or(i64::MAX)
+        } else {
+            0
+        };
+        self.pragma_state.borrow_mut().mmap_size = effective;
+        if result_columns.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![Row {
+                values: vec![SqliteValue::Integer(effective)],
+            }])
+        }
+    }
+
     fn concurrent_exec_context(&self) -> Result<Option<ConcurrentExecContext>> {
         let Some((session_id, handle)) = self.concurrent_session_handle()? else {
             return Ok(None);
@@ -30879,6 +31023,11 @@ impl Connection {
             #[cfg(not(target_arch = "wasm32"))]
             fsqlite_wal::remove_parallel_wal_coordinator(&db_path);
         }
+
+        // Release any active ordinary database file mmap before returning from
+        // close() / close_in_place() so VMA lifetimes stay strictly bounded
+        // (bd-dwjnq.3). Runs unconditionally even after runtime_region release.
+        self.pager.unmap_mmap_for_close();
 
         // Release any open statement engines and connection-local TEMP tables
         // before marking closed so every VFS temp spill handle is closed and
@@ -87794,6 +87943,9 @@ impl Connection {
         }
         if pragma_name == "temp_store_directory" {
             return self.execute_pragma_temp_store_directory(pragma, result_columns);
+        }
+        if pragma_name == "mmap_size" {
+            return self.execute_pragma_mmap_size(pragma, result_columns).await;
         }
         if matches!(pragma_name.as_str(), "cache_size" | "default_cache_size") {
             let mut next_state = self.pragma_state.borrow().clone();
@@ -227965,7 +228117,10 @@ mod tests {
 
             let updated = [
                 ("PRAGMA temp_store;", 2_i64),
-                ("PRAGMA mmap_size;", 8192_i64),
+                // `:memory:` does not support OS file mmap; readback must
+                // truthfully remain 0 rather than implying an active mapping
+                // (bd-dwjnq.3).
+                ("PRAGMA mmap_size;", 0_i64),
                 ("PRAGMA auto_vacuum;", 2_i64),
                 ("PRAGMA wal_autocheckpoint;", 0_i64),
                 ("PRAGMA user_version;", 123_i64),
@@ -227973,10 +228128,28 @@ mod tests {
                 ("PRAGMA foreign_keys;", 1_i64),
                 ("PRAGMA recursive_triggers;", 1_i64),
             ];
+            assert!(
+                !conn.mmap_status().supported,
+                ":memory: connection must explicitly report mmap unsupported"
+            );
             for (sql, expected) in updated {
                 let rows = conn.query(sql).await.unwrap();
                 assert_eq!(rows.len(), 1, "{sql} should return one row");
                 assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(expected));
+            }
+            #[cfg(all(feature = "native", unix))]
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let db_path = dir.path().join("mmap_knob.db");
+                let file_conn = Connection::open(db_path.to_string_lossy().as_ref())
+                    .await
+                    .unwrap();
+                file_conn.execute("PRAGMA mmap_size=8192;").await.unwrap();
+                let rows = file_conn.query("PRAGMA mmap_size;").await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(8192));
+                assert!(file_conn.mmap_status().supported);
+                file_conn.close().await.unwrap();
             }
         });
     }

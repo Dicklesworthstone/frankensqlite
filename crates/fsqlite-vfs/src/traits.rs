@@ -1805,6 +1805,291 @@ pub trait VfsFile: Send + Sync {
     /// Default implementation is a no-op (memory and stub VFS backends
     /// have no OS-level lock contention).
     fn set_busy_timeout_ms(&mut self, _ms: u64) {}
+
+    /// Configure the maximum byte prefix of this ordinary database file that
+    /// may be read through an OS read-only `MAP_SHARED` mapping
+    /// (`PRAGMA mmap_size`, `bd-dwjnq.3`).
+    ///
+    /// Passing `0` immediately unmaps any active database mapping. Backends
+    /// without OS file-mapping support keep `supported = false`,
+    /// `configured_limit_bytes = 0`, and `mapped_bytes = 0` so readback never
+    /// implies an active mapping.
+    fn set_mmap_size(&self, _cx: &Cx, _limit_bytes: u64) -> Result<VfsMmapStatus> {
+        Ok(VfsMmapStatus::default())
+    }
+
+    /// Observe live ordinary database file-mapping admission, mapped byte
+    /// length, hit/fallback counters, and unmap lifecycle (`bd-dwjnq.3`).
+    ///
+    /// Distinct from WAL `-shm` / shared WAL content mappings.
+    fn mmap_status(&self) -> VfsMmapStatus {
+        VfsMmapStatus::default()
+    }
+
+    /// Clone a bounded read-only handle to the currently active database
+    /// memory mapping, if any, for concurrent snapshot readers
+    /// (`SnapshotPageReader`, `bd-dwjnq.3`).
+    fn read_only_mmap_view(&self) -> Option<ReadOnlyMmapView> {
+        None
+    }
+
+    /// Inject deterministic `mmap` admission failures for testing fallback
+    /// semantics (`remaining_failures` consecutive map attempts fail and fall
+    /// back cleanly to `pread`).
+    #[doc(hidden)]
+    fn inject_mmap_failure(&self, _remaining_failures: u64) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+}
+
+/// Default upper bound for `PRAGMA mmap_size` (`0x7fff_0000` = `2 GiB - 64 KiB`),
+/// matching stock SQLite 3.46.1's `SQLITE_MAX_MMAP_SIZE`.
+pub const MAX_MMAP_SIZE: u64 = 0x7fff_0000;
+
+static ACTIVE_DATABASE_MMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of currently active OS read-only mappings of ordinary database files
+/// across this process (explicitly distinct from WAL `-shm` mappings).
+#[must_use]
+pub fn active_database_mmap_count() -> u64 {
+    ACTIVE_DATABASE_MMAP_COUNT.load(Ordering::Acquire)
+}
+
+/// Observable admission, byte coverage, and lifecycle status for ordinary
+/// database file memory-mapping (`PRAGMA mmap_size`, `bd-dwjnq.3`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VfsMmapStatus {
+    /// Whether this VFS backend supports OS memory-mapped database reads.
+    pub supported: bool,
+    /// Accepted byte limit (`0` disables mapping; always `0` when `!supported`).
+    pub configured_limit_bytes: u64,
+    /// Currently mapped prefix length in bytes (`0` when inactive or unmapped).
+    pub mapped_bytes: u64,
+    /// Monotonic generation incremented on each active map/remap.
+    pub mapping_generation: u64,
+    /// Cumulative reads satisfied directly from the read-only mapping.
+    pub mmap_read_hits: u64,
+    /// Cumulative reads served via `pread`/`io_uring` fallback while mmap was
+    /// requested (range past mapped prefix, empty file, or mapping failure).
+    pub pread_fallbacks: u64,
+    /// Cumulative OS `mmap` admission attempts.
+    pub map_attempts: u64,
+    /// Cumulative OS `mmap` failures that degraded cleanly to `pread`.
+    pub map_failures: u64,
+    /// Cumulative `munmap` teardowns proving bounded mapping lifetime.
+    pub unmap_count: u64,
+}
+
+impl VfsMmapStatus {
+    /// Whether an OS read-only mapping is currently active on this file.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.supported && self.mapped_bytes > 0
+    }
+}
+
+/// Shared atomic telemetry backing [`VfsMmapStatus`] and [`ReadOnlyMmapView`].
+#[derive(Debug, Default)]
+pub(crate) struct VfsMmapCounters {
+    pub(crate) mmap_read_hits: AtomicU64,
+    pub(crate) pread_fallbacks: AtomicU64,
+    pub(crate) map_attempts: AtomicU64,
+    pub(crate) map_failures: AtomicU64,
+    pub(crate) unmap_count: AtomicU64,
+}
+
+#[cfg(unix)]
+struct UnixReadOnlyMmap {
+    ptr: *const u8,
+    len: usize,
+    generation: u64,
+    counters: Arc<VfsMmapCounters>,
+    // Field drop runs AFTER Drop::drop, so the fd remains open through munmap.
+    _file: Arc<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for UnixReadOnlyMmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnixReadOnlyMmap")
+            .field("len", &self.len)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixReadOnlyMmap {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            // SAFETY: `self.ptr` and `self.len` were returned by a successful
+            // `libc::mmap(..., PROT_READ, MAP_SHARED, fd, 0)` call, no other
+            // `Arc<UnixReadOnlyMmap>` clones remain, and `_file` stays open
+            // until after `Drop::drop` finishes.
+            unsafe {
+                let _ = libc::munmap(self.ptr.cast_mut().cast::<libc::c_void>(), self.len);
+            }
+            self.counters.unmap_count.fetch_add(1, Ordering::Relaxed);
+            ACTIVE_DATABASE_MMAP_COUNT.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+// SAFETY: `UnixReadOnlyMmap` only permits bounds-checked read-only copies from
+// a `PROT_READ | MAP_SHARED` mapping whose lifetime is governed by `Arc` and
+// whose backing file descriptor is retained until after `munmap`.
+#[cfg(unix)]
+unsafe impl Send for UnixReadOnlyMmap {}
+#[cfg(unix)]
+unsafe impl Sync for UnixReadOnlyMmap {}
+
+/// Safe, bounds-checked, reference-counted handle to an OS read-only database
+/// file mapping (`PROT_READ | MAP_SHARED`).
+///
+/// Cloning shares the same underlying OS mapping; the last clone invokes
+/// `munmap` automatically so mapping lifetimes remain strictly bounded.
+#[derive(Clone, Debug)]
+pub struct ReadOnlyMmapView {
+    #[cfg(unix)]
+    inner: Arc<UnixReadOnlyMmap>,
+    #[cfg(not(unix))]
+    _unsupported: std::marker::PhantomData<()>,
+}
+
+impl ReadOnlyMmapView {
+    /// Map the prefix `[0..len)` of `file` read-only with `MAP_SHARED`.
+    #[cfg(unix)]
+    pub(crate) fn map_unix_prefix(
+        file: Arc<std::fs::File>,
+        len: usize,
+        generation: u64,
+        counters: Arc<VfsMmapCounters>,
+    ) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot mmap zero-length database prefix",
+            ));
+        }
+        // SAFETY: `file` is a valid open descriptor for the duration of `mmap`,
+        // `len > 0`, offset is 0, and `PROT_READ | MAP_SHARED` creates a
+        // read-only shared mapping.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if std::ptr::eq(raw, libc::MAP_FAILED) {
+            return Err(std::io::Error::last_os_error());
+        }
+        ACTIVE_DATABASE_MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+        Ok(Self {
+            inner: Arc::new(UnixReadOnlyMmap {
+                ptr: raw.cast::<u8>().cast_const(),
+                len,
+                generation,
+                counters,
+                _file: file,
+            }),
+        })
+    }
+
+    /// Mapped byte length of this prefix view.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        #[cfg(unix)]
+        {
+            self.inner.len
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+
+    /// Whether the mapped prefix is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Mapping generation identifier.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        #[cfg(unix)]
+        {
+            self.inner.generation
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+
+    /// Copy `dst.len()` bytes starting at `offset` if `[offset..offset+dst.len())`
+    /// lies completely within this mapped prefix.
+    ///
+    /// Returns `true` when satisfied from the mapping (recording an mmap read
+    /// hit) and `false` when the requested range extends past the mapped
+    /// prefix (caller must fall back to `pread`).
+    #[must_use]
+    pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> bool {
+        #[cfg(unix)]
+        {
+            if dst.is_empty() {
+                return true;
+            }
+            let Ok(start) = usize::try_from(offset) else {
+                return false;
+            };
+            let Some(end) = start.checked_add(dst.len()) else {
+                return false;
+            };
+            if end > self.inner.len {
+                return false;
+            }
+            // SAFETY: `self.inner.ptr..self.inner.ptr + self.inner.len` is a
+            // valid read-only mapping kept alive by `self.inner`, `end <= len`
+            // was verified above, and `dst` is an exclusive caller buffer
+            // disjoint from the file mapping.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.inner.ptr.add(start),
+                    dst.as_mut_ptr(),
+                    dst.len(),
+                );
+            }
+            self.inner
+                .counters
+                .mmap_read_hits
+                .fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (offset, dst);
+            false
+        }
+    }
+
+    /// Record a `pread` fallback taken by a snapshot reader holding this view
+    /// when a requested page lay outside the mapped prefix.
+    pub fn record_pread_fallback(&self) {
+        #[cfg(unix)]
+        {
+            self.inner
+                .counters
+                .pread_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]

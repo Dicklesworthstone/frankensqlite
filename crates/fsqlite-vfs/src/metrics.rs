@@ -588,6 +588,22 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.inner.set_busy_timeout_ms(ms);
     }
+
+    fn set_mmap_size(&self, cx: &Cx, limit_bytes: u64) -> Result<crate::traits::VfsMmapStatus> {
+        self.inner.set_mmap_size(cx, limit_bytes)
+    }
+
+    fn mmap_status(&self) -> crate::traits::VfsMmapStatus {
+        self.inner.mmap_status()
+    }
+
+    fn read_only_mmap_view(&self) -> Option<crate::traits::ReadOnlyMmapView> {
+        self.inner.read_only_mmap_view()
+    }
+
+    fn inject_mmap_failure(&self, remaining_failures: u64) -> Result<()> {
+        self.inner.inject_mmap_failure(remaining_failures)
+    }
 }
 
 #[cfg(test)]
