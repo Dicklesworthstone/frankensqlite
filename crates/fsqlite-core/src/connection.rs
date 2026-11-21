@@ -117479,11 +117479,12 @@ fn expr_matches_tracked_minmax(
     expr: &Expr,
     (is_max, arg, tracked_filter, tracked_distinct): &TrackedMinMax,
 ) -> bool {
+    let expected_filter = tracked_filter.as_ref();
     matches!(expr, Expr::FunctionCall {
         name, args: FunctionArgs::List(args), distinct, filter, order_by, over: None, ..
     } if name.eq_ignore_ascii_case(if *is_max { "max" } else { "min" })
         && args.as_slice() == std::slice::from_ref(arg)
-        && filter.as_deref() == tracked_filter.as_ref()
+        && filter.as_deref() == expected_filter
         && distinct == tracked_distinct
         && order_by.is_empty())
 }

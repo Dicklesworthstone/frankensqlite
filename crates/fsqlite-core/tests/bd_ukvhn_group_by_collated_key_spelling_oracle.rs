@@ -453,6 +453,57 @@ fn grouped_queries_use_each_tracked_argument_once() {
 }
 
 #[test]
+fn compiled_grouped_aggregates_share_only_identical_calls() {
+    asupersync::test_utils::run_test(|| async {
+        let db = Connection::open(":memory:").await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "CREATE TABLE g(k); INSERT INTO g VALUES (1),(1.0);";
+        db.execute_batch(setup).await.unwrap();
+        stock.execute_batch(setup).unwrap();
+        let steps =
+            |rows: &[Vec<String>]| rows.iter().filter(|row| row[1] == "text:AggStep").count();
+        for (columns, count) in [
+            ("max(random()), MAX(RANDOM())", 1),
+            ("sum(random()), SUM(RANDOM())", 1),
+            ("max(random()), min(random())", 2),
+            ("max(DISTINCT random()), max(random())", 2),
+            ("max((SELECT random())), max((SELECT random()))", 2),
+            (
+                "max(random()) FILTER (WHERE k>0), max(random()) FILTER (WHERE k<0)",
+                2,
+            ),
+        ] {
+            let sql = format!("EXPLAIN SELECT k,{columns} FROM g GROUP BY k");
+            let stock_steps = steps(&rq(&stock, &sql).unwrap());
+            assert_eq!(stock_steps, count, "{sql}");
+            assert_eq!(
+                steps(&tag_rows(&db.query(&sql).await.unwrap())),
+                stock_steps,
+                "{sql}"
+            );
+        }
+        let sql = "SELECT max(?), max(?) FROM g GROUP BY k";
+        let params = [SqliteValue::Integer(3), SqliteValue::Integer(7)];
+        let expected = stock
+            .query_row(sql, [3, 7], |row| {
+                Ok(vec![tag_r(&row.get(0)?), tag_r(&row.get(1)?)])
+            })
+            .unwrap();
+        let direct = db.query_with_params(sql, &params).await.unwrap();
+        let bound = db
+            .prepare(sql)
+            .await
+            .unwrap()
+            .query_with_params(&params)
+            .await
+            .unwrap();
+        assert_eq!(tag_rows(&direct), vec![expected.clone()]);
+        assert_eq!(tag_rows(&bound), vec![expected]);
+        db.close().await.unwrap();
+    });
+}
+
+#[test]
 fn collated_group_by_key_spelling_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         let mut diffs = Vec::new();

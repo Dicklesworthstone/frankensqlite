@@ -25754,12 +25754,13 @@ fn parse_group_by_output(
 
     let mut output_cols = Vec::with_capacity(columns.len());
     let mut agg_columns = Vec::with_capacity(columns.len());
+    let mut aggregate_exprs: Vec<&Expr> = Vec::new();
 
     for col in columns {
         match col {
             ResultColumn::Expr {
                 expr:
-                    Expr::FunctionCall {
+                    expr @ Expr::FunctionCall {
                         name,
                         args,
                         distinct,
@@ -25768,7 +25769,18 @@ fn parse_group_by_output(
                     },
                 ..
             } if is_aggregate_function_call(name, args) => {
+                // Stock steps an identical aggregate only once, including
+                // volatile arguments. Separate subqueries and unnumbered
+                // parameters can evaluate differently at each output site.
+                if let Some(agg_index) = aggregate_exprs.iter().position(|&prior| prior == expr)
+                    && !expr_contains_non_numbered_placeholder(expr)
+                    && !expr_contains_nested_subquery(expr)
+                {
+                    output_cols.push(GroupByOutputCol::Aggregate { agg_index });
+                    continue;
+                }
                 let agg_index = agg_columns.len();
+                aggregate_exprs.push(expr);
                 let canon_name = name.to_ascii_uppercase();
                 let filt = filter.clone();
                 match args {
