@@ -44,8 +44,61 @@ pub mod traits;
 pub use arc_cache::{ArcCache, ArcCacheInner, ArcEvictionModel, CacheKey, CacheLookup, CachedPage};
 #[cfg(feature = "encryption")]
 pub use encrypt::{
-    Argon2Params, DATABASE_ID_SIZE, DatabaseId, ENCRYPTION_RESERVED_BYTES, EncryptError, KEY_SIZE,
-    KeyManager, NONCE_SIZE, PageEncryptor, TAG_SIZE, validate_reserved_bytes,
+    ActivePageCipher, Argon2Params, DATABASE_ID_SIZE, DatabaseId, ENCRYPTION_RESERVED_BYTES,
+    EncryptError, KEY_ENVELOPE_MAGIC, KEY_ENVELOPE_SIZE, KEY_ENVELOPE_VERSION, KEY_SIZE,
+    KeyEnvelope, KeyManager, NONCE_SIZE, PageCipherSlot, PageEncryptor, TAG_SIZE, WRAPPED_DEK_SIZE,
+    decrypt_page_after_read, encrypt_page_for_write, generate_fresh_page_nonce,
+    key_envelope_path_for_db, validate_reserved_bytes,
+};
+#[cfg(all(feature = "encryption", not(target_arch = "wasm32")))]
+pub use encrypt::{read_key_envelope, remove_key_envelope_if_exists, write_key_envelope_atomic};
+#[cfg(not(feature = "encryption"))]
+mod encrypt_stub {
+    use fsqlite_error::Result;
+    use fsqlite_types::cx::Cx;
+
+    /// Zero-sized cipher stub when the `encryption` feature is disabled.
+    #[derive(Debug, Clone, Default)]
+    pub struct ActivePageCipher;
+
+    /// Zero-sized cipher slot stub when the `encryption` feature is disabled.
+    #[derive(Debug, Clone, Default)]
+    pub struct PageCipherSlot;
+
+    impl PageCipherSlot {
+        #[must_use]
+        pub fn is_enabled(&self) -> bool {
+            false
+        }
+
+        #[must_use]
+        pub fn get(&self) -> Option<ActivePageCipher> {
+            None
+        }
+
+        pub fn set(&self, _active: Option<ActivePageCipher>) {}
+    }
+
+    pub fn encrypt_page_for_write(
+        _active: &ActivePageCipher,
+        _cx: &Cx,
+        _page_no: u32,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        Ok(plaintext.to_vec())
+    }
+
+    pub fn decrypt_page_after_read(
+        _active: &ActivePageCipher,
+        _page_no: u32,
+        _buf: &mut [u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+#[cfg(not(feature = "encryption"))]
+pub use encrypt_stub::{
+    ActivePageCipher, PageCipherSlot, decrypt_page_after_read, encrypt_page_for_write,
 };
 #[cfg(feature = "evalue-eviction")]
 pub use evalue_eviction::{

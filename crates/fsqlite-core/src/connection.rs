@@ -195,11 +195,17 @@ pub struct CompactionReport {
     pub reclaimed_bytes: u64,
 }
 use fsqlite_pager::persistent_page_map::PersistentPageMap;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_pager::{
-    CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
-    PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, RollbackCleanup,
-    SimplePager, TransactionKind, WalCommitSyncPolicy, page_buffer_pool_metrics_snapshot,
-    pager_commit_profile_snapshot, reset_page_buffer_pool_metrics, reset_pager_commit_profile,
+    Argon2Params, ENCRYPTION_RESERVED_BYTES, KeyEnvelope, PageEncryptor, key_envelope_path_for_db,
+    read_key_envelope, remove_key_envelope_if_exists, write_key_envelope_atomic,
+};
+use fsqlite_pager::{
+    ActivePageCipher, CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
+    PageCipherSlot, PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot,
+    RollbackCleanup, SimplePager, TransactionKind, WalCommitSyncPolicy,
+    page_buffer_pool_metrics_snapshot, pager_commit_profile_snapshot,
+    reset_page_buffer_pool_metrics, reset_pager_commit_profile,
 };
 use fsqlite_parser::lexer::Lexer;
 use fsqlite_parser::{Parser, StatementParseScratch, parse_statements_with_scratch};
@@ -5222,6 +5228,183 @@ impl PagerBackend {
         }
     }
 
+    /// Return a shared handle to this pager's page-level encryption cipher slot.
+    #[must_use]
+    #[allow(dead_code)]
+    fn page_cipher_slot(&self) -> PageCipherSlot {
+        match self {
+            Self::Memory(p) => p.page_cipher_slot(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.page_cipher_slot(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.page_cipher_slot(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.page_cipher_slot(),
+        }
+    }
+
+    /// Install or clear the active page-level encryption cipher on this pager.
+    #[allow(dead_code)]
+    fn set_page_cipher(&self, active: Option<ActivePageCipher>) {
+        match self {
+            Self::Memory(p) => p.set_page_cipher(active),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.set_page_cipher(active),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.set_page_cipher(active),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.set_page_cipher(active),
+        }
+    }
+
+    /// Open an existing encrypted database in locked mode without parsing
+    /// ciphertext page 1 yet.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    async fn open_locked_with_page_buffer_max(
+        path: &str,
+        cx: &Cx,
+        requested_page_size: PageSize,
+        expected_identity: Option<FileIdentity>,
+        page_buffer_max: Option<usize>,
+        readonly: bool,
+    ) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let vfs = IoUringVfs::new();
+            let db_path = PathBuf::from(path);
+            let mut pager = SimplePager::open_locked_for_connection_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                requested_page_size,
+                page_buffer_max,
+                expected_identity,
+                readonly,
+            )
+            .await?;
+            if readonly {
+                let _ = pager.enable_single_connection_cache_fast_path();
+            }
+            Ok(Self::IoUring(Arc::new(pager)))
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let vfs = UnixVfs::new();
+            let db_path = PathBuf::from(path);
+            let mut pager = SimplePager::open_locked_for_connection_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                requested_page_size,
+                page_buffer_max,
+                expected_identity,
+                readonly,
+            )
+            .await?;
+            if readonly {
+                let _ = pager.enable_single_connection_cache_fast_path();
+            }
+            Ok(Self::Unix(Arc::new(pager)))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let vfs = fsqlite_vfs::WindowsVfs::new();
+            let db_path = PathBuf::from(path);
+            let mut pager = SimplePager::open_locked_for_connection_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                requested_page_size,
+                page_buffer_max,
+                expected_identity,
+                readonly,
+            )
+            .await?;
+            if readonly {
+                let _ = pager.enable_single_connection_cache_fast_path();
+            }
+            Ok(Self::Windows(Arc::new(pager)))
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    async fn unlock_with_cipher(
+        &self,
+        cx: &Cx,
+        active: ActivePageCipher,
+    ) -> Result<DatabaseHeader> {
+        match self {
+            Self::Memory(p) => p.unlock_with_cipher(cx, active).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.unlock_with_cipher(cx, active).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.unlock_with_cipher(cx, active).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.unlock_with_cipher(cx, active).await,
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    async fn initialize_empty_encrypted_page1(
+        &self,
+        cx: &Cx,
+        active: ActivePageCipher,
+        reserved_per_page: u8,
+    ) -> Result<DatabaseHeader> {
+        match self {
+            Self::Memory(p) => {
+                p.initialize_empty_encrypted_page1(cx, active, reserved_per_page)
+                    .await
+            }
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => {
+                p.initialize_empty_encrypted_page1(cx, active, reserved_per_page)
+                    .await
+            }
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => {
+                p.initialize_empty_encrypted_page1(cx, active, reserved_per_page)
+                    .await
+            }
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => {
+                p.initialize_empty_encrypted_page1(cx, active, reserved_per_page)
+                    .await
+            }
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    async fn replace_file_image_for_rekey(
+        &self,
+        cx: &Cx,
+        staged_path: &Path,
+        new_cipher: Option<ActivePageCipher>,
+        new_header: &DatabaseHeader,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(p) => {
+                p.replace_file_image_for_rekey(cx, staged_path, new_cipher, new_header)
+                    .await
+            }
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => {
+                p.replace_file_image_for_rekey(cx, staged_path, new_cipher, new_header)
+                    .await
+            }
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => {
+                p.replace_file_image_for_rekey(cx, staged_path, new_cipher, new_header)
+                    .await
+            }
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => {
+                p.replace_file_image_for_rekey(cx, staged_path, new_cipher, new_header)
+                    .await
+            }
+        }
+    }
+
     /// Begin a new transaction.
     async fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<TransactionKind> {
         match self {
@@ -5741,7 +5924,8 @@ where
         create_missing,
         #[cfg(all(feature = "native", any(unix, windows)))]
         pager.namespace_binding(),
-    );
+    )
+    .with_page_cipher(pager.page_cipher_slot());
     #[cfg(all(feature = "native", unix))]
     let adapter = {
         let mut adapter = adapter;
@@ -5789,7 +5973,7 @@ where
             ),
         });
     }
-    let adapter = WalBackendAdapter::new(wal);
+    let adapter = WalBackendAdapter::new(wal).with_page_cipher(pager.page_cipher_slot());
     #[cfg(all(feature = "native", unix))]
     let adapter = {
         let mut adapter = adapter;
@@ -6840,6 +7024,18 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
 
     // FrankenSQLite connection controls. Every setter here deliberately
     // echoes its effective value, so getter and setter forms share a shape.
+    if name_is("key") || name_is("hexkey") || name_is("rekey") || name_is("hexrekey") {
+        return &["ok"];
+    }
+    if full_name_is("fsqlite.cipher_argon2_m_cost") || full_name_is("cipher_argon2_m_cost") {
+        return &["cipher_argon2_m_cost"];
+    }
+    if full_name_is("fsqlite.cipher_argon2_t_cost") || full_name_is("cipher_argon2_t_cost") {
+        return &["cipher_argon2_t_cost"];
+    }
+    if full_name_is("fsqlite.cipher_argon2_p_cost") || full_name_is("cipher_argon2_p_cost") {
+        return &["cipher_argon2_p_cost"];
+    }
     if full_name_is("fsqlite.serializable") {
         return &["serializable"];
     }
@@ -15732,6 +15928,27 @@ pub struct Connection {
     /// falls back to the slow/instrumented path until the relevant
     /// state-transition site explicitly opens its bit.
     fast_path_gate: AtomicU32,
+    /// Page-level encryption lifecycle state (`bd-1vwiy.1`).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    encryption_state: RefCell<ConnectionEncryptionState>,
+    /// Argon2id KDF cost parameters for newly created or rekeyed envelopes.
+    /// Defaults to production [`Argon2Params::default()`] (64 MiB, t=3, p=4).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    cipher_argon2_params: RefCell<Argon2Params>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+enum ConnectionEncryptionState {
+    Plaintext,
+    Locked {
+        key_envelope_path: PathBuf,
+        open_readonly: bool,
+    },
+    Unlocked {
+        key_envelope_path: PathBuf,
+        envelope: KeyEnvelope,
+        encryptor: Arc<PageEncryptor>,
+    },
 }
 
 /// RAII guard that raises `statement_exec_depth` for the lifetime of a statement
@@ -17119,51 +17336,85 @@ impl Connection {
 
         let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
-        let pager = match disposition {
-            SchemaOnlyPagerDisposition::Ordinary if writable => {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let locked_key_envelope = if matches!(
+            disposition,
+            SchemaOnlyPagerDisposition::Ordinary | SchemaOnlyPagerDisposition::RecoverWalIndex
+        ) {
+            detect_locked_encrypted_database(&path)
+        } else {
+            None
+        };
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+        let locked_key_envelope: Option<(PathBuf, PageSize)> = None;
+        let pager = if let Some((_, locked_page_size)) = locked_key_envelope.as_ref() {
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            {
+                let locked_page_size = *locked_page_size;
                 retry_busy_connection_bootstrap(&bootstrap_cx, || {
-                    PagerBackend::open_existing_with_page_buffer_max(
+                    PagerBackend::open_locked_with_page_buffer_max(
                         &path,
                         &bootstrap_cx,
+                        locked_page_size,
                         expected_identity,
                         env.page_buffer_max(),
+                        !writable,
                     )
                 })
                 .await?
             }
-            SchemaOnlyPagerDisposition::Ordinary
-            | SchemaOnlyPagerDisposition::RecoverWalIndex
-            | SchemaOnlyPagerDisposition::Immutable => {
-                let mode = match disposition {
-                    SchemaOnlyPagerDisposition::RecoverWalIndex => {
-                        ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
-                    }
-                    SchemaOnlyPagerDisposition::Immutable => ConnectionPagerOpenMode::Immutable,
-                    _ => ConnectionPagerOpenMode::ReadOnly(expected_identity),
-                };
-                retry_busy_connection_bootstrap(&bootstrap_cx, || {
-                    PagerBackend::open_readonly_with_page_buffer_max(
-                        &path,
-                        &bootstrap_cx,
-                        mode,
-                        env.page_buffer_max(),
-                        env.memory_vfs_config(),
-                    )
-                })
-                .await?
+            #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+            {
+                let _ = locked_page_size;
+                unreachable!("locked encryption requires native")
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            SchemaOnlyPagerDisposition::ReservedEmptyRollback(expected_identity) => {
-                retry_busy_connection_bootstrap(&bootstrap_cx, || {
-                    PagerBackend::open_reserved_with_page_buffer_max(
-                        &path,
-                        &bootstrap_cx,
-                        expected_identity,
-                        env.page_buffer_max(),
-                        env.memory_vfs_config(),
-                    )
-                })
-                .await?
+        } else {
+            match disposition {
+                SchemaOnlyPagerDisposition::Ordinary if writable => {
+                    retry_busy_connection_bootstrap(&bootstrap_cx, || {
+                        PagerBackend::open_existing_with_page_buffer_max(
+                            &path,
+                            &bootstrap_cx,
+                            expected_identity,
+                            env.page_buffer_max(),
+                        )
+                    })
+                    .await?
+                }
+                SchemaOnlyPagerDisposition::Ordinary
+                | SchemaOnlyPagerDisposition::RecoverWalIndex
+                | SchemaOnlyPagerDisposition::Immutable => {
+                    let mode = match disposition {
+                        SchemaOnlyPagerDisposition::RecoverWalIndex => {
+                            ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+                        }
+                        SchemaOnlyPagerDisposition::Immutable => ConnectionPagerOpenMode::Immutable,
+                        _ => ConnectionPagerOpenMode::ReadOnly(expected_identity),
+                    };
+                    retry_busy_connection_bootstrap(&bootstrap_cx, || {
+                        PagerBackend::open_readonly_with_page_buffer_max(
+                            &path,
+                            &bootstrap_cx,
+                            mode,
+                            env.page_buffer_max(),
+                            env.memory_vfs_config(),
+                        )
+                    })
+                    .await?
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                SchemaOnlyPagerDisposition::ReservedEmptyRollback(expected_identity) => {
+                    retry_busy_connection_bootstrap(&bootstrap_cx, || {
+                        PagerBackend::open_reserved_with_page_buffer_max(
+                            &path,
+                            &bootstrap_cx,
+                            expected_identity,
+                            env.page_buffer_max(),
+                            env.memory_vfs_config(),
+                        )
+                    })
+                    .await?
+                }
             }
         };
         let file_identity = pager.file_identity(&bootstrap_cx).await?;
@@ -17483,6 +17734,16 @@ impl Connection {
             // corresponding state-transition site explicitly establishes
             // the invariant.
             fast_path_gate: AtomicU32::new(0),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            encryption_state: RefCell::new(match locked_key_envelope {
+                Some((key_envelope_path, _)) => ConnectionEncryptionState::Locked {
+                    key_envelope_path,
+                    open_readonly: !writable,
+                },
+                None => ConnectionEncryptionState::Plaintext,
+            }),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            cipher_argon2_params: RefCell::new(Argon2Params::default()),
         };
         let bootstrap_result: Result<()> = async {
             let _binding = conn.bind_bootstrap_cx(&env, &bootstrap_cx);
@@ -17493,6 +17754,12 @@ impl Connection {
                 conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
             }
             conn.register_cache_pages_module();
+            if conn.is_encryption_locked() {
+                conn.attach_connection_pool_metrics();
+                op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                conn.pager.finish_namespace_bootstrap()?;
+                return Ok(());
+            }
             conn.bootstrap_journal_mode_from_storage(false).await?;
             conn.bootstrap_pragma_state_from_storage();
             conn.apply_cache_size_to_pager(conn.pragma_state.borrow().cache_size)?;
@@ -17623,6 +17890,29 @@ impl Connection {
             ))
             .await;
         }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some((key_envelope_path, locked_page_size)) = detect_locked_encrypted_database(&path)
+        {
+            let pager = retry_busy_connection_bootstrap(&bootstrap_cx, || {
+                PagerBackend::open_locked_with_page_buffer_max(
+                    &path,
+                    &bootstrap_cx,
+                    locked_page_size,
+                    expected_identity,
+                    env.page_buffer_max(),
+                    false,
+                )
+            })
+            .await?;
+            return Self::open_with_env_and_pager_impl(
+                path,
+                env,
+                pager,
+                false,
+                Some((key_envelope_path, false)),
+            )
+            .await;
+        }
         let pager = retry_busy_connection_bootstrap(&bootstrap_cx, || {
             PagerBackend::open_existing_with_page_buffer_max(
                 &path,
@@ -17675,6 +17965,30 @@ impl Connection {
             return Box::pin(Self::open_schema_only_with_wal_index_recovery_and_env(
                 path, env,
             ))
+            .await;
+        }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some((key_envelope_path, locked_page_size)) = detect_locked_encrypted_database(&path)
+        {
+            return retry_busy_connection_bootstrap(&bootstrap_cx, || async {
+                let pager = PagerBackend::open_locked_with_page_buffer_max(
+                    &path,
+                    &bootstrap_cx,
+                    locked_page_size,
+                    None,
+                    env.page_buffer_max(),
+                    false,
+                )
+                .await?;
+                Self::open_with_env_and_pager_impl(
+                    path.clone(),
+                    env.clone(),
+                    pager,
+                    false,
+                    Some((key_envelope_path.clone(), false)),
+                )
+                .await
+            })
             .await;
         }
         retry_busy_connection_bootstrap(&bootstrap_cx, || async {
@@ -17747,6 +18061,18 @@ impl Connection {
         pager: PagerBackend,
         storage_was_empty: bool,
     ) -> Result<Self> {
+        Self::open_with_env_and_pager_impl(path, env, pager, storage_was_empty, None).await
+    }
+
+    async fn open_with_env_and_pager_impl(
+        path: String,
+        env: ConnectionEnv,
+        pager: PagerBackend,
+        storage_was_empty: bool,
+        locked_key_envelope: Option<(PathBuf, bool)>,
+    ) -> Result<Self> {
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+        let _ = locked_key_envelope;
         let mut attach_env = env.clone();
         attach_env.bootstrap_cx_override = None;
         let bootstrap_cx = env.bootstrap_cx();
@@ -18096,6 +18422,16 @@ impl Connection {
             // corresponding state-transition site explicitly establishes
             // the invariant.
             fast_path_gate: AtomicU32::new(0),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            encryption_state: RefCell::new(match locked_key_envelope {
+                Some((key_envelope_path, open_readonly)) => ConnectionEncryptionState::Locked {
+                    key_envelope_path,
+                    open_readonly,
+                },
+                None => ConnectionEncryptionState::Plaintext,
+            }),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            cipher_argon2_params: RefCell::new(Argon2Params::default()),
         };
         let bootstrap_result: Result<()> = async {
             let _binding = conn.bind_bootstrap_cx(&env, &bootstrap_cx);
@@ -18106,6 +18442,12 @@ impl Connection {
                 conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
             }
             conn.register_cache_pages_module();
+            if conn.is_encryption_locked() {
+                conn.attach_connection_pool_metrics();
+                op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                conn.pager.finish_namespace_bootstrap()?;
+                return Ok(());
+            }
             conn.bootstrap_journal_mode_from_storage(storage_was_empty)
                 .await?;
             conn.bootstrap_pragma_state_from_storage();
@@ -18163,6 +18505,570 @@ impl Connection {
         &self.path
     }
 
+    /// True while this connection opened an encrypted database and has not yet
+    /// been unlocked via `PRAGMA key`.
+    fn is_encryption_locked(&self) -> bool {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            matches!(
+                *self.encryption_state.borrow(),
+                ConnectionEncryptionState::Locked { .. }
+            )
+        }
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+        {
+            false
+        }
+    }
+
+    /// Only key-unlock and Argon2 cost pragmas are permitted while a connection
+    /// is locked on an encrypted database.
+    fn statement_allowed_while_encryption_locked(statement: &Statement) -> bool {
+        let Statement::Pragma(pragma) = statement else {
+            return false;
+        };
+        let name = pragma.name.name.to_ascii_lowercase();
+        let schema = pragma
+            .name
+            .schema
+            .as_deref()
+            .map(str::to_ascii_lowercase);
+        matches!(
+            (schema.as_deref(), name.as_str()),
+            (None, "key" | "hexkey")
+                | (
+                    Some("fsqlite") | None,
+                    "cipher_argon2_m_cost" | "cipher_argon2_t_cost" | "cipher_argon2_p_cost",
+                )
+        )
+    }
+
+    /// Configure or query Argon2id KDF parameters for newly created or rekeyed
+    /// encryption envelopes (`PRAGMA fsqlite.cipher_argon2_{m,t,p}_cost`).
+    fn execute_pragma_cipher_argon2_cost(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+        pragma_name: &str,
+    ) -> Result<Vec<Row>> {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let mut params = self.cipher_argon2_params.borrow().clone();
+            if let Some(value) = pragma.value.as_ref() {
+                let parsed = parse_pragma_nonnegative_usize(value, pragma_name)?;
+                let parsed_u32 = u32::try_from(parsed).map_err(|_| FrankenError::OutOfRange {
+                    what: pragma_name.to_owned(),
+                    value: parsed.to_string(),
+                })?;
+                match pragma_name {
+                    "cipher_argon2_m_cost" => params.m_cost = parsed_u32,
+                    "cipher_argon2_t_cost" => params.t_cost = parsed_u32,
+                    "cipher_argon2_p_cost" => params.p_cost = parsed_u32,
+                    _ => {}
+                }
+                params.validate()?;
+                *self.cipher_argon2_params.borrow_mut() = params.clone();
+            }
+            let reported = match pragma_name {
+                "cipher_argon2_m_cost" => i64::from(params.m_cost),
+                "cipher_argon2_t_cost" => i64::from(params.t_cost),
+                "cipher_argon2_p_cost" => i64::from(params.p_cost),
+                _ => 0,
+            };
+            Ok(vec![Row {
+                values: vec![SqliteValue::Integer(reported)],
+            }])
+        }
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+        {
+            let _ = (pragma, pragma_name);
+            Err(FrankenError::Unsupported)
+        }
+    }
+
+    /// Handle `PRAGMA key = '...'` / `PRAGMA hexkey = '...'` (`bd-1vwiy.1`).
+    ///
+    /// - On a locked encrypted database: reads `<db>-key`, derives the KEK via
+    ///   Argon2id, unwraps the DEK, unlocks the pager, replays any hot journal,
+    ///   binds WAL if applicable, and reloads schema.
+    /// - On a brand-new empty plaintext database: generates a fresh DEK and
+    ///   `<db>-key` envelope and initializes encrypted page 1 (`reserved = 40`).
+    /// - On an already-unlocked database: verifies the passphrase matches the
+    ///   active envelope.
+    /// - Never logs secret/passphrase bytes.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_pragma_key(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+        is_hex: bool,
+    ) -> Result<Vec<Row>> {
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+        {
+            let _ = (pragma, is_hex);
+            Err(FrankenError::Unsupported)
+        }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            if self.pager.is_memory() || self.path == ":memory:" {
+                return Err(FrankenError::Unsupported);
+            }
+            if self.in_transaction.get() || !self.savepoints.borrow().is_empty() {
+                return Err(FrankenError::function_error(
+                    "PRAGMA key cannot be executed inside a transaction".to_owned(),
+                ));
+            }
+            let Some(value) = pragma.value.as_ref() else {
+                return Err(FrankenError::function_error(
+                    "PRAGMA key requires a key value".to_owned(),
+                ));
+            };
+            let secret = parse_pragma_key_material(value, is_hex)?;
+            if secret.is_empty() {
+                return Err(FrankenError::NotADatabase {
+                    path: PathBuf::from(&self.path),
+                });
+            }
+            let cx = self.op_cx()?;
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+
+            enum KeyAction {
+                UnlockLocked {
+                    key_envelope_path: PathBuf,
+                    open_readonly: bool,
+                },
+                InitFreshEmpty,
+                VerifyUnlocked(KeyEnvelope),
+            }
+            let action = match &*self.encryption_state.borrow() {
+                ConnectionEncryptionState::Locked {
+                    key_envelope_path,
+                    open_readonly,
+                } => KeyAction::UnlockLocked {
+                    key_envelope_path: key_envelope_path.clone(),
+                    open_readonly: *open_readonly,
+                },
+                ConnectionEncryptionState::Plaintext => KeyAction::InitFreshEmpty,
+                ConnectionEncryptionState::Unlocked { envelope, .. } => {
+                    KeyAction::VerifyUnlocked(envelope.clone())
+                }
+            };
+
+            match action {
+                KeyAction::VerifyUnlocked(envelope) => {
+                    let _ = envelope.unlock(&cx, &secret)?;
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Text("ok".into())],
+                    }])
+                }
+                KeyAction::UnlockLocked {
+                    key_envelope_path,
+                    open_readonly,
+                } => {
+                    let envelope = read_key_envelope(&key_envelope_path)?.ok_or_else(|| {
+                        FrankenError::NotADatabase {
+                            path: key_envelope_path.clone(),
+                        }
+                    })?;
+                    let encryptor = Arc::new(envelope.unlock(&cx, &secret)?);
+                    let page_size_usize =
+                        usize::try_from(envelope.page_size()).map_err(|_| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "invalid key envelope page size {}",
+                                    envelope.page_size()
+                                ),
+                            }
+                        })?;
+                    let active = ActivePageCipher::new(Arc::clone(&encryptor), page_size_usize);
+                    let _header = self.pager.unlock_with_cipher(&cx, active).await?;
+
+                    *self.encryption_state.borrow_mut() = ConnectionEncryptionState::Unlocked {
+                        key_envelope_path: key_envelope_path.clone(),
+                        envelope,
+                        encryptor,
+                    };
+
+                    let finish_unlock: Result<()> = async {
+                        self.bootstrap_journal_mode_from_storage(false).await?;
+                        self.bootstrap_pragma_state_from_storage();
+                        self.apply_cache_size_to_pager(self.pragma_state.borrow().cache_size)?;
+                        if open_readonly {
+                            self.apply_current_journal_mode_to_pager_readonly().await?;
+                        } else {
+                            self.apply_current_journal_mode_to_pager().await?;
+                        }
+                        self.apply_current_synchronous_to_pager()?;
+                        #[cfg(unix)]
+                        if !self.pager.is_memory() {
+                            self.pager.refresh_published_snapshot(&cx).await?;
+                        }
+                        self.reload_memdb_from_pager_with_mode(&cx, !self.schema_only_open)
+                            .await?;
+                        self.bootstrap_cache_size_from_storage()?;
+                        self.align_commit_clock_floor(*self.memdb_visible_commit_seq.borrow());
+                        self.sync_change_tracking_context();
+                        Ok(())
+                    }
+                    .await;
+
+                    if let Err(err) = finish_unlock {
+                        self.pager.set_page_cipher(None);
+                        *self.encryption_state.borrow_mut() = ConnectionEncryptionState::Locked {
+                            key_envelope_path,
+                            open_readonly,
+                        };
+                        return Err(err);
+                    }
+                    tracing::info!(
+                        target: "fsqlite.encryption",
+                        mode = "unlock",
+                        "unlocked encrypted database"
+                    );
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Text("ok".into())],
+                    }])
+                }
+                KeyAction::InitFreshEmpty => {
+                    if self.pager.is_readonly() || self.pragma_state.borrow().query_only {
+                        return Err(FrankenError::ReadOnly);
+                    }
+                    self.quiesce_pager_export_state(&cx).await?;
+                    let is_empty = self.schema.borrow().is_empty()
+                        && self.views.borrow().is_empty()
+                        && self.triggers.borrow().is_empty()
+                        && self.pager.published_snapshot().db_size <= 1;
+                    if !is_empty {
+                        return Err(FrankenError::NotADatabase {
+                            path: PathBuf::from(&self.path),
+                        });
+                    }
+                    let key_path = key_envelope_path_for_db(Path::new(&self.path));
+                    let page_size_u32 = self.pager.page_size().get();
+                    let params = self.cipher_argon2_params.borrow().clone();
+                    let (envelope, encryptor) = KeyEnvelope::create_new(
+                        &cx,
+                        &secret,
+                        page_size_u32,
+                        ENCRYPTION_RESERVED_BYTES,
+                        params.clone(),
+                    )?;
+                    let encryptor = Arc::new(encryptor);
+                    let page_size_usize = usize::try_from(page_size_u32).map_err(|_| {
+                        FrankenError::OutOfRange {
+                            what: "page_size".to_owned(),
+                            value: page_size_u32.to_string(),
+                        }
+                    })?;
+                    let active = ActivePageCipher::new(Arc::clone(&encryptor), page_size_usize);
+                    self.pager
+                        .initialize_empty_encrypted_page1(&cx, active, ENCRYPTION_RESERVED_BYTES)
+                        .await?;
+                    if let Err(err) = write_key_envelope_atomic(&cx, &key_path, &envelope) {
+                        self.pager.set_page_cipher(None);
+                        return Err(err);
+                    }
+                    *self.encryption_state.borrow_mut() = ConnectionEncryptionState::Unlocked {
+                        key_envelope_path: key_path,
+                        envelope,
+                        encryptor,
+                    };
+                    tracing::info!(
+                        target: "fsqlite.encryption",
+                        mode = "init_fresh",
+                        m_cost = params.m_cost,
+                        t_cost = params.t_cost,
+                        p_cost = params.p_cost,
+                        "initialized page-level encryption on fresh database"
+                    );
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Text("ok".into())],
+                    }])
+                }
+            }
+        }
+    }
+
+    /// Handle `PRAGMA rekey = '...'` / `PRAGMA hexrekey = '...'` (`bd-1vwiy.1`).
+    ///
+    /// - Unlocked + non-empty key: O(1) KEK re-wrap of `<db>-key` preserving
+    ///   both the DEK and `DatabaseId`, touching zero database data pages.
+    /// - Plaintext + non-empty key: explicit conversion (`reserved_per_page`
+    ///   `0 -> 40`) via compacted staging image + atomic `<db>-key` write.
+    /// - Unlocked + empty key (`''`): explicit conversion (`reserved_per_page`
+    ///   `40 -> 0`) into a stock-readable plaintext database + `<db>-key` removal.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_pragma_rekey(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+        is_hex: bool,
+    ) -> Result<Vec<Row>> {
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+        {
+            let _ = (pragma, is_hex);
+            Err(FrankenError::Unsupported)
+        }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            if self.pager.is_memory() || self.path == ":memory:" {
+                return Err(FrankenError::Unsupported);
+            }
+            if self.is_encryption_locked() {
+                return Err(FrankenError::NotADatabase {
+                    path: PathBuf::from(&self.path),
+                });
+            }
+            if self.pager.is_readonly() || self.pragma_state.borrow().query_only {
+                return Err(FrankenError::ReadOnly);
+            }
+            if self.in_transaction.get() || !self.savepoints.borrow().is_empty() {
+                return Err(FrankenError::function_error(
+                    "PRAGMA rekey cannot be executed inside a transaction".to_owned(),
+                ));
+            }
+            let Some(value) = pragma.value.as_ref() else {
+                return Err(FrankenError::function_error(
+                    "PRAGMA rekey requires a key value".to_owned(),
+                ));
+            };
+            let new_secret = parse_pragma_key_material(value, is_hex)?;
+            let cx = self.op_cx()?;
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+
+            enum RekeyAction {
+                O1KekRewrap {
+                    key_envelope_path: PathBuf,
+                    envelope: KeyEnvelope,
+                    encryptor: Arc<PageEncryptor>,
+                },
+                EnableFromPlaintext,
+                DisableToPlaintext {
+                    key_envelope_path: PathBuf,
+                },
+                NoopPlaintext,
+            }
+            let action = match &*self.encryption_state.borrow() {
+                ConnectionEncryptionState::Locked { .. } => {
+                    return Err(FrankenError::NotADatabase {
+                        path: PathBuf::from(&self.path),
+                    });
+                }
+                ConnectionEncryptionState::Plaintext if new_secret.is_empty() => {
+                    RekeyAction::NoopPlaintext
+                }
+                ConnectionEncryptionState::Plaintext => RekeyAction::EnableFromPlaintext,
+                ConnectionEncryptionState::Unlocked {
+                    key_envelope_path,
+                    envelope,
+                    encryptor,
+                } if !new_secret.is_empty() => RekeyAction::O1KekRewrap {
+                    key_envelope_path: key_envelope_path.clone(),
+                    envelope: envelope.clone(),
+                    encryptor: Arc::clone(encryptor),
+                },
+                ConnectionEncryptionState::Unlocked {
+                    key_envelope_path, ..
+                } => RekeyAction::DisableToPlaintext {
+                    key_envelope_path: key_envelope_path.clone(),
+                },
+            };
+
+            match action {
+                RekeyAction::NoopPlaintext => Ok(vec![Row {
+                    values: vec![SqliteValue::Text("ok".into())],
+                }]),
+                RekeyAction::O1KekRewrap {
+                    key_envelope_path,
+                    envelope,
+                    encryptor,
+                } => {
+                    let params = self.cipher_argon2_params.borrow().clone();
+                    let next_envelope =
+                        envelope.rekey_o1(&cx, &encryptor, &new_secret, params.clone())?;
+                    write_key_envelope_atomic(&cx, &key_envelope_path, &next_envelope)?;
+                    *self.encryption_state.borrow_mut() = ConnectionEncryptionState::Unlocked {
+                        key_envelope_path,
+                        envelope: next_envelope,
+                        encryptor,
+                    };
+                    tracing::info!(
+                        target: "fsqlite.encryption",
+                        rekey_mode = "o1_kek_rewrap",
+                        m_cost = params.m_cost,
+                        t_cost = params.t_cost,
+                        p_cost = params.p_cost,
+                        "completed O(1) KEK re-wrap without rewriting database pages"
+                    );
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Text("ok".into())],
+                    }])
+                }
+                RekeyAction::EnableFromPlaintext => {
+                    self.convert_database_encryption_state(&cx, Some(&new_secret), None)
+                        .await?;
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Text("ok".into())],
+                    }])
+                }
+                RekeyAction::DisableToPlaintext { key_envelope_path } => {
+                    self.convert_database_encryption_state(&cx, None, Some(key_envelope_path))
+                        .await?;
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Text("ok".into())],
+                    }])
+                }
+            }
+        }
+    }
+
+    /// Explicitly convert a database between Plaintext (`reserved_per_page = 0`)
+    /// and Encrypted (`reserved_per_page = 40`) by rebuilding into an isolated
+    /// reserved staging file and atomically replacing the main file image.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[allow(clippy::too_many_lines)]
+    async fn convert_database_encryption_state(
+        &self,
+        cx: &Cx,
+        enable_secret: Option<&[u8]>,
+        disable_key_path: Option<PathBuf>,
+    ) -> Result<()> {
+        self.quiesce_database_image_publication_state(cx).await?;
+        let was_wal = self.pager.journal_mode() == JournalMode::Wal;
+        if was_wal {
+            // Checkpoint outstanding WAL frames first so WAL retirement
+            // succeeds cleanly before rewriting the physical database image.
+            let checkpoint = self.pager.checkpoint(cx, CheckpointMode::Truncate).await?;
+            if !checkpoint.completed || checkpoint.effective_mode != CheckpointMode::Truncate {
+                return Err(FrankenError::Busy);
+            }
+            let _ = self.pager.set_journal_mode(cx, JournalMode::Delete).await?;
+        }
+
+        let source_header = self
+            .reload_memdb_from_pager_with_mode(cx, true)
+            .await?
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "rekey source has no initialized database header".to_owned(),
+            })?;
+        let extra_master_entries = self.vacuum_extra_sqlite_master_entries();
+        let schema = self.schema.borrow().clone();
+        let db = self.db.borrow().clone();
+        let ddl = self.original_ddl_sql.borrow().clone();
+
+        let mut target_header = source_header.clone();
+        target_header.write_version = 1;
+        target_header.read_version = 1;
+        target_header.reserved_per_page = if enable_secret.is_some() {
+            ENCRYPTION_RESERVED_BYTES
+        } else {
+            0
+        };
+        target_header.change_counter = source_header.change_counter.wrapping_add(1).max(1);
+        target_header.schema_cookie = source_header.schema_cookie.wrapping_add(1).max(1);
+        target_header.version_valid_for = target_header.change_counter;
+
+        let new_encryption = if let Some(secret) = enable_secret {
+            let params = self.cipher_argon2_params.borrow().clone();
+            let (envelope, encryptor) = KeyEnvelope::create_new(
+                cx,
+                secret,
+                target_header.page_size.get(),
+                ENCRYPTION_RESERVED_BYTES,
+                params,
+            )?;
+            let encryptor = Arc::new(encryptor);
+            let page_size_usize = target_header.page_size.as_usize();
+            let active = ActivePageCipher::new(Arc::clone(&encryptor), page_size_usize);
+            Some((envelope, encryptor, active))
+        } else {
+            None
+        };
+
+        let rebuild_target =
+            crate::vacuum::reserve_temp_rebuild_target(cx, Path::new(&self.path))?;
+        let stage_result = crate::vacuum::persist_compacted_database_with_cipher(
+            cx,
+            &rebuild_target,
+            &schema,
+            &db,
+            &target_header,
+            &extra_master_entries,
+            &ddl,
+            new_encryption.as_ref().map(|(_, _, active)| active.clone()),
+        )
+        .await;
+        if let Err(err) = stage_result {
+            rebuild_target.cleanup_after_failure(
+                cx,
+                "rekey conversion staging failed and temp cleanup was incomplete",
+            );
+            return Err(err);
+        }
+
+        let replace_result = self
+            .pager
+            .replace_file_image_for_rekey(
+                cx,
+                rebuild_target.path(),
+                new_encryption.as_ref().map(|(_, _, active)| active.clone()),
+                &target_header,
+            )
+            .await;
+        let _ = rebuild_target.cleanup_if_owned(cx);
+        replace_result?;
+
+        // Retire any remaining stale WAL/FEC/certificate sidecars from the
+        // previous encryption regime so no plaintext/ciphertext residue survives.
+        cleanup_stale_wal_sidecars_for_rekey(&self.path);
+
+        if let Some((envelope, encryptor, _)) = new_encryption {
+            let key_path = key_envelope_path_for_db(Path::new(&self.path));
+            write_key_envelope_atomic(cx, &key_path, &envelope)?;
+            *self.encryption_state.borrow_mut() = ConnectionEncryptionState::Unlocked {
+                key_envelope_path: key_path,
+                envelope,
+                encryptor,
+            };
+            tracing::info!(
+                target: "fsqlite.encryption",
+                rekey_mode = "enable_conversion",
+                reserved_per_page = ENCRYPTION_RESERVED_BYTES,
+                "converted plaintext database to encrypted format"
+            );
+        } else {
+            if let Some(key_path) = disable_key_path {
+                remove_key_envelope_if_exists(&key_path)?;
+            }
+            *self.encryption_state.borrow_mut() = ConnectionEncryptionState::Plaintext;
+            tracing::info!(
+                target: "fsqlite.encryption",
+                rekey_mode = "disable_conversion",
+                reserved_per_page = 0,
+                "converted encrypted database to plaintext format"
+            );
+        }
+
+        // Reset connection-local cached snapshots/statements so every subsequent
+        // query reads through the newly installed image and WAL generation.
+        let _ = self.cached_read_snapshot.borrow_mut().take();
+        self.cached_autocommit_publication.set(None);
+        let _ = self.cached_write_txn.borrow_mut().take();
+        self.parse_cache.borrow_mut().clear();
+        self.compiled_cache.borrow_mut().clear();
+        self.prepared_cache.borrow_mut().clear();
+        self.storage_count_cache.borrow_mut().clear();
+        self.prepared_indexed_equality_cache.borrow_mut().clear();
+        let _ = self.table_execution_metadata_cache.borrow_mut().take();
+        *self.wal_fec_pipeline.borrow_mut() = None;
+
+        if was_wal {
+            "wal".clone_into(&mut self.pragma_state.borrow_mut().journal_mode);
+            self.apply_current_journal_mode_to_pager().await?;
+        }
+        self.reload_memdb_from_pager_with_mode(cx, !self.schema_only_open)
+            .await?;
+        self.sync_change_tracking_context();
+        Ok(())
+    }
+
     /// Return the identity of the main database object held by this connection.
     ///
     /// This is derived from the VFS's already-open main-file handle, never by
@@ -18186,6 +19092,11 @@ impl Connection {
 
     /// Export the current database as a self-contained SQLite database image.
     pub async fn export_bytes(&self) -> Result<Vec<u8>> {
+        if self.is_encryption_locked() {
+            return Err(FrankenError::NotADatabase {
+                path: PathBuf::from(&self.path),
+            });
+        }
         // bd-wymdl gap 2: a dropped transaction wrapper's deferred rollback
         // must run before image capture — otherwise the export quiesce either
         // observes the stale open transaction or stays Busy until an
@@ -30533,6 +31444,11 @@ impl Connection {
     }
 
     async fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
+        if self.is_encryption_locked() {
+            return Err(FrankenError::NotADatabase {
+                path: PathBuf::from(&self.path),
+            });
+        }
         let op_cx = self.op_cx_after_background_status();
         // bd-dk9ra (close_flush): preparing a statement runs memdb refreshes that
         // reload from the pager and consume the one-shot live-vtab preservation
@@ -31079,7 +31995,9 @@ impl Connection {
         clear_error_byte_offset();
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
-        if let Some(rows) = self.query_literal_statement_parameterized(sql).await? {
+        if !self.is_encryption_locked()
+            && let Some(rows) = self.query_literal_statement_parameterized(sql).await?
+        {
             return Ok(rows);
         }
         let statements = {
@@ -31654,6 +32572,15 @@ impl Connection {
             let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_multi(sql)?
         };
+        if self.is_encryption_locked()
+            && statements
+                .iter()
+                .any(|stmt| !Self::statement_allowed_while_encryption_locked(stmt.as_ref()))
+        {
+            return Err(FrankenError::NotADatabase {
+                path: PathBuf::from(&self.path),
+            });
+        }
         // INSERT ... ON CONFLICT conflict-target validation. Neither the VDBE
         // fast lane (codegen_insert, reached only for non-deferred inserts) nor
         // the dispatch path validates the arbiter, so run it here for every
@@ -42160,6 +43087,12 @@ impl Connection {
         statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        if self.is_encryption_locked() && !Self::statement_allowed_while_encryption_locked(statement)
+        {
+            return Err(FrankenError::NotADatabase {
+                path: PathBuf::from(&self.path),
+            });
+        }
         #[cfg(test)]
         record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
         #[cfg(test)]
@@ -86470,6 +87403,29 @@ impl Connection {
         let result_columns = pragma_result_columns(pragma);
         // First try connection-level knobs (journal_mode, synchronous, etc.).
         let pragma_name = pragma.name.name.to_ascii_lowercase();
+        let pragma_schema = pragma
+            .name
+            .schema
+            .as_deref()
+            .map(str::to_ascii_lowercase);
+        if pragma_schema.is_none() && matches!(pragma_name.as_str(), "key" | "hexkey") {
+            return self
+                .execute_pragma_key(pragma, pragma_name == "hexkey")
+                .await;
+        }
+        if pragma_schema.is_none() && matches!(pragma_name.as_str(), "rekey" | "hexrekey") {
+            return self
+                .execute_pragma_rekey(pragma, pragma_name == "hexrekey")
+                .await;
+        }
+        if matches!(pragma_schema.as_deref(), None | Some("fsqlite"))
+            && matches!(
+                pragma_name.as_str(),
+                "cipher_argon2_m_cost" | "cipher_argon2_t_cost" | "cipher_argon2_p_cost"
+            )
+        {
+            return self.execute_pragma_cipher_argon2_cost(pragma, &pragma_name);
+        }
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if pragma_name == "raptorq_repair_symbols" {
             let mut next = self.pragma_state.borrow().clone();
@@ -161895,6 +162851,106 @@ fn parse_pragma_nonnegative_usize(value: &fsqlite_ast::PragmaValue, what: &str) 
             "PRAGMA {what} value is too large for this platform: {raw}"
         ))
     })
+}
+
+/// Detect whether `path` is backed by an encrypted database (`<db>-key`
+/// sidecar present) and extract its nominal page size for locked open.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn detect_locked_encrypted_database(path: &str) -> Option<(PathBuf, PageSize)> {
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    let key_path = key_envelope_path_for_db(Path::new(path));
+    if !key_path.exists() {
+        return None;
+    }
+    let page_size = std::fs::read(&key_path)
+        .ok()
+        .and_then(|bytes| KeyEnvelope::from_bytes(&bytes).ok())
+        .and_then(|env| PageSize::new(env.page_size()))
+        .unwrap_or(PageSize::DEFAULT);
+    Some((key_path, page_size))
+}
+
+/// Remove stale WAL/FEC/certificate sidecars after Plaintext <-> Encrypted
+/// conversion so zero cross-regime ciphertext or plaintext residue remains.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn cleanup_stale_wal_sidecars_for_rekey(db_path: &str) {
+    let wal_path = wal_path_for_db_path(db_path);
+    let fec_path = fsqlite_wal::wal_fec_path_for_wal(&wal_path);
+    let mut candidates = vec![wal_path, fec_path];
+    for suffix in ["-shm", "-wal-cert", "-wal-cert-head"] {
+        let mut s = std::ffi::OsString::from(db_path);
+        s.push(suffix);
+        candidates.push(PathBuf::from(s));
+    }
+    for path in candidates {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "fsqlite.encryption",
+                    error = %err,
+                    path = %path.display(),
+                    "failed to remove stale WAL sidecar during rekey conversion"
+                );
+            }
+        }
+    }
+}
+
+/// Decode ASCII hexadecimal bytes without logging the input material.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn decode_hex_key_material(hex: &str) -> Result<Vec<u8>> {
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(FrankenError::function_error(
+            "PRAGMA hexkey/hexrekey requires an even number of hex digits".to_owned(),
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| FrankenError::function_error("invalid hex digit in key".to_owned()))?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| FrankenError::function_error("invalid hex digit in key".to_owned()))?;
+        #[allow(clippy::cast_possible_truncation)]
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
+}
+
+/// Extract raw key/passphrase bytes from `PRAGMA key`/`PRAGMA rekey` values.
+///
+/// Accepts UTF-8 string literals, SQL blob literals (`x'...'`), SQLCipher-style
+/// quoted hex literals (`"x'...'"`), and raw hex strings for `hexkey`/`hexrekey`.
+/// Never includes secret material in error diagnostics.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn parse_pragma_key_material(value: &PragmaValue, force_hex: bool) -> Result<Vec<u8>> {
+    let expr = match value {
+        PragmaValue::Assign(e) | PragmaValue::Call(e) => e,
+    };
+    match expr {
+        Expr::Literal(Literal::Blob(bytes), _) => Ok(bytes.clone()),
+        Expr::Literal(Literal::String(text), _) => {
+            if force_hex {
+                if text.is_empty() {
+                    return Ok(Vec::new());
+                }
+                decode_hex_key_material(text)
+            } else if (text.starts_with("x'") || text.starts_with("X'")) && text.ends_with('\'') {
+                decode_hex_key_material(&text[2..text.len() - 1])
+            } else {
+                Ok(text.as_bytes().to_vec())
+            }
+        }
+        _ => Err(FrankenError::function_error(
+            "PRAGMA key/rekey requires a string or hex blob literal".to_owned(),
+        )),
+    }
 }
 
 /// Parse a PRAGMA value as a positive finite f64.

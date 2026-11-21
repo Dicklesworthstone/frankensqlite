@@ -1195,6 +1195,7 @@ pub async fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
         extra_master_entries,
         original_ddl,
         None,
+        None,
     )
     .await
 }
@@ -1225,6 +1226,37 @@ pub async fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildH
         extra_master_entries,
         original_ddl,
         Some(expected_identity),
+        None,
+    )
+    .await
+}
+
+/// Like [`persist_to_reserved_sqlite_with_header_and_master_entries`], but
+/// optionally activates page-level encryption on the staged pager before any
+/// schema or user row pages are written.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+pub async fn persist_to_reserved_sqlite_with_header_and_master_entries_and_cipher<S: BuildHasher>(
+    cx: &Cx,
+    path: &Path,
+    expected_identity: FileIdentity,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String, S>,
+    page_cipher: Option<fsqlite_pager::ActivePageCipher>,
+) -> Result<()> {
+    persist_to_sqlite_with_header_and_master_entries_impl(
+        cx,
+        path,
+        schema,
+        db,
+        header_template,
+        extra_master_entries,
+        original_ddl,
+        Some(expected_identity),
+        page_cipher,
     )
     .await
 }
@@ -1240,6 +1272,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     extra_master_entries: &[SqliteMasterEntry],
     original_ddl: &HashMap<String, String, S>,
     expected_empty_identity: Option<FileIdentity>,
+    page_cipher: Option<fsqlite_pager::ActivePageCipher>,
 ) -> Result<()> {
     if expected_empty_identity.is_none() && path.exists() {
         // Legacy overwrite callers deliberately replace their own target.
@@ -1261,6 +1294,11 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     } else {
         SimplePager::open_with_cx(cx, vfs, path, header_template.page_size).await?
     };
+    if let Some(active_cipher) = page_cipher {
+        pager
+            .initialize_empty_encrypted_page1(cx, active_cipher, header_template.reserved_per_page)
+            .await?;
+    }
     let mut txn = pager.begin(cx, TransactionMode::Immediate).await?;
 
     let page_size = header_template.page_size;

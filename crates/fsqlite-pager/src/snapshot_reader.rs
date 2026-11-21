@@ -23,6 +23,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 
 use crate::traits::WalPublicationSnapshot;
+use crate::{PageCipherSlot, decrypt_page_after_read};
 
 /// Bytes of the WAL file header that precede frame 0.
 const WAL_HEADER_BYTES: u64 = 32;
@@ -61,6 +62,7 @@ struct SnapshotPages {
     wal: Option<WalSnapshotFrames>,
     page_size: usize,
     db_size: u32,
+    page_cipher: PageCipherSlot,
 }
 
 /// One thread's buffer for [`SnapshotPageReader::read_page`]: room for one
@@ -81,6 +83,18 @@ impl SnapshotPageReader {
         page_size: usize,
         db_size: u32,
     ) -> Self {
+        Self::new_with_cipher(db_file, wal, page_size, db_size, PageCipherSlot::default())
+    }
+
+    /// A reader of an optionally encrypted committed WAL snapshot.
+    #[must_use]
+    pub fn new_with_cipher(
+        db_file: Arc<File>,
+        wal: Option<WalSnapshotFrames>,
+        page_size: usize,
+        db_size: u32,
+        page_cipher: PageCipherSlot,
+    ) -> Self {
         let wal = wal.filter(|frames| frames.publication.last_commit_frame.is_some());
         Self {
             inner: Arc::new(SnapshotPages {
@@ -88,6 +102,7 @@ impl SnapshotPageReader {
                 wal,
                 page_size,
                 db_size,
+                page_cipher,
             }),
         }
     }
@@ -168,12 +183,30 @@ impl SnapshotPageReader {
                     ),
                 });
             }
+            if let Some(active) = pages.page_cipher.get() {
+                decrypt_page_after_read(
+                    &active,
+                    pgno,
+                    &mut buf.bytes[WAL_FRAME_HEADER_BYTES..frame_size],
+                )?;
+            }
             return Ok(&buf.bytes[WAL_FRAME_HEADER_BYTES..frame_size]);
         }
         let offset = u64::from(pgno - 1) * page_size as u64;
         let page = &mut buf.bytes[..page_size];
         let read = pread_full(&pages.db_file, page, offset)?;
-        page[read..].fill(0);
+        if let Some(active) = pages.page_cipher.get() {
+            if read < page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "short read on encrypted snapshot page {pgno}: got {read} of {page_size}"
+                    ),
+                });
+            }
+            decrypt_page_after_read(&active, pgno, page)?;
+        } else {
+            page[read..].fill(0);
+        }
         Ok(&buf.bytes[..page_size])
     }
 }

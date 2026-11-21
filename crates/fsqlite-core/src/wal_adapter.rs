@@ -19,8 +19,9 @@ use fsqlite_pager::traits::{
     WalNativeReadBinding, WalNativeReadOutcome, WalNativeReadToken, WalNativeRecoveryReason,
 };
 use fsqlite_pager::{
-    CheckpointMode, CheckpointPageWriter, CheckpointResult, ParallelWalCommitReconciliation,
-    WalBackend, WalIndexShmSource, WalPageImage, WalPageIndex, WalPublicationSnapshot,
+    CheckpointMode, CheckpointPageWriter, CheckpointResult, PageCipherSlot,
+    ParallelWalCommitReconciliation, WalBackend, WalIndexShmSource, WalPageImage, WalPageIndex,
+    WalPublicationSnapshot, decrypt_page_after_read, encrypt_page_for_write,
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -439,6 +440,8 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// Page bytes of committed frames already read, keyed by frame index
     /// within one WAL generation (see [`WalFramePageCache`]).
     frame_page_cache: std::sync::Mutex<WalFramePageCache>,
+    /// Optional page-level AEAD cipher shared with the owning pager.
+    page_cipher: PageCipherSlot,
 }
 
 /// Committed WAL frames never change within their generation: a frame index
@@ -625,6 +628,9 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let page_size = self.wal.page_size();
         frame_buf.copy_within(header_size.., 0);
         frame_buf.truncate(page_size);
+        if let Some(active) = self.page_cipher.get() {
+            decrypt_page_after_read(&active, page_number, &mut frame_buf)?;
+        }
         Ok(frame_buf)
     }
 
@@ -663,7 +669,16 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             appended_tail_index_builds: 0,
             appended_tail_index_folds: 0,
             frame_page_cache: std::sync::Mutex::new(WalFramePageCache::default()),
+            page_cipher: PageCipherSlot::default(),
         }
+    }
+
+    /// Attach a shared page-level cipher slot for encrypting WAL frames on
+    /// append and decrypting frames on read/checkpoint.
+    #[must_use]
+    pub fn with_page_cipher(mut self, page_cipher: PageCipherSlot) -> Self {
+        self.page_cipher = page_cipher;
+        self
     }
 
     /// Wrap an existing [`WalFile`] with an FEC commit hook.
@@ -699,6 +714,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             appended_tail_index_builds: 0,
             appended_tail_index_folds: 0,
             frame_page_cache: std::sync::Mutex::new(WalFramePageCache::default()),
+            page_cipher: PageCipherSlot::default(),
         }
     }
 
@@ -2782,7 +2798,16 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 std::iter::once((page_number, db_size_if_commit)),
                 completion.clone(),
             ).await?;
-            let frames = [WalAppendFrameRef { page_number, page_data, db_size_if_commit }];
+            let encrypted_page = match self.page_cipher.get() {
+                Some(active) => Some(encrypt_page_for_write(&active, cx, page_number, page_data)?),
+                None => None,
+            };
+            let effective_page_data = encrypted_page.as_deref().unwrap_or(page_data);
+            let frames = [WalAppendFrameRef {
+                page_number,
+                page_data: effective_page_data,
+                db_size_if_commit,
+            }];
             preflight.hand_off();
             drop(preflight);
             self.wal.append_frames_tracked(cx, &frames, completion).await?;
@@ -2792,7 +2817,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             // symbols and stores them for later sidecar persistence.
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if let Some(hook) = &mut self.fec_hook {
-                match hook.on_frame(cx, page_number, page_data, db_size_if_commit) {
+                match hook.on_frame(cx, page_number, effective_page_data, db_size_if_commit) {
                     Ok(Some(result)) => {
                         debug!(
                             pages = result.page_numbers.len(),
@@ -2832,12 +2857,31 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     .await?;
             }
 
-            let mut wal_frames = Vec::with_capacity(frames.len());
+            let active_cipher = self.page_cipher.get();
+            let mut encrypted_pages = if active_cipher.is_some() {
+                Vec::with_capacity(frames.len())
+            } else {
+                Vec::new()
+            };
             for frame in frames {
                 self.validate_append_page(frame.page_data)?;
+                if let Some(active) = active_cipher.as_ref() {
+                    encrypted_pages.push(encrypt_page_for_write(
+                        active,
+                        cx,
+                        frame.page_number,
+                        frame.page_data,
+                    )?);
+                }
+            }
+            let mut wal_frames = Vec::with_capacity(frames.len());
+            for (index, frame) in frames.iter().enumerate() {
+                let page_data = encrypted_pages
+                    .get(index)
+                    .map_or(frame.page_data, Vec::as_slice);
                 wal_frames.push(WalAppendFrameRef {
                     page_number: frame.page_number,
-                    page_data: frame.page_data,
+                    page_data,
                     db_size_if_commit: frame.db_size_if_commit,
                 });
             }
@@ -2855,7 +2899,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if let Some(hook) = &mut self.fec_hook {
-                for frame in frames {
+                for frame in &wal_frames {
                     match hook.on_frame(
                         cx,
                         frame.page_number,
@@ -2906,12 +2950,31 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     .await?;
             }
 
-            let mut wal_frames = Vec::with_capacity(frames.len());
+            let active_cipher = self.page_cipher.get();
+            let mut encrypted_pages = if active_cipher.is_some() {
+                Vec::with_capacity(frames.len())
+            } else {
+                Vec::new()
+            };
             for frame in frames {
                 self.validate_append_page(frame.page_data)?;
+                if let Some(active) = active_cipher.as_ref() {
+                    encrypted_pages.push(encrypt_page_for_write(
+                        active,
+                        cx,
+                        frame.page_number,
+                        frame.page_data,
+                    )?);
+                }
+            }
+            let mut wal_frames = Vec::with_capacity(frames.len());
+            for (index, frame) in frames.iter().enumerate() {
+                let page_data = encrypted_pages
+                    .get(index)
+                    .map_or(frame.page_data, Vec::as_slice);
                 wal_frames.push(WalAppendFrameRef {
                     page_number: frame.page_number,
-                    page_data: frame.page_data,
+                    page_data,
                     db_size_if_commit: frame.db_size_if_commit,
                 });
             }
@@ -2929,7 +2992,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if let Some(hook) = &mut self.fec_hook {
-                for frame in frames {
+                for frame in &wal_frames {
                     match hook.on_frame(
                         cx,
                         frame.page_number,
@@ -2969,13 +3032,32 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             return Ok(None);
         }
 
+        let active_cipher = self.page_cipher.get();
+        let mut encrypted_pages = if active_cipher.is_some() {
+            Vec::with_capacity(frames.len())
+        } else {
+            Vec::new()
+        };
+        if let Some(active) = active_cipher.as_ref() {
+            let nonce_cx = Cx::new();
+            for frame in frames {
+                encrypted_pages.push(encrypt_page_for_write(
+                    active,
+                    &nonce_cx,
+                    frame.page_number,
+                    frame.page_data,
+                )?);
+            }
+        }
         let mut frame_bytes = Vec::new();
         let mut checksum_transforms = Vec::new();
         let last_commit_frame_offset = self.wal.prepare_frame_bytes_with_transforms_into(
             frames.len(),
-            frames.iter().map(|frame| WalAppendFrameRef {
+            frames.iter().enumerate().map(|(index, frame)| WalAppendFrameRef {
                 page_number: frame.page_number,
-                page_data: frame.page_data,
+                page_data: encrypted_pages
+                    .get(index)
+                    .map_or(frame.page_data, Vec::as_slice),
                 db_size_if_commit: frame.db_size_if_commit,
             }),
             &mut frame_bytes,
@@ -3319,6 +3401,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             let page_size = self.wal.page_size();
             frame_buf.copy_within(header_size.., 0);
             frame_buf.truncate(page_size);
+            if let Some(active) = self.page_cipher.get() {
+                decrypt_page_after_read(&active, page_number, &mut frame_buf)?;
+            }
             Ok(Some(frame_buf))
         })
     }
@@ -3753,7 +3838,10 @@ impl<F: VfsFile> WalBackendAdapter<F> {
 
             // Wrap the CheckpointPageWriter in a CheckpointTargetAdapter.
             let mut target = CheckpointResetTarget {
-                delegate: CheckpointTargetAdapterRef { writer },
+                delegate: CheckpointTargetAdapterRef {
+                    writer,
+                    page_cipher: self.page_cipher.clone(),
+                },
                 pending: &mut self.pending_checkpoint_reset,
                 previous_header: *self.wal.header(),
                 native,
@@ -4287,6 +4375,14 @@ where
         self.inner
     }
 
+    /// Attach a shared page-level cipher slot for WAL frame encryption and
+    /// main-database verification decryption.
+    #[must_use]
+    pub fn with_page_cipher(mut self, page_cipher: PageCipherSlot) -> Self {
+        self.inner.page_cipher = page_cipher;
+        self
+    }
+
     /// Attach the inner adapter to an initialized index on the exact main file.
     ///
     /// The caller owns the external WRITE interval and its reconciliation;
@@ -4407,6 +4503,7 @@ where
             return Err(FrankenError::Busy);
         }
         let mut replacement = WalBackendAdapter::new(wal);
+        replacement.page_cipher = self.inner.page_cipher.clone();
         replacement.wal_index_shm_source.clone_from(&self.inner.wal_index_shm_source);
         replacement.native_recovery_requested = self.inner.native_recovery_requested;
         let old = std::mem::replace(&mut self.inner, replacement);
@@ -4590,9 +4687,18 @@ where
         let mut page_one = vec![0_u8; page_size];
         match db_file.read(cx, &mut page_one, 0).await {
             Ok(bytes_read) if bytes_read >= 92 => {
-                let mut id = [0_u8; 16];
-                id.copy_from_slice(&page_one[76..92]);
-                self.db_file_identity = Some(id);
+                let decrypted_ok = match self.inner.page_cipher.get() {
+                    Some(active) => {
+                        bytes_read == page_size
+                            && decrypt_page_after_read(&active, 1, &mut page_one).is_ok()
+                    }
+                    None => true,
+                };
+                if decrypted_ok {
+                    let mut id = [0_u8; 16];
+                    id.copy_from_slice(&page_one[76..92]);
+                    self.db_file_identity = Some(id);
+                }
             }
             // Short read / error: leave unknown, retry next call.
             _ => {}
@@ -4710,6 +4816,7 @@ where
 
         // Validate the current main-database header before trusting offsets.
         // SQLite encodes a 64 KiB page as the u16 value 1.
+        let active_cipher = self.inner.page_cipher.get();
         let mut page_one = vec![0_u8; page_size];
         let page_one_read = match db_file.read(cx, &mut page_one, 0).await {
             Ok(bytes_read) => bytes_read,
@@ -4718,6 +4825,13 @@ where
                 return candidates;
             }
         };
+        if let Some(active) = active_cipher.as_ref()
+            && (page_one_read != page_size
+                || decrypt_page_after_read(active, 1, &mut page_one).is_err())
+        {
+            let _ = db_file.close(cx);
+            return candidates;
+        }
         let header_page_size =
             (page_one_read == page_size).then(|| sqlite_database_header_page_size(&page_one));
         if header_page_size.flatten() != Some(self.page_size) {
@@ -4782,6 +4896,12 @@ where
                     conflicts.push(page_number);
                     continue;
                 }
+            }
+            if let Some(active) = active_cipher.as_ref()
+                && decrypt_page_after_read(active, page_number, &mut current_page).is_err()
+            {
+                conflicts.push(page_number);
+                continue;
             }
             if current_page.as_slice() != expected_image {
                 conflicts.push(page_number);
@@ -5143,10 +5263,23 @@ where
                 {
                     return Err(FrankenError::BusyRecovery);
                 }
-                let mut bytes = [0_u8; fsqlite_types::DATABASE_HEADER_SIZE];
-                if main.read(cx, &mut bytes, 0).await? != bytes.len() {
-                    return Err(FrankenError::BusyRecovery);
-                }
+                let bytes = if let Some(active) = self.inner.page_cipher.get() {
+                    let mut page_one = vec![0_u8; active.page_size];
+                    if main.read(cx, &mut page_one, 0).await? != page_one.len() {
+                        return Err(FrankenError::BusyRecovery);
+                    }
+                    decrypt_page_after_read(&active, 1, &mut page_one)
+                        .map_err(|_| FrankenError::BusyRecovery)?;
+                    let mut hdr = [0_u8; fsqlite_types::DATABASE_HEADER_SIZE];
+                    hdr.copy_from_slice(&page_one[..fsqlite_types::DATABASE_HEADER_SIZE]);
+                    hdr
+                } else {
+                    let mut bytes = [0_u8; fsqlite_types::DATABASE_HEADER_SIZE];
+                    if main.read(cx, &mut bytes, 0).await? != bytes.len() {
+                        return Err(FrankenError::BusyRecovery);
+                    }
+                    bytes
+                };
                 let header = fsqlite_types::DatabaseHeader::from_bytes(&bytes)
                     .map_err(|_| FrankenError::BusyRecovery)?;
                 if header.read_version != 1
@@ -7534,6 +7667,7 @@ where
 /// pager's writer to the WAL executor's target trait.
 struct CheckpointTargetAdapterRef<'a> {
     writer: &'a mut dyn CheckpointPageWriter,
+    page_cipher: PageCipherSlot,
 }
 
 impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
@@ -7544,7 +7678,17 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
     fn read_page_if_supported<'a>(
         &'a mut self, cx: &'a Cx, page_no: PageNumber, buf: &'a mut [u8],
     ) -> CheckpointTargetFuture<'a, Option<usize>> {
-        self.writer.read_page_if_supported(cx, page_no, buf)
+        if self.page_cipher.is_enabled() {
+            Box::pin(async move {
+                // Verify AEAD authentication of the newly written main-DB page,
+                // then opt out of raw ciphertext equality against the WAL frame
+                // (each write uses a fresh 24-byte random nonce per INV-ENC-1).
+                let _ = self.writer.read_page_if_supported(cx, page_no, buf).await?;
+                Ok(None)
+            })
+        } else {
+            self.writer.read_page_if_supported(cx, page_no, buf)
+        }
     }
 
     fn read_pages_if_supported<'a>(
@@ -7554,8 +7698,21 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
         page_size: usize,
         buf: &'a mut [u8],
     ) -> CheckpointTargetFuture<'a, Option<usize>> {
-        self.writer
-            .read_pages_if_supported(cx, first_page, page_size, buf)
+        if self.page_cipher.is_enabled() {
+            Box::pin(async move {
+                // Verify AEAD decryption of every newly checkpointed main-DB
+                // page, then return None so raw ciphertext comparison against
+                // WAL frames with distinct random nonces is skipped.
+                let _ = self
+                    .writer
+                    .read_pages_if_supported(cx, first_page, page_size, buf)
+                    .await?;
+                Ok(None)
+            })
+        } else {
+            self.writer
+                .read_pages_if_supported(cx, first_page, page_size, buf)
+        }
     }
 
     fn write_page<'a>(
@@ -7564,7 +7721,15 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
         page_no: PageNumber,
         data: &'a [u8],
     ) -> CheckpointTargetFuture<'a, ()> {
-        Box::pin(async move { self.writer.write_page(cx, page_no, data).await })
+        Box::pin(async move {
+            if let Some(active) = self.page_cipher.get() {
+                let mut plain = data.to_vec();
+                decrypt_page_after_read(&active, page_no.get(), &mut plain)?;
+                self.writer.write_page(cx, page_no, &plain).await
+            } else {
+                self.writer.write_page(cx, page_no, data).await
+            }
+        })
     }
 
     fn truncate_db<'a>(&'a mut self, cx: &'a Cx, n_pages: u32) -> CheckpointTargetFuture<'a, ()> {
@@ -16179,6 +16344,7 @@ mod tests {
         let mut writer = MockCheckpointPageWriter;
         let mut adapter = CheckpointTargetAdapterRef {
             writer: &mut writer,
+            page_cipher: PageCipherSlot::default(),
         };
 
         let page_no = PageNumber::new(1).expect("valid page number");
@@ -16193,6 +16359,7 @@ mod tests {
         let mut writer = MockCheckpointPageWriter;
         let mut adapter = CheckpointTargetAdapterRef {
             writer: &mut writer,
+            page_cipher: PageCipherSlot::default(),
         };
 
         adapter.truncate_db(&cx, 10).expect("truncate_db");
@@ -16204,6 +16371,7 @@ mod tests {
         let mut writer = MockCheckpointPageWriter;
         let mut adapter = CheckpointTargetAdapterRef {
             writer: &mut writer,
+            page_cipher: PageCipherSlot::default(),
         };
 
         adapter.sync_db(&cx).expect("sync_db");
@@ -16215,6 +16383,7 @@ mod tests {
         let mut writer = MockCheckpointPageWriter;
         let mut adapter = CheckpointTargetAdapterRef {
             writer: &mut writer,
+            page_cipher: PageCipherSlot::default(),
         };
 
         // Verify it can be used as a trait object.

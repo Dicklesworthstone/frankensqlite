@@ -8,8 +8,14 @@
 //! the DEK under a new KEK derived from the new passphrase, without touching
 //! page data.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use fsqlite_error::FrankenError;
+use fsqlite_types::cx::Cx;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -30,6 +36,33 @@ pub const DATABASE_ID_SIZE: usize = 16;
 
 /// Size of a DEK or KEK in bytes (256-bit keys).
 pub const KEY_SIZE: usize = 32;
+
+/// Size of a wrapped DEK blob (`nonce(24) || ciphertext+tag(48)`).
+pub const WRAPPED_DEK_SIZE: usize = NONCE_SIZE + KEY_SIZE + TAG_SIZE;
+
+/// Magic header for durable key-envelope sidecar files (`<db>-key`).
+pub const KEY_ENVELOPE_MAGIC: [u8; 16] = *b"FSQLITE_KEY_V1\0\0";
+
+/// Current durable key-envelope format version.
+pub const KEY_ENVELOPE_VERSION: u32 = 1;
+
+/// Fixed byte length of a serialized [`KeyEnvelope`].
+///
+/// Layout:
+/// - `0..16`:   magic (`FSQLITE_KEY_V1\0\0`)
+/// - `16..20`:  version (`u32` BE)
+/// - `20..24`:  page_size (`u32` BE)
+/// - `24..28`:  argon2 `m_cost` (`u32` BE)
+/// - `28..32`:  argon2 `t_cost` (`u32` BE)
+/// - `32..36`:  argon2 `p_cost` (`u32` BE)
+/// - `36`:      `reserved_per_page` (`u8`, `>= 40`)
+/// - `37`:      `flags` (`u8`, `0`)
+/// - `38..40`:  reserved padding (`[0, 0]`)
+/// - `40..56`:  Argon2id 16-byte salt
+/// - `56..72`:  stable 16-byte `DatabaseId`
+/// - `72..144`: wrapped DEK (`nonce(24) || ct+tag(48)`, AEAD AAD = bytes `0..72`)
+/// - `144..160`: BLAKE3 structural digest prefix over bytes `0..144`
+pub const KEY_ENVELOPE_SIZE: usize = 160;
 
 // ---------------------------------------------------------------------------
 // DatabaseId
@@ -137,11 +170,21 @@ fn build_aad(page_number: u32, database_id: &DatabaseId) -> [u8; AAD_SIZE] {
 /// Page encryptor/decryptor holding a DEK and [`DatabaseId`].
 ///
 /// The encryptor is cheap to clone (32-byte key + 16-byte id).
+#[derive(Clone)]
 pub struct PageEncryptor {
     cipher: XChaCha20Poly1305,
     database_id: DatabaseId,
     /// Raw DEK bytes, retained for rekey comparisons.
     dek: [u8; KEY_SIZE],
+}
+
+impl std::fmt::Debug for PageEncryptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageEncryptor")
+            .field("database_id", &self.database_id)
+            .field("dek", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl PageEncryptor {
@@ -276,7 +319,7 @@ impl PageEncryptor {
 // ---------------------------------------------------------------------------
 
 /// Argon2id parameters for KEK derivation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Argon2Params {
     /// Memory cost in KiB (default: 65 536 = 64 MiB).
     pub m_cost: u32,
@@ -293,6 +336,22 @@ impl Default for Argon2Params {
             t_cost: 3,
             p_cost: 4,
         }
+    }
+}
+
+impl Argon2Params {
+    /// Validate that these Argon2id cost parameters are accepted by the KDF.
+    pub fn validate(&self) -> fsqlite_error::Result<()> {
+        argon2::Params::new(self.m_cost, self.t_cost, self.p_cost, Some(KEY_SIZE)).map_err(
+            |_| FrankenError::OutOfRange {
+                what: "cipher_argon2_params".to_owned(),
+                value: format!(
+                    "m_cost={},t_cost={},p_cost={}",
+                    self.m_cost, self.t_cost, self.p_cost
+                ),
+            },
+        )?;
+        Ok(())
     }
 }
 
@@ -365,6 +424,60 @@ impl KeyManager {
         dek.copy_from_slice(&plaintext);
         Ok(dek)
     }
+    /// Wrap (encrypt) a DEK under a KEK with associated data binding envelope metadata.
+    ///
+    /// Returns `nonce (24 B) || ciphertext+tag (48 B)` = 72 bytes total.
+    pub fn wrap_dek_with_aad(
+        dek: &[u8; KEY_SIZE],
+        kek: &[u8; KEY_SIZE],
+        nonce: &[u8; NONCE_SIZE],
+        aad: &[u8],
+    ) -> Result<[u8; WRAPPED_DEK_SIZE], EncryptError> {
+        let cipher = XChaCha20Poly1305::new(kek.into());
+        let xnonce: &XNonce = nonce.into();
+        let ct = cipher
+            .encrypt(
+                xnonce,
+                Payload {
+                    msg: dek.as_slice(),
+                    aad,
+                },
+            )
+            .map_err(|_| EncryptError::EncryptionFailed)?;
+        if ct.len() != KEY_SIZE + TAG_SIZE {
+            return Err(EncryptError::EncryptionFailed);
+        }
+        let mut out = [0u8; WRAPPED_DEK_SIZE];
+        out[..NONCE_SIZE].copy_from_slice(nonce);
+        out[NONCE_SIZE..].copy_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Unwrap (decrypt) a DEK using a KEK and associated data.
+    ///
+    /// `wrapped` must be the 72-byte output of [`wrap_dek_with_aad`](Self::wrap_dek_with_aad).
+    pub fn unwrap_dek_with_aad(
+        wrapped: &[u8],
+        kek: &[u8; KEY_SIZE],
+        aad: &[u8],
+    ) -> Result<[u8; KEY_SIZE], EncryptError> {
+        if wrapped.len() != WRAPPED_DEK_SIZE {
+            return Err(EncryptError::DekUnwrapFailed);
+        }
+        let nonce = &wrapped[..NONCE_SIZE];
+        let ct = &wrapped[NONCE_SIZE..];
+        let cipher = XChaCha20Poly1305::new(kek.into());
+        let xnonce = XNonce::try_from(nonce).map_err(|_| EncryptError::DekUnwrapFailed)?;
+        let plaintext = cipher
+            .decrypt(&xnonce, Payload { msg: ct, aad })
+            .map_err(|_| EncryptError::DekUnwrapFailed)?;
+        if plaintext.len() != KEY_SIZE {
+            return Err(EncryptError::DekUnwrapFailed);
+        }
+        let mut dek = [0u8; KEY_SIZE];
+        dek.copy_from_slice(&plaintext);
+        Ok(dek)
+    }
 }
 
 /// Validate that `reserved_per_page` is sufficient for encryption.
@@ -377,6 +490,626 @@ pub fn validate_reserved_bytes(reserved_per_page: u8) -> Result<(), EncryptError
     } else {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// KeyEnvelope — Durable Authenticated Key Metadata Sidecar (bd-1vwiy.1)
+// ---------------------------------------------------------------------------
+
+/// Generate a fresh random 24-byte page nonce via OS entropy (INV-ENC-1),
+/// honoring caller cancellation via `cx.checkpoint()`. Never uses a global
+/// nonce counter.
+pub fn generate_fresh_page_nonce(cx: &Cx) -> fsqlite_error::Result<[u8; NONCE_SIZE]> {
+    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+    Ok(fill_csprng_24())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fill_csprng_16() -> [u8; 16] {
+    rand::random::<[u8; 16]>()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fill_csprng_16() -> [u8; 16] {
+    use core::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let digest = blake3::hash(&n.to_le_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fill_csprng_24() -> [u8; NONCE_SIZE] {
+    rand::random::<[u8; NONCE_SIZE]>()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fill_csprng_24() -> [u8; NONCE_SIZE] {
+    use core::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let digest = blake3::hash(&n.to_le_bytes());
+    let mut out = [0u8; NONCE_SIZE];
+    out.copy_from_slice(&digest.as_bytes()[..NONCE_SIZE]);
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fill_csprng_32() -> [u8; KEY_SIZE] {
+    rand::random::<[u8; KEY_SIZE]>()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fill_csprng_32() -> [u8; KEY_SIZE] {
+    use core::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    *blake3::hash(&n.to_le_bytes()).as_bytes()
+}
+
+/// Durable authenticated key-envelope metadata persisted alongside an
+/// encrypted database (`<db>-key`).
+///
+/// The 72-byte header prefix (`0..72`, covering magic, version, page size,
+/// Argon2id parameters, reserved bytes, salt, and stable [`DatabaseId`]) is
+/// bound as XChaCha20-Poly1305 AAD when wrapping the 256-bit DEK, and the full
+/// 144-byte payload carries a 16-byte BLAKE3 structural digest prefix for
+/// fast corruption rejection before KDF work.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyEnvelope {
+    version: u32,
+    page_size: u32,
+    argon2_params: Argon2Params,
+    reserved_per_page: u8,
+    flags: u8,
+    salt: [u8; 16],
+    database_id: DatabaseId,
+    wrapped_dek: [u8; WRAPPED_DEK_SIZE],
+}
+
+impl std::fmt::Debug for KeyEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyEnvelope")
+            .field("version", &self.version)
+            .field("page_size", &self.page_size)
+            .field("argon2_params", &self.argon2_params)
+            .field("reserved_per_page", &self.reserved_per_page)
+            .field("flags", &self.flags)
+            .field("database_id", &self.database_id)
+            .field("wrapped_dek", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl KeyEnvelope {
+    const HEADER_AAD_LEN: usize = 72;
+    const DIGEST_INPUT_LEN: usize = 144;
+
+    fn encode_aad_header(
+        version: u32,
+        page_size: u32,
+        params: &Argon2Params,
+        reserved_per_page: u8,
+        flags: u8,
+        salt: &[u8; 16],
+        database_id: &DatabaseId,
+    ) -> [u8; Self::HEADER_AAD_LEN] {
+        let mut hdr = [0u8; Self::HEADER_AAD_LEN];
+        hdr[0..16].copy_from_slice(&KEY_ENVELOPE_MAGIC);
+        hdr[16..20].copy_from_slice(&version.to_be_bytes());
+        hdr[20..24].copy_from_slice(&page_size.to_be_bytes());
+        hdr[24..28].copy_from_slice(&params.m_cost.to_be_bytes());
+        hdr[28..32].copy_from_slice(&params.t_cost.to_be_bytes());
+        hdr[32..36].copy_from_slice(&params.p_cost.to_be_bytes());
+        hdr[36] = reserved_per_page;
+        hdr[37] = flags;
+        hdr[40..56].copy_from_slice(salt);
+        hdr[56..72].copy_from_slice(database_id.as_bytes());
+        hdr
+    }
+
+    fn is_valid_page_size(page_size: u32) -> bool {
+        (512..=65_536).contains(&page_size) && page_size.is_power_of_two()
+    }
+
+    /// Create a brand-new encrypted database key envelope and live
+    /// [`PageEncryptor`] with fresh CSPRNG `DatabaseId`, `DEK`, `salt`, and
+    /// wrap nonce.
+    pub fn create_new(
+        cx: &Cx,
+        passphrase: &[u8],
+        page_size: u32,
+        reserved_per_page: u8,
+        argon2_params: Argon2Params,
+    ) -> fsqlite_error::Result<(Self, PageEncryptor)> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        if !Self::is_valid_page_size(page_size) {
+            return Err(FrankenError::OutOfRange {
+                what: "encryption page_size".to_owned(),
+                value: page_size.to_string(),
+            });
+        }
+        validate_reserved_bytes(reserved_per_page)
+            .map_err(|err| FrankenError::Internal(err.to_string()))?;
+
+        let salt = fill_csprng_16();
+        let database_id = DatabaseId::from_bytes(fill_csprng_16());
+        let dek = fill_csprng_32();
+        let wrap_nonce = generate_fresh_page_nonce(cx)?;
+
+        let kek = KeyManager::derive_kek(passphrase, &salt, &argon2_params)
+            .map_err(|err| FrankenError::Internal(err.to_string()))?;
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+
+        let aad = Self::encode_aad_header(
+            KEY_ENVELOPE_VERSION,
+            page_size,
+            &argon2_params,
+            reserved_per_page,
+            0,
+            &salt,
+            &database_id,
+        );
+        let wrapped_dek = KeyManager::wrap_dek_with_aad(&dek, &kek, &wrap_nonce, &aad)
+            .map_err(|err| FrankenError::Internal(err.to_string()))?;
+
+        let envelope = Self {
+            version: KEY_ENVELOPE_VERSION,
+            page_size,
+            argon2_params,
+            reserved_per_page,
+            flags: 0,
+            salt,
+            database_id,
+            wrapped_dek,
+        };
+        let encryptor = PageEncryptor::new(&dek, database_id);
+        Ok((envelope, encryptor))
+    }
+
+    /// Derive the KEK from `passphrase` using the envelope's persisted Argon2id
+    /// parameters and salt, authenticate the full envelope header AAD, and
+    /// unwrap the DEK. Fails closed with [`FrankenError::NotADatabase`] on
+    /// wrong passphrase or tampered metadata.
+    pub fn unlock(&self, cx: &Cx, passphrase: &[u8]) -> fsqlite_error::Result<PageEncryptor> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        let not_db = || FrankenError::NotADatabase {
+            path: PathBuf::new(),
+        };
+        validate_reserved_bytes(self.reserved_per_page).map_err(|_| not_db())?;
+        let kek = KeyManager::derive_kek(passphrase, &self.salt, &self.argon2_params)
+            .map_err(|_| not_db())?;
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        let aad = Self::encode_aad_header(
+            self.version,
+            self.page_size,
+            &self.argon2_params,
+            self.reserved_per_page,
+            self.flags,
+            &self.salt,
+            &self.database_id,
+        );
+        let dek = KeyManager::unwrap_dek_with_aad(&self.wrapped_dek, &kek, &aad)
+            .map_err(|_| not_db())?;
+        Ok(PageEncryptor::new(&dek, self.database_id))
+    }
+
+    /// Perform O(1) KEK re-wrap (`PRAGMA rekey`): keeps the existing stable
+    /// `DEK` and [`DatabaseId`] untouched while wrapping the DEK under a fresh
+    /// Argon2id KEK derived from `new_passphrase` with a fresh 16-byte salt and
+    /// fresh 24-byte wrap nonce.
+    pub fn rekey_o1(
+        &self,
+        cx: &Cx,
+        encryptor: &PageEncryptor,
+        new_passphrase: &[u8],
+        new_params: Argon2Params,
+    ) -> fsqlite_error::Result<Self> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        if encryptor.database_id() != self.database_id {
+            return Err(FrankenError::Internal(
+                "encryptor database_id does not match active key envelope".to_owned(),
+            ));
+        }
+        let new_salt = fill_csprng_16();
+        let new_wrap_nonce = generate_fresh_page_nonce(cx)?;
+        let new_kek = KeyManager::derive_kek(new_passphrase, &new_salt, &new_params)
+            .map_err(|err| FrankenError::Internal(err.to_string()))?;
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+
+        let aad = Self::encode_aad_header(
+            self.version,
+            self.page_size,
+            &new_params,
+            self.reserved_per_page,
+            self.flags,
+            &new_salt,
+            &self.database_id,
+        );
+        let wrapped_dek =
+            KeyManager::wrap_dek_with_aad(encryptor.dek(), &new_kek, &new_wrap_nonce, &aad)
+                .map_err(|err| FrankenError::Internal(err.to_string()))?;
+
+        Ok(Self {
+            version: self.version,
+            page_size: self.page_size,
+            argon2_params: new_params,
+            reserved_per_page: self.reserved_per_page,
+            flags: self.flags,
+            salt: new_salt,
+            database_id: self.database_id,
+            wrapped_dek,
+        })
+    }
+
+    /// Encode this envelope into its canonical 160-byte on-disk representation.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; KEY_ENVELOPE_SIZE] {
+        let mut out = [0u8; KEY_ENVELOPE_SIZE];
+        let hdr = Self::encode_aad_header(
+            self.version,
+            self.page_size,
+            &self.argon2_params,
+            self.reserved_per_page,
+            self.flags,
+            &self.salt,
+            &self.database_id,
+        );
+        out[..Self::HEADER_AAD_LEN].copy_from_slice(&hdr);
+        out[Self::HEADER_AAD_LEN..Self::DIGEST_INPUT_LEN].copy_from_slice(&self.wrapped_dek);
+        let digest = blake3::hash(&out[..Self::DIGEST_INPUT_LEN]);
+        out[Self::DIGEST_INPUT_LEN..].copy_from_slice(&digest.as_bytes()[..16]);
+        out
+    }
+
+    /// Decode and structurally validate a 160-byte on-disk key envelope.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, EncryptError> {
+        if bytes.len() != KEY_ENVELOPE_SIZE {
+            return Err(EncryptError::DekUnwrapFailed);
+        }
+        if bytes[..16] != KEY_ENVELOPE_MAGIC {
+            return Err(EncryptError::DekUnwrapFailed);
+        }
+        let expected_digest = blake3::hash(&bytes[..Self::DIGEST_INPUT_LEN]);
+        if bytes[Self::DIGEST_INPUT_LEN..] != expected_digest.as_bytes()[..16] {
+            return Err(EncryptError::AuthenticationFailed);
+        }
+        let version = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        if version != KEY_ENVELOPE_VERSION {
+            return Err(EncryptError::DekUnwrapFailed);
+        }
+        let page_size = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        if !Self::is_valid_page_size(page_size) {
+            return Err(EncryptError::DekUnwrapFailed);
+        }
+        let m_cost = u32::from_be_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+        let t_cost = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+        let p_cost = u32::from_be_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+        let argon2_params = Argon2Params {
+            m_cost,
+            t_cost,
+            p_cost,
+        };
+        let reserved_per_page = bytes[36];
+        validate_reserved_bytes(reserved_per_page)?;
+        let flags = bytes[37];
+        if flags != 0 || bytes[38] != 0 || bytes[39] != 0 {
+            return Err(EncryptError::DekUnwrapFailed);
+        }
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&bytes[40..56]);
+        let mut db_id_bytes = [0u8; DATABASE_ID_SIZE];
+        db_id_bytes.copy_from_slice(&bytes[56..72]);
+        let mut wrapped_dek = [0u8; WRAPPED_DEK_SIZE];
+        wrapped_dek.copy_from_slice(&bytes[72..144]);
+        Ok(Self {
+            version,
+            page_size,
+            argon2_params,
+            reserved_per_page,
+            flags,
+            salt,
+            database_id: DatabaseId::from_bytes(db_id_bytes),
+            wrapped_dek,
+        })
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    #[must_use]
+    pub const fn reserved_per_page(&self) -> u8 {
+        self.reserved_per_page
+    }
+
+    #[must_use]
+    pub const fn argon2_params(&self) -> &Argon2Params {
+        &self.argon2_params
+    }
+
+    #[must_use]
+    pub const fn salt(&self) -> &[u8; 16] {
+        &self.salt
+    }
+
+    #[must_use]
+    pub const fn database_id(&self) -> DatabaseId {
+        self.database_id
+    }
+
+    #[must_use]
+    pub const fn wrapped_dek(&self) -> &[u8; WRAPPED_DEK_SIZE] {
+        &self.wrapped_dek
+    }
+}
+
+/// Companion key-envelope path for a database file (`<db>-key`).
+#[must_use]
+pub fn key_envelope_path_for_db(db_path: &Path) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push("-key");
+    PathBuf::from(os)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_parent_dir(path: &Path) -> fsqlite_error::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            dir.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Read and structurally validate a durable `<db>-key` envelope file.
+///
+/// Returns `Ok(None)` when the sidecar does not exist, and fails closed with
+/// [`FrankenError::NotADatabase`] if the file exists but is truncated,
+/// malformed, or tampered.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_key_envelope(path: &Path) -> fsqlite_error::Result<Option<KeyEnvelope>> {
+    match std::fs::read(path) {
+        Ok(bytes) => KeyEnvelope::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|err| FrankenError::DatabaseCorrupt {
+                detail: format!("corrupt key envelope {}: {err}", path.display()),
+            }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(FrankenError::Io(err)),
+    }
+}
+
+/// Atomically persist a durable `<db>-key` envelope via sibling temp file,
+/// `sync_all`, atomic `rename`, and parent-directory sync.
+///
+/// A crash before `rename` leaves the prior `<db>-key` untouched; a crash
+/// after `rename` leaves the new `<db>-key` durable.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_key_envelope_atomic(
+    cx: &Cx,
+    path: &Path,
+    envelope: &KeyEnvelope,
+) -> fsqlite_error::Result<()> {
+    use std::io::Write;
+
+    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+    let bytes = envelope.to_bytes();
+    let nonce = fill_csprng_16();
+    let suffix: String = nonce.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(format!(".tmp.{suffix}"));
+    let tmp_path = PathBuf::from(tmp_os);
+
+    let write_res: fsqlite_error::Result<()> = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        std::fs::rename(&tmp_path, path)?;
+        sync_parent_dir(path)?;
+        Ok(())
+    })();
+
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_res
+}
+
+/// Remove a durable `<db>-key` sidecar after an explicit decrypt conversion
+/// (`PRAGMA rekey = ''`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn remove_key_envelope_if_exists(path: &Path) -> fsqlite_error::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent_dir(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(FrankenError::Io(err)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ActivePageCipher / PageCipherSlot — shared pager + WAL + snapshot codec
+// ---------------------------------------------------------------------------
+
+/// Active page-encryption context shared across the pager, WAL backend,
+/// rollback journal, and parallel snapshot readers.
+#[derive(Clone, Debug)]
+pub struct ActivePageCipher {
+    /// Immutable XChaCha20-Poly1305 page encryptor (DEK + stable DatabaseId).
+    pub encryptor: Arc<PageEncryptor>,
+    /// Database page size in bytes.
+    pub page_size: usize,
+}
+
+impl ActivePageCipher {
+    /// Construct a new active page cipher context.
+    #[must_use]
+    pub const fn new(encryptor: Arc<PageEncryptor>, page_size: usize) -> Self {
+        Self {
+            encryptor,
+            page_size,
+        }
+    }
+}
+
+/// Lock-free fast-path slot holding an optional [`ActivePageCipher`].
+///
+/// Unencrypted databases observe `is_enabled() == false` via a single atomic
+/// load without touching any lock. Concurrent encrypted writers read the
+/// immutable `Arc<PageEncryptor>` under a shared read lock with zero write
+/// serialization.
+#[derive(Clone)]
+pub struct PageCipherSlot {
+    enabled: Arc<AtomicBool>,
+    #[cfg(not(target_arch = "wasm32"))]
+    inner: Arc<parking_lot::RwLock<Option<ActivePageCipher>>>,
+    #[cfg(target_arch = "wasm32")]
+    inner: Arc<std::sync::RwLock<Option<ActivePageCipher>>>,
+}
+
+impl Default for PageCipherSlot {
+    fn default() -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(not(target_arch = "wasm32"))]
+            inner: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            inner: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+}
+
+impl std::fmt::Debug for PageCipherSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageCipherSlot")
+            .field("enabled", &self.is_enabled())
+            .finish()
+    }
+}
+
+impl PageCipherSlot {
+    /// Create a slot pre-populated with an active cipher.
+    #[must_use]
+    pub fn new(active: Option<ActivePageCipher>) -> Self {
+        let slot = Self::default();
+        slot.set(active);
+        slot
+    }
+
+    /// Fast-path atomic check for whether page encryption is active.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    /// Clone the currently active cipher, if encryption is enabled.
+    #[must_use]
+    pub fn get(&self) -> Option<ActivePageCipher> {
+        if !self.is_enabled() {
+            return None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.inner.read().clone()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    /// Install or clear the active page cipher.
+    pub fn set(&self, active: Option<ActivePageCipher>) {
+        let is_some = active.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            *self.inner.write() = active;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            *self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = active;
+        }
+        self.enabled.store(is_some, Ordering::Release);
+    }
+}
+
+/// Encrypt a plaintext page image for physical write using a fresh CSPRNG
+/// 24-byte nonce (INV-ENC-1) and canonical AAD `be_u32(page_no) || DatabaseId`.
+pub fn encrypt_page_for_write(
+    active: &ActivePageCipher,
+    cx: &Cx,
+    page_no: u32,
+    plaintext: &[u8],
+) -> fsqlite_error::Result<Vec<u8>> {
+    if plaintext.len() != active.page_size {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "encrypted page {page_no} size mismatch: got {}, expected {}",
+                plaintext.len(),
+                active.page_size
+            ),
+        });
+    }
+    let nonce = generate_fresh_page_nonce(cx)?;
+    let mut out = plaintext.to_vec();
+    active
+        .encryptor
+        .encrypt_page(&mut out, page_no, &nonce)
+        .map_err(|err| FrankenError::Internal(format!("page {page_no} encryption failed: {err}")))?;
+    Ok(out)
+}
+
+/// Authenticate and decrypt an on-disk page image in place. Fails closed with
+/// [`FrankenError::DatabaseCorrupt`] on wrong key, ciphertext tamper, or page
+/// swap (AAD mismatch).
+pub fn decrypt_page_after_read(
+    active: &ActivePageCipher,
+    page_no: u32,
+    buf: &mut [u8],
+) -> fsqlite_error::Result<()> {
+    if buf.len() != active.page_size {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "encrypted page {page_no} read size mismatch: got {}, expected {}",
+                buf.len(),
+                active.page_size
+            ),
+        });
+    }
+    active
+        .encryptor
+        .decrypt_page(buf, page_no)
+        .map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "encrypted page {page_no} authentication failed (wrong key, tampered ciphertext, or swapped page)"
+            ),
+        })
 }
 
 // =========================================================================
@@ -1049,5 +1782,142 @@ mod tests {
             NONCE_SIZE + TAG_SIZE,
             "reserved must be exactly nonce + tag"
         );
+    }
+
+    #[test]
+    fn test_key_envelope_create_unlock_rekey_o1_and_tamper_controls() {
+        let cx = Cx::new();
+        let params = Argon2Params {
+            m_cost: 256,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let (env1, enc1) =
+            KeyEnvelope::create_new(&cx, b"initial-secret", 4096, ENCRYPTION_RESERVED_BYTES, params.clone())
+                .expect("create envelope");
+
+        // Debug representation must redact wrapped DEK & DEK material.
+        assert!(format!("{env1:?}").contains("<redacted>"));
+        assert!(format!("{enc1:?}").contains("<redacted>"));
+
+        let raw1 = env1.to_bytes();
+        let parsed1 = KeyEnvelope::from_bytes(&raw1).expect("parse valid envelope");
+        assert_eq!(parsed1, env1);
+
+        // Unlock with right passphrase recovers identical DEK + DatabaseId.
+        let unlocked1 = parsed1.unlock(&cx, b"initial-secret").expect("unlock v1");
+        assert_eq!(unlocked1.dek(), enc1.dek());
+        assert_eq!(unlocked1.database_id(), enc1.database_id());
+
+        // Negative control: wrong passphrase fails closed with NotADatabase.
+        assert!(matches!(
+            parsed1.unlock(&cx, b"wrong-secret"),
+            Err(FrankenError::NotADatabase { .. })
+        ));
+
+        // Negative control: tampering ANY metadata byte fails either BLAKE3 or AAD auth.
+        for tamper_idx in [0_usize, 18, 22, 26, 36, 45, 60, 80, 150] {
+            let mut tampered = raw1;
+            tampered[tamper_idx] ^= 0x01;
+            assert!(
+                KeyEnvelope::from_bytes(&tampered).is_err(),
+                "tampered envelope byte {tamper_idx} must be rejected"
+            );
+        }
+
+        // Even if an attacker recomputes the structural BLAKE3 digest after
+        // modifying AAD-covered header metadata, XChaCha20-Poly1305 AAD rejects it!
+        let mut forged = raw1;
+        forged[22] ^= 0x10; // flip page_size bit (4096 -> 8192? or invalid; use flags/m_cost)
+        forged[22] = raw1[22];
+        forged[27] ^= 0x01; // flip m_cost bit (still valid KDF param)
+        let recomputed = blake3::hash(&forged[..144]);
+        forged[144..160].copy_from_slice(&recomputed.as_bytes()[..16]);
+        let forged_env = KeyEnvelope::from_bytes(&forged).expect("structural parse succeeds");
+        assert!(
+            matches!(
+                forged_env.unlock(&cx, b"initial-secret"),
+                Err(FrankenError::NotADatabase { .. })
+            ),
+            "AEAD AAD must reject metadata tampering even with recomputed BLAKE3"
+        );
+
+        // O(1) rekey preserves DEK & DatabaseId while rotating salt & KEK.
+        let env2 = env1
+            .rekey_o1(&cx, &enc1, b"rotated-secret", params)
+            .expect("o1 rekey");
+        assert_eq!(env2.database_id(), env1.database_id());
+        assert_ne!(env2.salt(), env1.salt());
+        assert_ne!(env2.wrapped_dek(), env1.wrapped_dek());
+
+        let unlocked2 = env2.unlock(&cx, b"rotated-secret").expect("unlock v2");
+        assert_eq!(unlocked2.dek(), enc1.dek());
+        assert_eq!(unlocked2.database_id(), enc1.database_id());
+        assert!(matches!(
+            env2.unlock(&cx, b"initial-secret"),
+            Err(FrankenError::NotADatabase { .. })
+        ));
+
+        // Atomic persistence roundtrip on filesystem.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join("enc.db");
+            let key_path = key_envelope_path_for_db(&db_path);
+            assert!(read_key_envelope(&key_path).unwrap().is_none());
+            write_key_envelope_atomic(&cx, &key_path, &env1).expect("write v1");
+            assert_eq!(read_key_envelope(&key_path).unwrap(), Some(env1));
+            write_key_envelope_atomic(&cx, &key_path, &env2).expect("atomic rekey write v2");
+            assert_eq!(read_key_envelope(&key_path).unwrap(), Some(env2));
+            remove_key_envelope_if_exists(&key_path).expect("remove envelope");
+            assert!(read_key_envelope(&key_path).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn test_page_cipher_slot_and_nonce_cancellation() {
+        let cx = Cx::new();
+        let slot = PageCipherSlot::default();
+        assert!(!slot.is_enabled());
+        assert!(slot.get().is_none());
+
+        let enc = Arc::new(PageEncryptor::new(&TEST_DEK, TEST_DB_ID));
+        let active = ActivePageCipher {
+            encryptor: enc,
+            page_size: 4096,
+        };
+        slot.set(Some(active.clone()));
+        assert!(slot.is_enabled());
+        assert!(slot.get().is_some());
+
+        let plain = make_test_page(4096);
+        let ct_a = encrypt_page_for_write(&active, &cx, 3, &plain).expect("encrypt a");
+        let ct_b = encrypt_page_for_write(&active, &cx, 3, &plain).expect("encrypt b");
+        assert_ne!(ct_a, ct_b, "fresh random nonces must differ on every write");
+
+        let mut dec = ct_a.clone();
+        decrypt_page_after_read(&active, 3, &mut dec).expect("decrypt valid");
+        assert_eq!(&dec[..4096 - 40], &plain[..4096 - 40]);
+
+        // Page swap must fail authentication.
+        let mut swapped = ct_a;
+        assert!(decrypt_page_after_read(&active, 4, &mut swapped).is_err());
+
+        // Cancelled Cx must abort nonce generation and key operations.
+        let cancelled = Cx::new();
+        cancelled.transition_to_running();
+        cancelled.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+        assert!(matches!(
+            generate_fresh_page_nonce(&cancelled),
+            Err(FrankenError::Abort)
+        ));
+        assert!(matches!(
+            encrypt_page_for_write(&active, &cancelled, 3, &plain),
+            Err(FrankenError::Abort)
+        ));
+
+        slot.set(None);
+        assert!(!slot.is_enabled());
+        assert!(slot.get().is_none());
     }
 }

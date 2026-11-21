@@ -22,8 +22,6 @@ use fsqlite_vfs::WindowsVfs as PlatformVfs;
 use fsqlite_vfs::{FileIdentity, Vfs, host_fs};
 
 use crate::compat_persist::SqliteMasterEntry;
-#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-use crate::compat_persist::persist_to_reserved_sqlite_with_header_and_master_entries;
 
 pub(crate) const ATTACHED_SCHEMA_UNSUPPORTED: &str = "VACUUM on attached schemas";
 pub(crate) const NON_TEXT_FILENAME: &str = "non-text filename";
@@ -281,6 +279,31 @@ pub(crate) async fn persist_compacted_database(
     extra_master_entries: &[SqliteMasterEntry],
     original_ddl: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
+    persist_compacted_database_with_cipher(
+        cx,
+        target,
+        schema,
+        db,
+        header,
+        extra_master_entries,
+        original_ddl,
+        None,
+    )
+    .await
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_compacted_database_with_cipher(
+    cx: &Cx,
+    target: &VacuumTargetReservation,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &std::collections::HashMap<String, String>,
+    page_cipher: Option<fsqlite_pager::ActivePageCipher>,
+) -> Result<()> {
     // INTO publishes a self-contained database, not the source's WAL family.
     // Preserve metadata while making the output's header describe its actual
     // standalone format. In-place rebuilds retain the source journal mode.
@@ -289,7 +312,7 @@ pub(crate) async fn persist_compacted_database(
         output_header.write_version = 1;
         output_header.read_version = 1;
     }
-    persist_to_reserved_sqlite_with_header_and_master_entries(
+    crate::compat_persist::persist_to_reserved_sqlite_with_header_and_master_entries_and_cipher(
         cx,
         target.path(),
         target.identity(),
@@ -298,6 +321,7 @@ pub(crate) async fn persist_compacted_database(
         &output_header,
         extra_master_entries,
         original_ddl,
+        page_cipher,
     )
     .await
 }

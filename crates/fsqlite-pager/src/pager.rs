@@ -49,6 +49,7 @@ use crate::traits::{
     self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend, WalFuture,
     WalPageImage,
 };
+use crate::{ActivePageCipher, PageCipherSlot, decrypt_page_after_read, encrypt_page_for_write};
 
 fn atomic_usize_checked_update(
     counter: &AtomicUsize,
@@ -5888,6 +5889,141 @@ async fn shared_db_file_write<'a, F: VfsFile>(
     async_rwlock_write(file, cx, "database-file").await
 }
 
+/// Read a single full database page, decrypting in place when `page_cipher` is active.
+async fn cipher_read_page<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    page_cipher: &PageCipherSlot,
+    page_no: u32,
+    buf: &mut [u8],
+) -> Result<usize> {
+    let offset = u64::from(page_no.saturating_sub(1)) * buf.len() as u64;
+    let bytes_read = file.read(cx, buf, offset).await?;
+    if bytes_read == buf.len()
+        && let Some(active) = page_cipher.get()
+    {
+        decrypt_page_after_read(&active, page_no, buf)?;
+    }
+    Ok(bytes_read)
+}
+
+/// Read one or more contiguous full database pages, decrypting each full page
+/// when `page_cipher` is active.
+async fn cipher_read_pages<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    page_cipher: &PageCipherSlot,
+    first_page: PageNumber,
+    page_size: usize,
+    buf: &mut [u8],
+) -> Result<usize> {
+    let offset = u64::from(first_page.get().saturating_sub(1)) * page_size as u64;
+    let bytes_read = file.read(cx, buf, offset).await?;
+    if let Some(active) = page_cipher.get() {
+        let full_bytes = (bytes_read / page_size) * page_size;
+        for (idx, chunk) in buf[..full_bytes].chunks_exact_mut(page_size).enumerate() {
+            let delta = u32::try_from(idx).map_err(|_| FrankenError::OutOfRange {
+                what: "encrypted page run index".to_owned(),
+                value: idx.to_string(),
+            })?;
+            let page_no = first_page
+                .get()
+                .checked_add(delta)
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "encrypted page number".to_owned(),
+                    value: delta.to_string(),
+                })?;
+            decrypt_page_after_read(&active, page_no, chunk)?;
+        }
+    }
+    Ok(bytes_read)
+}
+
+/// Read the 100-byte SQLite database header from page 1, authenticating and
+/// decrypting the full page 1 first when `page_cipher` is active.
+async fn cipher_read_header<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    page_cipher: &PageCipherSlot,
+    out: &mut [u8; DATABASE_HEADER_SIZE],
+) -> Result<usize> {
+    let Some(active) = page_cipher.get() else {
+        return file.read(cx, out, 0).await;
+    };
+    let mut page1 = vec![0_u8; active.page_size];
+    let bytes_read = file.read(cx, &mut page1, 0).await?;
+    if bytes_read < active.page_size {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "short read fetching encrypted page 1 header: got {bytes_read} of {}",
+                active.page_size
+            ),
+        });
+    }
+    decrypt_page_after_read(&active, 1, &mut page1)?;
+    out.copy_from_slice(&page1[..DATABASE_HEADER_SIZE]);
+    Ok(DATABASE_HEADER_SIZE)
+}
+
+/// Write a single full database page, encrypting with a fresh 24-byte CSPRNG
+/// nonce when `page_cipher` is active.
+async fn cipher_write_page<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    page_cipher: &PageCipherSlot,
+    page_no: u32,
+    data: &[u8],
+) -> Result<()> {
+    let offset = u64::from(page_no.saturating_sub(1)) * data.len() as u64;
+    if let Some(active) = page_cipher.get() {
+        let encrypted = encrypt_page_for_write(&active, cx, page_no, data)?;
+        file.write(cx, &encrypted, offset).await
+    } else {
+        file.write(cx, data, offset).await
+    }
+}
+
+/// Write a batch of page-aligned `(offset, bytes)` buffers, encrypting each
+/// page with a fresh 24-byte CSPRNG nonce when `page_cipher` is active.
+async fn cipher_write_page_batch<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    page_cipher: &PageCipherSlot,
+    writes: &[(u64, &[u8])],
+) -> Result<()> {
+    let Some(active) = page_cipher.get() else {
+        return file.write_page_batch(cx, writes).await;
+    };
+    let page_size_u64 = u64::try_from(active.page_size).map_err(|_| FrankenError::OutOfRange {
+        what: "encrypted page_size".to_owned(),
+        value: active.page_size.to_string(),
+    })?;
+    let mut encrypted_bufs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(writes.len());
+    for &(offset, data) in writes {
+        if !offset.is_multiple_of(page_size_u64) || data.len() != active.page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "unaligned encrypted batch write at offset {offset} len {}",
+                    data.len()
+                ),
+            });
+        }
+        let page_no = u32::try_from((offset / page_size_u64).saturating_add(1)).map_err(|_| {
+            FrankenError::OutOfRange {
+                what: "encrypted batch page number".to_owned(),
+                value: offset.to_string(),
+            }
+        })?;
+        let encrypted = encrypt_page_for_write(&active, cx, page_no, data)?;
+        encrypted_bufs.push((offset, encrypted));
+    }
+    let encrypted_refs: Vec<(u64, &[u8])> = encrypted_bufs
+        .iter()
+        .map(|(off, bytes)| (*off, bytes.as_slice()))
+        .collect();
+    file.write_page_batch(cx, &encrypted_refs).await
+}
+
 async fn shared_db_lock_external_snapshot<F: VfsFile>(
     file: &SharedDbFile<F>,
     cx: &Cx,
@@ -6639,6 +6775,7 @@ struct OrphanedRollbackRecovery {
 struct RollbackJournalOpenRecoveryContext<'a, F> {
     group_commit_queue: &'a Arc<GroupCommitQueue>,
     db_file: &'a SharedDbFile<F>,
+    page_cipher: &'a PageCipherSlot,
     current_db_path: &'a Path,
     current_db_identity: Option<FileIdentity>,
     journal_path: &'a Path,
@@ -8535,6 +8672,9 @@ async fn carry_refresh_state_past_own_flush<F: VfsFile>(
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
     db_file: SharedDbFile<F>,
+    /// Optional compatibility page-encryption codec shared with `SimplePager`,
+    /// WAL adapter, and snapshot readers (bd-1vwiy.1).
+    page_cipher: PageCipherSlot,
     /// This handle's configured admission timeout. Unlike the identity-wide
     /// settlement budget, a short-timeout connection must not inherit a peer's
     /// larger timeout when a pager operation retries native acquisition.
@@ -9833,9 +9973,7 @@ async fn flush_retained_memory_overlay_pages_to_db_file<F: VfsFile>(
         batched_writes.push((offset, page.as_bytes()));
     }
     let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-    db_file
-        .write_page_batch(cx, batched_writes.as_slice())
-        .await?;
+    cipher_write_page_batch(cx, &*db_file, &inner.page_cipher, batched_writes.as_slice()).await?;
     inner.committed_db_file_size_bytes =
         u64::from(original_db_size) * u64::from(inner.page_size.get());
     Ok(())
@@ -10285,6 +10423,10 @@ impl<F: VfsFile> PagerInner<F> {
             return Ok(vec![0_u8; self.page_size.as_usize()]);
         }
 
+        if self.page_cipher.is_enabled() {
+            return self.read_page_copy_uncached(cx, page_no).await;
+        }
+
         if let Some(data) = cache.get_copy(page_no) {
             return Ok(data);
         }
@@ -10317,10 +10459,10 @@ impl<F: VfsFile> PagerInner<F> {
 
     async fn read_page_copy_uncached(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         let page_size = self.page_size.as_usize();
-        let offset = u64::from(page_no.get() - 1) * page_size as u64;
         let mut out = vec![0_u8; page_size];
         let db_file = shared_db_file_read(&self.db_file, cx).await?;
-        let bytes_read = db_file.read(cx, &mut out, offset).await?;
+        let bytes_read =
+            cipher_read_page(cx, &*db_file, &self.page_cipher, page_no.get(), &mut out).await?;
         if bytes_read < page_size {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -10380,7 +10522,8 @@ impl<F: VfsFile> PagerInner<F> {
         }
 
         let mut out = vec![0_u8; page_size];
-        let bytes_read = db_file.read(cx, &mut out, offset).await?;
+        let bytes_read =
+            cipher_read_page(cx, &*db_file, &self.page_cipher, page_no.get(), &mut out).await?;
         if bytes_read < page_size {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -10405,7 +10548,7 @@ impl<F: VfsFile> PagerInner<F> {
 
         let mut out = [0_u8; DATABASE_HEADER_SIZE];
         let db_file = shared_db_file_read(&self.db_file, cx).await?;
-        let bytes_read = db_file.read(cx, &mut out, 0).await?;
+        let bytes_read = cipher_read_header(cx, &*db_file, &self.page_cipher, &mut out).await?;
         if bytes_read < DATABASE_HEADER_SIZE {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -11490,6 +11633,7 @@ fn return_pages_to_freelist(
 async fn load_freelist_from_disk<F: VfsFile>(
     cx: &Cx,
     db_file: &F,
+    page_cipher: &PageCipherSlot,
     page_size: PageSize,
     db_size: u32,
     first_trunk: u32,
@@ -11523,8 +11667,7 @@ async fn load_freelist_from_disk<F: VfsFile>(
         out.push(trunk_page);
 
         let mut buf = vec![0u8; ps];
-        let offset = u64::from(trunk.saturating_sub(1)) * ps as u64;
-        let bytes_read = db_file.read(cx, &mut buf, offset).await?;
+        let bytes_read = cipher_read_page(cx, db_file, page_cipher, trunk, &mut buf).await?;
         if bytes_read < ps {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -12122,6 +12265,7 @@ async fn read_durable_page_under_gate<F: VfsFile>(
     cx: &Cx,
     wal: &mut dyn WalBackend,
     db_file: &SharedDbFile<F>,
+    page_cipher: &PageCipherSlot,
     page_size: usize,
     page_no: u32,
 ) -> Result<Option<Vec<u8>>> {
@@ -12141,7 +12285,7 @@ async fn read_durable_page_under_gate<F: VfsFile>(
         return Ok(None);
     }
     let mut out = vec![0_u8; page_size];
-    let bytes_read = file.read(cx, &mut out, offset).await?;
+    let bytes_read = cipher_read_page(cx, &*file, page_cipher, page_no, &mut out).await?;
     if bytes_read < page_size {
         return Ok(None);
     }
@@ -12173,6 +12317,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
     cx: &Cx,
     wal: &mut dyn WalBackend,
     db_file: &SharedDbFile<F>,
+    page_cipher: &PageCipherSlot,
     page_size: usize,
     batches: &[TransactionFrameBatch],
 ) -> Result<Vec<u32>> {
@@ -12207,7 +12352,9 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
         return Ok(all);
     }
 
-    let Some(page_one) = read_durable_page_under_gate(cx, wal, db_file, page_size, 1).await? else {
+    let Some(page_one) =
+        read_durable_page_under_gate(cx, wal, db_file, page_cipher, page_size, 1).await?
+    else {
         // Brand-new database: no durable freelist exists for peers to have
         // touched, so the publication stands.
         return Ok(Vec::new());
@@ -12227,7 +12374,8 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
             // validate against garbage.
             return Ok(vec![trunk]);
         }
-        let Some(image) = read_durable_page_under_gate(cx, wal, db_file, page_size, trunk).await?
+        let Some(image) =
+            read_durable_page_under_gate(cx, wal, db_file, page_cipher, page_size, trunk).await?
         else {
             return Ok(vec![trunk]);
         };
@@ -12553,6 +12701,30 @@ fn group_commit_frame_payload_digest(frame_refs: &[traits::WalFrameRef<'_>]) -> 
             ))
         })?;
         digest.update(page_number, frame.db_size_if_commit, frame.page_data);
+    }
+    Ok(digest.finalize())
+}
+
+/// Payload digest computed directly from prepared WAL frame bytes (used when
+/// page-level encryption is enabled so the certificate binds the exact
+/// authenticated ciphertext bytes written to `-wal` and verifiable by both
+/// `PathRefreshingWalBackend` and `wal_fec_replay` without key material).
+fn group_commit_prepared_batch_payload_digest(
+    prepared: &traits::PreparedWalFrameBatch,
+) -> Result<[u8; 32]> {
+    let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+    for (index, meta) in prepared.frame_metas.iter().enumerate() {
+        let page_number = PageNumber::new(meta.page_number).ok_or_else(|| {
+            FrankenError::internal(format!(
+                "prepared WAL frame has invalid page number {}",
+                meta.page_number
+            ))
+        })?;
+        digest.update(
+            page_number,
+            meta.db_size_if_commit,
+            prepared.page_data(index),
+        );
     }
     Ok(digest.finalize())
 }
@@ -14757,6 +14929,8 @@ pub struct SimplePager<V: Vfs> {
     /// Identity-bound WAL publication queue shared by every pager that opened
     /// the same underlying file, including cloned MemoryVfs handles.
     group_commit_queue: GroupCommitQueueRef,
+    /// Shared compatibility page-encryption codec (bd-1vwiy.1).
+    page_cipher: PageCipherSlot,
 }
 
 /// Identity-bound digest of a complete SQLite main-database image.
@@ -15038,6 +15212,7 @@ struct ReadWriteOpenPolicy {
     disposition: ReadWriteOpenDisposition,
     expected_identity: Option<FileIdentity>,
     finish_namespace_bootstrap: bool,
+    defer_locked_header: bool,
 }
 
 /// Pager-open intent used by the SQL connection layer while it retains the
@@ -15573,6 +15748,7 @@ where
                     write_set_high_water_pages: Arc::clone(&self.write_set_high_water_pages),
                     write_set_cap_refusals: Arc::clone(&self.write_set_cap_refusals),
                     db_file: Arc::clone(&inner.db_file),
+                    page_cipher: self.page_cipher.clone(),
                     writer_idle: Arc::clone(&self.writer_idle),
                     cache: Arc::clone(&self.cache),
                     published: Arc::clone(&self.published),
@@ -15832,6 +16008,7 @@ where
                 write_set_high_water_pages: Arc::clone(&self.write_set_high_water_pages),
                 write_set_cap_refusals: Arc::clone(&self.write_set_cap_refusals),
                 db_file,
+                page_cipher: self.page_cipher.clone(),
                 writer_idle: Arc::clone(&self.writer_idle),
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
@@ -16040,7 +16217,9 @@ where
                 let validation = async {
                     self.validate_namespace_binding_locked(&mut inner)?;
                     let file = shared_db_file_read(&inner.db_file, cx).await?;
-                    if Self::journal_mode_from_database_file(cx, &*file).await? != mode {
+                    if Self::journal_mode_from_database_file(cx, &*file, &self.page_cipher).await?
+                        != mode
+                    {
                         return Err(FrankenError::ReadOnly);
                     }
                     Ok(())
@@ -16131,14 +16310,15 @@ where
                 let page_size = inner.page_size.as_usize();
                 let mut page1 = vec![0u8; page_size];
                 let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
-                let bytes_read = db_file.read(cx, &mut page1, 0).await?;
+                let bytes_read =
+                    cipher_read_page(cx, &*db_file, &inner.page_cipher, 1, &mut page1).await?;
                 if bytes_read >= DATABASE_HEADER_SIZE {
                     main_file_change_counter = Some(u64::from(u32::from_be_bytes([
                         page1[24], page1[25], page1[26], page1[27],
                     ])));
                     page1[18] = version_byte;
                     page1[19] = version_byte;
-                    db_file.write(cx, &page1, 0).await?;
+                    cipher_write_page(cx, &*db_file, &inner.page_cipher, 1, &page1).await?;
                     db_file.sync(cx, SyncFlags::FULL)?;
                     self.cache.evict(PageNumber::ONE);
                 }
@@ -17662,6 +17842,7 @@ where
                 let rebuilt_freelist = load_freelist_from_disk(
                     &cleanup_cx,
                     &*db_file,
+                    &inner.page_cipher,
                     page_size,
                     new_page_count,
                     candidate.header.freelist_trunk,
@@ -18895,7 +19076,11 @@ where
         }
     }
 
-    async fn journal_mode_from_database_file(cx: &Cx, db_file: &V::File) -> Result<JournalMode> {
+    async fn journal_mode_from_database_file(
+        cx: &Cx,
+        db_file: &V::File,
+        page_cipher: &PageCipherSlot,
+    ) -> Result<JournalMode> {
         let file_size = db_file.file_size(cx)?;
         if file_size < DATABASE_HEADER_SIZE as u64 {
             return Err(FrankenError::DatabaseCorrupt {
@@ -18905,7 +19090,7 @@ where
             });
         }
         let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-        let bytes_read = db_file.read(cx, &mut header_bytes, 0).await?;
+        let bytes_read = cipher_read_header(cx, db_file, page_cipher, &mut header_bytes).await?;
         if bytes_read != DATABASE_HEADER_SIZE {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -19043,7 +19228,7 @@ where
             // recovery before this attempt or its caller publishes metadata.
             let recovered_journal_mode = {
                 let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-                Self::journal_mode_from_database_file(cx, &*db_file).await?
+                Self::journal_mode_from_database_file(cx, &*db_file, &inner.page_cipher).await?
             };
             inner.journal_mode = recovered_journal_mode;
             if let Some(namespace) = inner.rollback_journal_recovery_namespace.as_mut() {
@@ -19117,6 +19302,7 @@ where
         let RollbackJournalOpenRecoveryContext {
             group_commit_queue,
             db_file,
+            page_cipher,
             current_db_path,
             current_db_identity,
             journal_path,
@@ -19164,52 +19350,60 @@ where
                 }
                 return Ok(None);
             }
+            let validator_cipher = page_cipher.clone();
             let outcome = Self::replay_journal_with_optional_page_size_validator(
                 cx,
                 vfs,
                 &mut *file,
                 exact_journal_path,
                 None,
-                |validator_cx, restored_file, journal_page_size| Box::pin(async move {
-                    let restored_size = restored_file.file_size(validator_cx)?;
-                    if restored_size == 0 {
-                        return Ok(());
-                    }
-                    if restored_size < DATABASE_HEADER_SIZE as u64 {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "rollback recovery restored a {restored_size}-byte main file, too short for its database header"
-                            ),
-                        });
-                    }
-                    let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-                    let bytes_read = restored_file
-                        .read(validator_cx, &mut header_bytes, 0)
+                move |validator_cx, restored_file, journal_page_size| {
+                    let validator_cipher = validator_cipher.clone();
+                    Box::pin(async move {
+                        let restored_size = restored_file.file_size(validator_cx)?;
+                        if restored_size == 0 {
+                            return Ok(());
+                        }
+                        if restored_size < DATABASE_HEADER_SIZE as u64 {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "rollback recovery restored a {restored_size}-byte main file, too short for its database header"
+                                ),
+                            });
+                        }
+                        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+                        let bytes_read = cipher_read_header(
+                            validator_cx,
+                            restored_file,
+                            &validator_cipher,
+                            &mut header_bytes,
+                        )
                         .await?;
-                    if bytes_read != DATABASE_HEADER_SIZE {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "short database-header read after rollback recovery: got {bytes_read} of {DATABASE_HEADER_SIZE} bytes"
-                            ),
-                        });
-                    }
-                    let restored_header =
-                        DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-                            error.to_franken_error(
-                                "rollback recovery restored an invalid database header",
-                            )
-                        })?;
-                    if restored_header.page_size != journal_page_size {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "rollback recovery restored page size {}, but the hot journal used {}",
-                                restored_header.page_size.get(),
-                                journal_page_size.get()
-                            ),
-                        });
-                    }
-                    Ok(())
-                }),
+                        if bytes_read != DATABASE_HEADER_SIZE {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "short database-header read after rollback recovery: got {bytes_read} of {DATABASE_HEADER_SIZE} bytes"
+                                ),
+                            });
+                        }
+                        let restored_header =
+                            DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
+                                error.to_franken_error(
+                                    "rollback recovery restored an invalid database header",
+                                )
+                            })?;
+                        if restored_header.page_size != journal_page_size {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "rollback recovery restored page size {}, but the hot journal used {}",
+                                    restored_header.page_size.get(),
+                                    journal_page_size.get()
+                                ),
+                            });
+                        }
+                        Ok(())
+                    })
+                },
             )
             .await?;
             match outcome {
@@ -19246,7 +19440,8 @@ where
             }
             if let Some(recovery) = orphaned_recovery.as_deref_mut() {
                 recovery.namespace.journal_mode =
-                    Self::journal_mode_from_database_file(cx, &*file).await?;
+                    Self::journal_mode_from_database_file(cx, &*file, &PageCipherSlot::default())
+                        .await?;
             }
             if let Err(error) = vfs.delete(cx, exact_journal_path, true) {
                 tracing::warn!(
@@ -19829,6 +20024,7 @@ where
                         disposition: ReadWriteOpenDisposition::CreateIfMissing,
                         expected_identity: None,
                         finish_namespace_bootstrap: false,
+                        defer_locked_header: false,
                     },
                 )
                 .await
@@ -19844,6 +20040,7 @@ where
                         disposition: ReadWriteOpenDisposition::ExistingOnly,
                         expected_identity,
                         finish_namespace_bootstrap: false,
+                        defer_locked_header: false,
                     },
                 )
                 .await
@@ -19859,6 +20056,7 @@ where
                         disposition: ReadWriteOpenDisposition::ReservedEmpty,
                         expected_identity: Some(expected_identity),
                         finish_namespace_bootstrap: false,
+                        defer_locked_header: false,
                     },
                 )
                 .await
@@ -19875,6 +20073,7 @@ where
                     ReadOnlyAdmission::Namespace {
                         finish_bootstrap: false,
                     },
+                    false,
                 )
                 .await?;
                 if matches!(mode, ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(_)) {
@@ -19893,6 +20092,7 @@ where
                     None,
                     page_buffer_max,
                     ReadOnlyAdmission::Immutable,
+                    false,
                 )
                 .await
             }
@@ -19943,6 +20143,7 @@ where
                 disposition: ReadWriteOpenDisposition::CreateIfMissing,
                 expected_identity: None,
                 finish_namespace_bootstrap: true,
+                defer_locked_header: false,
             },
         )
         .await
@@ -19974,6 +20175,7 @@ where
                 disposition: ReadWriteOpenDisposition::ReservedEmpty,
                 expected_identity: Some(expected_identity),
                 finish_namespace_bootstrap: true,
+                defer_locked_header: false,
             },
         )
         .await
@@ -20006,6 +20208,7 @@ where
                 disposition: ReadWriteOpenDisposition::ExistingOnly,
                 expected_identity,
                 finish_namespace_bootstrap: true,
+                defer_locked_header: false,
             },
         )
         .await
@@ -20024,6 +20227,7 @@ where
             disposition,
             expected_identity,
             finish_namespace_bootstrap,
+            defer_locked_header,
         } = policy;
         let vfs = Arc::new(vfs);
         let db_path = vfs.full_pathname(cx, path)?;
@@ -20207,6 +20411,7 @@ where
                 RollbackJournalOpenRecoveryContext {
                     group_commit_queue: &group_commit_queue,
                     db_file: &db_file,
+                    page_cipher: &PageCipherSlot::default(),
                     current_db_path: &db_path,
                     current_db_identity: database_identity,
                     journal_path: &journal_path,
@@ -20291,7 +20496,17 @@ where
             None
         };
         let (mut file_size, coherent_header_bytes, accept_proven_non_hot_leftover) =
-            if reserved_empty_existing_size == Some(0) {
+            if defer_locked_header {
+                let locked_size = with_main_shared_lock(
+                    cx,
+                    &group_commit_queue,
+                    &db_file,
+                    &mut (),
+                    |cx, db_file, ()| Box::pin(async move { db_file.file_size(cx) }),
+                )
+                .await?;
+                (locked_size, None, false)
+            } else if reserved_empty_existing_size == Some(0) {
                 (0, None, false)
             } else {
                 if reserved_empty_existing_size.is_some() && database_identity != expected_identity
@@ -20317,6 +20532,7 @@ where
                             RollbackJournalOpenRecoveryContext {
                                 group_commit_queue: &group_commit_queue,
                                 db_file: &db_file,
+                                page_cipher: &PageCipherSlot::default(),
                                 current_db_path: &db_path,
                                 current_db_identity: database_identity,
                                 journal_path: &journal_path,
@@ -20403,7 +20619,9 @@ where
                 }
             };
 
-        let page_size = if let Some(header_bytes) = coherent_header_bytes.as_ref() {
+        let page_size = if defer_locked_header {
+            requested_page_size
+        } else if let Some(header_bytes) = coherent_header_bytes.as_ref() {
             // A stale live-WAL bootstrap stub parses too, and its page size is
             // the WAL's (bd-25au0).
             match DatabaseHeader::from_bytes(header_bytes) {
@@ -20423,7 +20641,16 @@ where
             requested_page_size
         };
 
-        let (header, bootstrapped_from_live_wal_stub) = if file_size == 0 {
+        let (header, bootstrapped_from_live_wal_stub) = if defer_locked_header {
+            (
+                DatabaseHeader {
+                    page_size,
+                    reserved_per_page: 40,
+                    ..DatabaseHeader::default()
+                },
+                true,
+            )
+        } else if file_size == 0 {
             if disposition == ReadWriteOpenDisposition::ExistingOnly {
                 return Err(FrankenError::CannotOpen { path: db_path });
             }
@@ -20660,6 +20887,7 @@ where
                         load_freelist_from_disk(
                             cx,
                             db_file,
+                            &PageCipherSlot::default(),
                             *page_size,
                             *db_size,
                             *freelist_trunk,
@@ -20687,6 +20915,7 @@ where
         )));
         let pool = cache.pool().clone();
         let rollback_recovery_pending = Arc::clone(&maintenance_gate.rollback_recovery_pending);
+        let page_cipher = PageCipherSlot::default();
         let pager = Self {
             vfs,
             rollback_journal_path: Arc::from(Self::journal_path(&db_path)),
@@ -20698,6 +20927,7 @@ where
             maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
+                page_cipher: page_cipher.clone(),
                 vfs_busy_timeout_ms: 0,
                 database_path: inner_database_path,
                 database_identity,
@@ -20769,6 +20999,7 @@ where
             }))),
             shared_connection_count: OnceLock::new(),
             group_commit_queue,
+            page_cipher,
         };
         if finish_namespace_bootstrap {
             pager.finish_namespace_bootstrap()?;
@@ -20779,7 +21010,7 @@ where
         // :memory:/private-VFS opens use a fresh, connection-local ledger that
         // is always empty here. Fully best-effort — it never fails the open and
         // never drops a ledger entry (see `sweep_disowned_ledger_on_open`).
-        if !pager.vfs.is_memory() {
+        if !defer_locked_header && !pager.vfs.is_memory() {
             let _ = pager.sweep_disowned_ledger_on_open(cx).await;
         }
         Ok(pager)
@@ -20848,6 +21079,7 @@ where
             ReadOnlyAdmission::Namespace {
                 finish_bootstrap: true,
             },
+            false,
         )
         .await
     }
@@ -20875,11 +21107,12 @@ where
             ReadOnlyAdmission::Namespace {
                 finish_bootstrap: true,
             },
+            false,
         )
         .await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn open_readonly_with_optional_expected_identity(
         cx: &Cx,
         vfs: V,
@@ -20888,6 +21121,7 @@ where
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
         admission: ReadOnlyAdmission,
+        defer_locked_header: bool,
     ) -> Result<Self> {
         let immutable = admission == ReadOnlyAdmission::Immutable;
         let vfs = Arc::new(vfs);
@@ -21021,89 +21255,140 @@ where
         let db_file = Arc::new(AsyncRwLock::with_name("pager_db_file", db_file));
 
         let journal_path = Self::journal_path(&db_path);
-        let mut header_state = (
-            Arc::clone(&vfs),
-            journal_path.clone(),
-            db_path.clone(),
-            Arc::clone(&maintenance_gate),
-            immutable,
-        );
-        let (file_size, header_bytes) = with_main_shared_lock(
-            cx,
-            &group_commit_queue,
-            &db_file,
-            &mut header_state,
-            |cx, db_file, state| {
-            let (vfs, journal_path, db_path, maintenance_gate, immutable) = state;
-            Box::pin(async move {
-            // Read-only and schema-only opens cannot replay. A RESERVED owner
-            // makes its journal live rather than hot; our retained SHARED
-            // fence protects the committed image until this header is read.
-            // An immutable file has no journal to consider: stock opens it
-            // like a temp file and never looks (bd-j2dtf).
-            if !*immutable {
-                Self::verify_readonly_snapshot_journal_state(
-                    cx, &*vfs, journal_path, db_file, maintenance_gate,
-                ).await?;
-            }
-            let file_size = db_file.file_size(cx)?;
-            if file_size == 0 {
-                return Err(FrankenError::CannotOpen {
-                    path: db_path.clone(),
-                });
-            }
-            if file_size < DATABASE_HEADER_SIZE as u64 {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
-                    ),
-                });
-            }
+        let (file_size, header, page_size, reserved_per_page, pointer_map) = if defer_locked_header
+        {
+            let mut locked_state = (db_path.clone(),);
+            let file_size = with_main_shared_lock(
+                cx,
+                &group_commit_queue,
+                &db_file,
+                &mut locked_state,
+                |cx, db_file, state| {
+                    let (db_path,) = state;
+                    Box::pin(async move {
+                        let file_size = db_file.file_size(cx)?;
+                        if file_size == 0 {
+                            return Err(FrankenError::CannotOpen {
+                                path: db_path.clone(),
+                            });
+                        }
+                        Ok(file_size)
+                    })
+                },
+            )
+            .await?;
+            (
+                file_size,
+                None,
+                _requested_page_size,
+                40_u8,
+                PointerMapState::from_largest_root_page(0),
+            )
+        } else {
+            let mut header_state = (
+                Arc::clone(&vfs),
+                journal_path.clone(),
+                db_path.clone(),
+                Arc::clone(&maintenance_gate),
+                immutable,
+            );
+            let (file_size, header_bytes) = with_main_shared_lock(
+                cx,
+                &group_commit_queue,
+                &db_file,
+                &mut header_state,
+                |cx, db_file, state| {
+                    let (vfs, journal_path, db_path, maintenance_gate, immutable) = state;
+                    Box::pin(async move {
+                        // Read-only and schema-only opens cannot replay. A RESERVED owner
+                        // makes its journal live rather than hot; our retained SHARED
+                        // fence protects the committed image until this header is read.
+                        // An immutable file has no journal to consider: stock opens it
+                        // like a temp file and never looks (bd-j2dtf).
+                        if !*immutable {
+                            Self::verify_readonly_snapshot_journal_state(
+                                cx,
+                                &*vfs,
+                                journal_path,
+                                db_file,
+                                maintenance_gate,
+                            )
+                            .await?;
+                        }
+                        let file_size = db_file.file_size(cx)?;
+                        if file_size == 0 {
+                            return Err(FrankenError::CannotOpen {
+                                path: db_path.clone(),
+                            });
+                        }
+                        if file_size < DATABASE_HEADER_SIZE as u64 {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
+                                ),
+                            });
+                        }
 
-            let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-            let bytes_read = db_file.read(cx, &mut header_bytes, 0).await?;
-            if bytes_read != DATABASE_HEADER_SIZE {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "short read fetching database header: got {bytes_read} of {DATABASE_HEADER_SIZE}"
-                    ),
-                });
-            }
-            Ok((file_size, header_bytes))
-            })
-        })
-        .await?;
-        let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
-            Ok(header)
-                if !immutable
-                    && stale_main_header_can_be_recovered_from_live_wal(
-                        cx,
-                        &*vfs,
-                        &db_path,
-                        &header_bytes,
-                        true,
-                    )
-                    .await? =>
-            {
-                // Stale live-WAL bootstrap stub: the real page 1 lives in the
-                // WAL, so only the page size is taken from the main file.
-                (None, header.page_size)
-            }
-            Ok(header) => {
-                let page_size = header.page_size;
-                (Some(header), page_size)
-            }
-            Err(error) => {
-                return Err(error.to_franken_error("invalid database header"));
-            }
+                        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+                        let bytes_read = db_file.read(cx, &mut header_bytes, 0).await?;
+                        if bytes_read != DATABASE_HEADER_SIZE {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "short read fetching database header: got {bytes_read} of {DATABASE_HEADER_SIZE}"
+                                ),
+                            });
+                        }
+                        Ok((file_size, header_bytes))
+                    })
+                },
+            )
+            .await?;
+            let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
+                Ok(header)
+                    if !immutable
+                        && stale_main_header_can_be_recovered_from_live_wal(
+                            cx,
+                            &*vfs,
+                            &db_path,
+                            &header_bytes,
+                            true,
+                        )
+                        .await? =>
+                {
+                    // Stale live-WAL bootstrap stub: the real page 1 lives in the
+                    // WAL, so only the page size is taken from the main file.
+                    (None, header.page_size)
+                }
+                Ok(header) => {
+                    let page_size = header.page_size;
+                    (Some(header), page_size)
+                }
+                Err(error) => {
+                    return Err(error.to_franken_error("invalid database header"));
+                }
+            };
+            // Raw header byte 20 also covers the stale-stub bootstrap (no parsed
+            // header); the first committed-state refresh replaces it regardless.
+            let reserved_per_page = header_bytes[20];
+            let pointer_map = PointerMapState::from_largest_root_page(u32::from_be_bytes([
+                header_bytes[52],
+                header_bytes[53],
+                header_bytes[54],
+                header_bytes[55],
+            ]));
+            (file_size, header, page_size, reserved_per_page, pointer_map)
         };
 
         let page_size_u64 = page_size.as_usize() as u64;
         // GH#334 / bd-e26jr sig-2: a partial-page tail is slack, not
         // corruption — floor to whole pages (see the read-write open above).
-        let db_pages = file_size
-            .checked_div(page_size_u64)
-            .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?;
+        let db_pages = if defer_locked_header {
+            0
+        } else {
+            file_size
+                .checked_div(page_size_u64)
+                .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?
+        };
         let db_size = u32::try_from(db_pages).map_err(|_| FrankenError::OutOfRange {
             what: "database page count".to_owned(),
             value: db_pages.to_string(),
@@ -21120,15 +21405,6 @@ where
         let initial_commit_seq = CommitSeq::new(u64::from(
             header.as_ref().map_or(0, |header| header.change_counter),
         ));
-        // Raw header byte 20 also covers the stale-stub bootstrap (no parsed
-        // header); the first committed-state refresh replaces it regardless.
-        let reserved_per_page = header_bytes[20];
-        let pointer_map = PointerMapState::from_largest_root_page(u32::from_be_bytes([
-            header_bytes[52],
-            header_bytes[53],
-            header_bytes[54],
-            header_bytes[55],
-        ]));
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
@@ -21137,6 +21413,7 @@ where
         )));
         let pool = cache.pool().clone();
         let rollback_recovery_pending = Arc::clone(&maintenance_gate.rollback_recovery_pending);
+        let page_cipher = PageCipherSlot::default();
         let pager = Self {
             vfs,
             rollback_journal_path: Arc::from(Self::journal_path(&db_path)),
@@ -21148,6 +21425,7 @@ where
             maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
+                page_cipher: page_cipher.clone(),
                 vfs_busy_timeout_ms: 0,
                 database_path: inner_database_path,
                 database_identity,
@@ -21224,6 +21502,7 @@ where
             }))),
             shared_connection_count: OnceLock::new(),
             group_commit_queue,
+            page_cipher,
         };
         if admission
             == (ReadOnlyAdmission::Namespace {
@@ -21233,6 +21512,556 @@ where
             pager.finish_namespace_bootstrap()?;
         }
         Ok(pager)
+    }
+
+    /// Return a shared handle to this pager's page-level encryption slot.
+    #[must_use]
+    pub fn page_cipher_slot(&self) -> PageCipherSlot {
+        self.page_cipher.clone()
+    }
+
+    /// Install or clear the active page-level cipher and invalidate cached pages.
+    pub fn set_page_cipher(&self, active: Option<ActivePageCipher>) {
+        self.page_cipher.set(active);
+        self.cache.clear();
+    }
+
+    /// Open an existing encrypted database in locked mode without parsing its
+    /// ciphertext page 1 header yet. The caller must invoke
+    /// [`Self::unlock_with_cipher`] after `PRAGMA key` unwraps the DEK.
+    #[doc(hidden)]
+    pub async fn open_locked_for_connection_with_cx_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+        page_buffer_max: Option<usize>,
+        expected_identity: Option<FileIdentity>,
+        readonly: bool,
+    ) -> Result<Self> {
+        if readonly {
+            Self::open_readonly_with_optional_expected_identity(
+                cx,
+                vfs,
+                path,
+                requested_page_size,
+                expected_identity,
+                page_buffer_max,
+                ReadOnlyAdmission::Namespace {
+                    finish_bootstrap: false,
+                },
+                true,
+            )
+            .await
+        } else {
+            Self::open_readwrite_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                path,
+                requested_page_size,
+                page_buffer_max,
+                ReadWriteOpenPolicy {
+                    disposition: ReadWriteOpenDisposition::ExistingOnly,
+                    expected_identity,
+                    finish_namespace_bootstrap: false,
+                    defer_locked_header: true,
+                },
+            )
+            .await
+        }
+    }
+
+    /// Unlock a locked encrypted pager using the unwrapped page cipher.
+    ///
+    /// Replays any hot rollback journal (raw authenticated ciphertext pages),
+    /// decrypts and validates page 1 (`reserved_per_page >= 40` and matching
+    /// page size), loads the freelist if writable, and publishes the unlocked
+    /// header state. On any error, clears the cipher slot so the pager remains
+    /// locked and fail-closed.
+    #[allow(clippy::too_many_lines, clippy::await_holding_lock)]
+    pub async fn unlock_with_cipher(
+        &self,
+        cx: &Cx,
+        active: ActivePageCipher,
+    ) -> Result<DatabaseHeader> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        let (db_file, is_readonly, database_identity, expected_page_size) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.active_transactions > 0 || inner.checkpoint_active {
+                return Err(FrankenError::Busy);
+            }
+            (
+                Arc::clone(&inner.db_file),
+                inner.access_mode.is_readonly(),
+                inner.database_identity,
+                inner.page_size,
+            )
+        };
+        if active.page_size != expected_page_size.as_usize() {
+            return Err(FrankenError::NotADatabase {
+                path: self.db_path.clone(),
+            });
+        }
+
+        self.page_cipher.set(Some(active.clone()));
+        let unlock_result: Result<(u64, DatabaseHeader, u32, Vec<PageNumber>)> = async {
+            if !is_readonly
+                && self
+                    .vfs
+                    .access(cx, &self.rollback_journal_path, AccessFlags::EXISTS)?
+            {
+                let _recovery_guard = self.recovery_fence.acquire_for_recovery()?;
+                let mut open_lease = self
+                    .maintenance_open_lease
+                    .lock()
+                    .map_err(|_| FrankenError::internal("pager open-lease lock poisoned"))?;
+                let mut txn_lease = if open_lease.is_none() {
+                    Some(self.maintenance_gate.enter_transaction()?)
+                } else {
+                    None
+                };
+                let lease = open_lease
+                    .as_mut()
+                    .or(txn_lease.as_mut())
+                    .ok_or_else(|| FrankenError::internal("unlock maintenance lease missing"))?;
+                let prior_kind = lease.upgrade_to_exclusive(None)?;
+                let recovery_result = Self::recover_rollback_journal_for_open(
+                    cx,
+                    &*self.vfs,
+                    RollbackJournalOpenRecoveryContext {
+                        group_commit_queue: &self.group_commit_queue,
+                        db_file: &db_file,
+                        page_cipher: &self.page_cipher,
+                        current_db_path: &self.db_path,
+                        current_db_identity: database_identity,
+                        journal_path: &self.rollback_journal_path,
+                    },
+                    None,
+                )
+                .await;
+                let cleanup_cx = cleanup_child_cx(cx);
+                let _cleanup_mask = cleanup_cx.masked();
+                let downgrade_result = lease.downgrade_from_exclusive(prior_kind);
+                match (recovery_result, downgrade_result) {
+                    (Ok(_), Ok(())) => {}
+                    (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+                    (Err(recovery_error), Err(downgrade_error)) => {
+                        return Err(FrankenError::internal(format!(
+                            "encrypted unlock rollback recovery failed: recovery={recovery_error}; downgrade={downgrade_error}"
+                        )));
+                    }
+                }
+            }
+
+            let mut state = (
+                self.page_cipher.clone(),
+                active.page_size,
+                expected_page_size,
+                is_readonly,
+                self.db_path.clone(),
+            );
+            with_main_shared_lock(
+                cx,
+                &self.group_commit_queue,
+                &db_file,
+                &mut state,
+                |cx, db_file, state| {
+                    let (page_cipher, active_page_size, expected_page_size, is_readonly, db_path) =
+                        state;
+                    Box::pin(async move {
+                        let file_size = db_file.file_size(cx)?;
+                        if file_size < *active_page_size as u64 {
+                            return Err(FrankenError::NotADatabase {
+                                path: db_path.clone(),
+                            });
+                        }
+                        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+                        let bytes_read =
+                            cipher_read_header(cx, db_file, page_cipher, &mut header_bytes).await?;
+                        if bytes_read != DATABASE_HEADER_SIZE {
+                            return Err(FrankenError::NotADatabase {
+                                path: db_path.clone(),
+                            });
+                        }
+                        let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|_| {
+                            FrankenError::NotADatabase {
+                                path: db_path.clone(),
+                            }
+                        })?;
+                        if header.reserved_per_page < 40
+                            || header.page_size != *expected_page_size
+                            || header.page_size.as_usize() != *active_page_size
+                        {
+                            return Err(FrankenError::NotADatabase {
+                                path: db_path.clone(),
+                            });
+                        }
+                        let page_size_u64 = header.page_size.as_usize() as u64;
+                        let db_pages = file_size
+                            .checked_div(page_size_u64)
+                            .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?;
+                        let db_size =
+                            u32::try_from(db_pages).map_err(|_| FrankenError::OutOfRange {
+                                what: "database page count".to_owned(),
+                                value: db_pages.to_string(),
+                            })?;
+                        let freelist = if *is_readonly {
+                            Vec::new()
+                        } else {
+                            load_freelist_from_disk(
+                                cx,
+                                db_file,
+                                page_cipher,
+                                header.page_size,
+                                db_size,
+                                header.freelist_trunk,
+                                header.freelist_count,
+                            )
+                            .await?
+                        };
+                        Ok((file_size, header, db_size, freelist))
+                    })
+                },
+            )
+            .await
+        }
+        .await;
+
+        let (file_size, header, db_size, freelist) = match unlock_result {
+            Ok(unlocked) => unlocked,
+            Err(err) => {
+                self.page_cipher.set(None);
+                self.cache.clear();
+                return Err(err);
+            }
+        };
+
+        let journal_mode = Self::journal_mode_from_database_header(&header)?;
+        let commit_seq = CommitSeq::new(u64::from(header.change_counter));
+        let next_page = if db_size >= 2 {
+            db_size.saturating_add(1)
+        } else {
+            2
+        };
+        let freelist_count = freelist.len();
+        let dropped = u32::try_from(freelist_count)
+            .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded));
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            inner.page_size = header.page_size;
+            inner.reserved_per_page = header.reserved_per_page;
+            inner.pointer_map = PointerMapState::from_largest_root_page(header.largest_root_page);
+            inner.db_size = db_size;
+            inner.next_page = next_page;
+            inner.journal_mode = journal_mode;
+            inner.commit_seq = commit_seq;
+            inner.committed_db_file_size_bytes = file_size;
+            inner.committed_db_change_counter = u64::from(header.change_counter);
+            inner.durable_freelist_view = freelist.iter().map(|page| page.get()).collect();
+            inner.freelist = freelist;
+            inner.freelist_repair_pending = dropped > 0;
+            inner.freelist_repair_dropped = dropped;
+            self.cache.clear();
+            self.published.publish_replaced_image(
+                cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: inner.commit_seq,
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: inner.freelist.len(),
+                    checkpoint_active: inner.checkpoint_active,
+                },
+            );
+            self.publish_committed_snapshot_from_inner(&inner);
+        }
+        Ok(header)
+    }
+
+    /// Initialize page 1 of a brand-new empty database with page-level
+    /// encryption (`reserved_per_page >= 40`).
+    #[allow(clippy::too_many_lines)]
+    pub async fn initialize_empty_encrypted_page1(
+        &self,
+        cx: &Cx,
+        active: ActivePageCipher,
+        reserved_per_page: u8,
+    ) -> Result<DatabaseHeader> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        if reserved_per_page < 40 {
+            return Err(FrankenError::OutOfRange {
+                what: "encryption reserved_per_page".to_owned(),
+                value: reserved_per_page.to_string(),
+            });
+        }
+        let (db_file, page_size, journal_mode) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.access_mode.is_readonly() {
+                return Err(FrankenError::ReadOnly);
+            }
+            if inner.active_transactions > 0 || inner.checkpoint_active {
+                return Err(FrankenError::Busy);
+            }
+            if inner.page_size.as_usize() != active.page_size {
+                return Err(FrankenError::OutOfRange {
+                    what: "encryption page_size".to_owned(),
+                    value: active.page_size.to_string(),
+                });
+            }
+            (Arc::clone(&inner.db_file), inner.page_size, inner.journal_mode)
+        };
+
+        let mut external_lock =
+            BeginExternalLockState::new(&self.group_commit_queue, Arc::clone(&db_file), cx);
+        external_lock.arm_lock_level(LockLevel::None);
+        shared_db_lock(&db_file, cx, LockLevel::Exclusive).await?;
+        external_lock.mark_lock_level_acquired();
+
+        let previous_cipher = self.page_cipher.get();
+        self.page_cipher.set(Some(active));
+
+        let init_result: Result<(DatabaseHeader, u64)> = async {
+            let mut file = shared_db_file_write(&db_file, cx).await?;
+            let page_len = page_size.as_usize();
+            let mut page1 = vec![0_u8; page_len];
+            let format_ver = if journal_mode == JournalMode::Wal {
+                2
+            } else {
+                1
+            };
+            let header = DatabaseHeader {
+                page_size,
+                write_version: format_ver,
+                read_version: format_ver,
+                reserved_per_page,
+                page_count: 1,
+                sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
+                db_file_id: generate_db_file_id(),
+                ..DatabaseHeader::default()
+            };
+            let hdr_bytes = header.to_bytes().map_err(|err| {
+                FrankenError::internal(format!(
+                    "failed to encode encrypted database header: {err}"
+                ))
+            })?;
+            page1[..DATABASE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+            let usable = page_size.usable(reserved_per_page);
+            BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
+            cipher_write_page(cx, &*file, &self.page_cipher, 1, &page1).await?;
+            file.truncate(cx, page_len as u64)?;
+            file.durable_sync(cx, SyncKind::FullDurable)?;
+            let file_size = file.file_size(cx)?;
+            Ok((header, file_size))
+        }
+        .await;
+
+        let restore_result = external_lock.restore().await;
+        let (header, file_size) = match (init_result, restore_result) {
+            (Ok(value), Ok(())) => value,
+            (Err(err), Ok(())) | (Ok(_), Err(err)) => {
+                self.page_cipher.set(previous_cipher);
+                self.cache.clear();
+                return Err(err);
+            }
+            (Err(init_err), Err(restore_err)) => {
+                self.page_cipher.set(previous_cipher);
+                self.cache.clear();
+                return Err(FrankenError::internal(format!(
+                    "encrypted page 1 initialization failed: init={init_err}; restore={restore_err}"
+                )));
+            }
+        };
+
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            inner.reserved_per_page = reserved_per_page;
+            inner.db_size = 1;
+            inner.next_page = 2;
+            inner.freelist.clear();
+            inner.durable_freelist_view.clear();
+            inner.freelist_repair_pending = false;
+            inner.freelist_repair_dropped = 0;
+            inner.committed_db_file_size_bytes = file_size;
+            inner.committed_db_change_counter = u64::from(header.change_counter);
+            inner.committed_wal_generation = None;
+            inner.wal_refresh_signature = None;
+            self.cache.clear();
+            self.published.publish_replaced_image(
+                cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: inner.commit_seq,
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: 0,
+                    checkpoint_active: inner.checkpoint_active,
+                },
+            );
+            self.publish_committed_snapshot_from_inner(&inner);
+        }
+        Ok(header)
+    }
+
+    /// Atomically replace the physical main database image from a fully staged
+    /// target image during explicit Plaintext <-> Encrypted conversion (`PRAGMA rekey`).
+    ///
+    /// Preserves the main database file's `FileIdentity` and namespace binding
+    /// while updating the active cipher, `reserved_per_page`, cache, and
+    /// published snapshots.
+    #[allow(clippy::too_many_lines)]
+    pub async fn replace_file_image_for_rekey(
+        &self,
+        cx: &Cx,
+        staged_path: &Path,
+        new_cipher: Option<ActivePageCipher>,
+        new_header: &DatabaseHeader,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.access_mode.is_readonly() {
+                return Err(FrankenError::ReadOnly);
+            }
+            if inner.active_transactions > 0 || inner.checkpoint_active {
+                return Err(FrankenError::Busy);
+            }
+            Arc::clone(&inner.db_file)
+        };
+
+        let mut external_lock =
+            BeginExternalLockState::new(&self.group_commit_queue, Arc::clone(&db_file), cx);
+        external_lock.arm_lock_level(LockLevel::None);
+        shared_db_lock(&db_file, cx, LockLevel::Exclusive).await?;
+        external_lock.mark_lock_level_acquired();
+
+        let copy_result: Result<u64> = async {
+            let full_staged = self.vfs.full_pathname(cx, staged_path)?;
+            let (mut staged_file, _) = self.vfs.open(
+                cx,
+                Some(&full_staged),
+                VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB,
+            )?;
+            let staged_len = staged_file.file_size(cx)?;
+            let write_res: Result<()> = async {
+                let mut file = shared_db_file_write(&db_file, cx).await?;
+                let mut buf = vec![0_u8; 64 * 1024];
+                let mut offset = 0_u64;
+                while offset < staged_len {
+                    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                    let remaining = usize::try_from(staged_len - offset)
+                        .unwrap_or(buf.len())
+                        .min(buf.len());
+                    let read = staged_file.read(cx, &mut buf[..remaining], offset).await?;
+                    if read != remaining {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short read staging rekey image at offset {offset}: got {read}, expected {remaining}"
+                            ),
+                        });
+                    }
+                    file.write(cx, &buf[..remaining], offset).await?;
+                    offset = offset.saturating_add(remaining as u64);
+                }
+                file.truncate(cx, staged_len)?;
+                file.durable_sync(cx, SyncKind::FullDurable)?;
+                Ok(())
+            }
+            .await;
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _cleanup_mask = cleanup_cx.masked();
+            let close_res = staged_file.close(&cleanup_cx);
+            match (write_res, close_res) {
+                (Ok(()), Ok(())) => Ok(staged_len),
+                (Err(err), _) | (Ok(()), Err(err)) => Err(err),
+            }
+        }
+        .await;
+
+        let restore_result = external_lock.restore().await;
+        let staged_len = match (copy_result, restore_result) {
+            (Ok(len), Ok(())) => len,
+            (Err(err), Ok(())) | (Ok(_), Err(err)) => return Err(err),
+            (Err(copy_err), Err(restore_err)) => {
+                return Err(FrankenError::internal(format!(
+                    "rekey image replacement failed: copy={copy_err}; restore={restore_err}"
+                )));
+            }
+        };
+
+        // Detach any old WAL backend so the caller rebinds a fresh WAL with the
+        // new cipher state if WAL mode is requested.
+        {
+            let mut guard = self
+                .wal_backend
+                .write()
+                .map_err(|_| FrankenError::internal("WAL backend lock poisoned"))?;
+            *guard = None;
+        }
+        self.page_cipher.set(new_cipher);
+        self.cache.clear();
+
+        let new_journal_mode = Self::journal_mode_from_database_header(new_header)?;
+        let page_size_u64 = new_header.page_size.as_usize() as u64;
+        let db_pages = staged_len
+            .checked_div(page_size_u64)
+            .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?;
+        let new_db_size = u32::try_from(db_pages).map_err(|_| FrankenError::OutOfRange {
+            what: "database page count".to_owned(),
+            value: db_pages.to_string(),
+        })?;
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            inner.page_size = new_header.page_size;
+            inner.reserved_per_page = new_header.reserved_per_page;
+            inner.pointer_map =
+                PointerMapState::from_largest_root_page(new_header.largest_root_page);
+            inner.db_size = new_db_size;
+            inner.next_page = if new_db_size >= 2 {
+                new_db_size.saturating_add(1)
+            } else {
+                2
+            };
+            inner.journal_mode = new_journal_mode;
+            inner.freelist.clear();
+            inner.durable_freelist_view.clear();
+            inner.freelist_repair_pending = false;
+            inner.freelist_repair_dropped = 0;
+            inner.commit_seq = inner.commit_seq.next();
+            inner.committed_db_file_size_bytes = staged_len;
+            inner.committed_db_change_counter = u64::from(new_header.change_counter);
+            inner.committed_wal_generation = None;
+            inner.wal_refresh_signature = None;
+            inner.durable_db_size_floor = None;
+            inner.committed_wal_visible_commit_count = 0;
+            self.published.publish_replaced_image(
+                cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: inner.commit_seq,
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: 0,
+                    checkpoint_active: inner.checkpoint_active,
+                },
+            );
+            self.publish_committed_snapshot_from_inner(&inner);
+        }
+        Ok(())
     }
 
     /// Open (or create) a database and return a pager using a detached test context.
@@ -22187,6 +23016,8 @@ where
     /// handles for one file identity may proceed independently; transitions on
     /// this handle must not overtake one another.
     db_file: SharedDbFile<V::File>,
+    /// Shared compatibility page-encryption codec (bd-1vwiy.1).
+    page_cipher: PageCipherSlot,
     writer_idle: Arc<Condvar>,
     cache: Arc<ShardedPageCache>,
     /// Write-set page ceiling inherited from the pager. `0` means unlimited.
@@ -24531,8 +25362,8 @@ where
             let mut page_one_preimage: Option<Vec<u8>> = if write_set.contains_key(&PageNumber::ONE)
                 && original_db_size >= PageNumber::ONE.get()
             {
-                let mut image = vec![0u8; ps];
-                let bytes_read = db_file.read(cx, &mut image, 0).await?;
+                let mut raw_image = vec![0u8; ps];
+                let bytes_read = db_file.read(cx, &mut raw_image, 0).await?;
                 if bytes_read < ps {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -24540,6 +25371,13 @@ where
                         ),
                     });
                 }
+                let image = if let Some(active) = inner.page_cipher.get() {
+                    let mut decrypted = raw_image.clone();
+                    decrypt_page_after_read(&active, 1, &mut decrypted)?;
+                    decrypted
+                } else {
+                    raw_image.clone()
+                };
                 let committed_db_size =
                     u32::from_be_bytes([image[28], image[29], image[30], image[31]]);
                 if committed_db_size > original_db_size {
@@ -24588,6 +25426,7 @@ where
                     let committed_freelist: HashSet<u32> = load_freelist_from_disk(
                         cx,
                         &*db_file,
+                        &inner.page_cipher,
                         page_size,
                         committed_db_size,
                         first_trunk,
@@ -24615,7 +25454,7 @@ where
                         });
                     }
                 }
-                Some(image)
+                Some(raw_image)
             } else {
                 None
             };
@@ -24739,9 +25578,13 @@ where
                 let offset = u64::from(page_no.get() - 1) * page_size_bytes;
                 batched_writes.push((offset, staged.as_page_bytes()));
             }
-            if let Err(e) = db_file
-                .write_page_batch(&cleanup_cx, batched_writes.as_slice())
-                .await
+            if let Err(e) = cipher_write_page_batch(
+                &cleanup_cx,
+                &*db_file,
+                &inner.page_cipher,
+                batched_writes.as_slice(),
+            )
+            .await
             {
                 inner.db_size = saved_db_size;
                 return Err(e);
@@ -24847,9 +25690,7 @@ where
         }
 
         let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-        db_file
-            .write_page_batch(cx, batched_writes.as_slice())
-            .await
+        cipher_write_page_batch(cx, &*db_file, &inner.page_cipher, batched_writes.as_slice()).await
     }
 
     /// Commit using the WAL protocol with group commit batching.
@@ -25602,11 +26443,11 @@ where
                                 );
                             }
                         } else {
-                            let db_file = {
+                            let (db_file, page_cipher) = {
                                 let inner = inner_arc.lock().map_err(|_| {
                                     FrankenError::internal("SimpleTransaction lock poisoned")
                                 })?;
-                                Arc::clone(&inner.db_file)
+                                (Arc::clone(&inner.db_file), inner.page_cipher.clone())
                             };
                             let durable_page_one = {
                                 let backend = wal_backend_handle(wal_backend)?;
@@ -25616,6 +26457,7 @@ where
                                     cx,
                                     wal_guard.as_mut(),
                                     &db_file,
+                                    &page_cipher,
                                     frame_page_size,
                                     1,
                                 )
@@ -25653,6 +26495,9 @@ where
                     flatten_group_commit_batches(flush_base_db_size, &batches);
                 debug_assert_eq!(final_db_size, consolidated_db_size);
                 let frame_count = frame_refs.len();
+                let wal_encryption_active = inner_arc
+                    .lock()
+                    .is_ok_and(|inner| inner.page_cipher.is_enabled());
                 let mut wal_frame_payload_digest = group_commit_frame_payload_digest(&frame_refs)?;
                 let mut fallback_reason = if matches!(
                     parallel_wal_control.mode,
@@ -25665,7 +26510,10 @@ where
                 let mut shadow_verdict = ParallelWalShadowVerdict::NotRun;
                 let mut prepared_is_digested_frames = false;
 
-                let mut prepared_batch = if fallback_reason.is_none() {
+                let mut prepared_batch = if wal_encryption_active {
+                    let _ = queue.discard_prepared_batches_for_flush(&batches);
+                    None
+                } else if fallback_reason.is_none() {
                     match queue.take_prepared_batches_for_flush(&batches) {
                         Some(mut staged_by_batch_id) => {
                             if promoted_page_one_headers {
@@ -25760,10 +26608,11 @@ where
                 // ordered residue, either from a lane-staged batch or through
                 // this safe raw fallback.
                 if prepared_batch.is_none()
-                    && !matches!(
-                        parallel_wal_control.mode,
-                        ParallelWalOperatingMode::Conservative
-                    )
+                    && (wal_encryption_active
+                        || !matches!(
+                            parallel_wal_control.mode,
+                            ParallelWalOperatingMode::Conservative
+                        ))
                 {
                     let backend = wal_backend_handle(wal_backend)?;
                     #[cfg(test)]
@@ -25772,6 +26621,10 @@ where
                     let mut prepared = wal.prepare_append_frames(&frame_refs)?;
                     if let Some(prepared) = prepared.as_mut() {
                         wal.finalize_prepared_frames(cx, prepared)?;
+                        if wal_encryption_active {
+                            wal_frame_payload_digest =
+                                group_commit_prepared_batch_payload_digest(prepared)?;
+                        }
                     }
                     drop(wal);
                     prepared_batch = prepared;
@@ -25973,10 +26826,19 @@ where
                                                 &batches, header,
                                             )
                                         } else {
+                                            let page_cipher = {
+                                                let inner = inner_arc.lock().map_err(|_| {
+                                                    FrankenError::internal(
+                                                        "SimpleTransaction lock poisoned",
+                                                    )
+                                                })?;
+                                                inner.page_cipher.clone()
+                                            };
                                             let durable_page_one = read_durable_page_under_gate(
                                                 cx,
                                                 wal,
                                                 &db_file,
+                                                &page_cipher,
                                                 frame_page_size,
                                                 1,
                                             )
@@ -26008,11 +26870,20 @@ where
                                             });
                                         }
                                     }
+                                    let page_cipher_for_guard = {
+                                        let inner = inner_arc.lock().map_err(|_| {
+                                            FrankenError::internal(
+                                                "SimpleTransaction lock poisoned",
+                                            )
+                                        })?;
+                                        inner.page_cipher.clone()
+                                    };
                                     let freelist_guard_pages =
                                         resurrected_or_erased_freelist_pages(
                                             cx,
                                             wal,
                                             &db_file,
+                                            &page_cipher_for_guard,
                                             frame_page_size,
                                             &batches,
                                         )
@@ -26170,18 +27041,26 @@ where
                                     debug_assert_eq!(rebuilt_db_size, durable_db_size_floor);
                                     wal_frame_payload_digest =
                                         group_commit_frame_payload_digest(&rebuilt_frame_refs)?;
-                                    if prepared_batch.is_some() {
+                                    if wal_encryption_active || prepared_batch.is_some() {
                                         // The raw-fallback preparation, run
                                         // under the gate.
                                         let mut prepared =
                                             wal.prepare_append_frames(&rebuilt_frame_refs)?;
                                         if let Some(prepared) = prepared.as_mut() {
                                             wal.finalize_prepared_frames(cx, prepared)?;
+                                            if wal_encryption_active {
+                                                wal_frame_payload_digest =
+                                                    group_commit_prepared_batch_payload_digest(
+                                                        prepared,
+                                                    )?;
+                                            }
                                         }
                                         prepared_batch = prepared;
-                                        fallback_reason = Some(
-                                            ParallelWalFallbackReason::ControllerEvidenceLost,
-                                        );
+                                        if !wal_encryption_active {
+                                            fallback_reason = Some(
+                                                ParallelWalFallbackReason::ControllerEvidenceLost,
+                                            );
+                                        }
                                     }
                                     tracing::debug!(
                                         target: "fsqlite.pager.commit",
@@ -30234,11 +31113,12 @@ where
             return None;
         }
         let db_file = self.db_file.try_read().ok()?.positional_reader()?;
-        Some(crate::snapshot_reader::SnapshotPageReader::new(
+        Some(crate::snapshot_reader::SnapshotPageReader::new_with_cipher(
             db_file,
             Some(frames),
             self.pool.page_size(),
             self.published_db_size.get(),
+            self.page_cipher.clone(),
         ))
     }
 
@@ -31274,6 +32154,7 @@ where
     inner: Arc<Mutex<PagerInner<V::File>>>,
     cache: Arc<ShardedPageCache>,
     published: Arc<PublishedPagerState>,
+    page_cipher: PageCipherSlot,
     /// True once this checkpoint pass has actually mutated the database file
     /// (page write or truncation). GH #294: a checkpoint that finds every
     /// frame already backfilled byte-for-byte must leave the main file — its
@@ -31317,7 +32198,7 @@ where
 
         let mut page1 = vec![0u8; page_size];
         let db_file = shared_db_file_read(&db_file, cx).await?;
-        let bytes_read = db_file.read(cx, &mut page1, 0).await?;
+        let bytes_read = cipher_read_page(cx, &*db_file, &self.page_cipher, 1, &mut page1).await?;
         if bytes_read < DATABASE_HEADER_SIZE {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -31347,7 +32228,7 @@ where
         page1[24..28].copy_from_slice(&current_change_counter.to_be_bytes());
         page1[28..32].copy_from_slice(&db_size.to_be_bytes());
         page1[92..96].copy_from_slice(&current_change_counter.to_be_bytes());
-        db_file.write(cx, &page1, 0).await?;
+        cipher_write_page(cx, &*db_file, &self.page_cipher, 1, &page1).await?;
         self.record_page1_header_patch(&page1);
         self.cache.evict(PageNumber::ONE);
         Ok(())
@@ -31373,13 +32254,12 @@ where
         data: &'a [u8],
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            let (db_file, page_size) = {
+            let db_file = {
                 let inner = self.inner.lock().map_err(|_| {
                     FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
                 })?;
-                (Arc::clone(&inner.db_file), inner.page_size.as_usize())
+                Arc::clone(&inner.db_file)
             };
-            let offset = u64::from(page_no.get() - 1) * page_size as u64;
             {
                 let db_file = shared_db_file_read(&db_file, cx).await?;
                 // GH #294: the pager-level checkpoint entry always restarts
@@ -31389,34 +32269,37 @@ where
                 // ctime on every open/close cycle, so compare first and only
                 // touch the file when the page content genuinely differs.
                 let mut existing = vec![0_u8; data.len()];
-                let already_backfilled =
-                    db_file
-                        .read(cx, &mut existing, offset)
-                        .await
-                        .is_ok_and(|bytes_read| {
-                            bytes_read == data.len()
-                                && if page_no == PageNumber::ONE
-                                    && data.len() >= DATABASE_HEADER_SIZE
-                                {
-                                    // Page 1 compares with the patch-owned header
-                                    // fields masked out: `patch_page1_header`
-                                    // re-stamps the change counter (24..32) and
-                                    // version-valid-for (92..96) after every real
-                                    // backfill, so the on-disk values are the
-                                    // authoritative successors of the frame's
-                                    // values. Re-writing the frame's stale copy
-                                    // would dirty the pass and re-stamp the header
-                                    // with a drifted commit clock on every
-                                    // open/close cycle (GH #294).
-                                    existing[..24] == data[..24]
-                                        && existing[32..92] == data[32..92]
-                                        && existing[96..] == data[96..]
-                                } else {
-                                    existing == data
-                                }
-                        });
+                let already_backfilled = cipher_read_page(
+                    cx,
+                    &*db_file,
+                    &self.page_cipher,
+                    page_no.get(),
+                    &mut existing,
+                )
+                .await
+                .is_ok_and(|bytes_read| {
+                    bytes_read == data.len()
+                        && if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
+                            // Page 1 compares with the patch-owned header
+                            // fields masked out: `patch_page1_header`
+                            // re-stamps the change counter (24..32) and
+                            // version-valid-for (92..96) after every real
+                            // backfill, so the on-disk values are the
+                            // authoritative successors of the frame's
+                            // values. Re-writing the frame's stale copy
+                            // would dirty the pass and re-stamp the header
+                            // with a drifted commit clock on every
+                            // open/close cycle (GH #294).
+                            existing[..24] == data[..24]
+                                && existing[32..92] == data[32..92]
+                                && existing[96..] == data[96..]
+                        } else {
+                            existing == data
+                        }
+                });
                 if !already_backfilled {
-                    db_file.write(cx, data, offset).await?;
+                    cipher_write_page(cx, &*db_file, &self.page_cipher, page_no.get(), data)
+                        .await?;
                     self.dirty = true;
                 } else if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
                     // The exact existing successors were accepted by the
@@ -31527,9 +32410,10 @@ where
                     "checkpoint verification requires a complete page buffer",
                 ));
             }
-            let offset = u64::from(page_no.get() - 1) * page_size as u64;
             let db_file = shared_db_file_read(&db_file, cx).await?;
-            db_file.read(cx, buf, offset).await.map(Some)
+            cipher_read_page(cx, &*db_file, &self.page_cipher, page_no.get(), buf)
+                .await
+                .map(Some)
         })
     }
 
@@ -31554,9 +32438,10 @@ where
                     "checkpoint verification requires complete page buffers",
                 ));
             }
-            let offset = u64::from(first_page.get() - 1) * page_size as u64;
             let db_file = shared_db_file_read(&db_file, cx).await?;
-            db_file.read(cx, buf, offset).await.map(Some)
+            cipher_read_pages(cx, &*db_file, &self.page_cipher, first_page, page_size, buf)
+                .await
+                .map(Some)
         })
     }
 
@@ -31667,6 +32552,7 @@ where
             inner: Arc::clone(&self.inner),
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
+            page_cipher: self.page_cipher.clone(),
             dirty: false,
             page1_header_patch: None,
         }
@@ -51166,6 +52052,7 @@ mod tests {
                         &cx,
                         &mut wal,
                         &db_file,
+                        &PageCipherSlot::default(),
                         page_size.as_usize(),
                         &[batch],
                     )

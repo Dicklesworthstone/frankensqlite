@@ -21349,9 +21349,15 @@ impl VdbeEngine {
                 // MemDatabase allocates root pages beyond the pager's db_size.
                 let page_data = match page_io.read_page(&txn_cx, root_pgno).await {
                     Ok(bytes) => bytes,
-                    // Cancellation is terminal for this execution. It cannot
-                    // authorize a successful read from a transient snapshot.
-                    Err(FrankenError::Abort) => return Err(FrankenError::Abort),
+                    // Cancellation and on-disk corruption/auth errors are terminal
+                    // for this execution. They must never authorize a fallback to a
+                    // transient MemDatabase snapshot or be downgraded into an
+                    // opaque Internal("OpenRead failed") error.
+                    Err(
+                        err @ (FrankenError::Abort
+                        | FrankenError::DatabaseCorrupt { .. }
+                        | FrankenError::NotADatabase { .. }),
+                    ) => return Err(err),
                     Err(err) => {
                         // Check if MemDatabase can serve this table.
                         let has_mem_table = self
@@ -21650,7 +21656,12 @@ impl VdbeEngine {
                             error = %err,
                             "open_storage_cursor: failed to initialize writable root page in pager"
                         );
-                        return if matches!(err, FrankenError::Abort) {
+                        return if matches!(
+                            err,
+                            FrankenError::Abort
+                                | FrankenError::DatabaseCorrupt { .. }
+                                | FrankenError::NotADatabase { .. }
+                        ) {
                             Err(err)
                         } else {
                             Ok(false)
