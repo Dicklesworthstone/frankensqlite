@@ -103150,7 +103150,9 @@ impl Connection {
         // GH #152: a LIMIT inside the recursive CTE caps its output, which the
         // closed-form / direct SUM fast paths do not model — route those shapes
         // to the general materialize_recursive_cte path, which honors the LIMIT.
-        if cte.query.limit.is_some() {
+        // bd-gxbof: so does a body with its own WITH, which those paths do not
+        // read.
+        if cte.query.limit.is_some() || cte.query.with.is_some() {
             return None;
         }
         let SelectCore::Select {
@@ -103887,7 +103889,32 @@ impl Connection {
             // `c AS (SELECT * FROM c)` (no compound) would fall through to normal
             // materialization and mis-report "no such table: c".
             // bd-errmsg-parity-batch3-3brmm.
-            if select_core_references_table(&cte.query.body.select, cte_name) {
+            //
+            // bd-gxbof: stock resolves the body with the CTE's own name bound
+            // to the CTE, so every reference the body's own WITHs do not
+            // shadow is circular, wherever it sits: a FROM item, a derived
+            // table, a scalar, EXISTS or IN subquery, or a nested CTE body the
+            // body reads. A body whose WITH defines the name reads that nested
+            // CTE instead (`WITH c AS (WITH c AS (SELECT 1 AS x) SELECT x
+            // FROM c) ...` is 1). Only a recursive arm's own FROM items bind
+            // to the recursive table, so a body that may recurse (a UNION or
+            // UNION ALL compound) is checked in its anchor, which stock
+            // resolves under the body's WITH.
+            let body_may_recurse = cte
+                .query
+                .body
+                .compounds
+                .last()
+                .is_some_and(|(op, _)| matches!(op, CompoundOp::Union | CompoundOp::UnionAll));
+            let reads_itself = if body_may_recurse {
+                select_contains_relation_reference(
+                    &recursive_cte_anchor_select(&cte.query),
+                    &mut CteReference(cte_name),
+                )
+            } else {
+                select_contains_relation_reference(&cte.query, &mut CteReference(cte_name))
+            };
+            if reads_itself {
                 return Err(FrankenError::FunctionError(format!(
                     "circular reference: {cte_name}"
                 )));
@@ -104306,16 +104333,13 @@ impl Connection {
         );
         self.rebuild_schema_indices();
         temp_tables.push((cte_name.clone(), root_page));
-        // Execute the base case (first SELECT core only).
-        let base_select = SelectStatement {
-            with: None,
-            body: SelectBody {
-                select: cte.query.body.select.clone(),
-                compounds: vec![],
-            },
-            order_by: vec![],
-            limit: None,
-        };
+        // Execute the base case (first SELECT core only), under the body's own
+        // WITH (bd-gxbof): `WITH RECURSIVE c(x) AS (WITH c(x) AS (SELECT 1)
+        // SELECT x FROM c UNION ALL ...)` seeds from the inner c, as in stock.
+        let base_select = recursive_cte_anchor_select(&cte.query);
+        // bd-gxbof: the other arms read the body's WITH too; a recursive arm
+        // reads it with an inner CTE of the recursive name hidden.
+        let recursive_arm_with = recursive_cte_arm_with(cte);
         let base_rows = self
             .execute_statement(&Statement::Select(base_select), params)
             .await?;
@@ -104334,8 +104358,13 @@ impl Connection {
                     "recursive CTE supports only UNION and UNION ALL".to_owned(),
                 ));
             }
+            let recursive_arm = select_core_references_table(core, cte_name);
             let arm_select = SelectStatement {
-                with: None,
+                with: if recursive_arm {
+                    recursive_arm_with.clone()
+                } else {
+                    cte.query.with.clone()
+                },
                 body: SelectBody {
                     select: core.clone(),
                     compounds: vec![],
@@ -104343,7 +104372,7 @@ impl Connection {
                 order_by: vec![],
                 limit: None,
             };
-            if select_core_references_table(core, cte_name) {
+            if recursive_arm {
                 let execution_plan = if let Some(plan) =
                     self.recursive_cte_direct_eval_plan(cte_name, &col_names, &arm_select)
                 {
@@ -104697,6 +104726,13 @@ impl Connection {
         match execution_plan {
             RecursiveCteArmExecutionPlan::Direct(plan) => {
                 self.execute_recursive_cte_direct_eval_plan(plan, working_set, params)
+                    .await
+            }
+            // bd-gxbof: an arm that reads the body's own WITH runs as a
+            // statement, which materializes that WITH; the fallback reads
+            // FROM sources only.
+            RecursiveCteArmExecutionPlan::Statement(select) if select.with.is_some() => {
+                self.execute_statement(&Statement::Select(select.clone()), params)
                     .await
             }
             RecursiveCteArmExecutionPlan::Statement(select) => {
@@ -122626,7 +122662,81 @@ fn table_or_subquery_references_table(table: &TableOrSubquery, table_name: &str)
     }
 }
 
+/// Whether `select`'s own WITH defines a CTE named `name`, which then shadows
+/// any other relation of that name throughout `select` (bd-gxbof).
+fn select_with_defines(select: &SelectStatement, name: &str) -> bool {
+    select.with.as_ref().is_some_and(|with| {
+        with.ctes
+            .iter()
+            .any(|cte| cte.name.eq_ignore_ascii_case(name))
+    })
+}
+
+/// The anchor of a CTE body that may recurse: its first SELECT, under the
+/// body's own WITH, which stock lends the anchor while it resolves it
+/// (bd-gxbof).
+fn recursive_cte_anchor_select(body: &SelectStatement) -> SelectStatement {
+    SelectStatement {
+        with: body.with.clone(),
+        body: SelectBody {
+            select: body.body.select.clone(),
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    }
+}
+
+/// The body's WITH as a recursive arm of `cte` reads it (bd-gxbof).
+///
+/// Stock binds a recursive arm's own FROM references to the CTE's name to the
+/// recursive table before it consults the body's WITH, so an inner CTE of
+/// that name is hidden from them, while every other name in the arm still
+/// sees the inner CTEs. The hidden CTE keeps its rows under a name SQL cannot
+/// spell, and the other inner CTEs that read it follow it there:
+/// `WITH RECURSIVE c(x) AS (WITH c(x) AS (SELECT 1), d(y) AS (SELECT x * 10
+/// FROM c) SELECT x FROM c UNION ALL SELECT x + y FROM c, d WHERE x < 30)`
+/// is 1, 11, 21, 31.
+fn recursive_cte_arm_with(cte: &fsqlite_ast::Cte) -> Option<fsqlite_ast::WithClause> {
+    let mut with = cte.query.with.clone()?;
+    let Some(shadowing) = with
+        .ctes
+        .iter()
+        .position(|inner| inner.name.eq_ignore_ascii_case(&cte.name))
+    else {
+        return Some(with);
+    };
+    let hidden = format!("__fsqlite_recursive_arm_shadow__{}", cte.name);
+    for (index, inner) in with.ctes.iter_mut().enumerate() {
+        if index == shadowing {
+            continue;
+        }
+        visit_select_qualified_name_sites_mut(&mut inner.query, &mut |name, site| {
+            if name.schema.is_some() || !name.name.eq_ignore_ascii_case(&cte.name) {
+                return;
+            }
+            match site {
+                QualifiedNameSite::Source(alias) => {
+                    // Column references keep the qualifier they used.
+                    if alias.is_none() {
+                        *alias = Some(name.name.clone());
+                    }
+                    name.name.clone_from(&hidden);
+                }
+                QualifiedNameSite::InTable => name.name.clone_from(&hidden),
+                QualifiedNameSite::Target | QualifiedNameSite::TableStar => {}
+            }
+        });
+    }
+    with.ctes[shadowing].name = hidden;
+    Some(with)
+}
+
 fn select_references_table(select: &SelectStatement, table_name: &str) -> bool {
+    // bd-gxbof: a derived table whose WITH defines the name reads its own CTE.
+    if select_with_defines(select, table_name) {
+        return false;
+    }
     select_core_references_table(&select.body.select, table_name)
         || select
             .body
