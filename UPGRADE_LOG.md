@@ -1,5 +1,39 @@
 # Dependency Upgrade Log
 
+## November 21, 2026 — v0.5.1 pre-release dependency sweep
+
+- **Batch 1 — compatible-range `Cargo.lock` refresh (43 entries):** `ar_archive_writer` 0.5.5,
+  `bincode-next` / `bincode_derive-next` 3.2.0, `bit-vec` 0.10.2, `bumpalo` 3.20.4,
+  `bytes` 1.12.2, `cc` 1.11.3, `clap` 4.6.9, `const-oid` 0.10.3, `crc32fast` 1.5.5,
+  `email_address` 0.2.10, `errno` 0.3.15, `fancy-regex` 0.20.2, `json5` 1.3.8,
+  `jsonschema` family 0.61.2, `lru` 0.19.1, `mio` 1.2.5, `nix` 0.31.4, `pin-project` 1.2.0,
+  `pin-project-lite` 0.2.18, `prost` / `prost-derive` 0.14.6, `rand` 0.10.4,
+  `regex` 1.13.2 / `regex-automata` 0.4.19 / `regex-syntax` 0.8.12, `rsqlite-vfs` 0.2.0,
+  `smallvec` 1.16.6, `sqlite-wasm-rs` 0.6.3, `toml` 1.2.2 / `toml_edit` 0.25.20 / `toml_parser`
+  1.1.6, `trybuild` 1.0.125, `ucd-trie` 0.1.8, `walkdir` 2.5.1, `xxhash-rust` 0.8.21,
+  `zerocopy` / `zerocopy-derive` 0.8.64, `zeroize` 1.9.2; removed stale `hashbrown` 0.16.1 and
+  `itertools` 0.14.0 duplicates.
+- **Batch 2 — direct workspace manifest bumps (`Cargo.toml` + `Cargo.lock`):**
+  - `nix` 0.31 → 0.32 (verified zero usage of `fcntl::vmsplice` or deprecated event masks;
+    transitive `asupersync` retains `nix` 0.31.4).
+  - Raised compatible version floors to match locked versions: `smallvec` 1.15 → 1.16,
+    `proptest` 1.11 → 1.12, `insta` 1.48 → 1.49, `toml` 1.1 → 1.2, `syn` 3.0.5 → 3.0.10.
+- **Held back:**
+  - `asupersync` 0.6.2 (`default-features = false`) and `ftui` 0.10.0 (`default-features = false`):
+    preserved Franken-stack pins for the `0.5.x` compatibility line (`Cx` appears in public APIs).
+  - `wasm-bindgen` 0.2.128 / `wasm-bindgen-futures` 0.4.78 / `wasm-bindgen-test` 0.3.78 /
+    `js-sys` & `web-sys` 0.3.105: `wasm-bindgen-futures` 0.4.80 declares optional `tokio` for
+    emscripten, which would introduce `tokio` into `Cargo.lock` (forbidden). Confirmed 0 `tokio`
+    entries in `Cargo.lock`.
+  - `rusqlite` 0.41.1 (`libsqlite3-sys` 0.39.1, bundled SQLite 3.54.1): held because 0.41.1 already
+    bundles SQLite 3.54.1 with zero RustSec vulnerabilities while 0.43.0 changes empty/comment-only
+    SQL handling in differential oracle paths.
+  - `jsonschema` 0.61.2 (dev-only in `fsqlite-e2e`): held from 0.62 major jump.
+- **Security audit:** `cargo audit` reports 0 vulnerabilities (1 upstream `unmaintained` advisory
+  warning on `chrono` 0.4.45).
+- **Verification:** `cargo clippy --locked --workspace --all-targets -- -D warnings` clean;
+  `cargo clippy --locked -p fsqlite-e2e --features tui --all-targets -- -D warnings` clean.
+
 ## November 10, 2026 — latest-stable sweep (bd-w4pr1.3)
 
 asupersync was already at the latest release, 0.6.2 (1f65f6898), with the franken-* crates at
