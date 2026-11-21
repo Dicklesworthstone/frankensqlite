@@ -23,7 +23,8 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [v0.5.0](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.5.0) | Tag | 2026-11-12 | Uniform release of all 26 public crates on asupersync 0.6 (**breaking**: `Cx` appears in public APIs, table rows are stored in stock's layout without VIRTUAL generated columns, `FrankenError::PrimaryKeyViolation` carries the conflict's columns, and `FrankenError` has a new `RowidViolation` variant). Known issues: bd-r5mmz (a `WITH ... INSERT ... ON CONFLICT DO UPDATE SET` that reads its CTE, with triggers, can return wrong rows), bd-xz5f4 (a seek on a `REAL` index column can return wrong rows past 2^53), bd-aoukl (secondary indexes of a `WITHOUT ROWID` table with a `DESC` primary-key term fail stock's `integrity_check`) and bd-1ucvb (slow WITH ... INSERT trigger replay). No GitHub Release |
+| [v0.5.1](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.5.1) | Release | 2026-11-21 | Uniform release of all 26 public crates and signed `fsqlite` CLI binaries on asupersync 0.6.2 (first GitHub binary release of the 0.5 line since v0.4.13): compatibility page-level encryption with `PRAGMA key`/`PRAGMA rekey` and O(1) KEK re-wrap, automatic live WAL-FEC self-healing recovery on `Connection::open`, live `PRAGMA threads` auxiliary parallel scan admission, `PRAGMA secure_delete` (`ON`/`FAST`) storage scrubbing, `immutable=1` passive read-only opens and unwritable `-shm` read-only parity (GH#535), WAL commit certificate v5 (XXH3-128) and zero-filled / false-EOF certificate suffix recovery (GH#537), killed-writer `-shm` OFD lock release and unpublished WAL tail recovery (GH#534), WAL `pwrite` hang prevention, performance wins (`BtCursor` 8-leaf seek cache, in-place grouped aggregates, C API `block_on`, single-cursor column reads), SQL/datetime/FTS5/CTE/trigger parity fixes, and dependency refresh (`nix` 0.32, zero `tokio` in `Cargo.lock`) |
+| [0.5.0](https://crates.io/crates/fsqlite/0.5.0) | crates.io only | 2026-11-12 | Uniform crates.io release of all 26 public crates on asupersync 0.6 (**breaking**: `Cx` appears in public APIs, table rows are stored in stock's layout without VIRTUAL generated columns, `FrankenError::PrimaryKeyViolation` carries the conflict's columns, and `FrankenError` has a new `RowidViolation` variant). Known issues: bd-r5mmz (a `WITH ... INSERT ... ON CONFLICT DO UPDATE SET` that reads its CTE, with triggers, can return wrong rows), bd-xz5f4 (a seek on a `REAL` index column can return wrong rows past 2^53), bd-aoukl (secondary indexes of a `WITHOUT ROWID` table with a `DESC` primary-key term fail stock's `integrity_check`) and bd-1ucvb (slow WITH ... INSERT trigger replay). No GitHub Release |
 | [v0.4.13](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.13) | Release | 2026-11-01 | Uniform release of all 26 public crates, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format; a WITHOUT ROWID UPDATE or any upsert `DO UPDATE` read SET values the same SET had already assigned (bd-bymr0); UPDATE and DELETE with a correlated subquery over a join, view, derived table or OFFSET changed the wrong rows or stored wrong values (bd-h7hox), and such subqueries in RETURNING returned wrong values (bd-hga35, partly fixed). Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#526 (measured), GH#528 and GH#529 fixes, `random()`/`randomblob()` seeded per process instead of repeating one sequence (bd-w2sd6), seeks for correlated subqueries, simple views, join `LIMIT`, constant-expression keys and bare-column aggregates (one tied `min()` shape now differs from stock, bd-5kdea), `INSERT ... SELECT` that no longer loads a whole table or `generate_series` source (GH#491 still open), `json_each` over NULL input and table-valued functions listed before the table they read, stock's JSON error texts, `json_array_insert` and the jsonb_ aggregates, the JSON aggregates as window functions and with `->` arguments, contended checkpoints that failed with BusyRecovery, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524 and GH#525 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete`, geopoly return types and `JSON_TABLE_COLUMN_NAMES`, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run, and most from 2026-10-28 on record runs on macOS arm64 only; the release gate is under Qualification. The GH#530 streaming of table-function Cartesian aggregates was backed out before release, and GH#530 stays open |
 | [v0.4.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.12) | Release | 2026-10-13 | Uniform release of all 26 public crates, with an **upgrade advisory for 0.4.10**: a join whose outer table was read through an index with a `DESC` column returned no rows (GH#502); `:memory:` with `autocommit_retain = OFF` could lose every row of a table (GH#503); `DELETE ... WHERE EXISTS` over the same table deleted the wrong rows (bd-ntt2b). Plus FROM-less row-value comparisons (GH#450), attached-database DML and name resolution, conflict-clause and constraint parity, a full filesystem during WAL-index growth reported as an I/O error instead of a SIGBUS on Linux (GH#506), WAL-FEC attach/close fixes, and index seeks for `IN` lists and `WHERE k = ? ORDER BY id` |
 | [0.4.11](https://crates.io/crates/fsqlite-vfs/0.4.11) | crates.io only | 2026-10-09 | `fsqlite-vfs` alone: on macOS and other non-Linux Unix, a redundant main-DB descriptor opened while WAL lifetime locks were held is reused instead of parked forever, so long-running processes stop leaking about 2 fds per fresh connection (bd-l0rbc). Tag `fsqlite-vfs-v0.4.11`; no GitHub Release. The next uniform release must be >= 0.4.12 |
@@ -60,27 +61,55 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ## [Unreleased]
 
+---
+
+## [0.5.1] -- 2026-11-21
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.13...v0.5.1>
+
+First GitHub binary release of the 0.5 (`asupersync 0.6`) line and uniform crates.io publication of all 26 public crates (`fsqlite`, `fsqlite-cli`, `fsqlite-core`, and workspace crates).
+
+### Added
+
+- **Page-level database encryption (`PRAGMA key` / `PRAGMA rekey`)**: wired compatibility page-level encryption, O(1) KEK re-wrap on rekey, and end-to-end verification across pager, core, and VDBE (`89ae732c9`).
+- **Automatic live WAL-FEC self-healing recovery**: wired live WAL-FEC self-healing into `Connection::open` (`3678e7153`) with bounded RaptorQ source blocks so large-commit FEC encoding scales linearly in frame count (`aa66a145d`).
+- **Live `PRAGMA threads` parallel scan admission**: bound `PRAGMA threads` to live auxiliary parallel scan admission (`c762b0afe`).
+- **Strictly passive `immutable=1` read-only opens (GH#535)**: `immutable=1` opens read the main database file alone with no locks, no `-shm`, and no WAL access (`5d98aff3e`, `5419e2f78`).
+- **`fsqlite::blocking::block_on` and `Transaction::begin_deferred`**: added public helpers for blocking execution and deferred transactions (`c0e568aaf`).
+
 ### Changed
 
-- WAL commit certificates in `app.db-wal-cert` are written as record version 5, whose digest of
-  the certificate's frames is XXH3-128 instead of BLAKE3. Version 4 records are still read and
-  verified with BLAKE3, so a database last written by an earlier release opens normally, and its
-  sidecar then holds both versions. Hashing a 4 KiB frame now takes about 3.4k user instructions
-  where it took 11.2k, at commit and again when another process authorizes the certificate.
-  Against stock `sqlite3` 3.46.1 in the same runs: deleting 14% of a 300k-row table takes 470.5M
-  instructions where it took 506.0M (stock 120.7M), 5,000 autocommit `INSERT`s 1,161.5M where they
-  took 1,226.6M (stock 112.3M), and 8 processes of 500 autocommit `INSERT`s 1,149.2M where they took
-  1,272.2M (medians; stock 99.0M) (bd-w4pr1.7.2; the 2026-11-14 entry of
-  `docs/progress/perf-negative-results.md` has the runs and binaries).
-- A release before this change refuses to open a database whose `-wal-cert` or `-wal-cert-head`
-  holds a version 5 record, with `WAL file is corrupt: parallel WAL certificate newest record is
-  invalid: unsupported durable certificate record version 5`; stock `sqlite3` reads the database.
-  In one check, an earlier release opened a copy of such a database made without those two files,
-  with all of its rows.
+- **WAL commit certificate record v5 (XXH3-128)**: WAL commit certificates in `app.db-wal-cert` are written as record version 5, whose digest of the certificate's frames is XXH3-128 instead of BLAKE3. Version 4 records are still read and verified with BLAKE3, so a database last written by an earlier release opens normally, and its sidecar then holds both versions. Hashing a 4 KiB frame now takes about 3.4k user instructions where it took 11.2k, at commit and again when another process authorizes the certificate. Against stock `sqlite3` 3.46.1 in the same runs: deleting 14% of a 300k-row table takes 470.5M instructions where it took 506.0M (stock 120.7M), 5,000 autocommit `INSERT`s 1,161.5M where they took 1,226.6M (stock 112.3M), and 8 processes of 500 autocommit `INSERT`s 1,149.2M where they took 1,272.2M (medians; stock 99.0M) (bd-w4pr1.7.2; `docs/progress/perf-negative-results.md` has the runs and binaries).
+- A release before v0.5.1 refuses to open a database whose `-wal-cert` or `-wal-cert-head` holds a version 5 record, with `WAL file is corrupt: parallel WAL certificate newest record is invalid: unsupported durable certificate record version 5`; stock `sqlite3` reads the database.
+- **Internal workspace API note (`fsqlite-ext-fts5`)**: `Fts5Table::note_lazy_inserted_rows(&mut self, rowids: &[i64], new_row_count: usize)` now takes `new_row_count` to accurately track overlay writes into contentless and external-content FTS5 tables.
+- **Dependencies**: refreshed `Cargo.lock` (43 compatible stable updates), bumped `nix` 0.31 -> 0.32, aligned workspace manifest floors (`smallvec` 1.16, `proptest` 1.12, `insta` 1.49, `toml` 1.2, `syn` 3.0.10), preserved `asupersync 0.6.2` and `ftui 0.10.0`, and kept `tokio` completely absent from `Cargo.lock` (`cargo audit`: 0 vulnerabilities).
+
+### Fixed
+
+- **Crash recovery & lock hygiene (GH#534, GH#537)**:
+  - Killed writers release their `-shm` OFD locks immediately upon reap by mapping `-shm` through its own open file description (`079f87f8d`), and unpublished durable WAL tails left by a dead writer are adopted cleanly on reopen and commit (`a281a4086`, `4f720de26`, plus two-database checkpointed SIGKILL and stale-`-shm` regression coverage).
+  - Bounded zero-filled and false-EOF `-wal-cert` sidecar suffixes recover safely while still rejecting genuinely corrupted complete records (`4e65604a2`, `e7ffeff4e`, `cb5fff4ea`, GH#537).
+- **Read-only WAL & `-shm` parity (GH#535)**: read-only opens over an unwritable `-shm` read the WAL through a private in-memory index without writing (`375d8e5ee`), while read-only first attachers over a writable stale/truncated/missing `-shm` rebuild it to match stock (`f328c069d`, `ebdc9d5a8`).
+- **WAL I/O liveness**: WAL-flagged files write via `pwrite` rather than `io_uring` so a lost ring completion cannot hang `COMMIT` (`20fa52bc6`).
+- **Storage & B-tree correctness**:
+  - `PRAGMA secure_delete` (`ON` and `FAST`) now scrubs deleted cells and freed pages across pager and B-tree storage policies while preserving `TEMP` scope (`588b17d07`, `b405417ab`, `e1605fc92`).
+  - Cleared stale freeblock metadata after B-tree interior repacking (`467491919`).
+  - Replayed `COMMIT` internal retries no longer pollute shared conflict logs, refusal counts, or SSI telemetry (`7895f0e6a`, `d46a7cd1f`).
+- **SQL, datetime, trigger, CTE, and FTS5 parity**:
+  - Matched SQLite hour-24 datetime parsing and repaired persisted midnight indexed lookups (`cba05b928`, `96db8ba0b`).
+  - Row-value `CASE` operands, nested `WHERE` terms, partial-index and `DEFAULT` row values, `SET`/compound arity diagnostics, and partial-index membership on forced reads/writes (`9af6ea12d`, `742438e55`).
+  - `changes()` preserved after a statement fails to prepare (`2a359ad03`); DML whose triggers reference a missing table refused before execution (`cca453643`); trigger `NEW`/`OLD` collation parity (`902b30f5a`).
+  - CTE self-shadowing/circularity detection, CTE nesting-depth limits, and nested view depth limit of 1,000 matching SQLite 3.54.1 (`b5a7ca5b0`, `19083de03`, `e2bdf2ab8`).
+  - `IF`/`IIF` SQLite numeric truth semantics (`62c37f19b`), `:memory:` `GROUP BY` order over `DESC` indexes (`2873c6c0f`), explicit `COLLATE` index seek retention (`a614b8d3f`), and expression-index `UNIQUE` error naming (`d106057b2`).
+- **Performance**:
+  - Shrunk `BtCursor` by 88 bytes with an 8-leaf seek cache (`4e15416e8`).
+  - Single-cursor column reads on newly located rows (`009856eb4`), in-place grouped built-in aggregates (`2f4aac8bb`), per-frame-shape trigger body binding (`c03a452df`), and `fsqlite::blocking::block_on` in `fsqlite-c-api` (`c0e568aaf`).
+- **Browser SDK & worker packaging**: coalesced reentrant close, preserved disposal and snapshot lock cleanup on worker failure, fixed named WASM checkpoint opens, and routed browser `require` consumers to the module worker (`cf238133a`, `bf3f269d4`, `4fe5f45e6`, `b489acb41`, `11066b726`).
+- **Also verified since v0.4.13**: FK-checked `UPDATE` skips unchanged child FK checks (GH#451, `7efb85c25`), autocommit WAL readers retry peer commits instead of returning `BUSY` (GH#457, `93dd2b5fe`), cross-process busy-wait cancellation is prompt (GH#524, `24499460e`), and all 11 previously OOM-failing docs.rs crates build cleanly with `asupersync` `default-features = false` (GH#501).
 
 ---
 
-## [0.5.0] -- 2026-11-12 (tag; no GitHub Release)
+## [0.5.0] -- 2026-11-12 (crates.io only; no GitHub Release)
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.13...v0.5.0>
 

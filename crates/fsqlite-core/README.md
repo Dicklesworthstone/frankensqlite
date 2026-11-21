@@ -73,8 +73,8 @@ add these dependencies to the application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-fsqlite-core = "0.5.0"
-fsqlite-types = "0.5.0"
+fsqlite-core = "0.5.1"
+fsqlite-types = "0.5.1"
 asupersync = { version = "0.6.2", default-features = false }
 ```
 

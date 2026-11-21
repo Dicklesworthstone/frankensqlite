@@ -56,7 +56,7 @@ Add the database and the caller's runtime to your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-fsqlite = "0.5.0"
+fsqlite = "0.5.1"
 asupersync = { version = "0.6.2", default-features = false }
 ```
 

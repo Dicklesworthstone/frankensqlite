@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-pager"
-version = "0.5.0"
+version = "0.5.1"
 description = "Page cache and journal management"
 edition.workspace = true
 license-file.workspace = true
