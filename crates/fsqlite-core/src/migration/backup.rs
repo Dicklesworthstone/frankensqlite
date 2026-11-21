@@ -425,14 +425,13 @@ fn source_name(db_path: &str) -> Result<&str> {
         .ok_or_else(|| invalid_backup("database path has no filename"))
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    host_fs::open_file(path)?.sync_all()?;
-    // Match the native Windows VFS boundary: there is no portable directory
-    // fsync there. Per-file sync/atomic visibility is not a power-loss proof.
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+fn sync_directory(directory: &Path) -> Result<()> {
+    // `directory` is already a directory (the backup generation directory or its
+    // parent). Flush that directory itself, not its parent: on Unix this opens
+    // the directory read-only and fsyncs it (what the original helper did), on
+    // Windows it is a best-effort directory-handle flush. The helper does not
+    // parent the path again.
+    host_fs::sync_directory_handle(directory)
 }
 
 fn invalid_backup(detail: &str) -> FrankenError {
