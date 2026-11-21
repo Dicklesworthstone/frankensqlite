@@ -3039,7 +3039,11 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             Vec::new()
         };
         if let Some(active) = active_cipher.as_ref() {
-            let nonce_cx = Cx::new();
+            // `WalBackend::prepare_append_frames` is a pure pre-serialization hook
+            // without a caller `&Cx`; route nonce generation through the sanctioned
+            // detached factory while caller cancellation stays enforced in
+            // `finalize_prepared_frames` and `append_prepared_frames`.
+            let nonce_cx = Cx::detached_rebind();
             for frame in frames {
                 encrypted_pages.push(encrypt_page_for_write(
                     active,
