@@ -1570,26 +1570,20 @@ impl Connection {
         self.as_async().last_insert_rowid()
     }
 
-    fn counter(&self, sql: &str) -> u64 {
-        block_on(self.as_async().query_row(sql))
-            .ok()
-            .and_then(|row| match row.get(0) {
-                Some(SqliteValue::Integer(n)) => u64::try_from(*n).ok(),
-                _ => None,
-            })
-            .unwrap_or(0)
-    }
-
-    /// Rows changed by the most recent INSERT, UPDATE or DELETE.
+    /// Rows changed by the most recent INSERT, UPDATE or DELETE: the value
+    /// SQL `changes()` returns, read from the connection's counter
+    /// (bd-e64z4; this ran `SELECT changes()` per call).
     #[must_use]
     pub fn changes(&self) -> u64 {
-        self.counter("SELECT changes()")
+        u64::try_from(self.as_async().last_change_count()).unwrap_or(u64::MAX)
     }
 
-    /// Rows changed by INSERT, UPDATE and DELETE since the connection opened.
+    /// Rows changed by INSERT, UPDATE and DELETE since the connection opened:
+    /// the value SQL `total_changes()` returns, read from the connection's
+    /// counter (bd-e64z4).
     #[must_use]
     pub fn total_changes(&self) -> u64 {
-        self.counter("SELECT total_changes()")
+        u64::try_from(self.as_async().total_change_count()).unwrap_or(u64::MAX)
     }
 
     /// Whether no explicit transaction is open.
@@ -2697,6 +2691,69 @@ mod tests {
                 .any(|line| line.contains("ConstraintViolation")),
             "the scenario must exercise a constraint error: {theirs:?}"
         );
+    }
+
+    /// bd-e64z4: `changes()` and `total_changes()` read the connection's
+    /// counters; they ran `SELECT changes()` / `SELECT total_changes()` per
+    /// call. These are the 19 statements of the C API's
+    /// test_changes_and_total_changes_match_stock (bd-zqr9h L2), each run with
+    /// `execute_batch` on stock (rusqlite's bundled SQLite 3.54.1) and on this
+    /// API. After every statement both report the same outcome and the same
+    /// pair. Covered: statements that fail at prepare keep the count (#4,
+    /// #6 and #8; bd-rwo47), a UNIQUE failure part-way through a multi-row
+    /// UPDATE leaves 0 and adds nothing to the total (#11), an UPDATE of no
+    /// rows sets 0 (#13), DDL and SELECT keep the count. The two counters part
+    /// from #10 on, so returning one for the other fails.
+    #[test]
+    fn changes_and_total_changes_match_stock() {
+        let dir = tempfile::tempdir().unwrap();
+        let stock = rusqlite::Connection::open(temp_path(&dir, "stock.db")).unwrap();
+        let ours = Connection::open(temp_path(&dir, "fsqlite.db")).unwrap();
+        let statements = [
+            "CREATE TABLE w(x INTEGER PRIMARY KEY, y UNIQUE)",
+            "INSERT INTO w VALUES (1, 10), (2, 20), (3, 30)",
+            "SELECT count(*) FROM w",
+            "UPDATE nosuch SET x = 1",
+            "SELECT changes()",
+            "UPDATE w SET (x, nope) = (SELECT 1, 2, 3)",
+            "SELECT changes()",
+            "SELEC 1",
+            "SELECT changes()",
+            "UPDATE w SET y = y + 1 WHERE x <= 2",
+            "UPDATE w SET y = 21 WHERE x >= 1",
+            "SELECT changes()",
+            "UPDATE w SET y = y WHERE x = 99",
+            "INSERT INTO w VALUES (4, 40)",
+            "CREATE TABLE z(a)",
+            "SELECT changes()",
+            "DELETE FROM w WHERE x >= 3",
+            "SELECT changes()",
+            "SELECT total_changes()",
+        ];
+        let mut lines = Vec::new();
+        for sql in statements {
+            let theirs = (
+                stock.execute_batch(sql).is_ok(),
+                stock.changes(),
+                stock.total_changes(),
+            );
+            let mine = (
+                ours.execute_batch(sql).is_ok(),
+                ours.changes(),
+                ours.total_changes(),
+            );
+            assert_eq!(mine, theirs, "{sql}");
+            lines.push(mine);
+        }
+        assert_eq!(lines[1], (true, 3, 3));
+        assert_eq!(
+            lines[3],
+            (false, 3, 3),
+            "a prepare-time error keeps the count"
+        );
+        assert_eq!(lines[9], (true, 2, 5));
+        assert_eq!(lines[10], (false, 0, 5), "a failed UPDATE changed nothing");
+        assert_eq!(lines[18], (true, 2, 8));
     }
 
     /// rusqlite code that registers scalar functions, compiled against module
