@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFile, cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdtemp, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -25,9 +25,9 @@ for (const pack of packs) {
   const output = join(staged, "dist/npm");
   await cp(join(source, "dist/npm"), output, { recursive: true });
   await copyFile(join(source, "package.json"), join(staged, "package.json"));
-  await mkdir(join(output, "previous-build"));
-  await writeFile(join(output, "retired-entry.js"), "export default 0;");
-  await writeFile(join(output, "previous-build", "old.d.ts"), "export {};");
+  const obsolete = await mkdtemp(join(output, "previous-build-"));
+  await writeFile(obsolete + ".js", "export default 0;");
+  await writeFile(join(obsolete, "old.d.ts"), "export {};");
   const [incremental] = JSON.parse(npm(["pack", "--dry-run", "--json", "--ignore-scripts"], staged));
   const outputs = ({ files }) => files.map(f => f.path).filter(path => path.startsWith("dist/npm/")).sort();
   assert.deepEqual(outputs(incremental), outputs(pack), `${pack.name} packed stale build output`);
