@@ -503,9 +503,12 @@ fn grouped_index_order_streams_and_matches_sqlite() {
 
 /// With no ORDER BY, groups stream in a DESC index key's order, which is the
 /// order stock emits them in (bd-gazf2): an equality prefix, an IN list and a
-/// whole-index walk over `(k, suffix DESC)`. An ORDER BY that is an ASC prefix
-/// of the keys keeps the ascending sorter. Rows match stock in order, in
-/// memory and on a file database in strict mode.
+/// whole-index walk over `(k, suffix DESC)`; and in an index's key order when
+/// the GROUP BY names its keys in another order (`GROUP BY x, a` over
+/// `(a, x)`). An ORDER BY that is an ASC prefix of the keys keeps the
+/// ascending sorter. Rows match stock in order, in memory (where the mirror's
+/// grouped evaluator would sort them ascending by key) and on a file database
+/// in strict mode.
 #[test]
 fn grouped_desc_index_keys_stream_in_index_order() {
     asupersync::test_utils::run_test(|| async {
@@ -514,8 +517,17 @@ fn grouped_desc_index_keys_stream_in_index_order() {
         let schema = [
             "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER, suffix TEXT, n INTEGER);",
             "CREATE INDEX c_k_suffix ON c(k, suffix DESC);",
+            "CREATE TABLE p (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER);",
+            "CREATE INDEX p_a_x ON p(a, x);",
         ];
         let mut rows = Vec::new();
+        for i in 1..=60_i64 {
+            rows.push(format!(
+                "INSERT INTO p VALUES ({i}, {}, {});",
+                i % 5,
+                (i * 7) % 4
+            ));
+        }
         for i in 1..=400_i64 {
             let suffix = match i % 6 {
                 0 => "NULL".to_owned(),
@@ -543,6 +555,13 @@ fn grouped_desc_index_keys_stream_in_index_order() {
             "SELECT k, suffix, count(*) FROM c WHERE k = 2 GROUP BY k, suffix ORDER BY k, suffix",
             "SELECT k, suffix, count(*) FROM c GROUP BY k, suffix ORDER BY k, suffix",
         ];
+        // The GROUP BY names the index's keys in another order: stock walks
+        // `(a, x)` and emits a-major order, where ascending key order is
+        // x-major.
+        let permuted = [
+            "SELECT x, a, count(*) FROM p GROUP BY x, a",
+            "SELECT x, a, sum(id) FROM p WHERE a IN (1, 3) GROUP BY x, a",
+        ];
         for path in [":memory:", file.to_str().unwrap()] {
             let f = Connection::open(path).await.unwrap();
             let r = rusqlite::Connection::open_in_memory().unwrap();
@@ -554,25 +573,42 @@ fn grouped_desc_index_keys_stream_in_index_order() {
                 f.execute(stmt).await.unwrap();
                 r.execute_batch(stmt).unwrap();
             }
-            if path != ":memory:" {
+            if path == ":memory:" {
+                // A HAVING runs on the in-memory path, which loads the mirror's
+                // rows. The shapes below then meet the mirror's grouped
+                // evaluator, which orders groups by key whatever the index
+                // (bd-gazf2), and not only the storage substrate a mirror
+                // whose rows are not loaded hands them to.
+                for sql in [
+                    "SELECT k, count(*) FROM c GROUP BY k HAVING count(*) > 0",
+                    "SELECT a, count(*) FROM p GROUP BY a HAVING count(*) > 0",
+                ] {
+                    let got = frank_rows(&f, sql, &[]).await;
+                    assert_eq!(
+                        got,
+                        sqlite_rows(&r, sql, &[]),
+                        "diverged: `{sql}` at {path}"
+                    );
+                }
+            } else {
                 f.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
                     .await
                     .unwrap();
             }
-            for sql in streamed.iter().chain(&sorted) {
-                let mut got = frank_rows(&f, sql, &[]).await;
-                let mut want = sqlite_rows(&r, sql, &[]);
-                if path == ":memory:" && !sql.contains("ORDER BY") {
-                    // The in-memory mirror orders groups ascending whatever
-                    // the index (bd-gazf2 there): compare the groups only, and
-                    // skip a LIMIT, which keeps the first groups in its order.
-                    if sql.contains("LIMIT") {
-                        continue;
-                    }
-                    got.sort();
-                    want.sort();
-                }
+            for sql in streamed.iter().chain(&sorted).chain(&permuted) {
+                let got = frank_rows(&f, sql, &[]).await;
+                let want = sqlite_rows(&r, sql, &[]);
                 assert_eq!(got, want, "diverged: `{sql}` at {path}");
+                // A prepared statement chooses its route when it is prepared.
+                let prepared = f.prepare(sql).await.unwrap();
+                let via_prepared: Vec<Vec<String>> = prepared
+                    .query()
+                    .await
+                    .unwrap_or_else(|e| panic!("prepared `{sql}` at {path}: {e}"))
+                    .iter()
+                    .map(|row| row.values().iter().map(render).collect())
+                    .collect();
+                assert_eq!(via_prepared, want, "diverged prepared: `{sql}` at {path}");
             }
             // (The IN list keeps the sorter that orders its probes.)
             for sql in [

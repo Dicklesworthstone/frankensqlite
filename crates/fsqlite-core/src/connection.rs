@@ -26497,6 +26497,77 @@ impl Connection {
             .is_some_and(|table| table.root_page > 0 && !self.is_memdb_only_root_page(table.root_page))
     }
 
+    /// bd-gazf2: a `:memory:` GROUP BY whose plain-column keys an index of its
+    /// table holds in an order other than ascending key order (a DESC key
+    /// term on a group key, or the group keys in another relative order) runs
+    /// the storage substrate, also with the mirror's rows loaded. The
+    /// substrate walks that index and emits its groups in index order, as
+    /// stock does and as file databases do since d2afa758f; the mirror's
+    /// grouped evaluator sorts groups ascending by key whatever the index.
+    /// Every other `:memory:` GROUP BY keeps the mirror scan, which is
+    /// cheaper. A HAVING keeps the in-memory path, as in
+    /// [`Self::group_by_substrate_replaces_unloaded_memory_mirror`].
+    fn group_by_substrate_follows_memory_index_order(&self, select: &SelectStatement) -> bool {
+        if self.path != ":memory:" || self.time_travel_active.get() {
+            return false;
+        }
+        let SelectCore::Select {
+            from: Some(from),
+            group_by,
+            having: None,
+            ..
+        } = &select.body.select
+        else {
+            return false;
+        };
+        let TableOrSubquery::Table { name, .. } = &from.source else {
+            return false;
+        };
+        if group_by.is_empty()
+            || name.schema.is_some()
+            || self
+                .temp_table_names
+                .borrow()
+                .contains(&name.name.to_ascii_lowercase())
+        {
+            return false;
+        }
+        // The keys as column names; any other key keeps today's path.
+        let Some(keys) = group_by
+            .iter()
+            .map(|expr| match expr {
+                Expr::Column(col_ref, _) if col_ref.schema.is_none() => Some(&*col_ref.column),
+                _ => None,
+            })
+            .collect::<Option<Vec<&str>>>()
+        else {
+            return false;
+        };
+        let schema = self.schema.borrow();
+        let Some(table) = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+        else {
+            return false;
+        };
+        if table.root_page <= 0 || self.is_memdb_only_root_page(table.root_page) {
+            return false;
+        }
+        // An expression index leaves `columns` empty, so it never matches.
+        table.indexes.iter().any(|index| {
+            let mut previous_key: Option<usize> = None;
+            index.columns.iter().enumerate().any(|(key_pos, column)| {
+                let Some(group_pos) = keys.iter().position(|key| key.eq_ignore_ascii_case(column))
+                else {
+                    return false;
+                };
+                let out_of_order = previous_key.is_some_and(|previous| group_pos < previous);
+                previous_key = Some(group_pos);
+                out_of_order || index.key_term_descending(key_pos)
+            })
+        })
+    }
+
     /// The statement shapes the GROUP BY storage substrate compiles, whatever
     /// the storage.
     #[must_use]
@@ -26629,7 +26700,8 @@ impl Connection {
         decision_reason: &'static str,
     ) -> Result<Option<Vec<Row>>> {
         if !(self.can_execute_aggregate_window_storage_substrate()
-            || self.group_by_substrate_replaces_unloaded_memory_mirror(select))
+            || self.group_by_substrate_replaces_unloaded_memory_mirror(select)
+            || self.group_by_substrate_follows_memory_index_order(select))
             || !self.select_group_by_storage_substrate_shape_fits(select)
         {
             return Ok(None);
