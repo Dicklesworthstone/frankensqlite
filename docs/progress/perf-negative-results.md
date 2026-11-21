@@ -94,6 +94,31 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-21 - FIX (landed as e1605fc92; a correctness fix measured like a lever, inside its regression lines): PRAGMA secure_delete reaches the storage policies, so ON and FAST erase removed content as stock does (bd-i2u1c, bulk-write round 15)
+
+- Target: drop-in and security. 588b17d07 added OFF / ON / FAST policies to the pager and b-tree, but nothing
+  set them, so every deletion ran at OFF whatever the PRAGMA said. Touched: `crates/fsqlite-core/src/connection.rs`
+  (`begin_pager_txn_with_busy_timeout` hands each new transaction the connection's setting; `PRAGMA secure_delete=N`
+  also sets it on the active and parked autocommit transactions), `crates/fsqlite-vdbe/src/engine.rs`
+  (`SharedTxnPageIo` forwards `secure_delete_mode` and `note_freed_page_zeroed`; without them the VDBE's cursors read
+  the trait's OFF default). Keeper `crates/fsqlite-e2e/tests/secure_delete_file_bytes_oracle_e2e.rs` (file bytes
+  against rusqlite, WAL and rollback, OFF / ON / FAST, six shapes and four connection cases).
+- OFF-path cost, P = e0e82ede7 and L = P + the wiring, one pair job on vmi1153651 (P cargo f7db248cb4f7fca6, L cargo
+  8fa1141b55616d3d), stock 3.46.1 live: single-ELF instructions delete_14pct_300k +0.26% (358.5M -> 359.4M, about 22
+  a deleted row: the RefCell borrow and dispatch of `secure_delete_mode` per cell removal), every other row within
+  +-0.04%; layout-averaged lines (runs sda and sdc valid; sdb VOID at null max |z| 3.37): no replicated LOSE,
+  scan_filter_agg cpu and cycles replicated WINs at identical Ir (a layout effect, as bd-v3i4s's N2 showed one).
+- With secure_delete=1 in every arm (7 reps): delete_14pct_300k L 360.3M Ir against stock 3.46.1 120.7M and 3.54.1
+  107.5M (2.98x / 3.35x), task-clock 126.2 ms against 46.9 / 47.6; update_10pct_300k 557.6M against 273.4M / 236.8M;
+  memory_script_200k 3,417.1M against 1,913.9M / 1,692.2M. The zeroing itself costs fsqlite +1.8M Ir on delete
+  (perf counts a `rep stosb` once) and nothing visible in time.
+- Stock difference pinned in the keeper, not a secure_delete matter: fsqlite's leaf delete repacks the page
+  (compact-on-delete), so at OFF a deleted cell with cells below it leaves no residue, where stock's freeblock keeps
+  it.
+- Retry / follow-up: an unqualified PRAGMA does not reach ATTACHed databases (stock sets every attached b-tree). If
+  the +0.26% on delete matters, cache the policy in `SharedTxnPageIo` at each `set_transaction` instead of borrowing
+  the transaction per removal.
+
 ## 2026-11-21 - WIN (landed as 4e15416e8; under its prediction on the join and over it on rowid_lookups, inside every kill line): the table seek cache keeps eight leaves, slot 0 in the cursor and slots 1..7 in one array moved as a slice, so BtCursor shrinks by 88 B (bd-w4pr1.12, serial read lane round 12, lever SC8 v4)
 
 - Target: join_1M_to_pk_1000, whose 1M probes into u step across five leaves while the four-slot seek cache
