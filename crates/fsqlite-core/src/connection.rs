@@ -53390,8 +53390,11 @@ impl Connection {
         if self.insert_targets_live_fts5_command_column(insert) {
             return Ok(true);
         }
+        // bd-x5eqm: DML on a view runs its INSTEAD OF triggers (or stock's
+        // refusal) in the dispatcher; table bytecode finds no such table.
         Ok(self.targets_shadowed_main(&insert.table)
             || self.main_target_is_temp_only(&insert.table)
+            || self.view_index_of(&insert.table.name).is_some()
             || fts5_maintenance_insert_command(insert).is_some()
             || self.attached_target_schema(&insert.table)?.is_some())
     }
@@ -53403,6 +53406,7 @@ impl Connection {
         let registry = self.attached_schemas.borrow();
         Ok(self.targets_shadowed_main(&update.table.name)
             || self.main_target_is_temp_only(&update.table.name)
+            || self.view_index_of(&update.table.name.name).is_some()
             || determine_attached_update_schema(update, &registry)?.is_some())
     }
 
@@ -53413,6 +53417,7 @@ impl Connection {
         let registry = self.attached_schemas.borrow();
         Ok(self.targets_shadowed_main(&delete.table.name)
             || self.main_target_is_temp_only(&delete.table.name)
+            || self.view_index_of(&delete.table.name.name).is_some()
             || determine_attached_delete_schema(delete, &registry)?.is_some())
     }
 
@@ -83523,17 +83528,13 @@ impl Connection {
         }
         let bound = bind_placeholders_in_select_for_fallback(select, params)?;
         let cx = self.op_cx_after_background_status();
-        let implicit_agg = self.has_implicit_aggregation_with_registry(select) && !has_group_by(select);
         let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
-        if self.select_requires_grouped_window_pipeline(select) {
-            self.execute_group_by_window_select(&cx, &bound, None).await
-        } else if has_group_by(select) || implicit_agg || has_ordered_aggregate(select) {
-            self.execute_group_by_join_select(&cx, &bound, None).await
-        } else if has_window_functions(select) {
-            self.execute_window_select(&bound, None).await
-        } else {
-            self.execute_join_select(&bound, None).await
-        }
+        // bd-x5eqm: route by shape, FROM-less and VALUES bodies included. The
+        // join evaluator refuses a FROM-less body ("JOIN on non-SELECT
+        // core"), which `WITH c AS (SELECT 7) SELECT (SELECT x FROM c),
+        // (SELECT y FROM aux.w)` reached.
+        self.execute_interpreted_select_by_shape(&cx, select, &bound)
+            .await
     }
 
     // ── Transaction control ──────────────────────────────────────────────

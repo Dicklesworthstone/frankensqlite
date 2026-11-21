@@ -70,16 +70,13 @@ fn stock_outcome(conn: &rusqlite::Connection, sql: &str) -> String {
 }
 
 /// `sql` on fsqlite, run directly (`Connection::query`) or prepared first
-/// (a prepared SELECT is queried, a prepared DML statement executed). DDL
-/// and PRAGMA probes always run directly, and so does DML on the view `vt`
-/// or `v`: fsqlite's `prepare` takes no INSERT or UPDATE on a view with an
-/// INSTEAD OF trigger ("no such table: vt", on main too), a separate gap.
+/// (a prepared SELECT is queried, a prepared DML statement executed, DML on
+/// a view included since bd-x5eqm). DDL and PRAGMA probes always run
+/// directly.
 async fn fsqlite_outcome(conn: &Connection, sql: &str, prepared: bool) -> String {
-    let on_view = sql.starts_with("INSERT INTO vt ") || sql.starts_with("UPDATE v ");
-    let preparable = !on_view
-        && ["SELECT", "INSERT", "UPDATE", "DELETE"]
-            .iter()
-            .any(|keyword| sql.starts_with(keyword));
+    let preparable = ["SELECT", "INSERT", "UPDATE", "DELETE"]
+        .iter()
+        .any(|keyword| sql.starts_with(keyword));
     let result = if prepared && preparable {
         match conn.prepare(sql).await {
             Ok(statement) if sql.starts_with("SELECT") => statement.query().await,
