@@ -57,6 +57,18 @@
 //! appended key to the leaf. The middle-split arm is the other side: a stock
 //! split under the same parent that leaves the leaf the right edge is no
 //! conflict.
+//!
+//! bd-p9wzl, the mirror image: a stock DELETE that leaves a leaf under a
+//! third full merges it with its siblings (`balance_nonroot`), moves the last
+//! sibling's cells onto the others and frees that sibling. With secure_delete
+//! off (rusqlite's bundled build and most stock builds), a page freed onto an
+//! existing freelist trunk is never written: the commit carries page 1, the
+//! parent, the trunk and the surviving siblings. An fsqlite transaction whose
+//! snapshot predates that commit and writes the freed leaf finds no newer
+//! frame of any page it writes, so it commits a page that is on the freelist.
+//! The merge arms below stage an insert or an update on the freed leaf of a
+//! table, an index insert on a freed index leaf, and, as the negatives, the
+//! same writes on leaves the merge left alone.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -395,16 +407,17 @@ async fn transaction<F: std::future::Future<Output = ()>>(
     role: Role,
     before_commit: impl FnOnce() -> F,
 ) -> Outcome {
-    transaction_with_insert(conn, &insert_sql(role), before_commit).await
+    transaction_with_insert(conn, "BEGIN", &insert_sql(role), before_commit).await
 }
 
-/// [`transaction`] with the INSERT `insert`.
+/// [`transaction`] with the statement `begin` and the INSERT `insert`.
 async fn transaction_with_insert<F: std::future::Future<Output = ()>>(
     conn: &Connection,
+    begin: &str,
     insert: &str,
     before_commit: impl FnOnce() -> F,
 ) -> Outcome {
-    conn.execute("BEGIN").await.expect("BEGIN");
+    conn.execute(begin).await.expect("BEGIN");
     let insert_error = conn
         .execute(insert)
         .await
@@ -868,7 +881,7 @@ fn middle_split_appender_child() {
         conn.execute("PRAGMA busy_timeout=2000")
             .await
             .expect("busy_timeout");
-        let outcome = transaction_with_insert(&conn, MIDDLE_SPLIT_APPEND, || async {
+        let outcome = transaction_with_insert(&conn, "BEGIN", MIDDLE_SPLIT_APPEND, || async {
             std::fs::write(dir.join("staged"), b"").expect("staged");
             wait_for(&dir.join("commit"));
         })
@@ -1165,4 +1178,757 @@ fn in_process_threads_split_one_table_in_explicit_transactions() {
         durable, reported,
         "in-process threads: the durable rows are exactly the reported commits"
     );
+}
+
+const MERGE_CHILD_ENV: &str = "FSQLITE_MERGE_FREE_CHILD";
+/// The bd-p9wzl fixtures' seed rowids, 5, 10, ..., 100: one-byte varints,
+/// with room between them for the stale writers' rows.
+const MERGE_SEED_IDS: std::ops::RangeInclusive<i64> = 5..=100;
+const MERGE_PAGE_SIZE: usize = 4096;
+
+fn merge_seed_ids() -> impl Iterator<Item = i64> {
+    MERGE_SEED_IDS.step_by(5)
+}
+
+/// Page `page_no` of a main database file's bytes (4 KiB pages).
+fn merge_page(data: &[u8], page_no: u32) -> &[u8] {
+    let start = (usize::try_from(page_no).expect("page number") - 1) * MERGE_PAGE_SIZE;
+    &data[start..start + MERGE_PAGE_SIZE]
+}
+
+/// The varint at `bytes[at..]`: its value and its length.
+fn merge_varint(bytes: &[u8], at: usize) -> (u64, usize) {
+    let mut value = 0_u64;
+    for (index, &byte) in bytes[at..].iter().take(8).enumerate() {
+        value = (value << 7) | u64::from(byte & 0x7F);
+        if byte < 0x80 {
+            return (value, index + 1);
+        }
+    }
+    ((value << 8) | u64::from(bytes[at + 8]), 9)
+}
+
+/// The page numbers of the valid frames of `db`'s WAL, in frame order.
+fn wal_frame_pages(db: &Path) -> Vec<u32> {
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = std::fs::read(PathBuf::from(wal)).unwrap_or_default();
+    if wal.len() < 32 {
+        return Vec::new();
+    }
+    let page_size = usize::try_from(u32::from_be_bytes(
+        wal[8..12].try_into().expect("WAL page size"),
+    ))
+    .expect("page size");
+    let salts = &wal[16..24];
+    wal[32..]
+        .chunks_exact(24 + page_size)
+        .take_while(|frame| &frame[8..16] == salts)
+        .map(|frame| u32::from_be_bytes(frame[..4].try_into().expect("frame page number")))
+        .collect()
+}
+
+/// Every page on the main file's freelist: the trunks and their leaves.
+fn freelist_pages(db: &Path) -> Vec<u32> {
+    let data = std::fs::read(db).expect("read database file");
+    let word =
+        |bytes: &[u8], at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("u32"));
+    let mut pages = Vec::new();
+    let mut trunk = word(&data, 32);
+    while trunk != 0 {
+        assert!(pages.len() < 10_000, "a freelist cycle");
+        let page = merge_page(&data, trunk);
+        pages.push(trunk);
+        let leaves = usize::try_from(word(page, 4)).expect("leaf count");
+        pages.extend((0..leaves).map(|index| word(page, 8 + 4 * index)));
+        trunk = word(page, 0);
+    }
+    pages
+}
+
+/// The rowids on table leaf `page_no`, in cell order.
+fn table_leaf_rowids(data: &[u8], page_no: u32) -> Vec<i64> {
+    let page = merge_page(data, page_no);
+    assert_eq!(page[0], 0x0D, "page {page_no} is a table leaf");
+    (0..be16(page, 3))
+        .map(|index| {
+            let cell = be16(page, 8 + 2 * index);
+            let (_, payload_len_bytes) = merge_varint(page, cell);
+            let (rowid, _) = merge_varint(page, cell + payload_len_bytes);
+            i64::try_from(rowid).expect("rowid")
+        })
+        .collect()
+}
+
+/// The cells of index page `page_no` as `(left child, first three bytes of
+/// the key's first column)`, and the right child of an interior page. A leaf's
+/// cells have child 0 and it has no right child.
+fn index_page_cells(data: &[u8], page_no: u32) -> (Vec<(u32, String)>, Option<u32>) {
+    let page = merge_page(data, page_no);
+    let interior = match page[0] {
+        0x02 => true,
+        0x0A => false,
+        other => panic!("page {page_no} has b-tree type {other}"),
+    };
+    let pointers = if interior { 12 } else { 8 };
+    let cells = (0..be16(page, 3))
+        .map(|index| {
+            let mut at = be16(page, pointers + 2 * index);
+            let child = if interior {
+                at += 4;
+                u32::from_be_bytes(page[at - 4..at].try_into().expect("child"))
+            } else {
+                0
+            };
+            let (_, payload_len_bytes) = merge_varint(page, at);
+            let record = at + payload_len_bytes;
+            let (header_len, _) = merge_varint(page, record);
+            let body = record + usize::try_from(header_len).expect("record header length");
+            (
+                child,
+                String::from_utf8_lossy(&page[body..body + 3]).into_owned(),
+            )
+        })
+        .collect();
+    let right_child =
+        interior.then(|| u32::from_be_bytes(page[8..12].try_into().expect("right child")));
+    (cells, right_child)
+}
+
+/// fsqlite's `PRAGMA integrity_check` of the database family at `db`, its
+/// lines joined with newlines. It runs on a copy in `scratch`: fsqlite and
+/// stock in one process do not exclude each other through POSIX locks, so
+/// either one's close could otherwise checkpoint and reset the WAL under the
+/// other.
+fn fsqlite_integrity_of_copy(db: &Path, scratch: &Path) -> String {
+    std::fs::create_dir_all(scratch).expect("integrity scratch dir");
+    let copy = scratch.join("copy.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let from = PathBuf::from(format!("{}{suffix}", db.display()));
+        if from.exists() {
+            std::fs::copy(&from, PathBuf::from(format!("{}{suffix}", copy.display())))
+                .expect("copy the database family");
+        }
+    }
+    fsqlite_e2e::block_on(async {
+        let conn = Connection::open(copy.to_str().expect("utf8 path"))
+            .await
+            .expect("fsqlite integrity open");
+        let lines: Vec<String> = conn
+            .query("PRAGMA integrity_check")
+            .await
+            .expect("fsqlite integrity_check")
+            .iter()
+            .map(|row| match row.values() {
+                [SqliteValue::Text(line)] => line.to_string(),
+                other => panic!("integrity_check row {other:?}"),
+            })
+            .collect();
+        conn.close().await.expect("fsqlite integrity close");
+        lines.join("\n")
+    })
+}
+
+/// Stock's `PRAGMA integrity_check` lines.
+fn stock_integrity(stock: &rusqlite::Connection) -> Vec<String> {
+    stock
+        .prepare("PRAGMA integrity_check")
+        .expect("prepare integrity_check")
+        .query_map([], |row| row.get(0))
+        .expect("integrity_check")
+        .collect::<rusqlite::Result<_>>()
+        .expect("integrity_check rows")
+}
+
+/// The two ways the bd-p9wzl arms open the stale transaction. A plain `BEGIN`
+/// whose COMMIT loses a page conflict is replayed on the newest snapshot when
+/// everything the caller saw comes out identical (bd-q4o7z), so a refused
+/// stale write can still commit, correctly placed; an explicit
+/// `BEGIN CONCURRENT` is never replayed, so the refusal itself is visible.
+const MERGE_BEGINS: [&str; 2] = ["BEGIN CONCURRENT", "BEGIN"];
+
+/// The stale fsqlite writer of the bd-p9wzl arms: it opens its transaction
+/// with the spec's BEGIN, runs its statement, creates `staged`, commits once
+/// `commit` exists, and prints its outcome.
+#[test]
+fn merge_free_stale_writer_child() {
+    let Ok(spec) = std::env::var(MERGE_CHILD_ENV) else {
+        return;
+    };
+    let mut fields = spec.splitn(4, '|');
+    let (Some(db), Some(dir), Some(begin), Some(sql)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        panic!("malformed child spec {spec}");
+    };
+    let (db, dir, begin, sql) = (
+        db.to_owned(),
+        PathBuf::from(dir),
+        begin.to_owned(),
+        sql.to_owned(),
+    );
+    let outcome = fsqlite_e2e::block_on(async move {
+        let conn = Connection::open(&db).await.expect("stale writer open");
+        conn.execute("PRAGMA busy_timeout=2000")
+            .await
+            .expect("busy_timeout");
+        let outcome = transaction_with_insert(&conn, &begin, &sql, || async {
+            std::fs::write(dir.join("staged"), b"").expect("staged");
+            wait_for(&dir.join("commit"));
+        })
+        .await;
+        conn.close().await.expect("stale writer close");
+        outcome
+    });
+    println!("event=merge_free_outcome {}", outcome.encode());
+}
+
+/// One bd-p9wzl arm after its fixture: the fsqlite child opens its
+/// transaction with `begin`, takes its snapshot and stages `stale_sql`;
+/// `merge` commits the merging DELETE; then the child commits. Returns the
+/// child's outcome and the pages of the merge's frames.
+fn stale_write_across_merge(
+    db: &Path,
+    dir: &Path,
+    begin: &str,
+    stale_sql: &str,
+    merge: impl FnOnce(),
+) -> (Outcome, Vec<u32>) {
+    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "merge_free_stale_writer_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            MERGE_CHILD_ENV,
+            format!("{}|{}|{begin}|{stale_sql}", db.display(), dir.display()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the stale writer");
+    let started = Instant::now();
+    while !dir.join("staged").exists() {
+        assert!(
+            child.try_wait().expect("stale writer status").is_none(),
+            "the stale writer exited before staging its write"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the stale writer never staged its write"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        wal_frame_pages(db).is_empty(),
+        "nothing commits between the fixture and the merge"
+    );
+    merge();
+    let merge_frames = wal_frame_pages(db);
+    std::fs::write(dir.join("commit"), b"").expect("commit");
+    let output = child.wait_with_output().expect("stale writer output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let marker = "event=merge_free_outcome ";
+    let outcome = stdout
+        .lines()
+        .find_map(|line| {
+            line.find(marker)
+                .map(|at| Outcome::decode(&line[at + marker.len()..]))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the stale writer produced no outcome (status {:?}):\n{stdout}\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    (outcome, merge_frames)
+}
+
+/// The required COMMIT of a bd-p9wzl arm. A write on a page the merge freed
+/// must not commit that page: under `BEGIN CONCURRENT` the COMMIT is refused
+/// with BusySnapshot and ends the transaction; under a plain `BEGIN` it is
+/// refused the same way or replayed (bd-q4o7z), and the caller's durable-row
+/// check decides that a replayed write landed where the tree routes it. A
+/// write on a leaf the merge left alone commits under either.
+fn assert_stale_commit(label: &str, begin: &str, outcome: &Outcome, on_freed_page: bool) {
+    assert!(
+        outcome.insert_error.is_none(),
+        "{label}: the stale statement succeeds: {outcome:?}"
+    );
+    if on_freed_page && (begin != "BEGIN" || !outcome.committed()) {
+        let refused = outcome.commit_error.as_ref().unwrap_or_else(|| {
+            panic!("{label}: a COMMIT of a page the merge freed must be refused: {outcome:?}")
+        });
+        assert_eq!(
+            refused.0, SQLITE_BUSY_SNAPSHOT,
+            "{label}: the COMMIT is refused with BusySnapshot: {refused:?}"
+        );
+        assert!(
+            !outcome.in_transaction_after_commit,
+            "{label}: the refused COMMIT ends its transaction"
+        );
+    } else {
+        assert!(
+            outcome.committed(),
+            "{label}: a write on a leaf the merge left alone commits: {outcome:?}"
+        );
+    }
+}
+
+/// The pages of the bd-p9wzl table fixture's tree.
+#[derive(Debug, Clone, Copy)]
+struct TableMergeFixture {
+    root: u32,
+    /// Leaf B, [40, 45, 50]: the merge's DELETE leaves it with one row.
+    underfull: u32,
+    /// Leaf F, [55, 60]: the merge moves its rows onto B and frees it.
+    freed: u32,
+    /// Leaf D, [65, 70, 75, 80]: the merge leaves it alone.
+    kept: u32,
+}
+
+/// The bd-p9wzl table fixture, built by stock with 4 KiB pages and
+/// secure_delete off. `g` holds rows 5, 10, ..., 100 of about 1 KiB, four to
+/// a leaf, and a dropped table left a freelist trunk with room. Deleting 25,
+/// 30 and 35 rebalances the second and third leaves, so the root's cells are
+/// (A, 20) (B, 50) (F, 60) (D, 80) with right child E: A = [5..20],
+/// B = [40, 45, 50], F = [55, 60], D = [65..80], E = [85..100]. Deleting 40
+/// and 45 leaves B under a third full, and B, A and F's seven rows fit two
+/// leaves: stock keeps A and B and frees F.
+fn build_table_merge_fixture(stock: &rusqlite::Connection, db: &Path) -> TableMergeFixture {
+    stock
+        .execute_batch(
+            "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA secure_delete=OFF;
+             CREATE TABLE g(id INTEGER PRIMARY KEY, w INTEGER, payload BLOB);
+             CREATE TABLE junk(x);",
+        )
+        .expect("merge fixture schema");
+    for _ in 0..6 {
+        stock
+            .execute("INSERT INTO junk VALUES (zeroblob(3000))", [])
+            .expect("junk row");
+    }
+    stock.execute_batch("BEGIN").expect("seed BEGIN");
+    for id in merge_seed_ids() {
+        stock
+            .execute(
+                "INSERT INTO g(id, w, payload) VALUES (?1, 0, zeroblob(1000))",
+                [id],
+            )
+            .expect("seed row");
+    }
+    stock.execute_batch("COMMIT").expect("seed COMMIT");
+    stock
+        .execute_batch(
+            "DROP TABLE junk;
+             DELETE FROM g WHERE id IN (25, 30, 35);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("merge fixture shape");
+    let secure_delete: i64 = stock
+        .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+        .expect("secure_delete");
+    assert_eq!(secure_delete, 0, "fixture: secure_delete is off");
+    let (cells, edge) = interior_shape(db, 2);
+    assert_eq!(
+        cells
+            .iter()
+            .map(|(_, divider)| *divider)
+            .collect::<Vec<_>>(),
+        vec![20, 50, 60, 80],
+        "fixture: the root's dividers"
+    );
+    let data = std::fs::read(db).expect("read database file");
+    let fixture = TableMergeFixture {
+        root: 2,
+        underfull: cells[1].0,
+        freed: cells[2].0,
+        kept: cells[3].0,
+    };
+    for (page, rowids) in [
+        (fixture.underfull, vec![40, 45, 50]),
+        (fixture.freed, vec![55, 60]),
+        (fixture.kept, vec![65, 70, 75, 80]),
+        (edge, vec![85, 90, 95, 100]),
+    ] {
+        assert_eq!(
+            table_leaf_rowids(&data, page),
+            rowids,
+            "fixture: leaf {page}"
+        );
+    }
+    assert!(
+        !freelist_pages(db).is_empty(),
+        "fixture: the freelist has a trunk, so a freed leaf is not rewritten as one"
+    );
+    fixture
+}
+
+/// A table arm's stale write: what it does to `g` when it commits.
+#[derive(Debug, Clone, Copy)]
+enum StaleRow {
+    /// Insert the row `(id, 1)` with a 16-byte payload.
+    Insert(i64),
+    /// Set `w = 1` on the row `id`.
+    SetW(i64),
+}
+
+impl StaleRow {
+    fn sql(self) -> String {
+        match self {
+            Self::Insert(id) => {
+                format!("INSERT INTO g(id, w, payload) VALUES ({id}, 1, zeroblob(16))")
+            }
+            Self::SetW(id) => format!("UPDATE g SET w = 1 WHERE id = {id}"),
+        }
+    }
+
+    const fn id(self) -> i64 {
+        match self {
+            Self::Insert(id) | Self::SetW(id) => id,
+        }
+    }
+}
+
+/// bd-p9wzl, table arms: the stale writer's row lies inside leaf F (the merge
+/// frees it) or leaf D (the merge leaves it alone), never past the leaf's last
+/// rowid, so no right-edge append route is involved.
+fn table_merge_arm(label: &str, stale: StaleRow, on_freed_leaf: bool) {
+    for begin in MERGE_BEGINS {
+        table_merge_case(&format!("{label} ({begin})"), begin, stale, on_freed_leaf);
+    }
+}
+
+fn table_merge_case(label: &str, begin: &str, stale: StaleRow, on_freed_leaf: bool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("merge.db");
+    let stock = rusqlite::Connection::open(&db).expect("stock open");
+    let fixture = build_table_merge_fixture(&stock, &db);
+    let target = if on_freed_leaf {
+        fixture.freed
+    } else {
+        fixture.kept
+    };
+    let data = std::fs::read(&db).expect("read database file");
+    let target_rowids = table_leaf_rowids(&data, target);
+    assert!(
+        target_rowids[0] <= stale.id() && stale.id() < target_rowids[target_rowids.len() - 1],
+        "{label}: non-vacuity: row {} lies inside leaf {target} {target_rowids:?}",
+        stale.id()
+    );
+    let (outcome, merge_frames) =
+        stale_write_across_merge(&db, dir.path(), begin, &stale.sql(), || {
+            stock
+                .execute_batch("DELETE FROM g WHERE id IN (40, 45)")
+                .expect("stock merges B, A and F");
+        });
+    eprintln!(
+        "event=merge_free_case label={label:?} fixture={fixture:?} merge_frames={merge_frames:?} \
+         outcome={}",
+        outcome.encode()
+    );
+    assert!(
+        merge_frames.contains(&fixture.root) && merge_frames.contains(&fixture.underfull),
+        "{label}: non-vacuity: the merge rewrote the root and B: {merge_frames:?}"
+    );
+    assert!(
+        !merge_frames.contains(&fixture.freed) && !merge_frames.contains(&fixture.kept),
+        "{label}: non-vacuity: the merge wrote neither F nor D: {merge_frames:?}"
+    );
+
+    let durable: Vec<(i64, i64)> = stock
+        .prepare("SELECT id, w FROM g ORDER BY id")
+        .expect("prepare")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows")
+        .collect::<rusqlite::Result<_>>()
+        .expect("rows");
+    let mut expected: Vec<(i64, i64)> = merge_seed_ids()
+        .filter(|id| ![25, 30, 35, 40, 45].contains(id))
+        .map(|id| (id, 0))
+        .collect();
+    if outcome.committed() {
+        match stale {
+            StaleRow::Insert(id) => expected.push((id, 1)),
+            StaleRow::SetW(id) => {
+                for (row, w) in &mut expected {
+                    if *row == id {
+                        *w = 1;
+                    }
+                }
+            }
+        }
+        expected.sort_unstable();
+    }
+    let integrity = stock_integrity(&stock);
+    let fsqlite_integrity = fsqlite_integrity_of_copy(&db, &dir.path().join("fsqlite-check"));
+    eprintln!(
+        "event=merge_free_verdict label={label:?} stock_integrity={integrity:?} \
+         fsqlite_integrity={fsqlite_integrity:?} durable_rows={}",
+        durable.len()
+    );
+    assert_eq!(
+        durable, expected,
+        "{label}: the durable rows are the fixture's, less the merge's deletes, with exactly \
+         the reported commit ({outcome:?})"
+    );
+    assert_eq!(
+        integrity,
+        vec!["ok".to_owned()],
+        "{label}: stock integrity_check"
+    );
+    assert_eq!(fsqlite_integrity, "ok", "{label}: fsqlite integrity_check");
+    assert_stale_commit(label, begin, &outcome, on_freed_leaf);
+
+    stock
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("verification checkpoint");
+    assert!(
+        freelist_pages(&db).contains(&fixture.freed),
+        "{label}: non-vacuity: the merge freed F ({})",
+        fixture.freed
+    );
+}
+
+/// bd-p9wzl: the stale writer inserts row 57 between F's rows 55 and 60. On
+/// 07da95426 the COMMIT succeeded and the row was lost: it went to F, which
+/// the merge had put on the freelist, and both integrity checks said ok
+/// (10 runs of 10; the update arm lost its update the same way). Now the
+/// flusher refuses the stale F: `BEGIN CONCURRENT` gets BusySnapshot, and a
+/// plain `BEGIN` replays the insert onto B.
+#[test]
+fn cross_process_stock_merge_frees_the_leaf_of_a_stale_insert_bd_p9wzl() {
+    if std::env::var_os(MERGE_CHILD_ENV).is_some() {
+        return;
+    }
+    table_merge_arm("insert on the freed leaf", StaleRow::Insert(57), true);
+}
+
+/// bd-p9wzl: the stale writer updates row 55 on F in place. The merge moved
+/// row 55 onto B, so committing F would lose the update.
+#[test]
+fn cross_process_stock_merge_frees_the_leaf_of_a_stale_update_bd_p9wzl() {
+    if std::env::var_os(MERGE_CHILD_ENV).is_some() {
+        return;
+    }
+    table_merge_arm("update on the freed leaf", StaleRow::SetW(55), true);
+}
+
+/// bd-p9wzl, the negative: the same merge rewrites the root, but the stale
+/// writer's insert lands inside leaf D, which the merge left alone, so it
+/// commits.
+#[test]
+fn cross_process_stock_merge_keeps_an_insert_on_an_untouched_leaf_bd_p9wzl() {
+    if std::env::var_os(MERGE_CHILD_ENV).is_some() {
+        return;
+    }
+    table_merge_arm("insert on an untouched leaf", StaleRow::Insert(72), false);
+}
+
+/// The pages of the bd-p9wzl index fixture's trees.
+#[derive(Debug, Clone, Copy)]
+struct IndexMergeFixture {
+    index_root: u32,
+    /// The index leaf of keys `080` and `085`: the merge frees it.
+    freed: u32,
+    /// The index's right-edge leaf, keys `095` and `100`: the merge leaves it
+    /// alone.
+    kept: u32,
+    /// The table's right-edge leaf [85..100], where row 101 goes.
+    table_edge: u32,
+}
+
+/// The bd-p9wzl index fixture, built by stock with 4 KiB pages and
+/// secure_delete off: `h(id, k)` with index `hk(k)`, rows 5, 10, ..., 100
+/// whose k is the zero-padded id followed by 900 bytes, so four keys fill an
+/// index leaf. After deleting 55, then 60 and 65, the index root's dividers
+/// start `025` `045` `075` `090`; deleting 50 then leaves the leaf of `050`
+/// and `070` with one key, and its siblings' keys fit two leaves: stock
+/// frees the leaf of `080` and `085`.
+fn build_index_merge_fixture(stock: &rusqlite::Connection, db: &Path) -> IndexMergeFixture {
+    stock
+        .execute_batch(
+            "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA secure_delete=OFF;
+             CREATE TABLE h(id INTEGER PRIMARY KEY, k TEXT);
+             CREATE INDEX hk ON h(k);
+             CREATE TABLE junk(x);",
+        )
+        .expect("index fixture schema");
+    for _ in 0..6 {
+        stock
+            .execute("INSERT INTO junk VALUES (zeroblob(3000))", [])
+            .expect("junk row");
+    }
+    stock.execute_batch("BEGIN").expect("seed BEGIN");
+    for id in merge_seed_ids() {
+        stock
+            .execute(
+                "INSERT INTO h(id, k) VALUES (?1, printf('%03d', ?1) || hex(zeroblob(450)))",
+                [id],
+            )
+            .expect("seed row");
+    }
+    stock.execute_batch("COMMIT").expect("seed COMMIT");
+    stock
+        .execute_batch(
+            "DROP TABLE junk;
+             DELETE FROM h WHERE id = 55;
+             DELETE FROM h WHERE id IN (60, 65);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("index fixture shape");
+    let index_root: u32 = stock
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'hk'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("index root");
+    let data = std::fs::read(db).expect("read database file");
+    let (cells, right_child) = index_page_cells(&data, index_root);
+    assert_eq!(
+        cells
+            .iter()
+            .map(|(_, key)| key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["025", "045", "075", "090"],
+        "fixture: the index root's dividers"
+    );
+    let freed = cells[3].0;
+    let kept = right_child.expect("the index root is interior");
+    for (page, keys) in [(freed, vec!["080", "085"]), (kept, vec!["095", "100"])] {
+        let (leaf, _) = index_page_cells(&data, page);
+        assert_eq!(
+            leaf.iter().map(|(_, key)| key.as_str()).collect::<Vec<_>>(),
+            keys,
+            "fixture: index leaf {page}"
+        );
+    }
+    let (_, table_edge) = interior_shape(db, 2);
+    assert_eq!(
+        table_leaf_rowids(&data, table_edge),
+        vec![85, 90, 95, 100],
+        "fixture: the table's right edge"
+    );
+    assert!(
+        !freelist_pages(db).is_empty(),
+        "fixture: the freelist has a trunk"
+    );
+    IndexMergeFixture {
+        index_root,
+        freed,
+        kept,
+        table_edge,
+    }
+}
+
+/// bd-p9wzl, index arms: the stale writer inserts row 101, a table
+/// right-edge append the merge does not touch, whose short key `key` lands in
+/// the index leaf the merge frees ('082') or in the index's right edge, which
+/// it leaves alone ('097').
+fn index_merge_arm(label: &str, key: &str, on_freed_leaf: bool) {
+    for begin in MERGE_BEGINS {
+        index_merge_case(&format!("{label} ({begin})"), begin, key, on_freed_leaf);
+    }
+}
+
+fn index_merge_case(label: &str, begin: &str, key: &str, on_freed_leaf: bool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("merge.db");
+    let stock = rusqlite::Connection::open(&db).expect("stock open");
+    let fixture = build_index_merge_fixture(&stock, &db);
+    let (outcome, merge_frames) = stale_write_across_merge(
+        &db,
+        dir.path(),
+        begin,
+        &format!("INSERT INTO h(id, k) VALUES (101, '{key}')"),
+        || {
+            stock
+                .execute_batch("DELETE FROM h WHERE id = 50")
+                .expect("stock merges index leaves");
+        },
+    );
+    eprintln!(
+        "event=merge_free_case label={label:?} fixture={fixture:?} merge_frames={merge_frames:?} \
+         outcome={}",
+        outcome.encode()
+    );
+    assert!(
+        merge_frames.contains(&fixture.index_root),
+        "{label}: non-vacuity: the merge rewrote the index root: {merge_frames:?}"
+    );
+    assert!(
+        [fixture.freed, fixture.kept, fixture.table_edge]
+            .iter()
+            .all(|page| !merge_frames.contains(page)),
+        "{label}: non-vacuity: the merge wrote neither index leaf nor the table's right edge: \
+         {merge_frames:?}"
+    );
+
+    let durable: Vec<(i64, String)> = stock
+        .prepare("SELECT id, substr(k, 1, 3) FROM h ORDER BY id")
+        .expect("prepare")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows")
+        .collect::<rusqlite::Result<_>>()
+        .expect("rows");
+    let mut expected: Vec<(i64, String)> = merge_seed_ids()
+        .filter(|id| ![50, 55, 60, 65].contains(id))
+        .map(|id| (id, format!("{id:03}")))
+        .collect();
+    if outcome.committed() {
+        expected.push((101, key.to_owned()));
+    }
+    let integrity = stock_integrity(&stock);
+    let fsqlite_integrity = fsqlite_integrity_of_copy(&db, &dir.path().join("fsqlite-check"));
+    eprintln!(
+        "event=merge_free_verdict label={label:?} stock_integrity={integrity:?} \
+         fsqlite_integrity={fsqlite_integrity:?} durable_rows={}",
+        durable.len()
+    );
+    assert_eq!(
+        integrity,
+        vec!["ok".to_owned()],
+        "{label}: stock integrity_check ({outcome:?})"
+    );
+    assert_eq!(fsqlite_integrity, "ok", "{label}: fsqlite integrity_check");
+    assert_eq!(
+        durable, expected,
+        "{label}: the durable rows are the fixture's, less the merge's delete, with exactly the \
+         reported commit ({outcome:?})"
+    );
+    assert_stale_commit(label, begin, &outcome, on_freed_leaf);
+
+    stock
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("verification checkpoint");
+    assert!(
+        freelist_pages(&db).contains(&fixture.freed),
+        "{label}: non-vacuity: the merge freed index leaf {}",
+        fixture.freed
+    );
+}
+
+/// bd-p9wzl: row 101's index key '082' belongs to the index leaf the merge
+/// frees. Committing that leaf would leave the row without its index entry.
+#[test]
+fn cross_process_stock_merge_frees_the_index_leaf_of_a_stale_insert_bd_p9wzl() {
+    if std::env::var_os(MERGE_CHILD_ENV).is_some() {
+        return;
+    }
+    index_merge_arm("index insert on the freed leaf", "082", true);
+}
+
+/// bd-p9wzl, the negative: the same merge rewrites the index root, but key
+/// '097' belongs to the index's right edge, which it left alone, so the
+/// insert commits.
+#[test]
+fn cross_process_stock_merge_keeps_an_index_insert_on_an_untouched_leaf_bd_p9wzl() {
+    if std::env::var_os(MERGE_CHILD_ENV).is_some() {
+        return;
+    }
+    index_merge_arm("index insert on an untouched leaf", "097", false);
 }

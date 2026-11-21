@@ -217,42 +217,35 @@ pub struct TransactionFrameBatch {
     /// can have popped it and its absence from the current durable freelist
     /// is expected, not evidence of a conflict.
     pub consumed_durable_freelist_pages: Vec<u32>,
-    /// bd-1epn5: the routes this transaction's right-edge appends rely on.
-    /// Their parents are checked against committed WAL frames newer than
-    /// `conflict_snapshot` like `conflict_pages`, but a parent that changed
-    /// conflicts only if the route no longer leads to the leaf. They are not
-    /// write intent, so batches of one group-commit epoch never conflict on
-    /// them.
-    pub route_dependencies: Vec<TransactionRouteDependency>,
+    /// bd-1epn5, bd-p9wzl: the interior b-tree pages of the submitting
+    /// transaction's snapshot that it read and does not write, sorted. They
+    /// include the ancestors of every b-tree page the batch writes.
+    ///
+    /// A peer can move the keys of a page without writing that page, but
+    /// never without writing the page's parent: stock SQLite's quick balance
+    /// caps a right-edge leaf by writing only the parent and a new leaf, and
+    /// its merge frees the last sibling of a rebalanced group by writing only
+    /// the parent, the surviving siblings and the freelist. A batch that then
+    /// writes the capped or freed page finds no newer frame of any page it
+    /// writes. These pages are checked against committed WAL frames newer than
+    /// `conflict_snapshot` like `conflict_pages`, but one that changed
+    /// conflicts only if a page the batch writes, which its snapshot image
+    /// points at, is no longer where the current tree routes that page's keys.
+    /// They are not write intent, so batches of one group-commit epoch never
+    /// conflict on them. Their snapshot images are among
+    /// `conflict_page_baselines`.
+    pub route_watch_pages: Vec<u32>,
+    /// Whether the submitting transaction's read cache kept every page it
+    /// read. Only then do `route_watch_pages` reach each tree's root, so a
+    /// route can be derived again from the top; otherwise a changed watch
+    /// page above a page the batch writes always conflicts.
+    pub route_watch_complete: bool,
     /// bd-1q134: When `Some(new_db_size)`, this batch explicitly shrinks the
     /// database to `new_db_size` pages via `auto_vacuum = FULL` or
     /// `PRAGMA incremental_vacuum`. The WAL commit frame's `db_size_if_commit`
     /// and durability certificate must publish `new_db_size` directly instead of
     /// clamping upward with `max(current_db_size, ...)`.
     pub explicit_db_size_shrink: Option<u32>,
-}
-
-/// bd-1epn5: a right-edge append's dependency on the route to its leaf.
-///
-/// The transaction stored keys past the last cell of `leaf`, which its
-/// snapshot showed as `parent`'s right child. Those keys belong on `leaf` only
-/// while the tree routes them there. A peer can cap the leaf without writing
-/// it: a quick balance gives `parent` a divider equal to the leaf's largest
-/// key and a new right child, and stock SQLite's quick balance commits only
-/// the parent and the new leaf.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransactionRouteDependency {
-    /// The leaf's parent in the submitting transaction's snapshot.
-    pub parent: u32,
-    /// The table leaf the transaction appended past its last cell.
-    pub leaf: u32,
-    /// The largest rowid the transaction staged on `leaf`.
-    pub key: i64,
-    /// The topmost ancestor of `parent` among the pages the snapshot read,
-    /// from which the route is derived again. `None` when the snapshot did
-    /// not keep every page it read, so the route cannot be trusted to start
-    /// at the table's root; a changed parent then always conflicts.
-    pub top: Option<u32>,
 }
 
 /// WAL conflict horizon captured by a submitting transaction.
@@ -311,18 +304,19 @@ impl TransactionFrameBatch {
             freed_pages: Vec::new(),
             consumed_freelist_pages: Vec::new(),
             consumed_durable_freelist_pages: Vec::new(),
-            route_dependencies: Vec::new(),
+            route_watch_pages: Vec::new(),
+            route_watch_complete: false,
             explicit_db_size_shrink: None,
         }
     }
 
-    /// Attach the routes the batch's right-edge appends rely on (bd-1epn5).
+    /// Attach the interior pages whose changes the batch's writes must
+    /// survive, and whether they reach each tree's root (bd-1epn5,
+    /// bd-p9wzl).
     #[must_use]
-    pub fn with_route_dependencies(
-        mut self,
-        route_dependencies: Vec<TransactionRouteDependency>,
-    ) -> Self {
-        self.route_dependencies = route_dependencies;
+    pub fn with_route_watch(mut self, route_watch_pages: Vec<u32>, complete: bool) -> Self {
+        self.route_watch_pages = route_watch_pages;
+        self.route_watch_complete = complete;
         self
     }
 
