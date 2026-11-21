@@ -108,14 +108,21 @@ const QUERIES: &[(&str, &str)] = &[
          HAVING ((a, b), 1) = ((1, 2), 1) AND count(*) > 1",
         ONE_TWO,
     ),
-    // Not here (bd-4uurt): the IS form, `HAVING count(*) >= 1 AND ((a, b), 1)
-    // IS ((2, 2), 1)` (stock 2|2|1), and an arithmetic element, `HAVING ((a +
-    // 1, b), 1) = ((2, 3), 1)` (stock 1|3|1) and a scalar function element,
-    // `HAVING ((abs(a), b), 1) = ((1, 2), 1)` (stock 1|2|2). A prepared
-    // file-backed GROUP BY codes a HAVING operator other than a comparison,
-    // AND or OR, and a scalar call, without its group values, so it answers
-    // no row for `HAVING a IS 2` or `HAVING a + 1 = 2` on main too.
-    // Built from GROUP BY terms and a constant (NULL, so no group).
+    (
+        "SELECT a, b, count(*) FROM t GROUP BY a, b \
+         HAVING count(*) >= 1 AND ((a, b), 1) IS ((2, 2), 1)",
+        "rows=[[\"2\", \"2\", \"1\"]]",
+    ),
+    // Built from GROUP BY terms: an expression, a scalar function, a
+    // constant (NULL, so no group).
+    (
+        "SELECT a, b, count(*) FROM t GROUP BY a, b HAVING ((a + 1, b), 1) = ((2, 3), 1)",
+        "rows=[[\"1\", \"3\", \"1\"]]",
+    ),
+    (
+        "SELECT a, b, count(*) FROM t GROUP BY a, b HAVING ((abs(a), b), 1) = ((1, 2), 1)",
+        ONE_TWO,
+    ),
     (
         "SELECT a, b, count(*) FROM t GROUP BY a, b HAVING ((a, b), NULL) = ((1, 2), 1)",
         "rows=[]",
