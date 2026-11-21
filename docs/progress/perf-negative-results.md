@@ -94,6 +94,39 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-21 - REJECTED on its regression line (rowid_lookups_200k +47.0M Ir, +1.75% against +0.5%), the join -167.8M: a seek-cache hit on a resident cached leaf other than the cursor's own is answered without a wait, and a per-cursor flag stops asking a reader that holds none (bd-w4pr1.12, serial read lane round 12, lever SL2 v2)
+
+- Target: join_1M_to_pk_1000 on the SC8 v4 code. 405,000 probes are seek-cache hits on a cached leaf other than the
+  cursor's own, and they run the async table_move_to at 1,642 Ir each (665.0M; callgrind).
+- Retry of SL2 v1 (2026-11-19 entry, rejected on memory_script_200k's per-probe NotResident lookups). Its retry
+  condition, a landed multi-slot cursor cache, was met by SC8 v4 (4e15416e8).
+- Touched (not landed; patch `scratchpad rl12/sl2v2_v1.patch`): `crates/fsqlite-btree/src/cursor.rs`.
+  - try_table_seek_within_leaf keeps SL1 v3's newest-slot test first. When that does not answer, it takes the first
+    admitting slot and answers it from the reader's resident image (read_resident_btree_page_data). load_page's tail
+    moves into stack_entry_for_page so both can use it.
+  - A per-cursor `resident_seek_declined` flag is set by the first refusal.
+  - Keeper `test_try_table_seek_within_leaf_answers_resident_cached_leaves` (reference cursor; three negatives; the
+    flag).
+- Prediction (on the bead before the build): join -180 to -260M Ir, rowid_lookups +0.2 to +0.35%, memory_script
+  within +-0.1%. Kill: the join under 100M; rowid_lookups above +0.5%; any other row beyond +-0.5%; a replicated LOSE.
+- Result (parent 83fee06b2 against parent + v2, one layout_shuffle_pair job, callgrind of the fsqlite-cargo ELFs;
+  answers equal stock):
+  - join 3,615.6M -> 3,447.8M (-167.8M, under the band);
+  - rowid_lookups 2,679.2M -> 2,726.2M (+47.0M), line 2 crossed;
+  - the judgement runs were stopped during run 1, because a deterministic instruction line had already decided.
+- Why (callgrind self diff on rowid_lookups, 200k probes, almost none admitted by any slot):
+  - try_table_seek_within_leaf +150.5 Ir a probe: every probe the newest slot does not answer runs the flag test and
+    next_table_seek_slot's eight-slot scan before declining, and try_table_seek_cache then scans again;
+  - +82.7 a load from splitting load_page's decode tail into a non-inlined stack_entry_for_page (load_page -243.0,
+    stack_entry_for_page +325.7);
+  - total +235 a probe against the +40 predicted.
+- Mutants (rch, rc 101): the flag never set; a resident landing on the wrong cell. Remembering the hit in slot 0 was
+  an equivalent mutant: the general hit path re-derives the same slot.
+- Retry condition: an SL2 v3 that adds no instructions to a probe no slot admits.
+  - The slot scan runs once a probe and its answer is handed to try_table_seek_cache.
+  - load_page's decode tail stays inlined.
+  - Callgrind-attributed on rowid_lookups_200k (within +0.5%) and on the join (at least 100M) before any time run.
+
 ## 2026-11-21 - WIN (landed as f921f63c4; inside its prediction): AggFinal and AggValue observe a requested cancellation with one atomic load, not two full checkpoints, per group; gb_id -724.0M Ir (bd-w4pr1.12, serial read lane round 12, lever AFC)
 
 - Target: gb_id (`SELECT count(*), sum(n) FROM (SELECT id g, count(*) n FROM t GROUP BY id)`). Callgrind on
