@@ -15,6 +15,9 @@ const transpile = async name => ts.transpileModule(
 const hostSource = await transpile("connection");
 const leaseSource = await transpile("snapshot-ownership");
 const bulkSource = await transpile("bulk");
+const resultBudget = new SourceTextModule(await transpile("result-budget"));
+await resultBudget.link(name => { throw new Error(`Unexpected result-budget dependency ${name}`); });
+await resultBudget.evaluate();
 const LOST = "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST";
 const deferred = () => {
   let resolve, reject;
@@ -104,6 +107,7 @@ async function fixture(t) {
   await lease.link(() => { throw new Error("unexpected lease dependency"); });
   await lease.evaluate();
   const port = name => {
+    if (name === "./result-budget") return resultBudget;
     const exports = ports[name];
     assert.ok(exports, `unexpected host dependency ${name}`);
     return new SyntheticModule(Object.keys(exports), function () {
@@ -123,7 +127,10 @@ async function fixture(t) {
       async execute(sql) { state.calls.push(sql); await state.execute?.(sql); return 1; },
       async executeWithParams(sql, _params) { return this.execute(sql); },
       async executeBatch(sql) { state.calls.push(sql); await state.batch?.(sql); },
-      async query(sql) { state.calls.push(sql); await state.query?.(sql); return { columns: [], rows: [] }; },
+      async query(sql) {
+        state.calls.push(sql); await state.query?.(sql);
+        return { columns: [], columnCount: 0, columnTypes: [], rows: [], rowArrays: [], changes: 0 };
+      },
       async queryWithParams(sql, _params) { return this.query(sql); },
       async export() { state.exports++; await state.export?.(); return new Uint8Array([1]); },
       async prepare(sql) {

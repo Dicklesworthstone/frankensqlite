@@ -5,6 +5,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { parameterLayout } from "../../src/bindings.ts";
 import { WorkerConnectionHost } from "../../src/connection.ts";
 
 export function sqliteSnapshotWorker(hooks = {}) {
@@ -19,12 +20,27 @@ export function sqliteSnapshotWorker(hooks = {}) {
     const db = new DatabaseSync(path);
     let closed = false;
     let exports = 0;
-    const parameters = (params) =>
-      params.map((value) => (typeof value === "boolean" ? Number(value) : value));
+    function parameters(statement, params) {
+      if (params.length === 0) return [];
+      const { names } = parameterLayout(statement.sourceSQL);
+      const named = Object.create(null);
+      const positional = [];
+      for (const [index, item] of params.entries()) {
+        const value = typeof item === "boolean" ? Number(item) : item;
+        const name = names[index];
+        // node:sqlite accepts ?, ?NNN and unused numeric slots positionally.
+        // Its :name, @name and $name parameters require an object argument.
+        if (name && !name.startsWith("?")) named[name] = value;
+        else positional.push(value);
+      }
+      if (!Object.keys(named).length) return positional;
+      statement.setAllowBareNamedParameters(false);
+      return [named, ...positional];
+    }
     const query = (sql, params = []) => {
       const statement = db.prepare(sql);
       const columns = statement.columns().map((c) => c.name);
-      const rows = statement.all(...parameters(params));
+      const rows = statement.all(...parameters(statement, params));
       return {
         columns,
         columnCount: columns.length,
@@ -59,7 +75,8 @@ export function sqliteSnapshotWorker(hooks = {}) {
       async executeWithParams(sql, params) {
         events.push(sql);
         await hooks.beforeExecute?.(sql, params, db);
-        return Number(db.prepare(sql).run(...parameters(params)).changes);
+        const statement = db.prepare(sql);
+        return Number(statement.run(...parameters(statement, params)).changes);
       },
       async executeBatch(sql) {
         events.push(sql);
@@ -93,7 +110,7 @@ export function sqliteSnapshotWorker(hooks = {}) {
           async executeWithParams(params) {
             if (freed) throw new Error("freed");
             await hooks.beforeExecute?.(sql, params, db);
-            return Number(statement.run(...parameters(params)).changes);
+            return Number(statement.run(...parameters(statement, params)).changes);
           },
           async query() {
             return query(sql);

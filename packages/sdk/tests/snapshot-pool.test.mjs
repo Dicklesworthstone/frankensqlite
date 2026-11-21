@@ -585,7 +585,10 @@ test(
     const result = await pool.refresh(await changedImage());
     assert.equal(result.snapshot.generation, 2);
     assert.equal(result.cleanupErrors.length, 2);
-    assert.ok(result.cleanupErrors.every((error) => /old close failed/.test(error.message)));
+    for (const error of result.cleanupErrors) {
+      assert.equal(error.code, "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE");
+      assert.equal(error.cause.message, "old close failed");
+    }
     assert.ok(Object.isFrozen(result));
     assert.ok(Object.isFrozen(result.cleanupErrors));
     assert.equal((await pool.query("SELECT count(*) AS n FROM items")).rows[0].n, 3);
@@ -765,7 +768,7 @@ test(
       await Promise.all(stops);
     });
     const worker = () => {
-      const listeners = { message: new Set(), error: new Set() };
+      const listeners = { message: new Set(), error: new Set(), messageerror: new Set() };
       let reference, stopped;
       const host = new WorkerConnectionHost({
         async load() {

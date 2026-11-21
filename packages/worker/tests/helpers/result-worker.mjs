@@ -28,6 +28,18 @@ async function open(bytes) {
   const path = workerData?.path ?? join(directory, "db.sqlite");
   if (bytes !== undefined) await writeFile(path, bytes);
   const db = new DatabaseSync(path);
+  if (workerData?.poolBarrier !== undefined) {
+    const gate = new Int32Array(workerData.poolBarrier);
+    db.function("__pool_hold", (id) => {
+      // Rendezvous inside SQLite so the parent can observe simultaneous SQL reads.
+      Atomics.add(gate, 1, 1);
+      Atomics.notify(gate, 1);
+      if (Atomics.wait(gate, 0, 0, 10_000) === "timed-out") {
+        throw new Error("Pool SQL rendezvous timed out");
+      }
+      return BigInt(id);
+    });
+  }
   let closed = false,
     exports = 0;
   const parameters = (values) => values.map((v) => (typeof v === "boolean" ? Number(v) : v));

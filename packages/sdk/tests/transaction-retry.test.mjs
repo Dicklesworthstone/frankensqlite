@@ -199,10 +199,6 @@ class SqliteTransport {
   }
 }
 replacements.set("./worker-client", { FrankenWorkerClient: SqliteTransport });
-replacements.set("./utils", {
-  normalizeOpenOptions: (options) => options ?? {},
-  resolveWorker: (worker) => worker,
-});
 replacements.set("./stream", {
   checkStreamCancellation() {
     throw new Error("stream is outside this test");
@@ -215,6 +211,8 @@ replacements.set("./stream", {
   },
 });
 replacements.set("@frankensqlite/worker", {
+  isSnapshotPersistenceMode: production("../../worker/src/protocol").isSnapshotPersistenceMode,
+  resolveSnapshotOwnership: production("../../worker/src/snapshot-ownership").resolveSnapshotOwnership,
   resolveRequestLimits: (limits) => limits,
   resolveResultEncoding: (encoding) => encoding ?? "objects",
   // Prepared tests below deliberately have no parameters; binding semantics

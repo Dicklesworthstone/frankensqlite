@@ -307,12 +307,15 @@ test("host releases the lease even when error serialization throws", options, as
     };
   };
   const failing = f.host.handle({ kind: "execute", requestId: 2, sql: "FAIL" });
-  const rejected = assert.rejects(failing, (e) => e === failure);
   await entered.promise;
   const later = f.host.handle(request(3));
   release.resolve();
-  await rejected;
+  const response = await failing;
+  assert.equal(response.kind, "error");
+  assert.equal(response.requestId, 2);
+  assert.equal(response.error.message, failure.message);
   assert.equal((await later).kind, "query-result");
+  assert.equal(f.host.requestQueue.pendingRequests, 0);
   assert.equal(f.host.requestQueue.pendingBytes, 0);
   await f.close();
 });

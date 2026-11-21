@@ -56,11 +56,11 @@ function fixture(data = result()) {
         FrankenDB: {
           async create() {
             creates++;
-            return core;
+            return { ...core };
           },
           async import() {
             creates++;
-            return core;
+            return { ...core };
           },
         },
       };
@@ -140,13 +140,13 @@ test("auto threshold is measured on the encoded image, including the exact bound
 
 test("reinitialization resets the encoding and invalid negotiation cannot replace a live database", async () => {
   const f = fixture();
-  await f.init("binary");
+  assert.equal((await f.init("binary")).kind, "ready");
   const before = f.counts();
   const bad = await f.init("typo");
   assert.equal(bad.error.code, "ERR_FSQLITE_RESULT_ENCODING");
   assert.deepEqual(f.counts(), before);
   assert.equal((await f.send({ kind: "query", sql: "SELECT 1" })).kind, "query-binary-result");
-  await f.init();
+  assert.equal((await f.init()).kind, "ready");
   assert.equal((await f.send({ kind: "query", sql: "SELECT 1" })).kind, "query-result");
 });
 

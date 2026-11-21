@@ -65,7 +65,7 @@ async function setup(t, { workers = 2, rows = 10, resultEncoding = "binary" } = 
         workerData: { poolBarrier: gate.buffer },
       },
     );
-    const listeners = { message: new Set(), error: new Set() },
+    const listeners = { message: new Set(), error: new Set(), messageerror: new Set() },
       audit = [];
     let terminating = false,
       hadError = false,
@@ -88,6 +88,9 @@ async function setup(t, { workers = 2, rows = 10, resultEncoding = "binary" } = 
     native.on("error", (error) => {
       hadError = true;
       for (const fn of [...listeners.error]) fn({ message: error.message });
+    });
+    native.on("messageerror", (error) => {
+      for (const fn of [...listeners.messageerror]) fn({ message: error.message });
     });
     const bridge = {
       addEventListener(type, fn) {

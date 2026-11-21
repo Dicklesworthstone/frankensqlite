@@ -217,10 +217,6 @@ class SqliteTransport {
   }
 }
 replacements.set("./worker-client", { FrankenWorkerClient: SqliteTransport });
-replacements.set("./utils", {
-  normalizeOpenOptions: (o) => o ?? {},
-  resolveWorker: (worker) => worker,
-});
 replacements.set("./stream", {
   checkStreamCancellation() {
     throw new Error("not exercised");
@@ -233,6 +229,8 @@ replacements.set("./stream", {
   },
 });
 replacements.set("@frankensqlite/worker", {
+  isSnapshotPersistenceMode: worker("protocol").isSnapshotPersistenceMode,
+  resolveSnapshotOwnership: worker("snapshot-ownership").resolveSnapshotOwnership,
   parameterLayout,
   validateManagedSql,
   resolveRequestLimits: (x) => x,
