@@ -367,6 +367,14 @@ pub trait PageReader {
     fn is_dirty(&self, _page_no: PageNumber) -> bool {
         false
     }
+
+    /// Whether [`Self::is_dirty`] reports every page the current transaction
+    /// has changed. A table descent reuses the pages already on its cursor's
+    /// stack only when it does (bd-t0g9w): a reader that cannot tell could
+    /// hand back an image the cursor's own split or delete replaced.
+    fn tracks_dirty_pages(&self) -> bool {
+        false
+    }
 }
 
 /// Trait for writing pages (needed for insert/delete).
@@ -642,6 +650,10 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
 
     fn is_dirty(&self, page_no: PageNumber) -> bool {
         self.txn.is_page_dirty(page_no)
+    }
+
+    fn tracks_dirty_pages(&self) -> bool {
+        true
     }
 }
 
@@ -5179,18 +5191,41 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(result);
         }
 
-        self.stack.clear();
+        // bd-t0g9w: the descent keeps the pages the previous one left on the
+        // stack for as long as they are the pages it visits: the entry at each
+        // depth is reused when it is the page about to be read and this
+        // transaction has not changed it, which is `load_page`'s stack-top
+        // elision applied along the whole path (stock's moveToRoot keeps the
+        // root page the same way). The first page off the previous path
+        // truncates the stack there. A stack a seek-cache or same-leaf hit left
+        // holds only the landing leaf, so it offers no root to reuse. Only a
+        // reader that tracks dirty pages qualifies (`tracks_dirty_pages`).
+        let reuse_path = self.pager.tracks_dirty_pages();
+        let mut depth = 0_usize;
         let mut current_page = self.root_page;
 
         loop {
             observe_cursor_cancellation(cx)?;
-            if self.stack.len() >= BTREE_MAX_DEPTH as usize {
+            if depth >= BTREE_MAX_DEPTH as usize {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("B-tree depth exceeds maximum of {}", BTREE_MAX_DEPTH),
                 });
             }
 
-            let entry = self.load_page(cx, current_page).await?;
+            if reuse_path
+                && self
+                    .stack
+                    .get(depth)
+                    .is_some_and(|previous| previous.page_no == current_page)
+                && !self.pager.is_dirty(current_page)
+            {
+                self.note_page_visit(current_page);
+            } else {
+                self.stack.truncate(depth);
+                let entry = self.load_page(cx, current_page).await?;
+                self.stack.push(entry);
+            }
+            let entry = &self.stack[depth];
 
             // Guard: detect is_table vs actual page-type mismatch early.
             // If the cursor was opened with is_table=true but the page is
@@ -5209,12 +5244,13 @@ impl<P: PageReader> BtCursor<P> {
             if entry.header.page_type.is_leaf() {
                 // Table leaf pages are integer-keyed by rowid, so use a
                 // bounded interpolation probe before falling back to binary.
-                let result = Self::search_integer_key_table_leaf(cx, &entry, target_rowid)?;
+                let result = Self::search_integer_key_table_leaf(cx, entry, target_rowid)?;
+                let cell_count = entry.header.cell_count;
+                // Nothing lies below a leaf: drop what the previous path had there.
+                self.stack.truncate(depth + 1);
                 match result {
                     BinarySearchResult::Found(idx) => {
-                        let mut entry = entry;
-                        entry.cell_idx = idx;
-                        self.stack.push(entry);
+                        self.stack[depth].cell_idx = idx;
                         self.at_eof = false;
                         self.remember_table_landing(target_rowid, current_page, idx);
                         self.record_point_witness(
@@ -5228,14 +5264,12 @@ impl<P: PageReader> BtCursor<P> {
                         return Ok(SeekResult::Found);
                     }
                     BinarySearchResult::NotFound(idx) => {
-                        let mut entry = entry;
-                        if idx >= entry.header.cell_count {
+                        if idx >= cell_count {
                             // Target is strictly greater than the last key on this leaf.
                             // Keep the path anchored to this right-most leaf and mark EOF,
                             // so callers (notably INSERT) still have a valid stack context.
-                            let landed_cell_idx = entry.header.cell_count.saturating_sub(1);
-                            entry.cell_idx = landed_cell_idx;
-                            self.stack.push(entry);
+                            let landed_cell_idx = cell_count.saturating_sub(1);
+                            self.stack[depth].cell_idx = landed_cell_idx;
                             self.at_eof = true;
                             self.remember_table_landing(
                                 target_rowid,
@@ -5243,8 +5277,7 @@ impl<P: PageReader> BtCursor<P> {
                                 landed_cell_idx,
                             );
                         } else {
-                            entry.cell_idx = idx;
-                            self.stack.push(entry);
+                            self.stack[depth].cell_idx = idx;
                             self.at_eof = false;
                             self.remember_table_landing(target_rowid, current_page, idx);
                         }
@@ -5262,13 +5295,12 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Interior table page: binary search to find which child to descend.
-            let child_idx = Self::binary_search_table_interior(cx, &entry, target_rowid)?;
-            let child = Self::read_interior_child_inline(&entry, child_idx)?;
-            let mut entry = entry;
-            entry.cell_idx = child_idx;
-            self.stack.push(entry);
+            let child_idx = Self::binary_search_table_interior(cx, entry, target_rowid)?;
+            let child = Self::read_interior_child_inline(entry, child_idx)?;
+            self.stack[depth].cell_idx = child_idx;
             self.issue_prefetch_hint(cx, child);
             current_page = child;
+            depth += 1;
         }
     }
 
@@ -24951,6 +24983,268 @@ mod tests {
             let before = fast.position_stamp();
             assert_eq!(fast.try_table_seek_within_leaf(&cx, 35).unwrap(), None);
             assert_eq!(fast.position_stamp(), before);
+        });
+    }
+
+    /// bd-t0g9w: pages several cursors of one transaction share, as
+    /// `SharedTxnPageIo` shares the pager's staged writes, with the set of
+    /// pages written since the last `commit`.
+    #[derive(Debug, Default)]
+    struct SharedTxnPages {
+        pages: std::collections::HashMap<u32, Vec<u8>>,
+        dirty: BTreeSet<u32>,
+    }
+
+    /// One cursor's view of [`SharedTxnPages`]: it counts its own page reads
+    /// and says whether it reports dirty pages (`tracks`), which is what lets
+    /// a table descent reuse its stack.
+    #[derive(Debug)]
+    struct SharedTxnPageView {
+        shared: Rc<RefCell<SharedTxnPages>>,
+        reads: std::cell::Cell<u64>,
+        tracks: bool,
+    }
+
+    impl SharedTxnPageView {
+        fn new(shared: &Rc<RefCell<SharedTxnPages>>, tracks: bool) -> Self {
+            Self {
+                shared: Rc::clone(shared),
+                reads: std::cell::Cell::new(0),
+                tracks,
+            }
+        }
+
+        fn store(&self, page_no: PageNumber, mut bytes: Vec<u8>) {
+            bytes.resize(USABLE as usize, 0);
+            let mut shared = self.shared.borrow_mut();
+            shared.pages.insert(page_no.get(), bytes);
+            shared.dirty.insert(page_no.get());
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PageReader for SharedTxnPageView {
+        fn read_page<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            self.reads.set(self.reads.get() + 1);
+            let bytes = self.shared.borrow().pages.get(&page_no.get()).cloned();
+            async move { bytes.ok_or_else(|| FrankenError::internal("page not found")) }
+        }
+
+        fn is_dirty(&self, page_no: PageNumber) -> bool {
+            self.shared.borrow().dirty.contains(&page_no.get())
+        }
+
+        fn tracks_dirty_pages(&self) -> bool {
+            self.tracks
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PageWriter for SharedTxnPageView {
+        fn write_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            self.store(page_no, data.to_vec());
+            async move { Ok(()) }
+        }
+
+        fn write_page_data<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+            data: PageData,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            self.store(page_no, data.as_bytes().to_vec());
+            async move { Ok(()) }
+        }
+
+        fn allocate_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            let next = self
+                .shared
+                .borrow()
+                .pages
+                .keys()
+                .max()
+                .map_or(2, |max| max + 1);
+            let page_no = PageNumber::new(next).ok_or_else(|| FrankenError::internal("page 0"));
+            if let Ok(page_no) = page_no {
+                self.store(page_no, Vec::new());
+            }
+            async move { page_no }
+        }
+
+        fn free_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            let mut shared = self.shared.borrow_mut();
+            shared.pages.remove(&page_no.get());
+            shared.dirty.insert(page_no.get());
+            async move { Ok(()) }
+        }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    fn bd_t0g9w_payload(rowid: i64) -> Vec<u8> {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let fill = (rowid % 251) as u8;
+        vec![fill; 120]
+    }
+
+    /// Seek `targets` with both cursors and require the same answers, the
+    /// same position, and the rows `rows` says the table holds.
+    ///
+    /// Each seek starts with an empty seek cache, so every probe takes the
+    /// full descent whose path reuse this keeper is about: with the eight-slot
+    /// cache (SC8 v4) a revisited target is answered from its cached leaf and
+    /// never reaches the root, and the dirty-reuse mutant then passed.
+    async fn bd_t0g9w_compare(
+        cx: &Cx,
+        reuse: &mut BtCursor<SharedTxnPageView>,
+        reference: &mut BtCursor<SharedTxnPageView>,
+        rows: &BTreeSet<i64>,
+        targets: &[i64],
+        phase: &str,
+    ) {
+        for &target in targets {
+            reuse.clear_seek_cache();
+            reference.clear_seek_cache();
+            let got = reuse.table_move_to(cx, target).await.unwrap();
+            let want = reference.table_move_to(cx, target).await.unwrap();
+            assert_eq!(got.is_found(), want.is_found(), "{phase}: target {target}");
+            assert_eq!(
+                got.is_found(),
+                rows.contains(&target),
+                "{phase}: target {target}"
+            );
+            assert_eq!(reuse.eof(), reference.eof(), "{phase}: target {target}");
+            assert_eq!(
+                reuse.current_page_path(),
+                reference.current_page_path(),
+                "{phase}: target {target}"
+            );
+            if !reuse.eof() {
+                assert_eq!(
+                    reuse.rowid(cx).await.unwrap(),
+                    reference.rowid(cx).await.unwrap(),
+                    "{phase}: target {target}"
+                );
+            }
+            if got.is_found() {
+                assert_eq!(
+                    reuse.payload(cx).await.unwrap(),
+                    bd_t0g9w_payload(target),
+                    "{phase}: target {target}"
+                );
+            }
+        }
+    }
+
+    /// bd-t0g9w: a table descent reuses the clean pages its previous descent
+    /// left on the stack, and reloads every page another cursor of the same
+    /// transaction rewrote. Cursor `reuse` reports dirty pages, cursor
+    /// `reference` does not (so it never reuses), and `writer` splits, grows
+    /// and shrinks the tree under both between their seeks. Every answer must
+    /// match the reference and the rows the table holds; a descent that reused
+    /// a rewritten root or leaf would land on a page that no longer holds the
+    /// target.
+    #[test]
+    fn test_table_descent_reuses_its_clean_path_and_reloads_pages_a_peer_cursor_rewrote() {
+        const ROWS: i64 = 1500;
+        let payload = bd_t0g9w_payload;
+
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let shared = Rc::new(RefCell::new(SharedTxnPages::default()));
+            for (page_no, bytes) in MemPageStore::with_empty_table(root, USABLE).pages {
+                shared.borrow_mut().pages.insert(page_no, bytes);
+            }
+            let mut writer =
+                BtCursor::new(SharedTxnPageView::new(&shared, false), root, USABLE, true);
+            let mut rows = BTreeSet::new();
+            for i in 1..=ROWS {
+                writer
+                    .table_insert(&cx, 3 * i, &payload(3 * i))
+                    .await
+                    .unwrap();
+                rows.insert(3 * i);
+            }
+            shared.borrow_mut().dirty.clear();
+
+            let mut reuse =
+                BtCursor::new(SharedTxnPageView::new(&shared, true), root, USABLE, true);
+            let mut reference =
+                BtCursor::new(SharedTxnPageView::new(&shared, false), root, USABLE, true);
+            // The index-driven shape: runs of ascending rowids a few leaves
+            // apart, with misses, both ends, and keys past the last row.
+            let mut targets: Vec<i64> = Vec::new();
+            for run in 0..17 {
+                targets.extend((0..80).map(|k| 3 * (1 + run + 17 * k)));
+            }
+            targets.extend([0, 1, 2, 4, 3 * ROWS, 3 * ROWS + 1, 6 * ROWS, 9 * ROWS + 7]);
+            targets.extend((0..300).map(|k| (k * 7919 + 13) % (9 * ROWS)));
+
+            // 1. A clean transaction: the reusing cursor reads far fewer pages.
+            bd_t0g9w_compare(&cx, &mut reuse, &mut reference, &rows, &targets, "clean").await;
+            let (reuse_reads, reference_reads) =
+                (reuse.pager.reads.get(), reference.pager.reads.get());
+            assert!(
+                reuse_reads + 300 < reference_reads,
+                "non-vacuity: the descents must reuse their path (reads {reuse_reads} against \
+                 {reference_reads})"
+            );
+
+            // 2. A peer cursor rewrites the tree under both, uncommitted: new
+            // rows between the old ones split every leaf and the root, and
+            // deletes empty others.
+            for i in 1..=ROWS {
+                writer
+                    .table_insert(&cx, 3 * i + 1, &payload(3 * i + 1))
+                    .await
+                    .unwrap();
+                rows.insert(3 * i + 1);
+            }
+            for i in (1..=ROWS).step_by(7) {
+                assert!(writer.table_move_to(&cx, 3 * i).await.unwrap().is_found());
+                writer.delete(&cx).await.unwrap();
+                rows.remove(&(3 * i));
+            }
+            let mut written: Vec<i64> = targets.iter().map(|target| target + 1).collect();
+            written.extend(targets.iter().copied());
+            bd_t0g9w_compare(
+                &cx,
+                &mut reuse,
+                &mut reference,
+                &rows,
+                &written,
+                "peer writes",
+            )
+            .await;
+
+            // 3. Committed: the clean path is reusable again.
+            shared.borrow_mut().dirty.clear();
+            bd_t0g9w_compare(
+                &cx,
+                &mut reuse,
+                &mut reference,
+                &rows,
+                &written,
+                "after commit",
+            )
+            .await;
         });
     }
 

@@ -4997,6 +4997,10 @@ impl PageReader for SharedTxnPageIo {
         // not a dirty-page oracle (metadata writes can also be exempt).
         self.txn.borrow().is_page_dirty(page_no)
     }
+
+    fn tracks_dirty_pages(&self) -> bool {
+        true
+    }
 }
 
 impl PageWriter for SharedTxnPageIo {
