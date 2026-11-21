@@ -443,7 +443,8 @@ fn translate_vdbe_ops(ops: &[VdbeOp]) -> Result<Vec<DifferentialOperator>, Diffe
     let mut operators = Vec::new();
     let filter_slice = &ops[rewind_idx + 1..projection_start];
     if !filter_slice.is_empty() {
-        operators.push(extract_vdbe_filter(filter_slice)?);
+        let hoisted_literals = extract_hoisted_prologue_literals(ops, rewind_idx);
+        operators.push(extract_vdbe_filter(filter_slice, &hoisted_literals)?);
     }
     operators.push(DifferentialOperator::Project {
         columns: projection_columns,
@@ -494,60 +495,149 @@ fn extract_vdbe_projection(
         .collect()
 }
 
+fn extract_filter_column(column_op: &VdbeOp) -> Result<usize, DifferentialPlanError> {
+    match column_op.opcode {
+        Opcode::Column => {
+            usize::try_from(column_op.p2).map_err(|_| DifferentialPlanError::UnsupportedProgram {
+                detail: format!("negative filter column index: {}", column_op.p2),
+            })
+        }
+        Opcode::Rowid => Err(DifferentialPlanError::UnsupportedProgram {
+            detail: "rowid filters are not yet supported by differential bootstrap".to_owned(),
+        }),
+        _ => Err(DifferentialPlanError::UnsupportedProgram {
+            detail: format!(
+                "filter must start with Column/Rowid, found {:?}",
+                column_op.opcode
+            ),
+        }),
+    }
+}
+
+/// Extract non-NULL literals hoisted into the `Init` prologue by
+/// `ProgramBuilder::finish()` (bd-w4pr1.13.31).
+///
+/// The prologue starts at `ops[0].p2` (after the main scan loop), consists
+/// exclusively of non-NULL literal loads into distinct registers, and returns
+/// before `rewind_idx` via `Opcode::Goto`. Any register written outside the
+/// prologue is excluded so stale/mutated registers cannot match.
+fn extract_hoisted_prologue_literals(
+    ops: &[VdbeOp],
+    rewind_idx: usize,
+) -> BTreeMap<i32, SqliteValue> {
+    let Some(init) = ops.first().filter(|op| op.opcode == Opcode::Init) else {
+        return BTreeMap::new();
+    };
+    let Ok(prologue_start) = usize::try_from(init.p2) else {
+        return BTreeMap::new();
+    };
+    if prologue_start <= rewind_idx || prologue_start >= ops.len() {
+        return BTreeMap::new();
+    }
+
+    let mut literals = BTreeMap::new();
+    let mut terminated_by_valid_goto = false;
+    for op in &ops[prologue_start..] {
+        if op.opcode == Opcode::Goto {
+            let valid_resume =
+                usize::try_from(op.p2).is_ok_and(|resume| resume > 0 && resume <= rewind_idx);
+            if !valid_resume {
+                return BTreeMap::new();
+            }
+            terminated_by_valid_goto = true;
+            break;
+        }
+        let Ok((reg, value)) = decode_vdbe_literal_load(op) else {
+            return BTreeMap::new();
+        };
+        if matches!(value, SqliteValue::Null) || literals.insert(reg, value).is_some() {
+            return BTreeMap::new();
+        }
+    }
+    if !terminated_by_valid_goto {
+        return BTreeMap::new();
+    }
+
+    // Drop any register that is written by an instruction in the main body
+    // before the prologue so hoisted literal lookups stay sound.
+    for op in &ops[1..prologue_start] {
+        let written_reg = match op.opcode {
+            Opcode::Column => Some(op.p3),
+            Opcode::Integer
+            | Opcode::Int64
+            | Opcode::Real
+            | Opcode::String8
+            | Opcode::Null
+            | Opcode::Rowid
+            | Opcode::Copy
+            | Opcode::SCopy => Some(op.p2),
+            _ => None,
+        };
+        if let Some(reg) = written_reg {
+            literals.remove(&reg);
+        }
+    }
+
+    literals
+}
+
 fn extract_vdbe_filter(
     filter_ops: &[VdbeOp],
+    hoisted_literals: &BTreeMap<i32, SqliteValue>,
 ) -> Result<DifferentialOperator, DifferentialPlanError> {
-    let [column_op, literal_op, is_null_op, compare_op] = filter_ops else {
-        return Err(DifferentialPlanError::UnsupportedProgram {
+    match filter_ops {
+        // Inline literal equality filter: [Column, Literal, IsNull, Ne].
+        [column_op, literal_op, is_null_op, compare_op] => {
+            let column = extract_filter_column(column_op)?;
+            let (literal_register, value) = decode_vdbe_literal_load(literal_op)?;
+            if matches!(value, SqliteValue::Null) {
+                return Err(DifferentialPlanError::UnsupportedProgram {
+                    detail: "NULL equality filters are not supported by differential bootstrap"
+                        .to_owned(),
+                });
+            }
+            if is_null_op.opcode != Opcode::IsNull || is_null_op.p1 != literal_register {
+                return Err(DifferentialPlanError::UnsupportedProgram {
+                    detail: "simple equality filter must null-check the literal register"
+                        .to_owned(),
+                });
+            }
+            if compare_op.opcode != Opcode::Ne
+                || compare_op.p1 != literal_register
+                || compare_op.p3 != column_op.p3
+            {
+                return Err(DifferentialPlanError::UnsupportedProgram {
+                    detail: "simple equality filter must compare literal register against the filter column using Ne".to_owned(),
+                });
+            }
+            Ok(DifferentialOperator::FilterEq { column, value })
+        }
+        // Hoisted literal equality filter (bd-w4pr1.13.31): [Column, Ne], with
+        // the non-NULL literal loaded once in the Init prologue.
+        [column_op, compare_op] => {
+            let column = extract_filter_column(column_op)?;
+            if compare_op.opcode != Opcode::Ne || compare_op.p3 != column_op.p3 {
+                return Err(DifferentialPlanError::UnsupportedProgram {
+                    detail: "hoisted equality filter must compare hoisted literal register against the filter column using Ne".to_owned(),
+                });
+            }
+            let value = hoisted_literals.get(&compare_op.p1).cloned().ok_or_else(|| {
+                DifferentialPlanError::UnsupportedProgram {
+                    detail: format!(
+                        "hoisted equality filter register {} was not loaded as a non-NULL literal in the Init prologue",
+                        compare_op.p1
+                    ),
+                }
+            })?;
+            Ok(DifferentialOperator::FilterEq { column, value })
+        }
+        _ => Err(DifferentialPlanError::UnsupportedProgram {
             detail: format!(
-                "expected 4 opcodes for simple equality filter, found {}",
+                "expected 2 (hoisted literal) or 4 (inline literal) opcodes for simple equality filter, found {}",
                 filter_ops.len()
             ),
-        });
-    };
-
-    let column = match column_op.opcode {
-        Opcode::Column => usize::try_from(column_op.p2).map_err(|_| {
-            DifferentialPlanError::UnsupportedProgram {
-                detail: format!("negative filter column index: {}", column_op.p2),
-            }
-        })?,
-        Opcode::Rowid => {
-            return Err(DifferentialPlanError::UnsupportedProgram {
-                detail: "rowid filters are not yet supported by differential bootstrap".to_owned(),
-            });
-        }
-        _ => {
-            return Err(DifferentialPlanError::UnsupportedProgram {
-                detail: format!(
-                    "filter must start with Column/Rowid, found {:?}",
-                    column_op.opcode
-                ),
-            });
-        }
-    };
-
-    let (literal_register, value) = decode_vdbe_literal_load(literal_op)?;
-    if matches!(value, SqliteValue::Null) {
-        return Err(DifferentialPlanError::UnsupportedProgram {
-            detail: "NULL equality filters are not supported by differential bootstrap".to_owned(),
-        });
+        }),
     }
-    if is_null_op.opcode != Opcode::IsNull || is_null_op.p1 != literal_register {
-        return Err(DifferentialPlanError::UnsupportedProgram {
-            detail: "simple equality filter must null-check the literal register".to_owned(),
-        });
-    }
-    if compare_op.opcode != Opcode::Ne
-        || compare_op.p1 != literal_register
-        || compare_op.p3 != column_op.p3
-    {
-        return Err(DifferentialPlanError::UnsupportedProgram {
-            detail: "simple equality filter must compare literal register against the filter column using Ne".to_owned(),
-        });
-    }
-
-    Ok(DifferentialOperator::FilterEq { column, value })
 }
 
 fn decode_vdbe_literal_load(op: &VdbeOp) -> Result<(i32, SqliteValue), DifferentialPlanError> {
@@ -1617,6 +1707,392 @@ mod tests {
 
         assert!(matches!(
             DifferentialAutomaton::from_vdbe_ops(program.ops(), schema[0].columns.len()),
+            Err(DifferentialPlanError::UnsupportedProgram { .. })
+        ));
+    }
+
+    #[test]
+    fn differential_automaton_bootstraps_inline_four_opcode_filter_eq() {
+        let ops = vec![
+            VdbeOp {
+                opcode: Opcode::Init,
+                p1: 0,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::OpenRead,
+                p1: 0,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Rewind,
+                p1: 0,
+                p2: 10,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 0,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Integer,
+                p1: 2,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::IsNull,
+                p1: 2,
+                p2: 9,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Ne,
+                p1: 2,
+                p2: 9,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 1,
+                p3: 3,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::ResultRow,
+                p1: 3,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Next,
+                p1: 0,
+                p2: 3,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+        ];
+        let automaton = DifferentialAutomaton::from_vdbe_ops(&ops, 2).unwrap();
+        let rows = vec![
+            WeightedRow::new(
+                vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
+                1,
+            ),
+            WeightedRow::new(
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
+                1,
+            ),
+        ];
+        assert_eq!(
+            automaton.execute(&rows).unwrap(),
+            vec![WeightedRow::new(vec![SqliteValue::Text("bob".into())], 1)]
+        );
+    }
+
+    #[test]
+    fn differential_automaton_bootstrap_rejects_malformed_hoisted_filters() {
+        // Negative control 1: 2-opcode filter whose literal register is never
+        // loaded in the Init prologue must be rejected.
+        let missing_prologue_ops = vec![
+            VdbeOp {
+                opcode: Opcode::Init,
+                p1: 0,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::OpenRead,
+                p1: 0,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Rewind,
+                p1: 0,
+                p2: 8,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 0,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Ne,
+                p1: 9,
+                p2: 7,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 1,
+                p3: 3,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::ResultRow,
+                p1: 3,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Next,
+                p1: 0,
+                p2: 3,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+        ];
+        assert!(matches!(
+            DifferentialAutomaton::from_vdbe_ops(&missing_prologue_ops, 2),
+            Err(DifferentialPlanError::UnsupportedProgram { .. })
+        ));
+
+        // Negative control 2: Init prologue loading NULL into the filter
+        // literal register must be rejected.
+        let null_prologue_ops = vec![
+            VdbeOp {
+                opcode: Opcode::Init,
+                p1: 0,
+                p2: 9,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::OpenRead,
+                p1: 0,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Rewind,
+                p1: 0,
+                p2: 8,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 0,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Ne,
+                p1: 9,
+                p2: 7,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 1,
+                p3: 3,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::ResultRow,
+                p1: 3,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Next,
+                p1: 0,
+                p2: 3,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Null,
+                p1: 0,
+                p2: 9,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Goto,
+                p1: 0,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+        ];
+        assert!(matches!(
+            DifferentialAutomaton::from_vdbe_ops(&null_prologue_ops, 2),
+            Err(DifferentialPlanError::UnsupportedProgram { .. })
+        ));
+
+        // Negative control 3: 3-opcode filter slice must be rejected.
+        let three_opcode_ops = vec![
+            VdbeOp {
+                opcode: Opcode::Init,
+                p1: 0,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::OpenRead,
+                p1: 0,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Rewind,
+                p1: 0,
+                p2: 9,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 0,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Integer,
+                p1: 2,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Ne,
+                p1: 2,
+                p2: 8,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 1,
+                p3: 3,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::ResultRow,
+                p1: 3,
+                p2: 1,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Next,
+                p1: 0,
+                p2: 3,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+        ];
+        assert!(matches!(
+            DifferentialAutomaton::from_vdbe_ops(&three_opcode_ops, 2),
             Err(DifferentialPlanError::UnsupportedProgram { .. })
         ));
     }

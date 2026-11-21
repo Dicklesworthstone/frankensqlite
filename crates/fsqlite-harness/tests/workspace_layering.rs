@@ -836,38 +836,111 @@ fn test_bd_2v8x_unit_compliance_gate() -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn prop_bd_2v8x_structure_compliance() -> Result<(), String> {
-    // TOML itself rejects a feature defined twice. Beyond that, every
-    // `dep:NAME` a feature enables must be an optional dependency, or the
-    // feature cannot gate it.
-    let manifest = parse_manifest(&fsqlite_cargo_toml()?, "fsqlite_cargo_toml")?;
+/// Return every `feature -> dep:NAME` entry whose dependency is missing or not
+/// declared `optional = true` across `[dependencies]` and every
+/// `[target.<cfg>.dependencies]` table.
+fn find_ungated_dep_features(manifest: &toml::Table) -> Result<Vec<String>, String> {
     let features = manifest
         .get("features")
         .and_then(toml::Value::as_table)
-        .ok_or("fsqlite Cargo.toml has no [features]")?;
-    let dependencies = manifest.get("dependencies").and_then(toml::Value::as_table);
+        .ok_or("Cargo.toml has no [features]")?;
+
+    let mut dep_tables: Vec<&toml::Table> = Vec::new();
+    if let Some(dependencies) = manifest.get("dependencies").and_then(toml::Value::as_table) {
+        dep_tables.push(dependencies);
+    }
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for target_cfg in targets.values() {
+            if let Some(target_deps) = target_cfg
+                .get("dependencies")
+                .and_then(toml::Value::as_table)
+            {
+                dep_tables.push(target_deps);
+            }
+        }
+    }
+
     let mut ungated = Vec::new();
     for name in features.keys() {
         for member in feature_members(features, name).unwrap_or_default() {
             let Some(dependency) = member.strip_prefix("dep:") else {
                 continue;
             };
-            let optional = dependencies
-                .and_then(|dependencies| dependencies.get(dependency))
-                .and_then(|spec| spec.get("optional"))
-                .and_then(toml::Value::as_bool);
-            if optional != Some(true) {
+            let specs: Vec<&toml::Value> = dep_tables
+                .iter()
+                .filter_map(|table| table.get(dependency))
+                .collect();
+            let all_optional = !specs.is_empty()
+                && specs
+                    .iter()
+                    .all(|spec| spec.get("optional").and_then(toml::Value::as_bool) == Some(true));
+            if !all_optional {
                 ungated.push(format!("{name} -> {member}"));
             }
         }
     }
+    Ok(ungated)
+}
+
+#[test]
+fn prop_bd_2v8x_structure_compliance() -> Result<(), String> {
+    // TOML itself rejects a feature defined twice. Beyond that, every
+    // `dep:NAME` a feature enables must be an optional dependency (in
+    // `[dependencies]` or `[target.<cfg>.dependencies]`), or the feature
+    // cannot gate it.
+    let manifest = parse_manifest(&fsqlite_cargo_toml()?, "fsqlite_cargo_toml")?;
+    let ungated = find_ungated_dep_features(&manifest)?;
 
     assert!(
         ungated.is_empty(),
         "bead_id={DEP_BUILD_BEAD_ID} case=structure_compliance non_optional_dep_features={ungated:?}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn prop_bd_2v8x_structure_compliance_checks_target_dependencies() -> Result<(), String> {
+    let valid_target_optional: toml::Table = toml::from_str(
+        r#"
+[dependencies]
+alpha = { version = "1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+stacker = { version = "0.1", optional = true }
+
+[features]
+native = ["dep:alpha", "dep:stacker"]
+"#,
+    )
+    .map_err(|e| format!("parse valid manifest: {e}"))?;
+    assert!(find_ungated_dep_features(&valid_target_optional)?.is_empty());
+
+    // Planted negative controls: target-scoped non-optional dep, missing dep,
+    // and mixed optional-in-target + non-optional-in-top-level dep must all fail.
+    let planted_non_optional_target: toml::Table = toml::from_str(
+        r#"
+[dependencies]
+mixed = { version = "1" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+stacker = { version = "0.1" }
+mixed = { version = "1", optional = true }
+
+[features]
+native = ["dep:stacker", "dep:ghost", "dep:mixed"]
+"#,
+    )
+    .map_err(|e| format!("parse negative manifest: {e}"))?;
+    let ungated = find_ungated_dep_features(&planted_non_optional_target)?;
+    assert_eq!(
+        ungated,
+        vec![
+            "native -> dep:stacker".to_owned(),
+            "native -> dep:ghost".to_owned(),
+            "native -> dep:mixed".to_owned(),
+        ]
+    );
     Ok(())
 }
 
