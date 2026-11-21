@@ -1,5 +1,18 @@
 # State Of The Codebase And Next Steps
 
+## Compound writes and historical reads, 2026-11-21
+
+Stock SQLite reopened a database written by the previous engine and found
+`5,5` after a compound INSERT that should have stored `5,7,10`. Both files
+passed `integrity_check`. On `39ef96b0f`, all four compound INSERT tests
+passed against bundled SQLite 3.54.1, including both database creators,
+recursive CTEs, bound RETURNING and rollback after a later row failed.
+The compound reader now also applies the snapshot specified by each SELECT
+arm. All four historical-query tests passed, including reads at different
+commit sequences in one query and restoration of the live view afterward
+(Linux RCH `30097323753219011`, `bd-wiffk`, `bd-cglsc`). Durable history
+across file reopen remains open on `bd-cd7jt`.
+
 ## Compatibility and concurrent writers, 2026-11-20
 
 Two Linux CLI processes opened the same WAL database with the default settings.
