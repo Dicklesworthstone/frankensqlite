@@ -280,7 +280,11 @@ async fn check_cte_insert_compound_sources(file_backed: bool, prepared: bool) {
             case.name, case.sql
         );
         let expected_changes = r.execute(case.sql, []).expect("stock INSERT succeeds");
-        assert_eq!(expected_changes, case.expected.len(), "stock fixture: {label}");
+        assert_eq!(
+            expected_changes,
+            case.expected.len(),
+            "stock fixture: {label}"
+        );
         let actual_changes = if prepared {
             f.prepare(case.sql).await.unwrap().execute().await
         } else {
@@ -303,7 +307,11 @@ async fn check_cte_insert_compound_sources(file_backed: bool, prepared: bool) {
         assert_eq!(expected, pinned, "stock fixture: {label}");
         assert_eq!(fq(&f, query).await, expected, "written rows: {label}");
         assert_eq!(actual_changes, expected_changes, "changed rows: {label}");
-        assert_eq!(fq(&f, "SELECT changes()").await, rq(&r, "SELECT changes()"), "{label}");
+        assert_eq!(
+            fq(&f, "SELECT changes()").await,
+            rq(&r, "SELECT changes()"),
+            "{label}"
+        );
     }
     f.close().await.unwrap();
 }

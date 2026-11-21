@@ -85946,6 +85946,7 @@ impl Connection {
                 &schema,
                 active_state.as_ref().map(|(fl, _)| fl.as_slice()),
                 &mut owners,
+                None,
             )
             .await
         })
@@ -86055,6 +86056,7 @@ impl Connection {
                     &schema,
                     None,
                     &mut owners,
+                    None,
                 )
                 .await?;
 
@@ -86864,6 +86866,85 @@ impl Connection {
         Ok(serialize_record_with_encoding(&key_values, encoding))
     }
 
+    /// The WITHOUT ROWID table B-tree compares only its primary-key prefix.
+    /// Read the actual declaration so a table-level COLLATE override is not
+    /// lost through the compact TableSchema's column-name-only PK metadata.
+    fn integrity_without_rowid_primary_key(&self, table: &TableSchema) -> Result<IndexSchema> {
+        let sql = self
+            .original_ddl_sql
+            .borrow()
+            .get(&table.name.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("WITHOUT ROWID table `{}` has no stored definition", table.name),
+            })?;
+        let statement = parse_single_statement(&sql)?;
+        let Statement::CreateTable(create) = statement else {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("WITHOUT ROWID table `{}` has an invalid definition", table.name),
+            });
+        };
+        let CreateTableBody::Columns { columns, constraints } = &create.body else {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("WITHOUT ROWID table `{}` has no primary key", table.name),
+            });
+        };
+        let primary = implicit_autoindex_layout(columns, constraints, true)
+            .map_err(|error| FrankenError::DatabaseCorrupt {
+                detail: format!("WITHOUT ROWID table `{}` has an invalid primary key: {error}", table.name),
+            })?
+            .into_iter()
+            .find(|slot| slot.hidden_without_rowid_primary_key)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("WITHOUT ROWID table `{}` has no primary key", table.name),
+            })?
+            .definition;
+        // SQLite's WITHOUT ROWID conversion removes repeated key terms with
+        // the same column and effective collation, regardless of direction.
+        // Keep the first term's direction, and retain repeated columns when
+        // their collations differ: those occupy distinct record fields.
+        let mut primary_columns = Vec::<String>::new();
+        let mut key_sort_directions = Vec::new();
+        let mut key_collations = Vec::<Option<String>>::new();
+        for ((column, direction), collation) in primary
+            .columns
+            .into_iter()
+            .zip(primary.key_sort_directions)
+            .zip(primary.key_collations)
+        {
+            if primary_columns
+                .iter()
+                .zip(&key_collations)
+                .any(|(existing_column, existing_collation)| {
+                    existing_column.eq_ignore_ascii_case(&column)
+                        && implicit_autoindex_collations_match(
+                            existing_collation.as_deref(),
+                            collation.as_deref(),
+                        )
+                })
+            {
+                continue;
+            }
+            primary_columns.push(column);
+            key_sort_directions.push(direction);
+            // The layout has already inherited column collations unless a
+            // PK term overrides them. Make its remaining default explicit so
+            // root execution metadata cannot override the PK declaration.
+            key_collations.push(Some(collation.unwrap_or_else(|| "BINARY".to_owned())));
+        }
+        Ok(IndexSchema {
+            name: table.name.clone(),
+            root_page: table.root_page,
+            columns: primary_columns,
+            key_expressions: primary.key_expressions,
+            key_sort_directions,
+            key_collations,
+            where_clause: None,
+            is_unique: true,
+            conflict_action: primary.conflict_action,
+        })
+    }
+
     fn compare_index_key_values_for_integrity(
         &self,
         index: &IndexSchema,
@@ -86926,10 +87007,14 @@ impl Connection {
         let text_encoding = self.db_text_encoding.get();
         let shared_len = lhs.len().min(rhs.len());
         for idx in 0..shared_len {
-            let collation = collations
-                .and_then(|collations| collations.get(idx))
-                .and_then(Option::as_deref)
-                .or_else(|| index.key_term_collation(idx));
+            // Logical key terms come from the index's declaration. The
+            // execution metadata additionally describes appended primary-key
+            // fields on WITHOUT ROWID secondary indexes.
+            let collation = index.key_term_collation(idx).or_else(|| {
+                collations
+                    .and_then(|collations| collations.get(idx))
+                    .and_then(Option::as_deref)
+            });
             let mut ord = match (collation, &lhs[idx], &rhs[idx]) {
                 (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right))
                     if !(coll_name.eq_ignore_ascii_case("BINARY")
@@ -86944,11 +87029,15 @@ impl Connection {
                 }
                 _ => lhs[idx].partial_cmp(&rhs[idx])?,
             };
-            if descending
-                .and_then(|descending| descending.get(idx))
-                .copied()
-                .unwrap_or_else(|| index.key_term_descending(idx))
-            {
+            let is_descending = if idx < index.key_term_count() {
+                index.key_term_descending(idx)
+            } else {
+                descending
+                    .and_then(|descending| descending.get(idx))
+                    .copied()
+                    .unwrap_or(false)
+            };
+            if is_descending {
                 ord = ord.reverse();
             }
             if ord != std::cmp::Ordering::Equal {
@@ -87022,6 +87111,7 @@ impl Connection {
         local_size: u32,
         owner: &str,
         mut owners: Option<&mut PageOwnershipSink<'_>>,
+        mut payload: Option<&mut Vec<u8>>,
     ) -> Result<()> {
         let usable_size = page_size.usable(reserved_per_page);
         if usable_size <= 4 {
@@ -87081,7 +87171,11 @@ impl Connection {
                 });
             }
 
-            remaining = remaining.saturating_sub(remaining.min(available));
+            let consumed = remaining.min(available);
+            if let Some(payload) = payload.as_deref_mut() {
+                payload.extend_from_slice(&page_bytes[4..4 + consumed]);
+            }
+            remaining -= consumed;
             current = PageNumber::new(next_raw);
 
             if remaining == 0 && current.is_some() {
@@ -87112,7 +87206,13 @@ impl Connection {
     /// full `integrity_check`).  When `None`, the walk still validates
     /// every page's structural integrity but skips the ownership HashMap
     /// and orphan detection — this is the `quick_check` path.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Key checks are separate from ownership-only callers (migration and
+    /// bounded ownership accounting). Both PRAGMAs check rowid bounds;
+    /// only full integrity_check supplies an index comparator, matching
+    /// stock's quick_check omission of index ordering/concordance checks.
+    /// Index records decode byte-preserving, as the cursor comparator does.
+    #[allow(clippy::too_many_arguments, clippy::disallowed_methods)]
     // bd-h9o9r: `txn` is not used mutably today, but the signature is shared
     // by the recursive walk and its seven call sites in integrity checking;
     // loosening it ripples through the whole family for zero behavior gain.
@@ -87126,12 +87226,22 @@ impl Connection {
         page_no: PageNumber,
         owner: &str,
         mut owners: Option<&mut PageOwnershipSink<'_>>,
+        check_key_order: bool,
+        index_order: Option<(&Self, &IndexSchema, Option<usize>)>,
     ) -> Result<()> {
+        #[derive(Clone)]
+        enum IntegrityKey {
+            Rowid(i64),
+            Index(Arc<[SqliteValue]>),
+        }
+
         enum WalkTask {
             Btree {
                 page_no: PageNumber,
                 owner: String,
                 is_root: bool,
+                lower_key: Option<IntegrityKey>,
+                upper_key: Option<IntegrityKey>,
             },
             Overflow {
                 first_overflow: PageNumber,
@@ -87141,18 +87251,38 @@ impl Connection {
             },
         }
 
+        let root_page = page_no;
+        let compare_keys = |lhs: &IntegrityKey, rhs: &IntegrityKey| {
+            match (lhs, rhs, index_order) {
+                (IntegrityKey::Rowid(lhs), IntegrityKey::Rowid(rhs), _) => Some(lhs.cmp(rhs)),
+                (IntegrityKey::Index(lhs), IntegrityKey::Index(rhs), Some((connection, index, key_fields))) => {
+                    let (lhs, rhs) = if let Some(key_fields) = key_fields {
+                        (lhs.get(..key_fields)?, rhs.get(..key_fields)?)
+                    } else {
+                        (lhs.as_ref(), rhs.as_ref())
+                    };
+                    connection.compare_index_key_values_for_integrity(index, lhs, rhs)
+                }
+                _ => None,
+            }
+        };
+        let mut tree_is_table = None;
         let mut pending = vec![WalkTask::Btree {
             page_no,
             owner: owner.to_owned(),
             is_root: true,
+            lower_key: None,
+            upper_key: None,
         }];
         while let Some(task) = pending.pop() {
-            let (page_no, owner, is_root) = match task {
+            let (page_no, owner, is_root, lower_key, upper_key) = match task {
                 WalkTask::Btree {
                     page_no,
                     owner,
                     is_root,
-                } => (page_no, owner, is_root),
+                    lower_key,
+                    upper_key,
+                } => (page_no, owner, is_root, lower_key, upper_key),
                 WalkTask::Overflow {
                     first_overflow,
                     payload_size,
@@ -87170,6 +87300,7 @@ impl Connection {
                         local_size,
                         &owner,
                         owners.as_deref_mut(),
+                        None,
                     )
                     .await?;
                     continue;
@@ -87228,6 +87359,13 @@ impl Connection {
                         ),
                     })?;
 
+            if check_key_order && tree_is_table.is_some_and(|is_table| is_table != page_type.is_table()) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("Tree {} page {}: inconsistent B-tree page type", root_page.get(), page_no.get()),
+                });
+            }
+            tree_is_table.get_or_insert(page_type.is_table());
+            let mut previous_key = lower_key;
             let mut next_tasks = Vec::new();
             for (cell_idx, cell_pointer) in cell_pointers.iter().enumerate() {
                 let cell = fsqlite_btree::CellRef::parse(
@@ -87243,14 +87381,74 @@ impl Connection {
                     ),
                 })?;
 
+                let current_key = if check_key_order && page_type.is_table() {
+                    Some(IntegrityKey::Rowid(cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("Tree {} page {} cell {cell_idx}: missing rowid", root_page.get(), page_no.get()),
+                    })?))
+                } else if check_key_order && index_order.is_some() {
+                    let mut payload = cell.local_payload(page_bytes).to_vec();
+                    if let Some(first_overflow) = cell.overflow_page {
+                        Self::walk_integrity_overflow_chain(
+                            cx,
+                            txn,
+                            page_size,
+                            reserved_per_page,
+                            total_pages,
+                            first_overflow,
+                            cell.payload_size,
+                            cell.local_size,
+                            &format!("{owner} -> cell[{cell_idx}]"),
+                            owners.as_deref_mut(),
+                            Some(&mut payload),
+                        ).await?;
+                    }
+                    let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("Tree {} page {} cell {cell_idx}: invalid index record ({owner})", root_page.get(), page_no.get()),
+                    })?;
+                    if index_order.and_then(|(_, _, fields)| fields).is_some_and(|fields| values.len() < fields) {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("Tree {} page {} cell {cell_idx}: index record has too few key fields ({owner})", root_page.get(), page_no.get()),
+                        });
+                    }
+                    Some(IntegrityKey::Index(Arc::from(values)))
+                } else {
+                    None
+                };
+                if let Some(key) = current_key.as_ref() {
+                    let below_lower = previous_key.as_ref().is_some_and(|lower| {
+                        compare_keys(lower, key) != Some(std::cmp::Ordering::Less)
+                    });
+                    let above_upper = upper_key.as_ref().is_some_and(|upper| {
+                        let order = compare_keys(key, upper);
+                        if matches!(key, IntegrityKey::Rowid(_)) {
+                            !matches!(order, Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
+                        } else {
+                            order != Some(std::cmp::Ordering::Less)
+                        }
+                    });
+                    if below_lower || above_upper {
+                        let key_description = match key {
+                            IntegrityKey::Rowid(rowid) => format!("Rowid {rowid}"),
+                            IntegrityKey::Index(_) => "index key".to_owned(),
+                        };
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("Tree {} page {} cell {cell_idx}: {key_description} out of order ({owner})", root_page.get(), page_no.get()),
+                        });
+                    }
+                }
+
                 if let Some(left_child) = cell.left_child {
                     next_tasks.push(WalkTask::Btree {
                         page_no: left_child,
                         owner: format!("{owner} -> child[{cell_idx}]"),
                         is_root: false,
+                        lower_key: previous_key.clone(),
+                        upper_key: current_key.clone(),
                     });
                 }
-                if let Some(first_overflow) = cell.overflow_page {
+                if let Some(first_overflow) = cell.overflow_page
+                    && !(check_key_order && !page_type.is_table() && index_order.is_some())
+                {
                     next_tasks.push(WalkTask::Overflow {
                         first_overflow,
                         payload_size: cell.payload_size,
@@ -87258,12 +87456,15 @@ impl Connection {
                         owner: format!("{owner} -> cell[{cell_idx}]"),
                     });
                 }
+                previous_key = current_key;
             }
             if let Some(right_child) = header.right_most_child {
                 next_tasks.push(WalkTask::Btree {
                     page_no: right_child,
                     owner: format!("{owner} -> right_child"),
                     is_root: false,
+                    lower_key: previous_key,
+                    upper_key,
                 });
             }
             pending.extend(next_tasks.into_iter().rev());
@@ -87296,6 +87497,7 @@ impl Connection {
         schema: &[TableSchema],
         live_freelist: Option<&[PageNumber]>,
         owners: &mut PageOwnershipSink<'_>,
+        integrity_connection: Option<&Self>,
     ) -> Result<()> {
         if total_pages == 0 {
             return Ok(());
@@ -87329,6 +87531,8 @@ impl Connection {
             PageNumber::ONE,
             "sqlite_master root",
             Some(&mut *owners),
+            integrity_connection.is_some(),
+            None,
         )
         .await?;
 
@@ -87422,6 +87626,16 @@ impl Connection {
             }
             let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
             if table_root != PageNumber::ONE {
+                let primary_index = if table.without_rowid {
+                    integrity_connection
+                        .map(|connection| connection.integrity_without_rowid_primary_key(table))
+                        .transpose()?
+                } else {
+                    None
+                };
+                let primary_order = primary_index.as_ref().and_then(|index| {
+                    integrity_connection.map(|connection| (connection, index, Some(index.key_term_count())))
+                });
                 Self::walk_integrity_btree_pages(
                     cx,
                     txn,
@@ -87431,6 +87645,8 @@ impl Connection {
                     table_root,
                     &format!("table `{}` root", table.name),
                     Some(&mut *owners),
+                    integrity_connection.is_some(),
+                    primary_order,
                 )
                 .await?;
             }
@@ -87447,6 +87663,8 @@ impl Connection {
                     index_root,
                     &format!("index `{}` root", index.name),
                     Some(&mut *owners),
+                    integrity_connection.is_some(),
+                    integrity_connection.map(|connection| (connection, index, None)),
                 )
                 .await?;
             }
@@ -87567,6 +87785,7 @@ impl Connection {
             &schema,
             None,
             &mut owners,
+            None,
         )
         .await?;
 
@@ -87624,6 +87843,7 @@ impl Connection {
                 &schema,
                 live_freelist,
                 &mut owners,
+                Some(self),
             )
             .await?;
         } else {
@@ -87640,6 +87860,8 @@ impl Connection {
                 total_pages,
                 PageNumber::ONE,
                 "sqlite_master root",
+                None,
+                true,
                 None,
             )
             .await?;
@@ -87659,6 +87881,8 @@ impl Connection {
                         table_root,
                         &format!("table `{}`", table.name),
                         None,
+                        true,
+                        None,
                     )
                     .await?;
                 }
@@ -87673,6 +87897,8 @@ impl Connection {
                         total_pages,
                         index_root,
                         &format!("index `{}`", index.name),
+                        None,
+                        true,
                         None,
                     )
                     .await?;
@@ -87741,7 +87967,25 @@ impl Connection {
             // either SQLite's NULL placeholder or a full-width FrankenSQLite
             // rowid value; materialize the physical rowid before comparing
             // expected index keys against persisted indexes.
-            let max_payload_columns = table.columns.len();
+            let max_payload_columns = if uses_index_btree && !quick {
+                let primary = self.integrity_without_rowid_primary_key(table)?;
+                // A primary-key column repeated under different collations
+                // occupies multiple record fields. Non-key columns follow
+                // the physical PK prefix once each.
+                primary.key_term_count()
+                    + table
+                        .columns
+                        .iter()
+                        .filter(|column| {
+                            !primary
+                                .columns
+                                .iter()
+                                .any(|key| key.eq_ignore_ascii_case(&column.name))
+                        })
+                        .count()
+            } else {
+                table.columns.len()
+            };
 
             if uses_index_btree {
                 let mut cursor = Self::new_header_btree_cursor(
@@ -88231,6 +88475,13 @@ impl Connection {
                             index.name, index.root_page
                         ),
                     })?;
+
+                // Stock omits secondary-index key-order checks from quick_check
+                // for WITHOUT ROWID tables too. Keep the structural root checks
+                // above, while skipping the key comparison walk below.
+                if quick {
+                    continue;
+                }
 
                 let mut cursor = Self::new_header_btree_index_cursor(
                     txn,
@@ -288714,6 +288965,7 @@ mod pager_routing_tests {
                     &schema,
                     Some(&free),
                     &mut owners,
+                    None,
                 )
                 .await
                 .unwrap_err();
