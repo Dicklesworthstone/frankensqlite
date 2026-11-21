@@ -25,9 +25,7 @@ async function threaded(t) {
       if(request.fixture==='crash'){throw new Error('intentional queue test worker crash');}
       void f.host.handle(request).then(response=>parentPort.postMessage(response),error=>{throw error;});
     });`;
-  const native = new Worker(new URL(`data:text/javascript,${encodeURIComponent(script)}`), {
-    execArgv: process.execArgv,
-  });
+  const native = new Worker(new URL(`data:text/javascript,${encodeURIComponent(script)}`));
   t.after(() => native.terminate());
   const history = [],
     waiters = [],

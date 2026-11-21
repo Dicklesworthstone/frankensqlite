@@ -61,9 +61,7 @@ async function thread(t) {
     });
     parentPort.postMessage({fixture:'ready'});
   `;
-  const native = new Worker(new URL("data:text/javascript," + encodeURIComponent(script)), {
-    execArgv: process.execArgv,
-  });
+  const native = new Worker(new URL("data:text/javascript," + encodeURIComponent(script)));
   t.after(() => native.terminate());
   const messages = [],
     waiters = [],

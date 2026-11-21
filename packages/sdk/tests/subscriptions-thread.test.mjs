@@ -43,9 +43,7 @@ async function threaded(t, wal = false) {
     });
     parentPort.postMessage({fixture:'ready'});
   `;
-  const native = new Worker(new URL("data:text/javascript," + encodeURIComponent(script)), {
-    execArgv: process.execArgv,
-  });
+  const native = new Worker(new URL("data:text/javascript," + encodeURIComponent(script)));
   const history = [],
     waiters = [],
     wrappers = new Map();

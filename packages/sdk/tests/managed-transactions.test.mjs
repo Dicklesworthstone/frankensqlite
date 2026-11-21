@@ -704,7 +704,6 @@ async function threadedManaged(t, config = {}, limit = 4) {
       void f.host.handle(request).then(response=>parentPort.postMessage(response),error=>{throw error;});
     });`;
   const native = new Worker(new URL(`data:text/javascript,${encodeURIComponent(script)}`), {
-    execArgv: process.execArgv,
     workerData: { config, limit },
   });
   t.after(() => native.terminate());

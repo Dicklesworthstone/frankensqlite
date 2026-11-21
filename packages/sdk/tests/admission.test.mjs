@@ -562,7 +562,6 @@ async function threaded(t, hostLimits = {}, clientLimits = {}, pause = true) {
     });
   `;
   const native = new Worker(new URL(`data:text/javascript,${encodeURIComponent(script)}`), {
-    execArgv: process.execArgv,
     workerData: { hostLimits, pause },
   });
   t.after(async () => {

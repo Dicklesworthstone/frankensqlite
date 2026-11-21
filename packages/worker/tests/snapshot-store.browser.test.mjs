@@ -18,6 +18,20 @@ let context;
 let url;
 
 const fixture = `
+export class SqlWorker extends Worker {
+  requests = [];
+  constructor(fault) {
+    super(fault ? "/fault-worker.js?" + fault : "/packages/worker/src/worker.ts", { type: "module" });
+  }
+  postMessage(request, ...rest) {
+    this.requests.push([request.requestId, request.kind, request.action]);
+    super.postMessage(request, ...rest);
+  }
+}
+export async function rejection(operation) {
+  try { await operation; } catch (error) { return error; }
+  throw new Error("Expected the SDK operation to reject");
+}
 export * from "/packages/worker/src/snapshot-store.ts";
 export { OpfsSnapshotStore } from "/packages/worker/src/opfs-snapshot-store.ts";
 export function image(marker = 7, pageSize = 512) {
@@ -76,6 +90,28 @@ before(async () => {
         return;
       }
       response.setHeader("Content-Type", "text/javascript");
+      if (pathname === "/fault-worker.js") {
+        response.end('import "/fault-listener.js"; import "/packages/worker/src/worker.ts";');
+        return;
+      }
+      if (pathname === "/fault-listener.js") {
+        response.end(`
+          let failed = false;
+          addEventListener("message", event => {
+            if (failed) {
+              event.stopImmediatePropagation();
+              return;
+            }
+            const r = event.data;
+            if ((location.search === "?query" && r.kind === "query" && r.sql === "SELECT 99")
+                || (location.search === "?rollback" && r.kind === "transaction" && r.action === "rollback")) {
+              failed = true;
+              event.stopImmediatePropagation();
+              throw new Error("intentional worker failure on " + r.kind);
+            }
+          });`);
+        return;
+      }
       if (pathname === "/fixture.js") {
         response.end(fixture);
         return;
@@ -130,6 +166,182 @@ async function run(body, arg) {
     await page.close();
   }
 }
+
+const wasmLifecycle = {
+  skip: wasmModule ? false : "Set FSQLITE_WASM_BROWSER_MODULE to a web-target WASM binding",
+  timeout: 30_000,
+};
+
+test("SDK close drains posted WASM SQL and refuses retained handles", wasmLifecycle, async (t) => {
+  const result = await run(async () => {
+    const { FrankenDB } = await import("/packages/sdk/src/database.ts");
+    const { SqlWorker, rejection } = await import("/fixture.js");
+    const worker = new SqlWorker();
+    const db = await FrankenDB.open({ worker });
+    await db.execute("CREATE TABLE t(v)");
+    const statement = await db.prepare("SELECT v FROM t ORDER BY v");
+    const write = db.execute("INSERT INTO t VALUES (?)", [17]);
+    const read = statement.query();
+    const close = db.close();
+    const repeated = db.close() === close;
+    const count = worker.requests.length;
+    const late = await rejection(db.execute("INSERT INTO t VALUES (18)"));
+    const [changes, rows] = await Promise.all([write, read, close]);
+    const retained = await rejection(statement.query());
+    return {
+      changes, rows: rows.rowArrays, repeated: repeated && db.close() === close,
+      refused: [late.message, retained.message], noExtraPosts: count === worker.requests.length,
+      requests: worker.requests,
+    };
+  });
+  t.diagnostic(JSON.stringify(result.requests));
+  assert.equal(result.changes, 1);
+  assert.deepEqual(result.rows, [[17]]);
+  assert.equal(result.repeated, true);
+  assert.equal(result.noExtraPosts, true);
+  assert.match(result.refused[0], /clos/i);
+  assert.match(result.refused[1], /dispos|clos/i);
+});
+
+test("SDK transaction ownership isolates foreign writes and nested WASM savepoints", wasmLifecycle, async (t) => {
+  const result = await run(async () => {
+    const { FrankenDB } = await import("/packages/sdk/src/database.ts");
+    const { SqlWorker, rejection } = await import("/fixture.js");
+    const worker = new SqlWorker();
+    const db = await FrankenDB.open({ worker });
+    try {
+      await db.execute("CREATE TABLE events(id INTEGER PRIMARY KEY)");
+      const entered = Promise.withResolvers();
+      const resume = Promise.withResolvers();
+      const marker = new Error("rollback root");
+      let escaped;
+      const rollback = rejection(db.transaction(async (tx) => {
+        escaped = tx;
+        await tx.execute("INSERT INTO events VALUES (1)");
+        entered.resolve();
+        await resume.promise;
+        throw marker;
+      }));
+      await Promise.race([entered.promise, rollback.then(error => { throw error; })]);
+      const before = worker.requests.length;
+      let foreign, refusedBeforePosting;
+      try {
+        foreign = await rejection(db.execute("INSERT INTO events VALUES (2)"));
+        refusedBeforePosting = worker.requests.length === before;
+      } finally {
+        resume.resolve();
+      }
+      const original = (await rollback) === marker;
+      const expired = await rejection(escaped.execute("INSERT INTO events VALUES (3)"));
+      let parentBlocked, childExpired;
+      await db.transaction(async (parent) => {
+        await parent.transaction(async (child) => {
+          await child.execute("INSERT INTO events VALUES (4)");
+          parentBlocked = (await rejection(parent.execute("INSERT INTO events VALUES (5)"))).code;
+        });
+        let savedChild;
+        const childError = await rejection(parent.transaction(async (child) => {
+          savedChild = child;
+          await child.execute("INSERT INTO events VALUES (6)");
+          throw marker;
+        }));
+        if (childError !== marker) throw childError;
+        childExpired = (await rejection(savedChild.query("SELECT 1"))).code;
+        await parent.transaction(child => child.execute("INSERT INTO events VALUES (7)"));
+      });
+      return {
+        rows: (await db.query("SELECT id FROM events ORDER BY id")).rowArrays,
+        original, refusedBeforePosting, codes: [foreign.code, expired.code, parentBlocked, childExpired],
+        requests: worker.requests,
+      };
+    } finally {
+      await db.close();
+    }
+  });
+  t.diagnostic(JSON.stringify(result.requests));
+  assert.equal(result.original, true);
+  assert.equal(result.refusedBeforePosting, true);
+  assert.deepEqual(result.codes, ["ERR_FSQLITE_TRANSACTION_OWNERSHIP", "ERR_FSQLITE_TRANSACTION_CLOSED",
+    "ERR_FSQLITE_TRANSACTION_OWNERSHIP", "ERR_FSQLITE_TRANSACTION_CLOSED"]);
+  assert.deepEqual(result.rows, [[4], [7]]);
+});
+
+test("SDK worker crash settles pending requests and releases exclusive snapshot ownership", wasmLifecycle, async (t) => {
+  const result = await run(async () => {
+    const { FrankenDB } = await import("/packages/sdk/src/database.ts");
+    const { SqlWorker, rejection } = await import("/fixture.js");
+    const worker = new SqlWorker("query");
+    const options = { dbName: crypto.randomUUID(), persistence: "indexeddb-snapshot", snapshotOwnership: "exclusive" };
+    const db = await FrankenDB.open({ ...options, worker });
+    try {
+      await db.execute("CREATE TABLE saved(v)");
+      await db.execute("INSERT INTO saved VALUES (13)");
+      await db.checkpoint();
+      const stmt = await db.prepare("SELECT v FROM saved");
+      const { held } = await navigator.locks.query();
+      const lease = held.find(lock => lock.name.includes(options.dbName));
+      if (lease?.mode !== "exclusive") throw new Error("Missing exclusive session before crash");
+      const pending = await Promise.all([rejection(db.query("SELECT 99")), rejection(stmt.query())]);
+      const count = worker.requests.length;
+      const later = await rejection(db.query("SELECT 1"));
+      const retained = await rejection(stmt.query());
+      // An uncaught error in a browser worker does not itself terminate its realm.
+      // Wait on the same lock before doing any explicit close or termination.
+      await navigator.locks.request(lease.name, { signal: AbortSignal.timeout(5_000) }, () => {});
+      const close = db.close();
+      const repeated = close === db.close();
+      const failedClose = await rejection(close);
+      const reopened = await FrankenDB.open({ ...options, worker: new SqlWorker() });
+      try {
+        return {
+          message: pending[0].message,
+          sameCause: [pending[1], later, retained, failedClose].every(e => e === pending[0]),
+          repeated, noExtraPosts: count === worker.requests.length, requests: worker.requests,
+          rows: (await reopened.query("SELECT v FROM saved")).rowArrays,
+        };
+      } finally {
+        await reopened.close();
+      }
+    } finally {
+      worker.terminate();
+    }
+  });
+  t.diagnostic(JSON.stringify(result.requests));
+  assert.match(result.message, /intentional worker failure on query/);
+  assert.equal(result.sameCause, true);
+  assert.equal(result.repeated, true);
+  assert.equal(result.noExtraPosts, true);
+  assert.deepEqual(result.rows, [[13]]);
+});
+
+test("SDK keeps the callback error when its WASM worker crashes during rollback", wasmLifecycle, async (t) => {
+  const result = await run(async () => {
+    const { FrankenDB } = await import("/packages/sdk/src/database.ts");
+    const { SqlWorker, rejection } = await import("/fixture.js");
+    const worker = new SqlWorker("rollback");
+    const db = await FrankenDB.open({ worker });
+    try {
+      await db.execute("CREATE TABLE t(v)");
+      const original = new Error("callback refused");
+      const failure = await rejection(db.transaction(async (tx) => {
+        await tx.execute("INSERT INTO t VALUES (1)");
+        throw original;
+      }));
+      return {
+        originalCause: failure instanceof AggregateError && failure.cause === original && failure.errors[0] === original,
+        rollbackError: failure.errors?.[1]?.message,
+        terminal: (await rejection(db.query("SELECT 1"))) === failure,
+        requests: worker.requests,
+      };
+    } finally {
+      worker.terminate();
+    }
+  });
+  t.diagnostic(JSON.stringify(result.requests));
+  assert.equal(result.originalCause, true);
+  assert.match(result.rollbackError, /intentional worker failure on transaction/);
+  assert.equal(result.terminal, true);
+});
 
 test("SDK binds parameters across recursive and sibling CTEs in the WASM worker", {
   skip: wasmModule ? false : "Set FSQLITE_WASM_BROWSER_MODULE to a web-target WASM binding",

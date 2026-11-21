@@ -164,6 +164,12 @@ export class FrankenWorkerClient {
     this.#terminalError ??= error;
     this.#rejectPending(this.#terminalError, this.#hostTerminal);
     this.#notifyFailure(this.#terminalError);
+    if (!this.#hostTerminal && !this.#closing) {
+      // The channel cannot acknowledge a close. Run normal cleanup so that an
+      // otherwise live worker releases its exclusive snapshot lock. Callers
+      // can still await the same close promise for the original failure.
+      void this.close().catch(() => {});
+    }
   }
 
   constructor(worker: WorkerLike, limits: Partial<RequestLimits> = {}) {

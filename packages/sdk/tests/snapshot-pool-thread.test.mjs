@@ -61,7 +61,6 @@ async function setup(t, { workers = 2, rows = 10, resultEncoding = "binary" } = 
     const native = new Worker(
       new URL("../../worker/tests/helpers/result-worker.mjs", import.meta.url),
       {
-        execArgv: process.execArgv,
         workerData: { poolBarrier: gate.buffer },
       },
     );

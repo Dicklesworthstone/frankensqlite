@@ -63,6 +63,7 @@ describe("worker client terminal lifecycle", () => {
     worker.crash("WASM trap");
     await drain();
     const cause = rejected(pending);
+    expect(worker.terminateCount).toBe(1);
     const after = observe(client.query("SELECT 2"));
     const close = observe(client.close());
     await drain();
@@ -71,6 +72,48 @@ describe("worker client terminal lifecycle", () => {
     expect((cause as Error).message).toContain("WASM trap");
     expect(worker.requests.map((r) => r.kind)).toEqual(["execute"]);
     expect(worker.terminateCount).toBe(1);
+  });
+
+  it("cleans up an idle unreadable channel and preserves cleanup errors for close", async () => {
+    const { worker, client } = fixture();
+    const cleanup = new Error("could not terminate worker");
+    worker.onTerminate = () => {
+      throw cleanup;
+    };
+    worker.messageError();
+    await drain();
+    expect(worker.terminateCount).toBe(1);
+    const failed = observe(client.query("SELECT 2"));
+    const close = client.close();
+    const closing = observe(close);
+    await drain();
+    const transport = rejected(failed);
+    const combined = rejected(closing) as AggregateError;
+    expect(combined).toBeInstanceOf(AggregateError);
+    expect(combined.cause).toBe(transport);
+    expect(combined.errors).toEqual([transport, cleanup]);
+    expect(client.close()).toBe(close);
+    expect(worker.requests).toEqual([]);
+  });
+
+  it("preserves cleanup failure when the transport crashes during the close post", async () => {
+    const { worker, client } = fixture();
+    const cleanup = new Error("terminate failed");
+    worker.onTerminate = () => {
+      throw cleanup;
+    };
+    worker.onPost = (request) => {
+      if (request.kind === "close") worker.crash("close channel lost");
+    };
+    const close = client.close();
+    const error = await close.catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(AggregateError);
+    const combined = error as AggregateError;
+    expect(combined.cause).toBe(combined.errors[0]);
+    expect(combined.errors[1]).toBe(cleanup);
+    expect(client.close()).toBe(close);
+    expect(worker.terminateCount).toBe(1);
+    expect(worker.requests.map((r) => r.kind)).toEqual(["close"]);
   });
 
   it("coalesces close, drains accepted requests, and refuses new requests", async () => {

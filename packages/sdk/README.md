@@ -300,7 +300,10 @@ does not release an unsuccessfully rolled-back child into its parent.
 `close()` stops admitting new requests, completes previously admitted worker
 requests, and shares one completion promise across repeated calls. A worker
 crash or disposal rejects pending and future calls rather than leaving promises
-unsettled. Failed initialization also releases the worker's resources.
+unsettled. When the worker channel fails and can no longer acknowledge a close,
+the SDK terminates the worker automatically, releasing any exclusive snapshot
+lock. A fresh connection can reopen the last acknowledged checkpoint. Failed
+initialization also releases the worker's resources.
 
 ## Streaming imports
 
