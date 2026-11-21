@@ -16250,7 +16250,15 @@ impl VdbeEngine {
                     };
 
                     let accum_reg = op.p1;
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    // bd-w4pr1.12 (lever AFC): a per-group boundary, like
+                    // VNext's and AggStep's: a requested cancellation is one
+                    // atomic load before and after the finalize, and the
+                    // statement loop's interval checkpoint (every
+                    // VDBE_EXECUTION_CHECKPOINT_INTERVAL opcodes) covers the
+                    // e-process, native-runtime and deadline / budget planes.
+                    // Two full checkpoints here were ~720 instructions a group
+                    // (GROUP BY id over 1M rows: 722M of 5,024M).
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     let result = match self
                         .cold_state_mut()
                         .and_then(|cold_state| cold_state.aggregates.remove(&accum_reg))
@@ -16267,7 +16275,7 @@ impl VdbeEngine {
                         None => func.finalize(func.initial_state())?,
                     };
 
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(accum_reg, result);
                     if let Some(subtype) = func.result_subtype() {
                         self.set_register_subtype(accum_reg, subtype);
@@ -16352,7 +16360,9 @@ impl VdbeEngine {
                     })?;
 
                     let accum_reg = op.p1;
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    // bd-w4pr1.12 (lever AFC): a per-row boundary, as in
+                    // AggInverse and AggFinal: one atomic load each side.
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     let result = match self
                         .cold_state()
                         .and_then(|cold_state| cold_state.window_contexts.get(&accum_reg))
@@ -16360,7 +16370,7 @@ impl VdbeEngine {
                         Some(ctx) => ctx.func.value(&ctx.state)?,
                         None => func.value(&func.initial_state())?,
                     };
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(op.p3, result);
                     pc += 1;
                 }
@@ -28701,6 +28711,160 @@ mod tests {
             rows_delivered_before_cancellation_is_observed(Opcode::NotNull, true),
             expected
         );
+    }
+
+    /// How [`rows_before_aggregate_signal_is_observed`]'s row handler signals
+    /// the running statement (bd-w4pr1.12, lever AFC).
+    #[derive(Clone, Copy, Debug)]
+    enum AggregateSignal {
+        /// `Cx::cancel_with_reason`: the local flag that the per-group atomic
+        /// load reads.
+        Requested,
+        /// A cancellation published on an attached native context (a runtime
+        /// timeout), which only a full checkpoint consults.
+        NativeTimeout,
+        /// An attached native context whose poll quota is spent: the budget
+        /// plane, which only a full checkpoint consults.
+        NativeBudget,
+    }
+
+    /// Opcodes per group or row in [`rows_before_aggregate_signal_is_observed`].
+    const AGGREGATE_SIGNAL_LOOP_OPS: usize = 4;
+
+    /// Rows a statement delivers when `signal` is raised from its row handler
+    /// at row `at`, and its outcome. Each group of the GROUP BY shape is
+    /// `AddImm / AggFinal count / ResultRow / Goto`, and each row of the
+    /// window shape `AddImm / AggValue row_number / ResultRow / Goto`, so the
+    /// aggregate opcode is the only one that can observe a requested
+    /// cancellation per group. (`AggStep` observes one too, in
+    /// `plain_agg_step`, so a group that steps would not show whether
+    /// `AggFinal` does.)
+    fn rows_before_aggregate_signal_is_observed(
+        window: bool,
+        signal: AggregateSignal,
+        at: usize,
+    ) -> (usize, Result<ExecOutcome>) {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut builder = ProgramBuilder::new();
+        let r_counter = builder.alloc_reg();
+        let r_acc = builder.alloc_reg();
+        let r_out = builder.alloc_reg();
+        builder.emit_op(Opcode::Integer, 0, r_counter, 0, P4::None, 0);
+        let loop_top = builder.emit_op(Opcode::AddImm, r_counter, 1, 0, P4::None, 0);
+        if window {
+            let row_number = P4::FuncName("row_number".to_owned());
+            builder.emit_op(Opcode::AggValue, r_acc, 0, r_out, row_number, 0);
+            builder.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        } else {
+            let count = P4::FuncName("count".to_owned());
+            builder.emit_op(Opcode::AggFinal, r_acc, 0, 0, count, 0);
+            builder.emit_op(Opcode::ResultRow, r_acc, 1, 0, P4::None, 0);
+        }
+        let loop_top = i32::try_from(loop_top).expect("loop address fits i32");
+        builder.emit_op(Opcode::Goto, 0, loop_top, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let cx = Cx::new();
+        cx.transition_to_running();
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        fsqlite_func::register_window_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
+
+        let interval = usize::try_from(VDBE_EXECUTION_CHECKPOINT_INTERVAL).unwrap();
+        let mut rows = 0_usize;
+        let mut handler = |_row: &mut Vec<SqliteValue>| -> Result<()> {
+            rows += 1;
+            if rows == at {
+                match signal {
+                    AggregateSignal::Requested => {
+                        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+                    }
+                    AggregateSignal::NativeTimeout => {
+                        let native = asupersync::Cx::for_testing();
+                        native.set_cancel_reason(asupersync::types::CancelReason::timeout());
+                        cx.set_native_cx(native);
+                    }
+                    AggregateSignal::NativeBudget => {
+                        cx.set_native_cx(asupersync::Cx::for_testing_with_budget(
+                            asupersync::Budget::INFINITE.with_poll_quota(0),
+                        ));
+                    }
+                }
+            }
+            // A statement that never observes the signal would run forever;
+            // fail it instead, well past the next interval checkpoint.
+            if rows > at + 4 * interval {
+                return Err(FrankenError::internal(
+                    "the signal was not observed at a checkpoint",
+                ));
+            }
+            Ok(())
+        };
+        let outcome = run_async(engine.execute_with_borrowed_bindings_and_row_handler(
+            &program,
+            None,
+            &mut handler,
+        ));
+        drop(handler);
+        (rows, outcome)
+    }
+
+    /// bd-w4pr1.12 (lever AFC): AggFinal and AggValue observe a requested
+    /// cancellation with one atomic load each side of the call, so a request
+    /// made at a group is observed at the next group's AggFinal (the next
+    /// row's AggValue), halfway through about 1M groups. A boundary that
+    /// does not look at all leaves the request to the interval checkpoint,
+    /// hundreds of groups later.
+    #[test]
+    fn test_aggregate_boundaries_observe_a_requested_cancellation_at_the_next_group() {
+        for window in [false, true] {
+            let (rows, outcome) = rows_before_aggregate_signal_is_observed(
+                window,
+                AggregateSignal::Requested,
+                500_000,
+            );
+            assert!(
+                matches!(outcome, Err(FrankenError::Abort)),
+                "window={window}: unexpected outcome {outcome:?}"
+            );
+            assert_eq!(rows, 500_000, "window={window}");
+        }
+    }
+
+    /// bd-w4pr1.12 (lever AFC): the native-runtime and budget planes, which
+    /// only a full checkpoint consults, are still enforced on an aggregate
+    /// statement: by the statement loop's interval checkpoint, within
+    /// VDBE_EXECUTION_CHECKPOINT_INTERVAL opcodes of the signal, and the
+    /// statement stops with the cancellation error.
+    #[test]
+    fn test_aggregate_statements_observe_native_timeouts_and_spent_budgets_within_the_interval() {
+        let bound = usize::try_from(VDBE_EXECUTION_CHECKPOINT_INTERVAL).unwrap()
+            / AGGREGATE_SIGNAL_LOOP_OPS
+            + 1;
+        for window in [false, true] {
+            for signal in [
+                AggregateSignal::NativeTimeout,
+                AggregateSignal::NativeBudget,
+            ] {
+                let (rows, outcome) =
+                    rows_before_aggregate_signal_is_observed(window, signal, 500_000);
+                assert!(
+                    matches!(outcome, Err(FrankenError::Abort)),
+                    "window={window} {signal:?}: unexpected outcome {outcome:?}"
+                );
+                assert!(
+                    (500_000..=500_000 + bound).contains(&rows),
+                    "window={window} {signal:?}: {rows} rows, bound {bound} after row 500000"
+                );
+            }
+        }
     }
 
     #[test]
