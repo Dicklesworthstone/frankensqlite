@@ -57458,7 +57458,10 @@ impl Connection {
                 // bd-u01ku: stock's cursor budget at a CTE expansion.
                 Self::validate_cte_cursor_budget(select)?;
                 self.ensure_referenced_vtabs_available(select)?;
-                SelectRelationResolver::new(self).validate_select(select)
+                SelectRelationResolver::new(self).validate_select(select)?;
+                // bd-pn6az: stock flattens once the names resolve, then
+                // plans the join.
+                Self::validate_join_term_limits(select)
             }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
