@@ -224,7 +224,7 @@ fn cross_table_divider(bytes: &mut [u8], root: u32, cross_upper: bool) -> (u32, 
             let (_, payload_len_bytes) = read_varint(&page[pointer..]).unwrap();
             let rowid_offset = pointer + payload_len_bytes;
             let (_, old_len) = read_varint(&page[rowid_offset..]).unwrap();
-            let new_rowid = if cross_upper { bound + 1 } else { bound };
+            let new_rowid: i64 = if cross_upper { bound + 1 } else { bound };
             // SQLite's signed rowids use the two's-complement u64 varint.
             let encoded = u64::from_ne_bytes(new_rowid.to_ne_bytes());
             let mut encoded_bytes = [0_u8; 9];
