@@ -262,7 +262,7 @@ use fsqlite_vdbe::codegen::{
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
 use fsqlite_vdbe::engine::{
     ConstraintFailureAction, ExactResultRowOutcome, ExecOutcome, MemDatabase, MemDbVersionToken,
-    MemRowValues, ReplaceVictim, ReusableTableExecutionState, SharedTxnPageIo, VdbeEngine,
+    MemRowValues, MemTable, ReplaceVictim, ReusableTableExecutionState, SharedTxnPageIo, VdbeEngine,
     VdbeMetricsSnapshot, reset_vdbe_metrics, vdbe_metrics_snapshot,
 };
 #[cfg(feature = "diagnostic-pragmas")]
@@ -7962,11 +7962,6 @@ impl TableRowSink<'_, '_> {
         }
     }
 }
-
-/// bd-wjrs0: a captured connection-local `TEMP` table — its schema plus all
-/// `(rowid, row)` pairs — used to carry `TEMP` tables (and their data) across a
-/// destructive memdb reload that rebuilds state from the main `sqlite_master`.
-type CapturedTempTable = (TableSchema, Vec<(i64, Vec<SqliteValue>)>);
 
 /// A resolved FROM source during view-decltype resolution: the effective
 /// source name (alias or table name) plus its output columns as
@@ -29700,7 +29695,7 @@ impl Connection {
                 })
                 .collect()
         };
-        let mut base = self.db.borrow().clone_for_snapshot();
+        let mut base = self.db.borrow().clone_for_snapshot(&cx)?;
         for root_page in TimeTravelImage::pager_backed_roots(&pager_tables) {
             // Emptying a shared table swaps in fresh storage, so the snapshot
             // keeps no reference to the live table's rows; a later write to
@@ -29821,16 +29816,17 @@ impl Connection {
         cx: &Cx,
         image: &TimeTravelImage,
     ) -> Result<MemDatabase> {
-        let mut db = image.base.clone_for_snapshot();
+        let mut db = image.base.clone_for_snapshot(cx)?;
         for &(root_page, ipk) in &image.mirror_ipk_columns {
             if let Some(table) = db.get_table_mut(root_page) {
                 let rowids: Vec<i64> = table.iter_rows().map(|(rowid, _)| rowid).collect();
                 table.materialize_column_values(
+                    cx,
                     ipk,
                     rowids
                         .into_iter()
                         .map(|rowid| (rowid, SqliteValue::Integer(rowid))),
-                );
+                )?;
             }
         }
         let Some(page_one) = image.pages.get(1) else {
@@ -30233,7 +30229,7 @@ impl Connection {
         self.flush_pending_direct_write_runs(cx).await?;
 
         if !self.pending_memdb_direct_upserts.borrow().is_empty() {
-            self.flush_pending_memdb_direct_upserts();
+            self.flush_pending_memdb_direct_upserts(cx)?;
         }
 
         // bd-ztgst: a CTE-only WITH statement treats an unloaded row image as
@@ -38864,6 +38860,7 @@ impl Connection {
         );
         Ok(Some(
             self.finish_prepared_direct_simple_insert_after_storage(
+                execution_cx,
                 direct,
                 rowid,
                 conflict_action,
@@ -38874,7 +38871,7 @@ impl Connection {
                 can_use_prebuilt_constant_record,
                 used_preserialized_record,
                 profile_enabled,
-            ),
+            )?,
         ))
     }
 
@@ -38882,6 +38879,7 @@ impl Connection {
     #[inline]
     fn finish_prepared_direct_simple_insert_after_storage(
         &self,
+        cx: &Cx,
         direct: &PreparedDirectSimpleInsert,
         rowid: i64,
         conflict_action: fsqlite_ast::ConflictAction,
@@ -38892,7 +38890,7 @@ impl Connection {
         can_use_prebuilt_constant_record: bool,
         used_preserialized_record: bool,
         profile_enabled: bool,
-    ) -> i64 {
+    ) -> Result<i64> {
         if !can_use_prebuilt_constant_record
             && !used_preserialized_record
             && let Some(ipk_idx) = direct.rowid_alias_col_idx
@@ -38934,12 +38932,17 @@ impl Connection {
                 self.abandon_exact_memdb_row_mirror();
             } else {
                 let owned_values = std::mem::take(mem_row_values).into_vec();
-                self.apply_prepared_direct_insert_memdb_row(
+                if let Err(error) = self.apply_prepared_direct_insert_memdb_row(
+                    cx,
                     direct.root_page,
                     direct.columns.len(),
                     rowid,
                     owned_values,
-                );
+                ) {
+                    self.clear_retained_autocommit_count_sum_cache_for_root(direct.root_page);
+                    self.abandon_exact_memdb_row_mirror();
+                    return Err(error);
+                }
             }
         } else {
             mem_row_values.clear();
@@ -38955,7 +38958,7 @@ impl Connection {
         // for this root page yet (it will be seeded from the live B-tree
         // at first consultation, which already reflects the insert).
         self.qf_record_insert(direct.root_page, rowid);
-        rowid
+        Ok(rowid)
     }
 
     #[inline]
@@ -39331,6 +39334,7 @@ impl Connection {
                     .unwrap_or(fsqlite_ast::ConflictAction::Abort);
                 return Ok(Some(
                     self.finish_prepared_direct_simple_insert_after_storage(
+                        execution_cx,
                         direct,
                         rowid,
                         conflict_action,
@@ -39341,7 +39345,7 @@ impl Connection {
                         can_use_prebuilt_constant_record,
                         preserialized_record.is_some(),
                         profile_enabled,
-                    ),
+                    )?,
                 ));
             }
         }
@@ -51815,6 +51819,7 @@ impl Connection {
         });
 
         drop(schema);
+        let op_cx = self.op_cx()?;
 
         let mut affected = 0usize;
 
@@ -51886,7 +51891,8 @@ impl Connection {
                     if col_info.unique && !col_info.is_ipk {
                         let new_val = &col_values[i];
                         if !new_val.is_null() {
-                            for mem_row in table.iter_rows_cow() {
+                            for mem_row in table.iter_rows_cow(&op_cx) {
+                                let mem_row = mem_row?;
                                 if Some(mem_row.0) == explicit_rowid {
                                     continue; // Replacing this rowid.
                                 }
@@ -51936,7 +51942,8 @@ impl Connection {
                         let new_key: Vec<&SqliteValue> =
                             idx_positions.iter().map(|&pos| &col_values[pos]).collect();
 
-                        for mem_row in table.iter_rows_cow() {
+                        for mem_row in table.iter_rows_cow(&op_cx) {
+                            let mem_row = mem_row?;
                             if Some(mem_row.0) == explicit_rowid {
                                 continue;
                             }
@@ -51986,11 +51993,10 @@ impl Connection {
             // For REPLACE: delete rows that conflict on non-IPK UNIQUE columns.
             if *conflict == ConflictAction::Replace && !conflicting_rowids.is_empty() {
                 for rid in conflicting_rowids {
-                    db.delete_rowid(root_page, rid);
+                    db.delete_rowid(&op_cx, root_page, rid)?;
                 }
             }
 
-            let op_cx = self.op_cx()?;
             if let Some(rowid) = explicit_rowid {
                 let exists = db
                     .get_table(root_page)
@@ -64150,10 +64156,11 @@ impl Connection {
             return Ok(());
         }
         if temporary {
+            let cx = self.op_cx()?;
             if self
                 .db
                 .borrow_mut()
-                .remove_column_from_rows(root_page, removed_slot)
+                .remove_column_from_rows(&cx, root_page, removed_slot)?
             {
                 return Ok(());
             }
@@ -68150,11 +68157,11 @@ impl Connection {
         }
     }
 
-    fn flush_pending_memdb_direct_upserts(&self) {
+    fn flush_pending_memdb_direct_upserts(&self, cx: &Cx) -> Result<()> {
         let pending = {
             let mut pending = self.pending_memdb_direct_upserts.borrow_mut();
             if pending.is_empty() {
-                return;
+                return Ok(());
             }
             std::mem::take(&mut *pending)
         };
@@ -68169,8 +68176,16 @@ impl Connection {
                 self.memdb_storage_count_shortcuts_safe.set(false);
                 self.memdb_requires_active_txn_reload.set(true);
             }
-            db.upsert_row(upsert.root_page, upsert.rowid, upsert.values);
+            if let Err(error) =
+                db.upsert_row_checked(cx, upsert.root_page, upsert.rowid, upsert.values)
+            {
+                // These rows are already in the pager. Abandon the partially
+                // updated mirror so a later read rebuilds it in full.
+                self.abandon_exact_memdb_row_mirror();
+                return Err(error);
+            }
         }
+        Ok(())
     }
 
     fn clear_pending_memdb_direct_upserts(&self) {
@@ -68230,11 +68245,12 @@ impl Connection {
 
     fn apply_prepared_direct_insert_memdb_row(
         &self,
+        cx: &Cx,
         root_page: i32,
         num_columns: usize,
         rowid: i64,
         values: MemRowValues,
-    ) {
+    ) -> Result<()> {
         let mut db = self.db.borrow_mut();
         if db.get_table(root_page).is_none() {
             db.create_table_at(root_page, num_columns);
@@ -68244,7 +68260,7 @@ impl Connection {
             self.memdb_storage_count_shortcuts_safe.set(false);
             self.memdb_requires_active_txn_reload.set(true);
         }
-        db.upsert_row(root_page, rowid, values);
+        db.upsert_row_checked(cx, root_page, rowid, values)
     }
 
     fn prepared_direct_insert_memdb_next_rowid_hint(
@@ -72809,14 +72825,14 @@ impl Connection {
                 cursor.delete(cx).await?;
             }
             tracing::trace!(table = table_name, rows = matching_rowids.len(), "sqlite_sequence delete entries");
-            Ok(Some((root_page, matching_rowids)))
+            Ok(Some((cx.clone(), root_page, matching_rowids)))
         })
         .await?;
 
         self.sqlite_sequence_cache
             .borrow_mut()
             .remove(&table_name.to_ascii_lowercase());
-        if let Some((root_page, storage_rowids)) = deleted_rows {
+        if let Some((cx, root_page, storage_rowids)) = deleted_rows {
             let mirror_rowids = self
                 .db
                 .borrow()
@@ -72839,7 +72855,7 @@ impl Connection {
                 .unwrap_or_default();
             let mut db = self.db.borrow_mut();
             for rowid in storage_rowids.into_iter().chain(mirror_rowids) {
-                db.delete_rowid(root_page, rowid);
+                db.delete_rowid(&cx, root_page, rowid)?;
             }
         }
         Ok(())
@@ -72908,14 +72924,14 @@ impl Connection {
                 cursor.table_insert(cx, *rowid, &record).await?;
             }
             tracing::trace!(old = old_name, new = new_name, rows = matching_rows.len(), "sqlite_sequence rename entries");
-            Ok(Some((root_page, matching_rows)))
+            Ok(Some((cx.clone(), root_page, matching_rows)))
         })
         .await?;
 
         let mut cache = self.sqlite_sequence_cache.borrow_mut();
         cache.remove(&old_key);
         drop(cache);
-        if let Some((root_page, rows)) = renamed_rows {
+        if let Some((cx, root_page, rows)) = renamed_rows {
             let mirror_rowids = self
                 .db
                 .borrow()
@@ -72938,14 +72954,15 @@ impl Connection {
                 .unwrap_or_default();
             let mut db = self.db.borrow_mut();
             for rowid in mirror_rowids {
-                db.delete_rowid(root_page, rowid);
+                db.delete_rowid(&cx, root_page, rowid)?;
             }
             for (rowid, seq) in &rows {
-                db.upsert_row(
+                db.upsert_row_checked(
+                    &cx,
                     root_page,
                     *rowid,
                     vec![SqliteValue::Text(new_name.into()), seq.clone()],
-                );
+                )?;
             }
             drop(db);
             if let Some((_, seq)) = rows.last() {
@@ -74056,6 +74073,7 @@ impl Connection {
                 // the table root and no sqlite_schema index row is persisted.
                 let implicit_autoindex_slots =
                     implicit_autoindex_layout(columns, constraints, create.without_rowid)?;
+                let cx = self.op_cx()?;
                 // All validation that can reject the canonical layout must run
                 // before mutating connection-local schema maps.
                 let key = table_name.to_ascii_lowercase();
@@ -74115,6 +74133,7 @@ impl Connection {
                                 ));
                             };
                             mem_table.add_unique_column_group_labeled(
+                                &cx,
                                 col_indices,
                                 slot.definition.key_collations.clone(),
                                 qualified_unique_constraint_label(
@@ -74122,7 +74141,7 @@ impl Connection {
                                     slot.definition.columns.iter().map(String::as_str),
                                 ),
                                 slot.is_primary_key(),
-                            );
+                            )?;
                         }
                     }
                 }
@@ -76017,12 +76036,12 @@ impl Connection {
                     .iter()
                     .map(|c| c.expr.clone())
                     .collect();
+                let op_cx = self.op_cx()?;
                 if !added_check_exprs.is_empty() {
                     // Settle any pending active-transaction or pager refresh
                     // BEFORE mutating `self.schema` so the nested validation
                     // query below does not reload the pre-ALTER `sqlite_master`
                     // schema over our in-memory column addition (bd-whs71).
-                    let op_cx = self.op_cx_after_background_status();
                     self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
                         .await?;
                     if self.committed_pager_refresh_allowed() {
@@ -76031,10 +76050,13 @@ impl Connection {
                     }
                     let _ = self.refresh_prepared_schema_state(&op_cx, true).await?;
                 }
-                let mut schema = self.schema.borrow_mut();
-                let table = schema
-                    .iter_mut()
-                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                let (table_index, mut table) = self
+                    .schema
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| t.name.eq_ignore_ascii_case(table_name))
+                    .map(|(index, table)| (index, table.clone()))
                     .ok_or_else(|| FrankenError::NoSuchTable {
                         name: table_name.clone(),
                     })?;
@@ -76070,8 +76092,6 @@ impl Connection {
                 };
                 let default_for_existing_rows =
                     raw_default_for_existing_rows.apply_affinity(affinity_char_to_type(affinity));
-                let previous_table_schema =
-                    (!added_check_exprs.is_empty()).then(|| table.clone());
                 let new_column_index = table.columns.len();
                 // ALTER ADD COLUMN cannot add an IPK/UNIQUE; only a column-level
                 // NOT NULL ON CONFLICT clause is meaningful here.
@@ -76129,28 +76149,30 @@ impl Connection {
                 // new column. Without this, SELECT * returns NULL instead of the
                 // DEFAULT value for pre-existing rows (column_index >= values.len()).
                 let root_page = table.root_page;
-                let table_clone = table.clone();
-                drop(schema);
                 let previous_mem_table = {
                     let mut db = self.db.borrow_mut();
-                    let prev = if !added_check_exprs.is_empty() {
-                        db.get_table(root_page).cloned()
+                    if let Some(current) = db.get_table(root_page) {
+                        let mut updated = current.clone();
+                        updated.pad_rows_to_column_count(
+                            &op_cx,
+                            table.columns.len(),
+                            &default_for_existing_rows,
+                        )?;
+                        let previous = (!added_check_exprs.is_empty()).then(|| current.clone());
+                        let replaced = db.replace_table(root_page, updated);
+                        debug_assert!(replaced);
+                        previous
                     } else {
                         None
-                    };
-                    if let Some(mem_table) = db.get_table_mut(root_page) {
-                        mem_table.pad_rows_to_column_count(
-                            table_clone.columns.len(),
-                            &default_for_existing_rows,
-                        );
                     }
-                    prev
                 };
+                let previous_table_schema =
+                    std::mem::replace(&mut self.schema.borrow_mut()[table_index], table.clone());
                 // bd-whs71: stock SQLite runs a nested check after adding a
                 // column with a CHECK constraint (`sqlite3AlterFinishAddColumn`)
                 // and aborts with "CHECK constraint failed" if any existing row
                 // violates the new constraint, leaving the schema unchanged.
-                if let Some(prev_schema) = previous_table_schema {
+                if !added_check_exprs.is_empty() {
                     self.rebuild_schema_indices();
                     self.clear_compilation_reuse_caches();
                     self.table_execution_metadata_cache.borrow_mut().take();
@@ -76163,21 +76185,18 @@ impl Connection {
                     let check_sql = format!(
                         "SELECT 1 FROM {}.{} WHERE {} LIMIT 1",
                         schema_prefix,
-                        quote_identifier(&table_clone.name),
+                        quote_identifier(&table.name),
                         violation_predicates
                     );
-                    let check_failed = match self.fk_validation_query(&check_sql, &[]).await {
-                        Ok(rows) => !rows.is_empty(),
-                        Err(_) => true,
-                    };
-                    if check_failed {
+                    let validation = self.fk_validation_query(&check_sql, &[]).await;
+                    if !matches!(&validation, Ok(rows) if rows.is_empty()) {
                         if let Some(slot) = self
                             .schema
                             .borrow_mut()
                             .iter_mut()
-                            .find(|t| t.name.eq_ignore_ascii_case(&table_clone.name))
+                            .find(|t| t.name.eq_ignore_ascii_case(&table.name))
                         {
-                            *slot = prev_schema;
+                            *slot = previous_table_schema;
                         }
                         if let Some(prev_mem) = previous_mem_table
                             && let Some(mem_slot) = self.db.borrow_mut().get_table_mut(root_page)
@@ -76187,12 +76206,13 @@ impl Connection {
                         self.rebuild_schema_indices();
                         self.clear_compilation_reuse_caches();
                         self.table_execution_metadata_cache.borrow_mut().take();
+                        validation?;
                         return Err(FrankenError::FunctionError(
                             "CHECK constraint failed".to_owned(),
                         ));
                     }
                 }
-                table_clone
+                table
             }
             AlterTableAction::DropColumn(col_name) => {
                 let mut schema = self.schema.borrow_mut();
@@ -76355,30 +76375,7 @@ impl Connection {
                     }
                 }
                 let dependency_table_name = table.name.clone();
-                drop(schema);
-                self.validate_drop_column_view_and_trigger_dependencies(
-                    &dependency_table_name,
-                    col_name,
-                )?;
-
-                let mut schema = self.schema.borrow_mut();
-                let table = schema
-                    .iter_mut()
-                    .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                    .ok_or_else(|| FrankenError::NoSuchTable {
-                        name: table_name.clone(),
-                    })?;
-                let col_idx = table
-                    .columns
-                    .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| {
-                        FrankenError::FunctionError(format!("no such column: \"{col_name}\""))
-                    })?;
-                // bd-w4pr1.31: the dropped column's record slot, taken before the
-                // column leaves the schema. A record holds no VIRTUAL column, so
-                // stock rewrites no record for one; a TEMP (MemDatabase) row keeps
-                // every declared column (bd-01uq7).
+                // A TEMP row stores even VIRTUAL columns. Pager records omit them.
                 let removed_slot = if alters_temp_table {
                     Some(col_idx)
                 } else if table.columns[col_idx].is_virtual_generated() {
@@ -76390,6 +76387,27 @@ impl Connection {
                             .map_or(col_idx, |slots| slots[col_idx]),
                     )
                 };
+                drop(schema);
+                self.validate_drop_column_view_and_trigger_dependencies(
+                    &dependency_table_name,
+                    col_name,
+                )?;
+
+                // Finish fallible spill reads and the row rewrite before publishing
+                // the new column positions in the connection catalog.
+                if let Some(removed_slot) = removed_slot {
+                    self.rewrite_table_records_remove_slot(table_name, removed_slot)
+                        .await?;
+                } else {
+                    self.abandon_exact_memdb_row_mirror();
+                }
+                let mut schema = self.schema.borrow_mut();
+                let table = schema
+                    .iter_mut()
+                    .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                    .ok_or_else(|| FrankenError::NoSuchTable {
+                        name: table_name.clone(),
+                    })?;
                 table.columns.remove(col_idx);
                 table.check_constraints.retain(|check| {
                     !check
@@ -76447,17 +76465,6 @@ impl Connection {
                     } else {
                         self.delete_sqlite_master_typed_row("index", idx_name).await?;
                     }
-                }
-                // Physically rewrite stored rows to drop the column's record slot
-                // so trailing columns realign on read (the read path decodes by
-                // physical slot index). bd-nb2j9 / bd-w50nr.
-                if let Some(removed_slot) = removed_slot {
-                    self.rewrite_table_records_remove_slot(table_name, removed_slot)
-                        .await?;
-                } else {
-                    // No record holds the VIRTUAL column, but the MemDatabase
-                    // mirror's rows still carry its slot.
-                    self.abandon_exact_memdb_row_mirror();
                 }
                 table_clone
             }
@@ -78555,7 +78562,8 @@ impl Connection {
             ));
         }
 
-        let temp_unique_columns = if target_is_temp && stmt.unique {
+        let temp_unique_table = if target_is_temp && stmt.unique {
+            let cx = self.op_cx()?;
             let columns = col_names
                 .iter()
                 .map(|column| {
@@ -78570,18 +78578,31 @@ impl Connection {
                         "failed to resolve TEMP index columns for `{index_name}`"
                     ))
                 })?;
-            self.materialize_temp_virtual_key_cells(&table_schema, &columns)
+            let mut table = self
+                .db
+                .borrow()
+                .get_table(table_schema.root_page)
+                .cloned()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!("TEMP table `{table_name}` has no attached storage"))
+                })?;
+            self.materialize_temp_virtual_key_cells(&cx, &table_schema, &columns, &mut table)
                 .await?;
-            let db = self.db.borrow();
-            let table = db.get_table(table_schema.root_page).ok_or_else(|| {
-                FrankenError::Internal(format!("TEMP table `{table_name}` has no attached storage"))
-            })?;
-            if !table.unique_column_group_is_valid(&columns, &key_collations) {
+            if !table.unique_column_group_is_valid(&cx, &columns, &key_collations)? {
                 return Err(FrankenError::UniqueViolation {
                     columns: col_names.join(", "),
                 });
             }
-            Some(columns)
+            // Build the enforcement index privately before allocating its root
+            // or publishing its catalog entry. Reading a spill file can fail.
+            table.add_unique_column_group_labeled(
+                &cx,
+                columns,
+                key_collations,
+                qualified_unique_constraint_label(table_name, col_names.iter().map(String::as_str)),
+                false,
+            )?;
+            Some(table)
         } else {
             None
         };
@@ -78600,31 +78621,14 @@ impl Connection {
                 .ok_or_else(|| FrankenError::NoSuchTable {
                     name: table_name.clone(),
                 })?;
-            table.indexes.push(bound_index.into_index_schema(root_page));
-        }
-
-        if let Some(columns) = temp_unique_columns {
-            let table_root = self
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .map(|table| table.root_page)
-                .ok_or_else(|| FrankenError::NoSuchTable {
-                    name: table_name.clone(),
-                })?;
-            if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
-                // A `CREATE UNIQUE INDEX` never implements a PRIMARY KEY.
-                table.add_unique_column_group_labeled(
-                    columns,
-                    key_collations.clone(),
-                    qualified_unique_constraint_label(
-                        table_name,
-                        col_names.iter().map(String::as_str),
-                    ),
-                    false,
-                );
+            if let Some(updated) = temp_unique_table
+                && !self.db.borrow_mut().replace_table(table.root_page, updated)
+            {
+                return Err(FrankenError::Internal(format!(
+                    "TEMP table `{table_name}` has no attached storage"
+                )));
             }
+            table.indexes.push(bound_index.into_index_schema(root_page));
         }
 
         // Phase 5: Persist to sqlite_master. bd-xfmv9: reuse the verbatim CREATE
@@ -85908,7 +85912,7 @@ impl Connection {
         // receipt cannot survive as stale Connection state after rollback or
         // an abandoned future. The original MVCC, retry, settlement and
         // attached-participant finalizers below remain untouched.
-        let (committed_write, post_durable_commit_error) = {
+        let (committed_write, mut post_durable_commit_error) = {
             // Issue #115: the concurrent-commit publication must be a single
             // critical section spanning FCW/SSI validate → physical pager write
             // → publish into the shared `CommitIndex`. Previously the shared
@@ -86454,7 +86458,11 @@ impl Connection {
         // invalidate filters whose writes were durably committed here.
         self.clear_qf_txn_modifications();
         if committed_write {
-            self.flush_pending_memdb_direct_upserts();
+            // The pager commit is already durable. Finish its teardown even if
+            // rebuilding the compatibility mirror must wait for the next read.
+            if let Err(error) = self.flush_pending_memdb_direct_upserts(cx) {
+                post_durable_commit_error.get_or_insert(error);
+            }
         } else {
             self.clear_pending_memdb_direct_upserts();
         }
@@ -86645,14 +86653,14 @@ impl Connection {
     /// when the same snapshot was decoded last. The returned copy shares row
     /// storage with the cache, so handing it to a query costs O(tables).
     async fn time_travel_snapshot_db(&self, image: &Rc<TimeTravelImage>) -> Result<MemDatabase> {
+        let cx = self.op_cx()?;
         if let Some((cached_image, cached_db)) = self.time_travel_materialized.borrow().as_ref()
             && Rc::ptr_eq(cached_image, image)
         {
-            return Ok(cached_db.clone_for_snapshot());
+            return cached_db.clone_for_snapshot(&cx);
         }
-        let cx = self.op_cx()?;
         let db = self.materialize_time_travel_image(&cx, image).await?;
-        let handed_out = db.clone_for_snapshot();
+        let handed_out = db.clone_for_snapshot(&cx)?;
         *self.time_travel_materialized.borrow_mut() = Some((Rc::clone(image), db));
         Ok(handed_out)
     }
@@ -95163,67 +95171,36 @@ impl Connection {
     /// in schema order: a CTE may shadow a TEMP or main table, and nested CTEs
     /// may have the same name. Returns an empty Vec (taking no further borrows)
     /// when neither exists, so other connections pay nothing.
-    fn snapshot_temp_tables(&self) -> Vec<CapturedTempTable> {
+    fn restore_temp_table_storage(
+        &self,
+        cx: &Cx,
+        new_db: &mut MemDatabase,
+    ) -> Result<Vec<TableSchema>> {
         let temp_names = self.temp_table_names.borrow();
         let materialized_roots = self.materialized_temp_root_pages.borrow();
         if temp_names.is_empty() && materialized_roots.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let schema = self.schema.borrow();
-        let db = self.db.borrow();
-        let cx = self.root_cx.clone();
-        schema
+        let captured: Vec<_> = self
+            .schema
+            .borrow()
             .iter()
             .filter(|table| {
                 materialized_roots.contains(&table.root_page)
                     || temp_names.contains(&table.name.to_ascii_lowercase())
             })
-            .map(|table| {
-                let rows = db.get_table(table.root_page).map_or_else(Vec::new, |mt| {
-                    mt.snapshot_all_rows_owned(&cx).unwrap_or_else(|_| {
-                        mt.iter_rows()
-                            .map(|(rowid, vals)| (rowid, vals.to_vec()))
-                            .collect()
-                    })
-                });
-                (table.clone(), rows)
-            })
-            .collect()
-    }
-
-    /// bd-wjrs0: re-insert `TEMP` tables captured by `snapshot_temp_tables` into
-    /// a freshly rebuilt schema/memdb, re-parking any same-named `main` table the
-    /// reload re-materialized from `sqlite_master` so the `TEMP` table shadows it
-    /// again. Mirrors the TEMP-trigger preservation done in the same reload.
-    fn restore_temp_tables_into(
-        &self,
-        new_schema: &mut Vec<TableSchema>,
-        new_db: &mut MemDatabase,
-        captured: Vec<CapturedTempTable>,
-    ) {
-        // Preserve the captured order of both real TEMP tables and lexical
-        // materialized bindings; the latter precede persistent schema entries.
-        let mut materialized_schemas = Vec::new();
-        for (temp_schema, rows) in captured {
-            let name_lc = temp_schema.name.to_ascii_lowercase();
-            let materialized = self
-                .materialized_temp_root_pages
+            .cloned()
+            .collect();
+        drop(materialized_roots);
+        drop(temp_names);
+        for temp_schema in &captured {
+            let rows = self
+                .db
                 .borrow()
-                .contains(&temp_schema.root_page);
-            // If the rebuild re-materialized a same-named main table, park it so
-            // the TEMP table remains the visible (unqualified) entry. A
-            // materialized CTE shadows by schema order instead and parks nothing.
-            if !materialized
-                && let Some(pos) = new_schema
-                    .iter()
-                    .position(|t| t.name.eq_ignore_ascii_case(&name_lc))
-            {
-                let main_table = new_schema.remove(pos);
-                self.shadowed_main_tables
-                    .borrow_mut()
-                    .insert(name_lc.clone(), main_table);
-            }
-            // Recreate the TEMP table and its rows in the rebuilt memdb.
+                .get_table(temp_schema.root_page)
+                .map(|table| table.snapshot_all_rows_owned(cx))
+                .transpose()?
+                .unwrap_or_default();
             let ordinary_next_root = new_db.next_root_page();
             new_db.create_table_at(temp_schema.root_page, temp_schema.columns.len());
             for index in &temp_schema.indexes {
@@ -95251,6 +95228,7 @@ impl Connection {
                     };
                     if !columns.is_empty() {
                         mem_table.add_unique_column_group_labeled(
+                            cx,
                             columns,
                             index.key_collations.clone(),
                             qualified_unique_constraint_label(
@@ -95258,16 +95236,43 @@ impl Connection {
                                 index.columns.iter().map(String::as_str),
                             ),
                             temp_schema.index_is_primary_key(index),
-                        );
+                        )?;
                     }
                 }
             }
             for (rowid, vals) in rows {
-                let _ = new_db.upsert_row_checked(&self.root_cx, temp_schema.root_page, rowid, vals);
+                new_db.upsert_row_checked(cx, temp_schema.root_page, rowid, vals)?;
             }
+        }
+        Ok(captured)
+    }
+
+    /// Publish restored TEMP schemas after every spill read and write succeeds.
+    /// Materialized CTEs precede persistent entries, while ordinary TEMP tables
+    /// park the same-named main table so it remains available through `main`.
+    fn restore_temp_table_schemas(
+        &self,
+        new_schema: &mut Vec<TableSchema>,
+        captured: Vec<TableSchema>,
+    ) {
+        let mut materialized_schemas = Vec::new();
+        for temp_schema in captured {
+            let name_lc = temp_schema.name.to_ascii_lowercase();
+            let materialized = self
+                .materialized_temp_root_pages
+                .borrow()
+                .contains(&temp_schema.root_page);
             if materialized {
                 materialized_schemas.push(temp_schema);
             } else {
+                if let Some(pos) = new_schema
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(&name_lc))
+                {
+                    self.shadowed_main_tables
+                        .borrow_mut()
+                        .insert(name_lc.clone(), new_schema.remove(pos));
+                }
                 new_schema.push(temp_schema);
                 self.temp_table_names.borrow_mut().insert(name_lc);
             }
@@ -95489,8 +95494,10 @@ impl Connection {
     /// validated and registered.
     async fn materialize_temp_virtual_key_cells(
         &self,
+        cx: &Cx,
         table: &TableSchema,
         columns: &[usize],
+        mem_table: &mut MemTable,
     ) -> Result<()> {
         let virtual_columns: Vec<usize> = columns
             .iter()
@@ -95528,18 +95535,15 @@ impl Connection {
         let rows = self.query(&sql).await;
         *self.pending_ddl_source.borrow_mut() = pending_ddl_source;
         let rows = rows?;
-        let mut db = self.db.borrow_mut();
-        let Some(mem_table) = db.get_table_mut(table.root_page) else {
-            return Ok(());
-        };
         for (position, &column) in virtual_columns.iter().enumerate() {
             mem_table.materialize_column_values(
+                cx,
                 column,
                 rows.iter().filter_map(|row| {
                     let values = row.values();
                     Some((values.first()?.as_integer()?, values.get(position + 1)?.clone()))
                 }),
-            );
+            )?;
         }
         Ok(())
     }
@@ -115589,8 +115593,8 @@ impl Connection {
     /// identity, so no live instance is preserved — all are dropped.
     ///
     /// Reset state is derived entirely from connection-local fields plus the
-    /// supplied visibility sequence, so no transaction is required; `cx` is only
-    /// forwarded to the displaced-vtab destructors. All work below is
+    /// supplied visibility sequence, so no transaction is required. The caller's
+    /// context covers TEMP spill I/O and displaced-vtab destructors. All work below is
     /// synchronous (no `.await`), which is what lets the begin-error path invoke
     /// it without an open transaction.
     fn publish_empty_database_reset(
@@ -115598,24 +115602,20 @@ impl Connection {
         cx: &Cx,
         bound_visible_commit_seq: CommitSeq,
         hydrate_rows: bool,
-    ) {
+    ) -> Result<()> {
         let force_full_schema_reload = self.force_full_schema_reload_once.get();
         // bd-wjrs0: capture connection-local TEMP tables before the reset so
         // they (and their rows) survive — they are never in sqlite_master.
-        let captured_temp_tables = self.snapshot_temp_tables();
-        *self.db.borrow_mut() = MemDatabase::new();
-        self.schema.borrow_mut().clear();
+        let mut new_db = MemDatabase::new();
+        let captured_temp_tables = self.restore_temp_table_storage(cx, &mut new_db)?;
+        *self.db.borrow_mut() = new_db;
+        let mut new_schema = Vec::new();
+        self.restore_temp_table_schemas(&mut new_schema, captured_temp_tables);
+        *self.schema.borrow_mut() = new_schema;
         self.views.borrow_mut().retain(|view| view.temporary);
         // Preserve TEMP triggers even when the database is empty — they are
         // connection-local and must survive memdb reloads.
         self.triggers.borrow_mut().retain(|t| t.temporary);
-        // bd-wjrs0: re-insert TEMP tables (the empty main DB has no main
-        // tables to shadow, so this only restores the TEMP entries + rows).
-        {
-            let mut new_schema = self.schema.borrow_mut();
-            let mut new_db = self.db.borrow_mut();
-            self.restore_temp_tables_into(&mut new_schema, &mut new_db, captured_temp_tables);
-        }
         self.rebuild_schema_indices();
         self.rowid_alias_columns.borrow_mut().clear();
         self.autoincrement_tables.borrow_mut().clear();
@@ -115664,6 +115664,7 @@ impl Connection {
             LiveVtabCleanupAction::Disconnect,
             "empty schema reload staged-drop displacement",
         );
+        Ok(())
     }
 
     /// True for the `SimplePager::begin` refresh error raised when page 1's
@@ -115723,7 +115724,7 @@ impl Connection {
                 // The empty reset consumes `force_full_schema_reload_once`
                 // itself; the local `force_full_schema_reload` copy read above
                 // stays valid for the full-rebuild path below.
-                self.publish_empty_database_reset(cx, bound_visible_commit_seq, hydrate_rows);
+                self.publish_empty_database_reset(cx, bound_visible_commit_seq, hydrate_rows)?;
                 return Ok(None);
             }
 
@@ -116424,6 +116425,7 @@ impl Connection {
                             };
                             if !column_indices.is_empty() {
                                 mem_table.add_unique_column_group_labeled(
+                                    cx,
                                     column_indices,
                                     slot.key_collations().to_vec(),
                                     qualified_unique_constraint_label(
@@ -116431,7 +116433,7 @@ impl Connection {
                                         slot.columns().iter().map(String::as_str),
                                     ),
                                     slot.is_primary_key(),
-                                );
+                                )?;
                             }
                         }
                     }
@@ -116675,6 +116677,9 @@ impl Connection {
                 });
             }
 
+            // Stage TEMP spill I/O before rebuilding live vtabs or publishing any
+            // schema changes. A read or write error leaves the live tables intact.
+            let captured_temp_tables = self.restore_temp_table_storage(cx, &mut new_db)?;
             let reloaded_live_vtabs = if self.transactional_live_vtab_registry_active() {
                 None
             } else {
@@ -116888,8 +116893,7 @@ impl Connection {
             // same-named main table the reload re-materialized, before the schema
             // fingerprint + atomic publish below. Mirrors the TEMP-trigger
             // preservation a few lines down.
-            let captured_temp_tables = self.snapshot_temp_tables();
-            self.restore_temp_tables_into(&mut new_schema, &mut new_db, captured_temp_tables);
+            self.restore_temp_table_schemas(&mut new_schema, captured_temp_tables);
 
             let old_schema_fingerprint = {
                 let schema = self.schema.borrow();
@@ -155783,7 +155787,13 @@ impl Drop for VfsTempFileHandle {
     fn drop(&mut self) {
         let mut guard = lock_unpoisoned(&self.file);
         if let Some(mut file) = guard.take() {
-            let cx = Cx::new();
+            // The handle still owns a delete-on-close file. Its final VFS close
+            // must run even if the operation that opened it was cancelled.
+            let cx = Cx::detached_rebind();
+            if let Some(native_task_cx) = asupersync::Cx::current() {
+                cx.set_native_cx(native_task_cx);
+            }
+            let _mask = cx.masked();
             let _ = file.close(&cx);
         }
     }

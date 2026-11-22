@@ -2378,6 +2378,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 };
                 if !column_indices.is_empty() {
                     mem_table.add_unique_column_group_labeled(
+                        cx,
                         column_indices,
                         slot.key_collations().to_vec(),
                         qualified_unique_constraint_label(
@@ -2385,7 +2386,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                             slot.columns().iter().map(String::as_str),
                         ),
                         slot.is_primary_key(),
-                    );
+                    )?;
                 }
             }
             if cursor.first(cx).await? {

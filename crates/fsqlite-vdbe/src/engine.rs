@@ -987,13 +987,17 @@ impl MemTable {
         let Some(row) = self.rows.get(pos) else {
             return Ok(None);
         };
+        self.read_row_values(cx, row).map(Some)
+    }
+
+    fn read_row_values<'a>(&self, cx: &Cx, row: &'a MemRow) -> Result<Cow<'a, [SqliteValue]>> {
         if let Some(slice) = row.spilled {
             let spill = self.temp_spill.as_ref().ok_or_else(|| {
                 FrankenError::internal("spilled MemRow present without TempTableSpillState")
             })?;
-            return Ok(Some(Cow::Owned(spill.read_spilled_values(cx, slice)?)));
+            return Ok(Cow::Owned(spill.read_spilled_values(cx, slice)?));
         }
-        Ok(Some(Cow::Borrowed(row.values.as_slice())))
+        Ok(Cow::Borrowed(row.values.as_slice()))
     }
 
     /// Read row values by `rowid`, transparently loading from the temp spill file
@@ -1007,18 +1011,6 @@ impl MemTable {
             return Ok(None);
         };
         self.read_row_values_at(cx, pos)
-    }
-
-    /// Best-effort synchronous row read for internal non-fallible helpers
-    /// (constraint checks, DDL rewrites, undo capture).
-    fn read_row_values_sync<'a>(&'a self, row: &'a MemRow) -> Cow<'a, [SqliteValue]> {
-        if let Some(slice) = row.spilled
-            && let Some(spill) = self.temp_spill.as_ref()
-            && let Ok(values) = spill.read_spilled_values(&Cx::new(), slice)
-        {
-            return Cow::Owned(values);
-        }
-        Cow::Borrowed(row.values.as_slice())
     }
 
     /// Materialize all `(rowid, values)` pairs (inline and spilled) for
@@ -1199,18 +1191,19 @@ impl MemTable {
     }
 
     /// Register a group of columns that together form a UNIQUE constraint.
-    pub fn add_unique_column_group(&mut self, cols: Vec<usize>) {
-        self.add_unique_column_group_with_collations(cols, Vec::new());
+    pub fn add_unique_column_group(&mut self, cx: &Cx, cols: Vec<usize>) -> Result<()> {
+        self.add_unique_column_group_with_collations(cx, cols, Vec::new())
     }
 
     /// Register a group of columns that together form a UNIQUE constraint
     /// with explicit per-column collation metadata.
     pub fn add_unique_column_group_with_collations(
         &mut self,
+        cx: &Cx,
         cols: Vec<usize>,
         collations: Vec<Option<String>>,
-    ) {
-        self.add_unique_column_group_labeled(cols, collations, None, false);
+    ) -> Result<()> {
+        self.add_unique_column_group_labeled(cx, cols, collations, None, false)
     }
 
     /// As [`Self::add_unique_column_group_with_collations`], plus the qualified
@@ -1222,17 +1215,18 @@ impl MemTable {
     /// violation is SQLITE_CONSTRAINT_PRIMARYKEY rather than _UNIQUE.
     pub fn add_unique_column_group_labeled(
         &mut self,
+        cx: &Cx,
         cols: Vec<usize>,
         collations: Vec<Option<String>>,
         label: Option<String>,
         primary_key: bool,
-    ) {
+    ) -> Result<()> {
         let mut constraint = UniqueConstraintState::new(cols, collations, label);
         constraint.primary_key = primary_key;
         if let Some(index) = constraint.index.as_mut() {
             for row in self.rows.iter() {
                 if let Some(key) = Self::unique_key_for_constraint(
-                    &row.values,
+                    &self.read_row_values(cx, row)?,
                     &constraint.columns,
                     &constraint.collations,
                 ) {
@@ -1241,6 +1235,7 @@ impl MemTable {
             }
         }
         self.unique_constraints_mut().push(constraint);
+        Ok(())
     }
 
     /// Remove one matching UNIQUE constraint from the in-memory table.
@@ -1282,25 +1277,26 @@ impl MemTable {
     /// installed constraint; custom collations use the exact comparison path.
     pub fn unique_column_group_is_valid(
         &self,
+        cx: &Cx,
         cols: &[usize],
         collations: &[Option<String>],
-    ) -> bool {
+    ) -> Result<bool> {
         // Normalization only; validity does not depend on the label.
         let constraint = UniqueConstraintState::new(cols.to_vec(), collations.to_vec(), None);
         if constraint.index.is_some() {
             let mut seen = HashSet::new();
             for row in self.rows.iter() {
-                let row_values = self.read_row_values_sync(row);
+                let row_values = self.read_row_values(cx, row)?;
                 if let Some(key) = Self::unique_key_for_constraint(
                     &row_values,
                     &constraint.columns,
                     &constraint.collations,
                 ) && !seen.insert(key)
                 {
-                    return false;
+                    return Ok(false);
                 }
             }
-            return true;
+            return Ok(true);
         }
 
         let registry = self
@@ -1308,26 +1304,26 @@ impl MemTable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (idx, row) in self.rows.iter().enumerate() {
-            let row_values = self.read_row_values_sync(row);
-            if self.rows[idx + 1..].iter().any(|other| {
-                let other_values = self.read_row_values_sync(other);
-                Self::unique_constraint_matches_row(
+            let row_values = self.read_row_values(cx, row)?;
+            for other in &self.rows[idx + 1..] {
+                let other_values = self.read_row_values(cx, other)?;
+                if Self::unique_constraint_matches_row(
                     &row_values,
                     &other_values,
                     &constraint.columns,
                     &constraint.collations,
                     &registry,
-                )
-            }) {
-                return false;
+                ) {
+                    return Ok(false);
+                }
             }
         }
-        true
+        Ok(true)
     }
 
     /// Find rows that conflict with `new_values` on any UNIQUE constraint.
     /// Returns the rowids of all conflicting rows.
-    pub fn find_unique_conflicts(&self, new_values: &[SqliteValue]) -> Vec<i64> {
+    pub fn find_unique_conflicts(&self, cx: &Cx, new_values: &[SqliteValue]) -> Result<Vec<i64>> {
         let mut conflicts = BTreeSet::new();
         let mut collations = None;
         for constraint in self.unique_constraints.iter() {
@@ -1349,7 +1345,7 @@ impl MemTable {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             });
             for row in self.rows.iter() {
-                let row_values = self.read_row_values_sync(row);
+                let row_values = self.read_row_values(cx, row)?;
                 if Self::unique_constraint_matches_row(
                     &row_values,
                     new_values,
@@ -1361,7 +1357,7 @@ impl MemTable {
                 }
             }
         }
-        conflicts.into_iter().collect()
+        Ok(conflicts.into_iter().collect())
     }
 
     /// bd-towj6: the label of the first UNIQUE constraint `new_values` violates.
@@ -1372,8 +1368,7 @@ impl MemTable {
     /// success path. Returns `None` when the conflicting constraint was
     /// registered without a label, leaving the caller's previous wording in
     /// place. The flag is whether that constraint is the table's PRIMARY KEY.
-    #[must_use]
-    pub fn find_unique_conflict_label(&self, new_values: &[SqliteValue]) -> Option<(&str, bool)> {
+    pub fn find_unique_conflict_label(&self, cx: &Cx, new_values: &[SqliteValue]) -> Result<Option<(&str, bool)>> {
         let mut collations = None;
         for constraint in self.unique_constraints.iter() {
             let violated = if let Some(index) = &constraint.index {
@@ -1389,25 +1384,30 @@ impl MemTable {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                 });
-                self.rows.iter().any(|row| {
-                    let row_values = self.read_row_values_sync(row);
-                    Self::unique_constraint_matches_row(
+                let mut found = false;
+                for row in self.rows.iter() {
+                    let row_values = self.read_row_values(cx, row)?;
+                    if Self::unique_constraint_matches_row(
                         &row_values,
                         new_values,
                         &constraint.columns,
                         &constraint.collations,
                         registry,
-                    )
-                })
+                    ) {
+                        found = true;
+                        break;
+                    }
+                }
+                found
             };
             if violated {
-                return constraint
+                return Ok(constraint
                     .label
                     .as_deref()
-                    .map(|label| (label, constraint.primary_key));
+                    .map(|label| (label, constraint.primary_key)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Allocate a new unique rowid.
@@ -1471,17 +1471,11 @@ impl MemTable {
         // Replace if rowid already exists (UPSERT semantics).
         match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
             Ok(idx) => {
-                let old_was_spilled = self.rows[idx].spilled.is_some();
-                let old_values = self.read_row_values_sync(&self.rows[idx]).into_owned();
-                {
-                    let row = &mut self.rows_mut()[idx];
-                    row.values = values;
-                    row.spilled = None;
-                }
-                if old_was_spilled && let Some(spill) = self.temp_spill.as_mut() {
+                let old = std::mem::replace(&mut self.rows_mut()[idx], MemRow { rowid, values, spilled: None });
+                if old.spilled.is_some() && let Some(spill) = self.temp_spill.as_mut() {
                     spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
                 }
-                self.remove_unique_entries(rowid, &old_values);
+                self.forget_unique_row(&old);
                 self.insert_unique_keys(rowid, &new_keys);
             }
             Err(idx) => {
@@ -1502,17 +1496,15 @@ impl MemTable {
     /// read-only snapshot (such as `:memory:` time-travel capture) never pins a
     /// live `TrackedTempFile` handle after the live `TEMP` table is dropped or
     /// `PRAGMA temp_store` changes mode.
-    fn detach_temp_spill_for_snapshot(&mut self) {
-        if self.has_spilled_rows() {
-            self.hydrate_all_spilled_rows_sync();
-        }
+    fn detach_temp_spill_for_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.hydrate_all_spilled_rows(cx)?;
         self.temp_spill = None;
+        Ok(())
     }
 
     /// Delete a row by rowid. Returns true if a row was found and deleted.
     pub fn delete_by_rowid(&mut self, rowid: i64) -> bool {
         if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
-            let old_values = self.read_row_values_sync(&self.rows[idx]).into_owned();
             let row = self.rows_mut().remove(idx);
             let now_empty = self.rows.is_empty();
             if let Some(spill) = self.temp_spill.as_mut() {
@@ -1531,7 +1523,7 @@ impl MemTable {
                     }
                 }
             }
-            self.remove_unique_entries(row.rowid, &old_values);
+            self.forget_unique_row(&row);
             true
         } else {
             false
@@ -1591,8 +1583,8 @@ impl MemTable {
     /// appending `default_val` for any missing trailing columns.
     /// Used after ALTER TABLE ADD COLUMN to make pre-existing rows
     /// visible with the new column's default value.
-    pub fn pad_rows_to_column_count(&mut self, target_cols: usize, default_val: &SqliteValue) {
-        self.hydrate_all_spilled_rows_sync();
+    pub fn pad_rows_to_column_count(&mut self, cx: &Cx, target_cols: usize, default_val: &SqliteValue) -> Result<()> {
+        self.hydrate_all_spilled_rows(cx)?;
         self.num_columns = target_cols;
         for row in self.rows_mut() {
             while row.values.len() < target_cols {
@@ -1600,6 +1592,7 @@ impl MemTable {
             }
         }
         self.rebuild_unique_indexes();
+        Ok(())
     }
 
     /// bd-01uq7: store computed VIRTUAL generated values in `column`, keyed by
@@ -1607,10 +1600,11 @@ impl MemTable {
     /// padded by ALTER TABLE ADD COLUMN).
     pub fn materialize_column_values(
         &mut self,
+        cx: &Cx,
         column: usize,
         values: impl IntoIterator<Item = (i64, SqliteValue)>,
-    ) {
-        self.hydrate_all_spilled_rows_sync();
+    ) -> Result<()> {
+        self.hydrate_all_spilled_rows(cx)?;
         for (rowid, value) in values {
             if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid)
                 && let Some(cell) = self.rows_mut()[idx].values.get_mut(column)
@@ -1619,6 +1613,7 @@ impl MemTable {
             }
         }
         self.rebuild_unique_indexes();
+        Ok(())
     }
 
     /// Remove one declared column from every materialized row.
@@ -1626,8 +1621,8 @@ impl MemTable {
     /// TEMP tables use `MemTable` as their authoritative storage.  Keep the
     /// table's direct UNIQUE-constraint column positions aligned with the
     /// rewritten row image when `ALTER TABLE ... DROP COLUMN` removes a slot.
-    fn remove_column_from_rows(&mut self, removed_slot: usize) {
-        self.hydrate_all_spilled_rows_sync();
+    fn remove_column_from_rows(&mut self, cx: &Cx, removed_slot: usize) -> Result<()> {
+        self.hydrate_all_spilled_rows(cx)?;
         self.num_columns = self.num_columns.saturating_sub(1);
         for row in self.rows_mut() {
             if removed_slot < row.values.len() {
@@ -1642,31 +1637,37 @@ impl MemTable {
             }
         }
         self.rebuild_unique_indexes();
+        Ok(())
     }
 
     /// Hydrate any spilled rows back into inline storage before an in-place
     /// schema rewrite (`ALTER TABLE ADD/DROP COLUMN`).
-    fn hydrate_all_spilled_rows_sync(&mut self) {
+    fn hydrate_all_spilled_rows(&mut self, cx: &Cx) -> Result<()> {
         if !self.has_spilled_rows() {
-            return;
+            return Ok(());
         }
-        let Some(spill) = self.temp_spill.clone() else {
-            return;
-        };
-        let cx = Cx::new();
+        // Preserve all spill locations until every read has succeeded. A failed
+        // or cancelled read must leave the old row image available for retry.
+        let spill = self.temp_spill.as_ref().expect("has_spilled_rows");
+        let mut loaded = Vec::with_capacity(spill.spilled_row_count);
         let mut hydrated_bytes = 0usize;
-        for row in self.rows_mut() {
-            if let Some(slice) = row.spilled.take()
-                && let Ok(values) = spill.read_spilled_values(&cx, slice)
-            {
+        for (pos, row) in self.rows.iter().enumerate() {
+            if let Some(slice) = row.spilled {
+                let values = spill.read_spilled_values(cx, slice)?;
                 hydrated_bytes = hydrated_bytes.saturating_add(estimate_mem_row_values_size(&values));
-                row.values = values;
+                loaded.push((pos, values));
             }
+        }
+        let rows = self.rows_mut();
+        for (pos, values) in loaded {
+            rows[pos].values = values;
+            rows[pos].spilled = None;
         }
         if let Some(state) = self.temp_spill.as_mut() {
             state.spilled_row_count = 0;
             state.resident_bytes = state.resident_bytes.saturating_add(hydrated_bytes);
         }
+        Ok(())
     }
 
     /// Find a row by rowid. Returns the index.
@@ -1760,10 +1761,10 @@ impl MemTable {
 
     /// Iterate all rows as `(rowid, Cow<[SqliteValue]>)`, transparently
     /// reading spilled `TEMP` rows from their spill file when needed.
-    pub fn iter_rows_cow(&self) -> impl Iterator<Item = (i64, Cow<'_, [SqliteValue]>)> + '_ {
+    pub fn iter_rows_cow<'a>(&'a self, cx: &'a Cx) -> impl Iterator<Item = Result<(i64, Cow<'a, [SqliteValue]>)>> + 'a {
         self.rows
             .iter()
-            .map(|r| (r.rowid, self.read_row_values_sync(r)))
+            .map(move |row| self.read_row_values(cx, row).map(|values| (row.rowid, values)))
     }
 
     /// Insert a row with an explicit rowid (for loading from file).
@@ -1831,6 +1832,23 @@ impl MemTable {
         true
     }
 
+    fn forget_unique_row(&mut self, row: &MemRow) {
+        if row.spilled.is_none() {
+            self.remove_unique_entries(row.rowid, &row.values);
+        } else if self.unique_constraints.iter().any(|constraint| constraint.index.is_some()) {
+            // Rollback must be able to discard a spilled replacement after I/O
+            // failed. Its rowid already exists in the in-memory UNIQUE indexes.
+            for constraint in self.unique_constraints_mut() {
+                if let Some(index) = &mut constraint.index {
+                    index.retain(|_, rowids| {
+                        rowids.remove(&row.rowid);
+                        !rowids.is_empty()
+                    });
+                }
+            }
+        }
+    }
+
     fn remove_unique_entries(&mut self, rowid: i64, values: &[SqliteValue]) {
         if self.unique_constraints.iter().all(|constraint| constraint.index.is_none()) {
             return;
@@ -1888,7 +1906,7 @@ impl MemTable {
         if self.unique_constraints.iter().all(|constraint| constraint.index.is_none()) {
             return;
         }
-        let spill_ref = self.temp_spill.clone();
+        debug_assert!(!self.has_spilled_rows(), "DDL hydrates before rebuilding UNIQUE indexes");
         let rows_ref = Arc::clone(&self.rows);
         let constraints = Arc::make_mut(&mut self.unique_constraints);
         for constraint in constraints.iter_mut() {
@@ -1896,22 +1914,13 @@ impl MemTable {
                 index.clear();
             }
         }
-        let cx = Cx::new();
         for row in rows_ref.iter() {
-            let row_values: Cow<'_, [SqliteValue]> = if let Some(slice) = row.spilled
-                && let Some(spill) = spill_ref.as_ref()
-                && let Ok(values) = spill.read_spilled_values(&cx, slice)
-            {
-                Cow::Owned(values)
-            } else {
-                Cow::Borrowed(row.values.as_slice())
-            };
             for constraint in constraints.iter_mut() {
                 let Some(index) = constraint.index.as_mut() else {
                     continue;
                 };
                 if let Some(key) = Self::unique_key_for_constraint(
-                    &row_values,
+                    &row.values,
                     &constraint.columns,
                     &constraint.collations,
                 ) {
@@ -2311,43 +2320,6 @@ struct SpillRun {
 }
 
 impl SorterCursor {
-    #[cfg(test)]
-    fn new(
-        key_columns: usize,
-        sort_key_orders: Vec<SortKeyOrder>,
-        collations: Vec<Option<String>>,
-    ) -> Self {
-        Self::with_collation_registry(
-            key_columns,
-            sort_key_orders,
-            collations,
-            Arc::new(Mutex::new(CollationRegistry::new())),
-            None,
-            TextEncoding::Utf8,
-        )
-    }
-
-    #[cfg(test)]
-    fn with_collation_registry(
-        key_columns: usize,
-        sort_key_orders: Vec<SortKeyOrder>,
-        collations: Vec<Option<String>>,
-        collation_registry: Arc<Mutex<CollationRegistry>>,
-        top_n_limit: Option<usize>,
-        text_encoding: TextEncoding,
-    ) -> Self {
-        Self::with_collation_registry_and_temp_store(
-            key_columns,
-            sort_key_orders,
-            collations,
-            collation_registry,
-            top_n_limit,
-            text_encoding,
-            TempStoreRuntime::default(),
-            Cx::new(),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn with_collation_registry_and_temp_store(
         key_columns: usize,
@@ -7163,7 +7135,8 @@ enum MemDbUndoOp {
     },
     DeleteRow {
         root_page: i32,
-        row: MemRow,
+        rowid: i64,
+        values: MemRowValues,
         prev_next_rowid: i64,
     },
 }
@@ -7219,12 +7192,12 @@ impl MemDbUndoOp {
             }
             Self::DeleteRow {
                 root_page,
-                row,
+                rowid,
+                values,
                 prev_next_rowid,
             } => {
                 if let Some(table) = db.tables.get_mut(&root_page) {
-                    let restored_values = table.read_row_values_sync(&row).into_owned();
-                    table.insert(row.rowid, restored_values);
+                    table.insert(rowid, values);
                     table.next_rowid = prev_next_rowid;
                 }
             }
@@ -7278,22 +7251,21 @@ impl MemDatabase {
     /// not O(rows). The undo and statement bookkeeping start fresh: a snapshot
     /// never rolls back, and copying an in-flight transaction's undo records
     /// into it would only pin their memory.
-    #[must_use]
-    pub fn clone_for_snapshot(&self) -> Self {
+    pub fn clone_for_snapshot(&self, cx: &Cx) -> Result<Self> {
         let mut tables = self.tables.clone();
         for (_, table) in tables.iter_mut() {
             if table.temp_spill.is_some() {
-                table.detach_temp_spill_for_snapshot();
+                table.detach_temp_spill_for_snapshot(cx)?;
             }
         }
-        Self {
+        Ok(Self {
             tables,
             next_root_page: self.next_root_page,
             undo_enabled: true,
             undo_log: Vec::new(),
             statement_undo_marks: Vec::new(),
             in_explicit_txn: false,
-        }
+        })
     }
 
     /// Propagate a shared collation registry to all tracked MemTables.
@@ -7578,30 +7550,6 @@ impl MemDatabase {
         }
     }
 
-    pub fn upsert_row<V>(&mut self, root_page: i32, rowid: i64, values: V)
-    where
-        V: Into<MemRowValues>,
-    {
-        let values = values.into();
-        if let Some(table) = self.tables.get_mut(&root_page) {
-            let prev_next_rowid = table.next_rowid;
-            // Use binary search (O(log n)) instead of linear scan (O(n))
-            // since rows are maintained in rowid-sorted order.
-            let old_values = table
-                .rows
-                .binary_search_by_key(&rowid, |r| r.rowid)
-                .ok()
-                .map(|idx| table.read_row_values_sync(&table.rows[idx]).into_owned());
-            table.insert(rowid, values);
-            self.push_undo(MemDbUndoOp::UpsertRow {
-                root_page,
-                rowid,
-                prev_next_rowid,
-                old_values,
-            });
-        }
-    }
-
     /// Upsert a row while enforcing any attached `PRAGMA temp_store` budget
     /// (spilling `TEMP`/ephemeral rows to VFS temp files or checking
     /// `hard_heap_limit` / `Cx` cancellation).
@@ -7660,66 +7608,33 @@ impl MemDatabase {
     /// The pre-rewrite table image is recorded as one undo entry, so an
     /// enclosing statement savepoint restores row widths, UNIQUE metadata,
     /// and the column count together.
-    pub fn remove_column_from_rows(&mut self, root_page: i32, removed_slot: usize) -> bool {
+    pub fn remove_column_from_rows(&mut self, cx: &Cx, root_page: i32, removed_slot: usize) -> Result<bool> {
         let Some(previous) = self.tables.get(&root_page).cloned() else {
-            return false;
+            return Ok(false);
         };
         if previous
             .unique_constraints
             .iter()
             .any(|constraint| constraint.columns.contains(&removed_slot))
         {
-            return false;
+            return Ok(false);
+        }
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            table.remove_column_from_rows(cx, removed_slot)?;
         }
         self.push_undo(MemDbUndoOp::ClearTable {
             root_page,
             table: previous,
         });
-        if let Some(table) = self.tables.get_mut(&root_page) {
-            table.remove_column_from_rows(removed_slot);
-        }
-        true
+        Ok(true)
     }
 
-    /// Allocate an implicit rowid and insert the row, recording one undo entry
-    /// for both the rowid counter advance and the row mutation. If
-    /// `rowid_value_column` is present, that column is patched to the allocated
-    /// rowid before insertion.
-    #[must_use]
-    pub fn insert_auto_row<V>(
-        &mut self,
-        root_page: i32,
-        values: V,
-        rowid_value_column: Option<usize>,
-    ) -> Option<i64>
-    where
-        V: Into<MemRowValues>,
-    {
-        let mut values = values.into();
-        if let Some(table) = self.tables.get_mut(&root_page) {
-            let prev_next_rowid = table.next_rowid;
-            let rowid = table.alloc_rowid();
-            if let Some(column) = rowid_value_column
-                && let Some(value) = values.get_mut(column)
-            {
-                *value = SqliteValue::Integer(rowid);
-            }
-            let old_values = table
-                .rows
-                .binary_search_by_key(&rowid, |r| r.rowid)
-                .ok()
-                .map(|idx| table.read_row_values_sync(&table.rows[idx]).into_owned());
-            table.insert(rowid, values);
-            self.push_undo(MemDbUndoOp::UpsertRow {
-                root_page,
-                rowid,
-                prev_next_rowid,
-                old_values,
-            });
-            Some(rowid)
-        } else {
-            None
-        }
+    /// Publish a staged table rewrite and retain its previous image for rollback.
+    pub fn replace_table(&mut self, root_page: i32, updated: MemTable) -> bool {
+        let Some(slot) = self.tables.get_mut(&root_page) else { return false; };
+        let table = std::mem::replace(slot, updated);
+        self.push_undo(MemDbUndoOp::ClearTable { root_page, table });
+        true
     }
 
     /// Allocate an implicit rowid and insert the row while enforcing any
@@ -7739,7 +7654,7 @@ impl MemDatabase {
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;
             let prev_resident_bytes = table.temp_spill.as_ref().map(|s| s.resident_bytes);
-            let rowid = table.alloc_rowid();
+            let rowid = table.next_rowid_hint();
             if let Some(column) = rowid_value_column
                 && let Some(value) = values.get_mut(column)
             {
@@ -7753,6 +7668,9 @@ impl MemDatabase {
                 .transpose()?
                 .flatten()
                 .map(Cow::into_owned);
+            // A spilled old value can fail to read. Advance the counter only
+            // after its undo image is available.
+            table.alloc_rowid();
             if let Err(err) = table.insert_checked(cx, rowid, values) {
                 match old_values {
                     Some(prev) => table.insert(rowid, prev),
@@ -7781,54 +7699,25 @@ impl MemDatabase {
     }
 
     /// Delete a row by rowid, recording undo information for rollback.
-    pub fn delete_rowid(&mut self, root_page: i32, rowid: i64) -> bool {
-        if let Some(table) = self.tables.get_mut(&root_page)
-            && let Ok(index) = table.rows.binary_search_by_key(&rowid, |r| r.rowid)
-        {
-            let prev_next_rowid = table.next_rowid;
-            let old_values = table.read_row_values_sync(&table.rows[index]).into_owned();
-            let row = table.rows_mut().remove(index);
-            if row.spilled.is_some() && let Some(spill) = table.temp_spill.as_mut() {
-                spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
-            }
-            table.remove_unique_entries(row.rowid, &old_values);
-            self.push_undo(MemDbUndoOp::DeleteRow {
-                root_page,
-                row: MemRow {
-                    rowid: row.rowid,
-                    values: old_values,
-                    spilled: None,
-                },
-                prev_next_rowid,
-            });
-            true
-        } else {
-            false
-        }
+    pub fn delete_rowid(&mut self, cx: &Cx, root_page: i32, rowid: i64) -> Result<bool> {
+        let Some(pos) = self.tables.get(&root_page).and_then(|table| table.find_by_rowid(rowid)) else {
+            return Ok(false);
+        };
+        self.delete_at(cx, root_page, pos)
     }
 
-    #[allow(dead_code)]
-    fn delete_at(&mut self, root_page: i32, index: usize) {
-        if let Some(table) = self.tables.get_mut(&root_page) {
-            if index < table.rows.len() {
-                let prev_next_rowid = table.next_rowid;
-                let old_values = table.read_row_values_sync(&table.rows[index]).into_owned();
-                let row = table.rows_mut().remove(index);
-                if row.spilled.is_some() && let Some(spill) = table.temp_spill.as_mut() {
-                    spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
-                }
-                table.remove_unique_entries(row.rowid, &old_values);
-                self.push_undo(MemDbUndoOp::DeleteRow {
-                    root_page,
-                    row: MemRow {
-                        rowid: row.rowid,
-                        values: old_values,
-                        spilled: None,
-                    },
-                    prev_next_rowid,
-                });
-            }
+    fn delete_at(&mut self, cx: &Cx, root_page: i32, index: usize) -> Result<bool> {
+        let Some(table) = self.tables.get_mut(&root_page) else { return Ok(false); };
+        let Some(values) = table.read_row_values_at(cx, index)? else { return Ok(false); };
+        let values = values.into_owned();
+        let prev_next_rowid = table.next_rowid;
+        let row = table.rows_mut().remove(index);
+        if row.spilled.is_some() && let Some(spill) = table.temp_spill.as_mut() {
+            spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
         }
+        table.remove_unique_entries(row.rowid, &values);
+        self.push_undo(MemDbUndoOp::DeleteRow { root_page, rowid: row.rowid, values, prev_next_rowid });
+        Ok(true)
     }
 }
 
@@ -12069,10 +11958,11 @@ impl VdbeEngine {
                 rowid,
                 values,
             } => {
+                let cx = self.derive_execution_cx();
                 let db = self.db.as_mut().ok_or_else(|| {
                     FrankenError::internal("MemDatabase missing during UPDATE conflict restore")
                 })?;
-                db.upsert_row(root_page, rowid, values);
+                db.upsert_row_checked(&cx, root_page, rowid, values)?;
             }
         }
         Ok(())
@@ -15566,7 +15456,8 @@ impl VdbeEngine {
                                 // row on a UNIQUE column.
                                 let unique_conflicts = db
                                     .get_table(root)
-                                    .map(|t| t.find_unique_conflicts(&values))
+                                    .map(|t| t.find_unique_conflicts(&mem_op_cx, &values))
+                                    .transpose()?
                                     .unwrap_or_default();
 
                                 let has_conflict = rowid_conflict || !unique_conflicts.is_empty();
@@ -15605,7 +15496,7 @@ impl VdbeEngine {
                                                             old_values.into_owned(),
                                                         ));
                                                     }
-                                                    db.delete_rowid(root, conflict_rid);
+                                                    db.delete_rowid(&mem_op_cx, root, conflict_rid)?;
                                                 }
                                             }
                                             if rowid_conflict
@@ -15649,19 +15540,15 @@ impl VdbeEngine {
                                             // bd-w4pr1.22: an IPK collision, or
                                             // a violated PRIMARY KEY constraint,
                                             // halts with SQLITE_CONSTRAINT_PRIMARYKEY.
-                                            let unique_label = (!rowid_conflict)
-                                                .then(|| {
-                                                    self.db.as_ref().and_then(|db| {
-                                                        db.get_table(root).and_then(|table| {
-                                                            table
-                                                                .find_unique_conflict_label(&values)
-                                                                .map(|(label, primary_key)| {
-                                                                    (label.to_owned(), primary_key)
-                                                                })
-                                                        })
-                                                    })
-                                                })
-                                                .flatten();
+                                            let unique_label = if rowid_conflict {
+                                                None
+                                            } else {
+                                                db.get_table(root)
+                                                    .map(|table| table.find_unique_conflict_label(&mem_op_cx, &values))
+                                                    .transpose()?
+                                                    .flatten()
+                                                    .map(|(label, primary_key)| (label.to_owned(), primary_key))
+                                            };
                                             let (message, code) = match unique_label {
                                                 Some((label, primary_key)) => (
                                                     format!("UNIQUE constraint failed: {label}"),
@@ -15840,7 +15727,7 @@ impl VdbeEngine {
                                         values: restored_values,
                                     });
                                 }
-                                db.delete_at(root, pos);
+                                db.delete_at(&self.execution_cx, root, pos)?;
                                 deleted = true;
                             }
                         }
@@ -20059,11 +19946,13 @@ impl VdbeEngine {
                     rec_buf.clear();
                     self.make_record_lookaside.replace_buf(rec_buf);
 
+                    let op_cx = self.derive_execution_cx();
                     let unique_conflicts = self
                         .db
                         .as_ref()
                         .and_then(|db| db.get_table(root_page))
-                        .map(|table| table.find_unique_conflicts(&values))
+                        .map(|table| table.find_unique_conflicts(&op_cx, &values))
+                        .transpose()?
                         .unwrap_or_default();
                     if !unique_conflicts.is_empty() {
                         // bd-towj6: report the constraint that actually
@@ -20074,7 +19963,9 @@ impl VdbeEngine {
                             .db
                             .as_ref()
                             .and_then(|db| db.get_table(root_page))
-                            .and_then(|table| table.find_unique_conflict_label(&values))
+                            .map(|table| table.find_unique_conflict_label(&op_cx, &values))
+                            .transpose()?
+                            .flatten()
                             .map_or_else(
                                 || ("TEMP table unique constraint".to_owned(), false),
                                 |(label, primary_key)| (label.to_owned(), primary_key),
@@ -20086,7 +19977,6 @@ impl VdbeEngine {
                         }
                         return Err(FrankenError::UniqueViolation { columns });
                     }
-                    let op_cx = self.derive_execution_cx();
                     let db = self.db.as_mut().ok_or_else(|| {
                         FrankenError::internal(
                             "FusedAppendInsert: TEMP MemDatabase is not attached",
@@ -26136,6 +26026,33 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    impl SorterCursor {
+        fn new(
+            key_columns: usize,
+            sort_key_orders: Vec<SortKeyOrder>,
+            collations: Vec<Option<String>>,
+        ) -> Self {
+            Self::with_collation_registry(
+                key_columns, sort_key_orders, collations, Arc::new(Mutex::new(CollationRegistry::new())),
+                None, TextEncoding::Utf8,
+            )
+        }
+
+        fn with_collation_registry(
+            key_columns: usize,
+            sort_key_orders: Vec<SortKeyOrder>,
+            collations: Vec<Option<String>>,
+            collation_registry: Arc<Mutex<CollationRegistry>>,
+            top_n_limit: Option<usize>,
+            text_encoding: TextEncoding,
+        ) -> Self {
+            Self::with_collation_registry_and_temp_store(
+                key_columns, sort_key_orders, collations, collation_registry, top_n_limit,
+                text_encoding, TempStoreRuntime::default(), Cx::new(),
+            )
+        }
+    }
     use crate::{Label, ProgramBuilder};
     use asupersync::runtime::{Runtime, RuntimeBuilder};
     use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
@@ -26243,6 +26160,7 @@ mod tests {
 
     #[test]
     fn test_nocase_comparators_match_sqlite_boundaries() {
+        let cx = Cx::new();
         let sqlite = rusqlite::Connection::open_in_memory().expect("canonical SQLite");
         let registry = fsqlite_func::collation::CollationRegistry::new();
         let collation = registry.find("NOCASE").expect("built-in NOCASE");
@@ -26253,7 +26171,13 @@ mod tests {
         for left in values {
             let left_value = SqliteValue::Text(left.into());
             let mut table = MemTable::new(1);
-            table.add_unique_column_group_with_collations(vec![0], vec![Some("NOCASE".to_owned())]);
+            table
+                .add_unique_column_group_with_collations(
+                    &cx,
+                    vec![0],
+                    vec![Some("NOCASE".to_owned())],
+                )
+                .unwrap();
             table.insert(1, vec![left_value.clone()]);
             for right in values {
                 let comparison: i64 = sqlite
@@ -26283,7 +26207,7 @@ mod tests {
                     "DISTINCT {left:?}, {right:?}"
                 );
                 assert_eq!(
-                    table.find_unique_conflicts(&[right_value]),
+                    table.find_unique_conflicts(&cx, &[right_value]).unwrap(),
                     if expected == Ordering::Equal {
                         vec![1]
                     } else {
@@ -36950,15 +36874,19 @@ mod tests {
 
     #[test]
     fn test_memdb_repeated_clear_preserves_undo_and_temp_rows() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let main = db.create_table(1);
         let temp = db.create_table(1);
         assert!(temp > main);
         db.get_table_mut(main)
             .expect("main table")
-            .add_unique_column_group(vec![0]);
-        db.upsert_row(main, 7, vec![SqliteValue::Integer(42)]);
-        db.upsert_row(temp, 9, vec![SqliteValue::Integer(84)]);
+            .add_unique_column_group(&cx, vec![0])
+            .unwrap();
+        db.upsert_row_checked(&cx, main, 7, vec![SqliteValue::Integer(42)])
+            .unwrap();
+        db.upsert_row_checked(&cx, temp, 9, vec![SqliteValue::Integer(84)])
+            .unwrap();
         db.begin_undo();
         let original = db.undo_version();
 
@@ -36976,7 +36904,8 @@ mod tests {
             Some([SqliteValue::Integer(84)].as_slice())
         );
 
-        db.upsert_row(main, 11, vec![SqliteValue::Integer(63)]);
+        db.upsert_row_checked(&cx, main, 11, vec![SqliteValue::Integer(63)])
+            .unwrap();
         db.clear_table_rows_at_or_below(main);
         db.rollback_to(cleared);
         assert!(db.get_table(main).expect("main table").rows.is_empty());
@@ -36988,28 +36917,34 @@ mod tests {
         );
         assert_eq!(table.next_rowid_hint(), 8);
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(42)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(42)])
+                .unwrap(),
             vec![7]
         );
         assert!(
             table
-                .find_unique_conflicts(&[SqliteValue::Integer(63)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(63)])
+                .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
     fn test_memdb_clear_removes_stale_unique_entries_without_rows() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
         let table = db.get_table_mut(root).expect("table");
-        table.add_unique_column_group(vec![0]);
+        table.add_unique_column_group(&cx, vec![0]).unwrap();
         table.insert(1, vec![SqliteValue::Integer(42)]);
         // Deliberate inconsistent-state control: a row-only emptiness check
         // would incorrectly leave this unique-key entry in place.
         table.rows_mut().clear();
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(42)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(42)])
+                .unwrap(),
             vec![1]
         );
         db.begin_undo();
@@ -37019,14 +36954,16 @@ mod tests {
         assert!(
             db.get_table(root)
                 .expect("table")
-                .find_unique_conflicts(&[SqliteValue::Integer(42)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(42)])
+                .unwrap()
                 .is_empty()
         );
         db.rollback_to(original);
         assert_eq!(
             db.get_table(root)
                 .expect("table")
-                .find_unique_conflicts(&[SqliteValue::Integer(42)]),
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(42)])
+                .unwrap(),
             vec![1]
         );
     }
@@ -37054,25 +36991,33 @@ mod tests {
 
     #[test]
     fn test_memdb_delete_rowid_records_undo() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
         db.get_table_mut(root)
             .expect("table should exist")
-            .add_unique_column_group(vec![0]);
-        db.upsert_row(
+            .add_unique_column_group(&cx, vec![0])
+            .unwrap();
+        db.upsert_row_checked(
+            &cx,
             root,
             1,
             vec![SqliteValue::Integer(10), SqliteValue::Integer(100)],
-        );
+        )
+        .unwrap();
 
         db.begin_undo();
         let token = db.undo_version();
-        assert!(db.delete_rowid(root, 1), "delete should find the row");
+        assert!(
+            db.delete_rowid(&cx, root, 1).unwrap(),
+            "delete should find the row"
+        );
         let table = db.get_table(root).expect("table should exist");
         assert_eq!(table.row_values_by_rowid(1), None);
         assert!(
             table
-                .find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap()
                 .is_empty(),
             "delete should remove the unique-index entry"
         );
@@ -37082,7 +37027,9 @@ mod tests {
         let restored = vec![SqliteValue::Integer(10), SqliteValue::Integer(100)];
         assert_eq!(table.row_values_by_rowid(1), Some(restored.as_slice()));
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap(),
             vec![1],
             "rollback should restore the unique-index entry"
         );
@@ -37090,22 +37037,27 @@ mod tests {
 
     #[test]
     fn test_memdb_insert_auto_row_records_undo_and_patches_rowid_alias() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
-        db.upsert_row(
+        db.upsert_row_checked(
+            &cx,
             root,
             5,
             vec![SqliteValue::Integer(5), SqliteValue::Text("old".into())],
-        );
+        )
+        .unwrap();
 
         db.begin_undo();
         let token = db.undo_version();
         let rowid = db
-            .insert_auto_row(
+            .insert_auto_row_checked(
+                &cx,
                 root,
                 vec![SqliteValue::Null, SqliteValue::Text("new".into())],
                 Some(0),
             )
+            .unwrap()
             .expect("table should exist");
         assert_eq!(rowid, 6);
         let table = db.get_table(root).expect("table should exist");
@@ -37127,33 +37079,41 @@ mod tests {
 
     #[test]
     fn test_memdb_replace_secondary_unique_rollback_restores_deleted_and_replaced_rows() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
         db.get_table_mut(root)
             .expect("table should exist")
-            .add_unique_column_group(vec![1]);
-        db.upsert_row(
+            .add_unique_column_group(&cx, vec![1])
+            .unwrap();
+        db.upsert_row_checked(
+            &cx,
             root,
             1,
             vec![SqliteValue::Integer(1), SqliteValue::Text("alpha".into())],
-        );
-        db.upsert_row(
+        )
+        .unwrap();
+        db.upsert_row_checked(
+            &cx,
             root,
             2,
             vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())],
-        );
+        )
+        .unwrap();
 
         db.begin_undo();
         let token = db.undo_version();
         assert!(
-            db.delete_rowid(root, 1),
+            db.delete_rowid(&cx, root, 1).unwrap(),
             "REPLACE should delete the secondary-unique conflict"
         );
-        db.upsert_row(
+        db.upsert_row_checked(
+            &cx,
             root,
             2,
             vec![SqliteValue::Integer(2), SqliteValue::Text("alpha".into())],
-        );
+        )
+        .unwrap();
         let table = db.get_table(root).expect("table should exist");
         assert_eq!(table.row_values_by_rowid(1), None);
         assert_eq!(
@@ -37161,10 +37121,12 @@ mod tests {
             Some([SqliteValue::Integer(2), SqliteValue::Text("alpha".into())].as_slice())
         );
         assert_eq!(
-            table.find_unique_conflicts(&[
-                SqliteValue::Integer(99),
-                SqliteValue::Text("alpha".into())
-            ]),
+            table
+                .find_unique_conflicts(
+                    &cx,
+                    &[SqliteValue::Integer(99), SqliteValue::Text("alpha".into())]
+                )
+                .unwrap(),
             vec![2]
         );
 
@@ -37180,17 +37142,21 @@ mod tests {
             Some([SqliteValue::Integer(2), SqliteValue::Text("beta".into())].as_slice())
         );
         assert_eq!(
-            table.find_unique_conflicts(&[
-                SqliteValue::Integer(99),
-                SqliteValue::Text("alpha".into())
-            ]),
+            table
+                .find_unique_conflicts(
+                    &cx,
+                    &[SqliteValue::Integer(99), SqliteValue::Text("alpha".into())]
+                )
+                .unwrap(),
             vec![1]
         );
         assert_eq!(
-            table.find_unique_conflicts(&[
-                SqliteValue::Integer(99),
-                SqliteValue::Text("beta".into())
-            ]),
+            table
+                .find_unique_conflicts(
+                    &cx,
+                    &[SqliteValue::Integer(99), SqliteValue::Text("beta".into())]
+                )
+                .unwrap(),
             vec![2]
         );
     }
@@ -37259,13 +37225,16 @@ mod tests {
 
     #[test]
     fn test_memtable_unique_conflict_index_tracks_insert_delete_and_update() {
+        let cx = Cx::new();
         let mut table = MemTable::new(2);
-        table.add_unique_column_group(vec![0]);
+        table.add_unique_column_group(&cx, vec![0]).unwrap();
         table.insert(1, vec![SqliteValue::Integer(10), SqliteValue::Integer(100)]);
         table.insert(2, vec![SqliteValue::Integer(20), SqliteValue::Integer(200)]);
 
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap(),
             vec![1],
             "lookup should find the conflicting rowid via the unique index"
         );
@@ -37273,21 +37242,25 @@ mod tests {
         assert!(table.delete_by_rowid(1), "delete should succeed");
         assert!(
             table
-                .find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap()
                 .is_empty(),
             "deleted rows must be removed from the unique index"
         );
 
         table.insert(2, vec![SqliteValue::Integer(10), SqliteValue::Integer(200)]);
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap(),
             vec![2],
             "updates must refresh the unique index entry"
         );
 
         assert!(
             table
-                .find_unique_conflicts(&[SqliteValue::Null, SqliteValue::Integer(999)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Null, SqliteValue::Integer(999)])
+                .unwrap()
                 .is_empty(),
             "NULL keys must remain non-conflicting under SQLite UNIQUE semantics"
         );
@@ -37295,12 +37268,17 @@ mod tests {
 
     #[test]
     fn test_memtable_unique_conflict_index_honors_nocase_collation() {
+        let cx = Cx::new();
         let mut table = MemTable::new(1);
-        table.add_unique_column_group_with_collations(vec![0], vec![Some("NOCASE".to_owned())]);
+        table
+            .add_unique_column_group_with_collations(&cx, vec![0], vec![Some("NOCASE".to_owned())])
+            .unwrap();
         table.insert(1, vec![SqliteValue::Text("Alice".into())]);
 
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Text("alice".into())]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Text("alice".into())])
+                .unwrap(),
             vec![1],
             "builtin NOCASE unique indexes must normalize case-equivalent text"
         );
@@ -37333,14 +37311,18 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
             .register(DashlessNoCaseCollation);
 
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
         {
             let table = db.get_table_mut(root).expect("table should exist");
-            table.add_unique_column_group_with_collations(
-                vec![0],
-                vec![Some("DASHLESS_NOCASE".to_owned())],
-            );
+            table
+                .add_unique_column_group_with_collations(
+                    &cx,
+                    vec![0],
+                    vec![Some("DASHLESS_NOCASE".to_owned())],
+                )
+                .unwrap();
             table.insert(1, vec![SqliteValue::Text("Alpha-Beta".into())]);
         }
 
@@ -37353,7 +37335,9 @@ mod tests {
             .expect("database should still be attached");
         let table = db.get_table(root).expect("table should exist");
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Text("alpha beta".into())]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Text("alpha beta".into())])
+                .unwrap(),
             vec![1],
             "custom-collation UNIQUE fallback must use the engine-provided registry"
         );
@@ -42459,12 +42443,13 @@ mod tests {
             EffectiveTempStore, OsTempFileBackend, TempFileBackend, TempFileHandle, TempStoreMode,
             TempStoreRuntime, TempStoreStats,
         };
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
         struct FaultTempBackend {
             fail_on_write_at_byte: usize,
             disk_full: bool,
             bytes_written: AtomicUsize,
+            fail_read_offset: Arc<AtomicU64>,
         }
 
         struct FaultTempHandle {
@@ -42472,6 +42457,7 @@ mod tests {
             fail_on_write_at_byte: usize,
             disk_full: bool,
             bytes_written: Arc<AtomicUsize>,
+            fail_read_offset: Arc<AtomicU64>,
         }
 
         impl TempFileHandle for FaultTempHandle {
@@ -42494,6 +42480,11 @@ mod tests {
             }
 
             fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                if offset == self.fail_read_offset.load(Ordering::Relaxed) {
+                    return Err(FrankenError::Io(std::io::Error::other(
+                        "injected temp read failure",
+                    )));
+                }
                 self.inner.read_at(cx, offset, buf)
             }
 
@@ -42520,6 +42511,7 @@ mod tests {
                     bytes_written: Arc::new(AtomicUsize::new(
                         self.bytes_written.load(Ordering::Relaxed),
                     )),
+                    fail_read_offset: Arc::clone(&self.fail_read_offset),
                 }))
             }
         }
@@ -42618,6 +42610,7 @@ mod tests {
                     fail_on_write_at_byte: 1,
                     disk_full,
                     bytes_written: AtomicUsize::new(0),
+                    fail_read_offset: Arc::new(AtomicU64::new(u64::MAX)),
                 })),
                 Arc::clone(&fault_stats),
             );
@@ -42671,7 +42664,7 @@ mod tests {
             None,
             TextEncoding::Utf8,
             cancel_runtime,
-            cx,
+            cx.clone(),
         );
         let vals = vec![SqliteValue::Integer(1)];
         let blob = serialize_record(&vals);
@@ -42683,27 +42676,38 @@ mod tests {
 
         // 5. MemTable temp spill writes & reads back exact values and closes on drop.
         let tbl_stats = Arc::new(TempStoreStats::new());
+        let fail_read_offset = Arc::new(AtomicU64::new(u64::MAX));
         let tbl_runtime = TempStoreRuntime::new(
             TempStoreMode::File,
             256,
             None,
-            Some(Arc::new(OsTempFileBackend)),
+            Some(Arc::new(FaultTempBackend {
+                fail_on_write_at_byte: usize::MAX,
+                disk_full: false,
+                bytes_written: AtomicUsize::new(0),
+                fail_read_offset: Arc::clone(&fail_read_offset),
+            })),
             Arc::clone(&tbl_stats),
         );
         let cx_ok = Cx::new();
         {
             let mut table = MemTable::new(2);
             table.configure_temp_spill(tbl_runtime, TextEncoding::Utf8);
-            for i in 1..=25_i64 {
-                table
-                    .insert_checked(
-                        &cx_ok,
+            table.add_unique_column_group(&cx_ok, vec![0]).unwrap();
+            let expected_rows = (1..=25_i64)
+                .map(|i| {
+                    (
                         i,
                         vec![
                             SqliteValue::Integer(i),
                             SqliteValue::Text(SmallText::new(&format!("row-payload-{i:04}-xyz"))),
                         ],
                     )
+                })
+                .collect::<Vec<_>>();
+            for (rowid, values) in &expected_rows {
+                table
+                    .insert_checked(&cx_ok, *rowid, values.clone())
                     .expect("temp table insert");
             }
             assert!(table.has_spilled_rows(), "temp table must spill beyond 256B");
@@ -42716,6 +42720,83 @@ mod tests {
             assert_eq!(
                 read_back[1],
                 SqliteValue::Text(SmallText::new("row-payload-0013-xyz"))
+            );
+
+            let original_rows = table.rows.as_ref().clone();
+            let spill = table.temp_spill.as_ref().unwrap();
+            let original_accounting = (spill.spilled_row_count, spill.resident_bytes);
+            let original_stats = tbl_stats.snapshot();
+            assert_eq!(original_stats.active_temp_files, 1);
+            let first = original_rows[0].spilled.expect("first row spilled");
+            let second = original_rows[1].spilled.expect("second row spilled");
+            assert!(first.offset < second.offset);
+
+            // A failure on the second read catches rewrites that modify the
+            // first row before discovering that a later read cannot complete.
+            for cancelled in [true, false] {
+                let read_cx = if cancelled {
+                    &cx
+                } else {
+                    fail_read_offset.store(second.offset, Ordering::Relaxed);
+                    &cx_ok
+                };
+                for error in [
+                    table.snapshot_all_rows_owned(read_cx).unwrap_err(),
+                    table
+                        .pad_rows_to_column_count(read_cx, 3, &SqliteValue::Null)
+                        .unwrap_err(),
+                    table.add_unique_column_group(read_cx, vec![1]).unwrap_err(),
+                ] {
+                    if cancelled {
+                        assert!(matches!(error, FrankenError::Abort), "{error:?}");
+                    } else {
+                        assert!(matches!(error, FrankenError::Io(_)), "{error:?}");
+                    }
+                }
+                fail_read_offset.store(u64::MAX, Ordering::Relaxed);
+                assert_eq!(*table.rows, original_rows);
+                assert_eq!(table.num_columns, 2);
+                assert_eq!(table.unique_constraints.len(), 1);
+                let spill = table.temp_spill.as_ref().unwrap();
+                assert_eq!(
+                    (spill.spilled_row_count, spill.resident_bytes),
+                    original_accounting
+                );
+                assert_eq!(tbl_stats.snapshot(), original_stats);
+                assert_eq!(
+                    table.snapshot_all_rows_owned(&cx_ok).unwrap(),
+                    expected_rows
+                );
+                for (rowid, values) in &expected_rows {
+                    assert_eq!(
+                        table.find_unique_conflicts(&cx_ok, values).unwrap(),
+                        vec![*rowid]
+                    );
+                }
+            }
+
+            table.add_unique_column_group(&cx_ok, vec![1]).unwrap();
+            for (rowid, values) in &expected_rows {
+                let lookup = [SqliteValue::Null, values[1].clone()];
+                assert_eq!(
+                    table.find_unique_conflicts(&cx_ok, &lookup).unwrap(),
+                    vec![*rowid]
+                );
+            }
+            let default_value = SqliteValue::Text("added".into());
+            table
+                .pad_rows_to_column_count(&cx_ok, 3, &default_value)
+                .unwrap();
+            let padded_rows = expected_rows
+                .into_iter()
+                .map(|(rowid, mut values)| {
+                    values.push(default_value.clone());
+                    (rowid, values)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                table.snapshot_all_rows_owned(&cx_ok).unwrap(),
+                padded_rows
             );
         }
         let tbl_after_drop = tbl_stats.snapshot();

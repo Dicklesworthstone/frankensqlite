@@ -22125,7 +22125,14 @@ where
             return;
         };
         if let Ok(file) = db_file.try_read() {
-            let cx = Cx::new();
+            // Connection close has already released its runtime region. Unmapping
+            // the file is still required even if that region was cancelled.
+            let cx = Cx::detached_rebind();
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            if let Some(native_task_cx) = asupersync::Cx::current() {
+                cx.set_native_cx(native_task_cx);
+            }
+            let _mask = cx.masked();
             let _ = file.set_mmap_size(&cx, 0);
         }
     }

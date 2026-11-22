@@ -158,6 +158,54 @@ fn large_sorter_spill_builds_a_stock_readable_index() {
     });
 }
 
+#[test]
+fn spilled_temp_ddl_rollback_restores_row_width_and_unique_keys() {
+    const SETUP: &str = "PRAGMA temp_store=FILE; PRAGMA temp.cache_size=1;
+        CREATE TEMP TABLE t(k INTEGER, payload BLOB);
+        INSERT INTO t VALUES(7, zeroblob(16384));";
+    const DDL: &str = "BEGIN;
+        ALTER TABLE temp.t ADD COLUMN value TEXT DEFAULT 'first';
+        CREATE UNIQUE INDEX temp.by_key ON t(k);";
+    const DUPLICATE: &str = "INSERT INTO temp.t(k, payload) VALUES(7, x'2A')";
+    const ADD: &str = "ALTER TABLE temp.t ADD COLUMN value TEXT DEFAULT 'second'";
+    run_test(|| async {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("temp-ddl.db");
+        let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        stock.execute_batch(SETUP).unwrap();
+        conn.execute_batch(SETUP).await.unwrap();
+        assert!(conn.temp_store_stats().temp_table_spill_events > 0);
+
+        stock.execute_batch(DDL).unwrap();
+        conn.execute_batch(DDL).await.unwrap();
+        let stock_error = stock.execute_batch(DUPLICATE).unwrap_err().to_string();
+        let error = conn.execute(DUPLICATE).await.unwrap_err().to_string();
+        assert!(stock_error.contains("UNIQUE"), "{stock_error}");
+        assert!(error.contains("UNIQUE"), "{error}");
+        stock.execute_batch("ROLLBACK").unwrap();
+        conn.execute("ROLLBACK").await.unwrap();
+        for sql in [
+            "PRAGMA temp.table_info(t)",
+            "SELECT name FROM temp.sqlite_schema WHERE type='index' AND name='by_key'",
+        ] {
+            assert_eq!(fsqlite_query(&conn, sql).await, rusqlite_query(&stock, sql));
+        }
+
+        // A stale constraint rejects this duplicate. A stale physical row slot
+        // retains 'first' when the same column is added with a different default.
+        for sql in [DUPLICATE, ADD] {
+            stock.execute_batch(sql).unwrap();
+            conn.execute(sql).await.unwrap();
+        }
+        let read = "SELECT k,length(payload),value FROM temp.t ORDER BY rowid";
+        let expected = rusqlite_query(&stock, read);
+        assert_eq!(expected.len(), 2);
+        assert_eq!(fsqlite_query(&conn, read).await, expected);
+        conn.close().await.unwrap();
+    });
+}
+
 /// Inspecting native VFS backend that records every physical file created in
 /// `dir`, verifies the file exists on disk while open, captures raw bytes
 /// written (for optional zero-plaintext inspection), and can inject disk-full
