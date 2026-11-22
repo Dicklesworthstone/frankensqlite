@@ -94,6 +94,61 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - REJECTED on its time kill line (update_10pct_300k cpu a replicated layout-averaged LOSE, +6.2% / +12.5%, at identical instructions and cycles:u), every instruction line inside its prediction: a join or derived-table projection that is the joined row moves the row into the result instead of copying it (bd-w4pr1.12, serial read lane round 13, lever DS)
+
+- Target: gb_id's outer aggregate over its 1M-row derived table. On d52d8908b execute_join_select cost 355.1M outside
+  the inner statement: a new vector per row, a clone of each value (direct slots, lever W2), and a free of the
+  source row. The drop of the evaluator's rows (242.4M, free 192 Ir each) was out of scope.
+- Touched: `crates/fsqlite-core/src/connection.rs`, execute_join_select's projection only: when result column i reads
+  slot i (or is the raw projection's NULL for an unnamed column) and nothing is appended for ORDER BY, a row of that
+  width is moved (`Row { values: row }`) with the NULLs written in. Keeper `join_projection_move_tests` (rusqlite
+  oracle, 14 direct statements with the rows each must move, 6 outer statements). Mutants: moving a permutation and
+  moving a narrower prefix both fail it.
+- Prediction: gb_id -280 to -320M Ir, window_sum_over -195 to -235M, gb_id_mod100k -27 to -32M, every other row within
+  +-0.1%; gb_id and window_sum_over cpu replicated WINs. Kill: gb_id under 150M or window under 100M; any row beyond
+  +-0.5% Ir; any replicated cycles or cpu LOSE.
+- Result (perf-ds tree d52d8908b + patch, one layout job on vmi1227854, K=6; parent fsqlite-cargo 2238ee96467d2505,
+  lever b664daca642bfe91; stock sqlite3 3.54.1 live; thinkstation1, load 8-12, the controller disk at 99-100%):
+  - Instructions (callgrind, single ELF): gb_id 4,299.94M -> 4,009.96M (-290.0M), window_sum_over -200.0M,
+    gb_id_mod100k -29.0M, window_row_number -201.0M (not in the prediction's list: its outer reads a derived table
+    too). Every other judged row within +-0.08%.
+  - vs stock 3.54.1: gb_id Ir x3.25 -> x3.03, cycles x3.22 -> x2.88; window_sum_over Ir x0.57 -> x0.54.
+  - Time (runs 2 and 3; run 1 void, max null |z| 3.26): gb_id cycles 0.895 / 0.898 WIN, cpu 0.943 WIN / 0.976 TIE;
+    window_sum_over cycles 0.946 / 0.954 WIN, cpu TIE; update_10pct_300k cpu 1.062 / 1.125 LOSE (T 4.0% / 4.4%) with
+    instructions 1.0000 / 1.0004 and cycles 0.999 / 1.003. Its P / L / Q cpu medians were 154.4 / 164.0 / 155.8 and
+    132.0 / 148.5 / 133.1 ms: the excess is kernel time. LINE 3 CROSSED.
+  - Diagnostic: the write rows judged once with L = the parent's six ELFs copied to other paths (one trailing NUL
+    appended so the harness accepts them): update_10pct_300k cpu 0.995 TIE, cycles 1.012 TIE. A per-file effect does
+    not explain the lever's update result. The same copies gave memory_script_200k cycles 1.012 LOSE at T 1.03% in that
+    single run.
+- Retry condition: the same two ELFs (sha256 above) re-judged on a quiet host with update_10pct_300k's sys and user
+  time recorded separately; the lever lands only if no replicated LOSE remains. Its code path never runs on update,
+  so a reproduced kernel-time LOSE needs its own explanation before any retry.
+
+## 2026-11-22 - REJECTED on its gain line (join_1M_to_pk_1000 +263.3M Ir, +7.3%, against at least -100M): `length(column)` read from the stored record through ColumnOctetLength with a characters flag, instead of `Column` + `PureFunc LENGTH` (bd-w4pr1.12, serial read lane round 13, lever LN)
+
+- Target: join_1M_to_pk_1000 (`SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`), 3,615.6M Ir on
+  d52d8908b. Per joined row the profile showed the TEXT value built for u.name (71.2M), LengthFunc (115.2M), the
+  function lookup (~48M) and set_reg (86.0M).
+- Touched: `crates/fsqlite-types/src/opcode.rs` (P5 flag COLUMN_OCTET_LENGTH_CHARACTERS), `crates/fsqlite-vdbe/src/codegen.rs`
+  (try_emit_column_octet_length takes `length`; the lookup-join aggregate emitter emit_join_expr emits the opcode for
+  `length(<stored column>)`), `crates/fsqlite-vdbe/src/engine.rs` (column_char_length_direct: NULL, a BLOB's header
+  length, a UTF-8 database's TEXT counted in its stored bytes as LengthFunc counts valid UTF-8; everything else reads
+  the value and calls LengthFunc). Keeper in `crates/fsqlite-core/tests/bd_iubwb_octet_length_encoding.rs`
+  (`length_of_a_column_reads_the_record_and_matches_stock`, UTF-8 and UTF-16le, invalid UTF-8, overflow, LEFT JOIN
+  NULL rows; fails on main's source and on three mutants).
+- Prediction: join -150 to -300M Ir; every other row within +-0.1%. Kill: join down less than 100M.
+- Result (lnab tree d52d8908b + patch, one layout job on hz4; parent fsqlite-cargo 03b40c870e70ebb5, lever
+  1f5bd607b8da4203; callgrind, single ELF): join_1M_to_pk_1000 3,615.78M -> 3,879.09M (+263.3M), rowid_lookups_200k
+  +0.01%. Answers equal. No time run: line 1 is a deterministic instruction line.
+- Why (cg_selfdiff per row): ColumnOctetLength is not a synchronous hot-lane opcode. It leaves run_hot_opcodes_sync for
+  the async lane (try_execute_hot_opcode_async +385 Ir) and rebuilds the general storage-cursor row layout
+  (begin/ensure/finish_storage_cursor_row_layout and the payload prefix, about +590) that the sync lane's Column reads
+  in place; the value, the call and the result write it removed cost about 330 less than the lane it added.
+- Retry condition: a length() that stays in run_hot_opcodes_sync and reads the cell in place as the sync Column does
+  (try_read_column_in_place), with no async lane and no general row-layout pass; join_1M_to_pk_1000 at least 100M
+  down on callgrind before any time run. ColumnOctetLength itself pays the same lane (not measured here).
+
 ## 2026-11-21 - MAINTENANCE (landed as ad5f63595; inside its prediction): fsqlite::blocking changes() / total_changes() read the connection's counters instead of running a SELECT per call (bd-e64z4, part 1)
 
 - Target: `crates/fsqlite/src/blocking.rs`. `Connection::changes()` and `total_changes()` ran `SELECT changes()` /
