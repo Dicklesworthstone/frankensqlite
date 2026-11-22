@@ -94,6 +94,87 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - WIN (landed as be2bce0d3; inside its prediction; trig_cte x14.40 -> x11.57 stock 3.54.1 in instructions): a trigger body INSERT, UPDATE or DELETE runs its compiled program without the dispatcher's per-statement validation and rewriting (bd-fpr5g, trig lane round 1, lever 3b)
+
+- Target: bd-fpr5g's script, an AFTER INSERT trigger with a WHEN guard and an INSERT and an UPDATE in its
+  body, over 20,000 rows. After lever 3a every bound body statement still went through the whole statement
+  dispatcher on every firing. Callgrind on main 488ae3f6a: differential trig_src variants (one or two copies
+  of each body statement, a WHEN that never holds, no trigger), stock 3.54.1 on the same files.
+  - body INSERT 36.4k instructions per firing: its program 21.9k, the dispatcher ~14.5k;
+  - body UPDATE 54.6k: its program 20.6k, the dispatcher ~34.0k. That covers two placeholder
+    canonicalizations that clone the statement (a CASE is not "plain"), the UPDATE arm's limit-scope copy,
+    semantic validation (~2.2k), the subquery-rewrite walk, the statement text and the cache lookup.
+  - Stock pays 2.75k and 2.94k for the whole statements.
+- Ledger preflight: levers 1, 2 and 3a (2026-11-18 to 2026-11-20) are this bead's WINs; no entry covers a
+  trigger body's dispatcher. The 2026-11-22 C API L3 rejection (sqlite3_step reusing prepare_v2's
+  statement) is the nearest. It removed a second parse, which is not where this cost sits.
+- Change (connection/insert_batch.rs, connection.rs):
+  - Each TriggerBodyTemplate holds a kernel slot. After the template's statement has run once through the
+    ordinary dispatcher and succeeded, the slot takes the compiled cache's own entry for the text that
+    dispatcher compiled, with the GH#516 replay identity.
+  - Admitted (once per template): a one-row INSERT ... VALUES, an UPDATE or a DELETE with no WITH, FROM,
+    RETURNING, ORDER BY, LIMIT, upsert, subquery or row value, already in canonical form, that no outer-layer
+    rewrite changes, on a MAIN table that has no triggers of its own and is not a view, a virtual table, a
+    sqlite_ table, a TEMP name or an attached target.
+  - Per row, falling back to the ordinary path otherwise: the identity is unchanged and the cache still holds
+    that program; foreign keys are off; the cache is not bypassed; no statement or compat tracing is on; the
+    connection is not at an autocommit retry boundary or a committed-pager refresh point; it is not
+    encryption-locked.
+  - The kernel keeps every step with an effect, in the dispatcher's order. INSERT runs the shared GH#516
+    kernel (execute_insert_dispatch with the program); UPDATE and DELETE run their arm's tail for a target
+    without triggers.
+- Prediction (posted before the build, restated on the rebased profile): -450M to -700M instructions on
+  each trigger row. Kill lines: trig_cte gains less than 250M; any answer differs; any keeper red; any
+  non-trigger row worse than +0.5% Ir; any replicated cycles or cpu LOSE above 1%.
+- Defect found before measuring: the first lib test run counted 85 kernel runs where 170 were due. The
+  admission used statement_may_target_attached_schema, a coarse dispatcher gate that holds for every UPDATE
+  and DELETE. It now uses the exact delegation predicate, attached_target_schema(target) == None.
+- Measured (scratchpad trig1):
+  - Arms: parent ab9184258 and lever (the landed diff on it, patch 6eee026e2a060ecb), built in one rch job on
+    hz4. Cargo-link sha256 69b5758e9e0544ed (parent) and e286ba2202681e5d (lever).
+  - The parent's 1,954 sources equal git. Only the lever ELF carries the kernel. Every ELF matches the
+    worker's manifest and gives stock's output on the smoke script.
+  - Conditions: thinkstation1, powersave, stock 3.54.1 (scripts/build_stock_sqlite3.sh) live, answers equal
+    on every row and run.
+
+  | row | Ir lever / parent (single ELF, 5 reps; A/A within 0.06%) | x stock, Ir | x stock, cycles | x stock, cpu |
+  |---|---|---|---|---|
+  | trig_cte (the bead's script) | 0.803 (-651M) | 14.40 -> 11.57 | 40.2 -> 26.6 | 33.7 -> 22.6 |
+  | trig_src | 0.790 (-646M) | 11.83 -> 9.35 | 33.4 -> 21.8 | 27.9 -> 18.3 |
+  | trig_values | 0.787 (-669M) | 2.69 -> 2.11 | 6.7 -> 4.7 | 6.5 -> 4.5 |
+  | notrig_cte, ctl_insert_txn, ctl_select | 1.0000, 1.0010, 1.0001 | | | |
+
+  - Layout-averaged time (bd-es2im lines, K=6, 7 reps):
+    - Run 1 was VOID (a Q-vs-P null at |z| 4.31). My judge's process name did not match the lanes'
+      bracketed bench pattern, so another lane's judge could start alongside it. Run 3 ran as
+      trig1/trig_probe.py, which the pattern sees.
+    - Runs 2 and 3 are valid (max |z| 2.64 and 2.93). Every trigger row is a replicated WIN on cycles and
+      cpu (lever/parent 0.63 to 0.70). Every control is a replicated TIE.
+    - The cycles and cpu columns in the table are from run 2.
+- Keepers:
+  - insert_batch.rs lib tests count kernel runs: exact counts on :memory: and a file; none with foreign keys
+    on; one ordinary run after CREATE INDEX on the target, then integrity_check ok; a trigger on the target
+    keeps that statement off the kernel.
+  - bd_fpr5g_trigger_body_cache_under_cte.rs `kernel_run_trigger_bodies_follow_targets_pragmas_failures_and_rollback`,
+    stock 3.54.1, :memory: and a file.
+- Gate (rch, on the lever commit over ab9184258):
+  - clippy -D warnings, fsqlite-core all targets: clean; it ran clean again on the rebased commit;
+  - the kernel lib tests: 2 passed;
+  - 38 trigger / conflict / RETURNING keeper targets: 190 passed, 0 failed;
+  - fsqlite-core --lib: 4,203 passed, 1 failed. The failure is bd-c2mbm's load flake, the identical
+    assertion; it passed on its rerun in the same job;
+  - 8 e2e trigger targets: 51 passed;
+  - the fsqlite crate: 125 binaries, 1,104 passed, 0 failed.
+  - The rebase onto b04628fe8 crossed main's btree, rowid-allocator, WAL-open, ignore_check_constraints and
+    trigger-DQS commits. The UPDATE / DELETE arms and execute_insert_dispatch are byte-identical across it,
+    and the kernel's cache check inherits the new ignore_check_constraints key.
+- Retry condition: none for this lever.
+- Left on the row (main 488ae3f6a per inserted row): the outer replay's ~34k (lever 5, scoped on bd-fpr5g:
+  GH#516's kernel refuses SELECT sources and any temp root); per firing ~19k outside the body statements, of
+  which ~13k is the outer INSERT losing its retained cursors to the body programs on the one cached VDBE
+  engine; and the body programs themselves (~21k each against stock's ~3k whole statements). The bead's
+  script is x11.6 stock in instructions against its 5x target.
+
 ## 2026-11-22 - WIN (landed as 31ac790f3; beyond its prediction, inside every kill line): a GROUP BY on the rowid alone streams the table scan's groups in rowid order with no sorter; gb_id -6,593.1M Ir on 488ae3f6a (bd-w4pr1.12, serial read lane round 13, lever GR v3; v1 never fired, v2 rejected)
 
 - Target: gb_id's inner `SELECT id g, count(*) n FROM t GROUP BY id` (1M rows, 1M groups). Its program inserted every
