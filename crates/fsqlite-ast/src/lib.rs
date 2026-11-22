@@ -329,6 +329,162 @@ impl BinaryOp {
     }
 }
 
+/// Resolve unquoted `TRUE`/`FALSE` to bare column references in a table-scoped expression.
+///
+/// Rewrites `Expr::Literal(Literal::True/False)` when the enclosing single-table
+/// scope (partial index predicate, expression index key, `CHECK` constraint, or
+/// generated column) declares a column named `"true"` or `"false"` (case-insensitive).
+///
+/// Subqueries are intentionally not descended into because each subquery owns
+/// its own lexical scope (and single-table schema expressions forbid them).
+#[allow(clippy::too_many_lines)]
+pub fn resolve_table_true_false_columns_in_expr(
+    expr: &mut Expr,
+    has_true: bool,
+    has_false: bool,
+) -> bool {
+    if !has_true && !has_false {
+        return false;
+    }
+    match expr {
+        Expr::Literal(Literal::True, span) if has_true => {
+            *expr = Expr::Column(ColumnRef::bare("true"), *span);
+            true
+        }
+        Expr::Literal(Literal::False, span) if has_false => {
+            *expr = Expr::Column(ColumnRef::bare("false"), *span);
+            true
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            let l = resolve_table_true_false_columns_in_expr(left, has_true, has_false);
+            let r = resolve_table_true_false_columns_in_expr(right, has_true, has_false);
+            l || r
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => {
+            resolve_table_true_false_columns_in_expr(inner, has_true, has_false)
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            let a = resolve_table_true_false_columns_in_expr(inner, has_true, has_false);
+            let b = resolve_table_true_false_columns_in_expr(low, has_true, has_false);
+            let c = resolve_table_true_false_columns_in_expr(high, has_true, has_false);
+            a || b || c
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            let mut changed = resolve_table_true_false_columns_in_expr(inner, has_true, has_false);
+            if let InSet::List(items) = set {
+                for item in items {
+                    changed |= resolve_table_true_false_columns_in_expr(item, has_true, has_false);
+                }
+            }
+            changed
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            let mut changed = resolve_table_true_false_columns_in_expr(inner, has_true, has_false);
+            changed |= resolve_table_true_false_columns_in_expr(pattern, has_true, has_false);
+            if let Some(escape) = escape {
+                changed |= resolve_table_true_false_columns_in_expr(escape, has_true, has_false);
+            }
+            changed
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let mut changed = operand.as_deref_mut().is_some_and(|op| {
+                resolve_table_true_false_columns_in_expr(op, has_true, has_false)
+            });
+            for (when, then) in whens {
+                changed |= resolve_table_true_false_columns_in_expr(when, has_true, has_false);
+                changed |= resolve_table_true_false_columns_in_expr(then, has_true, has_false);
+            }
+            if let Some(else_expr) = else_expr {
+                changed |= resolve_table_true_false_columns_in_expr(else_expr, has_true, has_false);
+            }
+            changed
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let mut changed = false;
+            if let FunctionArgs::List(items) = args {
+                for item in items {
+                    changed |= resolve_table_true_false_columns_in_expr(item, has_true, has_false);
+                }
+            }
+            for term in order_by {
+                changed |=
+                    resolve_table_true_false_columns_in_expr(&mut term.expr, has_true, has_false);
+            }
+            if let Some(filter) = filter {
+                changed |= resolve_table_true_false_columns_in_expr(filter, has_true, has_false);
+            }
+            if let Some(over) = over {
+                for part in &mut over.partition_by {
+                    changed |= resolve_table_true_false_columns_in_expr(part, has_true, has_false);
+                }
+                for term in &mut over.order_by {
+                    changed |= resolve_table_true_false_columns_in_expr(
+                        &mut term.expr,
+                        has_true,
+                        has_false,
+                    );
+                }
+                if let Some(frame) = &mut over.frame {
+                    for bound in std::iter::once(&mut frame.start).chain(frame.end.as_mut()) {
+                        if let FrameBound::Preceding(e) | FrameBound::Following(e) = bound {
+                            changed |=
+                                resolve_table_true_false_columns_in_expr(e, has_true, has_false);
+                        }
+                    }
+                }
+            }
+            changed
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            let a = resolve_table_true_false_columns_in_expr(inner, has_true, has_false);
+            let b = resolve_table_true_false_columns_in_expr(path, has_true, has_false);
+            a || b
+        }
+        Expr::RowValue(items, _) => {
+            let mut changed = false;
+            for item in items {
+                changed |= resolve_table_true_false_columns_in_expr(item, has_true, has_false);
+            }
+            changed
+        }
+        Expr::Literal(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Column(..)
+        | Expr::Exists { .. }
+        | Expr::Subquery(..)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(..) => false,
+    }
+}
+
 impl fmt::Display for BinaryOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

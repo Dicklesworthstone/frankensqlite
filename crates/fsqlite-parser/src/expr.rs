@@ -2067,6 +2067,18 @@ impl<'a> ParseMachine<'a> {
                 ParsedExpr::leaf(Expr::Literal(Literal::Blob(value), token_span))
             }
             TokenKind::KwNull => ParsedExpr::leaf(Expr::Literal(Literal::Null, token_span)),
+            TokenKind::KwTrue
+                if self.parser.at_kind(&TokenKind::Dot)
+                    || self.parser.at_kind(&TokenKind::LeftParen) =>
+            {
+                return self.identifier_or_function(Arc::<str>::from("true"), token_span, min_bp);
+            }
+            TokenKind::KwFalse
+                if self.parser.at_kind(&TokenKind::Dot)
+                    || self.parser.at_kind(&TokenKind::LeftParen) =>
+            {
+                return self.identifier_or_function(Arc::<str>::from("false"), token_span, min_bp);
+            }
             TokenKind::KwTrue => ParsedExpr::leaf(Expr::Literal(Literal::True, token_span)),
             TokenKind::KwFalse => ParsedExpr::leaf(Expr::Literal(Literal::False, token_span)),
             TokenKind::KwCurrentTime => {
@@ -4023,6 +4035,16 @@ impl Parser {
                 token_span,
             ))),
             TokenKind::KwNull => Ok(ParsedExpr::leaf(Expr::Literal(Literal::Null, token_span))),
+            TokenKind::KwTrue
+                if matches!(self.peek_kind(), TokenKind::Dot | TokenKind::LeftParen) =>
+            {
+                self.parse_ident_expr("true", token_span)
+            }
+            TokenKind::KwFalse
+                if matches!(self.peek_kind(), TokenKind::Dot | TokenKind::LeftParen) =>
+            {
+                self.parse_ident_expr("false", token_span)
+            }
             TokenKind::KwTrue => Ok(ParsedExpr::leaf(Expr::Literal(Literal::True, token_span))),
             TokenKind::KwFalse => Ok(ParsedExpr::leaf(Expr::Literal(Literal::False, token_span))),
             TokenKind::KwCurrentTime => Ok(ParsedExpr::leaf(Expr::Literal(

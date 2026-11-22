@@ -19915,7 +19915,7 @@ impl Connection {
             .iter()
             .enumerate()
             .map(|(constraint_index, expression)| {
-                fsqlite_parser::expr::parse_expr(&expression.expr).map_err(|error| {
+                let mut expr = fsqlite_parser::expr::parse_expr(&expression.expr).map_err(|error| {
                     FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "CHECK constraint {} on table `{}` is invalid: {error}",
@@ -19923,7 +19923,9 @@ impl Connection {
                             table.name
                         ),
                     }
-                })
+                })?;
+                resolve_table_true_false_columns(&mut expr, table);
+                Ok(expr)
             })
             .collect::<Result<Vec<_>>>()?;
         if table.without_rowid {
@@ -20261,17 +20263,19 @@ impl Connection {
             .key_expressions
             .iter()
             .map(|expression| {
-                fsqlite_parser::expr::parse_expr(expression).map_err(|error| {
+                let mut expr = fsqlite_parser::expr::parse_expr(expression).map_err(|error| {
                     FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "index `{}` has invalid key expression `{expression}`: {error}",
                             index.name
                         ),
                     }
-                })
+                })?;
+                resolve_table_true_false_columns(&mut expr, table);
+                Ok(expr)
             })
             .collect::<Result<Vec<_>>>()?;
-        let predicate = Self::parse_partial_index_predicate_for_integrity(index)?;
+        let predicate = Self::parse_partial_index_predicate_for_integrity(index, table)?;
         Ok(BoundedIndexValidationSpec {
             column_positions,
             key_expressions,
@@ -20875,8 +20879,12 @@ impl Connection {
     }
 
     /// A partial index's stored predicate, parsed, with its row-value
-    /// comparisons expanded as every reader of it expands them (bd-65jog).
-    fn parse_partial_index_predicate_for_integrity(index: &IndexSchema) -> Result<Option<Expr>> {
+    /// comparisons expanded as every reader of it expands them (bd-65jog) and
+    /// unquoted `TRUE`/`FALSE` resolved against `table` (bd-pud7p).
+    fn parse_partial_index_predicate_for_integrity(
+        index: &IndexSchema,
+        table: &TableSchema,
+    ) -> Result<Option<Expr>> {
         let predicate = index
             .where_clause
             .as_deref()
@@ -20890,6 +20898,7 @@ impl Connection {
             })?;
         Ok(predicate.map(|mut predicate| {
             fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+            resolve_table_true_false_columns(&mut predicate, table);
             predicate
         }))
     }
@@ -47895,10 +47904,15 @@ impl Connection {
         let mut used_names: HashSet<String> = HashSet::with_capacity(width);
         let unique_names: Vec<String> = (0..width)
             .map(|i| {
-                let name = col_names
+                let raw = col_names
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("_c{i}"));
+                let name = if is_sqlite_true_or_false_name(&raw) {
+                    format!("column{}", i + 1)
+                } else {
+                    raw
+                };
                 if used_names.insert(name.to_ascii_lowercase()) {
                     return name;
                 }
@@ -57646,8 +57660,10 @@ impl Connection {
                 ResultColumn::Expr {
                     alias: Some(alias), ..
                 } => resolved.push(alias.clone()),
-                ResultColumn::Expr { expr, .. } => match expr {
+                ResultColumn::Expr { expr, .. } => match strip_collate_wrappers(expr) {
                     Expr::Column(col_ref, _) => resolved.push(col_ref.column.to_string()),
+                    Expr::Literal(Literal::True, _) => resolved.push("true".to_owned()),
+                    Expr::Literal(Literal::False, _) => resolved.push("false".to_owned()),
                     _ => resolved.push(format!("_c{i}")),
                 },
             }
@@ -57778,9 +57794,11 @@ impl Connection {
                     let views = self.views.borrow();
                     let view = views.get(idx)?;
                     let names = if view.columns.is_empty() {
-                        self.select_result_column_names(&view.query, &[], &mut Vec::new())
+                        Self::deduplicate_relation_column_names(
+                            self.select_result_column_names(&view.query, &[], &mut Vec::new()),
+                        )
                     } else {
-                        view.columns.clone()
+                        Self::deduplicate_relation_column_names(view.columns.clone())
                     };
                     (view.query.clone(), names)
                 };
@@ -57845,19 +57863,28 @@ impl Connection {
         tables: &[TableSchema],
         is_xinfo: bool,
     ) -> Vec<Row> {
+        let bound_query = self
+            .bind_schema_qualified_columns(&Statement::Select(view.query.clone()))
+            .ok()
+            .flatten()
+            .and_then(|stmt| match stmt {
+                Statement::Select(select) => Some(select),
+                _ => None,
+            });
+        let view_query = bound_query.as_ref().unwrap_or(&view.query);
         let names: Vec<String> = if view.columns.is_empty() {
             Self::deduplicate_relation_column_names(self.select_result_column_names(
-                &view.query,
+                view_query,
                 &[],
                 &mut Vec::new(),
             ))
         } else {
-            view.columns.clone()
+            Self::deduplicate_relation_column_names(view.columns.clone())
         };
         // Decltypes are computed from the SELECT projection and must align by
         // position with `names`; a length mismatch (e.g. `*` over a non-simple
         // source) falls back to all-empty types rather than misaligning.
-        let mut decltypes = self.view_result_column_decltypes(&view.query, tables);
+        let mut decltypes = self.view_result_column_decltypes(view_query, tables);
         if decltypes.len() != names.len() {
             decltypes = vec![None; names.len()];
         }
@@ -58561,15 +58588,18 @@ impl Connection {
     /// row values as written (bd-wpfqs).
     fn resolve_forced_index_partial_predicate(&self, ti: usize, idx: &str) -> (bool, Option<Expr>) {
         let schema = self.schema.borrow();
-        match schema
-            .get(ti)
-            .and_then(|t| t.indexes.iter().find(|i| i.name.eq_ignore_ascii_case(idx)))
-        {
-            Some(forced_index) => {
-                let predicate = forced_index
-                    .where_clause
-                    .as_deref()
-                    .and_then(|sql| fsqlite_parser::expr::parse_expr(sql).ok());
+        match schema.get(ti).and_then(|t| {
+            t.indexes
+                .iter()
+                .find(|i| i.name.eq_ignore_ascii_case(idx))
+                .map(|forced_index| (t, forced_index))
+        }) {
+            Some((table, forced_index)) => {
+                let predicate = forced_index.where_clause.as_deref().and_then(|sql| {
+                    let mut expr = fsqlite_parser::expr::parse_expr(sql).ok()?;
+                    resolve_table_true_false_columns(&mut expr, table);
+                    Some(expr)
+                });
                 (true, predicate)
             }
             None => (false, None),
@@ -59326,7 +59356,7 @@ impl Connection {
             let views = self.views.borrow();
             if let Some(view) = views.get(i) {
                 if !view.columns.is_empty() {
-                    return view.columns.clone();
+                    return Self::deduplicate_relation_column_names(view.columns.clone());
                 }
                 let mut query = view.query.clone();
                 let temporary = view.temporary;
@@ -59364,7 +59394,7 @@ impl Connection {
         active_ctes: &mut Vec<String>,
     ) -> Vec<String> {
         if !cte.columns.is_empty() {
-            return cte.columns.clone();
+            return Self::deduplicate_relation_column_names(cte.columns.clone());
         }
         if active_ctes
             .iter()
@@ -59393,14 +59423,22 @@ impl Connection {
         }
     }
 
-    /// Rename duplicate column names in a derived relation (view, subquery in
-    /// FROM, CTE without explicit column list) to `name:1`, `name:2`, ... matching
-    /// C SQLite's `sqlite3ColumnsFromExprList` (`bd-073qp`, `bd-84b60`).
+    /// Normalize derived-relation column names like `sqlite3ColumnsFromExprList`.
+    ///
+    /// Renames `true`/`false` to `column{i+1}` and duplicate column names in a
+    /// derived relation (view, subquery in FROM, CTE) to `name:1`, `name:2`, ...
+    /// (`bd-073qp`, `bd-84b60`, `bd-pud7p`).
     fn deduplicate_relation_column_names(col_names: Vec<String>) -> Vec<String> {
         let mut used_names: HashSet<String> = HashSet::with_capacity(col_names.len());
         col_names
             .into_iter()
-            .map(|name| {
+            .enumerate()
+            .map(|(index, raw_name)| {
+                let name = if is_sqlite_true_or_false_name(&raw_name) {
+                    format!("column{}", index + 1)
+                } else {
+                    raw_name
+                };
                 if used_names.insert(name.to_ascii_lowercase()) {
                     return name;
                 }
@@ -65353,9 +65391,10 @@ impl Connection {
 
         let mut predicate: Option<Expr> = None;
         if let Some(pred_sql) = index.where_clause.as_deref() {
-            let Ok(pred_expr) = fsqlite_parser::expr::parse_expr(pred_sql) else {
+            let Ok(mut pred_expr) = fsqlite_parser::expr::parse_expr(pred_sql) else {
                 return UpsertIndexConflictMatch::Indeterminate;
             };
+            resolve_table_true_false_columns(&mut pred_expr, table);
             let Ok(pred_val) = self.eval_join_expr_with_registry(&pred_expr, attempted, &col_map)
             else {
                 return UpsertIndexConflictMatch::Indeterminate;
@@ -65388,9 +65427,10 @@ impl Connection {
                 let Some(expr_sql) = index.key_term_sql(key_pos) else {
                     return UpsertIndexConflictMatch::Indeterminate;
                 };
-                let Ok(expr) = fsqlite_parser::expr::parse_expr(expr_sql) else {
+                let Ok(mut expr) = fsqlite_parser::expr::parse_expr(expr_sql) else {
                     return UpsertIndexConflictMatch::Indeterminate;
                 };
+                resolve_table_true_false_columns(&mut expr, table);
                 let Ok(val) = self.eval_join_expr_with_registry(&expr, attempted, &col_map) else {
                     return UpsertIndexConflictMatch::Indeterminate;
                 };
@@ -77388,7 +77428,7 @@ impl Connection {
         }
 
         for expression_sql in &index.key_expressions {
-            let expression = fsqlite_parser::expr::parse_expr(expression_sql).map_err(|error| {
+            let mut expression = fsqlite_parser::expr::parse_expr(expression_sql).map_err(|error| {
                 FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "index `{}` on table `{}` has invalid key expression `{expression_sql}`: {error}",
@@ -77396,6 +77436,7 @@ impl Connection {
                     ),
                 }
             })?;
+            resolve_table_true_false_columns(&mut expression, table);
             if index_expr_uses_collation_dependency(self, &expression, table, collation) {
                 return Ok(true);
             }
@@ -77412,6 +77453,7 @@ impl Connection {
             })?;
             // bd-65jog: read as every consumer reads it, row values expanded.
             fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+            resolve_table_true_false_columns(&mut predicate, table);
             if index_expr_uses_collation_dependency(self, &predicate, table, collation) {
                 return Ok(true);
             }
@@ -77472,14 +77514,16 @@ impl Connection {
                 .key_expressions
                 .iter()
                 .map(|sql| {
-                    fsqlite_parser::expr::parse_expr(sql).map_err(|e| {
+                    let mut expr = fsqlite_parser::expr::parse_expr(sql).map_err(|e| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "index `{}` on table `{}` has invalid key expression `{sql}`: {e}",
                                 index.name, table.name
                             ),
                         }
-                    })
+                    })?;
+                    resolve_table_true_false_columns(&mut expr, table);
+                    Ok(expr)
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
@@ -77503,6 +77547,7 @@ impl Connection {
             })?
             .map(|mut predicate| {
                 fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+                resolve_table_true_false_columns(&mut predicate, table);
                 predicate
             });
 
@@ -78535,22 +78580,26 @@ impl Connection {
             validate_registered_collation(collation, &collation_registry)?;
         }
         for indexed in &stmt.columns {
+            let mut resolved_expr = indexed.expr.clone();
+            resolve_table_true_false_columns(&mut resolved_expr, &table_schema);
             validate_index_expr_collation_dependencies(
                 self,
-                &indexed.expr,
+                &resolved_expr,
                 &table_schema,
                 &collation_registry,
             )?;
-            self.validate_live_index_expr_functions(&indexed.expr)?;
+            self.validate_live_index_expr_functions(&resolved_expr)?;
         }
         if let Some(predicate) = stmt.where_clause.as_ref() {
+            let mut resolved_predicate = predicate.clone();
+            resolve_table_true_false_columns(&mut resolved_predicate, &table_schema);
             validate_index_expr_collation_dependencies(
                 self,
-                predicate,
+                &resolved_predicate,
                 &table_schema,
                 &collation_registry,
             )?;
-            self.validate_live_index_expr_functions(predicate)?;
+            self.validate_live_index_expr_functions(&resolved_predicate)?;
         }
         let has_expression_term = !bound_index.key_expressions.is_empty();
         let col_names = bound_index.columns.clone();
@@ -81552,7 +81601,12 @@ impl Connection {
             resolver.validate_trigger_body_statement(statement)?;
             if let Some(frame) = &frame {
                 let (bound, _) = bind_trigger_body_statement(statement, frame, !trigger.temporary);
-                self.trigger_names_result(trigger, self.validate_trigger_statement_names(&bound))?;
+                let bound_qualified = self.bind_schema_qualified_columns(&bound)?;
+                let check_stmt = bound_qualified.as_ref().unwrap_or(&bound);
+                self.trigger_names_result(
+                    trigger,
+                    self.validate_trigger_statement_names(check_stmt),
+                )?;
             }
             if let Some(mut firing) = DmlTriggerFiring::of(statement, recursive_triggers) {
                 if !trigger.temporary && firing.schema.is_none() {
@@ -83765,7 +83819,8 @@ impl Connection {
             if columns.len() != view.columns.len() {
                 return None;
             }
-            for (column, name) in columns.iter_mut().zip(&view.columns) {
+            let normalized_columns = Self::deduplicate_relation_column_names(view.columns.clone());
+            for (column, name) in columns.iter_mut().zip(&normalized_columns) {
                 let ResultColumn::Expr { alias, .. } = column else {
                     return None;
                 };
@@ -83858,7 +83913,9 @@ impl Connection {
                     // bd-ws183: an explicit `CREATE VIEW v(c1, c2, ...)` column
                     // list renames the view's output columns; only fall back to
                     // the SELECT's own result names when no list was declared.
-                    let col_names = inferred_col_names.unwrap_or_else(|| view.columns.clone());
+                    let col_names = inferred_col_names.unwrap_or_else(|| {
+                        Self::deduplicate_relation_column_names(view.columns.clone())
+                    });
                     let width = if col_names.is_empty() {
                         view_rows.first().map_or(1, |r| r.values().len())
                     } else {
@@ -88416,6 +88473,7 @@ impl Connection {
                         ),
                     }
                 })?;
+            resolve_table_true_false_columns(&mut expr, table);
             if let Some(ipk_column) = rowid_alias_col_idx.and_then(|idx| table.columns.get(idx)) {
                 rewrite_rowid_aliases_in_expr(&mut expr, table, &ipk_column.name);
             }
@@ -94857,7 +94915,11 @@ impl Connection {
                     index
                         .key_expressions
                         .iter()
-                        .map(|sql| fsqlite_parser::expr::parse_expr(sql).ok())
+                        .map(|sql| {
+                            let mut expr = fsqlite_parser::expr::parse_expr(sql).ok()?;
+                            resolve_table_true_false_columns(&mut expr, table);
+                            Some(expr)
+                        })
                         .collect::<Option<Vec<_>>>()?
                 } else {
                     Vec::new()
@@ -94871,6 +94933,7 @@ impl Connection {
                         // bd-65jog: expanded as the statement's WHERE is, so
                         // that WHERE can imply a row-value predicate.
                         fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+                        resolve_table_true_false_columns(&mut predicate, table);
                         Some(predicate)
                     }
                     None => None,
@@ -94997,10 +95060,10 @@ impl Connection {
                     planner_directive_index_column(table, table_alias, &where_terms, &index_name)?
                 };
                 let index_equality_target = if index_key_is_expression {
-                    planner_directive_expression_index_equality_target(
+                    planner_directive_expression_index_equality_target_for_table(
                         where_clause.as_deref(),
                         index,
-                        &table.name,
+                        table,
                         table_alias,
                     )
                 } else {
@@ -95037,10 +95100,10 @@ impl Connection {
                     planner_directive_index_column(table, table_alias, &where_terms, &index_name)?
                 };
                 let index_range_target = if index_key_is_expression {
-                    let t = planner_directive_expression_index_range_target(
+                    let t = planner_directive_expression_index_range_target_for_table(
                         where_clause.as_deref(),
                         index,
-                        &table.name,
+                        table,
                         table_alias,
                     );
                     if t.is_none() {
@@ -108947,7 +109010,7 @@ impl Connection {
                         resolved
                     }
                 } else {
-                    cte.columns.clone()
+                    Self::deduplicate_relation_column_names(cte.columns.clone())
                 };
                 // A materialized CTE is still a typed/collated subquery
                 // result. Preserve that metadata on the temporary schema so
@@ -118173,7 +118236,7 @@ impl<'a> CteResultMetadataResolver<'a> {
             with_view_expansion_stack(|| self.resolve_select(&cte.query, outer_lookup));
         self.active.remove(&key);
         if !cte.columns.is_empty() {
-            metadata.names.clone_from(&cte.columns);
+            metadata.names = Connection::deduplicate_relation_column_names(cte.columns.clone());
         } else {
             metadata.names = Connection::deduplicate_relation_column_names(metadata.names);
         }
@@ -118202,7 +118265,7 @@ impl<'a> CteResultMetadataResolver<'a> {
                     &view.query,
                 ))
             } else {
-                view.columns
+                Connection::deduplicate_relation_column_names(view.columns)
             };
             return MaterializedCteResultMetadata {
                 columns: vec![MaterializedResultColumnMetadata::default(); names.len()],
@@ -118228,7 +118291,7 @@ impl<'a> CteResultMetadataResolver<'a> {
             )
         });
         if !view.columns.is_empty() {
-            metadata.names = view.columns;
+            metadata.names = Connection::deduplicate_relation_column_names(view.columns);
         } else {
             metadata.names = Connection::deduplicate_relation_column_names(metadata.names);
         }
@@ -127988,7 +128051,8 @@ fn cte_inline_body(cte: &fsqlite_ast::Cte) -> Option<SelectStatement> {
     if columns.len() != cte.columns.len() {
         return None;
     }
-    for (column, alias_name) in columns.iter_mut().zip(&cte.columns) {
+    let normalized_columns = Connection::deduplicate_relation_column_names(cte.columns.clone());
+    for (column, alias_name) in columns.iter_mut().zip(&normalized_columns) {
         let ResultColumn::Expr { alias, .. } = column else {
             return None;
         };
@@ -130222,7 +130286,7 @@ fn flatten_inner_expr_is_substitutable(expr: &Expr) -> bool {
 fn build_flatten_projection_map(columns: &[ResultColumn]) -> Option<FlattenProjectionMap> {
     let mut projection = FlattenProjectionMap::default();
 
-    for column in columns {
+    for (index, column) in columns.iter().enumerate() {
         match column {
             ResultColumn::Star | ResultColumn::TableStar(_) => {
                 projection.passthrough_columns = true;
@@ -130231,10 +130295,14 @@ fn build_flatten_projection_map(columns: &[ResultColumn]) -> Option<FlattenProje
                 expr: Expr::Column(column_ref, span),
                 alias,
             } => {
-                let exposed_name = alias
+                let raw_name = alias
                     .clone()
-                    .unwrap_or_else(|| column_ref.column.to_string())
-                    .to_ascii_lowercase();
+                    .unwrap_or_else(|| column_ref.column.to_string());
+                let exposed_name = if is_sqlite_true_or_false_name(&raw_name) {
+                    format!("column{}", index + 1)
+                } else {
+                    raw_name.to_ascii_lowercase()
+                };
                 if projection.columns.contains_key(&exposed_name) {
                     return None;
                 }
@@ -130246,7 +130314,11 @@ fn build_flatten_projection_map(columns: &[ResultColumn]) -> Option<FlattenProje
                 expr,
                 alias: Some(alias),
             } if flatten_inner_expr_is_substitutable(expr) => {
-                let exposed_name = alias.to_ascii_lowercase();
+                let exposed_name = if is_sqlite_true_or_false_name(alias) {
+                    format!("column{}", index + 1)
+                } else {
+                    alias.to_ascii_lowercase()
+                };
                 if projection.columns.contains_key(&exposed_name) {
                     return None;
                 }
@@ -138682,11 +138754,11 @@ fn cte_scopes_with(
                 collect_derived_table_columns(&cte.query, lookup, &scopes, &mut columns)
                     .map(|()| columns)
             } else {
-                let columns: HashSet<String> = cte
-                    .columns
-                    .iter()
-                    .map(|column| column.to_ascii_lowercase())
-                    .collect();
+                let columns: HashSet<String> =
+                    Connection::deduplicate_relation_column_names(cte.columns.clone())
+                        .into_iter()
+                        .map(|column| column.to_ascii_lowercase())
+                        .collect();
                 Some(columns)
             };
             if columns.is_some() {
@@ -138740,28 +138812,37 @@ fn collect_derived_table_columns(
             out.extend((1..=width).map(|index| format!("column{index}")));
         }
         SelectCore::Select { columns, from, .. } => {
-            for column in columns {
+            for (index, column) in columns.iter().enumerate() {
                 match column {
                     ResultColumn::Expr {
                         alias: Some(alias), ..
                     } => {
-                        out.insert(alias.to_ascii_lowercase());
+                        if is_sqlite_true_or_false_name(alias) {
+                            out.insert(format!("column{}", index + 1));
+                        } else {
+                            out.insert(alias.to_ascii_lowercase());
+                        }
                     }
                     ResultColumn::Expr {
                         expr: Expr::Column(column_ref, _),
                         ..
                     } => {
-                        out.insert(column_ref.column.to_ascii_lowercase());
+                        if is_sqlite_true_or_false_name(&column_ref.column) {
+                            out.insert(format!("column{}", index + 1));
+                        } else {
+                            out.insert(column_ref.column.to_ascii_lowercase());
+                        }
                     }
                     ResultColumn::Expr { .. } => {}
                     ResultColumn::Star | ResultColumn::TableStar(_) => {
                         let from = from.as_ref()?;
+                        let mut star_names = HashSet::new();
                         collect_known_source_columns(
                             &from.source,
                             lookup,
                             cte_names,
                             SourceNames::Star,
-                            out,
+                            &mut star_names,
                         )?;
                         for join in &from.joins {
                             collect_known_source_columns(
@@ -138769,9 +138850,15 @@ fn collect_derived_table_columns(
                                 lookup,
                                 cte_names,
                                 SourceNames::Star,
-                                out,
+                                &mut star_names,
                             )?;
                         }
+                        // SQLite's `sqlite3ColumnsFromExprList` renames any
+                        // `true`/`false` derived-table column to `columnN`, so
+                        // a derived table never shadows an outer `true`/`false`.
+                        star_names.remove("true");
+                        star_names.remove("false");
+                        out.extend(star_names);
                     }
                 }
             }
@@ -144235,6 +144322,11 @@ fn rename_column_refs_in_expr_sql(expr_sql: &str, old: &str, new: &str) -> Resul
             "failed to parse schema expression `{expr_sql}` during column rename: {err}"
         ))
     })?;
+    fsqlite_ast::resolve_table_true_false_columns_in_expr(
+        &mut expr,
+        old.eq_ignore_ascii_case("true"),
+        old.eq_ignore_ascii_case("false"),
+    );
     if rename_column_refs_in_expr(&mut expr, old, new) {
         Ok(Some(expr.to_string()))
     } else {
@@ -144254,11 +144346,16 @@ fn rename_column_refs_in_stored_expr_sql(
 }
 
 fn stored_expr_references_column(expr_sql: &str, column_name: &str) -> Result<bool> {
-    let expr = fsqlite_parser::expr::parse_expr(expr_sql).map_err(|err| {
+    let mut expr = fsqlite_parser::expr::parse_expr(expr_sql).map_err(|err| {
         FrankenError::Internal(format!(
             "failed to parse schema expression `{expr_sql}` during column drop: {err}"
         ))
     })?;
+    fsqlite_ast::resolve_table_true_false_columns_in_expr(
+        &mut expr,
+        column_name.eq_ignore_ascii_case("true"),
+        column_name.eq_ignore_ascii_case("false"),
+    );
     let mut column_refs = Vec::new();
     collect_expr_column_refs(&expr, &mut column_refs);
     Ok(column_refs
@@ -154939,14 +155036,54 @@ fn planner_normalize_expression_index_columns(
     }
 }
 
+fn planner_directive_expression_index_equality_target_for_table(
+    where_clause: Option<&Expr>,
+    index: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<Expr> {
+    planner_directive_expression_index_equality_target_impl(
+        where_clause,
+        index,
+        &table.name,
+        table_alias,
+        (
+            table.column_index("true").is_some(),
+            table.column_index("false").is_some(),
+        ),
+    )
+}
+
+#[cfg(test)]
 fn planner_directive_expression_index_equality_target(
     where_clause: Option<&Expr>,
     index: &IndexSchema,
     table_name: &str,
     table_alias: Option<&str>,
 ) -> Option<Expr> {
+    planner_directive_expression_index_equality_target_impl(
+        where_clause,
+        index,
+        table_name,
+        table_alias,
+        (false, false),
+    )
+}
+
+fn planner_directive_expression_index_equality_target_impl(
+    where_clause: Option<&Expr>,
+    index: &IndexSchema,
+    table_name: &str,
+    table_alias: Option<&str>,
+    table_true_false: (bool, bool),
+) -> Option<Expr> {
     let root = where_clause?;
-    let key_expr = fsqlite_parser::expr::parse_expr(index.key_term_sql(0)?).ok()?;
+    let mut key_expr = fsqlite_parser::expr::parse_expr(index.key_term_sql(0)?).ok()?;
+    fsqlite_ast::resolve_table_true_false_columns_in_expr(
+        &mut key_expr,
+        table_true_false.0,
+        table_true_false.1,
+    );
 
     // Equality probes may sit beside the predicate guaranteed by a partial
     // index. Walk only AND conjuncts: descending through OR would incorrectly
@@ -155002,18 +155139,64 @@ fn planner_directive_expression_index_equality_target(
         }
     }
     target.filter(|_| {
-        planner_expression_index_residuals_match(&residuals, index, table_name, table_alias)
+        planner_expression_index_residuals_match(
+            &residuals,
+            index,
+            table_name,
+            table_alias,
+            table_true_false,
+        )
     })
 }
 
+fn planner_directive_expression_index_range_target_for_table(
+    where_clause: Option<&Expr>,
+    index: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<PlannerIndexRangeTarget> {
+    planner_directive_expression_index_range_target_impl(
+        where_clause,
+        index,
+        &table.name,
+        table_alias,
+        (
+            table.column_index("true").is_some(),
+            table.column_index("false").is_some(),
+        ),
+    )
+}
+
+#[cfg(test)]
 fn planner_directive_expression_index_range_target(
     where_clause: Option<&Expr>,
     index: &IndexSchema,
     table_name: &str,
     table_alias: Option<&str>,
 ) -> Option<PlannerIndexRangeTarget> {
+    planner_directive_expression_index_range_target_impl(
+        where_clause,
+        index,
+        table_name,
+        table_alias,
+        (false, false),
+    )
+}
+
+fn planner_directive_expression_index_range_target_impl(
+    where_clause: Option<&Expr>,
+    index: &IndexSchema,
+    table_name: &str,
+    table_alias: Option<&str>,
+    table_true_false: (bool, bool),
+) -> Option<PlannerIndexRangeTarget> {
     let expr = where_clause?;
-    let key_expr = fsqlite_parser::expr::parse_expr(index.key_term_sql(0)?).ok()?;
+    let mut key_expr = fsqlite_parser::expr::parse_expr(index.key_term_sql(0)?).ok()?;
+    fsqlite_ast::resolve_table_true_false_columns_in_expr(
+        &mut key_expr,
+        table_true_false.0,
+        table_true_false.1,
+    );
     let mut target = PlannerIndexRangeTarget::default();
     let mut residuals = SmallVec::<[&Expr; 8]>::new();
     if planner_collect_expression_index_range_bounds(
@@ -155024,7 +155207,13 @@ fn planner_directive_expression_index_range_target(
         &mut target,
         &mut residuals,
     ) && (target.lower.is_some() || target.upper.is_some())
-        && planner_expression_index_residuals_match(&residuals, index, table_name, table_alias)
+        && planner_expression_index_residuals_match(
+            &residuals,
+            index,
+            table_name,
+            table_alias,
+            table_true_false,
+        )
     {
         Some(target)
     } else {
@@ -155121,6 +155310,7 @@ fn planner_expression_index_residuals_match(
     index: &IndexSchema,
     table_name: &str,
     table_alias: Option<&str>,
+    table_true_false: (bool, bool),
 ) -> bool {
     let Some(predicate_sql) = index.where_clause.as_deref() else {
         return residuals.is_empty();
@@ -155130,6 +155320,11 @@ fn planner_expression_index_residuals_match(
     };
     // bd-65jog: expanded as the statement's residuals are.
     fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+    fsqlite_ast::resolve_table_true_false_columns_in_expr(
+        &mut predicate,
+        table_true_false.0,
+        table_true_false.1,
+    );
     let predicate_terms = decompose_where(&predicate);
 
     predicate_terms.iter().all(|predicate_term| {
@@ -155301,10 +155496,10 @@ fn planner_directive_covering_access_kind(
         .find(|candidate| candidate.name.eq_ignore_ascii_case(index_name))?;
     if planner_directive_index_is_expression(index) {
         let index_key_label = planner_directive_index_key_label(index)?;
-        if let Some(target) = planner_directive_expression_index_equality_target(
+        if let Some(target) = planner_directive_expression_index_equality_target_for_table(
             where_clause,
             index,
-            &table.name,
+            table,
             table_alias,
         ) {
             return Some((
@@ -155315,10 +155510,10 @@ fn planner_directive_covering_access_kind(
                 None,
             ));
         }
-        if let Some(target) = planner_directive_expression_index_range_target(
+        if let Some(target) = planner_directive_expression_index_range_target_for_table(
             where_clause,
             index,
-            &table.name,
+            table,
             table_alias,
         ) {
             return Some((
@@ -162713,10 +162908,11 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             .cloned()
             .ok_or_else(|| FrankenError::Internal("view metadata index is stale".to_owned()))?;
         if !view.columns.is_empty() {
+            let names = Connection::deduplicate_relation_column_names(view.columns);
             return Ok(SelectResultColumnMetadata {
-                approximate_names: vec![false; view.columns.len()],
-                generated_suffix_upper_bounds: vec![None; view.columns.len()],
-                names: view.columns,
+                approximate_names: vec![false; names.len()],
+                generated_suffix_upper_bounds: vec![None; names.len()],
+                names,
                 width_is_exact: true,
             });
         }
@@ -162923,7 +163119,13 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             for (_, core) in select.body.compounds.iter().rev() {
                 self.metadata_select_core_column_names(core)?;
             }
-            self.metadata_select_core_column_names(&select.body.select)
+            let mut metadata = self.metadata_select_core_column_names(&select.body.select)?;
+            for (index, name) in metadata.names.iter_mut().enumerate() {
+                if is_sqlite_true_or_false_name(name) {
+                    *name = format!("column{}", index + 1);
+                }
+            }
+            Ok(metadata)
         })();
         self.cte_scopes.truncate(cte_scope_depth);
         if let Ok(metadata) = &metadata_result {
@@ -163127,10 +163329,11 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
         }
         if !self.metadata_active_ctes.insert(key) {
             if !cte.columns.is_empty() {
+                let names = Connection::deduplicate_relation_column_names(cte.columns.clone());
                 return Ok(SelectResultColumnMetadata {
-                    names: cte.columns.clone(),
-                    approximate_names: vec![false; cte.columns.len()],
-                    generated_suffix_upper_bounds: vec![None; cte.columns.len()],
+                    approximate_names: vec![false; names.len()],
+                    generated_suffix_upper_bounds: vec![None; names.len()],
+                    names,
                     width_is_exact: true,
                 });
             }
@@ -163178,7 +163381,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             )));
         }
         if !cte.columns.is_empty() {
-            names.clone_from(&cte.columns);
+            names = Connection::deduplicate_relation_column_names(cte.columns.clone());
             metadata.approximate_names = vec![false; names.len()];
             metadata.generated_suffix_upper_bounds = vec![None; names.len()];
             metadata.width_is_exact = true;
@@ -178266,6 +178469,18 @@ fn resolve_group_by_aliases(
             }
         }
     }
+}
+
+fn is_sqlite_true_or_false_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("true") || name.eq_ignore_ascii_case("false")
+}
+
+fn resolve_table_true_false_columns(expr: &mut Expr, table: &TableSchema) -> bool {
+    fsqlite_ast::resolve_table_true_false_columns_in_expr(
+        expr,
+        table.column_index("true").is_some(),
+        table.column_index("false").is_some(),
+    )
 }
 
 fn rewrite_rowid_aliases_in_expr(expr: &mut Expr, table: &TableSchema, real_col: &str) {

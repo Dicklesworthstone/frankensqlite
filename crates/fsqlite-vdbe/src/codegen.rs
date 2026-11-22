@@ -1079,9 +1079,11 @@ pub fn bind_explicit_index(
 
     for (term_index, indexed) in stmt.columns.iter().enumerate() {
         let context = format!("key term {}", term_index + 1);
-        validate_explicit_index_term(indexed, table, &context)?;
+        let mut resolved_indexed = indexed.clone();
+        resolve_table_true_false_columns(&mut resolved_indexed.expr, table);
+        validate_explicit_index_term(&resolved_indexed, table, &context)?;
 
-        let simple_column = explicit_index_simple_column_name(&indexed.expr);
+        let simple_column = explicit_index_simple_column_name(&resolved_indexed.expr);
         if let Some(column_name) = simple_column {
             if table.column_index(column_name).is_none() {
                 return Err(CodegenError::ColumnNotFound {
@@ -1101,7 +1103,7 @@ pub fn bind_explicit_index(
         // declaration) or to a COLLATE operator at the root of the indexed
         // expression. Nested COLLATE operators, CAST, and unary plus can still
         // be runtime dependencies without changing the stored key ordering.
-        let root_collation = match &indexed.expr {
+        let root_collation = match &resolved_indexed.expr {
             Expr::Collate { collation, .. } => Some(collation.as_str()),
             _ => None,
         };
@@ -1116,7 +1118,9 @@ pub fn bind_explicit_index(
     }
 
     if let Some(predicate) = stmt.where_clause.as_ref() {
-        validate_partial_index_predicate(predicate, table)?;
+        let mut resolved_predicate = predicate.clone();
+        resolve_table_true_false_columns(&mut resolved_predicate, table);
+        validate_partial_index_predicate(&resolved_predicate, table)?;
     }
 
     let all_terms_are_simple = simple_columns.len() == stmt.columns.len();
@@ -1560,7 +1564,7 @@ fn upsert_target_matches_index_predicate(
     let Some(target_predicate) = target.where_clause.as_ref() else {
         return false;
     };
-    let Some(index_predicate) = parse_default_expr(index_predicate_sql) else {
+    let Some(index_predicate) = parse_table_expr(index_predicate_sql, table) else {
         return false;
     };
     expressions_match_table_locally(target_predicate, &index_predicate, table, None)
@@ -16966,7 +16970,7 @@ fn emit_join_expr(
                         // projected as NULL through a join. Emitting `Rowid`
                         // directly is what stock does and needs no runtime map.
                         b.emit_op(Opcode::Rowid, cursor, target, 0, P4::None, 0);
-                    } else if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
+                    } else if virtual_generated_column_expr(&table.columns[col_idx], table).is_some() {
                         // GH#227 (bd-gh-virtual-generated-columns-5e0u1): a
                         // VIRTUAL generated column is not materialized in the
                         // record — the slot holds a NULL placeholder. Reading it
@@ -20447,7 +20451,7 @@ fn emit_aggregate_accumulate_body(
                 // an aggregate argument on a table scan (no GROUP BY) read its
                 // NULL placeholder, so sum/avg/min/max/count saw NULLs. Compute
                 // the generating expression via the canonical reader instead.
-                if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
+                if virtual_generated_column_expr(&table.columns[col_idx], table).is_some() {
                     emit_table_column_read(
                         b,
                         cursor,
@@ -21992,7 +21996,7 @@ fn index_partial_predicate_is_covered_by_query_conjuncts(
     let Some(predicate_sql) = index.where_clause.as_deref() else {
         return true;
     };
-    let Some(predicate) = parse_default_expr(predicate_sql) else {
+    let Some(predicate) = parse_table_expr(predicate_sql, table) else {
         return false;
     };
     if !use_builtin_scalar_function_semantics() && expr_contains_function_call(&predicate) {
@@ -27134,7 +27138,7 @@ fn codegen_select_group_by_aggregate(
                         let key_position = index_key_position_of(index, table, *col_idx)
                             .expect("a covering index stores every group key");
                         b.emit_op(Opcode::Column, idx_cursor, key_position, reg, P4::None, 0);
-                    } else if virtual_generated_column_expr(&table.columns[*col_idx]).is_some() {
+                    } else if virtual_generated_column_expr(&table.columns[*col_idx], table).is_some() {
                         emit_table_column_read(
                             b,
                             cursor,
@@ -27162,7 +27166,7 @@ fn codegen_select_group_by_aggregate(
                 let key_position = index_key_position_of(index, table, col_idx)
                     .expect("a covering index stores every aggregate argument");
                 b.emit_op(Opcode::Column, idx_cursor, key_position, reg, P4::None, 0);
-            } else if virtual_generated_column_expr(&table.columns[col_idx]).is_some() {
+            } else if virtual_generated_column_expr(&table.columns[col_idx], table).is_some() {
                 emit_table_column_read(b, cursor, table, table_alias, Some(schema), col_idx, reg);
             } else {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -35832,19 +35836,29 @@ fn emit_default_value(
     }
 }
 
-/// Parse a schema expression's SQL text (a CHECK constraint, a generated
-/// column, a partial index's WHERE) into an expression AST, with its
-/// row-value comparisons expanded into scalar ones (bd-s7gqh): codegen reads
-/// a row value as NULL, so `CHECK ((x, y) <> (0, 0))` passed every row. A
-/// partial index's WHERE is expanded wherever it is read, so a statement's
-/// expanded WHERE can imply it (bd-65jog).
-fn parse_default_expr(default_sql: &str) -> Option<Expr> {
-    let trimmed = default_sql.trim();
+/// Resolve unquoted `TRUE`/`FALSE` to bare column references when `table`
+/// declares a column named `"true"` or `"false"` (bd-pud7p).
+fn resolve_table_true_false_columns(expr: &mut Expr, table: &TableSchema) -> bool {
+    fsqlite_ast::resolve_table_true_false_columns_in_expr(
+        expr,
+        table.column_index("true").is_some(),
+        table.column_index("false").is_some(),
+    )
+}
+
+/// Parse a table-scoped schema expression into an AST.
+///
+/// Handles `CHECK` constraints, generated columns, partial index predicates,
+/// and expression index keys, expanding row-value comparisons (bd-s7gqh,
+/// bd-65jog) and resolving unquoted `TRUE`/`FALSE` against `table` (bd-pud7p).
+fn parse_table_expr(expr_sql: &str, table: &TableSchema) -> Option<Expr> {
+    let trimmed = expr_sql.trim();
     if trimmed.is_empty() {
         return None;
     }
     let mut expr = parse_sql_expr(trimmed).ok()?;
     fsqlite_ast::row_value::lower_row_values_in_expr(&mut expr);
+    resolve_table_true_false_columns(&mut expr, table);
     Some(expr)
 }
 
@@ -35979,7 +35993,7 @@ fn emit_index_predicate_guard(
     let Some(where_sql) = index.where_clause.as_deref() else {
         return;
     };
-    let Some(predicate) = parse_default_expr(where_sql) else {
+    let Some(predicate) = parse_table_expr(where_sql, scan_ctx.table) else {
         // Invalid persisted predicate metadata should not panic compilation.
         // Conservatively skip maintenance for this row.
         b.emit_jump_to_label(Opcode::Goto, 0, 0, skip_label, P4::None, 0);
@@ -36004,7 +36018,7 @@ fn emit_index_key_term(
         b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
         return;
     };
-    if let Some(expr) = parse_default_expr(term_sql) {
+    if let Some(expr) = parse_table_expr(term_sql, scan_ctx.table) {
         b.with_schema_evaluation_context(SchemaEvaluationContext::Index, |b| {
             emit_expr(b, &expr, dest_reg, Some(scan_ctx));
         });
@@ -36029,7 +36043,7 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
         let dest_reg = val_regs + col_idx as i32;
         if col.generated_stored == Some(true) {
             // STORED: evaluate expression and write result to register.
-            if let Some(expr) = parse_default_expr(expr_sql) {
+            if let Some(expr) = parse_table_expr(expr_sql, table) {
                 let gen_ctx = ScanCtx {
                     cursor: 0,
                     table,
@@ -36068,7 +36082,7 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
             secondaries: &[],
         };
         for (col_idx, col) in table.columns.iter().enumerate() {
-            if let Some(expr) = virtual_generated_column_expr(col) {
+            if let Some(expr) = virtual_generated_column_expr(col, table) {
                 emit_virtual_generated_column(b, col_idx, &expr, val_regs + col_idx as i32, &gen_ctx);
             }
         }
@@ -36080,11 +36094,11 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
 ///
 /// Returns `None` for non-generated columns and for STORED generated columns
 /// (which are computed and persisted at write time, then read back directly).
-fn virtual_generated_column_expr(col: &ColumnInfo) -> Option<Expr> {
+fn virtual_generated_column_expr(col: &ColumnInfo, table: &TableSchema) -> Option<Expr> {
     if col.generated_stored != Some(false) {
         return None;
     }
-    parse_default_expr(col.generated_expr.as_ref()?)
+    parse_table_expr(col.generated_expr.as_ref()?, table)
 }
 
 /// Expand one VIRTUAL column while detecting recursive schema references.
@@ -36152,7 +36166,7 @@ fn virtual_generated_dependency_cycle(scan: &ScanCtx<'_>, start: usize) -> Optio
             2 => continue,
             _ => {}
         }
-        let Some(expr) = virtual_generated_column_expr(&scan.table.columns[index]) else {
+        let Some(expr) = virtual_generated_column_expr(&scan.table.columns[index], scan.table) else {
             continue;
         };
         state[index] = 1;
@@ -36214,7 +36228,7 @@ fn emit_table_column_read(
     let col = &table.columns[col_idx];
     if col.is_ipk {
         b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
-    } else if let Some(gen_expr) = virtual_generated_column_expr(col) {
+    } else if let Some(gen_expr) = virtual_generated_column_expr(col, table) {
         let scan = ScanCtx {
             cursor,
             table,
@@ -36259,7 +36273,7 @@ fn emit_check_constraints(
     const SQLITE_CONSTRAINT: i32 = 19;
 
     for check in &table.check_constraints {
-        let Some(expr) = parse_default_expr(&check.expr) else {
+        let Some(expr) = parse_table_expr(&check.expr, table) else {
             b.emit_op(
                 Opcode::Halt,
                 ErrorCode::Internal as i32,
@@ -36344,7 +36358,7 @@ fn emit_not_null_constraints(
 
     for (col_idx, col) in table.columns.iter().enumerate() {
         if (col.notnull || wr_pk.contains(&col_idx)) && !col.is_ipk {
-            let reg = if let Some(expr) = virtual_generated_column_expr(col) {
+            let reg = if let Some(expr) = virtual_generated_column_expr(col, table) {
                 // A VIRTUAL column's register holds NULL (the record leaves
                 // it out). Evaluate its value in scratch storage for the
                 // constraint, just as CHECK and index expressions resolve
@@ -37064,7 +37078,7 @@ fn emit_ordered_distinct_source_state(
 
     for (column_index, column) in table.columns.iter().enumerate() {
         let target = state_base + column_index as i32;
-        if virtual_generated_column_expr(column).is_some() {
+        if virtual_generated_column_expr(column, table).is_some() {
             b.emit_op(Opcode::Null, 0, target, 0, P4::None, 0);
         } else {
             b.emit_op(
@@ -37095,7 +37109,7 @@ fn emit_table_column_read_from_register_row(
     target: i32,
 ) {
     let column = &table.columns[column_index];
-    if let Some(generated_expr) = virtual_generated_column_expr(column) {
+    if let Some(generated_expr) = virtual_generated_column_expr(column, table) {
         let scan = ScanCtx {
             cursor: 0,
             table,
@@ -39572,7 +39586,7 @@ fn expr_reads_only_index_columns(
             Some(SortKeySource::Rowid) => true,
             Some(SortKeySource::Column(col_idx)) => table.columns.get(col_idx).is_some_and(|column| {
                 !column.affinity.eq_ignore_ascii_case(&'E')
-                    && virtual_generated_column_expr(column).is_none()
+                    && virtual_generated_column_expr(column, table).is_none()
                     && index_column_position(index, &column.name).is_some()
             }),
             Some(SortKeySource::Expression(_)) => false,
@@ -41325,7 +41339,7 @@ fn expression_index_residuals_match(
     let Some(predicate_sql) = index.where_clause.as_deref() else {
         return residuals.is_empty();
     };
-    let Some(predicate) = parse_default_expr(predicate_sql) else {
+    let Some(predicate) = parse_table_expr(predicate_sql, table) else {
         return false;
     };
     let mut predicate_terms = Vec::new();
@@ -44781,7 +44795,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     if let Some(gen_expr) =
-                        virtual_generated_column_expr(&sc.table.columns[col_idx])
+                        virtual_generated_column_expr(&sc.table.columns[col_idx], sc.table)
                     {
                         // bd-r3303: a VIRTUAL generated column has only a NULL
                         // placeholder register (it is never materialized), so when
@@ -44807,7 +44821,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 if sc.table.columns[col_idx].is_ipk {
                     b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
                 } else if let Some(gen_expr) =
-                    virtual_generated_column_expr(&sc.table.columns[col_idx])
+                    virtual_generated_column_expr(&sc.table.columns[col_idx], sc.table)
                 {
                     // bd-r3303: a VIRTUAL generated column is not materialized in
                     // the stored record, so compute it on read by emitting its

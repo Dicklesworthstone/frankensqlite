@@ -38,6 +38,12 @@ struct QualifiedColumnRelation {
     columns: Option<Vec<String>>,
     /// Which of `rowid`, `_rowid_` and `oid` name the hidden rowid.
     rowid_names: Vec<&'static str>,
+    /// Whether this relation exposes an explicit `true` or `false` column (bd-pud7p).
+    ///
+    /// Derived relations (subqueries, CTEs, views) never expose `true`/`false`
+    /// because SQLite's `sqlite3ColumnsFromExprList` renames them to `columnN`.
+    exposes_true: bool,
+    exposes_false: bool,
 }
 
 impl QualifiedColumnRelation {
@@ -49,6 +55,18 @@ impl QualifiedColumnRelation {
                 .into_iter()
                 .filter(|name| !table.without_rowid && table.column_index(name).is_none())
                 .collect(),
+            exposes_true: table.column_index("true").is_some(),
+            exposes_false: table.column_index("false").is_some(),
+        }
+    }
+
+    fn vtab(database: &str, table: Option<&TableSchema>) -> Self {
+        Self {
+            database: Some(database.to_owned()),
+            columns: None,
+            rowid_names: Vec::new(),
+            exposes_true: table.is_some_and(|t| t.column_index("true").is_some()),
+            exposes_false: table.is_some_and(|t| t.column_index("false").is_some()),
         }
     }
 
@@ -57,6 +75,8 @@ impl QualifiedColumnRelation {
             database: Some(database.to_owned()),
             columns,
             rowid_names: Vec::new(),
+            exposes_true: false,
+            exposes_false: false,
         }
     }
 
@@ -71,6 +91,14 @@ impl QualifiedColumnRelation {
         self.rowid_names
             .iter()
             .any(|name| name.eq_ignore_ascii_case(column))
+    }
+
+    fn exposes_true_or_false(&self, is_true: bool) -> bool {
+        if is_true {
+            self.exposes_true
+        } else {
+            self.exposes_false
+        }
     }
 }
 
@@ -165,7 +193,17 @@ impl Connection {
                 .keys()
                 .any(|key| key.eq_ignore_ascii_case(name))
             {
-                return Some(QualifiedColumnRelation::opaque(database, None));
+                if matches!(scope, PragmaSchemaScope::Main)
+                    && let Some(table) = self
+                        .shadowed_main_tables
+                        .borrow()
+                        .get(&name.to_ascii_lowercase())
+                {
+                    return Some(QualifiedColumnRelation::vtab(database, Some(table)));
+                }
+                let schema = self.schema.borrow();
+                let table = self.schema_index_of(name).and_then(|idx| schema.get(idx));
+                return Some(QualifiedColumnRelation::vtab(database, table));
             }
             if matches!(scope, PragmaSchemaScope::Main)
                 && let Some(table) = self
@@ -230,7 +268,7 @@ fn bind_schema_qualified_columns_with(
         .table_star_groups
         .iter()
         .any(|group| group.len() > 1);
-    if binder.three_part_refs == 0 && !splits_table_star {
+    if binder.three_part_refs == 0 && !splits_table_star && binder.true_false_rewrites == 0 {
         return Ok(None);
     }
     binder.assign_aliases();
@@ -285,10 +323,54 @@ enum Lookup {
     Missing,
 }
 
+enum TrueFalseLookup {
+    /// Resolved to an unambiguous FROM/DML table column named `true` or `false`.
+    Column,
+    /// Resolved to an explicit `AS "true"` / `AS "false"` result-set alias.
+    Alias {
+        alias_expr: Box<Expr>,
+        from_outer: bool,
+    },
+    /// Two or more uncoalesced sources in the same scope expose `true` / `false`.
+    Ambiguous,
+    /// No visible column or alias matched — keep as boolean literal `TRUE`/`FALSE`.
+    Literal,
+}
+
+/// One lexical query scope: its FROM/DML sources plus optional `SELECT`
+/// result-set aliases named `true` or `false` (SQLite's `NC_UEList`).
+#[derive(Debug, Default)]
+struct BindingScope {
+    sources: Vec<BindingSource>,
+    true_alias: Option<Expr>,
+    false_alias: Option<Expr>,
+    aliases_visible: bool,
+}
+
+impl BindingScope {
+    fn from_sources(sources: Vec<BindingSource>) -> Self {
+        Self {
+            sources,
+            true_alias: None,
+            false_alias: None,
+            aliases_visible: false,
+        }
+    }
+
+    fn alias_for(&self, is_true: bool) -> Option<&Expr> {
+        if is_true {
+            self.true_alias.as_ref()
+        } else {
+            self.false_alias.as_ref()
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BindPass {
-    /// Resolve every qualified reference, record errors, and find the items
-    /// that need a synthetic alias. Does not modify the statement.
+    /// Resolve every qualified reference and unquoted `TRUE`/`FALSE`, record
+    /// errors, and find the items that need a synthetic alias. Does not modify
+    /// the statement.
     Bind,
     /// Apply the synthetic aliases and rewrite the references.
     Rewrite,
@@ -297,13 +379,14 @@ enum BindPass {
 struct QualifiedColumnBinder<'a> {
     catalog: &'a dyn QualifiedColumnCatalog,
     pass: BindPass,
-    /// FROM items of each enclosing query, outermost first.
-    scopes: Vec<Vec<BindingSource>>,
+    /// Enclosing query scopes, outermost first.
+    scopes: Vec<BindingScope>,
     /// The CTEs in scope, per WITH clause: lowercased name and the columns
     /// it exposes when they are known (see [`cte_known_columns`]).
     ctes: Vec<Vec<(String, Option<Vec<String>>)>>,
     next_id: usize,
     three_part_refs: usize,
+    true_false_rewrites: usize,
     unresolved_relation: bool,
     error: Option<FrankenError>,
     /// Items that get a synthetic alias: id -> (name, database).
@@ -317,6 +400,9 @@ struct QualifiedColumnBinder<'a> {
     taken_names: HashSet<String>,
     /// The DML scope while its RETURNING clause is walked.
     returning_scope: Option<usize>,
+    /// True while walking a `WHERE` clause (so aliased aggregate/window
+    /// expressions stay spelled as bare aliases for exact error reporting).
+    in_where_clause: bool,
 }
 
 impl<'a> QualifiedColumnBinder<'a> {
@@ -328,6 +414,7 @@ impl<'a> QualifiedColumnBinder<'a> {
             ctes: Vec::new(),
             next_id: 0,
             three_part_refs: 0,
+            true_false_rewrites: 0,
             unresolved_relation: false,
             error: None,
             needs_alias: BTreeMap::new(),
@@ -335,6 +422,7 @@ impl<'a> QualifiedColumnBinder<'a> {
             aliases: HashMap::new(),
             taken_names: HashSet::new(),
             returning_scope: None,
+            in_where_clause: false,
         }
     }
 
@@ -343,6 +431,8 @@ impl<'a> QualifiedColumnBinder<'a> {
         self.scopes.clear();
         self.ctes.clear();
         self.next_id = 0;
+        self.returning_scope = None;
+        self.in_where_clause = false;
     }
 
     fn fail(&mut self, error: FrankenError) {
@@ -451,8 +541,43 @@ impl<'a> QualifiedColumnBinder<'a> {
             let mut settled: Vec<bool> = select
                 .order_by
                 .iter_mut()
-                .map(|term| compound_order_column(&mut term.expr).is_none())
+                .map(|term| {
+                    compound_order_column(&mut term.expr).is_none()
+                        && bare_true_false_under_collate(&mut term.expr).is_none()
+                })
                 .collect();
+            // SQLite's `resolveCompoundOrderBy` matches bare ORDER BY names
+            // against the leftmost SELECT's explicit AS aliases before probing
+            // individual arms (`resolveAsName`).
+            if let SelectCore::Select { columns, .. } = &select.body.select {
+                for (term, is_settled) in select.order_by.iter_mut().zip(settled.iter_mut()) {
+                    if *is_settled {
+                        continue;
+                    }
+                    let Some((leaf, is_true, span)) =
+                        bare_true_false_under_collate(&mut term.expr)
+                    else {
+                        continue;
+                    };
+                    let col_name = if is_true { "true" } else { "false" };
+                    let matches_leftmost_alias = columns.iter().any(|col| {
+                        matches!(
+                            col,
+                            ResultColumn::Expr { alias: Some(alias), .. }
+                                if alias.eq_ignore_ascii_case(col_name)
+                        )
+                    });
+                    if matches_leftmost_alias {
+                        *is_settled = true;
+                        match self.pass {
+                            BindPass::Bind => self.true_false_rewrites += 1,
+                            BindPass::Rewrite => {
+                                *leaf = Expr::Column(ColumnRef::bare(col_name), span);
+                            }
+                        }
+                    }
+                }
+            }
             self.core(
                 &mut select.body.select,
                 None,
@@ -483,7 +608,7 @@ impl<'a> QualifiedColumnBinder<'a> {
         limit: Option<&mut LimitClause>,
         compound_order_by: Option<(&mut [OrderingTerm], &mut [bool])>,
     ) {
-        let mut scope = Vec::new();
+        let mut scope = BindingScope::default();
         match core {
             SelectCore::Values(rows) => {
                 self.scopes.push(scope);
@@ -505,7 +630,7 @@ impl<'a> QualifiedColumnBinder<'a> {
                 // FROM subqueries see only the enclosing queries, so they are
                 // walked while this query's items are still being collected.
                 if let Some(from) = from.as_mut() {
-                    self.register_from(from, &mut scope);
+                    self.register_from(from, &mut scope.sources);
                 }
                 self.scopes.push(scope);
                 // Before the result columns are rewritten, so both passes
@@ -513,12 +638,30 @@ impl<'a> QualifiedColumnBinder<'a> {
                 if let Some((terms, settled)) = compound_order_by {
                     self.compound_order_terms(terms, settled, columns);
                 }
+                // Walk the SELECT projection list FIRST with `aliases_visible = false`
+                // (mirroring SQLite's `resolveSelectStep`: result columns cannot
+                // reference sibling `AS` aliases, and their resolved expressions
+                // then seed `NC_UEList` for WHERE / GROUP BY / HAVING / ORDER BY).
+                self.result_columns(columns);
+                let (true_alias, false_alias) = collect_true_false_result_aliases(columns);
+                if let Some(current) = self.scopes.last_mut() {
+                    current.true_alias = true_alias;
+                    current.false_alias = false_alias;
+                }
                 if let Some(from) = from.as_mut() {
                     self.join_exprs(from);
                 }
-                self.result_columns(columns);
+                for window in windows {
+                    self.window_spec(&mut window.spec);
+                }
+                if let Some(current) = self.scopes.last_mut() {
+                    current.aliases_visible = true;
+                }
                 if let Some(expr) = where_clause {
+                    let prev_where = self.in_where_clause;
+                    self.in_where_clause = true;
                     self.expr(expr);
+                    self.in_where_clause = prev_where;
                 }
                 for expr in group_by {
                     self.expr(expr);
@@ -526,12 +669,28 @@ impl<'a> QualifiedColumnBinder<'a> {
                 if let Some(expr) = having {
                     self.expr(expr);
                 }
-                for window in windows {
-                    self.window_spec(&mut window.spec);
-                }
             }
         }
         for term in order_by.into_iter().flatten() {
+            // SQLite's `resolveOrderGroupBy` (`zType[0] != 'G'`) resolves a
+            // bare (or COLLATE-wrapped) ORDER BY identifier against `AS`
+            // aliases before FROM columns (`resolveAsName`).
+            if let Some((leaf, is_true, span)) = bare_true_false_under_collate(&mut term.expr)
+                && self
+                    .scopes
+                    .last()
+                    .and_then(|current| current.alias_for(is_true))
+                    .is_some()
+            {
+                let col_name = if is_true { "true" } else { "false" };
+                match self.pass {
+                    BindPass::Bind => self.true_false_rewrites += 1,
+                    BindPass::Rewrite => {
+                        *leaf = Expr::Column(ColumnRef::bare(col_name), span);
+                    }
+                }
+                continue;
+            }
             self.expr(&mut term.expr);
         }
         if let Some(limit) = limit {
@@ -545,7 +704,7 @@ impl<'a> QualifiedColumnBinder<'a> {
         match &mut insert.source {
             InsertSource::Select(select) => self.select(select),
             InsertSource::Values(rows) => {
-                self.scopes.push(Vec::new());
+                self.scopes.push(BindingScope::default());
                 for expr in rows.iter_mut().flatten() {
                     self.expr(expr);
                 }
@@ -553,9 +712,9 @@ impl<'a> QualifiedColumnBinder<'a> {
             }
             InsertSource::DefaultValues => {}
         }
-        let mut scope = Vec::new();
-        self.register_named(&insert.table, &mut insert.alias, true, &mut scope);
-        self.scopes.push(scope);
+        let mut sources = Vec::new();
+        self.register_named(&insert.table, &mut insert.alias, true, &mut sources);
+        self.scopes.push(BindingScope::from_sources(sources));
         for upsert in &mut insert.upsert {
             if let Some(expr) = upsert
                 .target
@@ -586,17 +745,17 @@ impl<'a> QualifiedColumnBinder<'a> {
 
     fn update(&mut self, update: &mut UpdateStatement) {
         let pushed_ctes = self.with_clause(update.with.as_mut());
-        let mut scope = Vec::new();
+        let mut sources = Vec::new();
         self.register_named(
             &update.table.name,
             &mut update.table.alias,
             true,
-            &mut scope,
+            &mut sources,
         );
         if let Some(from) = update.from.as_mut() {
-            self.register_from(from, &mut scope);
+            self.register_from(from, &mut sources);
         }
-        self.scopes.push(scope);
+        self.scopes.push(BindingScope::from_sources(sources));
         if let Some(from) = update.from.as_mut() {
             self.join_exprs(from);
         }
@@ -621,14 +780,14 @@ impl<'a> QualifiedColumnBinder<'a> {
 
     fn delete(&mut self, delete: &mut DeleteStatement) {
         let pushed_ctes = self.with_clause(delete.with.as_mut());
-        let mut scope = Vec::new();
+        let mut sources = Vec::new();
         self.register_named(
             &delete.table.name,
             &mut delete.table.alias,
             true,
-            &mut scope,
+            &mut sources,
         );
-        self.scopes.push(scope);
+        self.scopes.push(BindingScope::from_sources(sources));
         if let Some(expr) = &mut delete.where_clause {
             self.expr(expr);
         }
@@ -744,9 +903,7 @@ impl<'a> QualifiedColumnBinder<'a> {
     ) {
         let id = self.next_id;
         self.next_id += 1;
-        let cte = name
-            .schema
-            .is_none()
+        let cte = (!is_target && name.schema.is_none())
             .then(|| self.cte_relation(&name.name))
             .flatten();
         let relation = if let Some(cte) = cte {
@@ -785,14 +942,28 @@ impl<'a> QualifiedColumnBinder<'a> {
         written
     }
 
-    /// Walk a FROM clause's ON constraints and table-function arguments,
-    /// which see the whole query's items.
+    /// Walk a FROM clause's ON constraints and table-function arguments.
+    ///
+    /// In SQLite, non-outer (INNER/CROSS) JOIN ON predicates and table-function
+    /// arguments see `NC_UEList` result aliases, whereas outer (LEFT/RIGHT/FULL)
+    /// JOIN ON predicates do not.
     fn join_exprs(&mut self, from: &mut FromClause) {
         self.source_exprs(&mut from.source);
         for join in &mut from.joins {
             self.source_exprs(&mut join.table);
             if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                let is_outer = matches!(
+                    join.join_type.kind,
+                    JoinKind::Left | JoinKind::Right | JoinKind::Full
+                );
+                let prev = self.scopes.last().is_some_and(|s| s.aliases_visible);
+                if let Some(current) = self.scopes.last_mut() {
+                    current.aliases_visible = !is_outer;
+                }
                 self.expr(expr);
+                if let Some(current) = self.scopes.last_mut() {
+                    current.aliases_visible = prev;
+                }
             }
         }
     }
@@ -800,8 +971,15 @@ impl<'a> QualifiedColumnBinder<'a> {
     fn source_exprs(&mut self, source: &mut TableOrSubquery) {
         match source {
             TableOrSubquery::TableFunction { args, .. } => {
+                let prev = self.scopes.last().is_some_and(|s| s.aliases_visible);
+                if let Some(current) = self.scopes.last_mut() {
+                    current.aliases_visible = true;
+                }
                 for expr in args {
                     self.expr(expr);
+                }
+                if let Some(current) = self.scopes.last_mut() {
+                    current.aliases_visible = prev;
                 }
             }
             TableOrSubquery::ParenJoin(inner) => self.join_exprs(inner),
@@ -820,7 +998,7 @@ impl<'a> QualifiedColumnBinder<'a> {
                             .scopes
                             .last()
                             .into_iter()
-                            .flatten()
+                            .flat_map(|scope| scope.sources.iter())
                             .filter(|source| {
                                 !source.is_target
                                     && source.addressed_as().is_some_and(|addressed| {
@@ -848,6 +1026,7 @@ impl<'a> QualifiedColumnBinder<'a> {
         };
         let matching = |name: &str| -> Vec<&BindingSource> {
             scope
+                .sources
                 .iter()
                 .filter(|source| {
                     source
@@ -892,7 +1071,7 @@ impl<'a> QualifiedColumnBinder<'a> {
     /// before. Called with this arm's scope innermost and `columns` not yet
     /// rewritten.
     fn compound_order_terms(
-        &self,
+        &mut self,
         terms: &mut [OrderingTerm],
         settled: &mut [bool],
         columns: &[ResultColumn],
@@ -900,6 +1079,33 @@ impl<'a> QualifiedColumnBinder<'a> {
         let arm = self.scopes.len() - 1;
         for (term, settled) in terms.iter_mut().zip(settled.iter_mut()) {
             if *settled {
+                continue;
+            }
+            if let Some((leaf, is_true, span)) = bare_true_false_under_collate(&mut term.expr) {
+                let col_name = if is_true { "true" } else { "false" };
+                let has_col_in_arm = matches!(
+                    self.lookup_unqualified_true_false_in_scope(arm, is_true),
+                    TrueFalseLookup::Column
+                );
+                let matches_result = has_col_in_arm
+                    && columns.iter().any(|result| match result {
+                        ResultColumn::Star | ResultColumn::TableStar(_) => true,
+                        ResultColumn::Expr { expr, .. } => match strip_collate_ref(expr) {
+                            Expr::Column(col, _) => col.column.eq_ignore_ascii_case(col_name),
+                            Expr::Literal(Literal::True, _) if is_true => true,
+                            Expr::Literal(Literal::False, _) if !is_true => true,
+                            _ => false,
+                        },
+                    });
+                if matches_result {
+                    *settled = true;
+                    match self.pass {
+                        BindPass::Bind => self.true_false_rewrites += 1,
+                        BindPass::Rewrite => {
+                            *leaf = Expr::Column(ColumnRef::bare(col_name), span);
+                        }
+                    }
+                }
                 continue;
             }
             let Some(column) = compound_order_column(&mut term.expr) else {
@@ -952,10 +1158,16 @@ impl<'a> QualifiedColumnBinder<'a> {
     }
 
     fn limit(&mut self, limit: &mut LimitClause) {
+        // SQLite evaluates LIMIT/OFFSET with no table/outer columns in scope,
+        // while subqueries nested inside LIMIT push their own fresh scopes.
+        let saved_scopes = std::mem::take(&mut self.scopes);
+        let saved_returning = self.returning_scope.take();
         self.expr(&mut limit.limit);
         if let Some(offset) = &mut limit.offset {
             self.expr(offset);
         }
+        self.scopes = saved_scopes;
+        self.returning_scope = saved_returning;
     }
 
     fn window_spec(&mut self, spec: &mut WindowSpec) {
@@ -974,6 +1186,7 @@ impl<'a> QualifiedColumnBinder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn expr(&mut self, expr: &mut Expr) {
         match expr {
             Expr::Column(column, _) => self.column(column),
@@ -1065,6 +1278,53 @@ impl<'a> QualifiedColumnBinder<'a> {
                     self.expr(item);
                 }
             }
+            Expr::Literal(lit @ (Literal::True | Literal::False), span) => {
+                let is_true = matches!(lit, Literal::True);
+                let col_name = if is_true { "true" } else { "false" };
+                let span = *span;
+                match self.lookup_unqualified_true_false(is_true) {
+                    TrueFalseLookup::Column => match self.pass {
+                        BindPass::Bind => self.true_false_rewrites += 1,
+                        BindPass::Rewrite => {
+                            *expr = Expr::Column(ColumnRef::bare(col_name), span);
+                        }
+                    },
+                    TrueFalseLookup::Alias {
+                        alias_expr,
+                        from_outer,
+                    } => {
+                        let replacement = if !from_outer
+                            && self.in_where_clause
+                            && expr_contains_function_call(&alias_expr)
+                        {
+                            // Preserve alias spelling in WHERE when the aliased
+                            // expression could be an aggregate/window function so
+                            // downstream diagnostics report "misuse of aliased ...".
+                            Expr::Column(ColumnRef::bare(col_name), span)
+                        } else {
+                            *alias_expr
+                        };
+                        match self.pass {
+                            BindPass::Bind => {
+                                if replacement != *expr {
+                                    self.true_false_rewrites += 1;
+                                }
+                            }
+                            BindPass::Rewrite => {
+                                *expr = replacement;
+                            }
+                        }
+                    }
+                    TrueFalseLookup::Ambiguous => {
+                        if self.pass == BindPass::Bind {
+                            self.fail(FrankenError::AmbiguousColumn {
+                                name: col_name.to_owned(),
+                            });
+                        }
+                    }
+                    TrueFalseLookup::Literal => {}
+                }
+            }
             Expr::Literal(..)
             | Expr::BoundOuterValue { .. }
             | Expr::Raise { .. }
@@ -1154,7 +1414,7 @@ impl<'a> QualifiedColumnBinder<'a> {
             let mut found = None;
             let mut unknown = None;
             let mut addressed = Vec::new();
-            for source in scope {
+            for source in &scope.sources {
                 if let Some(database) = database.as_deref()
                     && source.relation.database.as_deref() != Some(database)
                 {
@@ -1202,8 +1462,55 @@ impl<'a> QualifiedColumnBinder<'a> {
         Lookup::Missing
     }
 
+    fn lookup_unqualified_true_false_in_scope(
+        &self,
+        scope_index: usize,
+        is_true: bool,
+    ) -> TrueFalseLookup {
+        let Some(scope) = self.scopes.get(scope_index) else {
+            return TrueFalseLookup::Literal;
+        };
+        let col_name = if is_true { "true" } else { "false" };
+        let mut definite = 0_usize;
+        for source in &scope.sources {
+            if source.relation.exposes_true_or_false(is_true) {
+                if definite > 0 && source.coalesces(col_name) {
+                    continue;
+                }
+                definite += 1;
+            }
+        }
+        if definite > 1 {
+            return TrueFalseLookup::Ambiguous;
+        }
+        if definite == 1 {
+            return TrueFalseLookup::Column;
+        }
+        if scope.aliases_visible
+            && let Some(alias_expr) = scope.alias_for(is_true)
+        {
+            let from_outer = scope_index + 1 < self.scopes.len();
+            return TrueFalseLookup::Alias {
+                alias_expr: Box::new(alias_expr.clone()),
+                from_outer,
+            };
+        }
+        TrueFalseLookup::Literal
+    }
+
+    fn lookup_unqualified_true_false(&self, is_true: bool) -> TrueFalseLookup {
+        for scope_index in (0..self.scopes.len()).rev() {
+            match self.lookup_unqualified_true_false_in_scope(scope_index, is_true) {
+                TrueFalseLookup::Literal => {}
+                found => return found,
+            }
+        }
+        TrueFalseLookup::Literal
+    }
+
     fn source(&self, scope: usize, id: usize) -> &BindingSource {
         self.scopes[scope]
+            .sources
             .iter()
             .find(|source| source.id == id)
             .expect("a bound source belongs to the scope it was found in")
@@ -1229,7 +1536,7 @@ impl<'a> QualifiedColumnBinder<'a> {
         };
         let sharers: Vec<(usize, (String, String))> = self.scopes[scope..]
             .iter()
-            .flatten()
+            .flat_map(|s| s.sources.iter())
             .filter(|other| {
                 other.id != id
                     && other
@@ -1261,6 +1568,48 @@ fn compound_order_column(expr: &mut Expr) -> Option<&mut ColumnRef> {
         Expr::Collate { expr, .. } => compound_order_column(expr),
         _ => None,
     }
+}
+
+fn strip_collate_ref(mut expr: &Expr) -> &Expr {
+    while let Expr::Collate { expr: inner, .. } = expr {
+        expr = inner.as_ref();
+    }
+    expr
+}
+
+fn bare_true_false_under_collate(expr: &mut Expr) -> Option<(&mut Expr, bool, Span)> {
+    match expr {
+        Expr::Collate { expr: inner, .. } => bare_true_false_under_collate(inner),
+        Expr::Literal(Literal::True, span) => {
+            let span = *span;
+            Some((expr, true, span))
+        }
+        Expr::Literal(Literal::False, span) => {
+            let span = *span;
+            Some((expr, false, span))
+        }
+        _ => None,
+    }
+}
+
+fn collect_true_false_result_aliases(columns: &[ResultColumn]) -> (Option<Expr>, Option<Expr>) {
+    let mut true_alias = None;
+    let mut false_alias = None;
+    for column in columns {
+        let ResultColumn::Expr {
+            expr,
+            alias: Some(alias),
+        } = column
+        else {
+            continue;
+        };
+        if true_alias.is_none() && alias.eq_ignore_ascii_case("true") {
+            true_alias = Some(expr.clone());
+        } else if false_alias.is_none() && alias.eq_ignore_ascii_case("false") {
+            false_alias = Some(expr.clone());
+        }
+    }
+    (true_alias, false_alias)
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,6 +1698,7 @@ fn statement_needs_binding(statement: &Statement) -> bool {
                     .order_by
                     .iter()
                     .any(|term| expr_needs_binding(&term.expr))
+                || update.limit.as_ref().is_some_and(limit_needs_binding)
         }
         Statement::Delete(delete) => {
             with_needs_binding(delete.with.as_ref())
@@ -1358,6 +1708,7 @@ fn statement_needs_binding(statement: &Statement) -> bool {
                     .order_by
                     .iter()
                     .any(|term| expr_needs_binding(&term.expr))
+                || delete.limit.as_ref().is_some_and(limit_needs_binding)
         }
         Statement::CreateTable(create) => {
             matches!(&create.body, CreateTableBody::AsSelect(select) if select_needs_binding(select))
@@ -1383,6 +1734,11 @@ fn select_needs_binding(select: &SelectStatement) -> bool {
             .order_by
             .iter()
             .any(|term| expr_needs_binding(&term.expr))
+        || select.limit.as_ref().is_some_and(limit_needs_binding)
+}
+
+fn limit_needs_binding(limit: &LimitClause) -> bool {
+    expr_needs_binding(&limit.limit) || limit.offset.as_ref().is_some_and(expr_needs_binding)
 }
 
 fn core_needs_binding(core: &SelectCore) -> bool {
@@ -1497,11 +1853,24 @@ fn window_needs_binding(spec: &WindowSpec) -> bool {
             .order_by
             .iter()
             .any(|term| expr_needs_binding(&term.expr))
+        || spec.frame.as_ref().is_some_and(|frame| {
+            std::iter::once(&frame.start)
+                .chain(frame.end.as_ref())
+                .any(|bound| match bound {
+                    FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+                        expr_needs_binding(expr)
+                    }
+                    FrameBound::UnboundedPreceding
+                    | FrameBound::CurrentRow
+                    | FrameBound::UnboundedFollowing => false,
+                })
+        })
 }
 
 fn expr_needs_binding(expr: &Expr) -> bool {
     match expr {
         Expr::Column(column, _) => column.schema.is_some(),
+        Expr::Literal(Literal::True | Literal::False, _) => true,
         Expr::BinaryOp { left, right, .. } => expr_needs_binding(left) || expr_needs_binding(right),
         Expr::UnaryOp { expr, .. }
         | Expr::Cast { expr, .. }
@@ -1598,6 +1967,8 @@ mod tests {
                     database: Some((*database).to_owned()),
                     columns: Some(vec![(*column).to_owned()]),
                     rowid_names: vec!["rowid", "_rowid_", "oid"],
+                    exposes_true: column.eq_ignore_ascii_case("true"),
+                    exposes_false: column.eq_ignore_ascii_case("false"),
                 })
         }
     }
