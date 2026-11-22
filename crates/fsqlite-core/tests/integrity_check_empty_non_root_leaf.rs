@@ -648,7 +648,7 @@ fn quick_check_counts_unconditional_index_entries_in_the_selected_database() {
                 }
             }
             if without_rowid {
-                for sql in ["PRAGMA integrity_check(1)", "PRAGMA integrity_check(2)", "PRAGMA integrity_check(q)"] {
+                for sql in ["PRAGMA integrity_check", "PRAGMA integrity_check(1)", "PRAGMA integrity_check(2)", "PRAGMA integrity_check(t)", "PRAGMA integrity_check(q)"] {
                     let oracle = stock_connection_reports(&stock, sql);
                     for prepared in [false, true] {
                         assert_eq!(native_reports(&native, sql, prepared).await, oracle, "{sql}");
@@ -664,6 +664,24 @@ fn quick_check_counts_unconditional_index_entries_in_the_selected_database() {
             assert_eq!(native_reports(&native, "PRAGMA quick_check(t)", false).await, ["ok"]);
             native.close().await.unwrap();
         });
+        if without_rowid {
+            stock.execute_batch(
+                "PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema SET sql='CREATE INDEX partial_idx ON t(x) WHERE x<=100 AND x<>1'
+                 WHERE name='partial_idx'; PRAGMA writable_schema=RESET;"
+            ).unwrap();
+            assert_eq!(stock_connection_reports(&stock, "PRAGMA integrity_check(t)"), ["row 100 missing from index partial_idx"]);
+            asupersync::test_utils::run_test(|| async {
+                let native = Connection::open(path.to_str().unwrap()).await.unwrap();
+                for sql in ["PRAGMA integrity_check(t)", "PRAGMA integrity_check(q)", "PRAGMA quick_check(t)"] {
+                    let oracle = stock_connection_reports(&stock, sql);
+                    for prepared in [false, true] {
+                        assert_eq!(native_reports(&native, sql, prepared).await, oracle, "{sql}");
+                    }
+                }
+                native.close().await.unwrap();
+            });
+        }
     }
 }
 
@@ -741,6 +759,45 @@ fn bd_3koph_healthy_multilevel_collated_trees_match_stock() {
 }
 
 #[test]
+fn without_rowid_partial_blob_cast_uses_database_encoding() {
+    let dir = tempfile::tempdir().unwrap();
+    for (encoding, mixed) in [
+        ("UTF-8", "4D69586544"),
+        ("UTF-16le", "4D006900580065004400"),
+        ("UTF-16be", "004D0069005800650044"),
+    ] {
+        let path = dir.path().join(format!("partial-cast-{encoding}.db"));
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        stock.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID;
+             CREATE INDEX utf8 ON t(v) WHERE CAST(v AS BLOB)=X'4D69586544';
+             CREATE INDEX changed ON t(v) WHERE k=2;
+             INSERT INTO t VALUES(1,'MiXeD'),(2,'other');"
+        )).unwrap();
+        for damaged in [false, true] {
+            if damaged {
+                stock.execute_batch(&format!(
+                    "PRAGMA writable_schema=ON;
+                     UPDATE sqlite_schema SET sql='CREATE INDEX changed ON t(v) WHERE CAST(v AS BLOB)=X''{mixed}''' WHERE name='changed';
+                     PRAGMA writable_schema=RESET;"
+                )).unwrap();
+            }
+            let full = stock_connection_reports(&stock, "PRAGMA integrity_check(t)");
+            assert_eq!(full, [if damaged { "row 1 missing from index changed" } else { "ok" }]);
+            asupersync::test_utils::run_test(|| async {
+                let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+                for prepared in [false, true] {
+                    assert_eq!(native_reports(&conn, "PRAGMA integrity_check(t)", prepared).await, full);
+                    assert_eq!(native_reports(&conn, "PRAGMA quick_check(t)", prepared).await, ["ok"]);
+                }
+                conn.close().await.unwrap();
+            });
+        }
+    }
+}
+
+#[test]
 fn bd_3koph_without_rowid_primary_key_collations_match_stock() {
     let dir = tempfile::tempdir().unwrap();
     for count in [0, 8, 240] {
@@ -759,6 +816,8 @@ fn bd_3koph_without_rowid_primary_key_collations_match_stock() {
                          key TEXT COLLATE NOCASE, payload TEXT, \
                          PRIMARY KEY(key COLLATE BINARY) \
                      ) WITHOUT ROWID; \
+                     CREATE INDEX binary_key_covered ON binary_pk(key COLLATE BINARY,payload); \
+                     CREATE INDEX binary_key_appended ON binary_pk(key COLLATE NOCASE,payload); \
                      CREATE TABLE composite_pk( \
                          tenant TEXT COLLATE NOCASE, revision INTEGER, payload TEXT, \
                          PRIMARY KEY(tenant DESC, revision ASC) \

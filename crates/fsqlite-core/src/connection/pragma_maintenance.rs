@@ -181,8 +181,8 @@ impl Connection {
             }
         }
         if structural.is_ok() {
-            let n = reports.index_counts.len().min(*remaining);
-            rows.extend(reports.index_counts.into_iter().take(n));
+            let n = reports.index_findings.len().min(*remaining);
+            rows.extend(reports.index_findings.into_iter().take(n));
             *remaining -= n;
             if *remaining == 0 {
                 return Ok(());
