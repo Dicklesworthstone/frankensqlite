@@ -774,18 +774,12 @@ impl Parser {
         }
     }
 
-    fn parse_dml_target_name(
-        &mut self,
-        context: DmlParseContext,
-    ) -> Result<QualifiedName, ParseError> {
+    /// A trigger body's qualified target parses here: whether stock allows it
+    /// depends on the schema the trigger lands in (a TEMP trigger may write
+    /// `main.t`, bd-82fon), which the connection decides with the catalog.
+    fn parse_dml_target_name(&mut self) -> Result<QualifiedName, ParseError> {
         let first = self.parse_identifier()?;
         if self.check(&TokenKind::Dot) {
-            if context == DmlParseContext::TriggerBody {
-                return Err(self.err_semantic(
-                    "qualified table names are not allowed on INSERT, UPDATE, and DELETE \
-                     statements within triggers",
-                ));
-            }
             self.advance();
             let second = self.parse_identifier()?;
             Ok(QualifiedName::qualified(first, second))
@@ -798,7 +792,7 @@ impl Parser {
         &mut self,
         context: DmlParseContext,
     ) -> Result<QualifiedTableRef, ParseError> {
-        let name = self.parse_dml_target_name(context)?;
+        let name = self.parse_dml_target_name()?;
         let alias = if context == DmlParseContext::TriggerBody {
             if self.eat_kw(&TokenKind::KwAs) {
                 Some(self.parse_identifier()?)
@@ -1594,7 +1588,7 @@ impl Parser {
             }
         };
         self.eat_kw(&TokenKind::KwInto);
-        let table = self.parse_dml_target_name(context)?;
+        let table = self.parse_dml_target_name()?;
         let alias = if self.eat_kw(&TokenKind::KwAs) {
             Some(self.parse_identifier()?)
         } else {
@@ -4523,22 +4517,11 @@ mod tests {
 
     #[test]
     fn test_trigger_body_rejects_stock_forbidden_dml_forms_at_exact_tokens() {
+        // A qualified INSERT/UPDATE/DELETE target is not here (bd-82fon):
+        // stock refuses it only outside a TEMP trigger, which needs the
+        // catalog (an unqualified trigger on a TEMP table is TEMP), so the
+        // connection refuses it; see test_trigger_body_keeps_a_qualified_dml_target.
         for (sql, rejected) in [
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 INSERT INTO main.audit VALUES (1); END",
-                ".",
-            ),
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 UPDATE main.audit SET value = 1; END",
-                ".",
-            ),
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 DELETE FROM main.audit; END",
-                ".",
-            ),
             (
                 "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
                  INSERT INTO audit DEFAULT VALUES; END",
@@ -4629,6 +4612,32 @@ mod tests {
                 rejected,
                 "the diagnostic for `{sql}` must identify the forbidden token"
             );
+        }
+    }
+
+    #[test]
+    fn test_trigger_body_keeps_a_qualified_dml_target() {
+        // bd-82fon: the parser keeps the schema; whether stock allows it (only
+        // in a TEMP trigger) is decided by the connection with the catalog.
+        for sql in [
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO main.audit VALUES (1); END",
+            "CREATE TEMP TRIGGER trg AFTER INSERT ON t BEGIN UPDATE main.audit SET value = 1; END",
+            "CREATE TRIGGER temp.trg AFTER INSERT ON t BEGIN DELETE FROM main.audit; END",
+        ] {
+            let Ok(Some((statement, _))) = parse_first_statement_with_tail(sql) else {
+                panic!("`{sql}` must parse");
+            };
+            let Statement::CreateTrigger(trigger) = statement else {
+                panic!("`{sql}` must parse to CREATE TRIGGER");
+            };
+            let target = match &trigger.body[..] {
+                [Statement::Insert(insert)] => &insert.table,
+                [Statement::Update(update)] => &update.table.name,
+                [Statement::Delete(delete)] => &delete.table.name,
+                other => panic!("unexpected body for `{sql}`: {other:?}"),
+            };
+            assert_eq!(target.schema.as_deref(), Some("main"), "`{sql}`");
+            assert_eq!(target.name, "audit", "`{sql}`");
         }
     }
 

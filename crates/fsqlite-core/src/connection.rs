@@ -11574,10 +11574,17 @@ struct TriggerDef {
 }
 
 impl TriggerDef {
+    /// `dqs`: whether double-quoted strings are on (see
+    /// [`Self::dqs_values_as_strings`]).
     fn from_create_statement(
         stmt: &fsqlite_ast::CreateTriggerStatement,
         create_sql: String,
+        dqs: bool,
     ) -> Self {
+        let mut body = stmt.body.clone();
+        if dqs {
+            Self::dqs_values_as_strings(&mut body, &create_sql);
+        }
         Self {
             name: stmt.name.name.clone(),
             table_name: stmt.table.clone(),
@@ -11587,10 +11594,110 @@ impl TriggerDef {
             event: stmt.event.clone(),
             for_each_row: stmt.for_each_row,
             when_clause: stmt.when.clone(),
-            body: stmt.body.clone(),
+            body,
             temporary: stmt.temporary,
             create_sql,
         }
+    }
+
+    /// bd-82fon: a bare double-quoted name in a value of a body step's
+    /// `INSERT ... VALUES` row, outside any subquery, is the string literal
+    /// under double-quoted strings, as stock resolves it when the trigger
+    /// compiles: a VALUES row has no source, so the name can only be the
+    /// string (the bd-82jdw rule for a top-level INSERT). The body AST keeps
+    /// no quote marks, so the stored text is parsed again; its columns and the
+    /// body's are matched in one fixed walk order, and a value whose walk
+    /// differs is left alone.
+    fn dqs_values_as_strings(body: &mut [Statement], create_sql: &str) {
+        if !create_sql.contains('"') {
+            return;
+        }
+        let Ok(Statement::CreateTrigger(mut reparsed)) = parse_single_statement(create_sql)
+        else {
+            return;
+        };
+        if reparsed.body.len() != body.len() {
+            return;
+        }
+        let quoted = Connection::double_quoted_identifier_tokens(create_sql);
+        for (step, parsed_step) in body.iter_mut().zip(&mut reparsed.body) {
+            let (Statement::Insert(insert), Statement::Insert(parsed_insert)) = (step, parsed_step)
+            else {
+                continue;
+            };
+            let (
+                fsqlite_ast::InsertSource::Values(rows),
+                fsqlite_ast::InsertSource::Values(parsed_rows),
+            ) = (&mut insert.source, &mut parsed_insert.source)
+            else {
+                continue;
+            };
+            for (row, parsed_row) in rows.iter_mut().zip(parsed_rows) {
+                for (value, parsed_value) in row.iter_mut().zip(parsed_row) {
+                    // Each column of the parsed value in walk order: its name
+                    // when it is a bare double-quoted token.
+                    let mut parsed_columns: Vec<Option<String>> = Vec::new();
+                    walk_expr_mut(
+                        parsed_value,
+                        UNPLACED_AGGREGATE_WALK_SITE,
+                        false,
+                        &mut |expr, _| {
+                            if let Expr::Column(column, span) = expr {
+                                let bare_quoted = column.table.is_none()
+                                    && quoted.iter().any(|(start, end, name)| {
+                                        *start == span.start
+                                            && *end == span.end
+                                            && name.as_str() == column.column.as_ref()
+                                    });
+                                parsed_columns
+                                    .push(bare_quoted.then(|| column.column.to_string()));
+                            }
+                            true
+                        },
+                    );
+                    if parsed_columns.iter().all(Option::is_none) {
+                        continue;
+                    }
+                    let mut columns = 0_usize;
+                    walk_expr_mut(value, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |expr, _| {
+                        columns += usize::from(matches!(expr, Expr::Column(..)));
+                        true
+                    });
+                    if columns != parsed_columns.len() {
+                        continue;
+                    }
+                    let mut index = 0_usize;
+                    walk_expr_mut(value, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |expr, _| {
+                        let Expr::Column(column, span) = expr else {
+                            return true;
+                        };
+                        let quoted_name = parsed_columns.get_mut(index).and_then(Option::take);
+                        index += 1;
+                        match quoted_name {
+                            Some(name)
+                                if column.table.is_none()
+                                    && column.column.as_ref() == name.as_str() =>
+                            {
+                                let span = *span;
+                                *expr = Expr::Literal(Literal::String(name), span);
+                                false
+                            }
+                            _ => true,
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Whether a trigger body step writes a schema-qualified table (bd-82fon).
+fn trigger_step_target_is_qualified(step: &Statement) -> bool {
+    match step {
+        Statement::Insert(insert) => insert.table.schema.is_some(),
+        Statement::Update(update) => update.table.name.schema.is_some(),
+        Statement::Delete(delete) => delete.table.name.schema.is_some(),
+        _ => false,
     }
 }
 
@@ -79355,6 +79462,19 @@ impl Connection {
         }
         drop(triggers);
 
+        // bd-82fon: stock refuses a qualified INSERT, UPDATE or DELETE target
+        // in the body only of a trigger outside the TEMP schema
+        // (triggerStepAllocate), which sqlite3BeginTrigger placed first; a
+        // TEMP trigger may write `main.t`. An IF NOT EXISTS over an existing
+        // trigger returned above: stock's NULL pNewTrigger skips the check.
+        if !is_temp_trigger && stmt.body.iter().any(trigger_step_target_is_qualified) {
+            return Err(FrankenError::FunctionError(
+                "qualified table names are not allowed on INSERT, UPDATE, and DELETE \
+                 statements within triggers"
+                    .to_owned(),
+            ));
+        }
+
         // bd-xfmv9 (GH#350): prefer the verbatim CREATE TRIGGER text captured in
         // execute() over an AST re-render. The re-render collapsed redundant
         // `WHEN (((a) AND (b)))` parentheses, so a trigger could not round-trip
@@ -79372,7 +79492,8 @@ impl Connection {
                 stored_stmt.temporary = false;
                 stored_stmt.to_string()
             });
-        let mut trigger_def = TriggerDef::from_create_statement(stmt, create_sql.clone());
+        let mut trigger_def =
+            TriggerDef::from_create_statement(stmt, create_sql.clone(), self.dqs_enabled.get());
         trigger_def.temporary = is_temp_trigger;
         trigger_def.bound_table_schema = bound_table_schema;
         self.triggers.borrow_mut().push(Arc::new(trigger_def));
@@ -116387,6 +116508,7 @@ impl Connection {
                     new_triggers.push(Arc::new(TriggerDef::from_create_statement(
                         &stmt,
                         create_sql.to_string(),
+                        self.dqs_enabled.get(),
                     )));
                     continue;
                 }
@@ -130217,10 +130339,15 @@ fn qualify_column_refs_with_alias(expr: &mut Expr, alias: &Arc<str>) {
     }
 }
 
-/// Whether a core of `select` (its own or a compound arm's) reads its FROM
-/// clause from a parenthesized join first, as in `FROM (t JOIN u) ...`.
+/// Whether a core of `select` (its own, a compound arm's, or one of a WITH
+/// query's) reads its FROM clause from a parenthesized join first, as in
+/// `FROM (t JOIN u) ...`.
 fn select_has_leading_paren_join(select: &SelectStatement) -> bool {
-    std::iter::once(&select.body.select)
+    select.with.as_ref().is_some_and(|with| {
+        with.ctes
+            .iter()
+            .any(|cte| select_has_leading_paren_join(&cte.query))
+    }) || std::iter::once(&select.body.select)
         .chain(select.body.compounds.iter().map(|(_, core)| core))
         .any(|core| {
             matches!(
@@ -130242,7 +130369,14 @@ fn select_has_leading_paren_join(select: &SelectStatement) -> bool {
 /// core's leading parenthesized joins are spliced into its join list, so the
 /// planner, codegen and the join executor see an ordinary FROM clause. (A
 /// parenthesized join later in the list does regroup and is left alone.)
+/// The WITH queries are flattened too (bd-82fon): a recursive arm `FROM (c
+/// JOIN o)` is `FROM c JOIN o`, as stock's grammar reads it.
 fn flatten_leading_paren_joins(select: &mut SelectStatement) {
+    if let Some(with) = select.with.as_mut() {
+        for cte in &mut with.ctes {
+            flatten_leading_paren_joins(&mut cte.query);
+        }
+    }
     for core in std::iter::once(&mut select.body.select)
         .chain(select.body.compounds.iter_mut().map(|(_, core)| core))
     {
