@@ -21,6 +21,16 @@ processes read all three rows in index order and passed `integrity_check`
 on both files. Both readers also recovered every byte of a separate
 1,048,577-byte mixed-byte BLOB through the index (`bd-46l13`).
 
+The previous CLI also reported `ok` on three saved corrupt WAL databases.
+On `5fd6a795e` (Linux build `30097323753219347`), both `integrity_check`
+and `quick_check` identified a stock-reported rowid on each file. On eight
+constructed databases, all 16 checks matched SQLite's tree, page, cell and
+signed rowid. This includes right children whose first key is too small,
+where SQLite reports the preceding divider. All five regression tests
+passed, including healthy collated and WITHOUT ROWID trees (`bd-3koph`).
+One saved file contains two independent errors. SQLite reports both at a
+limit of two. FrankenSQLite currently reports one (`bd-vojth`).
+
 ## Compatibility and concurrent writers, 2026-11-20
 
 Two Linux CLI processes opened the same WAL database with the default settings.
