@@ -88024,7 +88024,7 @@ impl Connection {
             Btree {
                 page_no: PageNumber,
                 owner: String,
-                is_root: bool,
+                depth: u8,
                 lower_key: Option<Arc<[SqliteValue]>>,
                 upper_key: Option<Arc<[SqliteValue]>>,
             },
@@ -88052,12 +88052,12 @@ impl Connection {
         let mut pending = vec![WalkTask::Btree {
             page_no,
             owner: owner.to_owned(),
-            is_root: true,
+            depth: 0,
             lower_key: None,
             upper_key: None,
         }];
         while let Some(task) = pending.pop() {
-            let (page_no, owner, is_root, lower_key, upper_key) = match task {
+            let (page_no, owner, depth, lower_key, upper_key) = match task {
                 WalkTask::TableDivider { page, cell, rowid } => {
                     reports.check(&mut upper_rowid, root_page, page, cell, rowid, true)?;
                     continue;
@@ -88065,10 +88065,10 @@ impl Connection {
                 WalkTask::Btree {
                     page_no,
                     owner,
-                    is_root,
+                    depth,
                     lower_key,
                     upper_key,
-                } => (page_no, owner, is_root, lower_key, upper_key),
+                } => (page_no, owner, depth, lower_key, upper_key),
                 WalkTask::Overflow {
                     first_overflow,
                     payload_size,
@@ -88093,6 +88093,14 @@ impl Connection {
                 }
             };
 
+            // Use the same depth bound as ordinary cursors. In particular,
+            // quick_check does not keep the full walk's page ownership map.
+            if depth >= fsqlite_types::limits::BTREE_MAX_DEPTH {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("Tree {} page {}: B-tree depth exceeds maximum of {}",
+                        root_page.get(), page_no.get(), fsqlite_types::limits::BTREE_MAX_DEPTH),
+                });
+            }
             Self::record_integrity_page_owner(
                 owners.as_deref_mut(),
                 page_size,
@@ -88112,7 +88120,7 @@ impl Connection {
             .map_err(|err| FrankenError::DatabaseCorrupt {
                 detail: format!("{owner}: page {} header invalid: {err}", page_no.get()),
             })?;
-            if !is_root && header.cell_count == 0 {
+            if depth != 0 && header.cell_count == 0 {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "{owner}: page {} is an empty non-root B-tree page",
@@ -88221,7 +88229,7 @@ impl Connection {
                     next_tasks.push(WalkTask::Btree {
                         page_no: left_child,
                         owner: format!("{owner} -> child[{cell_idx}]"),
-                        is_root: false,
+                        depth: depth + 1,
                         lower_key: previous_key.clone(),
                         upper_key: current_key.clone(),
                     });
@@ -88252,7 +88260,7 @@ impl Connection {
                 next_tasks.push(WalkTask::Btree {
                     page_no: right_child,
                     owner: format!("{owner} -> right_child"),
-                    is_root: false,
+                    depth: depth + 1,
                     lower_key: previous_key,
                     upper_key,
                 });

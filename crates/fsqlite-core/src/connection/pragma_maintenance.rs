@@ -92,18 +92,22 @@ impl Connection {
     ) -> Result<()> {
         let mut reports = IntegrityRowidReports { limit: *remaining, findings: Vec::new() };
         let structural = self.validate_database_integrity_reporting(quick, &mut reports).await;
-        *remaining -= reports.findings.len();
-        let has_rowid_findings = !reports.findings.is_empty();
-        if has_rowid_findings {
-            rows.push(format!("*** in database {schema} ***\n{}", reports.findings.join("\n")));
+        if let Err(error) = &structural && error.is_transient() {
+            return structural;
         }
-        // Once the final allowed rowid finding is recorded, the tree walk
-        // returns that same corruption error to stop before visiting more pages.
+        if !reports.findings.is_empty() {
+            // At the limit the error is the last rowid already recorded. A
+            // different structural failure before the limit belongs to the
+            // same grouped SQL row as the preceding rowid findings.
+            if reports.findings.len() < *remaining && let Err(error) = structural {
+                reports.findings.push(error.to_string());
+            }
+            *remaining -= reports.findings.len();
+            rows.push(format!("*** in database {schema} ***\n{}", reports.findings.join("\n")));
+            return Ok(());
+        }
         let result = match structural {
-            Err(error) if error.is_transient() => return Err(error),
-            Err(_) if *remaining == 0 => return Ok(()),
             Err(error) => Err(error),
-            Ok(()) if has_rowid_findings => return Ok(()),
             Ok(()) => self.integrity_check_row_constraints(scope, *remaining).await,
         };
         match result {

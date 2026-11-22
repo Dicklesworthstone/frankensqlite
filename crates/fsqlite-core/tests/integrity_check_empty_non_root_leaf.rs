@@ -301,9 +301,10 @@ fn bd_3koph_table_subtree_bounds_match_stock() {
                 asupersync::test_utils::run_test(|| async {
                     let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
                     for pragma in ["PRAGMA integrity_check", "PRAGMA quick_check"] {
+                        let oracle = stock_reports(&path, pragma);
                         for prepared in [false, true] {
                             let reports = native_reports(&conn, pragma, prepared).await;
-                            assert_eq!(reports, stock_reports(&path, pragma), "{pragma}, prepared={prepared}");
+                            assert_eq!(reports, oracle, "{pragma}, prepared={prepared}");
                         }
                     }
                     conn.close().await.unwrap();
@@ -342,16 +343,18 @@ fn bd_vojth_rowid_reports_match_stock_across_attached_databases() {
         assert_eq!(single[0].matches("out of order").count(), 2, "{single:?}");
     }
 
-    let attach = format!("ATTACH DATABASE '{}' AS SeCond", second.display());
+    let attach = "ATTACH DATABASE ?1 AS SeCond";
+    let second = second.to_str().unwrap();
     let expected = {
         let stock = rusqlite::Connection::open(&main).unwrap();
-        stock.execute_batch(&attach).unwrap();
+        stock.execute(attach, [second]).unwrap();
         let mut cases = Vec::new();
         for kind in ["integrity_check", "quick_check"] {
             for schema in ["", "main.", "SECOND."] {
                 for limit in ["", "(1)", "(2)", "(3)", "(4)"] {
                     let sql = format!("PRAGMA {schema}{kind}{limit}");
-                    cases.push((sql.clone(), stock_connection_reports(&stock, &sql)));
+                    let rows = stock_connection_reports(&stock, &sql);
+                    cases.push((sql, rows));
                 }
             }
         }
@@ -359,10 +362,55 @@ fn bd_vojth_rowid_reports_match_stock_across_attached_databases() {
     };
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(main.to_str().unwrap()).await.unwrap();
-        conn.execute(&attach).await.unwrap();
+        conn.execute_with_params(attach, &[SqliteValue::Text(second.into())])
+            .await
+            .unwrap();
         for (sql, oracle) in &expected {
             for prepared in [false, true] {
-                assert_eq!(native_reports(&conn, sql, prepared).await, *oracle, "{sql}, prepared={prepared}");
+                assert_eq!(
+                    native_reports(&conn, sql, prepared).await,
+                    *oracle,
+                    "{sql}, prepared={prepared}"
+                );
+            }
+        }
+        conn.close().await.unwrap();
+    });
+}
+
+#[test]
+fn bd_vojth_rowid_and_orphan_share_one_structural_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.db");
+    let root = create_stock_table(&path, 1, 4);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let size = header_page_size(&bytes);
+    let page = (usize::try_from(root).unwrap() - 1) * size;
+    assert_eq!(bytes[page], 0x0d);
+    bytes[page + 10..page + 14].rotate_left(2);
+    let orphan = u32::try_from(bytes.len() / size + 1).unwrap();
+    bytes.resize(bytes.len() + size, 0);
+    bytes[28..32].copy_from_slice(&orphan.to_be_bytes());
+    std::fs::write(&path, bytes).unwrap();
+
+    let stock = stock_reports(&path, "PRAGMA integrity_check(2)");
+    assert_eq!(stock.len(), 1);
+    let lines: Vec<_> = stock[0].lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1].contains("Rowid 3 out of order"));
+    assert_eq!(lines[2], format!("Page {orphan}: never used"));
+    asupersync::test_utils::run_test(|| async {
+        // Keep first-open repair from reclaiming the orphan before the check.
+        let conn = Connection::open_schema_only(path.to_str().unwrap()).await.unwrap();
+        for prepared in [false, true] {
+            let native = native_reports(&conn, "PRAGMA integrity_check(2)", prepared).await;
+            assert_eq!(native.len(), 1, "{native:?}");
+            let grouped: Vec<_> = native[0].lines().collect();
+            assert_eq!(grouped.len(), 3, "{native:?}");
+            assert_eq!(grouped[..2], lines[..2]);
+            assert!(grouped[2].contains(&format!("page {orphan} is never used")));
+            for sql in ["PRAGMA integrity_check(1)", "PRAGMA quick_check(2)"] {
+                assert_eq!(native_reports(&conn, sql, prepared).await, [lines[..2].join("\n")]);
             }
         }
         conn.close().await.unwrap();
