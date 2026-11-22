@@ -87727,9 +87727,8 @@ impl Connection {
     /// generated columns are physically materialized in a stored record, so a
     /// row read from storage leaves them untouched (they are never
     /// double-computed); a row that was never stored (a trigger's NEW row,
-    /// whose base columns are new) passes `recompute_stored`. Columns are
-    /// filled in declared order, so a generated column may reference an
-    /// earlier one.
+    /// whose base columns are new) passes `recompute_stored`. SQLite permits
+    /// a generated expression to reference a column declared later in the table.
     ///
     /// Reuses the synchronous `eval_join_expr` interpreter (the same evaluator
     /// used by `build_expected_index_key_for_integrity` for index-on-expression
@@ -87769,6 +87768,10 @@ impl Connection {
             .collect::<Vec<_>>();
         push_hidden_rowid_eval_column(table, rowid, &mut eval_row, &mut col_map);
 
+        let mut expressions = vec![None; table.columns.len()];
+        let mut dependents = vec![Vec::new(); table.columns.len()];
+        let mut inputs = vec![0_usize; table.columns.len()];
+        let mut ready = VecDeque::new();
         for (col_idx, column) in table.columns.iter().enumerate() {
             if !fills(column) {
                 // Not generated, or STORED and already materialized in the
@@ -87790,10 +87793,38 @@ impl Connection {
             if let Some(ipk_column) = rowid_alias_col_idx.and_then(|idx| table.columns.get(idx)) {
                 rewrite_rowid_aliases_in_expr(&mut expr, table, &ipk_column.name);
             }
-            let computed = eval_join_expr(&expr, &eval_row, &col_map)?
-                .apply_affinity(affinity_char_to_type(column.affinity));
+            let mut references = Vec::new();
+            collect_expr_column_refs(&expr, &mut references);
+            for dependency in references.into_iter().filter_map(|name| table.column_index(name)) {
+                if fills(&table.columns[dependency]) {
+                    dependents[dependency].push(col_idx);
+                    inputs[col_idx] += 1;
+                }
+            }
+            expressions[col_idx] = Some(expr);
+            if inputs[col_idx] == 0 {
+                ready.push_back(col_idx);
+            }
+        }
+        while let Some(col_idx) = ready.pop_front() {
+            let expr = expressions[col_idx].as_ref().ok_or_else(|| {
+                FrankenError::internal("missing expression for a generated column")
+            })?;
+            let computed = eval_join_expr(expr, &eval_row, &col_map)?
+                .apply_affinity(affinity_char_to_type(table.columns[col_idx].affinity));
             values[col_idx] = computed.clone();
             eval_row[col_idx] = computed;
+            for &dependent in &dependents[col_idx] {
+                inputs[dependent] -= 1;
+                if inputs[dependent] == 0 {
+                    ready.push_back(dependent);
+                }
+            }
+        }
+        if let Some(col_idx) = inputs.iter().position(|&count| count > 0) {
+            return Err(FrankenError::function_error(format!(
+                "generated column loop on \"{}\"", table.columns[col_idx].name
+            )));
         }
         Ok(())
     }
