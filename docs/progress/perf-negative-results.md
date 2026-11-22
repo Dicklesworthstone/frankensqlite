@@ -94,6 +94,45 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - WIN (landed as 18c00643a; under its prediction on instructions, inside every kill line): MakeRecord's serializer keeps a record's layouts in a stack array and writes the record through one slice, without its layout SmallVec; bulk -288.4M Ir and its cycles a replicated WIN (bd-w4pr1.13, bulk-write round 16, lever MR)
+
+- Target: the 4-column MakeRecord of bulk_insert_1M_one_txn. Callgrind on 94395a013 (100k rows): the serializer
+  about 698 Ir a row against stock 3.54.1's OP_MakeRecord body 237. `write_serialized_record_from_layouts` 505.7
+  inclusive: 182 in out-of-line `append_serialized_value` calls (one `extend_from_slice` each), 65 in one memcpy (the
+  layout `SmallVec`, about 400 bytes, moved into the writer), 45 in out-of-line `write_varint` calls, 64 in
+  `smallvec::IntoIter::next`; in the lane one more 65-Ir memcpy (the `SmallVec` moved into its `IntoIter`).
+- Touched: `crates/fsqlite-types/src/record.rs`. Records of 3..=16 values (size hint) cache their layouts in a
+  `[Option<(&SqliteValue, u64, usize)>; 16]`; the writer sizes the buffer once and writes each header byte (one-byte
+  varint inline) and payload into its slot; wider records keep the `SmallVec` cache and the same writer by slice; an
+  iterator longer than its size hint falls back to the cached path; integer payloads are fixed-width copies. Byte
+  output unchanged. Keeper `record::tests::test_record_writer_matches_the_file_format_byte_for_byte` (reference
+  encoder from the file-format document, widths 1-20 at every serial-type boundary, hand-written bulk-row bytes, a
+  dirty reused buffer, an under-hinted iterator, a two-byte header size); three mutants each fail it (rc 101).
+- Ledger preflight: not FusedAppendInsert / BulkTableLeafPage* (page builders), S3F v2 (eviction trace) or SR
+  (cursor stack); the 2026-07-24 code-screen REJECT counted the sideband buffer, not this serializer; the May 2026
+  record entries were the prepared direct-INSERT lane in connection.rs; `write_varint` itself is unchanged (05-06).
+- Prediction (on the bead before the build): bulk -300M to -460M Ir, cycles and cpu -2% to -5%; memory_script_200k
+  -55M to -100M; update_10pct_300k -8M to -15M; other rows within +-0.5% or lower. Kill: bulk under 150M (2% of the
+  row, the smallest gain worth a third serializer path); any row's Ir up more than 0.5%; a replicated
+  layout-averaged LOSE above 1%; a failing test, a surviving mutant or a differing answer.
+- Result (stock SQLite 3.54.1 live; parent 4a81b25a9, one layout_shuffle_pair job on hz4, K=6, two valid runs,
+  null max |z| 2.86 / 2.81; answers equal stock, integrity_check ok):
+  - Instructions (cargo ELFs): bulk 7,040.8M -> 6,752.4M (-288.4M; x1.950 -> x1.870 stock 3,610.9M);
+    memory_script -69.8M (x1.911 -> x1.868); update -9.0M (x2.365 -> x2.326); delete -0.5M; the read rows -0.07% to
+    -0.81%. Callgrind 100k: 710.2M -> 682.8M (stock 335.1M).
+  - Time (layout-averaged): bulk cycles 0.9651 / 0.9544 WIN (against stock x2.585 -> x2.494 and x2.559 ->
+    x2.442), cpu 0.9657 TIE / 0.9747 WIN (x2.241 -> x2.164, x2.343 -> x2.284);
+    update cycles 0.9724 / 0.9755 WIN; every other row and metric a replicated TIE.
+  - An earlier pair on 8a9a6410c gave the same instruction lines (bulk -277.9M) but both its time runs were void
+    (null |z| 3.50 and 6.68, load 9-14), and its GROUP BY rows errored in both arms (bd-46l13's spill defect, fixed
+    by 269f4b0ac after that parent).
+- Lesson (prediction miss): the band assumed the writer would inline into the lane at about 140 a row. It stayed
+  out of line (334 a row), and so did `encode_serialized_value` (400k calls, 110 a row); the header bytes are
+  written through a fresh sub-slice per value (about 65 a row).
+- Retry / next: the remaining writer cost above: `encode_serialized_value` inlined into the writer and the one-byte
+  serial type stored straight into its header slot (about 80-110 a row, measured by callgrind on the bulk row
+  first). The lane's own MakeRecord lines (the layout match, 52 a row; the integer-record probe, 15) are separate.
+
 ## 2026-11-22 - REJECTED on its GAIN kill line (reused INSERT -6.3% Ir against -10%); point SELECT -22.2%: sqlite3_step runs the statement sqlite3_prepare_v2 compiled instead of parsing and preparing the SQL again (bd-e64z4 part 2, single-writer lane round 10, lever L3)
 
 - Target: `crates/fsqlite-c-api/src/lib.rs`. prepare_v2 compiled the statement only to read its column count and
