@@ -1,5 +1,34 @@
 # State Of The Codebase And Next Steps
 
+## Encoded index writes, backups and TEMP schema ownership, 2026-11-22
+
+FrankenSQLite previously wrote a UTF-8 key when a UTF-16 database's index
+expression cast text to BLOB. Stock SQLite then missed qualifying rows in
+the saved index. On Linux `ee8809bd0` (CLI build `30097323753220078`),
+all 354 comparisons with SQLite 3.54.1 passed across UTF-8, UTF-16LE and
+UTF-16BE, including indexed writes, transaction rollback and independently
+reopened backups. The backup cases include WITHOUT ROWID tables whose
+secondary index stores a composite primary key. On the same build, all 16
+checkpoint comparisons passed with a reader holding a WAL snapshot across
+PASSIVE, FULL, RESTART and TRUNCATE. The optional per-page XXH3 check in
+specification §7.7 still needs qualification on `bd-fjieg`.
+
+The Linux CLI at `17f3faa49` (build `30097323753220111`) also matched
+SQLite 3.54.1 on 168 malformed UTF-16 checks. An unrelated UPDATE used to
+replace an unpaired surrogate in the saved text even though both engines
+reported `integrity_check=ok`. Both engines now recover the original bytes
+after UPDATE, rollback and VACUUM INTO. A UNIQUE index can still distinguish
+two different stored keys with the same UTF-8 projection. Nine raw TEXT,
+BLOB and NULL controls passed on the same binary.
+
+On that build, all 80 schema and 40 trigger and AUTOINCREMENT ownership
+checks matched SQLite. Renaming a TEMP table preserves the same-named main
+table, its dependent objects and its rowid high-water mark. After issuing
+and deleting rowid 100, the next main row received 101 while the TEMP table
+shadowed it, and the following row received 102 after the TEMP rename.
+Fresh processes confirmed the persistent rows and catalog. The 354
+encoded-write and 16 active-reader checkpoint comparisons passed again.
+
 ## Compound writes, integrity checks and historical reads, 2026-11-21 through 2026-11-22
 
 Stock SQLite reopened a database written by the previous engine and found
