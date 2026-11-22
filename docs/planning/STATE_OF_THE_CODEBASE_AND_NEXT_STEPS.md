@@ -1,6 +1,6 @@
 # State Of The Codebase And Next Steps
 
-## Compound writes and historical reads, 2026-11-21
+## Compound writes, integrity checks and historical reads, 2026-11-21 through 2026-11-22
 
 Stock SQLite reopened a database written by the previous engine and found
 `5,5` after a compound INSERT that should have stored `5,7,10`. Both files
@@ -75,10 +75,33 @@ The cases cover rowid and WITHOUT ROWID tables, ordinary and expression
 indexes, and a healthy partial index. Twelve further checks matched the
 order and limits for a table with two short indexes and a CHECK violation
 (`bd-rhhl9`). Full `integrity_check` also detects a short secondary index
-on WITHOUT ROWID tables as of `5b42b1ebf`. All 240 cases covering database
-origin, table scope, limits and repair passed. An equal-size index that
-omits a qualifying row is a separate failure. On both database origins,
-SQLite named the missing rows and FrankenSQLite still returned `ok`.
+on WITHOUT ROWID tables as of `5b42b1ebf`. An equal-size index that omitted
+a qualifying row still passed at that point. On November 22, the Linux CLI
+at `2fd6b3a6e` named the missing rows on files created by either engine.
+All 72 index-membership and healthy-file comparisons matched SQLite,
+including UTF-16 expression indexes, partial predicates, and composite
+primary keys with different collations. All 240 short-index, scope, limit
+and repair checks also passed. An index on a generated column that refers
+to a later declaration passed on the healthy stock file. The full check
+holds one secondary index's expected keys in memory while switching from
+the table scan to index lookups. Peak memory on large tables remains unmeasured.
+
+Migration preserved the original backup byte for byte in both repair
+cases. When the only defect was an orphan page, it repaired the file and
+recorded completion. When a secondary index still lacked a qualifying row,
+the full check named that row and migration left the completion marker
+absent (RCH CLI build `30097323753220028`, `bd-rhhl9`). On the same
+source, all 39 tests in ten integration targets passed on Linux,
+including both direct and prepared PRAGMAs (RCH `30097323753220039`).
+
+Native writes at `5b42b1ebf` also exposed an encoding defect. On a UTF-16
+database, a partial index whose predicate casts text to BLOB can omit a row
+that qualifies in the database's byte order. Stock SQLite reported the
+missing row on both UTF-16LE and UTF-16BE files. The same schema and data
+passed on UTF-8 and on files created by stock in all three encodings.
+The reader at `2fd6b3a6e` identified the same missing row as stock in each
+file. Running stock `REINDEX` on copies repaired both UTF-16 indexes.
+Both engines then reopened the two original rows and passed the full check.
 
 ## Compatibility and concurrent writers, 2026-11-20 through 2026-11-21
 
