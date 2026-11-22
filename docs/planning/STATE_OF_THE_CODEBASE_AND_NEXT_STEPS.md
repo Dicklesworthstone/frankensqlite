@@ -66,6 +66,17 @@ or erased the deleted marker as SQLite did. Both readers also recovered
 the surviving rows after rollback in all eight combinations of database
 creator, writer and journal mode (`bd-d4fr8`).
 
+On November 22, the previous CLI returned `ok` for an unconditional
+index missing a stored entry. It disagreed with SQLite 3.54.1 in 20 of
+52 checks on each engine's files. On `913e81be4`, all 104 checks matched.
+Both shells inspected the damaged table, an unaffected table and an
+attached copy, then reopened the files after each engine ran `REINDEX`.
+The cases cover rowid and WITHOUT ROWID tables, ordinary and expression
+indexes, and a healthy partial index. Twelve further checks matched the
+order and limits for a table with two short indexes and a CHECK violation
+(`bd-rhhl9`). On the same damaged files, full `integrity_check` diagnoses
+the rowid case but can still return `ok` for a WITHOUT ROWID table.
+
 ## Compatibility and concurrent writers, 2026-11-20 through 2026-11-21
 
 Two Linux CLI processes opened the same WAL database with the default settings.
