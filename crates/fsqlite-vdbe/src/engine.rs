@@ -23369,8 +23369,8 @@ fn collate_compare(
 ) -> Option<std::cmp::Ordering> {
     match (lhs, rhs) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => Some(compare_text_with_collation(
-            l.as_bytes_direct(),
-            r.as_bytes_direct(),
+            l,
+            r,
             coll_name,
             collation_registry,
             enc,
@@ -23380,8 +23380,8 @@ fn collate_compare(
 }
 
 fn compare_text_with_collation(
-    left: &[u8],
-    right: &[u8],
+    left: &SmallText,
+    right: &SmallText,
     coll_name: &str,
     collation_registry: &CollationRegistry,
     enc: TextEncoding,
@@ -23400,12 +23400,11 @@ fn compare_text_with_collation(
     if coll_name.eq_ignore_ascii_case("BINARY")
         && collation_registry.uses_builtin_implementation("BINARY")
     {
-        return binary_compare_bytes(left, right, enc);
+        return left.cmp_binary_in(right, enc);
     }
     collation_registry
         .find(coll_name)
-        .map(|collation| collation.compare(left, right))
-        .unwrap_or_else(|| binary_compare_bytes(left, right, enc))
+        .map_or_else(|| left.cmp_binary_in(right, enc), |collation| collation.compare(left.as_bytes_direct(), right.as_bytes_direct()))
 }
 
 /// BINARY collation byte comparison that honors the database storage encoding
@@ -23422,6 +23421,7 @@ fn compare_text_with_collation(
 ///
 /// For UTF-8 databases this is a plain `memcmp` — byte-for-byte the previous
 /// behavior, so the common hot path pays nothing.
+#[cfg(test)]
 fn binary_compare_bytes(left: &[u8], right: &[u8], enc: TextEncoding) -> Ordering {
     // Raw (byte-preserved non-UTF-8) TEXT is the bd-6y0jd concern — it
     // compares as stored.
@@ -23434,11 +23434,11 @@ fn builtin_collation_compare_text(
     coll_name: &str,
     enc: TextEncoding,
 ) -> Option<Ordering> {
+    if coll_name.eq_ignore_ascii_case("BINARY") {
+        return Some(left.cmp_binary_in(right, enc));
+    }
     let left = left.as_bytes_direct();
     let right = right.as_bytes_direct();
-    if coll_name.eq_ignore_ascii_case("BINARY") {
-        return Some(binary_compare_bytes(left, right, enc));
-    }
     if coll_name.eq_ignore_ascii_case("NOCASE") {
         return Some(compare_ascii_nocase_bytes(left, right));
     }
@@ -23457,7 +23457,7 @@ fn cmp_sqlite_values_collated(
     match (a, b) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => {
             builtin_collation_compare_text(l, r, coll, enc).unwrap_or_else(|| {
-                binary_compare_bytes(l.as_bytes_direct(), r.as_bytes_direct(), enc)
+                l.cmp_binary_in(r, enc)
             })
         }
         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
@@ -23559,11 +23559,7 @@ fn fast_compare_same_storage_class(
                 builtin_collation_compare_text(a, b, coll_name, enc).map(Some)
             }
             // No collation named ⇒ implicit BINARY, which is encoding-aware.
-            _ => Some(Some(binary_compare_bytes(
-                a.as_bytes_direct(),
-                b.as_bytes_direct(),
-                enc,
-            ))),
+            _ => Some(Some(a.cmp_binary_in(b, enc))),
         },
         (SqliteValue::Blob(a), SqliteValue::Blob(b)) if !matches!(p4, P4::Collation(_)) => {
             Some(Some(a.as_ref().cmp(b.as_ref())))
@@ -25777,20 +25773,14 @@ fn cmp_values_collated(
 ) -> Ordering {
     if let (SqliteValue::Text(lt), SqliteValue::Text(rt)) = (lhs, rhs) {
         return match collation {
-            Some(coll) => compare_text_with_collation(
-                lt.as_bytes_direct(),
-                rt.as_bytes_direct(),
-                coll,
-                collation_registry,
-                enc,
-            ),
+            Some(coll) => compare_text_with_collation(lt, rt, coll, collation_registry, enc),
             // bd-9pi70: an absent collation is implicit BINARY, which orders in
             // the DB storage encoding (bd-bld9w.4). Now that sort keys are decoded
             // to canonical UTF-8 (SorterInsert), a plain `partial_cmp` here would
             // order by UTF-8 bytes and diverge from stock on a UTF-16 database; the
             // encoding-aware comparator re-encodes to the storage encoding. For a
             // UTF-8 database this is byte-for-byte identical to `partial_cmp`.
-            None => binary_compare_bytes(lt.as_bytes_direct(), rt.as_bytes_direct(), enc),
+            None => lt.cmp_binary_in(rt, enc),
         };
     }
     lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
@@ -26038,8 +26028,8 @@ fn parse_cast_integer_prefix(s: &str) -> i64 {
 /// On a UTF-8 database this is `SmallText::from_arc_bytes`: the bytes are
 /// preserved verbatim (invalid UTF-8 kept in the byte-preserving raw form) and
 /// the `Arc` is retained without a copy. On a UTF-16 database the bytes are
-/// decoded as UTF-16LE/BE code units (an odd trailing byte is dropped, lone
-/// surrogates become U+FFFD) — a pure byte-relabel matching stock's per-value
+/// interpreted as UTF-16LE/BE code units (an odd trailing byte is dropped and
+/// unpaired surrogates keep their native units) — a byte-relabel matching stock's per-value
 /// encoding tag, NOT a canonical-UTF-8 interpretation followed by a transcode.
 fn blob_to_text_via_db_encoding(bytes: Arc<[u8]>, text_encoding: TextEncoding) -> SmallText {
     match text_encoding {

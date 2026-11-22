@@ -151765,7 +151765,7 @@ fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => int_float_cmp(*ai, *bf),
         (SqliteValue::Float(af), SqliteValue::Integer(bi)) => int_float_cmp(*bi, *af).reverse(),
         (SqliteValue::Text(at), SqliteValue::Text(bt)) => {
-            binary_text_cmp(at.as_bytes_direct(), bt.as_bytes_direct(), statement_text_encoding())
+            at.cmp_binary_in(bt, statement_text_encoding())
         }
         (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
         _ => unreachable!("same rank guarantees same type class"),
@@ -151809,7 +151809,7 @@ fn cmp_values_no_affinity(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Orderin
         (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => int_float_cmp(*ai, *bf),
         (SqliteValue::Float(af), SqliteValue::Integer(bi)) => int_float_cmp(*bi, *af).reverse(),
         (SqliteValue::Text(at), SqliteValue::Text(bt)) => {
-            binary_text_cmp(at.as_bytes_direct(), bt.as_bytes_direct(), statement_text_encoding())
+            at.cmp_binary_in(bt, statement_text_encoding())
         }
         (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
         _ => unreachable!("same rank guarantees same type class"),
@@ -152165,7 +152165,7 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         (SqliteValue::Integer(a), SqliteValue::Float(b)) => int_float_cmp(*a, *b),
         (SqliteValue::Float(a), SqliteValue::Integer(b)) => int_float_cmp(*b, *a).reverse(),
         (SqliteValue::Text(a), SqliteValue::Text(b)) => {
-            binary_text_cmp(a.as_bytes_direct(), b.as_bytes_direct(), statement_text_encoding())
+            a.cmp_binary_in(b, statement_text_encoding())
         }
         (SqliteValue::Blob(a), SqliteValue::Blob(b)) => a.cmp(b),
         _ => unreachable!("unreachable given rank check above"),
@@ -152176,47 +152176,36 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
 /// (and an unregistered name, which SQLite resolves to BINARY) orders in the
 /// statement's database encoding like stock; any other collation, including
 /// an application override of BINARY, decides through the registry.
-fn compare_text_bytes_with_registry(
-    left: &[u8],
-    right: &[u8],
+fn compare_text_with_registry(
+    left: &fsqlite_types::SmallText,
+    right: &fsqlite_types::SmallText,
     collation: &str,
     registry: &CollationRegistry,
 ) -> std::cmp::Ordering {
     if collation.eq_ignore_ascii_case("BINARY") && registry.uses_builtin_implementation("BINARY") {
-        return binary_text_cmp(left, right, statement_text_encoding());
+        return left.cmp_binary_in(right, statement_text_encoding());
     }
     registry
         .find(collation)
-        .map(|coll_fn| coll_fn.compare(left, right))
-        .unwrap_or_else(|| binary_text_cmp(left, right, statement_text_encoding()))
+        .map_or_else(|| left.cmp_binary_in(right, statement_text_encoding()),
+            |coll_fn| coll_fn.compare(left.as_bytes_direct(), right.as_bytes_direct()))
 }
 
 /// Compare text bytes using a pre-snapshotted collation registry.
 /// Avoids mutex acquisition on every comparison in O(N log N) sort loops.
 #[cfg_attr(not(test), allow(dead_code))]
-fn compare_text_bytes_collated(
-    left: &[u8],
-    right: &[u8],
+fn compare_text_collated(
+    left: &fsqlite_types::SmallText,
+    right: &fsqlite_types::SmallText,
     collation: &str,
     collation_registry: &Mutex<CollationRegistry>,
 ) -> std::cmp::Ordering {
-    compare_text_bytes_with_registry(
+    compare_text_with_registry(
         left,
         right,
         collation,
         &lock_unpoisoned(collation_registry),
     )
-}
-
-/// Compare text bytes using a pre-snapshotted collation registry.
-/// Avoids mutex acquisition on every comparison in O(N log N) sort loops.
-fn compare_text_bytes_collated_snapshot(
-    left: &[u8],
-    right: &[u8],
-    collation: &str,
-    registry: &CollationRegistry,
-) -> std::cmp::Ordering {
-    compare_text_bytes_with_registry(left, right, collation, registry)
 }
 
 /// Lock-free variant using a pre-snapshotted registry.
@@ -152228,7 +152217,7 @@ fn cmp_sqlite_values_collated(
     collation_registry: &Mutex<CollationRegistry>,
 ) -> std::cmp::Ordering {
     if let (Some(coll), SqliteValue::Text(at), SqliteValue::Text(bt)) = (collation, a, b) {
-        return compare_text_bytes_collated(at.as_bytes(), bt.as_bytes(), coll, collation_registry);
+        return compare_text_collated(at, bt, coll, collation_registry);
     }
     cmp_sqlite_values(a, b)
 }
@@ -152241,7 +152230,7 @@ fn cmp_sqlite_values_collated_snapshot(
     registry: &CollationRegistry,
 ) -> std::cmp::Ordering {
     if let (Some(coll), SqliteValue::Text(at), SqliteValue::Text(bt)) = (collation, a, b) {
-        return compare_text_bytes_collated_snapshot(at.as_bytes(), bt.as_bytes(), coll, registry);
+        return compare_text_with_registry(at, bt, coll, registry);
     }
     cmp_sqlite_values(a, b)
 }
@@ -176036,9 +176025,9 @@ fn cmp_values_with_affinity(
     if let (Some(collation), SqliteValue::Text(left_text), SqliteValue::Text(right_text)) =
         (collation, left.as_ref(), right.as_ref())
     {
-        return compare_text_bytes_collated_snapshot(
-            left_text.as_bytes(),
-            right_text.as_bytes(),
+        return compare_text_with_registry(
+            left_text,
+            right_text,
             collation,
             registry,
         );
@@ -176213,9 +176202,9 @@ fn compare_join_in_values(
                     operand_value.as_ref(),
                     list_value.as_ref(),
                 ) {
-                    compare_text_bytes_collated_snapshot(
-                        left_text.as_bytes(),
-                        right_text.as_bytes(),
+                    compare_text_with_registry(
+                        left_text,
+                        right_text,
                         collation,
                         &context.registry,
                     )
@@ -286536,9 +286525,9 @@ mod pager_routing_tests {
             );
 
             assert_eq!(
-                super::compare_text_bytes_collated(
-                    b"aa",
-                    b"b",
+                super::compare_text_collated(
+                    &"aa".into(),
+                    &"b".into(),
                     "LENFIRST",
                     conn.collation_registry.as_ref()
                 ),

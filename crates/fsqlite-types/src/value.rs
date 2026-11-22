@@ -259,6 +259,15 @@ enum SmallTextRepr {
     /// `lossy` exists only to satisfy Rust-facing string APIs. Storage,
     /// equality, ordering, hashing, and CAST-to-BLOB use `bytes`.
     Raw { bytes: Arc<[u8]>, lossy: Arc<str> },
+    /// UTF-16 whose code units cannot be recovered from its UTF-8 projection.
+    RawUtf16(Arc<RawUtf16>),
+}
+
+struct RawUtf16 {
+    bytes: Box<[u8]>,
+    encoding: TextEncoding,
+    utf8: Box<[u8]>,
+    display: Box<str>,
 }
 
 impl Clone for SmallText {
@@ -285,6 +294,7 @@ impl Clone for SmallTextRepr {
                 bytes: Arc::clone(bytes),
                 lossy: Arc::clone(lossy),
             },
+            Self::RawUtf16(raw) => Self::RawUtf16(Arc::clone(raw)),
         }
     }
 }
@@ -396,30 +406,14 @@ impl SmallText {
     /// UTF-16LE/BE payloads are decoded to canonical UTF-8: 16-bit code units are
     /// read in the declared byte order and converted through
     /// [`char::decode_utf16`], so a UTF-16 `sqlite_master` no longer decodes as
-    /// `t\0a\0b\0l\0e\0`. Lone surrogates decode to U+FFFD and any trailing odd
-    /// byte is ignored; byte-exact preservation of malformed UTF-16 sequences is
-    /// tracked separately (GH #180 / bd-bld9w.8). This is the shared decode core
-    /// the record-decode sites (bd-bld9w.2) route TEXT through.
+    /// `t\0a\0b\0l\0e\0`. A trailing odd byte is ignored. Malformed sequences
+    /// retain their native code units for BINARY comparisons and record writes.
     #[must_use]
     pub fn from_record_text_bytes(bytes: &[u8], encoding: TextEncoding) -> Self {
         match encoding {
             TextEncoding::Utf8 => Self::from_bytes(bytes),
             TextEncoding::Utf16le | TextEncoding::Utf16be => {
-                let little_endian = matches!(encoding, TextEncoding::Utf16le);
-                // `as_chunks::<2>` drops any trailing odd byte, matching the
-                // lenient handling of a malformed UTF-16 payload length.
-                let (pairs, _trailing_odd_byte) = bytes.as_chunks::<2>();
-                let units = pairs.iter().map(|pair| {
-                    if little_endian {
-                        u16::from_le_bytes(*pair)
-                    } else {
-                        u16::from_be_bytes(*pair)
-                    }
-                });
-                let decoded: String = char::decode_utf16(units)
-                    .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect();
-                Self::from_string(decoded)
+                Self::from_utf16_record(bytes, encoding, false)
             }
         }
     }
@@ -438,20 +432,59 @@ impl SmallText {
         match encoding {
             TextEncoding::Utf8 => Self::from_bytes_shared(bytes),
             TextEncoding::Utf16le | TextEncoding::Utf16be => {
-                let little_endian = matches!(encoding, TextEncoding::Utf16le);
-                let (pairs, _trailing_odd_byte) = bytes.as_chunks::<2>();
-                let units = pairs.iter().map(|pair| {
-                    if little_endian {
-                        u16::from_le_bytes(*pair)
-                    } else {
-                        u16::from_be_bytes(*pair)
-                    }
-                });
-                let decoded: String = char::decode_utf16(units)
-                    .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect();
-                Self::from_str_shared(&decoded)
+                Self::from_utf16_record(bytes, encoding, true)
             }
+        }
+    }
+
+    fn from_utf16_record(bytes: &[u8], encoding: TextEncoding, shared: bool) -> Self {
+        let (pairs, _) = bytes.as_chunks::<2>();
+        let mut units = pairs.iter().map(|&pair| match encoding {
+            TextEncoding::Utf16le => u16::from_le_bytes(pair),
+            TextEncoding::Utf16be => u16::from_be_bytes(pair),
+            TextEncoding::Utf8 => unreachable!("UTF-16 record decoder"),
+        });
+        if let Ok(text) = char::decode_utf16(units.clone()).collect::<Result<String, _>>() {
+            return if shared {
+                Self::from_str_shared(&text)
+            } else {
+                Self::from_string(text)
+            };
+        }
+
+        // SQLite's UTF-8 projection consumes the next unit after any surrogate,
+        // even a non-pair. A final solitary surrogate yields three non-UTF-8
+        // bytes. Neither projection can reconstruct the original native record.
+        let mut text = String::new();
+        let mut trailing = None;
+        while let Some(unit) = units.next() {
+            let value = if (0xd800..=0xdfff).contains(&unit) {
+                let Some(next) = units.next() else {
+                    trailing = Some(unit);
+                    break;
+                };
+                0x1_0000 + (u32::from(unit & 0x3ff) << 10) + u32::from(next & 0x3ff)
+            } else {
+                u32::from(unit)
+            };
+            text.push(char::from_u32(value).expect("decoded scalar is in the Unicode range"));
+        }
+        let mut utf8 = text.as_bytes().to_vec();
+        if let Some(unit) = trailing {
+            utf8.extend_from_slice(&[
+                0xed,
+                0x80 | u8::try_from((unit >> 6) & 0x3f).expect("six bits"),
+                0x80 | u8::try_from(unit & 0x3f).expect("six bits"),
+            ]);
+            text.push(char::REPLACEMENT_CHARACTER);
+        }
+        Self {
+            repr: SmallTextRepr::RawUtf16(Arc::new(RawUtf16 {
+                bytes: pairs.as_flattened().into(),
+                encoding,
+                utf8: utf8.into_boxed_slice(),
+                display: text.into_boxed_str(),
+            })),
         }
     }
 
@@ -502,13 +535,27 @@ impl SmallText {
     /// UTF-8 returns the value's exact bytes without copying (byte-preserving,
     /// including invalid UTF-8). UTF-16LE/BE encode the value's characters to
     /// 16-bit code units in the requested byte order. Invalid-UTF-8 raw TEXT is
-    /// encoded from its lossy string form under UTF-16; byte-exact preservation
-    /// of such payloads is GH #180 / bd-bld9w.8.
+    /// encoded from its lossy string form under UTF-16. Values read as UTF-16
+    /// retain all complete code units, including unpaired surrogates.
     #[must_use]
     pub fn to_record_text_bytes(&self, encoding: TextEncoding) -> Cow<'_, [u8]> {
         match encoding {
             TextEncoding::Utf8 => Cow::Borrowed(self.as_bytes_direct()),
             TextEncoding::Utf16le | TextEncoding::Utf16be => {
+                if let SmallTextRepr::RawUtf16(raw) = &self.repr {
+                    return if encoding == raw.encoding {
+                        Cow::Borrowed(&raw.bytes)
+                    } else {
+                        Cow::Owned(
+                            raw.bytes
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .flat_map(|&[a, b]| [b, a])
+                                .collect(),
+                        )
+                    };
+                }
                 let little_endian = matches!(encoding, TextEncoding::Utf16le);
                 let text = self.as_str();
                 let mut bytes = Vec::with_capacity(text.len().saturating_mul(2));
@@ -522,6 +569,33 @@ impl SmallText {
                 }
                 Cow::Owned(bytes)
             }
+        }
+    }
+
+    /// Compare SQLite TEXT in the byte order of the BINARY collation.
+    #[must_use]
+    pub fn cmp_binary_in(&self, other: &Self, encoding: TextEncoding) -> Ordering {
+        if encoding != TextEncoding::Utf8
+            && (matches!(self.repr, SmallTextRepr::RawUtf16(_))
+                || matches!(other.repr, SmallTextRepr::RawUtf16(_)))
+        {
+            return self
+                .to_record_text_bytes(encoding)
+                .cmp(&other.to_record_text_bytes(encoding));
+        }
+        binary_text_cmp(self.as_bytes_direct(), other.as_bytes_direct(), encoding)
+    }
+
+    // Different native UTF-16 sequences can project to the same UTF-8 bytes.
+    // Keep them distinct when a sorter or a set compares canonical values.
+    fn cmp_utf16_identity(&self, other: &Self) -> Ordering {
+        match (&self.repr, &other.repr) {
+            (SmallTextRepr::RawUtf16(_), SmallTextRepr::RawUtf16(_)) => {
+                self.cmp_binary_in(other, TextEncoding::Utf16be)
+            }
+            (SmallTextRepr::RawUtf16(_), _) => Ordering::Greater,
+            (_, SmallTextRepr::RawUtf16(_)) => Ordering::Less,
+            _ => Ordering::Equal,
         }
     }
 
@@ -591,6 +665,7 @@ impl SmallText {
             SmallTextRepr::HeapOwned { text, .. } => text.as_str(),
             SmallTextRepr::HeapShared(text) => text,
             SmallTextRepr::Raw { lossy, .. } => lossy,
+            SmallTextRepr::RawUtf16(raw) => &raw.display,
         }
     }
 
@@ -600,6 +675,7 @@ impl SmallText {
     pub fn as_str_checked(&self) -> Option<&str> {
         match &self.repr {
             SmallTextRepr::Raw { .. } => None,
+            SmallTextRepr::RawUtf16(raw) => std::str::from_utf8(&raw.utf8).ok(),
             _ => Some(self.as_str()),
         }
     }
@@ -608,7 +684,11 @@ impl SmallText {
     #[inline]
     #[must_use]
     pub fn is_valid_utf8(&self) -> bool {
-        !matches!(&self.repr, SmallTextRepr::Raw { .. })
+        match &self.repr {
+            SmallTextRepr::Raw { .. } => false,
+            SmallTextRepr::RawUtf16(raw) => std::str::from_utf8(&raw.utf8).is_ok(),
+            _ => true,
+        }
     }
 
     /// Get the raw bytes of this text value without going through `&str`.
@@ -631,6 +711,7 @@ impl SmallText {
             SmallTextRepr::HeapOwned { text, .. } => text.as_bytes(),
             SmallTextRepr::HeapShared(text) => text.as_bytes(),
             SmallTextRepr::Raw { bytes, .. } => bytes,
+            SmallTextRepr::RawUtf16(raw) => &raw.utf8,
         }
     }
 
@@ -642,6 +723,7 @@ impl SmallText {
             SmallTextRepr::HeapOwned { text, .. } => text.len(),
             SmallTextRepr::HeapShared(text) => text.len(),
             SmallTextRepr::Raw { bytes, .. } => bytes.len(),
+            SmallTextRepr::RawUtf16(raw) => raw.utf8.len(),
         }
     }
 
@@ -672,6 +754,7 @@ impl SmallText {
                 .unwrap_or_else(|| Arc::<str>::from(text)),
             SmallTextRepr::HeapShared(text) => text,
             SmallTextRepr::Raw { lossy, .. } => lossy,
+            SmallTextRepr::RawUtf16(raw) => Arc::from(&*raw.display),
         }
     }
 }
@@ -698,6 +781,11 @@ impl fmt::Display for SmallText {
 impl PartialEq for SmallText {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
+        if matches!(self.repr, SmallTextRepr::RawUtf16(_))
+            || matches!(other.repr, SmallTextRepr::RawUtf16(_))
+        {
+            return self.cmp_utf16_identity(other).is_eq();
+        }
         #[cfg(feature = "bench-internals")]
         if SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
             SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH
@@ -723,6 +811,14 @@ impl PartialOrd for SmallText {
 impl Ord for SmallText {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
+        if matches!(self.repr, SmallTextRepr::RawUtf16(_))
+            || matches!(other.repr, SmallTextRepr::RawUtf16(_))
+        {
+            return self
+                .as_bytes_direct()
+                .cmp(other.as_bytes_direct())
+                .then_with(|| self.cmp_utf16_identity(other));
+        }
         #[cfg(feature = "bench-internals")]
         if SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
             SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH
@@ -2325,7 +2421,7 @@ impl SqliteValue {
     pub fn cmp_binary_in(&self, other: &Self, encoding: TextEncoding) -> Ordering {
         match (self, other) {
             (Self::Text(a), Self::Text(b)) if !matches!(encoding, TextEncoding::Utf8) => {
-                binary_text_cmp(a.as_bytes_direct(), b.as_bytes_direct(), encoding)
+                a.cmp_binary_in(b, encoding)
             }
             _ => self.cmp(other),
         }
@@ -3206,14 +3302,32 @@ mod tests {
     }
 
     #[test]
-    fn from_record_text_bytes_utf16_lone_surrogate_becomes_replacement() {
-        // Lone high surrogate with no following low surrogate decodes to U+FFFD
-        // (byte-exact preservation of malformed UTF-16 is GH #180 / bd-bld9w.8).
-        let bytes = 0xD800_u16.to_le_bytes().to_vec();
-        assert_eq!(
-            SmallText::from_record_text_bytes(&bytes, TextEncoding::Utf16le).as_str(),
-            "\u{FFFD}"
-        );
+    fn malformed_utf16_keeps_native_units_and_separate_utf8_projection() {
+        for decode in [
+            SmallText::from_record_text_bytes,
+            SmallText::from_record_text_bytes_shared,
+        ] {
+            let lone = decode(&[0, 0xd8], TextEncoding::Utf16le);
+            assert_eq!(lone.as_str(), "\u{fffd}");
+            assert_eq!(lone.as_bytes_direct(), &[0xed, 0xa0, 0x80]);
+            assert!(lone.as_str_checked().is_none());
+            assert_eq!(
+                &*lone.to_record_text_bytes(TextEncoding::Utf16be),
+                &[0xd8, 0]
+            );
+            assert_eq!(lone, decode(&[0xd8, 0], TextEncoding::Utf16be));
+            // Both native sequences project to the same valid UTF-8 scalar.
+            let malformed = decode(&[0xd8, 0, 0, 0x41], TextEncoding::Utf16be);
+            let valid = SmallText::new("\u{10041}");
+            assert_eq!(malformed.as_bytes_direct(), valid.as_bytes_direct());
+            assert_ne!(malformed, valid);
+            assert!(
+                malformed
+                    .cmp_binary_in(&valid, TextEncoding::Utf16be)
+                    .is_lt()
+            );
+            assert_eq!(malformed, malformed.clone());
+        }
     }
 
     #[test]

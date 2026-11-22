@@ -6290,13 +6290,14 @@ impl<P: PageReader> BtCursor<P> {
         encoding: TextEncoding,
     ) -> Option<std::cmp::Ordering> {
         if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (lhs, rhs) {
-            return Some(Self::cmp_index_text_collated(
-                left.as_bytes_direct(),
-                right.as_bytes_direct(),
-                coll_name,
-                registry,
-                encoding,
-            ));
+            if let Some(name) = coll_name
+                && !(name.eq_ignore_ascii_case("BINARY")
+                    && registry.uses_builtin_implementation("BINARY"))
+                && let Some(collation) = registry.find(name)
+            {
+                return Some(collation.compare(left.as_bytes_direct(), right.as_bytes_direct()));
+            }
+            return Some(left.cmp_binary_in(right, encoding));
         }
         lhs.partial_cmp(rhs)
     }

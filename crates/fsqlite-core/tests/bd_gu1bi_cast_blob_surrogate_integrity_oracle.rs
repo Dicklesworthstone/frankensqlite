@@ -282,3 +282,57 @@ fn bd_gu1bi_utf16le_unpaired_surrogate_plain_index_integrity_matches_stock() {
         assert_fsqlite_integrity_ok(&path, "surrogate-utf16le").await;
     });
 }
+
+#[test]
+fn unrelated_update_and_vacuum_preserve_malformed_utf16_units() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for (encoding, lone, malformed, valid) in [
+            ("UTF-16le", "00D8", "00D84100", "00D841DC"),
+            ("UTF-16be", "D800", "D8000041", "D800DC41"),
+        ] {
+            let path = dir.path().join(format!("{encoding}.db"));
+            let backup = dir.path().join(format!("{encoding}-backup.db"));
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; CREATE TABLE t(id INTEGER PRIMARY KEY,y TEXT,n INT);
+                 INSERT INTO t VALUES(1,CAST(x'{lone}' AS TEXT),0),(2,CAST(x'{malformed}' AS TEXT),0),
+                                     (3,CAST(x'{valid}' AS TEXT),0);
+                 CREATE UNIQUE INDEX iy ON t(y);"
+            )).unwrap();
+            let query = "SELECT hex(CAST(y AS BLOB)) FROM t ORDER BY id";
+            let read = |db: &rusqlite::Connection| {
+                db.prepare(query).unwrap().query_map([], |row| row.get::<_, String>(0))
+                    .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            };
+            let expected = read(&stock);
+            assert_eq!(expected, [lone, malformed, valid]);
+            drop(stock);
+
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for (id, raw) in [(1, lone), (2, malformed), (3, valid)] {
+                for access in ["NOT INDEXED", "INDEXED BY iy"] {
+                    let sql = format!("SELECT id FROM t {access} WHERE y=CAST(x'{raw}' AS TEXT)");
+                    let found = db.query(&sql).await.unwrap();
+                    assert_eq!(found.len(), 1, "{encoding} {raw} {access}");
+                    assert_eq!(found[0].values(), &[SqliteValue::Integer(id)]);
+                }
+            }
+            db.execute("UPDATE t SET n=n+1").await.unwrap();
+            db.execute("BEGIN").await.unwrap();
+            db.execute("UPDATE t SET n=n+2").await.unwrap();
+            db.execute("ROLLBACK").await.unwrap();
+            db.execute_with_params("VACUUM INTO ?1", &[SqliteValue::from(backup.to_str().unwrap())])
+                .await.unwrap();
+            db.close().await.unwrap();
+            for file in [&path, &backup] {
+                let reopened = rusqlite::Connection::open(file).unwrap();
+                assert_eq!(read(&reopened), expected, "stock reopen of {}", file.display());
+                let changed: i64 = reopened.query_row("SELECT count(*) FROM t WHERE n=1", [], |r| r.get(0)).unwrap();
+                assert_eq!(changed, 3);
+                let verdict: String = reopened.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+                assert_eq!(verdict, "ok");
+            }
+        }
+    });
+}
