@@ -567,6 +567,25 @@ fn partial_integrity_checks_resolve_tables_in_sqlite_search_order() {
                 }
             }
         }
+        // Changing LIKE semantics invalidates a stored CHECK without needing
+        // to modify the connection-local TEMP database outside either engine.
+        let ddl = "CREATE TEMP TABLE temp_violation(x CHECK(x LIKE 'a'));
+                   INSERT INTO temp_violation VALUES('A'); PRAGMA case_sensitive_like=ON";
+        stock.execute_batch(ddl).unwrap();
+        native.execute_batch(ddl).await.unwrap();
+        for kind in ["integrity_check", "quick_check"] {
+            for limit in [2, 3, 4] {
+                let sql = format!("PRAGMA {kind}({limit})");
+                let oracle = stock_connection_reports(&stock, &sql);
+                assert_eq!(oracle.len(), limit);
+                if limit >= 3 {
+                    assert_eq!(oracle[2], "CHECK constraint failed in temp_violation");
+                }
+                for prepared in [false, true] {
+                    assert_eq!(native_reports(&native, &sql, prepared).await, oracle, "{sql}");
+                }
+            }
+        }
         native.close().await.unwrap();
     });
 }

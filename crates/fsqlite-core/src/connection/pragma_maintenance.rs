@@ -36,6 +36,12 @@ impl Connection {
         // A table argument is a partial check, not a request to inspect the
         // same table name (or unrelated corruption) in every attached schema.
         if pragma.name.schema.is_none() && scope.is_none() {
+            // Stock visits main, TEMP and then the attached files in order.
+            // TEMP has connection-local rows and no separate file to lock.
+            if remaining > 0 && !self.temp_table_names.borrow().is_empty() {
+                self.collect_integrity_findings("temp", quick, None, &mut remaining, &mut failures)
+                    .await?;
+            }
             let attached_schemas = self
                 .attached_schemas
                 .borrow()
