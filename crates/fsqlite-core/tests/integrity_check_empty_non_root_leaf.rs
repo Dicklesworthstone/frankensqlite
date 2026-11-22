@@ -148,6 +148,10 @@ fn integrity_check_flags_empty_non_root_leaf() {
 
 fn stock_reports(path: &std::path::Path, pragma: &str) -> Vec<String> {
     let conn = rusqlite::Connection::open(path).expect("open stock fixture");
+    stock_connection_reports(&conn, pragma)
+}
+
+fn stock_connection_reports(conn: &rusqlite::Connection, pragma: &str) -> Vec<String> {
     conn.prepare(pragma)
         .expect("prepare stock check")
         .query_map([], |row| row.get(0))
@@ -156,17 +160,22 @@ fn stock_reports(path: &std::path::Path, pragma: &str) -> Vec<String> {
         .expect("read stock reports")
 }
 
-async fn native_reports(conn: &Connection, pragma: &str, prepared: bool) -> Vec<String> {
-    let rows = if prepared {
-        conn.prepare(pragma)
-            .await
-            .expect("prepare native check")
-            .query()
-            .await
-            .expect("run prepared native check")
+async fn native_check(
+    conn: &Connection,
+    pragma: &str,
+    prepared: bool,
+) -> fsqlite_error::Result<Vec<fsqlite_core::connection::Row>> {
+    if prepared {
+        conn.prepare(pragma).await?.query().await
     } else {
-        conn.query(pragma).await.expect("run direct native check")
-    };
+        conn.query(pragma).await
+    }
+}
+
+async fn native_reports(conn: &Connection, pragma: &str, prepared: bool) -> Vec<String> {
+    let rows = native_check(conn, pragma, prepared)
+        .await
+        .expect("run native check");
     rows.iter()
         .map(|row| match &row.values()[0] {
             SqliteValue::Text(text) => text.to_string(),
@@ -297,15 +306,10 @@ fn bd_3koph_table_subtree_bounds_match_stock() {
                 asupersync::test_utils::run_test(|| async {
                     let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
                     for pragma in ["PRAGMA integrity_check", "PRAGMA quick_check"] {
+                        let oracle = stock_reports(&path, pragma);
                         for prepared in [false, true] {
                             let reports = native_reports(&conn, pragma, prepared).await;
-                            // The public wrapper currently prefixes structural findings
-                            // with `database disk image is malformed`; the diagnostic's
-                            // tree/page/cell/rowid must match the live stock oracle.
-                            assert!(
-                                reports.iter().any(|line| line.contains(&diagnostic)),
-                                "{pragma}, prepared={prepared}: expected {diagnostic}, got {reports:?}"
-                            );
+                            assert_eq!(reports, oracle, "{pragma}, prepared={prepared}");
                         }
                     }
                     conn.close().await.unwrap();
@@ -313,6 +317,201 @@ fn bd_3koph_table_subtree_bounds_match_stock() {
             }
         }
     }
+}
+
+#[test]
+fn bd_vojth_rowid_reports_match_stock_across_attached_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.db");
+    let second = dir.path().join("attachment.db");
+    for (path, start) in [(&main, -4_000), (&second, 1_000)] {
+        create_stock_table(path, start, 240);
+        assert_eq!(stock_reports(path, "PRAGMA integrity_check"), ["ok"]);
+        let mut bytes = std::fs::read(path).unwrap();
+        let size = header_page_size(&bytes);
+        let mut changed = 0;
+        for page in bytes.chunks_exact_mut(size).skip(2) {
+            if page[0] == 0x0d && u16::from_be_bytes([page[3], page[4]]) >= 4 {
+                // Exchange the second and third cell pointers. Both records and
+                // both subtree bounds stay intact. Each leaf has one inversion.
+                page[10..14].rotate_left(2);
+                changed += 1;
+                if changed == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(changed, 2);
+        std::fs::write(path, bytes).unwrap();
+        let single = stock_reports(path, "PRAGMA quick_check");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].matches("out of order").count(), 2, "{single:?}");
+    }
+
+    let attach = "ATTACH DATABASE ?1 AS SeCond";
+    let second = second.to_str().unwrap();
+    let expected = {
+        let stock = rusqlite::Connection::open(&main).unwrap();
+        stock.execute(attach, [second]).unwrap();
+        let mut cases = Vec::new();
+        for kind in ["integrity_check", "quick_check"] {
+            for schema in ["", "main.", "SECOND."] {
+                for limit in ["", "(1)", "(2)", "(3)", "(4)"] {
+                    let sql = format!("PRAGMA {schema}{kind}{limit}");
+                    let rows = stock_connection_reports(&stock, &sql);
+                    cases.push((sql, rows));
+                }
+            }
+        }
+        cases
+    };
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(main.to_str().unwrap()).await.unwrap();
+        conn.execute_with_params(attach, &[SqliteValue::Text(second.into())])
+            .await
+            .unwrap();
+        for (sql, oracle) in &expected {
+            for prepared in [false, true] {
+                assert_eq!(
+                    native_reports(&conn, sql, prepared).await,
+                    *oracle,
+                    "{sql}, prepared={prepared}"
+                );
+            }
+        }
+        // Linux OFD pager locks conflict with stock's POSIX byte-range
+        // locks even when each engine opens its handle in this process.
+        #[cfg(target_os = "linux")]
+        {
+            let reader = rusqlite::Connection::open(&main).unwrap();
+            reader.execute(attach, [second]).unwrap();
+            reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+            conn.execute("PRAGMA busy_timeout=0").await.unwrap();
+            let holder = rusqlite::Connection::open(second).unwrap();
+            holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            for kind in ["integrity_check", "quick_check"] {
+                let sql = format!("PRAGMA {kind}(1)");
+                let error = reader
+                    .query_row(&sql, [], |row| row.get::<_, String>(0))
+                    .unwrap_err();
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                );
+                let qualified = format!("PRAGMA main.{kind}(1)");
+                let oracle = stock_connection_reports(&reader, &qualified);
+                for prepared in [false, true] {
+                    let error = native_check(&conn, &sql, prepared).await.unwrap_err();
+                    assert!(error.is_transient(), "{sql}: {error}");
+                    assert_eq!(native_reports(&conn, &qualified, prepared).await, oracle);
+                }
+            }
+            holder.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(
+                native_reports(&conn, "PRAGMA quick_check(1)", false).await,
+                stock_connection_reports(&reader, "PRAGMA quick_check(1)")
+            );
+        }
+        conn.close().await.unwrap();
+    });
+}
+
+#[test]
+fn bd_vojth_checks_stored_rows_after_rowid_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    for damaged in ["t", "q"] {
+        let path = dir.path().join(format!("{damaged}.db"));
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        stock
+            .execute_batch(
+                "CREATE TABLE t(x CHECK(x>0)); CREATE TABLE q(x);
+                 PRAGMA ignore_check_constraints=ON;
+                 INSERT INTO t VALUES(1),(-2),(-3),(4);
+                 INSERT INTO q VALUES(1),(2),(3),(4);",
+            )
+            .unwrap();
+        let root: u32 = stock
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name=?1",
+                [damaged],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(stock);
+        let mut image = std::fs::read(&path).unwrap();
+        let page = usize::try_from(root - 1).unwrap() * header_page_size(&image);
+        assert_eq!(image[page], 0x0d);
+        image[page + 10..page + 14].rotate_left(2);
+        std::fs::write(&path, image).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for kind in ["quick_check", "integrity_check"] {
+                for limit in 1..=4 {
+                    let sql = format!("PRAGMA {kind}({limit})");
+                    let oracle = stock_reports(&path, &sql);
+                    assert!(oracle[0].contains("Rowid 3 out of order"));
+                    assert_eq!(oracle.len(), limit.min(3));
+                    assert!(
+                        oracle[1..]
+                            .iter()
+                            .all(|s| s == "CHECK constraint failed in t")
+                    );
+                    for prepared in [false, true] {
+                        assert_eq!(
+                            native_reports(&conn, &sql, prepared).await,
+                            oracle,
+                            "{damaged}: {sql}"
+                        );
+                    }
+                }
+            }
+            conn.close().await.unwrap();
+        });
+    }
+}
+
+#[test]
+fn bd_vojth_rowid_and_orphan_share_one_structural_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.db");
+    let root = create_stock_table(&path, 1, 4);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let size = header_page_size(&bytes);
+    let page = (usize::try_from(root).unwrap() - 1) * size;
+    assert_eq!(bytes[page], 0x0d);
+    bytes[page + 10..page + 14].rotate_left(2);
+    let orphan = u32::try_from(bytes.len() / size + 1).unwrap();
+    bytes.resize(bytes.len() + size, 0);
+    bytes[28..32].copy_from_slice(&orphan.to_be_bytes());
+    std::fs::write(&path, bytes).unwrap();
+
+    let stock = stock_reports(&path, "PRAGMA integrity_check(2)");
+    assert_eq!(stock.len(), 1);
+    let lines: Vec<_> = stock[0].lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1].contains("Rowid 3 out of order"));
+    assert_eq!(lines[2], format!("Page {orphan}: never used"));
+    asupersync::test_utils::run_test(|| async {
+        // Keep first-open repair from reclaiming the orphan before the check.
+        let conn = Connection::open_schema_only(path.to_str().unwrap())
+            .await
+            .unwrap();
+        for prepared in [false, true] {
+            let native = native_reports(&conn, "PRAGMA integrity_check(2)", prepared).await;
+            assert_eq!(native.len(), 1, "{native:?}");
+            let grouped: Vec<_> = native[0].lines().collect();
+            assert_eq!(grouped.len(), 3, "{native:?}");
+            assert_eq!(grouped[..2], lines[..2]);
+            assert!(grouped[2].contains(&format!("page {orphan} is never used")));
+            for sql in ["PRAGMA integrity_check(1)", "PRAGMA quick_check(2)"] {
+                assert_eq!(
+                    native_reports(&conn, sql, prepared).await,
+                    [lines[..2].join("\n")]
+                );
+            }
+        }
+        conn.close().await.unwrap();
+    });
 }
 
 #[test]

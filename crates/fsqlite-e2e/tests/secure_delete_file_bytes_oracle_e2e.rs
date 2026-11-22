@@ -228,6 +228,91 @@ fn secure_delete_matches_stock_file_bytes_for_every_mode_and_shape() {
 }
 
 #[test]
+fn secure_delete_applies_to_existing_and_later_attachments_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        for (assignment, initial, expected) in [
+            ("secure_delete=ON", 0, [1, 1, 1, 1]),
+            ("main.secure_delete=ON", 0, [0, 0, 1, 1]),
+            ("early.secure_delete=ON", 0, [1, 0, 0, 0]),
+            ("secure_delete=FAST", 0, [2, 2, 2, 2]),
+            ("secure_delete=OFF", 1, [0, 0, 0, 0]),
+        ] {
+            for journal in JOURNAL_MODES {
+                for stock in [true, false] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let open_attachment = |name: &str| {
+                        let db = dir.path().join(format!("{name}.db"));
+                        let path = db.to_str().unwrap().replace('\'', "''");
+                        format!("ATTACH '{path}' AS {name}; PRAGMA {name}.journal_mode={journal};")
+                    };
+                    let early = open_attachment("early");
+                    let sibling = open_attachment("sibling");
+                    let late = open_attachment("late");
+                    let checkpoint = if journal == "WAL" {
+                        "PRAGMA early.wal_checkpoint(TRUNCATE); PRAGMA late.wal_checkpoint(TRUNCATE);"
+                    } else {
+                        ""
+                    };
+                    let script = format!(
+                        "PRAGMA secure_delete={initial}; {early} {sibling}
+                         CREATE TABLE early.t(id INTEGER PRIMARY KEY, v);
+                         INSERT INTO early.t VALUES(1,'keep');
+                         BEGIN;
+                         INSERT INTO early.t VALUES(2,'SECDEL-attached-early-marker');
+                         PRAGMA {assignment};
+                         DELETE FROM early.t WHERE id=2;
+                         COMMIT;
+                         {late}
+                         CREATE TABLE late.t(id INTEGER PRIMARY KEY, v);
+                         INSERT INTO late.t VALUES(1,'keep');
+                         INSERT INTO late.t VALUES(2,'SECDEL-attached-late-marker');
+                         DELETE FROM late.t WHERE id=2;
+                         {checkpoint}"
+                    );
+                    let queries = ["early", "sibling", "late", "main"]
+                        .map(|name| format!("PRAGMA {name}.secure_delete"));
+                    let main = dir.path().join("main.db");
+                    let modes = if stock {
+                        let conn = rusqlite::Connection::open(main).unwrap();
+                        conn.execute_batch(&script).unwrap();
+                        queries.map(|sql| {
+                            conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+                                .unwrap()
+                        })
+                    } else {
+                        let conn = Connection::open(main.to_str().unwrap()).await.unwrap();
+                        conn.execute_batch(&script).await.unwrap();
+                        let mut modes = [0; 4];
+                        for (mode, sql) in modes.iter_mut().zip(queries) {
+                            let rows = conn.prepare(&sql).await.unwrap().query().await.unwrap();
+                            let [fsqlite::SqliteValue::Integer(value)] = rows[0].values() else {
+                                panic!("unexpected {sql} result {rows:?}");
+                            };
+                            *mode = *value;
+                        }
+                        conn.close().await.unwrap();
+                        modes
+                    };
+                    assert_eq!(modes, expected, "{assignment} {journal} stock={stock}");
+                    for (schema, mode) in [("early", modes[0]), ("late", modes[2])] {
+                        let marker = format!("SECDEL-attached-{schema}-marker");
+                        let files = files_holding(dir.path(), marker.as_bytes());
+                        if mode == 0 {
+                            assert!(
+                                files.contains(&format!("{schema}.db")),
+                                "{assignment} {journal} {files:?}"
+                            );
+                        } else {
+                            assert!(files.is_empty(), "{assignment} {journal} {files:?}");
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn secure_delete_default_and_mid_connection_changes_match_stock() {
     asupersync::test_utils::run_test(|| async {
         let root = tempfile::tempdir().expect("tempdir");
