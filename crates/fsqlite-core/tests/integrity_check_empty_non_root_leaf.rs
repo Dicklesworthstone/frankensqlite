@@ -648,7 +648,7 @@ fn quick_check_counts_unconditional_index_entries_in_the_selected_database() {
                 }
             }
             if without_rowid {
-                for sql in ["PRAGMA integrity_check(1)", "PRAGMA integrity_check(2)", "PRAGMA integrity_check(q)"] {
+                for sql in ["PRAGMA integrity_check", "PRAGMA integrity_check(1)", "PRAGMA integrity_check(2)", "PRAGMA integrity_check(t)", "PRAGMA integrity_check(q)"] {
                     let oracle = stock_connection_reports(&stock, sql);
                     for prepared in [false, true] {
                         assert_eq!(native_reports(&native, sql, prepared).await, oracle, "{sql}");
@@ -664,6 +664,24 @@ fn quick_check_counts_unconditional_index_entries_in_the_selected_database() {
             assert_eq!(native_reports(&native, "PRAGMA quick_check(t)", false).await, ["ok"]);
             native.close().await.unwrap();
         });
+        if without_rowid {
+            stock.execute_batch(
+                "PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema SET sql='CREATE INDEX partial_idx ON t(x) WHERE x<=100 AND x<>1'
+                 WHERE name='partial_idx'; PRAGMA writable_schema=RESET;"
+            ).unwrap();
+            assert_eq!(stock_connection_reports(&stock, "PRAGMA integrity_check(t)"), ["row 100 missing from index partial_idx"]);
+            asupersync::test_utils::run_test(|| async {
+                let native = Connection::open(path.to_str().unwrap()).await.unwrap();
+                for sql in ["PRAGMA integrity_check(t)", "PRAGMA integrity_check(q)", "PRAGMA quick_check(t)"] {
+                    let oracle = stock_connection_reports(&stock, sql);
+                    for prepared in [false, true] {
+                        assert_eq!(native_reports(&native, sql, prepared).await, oracle, "{sql}");
+                    }
+                }
+                native.close().await.unwrap();
+            });
+        }
     }
 }
 

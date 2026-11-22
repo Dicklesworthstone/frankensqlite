@@ -20237,6 +20237,42 @@ impl Connection {
         row_values: &[SqliteValue],
         rowid_alias_col_idx: Option<usize>,
     ) -> Result<Vec<u8>> {
+        let values = self.index_validation_key_values(
+            table, index, spec, rowid, row_values, rowid_alias_col_idx,
+        )?;
+        let value_bytes = values.iter().try_fold(0_usize, |total, value| {
+            let bytes = match value {
+                SqliteValue::Text(value) => value.len(),
+                SqliteValue::Blob(value) => value.len(),
+                SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => 9,
+            };
+            total.checked_add(bytes).ok_or(FrankenError::TooBig)
+        })?;
+        if value_bytes > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "index `{}` computed key values exceed the fixed {}-byte record bound",
+                index.name, BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            )));
+        }
+        let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
+        if record.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "index `{}` computed record {} exceeds the fixed {}-byte bound",
+                index.name, record.len(), BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            )));
+        }
+        Ok(record)
+    }
+
+    fn index_validation_key_values(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        spec: &BoundedIndexValidationSpec,
+        rowid: i64,
+        row_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<Vec<SqliteValue>> {
         let mut values = if spec.key_expressions.is_empty() {
             spec.column_positions
                 .iter()
@@ -20289,34 +20325,7 @@ impl Connection {
         } else {
             values.push(SqliteValue::Integer(rowid));
         }
-        let value_bytes = values.iter().try_fold(0_usize, |total, value| {
-            let bytes = match value {
-                SqliteValue::Text(value) => value.len(),
-                SqliteValue::Blob(value) => value.len(),
-                SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => 9,
-            };
-            total.checked_add(bytes).ok_or(FrankenError::TooBig)
-        })?;
-        if value_bytes > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
-            return Err(Self::bounded_validation_refusal(format!(
-                "index `{}` computed key values exceed the fixed {}-byte record bound",
-                index.name, BOUNDED_VALIDATION_MAX_RECORD_BYTES
-            )));
-        }
-        // bd-7c6g7 #6: serialize the expected index key under the DB storage
-        // encoding so it matches the on-disk key byte-exact. A UTF-8-hardcoded
-        // serialize on a UTF-16 database made every recomputed key diverge and
-        // the bounded integrity checker report false corruption on a clean image.
-        let record = serialize_record_with_encoding(&values, self.db_text_encoding.get());
-        if record.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
-            return Err(Self::bounded_validation_refusal(format!(
-                "index `{}` computed record {} exceeds the fixed {}-byte bound",
-                index.name,
-                record.len(),
-                BOUNDED_VALIDATION_MAX_RECORD_BYTES
-            )));
-        }
-        Ok(record)
+        Ok(values)
     }
 
     fn bounded_unique_terms_equal(
@@ -50560,10 +50569,20 @@ enum PageOwnershipSink<'a> {
 struct IntegrityCheckReports {
     limit: usize,
     findings: Vec<String>,
-    index_counts: Vec<String>,
+    index_findings: Vec<String>,
 }
 
 impl IntegrityCheckReports {
+    fn index_finding(&mut self, detail: String) -> Result<()> {
+        if self.limit == 0 {
+            return Err(FrankenError::DatabaseCorrupt { detail });
+        }
+        if self.index_findings.len() < self.limit {
+            self.index_findings.push(detail);
+        }
+        Ok(())
+    }
+
     fn check(
         &mut self,
         upper: &mut Option<(i64, bool)>,
@@ -88099,6 +88118,26 @@ impl Connection {
         Ok(is_sqlite_truthy(&predicate_value))
     }
 
+    fn integrity_table_eval_context(&self, table: &TableSchema) -> Arc<JoinEvalCollationContext> {
+        let mut column_collations = table.columns.iter()
+            .map(|column| normalize_column_collation(column.collation.as_deref()))
+            .collect::<Vec<_>>();
+        let mut column_affinities = table.columns.iter()
+            .map(|column| affinity_char_to_type(column.affinity))
+            .collect::<Vec<_>>();
+        if unshadowed_hidden_rowid_alias(table).is_some() {
+            column_collations.push(None);
+            column_affinities.push(TypeAffinity::Integer);
+        }
+        Arc::new(JoinEvalCollationContext {
+            declared_json_keys: HashSet::new(),
+            column_collations,
+            column_affinities,
+            using_column_projections: HashMap::new(),
+            registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_expected_index_key_for_integrity(
         table: &TableSchema,
@@ -89019,17 +89058,128 @@ impl Connection {
                     && index.where_clause.is_none()
                     && table_count.is_some_and(|expected| expected != index_count)
                 {
-                    let detail = format!("wrong # of entries in index {}", index.name);
-                    if reports.limit == 0 {
-                        return Err(FrankenError::DatabaseCorrupt { detail });
-                    }
-                    if reports.index_counts.len() < reports.limit {
-                        reports.index_counts.push(detail);
-                    }
+                    reports.index_finding(format!("wrong # of entries in index {}", index.name))?;
                 }
             }
         }
 
+        Ok(())
+    }
+
+    /// A WITHOUT ROWID secondary index stores its primary-key locator after
+    /// the indexed terms. Comparing counts alone misses a row replaced by a
+    /// different row. Probe the physical index inside the same read transaction.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn check_without_rowid_index_membership<T: TransactionHandle + ?Sized>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        table: &TableSchema,
+        page_size: PageSize,
+        reserved: u8,
+        defaults: Option<&[Option<SqliteValue>]>,
+        reports: &mut IntegrityCheckReports,
+    ) -> Result<()> {
+        if table.indexes.is_empty() || (reports.limit > 0 && reports.index_findings.len() >= reports.limit) {
+            return Ok(());
+        }
+        let primary = self.integrity_without_rowid_primary_key(table)?;
+        let mut storage_order = primary.columns.iter().map(|column| {
+            table.column_index(column).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("unknown primary-key column {column} of {}", table.name),
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        for (column, definition) in table.columns.iter().enumerate() {
+            if !definition.is_virtual_generated() && !storage_order.contains(&column) {
+                storage_order.push(column);
+            }
+        }
+        let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+        let encoding = self.db_text_encoding.get();
+        let context = self.integrity_table_eval_context(table);
+        let functions = Arc::clone(&self.func_registry.borrow());
+        let aggregates = Arc::clone(&self.custom_aggregate_keys.borrow());
+        let metadata = self.table_execution_metadata();
+        let mut missing = Vec::new();
+        for (index_order, index) in table.indexes.iter().rev().enumerate() {
+            let spec = Self::bounded_index_spec(table, index)?;
+            let root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
+            let mut expected = Vec::new();
+            {
+                let mut scan = Self::new_header_btree_cursor(txn, table_root, page_size, reserved, false);
+                let mut position = 0_i64;
+                let mut more = scan.first(cx).await?;
+                while more {
+                    position = position.checked_add(1).ok_or(FrankenError::TooBig)?;
+                    let payload = scan.payload(cx).await?;
+                    let project = |values: Option<Vec<SqliteValue>>,
+                                   key_encoding,
+                                   test_predicate|
+                     -> Result<Option<Vec<u8>>> {
+                        let values = values.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!("invalid record in WITHOUT ROWID table {}", table.name),
+                        })?;
+                        let mut row: Vec<_> = (0..table.columns.len())
+                            .map(|column| defaults.and_then(|values| values.get(column))
+                                .cloned().flatten().unwrap_or(SqliteValue::Null))
+                            .collect();
+                        for (&column, value) in storage_order.iter().zip(values) {
+                            row[column] = value;
+                        }
+                        with_sync_function_registry(Arc::clone(&functions), Arc::clone(&aggregates), || {
+                            let _index_guard = IndexExpressionEvaluationGuard::push();
+                            let _collation_guard = JoinEvalCollationContextGuard::push_shared(Arc::clone(&context));
+                            Self::fill_generated_columns(table, position, None, &mut row, false)?;
+                            if test_predicate && !Self::row_matches_partial_index_for_integrity(
+                                table, spec.predicate.as_ref(), position, &row, None,
+                            )? {
+                                return Ok(None);
+                            }
+                            let key = self.index_validation_key_values(table, index, &spec, position, &row, None)?;
+                            Ok(Some(serialize_record_with_encoding(&key, key_encoding)))
+                        })
+                    };
+                    if let Some(key) = project(parse_record_with_encoding(&payload, encoding), encoding, true)? {
+                        // SQLite CAST(text AS BLOB) and unpaired surrogates may depend on
+                        // the stored bytes. Preserve the alternate used by rowid index checks.
+                        let raw = if encoding == TextEncoding::Utf8 {
+                            None
+                        } else {
+                            project(parse_record(&payload), TextEncoding::Utf8, false)?.filter(|other| *other != key)
+                        };
+                        expected.push((position, key, raw));
+                    }
+                    more = scan.next(cx).await?;
+                }
+            }
+            let mut cursor = Self::new_header_btree_index_cursor(
+                txn, root, page_size, reserved,
+                metadata.index_desc_flags_by_root_page.get(&index.root_page).cloned().unwrap_or_default(),
+                metadata.index_collations_by_root_page.get(&index.root_page).cloned().unwrap_or_default(),
+                Arc::clone(&self.collation_registry), encoding,
+            );
+            let mut index_errors = 0;
+            for (position, key, raw) in expected {
+                if cursor.index_move_to(cx, &key).await?.is_found() {
+                    continue;
+                }
+                if let Some(raw) = raw && cursor.index_move_to(cx, &raw).await?.is_found() {
+                    continue;
+                }
+                if reports.limit == 0 {
+                    return reports.index_finding(format!("row {position} missing from index {}", index.name));
+                }
+                missing.push((position, index_order, &index.name));
+                index_errors += 1;
+                if index_errors >= reports.limit - reports.index_findings.len() {
+                    break;
+                }
+            }
+        }
+        missing.sort_unstable();
+        for (position, _, name) in missing {
+            reports.index_finding(format!("row {position} missing from index {name}"))?;
+        }
         Ok(())
     }
 
@@ -89423,6 +89573,14 @@ impl Connection {
                         }
                     }
                 }
+                drop(cursor);
+                if !quick {
+                    let defaults = column_defaults_by_root_page.as_ref()
+                        .and_then(|map| map.get(&table.root_page)).map(Vec::as_slice);
+                    self.check_without_rowid_index_membership(
+                        cx, txn, table, page_size, reserved_per_page, defaults, reports,
+                    ).await?;
+                }
             } else {
                 struct IntegrityIndexSpec<'a> {
                     index: &'a IndexSchema,
@@ -89447,33 +89605,7 @@ impl Connection {
                     byte_preserving: Vec<u8>,
                 }
 
-                let integrity_eval_collation_context = if quick {
-                    None
-                } else {
-                    // One slot per `push_hidden_rowid_eval_column` pseudo column.
-                    let has_hidden_rowid = unshadowed_hidden_rowid_alias(table).is_some();
-                    let mut column_collations = table
-                        .columns
-                        .iter()
-                        .map(|column| normalize_column_collation(column.collation.as_deref()))
-                        .collect::<Vec<_>>();
-                    let mut column_affinities = table
-                        .columns
-                        .iter()
-                        .map(|column| affinity_char_to_type(column.affinity))
-                        .collect::<Vec<_>>();
-                    if has_hidden_rowid {
-                        column_collations.push(None);
-                        column_affinities.push(TypeAffinity::Integer);
-                    }
-                    Some(Arc::new(JoinEvalCollationContext {
-                        declared_json_keys: HashSet::new(),
-                        column_collations,
-                        column_affinities,
-                        using_column_projections: HashMap::new(),
-                        registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
-                    }))
-                };
+                let integrity_eval_collation_context = (!quick).then(|| self.integrity_table_eval_context(table));
                 let integrity_function_context = if quick {
                     None
                 } else {
