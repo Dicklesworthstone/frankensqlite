@@ -12,26 +12,9 @@ impl Connection {
         let max_errors = integrity_check_error_limit(pragma.value.as_ref());
         let scope = integrity_check_table_scope(pragma.value.as_ref());
         let mut failures = Vec::new();
-        // bd-svwm7: a lock conflict is not a verdict. Stock SQLite fails the
-        // statement with SQLITE_BUSY, so busy_timeout and the autocommit retry
-        // apply; folding it into a row reported "database is busy" as though the
-        // database were damaged. Only genuine findings become rows.
-        if let Err(error) = self.validate_database_integrity(quick).await {
-            if error.is_transient() {
-                return Err(error);
-            }
-            failures.push(error.to_string());
-        } else {
-            // Rows are only readable once the B-trees they live in are sound.
-            match self
-                .integrity_check_row_constraints(scope.as_deref(), max_errors)
-                .await
-            {
-                Ok(reports) => failures.extend(reports),
-                Err(error) if error.is_transient() => return Err(error),
-                Err(error) => failures.push(error.to_string()),
-            }
-        }
+        let mut remaining = max_errors;
+        self.collect_integrity_findings("main", quick, scope.as_deref(), &mut remaining, &mut failures)
+            .await?;
 
         // Qualified attached PRAGMAs already delegate to their child Connection.
         // Unqualified whole-database checks must also visit every attachment;
@@ -50,28 +33,14 @@ impl Connection {
             for schema in attached_schemas {
                 // N caps all findings, not just structural errors, across
                 // the entire traversal. Do not reset the budget per schema.
-                if failures.len() >= max_errors {
+                if remaining == 0 {
                     break;
                 }
-                let remaining = max_errors - failures.len();
-                match self
-                    .with_attached_connection_async(&schema, async |child| {
-                        // A sound B-tree does not establish that its stored
-                        // rows obey NOT NULL/CHECK constraints. Apply exactly
-                        // the same second phase as the main-database check.
-                        child.validate_database_integrity(quick).await?;
-                        child.integrity_check_row_constraints(None, remaining).await
-                    })
-                    .await
-                {
-                    // SQLite's row-constraint diagnostics are not prefixed
-                    // with the database name, including for attached tables.
-                    Ok(reports) => failures.extend(reports),
-                    Err(error) if error.is_transient() => return Err(error),
-                    Err(error) => {
-                        failures.push(format!("*** in database {schema} ***\n{error}"));
-                    }
-                }
+                self.with_attached_connection_async(&schema, async |child| {
+                    child.collect_integrity_findings(&schema, quick, None, &mut remaining, &mut failures)
+                        .await
+                })
+                .await?;
             }
         }
 
@@ -111,6 +80,48 @@ impl Connection {
             });
         }
         Ok(rows)
+    }
+
+    async fn collect_integrity_findings(
+        &self,
+        schema: &str,
+        quick: bool,
+        scope: Option<&str>,
+        remaining: &mut usize,
+        rows: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut reports = IntegrityRowidReports { limit: *remaining, findings: Vec::new() };
+        let structural = self.validate_database_integrity_reporting(quick, &mut reports).await;
+        *remaining -= reports.findings.len();
+        let has_rowid_findings = !reports.findings.is_empty();
+        if has_rowid_findings {
+            rows.push(format!("*** in database {schema} ***\n{}", reports.findings.join("\n")));
+        }
+        // Once the final allowed rowid finding is recorded, the tree walk
+        // returns that same corruption error to stop before visiting more pages.
+        let result = match structural {
+            Err(error) if error.is_transient() => return Err(error),
+            Err(_) if *remaining == 0 => return Ok(()),
+            Err(error) => Err(error),
+            Ok(()) if has_rowid_findings => return Ok(()),
+            Ok(()) => self.integrity_check_row_constraints(scope, *remaining).await,
+        };
+        match result {
+            Ok(findings) => {
+                *remaining -= findings.len();
+                rows.extend(findings);
+            }
+            Err(error) if error.is_transient() => return Err(error),
+            Err(error) => {
+                *remaining -= 1;
+                rows.push(if schema == "main" {
+                    error.to_string()
+                } else {
+                    format!("*** in database {schema} ***\n{error}")
+                });
+            }
+        }
+        Ok(())
     }
 
     /// bd-fjieg.4: stock `integrity_check` and `quick_check` both verify every

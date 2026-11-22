@@ -24202,6 +24202,22 @@ impl Connection {
                                 *schema = SqliteValue::Text(target_schema.clone().into());
                             }
                         }
+                    } else if pragma.name.name.eq_ignore_ascii_case("integrity_check")
+                        || pragma.name.name.eq_ignore_ascii_case("quick_check")
+                    {
+                        // The child sees its own file as main. Preserve its SQL
+                        // execution path, but label its grouped report with the
+                        // attachment's declared name (including original case).
+                        let registry = self.attached_schemas.borrow();
+                        if let Some(db) = registry.find(&target_schema) {
+                            for row in &mut rows {
+                                if let Some(SqliteValue::Text(text)) = row.values.first_mut()
+                                    && let Some(body) = text.strip_prefix("*** in database main ***\n")
+                                {
+                                    *text = format!("*** in database {} ***\n{body}", db.schema).into();
+                                }
+                            }
+                        }
                     }
                     Ok(Some(rows))
                 }
@@ -50465,6 +50481,43 @@ enum PageOwnershipSink<'a> {
         spool: &'a mut crate::bounded_validation::PrivatePageOwnership,
         owner_class: u8,
     },
+}
+
+/// PRAGMAs collect independent rowid findings up to their SQL error limit.
+/// Internal validators use the default (zero budget) and fail on the first.
+#[derive(Default)]
+struct IntegrityRowidReports {
+    limit: usize,
+    findings: Vec<String>,
+}
+
+impl IntegrityRowidReports {
+    fn check(
+        &mut self,
+        upper: &mut Option<(i64, bool)>,
+        root: PageNumber,
+        page: PageNumber,
+        cell: usize,
+        value: i64,
+        divider: bool,
+    ) -> Result<()> {
+        // A divider may equal the maximum key of its left child. A leaf
+        // key and the minimum key of a right child both require strict order.
+        let next = upper.replace((value, divider));
+        if next.is_some_and(|(bound, inclusive)| value > bound || (value == bound && !inclusive)) {
+            let detail = format!(
+                "Tree {} page {} cell {cell}: Rowid {value} out of order", root.get(), page.get()
+            );
+            if self.limit > 0 {
+                self.findings.push(detail.clone());
+                if self.findings.len() < self.limit {
+                    return Ok(());
+                }
+            }
+            return Err(FrankenError::DatabaseCorrupt { detail });
+        }
+        Ok(())
+    }
 }
 
 impl PageOwnershipSink<'_> {
@@ -86673,6 +86726,7 @@ impl Connection {
                 active_state.as_ref().map(|(fl, _)| fl.as_slice()),
                 &mut owners,
                 None,
+                &mut IntegrityRowidReports::default(),
             )
             .await
         })
@@ -86680,6 +86734,14 @@ impl Connection {
     }
 
     pub(crate) async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
+        self.validate_database_integrity_reporting(quick, &mut IntegrityRowidReports::default()).await
+    }
+
+    async fn validate_database_integrity_reporting(
+        &self,
+        quick: bool,
+        reports: &mut IntegrityRowidReports,
+    ) -> Result<()> {
         let active_state = self.integrity_active_state();
         self.with_integrity_txn(async |cx, txn| {
             let Some((header, total_pages)) = self
@@ -86708,6 +86770,7 @@ impl Connection {
                 header.freelist_count,
                 header.largest_root_page,
                 active_state.as_ref().map(|(fl, _)| fl.as_slice()),
+                reports,
             )
             .await?;
             Ok(())
@@ -86783,6 +86846,7 @@ impl Connection {
                     None,
                     &mut owners,
                     None,
+                    &mut IntegrityRowidReports::default(),
                 )
                 .await?;
 
@@ -87954,21 +88018,17 @@ impl Connection {
         mut owners: Option<&mut PageOwnershipSink<'_>>,
         check_key_order: bool,
         index_order: Option<(&Self, &IndexSchema, Option<usize>)>,
+        reports: &mut IntegrityRowidReports,
     ) -> Result<()> {
-        #[derive(Clone)]
-        enum IntegrityKey {
-            Rowid { value: i64, page: PageNumber, cell: usize },
-            Index(Arc<[SqliteValue]>),
-        }
-
         enum WalkTask {
             Btree {
                 page_no: PageNumber,
                 owner: String,
                 is_root: bool,
-                lower_key: Option<IntegrityKey>,
-                upper_key: Option<IntegrityKey>,
+                lower_key: Option<Arc<[SqliteValue]>>,
+                upper_key: Option<Arc<[SqliteValue]>>,
             },
+            TableDivider { page: PageNumber, cell: usize, rowid: i64 },
             Overflow {
                 first_overflow: PageNumber,
                 payload_size: u32,
@@ -87978,20 +88038,16 @@ impl Connection {
         }
 
         let root_page = page_no;
-        let compare_keys = |lhs: &IntegrityKey, rhs: &IntegrityKey| {
-            match (lhs, rhs, index_order) {
-                (IntegrityKey::Rowid { value: lhs, .. }, IntegrityKey::Rowid { value: rhs, .. }, _) => Some(lhs.cmp(rhs)),
-                (IntegrityKey::Index(lhs), IntegrityKey::Index(rhs), Some((connection, index, key_fields))) => {
-                    let (lhs, rhs) = if let Some(key_fields) = key_fields {
-                        (lhs.get(..key_fields)?, rhs.get(..key_fields)?)
-                    } else {
-                        (lhs.as_ref(), rhs.as_ref())
-                    };
-                    connection.compare_index_key_values_for_integrity(index, lhs, rhs)
-                }
-                _ => None,
-            }
+        let compare_keys = |lhs: &[SqliteValue], rhs: &[SqliteValue]| {
+            let (connection, index, key_fields) = index_order?;
+            let (lhs, rhs) = if let Some(key_fields) = key_fields {
+                (lhs.get(..key_fields)?, rhs.get(..key_fields)?)
+            } else {
+                (lhs, rhs)
+            };
+            connection.compare_index_key_values_for_integrity(index, lhs, rhs)
         };
+        let mut upper_rowid = None;
         let mut tree_is_table = None;
         let mut pending = vec![WalkTask::Btree {
             page_no,
@@ -88002,6 +88058,10 @@ impl Connection {
         }];
         while let Some(task) = pending.pop() {
             let (page_no, owner, is_root, lower_key, upper_key) = match task {
+                WalkTask::TableDivider { page, cell, rowid } => {
+                    reports.check(&mut upper_rowid, root_page, page, cell, rowid, true)?;
+                    continue;
+                }
                 WalkTask::Btree {
                     page_no,
                     owner,
@@ -88094,7 +88154,13 @@ impl Connection {
             tree_is_table.get_or_insert(page_is_table);
             let mut previous_key = lower_key;
             let mut next_tasks = Vec::new();
-            for (cell_idx, cell_pointer) in cell_pointers.iter().enumerate() {
+            let check_rowids = check_key_order && page_is_table;
+            let mut cells = cell_pointers.iter().enumerate();
+            while let Some((cell_idx, cell_pointer)) = if check_rowids && page_type.is_leaf() {
+                cells.next_back()
+            } else {
+                cells.next()
+            } {
                 let cell = fsqlite_btree::CellRef::parse(
                     page_bytes,
                     usize::from(*cell_pointer),
@@ -88108,12 +88174,7 @@ impl Connection {
                     ),
                 })?;
 
-                let current_key = if check_key_order && page_is_table {
-                    let value = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!("Tree {} page {} cell {cell_idx}: missing rowid", root_page.get(), page_no.get()),
-                    })?;
-                    Some(IntegrityKey::Rowid { value, page: page_no, cell: cell_idx })
-                } else if check_key_order && index_order.is_some() {
+                let current_key: Option<Arc<[SqliteValue]>> = if check_key_order && !page_is_table && index_order.is_some() {
                     let mut payload = cell.local_payload(page_bytes).to_vec();
                     if let Some(first_overflow) = cell.overflow_page {
                         Self::walk_integrity_overflow_chain(
@@ -88138,7 +88199,7 @@ impl Connection {
                             detail: format!("Tree {} page {} cell {cell_idx}: index record has too few key fields ({owner})", root_page.get(), page_no.get()),
                         });
                     }
-                    Some(IntegrityKey::Index(Arc::from(values)))
+                    Some(Arc::from(values))
                 } else {
                     None
                 };
@@ -88147,31 +88208,12 @@ impl Connection {
                         compare_keys(lower, key) != Some(std::cmp::Ordering::Less)
                     });
                     let above_upper = upper_key.as_ref().is_some_and(|upper| {
-                        let order = compare_keys(key, upper);
-                        if matches!(key, IntegrityKey::Rowid { .. }) {
-                            !matches!(order, Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
-                        } else {
-                            order != Some(std::cmp::Ordering::Less)
-                        }
+                        compare_keys(key, upper) != Some(std::cmp::Ordering::Less)
                     });
                     if below_lower || above_upper {
-                        // Stock checks rowids from right to left. When the right
-                        // key is too small, it reports the preceding key, which
-                        // may be a divider inherited several levels above.
-                        let reported = match (previous_key.as_ref(), key) {
-                            (Some(prior @ IntegrityKey::Rowid { .. }), IntegrityKey::Rowid { .. })
-                                if below_lower => prior,
-                            _ => key,
-                        };
-                        let detail = match reported {
-                            IntegrityKey::Rowid { value, page, cell } => format!(
-                                "Tree {} page {} cell {cell}: Rowid {value} out of order", root_page.get(), page.get()
-                            ),
-                            IntegrityKey::Index(_) => format!(
-                                "Tree {} page {} cell {cell_idx}: index key out of order ({owner})", root_page.get(), page_no.get()
-                            ),
-                        };
-                        return Err(FrankenError::DatabaseCorrupt { detail });
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("Tree {} page {} cell {cell_idx}: index key out of order ({owner})", root_page.get(), page_no.get()),
+                        });
                     }
                 }
 
@@ -88183,6 +88225,16 @@ impl Connection {
                         lower_key: previous_key.clone(),
                         upper_key: current_key.clone(),
                     });
+                }
+                if check_rowids {
+                    let rowid = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("Tree {} page {} cell {cell_idx}: missing rowid", root_page.get(), page_no.get()),
+                    })?;
+                    if page_type.is_leaf() {
+                        reports.check(&mut upper_rowid, root_page, page_no, cell_idx, rowid, false)?;
+                    } else {
+                        next_tasks.push(WalkTask::TableDivider { page: page_no, cell: cell_idx, rowid });
+                    }
                 }
                 if let Some(first_overflow) = cell.overflow_page
                     && !(check_key_order && !page_is_table && index_order.is_some())
@@ -88205,7 +88257,12 @@ impl Connection {
                     upper_key,
                 });
             }
-            pending.extend(next_tasks.into_iter().rev());
+            if check_rowids {
+                // Pop the right subtree, then its divider, then the left subtree.
+                pending.extend(next_tasks);
+            } else {
+                pending.extend(next_tasks.into_iter().rev());
+            }
         }
 
         Ok(())
@@ -88236,6 +88293,7 @@ impl Connection {
         live_freelist: Option<&[PageNumber]>,
         owners: &mut PageOwnershipSink<'_>,
         integrity_connection: Option<&Self>,
+        reports: &mut IntegrityRowidReports,
     ) -> Result<()> {
         if total_pages == 0 {
             return Ok(());
@@ -88271,6 +88329,7 @@ impl Connection {
             Some(&mut *owners),
             integrity_connection.is_some(),
             None,
+            reports,
         )
         .await?;
 
@@ -88385,6 +88444,7 @@ impl Connection {
                     Some(&mut *owners),
                     integrity_connection.is_some(),
                     primary_order,
+                    reports,
                 )
                 .await?;
             }
@@ -88403,6 +88463,7 @@ impl Connection {
                     Some(&mut *owners),
                     integrity_connection.is_some(),
                     integrity_connection.map(|connection| (connection, index, None)),
+                    reports,
                 )
                 .await?;
             }
@@ -88524,6 +88585,7 @@ impl Connection {
             None,
             &mut owners,
             None,
+            &mut IntegrityRowidReports::default(),
         )
         .await?;
 
@@ -88552,6 +88614,7 @@ impl Connection {
         freelist_count: u32,
         largest_root_page: u32,
         live_freelist: Option<&[PageNumber]>,
+        reports: &mut IntegrityRowidReports,
     ) -> Result<()> {
         let auto_vacuum_enabled = largest_root_page != 0;
         let schema = self.integrity_schema();
@@ -88583,6 +88646,7 @@ impl Connection {
                 live_freelist,
                 &mut owners,
                 Some(self),
+                reports,
             )
             .await?;
             if auto_vacuum_enabled && total_pages > 0 {
@@ -88661,6 +88725,7 @@ impl Connection {
                 None,
                 true,
                 None,
+                reports,
             )
             .await?;
             for table in &schema {
@@ -88681,6 +88746,7 @@ impl Connection {
                         None,
                         true,
                         None,
+                        reports,
                     )
                     .await?;
                 }
@@ -88698,12 +88764,17 @@ impl Connection {
                         None,
                         true,
                         None,
+                        reports,
                     )
                     .await?;
                 }
             }
         }
 
+        // Cursor-based consistency checks assume each tree is ordered.
+        if !reports.findings.is_empty() {
+            return Ok(());
+        }
         let mut without_rowid_tables = HashSet::new();
         for row in master_rows {
             let (entry_type, name, _, _) = sqlite_master_signature(row)?;
@@ -289592,6 +289663,7 @@ mod pager_routing_tests {
                     Some(&free),
                     &mut owners,
                     None,
+                    &mut super::IntegrityRowidReports::default(),
                 )
                 .await
                 .unwrap_err();

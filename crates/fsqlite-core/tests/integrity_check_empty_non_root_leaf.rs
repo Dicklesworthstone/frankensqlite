@@ -148,6 +148,10 @@ fn integrity_check_flags_empty_non_root_leaf() {
 
 fn stock_reports(path: &std::path::Path, pragma: &str) -> Vec<String> {
     let conn = rusqlite::Connection::open(path).expect("open stock fixture");
+    stock_connection_reports(&conn, pragma)
+}
+
+fn stock_connection_reports(conn: &rusqlite::Connection, pragma: &str) -> Vec<String> {
     conn.prepare(pragma)
         .expect("prepare stock check")
         .query_map([], |row| row.get(0))
@@ -299,13 +303,7 @@ fn bd_3koph_table_subtree_bounds_match_stock() {
                     for pragma in ["PRAGMA integrity_check", "PRAGMA quick_check"] {
                         for prepared in [false, true] {
                             let reports = native_reports(&conn, pragma, prepared).await;
-                            // The public wrapper currently prefixes structural findings
-                            // with `database disk image is malformed`; the diagnostic's
-                            // tree/page/cell/rowid must match the live stock oracle.
-                            assert!(
-                                reports.iter().any(|line| line.contains(&diagnostic)),
-                                "{pragma}, prepared={prepared}: expected {diagnostic}, got {reports:?}"
-                            );
+                            assert_eq!(reports, stock_reports(&path, pragma), "{pragma}, prepared={prepared}");
                         }
                     }
                     conn.close().await.unwrap();
@@ -313,6 +311,62 @@ fn bd_3koph_table_subtree_bounds_match_stock() {
             }
         }
     }
+}
+
+#[test]
+fn bd_vojth_rowid_reports_match_stock_across_attached_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.db");
+    let second = dir.path().join("attachment.db");
+    for (path, start) in [(&main, -4_000), (&second, 1_000)] {
+        create_stock_table(path, start, 240);
+        assert_eq!(stock_reports(path, "PRAGMA integrity_check"), ["ok"]);
+        let mut bytes = std::fs::read(path).unwrap();
+        let size = header_page_size(&bytes);
+        let mut changed = 0;
+        for page in bytes.chunks_exact_mut(size).skip(2) {
+            if page[0] == 0x0d && u16::from_be_bytes([page[3], page[4]]) >= 4 {
+                // Exchange the second and third cell pointers. Both records and
+                // both subtree bounds stay intact. Each leaf has one inversion.
+                page[10..14].rotate_left(2);
+                changed += 1;
+                if changed == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(changed, 2);
+        std::fs::write(path, bytes).unwrap();
+        let single = stock_reports(path, "PRAGMA quick_check");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].matches("out of order").count(), 2, "{single:?}");
+    }
+
+    let attach = format!("ATTACH DATABASE '{}' AS SeCond", second.display());
+    let expected = {
+        let stock = rusqlite::Connection::open(&main).unwrap();
+        stock.execute_batch(&attach).unwrap();
+        let mut cases = Vec::new();
+        for kind in ["integrity_check", "quick_check"] {
+            for schema in ["", "main.", "SECOND."] {
+                for limit in ["", "(1)", "(2)", "(3)", "(4)"] {
+                    let sql = format!("PRAGMA {schema}{kind}{limit}");
+                    cases.push((sql.clone(), stock_connection_reports(&stock, &sql)));
+                }
+            }
+        }
+        cases
+    };
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(main.to_str().unwrap()).await.unwrap();
+        conn.execute(&attach).await.unwrap();
+        for (sql, oracle) in &expected {
+            for prepared in [false, true] {
+                assert_eq!(native_reports(&conn, sql, prepared).await, *oracle, "{sql}, prepared={prepared}");
+            }
+        }
+        conn.close().await.unwrap();
+    });
 }
 
 #[test]
