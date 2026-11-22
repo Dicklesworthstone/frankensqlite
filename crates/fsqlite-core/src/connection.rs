@@ -10297,6 +10297,14 @@ impl PreparedStatement<'_> {
         }
     }
 
+    /// bd-nnnd8: the schema or control statement this handle runs from its
+    /// text at each step, if it is one.
+    fn prepared_schema_statement(&self) -> Option<&Statement> {
+        self.deferred_query_statement
+            .as_deref()
+            .filter(|statement| is_prepared_schema_statement(statement))
+    }
+
     fn deferred_dml_statement(&self) -> Option<&Statement> {
         match self.dml_dispatch.as_ref() {
             Some(PreparedDmlDispatch::Deferred(statement)) => Some(statement.as_ref()),
@@ -11476,6 +11484,10 @@ impl PreparedStatement<'_> {
     pub fn explain(&self) -> String {
         if let Some(reprepared) = self.reprepared_statement() {
             return reprepared.explain();
+        }
+        if self.prepared_schema_statement().is_some() {
+            return "-- prepared schema statement runs from its text at each step; no precompiled bytecode"
+                .to_owned();
         }
         if self.deferred_query_statement.is_some() {
             return "-- prepared SELECT is dispatched dynamically; no precompiled bytecode"
@@ -32367,8 +32379,14 @@ impl Connection {
         // generation embedded in the cache identity. Insert under the final
         // identity rather than orphaning the template under the stale lookup
         // key captured before the callback.
-        let insert_key = self.prepared_cache_key(sql);
-        self.insert_prepared_cache(insert_key, sql, &prepared);
+        //
+        // bd-nnnd8: a schema or control statement is checked against the
+        // schema at every prepare, as stock's parser checks it, so it is
+        // never served from the cache.
+        if prepared.prepared_schema_statement().is_none() {
+            let insert_key = self.prepared_cache_key(sql);
+            self.insert_prepared_cache(insert_key, sql, &prepared);
+        }
         self.log_statement_reuse_event("prepared", sql, false, "none", 0, 0, "none");
         record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, cache_insert_start);
         self.note_connection_prepare_call();
@@ -32393,6 +32411,11 @@ impl Connection {
                 let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
                 self.cached_parse_single(sql)?
             };
+            // bd-nnnd8: a schema or control statement runs from its text at
+            // each step, so none of the query preparation below applies.
+            if is_prepared_schema_statement(parsed.as_ref()) {
+                return self.prepare_schema_statement(sql, parsed.as_ref());
+            }
             // bd-at0bx: bind `schema.table.column` references before
             // validation and compilation, as the direct execute path does.
             let bound = self.bind_schema_qualified_columns(parsed.as_ref())?;
@@ -34329,6 +34352,27 @@ impl Connection {
         }))
     }
 
+    /// bd-nnnd8: step a prepared schema or control statement. It runs from the
+    /// text it was prepared from, down the path `Connection::query` (or
+    /// `query_with_params`) takes for that text: the DQS rewrite and retry,
+    /// the verbatim source a CREATE stores, the error-offset suffix, the
+    /// statement's own checks against the current schema. So a step has the
+    /// effects and errors executing the statement has, and a step after a
+    /// schema change fails as stock's re-prepare there does.
+    async fn run_prepared_schema_statement(
+        &self,
+        stmt: &PreparedStatement<'_>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let sql = stmt.original_sql.as_ref();
+        match params {
+            Some(params) if !params.is_empty() => {
+                boxed_future(|| self.query_with_params_unrecorded(sql, params)).await
+            }
+            _ => boxed_future(|| self.query_unrecorded(sql)).await,
+        }
+    }
+
     async fn query_prepared_with_params_after_background_status(
         &self,
         stmt: &PreparedStatement<'_>,
@@ -34341,6 +34385,9 @@ impl Connection {
                 return Err(FrankenError::internal(
                     "prepared statement belongs to a different connection",
                 ));
+            }
+            if stmt.prepared_schema_statement().is_some() {
+                return self.run_prepared_schema_statement(stmt, params).await;
             }
             if stmt.dml_dispatch.is_some() {
                 if let Some(dml) = stmt.deferred_dml_statement()
@@ -34695,6 +34742,12 @@ impl Connection {
                     "prepared statement belongs to a different connection",
                 ));
             }
+            if stmt.prepared_schema_statement().is_some() {
+                for row in self.run_prepared_schema_statement(stmt, Some(params)).await? {
+                    f(&row)?;
+                }
+                return Ok(());
+            }
             if stmt.dml_dispatch.is_some() {
                 if let Some(dml) = stmt.deferred_dml_statement()
                     && match dml {
@@ -34834,6 +34887,11 @@ impl Connection {
                 return Err(FrankenError::internal(
                     "prepared statement belongs to a different connection",
                 ));
+            }
+            if stmt.prepared_schema_statement().is_some() {
+                return exactly_one_row_or_error(
+                    self.run_prepared_schema_statement(stmt, params).await?,
+                );
             }
             if stmt.dml_dispatch.is_some() {
                 if let Some(dml) = stmt.deferred_dml_statement()
@@ -52469,6 +52527,251 @@ impl Connection {
             })
     }
 
+    /// bd-nnnd8: prepare a schema or control statement (DDL, ATTACH and
+    /// DETACH, transaction control, savepoints, VACUUM, ANALYZE, REINDEX), as
+    /// stock's `sqlite3_prepare_v2` prepares it. Preparing raises the errors
+    /// stock's parser raises (see [`Self::validate_prepared_schema_statement`])
+    /// and runs nothing: a statement dropped without a step changes nothing.
+    /// Each step runs the statement from this text, as `Connection::query`
+    /// runs it ([`Self::run_prepared_schema_statement`]).
+    fn prepare_schema_statement(
+        &self,
+        sql: &str,
+        statement: &Statement,
+    ) -> Result<PreparedStatement<'_>> {
+        if let Err(error) = self.validate_prepared_schema_statement(statement) {
+            // A missing column named by a double-quoted token is retried as a
+            // string literal by the DQS fallback when the statement runs, so
+            // only the run can tell whether the error stands.
+            let dqs_may_retry = self.dqs_enabled.get()
+                && sql.contains('"')
+                && Self::dqs_missing_column_name(&error).is_some();
+            if !dqs_may_retry {
+                return Err(error);
+            }
+        }
+        Ok(PreparedStatement {
+            sql: Rc::<str>::from(sql),
+            original_sql: Rc::<str>::from(sql),
+            program: build_placeholder_program()?,
+            func_registry: Some(Arc::clone(&*self.func_registry.borrow())),
+            expression_postprocess: None,
+            distinct: false,
+            distinct_collations: Vec::new(),
+            db: None,
+            schema_cookie: self.schema_cookie(),
+            local_ddl_epoch: self.local_ddl_epoch(),
+            schema_generation: self.schema_generation(),
+            function_registry_generation: self.function_registry_generation(),
+            dml_dispatch: None,
+            prepared_update_delete_fast_path: None,
+            deferred_query_statement: Some(Arc::new(statement.clone())),
+            deferred_query_column_count: Some(0),
+            column_names: Vec::new(),
+            prepared_query_fast_path: None,
+            // The text each step runs syncs change tracking itself.
+            may_observe_change_tracking: false,
+            reprepared: RefCell::new(None),
+            reprepare_generation: Cell::new(0),
+            conn: self,
+        })
+    }
+
+    /// bd-nnnd8: the errors stock's parser raises while it prepares a schema
+    /// statement, raised at prepare. Stock also raises them at a step that
+    /// re-prepares the statement after a schema change; here the step runs
+    /// the statement, whose executor raises the same errors.
+    ///
+    /// CREATE TABLE, VIEW, INDEX and TRIGGER run the checks their executors
+    /// run first (one copy of each). DROP, ALTER TABLE, ANALYZE and REINDEX
+    /// report a name that resolves to nothing only where nothing else could
+    /// resolve it: no attached database and no TEMP object. Anything those
+    /// cases leave out is refused when the statement runs. Transaction
+    /// control, savepoints, ATTACH, DETACH and VACUUM fail only when they
+    /// run, in stock as here.
+    fn validate_prepared_schema_statement(&self, statement: &Statement) -> Result<()> {
+        match statement {
+            Statement::CreateTable(create) => {
+                if self.prepared_target_is_local(&create.name, statement)? {
+                    self.create_table_name_check(create)?;
+                }
+            }
+            Statement::CreateView(create) => {
+                if self.prepared_target_is_local(&create.name, statement)? {
+                    self.create_view_name_check(create)?;
+                }
+            }
+            Statement::CreateIndex(create) => {
+                if self.prepared_target_is_local(&create.name, statement)? {
+                    self.bind_create_index(create)?;
+                }
+            }
+            Statement::CreateTrigger(create) => {
+                if self.prepared_target_is_local(&create.name, statement)? {
+                    self.create_trigger_target_check(create)?;
+                }
+            }
+            Statement::Drop(drop_stmt) => {
+                if self.prepared_target_is_local(&drop_stmt.name, statement)? {
+                    self.validate_prepared_drop(drop_stmt)?;
+                }
+            }
+            Statement::AlterTable(alter) => {
+                if self.prepared_target_is_local(&alter.table, statement)? {
+                    self.validate_prepared_alter(alter)?;
+                }
+            }
+            Statement::Analyze(Some(target)) | Statement::Reindex(Some(target))
+                if self.prepared_names_resolve_locally()
+                    && target
+                        .schema
+                        .as_deref()
+                        .is_none_or(|schema| schema.eq_ignore_ascii_case("main"))
+                    && !is_builtin_schema(&target.name) =>
+            {
+                if matches!(statement, Statement::Analyze(_)) {
+                    self.resolve_analyze_plan(Some(target))?;
+                } else {
+                    self.resolve_reindex_targets(Some(target))?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whether a schema statement's target is local (unqualified, `main` or
+    /// `temp`). A target in an attached database is checked by that
+    /// database's connection when the statement runs; an unknown schema is
+    /// refused with the error the statement reports for it at run time.
+    fn prepared_target_is_local(&self, name: &QualifiedName, statement: &Statement) -> Result<bool> {
+        match self.attached_target_schema(name) {
+            Ok(target) => Ok(target.is_none()),
+            Err(error) => Err(self.remap_unknown_attached_schema_for_statement(error, statement)),
+        }
+    }
+
+    /// Whether an unqualified name can only mean a MAIN object: no database
+    /// is attached and no TEMP table, view or trigger exists.
+    fn prepared_names_resolve_locally(&self) -> bool {
+        self.attached_schemas.borrow().count() == 0
+            && self.temp_table_names.borrow().is_empty()
+            && !self.views.borrow().iter().any(|view| view.temporary)
+            && !self.triggers.borrow().iter().any(|trigger| trigger.temporary)
+    }
+
+    /// bd-nnnd8: DROP's prepare-time errors, for an unqualified name (or a
+    /// `main.` table) of a MAIN object: the object is missing, or is a view
+    /// dropped as a table or a table dropped as a view. The messages are the
+    /// ones `execute_drop_single` raises for the same lookups; a missing
+    /// table's qualifier is restored by `qualify_missing_target_table`.
+    fn validate_prepared_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
+        let name = &drop_stmt.name.name;
+        let checked_qualifier = drop_stmt.name.schema.as_deref().is_none_or(|schema| {
+            schema.eq_ignore_ascii_case("main")
+                && matches!(drop_stmt.object_type, DropObjectType::Table)
+        });
+        if drop_stmt.if_exists
+            || !checked_qualifier
+            || !self.prepared_names_resolve_locally()
+            || (name.len() >= 7 && name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_"))
+        {
+            return Ok(());
+        }
+        let table_exists = self.table_exists_for_scope(name, PragmaSchemaScope::Main);
+        let view_exists = self
+            .view_index_for_scope(name, PragmaSchemaScope::Main)
+            .is_some();
+        match drop_stmt.object_type {
+            DropObjectType::Table if view_exists => Err(FrankenError::FunctionError(format!(
+                "use DROP VIEW to delete view {name}"
+            ))),
+            DropObjectType::Table if !table_exists => {
+                Err(FrankenError::NoSuchTable { name: name.clone() })
+            }
+            DropObjectType::View if table_exists => Err(FrankenError::FunctionError(format!(
+                "use DROP TABLE to delete table {name}"
+            ))),
+            DropObjectType::View if !view_exists => Err(FrankenError::FunctionError(format!(
+                "no such view: {name}"
+            ))),
+            DropObjectType::Index
+                if !self.index_exists_for_scope(name, PragmaSchemaScope::Unqualified) =>
+            {
+                Err(FrankenError::FunctionError(format!(
+                    "no such index: {name}"
+                )))
+            }
+            DropObjectType::Trigger
+                if !self
+                    .triggers
+                    .borrow()
+                    .iter()
+                    .any(|trigger| trigger.name.eq_ignore_ascii_case(name)) =>
+            {
+                Err(FrankenError::FunctionError(format!(
+                    "no such trigger: {name}"
+                )))
+            }
+            DropObjectType::Table
+            | DropObjectType::View
+            | DropObjectType::Index
+            | DropObjectType::Trigger => Ok(()),
+        }
+    }
+
+    /// bd-nnnd8: ALTER TABLE's prepare-time errors on an unqualified MAIN
+    /// table that is neither virtual, a view nor internal: the table is
+    /// missing, ADD COLUMN names an existing column, or RENAME TO takes the
+    /// name of a table, index or view. The messages are the ones
+    /// `execute_alter_table_impl` raises for the same lookups.
+    fn validate_prepared_alter(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
+        let name = &alter.table.name;
+        if alter.table.schema.is_some()
+            || !self.prepared_names_resolve_locally()
+            || (name.len() >= 7 && name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_"))
+            || self.table_name_is_virtual(name)
+            || self.view_index_of(name).is_some()
+        {
+            return Ok(());
+        }
+        let schema = self.schema.borrow();
+        let Some(table) = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(name))
+        else {
+            return Err(FrankenError::NoSuchTable { name: name.clone() });
+        };
+        match &alter.action {
+            AlterTableAction::AddColumn(column)
+                if table
+                    .columns
+                    .iter()
+                    .any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) =>
+            {
+                Err(FrankenError::FunctionError(format!(
+                    "duplicate column name: {}",
+                    column.name
+                )))
+            }
+            AlterTableAction::RenameTo(new_name)
+                if schema_table_index_or_view_name_exists(
+                    &schema,
+                    &self.views.borrow(),
+                    new_name,
+                ) =>
+            {
+                Err(FrankenError::FunctionError(format!(
+                    "there is already another table or index with this name: {new_name}"
+                )))
+            }
+            AlterTableAction::RenameTo(_)
+            | AlterTableAction::RenameColumn { .. }
+            | AlterTableAction::AddColumn(_)
+            | AlterTableAction::DropColumn(_) => Ok(()),
+        }
+    }
+
     fn wrap_deferred_prepared_dml<'conn>(
         &'conn self,
         sql: &str,
@@ -53058,9 +53361,10 @@ impl Connection {
                 reprepare_generation: Cell::new(0),
                 conn: self,
             }),
+            // Schema and control statements never reach here (bd-nnnd8,
+            // `prepare_schema_statement`); EXPLAIN runs through `query`.
             _ => Err(FrankenError::NotImplemented(
-                "prepare() supports SELECT, INSERT, UPDATE, DELETE, and PRAGMA statements only"
-                    .to_owned(),
+                "prepare() of EXPLAIN is not supported; run it with Connection::query".to_owned(),
             )),
         }
     }
@@ -73918,11 +74222,41 @@ impl Connection {
             .collect()
     }
 
-    /// Process a CREATE TABLE statement: register the schema and create the
-    /// in-memory table, and insert a row into sqlite_master on page 1.
-    #[allow(clippy::too_many_lines)]
-    async fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
-        let table_name = create.name.name.clone();
+    /// Whether an index named `name` lives in one local namespace: on a table
+    /// of the TEMP namespace, or on a MAIN table (one a TEMP table shadows
+    /// included). An unqualified scope searches both.
+    fn index_exists_for_scope(&self, name: &str, scope: PragmaSchemaScope) -> bool {
+        let names_index = |table: &TableSchema| {
+            table
+                .indexes
+                .iter()
+                .any(|index| index.name.eq_ignore_ascii_case(name))
+        };
+        let temp_names = self.temp_table_names.borrow();
+        let in_scope = |table: &TableSchema| {
+            let is_temp = temp_names.contains(&table.name.to_ascii_lowercase());
+            match scope {
+                PragmaSchemaScope::Unqualified => true,
+                PragmaSchemaScope::Main => !is_temp,
+                PragmaSchemaScope::Temp => is_temp,
+            }
+        };
+        self.schema
+            .borrow()
+            .iter()
+            .any(|table| in_scope(table) && names_index(table))
+            || (scope != PragmaSchemaScope::Temp
+                && self.shadowed_main_tables.borrow().values().any(names_index))
+    }
+
+    /// The checks stock's sqlite3StartTable makes on a CREATE TABLE's name
+    /// before it builds anything, in its order: a TEMP table's qualifier, a
+    /// reserved name, a table or view of the name, an index of the name.
+    /// `Ok(true)` when IF NOT EXISTS met a table or view of the name, so the
+    /// statement does nothing. Preparing the statement runs them too, where
+    /// stock raises them (bd-nnnd8).
+    fn create_table_name_check(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<bool> {
+        let table_name = &create.name.name;
 
         // As in stock's sqlite3StartTable, a TEMP table may only be qualified
         // with `temp`: `CREATE TEMP TABLE main.t(...)` is an error, checked
@@ -73950,11 +74284,6 @@ impl Connection {
             )));
         }
 
-        // bd-wjrs0: a `TEMP`/`TEMPORARY` table (or a `temp.<name>` qualifier)
-        // lives in the connection-local temp namespace and may shadow a
-        // same-named `main` table; it is never persisted to the main
-        // `sqlite_master`. An unqualified non-TEMP create, or a `main.<name>`
-        // qualifier, targets the main namespace.
         let target_is_temp = create.temporary
             || create
                 .name
@@ -73971,7 +74300,7 @@ impl Connection {
             let temp_names = self.temp_table_names.borrow();
             let visible_same_name = schema
                 .iter()
-                .any(|t| t.name.eq_ignore_ascii_case(&table_name));
+                .any(|t| t.name.eq_ignore_ascii_case(table_name));
             let temp_exists = temp_names.contains(&name_lc);
             // A main table named X exists when a visible non-temp entry holds
             // the name, or when a temp table currently shadows it.
@@ -73984,7 +74313,7 @@ impl Connection {
             };
             if conflict {
                 if create.if_not_exists {
-                    return Ok(());
+                    return Ok(true);
                 }
                 return Err(FrankenError::FunctionError(format!(
                     "table {table_name} already exists",
@@ -74002,16 +74331,47 @@ impl Connection {
             PragmaSchemaScope::Main
         };
         if self
-            .view_index_for_scope(&table_name, target_scope)
+            .view_index_for_scope(table_name, target_scope)
             .is_some()
         {
             if create.if_not_exists {
-                return Ok(());
+                return Ok(true);
             }
             return Err(FrankenError::FunctionError(format!(
                 "view {table_name} already exists",
             )));
         }
+        // bd-nnnd8: nor an index's name in its namespace, IF NOT EXISTS or
+        // not (sqlite3StartTable's sqlite3FindIndex check).
+        if self.index_exists_for_scope(table_name, target_scope) {
+            return Err(FrankenError::FunctionError(format!(
+                "there is already an index named {table_name}"
+            )));
+        }
+        Ok(false)
+    }
+
+    /// Process a CREATE TABLE statement: register the schema and create the
+    /// in-memory table, and insert a row into sqlite_master on page 1.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
+        let table_name = create.name.name.clone();
+        if self.create_table_name_check(create)? {
+            return Ok(());
+        }
+
+        // bd-wjrs0: a `TEMP`/`TEMPORARY` table (or a `temp.<name>` qualifier)
+        // lives in the connection-local temp namespace and may shadow a
+        // same-named `main` table; it is never persisted to the main
+        // `sqlite_master`. An unqualified non-TEMP create, or a `main.<name>`
+        // qualifier, targets the main namespace.
+        let target_is_temp = create.temporary
+            || create
+                .name
+                .schema
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("temp"));
+        let name_lc = table_name.to_ascii_lowercase();
 
         match &create.body {
             CreateTableBody::Columns {
@@ -78781,8 +79141,17 @@ impl Connection {
         Ok(())
     }
 
-    /// Execute a CREATE INDEX statement, allocating a B-tree root page.
-    async fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
+    /// Everything stock's sqlite3CreateIndex checks before it allocates the
+    /// index: its name and schema, the table it indexes, and the bound index
+    /// (columns, expressions, partial predicate, collations, functions).
+    /// `None` when IF NOT EXISTS met an index of the name, so the statement
+    /// does nothing; otherwise the indexed table's schema and the bound index.
+    /// Preparing the statement runs it too, where stock raises these errors
+    /// (bd-nnnd8).
+    fn bind_create_index(
+        &self,
+        stmt: &fsqlite_ast::CreateIndexStatement,
+    ) -> Result<Option<(TableSchema, fsqlite_vdbe::codegen::BoundExplicitIndex)>> {
         let table_name = &stmt.table;
         let index_name = stmt.name.name.clone();
         // Stock reserves "sqlite_"-prefixed object names for internal use; a user
@@ -78854,7 +79223,9 @@ impl Connection {
                 .iter()
                 .any(|v| v.name.eq_ignore_ascii_case(&index_name));
             if name_taken_by_table || name_taken_by_view {
-                return Err(FrankenError::Internal(format!(
+                // Stock's text under SQLITE_ERROR, not "internal error:"
+                // under SQLITE_INTERNAL (bd-nnnd8).
+                return Err(FrankenError::FunctionError(format!(
                     "there is already a table named {index_name}"
                 )));
             }
@@ -78866,7 +79237,7 @@ impl Connection {
             });
             if index_name_exists {
                 if stmt.if_not_exists {
-                    return Ok(());
+                    return Ok(None);
                 }
                 return Err(FrankenError::FunctionError(format!(
                     "index {index_name} already exists"
@@ -78916,6 +79287,20 @@ impl Connection {
             )?;
             self.validate_live_index_expr_functions(&resolved_predicate)?;
         }
+        Ok(Some((table_schema, bound_index)))
+    }
+
+    /// Execute a CREATE INDEX statement, allocating a B-tree root page.
+    async fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
+        let Some((table_schema, bound_index)) = self.bind_create_index(stmt)? else {
+            return Ok(());
+        };
+        let table_name = &stmt.table;
+        let index_name = stmt.name.name.clone();
+        let target_is_temp = self
+            .temp_table_names
+            .borrow()
+            .contains(&table_name.to_ascii_lowercase());
         let has_expression_term = !bound_index.key_expressions.is_empty();
         let col_names = bound_index.columns.clone();
         let key_collations = bound_index.key_collations.clone();
@@ -79283,8 +79668,12 @@ impl Connection {
         b.finish()
     }
 
-    /// Execute a CREATE VIEW statement (store definition in memory).
-    async fn execute_create_view(&self, stmt: &fsqlite_ast::CreateViewStatement) -> Result<()> {
+    /// The checks stock's sqlite3CreateView makes before it builds anything: a
+    /// reserved name, a TEMP view's qualifier, a view, table or index of the
+    /// name, and a persistent view's references to another schema. `Ok(true)`
+    /// when IF NOT EXISTS met a view or table of the name, so the statement
+    /// does nothing. Preparing the statement runs them too (bd-nnnd8).
+    fn create_view_name_check(&self, stmt: &fsqlite_ast::CreateViewStatement) -> Result<bool> {
         let view_name = &stmt.name.name;
         // Stock reserves "sqlite_"-prefixed object names for internal use.
         // bd-errmsg-parity-batch2-g8v6e.
@@ -79309,7 +79698,7 @@ impl Connection {
 
         if self.view_index_for_scope(view_name, target_scope).is_some() {
             if stmt.if_not_exists {
-                return Ok(());
+                return Ok(true);
             }
             return Err(FrankenError::FunctionError(format!(
                 "view {view_name} already exists"
@@ -79321,15 +79710,37 @@ impl Connection {
         // MAIN are separate namespaces and may shadow one another.
         if self.table_exists_for_scope(view_name, target_scope) {
             if stmt.if_not_exists {
-                return Ok(());
+                return Ok(true);
             }
             return Err(FrankenError::FunctionError(format!(
                 "table {view_name} already exists"
             )));
         }
+        // bd-nnnd8: nor an index's name in its namespace, IF NOT EXISTS or
+        // not (sqlite3StartTable's sqlite3FindIndex check).
+        if self.index_exists_for_scope(view_name, target_scope) {
+            return Err(FrankenError::FunctionError(format!(
+                "there is already an index named {view_name}"
+            )));
+        }
         if !target_is_temp {
             validate_persistent_view_schema_references(&stmt.query, view_name, "main")?;
         }
+        Ok(false)
+    }
+
+    /// Execute a CREATE VIEW statement (store definition in memory).
+    async fn execute_create_view(&self, stmt: &fsqlite_ast::CreateViewStatement) -> Result<()> {
+        if self.create_view_name_check(stmt)? {
+            return Ok(());
+        }
+        let view_name = &stmt.name.name;
+        let target_is_temp = stmt.temporary
+            || stmt
+                .name
+                .schema
+                .as_deref()
+                .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"));
         // bd-xfmv9: prefer the verbatim CREATE VIEW text captured in execute()
         // (byte-faithful to the issued statement, incl. redundant parens in the
         // view's SELECT) over an AST re-render; fall back for batches / rewrites.
@@ -79364,11 +79775,17 @@ impl Connection {
         Ok(())
     }
 
-    /// Execute a CREATE TRIGGER statement.
-    async fn execute_create_trigger(
+    /// The checks stock's sqlite3BeginTrigger makes before it builds the
+    /// trigger: its name, the table or view it fires on and the timing that
+    /// object allows, an existing trigger of the name, and a qualified DML
+    /// target in a persistent trigger's body. `None` when IF NOT EXISTS met a
+    /// trigger of the name, so the statement does nothing; otherwise whether
+    /// the trigger is TEMP and the schema its table binds to. Preparing the
+    /// statement runs them too, where stock raises them (bd-nnnd8).
+    fn create_trigger_target_check(
         &self,
         stmt: &fsqlite_ast::CreateTriggerStatement,
-    ) -> Result<()> {
+    ) -> Result<Option<(bool, String)>> {
         let trigger_name = &stmt.name.name;
         if stmt.temporary && stmt.name.schema.is_some() {
             return Err(FrankenError::FunctionError(
@@ -79520,7 +79937,7 @@ impl Connection {
             .any(|trigger| trigger.name.eq_ignore_ascii_case(trigger_name))
         {
             if stmt.if_not_exists {
-                return Ok(());
+                return Ok(None);
             }
             return Err(FrankenError::FunctionError(format!(
                 "trigger {trigger_name} already exists"
@@ -79540,6 +79957,20 @@ impl Connection {
                     .to_owned(),
             ));
         }
+        Ok(Some((is_temp_trigger, bound_table_schema)))
+    }
+
+    /// Execute a CREATE TRIGGER statement.
+    async fn execute_create_trigger(
+        &self,
+        stmt: &fsqlite_ast::CreateTriggerStatement,
+    ) -> Result<()> {
+        let Some((is_temp_trigger, bound_table_schema)) = self.create_trigger_target_check(stmt)?
+        else {
+            return Ok(());
+        };
+        let trigger_name = &stmt.name.name;
+        let table_name = &stmt.table;
 
         // bd-xfmv9 (GH#350): prefer the verbatim CREATE TRIGGER text captured in
         // execute() over an AST re-render. The re-render collapsed redundant
@@ -127280,6 +127711,22 @@ fn normalize_create_object_sql_for_storage(source: &str) -> Option<String> {
     let suffix = source.get(usize::try_from(name.span.start).ok()?..)?;
     let unique = if unique { "UNIQUE " } else { "" };
     Some(format!("CREATE {unique}{kind} {suffix}"))
+}
+
+/// bd-nnnd8: the statements a prepared handle runs from their text at each
+/// step, down the path `Connection::query` takes: DDL, ATTACH and DETACH,
+/// transaction control, savepoints, VACUUM, ANALYZE and REINDEX. Queries, DML,
+/// PRAGMA and EXPLAIN prepare as before.
+fn is_prepared_schema_statement(statement: &Statement) -> bool {
+    !matches!(
+        statement,
+        Statement::Select(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::Pragma(_)
+            | Statement::Explain { .. }
+    )
 }
 
 /// Statements whose source text is persisted (or spliced) into the schema as
