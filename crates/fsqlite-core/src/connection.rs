@@ -56823,6 +56823,21 @@ impl Connection {
                     let scoped_select = insert_source_select_for_validation(insert, select);
                     SelectRelationResolver::new(self).validate_select(&scoped_select)?;
                 }
+                if insert_dml_clauses_have_subquery_or_in_table(insert) {
+                    SelectRelationResolver::new(self).validate_dml_insert_relations(insert)?;
+                }
+                Ok(())
+            }
+            Statement::Update(update) => {
+                if update_dml_clauses_have_subquery_or_in_table(update) {
+                    SelectRelationResolver::new(self).validate_dml_update_relations(update)?;
+                }
+                Ok(())
+            }
+            Statement::Delete(delete) => {
+                if delete_dml_clauses_have_subquery_or_in_table(delete) {
+                    SelectRelationResolver::new(self).validate_dml_delete_relations(delete)?;
+                }
                 Ok(())
             }
             Statement::CreateTable(create) => {
@@ -56893,38 +56908,9 @@ impl Connection {
                     )?;
                     self.validate_select_index_hints(select, spelling)?;
                 }
-                // bd-u01ku: VALUES rows, then the upserts, then RETURNING (a
-                // SELECT source's calls are resolved with the SELECT above).
-                let values = match &insert.source {
-                    InsertSource::Values(rows) => rows.iter().flatten().collect::<Vec<_>>(),
-                    InsertSource::Select(_) | InsertSource::DefaultValues => Vec::new(),
-                };
-                let upserts = insert.upsert.iter().flat_map(|upsert| {
-                    let target_where = upsert
-                        .target
-                        .as_ref()
-                        .and_then(|target| target.where_clause.as_ref());
-                    let (assignments, action_where): (&[fsqlite_ast::Assignment], _) =
-                        match &upsert.action {
-                            fsqlite_ast::UpsertAction::Update {
-                                assignments,
-                                where_clause,
-                            } => (assignments.as_slice(), where_clause.as_deref()),
-                            fsqlite_ast::UpsertAction::Nothing => (&[], None),
-                        };
-                    target_where
-                        .into_iter()
-                        .chain(assignments.iter().map(|assignment| &assignment.value))
-                        .chain(action_where)
-                });
-                for expr in values
-                    .into_iter()
-                    .chain(upserts)
-                    .chain(result_column_exprs(&insert.returning))
-                {
-                    validate_function_call_modifiers_in_expr(expr)?;
-                }
-                Ok(())
+                // bd-u01ku + bd-x9br8: VALUES rows, then the upserts, then RETURNING
+                // (a SELECT source's calls and names are resolved with the SELECT above).
+                self.validate_insert_dml_expr_semantics(insert)
             }
             Statement::CreateTable(create) => {
                 if let CreateTableBody::AsSelect(select) = &create.body {
@@ -56976,16 +56962,8 @@ impl Connection {
                         Self::validate_update_target_columns(table_schema, &update.assignments)?;
                     }
                 }
-                // bd-u01ku: SET values, then WHERE, then RETURNING.
-                for expr in update
-                    .assignments
-                    .iter()
-                    .map(|assignment| &assignment.value)
-                    .chain(update.where_clause.iter())
-                    .chain(result_column_exprs(&update.returning))
-                {
-                    validate_function_call_modifiers_in_expr(expr)?;
-                }
+                // bd-u01ku + bd-x9br8: SET values, then WHERE, ORDER BY/LIMIT, then RETURNING.
+                self.validate_update_dml_expr_semantics(update)?;
                 // bd-wlo29 L10: a forced partial INDEXED BY on the UPDATE target
                 // must be covered by the statement WHERE, exactly like a SELECT
                 // source. The schema borrow above is scoped so this can re-borrow.
@@ -57017,14 +56995,8 @@ impl Connection {
                 // parent check wrongly disabled the truncate with fk OFF, so frank
                 // erred on an uncovered forced partial index where stock silently
                 // truncates. Gate the parent check on FK enforcement.
-                // bd-u01ku: WHERE, then RETURNING.
-                for expr in delete
-                    .where_clause
-                    .iter()
-                    .chain(result_column_exprs(&delete.returning))
-                {
-                    validate_function_call_modifiers_in_expr(expr)?;
-                }
+                // bd-u01ku + bd-x9br8: WHERE, ORDER BY/LIMIT, then RETURNING.
+                self.validate_delete_dml_expr_semantics(delete)?;
                 let uses_truncate_opt = delete.where_clause.is_none()
                     && delete.returning.is_empty()
                     && !(self.fk_enforcement_enabled()
@@ -57054,6 +57026,455 @@ impl Connection {
             }
             _ => Ok(()),
         }
+    }
+
+    fn validate_dml_expr_subquery_structure(
+        &self,
+        expr: &Expr,
+        with: Option<&fsqlite_ast::WithClause>,
+        enclosing_selects: &[&SelectStatement],
+        row_value_ctx: bool,
+    ) -> Result<()> {
+        let mut structure_resolver = SelectStructureResolver::new(self);
+        structure_resolver.semantic_depth = 1;
+        structure_resolver.column_reference_preflight_completed = true;
+        if let Some(with) = with {
+            structure_resolver.scopes.push(&with.ctes);
+        }
+        structure_resolver
+            .enclosing_selects
+            .extend_from_slice(enclosing_selects);
+        let _row_value_guard =
+            BoolCellRestoreGuard::new(&self.scalar_subquery_row_value_context, row_value_ctx);
+        structure_resolver.validate_expr(expr, &[])
+    }
+
+    /// bd-u01ku + bd-x9br8: validate function calls and embedded subqueries in
+    /// an INSERT's VALUES, UPSERT, and RETURNING clauses at prepare time.
+    #[allow(clippy::too_many_lines)]
+    fn validate_insert_dml_expr_semantics(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<()> {
+        let target_source = TableOrSubquery::Table {
+            name: insert.table.clone(),
+            alias: insert.alias.clone(),
+            index_hint: None,
+            time_travel: None,
+        };
+        let excluded_source = TableOrSubquery::Table {
+            name: insert.table.clone(),
+            alias: Some("excluded".to_owned()),
+            index_hint: None,
+            time_travel: None,
+        };
+        let target_select = select_of_result_exprs(
+            Vec::new(),
+            Some(FromClause {
+                source: target_source.clone(),
+                joins: Vec::new(),
+            }),
+        );
+        let excluded_select = select_of_result_exprs(
+            Vec::new(),
+            Some(FromClause {
+                source: excluded_source.clone(),
+                joins: Vec::new(),
+            }),
+        );
+
+        let mut resolver = SelectColumnReferenceResolver::new(self);
+        let mut target_scope_slot: Option<SelectColumnReferenceScope> = None;
+        let mut excluded_scope_slot: Option<SelectColumnReferenceScope> = None;
+        if let Some(with) = &insert.with {
+            resolver.cte_scopes.push(&with.ctes);
+        }
+
+        if let InsertSource::Values(rows) = &insert.source {
+            for expr in rows.iter().flatten() {
+                if expr_has_any_subquery(expr) {
+                    resolver.outer_scopes.clear();
+                    resolver.validate_dml_expr_subqueries(expr)?;
+                    self.validate_dml_expr_subquery_structure(
+                        expr,
+                        insert.with.as_ref(),
+                        &[],
+                        false,
+                    )?;
+                }
+                validate_function_call_modifiers_in_expr(expr)?;
+            }
+        }
+
+        for upsert in &insert.upsert {
+            if let Some(target_where) = upsert
+                .target
+                .as_ref()
+                .and_then(|target| target.where_clause.as_ref())
+            {
+                if expr_has_any_subquery(target_where) {
+                    let target_scope = if let Some(scope) = target_scope_slot.as_ref() {
+                        scope.clone()
+                    } else {
+                        let built = resolver.build_dml_target_scope(2, &target_source)?;
+                        target_scope_slot = Some(built.clone());
+                        built
+                    };
+                    resolver.outer_scopes.clear();
+                    resolver.outer_scopes.push(target_scope);
+                    resolver.validate_dml_expr_subqueries(target_where)?;
+                    self.validate_dml_expr_subquery_structure(
+                        target_where,
+                        insert.with.as_ref(),
+                        &[&target_select],
+                        false,
+                    )?;
+                }
+                validate_function_call_modifiers_in_expr(target_where)?;
+            }
+            if let fsqlite_ast::UpsertAction::Update {
+                assignments,
+                where_clause,
+            } = &upsert.action
+            {
+                for assignment in assignments {
+                    if expr_has_any_subquery(&assignment.value) {
+                        let target_scope = if let Some(scope) = target_scope_slot.as_ref() {
+                            scope.clone()
+                        } else {
+                            let built = resolver.build_dml_target_scope(2, &target_source)?;
+                            target_scope_slot = Some(built.clone());
+                            built
+                        };
+                        let excluded_scope = if let Some(scope) = excluded_scope_slot.as_ref() {
+                            scope.clone()
+                        } else {
+                            let built = resolver.build_dml_target_scope(1, &excluded_source)?;
+                            excluded_scope_slot = Some(built.clone());
+                            built
+                        };
+                        // Push excluded first (outermost) and target second (innermost) so
+                        // unqualified names resolve to target without ambiguity while
+                        // `excluded.<col>` resolves cleanly to excluded.
+                        resolver.outer_scopes.clear();
+                        resolver.outer_scopes.push(excluded_scope);
+                        resolver.outer_scopes.push(target_scope);
+                        resolver.validate_dml_expr_subqueries(&assignment.value)?;
+                        let row_value_ctx = matches!(
+                            &assignment.target,
+                            fsqlite_ast::AssignmentTarget::ColumnList(_)
+                        ) && matches!(&assignment.value, Expr::Subquery(_, _));
+                        self.validate_dml_expr_subquery_structure(
+                            &assignment.value,
+                            insert.with.as_ref(),
+                            &[&excluded_select, &target_select],
+                            row_value_ctx,
+                        )?;
+                    }
+                    validate_function_call_modifiers_in_expr(&assignment.value)?;
+                }
+                if let Some(predicate) = where_clause.as_deref() {
+                    if expr_has_any_subquery(predicate) {
+                        let target_scope = if let Some(scope) = target_scope_slot.as_ref() {
+                            scope.clone()
+                        } else {
+                            let built = resolver.build_dml_target_scope(2, &target_source)?;
+                            target_scope_slot = Some(built.clone());
+                            built
+                        };
+                        let excluded_scope = if let Some(scope) = excluded_scope_slot.as_ref() {
+                            scope.clone()
+                        } else {
+                            let built = resolver.build_dml_target_scope(1, &excluded_source)?;
+                            excluded_scope_slot = Some(built.clone());
+                            built
+                        };
+                        resolver.outer_scopes.clear();
+                        resolver.outer_scopes.push(excluded_scope);
+                        resolver.outer_scopes.push(target_scope);
+                        resolver.validate_dml_expr_subqueries(predicate)?;
+                        self.validate_dml_expr_subquery_structure(
+                            predicate,
+                            insert.with.as_ref(),
+                            &[&excluded_select, &target_select],
+                            false,
+                        )?;
+                    }
+                    validate_function_call_modifiers_in_expr(predicate)?;
+                }
+            }
+        }
+
+        for expr in result_column_exprs(&insert.returning) {
+            if expr_has_any_subquery(expr) {
+                let target_scope = if let Some(scope) = target_scope_slot.as_ref() {
+                    scope.clone()
+                } else {
+                    let built = resolver.build_dml_target_scope(2, &target_source)?;
+                    target_scope_slot = Some(built.clone());
+                    built
+                };
+                resolver.outer_scopes.clear();
+                resolver.outer_scopes.push(target_scope);
+                resolver.validate_dml_expr_subqueries(expr)?;
+                self.validate_dml_expr_subquery_structure(
+                    expr,
+                    insert.with.as_ref(),
+                    &[&target_select],
+                    false,
+                )?;
+            }
+            validate_function_call_modifiers_in_expr(expr)?;
+        }
+        Ok(())
+    }
+
+    /// bd-u01ku + bd-x9br8: validate function calls and embedded subqueries in
+    /// an UPDATE's FROM, SET, WHERE, ORDER BY, LIMIT, and RETURNING clauses at
+    /// prepare time.
+    #[allow(clippy::too_many_lines)]
+    fn validate_update_dml_expr_semantics(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+    ) -> Result<()> {
+        let target_source = dml_target_source(&update.table);
+        let target_from = FromClause {
+            source: target_source.clone(),
+            joins: Vec::new(),
+        };
+        let target_select = select_of_result_exprs(Vec::new(), Some(target_from));
+        let target_and_from_select = select_of_result_exprs(
+            Vec::new(),
+            Some(row_value_set_scope(
+                target_source.clone(),
+                None,
+                update.from.as_ref(),
+            )),
+        );
+
+        let mut resolver = SelectColumnReferenceResolver::new(self);
+        let mut target_scope_slot: Option<SelectColumnReferenceScope> = None;
+        let mut target_and_from_scope_slot: Option<SelectColumnReferenceScope> = None;
+        if let Some(with) = &update.with {
+            resolver.cte_scopes.push(&with.ctes);
+        }
+
+        if let Some(from) = &update.from
+            && from_has_derived_source(from)
+        {
+            resolver.validate_from_sources(from)?;
+        }
+
+        for assignment in &update.assignments {
+            if expr_has_any_subquery(&assignment.value) {
+                let scope = if let Some(scope) = target_and_from_scope_slot.as_ref() {
+                    scope.clone()
+                } else {
+                    let mut built = resolver.build_dml_target_scope(3, &target_source)?;
+                    if let Some(from) = &update.from {
+                        built.extend_with_from(self, from, &mut |src| {
+                            resolver.metadata_source_column_names(src)
+                        })?;
+                    }
+                    target_and_from_scope_slot = Some(built.clone());
+                    built
+                };
+                resolver.outer_scopes.clear();
+                resolver.outer_scopes.push(scope);
+                resolver.validate_dml_expr_subqueries(&assignment.value)?;
+                let row_value_ctx = matches!(
+                    &assignment.target,
+                    fsqlite_ast::AssignmentTarget::ColumnList(_)
+                ) && matches!(&assignment.value, Expr::Subquery(_, _));
+                self.validate_dml_expr_subquery_structure(
+                    &assignment.value,
+                    update.with.as_ref(),
+                    &[&target_and_from_select],
+                    row_value_ctx,
+                )?;
+            }
+            validate_function_call_modifiers_in_expr(&assignment.value)?;
+        }
+
+        if let Some(predicate) = &update.where_clause {
+            if expr_has_any_subquery(predicate) {
+                let scope = if let Some(scope) = target_and_from_scope_slot.as_ref() {
+                    scope.clone()
+                } else {
+                    let mut built = resolver.build_dml_target_scope(3, &target_source)?;
+                    if let Some(from) = &update.from {
+                        built.extend_with_from(self, from, &mut |src| {
+                            resolver.metadata_source_column_names(src)
+                        })?;
+                    }
+                    target_and_from_scope_slot = Some(built.clone());
+                    built
+                };
+                resolver.outer_scopes.clear();
+                resolver.outer_scopes.push(scope);
+                resolver.validate_dml_expr_subqueries(predicate)?;
+                self.validate_dml_expr_subquery_structure(
+                    predicate,
+                    update.with.as_ref(),
+                    &[&target_and_from_select],
+                    false,
+                )?;
+            }
+            validate_function_call_modifiers_in_expr(predicate)?;
+        }
+
+        for term in &update.order_by {
+            if expr_has_any_subquery(&term.expr) {
+                let scope = if let Some(scope) = target_and_from_scope_slot.as_ref() {
+                    scope.clone()
+                } else {
+                    let mut built = resolver.build_dml_target_scope(3, &target_source)?;
+                    if let Some(from) = &update.from {
+                        built.extend_with_from(self, from, &mut |src| {
+                            resolver.metadata_source_column_names(src)
+                        })?;
+                    }
+                    target_and_from_scope_slot = Some(built.clone());
+                    built
+                };
+                resolver.outer_scopes.clear();
+                resolver.outer_scopes.push(scope);
+                resolver.validate_dml_expr_subqueries(&term.expr)?;
+                self.validate_dml_expr_subquery_structure(
+                    &term.expr,
+                    update.with.as_ref(),
+                    &[&target_and_from_select],
+                    false,
+                )?;
+            }
+            validate_function_call_modifiers_in_expr(&term.expr)?;
+        }
+
+        if let Some(limit) = &update.limit {
+            for expr in std::iter::once(&limit.limit).chain(limit.offset.as_ref()) {
+                if expr_has_any_subquery(expr) {
+                    resolver.outer_scopes.clear();
+                    resolver.validate_dml_expr_subqueries(expr)?;
+                    self.validate_dml_expr_subquery_structure(
+                        expr,
+                        update.with.as_ref(),
+                        &[],
+                        false,
+                    )?;
+                }
+                validate_function_call_modifiers_in_expr(expr)?;
+            }
+        }
+
+        for expr in result_column_exprs(&update.returning) {
+            if expr_has_any_subquery(expr) {
+                let scope = if let Some(scope) = target_scope_slot.as_ref() {
+                    scope.clone()
+                } else {
+                    let built = resolver.build_dml_target_scope(2, &target_source)?;
+                    target_scope_slot = Some(built.clone());
+                    built
+                };
+                resolver.outer_scopes.clear();
+                resolver.outer_scopes.push(scope);
+                resolver.validate_dml_expr_subqueries(expr)?;
+                self.validate_dml_expr_subquery_structure(
+                    expr,
+                    update.with.as_ref(),
+                    &[&target_select],
+                    false,
+                )?;
+            }
+            validate_function_call_modifiers_in_expr(expr)?;
+        }
+        Ok(())
+    }
+
+    /// bd-u01ku + bd-x9br8: validate function calls and embedded subqueries in
+    /// a DELETE's WHERE, ORDER BY, LIMIT, and RETURNING clauses at prepare time.
+    fn validate_delete_dml_expr_semantics(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+    ) -> Result<()> {
+        let target_source = dml_target_source(&delete.table);
+        let target_select = select_of_result_exprs(
+            Vec::new(),
+            Some(FromClause {
+                source: target_source.clone(),
+                joins: Vec::new(),
+            }),
+        );
+
+        let mut resolver = SelectColumnReferenceResolver::new(self);
+        let mut target_scope_slot: Option<SelectColumnReferenceScope> = None;
+        if let Some(with) = &delete.with {
+            resolver.cte_scopes.push(&with.ctes);
+        }
+
+        for expr in delete
+            .where_clause
+            .iter()
+            .chain(delete.order_by.iter().map(|term| &term.expr))
+        {
+            if expr_has_any_subquery(expr) {
+                let scope = if let Some(scope) = target_scope_slot.as_ref() {
+                    scope.clone()
+                } else {
+                    let built = resolver.build_dml_target_scope(2, &target_source)?;
+                    target_scope_slot = Some(built.clone());
+                    built
+                };
+                resolver.outer_scopes.clear();
+                resolver.outer_scopes.push(scope);
+                resolver.validate_dml_expr_subqueries(expr)?;
+                self.validate_dml_expr_subquery_structure(
+                    expr,
+                    delete.with.as_ref(),
+                    &[&target_select],
+                    false,
+                )?;
+            }
+            validate_function_call_modifiers_in_expr(expr)?;
+        }
+
+        if let Some(limit) = &delete.limit {
+            for expr in std::iter::once(&limit.limit).chain(limit.offset.as_ref()) {
+                if expr_has_any_subquery(expr) {
+                    resolver.outer_scopes.clear();
+                    resolver.validate_dml_expr_subqueries(expr)?;
+                    self.validate_dml_expr_subquery_structure(
+                        expr,
+                        delete.with.as_ref(),
+                        &[],
+                        false,
+                    )?;
+                }
+                validate_function_call_modifiers_in_expr(expr)?;
+            }
+        }
+
+        for expr in result_column_exprs(&delete.returning) {
+            if expr_has_any_subquery(expr) {
+                let scope = if let Some(scope) = target_scope_slot.as_ref() {
+                    scope.clone()
+                } else {
+                    let built = resolver.build_dml_target_scope(2, &target_source)?;
+                    target_scope_slot = Some(built.clone());
+                    built
+                };
+                resolver.outer_scopes.clear();
+                resolver.outer_scopes.push(scope);
+                resolver.validate_dml_expr_subqueries(expr)?;
+                self.validate_dml_expr_subquery_structure(
+                    expr,
+                    delete.with.as_ref(),
+                    &[&target_select],
+                    false,
+                )?;
+            }
+            validate_function_call_modifiers_in_expr(expr)?;
+        }
+        Ok(())
     }
 
     fn compound_select_core_column_count_with_outer_ctes(
@@ -137235,6 +137656,192 @@ fn expr_has_any_subquery(expr: &Expr) -> bool {
     expr_contains_subquery_match(expr, &mut |_| true)
 }
 
+/// Check if an expression tree contains any subquery (`Subquery`, `Exists`,
+/// `IN (SELECT ...)`) or bare `IN <table>` relation reference.
+fn expr_has_subquery_or_in_table(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_, _) | Expr::Exists { .. } => true,
+        Expr::In { expr, set, .. } => {
+            if matches!(set, InSet::List(values) if values.is_empty()) {
+                return false;
+            }
+            expr_has_subquery_or_in_table(expr)
+                || match set {
+                    InSet::List(values) => values.iter().any(expr_has_subquery_or_in_table),
+                    InSet::Subquery(_) | InSet::Table(_) => true,
+                }
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => expr_has_subquery_or_in_table(left) || expr_has_subquery_or_in_table(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => expr_has_subquery_or_in_table(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_has_subquery_or_in_table(expr)
+                || expr_has_subquery_or_in_table(low)
+                || expr_has_subquery_or_in_table(high)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_subquery_or_in_table(expr)
+                || expr_has_subquery_or_in_table(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(expr_has_subquery_or_in_table)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(expr_has_subquery_or_in_table)
+                || whens.iter().any(|(cond, val)| {
+                    expr_has_subquery_or_in_table(cond) || expr_has_subquery_or_in_table(val)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_has_subquery_or_in_table)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let args_match = match args {
+                FunctionArgs::Star => false,
+                FunctionArgs::List(values) => values.iter().any(expr_has_subquery_or_in_table),
+            };
+            args_match
+                || order_by
+                    .iter()
+                    .any(|term| expr_has_subquery_or_in_table(&term.expr))
+                || filter
+                    .as_deref()
+                    .is_some_and(expr_has_subquery_or_in_table)
+                || over.as_ref().is_some_and(|window| {
+                    window.partition_by.iter().any(expr_has_subquery_or_in_table)
+                        || window
+                            .order_by
+                            .iter()
+                            .any(|term| expr_has_subquery_or_in_table(&term.expr))
+                        || window.frame.as_ref().is_some_and(|frame| {
+                            let bound_match = |bound: &FrameBound| match bound {
+                                FrameBound::Preceding(e) | FrameBound::Following(e) => {
+                                    expr_has_subquery_or_in_table(e)
+                                }
+                                FrameBound::UnboundedPreceding
+                                | FrameBound::CurrentRow
+                                | FrameBound::UnboundedFollowing => false,
+                            };
+                            bound_match(&frame.start)
+                                || frame.end.as_ref().is_some_and(bound_match)
+                        })
+                })
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_has_subquery_or_in_table),
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => false,
+    }
+}
+
+fn insert_dml_clauses_have_subquery_or_in_table(insert: &fsqlite_ast::InsertStatement) -> bool {
+    let values_have = matches!(
+        &insert.source,
+        InsertSource::Values(rows)
+            if rows
+                .iter()
+                .flatten()
+                .any(expr_has_subquery_or_in_table)
+    );
+    let upsert_has = insert.upsert.iter().any(|upsert| {
+        let target_has = upsert
+            .target
+            .as_ref()
+            .and_then(|target| target.where_clause.as_ref())
+            .is_some_and(expr_has_subquery_or_in_table);
+        let action_has = match &upsert.action {
+            fsqlite_ast::UpsertAction::Update {
+                assignments,
+                where_clause,
+            } => {
+                assignments
+                    .iter()
+                    .any(|assignment| expr_has_subquery_or_in_table(&assignment.value))
+                    || where_clause
+                        .as_deref()
+                        .is_some_and(expr_has_subquery_or_in_table)
+            }
+            fsqlite_ast::UpsertAction::Nothing => false,
+        };
+        target_has || action_has
+    });
+    values_have
+        || upsert_has
+        || result_column_exprs(&insert.returning).any(expr_has_subquery_or_in_table)
+}
+
+fn update_dml_clauses_have_subquery_or_in_table(update: &fsqlite_ast::UpdateStatement) -> bool {
+    update.from.as_ref().is_some_and(from_has_derived_source)
+        || update
+            .assignments
+            .iter()
+            .any(|assignment| expr_has_subquery_or_in_table(&assignment.value))
+        || update
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_has_subquery_or_in_table)
+        || update
+            .order_by
+            .iter()
+            .any(|term| expr_has_subquery_or_in_table(&term.expr))
+        || update.limit.as_ref().is_some_and(|limit| {
+            expr_has_subquery_or_in_table(&limit.limit)
+                || limit
+                    .offset
+                    .as_ref()
+                    .is_some_and(expr_has_subquery_or_in_table)
+        })
+        || result_column_exprs(&update.returning).any(expr_has_subquery_or_in_table)
+}
+
+fn delete_dml_clauses_have_subquery_or_in_table(delete: &fsqlite_ast::DeleteStatement) -> bool {
+    delete
+        .where_clause
+        .as_ref()
+        .is_some_and(expr_has_subquery_or_in_table)
+        || delete
+            .order_by
+            .iter()
+            .any(|term| expr_has_subquery_or_in_table(&term.expr))
+        || delete.limit.as_ref().is_some_and(|limit| {
+            expr_has_subquery_or_in_table(&limit.limit)
+                || limit
+                    .offset
+                    .as_ref()
+                    .is_some_and(expr_has_subquery_or_in_table)
+        })
+        || result_column_exprs(&delete.returning).any(expr_has_subquery_or_in_table)
+}
+
 /// Whether a prepared INSERT, UPDATE or DELETE reads a subquery. Preparation
 /// folds such subqueries into literals once, so the statement must instead be
 /// dispatched (and its subqueries folded) on every execution; see
@@ -159719,6 +160326,126 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         result
     }
 
+    /// bd-x9br8: validate catalog relations referenced inside an INSERT's
+    /// VALUES, UPSERT, and RETURNING subqueries (target checked first).
+    fn validate_dml_insert_relations(
+        &mut self,
+        insert: &'select fsqlite_ast::InsertStatement,
+    ) -> Result<()> {
+        self.validate_catalog_relation(&insert.table)?;
+        let scope_depth = self.scopes.len();
+        if let Some(with) = &insert.with {
+            self.scopes.push(&with.ctes);
+        }
+        let result: Result<()> = (|| {
+            if let InsertSource::Values(rows) = &insert.source {
+                for expr in rows.iter().flatten() {
+                    self.validate_expr(expr)?;
+                }
+            }
+            for clause in &insert.upsert {
+                if let Some(target_where) = clause
+                    .target
+                    .as_ref()
+                    .and_then(|target| target.where_clause.as_ref())
+                {
+                    self.validate_expr(target_where)?;
+                }
+                if let fsqlite_ast::UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &clause.action
+                {
+                    for assignment in assignments {
+                        self.validate_expr(&assignment.value)?;
+                    }
+                    if let Some(predicate) = where_clause.as_deref() {
+                        self.validate_expr(predicate)?;
+                    }
+                }
+            }
+            for expr in result_column_exprs(&insert.returning) {
+                self.validate_expr(expr)?;
+            }
+            Ok(())
+        })();
+        self.scopes.truncate(scope_depth);
+        result
+    }
+
+    /// bd-x9br8: validate catalog relations referenced inside an UPDATE's
+    /// FROM, SET, WHERE, ORDER BY, LIMIT, and RETURNING subqueries (target
+    /// checked first).
+    fn validate_dml_update_relations(
+        &mut self,
+        update: &'select fsqlite_ast::UpdateStatement,
+    ) -> Result<()> {
+        self.validate_catalog_relation(&update.table.name)?;
+        let scope_depth = self.scopes.len();
+        if let Some(with) = &update.with {
+            self.scopes.push(&with.ctes);
+        }
+        let result: Result<()> = (|| {
+            if let Some(from) = &update.from {
+                self.validate_from_sources(from)?;
+            }
+            for assignment in &update.assignments {
+                self.validate_expr(&assignment.value)?;
+            }
+            if let Some(predicate) = &update.where_clause {
+                self.validate_expr(predicate)?;
+            }
+            for term in &update.order_by {
+                self.validate_expr(&term.expr)?;
+            }
+            if let Some(limit) = &update.limit {
+                self.validate_expr(&limit.limit)?;
+                if let Some(offset) = &limit.offset {
+                    self.validate_expr(offset)?;
+                }
+            }
+            for expr in result_column_exprs(&update.returning) {
+                self.validate_expr(expr)?;
+            }
+            Ok(())
+        })();
+        self.scopes.truncate(scope_depth);
+        result
+    }
+
+    /// bd-x9br8: validate catalog relations referenced inside a DELETE's
+    /// WHERE, ORDER BY, LIMIT, and RETURNING subqueries (target checked first).
+    fn validate_dml_delete_relations(
+        &mut self,
+        delete: &'select fsqlite_ast::DeleteStatement,
+    ) -> Result<()> {
+        self.validate_catalog_relation(&delete.table.name)?;
+        let scope_depth = self.scopes.len();
+        if let Some(with) = &delete.with {
+            self.scopes.push(&with.ctes);
+        }
+        let result: Result<()> = (|| {
+            if let Some(predicate) = &delete.where_clause {
+                self.validate_expr(predicate)?;
+            }
+            for term in &delete.order_by {
+                self.validate_expr(&term.expr)?;
+            }
+            if let Some(limit) = &delete.limit {
+                self.validate_expr(&limit.limit)?;
+                if let Some(offset) = &limit.offset {
+                    self.validate_expr(offset)?;
+                }
+            }
+            for expr in result_column_exprs(&delete.returning) {
+                self.validate_expr(expr)?;
+            }
+            Ok(())
+        })();
+        self.scopes.truncate(scope_depth);
+        result
+    }
+
     fn validate_named_window_definition_legality(&self, core: &SelectCore) -> Result<()> {
         let SelectCore::Select { windows, .. } = core else {
             return Ok(());
@@ -160808,6 +161535,69 @@ impl SelectColumnReferenceScope {
             scope.record_from_qualifiers(from);
         }
         Ok(scope)
+    }
+
+    fn new_dml_scope(identity: usize) -> Self {
+        Self {
+            identity,
+            col_map: Vec::new(),
+            using_skip: HashSet::new(),
+            output_aliases: Vec::new(),
+            valid_qualifiers: Vec::new(),
+            match_table_names: Vec::new(),
+            fts5_rank_table_names: Vec::new(),
+            approximate_col_map: Vec::new(),
+        }
+    }
+
+    fn extend_with_source<'source, F>(
+        &mut self,
+        connection: &Connection,
+        source: &'source TableOrSubquery,
+        source_column_names: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&'source TableOrSubquery) -> Result<SelectSourceColumnMetadata>,
+    {
+        let mut layout_width_is_exact = true;
+        let _ = Self::append_source_layout(
+            connection,
+            source,
+            source_column_names,
+            &mut self.col_map,
+            &mut self.using_skip,
+            &mut self.match_table_names,
+            &mut self.fts5_rank_table_names,
+            &mut self.approximate_col_map,
+            &mut layout_width_is_exact,
+        )?;
+        self.record_source_qualifiers(source);
+        Ok(())
+    }
+
+    fn extend_with_from<'source, F>(
+        &mut self,
+        connection: &Connection,
+        from: &'source FromClause,
+        source_column_names: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&'source TableOrSubquery) -> Result<SelectSourceColumnMetadata>,
+    {
+        let mut layout_width_is_exact = true;
+        let _ = Self::append_from_layout(
+            connection,
+            from,
+            source_column_names,
+            &mut self.col_map,
+            &mut self.using_skip,
+            &mut self.match_table_names,
+            &mut self.fts5_rank_table_names,
+            &mut self.approximate_col_map,
+            &mut layout_width_is_exact,
+        )?;
+        self.record_from_qualifiers(from);
+        Ok(())
     }
 
     fn append_from_layout<'source, F>(
@@ -162361,6 +163151,164 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
         let result = self.validate_select(select);
         self.outer_scopes.pop();
         result
+    }
+
+    /// Build a DML target scope against the real catalog table (ignoring any
+    /// enclosing `WITH` CTE that shares the target table's name).
+    fn build_dml_target_scope(
+        &mut self,
+        identity: usize,
+        target: &'select TableOrSubquery,
+    ) -> Result<SelectColumnReferenceScope> {
+        let saved_ctes = std::mem::take(&mut self.cte_scopes);
+        let connection = self.connection;
+        let mut scope = SelectColumnReferenceScope::new_dml_scope(identity);
+        let result = scope.extend_with_source(connection, target, &mut |src| {
+            self.metadata_source_column_names(src)
+        });
+        self.cte_scopes = saved_ctes;
+        result?;
+        Ok(scope)
+    }
+
+    /// bd-x9br8: validate every subquery nested inside a DML expression using
+    /// the enclosing DML scopes already installed in `self.outer_scopes` and
+    /// `self.cte_scopes`.
+    #[allow(clippy::too_many_lines)]
+    fn validate_dml_expr_subqueries(&mut self, expr: &'select Expr) -> Result<()> {
+        if expr_folds_to_integer_zero_via_and(expr) {
+            return Ok(());
+        }
+        match expr {
+            Expr::BoundOuterValue { .. }
+            | Expr::Literal(_, _)
+            | Expr::Column(_, _)
+            | Expr::Raise { .. }
+            | Expr::Placeholder(_, _) => Ok(()),
+            Expr::Subquery(select, _)
+            | Expr::Exists {
+                subquery: select, ..
+            } => self.validate_select(select),
+            Expr::In { expr, set, .. } => {
+                if matches!(set, InSet::List(values) if values.is_empty()) {
+                    return Ok(());
+                }
+                let singleton_subquery = match set {
+                    InSet::Subquery(select) => Some(select.as_ref()),
+                    InSet::List(values) => match values.as_slice() {
+                        [Expr::Subquery(select, _)] => Some(select.as_ref()),
+                        _ => None,
+                    },
+                    InSet::Table(_) => None,
+                };
+                if let Some(select) = singleton_subquery {
+                    self.validate_select(select)?;
+                    return self.validate_dml_expr_subqueries(expr);
+                }
+                self.validate_dml_expr_subqueries(expr)?;
+                if let InSet::List(values) = set {
+                    for value in values {
+                        self.validate_dml_expr_subqueries(value)?;
+                    }
+                }
+                Ok(())
+            }
+            Expr::BinaryOp { left, right, .. }
+            | Expr::JsonAccess {
+                expr: left,
+                path: right,
+                ..
+            } => {
+                self.validate_dml_expr_subqueries(left)?;
+                self.validate_dml_expr_subqueries(right)
+            }
+            Expr::UnaryOp { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Collate { expr, .. } => self.validate_dml_expr_subqueries(expr),
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.validate_dml_expr_subqueries(expr)?;
+                self.validate_dml_expr_subqueries(low)?;
+                self.validate_dml_expr_subqueries(high)
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.validate_dml_expr_subqueries(pattern)?;
+                self.validate_dml_expr_subqueries(expr)?;
+                if let Some(escape) = escape {
+                    self.validate_dml_expr_subqueries(escape)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    self.validate_dml_expr_subqueries(operand)?;
+                }
+                for (condition, value) in whens {
+                    self.validate_dml_expr_subqueries(condition)?;
+                    self.validate_dml_expr_subqueries(value)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    self.validate_dml_expr_subqueries(else_expr)?;
+                }
+                Ok(())
+            }
+            Expr::FunctionCall {
+                args,
+                order_by,
+                filter,
+                over,
+                ..
+            } => {
+                if let FunctionArgs::List(values) = args {
+                    for value in values {
+                        self.validate_dml_expr_subqueries(value)?;
+                    }
+                }
+                for term in order_by {
+                    self.validate_dml_expr_subqueries(&term.expr)?;
+                }
+                if let Some(filter) = filter {
+                    self.validate_dml_expr_subqueries(filter)?;
+                }
+                if let Some(window) = over {
+                    for expr in &window.partition_by {
+                        self.validate_dml_expr_subqueries(expr)?;
+                    }
+                    for term in &window.order_by {
+                        self.validate_dml_expr_subqueries(&term.expr)?;
+                    }
+                    if let Some(frame) = &window.frame {
+                        if let FrameBound::Preceding(e) | FrameBound::Following(e) = &frame.start {
+                            self.validate_dml_expr_subqueries(e)?;
+                        }
+                        if let Some(FrameBound::Preceding(e) | FrameBound::Following(e)) =
+                            &frame.end
+                        {
+                            self.validate_dml_expr_subqueries(e)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::RowValue(values, _) => {
+                for value in values {
+                    self.validate_dml_expr_subqueries(value)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
