@@ -6209,6 +6209,101 @@ where
     false
 }
 
+/// bd-l1pph: whether the stop of `wal`'s open scan is only a frame a live
+/// writer was still writing, as the shared WAL index shows it. A writer
+/// appends its frames before it publishes them, so a connection that opens
+/// while a peer commits can scan up to a frame the peer has not finished (a
+/// checksum or salt mismatch) although no committed frame is damaged; by the
+/// time the open looks again, the peer may have finished and published it.
+/// Taking the exclusive whole-image maintenance fence for such a stop blocks
+/// every peer's next transaction until its busy_timeout runs out.
+///
+/// The open reads the shared header first and then scans the WAL again.
+/// Published frames are complete before their publication and stay until the
+/// next restart, so on that second scan:
+/// - no damage at all means the first stop was a frame finished since;
+/// - damage inside the prefix the header publishes is real;
+/// - damage past it is a live writer's unfinished append only while some
+///   connection holds WAL WRITE (or the header has meanwhile published that
+///   frame). With WAL WRITE free it is damage left behind, which a recovery
+///   that stopped there excluded from the header it published.
+/// A header mid-publication (its two copies differ) or bound to another WAL
+/// generation (a restart raced the scan) also means a live writer. Without a
+/// shared index the stop is damage, and live repair proceeds as before.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+async fn wal_scan_stop_is_live_writers_tail<V>(
+    pager: &Arc<SimplePager<V>>,
+    vfs: &V,
+    cx: &Cx,
+    wal_path: &Path,
+    wal: &WalFile<V::File>,
+) -> bool
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    if wal.last_scan_stop().is_none() {
+        return false;
+    }
+    let Ok(source) = pager.wal_index_shm_source() else {
+        return false;
+    };
+    let Ok(region) = source.map_region(cx, 0, false).await else {
+        return false;
+    };
+    if fsqlite_wal::wal_index::shared_wal_index_header_is_torn(&region).unwrap_or(false) {
+        return true;
+    }
+    let Ok(Some(header)) = fsqlite_wal::wal_index::read_shared_wal_index_header(&region) else {
+        return false;
+    };
+    let bound_to = |wal: &WalFile<V::File>| {
+        let salts = wal.header().salts;
+        header.a_salt == [salts.salt1, salts.salt2]
+    };
+    if !bound_to(wal) {
+        return true;
+    }
+    let Ok(Some(rescan)) = open_valid_wal_for_install(vfs, cx, wal_path).await else {
+        return false;
+    };
+    let (bound, stop) = (bound_to(&rescan), rescan.last_scan_stop());
+    let _ = rescan.close(cx);
+    if !bound {
+        return true;
+    }
+    let Some(stop) = stop else {
+        return true;
+    };
+    if stop.frame_no() <= header.mx_frame {
+        return false;
+    }
+    if matches!(source.wal_write_lock_is_free(cx).await, Ok(false)) {
+        return true;
+    }
+    // WAL WRITE is free: unless the frame was published in the meantime, the
+    // tail past the published prefix is not being written.
+    matches!(
+        fsqlite_wal::wal_index::read_shared_wal_index_header(&region),
+        Ok(Some(now)) if now.mx_frame >= stop.frame_no()
+    )
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+async fn wal_scan_stop_is_live_writers_tail<V>(
+    _pager: &Arc<SimplePager<V>>,
+    _vfs: &V,
+    _cx: &Cx,
+    _wal_path: &Path,
+    _wal: &WalFile<V::File>,
+) -> bool
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    false
+}
+
 /// After live in-place WAL-FEC repair mutates damaged WAL frames under the
 /// exclusive maintenance fence, invalidate any existing `-shm` header so the
 /// subsequent native snapshot refresh rebuilds the shared WAL index from the
@@ -6313,7 +6408,9 @@ where
     V::File: Send + Sync + 'static,
 {
     if let Some(wal) = open_valid_wal_for_install(&vfs, cx, wal_path).await? {
-        if wal_needs_live_fec_repair(&wal, &vfs, pager, wal_path) {
+        if wal_needs_live_fec_repair(&wal, &vfs, pager, wal_path)
+            && !wal_scan_stop_is_live_writers_tail(pager, &vfs, cx, wal_path, &wal).await
+        {
             // Re-inspect and heal under the exclusive whole-image maintenance
             // fence so no concurrent writer or checkpoint can race the repair.
             let _ = wal.close(cx);
@@ -6568,7 +6665,9 @@ where
                 );
             }
         })?;
-    } else if wal_needs_live_fec_repair(&wal, &vfs, pager, wal_path) {
+    } else if wal_needs_live_fec_repair(&wal, &vfs, pager, wal_path)
+        && !wal_scan_stop_is_live_writers_tail(pager, &vfs, cx, wal_path, &wal).await
+    {
         let _ = wal.close(cx);
         let mut state = (vfs, wal_path.to_path_buf(), Arc::clone(pager));
         let repaired_wal = pager
