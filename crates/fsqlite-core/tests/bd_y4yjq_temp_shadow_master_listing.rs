@@ -112,6 +112,37 @@ fn before_and_after_triggers_follow_their_table_across_a_temp_shadow() {
     });
 }
 
+#[test]
+fn temp_shadow_and_rename_preserve_the_main_autoincrement_high_water() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for temp_key in ["id INTEGER PRIMARY KEY", "id INTEGER PRIMARY KEY AUTOINCREMENT"] {
+            let file = dir.path().join(format!("shadow-{}.db", temp_key.len()));
+            let stock = rusqlite::Connection::open(&file).unwrap();
+            stock.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT,v);
+                INSERT INTO t VALUES(1,'first'),(100,'old'); DELETE FROM t WHERE id=100;").unwrap();
+            drop(stock);
+            let f = Connection::open(file.to_str().unwrap()).await.unwrap();
+            f.execute(&format!("CREATE TEMP TABLE t({temp_key},v)")).await.unwrap();
+            f.execute("INSERT INTO temp.t VALUES(8,'temporary')").await.unwrap();
+            let stmt = f.prepare("INSERT INTO main.t(v) VALUES('shadowed')").await.unwrap();
+            assert_eq!(stmt.execute().await.unwrap(), 1);
+            drop(stmt);
+            f.execute("ALTER TABLE temp.t RENAME TO moved").await.unwrap();
+            f.execute("INSERT INTO main.t(v) VALUES('restored')").await.unwrap();
+            f.execute("INSERT INTO moved(v) VALUES('still temporary')").await.unwrap();
+            assert_eq!(fq(&f, "SELECT id FROM moved ORDER BY id").await,
+                [vec!["int:8".to_owned()], vec!["int:9".to_owned()]]);
+            f.close().await.unwrap();
+            let stock = rusqlite::Connection::open(&file).unwrap();
+            assert_eq!(rq(&stock, "SELECT id FROM t ORDER BY id"),
+                [vec!["int:1".to_owned()], vec!["int:101".to_owned()], vec!["int:102".to_owned()]]);
+            assert_eq!(rq(&stock, "SELECT name,seq FROM sqlite_sequence"),
+                [vec!["text:t".to_owned(), "int:102".to_owned()]]);
+        }
+    });
+}
+
 fn tag_f(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_owned(),

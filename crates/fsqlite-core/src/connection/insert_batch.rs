@@ -1456,11 +1456,12 @@ impl Connection {
 
         if table_name.eq_ignore_ascii_case("sqlite_sequence") {
             Box::pin(self.refresh_sqlite_sequence_cache()).await?;
-        } else if self.is_autoincrement_table(table_name) {
+        } else if self.is_autoincrement_target(table_name, insert.table.schema.as_deref()) {
             // Only an AUTOINCREMENT table has a high-water to refresh; other
             // tables do not allocate the refresh future.
             Box::pin(self.refresh_autoincrement_sequence_after_insert(
                 table_name,
+                insert.table.schema.as_deref(),
                 affected,
                 last_insert_rowid,
             ))

@@ -15452,13 +15452,14 @@ pub struct Connection {
     /// written (bd-i95tk). Separate from `pending_ddl_source`, which nested
     /// statements run by DDL handlers reset; taken before any of them run.
     pending_alter_source: RefCell<Option<String>>,
-    /// Set of table names (lowercased) declared as
+    /// Set of main table names (lowercased) declared as
     /// `INTEGER PRIMARY KEY AUTOINCREMENT`.
     autoincrement_tables: TxnRestorableCell<HashSet<String>>,
     /// Cached sqlite_sequence high-water values keyed by lowercased table name.
     sqlite_sequence_cache: RefCell<HashMap<String, i64>>,
     /// AUTOINCREMENT high-water values of TEMP tables, keyed by lowercased
-    /// name. Stock keeps these in the temp schema's own sqlite_sequence; they
+    /// name, present from CREATE until DROP even before the first INSERT.
+    /// Stock keeps these in the temp schema's own sqlite_sequence; they
     /// never belong in the main database's durable one.
     temp_sqlite_sequence: RefCell<HashMap<String, i64>>,
     /// Next rowid to use when inserting into the sqlite_master B-tree on
@@ -38461,6 +38462,7 @@ impl Connection {
             PreparedInsertPostWriteAction::RefreshAutoincrementSequence => {
                 self.refresh_autoincrement_sequence_after_insert(
                     table_name,
+                    None,
                     affected,
                     last_insert_rowid,
                 )
@@ -54322,20 +54324,11 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> Result<TableExecutionRuntimeRequirements> {
-        let target_root_page = {
-            let schema = self.schema.borrow();
-            schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
-                .map(|table| table.root_page)
-                .ok_or_else(|| {
-                    FrankenError::FunctionError(format!("no such table: {}", insert.table.name))
-                })?
-        };
+        let target_root_page = self.local_dml_target_table(&insert.table.name, insert.table.schema.as_deref())
+            .map(|table| table.root_page)
+            .ok_or_else(|| FrankenError::FunctionError(format!("no such table: {}", insert.table.name)))?;
         let autoincrement_root_page = self
-            .autoincrement_tables
-            .borrow()
-            .contains(&insert.table.name.to_ascii_lowercase())
+            .is_autoincrement_target(&insert.table.name, insert.table.schema.as_deref())
             .then_some(target_root_page);
         // Simple VALUES/DEFAULT VALUES inserts already have omitted-column
         // defaults compiled directly into bytecode, so they do not need the
@@ -71867,9 +71860,16 @@ impl Connection {
     }
 
     fn is_autoincrement_table(&self, table_name: &str) -> bool {
-        self.autoincrement_tables
-            .borrow()
-            .contains(&table_name.to_ascii_lowercase())
+        self.is_autoincrement_target(table_name, None)
+    }
+
+    fn is_autoincrement_target(&self, table_name: &str, schema: Option<&str>) -> bool {
+        let key = table_name.to_ascii_lowercase();
+        if schema.map_or_else(|| self.temp_table_names.borrow().contains(&key), |s| s.eq_ignore_ascii_case("temp")) {
+            self.temp_sqlite_sequence.borrow().contains_key(&key)
+        } else {
+            self.autoincrement_tables.borrow().contains(&key)
+        }
     }
 
     async fn ensure_sqlite_sequence_table_exists(&self) -> Result<()> {
@@ -72539,16 +72539,7 @@ impl Connection {
     /// The highest AUTOINCREMENT rowid the just-executed program recorded for
     /// `table_name` beyond the rows it kept (0 when none). The engine stays
     /// parked in `cached_vdbe_engine` until the next program resets it.
-    fn recorded_autoincrement_high_water(&self, table_name: &str) -> i64 {
-        let Some(root_page) = self
-            .schema
-            .borrow()
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(table_name))
-            .map(|table| table.root_page)
-        else {
-            return 0;
-        };
+    fn recorded_autoincrement_high_water(&self, root_page: i32) -> i64 {
         self.cached_vdbe_engine
             .borrow()
             .as_ref()
@@ -72559,6 +72550,7 @@ impl Connection {
     async fn try_fast_path_autoincrement_sequence_after_insert(
         &self,
         table_name: &str,
+        root_page: i32,
         affected: usize,
         last_insert_rowid: Option<i64>,
     ) -> Result<bool> {
@@ -72571,7 +72563,7 @@ impl Connection {
         // The one row inserted need not carry the statement's highest rowid:
         // the program also records a rowid an OR IGNORE burned (GH #186) or
         // an IGNORE discarded (bd-jlbrk).
-        let inserted_rowid = last_rowid.max(self.recorded_autoincrement_high_water(table_name));
+        let inserted_rowid = last_rowid.max(self.recorded_autoincrement_high_water(root_page));
 
         self.ensure_sqlite_sequence_table_exists().await?;
         let key = table_name.to_ascii_lowercase();
@@ -72611,16 +72603,7 @@ impl Connection {
     /// TEMP root is past any main-file extent), and the statement retry then
     /// re-ran an INSERT whose rows had already landed; writing the value into
     /// main's durable sqlite_sequence leaked a TEMP name into the database.
-    fn refresh_temp_autoincrement_sequence(&self, table_key: String, last_insert_rowid: Option<i64>) {
-        let Some(root_page) = self
-            .schema
-            .borrow()
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(&table_key))
-            .map(|table| table.root_page)
-        else {
-            return;
-        };
+    fn refresh_temp_autoincrement_sequence(&self, table_key: String, root_page: i32, last_insert_rowid: Option<i64>) {
         let max_rowid = self
             .db
             .borrow()
@@ -72645,20 +72628,25 @@ impl Connection {
     async fn refresh_autoincrement_sequence_after_insert(
         &self,
         table_name: &str,
+        schema: Option<&str>,
         affected: usize,
         last_insert_rowid: Option<i64>,
     ) -> Result<()> {
-        if !self.is_autoincrement_table(table_name) {
+        if !self.is_autoincrement_target(table_name, schema) {
             return Ok(());
         }
         let table_key = table_name.to_ascii_lowercase();
-        if self.temp_table_names.borrow().contains(&table_key) {
-            self.refresh_temp_autoincrement_sequence(table_key, last_insert_rowid);
+        let Some(root_page) = self.local_dml_target_table(table_name, schema).map(|t| t.root_page) else {
+            return Ok(());
+        };
+        if self.temp_table_sql.borrow().contains_key(&root_page) {
+            self.refresh_temp_autoincrement_sequence(table_key, root_page, last_insert_rowid);
             return Ok(());
         }
         if self
             .try_fast_path_autoincrement_sequence_after_insert(
                 table_name,
+                root_page,
                 affected,
                 last_insert_rowid,
             )
@@ -72671,15 +72659,6 @@ impl Connection {
         }
         self.ensure_sqlite_sequence_table_exists().await?;
         self.with_pager_write_txn(async |cx, txn| {
-            let Some(root_page) = self
-                .schema
-                .borrow()
-                .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(table_name))
-                .map(|t| t.root_page)
-            else {
-                return Ok(());
-            };
             // GH #186: an INSERT OR IGNORE conflict allocates (burns) an
             // AUTOINCREMENT rowid via NewRowid but inserts no row, so the
             // stored-row scan misses it. The just-executed engine (parked in
@@ -72722,19 +72701,17 @@ impl Connection {
     #[cfg_attr(not(test), allow(dead_code))]
     fn autoincrement_sequence_by_root_page(&self) -> HashMap<i32, i64> {
         let metadata = self.table_execution_metadata();
-        let autoincrement_tables = self.autoincrement_tables.borrow();
         metadata
             .autoincrement_table_name_by_root_page
             .iter()
-            .filter(|(_, table_name)| autoincrement_tables.contains(*table_name))
-            .map(|(root_page, table_name)| (*root_page, self.autoincrement_sequence(table_name)))
+            .map(|(root_page, table_name)| (*root_page, self.autoincrement_sequence(*root_page, table_name)))
             .collect()
     }
 
     /// The AUTOINCREMENT high-water of `table_key` (lowercased): a TEMP
     /// table's lives in the connection-local temp sequence, never in main's.
-    fn autoincrement_sequence(&self, table_key: &str) -> i64 {
-        let sequence = if self.temp_table_names.borrow().contains(table_key) {
+    fn autoincrement_sequence(&self, root_page: i32, table_key: &str) -> i64 {
+        let sequence = if self.temp_table_sql.borrow().contains_key(&root_page) {
             self.temp_sqlite_sequence.borrow().get(table_key).copied()
         } else {
             self.sqlite_sequence_cache.borrow().get(table_key).copied()
@@ -72766,7 +72743,7 @@ impl Connection {
                     .autoincrement_table_name_by_root_page
                     .get(&root_page)
                 {
-                    map.insert(root_page, self.autoincrement_sequence(table_name));
+                    map.insert(root_page, self.autoincrement_sequence(root_page, table_name));
                 }
                 map
             } else {
@@ -72939,7 +72916,12 @@ impl Connection {
                     wr_binary_ascending_roots.push(table.root_page);
                 }
             }
-            if autoincrement_tables.contains(&table_name_key) {
+            let is_autoincrement = if temp_names.contains(&table_name_key) {
+                self.temp_sqlite_sequence.borrow().contains_key(&table_name_key)
+            } else {
+                autoincrement_tables.contains(&table_name_key)
+            };
+            if is_autoincrement {
                 autoincrement_table_name_by_root_page
                     .insert(table.root_page, table_name_key.clone());
             }
@@ -73078,6 +73060,14 @@ impl Connection {
             }
         }
 
+        for (name, main) in self.shadowed_main_tables.borrow().iter() {
+            if autoincrement_tables.contains(name) {
+                autoincrement_table_name_by_root_page.insert(main.root_page, name.clone());
+            }
+            if let Some(slot) = main.columns.iter().position(|col| col.is_ipk) {
+                rowid_alias_col_by_root_page.insert(main.root_page, slot);
+            }
+        }
         let rowid_alias_col_by_root_page = Arc::new(rowid_alias_col_by_root_page);
         let autoincrement_table_name_by_root_page = Arc::new(autoincrement_table_name_by_root_page);
         let table_column_count_by_root_page = Arc::new(table_column_count_by_root_page);
@@ -73647,12 +73637,14 @@ impl Connection {
                     implicit_autoindex_layout(columns, constraints, create.without_rowid)?;
                 // All validation that can reject the canonical layout must run
                 // before mutating connection-local schema maps.
-                if !create.without_rowid
-                    && let Some(idx) = rowid_col_idx
-                {
-                    self.rowid_alias_columns
-                        .borrow_mut()
-                        .insert(table_name.to_ascii_lowercase(), idx);
+                let key = table_name.to_ascii_lowercase();
+                if target_is_temp || !self.temp_table_names.borrow().contains(&key) {
+                    let mut aliases = self.rowid_alias_columns.borrow_mut();
+                    if let Some(idx) = rowid_col_idx.filter(|_| !create.without_rowid) {
+                        aliases.insert(key, idx);
+                    } else {
+                        aliases.remove(&key);
+                    }
                 }
                 let mut implicit_indexes = Vec::new();
                 for (slot_index, slot) in implicit_autoindex_slots.iter().cloned().enumerate() {
@@ -73852,15 +73844,13 @@ impl Connection {
                 }
                 if is_autoincrement {
                     let table_key = tbl_name.to_ascii_lowercase();
-                    self.autoincrement_tables
-                        .borrow_mut()
-                        .insert(table_key.clone());
                     if target_is_temp {
                         // A TEMP table's sequence is connection-local; stock
                         // keeps it in the temp schema's sqlite_sequence, never
                         // the main database's.
                         self.temp_sqlite_sequence.borrow_mut().insert(table_key, 0);
                     } else {
+                        self.autoincrement_tables.borrow_mut().insert(table_key.clone());
                         self.ensure_sqlite_sequence_table_exists().await?;
                         self.sqlite_sequence_cache
                             .borrow_mut()
@@ -74329,6 +74319,9 @@ impl Connection {
                 if let Some(main_table) =
                     self.shadowed_main_tables.borrow_mut().remove(&drop_name_lc)
                 {
+                    if let Some(slot) = main_table.columns.iter().position(|col| col.is_ipk) {
+                        self.rowid_alias_columns.borrow_mut().insert(drop_name_lc.clone(), slot);
+                    }
                     self.schema.borrow_mut().push(main_table);
                 }
                 self.rebuild_schema_indices();
@@ -76078,23 +76071,16 @@ impl Connection {
                     .borrow_mut()
                     .insert(new_key.clone(), flags);
             }
-            let had_autoincrement = self.autoincrement_tables.borrow_mut().remove(&old_key);
-            if had_autoincrement {
+            if alters_temp_table {
+                let mut sequences = self.temp_sqlite_sequence.borrow_mut();
+                if let Some(sequence) = sequences.remove(&old_key) {
+                    sequences.insert(new_key, sequence);
+                }
+            } else if self.autoincrement_tables.borrow_mut().remove(&old_key) {
                 self.autoincrement_tables
                     .borrow_mut()
                     .insert(new_key.clone());
-                let temp_names = self.temp_table_names.borrow();
-                let renamed_temp = temp_names.contains(&old_key) || temp_names.contains(&new_key);
-                drop(temp_names);
-                if renamed_temp {
-                    let mut sequences = self.temp_sqlite_sequence.borrow_mut();
-                    if let Some(sequence) = sequences.remove(&old_key) {
-                        sequences.insert(new_key.clone(), sequence);
-                    }
-                } else {
-                    self.rename_sqlite_sequence_entry(&old_name, new_name)
-                        .await?;
-                }
+                self.rename_sqlite_sequence_entry(&old_name, new_name).await?;
             }
         }
 
@@ -76488,7 +76474,7 @@ impl Connection {
                 && target.matches_schema(trigger.table_schema.as_deref()) {
                 trigger.table_name.clear();
                 trigger.table_name.push_str(new_name);
-                trigger.bound_table_schema = target.schema.to_owned();
+                target.schema.clone_into(&mut trigger.bound_table_schema);
                 true
             } else {
                 false
@@ -78801,7 +78787,7 @@ impl Connection {
         new_rowid: Option<i64>,
         new_loaded: Option<&[bool]>,
     ) -> Result<TriggerFrame> {
-        let stored = self.trigger_target_table(&target.name, target.schema.as_deref())
+        let stored = self.local_dml_target_table(&target.name, target.schema.as_deref())
             .ok_or_else(|| FrankenError::NoSuchTable {
                 name: target.name.clone(),
             })?;
@@ -78933,7 +78919,7 @@ impl Connection {
         if assigned_columns.is_empty() {
             return None;
         }
-        let table = self.trigger_target_table(&target.name, target.schema.as_deref())?;
+        let table = self.local_dml_target_table(&target.name, target.schema.as_deref())?;
         if !table
             .columns
             .iter()
@@ -80858,7 +80844,7 @@ impl Connection {
             )
     }
 
-    fn trigger_target_table(&self, name: &str, schema: Option<&str>) -> Option<std::cell::Ref<'_, TableSchema>> {
+    fn local_dml_target_table(&self, name: &str, schema: Option<&str>) -> Option<std::cell::Ref<'_, TableSchema>> {
         if schema.is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
             && let Ok(main) = std::cell::Ref::filter_map(self.shadowed_main_tables.borrow(), |tables| {
                 tables.get(&name.to_ascii_lowercase())
@@ -81186,7 +81172,7 @@ impl Connection {
             if trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf {
                 (self.view_trigger_column_names(&trigger.table_name).ok()?, None, false)
             } else {
-                let table = self.trigger_target_table(&trigger.table_name, Some(&trigger.bound_table_schema))?;
+                let table = self.local_dml_target_table(&trigger.table_name, Some(&trigger.bound_table_schema))?;
                 (
                     table
                         .columns
@@ -83855,10 +83841,7 @@ impl Connection {
             {
                 continue;
             }
-            let is_autoincrement = self
-                .autoincrement_tables
-                .borrow()
-                .contains(&table.name.to_ascii_lowercase());
+            let is_autoincrement = self.temp_sqlite_sequence.borrow().contains_key(&table.name.to_ascii_lowercase());
 
             let table_sql = ddl_cache
                 .get(&table.root_page)
