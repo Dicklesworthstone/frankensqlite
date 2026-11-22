@@ -46695,7 +46695,8 @@ impl Connection {
                 // surface as `ReadOnly` rather than mutating a file the parent
                 // was never granted write access to. A writable main opens the
                 // attached database read-write as usual.
-                let attach_env = self.attach_env.clone().with_bootstrap_cx(self.op_cx()?);
+                let cx = self.op_cx()?;
+                let attach_env = self.attach_env.clone().with_bootstrap_cx(cx.clone());
                 let attached_connection = if self.pager.is_readonly() {
                     Box::new(
                         boxed_future(|| Self::open_schema_only_with_env(path.clone(), attach_env))
@@ -46758,8 +46759,14 @@ impl Connection {
                 // setting made by a schema-qualified PRAGMA main.secure_delete.
                 attached_connection.inherit_secure_delete(self);
                 // SQLite's busy handler belongs to the outer connection.
-                attached_connection.pragma_state.borrow_mut().busy_timeout_ms =
-                    self.pragma_state.borrow().busy_timeout_ms;
+                let timeout = self.pragma_state.borrow().busy_timeout_ms;
+                if attached_connection.pragma_state.borrow().busy_timeout_ms != timeout {
+                    attached_connection.pragma_state.borrow_mut().busy_timeout_ms = timeout;
+                    attached_connection
+                        .pager
+                        .set_vfs_busy_timeout_ms(&cx, timeout.max(0) as u64)
+                        .await;
+                }
                 self.attached_schemas
                     .borrow_mut()
                     .attach(attach.schema.clone(), path)?;
@@ -90095,12 +90102,6 @@ impl Connection {
             let mut state = self.pragma_state.borrow_mut();
             fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)?
         };
-        if pragma_name == "busy_timeout" && pragma.value.is_some() {
-            let timeout = self.pragma_state.borrow().busy_timeout_ms;
-            for child in self.attached_connections.borrow().values() {
-                child.pragma_state.borrow_mut().busy_timeout_ms = timeout;
-            }
-        }
         if pragma_name == "secure_delete" && pragma.value.is_some() {
             self.apply_secure_delete_policy_to_held_txns();
             if pragma.name.schema.is_none() {
@@ -90188,9 +90189,22 @@ impl Connection {
                 "busy_timeout" => {
                     // Propagate busy_timeout to the VFS file so posix_lock
                     // retries with backoff on cross-process lock contention.
-                    let ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                    let timeout = self.pragma_state.borrow().busy_timeout_ms;
+                    let ms = timeout.max(0) as u64;
                     let cx = self.op_cx()?;
+                    let attached_pagers: Vec<_> = self
+                        .attached_connections
+                        .borrow()
+                        .values()
+                        .map(|child| {
+                            child.pragma_state.borrow_mut().busy_timeout_ms = timeout;
+                            child.pager.clone()
+                        })
+                        .collect();
                     self.pager.set_vfs_busy_timeout_ms(&cx, ms).await;
+                    for pager in attached_pagers {
+                        pager.set_vfs_busy_timeout_ms(&cx, ms).await;
+                    }
                 }
                 "threads" => {
                     // bd-dwjnq.7: bind explicit non-negative `PRAGMA threads = N`
