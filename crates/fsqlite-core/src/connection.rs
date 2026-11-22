@@ -20237,9 +20237,26 @@ impl Connection {
         row_values: &[SqliteValue],
         rowid_alias_col_idx: Option<usize>,
     ) -> Result<Vec<u8>> {
-        let values = self.index_validation_key_values(
+        let mut values = self.index_validation_terms(
             table, index, spec, rowid, row_values, rowid_alias_col_idx,
         )?;
+        if table.without_rowid {
+            let pk = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
+            let suffix = if self.table_execution_metadata().wr_index_suffix_roots.contains(&table.root_page) {
+                without_rowid_index_appended_pk(table, index, &pk)
+            } else {
+                pk
+            };
+            for position in suffix {
+                values.push(row_values.get(position).cloned().ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!("WITHOUT ROWID table `{}` row is missing primary-key column at position {position}", table.name),
+                    }
+                })?);
+            }
+        } else {
+            values.push(SqliteValue::Integer(rowid));
+        }
         let value_bytes = values.iter().try_fold(0_usize, |total, value| {
             let bytes = match value {
                 SqliteValue::Text(value) => value.len(),
@@ -20264,7 +20281,7 @@ impl Connection {
         Ok(record)
     }
 
-    fn index_validation_key_values(
+    fn index_validation_terms(
         &self,
         table: &TableSchema,
         index: &IndexSchema,
@@ -20273,7 +20290,7 @@ impl Connection {
         row_values: &[SqliteValue],
         rowid_alias_col_idx: Option<usize>,
     ) -> Result<Vec<SqliteValue>> {
-        let mut values = if spec.key_expressions.is_empty() {
+        if spec.key_expressions.is_empty() {
             spec.column_positions
                 .iter()
                 .map(|position| {
@@ -20286,7 +20303,7 @@ impl Connection {
                         }
                     })
                 })
-                .collect::<Result<Vec<_>>>()?
+                .collect()
         } else {
             self.bounded_evaluate_index_expressions(
                 table,
@@ -20294,38 +20311,8 @@ impl Connection {
                 rowid,
                 row_values,
                 rowid_alias_col_idx,
-            )?
-        };
-        // Row-locator suffix. A rowid table appends its integer rowid; a
-        // WITHOUT ROWID indexes append only PK fields not already represented
-        // by an index term with the same collation, when the original DDL
-        // proves that compact schema metadata describes the PK collations.
-        if table.without_rowid {
-            let pk = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
-            let suffix = if self
-                .table_execution_metadata()
-                .wr_index_suffix_roots
-                .contains(&table.root_page)
-            {
-                without_rowid_index_appended_pk(table, index, &pk)
-            } else {
-                pk
-            };
-            for pk_position in suffix {
-                let value = row_values.get(pk_position).cloned().ok_or_else(|| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "WITHOUT ROWID table `{}` row is missing primary-key column at position {pk_position}",
-                            table.name
-                        ),
-                    }
-                })?;
-                values.push(value);
-            }
-        } else {
-            values.push(SqliteValue::Integer(rowid));
+            )
         }
-        Ok(values)
     }
 
     fn bounded_unique_terms_equal(
@@ -89099,10 +89086,39 @@ impl Connection {
         let context = self.integrity_table_eval_context(table);
         let functions = Arc::clone(&self.func_registry.borrow());
         let aggregates = Arc::clone(&self.custom_aggregate_keys.borrow());
-        let metadata = self.table_execution_metadata();
         let mut missing = Vec::new();
         for (index_order, index) in table.indexes.iter().rev().enumerate() {
             let spec = Self::bounded_index_spec(table, index)?;
+            let columns: Vec<Option<usize>> = if spec.key_expressions.is_empty() {
+                spec.column_positions.iter().copied().map(Some).collect()
+            } else {
+                spec.key_expressions.iter().map(|expr| match strip_collate_wrappers(expr) {
+                    Expr::Column(reference, _) => table.column_index(&reference.column),
+                    _ => None,
+                }).collect()
+            };
+            let mut descending: Vec<_> = (0..index.key_term_count())
+                .map(|slot| index.key_term_descending(slot)).collect();
+            let mut collations: Vec<_> = columns.iter().enumerate().map(|(slot, &column)| {
+                index.key_term_collation(slot)
+                    .or_else(|| column.and_then(|col| table.columns[col].collation.as_deref()))
+                    .map(str::to_owned)
+            }).collect();
+            // SQLite elides a primary-key field from the suffix only if the
+            // secondary index already stores that column under the same collation.
+            // A table-level PRIMARY KEY may override the declared column collation.
+            let mut suffix = Vec::new();
+            for (slot, &column) in storage_order[..primary.key_term_count()].iter().enumerate() {
+                let pk_collation = primary.key_term_collation(slot);
+                let covered = columns.iter().zip(&collations).any(|(key_col, coll)| {
+                    *key_col == Some(column) && implicit_autoindex_collations_match(coll.as_deref(), pk_collation)
+                });
+                if !covered {
+                    suffix.push(column);
+                    descending.push(primary.key_term_descending(slot));
+                    collations.push(pk_collation.map(str::to_owned));
+                }
+            }
             let root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
             let mut expected = Vec::new();
             {
@@ -89135,7 +89151,8 @@ impl Connection {
                             )? {
                                 return Ok(None);
                             }
-                            let key = self.index_validation_key_values(table, index, &spec, position, &row, None)?;
+                            let mut key = self.index_validation_terms(table, index, &spec, position, &row, None)?;
+                            key.extend(suffix.iter().map(|&col| row[col].clone()));
                             Ok(Some(serialize_record_with_encoding(&key, key_encoding)))
                         })
                     };
@@ -89154,9 +89171,7 @@ impl Connection {
             }
             let mut cursor = Self::new_header_btree_index_cursor(
                 txn, root, page_size, reserved,
-                metadata.index_desc_flags_by_root_page.get(&index.root_page).cloned().unwrap_or_default(),
-                metadata.index_collations_by_root_page.get(&index.root_page).cloned().unwrap_or_default(),
-                Arc::clone(&self.collation_registry), encoding,
+                descending, collations, Arc::clone(&self.collation_registry), encoding,
             );
             let mut index_errors = 0;
             for (position, key, raw) in expected {

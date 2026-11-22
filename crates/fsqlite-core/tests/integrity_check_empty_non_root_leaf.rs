@@ -777,6 +777,8 @@ fn bd_3koph_without_rowid_primary_key_collations_match_stock() {
                          key TEXT COLLATE NOCASE, payload TEXT, \
                          PRIMARY KEY(key COLLATE BINARY) \
                      ) WITHOUT ROWID; \
+                     CREATE INDEX binary_key_covered ON binary_pk(key COLLATE BINARY,payload); \
+                     CREATE INDEX binary_key_appended ON binary_pk(key COLLATE NOCASE,payload); \
                      CREATE TABLE composite_pk( \
                          tenant TEXT COLLATE NOCASE, revision INTEGER, payload TEXT, \
                          PRIMARY KEY(tenant DESC, revision ASC) \
