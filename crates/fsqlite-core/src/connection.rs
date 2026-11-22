@@ -329877,6 +329877,18 @@ mod pager_routing_tests {
         handle: std::thread::JoinHandle<()>,
     }
 
+    /// Run `future` on a current-thread runtime with a blocking pool. An
+    /// opted-in WAL-FEC database (bd-71vt5) needs one for its repair worker;
+    /// a default database runs the same on it.
+    #[cfg(unix)]
+    fn i0tn6_block_on<F: std::future::Future>(future: F) -> F::Output {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("i0tn6 test runtime")
+            .block_on(future)
+    }
+
     /// Clears the process-global commit-window hook when a test ends.
     #[cfg(unix)]
     struct I0tn6CommitWindowHookGuard;
@@ -329924,18 +329936,14 @@ mod pager_routing_tests {
         let a_target = Arc::clone(&target);
         let handle = std::thread::spawn(move || {
             *a_target.lock().unwrap() = Some(std::thread::current().id());
-            let mut res: Result<()> = Ok(());
-            asupersync::test_utils::run_test(|| async {
-                res = async {
-                    let conn = Connection::open(&path).await?;
-                    for sql in a_sql {
-                        conn.execute(sql).await?;
-                    }
-                    conn.execute("COMMIT;").await?;
-                    conn.close_without_checkpoint().await?;
-                    Ok(())
+            let res: Result<()> = i0tn6_block_on(async {
+                let conn = Connection::open(&path).await?;
+                for sql in a_sql {
+                    conn.execute(sql).await?;
                 }
-                .await;
+                conn.execute("COMMIT;").await?;
+                conn.close_without_checkpoint().await?;
+                Ok(())
             });
             let _ = done_tx.send(res);
         });
@@ -329949,40 +329957,72 @@ mod pager_routing_tests {
         }
     }
 
-    /// Run `sql` on a fresh connection on its own thread.
+    /// Run `sql` on a fresh connection on its own thread. The receiver gets
+    /// the statements' outcome as soon as the last one returns, before the
+    /// connection closes; the thread's result is the close. The counter is the
+    /// number of steps finished so far: the open, then one per statement.
+    ///
+    /// bd-c2mbm: the close is kept out of the receiver's result because, on a
+    /// loaded host and an opted-in WAL-FEC database, `close_without_checkpoint`
+    /// can spend 60 s in two 30 s WAL-FEC pipeline flushes while another
+    /// connection's commit is unpublished (bd-b1gy3). That is the close's
+    /// latency, not the statements'.
     #[cfg(unix)]
     fn run_peer_statements(
         db_path: &str,
         sql: &'static [&'static str],
     ) -> (
         std::sync::mpsc::Receiver<Result<()>>,
-        std::thread::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<Result<()>>,
     ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let path = db_path.to_owned();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<()>>();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let steps = Arc::clone(&progress);
         let handle = std::thread::spawn(move || {
-            let mut res: Result<()> = Ok(());
-            asupersync::test_utils::run_test(|| async {
-                res = async {
-                    let conn = Connection::open(&path).await?;
-                    for statement in sql {
-                        conn.execute(statement).await?;
+            i0tn6_block_on(async {
+                let conn = match Connection::open(&path).await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        let _ = done_tx.send(Err(error));
+                        return Ok(());
                     }
-                    conn.close_without_checkpoint().await?;
-                    Ok(())
+                };
+                steps.fetch_add(1, Ordering::SeqCst);
+                let mut ran: Result<()> = Ok(());
+                for statement in sql {
+                    if let Err(error) = conn.execute(statement).await {
+                        ran = Err(error);
+                        break;
+                    }
+                    steps.fetch_add(1, Ordering::SeqCst);
                 }
-                .await;
-            });
-            let _ = done_tx.send(res);
+                let _ = done_tx.send(ran);
+                conn.close_without_checkpoint().await
+            })
         });
-        (done_rx, handle)
+        (done_rx, progress, handle)
     }
 
-    /// Two tables with one row each; returns the database path.
+    /// Two tables with one row each; returns the database path. A nonzero
+    /// `repair_symbols` opts the database into WAL-FEC repair-symbol
+    /// generation first (`PRAGMA raptorq_repair_symbols`, bd-71vt5).
     #[cfg(unix)]
-    async fn i0tn6_two_table_db(dir: &tempfile::TempDir, name: &str) -> String {
+    async fn i0tn6_two_table_db(
+        dir: &tempfile::TempDir,
+        name: &str,
+        repair_symbols: u8,
+    ) -> String {
         let db = dir.path().join(name).to_string_lossy().into_owned();
         let setup = Connection::open(&db).await.unwrap();
+        if repair_symbols > 0 {
+            setup
+                .execute(&format!("PRAGMA raptorq_repair_symbols = {repair_symbols};"))
+                .await
+                .unwrap();
+        }
         for sql in [
             "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);",
             "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);",
@@ -330019,50 +330059,97 @@ mod pager_routing_tests {
 
     /// bd-i0tn6 S3: the registry guard no longer covers a concurrent commit's
     /// physical write. While A's durable commit waits to publish, a peer
-    /// writing a disjoint table validates, writes and publishes. On a build
-    /// whose guard spans validate -> write -> publish, B cannot finish until
-    /// A is released and this test fails at the in-window assertion.
+    /// writing a disjoint table validates, writes and publishes.
+    ///
+    /// bd-c2mbm: A is released only once B's statements have reported, or
+    /// once a safety deadline of minutes has passed, and the test requires
+    /// B's COMMIT result to have arrived before that release. A build that
+    /// serializes B behind A (a guard spanning validate -> write -> publish,
+    /// or B waiting for A's publication) can finish B's COMMIT only after the
+    /// release, so it fails, at the deadline. The window ends at B's COMMIT,
+    /// not at B's close: the earlier 20 s window also timed B's close, which
+    /// on a loaded host and an opted-in WAL-FEC database can take 60 s (two
+    /// 30 s WAL-FEC flushes, bd-b1gy3) while A is unpublished, although B had
+    /// committed in milliseconds. B's close must still succeed, after the
+    /// release. Runs on a default database (`repair_symbols` 0) and on one
+    /// opted into WAL-FEC repair symbols.
     #[cfg(unix)]
-    #[test]
-    fn i0tn6_disjoint_peer_commits_while_a_durable_commit_is_unpublished() {
-        use std::time::Duration;
-        asupersync::test_utils::run_test(|| async {
+    fn i0tn6_disjoint_peer_case(repair_symbols: u8) {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        /// Only a B that cannot finish while A is parked comes near this; an
+        /// unloaded disjoint commit takes well under a second.
+        const B_SAFETY_DEADLINE: Duration = Duration::from_secs(180);
+        i0tn6_block_on(async {
             let _serial = super::fsqlite_core_test_serializer();
             let dir = tempfile::tempdir().unwrap();
-            let db = i0tn6_two_table_db(&dir, "i0tn6_disjoint.db").await;
+            let db = i0tn6_two_table_db(&dir, "i0tn6_disjoint.db", repair_symbols).await;
             let hook_guard = I0tn6CommitWindowHookGuard;
             let parked = park_commit_before_publication(
                 &db,
                 &["BEGIN;", "UPDATE a SET v = v + 1 WHERE id = 1;"],
             );
-            let (b_done, b_handle) = run_peer_statements(
+            let b_started = Instant::now();
+            let (b_done, b_progress, b_handle) = run_peer_statements(
                 &db,
                 &["BEGIN;", "UPDATE b SET v = v + 1 WHERE id = 1;", "COMMIT;"],
             );
-            let b_in_window = b_done.recv_timeout(Duration::from_secs(20)).ok();
+            // A stays parked, durable and unpublished, until this returns:
+            // B's COMMIT result is received before A's release is sent.
+            let b_in_window = b_done.recv_timeout(B_SAFETY_DEADLINE).ok();
+            let b_elapsed = b_started.elapsed();
+            let b_steps = b_progress.load(Ordering::SeqCst);
             parked.release.send(()).unwrap();
+            eprintln!(
+                "bd-c2mbm i0tn6 disjoint peer: repair_symbols={repair_symbols} \
+                 resolved_before_release={} elapsed={b_elapsed:?} steps={b_steps}/4",
+                b_in_window.is_some()
+            );
             let a_res = parked
                 .done
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(B_SAFETY_DEADLINE)
                 .expect("A should finish after release");
             parked.handle.join().expect("A thread");
-            let b_res = match b_in_window {
-                Some(res) => res,
-                None => {
-                    let late = b_done.recv_timeout(Duration::from_secs(30));
-                    b_handle.join().expect("B thread");
-                    panic!(
-                        "a disjoint peer must commit while A's durable commit waits to publish; \
-                         B only resolved after A was released ({late:?})"
-                    );
-                }
+            let Some(b_res) = b_in_window else {
+                let late = b_done.recv_timeout(B_SAFETY_DEADLINE);
+                let closed = b_handle.join().expect("B thread");
+                panic!(
+                    "a disjoint peer must commit while A's durable commit waits to publish; \
+                     B had finished {b_steps} of its 4 steps (open, BEGIN, UPDATE, COMMIT) when \
+                     the {B_SAFETY_DEADLINE:?} deadline released A, and resolved only after the \
+                     release ({late:?}; close {closed:?})"
+                );
             };
-            b_handle.join().expect("B thread");
+            let b_closed = b_handle.join().expect("B thread");
             drop(hook_guard);
             a_res.expect("A's commit must succeed");
             b_res.expect("B's disjoint commit must succeed inside A's window");
+            b_closed.expect("B's close must succeed");
             i0tn6_assert_final_state(&db, 1, 1).await;
+            if repair_symbols > 0 {
+                // The opted-in configuration really is opted in.
+                let sidecar = fsqlite_wal::wal_fec_path_for_wal(&wal_path_for_db_path(&db));
+                assert_eq!(
+                    fsqlite_wal::read_wal_fec_raptorq_repair_symbols(&sidecar).unwrap(),
+                    repair_symbols,
+                    "the database must stay opted into WAL-FEC"
+                );
+            }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn i0tn6_disjoint_peer_commits_while_a_durable_commit_is_unpublished() {
+        i0tn6_disjoint_peer_case(0);
+    }
+
+    /// bd-c2mbm: the same on a database opted into WAL-FEC repair symbols,
+    /// where B's close is what used to cross the old 20 s window.
+    #[cfg(all(unix, feature = "native"))]
+    #[test]
+    fn i0tn6_disjoint_peer_commits_while_a_durable_commit_is_unpublished_with_wal_fec() {
+        i0tn6_disjoint_peer_case(2);
     }
 
     /// bd-i0tn6 S3: a peer that read a page A wrote could form an SSI edge
@@ -330077,13 +330164,13 @@ mod pager_routing_tests {
         asupersync::test_utils::run_test(|| async {
             let _serial = super::fsqlite_core_test_serializer();
             let dir = tempfile::tempdir().unwrap();
-            let db = i0tn6_two_table_db(&dir, "i0tn6_reader_waits.db").await;
+            let db = i0tn6_two_table_db(&dir, "i0tn6_reader_waits.db", 0).await;
             let hook_guard = I0tn6CommitWindowHookGuard;
             let parked = park_commit_before_publication(
                 &db,
                 &["BEGIN;", "UPDATE a SET v = v + 1 WHERE id = 1;"],
             );
-            let (b_done, b_handle) = run_peer_statements(
+            let (b_done, _b_progress, b_handle) = run_peer_statements(
                 &db,
                 &[
                     "BEGIN;",
@@ -330107,7 +330194,7 @@ mod pager_routing_tests {
                         .expect("B should resolve once A publishes"),
                 ),
             };
-            b_handle.join().expect("B thread");
+            let b_closed = b_handle.join().expect("B thread");
             drop(hook_guard);
             a_res.expect("A's commit must succeed");
             assert!(
@@ -330118,6 +330205,7 @@ mod pager_routing_tests {
             b_res
                 .expect("B result")
                 .expect("once A has published, B validates against it and commits");
+            b_closed.expect("B's close must succeed");
             i0tn6_assert_final_state(&db, 1, 1).await;
         });
     }
@@ -330132,13 +330220,13 @@ mod pager_routing_tests {
         asupersync::test_utils::run_test(|| async {
             let _serial = super::fsqlite_core_test_serializer();
             let dir = tempfile::tempdir().unwrap();
-            let db = i0tn6_two_table_db(&dir, "i0tn6_schema_waits.db").await;
+            let db = i0tn6_two_table_db(&dir, "i0tn6_schema_waits.db", 0).await;
             let hook_guard = I0tn6CommitWindowHookGuard;
             let parked = park_commit_before_publication(
                 &db,
                 &["BEGIN;", "UPDATE a SET v = v + 1 WHERE id = 1;"],
             );
-            let (b_done, b_handle) =
+            let (b_done, _b_progress, b_handle) =
                 run_peer_statements(&db, &["CREATE INDEX b_v ON b(v);"]);
             let b_in_window = b_done.recv_timeout(Duration::from_secs(3)).ok();
             parked.release.send(()).unwrap();
@@ -330155,7 +330243,7 @@ mod pager_routing_tests {
                         .expect("the DDL should resolve once A publishes"),
                 ),
             };
-            b_handle.join().expect("B thread");
+            let b_closed = b_handle.join().expect("B thread");
             drop(hook_guard);
             a_res.expect("A's commit must succeed");
             assert!(
@@ -330165,6 +330253,7 @@ mod pager_routing_tests {
             b_res
                 .expect("B result")
                 .expect("the DDL commits after A publishes");
+            b_closed.expect("B's close must succeed");
             i0tn6_assert_final_state(&db, 1, 0).await;
         });
     }
