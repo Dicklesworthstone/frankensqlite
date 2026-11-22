@@ -612,3 +612,140 @@ fn indexed_group_by_work_tracks_matches_instead_of_table_size() {
         f.close().await.unwrap();
     });
 }
+
+/// bd-w4pr1.12 lever GR: with no index input a table is scanned in rowid
+/// order, so a GROUP BY on its rowid alone (the INTEGER PRIMARY KEY or
+/// `rowid`) streams one group per row, in ascending key order, with no
+/// sorter, as stock's scan does. Every statement is one the VDBE's GROUP BY
+/// codegen takes (a HAVING only on finalized outputs, no COLLATE key, no
+/// min()/max() beside bare columns, no bare column outside the GROUP BY: the
+/// others go to the in-memory evaluator or are refused, and strict mode
+/// refuses the evaluator). Planted
+/// negatives keep the sorter: rows an index on another column delivers (a
+/// range, an IN list), a key that is not the rowid, a second key, and a
+/// min()/max() that tracks the keys' spellings.
+/// Every ordered result equals stock's, so a stream over rows that do not
+/// arrive in key order would show up as a reordered answer. Every statement
+/// runs before the test fails, and the failure lists each one that broke.
+#[test]
+fn grouping_on_the_rowid_alias_streams_in_rowid_order_without_a_sorter() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grouped-rowid.db");
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        // Ids are inserted out of order with gaps; `a` repeats and holds
+        // NULLs, `b` holds NULLs, `c` is a real.
+        let rows = (1..=300_i64)
+            .map(|i| {
+                let id = (i * 7919) % 1009 + 1;
+                let a = if i % 11 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    (i % 6).to_string()
+                };
+                let b = if i % 7 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    format!("'b{}'", i % 23)
+                };
+                format!("({id},{a},{b},{i}.25)")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        stock
+            .execute_batch(&format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY,a INTEGER,b TEXT,c REAL);\
+                 CREATE INDEX t_a ON t(a);\
+                 INSERT INTO t VALUES {rows};\
+                 CREATE TABLE e(id INTEGER PRIMARY KEY,a INTEGER);"
+            ))
+            .unwrap();
+        let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+        f.set_reject_mem_fallback(true);
+        f.set_strict_mem_fallback_rejection(true);
+        let mut failures: Vec<String> = Vec::new();
+        // (statement, whether it streams with no sorter)
+        for (sql, streams) in [
+            ("SELECT id, count(*), sum(a), total(c) FROM t GROUP BY id", true),
+            ("SELECT rowid, count(*), total(c) FROM t GROUP BY rowid", true),
+            // The key after an aggregate in the result row.
+            ("SELECT count(*), id, avg(a) FROM t GROUP BY id", true),
+            // A min() or max() tracks the keys' spellings, which keeps the sorter.
+            ("SELECT count(*), max(b) FROM t GROUP BY id", false),
+            (
+                "SELECT id, count(*) FROM t WHERE b IS NOT NULL GROUP BY id \
+                 ORDER BY id LIMIT 7 OFFSET 3",
+                true,
+            ),
+            ("SELECT t.id, group_concat(b) FROM t WHERE c > 100 GROUP BY t.id", true),
+            // A HAVING on finalized outputs skips some streamed groups and
+            // keeps the others.
+            (
+                "SELECT id, count(*), sum(a) FROM t GROUP BY id \
+                 HAVING id > 500 AND sum(a) >= 2",
+                true,
+            ),
+            ("SELECT id, sum(a) FROM t GROUP BY id HAVING sum(a) IS NOT NULL", true),
+            ("SELECT id, count(*) FROM e GROUP BY id", true),
+            ("SELECT id, count(*), sum(c) FROM t WHERE a > 2 GROUP BY id", false),
+            ("SELECT id, count(*) FROM t WHERE a IN (5, 1, 3) GROUP BY id", false),
+            ("SELECT a, count(*), sum(c) FROM t GROUP BY a", false),
+            ("SELECT id, b, count(*) FROM t GROUP BY id, b", false),
+        ] {
+            let expected = rq(&stock, sql);
+            if expected.is_empty() && !sql.contains("FROM e") {
+                failures.push(format!("{sql}: the fixture gives no rows"));
+                continue;
+            }
+            let prepared = match f.prepare(sql).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    failures.push(format!("{sql}: prepare: {error}"));
+                    continue;
+                }
+            };
+            set_vdbe_metrics_enabled(true);
+            reset_vdbe_metrics();
+            let result = prepared.query().await;
+            let metrics = vdbe_metrics_snapshot();
+            set_vdbe_metrics_enabled(false);
+            let actual: Vec<Vec<String>> = match result {
+                Ok(rows) => rows
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect(),
+                Err(error) => {
+                    failures.push(format!("{sql}: query: {error}"));
+                    continue;
+                }
+            };
+            if actual != expected {
+                failures.push(format!("{sql}: answered {actual:?}, stock {expected:?}"));
+            }
+            if metrics.opcodes_executed_total == 0 {
+                failures.push(format!("{sql}: execution counters were inactive"));
+                continue;
+            }
+            let sorter_inserts: u64 = metrics
+                .opcode_execution_totals
+                .iter()
+                .filter(|entry| entry.opcode == "SorterInsert")
+                .map(|entry| entry.total)
+                .sum();
+            if streams && sorter_inserts != 0 {
+                failures.push(format!("{sql}: must stream, {sorter_inserts} SorterInsert"));
+            }
+            if !streams && sorter_inserts == 0 {
+                failures.push(format!("{sql}: must keep its sorter, 0 SorterInsert"));
+            }
+        }
+        f.close().await.unwrap();
+        assert!(
+            failures.is_empty(),
+            "{} statement(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}

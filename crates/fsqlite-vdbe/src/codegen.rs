@@ -26971,6 +26971,28 @@ fn codegen_select_group_by_aggregate(
         })
         .or_else(|| index_walk_input.filter(|_| where_clause.is_none()))
         .filter(|index| covers_grouping(index));
+    // bd-w4pr1.12 (lever GR): with no index input the table is scanned in
+    // rowid order, so a GROUP BY on the rowid alone (the INTEGER PRIMARY KEY,
+    // or `rowid` itself, which `resolve_column_ref` resolves to the rowid) gets
+    // one row per group, in ascending key order: the order the sorter would
+    // give, and stock's, which scans the table for it with no sorter. A
+    // grouping that tracks its keys' spellings for a min() or max() keeps the
+    // sorter.
+    let key_is_rowid = |key: &GroupByKey| match key {
+        GroupByKey::Column(column) => table.columns[*column].is_ipk,
+        GroupByKey::Expression(expr) => matches!(
+            resolve_column_ref(expr, table, table_alias),
+            Some(SortKeySource::Rowid)
+        ),
+    };
+    let groups_in_rowid_order = index_eq_seek.is_none()
+        && index_in_seek.is_none()
+        && index_range_input.is_none()
+        && index_walk_input.is_none()
+        && covering_index.is_none()
+        && !table.without_rowid
+        && !key_spelling_tracked
+        && matches!(group_by_keys.as_slice(), [key] if key_is_rowid(key));
     // Rows that arrive grouped skip the sorter: each one goes straight to the
     // group accumulation below, and a LIMIT ends the walk after its last
     // group. IN probes run once per distinct value in ascending order, each
@@ -26982,7 +27004,8 @@ fn codegen_select_group_by_aggregate(
             .as_ref()
             .is_some_and(|target| groups_in_index_order(target.index, 0))
         || index_range_input.is_some_and(|(index, _)| groups_in_index_order(index, 0))
-        || index_walk_input.is_some();
+        || index_walk_input.is_some()
+        || groups_in_rowid_order;
     if !streams_groups {
         // Open sorter: p2 = number of key columns (for sorting by group keys).
         let sort_order: String = std::iter::repeat_n('+', num_group_keys).collect();
@@ -27065,16 +27088,18 @@ fn codegen_select_group_by_aggregate(
         )
     };
     let streamed_group_state = streams_groups.then(|| alloc_group_state(b, true));
-    // Streaming runs the group accumulation once per row. Its rows come from
-    // an index driver that calls the row body as a subroutine, so the body
-    // jumps into the accumulation and the accumulation returns to the driver
-    // through the body's own return register: one call per row, not two.
+    // Streaming runs the group accumulation once per row: the row body jumps
+    // into it. Rows from an index driver, which calls the row body as a
+    // subroutine, return to the driver through the body's own return
+    // register: one call per row, not two. Rows of the table scan (lever GR)
+    // step the scan from the accumulation itself, so a row costs no call.
     let group_row = b.emit_label();
-    let group_row_return =
-        streams_groups.then(|| input_return.unwrap_or_else(|| b.alloc_reg()));
+    let group_row_return = if streams_groups { input_return } else { None };
 
     // === Pass 1: Feed qualifying rows into the sorter, or to the groups ===
     let scan_start = b.current_addr();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let scan_body = (scan_start + 1) as i32;
     let scan_done = b.emit_label();
     if indexed_input {
         b.emit_jump_to_label(Opcode::Goto, 0, 0, input_driver, P4::None, 0);
@@ -27225,13 +27250,9 @@ fn codegen_select_group_by_aggregate(
         }
     }
 
-    if let Some(return_reg) = group_row_return {
+    if streams_groups {
         // The row's values in `sorter_base` go straight to its group.
-        if input_return == Some(return_reg) {
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, group_row, P4::None, 0);
-        } else {
-            b.emit_jump_to_label(Opcode::Gosub, return_reg, 0, group_row, P4::None, 0);
-        }
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, group_row, P4::None, 0);
     } else {
         // MakeRecord + SorterInsert.
         let record_reg = b.alloc_reg();
@@ -27351,14 +27372,16 @@ fn codegen_select_group_by_aggregate(
         b.set_next_anon_placeholder(after_body_placeholder);
     } else {
         b.resolve_label(input_driver);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let scan_body = (scan_start + 1) as i32;
         b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
     }
 
-    // End of pass 1.
+    // End of pass 1. A streamed table scan steps its cursor from the group
+    // accumulation below, so the cursor stays open to Halt: a `Close` here
+    // would put that `Next` after the cursor's close in program order, which
+    // hands the statement to the in-memory evaluator (lever GR v2 measured
+    // that: +3,642M instructions on GROUP BY id).
     b.resolve_label(scan_done);
-    if covering_index.is_none() {
+    if covering_index.is_none() && (indexed_input || !streams_groups) {
         b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     }
 
@@ -27669,8 +27692,12 @@ fn codegen_select_group_by_aggregate(
     }
 
     if let Some(return_reg) = group_row_return {
-        // Back to pass 1 for the next row.
+        // Back to the index driver for the next row.
         b.emit_op(Opcode::Return, return_reg, 0, 0, P4::None, 0);
+    } else if streams_groups {
+        // The next row of the table scan. Past its last row this falls
+        // through to the final group, as the scan's own end does.
+        b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
     } else if let Some(sort_loop_body) = sort_loop_body {
         // SorterNext: advance to next sorted row.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
