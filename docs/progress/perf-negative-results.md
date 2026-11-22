@@ -94,6 +94,84 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - WIN (landed as 31ac790f3; beyond its prediction, inside every kill line): a GROUP BY on the rowid alone streams the table scan's groups in rowid order with no sorter; gb_id -6,593.1M Ir on 488ae3f6a (bd-w4pr1.12, serial read lane round 13, lever GR v3; v1 never fired, v2 rejected)
+
+- Target: gb_id's inner `SELECT id g, count(*) n FROM t GROUP BY id` (1M rows, 1M groups). Its program inserted every
+  row into a sorter, sorted it and read it back, although the table scan already delivers the rows in rowid order.
+  Stock 3.54.1 walks the rowid order with no sorter.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs`, codegen_select_group_by_aggregate only. With no index input (no
+  equality, IN, range or walk, no covering index), a rowid table, no tracked key spellings for min() / max(), and one
+  key that resolves to the rowid (the INTEGER PRIMARY KEY, `rowid`, a table-qualified spelling), the grouping
+  streams: the scan's row body jumps into the group accumulation, which steps the table cursor itself and falls
+  through to the final group past the last row. The streamed scan's cursor stays open to Halt. Keeper
+  `grouping_on_the_rowid_alias_streams_in_rowid_order_without_a_sorter` in
+  `crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs` (file-backed, strict mem-fallback rejection, rusqlite
+  oracle on ordered results, the VDBE's SorterInsert count; every statement runs and the failure lists each broken
+  one; two HAVINGs on finalized outputs among the streaming statements).
+- Prediction (made on d52d8908b): gb_id -500 to -650M Ir; the a-keyed and expression-keyed GROUP BY rows within
+  +-0.05%; every other row within +-0.1%; gb_id cpu a replicated WIN at 0.80 to 0.90. Kill: gb_id under 350M; any
+  other row beyond +-0.5% Ir; any replicated cycles or cpu LOSE; answers unequal to stock; the keeper red on the lever,
+  green on main's codegen or green on mutant m1 (streams under a range or IN input too).
+- v1 (never fired): the condition matched GroupByKey::Column with is_ipk, but parse_group_by_output keys a GROUP BY
+  on the INTEGER PRIMARY KEY as GroupByKey::Expression. Fixed by resolving the key through resolve_column_ref.
+- v2 (REJECTED on kill line 1, gb_id +3,642.5M Ir, +84.7%): the scan stream's `Next cursor` in the accumulation
+  came after pass 1's `Close cursor` in program order. A cursor op after its close makes the program need the
+  MemDatabase, so the statement went to the connection's in-memory GROUP BY evaluator (SqliteValue::cmp +2,409 Ir a
+  row, BTreeMap insert +1,231). Retry condition met by v3: the streamed scan keeps its cursor open.
+- First v3 measurement, WITHDRAWN as landing evidence: arms on d52d8908b, inside the GROUP BY spill-bug window
+  (after e0e82ede7, before 269f4b0ac; rules_common MEASUREMENT HAZARD). Every arm answered every row as stock did
+  there (the parent ran its full 4,299.96M), and GR measured -1,150.2M Ir with gb_id cpu 0.787 / 0.717 WIN, but the
+  rule forbids measuring on that window, so it was re-measured.
+- Result (v3 on origin/main 488ae3f6a; tree 488ae3f6a + GR's codegen hunks, one layout job on vmi1227854, -j 2, K=6;
+  parent fsqlite-cargo 8eb631b53ba4b25a, lever 1caf8d77745f203f; stock sqlite3 3.54.1 live; thinkstation1, governor
+  powersave, load 4-8):
+  - Instructions (callgrind, single ELF, fresh copies of one database; answers equal stock): gb_id 9,725.47M ->
+    3,132.35M (-6,593.1M, -67.8%). gb_id_mod100k -3.6K, group_by_1000_groups +29K. The prediction is missed, far
+    beyond its range: on this main the sorter GR removes spills (see the finding below), so its cost is the spilled
+    sort and merge, not d52d8908b's in-memory sort.
+  - vs stock 3.54.1: gb_id Ir x7.34 -> x2.36; cpu x6.29 -> x2.89 and x6.35 -> x2.83; cycles x5.63 -> x2.25 and
+    x5.54 -> x2.23.
+  - Time (layout-averaged, runs 2 and 3 valid at max null |z| 2.01 / 2.13; run 1 void at 3.27 with gb_id a cpu and
+    cycles WIN): gb_id cpu 0.459 / 0.446 and cycles 0.400 / 0.402 WIN; no replicated LOSE. Single-run LOSEs, not
+    repeated: run 2 rowid_lookups_200k cycles 1.019 and update_10pct_300k cycles 1.026 (run 3: 0.988 WIN, 0.998 TIE),
+    both at Ir 1.0000. Every other row's Ir within 0.06%.
+- Unit (488ae3f6a + diff 072d76a76ef2eed6): the keeper's target 5 passed on the lever; on main's codegen the keeper
+  fails on its 7 streaming statements over t (one SorterInsert a row), answers equal stock; on m1 it fails 3 ways
+  (range and IN statements answer in index order, the range one with no sorter).
+- Gate (rch; 488ae3f6a + diff 072d76a76ef2eed6): clippy -D warnings vdbe + core all targets clean; vdbe + core libs
+  with golden_bytecode_snapshots, hot_arm_stream_reachability and issue_531_grouped_index_input 5,489 passed; 22 core
+  aggregate targets 55 passed; 18 window targets 68 passed; 15 plan / EXPLAIN-pinning targets 109 passed; 25 e2e
+  oracles 149 passed; 27 extra core / e2e targets that group on a rowid-like key 2,080 passed, 1 failed; the fsqlite
+  crate's 123 targets in 7 batches 1,104 passed, 0 failed. The one failure,
+  bd_4t938_table_function_forward_reference (`SELECT j.value, t.id FROM json_each(t.tags) AS j LEFT JOIN t`: frank
+  Ok([]), stock 3.54.1 an error), fails identically on main's codegen. After PR1 (d95fb43fb, cursor.rs) landed, on
+  71ee5c412 + GR (diff e6b078c9d5cbc3c4): clippy clean, libs + goldens 5,491 passed, aggregate 55 and plan 109 passed.
+  Landed rebased onto 82d391472 (core-only commits in between). rustfmt: ignored crates (vdbe, core). ubs on the test
+  file: exit 0 (87 warnings against 80 on main's file: the keeper's unwrap() / assert! setup).
+- Keeper defect found on the way: a bare-column statement (`SELECT id, b, count(*) FROM t GROUP BY id`) added to the
+  keeper without a unit run is refused by parse_group_by_output on every codegen ("result column not in GROUP BY
+  clause"), which strict mode surfaces; replaced by `SELECT count(*), id, avg(a) FROM t GROUP BY id`.
+- Measurement trap found on the way (judge harness, not changed): the A/A group Q reuses P's ELF files, so each P
+  ELF serves two arms and each L ELF one. On a host that evicts page cache mid-run, the L files lose residency first
+  (fincore 80 s after a run: P ELFs 3,104..6,852 resident pages of 33,986, L.s2 29), and L alone pays extra faults
+  and kernel time that the Q null cannot see. In the write rows (the only ones that record faults) of this lever's
+  d52d8908b judgements and lever DS's, every cpu-only LOSE at TIE cycles had an L-only fault excess in the same row
+  (+30..+300 per-seed median faults in most seeds), and every row whose L faults equalled P's was a TIE. An excess
+  does not always cross the threshold (bulk_insert_1M_one_txn in GR run 4: +193..+280 faults, cpu 1.013 TIE).
+  Worth retrying DS's update_10pct_300k verdict once the A/A group has its own file copies or the ELFs are
+  pre-faulted.
+- Finding on main, not this lever (retry condition for a new lever): between d52d8908b and 488ae3f6a the parent's
+  gb_id went 4,299.96M -> 9,725.47M and gb_id_mod100k 2,646.33M -> 9,283.20M (x1.08 -> x3.78 vs stock). On
+  gb_id_mod100k: compare_sorter_rows +2,460.9M, SorterCursor::sort +2,363.6M, SqliteValue::cmp +1,513.9M, the spill
+  reader / run iterator / spill_to_disk about +300M, while sort_rows_by_single_integer_key's (i64, u32) quicksort fell
+  from about 330M to 44M: a spilled sorter sorts and merges with the generic record comparator, not the
+  single-integer-key path. GR removes this cost only for rowid groupings.
+- Retry / extend condition: a GROUP BY whose key is not the rowid but arrives in key order from the scan (none today
+  without an index) could stream the same way; the spilled-sorter finding above is the next lever for every other
+  large GROUP BY whose sorter spills (gb_id_mod100k x3.78 vs stock). GR needs revisiting if
+  codegen_select_group_by_aggregate ever scans in reverse (it always opens with Rewind; reverse_unordered_selects
+  reaches only plain SELECT scans).
+
 ## 2026-11-22 - FEC OFF BY DEFAULT (owner decision, landed as 7d15bd341; a cost removed from the default commit, not a win against stock): WAL-FEC repair-symbol generation is opt-in on every API (bd-71vt5, bd-yt7te)
 
 - Decision: bd-71vt5 (2026-11-17), kept on 2026-11-21 after bd-1hi.11 made a writable open repair damaged WAL frames
