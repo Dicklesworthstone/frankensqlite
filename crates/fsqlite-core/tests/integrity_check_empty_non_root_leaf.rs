@@ -759,6 +759,45 @@ fn bd_3koph_healthy_multilevel_collated_trees_match_stock() {
 }
 
 #[test]
+fn without_rowid_partial_blob_cast_uses_database_encoding() {
+    let dir = tempfile::tempdir().unwrap();
+    for (encoding, mixed) in [
+        ("UTF-8", "4D69586544"),
+        ("UTF-16le", "4D006900580065004400"),
+        ("UTF-16be", "004D0069005800650044"),
+    ] {
+        let path = dir.path().join(format!("partial-cast-{encoding}.db"));
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        stock.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}';
+             CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID;
+             CREATE INDEX utf8 ON t(v) WHERE CAST(v AS BLOB)=X'4D69586544';
+             CREATE INDEX changed ON t(v) WHERE k=2;
+             INSERT INTO t VALUES(1,'MiXeD'),(2,'other');"
+        )).unwrap();
+        for damaged in [false, true] {
+            if damaged {
+                stock.execute_batch(&format!(
+                    "PRAGMA writable_schema=ON;
+                     UPDATE sqlite_schema SET sql='CREATE INDEX changed ON t(v) WHERE CAST(v AS BLOB)=X''{mixed}''' WHERE name='changed';
+                     PRAGMA writable_schema=RESET;"
+                )).unwrap();
+            }
+            let full = stock_connection_reports(&stock, "PRAGMA integrity_check(t)");
+            assert_eq!(full, [if damaged { "row 1 missing from index changed" } else { "ok" }]);
+            asupersync::test_utils::run_test(|| async {
+                let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+                for prepared in [false, true] {
+                    assert_eq!(native_reports(&conn, "PRAGMA integrity_check(t)", prepared).await, full);
+                    assert_eq!(native_reports(&conn, "PRAGMA quick_check(t)", prepared).await, ["ok"]);
+                }
+                conn.close().await.unwrap();
+            });
+        }
+    }
+}
+
+#[test]
 fn bd_3koph_without_rowid_primary_key_collations_match_stock() {
     let dir = tempfile::tempdir().unwrap();
     for count in [0, 8, 240] {

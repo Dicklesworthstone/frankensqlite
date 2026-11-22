@@ -89143,7 +89143,7 @@ impl Connection {
                             row[column] = value;
                         }
                         with_sync_function_registry(Arc::clone(&functions), Arc::clone(&aggregates), || {
-                            let _index_guard = IndexExpressionEvaluationGuard::push();
+                            let _index_guard = IndexExpressionEvaluationGuard::push(key_encoding);
                             let _collation_guard = JoinEvalCollationContextGuard::push_shared(Arc::clone(&context));
                             Self::fill_generated_columns(table, position, None, &mut row, false)?;
                             if test_predicate && !Self::row_matches_partial_index_for_integrity(
@@ -89742,7 +89742,7 @@ impl Connection {
                                     Arc::clone(custom_aggregate_keys),
                                     || {
                                         let _index_expression_guard =
-                                            IndexExpressionEvaluationGuard::push();
+                                            IndexExpressionEvaluationGuard::push(self.db_text_encoding.get());
                                         let _collation_guard = integrity_eval_collation_context
                                             .as_ref()
                                             .map(|context| {
@@ -89767,7 +89767,7 @@ impl Connection {
                                     Arc::clone(custom_aggregate_keys),
                                     || -> Result<IntegrityExpectedKey> {
                                         let _index_expression_guard =
-                                            IndexExpressionEvaluationGuard::push();
+                                            IndexExpressionEvaluationGuard::push(TextEncoding::Utf8);
                                         let _collation_guard = integrity_eval_collation_context
                                             .as_ref()
                                             .map(|context| {
@@ -172524,25 +172524,20 @@ fn current_join_eval_collation_registry_snapshot() -> CollationRegistry {
 thread_local! {
     static CURRENT_SYNC_FUNCTION_CONTEXT: RefCell<Vec<SyncFunctionContext>> =
         const { RefCell::new(Vec::new()) };
-    static INDEX_EXPRESSION_EVALUATION_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static INDEX_EXPRESSION_ENCODING: Cell<Option<TextEncoding>> = const { Cell::new(None) };
 }
 
-struct IndexExpressionEvaluationGuard;
+struct IndexExpressionEvaluationGuard(Option<TextEncoding>);
 
 impl IndexExpressionEvaluationGuard {
-    fn push() -> Self {
-        INDEX_EXPRESSION_EVALUATION_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_add(1));
-        });
-        Self
+    fn push(encoding: TextEncoding) -> Self {
+        Self(INDEX_EXPRESSION_ENCODING.replace(Some(encoding)))
     }
 }
 
 impl Drop for IndexExpressionEvaluationGuard {
     fn drop(&mut self) {
-        INDEX_EXPRESSION_EVALUATION_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_sub(1));
-        });
+        INDEX_EXPRESSION_ENCODING.set(self.0);
     }
 }
 
@@ -172672,7 +172667,7 @@ fn validate_scalar_for_sync_evaluation(
     schema_safety: fsqlite_func::ScalarSchemaSafety,
     args: &[SqliteValue],
 ) -> Result<()> {
-    let evaluating_index = INDEX_EXPRESSION_EVALUATION_DEPTH.with(|depth| depth.get() > 0);
+    let evaluating_index = INDEX_EXPRESSION_ENCODING.get().is_some();
     let invocation_is_schema_safe = match schema_safety {
         fsqlite_func::ScalarSchemaSafety::Always => true,
         fsqlite_func::ScalarSchemaSafety::Never => false,
@@ -178010,11 +178005,16 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
         // through to the NUMERIC branch below. bd-errmsg-parity-batch4-deqcb.
         match val {
             SqliteValue::Blob(_) => val,
-            SqliteValue::Text(s) => SqliteValue::Blob(s.as_bytes_direct().to_vec().into()),
-            SqliteValue::Integer(_) | SqliteValue::Float(_) => {
-                SqliteValue::Blob(val.to_text().into_bytes().into())
+            text_or_number => {
+                // A persisted index predicate casts to BLOB in the database
+                // encoding. Raw record projections already contain those bytes.
+                let encoding = INDEX_EXPRESSION_ENCODING.get().unwrap_or(TextEncoding::Utf8);
+                let text = match text_or_number {
+                    SqliteValue::Text(text) => text,
+                    other => other.to_text().into(),
+                };
+                SqliteValue::Blob(text.to_record_text_bytes(encoding).into_owned().into())
             }
-            SqliteValue::Null => SqliteValue::Null,
         }
     } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
         match val {
