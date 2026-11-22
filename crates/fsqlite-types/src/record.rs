@@ -2274,14 +2274,20 @@ fn serialized_value_layout(value: &SqliteValue) -> (u64, usize) {
     }
 }
 
+/// The widest record whose value layouts are cached in an array on the stack
+/// rather than in a [`SmallVec`] (bd-w4pr1.13, bulk-write round 16).
+const FIXED_LAYOUT_VALUES: usize = 16;
+
 fn serialize_record_iter_into_impl<'a, I>(values: I, buf: &mut Vec<u8>)
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
-    if values.size_hint().1.is_some_and(|len| len <= 2) {
-        serialize_record_iter_into_impl_two_pass(values, buf);
-    } else {
-        serialize_record_iter_into_impl_cached_layout(values, buf);
+    match values.size_hint().1 {
+        Some(len) if len <= 2 => serialize_record_iter_into_impl_two_pass(values, buf),
+        Some(len) if len <= FIXED_LAYOUT_VALUES => {
+            serialize_record_iter_into_impl_fixed_layout(values, buf);
+        }
+        _ => serialize_record_iter_into_impl_cached_layout(values, buf),
     }
 }
 
@@ -2321,6 +2327,45 @@ where
     debug_assert_eq!(buf.len(), total_size);
 }
 
+/// A record of 3..=[`FIXED_LAYOUT_VALUES`] values (bd-w4pr1.13, bulk-write
+/// round 16): each value's layout is computed once into an array on the stack
+/// and the record is written through one exactly sized slice.
+///
+/// On the 4-column `MakeRecord` of a bulk INSERT the [`SmallVec`] this
+/// replaces was moved whole (some 400 bytes) twice per record, into its
+/// `IntoIter` and into the out-of-line writer, which then appended each value
+/// through an out-of-line call that grew the vector.
+fn serialize_record_iter_into_impl_fixed_layout<'a, I>(values: I, buf: &mut Vec<u8>)
+where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
+    let mut layouts: [Option<(&'a SqliteValue, u64, usize)>; FIXED_LAYOUT_VALUES] =
+        [None; FIXED_LAYOUT_VALUES];
+    let mut count = 0usize;
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+
+    for value in values.clone() {
+        let Some(slot) = layouts.get_mut(count) else {
+            // More values than the size hint's upper bound promised.
+            serialize_record_iter_into_impl_cached_layout(values, buf);
+            return;
+        };
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_content_size += varint_len(serial_type);
+        body_size += payload_len;
+        *slot = Some((value, serial_type, payload_len));
+        count += 1;
+    }
+
+    write_serialized_record_from_layouts(
+        layouts[..count].iter().flatten().copied(),
+        header_content_size,
+        body_size,
+        buf,
+    );
+}
+
 fn serialize_record_iter_into_impl_cached_layout<'a, I>(values: I, buf: &mut Vec<u8>)
 where
     I: Iterator<Item = &'a SqliteValue>,
@@ -2336,9 +2381,19 @@ where
         layouts.push((value, serial_type, payload_len));
     }
 
-    write_serialized_record_from_layouts(layouts.into_iter(), header_content_size, body_size, buf);
+    write_serialized_record_from_layouts(
+        layouts.iter().copied(),
+        header_content_size,
+        body_size,
+        buf,
+    );
 }
 
+/// Write a record whose layouts were computed once: `layouts` yields each
+/// value with its serial type and payload length, and `header_content_size` /
+/// `body_size` are their varint and payload sums. `buf` is sized once and every
+/// header byte and payload is written in place.
+#[inline]
 fn write_serialized_record_from_layouts<'a, I>(
     layouts: I,
     header_content_size: usize,
@@ -2350,23 +2405,36 @@ fn write_serialized_record_from_layouts<'a, I>(
     let header_size = compute_header_size(header_content_size);
     let total_size = header_size + body_size;
     buf.clear();
-    if buf.capacity() < total_size {
-        buf.reserve(total_size - buf.capacity());
-    }
-    buf.resize(header_size, 0);
+    buf.resize(total_size, 0);
+    let dst = buf.as_mut_slice();
 
-    let mut header_offset = write_varint(
-        buf.as_mut_slice(),
+    let mut header_offset = write_small_varint(
+        &mut dst[..header_size],
         u64::try_from(header_size).unwrap_or(u64::MAX),
     );
-
+    let mut body_offset = header_size;
     for (value, serial_type, payload_len) in layouts {
-        header_offset += write_varint(&mut buf[header_offset..], serial_type);
-        append_serialized_value(value, payload_len, buf);
+        header_offset += write_small_varint(&mut dst[header_offset..header_size], serial_type);
+        let body_end = body_offset + payload_len;
+        encode_serialized_value(value, payload_len, &mut dst[body_offset..body_end]);
+        body_offset = body_end;
     }
 
     debug_assert_eq!(header_offset, header_size);
-    debug_assert_eq!(buf.len(), total_size);
+    debug_assert_eq!(body_offset, total_size);
+}
+
+/// [`write_varint`] with the one-byte case (every serial type but TEXT and
+/// BLOB of 58 bytes or more, and every header size under 128) inline.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn write_small_varint(buf: &mut [u8], value: u64) -> usize {
+    if value <= 0x7F {
+        buf[0] = value as u8;
+        1
+    } else {
+        write_varint(buf, value)
+    }
 }
 
 /// Vectorized two-pass batch encoder for the SQLite record format.
@@ -3035,12 +3103,18 @@ fn encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u
     match value {
         SqliteValue::Null => {} // serial type 0: no data
         SqliteValue::Integer(i) => {
-            if payload_len == 0 {
-                return;
-            }
             let bytes = i.to_be_bytes();
-            // Take the least significant `payload_len` bytes.
-            buf.copy_from_slice(&bytes[8 - payload_len..]);
+            // Take the least significant `payload_len` bytes, as fixed-width
+            // copies for the widths an integer serial type has.
+            match payload_len {
+                0 => {}
+                1 => buf[0] = bytes[7],
+                2 => buf[..2].copy_from_slice(&bytes[6..]),
+                3 => buf[..3].copy_from_slice(&bytes[5..]),
+                4 => buf[..4].copy_from_slice(&bytes[4..]),
+                6 => buf[..6].copy_from_slice(&bytes[2..]),
+                _ => buf.copy_from_slice(&bytes[8 - payload_len..]),
+            }
         }
         SqliteValue::Float(f) => {
             if f.is_nan() {
@@ -4170,6 +4244,201 @@ mod tests {
         assert_eq!(parsed[9].as_integer(), Some(1));
         assert_eq!(parsed[10].as_blob(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
         assert_eq!(parsed[11].as_text(), Some("serial-type-text"));
+    }
+
+    /// The record format written out from the file-format document alone
+    /// (bd-w4pr1.13, bulk-write round 16): it shares no helper with the
+    /// serializer, so the serializer is checked byte for byte against it.
+    #[allow(clippy::cast_possible_truncation)]
+    fn reference_record_bytes(values: &[SqliteValue]) -> Vec<u8> {
+        fn varint(mut v: u64) -> Vec<u8> {
+            if v > 0x00FF_FFFF_FFFF_FFFF {
+                let mut out = vec![0_u8; 9];
+                out[8] = v as u8;
+                v >>= 8;
+                for byte in out[..8].iter_mut().rev() {
+                    *byte = (v as u8 & 0x7F) | 0x80;
+                    v >>= 7;
+                }
+                return out;
+            }
+            let mut out = vec![(v & 0x7F) as u8];
+            v >>= 7;
+            while v > 0 {
+                out.push((v & 0x7F) as u8 | 0x80);
+                v >>= 7;
+            }
+            out.reverse();
+            out
+        }
+        let mut types: Vec<u64> = Vec::new();
+        let mut body = Vec::new();
+        for value in values {
+            match value {
+                SqliteValue::Float(f) if !f.is_nan() => {
+                    types.push(7);
+                    body.extend_from_slice(&f.to_bits().to_be_bytes());
+                }
+                // NULL, and a NaN, which is stored as NULL.
+                SqliteValue::Null | SqliteValue::Float(_) => types.push(0),
+                SqliteValue::Integer(0) => types.push(8),
+                SqliteValue::Integer(1) => types.push(9),
+                SqliteValue::Integer(i) => {
+                    let (serial_type, width) = [(1_u64, 1_usize), (2, 2), (3, 3), (4, 4), (5, 6)]
+                        .into_iter()
+                        .find(|&(_, width)| {
+                            let half = 1_i64 << (8 * width - 1);
+                            (-half..half).contains(i)
+                        })
+                        .unwrap_or((6, 8));
+                    types.push(serial_type);
+                    body.extend_from_slice(&i.to_be_bytes()[8 - width..]);
+                }
+                SqliteValue::Text(text) => {
+                    let bytes = text.as_str().as_bytes();
+                    types.push(2 * bytes.len() as u64 + 13);
+                    body.extend_from_slice(bytes);
+                }
+                SqliteValue::Blob(blob) => {
+                    types.push(2 * blob.len() as u64 + 12);
+                    body.extend_from_slice(blob);
+                }
+            }
+        }
+        let type_bytes: Vec<u8> = types.iter().flat_map(|&t| varint(t)).collect();
+        let mut header_len = type_bytes.len() + 1;
+        loop {
+            let needed = varint(header_len as u64).len() + type_bytes.len();
+            if needed == header_len {
+                break;
+            }
+            header_len = needed;
+        }
+        let mut out = varint(header_len as u64);
+        out.extend_from_slice(&type_bytes);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Values at every serial-type boundary: each integer width and its edges,
+    /// 0 and 1, NaN (stored as NULL), TEXT and BLOB on both sides of the
+    /// two-byte serial type (57 and 58 bytes of TEXT, 57 and 58 of BLOB).
+    fn serial_type_boundary_pool() -> Vec<SqliteValue> {
+        let mut pool = vec![SqliteValue::Null];
+        for i in [
+            0_i64,
+            1,
+            -1,
+            2,
+            127,
+            128,
+            -128,
+            -129,
+            32_767,
+            32_768,
+            -32_769,
+            8_388_607,
+            8_388_608,
+            -8_388_609,
+            2_147_483_647,
+            2_147_483_648,
+            -2_147_483_649,
+            140_737_488_355_327,
+            140_737_488_355_328,
+            -140_737_488_355_329,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            pool.push(SqliteValue::Integer(i));
+        }
+        for f in [1.5_f64, -0.0, f64::NAN, f64::INFINITY] {
+            pool.push(SqliteValue::Float(f));
+        }
+        for len in [0_usize, 9, 57, 58, 200] {
+            pool.push(SqliteValue::Text(SmallText::new(&"r".repeat(len))));
+        }
+        for len in [0_usize, 3, 57, 58] {
+            pool.push(SqliteValue::Blob(Arc::from(vec![0xA5_u8; len].as_slice())));
+        }
+        pool
+    }
+
+    /// An iterator whose size hint promises fewer values than it yields.
+    #[derive(Clone)]
+    struct UnderHintedValues<'a>(std::slice::Iter<'a, SqliteValue>);
+
+    impl<'a> Iterator for UnderHintedValues<'a> {
+        type Item = &'a SqliteValue;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.next()
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (0, Some(3))
+        }
+    }
+
+    #[test]
+    fn test_record_writer_matches_the_file_format_byte_for_byte() {
+        // The bulk INSERT's record (INTEGER PRIMARY KEY placeholder, INTEGER,
+        // TEXT, REAL), spelled out by hand.
+        let bulk_row = [
+            SqliteValue::Null,
+            SqliteValue::Integer(1000),
+            SqliteValue::Text(SmallText::new("row-7")),
+            SqliteValue::Float(1.5),
+        ];
+        let mut expected = vec![0x05, 0x00, 0x02, 0x17, 0x07, 0x03, 0xE8];
+        expected.extend_from_slice(b"row-7");
+        expected.extend_from_slice(&[0x3F, 0xF8, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(serialize_record(&bulk_row), expected);
+        assert_eq!(reference_record_bytes(&bulk_row), expected);
+        // The engine's shape: a register-range map with an exact size hint.
+        let mut buf = vec![0xEE_u8; 300];
+        serialize_record_iter_into((0..bulk_row.len()).map(|i| &bulk_row[i]), &mut buf);
+        assert_eq!(buf, expected);
+
+        // Every width from 1 to 20 values (the two-pass, fixed-layout and
+        // cached-layout writers, and the 16 / 17 boundary between the last
+        // two), in every rotation of the pool, through one reused buffer.
+        let pool = serial_type_boundary_pool();
+        let mut checked = 0_usize;
+        for width in 1..=20 {
+            for start in 0..pool.len() {
+                let record: Vec<SqliteValue> = pool
+                    .iter()
+                    .cycle()
+                    .skip(start)
+                    .take(width)
+                    .cloned()
+                    .collect();
+                let want = reference_record_bytes(&record);
+                assert_eq!(
+                    serialize_record(&record),
+                    want,
+                    "width {width} start {start}"
+                );
+                serialize_record_iter_into(record.iter(), &mut buf);
+                assert_eq!(buf, want, "reused buffer, width {width} start {start}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 20 * pool.len());
+
+        // A size hint whose upper bound is too low must not lose values.
+        let long: Vec<SqliteValue> = pool.iter().cycle().take(20).cloned().collect();
+        serialize_record_iter_into(UnderHintedValues(long.iter()), &mut buf);
+        assert_eq!(buf, reference_record_bytes(&long));
+
+        // A header past 127 bytes takes a two-byte header-size varint.
+        let wide: Vec<SqliteValue> = (0..70)
+            .map(|i| SqliteValue::Text(SmallText::new(&format!("{i:060}"))))
+            .collect();
+        let want = reference_record_bytes(&wide);
+        // 70 two-byte serial types and the two-byte size itself: 142 bytes.
+        assert_eq!(&want[..2], &[0x81, 0x0E]);
+        assert_eq!(serialize_record(&wide), want);
     }
 
     #[test]
