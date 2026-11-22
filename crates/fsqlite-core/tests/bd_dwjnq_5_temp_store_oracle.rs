@@ -101,14 +101,23 @@ fn synchronous_spill_io_preserves_offset_eof_and_cancellation() {
     let payload = vec![0xa5; 65_537];
     file.write_at_sync(&cx, &payload, 7).unwrap();
     let mut actual = vec![0xff; payload.len() + 16];
-    assert_eq!(file.read_at_sync(&cx, &mut actual, 0).unwrap(), 7 + payload.len());
+    assert_eq!(
+        file.read_at_sync(&cx, &mut actual, 0).unwrap(),
+        7 + payload.len()
+    );
     assert_eq!(&actual[..7], &[0; 7]);
     assert_eq!(&actual[7..7 + payload.len()], payload);
     assert_eq!(&actual[7 + payload.len()..], &[0; 9]);
     let cancelled = Cx::new();
     cancelled.cancel();
-    assert!(matches!(file.write_at_sync(&cancelled, &[0], 7), Err(FrankenError::Abort)));
-    assert!(matches!(file.read_at_sync(&cancelled, &mut actual, 7), Err(FrankenError::Abort)));
+    assert!(matches!(
+        file.write_at_sync(&cancelled, &[0], 7),
+        Err(FrankenError::Abort)
+    ));
+    assert!(matches!(
+        file.read_at_sync(&cancelled, &mut actual, 7),
+        Err(FrankenError::Abort)
+    ));
     file.close(&cx).unwrap();
     assert_eq!(&fs::read(path).unwrap()[7..], payload);
 }
@@ -351,7 +360,10 @@ fn disk_full_fault_budget_spans_separate_spill_files() {
     let second = backend.create_temp_file(&cx, "second").unwrap();
     first.write_at(&cx, 0, &[1; 4]).unwrap();
     second.write_at(&cx, 0, &[2; 3]).unwrap();
-    assert!(matches!(second.write_at(&cx, 3, &[3]), Err(FrankenError::DatabaseFull)));
+    assert!(matches!(
+        second.write_at(&cx, 3, &[3]),
+        Err(FrankenError::DatabaseFull)
+    ));
     assert_eq!(first.file_size(&cx).unwrap(), 4);
     assert_eq!(second.file_size(&cx).unwrap(), 3);
     first.close(&cx).unwrap();
