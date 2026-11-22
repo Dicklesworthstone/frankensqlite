@@ -17537,10 +17537,35 @@ where
         cx: &Cx,
         image_path: &Path,
     ) -> Result<DatabaseImageReceipt> {
-        let full_path = self.vfs.full_pathname(cx, image_path)?;
-        self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
-        let receipt = self.inspect_database_image(cx, &full_path).await?;
-        self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
+        Self::inspect_self_contained_database_image_in_vfs(
+            &self.vfs,
+            cx,
+            image_path,
+            self.page_size(),
+        )
+        .await
+    }
+
+    /// Inspect a private database image residing in `vfs` and prove that no
+    /// recovery sidecar is part of its current state.
+    ///
+    /// Used when the live pager is `:memory:` (`MemoryVfs`) while the
+    /// `VACUUM INTO '<file>'` / backup target resides on the host OS VFS.
+    pub async fn inspect_self_contained_database_image_in_vfs(
+        vfs: &V,
+        cx: &Cx,
+        image_path: &Path,
+        expected_page_size: PageSize,
+    ) -> Result<DatabaseImageReceipt> {
+        let full_path = vfs.full_pathname(cx, image_path)?;
+        Self::ensure_vacuum_candidate_is_self_contained_in_vfs(vfs, cx, &full_path)?;
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = vfs.open(cx, Some(&full_path), flags)?;
+        let result = database_image_receipt_for_open_file(cx, &file, Some(expected_page_size)).await;
+        let close_result = file.close(cx);
+        let receipt = result?;
+        close_result?;
+        Self::ensure_vacuum_candidate_is_self_contained_in_vfs(vfs, cx, &full_path)?;
         Ok(receipt)
     }
 
@@ -17812,13 +17837,13 @@ where
     /// `CREATE`: a read-only WAL open can become a canonical inode descriptor
     /// on Unix and poison a later writer with `EBADF`; failure to inspect or
     /// close the handle is propagated so the caller fails closed.
-    fn wal_companion_is_too_small_for_a_complete_frame(
-        &self,
+    fn wal_companion_is_too_small_for_a_complete_frame_in_vfs(
+        vfs: &V,
         cx: &Cx,
         wal_path: &Path,
     ) -> Result<bool> {
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
-        let (mut wal, _) = self.vfs.open(cx, Some(wal_path), flags)?;
+        let (mut wal, _) = vfs.open(cx, Some(wal_path), flags)?;
         let size_result = wal.file_size(cx);
         let close_result = wal.close(cx);
         let byte_len = size_result?;
@@ -17826,12 +17851,16 @@ where
         Ok(byte_len < Self::MIN_COMPLETE_WAL_BYTES)
     }
 
-    fn ensure_vacuum_candidate_is_self_contained(&self, cx: &Cx, image_path: &Path) -> Result<()> {
+    fn ensure_vacuum_candidate_is_self_contained_in_vfs(
+        vfs: &V,
+        cx: &Cx,
+        image_path: &Path,
+    ) -> Result<()> {
         for suffix in ["-journal", "-wal", "-shm", "-wal-fec"] {
             let mut sidecar = image_path.as_os_str().to_owned();
             sidecar.push(suffix);
             let sidecar = PathBuf::from(sidecar);
-            if !self.vfs.access(cx, &sidecar, AccessFlags::EXISTS)? {
+            if !vfs.access(cx, &sidecar, AccessFlags::EXISTS)? {
                 continue;
             }
             // This is the sole narrow exception. A WAL too short for even one
@@ -17843,7 +17872,7 @@ where
             // a companion that grows into a complete frame during inspection
             // is refused by the second bracket.
             if suffix == "-wal"
-                && self.wal_companion_is_too_small_for_a_complete_frame(cx, &sidecar)?
+                && Self::wal_companion_is_too_small_for_a_complete_frame_in_vfs(vfs, cx, &sidecar)?
             {
                 continue;
             }
@@ -17855,6 +17884,10 @@ where
             });
         }
         Ok(())
+    }
+
+    fn ensure_vacuum_candidate_is_self_contained(&self, cx: &Cx, image_path: &Path) -> Result<()> {
+        Self::ensure_vacuum_candidate_is_self_contained_in_vfs(&self.vfs, cx, image_path)
     }
 
     /// Publish a semantically-validated VACUUM image over the already-open
@@ -18473,6 +18506,170 @@ where
                 ))),
             },
         }
+    }
+
+    /// Replace an in-memory database's backing image atomically with a freshly
+    /// compacted SQLite database image (bd-6873b).
+    ///
+    /// Requires the pager to be quiescent (no active transactions, writers,
+    /// checkpoints, or pending recovery). Updates the backing VFS file, clears
+    /// the page cache, rebuilds the in-memory freelist, refreshes pager header
+    /// state (`page_size`, `reserved_per_page`, `pointer_map`, `db_size`,
+    /// `next_page`), and publishes the new snapshot generation.
+    pub async fn publish_in_memory_database_image(
+        &self,
+        cx: &Cx,
+        bytes: &[u8],
+        header: &DatabaseHeader,
+    ) -> Result<()> {
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
+        let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
+        self.validate_namespace_binding()?;
+
+        let page_size = header.page_size;
+        let page_size_usize = page_size.as_usize();
+        let page_size_bytes = u64::from(page_size.get());
+        let new_page_count = header.page_count;
+        let expected_len = usize::try_from(new_page_count)
+            .ok()
+            .and_then(|pages| pages.checked_mul(page_size_usize))
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "in-memory VACUUM image size".to_owned(),
+                value: new_page_count.to_string(),
+            })?;
+        if new_page_count == 0 || bytes.len() != expected_len {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "in-memory VACUUM image length mismatch: got {} bytes, expected {expected_len} ({new_page_count} pages x {page_size_usize})",
+                    bytes.len()
+                ),
+            });
+        }
+
+        let (db_file, page_cipher) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.active_transactions > 0
+                || inner.writer_active
+                || inner.checkpoint_active
+                || inner.rollback_journal_recovery_state.is_pending()
+            {
+                return Err(FrankenError::Busy);
+            }
+            (Arc::clone(&inner.db_file), inner.page_cipher.clone())
+        };
+
+        if !page_cipher.is_enabled() {
+            let header_bytes: &[u8; DATABASE_HEADER_SIZE] = bytes
+                .get(..DATABASE_HEADER_SIZE)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "in-memory VACUUM image shorter than database header".to_owned(),
+                })?;
+            let decoded = DatabaseHeader::from_bytes(header_bytes)
+                .map_err(|err| err.to_franken_error("invalid in-memory VACUUM header"))?;
+            if decoded != *header {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "in-memory VACUUM image header does not match expected header"
+                        .to_owned(),
+                });
+            }
+        }
+
+        let lock_byte_page = crate::journal::lock_byte_page(page_size);
+        let rebuilt_freelist = {
+            let mut db_file_guard = shared_db_file_write(&db_file, cx).await?;
+            for raw_page_no in 1..=new_page_count {
+                if raw_page_no == lock_byte_page {
+                    continue;
+                }
+                let start = usize::try_from(raw_page_no - 1)
+                    .ok()
+                    .and_then(|idx| idx.checked_mul(page_size_usize))
+                    .ok_or_else(|| FrankenError::OutOfRange {
+                        what: "in-memory VACUUM page slice offset".to_owned(),
+                        value: raw_page_no.to_string(),
+                    })?;
+                let offset = u64::from(raw_page_no - 1)
+                    .checked_mul(page_size_bytes)
+                    .ok_or_else(|| FrankenError::OutOfRange {
+                        what: "in-memory VACUUM page offset".to_owned(),
+                        value: raw_page_no.to_string(),
+                    })?;
+                db_file_guard
+                    .write(cx, &bytes[start..start + page_size_usize], offset)
+                    .await?;
+            }
+            let target_len = u64::try_from(bytes.len()).map_err(|_| FrankenError::OutOfRange {
+                what: "in-memory VACUUM file size".to_owned(),
+                value: bytes.len().to_string(),
+            })?;
+            db_file_guard.truncate(cx, target_len)?;
+            load_freelist_from_disk(
+                cx,
+                &*db_file_guard,
+                &page_cipher,
+                page_size,
+                new_page_count,
+                header.freelist_trunk,
+                header.freelist_count,
+            )
+            .await?
+        };
+
+        let expected_freelist_len =
+            usize::try_from(header.freelist_count).map_err(|_| FrankenError::OutOfRange {
+                what: "in-memory VACUUM freelist count".to_owned(),
+                value: header.freelist_count.to_string(),
+            })?;
+        if rebuilt_freelist.len() != expected_freelist_len {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "in-memory VACUUM freelist contains {} pages but header declares {}",
+                    rebuilt_freelist.len(),
+                    header.freelist_count
+                ),
+            });
+        }
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        let next_commit_seq = inner.commit_seq.next();
+        self.cache.clear();
+        inner.page_size = header.page_size;
+        inner.reserved_per_page = header.reserved_per_page;
+        inner.pointer_map =
+            PointerMapState::from_header(header.largest_root_page, header.incremental_vacuum);
+        inner.db_size = new_page_count;
+        inner.next_page = if new_page_count >= 2 {
+            new_page_count.saturating_add(1)
+        } else {
+            2
+        };
+        inner.durable_freelist_view = rebuilt_freelist.iter().map(|page| page.get()).collect();
+        inner.freelist = rebuilt_freelist;
+        inner.commit_seq = next_commit_seq;
+        inner.committed_db_file_size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        inner.committed_db_change_counter = u64::from(header.change_counter);
+        inner.committed_wal_generation = None;
+        inner.committed_wal_visible_commit_count = 0;
+        self.published.publish_replaced_image(
+            cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: false,
+            },
+        );
+        self.publish_committed_snapshot_from_inner(&inner);
+        remove_group_commit_queue(&self.db_path);
+        Ok(())
     }
 
     /// Export the pager's main database image as a self-contained SQLite file.

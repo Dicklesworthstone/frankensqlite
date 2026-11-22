@@ -4581,6 +4581,32 @@ impl PagerBackend {
         path: &Path,
     ) -> Result<DatabaseImageReceipt> {
         match self {
+            #[cfg(all(feature = "native", unix))]
+            Self::Memory(p) => {
+                // `VACUUM INTO '<file>'` and host-file backups from a `:memory:`
+                // connection write their candidate image on the native OS VFS,
+                // not in the private `MemoryVfs` backing `:memory:`.
+                let vfs = fsqlite_vfs::UnixVfs::new();
+                SimplePager::inspect_self_contained_database_image_in_vfs(
+                    &vfs,
+                    cx,
+                    path,
+                    p.page_size(),
+                )
+                .await
+            }
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Memory(p) => {
+                let vfs = fsqlite_vfs::WindowsVfs::new();
+                SimplePager::inspect_self_contained_database_image_in_vfs(
+                    &vfs,
+                    cx,
+                    path,
+                    p.page_size(),
+                )
+                .await
+            }
+            #[cfg(not(all(feature = "native", any(unix, target_os = "windows"))))]
             Self::Memory(p) => p.inspect_self_contained_database_image(cx, path).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.inspect_self_contained_database_image(cx, path).await,
@@ -4723,6 +4749,23 @@ impl PagerBackend {
                 p.publish_validated_database_image(cx, path, source, candidate)
                     .await
             }
+        }
+    }
+
+    async fn publish_in_memory_database_image(
+        &self,
+        cx: &Cx,
+        bytes: &[u8],
+        header: &DatabaseHeader,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.publish_in_memory_database_image(cx, bytes, header).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(_) => Err(FrankenError::Unsupported),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(_) => Err(FrankenError::Unsupported),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(_) => Err(FrankenError::Unsupported),
         }
     }
 
@@ -77377,7 +77420,7 @@ impl Connection {
             None
         };
 
-        let persistence_result = {
+        let persistence_result: Result<Option<(Vec<u8>, DatabaseHeader)>> = {
             let schema = self.schema.borrow().clone();
             let db = self.db.borrow().clone();
             let ddl = self.original_ddl_sql.borrow().clone();
@@ -77399,6 +77442,7 @@ impl Connection {
                     &ddl,
                 )
                 .await
+                .map(|()| None)
             } else if let Some(rebuild_target) = rebuild_target.as_ref() {
                 let mut rebuilt_header = source_header.clone();
                 if let Some(pending_av) = self.pending_auto_vacuum.get() {
@@ -77420,19 +77464,56 @@ impl Connection {
                     &ddl,
                 )
                 .await
+                .map(|()| None)
             } else {
-                Ok(())
+                // bd-6873b: In-place VACUUM on a `:memory:` database compacts
+                // into a fresh in-memory SQLite image and atomically replaces
+                // the live MemoryVfs pager backing image so `page_count` and
+                // `freelist_count` shrink identically to stock SQLite.
+                let mut rebuilt_header = source_header.clone();
+                if let Some(pending_av) = self.pending_auto_vacuum.get() {
+                    rebuilt_header.largest_root_page = u32::from(pending_av.uses_pointer_map());
+                    rebuilt_header.incremental_vacuum =
+                        u32::from(pending_av == fsqlite_types::AutoVacuumMode::Incremental);
+                }
+                rebuilt_header.change_counter =
+                    rebuilt_header.change_counter.wrapping_add(1).max(1);
+                rebuilt_header.schema_cookie = rebuilt_header.schema_cookie.wrapping_add(1).max(1);
+                rebuilt_header.version_valid_for = rebuilt_header.change_counter;
+                crate::vacuum::persist_compacted_memory_database(
+                    &cx,
+                    &schema,
+                    &db,
+                    &rebuilt_header,
+                    &extra_master_entries,
+                    &ddl,
+                    self.pager.page_cipher_slot().get(),
+                )
+                .await
             }
         };
 
-        if let Err(error) = persistence_result {
-            if let Some(target) = target_reservation.as_ref().or(rebuild_target.as_ref()) {
-                target.cleanup_after_failure(
-                    &cx,
-                    "VACUUM persistence failed and exact-reservation cleanup was incomplete",
-                );
+        let in_memory_rebuild = match persistence_result {
+            Ok(rebuilt) => rebuilt,
+            Err(error) => {
+                if let Some(target) = target_reservation.as_ref().or(rebuild_target.as_ref()) {
+                    target.cleanup_after_failure(
+                        &cx,
+                        "VACUUM persistence failed and exact-reservation cleanup was incomplete",
+                    );
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+
+        if let Some((compacted_bytes, final_header)) = in_memory_rebuild {
+            self.pager
+                .publish_in_memory_database_image(&cx, &compacted_bytes, &final_header)
+                .await?;
+            self.rebind_after_committed_vacuum(&cx, restore_hydrated_rows)
+                .await?;
+            self.pending_auto_vacuum.set(None);
+            return Ok(());
         }
 
         let mut finalized_output_receipt = None;

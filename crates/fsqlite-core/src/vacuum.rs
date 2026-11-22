@@ -326,6 +326,47 @@ pub(crate) async fn persist_compacted_database_with_cipher(
     .await
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_compacted_memory_database(
+    cx: &Cx,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &std::collections::HashMap<String, String>,
+    page_cipher: Option<fsqlite_pager::ActivePageCipher>,
+) -> Result<Option<(Vec<u8>, DatabaseHeader)>> {
+    let mut output_header = header.clone();
+    output_header.write_version = 1;
+    output_header.read_version = 1;
+    crate::compat_persist::persist_to_memory_image_bytes(
+        cx,
+        schema,
+        db,
+        &output_header,
+        extra_master_entries,
+        original_ddl,
+        page_cipher,
+    )
+    .await
+    .map(Some)
+}
+
+#[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+#[allow(clippy::unused_async, clippy::too_many_arguments)]
+pub(crate) async fn persist_compacted_memory_database(
+    _cx: &Cx,
+    _schema: &[TableSchema],
+    _db: &MemDatabase,
+    _header: &DatabaseHeader,
+    _extra_master_entries: &[SqliteMasterEntry],
+    _original_ddl: &std::collections::HashMap<String, String>,
+    _page_cipher: Option<fsqlite_pager::ActivePageCipher>,
+) -> Result<Option<(Vec<u8>, DatabaseHeader)>> {
+    Ok(None)
+}
+
 #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
 #[allow(clippy::unused_async)]
 pub(crate) async fn persist_compacted_database(

@@ -1299,6 +1299,96 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             .initialize_empty_encrypted_page1(cx, active_cipher, header_template.reserved_per_page)
             .await?;
     }
+    persist_into_open_pager(
+        cx,
+        &pager,
+        schema,
+        db,
+        header_template,
+        extra_master_entries,
+        original_ddl,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Persist `MemDatabase` + schema into a fresh in-memory SQLite database image
+/// and return the compacted bytes together with the final page-1 header
+/// (bd-6873b).
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn persist_to_memory_image_bytes<S: BuildHasher>(
+    cx: &Cx,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String, S>,
+    page_cipher: Option<fsqlite_pager::ActivePageCipher>,
+) -> Result<(Vec<u8>, DatabaseHeader)> {
+    let vfs = fsqlite_vfs::MemoryVfs::new();
+    let pager =
+        SimplePager::open_with_cx(cx, vfs, Path::new(":memory:"), header_template.page_size)
+            .await?;
+    if let Some(active_cipher) = page_cipher {
+        pager
+            .initialize_empty_encrypted_page1(cx, active_cipher, header_template.reserved_per_page)
+            .await?;
+    }
+    persist_into_open_pager(
+        cx,
+        &pager,
+        schema,
+        db,
+        header_template,
+        extra_master_entries,
+        original_ddl,
+    )
+    .await?;
+    // Read back the authoritative committed page-1 header after `txn.commit()`
+    // so pager-stamped counters (e.g. `change_counter` / `version_valid_for`)
+    // match the exported image byte-for-byte for both plaintext and encrypted
+    // databases.
+    let committed_header = {
+        let mut read_txn = pager.begin(cx, TransactionMode::ReadOnly).await?;
+        let page1 = read_txn.get_page(cx, PageNumber::ONE).await?;
+        let header_bytes: &[u8; DATABASE_HEADER_SIZE] = page1
+            .as_ref()
+            .get(..DATABASE_HEADER_SIZE)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "compacted in-memory page 1 shorter than database header".to_owned(),
+            })?;
+        let header = DatabaseHeader::from_bytes(header_bytes).map_err(|err| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!("invalid compacted in-memory database header: {err}"),
+            }
+        })?;
+        let _ = read_txn.rollback(cx).await;
+        header
+    };
+    let bytes = pager.export_database_bytes(cx).await?;
+    Ok((bytes, committed_header))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation
+)]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+async fn persist_into_open_pager<V: fsqlite_vfs::Vfs, S: BuildHasher>(
+    cx: &Cx,
+    pager: &SimplePager<V>,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String, S>,
+) -> Result<()>
+where
+    V::File: 'static,
+{
     let mut txn = pager.begin(cx, TransactionMode::Immediate).await?;
 
     let page_size = header_template.page_size;
@@ -2036,20 +2126,9 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
 
         let mut hdr_page = txn.get_page(cx, PageNumber::ONE).await?.into_vec();
 
-        // In auto-vacuum mode, never allocate a dummy trailing page because
-        // every page in `2..=page_count` must have a valid pointer-map entry
-        // and be reachable or on the freelist.
-        let max_page = if uses_pointer_map {
-            txn.live_db_size().max(1)
-        } else {
-            // Discover the current page count by allocating one more page.
-            // The extra page is included in the commit (the pager does not
-            // support free_page), so the exported file has one trailing empty
-            // page. This is benign: SQLite tolerates pages beyond the last
-            // B-tree node, and the page_count header excludes it.
-            let next_page = txn.allocate_page(cx).await?.get();
-            next_page.saturating_sub(1).max(1)
-        };
+        // Use the pager transaction's authoritative live page count without
+        // allocating a dummy trailing page (bd-1q134, bd-6873b).
+        let max_page = txn.live_db_size().max(1);
 
         let mut final_header = header_template.clone();
         final_header.page_count = max_page;
