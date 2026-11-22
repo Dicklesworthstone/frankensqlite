@@ -204,8 +204,14 @@ impl SortedWindow {
     }
 
     /// The sample at 1-based nearest rank `ceil(numerator * population / denominator)`,
-    /// clamped to the window, where `population` is the window length plus
-    /// `extra_population`. `None` for an empty window.
+    /// where `population` is the window length plus `extra_population`.
+    ///
+    /// `None` for an empty window, and when the rank lies beyond the window:
+    /// with a population larger than the window the quantile can fall past
+    /// every held sample, and there it is unbounded. Clamping that rank to the
+    /// largest sample made the 99% conformal bound of a window under 99
+    /// samples its running maximum, so a process's first slower operation
+    /// disabled its io_uring backend (bd-0oa1b).
     fn nearest_rank(
         &self,
         numerator: usize,
@@ -218,10 +224,8 @@ impl SortedWindow {
         }
         let rank = numerator
             .saturating_mul(n.saturating_add(extra_population))
-            .div_ceil(denominator)
-            .saturating_sub(1)
-            .min(n - 1);
-        self.sorted.get(rank).copied()
+            .div_ceil(denominator);
+        self.sorted.get(rank.saturating_sub(1)).copied()
     }
 
     fn clear(&mut self) {
@@ -230,10 +234,39 @@ impl SortedWindow {
     }
 }
 
+/// Tail violations that make a breach sustained (bd-0oa1b): at least this
+/// many among the last 64 calibrated samples of one operation kind (the bits
+/// of `IoLatencySeries::recent_violations`).
+///
+/// With exchangeable latencies a calibrated sample exceeds its 99% conformal
+/// bound with probability at most 1%, so a single violation is expected about
+/// once per hundred operations and says nothing about the backend; 10 of 64
+/// has probability about 9.3e-10 (the binomial tail). A sustained slowdown
+/// of 3x or more gives 12-19 violations within 64 samples before the window
+/// absorbs the new level, in about 11 samples.
+const SUSTAINED_BREACH_VIOLATIONS: u32 = 10;
+
+/// What one recorded io_uring latency sample showed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IoLatencyVerdict {
+    /// The sample exceeded the conformal upper bound of the samples before it
+    /// (counted in `read_tail_violations_total` / `write_tail_violations_total`).
+    pub tail_violation: bool,
+    /// A sustained breach: this violation makes at least
+    /// `SUSTAINED_BREACH_VIOLATIONS` (10) of the last 64 calibrated samples of
+    /// its kind violations. The io_uring backend is disabled only on this
+    /// (bd-0oa1b).
+    pub sustained_breach: bool,
+}
+
 #[derive(Default)]
 struct IoLatencySeries {
     latencies_ns: SortedWindow,
     nonconformity_ns: SortedWindow,
+    /// One bit per calibrated sample, newest in bit 0, set when that sample
+    /// violated its bound. Samples recorded while the bound is unbounded do
+    /// not shift in.
+    recent_violations: u64,
 }
 
 impl IoLatencySeries {
@@ -241,14 +274,26 @@ impl IoLatencySeries {
         Self {
             latencies_ns: SortedWindow::new(),
             nonconformity_ns: SortedWindow::new(),
+            recent_violations: 0,
         }
     }
 
-    fn push(&mut self, sample_ns: u64, sample_capacity: usize) {
-        let baseline = self.p99_latency_ns().unwrap_or(sample_ns);
-        let score = sample_ns.saturating_sub(baseline);
+    /// Judge `sample_ns` against the bound of the samples before it, then add
+    /// it to the window.
+    fn record(&mut self, sample_ns: u64, sample_capacity: usize) -> IoLatencyVerdict {
+        let baseline = self.p99_latency_ns();
+        let mut verdict = IoLatencyVerdict::default();
+        if let (Some(baseline), Some(quantile)) = (baseline, self.conformal_quantile_ns()) {
+            verdict.tail_violation = sample_ns > baseline.saturating_add(quantile);
+            self.recent_violations =
+                (self.recent_violations << 1) | u64::from(verdict.tail_violation);
+            verdict.sustained_breach = verdict.tail_violation
+                && self.recent_violations.count_ones() >= SUSTAINED_BREACH_VIOLATIONS;
+        }
+        let score = sample_ns.saturating_sub(baseline.unwrap_or(sample_ns));
         self.latencies_ns.push(sample_ns, sample_capacity);
         self.nonconformity_ns.push(score, sample_capacity);
+        verdict
     }
 
     fn p99_latency_ns(&self) -> Option<u64> {
@@ -257,21 +302,29 @@ impl IoLatencySeries {
     }
 
     /// Split-conformal quantile of the nonconformity scores: nearest rank over
-    /// a population one larger than the window.
+    /// a population one larger than the window. `None` while the window is
+    /// empty or holds fewer than 99 scores, where the rank,
+    /// `ceil(0.99 (n + 1))`, exceeds the `n` scores and the quantile is
+    /// unbounded.
     fn conformal_quantile_ns(&self) -> Option<u64> {
         self.nonconformity_ns
             .nearest_rank(P99_NUMERATOR, P99_DENOMINATOR, 1)
     }
 
+    /// The conformal upper bound on the next sample: `None` for an empty
+    /// window, and `u64::MAX` (unbounded) while the quantile is.
     fn conformal_upper_bound_ns(&self) -> Option<u64> {
         let baseline = self.p99_latency_ns()?;
-        let q = self.conformal_quantile_ns()?;
-        Some(baseline.saturating_add(q))
+        Some(
+            self.conformal_quantile_ns()
+                .map_or(u64::MAX, |quantile| baseline.saturating_add(quantile)),
+        )
     }
 
     fn reset(&mut self) {
         self.latencies_ns.clear();
         self.nonconformity_ns.clear();
+        self.recent_violations = 0;
     }
 }
 
@@ -312,32 +365,34 @@ impl IoUringLatencyMetrics {
         }
     }
 
-    pub fn record_read_latency(&self, latency: Duration) -> bool {
+    pub fn record_read_latency(&self, latency: Duration) -> IoLatencyVerdict {
         self.read_samples_total.fetch_add(1, Ordering::Relaxed);
         let sample_ns = duration_to_nanos_saturated(latency);
-        let mut window = self.window.lock();
-        let prior_bound = window.read.conformal_upper_bound_ns();
-        window.read.push(sample_ns, self.sample_capacity);
-        let is_tail_violation = prior_bound.is_some_and(|bound| sample_ns > bound);
-        if is_tail_violation {
+        let verdict = self
+            .window
+            .lock()
+            .read
+            .record(sample_ns, self.sample_capacity);
+        if verdict.tail_violation {
             self.read_tail_violations_total
                 .fetch_add(1, Ordering::Relaxed);
         }
-        is_tail_violation
+        verdict
     }
 
-    pub fn record_write_latency(&self, latency: Duration) -> bool {
+    pub fn record_write_latency(&self, latency: Duration) -> IoLatencyVerdict {
         self.write_samples_total.fetch_add(1, Ordering::Relaxed);
         let sample_ns = duration_to_nanos_saturated(latency);
-        let mut window = self.window.lock();
-        let prior_bound = window.write.conformal_upper_bound_ns();
-        window.write.push(sample_ns, self.sample_capacity);
-        let is_tail_violation = prior_bound.is_some_and(|bound| sample_ns > bound);
-        if is_tail_violation {
+        let verdict = self
+            .window
+            .lock()
+            .write
+            .record(sample_ns, self.sample_capacity);
+        if verdict.tail_violation {
             self.write_tail_violations_total
                 .fetch_add(1, Ordering::Relaxed);
         }
-        is_tail_violation
+        verdict
     }
 
     pub fn record_unix_fallback(&self) {
@@ -402,11 +457,11 @@ impl Default for IoUringLatencyMetrics {
     }
 }
 
-pub fn record_io_uring_read_latency(latency: Duration) -> bool {
+pub fn record_io_uring_read_latency(latency: Duration) -> IoLatencyVerdict {
     GLOBAL_IO_URING_LATENCY_METRICS.record_read_latency(latency)
 }
 
-pub fn record_io_uring_write_latency(latency: Duration) -> bool {
+pub fn record_io_uring_write_latency(latency: Duration) -> IoLatencyVerdict {
     GLOBAL_IO_URING_LATENCY_METRICS.record_write_latency(latency)
 }
 
@@ -1668,12 +1723,24 @@ mod tests {
 
     #[test]
     fn io_uring_latency_conformal_upper_bound_is_tail_safe() {
-        let metrics = IoUringLatencyMetrics::new(16);
+        // bd-0oa1b: the 99% split-conformal bound needs 99 calibration scores;
+        // with fewer it is unbounded (io_uring_latency_early_samples_never_breach
+        // runs this test's original eight samples alone). So the same eight
+        // samples follow 99 like them, at a capacity of 99, where the p99 of
+        // the window is again its maximum.
+        let calibration = [20_u64, 22, 21, 23, 20, 24, 26];
+        let metrics = IoUringLatencyMetrics::new(99);
+        for latency in calibration.iter().cycle().take(99) {
+            let verdict = metrics.record_read_latency(Duration::from_micros(*latency));
+            assert_eq!(verdict, IoLatencyVerdict::default());
+        }
         let mut saw_violation = false;
         for latency in [20_u64, 22, 21, 23, 20, 24, 26, 200] {
-            if metrics.record_read_latency(Duration::from_micros(latency)) {
+            let verdict = metrics.record_read_latency(Duration::from_micros(latency));
+            if verdict.tail_violation {
                 saw_violation = true;
             }
+            assert!(!verdict.sustained_breach, "one violation is not sustained");
         }
 
         let snapshot = metrics.snapshot();
@@ -1683,11 +1750,130 @@ mod tests {
         assert!(snapshot.read_tail_violations_total >= 1);
     }
 
+    /// Deterministic latency jitter for the policy keepers: a xorshift64
+    /// stream mapped to 100..200 us.
+    fn jittered_us(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        100 + *state % 100
+    }
+
+    /// bd-0oa1b keeper: early samples never breach, however each compares
+    /// with the ones before it. On main every one of these was a "tail
+    /// breach" (the bound of a window under 99 samples was its running
+    /// maximum), and the first one disabled the process's io_uring backend.
+    #[test]
+    fn io_uring_latency_early_samples_never_breach() {
+        let metrics = IoUringLatencyMetrics::new(1024);
+        for latency in [20_u64, 22, 21, 23, 20, 24, 26, 200] {
+            assert_eq!(
+                metrics.record_write_latency(Duration::from_micros(latency)),
+                IoLatencyVerdict::default(),
+                "{latency} us among the first eight samples"
+            );
+        }
+        let early = IoUringLatencyMetrics::new(1024);
+        // 99 samples, each slower than every one before it. Each is judged
+        // against the scores of the ones before it, at most 98.
+        for index in 0..99_u64 {
+            if index == 98 {
+                assert_eq!(
+                    early.snapshot().write_conformal_upper_bound_us,
+                    u64::MAX / 1_000,
+                    "the bound is unbounded below 99 calibration scores"
+                );
+            }
+            assert_eq!(
+                early.record_write_latency(Duration::from_micros(100 + index)),
+                IoLatencyVerdict::default(),
+                "sample {index}"
+            );
+        }
+        let snapshot = early.snapshot();
+        assert_eq!(snapshot.write_tail_violations_total, 0);
+        // With 99 scores the bound is defined: 198 us, the maximum, plus the
+        // largest score, 1 us. A slower sample exceeds it, once.
+        assert_eq!(snapshot.write_conformal_upper_bound_us, 199);
+        assert_eq!(
+            early.record_write_latency(Duration::from_micros(500)),
+            IoLatencyVerdict {
+                tail_violation: true,
+                sustained_breach: false,
+            }
+        );
+        assert_eq!(early.snapshot().write_tail_violations_total, 1);
+    }
+
+    /// bd-0oa1b keeper: stationary latencies on a full window produce
+    /// isolated tail violations, about 1% of samples as a 99% bound should,
+    /// and never a sustained breach. On main the first such violation
+    /// disabled io_uring.
+    #[test]
+    fn io_uring_latency_stationary_jitter_never_sustains_a_breach() {
+        let metrics = IoUringLatencyMetrics::new(1024);
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for index in 0..50_000 {
+            let verdict = metrics.record_read_latency(Duration::from_nanos(
+                jittered_us(&mut state) * 1_000 + (state >> 40) % 1_000,
+            ));
+            assert!(!verdict.sustained_breach, "sample {index}");
+        }
+        let violations = metrics.snapshot().read_tail_violations_total;
+        assert!(
+            (10..=1_000).contains(&violations),
+            "isolated violations occur at about the bound's 1%: {violations} of 50000"
+        );
+    }
+
+    /// bd-0oa1b keeper, the negative a naive never-disable fix fails: a
+    /// sustained 5x slowdown on a full window is a sustained breach within its
+    /// first 11 samples, before the window absorbs the new level.
+    #[test]
+    fn io_uring_latency_sustained_slowdown_on_a_full_window_breaches() {
+        let metrics = IoUringLatencyMetrics::new(1024);
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for index in 0..2_000 {
+            let verdict =
+                metrics.record_write_latency(Duration::from_micros(jittered_us(&mut state)));
+            assert!(!verdict.sustained_breach, "stationary sample {index}");
+        }
+        let breach = (0..64).find(|_| {
+            metrics
+                .record_write_latency(Duration::from_micros(5 * jittered_us(&mut state)))
+                .sustained_breach
+        });
+        assert!(
+            breach.is_some_and(|slowed| slowed <= 10),
+            "a sustained 5x slowdown must breach within its first 11 samples: {breach:?}"
+        );
+
+        // A reset forgets the violations: after it, a full calibration and one
+        // violation make no sustained breach.
+        metrics.reset();
+        for _ in 0..99 {
+            let verdict =
+                metrics.record_write_latency(Duration::from_micros(jittered_us(&mut state)));
+            assert_eq!(verdict, IoLatencyVerdict::default());
+        }
+        assert_eq!(
+            metrics.record_write_latency(Duration::from_millis(50)),
+            IoLatencyVerdict {
+                tail_violation: true,
+                sustained_breach: false,
+            }
+        );
+    }
+
     #[test]
     fn io_uring_latency_window_matches_sorted_reference() {
         // Keep a full-sort oracle independent of the production quantile
         // algorithm. The 99/100/101 capacities straddle nearest-rank changes;
         // three windows exercise eviction, duplicates, and saturated bounds.
+        // bd-0oa1b: the conformal rank, ceil(0.99 (n + 1)), exceeds the n held
+        // scores below 99 of them. The quantile is then unbounded (`None`
+        // here), not the largest score: the reference used to clamp the rank
+        // as the production code did, and so encoded the defect.
         fn reference_quantile(values: &VecDeque<u64>, conformal: bool) -> Option<u64> {
             if values.is_empty() {
                 return None;
@@ -1695,8 +1881,8 @@ mod tests {
             let mut sorted: Vec<_> = values.iter().copied().collect();
             sorted.sort_unstable();
             let population = sorted.len() + usize::from(conformal);
-            let rank = (99 * population).div_ceil(100).min(sorted.len());
-            Some(sorted[rank - 1])
+            let rank = (99 * population).div_ceil(100);
+            sorted.get(rank - 1).copied()
         }
 
         for capacity in [0, 1, 2, 7, 99, 100, 101, 1024] {
@@ -1705,6 +1891,9 @@ mod tests {
                 let mut latencies = VecDeque::new();
                 let mut scores = VecDeque::new();
                 let mut violations = 0;
+                // The last 64 calibrated verdicts, newest in bit 0; a breach
+                // is sustained at 10 violations among them.
+                let mut recent = 0_u64;
                 let samples = 3 * capacity + 32;
                 for index in 0..samples {
                     let sample = match index {
@@ -1724,13 +1913,18 @@ mod tests {
                         .zip(reference_quantile(&scores, true))
                         .map(|(value, score)| value.saturating_add(score));
                     let expected_violation = prior_bound.is_some_and(|bound| sample > bound);
-                    let actual_violation = if read {
+                    if prior_bound.is_some() {
+                        recent = (recent << 1) | u64::from(expected_violation);
+                    }
+                    let expected_sustained = expected_violation && recent.count_ones() >= 10;
+                    let verdict = if read {
                         metrics.record_read_latency(Duration::from_nanos(sample))
                     } else {
                         metrics.record_write_latency(Duration::from_nanos(sample))
                     };
                     assert_eq!(
-                        actual_violation, expected_violation,
+                        (verdict.tail_violation, verdict.sustained_breach),
+                        (expected_violation, expected_sustained),
                         "capacity={capacity} read={read} index={index}"
                     );
                     violations += u64::from(expected_violation);
@@ -1743,8 +1937,12 @@ mod tests {
                         }
                     }
                     let expected_p99 = reference_quantile(&latencies, false).unwrap_or(0);
-                    let expected_bound =
-                        expected_p99.saturating_add(reference_quantile(&scores, true).unwrap_or(0));
+                    let expected_bound = if latencies.is_empty() {
+                        0
+                    } else {
+                        expected_p99
+                            .saturating_add(reference_quantile(&scores, true).unwrap_or(u64::MAX))
+                    };
                     let snapshot = metrics.snapshot();
                     let actual = if read {
                         (
@@ -1780,8 +1978,14 @@ mod tests {
                 assert_eq!(reset.read_samples_total + reset.write_samples_total, 0);
                 assert_eq!(reset.read_window_len + reset.write_window_len, 0);
                 assert_eq!(reset.read_p99_latency_us + reset.write_p99_latency_us, 0);
-                assert!(!metrics.record_read_latency(Duration::from_nanos(u64::MAX)));
-                assert!(!metrics.record_write_latency(Duration::from_nanos(u64::MAX)));
+                assert_eq!(
+                    metrics.record_read_latency(Duration::from_nanos(u64::MAX)),
+                    IoLatencyVerdict::default()
+                );
+                assert_eq!(
+                    metrics.record_write_latency(Duration::from_nanos(u64::MAX)),
+                    IoLatencyVerdict::default()
+                );
             }
         }
     }

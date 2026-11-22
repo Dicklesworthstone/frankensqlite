@@ -244,6 +244,10 @@ fn next_chunk_end(total: usize, len: usize) -> usize {
     total + remaining.min(IO_URING_MAX_RW_CHUNK_BYTES)
 }
 
+/// Disable `runtime` for the rest of the process. Called only on a sustained
+/// conformal tail breach (`IoLatencyVerdict::sustained_breach`): a single
+/// sample over a 99% bound is expected once per hundred operations, and a
+/// window under 99 samples has no bound at all (bd-0oa1b).
 fn enforce_conformal_breach_policy(
     runtime: &IoUringRuntime,
     operation: &'static str,
@@ -260,7 +264,8 @@ fn enforce_conformal_breach_policy(
         operation,
         observed_latency_us = duration_to_micros_saturated(observed),
         conformal_upper_bound_us,
-        "io_uring latency exceeded conformal upper bound; backend disabled and unix path will be used"
+        "io_uring latency exceeded its conformal upper bound in a sustained run (bd-0oa1b); \
+         backend disabled and unix path will be used"
     );
 }
 
@@ -1845,7 +1850,7 @@ impl IoUringFile {
         }
 
         let elapsed = start.elapsed();
-        if record_io_uring_read_latency(elapsed) {
+        if record_io_uring_read_latency(elapsed).sustained_breach {
             let snapshot = io_uring_latency_snapshot();
             enforce_conformal_breach_policy(
                 &self.runtime,
@@ -2010,7 +2015,7 @@ impl IoUringFile {
         }
 
         let elapsed = start.elapsed();
-        if record_io_uring_write_latency(elapsed) {
+        if record_io_uring_write_latency(elapsed).sustained_breach {
             let snapshot = io_uring_latency_snapshot();
             enforce_conformal_breach_policy(
                 &self.runtime,
@@ -2149,7 +2154,7 @@ impl IoUringFile {
         checkpoint_or_abort(cx)?;
 
         let elapsed = start.elapsed();
-        if record_io_uring_write_latency(elapsed) {
+        if record_io_uring_write_latency(elapsed).sustained_breach {
             let snapshot = io_uring_latency_snapshot();
             enforce_conformal_breach_policy(
                 &self.runtime,
@@ -2318,7 +2323,7 @@ impl IoUringFile {
         checkpoint_or_abort(cx)?;
 
         let elapsed = start.elapsed();
-        if record_io_uring_write_latency(elapsed) {
+        if record_io_uring_write_latency(elapsed).sustained_breach {
             let snapshot = io_uring_latency_snapshot();
             enforce_conformal_breach_policy(
                 &self.runtime,
@@ -3080,6 +3085,101 @@ mod tests {
         );
         full.close(&cx).expect("close full");
         short.close(&cx).expect("close short");
+    }
+
+    /// bd-0oa1b keepers on the real ring. The latency window is process-wide,
+    /// so the body runs in a child process of this test binary, filtered to
+    /// this test alone, where no other test's samples share it.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_conformal_policy_spares_early_writes_and_disables_on_a_sustained_breach() {
+        const CHILD_ENV: &str = "FSQLITE_BD_0OA1B_POLICY_CHILD";
+        const TEST: &str = "uring::tests::test_conformal_policy_spares_early_writes_and_disables_on_a_sustained_breach";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            conformal_policy_child_body();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run the isolated conformal-policy child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated conformal-policy child failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn conformal_policy_child_body() {
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        assert!(vfs.is_available(), "requires io_uring: {}", vfs.status());
+        reset_io_uring_latency_metrics();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut file, _) = vfs
+            .open(
+                &cx,
+                Some(&dir.path().join("policy.db")),
+                open_flags_create_unlocked(),
+            )
+            .expect("open");
+        let page = [0x5A_u8; 4096];
+        let mut offset = 0_u64;
+        let mut write = |file: &mut IoUringFile| {
+            block_on_test(&cx, file.write(&cx, &page, offset)).expect("write");
+            offset += 4096;
+        };
+
+        // A process's first 99 ring writes cannot breach, whatever their
+        // latencies: with fewer than 99 calibration scores the 99% conformal
+        // bound is unbounded. On main the bound of such a window was its
+        // running maximum; the CLI lost io_uring at its 58th ring write.
+        for _ in 0..99 {
+            write(&mut file);
+        }
+        let early = io_uring_latency_snapshot();
+        assert_eq!(
+            early.write_samples_total, 99,
+            "every early write went through the ring"
+        );
+        assert_eq!(early.write_tail_violations_total, 0);
+        assert!(
+            vfs.is_available(),
+            "early writes must not disable io_uring: {}",
+            vfs.status()
+        );
+
+        // A sustained breach on a full window still disables it. Calibrate
+        // the window at 1 ns, so that every real ring write exceeds the bound
+        // until about 11 of them have entered the window; the policy needs 10
+        // violations among the last 64 calibrated samples.
+        for _ in 0..2_000 {
+            let _ = record_io_uring_write_latency(Duration::from_nanos(1));
+        }
+        for violation in 1..10 {
+            write(&mut file);
+            assert!(
+                vfs.is_available(),
+                "{violation} violations are not a sustained breach: {}",
+                vfs.status()
+            );
+        }
+        write(&mut file);
+        let status = vfs.status();
+        assert!(
+            !vfs.is_available(),
+            "the tenth violation is a sustained breach: {status}"
+        );
+        assert!(
+            status.contains(IO_URING_WRITE_CONFORMAL_BREACH_MSG),
+            "{status}"
+        );
+        assert_eq!(io_uring_latency_snapshot().write_tail_violations_total, 10);
+        file.close(&cx).expect("close");
     }
 
     #[test]
