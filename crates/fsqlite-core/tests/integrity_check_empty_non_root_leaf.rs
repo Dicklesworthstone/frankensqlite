@@ -401,7 +401,9 @@ fn bd_vojth_rowid_and_orphan_share_one_structural_report() {
     assert_eq!(lines[2], format!("Page {orphan}: never used"));
     asupersync::test_utils::run_test(|| async {
         // Keep first-open repair from reclaiming the orphan before the check.
-        let conn = Connection::open_schema_only(path.to_str().unwrap()).await.unwrap();
+        let conn = Connection::open_schema_only(path.to_str().unwrap())
+            .await
+            .unwrap();
         for prepared in [false, true] {
             let native = native_reports(&conn, "PRAGMA integrity_check(2)", prepared).await;
             assert_eq!(native.len(), 1, "{native:?}");
@@ -410,7 +412,10 @@ fn bd_vojth_rowid_and_orphan_share_one_structural_report() {
             assert_eq!(grouped[..2], lines[..2]);
             assert!(grouped[2].contains(&format!("page {orphan} is never used")));
             for sql in ["PRAGMA integrity_check(1)", "PRAGMA quick_check(2)"] {
-                assert_eq!(native_reports(&conn, sql, prepared).await, [lines[..2].join("\n")]);
+                assert_eq!(
+                    native_reports(&conn, sql, prepared).await,
+                    [lines[..2].join("\n")]
+                );
             }
         }
         conn.close().await.unwrap();

@@ -46726,6 +46726,9 @@ impl Connection {
                         ));
                     }
                 }
+                // A later ATTACH inherits main's current mode, including a
+                // setting made by a schema-qualified PRAGMA main.secure_delete.
+                attached_connection.inherit_secure_delete(self);
                 self.attached_schemas
                     .borrow_mut()
                     .attach(attach.schema.clone(), path)?;
@@ -89762,6 +89765,11 @@ impl Connection {
         };
         if pragma_name == "secure_delete" && pragma.value.is_some() {
             self.apply_secure_delete_policy_to_held_txns();
+            if pragma.name.schema.is_none() {
+                for child in self.attached_connections.borrow().values() {
+                    child.inherit_secure_delete(self);
+                }
+            }
         }
 
         if fsqlite_vdbe::pragma::is_writable_schema_reset(pragma) {
@@ -93143,6 +93151,11 @@ impl Connection {
     /// The policy is per transaction handle, so the shared pager is untouched.
     fn apply_secure_delete_policy(&self, txn: &mut TransactionKind) {
         txn.set_secure_delete_mode(self.secure_delete_policy());
+    }
+
+    fn inherit_secure_delete(&self, parent: &Self) {
+        self.pragma_state.borrow_mut().secure_delete = parent.pragma_state.borrow().secure_delete;
+        self.apply_secure_delete_policy_to_held_txns();
     }
 
     /// bd-i2u1c: stock applies a changed `PRAGMA secure_delete` to the very
