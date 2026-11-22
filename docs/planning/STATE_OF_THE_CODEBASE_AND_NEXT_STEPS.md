@@ -22,7 +22,7 @@ on both files. Both readers also recovered every byte of a separate
 1,048,577-byte mixed-byte BLOB through the index (`bd-46l13`).
 
 The previous CLI also reported `ok` on three saved corrupt WAL databases.
-On `5fd6a795e` (Linux build `30097323753219347`), both `integrity_check`
+On `4ab88f36f` (Linux build `30097323753219356`), both `integrity_check`
 and `quick_check` identified a stock-reported rowid on each file. On eight
 constructed databases, all 16 checks matched SQLite's tree, page, cell and
 signed rowid. This includes right children whose first key is too small,
@@ -31,7 +31,7 @@ passed, including healthy collated and WITHOUT ROWID trees (`bd-3koph`).
 One saved file contains two independent errors. SQLite reports both at a
 limit of two. FrankenSQLite currently reports one (`bd-vojth`).
 
-## Compatibility and concurrent writers, 2026-11-20
+## Compatibility and concurrent writers, 2026-11-20 through 2026-11-21
 
 Two Linux CLI processes opened the same WAL database with the default settings.
 Both reported `fsqlite.concurrent_mode=1`. Using plain `BEGIN`, each updated a
@@ -41,6 +41,15 @@ and stock SQLite 3.54.1 processes read back both values (`11|22`) and reported
 `integrity_check=ok`. This exercises the disjoint-write case in V03–V05.
 Cross-process conflict handling and the many-writer performance gate still
 have their own acceptance on `bd-zywqc.20` and `bd-z4zl7`.
+
+On Linux `4ab88f36f`, two processes read the same row before either wrote.
+After one committed, SQLite rejected the stale writer at UPDATE and
+FrankenSQLite rejected it at COMMIT with a page-2 snapshot conflict. Both
+readers reopened both database origins with the committed value and
+`integrity_check=ok`. Killing a writer after its uncommitted UPDATE also
+preserved the previous value in all four creator/writer combinations. A
+new writer then committed successfully. Global commit identity and the
+other cross-process authority requirements remain on `bd-zywqc.20`.
 
 The September GH407 count query now returns the expected integer 1 on both
 engines. A separate wrong-answer path remained in forced partial indexes. An
