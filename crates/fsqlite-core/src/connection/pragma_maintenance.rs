@@ -152,7 +152,6 @@ impl Connection {
         }
         let mut reports = IntegrityCheckReports {
             limit: *remaining,
-            quick_index_counts: quick.then(Vec::new),
             ..Default::default()
         };
         // TEMP uses connection-local memory roots. Their numeric identifiers
@@ -181,9 +180,9 @@ impl Connection {
                 return Ok(());
             }
         }
-        if structural.is_ok() && let Some(count_errors) = reports.quick_index_counts {
-            let n = count_errors.len().min(*remaining);
-            rows.extend(count_errors.into_iter().take(n));
+        if structural.is_ok() {
+            let n = reports.index_counts.len().min(*remaining);
+            rows.extend(reports.index_counts.into_iter().take(n));
             *remaining -= n;
             if *remaining == 0 {
                 return Ok(());

@@ -647,6 +647,14 @@ fn quick_check_counts_unconditional_index_entries_in_the_selected_database() {
                     assert_eq!(native_reports(&native, sql, prepared).await, oracle, "{sql}");
                 }
             }
+            if without_rowid {
+                for sql in ["PRAGMA integrity_check(1)", "PRAGMA integrity_check(2)", "PRAGMA integrity_check(q)"] {
+                    let oracle = stock_connection_reports(&stock, sql);
+                    for prepared in [false, true] {
+                        assert_eq!(native_reports(&native, sql, prepared).await, oracle, "{sql}");
+                    }
+                }
+            }
             native.close().await.unwrap();
         });
         stock.execute_batch("REINDEX a; REINDEX b;").unwrap();
