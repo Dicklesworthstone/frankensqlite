@@ -94,6 +94,100 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - WIN (landed as d95fb43fb; inside its prediction on rowid_lookups_200k, x5.86 -> x5.44 stock 3.54.1 in instructions): a table descent reuses the clean pages its previous descent left on the cursor's stack, as stock's moveToRoot keeps the root (bd-t0g9w, read/seek rounds 9-10, lever PR1)
+
+- Target: the scorecard's worst row, rowid_lookups_200k (200k random rowid probes into a depth-3 table; x5.83 stock
+  3.54.1 in instructions on the scorecard), and bd-t0g9w's per-entry table seek of index-driven lookups. A probe the
+  seek cache does not answer cleared the cursor's stack and loaded the root, then every page below, again.
+- Touched: `crates/fsqlite-btree/src/cursor.rs` (`table_seek_for_insert`; the new `PageReader::tracks_dirty_pages`,
+  default false, true for `TransactionPageIo`; the keeper), `crates/fsqlite-vdbe/src/engine.rs`
+  (`SharedTxnPageIo::tracks_dirty_pages`).
+  - At each depth the descent keeps the entry the previous descent left there when it is the page about to be read
+    and the reader says this transaction has not changed it: `load_page`'s stack-top elision rule along the path. The
+    first page off the path truncates the stack. A seek-cache or SL1 same-leaf hit leaves only the leaf, so the next
+    descent reloads the root.
+  - Only readers that track dirty pages qualify (`TransactionHandle::is_page_dirty` defaults to `true`), so
+    MemPageStore keeps the full descent.
+  - Keeper `test_table_descent_reuses_its_clean_path_and_reloads_pages_a_peer_cursor_rewrote`: a reusing cursor, a
+    reference cursor that never reuses, and a writer that splits, grows and shrinks the tree under both, uncommitted;
+    answers, positions and payloads must match and the reuse must read far fewer pages.
+- Ledger preflight: SL1 v3 (landed), SC8 v1-v4 (v4 landed 4e15416e8), SL2 v1/v2 (rejected; v2 added a slot scan to
+  every probe no slot admits, rowid_lookups +1.75%), DEC v1, bd-k96op / bd-y8zgm. None reused the descent's upper
+  pages.
+- Round 9 (base 47ec41f99, stock 3.46.1 for the read set): rowid_lookups -7.06%, the bd-79p0a statements -2.8%, a
+  layout-averaged rowid_lookups WIN (cpu 0.952 / 0.961, cycles 0.935 / 0.935), no replicated LOSE; not landed before
+  the session ended. Rebased with no conflict over CL1 (009856eb4), SC8 v4 (4e15416e8), AFC (f921f63c4), secure-delete
+  (588b17d07) and the freeblock fix (467491919); re-predicted on the bead before the rebuild.
+- Prediction (bd-t0g9w, 2026-11-21, before the rebuild): rowid_lookups -170M to -200M Ir; join 0 to -12M;
+  memory_script -5M to -35M; bd-79p0a statements at 40,000 rows -2.0% to -3.2%, at 400 rows within 0.1%;
+  select-index / select-rowid / insert within 0.1%; every other row within 0.1%; rowid_lookups cycles and cpu a
+  replicated layout-averaged WIN. Kill: any judged row above +0.5% Ir; rowid_lookups better by less than 4% or the
+  bound statement by less than 2%; any replicated layout-averaged LOSE; answers differing; a keeper red; the
+  dirty-reuse mutant passing.
+- Result. Parent = main 579ab83ce, lever = parent + PR1; the CLI arms in one rch job (layout_shuffle_pair.sh, K=6,
+  hz4; parent fsqlite-cargo b5ec3211adbb26b3, lever 9651a9f38d4fca6e), the probe and statement-loop arms in one
+  second job (hz4; probe 36844a63cd0ef0df / c420288320f2ea6d, loop 72ebbc27de19036f / 5607d57725080d00). Every ELF
+  matches its manifest and stock on the smoke script; the parent's sources equal git. thinkstation1, powersave,
+  io_uring refused, stock SQLite 3.54.1 (rl12/stock354) live in every run.
+  - Read set and write rows (two layout-averaged judgement runs; instructions are the median of the layouts' minima,
+    identical in both runs to 0.01M):
+
+    | row | stock 3.54.1 | parent | PR1 |
+    |---|---|---|---|
+    | rowid_lookups_200k | 459.2M | 2,689.9M (x5.86) | 2,499.3M (x5.44), -190.6M, -7.09% |
+    | join_1M_to_pk_1000 | 1,420.4M | 3,608.9M | -1.45M (-0.04%) |
+    | memory_script_200k | 1,692.2M | 3,219.7M | -0.22M / -0.38M |
+    | every other row | | | within +-0.02% |
+
+  - bd-79p0a statements (rs9/aggloop.py, 7 reps, A/A arm within 0.03%): 40,000 rows bound 31.112M -> 30.229M
+    (-2.84%), literal 30.188M -> 29.306M (-2.92%), count bound 30.950M -> 30.068M (-2.85%), count literal
+    30.027M -> 29.145M (-2.94%); x5.47 -> x5.32 stock on the bound statement. 400 rows within 0.02%.
+  - prepared-dml-probe (rs6_lookup.py, 7 reps): select-index 63,904 -> 63,983 (+0.12%; A/A +0.17%), select-rowid
+    8,616 both, insert-autocommit 140,333 -> 140,321.
+  - Time: bd-es2im layout-averaged, K=6. Run 2 was VOID (null |z| 5.18 on gb_a_sum_c cycles and 3.14 on gb_id, two
+    of the error rows below) and was replaced by run 3, so runs 1 and 3 judge (null max |z| 2.51 / 2.89):
+    rowid_lookups_200k cycles 0.948 / 0.925, a replicated WIN; its cpu 0.961 WIN / 0.997 TIE (T 7.5%), a TIE.
+    No row a replicated LOSE (single-run LOSEs: scan_filter_agg cpu, order_by_text_limit10 cycles, memory_script cpu,
+    and the error rows). Void run 2, for the record: rowid_lookups cycles 0.950, cpu 0.981.
+  - Main defect seen in these runs (not PR1's): the arms were built at 579ab83ce, inside bd-46l13's window, so
+    gb_id, gb_a_sum_c and gb_id_mod100k fail in both arms with "synchronous VFS temp file I/O unexpectedly returned
+    Pending" (reported from this lane). Those three rows measure an error path and are judged instead from round 9's
+    run (pre-window binaries, the same PR1 code, stock 3.46.1): a replicated TIE on cpu and cycles, Ir 1.0000.
+  - MISSED: memory_script -0.2M against -5M to -35M (SC8 v4's eight slots now answer its probes, so few descents
+    remain); rowid_lookups cpu not a replicated WIN (its cycles are); select-index +0.12% against 0.1% (inside its
+    A/A spread of +0.17%).
+- Mutant (never committed): the descent reuses dirty pages too (`&& (true || !is_dirty)`). On 579ab83ce + PR1 it
+  PASSED the round-9 keeper: SC8 v4's eight-slot seek cache answered the keeper's revisited targets from their cached
+  leaves, so no probe descended through a dirty root. The keeper now clears both cursors' seek caches before every
+  probe; on main 94395a013 + PR1 the mutant fails it at "peer writes: target 106" (rch vmi1227854, rc 101).
+- Gate, two trees, rch.
+  - 579ab83ce + PR1 (9061b48d4): clippy -D warnings btree, wal, pager, vdbe, core (all targets) clean; lib btree 576,
+    wal 1,263, pager 1,126, vdbe 1,189, core 4,201; goldens 8 + hot_arm_stream_reachability 1; T1+T2 (bd_79p0a,
+    bd_d4rbi, bd-5i14u, bd_aavtp, join_aggregate_lookup_oracle, bd_kcf1h among them) 79; T3+XP 268; PS 184; EQP 100;
+    e2e (14 targets, --test-threads=1) 120; the fsqlite crate in 7 batches of up to 19 targets, 1,103 passed in 125
+    binaries: all 0 failed. A second e2e run of that tree hit bd-1epn5's "Rowid out of order"; that base predates its
+    fix 87b4a8741.
+  - 94395a013 + PR1 with the stronger keeper (9ee59eafe), after f5c997356 (auto_vacuum) landed in cursor.rs and
+    engine.rs: clippy btree, wal, vdbe (all targets) clean; lib btree 579, wal 1,263, vdbe 1,189, core 4,201; goldens
+    8 + 1; T1+T2 79; bd_1q134_auto_vacuum_oracle 6; auto_vacuum_stock_database_write_guard + stock_file_variant_matrix
+    16; e2e 124; the mixed stock+fsqlite explicit-writer test 30 runs, 0 failed, no "out of order"; the fsqlite crate
+    1,103 passed, 1 failed: agg_index_range_oracle grouped_index_order_streams_and_matches_sqlite (its strict-HAVING
+    assertion, stale on that base; main updated the test in 8f0c8ac6d, bd-4uurt).
+  - Landing tree (PR1 on 488ae3f6a; the 107 commits after 94395a013 touch none of PR1's functions or callers):
+    clippy -D warnings btree, vdbe, core (all targets) clean; btree lib 579 (the keeper among them), fsqlite lib 750,
+    agg_index_range_oracle 7 (rch vmi1227854), all 0 failed. rustfmt --check cursor.rs clean (engine.rs: ignored
+    crate). ubs cursor.rs: 0 critical; the new findings are the keeper's test inventory and the four `stack[depth]`
+    indexings right after the entry at that depth is matched or pushed. Pushed on 86d102bdf (4 later commits, none in
+    PR1's files) as d95fb43fb.
+- Retry condition / next: the SL1 and seek-cache hits still drop the root (a v2 could keep the path when the same
+  leaf lies under the same parent; SL1's keeper pins the current stack shape). On rowid_lookups the interior page
+  below the root is reused only when two probes share it; its load still decodes the cell pointers on a memo miss.
+  Where rowid_lookups_200k's probe goes after PR1 (callgrind of the lever's fsqlite-cargo ELF, statement minus open,
+  per probe of about 12.4k callgrind Ir): table_move_to 10.5k, of which load_page 7.2k and the page-cache miss
+  (get_nonresident_page) 5.9k; inclusive and nested inside it: read_page_copy 4.6k, InFlightReadLeader::finish 2.3k,
+  trim_to_page_budget 2.1k, take_clean_buffer 1.9k, S3-FIFO forget 1.5k (first_access_trace_position 1.1k). The VDBE
+  loop 1.6k.
+
 ## 2026-11-22 - REJECTED on two kill lines (callgrind one-key cost +73.8 Ir a statement against +60; its own keeper red: an admitted one-key count over a TEXT column takes a different plan bound than literal), with multicol_eq_1000 x7.20 -> x5.37 stock 3.54.1 and its cpu and cycles replicated WINs: a literal SELECT of aggregates or columns over ANDed integer keys runs parameterized only when its keys are exactly an ascending index prefix (bd-w4pr1.13.18, read/seek round 10, lever L5 v3)
 
 - Target: multicol_eq_1000 of the read sweep (`SELECT count(*), sum(val) FROM s WHERE g = <int> AND h = <int>`, 1,000
