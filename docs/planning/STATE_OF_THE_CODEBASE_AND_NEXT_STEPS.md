@@ -11,7 +11,10 @@ reopened backups. The backup cases include WITHOUT ROWID tables whose
 secondary index stores a composite primary key. On the same build, all 16
 checkpoint comparisons passed with a reader holding a WAL snapshot across
 PASSIVE, FULL, RESTART and TRUNCATE. The optional per-page XXH3 check in
-specification §7.7 still needs qualification on `bd-fjieg`.
+specification §7.7 remains open on `bd-fjieg`. On `17f3faa49`, setting
+`PRAGMA page_checksum=ON` before creating the first table left database
+header byte 20 at zero after reopen. Section 7.4 requires 16 reserved
+bytes per page when checksums are enabled.
 
 The Linux CLI at `17f3faa49` (build `30097323753220111`) also matched
 SQLite 3.54.1 on 168 malformed UTF-16 checks. An unrelated UPDATE used to
@@ -28,6 +31,25 @@ and deleting rowid 100, the next main row received 101 while the TEMP table
 shadowed it, and the following row received 102 after the TEMP rename.
 Fresh processes confirmed the persistent rows and catalog. The 354
 encoded-write and 16 active-reader checkpoint comparisons passed again.
+
+## TEMP spill cancellation and rollback, 2026-11-22
+
+A failed disk read during a TEMP table rewrite could discard the original
+spill location. On `066f8f355` the rewrite reads every needed row before
+changing any location. Failing the second read left all 25 stored rows
+and their UNIQUE index entries intact. Retrying with a live statement
+context recovered the rows. The injected failure and cancellation test
+passed on Linux (RCH `30097323753220135`, `bd-ragyd`).
+
+Rolling back a TEMP column addition and a UNIQUE index also restores
+the prior row width and constraints. Both engines then accepted a duplicate
+key and applied a new column default to both rows, including the previously
+spilled 16,384-byte row. The final CLI repeated all 667 encoding, schema,
+ownership, checkpoint and raw-text comparisons above. All 56 tests in
+13 affected integration suites passed (RCH `30097323753220125`), including
+all nine TEMP-storage and five mmap tests. The types suite passed all 593
+tests and the VDBE suite passed all 1,263 active tests. Its sole ignored
+test is a manual performance benchmark.
 
 ## Compound writes, integrity checks and historical reads, 2026-11-21 through 2026-11-22
 
