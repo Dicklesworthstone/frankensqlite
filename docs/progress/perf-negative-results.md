@@ -94,6 +94,101 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - WIN (landed as 986d2ca38; inside every kill line, prediction missed low by 1.0M on rowid_lookups_200k, x5.46 -> x4.94 stock 3.54.1 in instructions): an eviction on a sparse access trace waits for one batched compaction instead of searching and moving the whole trace (bd-w4pr1.13.18, read/seek round 11, lever BF1)
+
+- Target: `S3FifoEvictionTracker::forget`, run on every page-cache eviction. Callgrind on main 5aa8fd2f7: 1,587 per
+  eviction, 297.5M of rowid_lookups_200k (11.9%, 187,524 evictions), 11.26M of each judged 1M-row scan (7,105
+  evictions). The read-path eviction (`take_clean_buffer`) does not consult the tracker; the trace is replayed only
+  by `evict_any`, the queue metrics and page snapshots. Records happen on admission only (two per miss), so the
+  live trace holds about two entries per resident page (1,000 of the 4,000-entry bound at the 500-page cache).
+- Touched: `crates/fsqlite-pager/src/page_cache.rs`. A new `AccessTrace` holds both trackers' history (S3-FIFO and
+  ARC), with the eager history's logical contents entry for entry. A forget on a sparse trace (no forget waiting and
+  live length under 3/8 of the bound, or forgets waiting and the physical length under 1/2) stores the page in an
+  open-addressing table (`ForgottenTracePages`, 1,024 slots of key and cut at the default cache, 8 KiB) with its cut,
+  the trace length at the forget; entries before the cut are dead, entries recorded after it live. One compaction
+  pass drops every waiting page's dead entries at half the bound, a half-full table, or a record into a full trace;
+  the front is popped only after a compaction. A forget on a denser trace removes the page at once with the old block
+  search. Records are unchanged.
+  - Keepers `test_bd_w4pr1_13_18_access_trace_forgets_like_the_eager_history` (an eager-history oracle at bounds 64,
+    128, 4,000 and 8,192 that must exercise readmission while a forget waits, a record into a full trace while
+    forgets wait, a forget above 4,096 physical entries while forgets wait, both compaction triggers, skipped and
+    eager forgets) and `test_bd_w4pr1_13_18_trackers_replay_the_eager_history_while_forgets_wait` (S3-FIFO and ARC
+    victims, snapshot and assignments equal to trackers replaying the eager history). Three planted mutants (a
+    waiting page's entries all die; a full trace pops without compacting; the 4,096 rule on the physical length)
+    each fail the oracle keeper. The two existing forget tests assert on the logical trace and, after a compaction,
+    on the physical ring; the block search is still checked directly for every length and ring layout.
+- Ledger preflight: 2026-11-11 (admission stamps in a map, ~250 per admission), 2026-11-12 (per-page count map; its
+  retry condition named this design: forget touches no trace entry and the consumers skip dead entries, with an
+  all-hits kill line), 2026-11-14 (lazy deletion with a page-to-slot map, cost on admission), S3F v1 / v2 (O(1) node
+  list; v2 killed by update_10pct_300k cycles, attributed by bd-v3i4s to its 176 KB tracker). BF1 adds no work per
+  admission and 8 KiB per tracker.
+- Prediction (bead, before the build): tracker forget 60-200 per call; rowid -240M to -285M; each 1M-row scan -9.0M
+  to -11.0M; write rows within +-0.3%; all-hits control within +-0.1%; rowid cycles and cpu a replicated WIN, every
+  other row TIE. Kill: rowid better by less than 200M; any row above +0.5% Ir or the all-hits control above +0.3%;
+  any replicated layout-averaged LOSE; an answer differing; clippy or the keepers red; a mutant passing.
+- Result. Parent = main 5aa8fd2f7, lever = parent + BF1, one rch job on ovh-a (clippy, keepers, mutants, then
+  layout_shuffle_pair.sh K=6; parent fsqlite-cargo 0239b49a6ad8d35b, lever a9d14f21b4e2118f). thinkstation1,
+  powersave, io_uring refused, stock SQLite 3.54.1 (rl12/stock354) live.
+  - Callgrind, single cargo ELFs: rowid 2,495.25M -> 2,257.75M (-237.5M, -9.52%; x5.43 -> x4.92 stock); all-hits
+    control +0.009%. `AccessTrace::forget` 331 per call: 252 of it the 375 compactions (126k each, about 63 Ir per
+    scanned entry), 79 the rest.
+  - Judge instructions (median of six layouts' minima, identical in both runs to 0.05M): rowid 2,506.4M -> 2,267.4M
+    (-239.0M, -9.54%; x5.46 -> x4.94); each 1M-row scan -9.0M to -9.5M (scan_filter_agg -0.78%, join -0.25%,
+    order_by_text_limit10 -0.79%, the GROUP BY rows -0.07% to -0.41%); delete -0.14%, update -0.09%, bulk -0.14%,
+    memory_script -0.27%.
+  - Time (bd-es2im layout-averaged, two valid runs, null max |z| 1.36 / 3.05): rowid_lookups_200k cycles 0.949 /
+    0.963, a replicated WIN (cpu 0.984 TIE / 0.970 WIN, a TIE); order_by_text_limit10 cycles 0.983 / 0.985, a
+    replicated WIN; no replicated LOSE (single-run LOSEs: update_10pct cpu run 1 and cycles run 2, memory_script
+    cycles run 1, group_by_1000_groups cpu run 2). Answers equal stock everywhere.
+  - MISSED: rowid -239.0M against -240M to -285M and tracker work 331 against 60-200 (the compaction loop costs about
+    63 Ir an entry, not 10-25); rowid cpu not a replicated WIN; order_by cycles a WIN where TIE was predicted.
+- Gate: Gate (rch; the lever on 5aa8fd2f7, 5b01fb9d1): clippy -D warnings fsqlite-pager (all targets)
+  clean; fsqlite-pager lib 1,132 and fsqlite-core lib 4,202 (+1) passed; T3+XP 268, PS 184, e2e (14 targets) 130;
+  the fsqlite crate in 7 batches, 1,104 passed in 125 binaries; all 0 failed. Landing tree (BF1 on 31ac790f3):
+  clippy fsqlite-pager clean, pager lib 1,132 passed; rebased with no conflict onto 95f4ee645 (42d0f716c changed
+  pager.rs's group-commit flush, not the page cache) and pushed as 986d2ca38. rustfmt: ignored crate. ubs
+  page_cache.rs: 0 critical; the 32 new warnings are the keepers' asserts, unwraps and clones and the table's masked
+  indexing.
+- Retry condition / next: the compaction loop (about 47M of the remaining tracker cost on rowid) could take a
+  cheaper membership test per entry (a bitmap prefilter in front of the table, or a bulk pass that skips entries
+  recorded after the oldest cut); measure that alone first, since the forget path is now under 0.4k per eviction.
+  take_clean_buffer's flat-slot search (about 0.4k per eviction) and InFlightReadLeader::finish's other work remain.
+
+## 2026-11-22 - REJECTED on its time kill line (gb_id cycles a replicated layout-averaged LOSE, 1.0104 / 1.0252, at Ir 1.0000), with select-index -1,423 Ir an execution (-2.2%) and the point rows -0.9% to -1.3%: a cursor open reads its root page and the page-1 header as the image the transaction shares, not as a 4 KiB Vec copy (bd-05xlf, read/seek round 11, lever 3a)
+
+- Target: `VdbeEngine::open_storage_cursor`, two `SharedTxnPageIo::read_page` calls per cursor open (the root, then
+  page 1 through `btree_cursor_page_layout_from_page_one`, which keeps 100 bytes); `read_page` is
+  `get_page(..).into_vec()`, a 4 KiB allocation and copy of an image the transaction already shares.
+- Touched (not landed; patch `scripts/layout_patches/l3a.patch` in frankensqlite-perf5-shm, sha256 fef9c1ced3fcc5c0,
+  and local branch lane-l3a-r11 1de7d0a1d with a keeper): `crates/fsqlite-vdbe/src/engine.rs`. Both reads use
+  `read_page_data` and parse from `as_bytes()`; error classes, the MemDatabase fallback, the zero-page check and the
+  read witness are unchanged. Keeper `test_bd_05xlf_cursor_layout_reads_page_one_without_a_copy` (a reader whose
+  `read_page` fails the test must still give the page-1 layout, reserved bytes and UTF-16le; a page-1 `Busy` from
+  `read_page_data` must propagate); the parent's `read_page` copy (mutant m0) fails it.
+- Prediction (bead, 2026-11-21, re-checked on 2026-11-22 before the build): select-index -400 to -900 an execution;
+  select-rowid within 0.15k; insert-autocommit -0.2% to -0.6%; point rows -0.3% to -0.8%, multicol -0.2% to -0.5%;
+  the judged rows within +-0.05%. Kill: select-index better by less than 300; any row above +0.5% Ir; select-rowid
+  above +0.15k; any replicated layout-averaged LOSE, cpu or cycles; an answer differing; a keeper red.
+- Result. Parent = main 5aa8fd2f7, lever = parent + 3a; the CLI pair (K=6) and both probe arms in one rch job on hz4
+  (parent fsqlite-cargo cc150df888106ecd, probe 63bef4b6dd86fbe6; lever a25231cbcecf2fd4, 368e2ab7dd4e92b1).
+  thinkstation1, powersave, io_uring refused, stock SQLite 3.54.1 live.
+  - select-index 64,064 -> 62,641 (A/A 64,022; x11.63 -> x11.37 stock); select-rowid 8,665 in every arm;
+    insert-autocommit +0.1% (A/A +0.04%). Sweep, two runs: point_rowid -0.87%, point_hot -1.14%, point_sec_key
+    -1.29%, multicol -0.44%, rowid_lookups 0, every row a replicated TIE in time. Judged rows within +-0.013% Ir.
+    Answers equal stock everywhere.
+  - Time: run 1 VOID (null max |z| 6.75; its write rows overlapped another lane's stock callgrind at 18:35-18:36Z);
+    runs 2 and 3 judge (null max |z| 3.06 / 2.66): gb_id cycles 1.0104 (T 1.00%) / 1.0252 (T 1.75%), a replicated
+    LOSE at Ir 1.0000 (1.0227 in the void run too). KILL LINE FIRES. Every other row a replicated TIE.
+  - MISSED (beyond): select-index -1,423 against -400 to -900, the point rows beyond -0.8%. MISSED: insert-autocommit
+    no gain.
+- Gate before the verdict (local branch): clippy vdbe (all targets) clean; vdbe page-1 and cursor-open tests 20,
+  libs btree 579 / core 4,202 / vdbe 1,264, goldens + hot-arm 9, T1+T2 79, all 0 failed.
+- Retry condition: with lever 3's remaining cursor-open cost (the page-1 layout cached per transaction) in the same
+  lever, so a judged row moves beyond its T; or the same two ELFs re-judged if a later finding shows gb_id's cycles
+  move between same-source builds (bd-v3i4s's N1 two-build null found none in 28 tests, so this kill stands as a real
+  cost until then). Main has since replaced gb_id's sorter (31ac790f3, lever GR), so on a base after it the row
+  that killed this lever runs another program; a retry there needs its own prediction and the same kill lines.
+
 ## 2026-11-22 - WIN (landed as be2bce0d3; inside its prediction; trig_cte x14.40 -> x11.57 stock 3.54.1 in instructions): a trigger body INSERT, UPDATE or DELETE runs its compiled program without the dispatcher's per-statement validation and rewriting (bd-fpr5g, trig lane round 1, lever 3b)
 
 - Target: bd-fpr5g's script, an AFTER INSERT trigger with a WHEN guard and an INSERT and an UPDATE in its
