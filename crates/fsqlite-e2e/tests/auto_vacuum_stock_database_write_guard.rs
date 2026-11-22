@@ -1,15 +1,13 @@
-//! bd-1q134 — writes to a stock auto-vacuum database are refused, not corrupting.
+//! bd-1q134 — stock auto-vacuum databases accept mixed DML/DDL writes with full
+//! pointer-map maintenance and pass C SQLite's `PRAGMA integrity_check`.
 //!
-//! A database created by stock SQLite with `PRAGMA auto_vacuum = FULL` (or
-//! `INCREMENTAL`) keeps pointer-map pages, and its header's largest-root-page
-//! field (bytes 52..56) is nonzero. FrankenSQLite does not maintain pointer
-//! maps yet. Before this guard, writing such a file succeeded and FrankenSQLite's
-//! own `integrity_check` said `ok`, but stock SQLite then reported
-//! `Freelist: Failed to read ptrmap key=...` (2026-11-09 reality check).
-//!
-//! The pager now refuses every writer upgrade on such a file. This test asks C
-//! SQLite for the verdict on the file afterwards, and keeps a negative control:
-//! the same workload on a non-auto-vacuum stock database must still write.
+//! Previously, before pointer-map maintenance was implemented, the pager had a
+//! stop-gap write guard refusing writers on stock `auto_vacuum = FULL` /
+//! `INCREMENTAL` databases to avoid silently corrupting pointer maps. Now that
+//! `PRAGMA auto_vacuum`, pointer-map maintenance, root compaction, and
+//! truncation are wired end-to-end, FrankenSQLite must read and mutate stock
+//! `FULL`, `INCREMENTAL`, and `NONE` databases cleanly while preserving their
+//! mode and passing stock SQLite's `PRAGMA integrity_check = ok`.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -31,7 +29,7 @@ fn create_stock_database(path: &Path, auto_vacuum: &str) {
     .expect("stock setup");
 }
 
-fn stock_verdict(path: &Path) -> (String, i64, i64) {
+fn stock_verdict(path: &Path) -> (String, i64, i64, i64, i64) {
     let c = rusqlite::Connection::open(path).expect("rusqlite reopen");
     let integrity: String = c
         .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
@@ -42,11 +40,16 @@ fn stock_verdict(path: &Path) -> (String, i64, i64) {
     let rows: i64 = c
         .query_row("SELECT count(*) FROM t;", [], |row| row.get(0))
         .expect("stock count");
-    (integrity, auto_vacuum, rows)
+    let page_count: i64 = c
+        .query_row("PRAGMA page_count;", [], |row| row.get(0))
+        .expect("stock page_count");
+    let freelist_count: i64 = c
+        .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+        .expect("stock freelist_count");
+    (integrity, auto_vacuum, rows, page_count, freelist_count)
 }
 
-/// Runs reads then a battery of writes through FrankenSQLite. Returns the row
-/// count it read and every write's outcome.
+/// Runs reads then a battery of mixed DML/DDL writes through FrankenSQLite.
 fn exercise_with_fsqlite(path: &Path) -> (i64, Vec<Result<(), String>>) {
     let db = path.to_str().expect("utf-8 path").to_owned();
     let cell = RefCell::new(None);
@@ -89,12 +92,12 @@ fn temp_dir() -> tempfile::TempDir {
 }
 
 #[test]
-fn stock_auto_vacuum_database_is_readable_but_refuses_writes() {
+fn stock_auto_vacuum_database_accepts_writes_and_preserves_integrity() {
     for mode in ["FULL", "INCREMENTAL"] {
         let dir = temp_dir();
         let path = dir.path().join("av.db");
         create_stock_database(&path, mode);
-        let (_, auto_vacuum_before, _) = stock_verdict(&path);
+        let (_, auto_vacuum_before, _, pages_before, _) = stock_verdict(&path);
         assert_ne!(
             auto_vacuum_before, 0,
             "{mode}: stock must have enabled auto_vacuum"
@@ -103,34 +106,46 @@ fn stock_auto_vacuum_database_is_readable_but_refuses_writes() {
         let (count, writes) = exercise_with_fsqlite(&path);
         assert_eq!(count, ROWS, "{mode}: reads must keep working");
         for (i, w) in writes.iter().enumerate() {
-            let err = w
-                .as_ref()
-                .expect_err(&format!("{mode}: write #{i} must be refused"));
             assert!(
-                err.contains("auto_vacuum"),
-                "{mode}: write #{i} must name the reason, got: {err}"
+                w.is_ok(),
+                "{mode}: write #{i} must succeed with pointer-map maintenance: {w:?}"
             );
         }
 
-        let (integrity, auto_vacuum_after, rows_after) = stock_verdict(&path);
+        let (integrity, auto_vacuum_after, rows_after, pages_after, freelist_after) =
+            stock_verdict(&path);
         assert_eq!(
             integrity, "ok",
-            "{mode}: stock must still find the file intact"
+            "{mode}: stock integrity_check must pass after FrankenSQLite mutations"
         );
         assert_eq!(
             auto_vacuum_after, auto_vacuum_before,
-            "{mode}: mode unchanged"
+            "{mode}: auto_vacuum mode must be preserved"
         );
-        assert_eq!(
-            rows_after, ROWS,
-            "{mode}: refused writes must not change data"
+        assert!(
+            rows_after < ROWS,
+            "{mode}: DELETE must have taken effect (rows_after={rows_after}, ROWS={ROWS})"
         );
+        if mode == "FULL" {
+            assert!(
+                pages_after < pages_before,
+                "FULL: deleting 1/3 of rows + dropping index must shrink page_count ({pages_before} -> {pages_after})"
+            );
+            assert_eq!(
+                freelist_after, 0,
+                "FULL: freelist_count must be 0 after commit"
+            );
+        } else {
+            assert!(
+                freelist_after > 0,
+                "INCREMENTAL: deleted pages must remain on freelist until PRAGMA incremental_vacuum"
+            );
+        }
     }
 }
 
 #[test]
 fn stock_database_without_auto_vacuum_stays_writable() {
-    // Negative control: the guard must key on the header, not on stock origin.
     let dir = temp_dir();
     let path = dir.path().join("plain.db");
     create_stock_database(&path, "NONE");
@@ -144,7 +159,7 @@ fn stock_database_without_auto_vacuum_stays_writable() {
         );
     }
 
-    let (integrity, auto_vacuum, rows_after) = stock_verdict(&path);
+    let (integrity, auto_vacuum, rows_after, _, _) = stock_verdict(&path);
     assert_eq!(integrity, "ok");
     assert_eq!(auto_vacuum, 0);
     // One insert, then every third row (by id) deleted.

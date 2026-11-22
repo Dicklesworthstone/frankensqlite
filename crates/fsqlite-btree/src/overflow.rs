@@ -559,8 +559,9 @@ pub(crate) async fn write_overflow_chain_async<W: PageWriter>(
             cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             let page_no = state.pages[index];
             state.prepare_page(index, overflow_data);
+            let prev_overflow = index.checked_sub(1).map(|prev| state.pages[prev]);
             writer
-                .write_page_data(cx, page_no, state.page_buf.clone())
+                .write_overflow_page_data(cx, page_no, state.page_buf.clone(), prev_overflow)
                 .await?;
         }
         Ok(state.pages[0])

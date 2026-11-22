@@ -19,10 +19,22 @@
 //! `(usable_size / 4) - 2` (the first 8 bytes are the next pointer
 //! and count).
 
+use crate::cell::{
+    BtreePageHeader, BtreePageType, CellRef, header_offset_for_page, read_cell_pointers,
+};
+use crate::cursor::{PageReader, PageWriter};
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::PageNumber;
+use fsqlite_pager::TransactionHandle;
+use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::MAX_PAGE_COUNT;
-use std::collections::HashSet;
+pub use fsqlite_types::{
+    AutoVacuumMode, PTRMAP_ENTRY_SIZE_BYTES, PtrMapEntry, PtrMapType, is_ptrmap_page,
+    ptrmap_data_page_count_up_to, ptrmap_entries_per_page, ptrmap_entry_offset,
+    ptrmap_final_db_size, ptrmap_group_size, ptrmap_lock_byte_page, ptrmap_next_data_page,
+    ptrmap_page_count_up_to, ptrmap_page_for, ptrmap_prev_data_page,
+};
+use fsqlite_types::{PageData, PageNumber};
+use std::collections::{HashMap, HashSet};
 
 /// Maximum leaf entries that fit on a single trunk page.
 #[must_use]
@@ -240,193 +252,732 @@ impl Freelist {
     }
 }
 
-/// Pointer-map entry size in bytes (§11.6).
-pub const PTRMAP_ENTRY_SIZE_BYTES: u32 = 5;
+// Pointer-map types and layout arithmetic (`PtrMapType`, `PtrMapEntry`,
+// `is_ptrmap_page`, `ptrmap_page_for`, `ptrmap_entry_offset`, `ptrmap_final_db_size`,
+// etc.) live in `fsqlite_types` and are re-exported above so `fsqlite-pager`,
+// `fsqlite-btree`, and `fsqlite-core` share one single source of truth (bd-1q134).
 
-/// Pointer-map entry type code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PtrMapType {
-    /// Root b-tree page, parent must be 0.
-    RootPage = 1,
-    /// Freelist page, parent must be 0.
-    FreePage = 2,
-    /// First overflow page, parent is owning b-tree page.
-    Overflow1 = 3,
-    /// Subsequent overflow page, parent is previous overflow page.
-    Overflow2 = 4,
-    /// Non-root b-tree page, parent is b-tree parent page.
-    Btree = 5,
+/// Collect every direct child page referenced by a B-tree page (`page_no`):
+/// - interior `right_child` and every cell's `left_child` as [`PtrMapType::Btree`],
+/// - every cell's first overflow page as [`PtrMapType::Overflow1`].
+pub fn ptrmap_collect_btree_page_children(
+    page_no: PageNumber,
+    page_bytes: &[u8],
+    usable_size: u32,
+) -> Result<Vec<(PageNumber, PtrMapType)>> {
+    let hdr_off = header_offset_for_page(page_no);
+    if page_bytes.len() < hdr_off + 8 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "b-tree page {} too short ({} bytes) for header",
+                page_no.get(),
+                page_bytes.len()
+            ),
+        });
+    }
+    let header = BtreePageHeader::parse(page_bytes, hdr_off)?;
+    let cell_ptrs = read_cell_pointers(page_bytes, &header, hdr_off)?;
+    let mut children = Vec::new();
+    if let Some(right_child) = header.right_child {
+        children.push((right_child, PtrMapType::Btree));
+    }
+    let is_interior = header.page_type.is_interior();
+    let has_payload = matches!(
+        header.page_type,
+        BtreePageType::LeafTable | BtreePageType::LeafIndex | BtreePageType::InteriorIndex
+    );
+    for cell_ptr in cell_ptrs {
+        let cell_off = usize::from(cell_ptr);
+        if is_interior {
+            if cell_off + 4 > page_bytes.len() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior cell pointer {} out of bounds on page {}",
+                        cell_off,
+                        page_no.get()
+                    ),
+                });
+            }
+            let left_raw = u32::from_be_bytes([
+                page_bytes[cell_off],
+                page_bytes[cell_off + 1],
+                page_bytes[cell_off + 2],
+                page_bytes[cell_off + 3],
+            ]);
+            let left_child =
+                PageNumber::new(left_raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "zero left-child pointer in cell at {} on page {}",
+                        cell_off,
+                        page_no.get()
+                    ),
+                })?;
+            children.push((left_child, PtrMapType::Btree));
+        }
+        if has_payload {
+            let cell = CellRef::parse(page_bytes, cell_off, header.page_type, usable_size)?;
+            if let Some(ovf) = cell.overflow_page {
+                children.push((ovf, PtrMapType::Overflow1));
+            }
+        }
+    }
+    Ok(children)
 }
 
-impl PtrMapType {
-    fn from_code(code: u8) -> Result<Self> {
-        match code {
-            1 => Ok(Self::RootPage),
-            2 => Ok(Self::FreePage),
-            3 => Ok(Self::Overflow1),
-            4 => Ok(Self::Overflow2),
-            5 => Ok(Self::Btree),
-            _ => Err(FrankenError::DatabaseCorrupt {
-                detail: format!("invalid pointer-map type code: {code}"),
-            }),
+/// Extract the next overflow page pointer (bytes `0..4`) from an overflow page.
+#[must_use]
+pub fn ptrmap_collect_overflow_next(page_bytes: &[u8]) -> Option<PageNumber> {
+    if page_bytes.len() < 4 {
+        return None;
+    }
+    PageNumber::new(u32::from_be_bytes([
+        page_bytes[0],
+        page_bytes[1],
+        page_bytes[2],
+        page_bytes[3],
+    ]))
+}
+
+/// Rewrite a parent page's 4-byte child reference from `old_child` to `new_child`.
+///
+/// Fails closed with [`FrankenError::DatabaseCorrupt`] if `old_child` is not
+/// referenced by `parent_bytes` in the role declared by `child_kind`.
+pub fn ptrmap_rewrite_parent_pointer(
+    parent_page_no: PageNumber,
+    parent_bytes: &mut [u8],
+    child_kind: PtrMapType,
+    old_child: PageNumber,
+    new_child: PageNumber,
+    usable_size: u32,
+) -> Result<()> {
+    let old_raw = old_child.get();
+    let new_be = new_child.get().to_be_bytes();
+    match child_kind {
+        PtrMapType::Overflow2 => {
+            if parent_bytes.len() < 4 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "overflow parent page {} too short ({} bytes)",
+                        parent_page_no.get(),
+                        parent_bytes.len()
+                    ),
+                });
+            }
+            let cur = u32::from_be_bytes([
+                parent_bytes[0],
+                parent_bytes[1],
+                parent_bytes[2],
+                parent_bytes[3],
+            ]);
+            if cur != old_raw {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "overflow parent page {} points to {}, expected {} during relocation",
+                        parent_page_no.get(),
+                        cur,
+                        old_raw
+                    ),
+                });
+            }
+            parent_bytes[0..4].copy_from_slice(&new_be);
+            Ok(())
         }
+        PtrMapType::Btree => {
+            let hdr_off = header_offset_for_page(parent_page_no);
+            let header = BtreePageHeader::parse(parent_bytes, hdr_off)?;
+            if !header.page_type.is_interior() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "pointer map claims page {} is B-tree parent of {}, but page type is {:?}",
+                        parent_page_no.get(),
+                        old_raw,
+                        header.page_type
+                    ),
+                });
+            }
+            if header.right_child == Some(old_child) {
+                parent_bytes[hdr_off + 8..hdr_off + 12].copy_from_slice(&new_be);
+                return Ok(());
+            }
+            let cell_ptrs = read_cell_pointers(parent_bytes, &header, hdr_off)?;
+            for cell_ptr in cell_ptrs {
+                let off = usize::from(cell_ptr);
+                if off + 4 <= parent_bytes.len()
+                    && u32::from_be_bytes([
+                        parent_bytes[off],
+                        parent_bytes[off + 1],
+                        parent_bytes[off + 2],
+                        parent_bytes[off + 3],
+                    ]) == old_raw
+                {
+                    parent_bytes[off..off + 4].copy_from_slice(&new_be);
+                    return Ok(());
+                }
+            }
+            Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "parent interior page {} does not reference child {} during relocation",
+                    parent_page_no.get(),
+                    old_raw
+                ),
+            })
+        }
+        PtrMapType::Overflow1 => {
+            let hdr_off = header_offset_for_page(parent_page_no);
+            let header = BtreePageHeader::parse(parent_bytes, hdr_off)?;
+            let cell_ptrs = read_cell_pointers(parent_bytes, &header, hdr_off)?;
+            for cell_ptr in cell_ptrs {
+                let cell_off = usize::from(cell_ptr);
+                let cell = CellRef::parse(parent_bytes, cell_off, header.page_type, usable_size)?;
+                if cell.overflow_page == Some(old_child) {
+                    let ovf_off = cell.payload_offset + cell.local_size as usize;
+                    if ovf_off + 4 > parent_bytes.len() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "overflow pointer offset {} out of bounds on page {}",
+                                ovf_off,
+                                parent_page_no.get()
+                            ),
+                        });
+                    }
+                    parent_bytes[ovf_off..ovf_off + 4].copy_from_slice(&new_be);
+                    return Ok(());
+                }
+            }
+            Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "parent b-tree page {} does not reference overflow1 page {} during relocation",
+                    parent_page_no.get(),
+                    old_raw
+                ),
+            })
+        }
+        PtrMapType::RootPage | PtrMapType::FreePage => Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "cannot rewrite parent pointer for non-child pointer-map kind {:?}",
+                child_kind
+            ),
+        }),
     }
 }
 
-/// Parsed pointer-map entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PtrMapEntry {
-    pub kind: PtrMapType,
-    pub parent: Option<PageNumber>,
+/// Synchronize pointer-map entries for all direct B-tree children and first
+/// overflow pages referenced by a B-tree page just written on `txn`.
+pub async fn ptrmap_sync_btree_page_children_on_txn<T: TransactionHandle + ?Sized>(
+    cx: &Cx,
+    txn: &mut T,
+    page_no: PageNumber,
+    page_bytes: &[u8],
+    usable_size: u32,
+) -> Result<()> {
+    let hdr_off = header_offset_for_page(page_no);
+    if page_bytes.len() < hdr_off + 8 {
+        return Ok(());
+    }
+    if BtreePageType::from_flag(page_bytes[hdr_off]).is_none() {
+        return Ok(());
+    }
+    let children = ptrmap_collect_btree_page_children(page_no, page_bytes, usable_size)?;
+    for (child_pg, child_kind) in children {
+        txn.write_ptrmap_entry(
+            cx,
+            child_pg,
+            PtrMapEntry {
+                kind: child_kind,
+                parent: Some(page_no),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
-impl PtrMapEntry {
-    /// Decode one 5-byte pointer-map entry.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < PTRMAP_ENTRY_SIZE_BYTES as usize {
+/// Relocate a live non-root page (`src`) to destination slot (`dst`).
+///
+/// Updates the parent pointer, destination pointer-map entry, and all direct
+/// child pointer-map backpointers while preserving global pointer-map invariants.
+pub async fn ptrmap_relocate_page<P: PageReader + PageWriter>(
+    cx: &Cx,
+    io: &mut P,
+    src: PageNumber,
+    dst: PageNumber,
+    usable_size: u32,
+) -> Result<()> {
+    if src == dst {
+        return Ok(());
+    }
+    let entry = io.read_ptrmap_entry(cx, src).await?;
+    let parent = match entry.kind {
+        PtrMapType::Btree | PtrMapType::Overflow1 | PtrMapType::Overflow2 => {
+            entry.parent.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "pointer-map entry for page {} ({:?}) missing parent",
+                    src.get(),
+                    entry.kind
+                ),
+            })?
+        }
+        PtrMapType::RootPage | PtrMapType::FreePage => {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: "pointer-map entry too small".to_owned(),
+                detail: format!(
+                    "refusing to relocate page {} with pointer-map type {:?}",
+                    src.get(),
+                    entry.kind
+                ),
             });
         }
+    };
 
-        let kind = PtrMapType::from_code(bytes[0])?;
-        let parent_raw = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-        let parent = PageNumber::new(parent_raw);
+    let src_bytes = io.read_page(cx, src).await?;
+    let mut parent_bytes = io.read_page(cx, parent).await?;
+    ptrmap_rewrite_parent_pointer(parent, &mut parent_bytes, entry.kind, src, dst, usable_size)?;
+    io.write_raw_page_data(cx, parent, PageData::from_vec(parent_bytes))
+        .await?;
 
-        match kind {
-            PtrMapType::RootPage | PtrMapType::FreePage => {
-                if parent_raw != 0 {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "pointer-map type {:?} must have parent 0, got {}",
-                            kind, parent_raw
-                        ),
-                    });
-                }
-            }
-            PtrMapType::Overflow1 | PtrMapType::Overflow2 | PtrMapType::Btree => {
-                if parent.is_none() {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "pointer-map type {:?} requires non-zero parent page",
-                            kind
-                        ),
-                    });
-                }
+    // Collect direct children of `src` before moving `src_bytes` into `dst`.
+    let child_updates: Vec<(PageNumber, PtrMapType)> = match entry.kind {
+        PtrMapType::Btree => ptrmap_collect_btree_page_children(src, &src_bytes, usable_size)?,
+        PtrMapType::Overflow1 | PtrMapType::Overflow2 => ptrmap_collect_overflow_next(&src_bytes)
+            .map(|next| vec![(next, PtrMapType::Overflow2)])
+            .unwrap_or_default(),
+        PtrMapType::RootPage | PtrMapType::FreePage => Vec::new(),
+    };
+
+    io.write_raw_page_data(cx, dst, PageData::from_vec(src_bytes))
+        .await?;
+    io.write_ptrmap_entry(cx, dst, entry).await?;
+    for (child_pg, child_kind) in child_updates {
+        io.write_ptrmap_entry(
+            cx,
+            child_pg,
+            PtrMapEntry {
+                kind: child_kind,
+                parent: Some(dst),
+            },
+        )
+        .await?;
+    }
+
+    tracing::info!(
+        from_page = src.get(),
+        to_page = dst.get(),
+        kind = ?entry.kind,
+        parent = parent.get(),
+        "auto_vacuum relocated page during truncation"
+    );
+    Ok(())
+}
+
+/// Relocate a B-tree root page (`old_root`) to `new_root`, updating its
+/// pointer-map entry to `(RootPage, None)` and updating all direct B-tree
+/// children & first overflow pages to point to `new_root`.
+///
+/// The caller is responsible for updating `sqlite_master` and in-memory schema
+/// references from `old_root` to `new_root` and freeing `old_root`.
+pub async fn ptrmap_relocate_root_page<P: PageReader + PageWriter>(
+    cx: &Cx,
+    io: &mut P,
+    old_root: PageNumber,
+    new_root: PageNumber,
+    usable_size: u32,
+) -> Result<()> {
+    if old_root == new_root {
+        return Ok(());
+    }
+    let root_bytes = io.read_page(cx, old_root).await?;
+    let children = ptrmap_collect_btree_page_children(old_root, &root_bytes, usable_size)?;
+    io.write_raw_page_data(cx, new_root, PageData::from_vec(root_bytes))
+        .await?;
+    io.write_ptrmap_entry(
+        cx,
+        new_root,
+        PtrMapEntry {
+            kind: PtrMapType::RootPage,
+            parent: None,
+        },
+    )
+    .await?;
+    for (child_pg, child_kind) in children {
+        io.write_ptrmap_entry(
+            cx,
+            child_pg,
+            PtrMapEntry {
+                kind: child_kind,
+                parent: Some(new_root),
+            },
+        )
+        .await?;
+    }
+    tracing::info!(
+        from_page = old_root.get(),
+        to_page = new_root.get(),
+        kind = "RootPage",
+        "auto_vacuum relocated root page during drop compaction"
+    );
+    Ok(())
+}
+
+/// Outcome of an auto-vacuum (`FULL` or `INCREMENTAL`) compaction pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoVacuumOutcome {
+    /// Post-compaction database size in pages (`<= orig_db_size`).
+    pub new_db_size: u32,
+    /// Number of pages reclaimed/truncated from the tail of the database.
+    pub pages_reclaimed: u32,
+    /// Remaining un-reclaimed free pages `<= new_db_size`.
+    pub remaining_freelist: Vec<PageNumber>,
+    /// Source page numbers that were relocated away from the tail.
+    pub relocated_src_pages: Vec<PageNumber>,
+}
+
+/// Execute SQLite's `auto_vacuum = FULL` compaction pass over `io`, relocating
+/// every live page above `final_db_size` into a free slot `<= final_db_size`.
+pub async fn ptrmap_compact_full<P: PageReader + PageWriter>(
+    cx: &Cx,
+    io: &mut P,
+    orig_db_size: u32,
+    largest_root_page: u32,
+    free_pages: &[PageNumber],
+    usable_size: u32,
+    page_size: u32,
+) -> Result<AutoVacuumOutcome> {
+    let lock_byte = ptrmap_lock_byte_page(page_size);
+    let mut free_set: HashSet<u32> = HashSet::with_capacity(free_pages.len());
+    for &pg in free_pages {
+        let raw = pg.get();
+        if raw >= 3
+            && raw <= orig_db_size
+            && raw != lock_byte
+            && !is_ptrmap_page(pg, usable_size, page_size)
+        {
+            free_set.insert(raw);
+        }
+    }
+    if free_set.is_empty() || orig_db_size <= 1 {
+        return Ok(AutoVacuumOutcome {
+            new_db_size: orig_db_size,
+            pages_reclaimed: 0,
+            remaining_freelist: Vec::new(),
+            relocated_src_pages: Vec::new(),
+        });
+    }
+
+    let final_db_size = ptrmap_final_db_size(
+        orig_db_size,
+        u32::try_from(free_set.len()).unwrap_or(u32::MAX),
+        largest_root_page,
+        usable_size,
+        page_size,
+    );
+    if final_db_size >= orig_db_size {
+        let mut remaining: Vec<PageNumber> =
+            free_set.into_iter().filter_map(PageNumber::new).collect();
+        remaining.sort_unstable_by_key(|p| std::cmp::Reverse(p.get()));
+        return Ok(AutoVacuumOutcome {
+            new_db_size: orig_db_size,
+            pages_reclaimed: 0,
+            remaining_freelist: remaining,
+            relocated_src_pages: Vec::new(),
+        });
+    }
+
+    // Destination slots: free pages <= final_db_size (lowest first).
+    let mut free_slots: Vec<PageNumber> = free_set
+        .iter()
+        .copied()
+        .filter(|&raw| raw <= final_db_size)
+        .filter_map(PageNumber::new)
+        .collect();
+    free_slots.sort_unstable_by_key(|p| p.get());
+
+    // Live pages strictly above final_db_size (excluding ptrmap, lock-byte, and free pages).
+    let mut live_tail: Vec<PageNumber> = Vec::new();
+    for raw in final_db_size.saturating_add(1)..=orig_db_size {
+        if raw == lock_byte || free_set.contains(&raw) {
+            continue;
+        }
+        if let Some(pg) = PageNumber::new(raw)
+            && !is_ptrmap_page(pg, usable_size, page_size)
+        {
+            live_tail.push(pg);
+        }
+    }
+
+    if live_tail.len() > free_slots.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "auto_vacuum FULL invariant violation: {} live tail pages exceed {} free slots (orig={} final={} lrp={})",
+                live_tail.len(),
+                free_slots.len(),
+                orig_db_size,
+                final_db_size,
+                largest_root_page
+            ),
+        });
+    }
+
+    let mut relocated_src_pages = Vec::with_capacity(live_tail.len());
+    for (src, dst) in live_tail.iter().copied().zip(free_slots.iter().copied()) {
+        ptrmap_relocate_page(cx, io, src, dst, usable_size).await?;
+        relocated_src_pages.push(src);
+    }
+
+    let mut remaining_freelist: Vec<PageNumber> = free_slots[live_tail.len()..].to_vec();
+    remaining_freelist.sort_unstable_by_key(|p| std::cmp::Reverse(p.get()));
+
+    Ok(AutoVacuumOutcome {
+        new_db_size: final_db_size,
+        pages_reclaimed: orig_db_size.saturating_sub(final_db_size),
+        remaining_freelist,
+        relocated_src_pages,
+    })
+}
+
+/// Execute up to `max_pages` (`0` = all) steps of SQLite's `PRAGMA incremental_vacuum`.
+#[allow(clippy::too_many_arguments)]
+pub async fn ptrmap_compact_incremental<P: PageReader + PageWriter>(
+    cx: &Cx,
+    io: &mut P,
+    orig_db_size: u32,
+    largest_root_page: u32,
+    free_pages: &[PageNumber],
+    max_pages: u32,
+    usable_size: u32,
+    page_size: u32,
+) -> Result<AutoVacuumOutcome> {
+    let lock_byte = ptrmap_lock_byte_page(page_size);
+    let mut free_set: HashSet<u32> = HashSet::with_capacity(free_pages.len());
+    for &pg in free_pages {
+        let raw = pg.get();
+        if raw >= 3
+            && raw <= orig_db_size
+            && raw != lock_byte
+            && !is_ptrmap_page(pg, usable_size, page_size)
+        {
+            free_set.insert(raw);
+        }
+    }
+    let floor = largest_root_page.max(1);
+    let mut cur_db_size = orig_db_size;
+    let mut steps_done = 0_u32;
+    let mut relocated_src_pages = Vec::new();
+
+    while !free_set.is_empty() && cur_db_size > floor && (max_pages == 0 || steps_done < max_pages)
+    {
+        // Strip any trailing pointer-map or lock-byte pages cleanly.
+        while cur_db_size > floor {
+            let is_special = cur_db_size == lock_byte
+                || PageNumber::new(cur_db_size)
+                    .is_some_and(|pg| is_ptrmap_page(pg, usable_size, page_size));
+            if is_special {
+                cur_db_size -= 1;
+            } else {
+                break;
             }
         }
-
-        Ok(Self { kind, parent })
+        if cur_db_size <= floor {
+            break;
+        }
+        if !free_set.remove(&cur_db_size) {
+            // Find a free slot strictly below `cur_db_size` (lowest first).
+            let Some(&dst_raw) = free_set.iter().filter(|&&p| p < cur_db_size).min() else {
+                break;
+            };
+            let Some(src) = PageNumber::new(cur_db_size) else {
+                break;
+            };
+            let Some(dst) = PageNumber::new(dst_raw) else {
+                break;
+            };
+            // Refuse to move a RootPage even if largest_root_page was stale.
+            let entry = io.read_ptrmap_entry(cx, src).await?;
+            if entry.kind == PtrMapType::RootPage {
+                break;
+            }
+            ptrmap_relocate_page(cx, io, src, dst, usable_size).await?;
+            free_set.remove(&dst_raw);
+            relocated_src_pages.push(src);
+        }
+        cur_db_size -= 1;
+        steps_done += 1;
     }
 
-    /// Encode one 5-byte pointer-map entry.
-    #[must_use]
-    pub fn encode(self) -> [u8; PTRMAP_ENTRY_SIZE_BYTES as usize] {
-        let mut out = [0u8; PTRMAP_ENTRY_SIZE_BYTES as usize];
-        out[0] = self.kind as u8;
-        let parent = self.parent.map_or(0u32, PageNumber::get);
-        out[1..5].copy_from_slice(&parent.to_be_bytes());
-        out
+    // Strip any trailing pointer-map or lock-byte pages exposed by the final step
+    // (for example, shrinking page 3 down to page 1 strips page 2 ptrmap too).
+    while cur_db_size > floor {
+        let is_special = cur_db_size == lock_byte
+            || PageNumber::new(cur_db_size)
+                .is_some_and(|pg| is_ptrmap_page(pg, usable_size, page_size));
+        if is_special {
+            cur_db_size -= 1;
+        } else {
+            break;
+        }
     }
+
+    let mut remaining_freelist: Vec<PageNumber> = free_set
+        .into_iter()
+        .filter(|&raw| raw <= cur_db_size)
+        .filter_map(PageNumber::new)
+        .collect();
+    remaining_freelist.sort_unstable_by_key(|p| std::cmp::Reverse(p.get()));
+
+    Ok(AutoVacuumOutcome {
+        new_db_size: cur_db_size,
+        pages_reclaimed: orig_db_size.saturating_sub(cur_db_size),
+        remaining_freelist,
+        relocated_src_pages,
+    })
 }
 
-/// Byte offset of the 1 GiB pending byte region.
-const PENDING_BYTE_OFFSET: u32 = 0x4000_0000;
-
-/// Number of pointer-map entries per pointer-map page for a usable page size.
-#[must_use]
-pub const fn ptrmap_entries_per_page(usable_size: u32) -> u32 {
-    usable_size / PTRMAP_ENTRY_SIZE_BYTES
-}
-
-/// Pointer-map group size = entries per page + the pointer-map page itself.
-#[must_use]
-pub const fn ptrmap_group_size(usable_size: u32) -> u32 {
-    ptrmap_entries_per_page(usable_size) + 1
-}
-
-/// Compute the logical pointer map page for a given `pgno`.
-#[must_use]
-const fn compute_ptrmap_page(pgno: u32, usable_size: u32, page_size: u32) -> u32 {
-    if pgno < 2 {
-        return 0;
-    }
-    let group = ptrmap_group_size(usable_size);
-    if group == 0 {
-        return 0;
-    }
-    let i_ptr_map = (pgno - 2) / group;
-    let mut ret = (i_ptr_map * group) + 2;
-    let pending_byte_page = (PENDING_BYTE_OFFSET / page_size) + 1;
-    if ret == pending_byte_page {
-        ret += 1;
-    }
-    ret
-}
-
-/// Whether `pgno` is itself a pointer-map page.
-#[must_use]
-pub const fn is_ptrmap_page(pgno: PageNumber, usable_size: u32, page_size: u32) -> bool {
-    let raw = pgno.get();
-    if raw < 2 {
-        return false;
-    }
-    compute_ptrmap_page(raw, usable_size, page_size) == raw
-}
-
-/// Pointer-map page that stores metadata for `pgno`.
-///
-/// Returns `None` when `pgno` is itself a pointer-map page.
-#[must_use]
-pub const fn ptrmap_page_for(
-    pgno: PageNumber,
+/// Independently verify EVERY pointer-map entry across `3..=db_size` by walking
+/// all B-trees (`PageNumber::ONE` plus `root_pages`), all overflow chains, and
+/// `freelist_pages`.
+pub async fn ptrmap_verify_all_invariants<P: PageReader + PageWriter>(
+    cx: &Cx,
+    io: &P,
+    root_pages: &[PageNumber],
+    freelist_pages: &[PageNumber],
+    db_size: u32,
     usable_size: u32,
     page_size: u32,
-) -> Option<PageNumber> {
-    if is_ptrmap_page(pgno, usable_size, page_size) {
-        return None;
-    }
-    let raw = pgno.get();
-    if raw < 3 {
-        // Page 1 is database header; pointer map entries begin at page 3.
-        return None;
-    }
+) -> Result<()> {
+    let lock_byte = ptrmap_lock_byte_page(page_size);
+    let mut expected: HashMap<u32, PtrMapEntry> = HashMap::new();
+    let mut btree_stack: Vec<PageNumber> = Vec::new();
+    let mut visited_btree: HashSet<u32> = HashSet::new();
 
-    let ptrmap = compute_ptrmap_page(raw, usable_size, page_size);
-    if ptrmap == 0 {
-        return None;
+    // Page 1 (`sqlite_master`) may exist when verifying full databases.
+    if io.read_page(cx, PageNumber::ONE).await.is_ok() {
+        btree_stack.push(PageNumber::ONE);
     }
-    PageNumber::new(ptrmap)
-}
-
-/// Byte offset of `pgno`'s pointer-map entry within its pointer-map page.
-///
-/// Returns `None` when `pgno` is itself a pointer-map page, or if `pgno` is the
-/// pending byte page itself (which has no pointer-map entry).
-#[must_use]
-pub const fn ptrmap_entry_offset(
-    pgno: PageNumber,
-    usable_size: u32,
-    page_size: u32,
-) -> Option<u32> {
-    let pending_byte_page = (PENDING_BYTE_OFFSET / page_size) + 1;
-    if pgno.get() == pending_byte_page {
-        return None;
+    for &root in root_pages {
+        if root != PageNumber::ONE {
+            if expected
+                .insert(
+                    root.get(),
+                    PtrMapEntry {
+                        kind: PtrMapType::RootPage,
+                        parent: None,
+                    },
+                )
+                .is_some()
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("duplicate root page {} in ptrmap verification", root.get()),
+                });
+            }
+            btree_stack.push(root);
+        }
     }
 
-    let Some(ptrmap_page) = ptrmap_page_for(pgno, usable_size, page_size) else {
-        return None;
-    };
-    if pgno.get() <= ptrmap_page.get() {
-        // This handles the edge case where the pending byte page pushes the
-        // pointer map page forward by one page.
-        return None;
+    while let Some(pgno) = btree_stack.pop() {
+        if !visited_btree.insert(pgno.get()) {
+            continue;
+        }
+        let page_bytes = io.read_page(cx, pgno).await?;
+        let hdr_off = header_offset_for_page(pgno);
+        if page_bytes.len() < hdr_off + 8 || BtreePageType::from_flag(page_bytes[hdr_off]).is_none()
+        {
+            continue;
+        }
+        let children = ptrmap_collect_btree_page_children(pgno, &page_bytes, usable_size)?;
+        for (child_pg, child_kind) in children {
+            let entry = PtrMapEntry {
+                kind: child_kind,
+                parent: Some(pgno),
+            };
+            if let Some(prev) = expected.insert(child_pg.get(), entry) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "page {} claimed twice during ptrmap walk: prev={:?} new={:?}",
+                        child_pg.get(),
+                        prev,
+                        entry
+                    ),
+                });
+            }
+            match child_kind {
+                PtrMapType::Btree => btree_stack.push(child_pg),
+                PtrMapType::Overflow1 => {
+                    let mut cur = child_pg;
+                    let mut steps = 0_usize;
+                    while let Some(next_ovf) = {
+                        let ovf_bytes = io.read_page(cx, cur).await?;
+                        ptrmap_collect_overflow_next(&ovf_bytes)
+                    } {
+                        steps += 1;
+                        if steps > crate::overflow::MAX_OVERFLOW_CHAIN {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "overflow cycle detected from page {}",
+                                    child_pg.get()
+                                ),
+                            });
+                        }
+                        let ovf_entry = PtrMapEntry {
+                            kind: PtrMapType::Overflow2,
+                            parent: Some(cur),
+                        };
+                        if let Some(prev) = expected.insert(next_ovf.get(), ovf_entry) {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "overflow page {} claimed twice: prev={:?} new={:?}",
+                                    next_ovf.get(),
+                                    prev,
+                                    ovf_entry
+                                ),
+                            });
+                        }
+                        cur = next_ovf;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
-    let index = pgno.get() - ptrmap_page.get() - 1;
+    for &free_pg in freelist_pages {
+        if free_pg.get() >= 3 && free_pg.get() <= db_size {
+            let entry = PtrMapEntry {
+                kind: PtrMapType::FreePage,
+                parent: None,
+            };
+            if let Some(prev) = expected.insert(free_pg.get(), entry) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("free page {} also claimed as {:?}", free_pg.get(), prev),
+                });
+            }
+        }
+    }
 
-    Some(index * PTRMAP_ENTRY_SIZE_BYTES)
+    for raw in 3..=db_size {
+        if raw == lock_byte {
+            continue;
+        }
+        let Some(pg) = PageNumber::new(raw) else {
+            continue;
+        };
+        if is_ptrmap_page(pg, usable_size, page_size) {
+            continue;
+        }
+        let exp = expected
+            .get(&raw)
+            .copied()
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {raw} is unowned during ptrmap verification (db_size={db_size})"
+                ),
+            })?;
+        let actual = io.read_ptrmap_entry(cx, pg).await?;
+        if actual != exp {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("Bad ptr map entry key={raw} expected={exp:?} got={actual:?}"),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Read the entire freelist from the database, starting from the first
@@ -505,7 +1056,10 @@ where
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
+    use crate::traits::BtreeCursorOps;
     use std::collections::HashMap;
+
+    const PENDING_BYTE_OFFSET: u32 = 0x4000_0000;
 
     #[test]
     fn test_max_leaf_entries() {
@@ -1240,6 +1794,310 @@ mod tests {
                     assert!(off < usable, "entry offset {off} past usable {usable}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_ptrmap_final_db_size_matches_sqlite_boundaries() {
+        // 4096B page: group=820, ptrmap at 2, 822.
+        assert_eq!(ptrmap_final_db_size(55, 48, 5, 4096, 4096), 7);
+        assert_eq!(ptrmap_final_db_size(3, 1, 1, 4096, 4096), 1);
+        assert_eq!(ptrmap_final_db_size(10, 0, 3, 4096, 4096), 10);
+        // 512B page: group=103, ptrmap at 2, 105, 208.
+        assert_eq!(ptrmap_final_db_size(106, 1, 3, 512, 512), 104);
+        assert_eq!(ptrmap_final_db_size(260, 250, 3, 512, 512), 8);
+    }
+
+    #[test]
+    fn test_ptrmap_full_and_incremental_compaction_and_corrupt_negative_control() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            let cx = Cx::new();
+            let page_size = 512_u32;
+            let (mut store, root) =
+                crate::cursor::MemPageStore::with_pointer_map_leaf_table(page_size);
+            let mut expected_rows: std::collections::BTreeMap<i64, Vec<u8>> =
+                std::collections::BTreeMap::new();
+
+            // Grow past page 105 (second pointer-map page!) using both inline and overflowing rows.
+            {
+                let mut cursor = crate::cursor::BtCursor::new(store, root, page_size, true);
+                for id in 1..=200_i64 {
+                    let len = if id % 7 == 0 { 1100 } else { 180 };
+                    let payload = vec![(id % 251) as u8; len];
+                    cursor
+                        .table_insert(&cx, id, &payload)
+                        .await
+                        .expect("insert");
+                    expected_rows.insert(id, payload);
+                }
+                store = cursor.into_pager();
+            }
+            let grown_db_size = store.max_page_number();
+            assert!(
+                grown_db_size > 110,
+                "512B table must cross second ptrmap page 105 (got {grown_db_size})"
+            );
+            ptrmap_verify_all_invariants(
+                &cx,
+                &store,
+                &[root],
+                store.free_pages_snapshot(),
+                grown_db_size,
+                page_size,
+                page_size,
+            )
+            .await
+            .expect("ptrmap must match full walk after multi-ptrmap growth");
+
+            // Delete 85% of rows (including overflowing rows).
+            {
+                let mut cursor = crate::cursor::BtCursor::new(store, root, page_size, true);
+                for id in 21..=200_i64 {
+                    assert!(
+                        cursor
+                            .table_move_to(&cx, id)
+                            .await
+                            .expect("seek")
+                            .is_found()
+                    );
+                    cursor.delete(&cx).await.expect("delete");
+                    expected_rows.remove(&id);
+                }
+                store = cursor.into_pager();
+            }
+            let after_delete_size = store.max_page_number();
+            let free_after_delete = store.free_pages_snapshot().to_vec();
+            assert!(
+                !free_after_delete.is_empty(),
+                "deleting 85% of rows must produce freed pages"
+            );
+            ptrmap_verify_all_invariants(
+                &cx,
+                &store,
+                &[root],
+                &free_after_delete,
+                after_delete_size,
+                page_size,
+                page_size,
+            )
+            .await
+            .expect("ptrmap valid after deletes");
+
+            // Incremental vacuum 5 pages first.
+            let inc = ptrmap_compact_incremental(
+                &cx,
+                &mut store,
+                after_delete_size,
+                root.get(),
+                &free_after_delete,
+                5,
+                page_size,
+                page_size,
+            )
+            .await
+            .expect("incremental vacuum 5");
+            assert!(inc.new_db_size < after_delete_size);
+            store.truncate_to_db_size(inc.new_db_size, inc.remaining_freelist.clone());
+            ptrmap_verify_all_invariants(
+                &cx,
+                &store,
+                &[root],
+                store.free_pages_snapshot(),
+                inc.new_db_size,
+                page_size,
+                page_size,
+            )
+            .await
+            .expect("ptrmap valid after incremental vacuum(5)");
+
+            // Full vacuum the rest.
+            let full = ptrmap_compact_full(
+                &cx,
+                &mut store,
+                inc.new_db_size,
+                root.get(),
+                &inc.remaining_freelist,
+                page_size,
+                page_size,
+            )
+            .await
+            .expect("full vacuum");
+            assert!(
+                full.new_db_size < grown_db_size / 3,
+                "full vacuum must dramatically shrink DB: grown={grown_db_size} final={}",
+                full.new_db_size
+            );
+            assert!(full.remaining_freelist.is_empty());
+            store.truncate_to_db_size(full.new_db_size, full.remaining_freelist.clone());
+            ptrmap_verify_all_invariants(
+                &cx,
+                &store,
+                &[root],
+                store.free_pages_snapshot(),
+                full.new_db_size,
+                page_size,
+                page_size,
+            )
+            .await
+            .expect("ptrmap valid after full vacuum");
+
+            // Verify every surviving row's exact payload after all relocations!
+            {
+                let mut cursor = crate::cursor::BtCursor::new(store, root, page_size, true);
+                let mut actual_rows = std::collections::BTreeMap::new();
+                if cursor.first(&cx).await.expect("first") {
+                    loop {
+                        let rid = cursor.rowid(&cx).await.expect("rowid");
+                        let pay = cursor.payload(&cx).await.expect("payload");
+                        actual_rows.insert(rid, pay);
+                        if !cursor.next(&cx).await.expect("next") {
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(actual_rows, expected_rows);
+                store = cursor.into_pager();
+            }
+
+            // Planted negative control: corrupt one ptrmap entry -> verifier MUST fail!
+            if full.new_db_size >= 4 {
+                let victim = PageNumber::new(4).unwrap();
+                store
+                    .write_ptrmap_entry(
+                        &cx,
+                        victim,
+                        PtrMapEntry {
+                            kind: PtrMapType::Btree,
+                            parent: Some(PageNumber::new(999).unwrap()),
+                        },
+                    )
+                    .await
+                    .expect("plant corrupt ptrmap");
+                let err = ptrmap_verify_all_invariants(
+                    &cx,
+                    &store,
+                    &[root],
+                    store.free_pages_snapshot(),
+                    full.new_db_size,
+                    page_size,
+                    page_size,
+                )
+                .await
+                .expect_err("corrupted ptrmap entry MUST fail invariant verification");
+                assert!(
+                    err.to_string().contains("Bad ptr map entry"),
+                    "unexpected error: {err}"
+                );
+            }
+        });
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        #[test]
+        fn proptest_ptrmap_invariants_across_splits_overflows_deletes_and_compaction(
+            ops in proptest::collection::vec(
+                (0_u8..4, 1_i64..=90, 16_usize..=720),
+                12..65,
+            )
+        ) {
+            let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(async {
+                let cx = Cx::new();
+                let page_size = 512_u32;
+                let (mut store, root) =
+                    crate::cursor::MemPageStore::with_pointer_map_leaf_table(page_size);
+                let mut model: std::collections::BTreeMap<i64, Vec<u8>> =
+                    std::collections::BTreeMap::new();
+
+                for (step_idx, (op, key, size)) in ops.into_iter().enumerate() {
+                    let payload = vec![((key as usize + step_idx) % 251) as u8; size];
+                    {
+                        let mut cursor =
+                            crate::cursor::BtCursor::new(store, root, page_size, true);
+                        match op {
+                            0..=2 => {
+                                // Insert or replace
+                                if cursor.table_move_to(&cx, key).await.expect("seek").is_found() {
+                                    cursor.delete(&cx).await.expect("delete before replace");
+                                }
+                                cursor.table_insert(&cx, key, &payload).await.expect("insert");
+                                model.insert(key, payload);
+                            }
+                            _ => {
+                                // Delete if present
+                                if cursor.table_move_to(&cx, key).await.expect("seek").is_found() {
+                                    cursor.delete(&cx).await.expect("delete");
+                                    model.remove(&key);
+                                }
+                            }
+                        }
+                        store = cursor.into_pager();
+                    }
+
+                    // Verify EVERY ptrmap entry after each mutation / split / balance!
+                    let db_size = store.max_page_number();
+                    ptrmap_verify_all_invariants(
+                        &cx,
+                        &store,
+                        &[root],
+                        store.free_pages_snapshot(),
+                        db_size,
+                        page_size,
+                        page_size,
+                    )
+                    .await
+                    .expect("ptrmap invariant broken after b-tree op");
+
+                    // Periodically run full compaction when free pages exist.
+                    if step_idx % 9 == 8 && !store.free_pages_snapshot().is_empty() {
+                        let free_before = store.free_pages_snapshot().to_vec();
+                        let outcome = ptrmap_compact_full(
+                            &cx,
+                            &mut store,
+                            db_size,
+                            root.get(),
+                            &free_before,
+                            page_size,
+                            page_size,
+                        )
+                        .await
+                        .expect("full compaction");
+                        store.truncate_to_db_size(outcome.new_db_size, outcome.remaining_freelist);
+                        ptrmap_verify_all_invariants(
+                            &cx,
+                            &store,
+                            &[root],
+                            store.free_pages_snapshot(),
+                            outcome.new_db_size,
+                            page_size,
+                            page_size,
+                        )
+                        .await
+                        .expect("ptrmap invariant broken after full compaction");
+                    }
+                }
+
+                // Final full data-parity check against reference BTreeMap model.
+                let mut cursor = crate::cursor::BtCursor::new(store, root, page_size, true);
+                let mut actual = std::collections::BTreeMap::new();
+                if cursor.first(&cx).await.expect("first") {
+                    loop {
+                        let rid = cursor.rowid(&cx).await.expect("rowid");
+                        let pay = cursor.payload(&cx).await.expect("payload");
+                        actual.insert(rid, pay);
+                        if !cursor.next(&cx).await.expect("next") {
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(actual, model);
+            });
         }
     }
 }

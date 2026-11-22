@@ -930,7 +930,8 @@ impl TableSchema {
         )
     }
 
-    fn resolves_to_hidden_rowid(&self, name: &str) -> bool {
+    #[must_use]
+    pub fn resolves_to_hidden_rowid(&self, name: &str) -> bool {
         !self.without_rowid && self.column_index(name).is_none() && is_hidden_rowid_alias_name(name)
     }
 

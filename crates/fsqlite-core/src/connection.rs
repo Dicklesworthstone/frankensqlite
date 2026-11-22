@@ -6937,7 +6937,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     if name_is("function_list") {
         return &PRAGMA_FUNCTION_LIST_COLUMNS;
     }
-    if name_is("case_sensitive_like") {
+    if name_is("case_sensitive_like") || name_is("incremental_vacuum") {
         return &[];
     }
     if has_value
@@ -15348,6 +15348,12 @@ pub struct Connection {
     /// Connection-scoped PRAGMA state used by the E2E harness for fairness knobs
     /// (journal_mode, synchronous, cache_size, page_size).
     pragma_state: RefCell<fsqlite_vdbe::pragma::ConnectionPragmaState>,
+    /// Pending `PRAGMA auto_vacuum` mode transition (`NONE <-> FULL/INCREMENTAL`)
+    /// requested on a non-empty database; takes effect on the next `VACUUM`.
+    pending_auto_vacuum: Cell<Option<fsqlite_types::AutoVacuumMode>>,
+    /// Suppresses automatic `auto_vacuum = FULL` commit-time compaction while
+    /// multi-step DDL (such as `DROP TABLE` teardown and root compaction) is in progress.
+    suppress_auto_vacuum_commit: Cell<bool>,
     /// Differential-view subscriber registry for Bloodstream bootstrap/stream handoff.
     differential_registry: DifferentialRegistry,
     /// Maps table name (lowercased) to the 0-based column index of the
@@ -17646,6 +17652,8 @@ impl Connection {
             fused_entry_control_mode: Cell::new(FusedEntryControlMode::Auto),
             vectorized_makerecord_enabled: Cell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
+            pending_auto_vacuum: Cell::new(None),
+            suppress_auto_vacuum_commit: Cell::new(false),
             differential_registry: DifferentialRegistry::default(),
             rowid_alias_columns: TxnRestorableCell::new(HashMap::new()),
             without_rowid_pk_desc: RefCell::new(HashMap::new()),
@@ -18318,6 +18326,8 @@ impl Connection {
             fused_entry_control_mode: Cell::new(FusedEntryControlMode::Auto),
             vectorized_makerecord_enabled: Cell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
+            pending_auto_vacuum: Cell::new(None),
+            suppress_auto_vacuum_commit: Cell::new(false),
             differential_registry: DifferentialRegistry::default(),
             rowid_alias_columns: TxnRestorableCell::new(HashMap::new()),
             without_rowid_pk_desc: RefCell::new(HashMap::new()),
@@ -30598,6 +30608,7 @@ impl Connection {
             pragma_state.user_version = i64::from(header.user_version.cast_signed());
             pragma_state.application_id = i64::from(header.application_id.cast_signed());
             pragma_state.default_cache_size = i64::from(header.default_cache_size);
+            pragma_state.auto_vacuum = header.auto_vacuum_mode().as_pragma_int();
         }
         *self.change_counter.borrow_mut() = header.change_counter;
         // bd-#70 wedge extension: raise the connection's finalized commit
@@ -66855,6 +66866,9 @@ impl Connection {
         }
 
         let txn_had_pending_writes = txn.has_pending_writes();
+        if txn_had_pending_writes && !self.suppress_auto_vacuum_commit.get() {
+            Self::maybe_run_auto_vacuum_full_before_commit(cx, &mut txn).await?;
+        }
         // Commit the accumulated writes. If that fails, match the normal
         // autocommit cleanup path by explicitly rolling the pager txn back and
         // restoring the MemDatabase mirror before we clear connection state.
@@ -68828,6 +68842,9 @@ impl Connection {
             self.flush_retained_autocommit_txn(cx).await?;
             return Ok(());
         }
+        if ok && txn_has_pending_writes && !self.suppress_auto_vacuum_commit.get() {
+            Self::maybe_run_auto_vacuum_full_before_commit(cx, &mut txn).await?;
+        }
         // Use the pager's lock-free conservative conflict surface here. Pager
         // implementations must include explicit writes plus any freed pages and
         // a shared metadata conflict token needed to serialize commit-time
@@ -68989,6 +69006,7 @@ impl Connection {
                 && txn_has_pending_writes
                 && concurrent_plan.is_none()
                 && !force_immediate_autocommit_commit
+                && !txn.auto_vacuum_mode().uses_pointer_map()
                 && self.autocommit_retain_enabled.get()
                 && self.retained_autocommit_retention_safe()
                 && self.live_vtab_transactions.borrow().is_empty();
@@ -69502,34 +69520,690 @@ impl Connection {
 
     // ── pager page allocation (bd-3ez5 / 5A.3) ───────────────────────────
 
+    /// Run `auto_vacuum = FULL` compaction right before a write transaction commits.
+    ///
+    /// Zero overhead when `auto_vacuum != FULL`, when the transaction has no
+    /// pending writes, or when the live freelist is empty.
+    async fn maybe_run_auto_vacuum_full_before_commit(
+        cx: &Cx,
+        txn: &mut TransactionKind,
+    ) -> Result<()> {
+        if txn.auto_vacuum_mode() != fsqlite_types::AutoVacuumMode::Full || !txn.is_writer() {
+            return Ok(());
+        }
+        let live_free = txn.live_freelist_pages();
+        if live_free.is_empty() {
+            return Ok(());
+        }
+        let Some((usable_size, page_size)) = txn.pointer_map_page_sizes() else {
+            return Ok(());
+        };
+        let orig_db_size = txn.live_db_size();
+        let largest_root_page = txn.largest_root_page().max(1);
+        let outcome = fsqlite_btree::freelist::ptrmap_compact_full(
+            cx,
+            &mut TransactionPageIo::new(txn),
+            orig_db_size,
+            largest_root_page,
+            &live_free,
+            usable_size,
+            page_size,
+        )
+        .await?;
+        if outcome.pages_reclaimed > 0 {
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+            let mut page1_bytes = page1.as_ref().to_vec();
+            if page1_bytes.len() >= DATABASE_HEADER_SIZE {
+                let mut hdr_bytes = [0u8; DATABASE_HEADER_SIZE];
+                hdr_bytes.copy_from_slice(&page1_bytes[..DATABASE_HEADER_SIZE]);
+                if let Ok(mut header) = DatabaseHeader::from_bytes(&hdr_bytes) {
+                    header.page_count = outcome.new_db_size;
+                    header.largest_root_page = largest_root_page;
+                    header.incremental_vacuum = 0;
+                    if let Ok(encoded) = header.to_bytes() {
+                        page1_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
+                        txn.write_page(cx, PageNumber::ONE, &page1_bytes).await?;
+                    }
+                }
+            }
+            txn.apply_auto_vacuum_truncation(
+                outcome.new_db_size,
+                outcome.remaining_freelist,
+                &outcome.relocated_src_pages,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Allocate and initialize a persistent table (`is_table = true`) or index
+    /// (`is_table = false`) root page inside `txn`, maintaining contiguous
+    /// `3..=largest_root_page` packing and pointer-map entries when
+    /// `auto_vacuum` is enabled (bd-1q134).
+    #[allow(clippy::cast_possible_wrap)]
+    async fn allocate_btree_root_page_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        is_table: bool,
+    ) -> Result<i32> {
+        let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn).await?;
+        let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+        let header_opt = parse_database_header(page1.as_ref());
+        let configured_mode = fsqlite_types::AutoVacuumMode::from_pragma_int(
+            self.pragma_state.borrow().auto_vacuum,
+        )
+        .unwrap_or(fsqlite_types::AutoVacuumMode::None);
+        let (mode, cur_lrp) = match header_opt.as_ref() {
+            Some(hdr) if hdr.largest_root_page != 0 => {
+                (hdr.auto_vacuum_mode(), hdr.largest_root_page)
+            }
+            Some(hdr)
+                if configured_mode.uses_pointer_map()
+                    && hdr.schema_cookie == 0
+                    && self.schema.borrow().is_empty() =>
+            {
+                (configured_mode, 1)
+            }
+            None if configured_mode.uses_pointer_map() && self.schema.borrow().is_empty() => {
+                (configured_mode, 1)
+            }
+            _ => (fsqlite_types::AutoVacuumMode::None, 0),
+        };
+
+        if !mode.uses_pointer_map() {
+            let page_no = txn.allocate_page(cx).await?;
+            let mut page = vec![0u8; page_size as usize];
+            if is_table {
+                BTreePageHeader::write_empty_leaf_table(&mut page, 0, usable_size);
+            } else {
+                BTreePageHeader::write_empty_leaf_index(&mut page, 0, usable_size);
+            }
+            txn.write_page(cx, page_no, &page).await?;
+            return Ok(page_no.get() as i32);
+        }
+
+        txn.set_auto_vacuum_state(mode, cur_lrp.max(1));
+        let target = fsqlite_types::ptrmap_next_data_page(cur_lrp.max(1), usable_size, page_size)
+            .ok_or(FrankenError::DatabaseFull)?;
+        let pm_page = fsqlite_types::ptrmap_page_for(target, usable_size, page_size)
+            .ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "missing pointer-map page for target root {}",
+                    target.get()
+                ))
+            })?;
+        txn.ensure_ptrmap_page_initialized(cx, pm_page).await?;
+
+        let cur_db_size = txn.live_db_size();
+        if target.get() <= cur_db_size {
+            if !txn.claim_specific_free_page(target)? {
+                // A live non-root page currently occupies the next root slot;
+                // relocate it to a freshly allocated page before taking `target`.
+                let dst = txn.allocate_page(cx).await?;
+                fsqlite_btree::freelist::ptrmap_relocate_page(
+                    cx,
+                    &mut TransactionPageIo::new(txn),
+                    target,
+                    dst,
+                    usable_size,
+                )
+                .await?;
+            }
+        } else {
+            let allocated = txn.allocate_page(cx).await?;
+            if allocated != target {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "auto_vacuum root allocation expected page {} above extent {cur_db_size}, got {}",
+                        target.get(),
+                        allocated.get()
+                    ),
+                });
+            }
+        }
+
+        let mut page = vec![0u8; page_size as usize];
+        if is_table {
+            BTreePageHeader::write_empty_leaf_table(&mut page, 0, usable_size);
+        } else {
+            BTreePageHeader::write_empty_leaf_index(&mut page, 0, usable_size);
+        }
+        txn.write_page(cx, target, &page).await?;
+        txn.write_ptrmap_entry(
+            cx,
+            target,
+            fsqlite_types::PtrMapEntry {
+                kind: fsqlite_types::PtrMapType::RootPage,
+                parent: None,
+            },
+        )
+        .await?;
+
+        // Re-read page 1 after any relocation (page 1 itself may have been
+        // updated if a sqlite_master child/overflow page was relocated out of
+        // `target`), then stamp the new `largest_root_page`.
+        let page1_latest = txn.get_page(cx, PageNumber::ONE).await?;
+        let mut page1_bytes = page1_latest.as_ref().to_vec();
+        if page1_bytes.len() >= DATABASE_HEADER_SIZE {
+            let mut hdr_bytes = [0u8; DATABASE_HEADER_SIZE];
+            hdr_bytes.copy_from_slice(&page1_bytes[..DATABASE_HEADER_SIZE]);
+            let mut header = DatabaseHeader::from_bytes(&hdr_bytes).map_err(|e| {
+                FrankenError::internal(format!(
+                    "invalid database header during root allocation: {e}"
+                ))
+            })?;
+            header.largest_root_page = target.get();
+            header.incremental_vacuum = u32::from(mode == fsqlite_types::AutoVacuumMode::Incremental);
+            let encoded = header.to_bytes().map_err(|e| {
+                FrankenError::internal(format!(
+                    "failed to encode database header during root allocation: {e}"
+                ))
+            })?;
+            page1_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
+            txn.write_page(cx, PageNumber::ONE, &page1_bytes).await?;
+        }
+        txn.set_auto_vacuum_state(mode, target.get());
+        Ok(target.get() as i32)
+    }
+
     /// Allocate a fresh page from the pager and initialize it as an empty
     /// B-tree leaf table page (type 0x0D).  Returns the real `PageNumber`.
-    #[allow(clippy::cast_possible_wrap)]
     async fn allocate_root_page(&self) -> Result<i32> {
         self.with_pager_write_txn(async |cx, txn| {
-            let page_no = txn.allocate_page(cx).await?;
-            let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn).await?;
-            let mut page = vec![0u8; page_size as usize];
-            BTreePageHeader::write_empty_leaf_table(&mut page, 0, usable_size);
-            txn.write_page(cx, page_no, &page).await?;
-            Ok(page_no.get() as i32)
+            self.allocate_btree_root_page_in_txn(cx, txn, true).await
         })
         .await
     }
 
     /// Allocate a fresh page from the pager and initialize it as an empty
     /// B-tree leaf index page (type 0x0A).  Returns the real `PageNumber`.
-    #[allow(clippy::cast_possible_wrap)]
     async fn allocate_index_root_page(&self) -> Result<i32> {
         self.with_pager_write_txn(async |cx, txn| {
-            let page_no = txn.allocate_page(cx).await?;
-            let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn).await?;
-            let mut page = vec![0u8; page_size as usize];
-            BTreePageHeader::write_empty_leaf_index(&mut page, 0, usable_size);
-            txn.write_page(cx, page_no, &page).await?;
-            Ok(page_no.get() as i32)
+            self.allocate_btree_root_page_in_txn(cx, txn, false).await
         })
         .await
+    }
+
+    /// Execute `PRAGMA auto_vacuum [= 0|1|2|NONE|FULL|INCREMENTAL]` (bd-1q134).
+    async fn execute_pragma_auto_vacuum(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+        pragma_schema: Option<&str>,
+        result_columns: &[&str],
+    ) -> Result<Vec<Row>> {
+        if pragma_schema == Some("temp") {
+            return if pragma.value.is_some() || result_columns.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(0)],
+                }])
+            };
+        }
+
+        if pragma.value.is_none() {
+            let header = self.pragma_database_header().await?;
+            let mode_val = match header.as_ref() {
+                Some(hdr)
+                    if hdr.largest_root_page == 0
+                        && hdr.schema_cookie == 0
+                        && hdr.page_count <= 1
+                        && self.schema.borrow().is_empty() =>
+                {
+                    self.pragma_state.borrow().auto_vacuum
+                }
+                Some(hdr) => {
+                    let m = hdr.auto_vacuum_mode().as_pragma_int();
+                    self.pragma_state.borrow_mut().auto_vacuum = m;
+                    m
+                }
+                None => self.pragma_state.borrow().auto_vacuum,
+            };
+            return if result_columns.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(mode_val)],
+                }])
+            };
+        }
+
+        let mut scratch = self.pragma_state.borrow().clone();
+        let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut scratch, pragma)?;
+        let raw_val = match output {
+            fsqlite_vdbe::pragma::PragmaOutput::Int(v) => v,
+            _ => {
+                return Err(FrankenError::internal(
+                    "auto_vacuum pragma returned a non-integer",
+                ));
+            }
+        };
+        let target = fsqlite_types::AutoVacuumMode::from_pragma_int(raw_val).ok_or_else(|| {
+            FrankenError::OutOfRange {
+                what: "auto_vacuum".to_owned(),
+                value: raw_val.to_string(),
+            }
+        })?;
+        let header = self.pragma_database_header().await?;
+        let is_empty_db = self.schema.borrow().is_empty()
+            && self.schema_cookie() == 0
+            && header
+                .as_ref()
+                .is_none_or(|h| h.page_count <= 1 && h.schema_cookie == 0);
+
+        if is_empty_db {
+            self.pragma_state.borrow_mut().auto_vacuum = target.as_pragma_int();
+            self.pending_auto_vacuum.set(None);
+            if !self.pager.is_readonly() {
+                let new_lrp = u32::from(target.uses_pointer_map());
+                let new_inc = u32::from(target == fsqlite_types::AutoVacuumMode::Incremental);
+                self.with_pager_write_txn(async |cx, txn| {
+                    let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+                    let mut page_bytes = page1.as_ref().to_vec();
+                    if page_bytes.len() >= DATABASE_HEADER_SIZE {
+                        let mut hdr_bytes = [0u8; DATABASE_HEADER_SIZE];
+                        hdr_bytes.copy_from_slice(&page_bytes[..DATABASE_HEADER_SIZE]);
+                        if let Ok(mut hdr) = DatabaseHeader::from_bytes(&hdr_bytes) {
+                            hdr.largest_root_page = new_lrp;
+                            hdr.incremental_vacuum = new_inc;
+                            if let Ok(encoded) = hdr.to_bytes() {
+                                page_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
+                                txn.write_page(cx, PageNumber::ONE, &page_bytes).await?;
+                            }
+                        }
+                    }
+                    txn.set_auto_vacuum_state(target, new_lrp);
+                    Ok(())
+                })
+                .await?;
+            }
+            return Ok(Vec::new());
+        }
+
+        let current_mode = header
+            .as_ref()
+            .map_or(fsqlite_types::AutoVacuumMode::None, DatabaseHeader::auto_vacuum_mode);
+        let cur_lrp = header.as_ref().map_or(0, |h| h.largest_root_page);
+
+        if target == current_mode {
+            self.pending_auto_vacuum.set(None);
+            self.pragma_state.borrow_mut().auto_vacuum = current_mode.as_pragma_int();
+        } else if current_mode.uses_pointer_map() && target.uses_pointer_map() {
+            // FULL <-> INCREMENTAL switches live without requiring VACUUM.
+            if self.pager.is_readonly() {
+                return Err(FrankenError::ReadOnly);
+            }
+            let new_inc = u32::from(target == fsqlite_types::AutoVacuumMode::Incremental);
+            self.with_pager_write_txn(async |cx, txn| {
+                let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+                let mut page_bytes = page1.as_ref().to_vec();
+                if page_bytes.len() >= DATABASE_HEADER_SIZE {
+                    let mut hdr_bytes = [0u8; DATABASE_HEADER_SIZE];
+                    hdr_bytes.copy_from_slice(&page_bytes[..DATABASE_HEADER_SIZE]);
+                    let mut hdr = DatabaseHeader::from_bytes(&hdr_bytes).map_err(|e| {
+                        FrankenError::internal(format!("invalid database header: {e}"))
+                    })?;
+                    hdr.incremental_vacuum = new_inc;
+                    let encoded = hdr.to_bytes().map_err(|e| {
+                        FrankenError::internal(format!("failed to encode header: {e}"))
+                    })?;
+                    page_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
+                    txn.write_page(cx, PageNumber::ONE, &page_bytes).await?;
+                }
+                txn.set_auto_vacuum_state(target, cur_lrp.max(1));
+                Ok(())
+            })
+            .await?;
+            self.pragma_state.borrow_mut().auto_vacuum = target.as_pragma_int();
+            self.pending_auto_vacuum.set(None);
+        } else {
+            // NONE <-> FULL/INCREMENTAL on a non-empty database is deferred
+            // until the next VACUUM; readback keeps reporting the on-disk mode.
+            self.pending_auto_vacuum.set(Some(target));
+            self.pragma_state.borrow_mut().auto_vacuum = current_mode.as_pragma_int();
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Execute `PRAGMA incremental_vacuum` / `PRAGMA incremental_vacuum(N)` (bd-1q134).
+    async fn execute_pragma_incremental_vacuum(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+        pragma_schema: Option<&str>,
+    ) -> Result<Vec<Row>> {
+        if pragma_schema == Some("temp") {
+            return Ok(Vec::new());
+        }
+        let max_pages: u32 = match pragma.value.as_ref() {
+            None => 0,
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let raw = match expr {
+                    Expr::Literal(Literal::Integer(n), _) => *n,
+                    Expr::UnaryOp {
+                        op: UnaryOp::Negate,
+                        expr: inner,
+                        ..
+                    } => match inner.as_ref() {
+                        Expr::Literal(Literal::Integer(n), _) => n.saturating_neg(),
+                        _ => 0,
+                    },
+                    Expr::UnaryOp {
+                        op: UnaryOp::Plus,
+                        expr: inner,
+                        ..
+                    } => match inner.as_ref() {
+                        Expr::Literal(Literal::Integer(n), _) => *n,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                if raw <= 0 {
+                    0
+                } else {
+                    u32::try_from(raw).unwrap_or(u32::MAX)
+                }
+            }
+        };
+
+        let header = self.pragma_database_header().await?;
+        let mode = header
+            .as_ref()
+            .map_or(fsqlite_types::AutoVacuumMode::None, DatabaseHeader::auto_vacuum_mode);
+        if mode != fsqlite_types::AutoVacuumMode::Incremental {
+            return Ok(Vec::new());
+        }
+        if self.pager.is_readonly() {
+            return Err(FrankenError::ReadOnly);
+        }
+
+        let cx = self.op_cx()?;
+        self.flush_retained_autocommit_txn(&cx).await?;
+
+        self.with_pager_write_txn(async |cx, txn| {
+            if txn.auto_vacuum_mode() != fsqlite_types::AutoVacuumMode::Incremental {
+                return Ok(());
+            }
+            let live_free = txn.live_freelist_pages();
+            if live_free.is_empty() {
+                return Ok(());
+            }
+            let Some((usable_size, page_size)) = txn.pointer_map_page_sizes() else {
+                return Ok(());
+            };
+            let orig_db_size = txn.live_db_size();
+            let largest_root_page = txn.largest_root_page().max(1);
+            let outcome = fsqlite_btree::freelist::ptrmap_compact_incremental(
+                cx,
+                &mut TransactionPageIo::new(txn),
+                orig_db_size,
+                largest_root_page,
+                &live_free,
+                max_pages,
+                usable_size,
+                page_size,
+            )
+            .await?;
+            if outcome.pages_reclaimed > 0 {
+                let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+                let mut page1_bytes = page1.as_ref().to_vec();
+                if page1_bytes.len() >= DATABASE_HEADER_SIZE {
+                    let mut hdr_bytes = [0u8; DATABASE_HEADER_SIZE];
+                    hdr_bytes.copy_from_slice(&page1_bytes[..DATABASE_HEADER_SIZE]);
+                    if let Ok(mut hdr) = DatabaseHeader::from_bytes(&hdr_bytes) {
+                        hdr.page_count = outcome.new_db_size;
+                        hdr.largest_root_page = largest_root_page;
+                        hdr.incremental_vacuum = 1;
+                        if let Ok(encoded) = hdr.to_bytes() {
+                            page1_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
+                            txn.write_page(cx, PageNumber::ONE, &page1_bytes).await?;
+                        }
+                    }
+                }
+                txn.apply_auto_vacuum_truncation(
+                    outcome.new_db_size,
+                    outcome.remaining_freelist,
+                    &outcome.relocated_src_pages,
+                )?;
+            }
+            Ok(())
+        })
+        .await?;
+
+        Ok(Vec::new())
+    }
+
+    /// Update the `rootpage` column of the `sqlite_master` row currently
+    /// pointing at `old_root` to point at `new_root`, inside an active pager
+    /// write transaction (used during `auto_vacuum` root-page compaction).
+    async fn update_sqlite_master_rootpage_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        old_root: i32,
+        new_root: i32,
+    ) -> Result<()> {
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+        let mut matched: Option<(i64, Vec<SqliteValue>)> = None;
+        if cursor.first(cx).await? {
+            loop {
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
+                let mut values = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                if values.get(3) == Some(&SqliteValue::Integer(i64::from(old_root))) {
+                    values[3] = SqliteValue::Integer(i64::from(new_root));
+                    matched = Some((rowid, values));
+                    break;
+                }
+                if !cursor.next(cx).await? {
+                    break;
+                }
+            }
+        }
+        if let Some((rowid, updated)) = matched {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+            if !cursor.table_move_to(cx, rowid).await?.is_found() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master row {rowid} vanished during auto_vacuum root relocation"
+                    ),
+                });
+            }
+            cursor.delete(cx).await?;
+            let record = serialize_record_with_encoding(&updated, self.db_text_encoding.get());
+            cursor.table_insert(cx, rowid, &record).await?;
+        }
+        Ok(())
+    }
+
+    /// Highest persistent root page currently live in `main` (excluding
+    /// `TEMP`, materialized temp roots, and virtual tables with `root_page <= 0`).
+    fn max_persistent_main_root_page(&self) -> Option<i32> {
+        let temp_names = self.temp_table_names.borrow();
+        let mat_roots = self.materialized_temp_root_pages.borrow();
+        let schema = self.schema.borrow();
+        let shadowed = self.shadowed_main_tables.borrow();
+        let mut max_root: Option<i32> = None;
+        for table in schema
+            .iter()
+            .filter(|t| {
+                !is_sqlite_schema_name(&t.name)
+                    && !temp_names.contains(&t.name.to_ascii_lowercase())
+                    && !mat_roots.contains(&t.root_page)
+            })
+            .chain(shadowed.values())
+        {
+            if table.root_page > 0 {
+                max_root = Some(max_root.map_or(table.root_page, |cur| cur.max(table.root_page)));
+            }
+            for idx in &table.indexes {
+                if idx.root_page > 0 {
+                    max_root = Some(max_root.map_or(idx.root_page, |cur| cur.max(idx.root_page)));
+                }
+            }
+        }
+        max_root
+    }
+
+    /// Rebind any persistent table or index in `self.schema` /
+    /// `self.shadowed_main_tables` from `old_root` to `new_root`.
+    fn rebind_persistent_root_in_schema(&self, old_root: i32, new_root: i32) {
+        let temp_names = self.temp_table_names.borrow();
+        let mat_roots = self.materialized_temp_root_pages.borrow();
+        {
+            let mut schema = self.schema.borrow_mut();
+            for table in schema.iter_mut() {
+                if is_sqlite_schema_name(&table.name)
+                    || temp_names.contains(&table.name.to_ascii_lowercase())
+                    || mat_roots.contains(&table.root_page)
+                {
+                    continue;
+                }
+                if table.root_page == old_root {
+                    table.root_page = new_root;
+                }
+                for idx in &mut table.indexes {
+                    if idx.root_page == old_root {
+                        idx.root_page = new_root;
+                    }
+                }
+            }
+        }
+        {
+            let mut shadowed = self.shadowed_main_tables.borrow_mut();
+            for table in shadowed.values_mut() {
+                if table.root_page == old_root {
+                    table.root_page = new_root;
+                }
+                for idx in &mut table.indexes {
+                    if idx.root_page == old_root {
+                        idx.root_page = new_root;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns `true` when the active database has pointer-map auto-vacuum
+    /// enabled (`largest_root_page != 0` in page 1).
+    async fn is_auto_vacuum_enabled_on_main(&self) -> Result<bool> {
+        let header = self.pragma_database_header().await?;
+        Ok(header.is_some_and(|h| h.largest_root_page != 0))
+    }
+
+    /// Free every B-tree in `dropped_roots` inside ONE write transaction,
+    /// relocate highest live roots into any vacated root slots so roots stay
+    /// contiguously packed in `3..=largest_root_page`, update `sqlite_master`
+    /// and page 1's `largest_root_page`, and let the commit hook compact/shrink
+    /// the file when `auto_vacuum = FULL` (bd-1q134).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    async fn free_btree_pages_and_compact_roots_for_auto_vacuum(
+        &self,
+        dropped_roots: &[(i32, bool)],
+    ) -> Result<()> {
+        let mut relocated_any = false;
+        self.with_pager_write_txn(async |cx, txn| {
+            let (usable_size, _page_size) =
+                Self::current_btree_cursor_sizes_in_txn(cx, txn).await?;
+
+            let mut dropped_slots: Vec<u32> = Vec::new();
+            for &(root_page_i32, is_table) in dropped_roots {
+                let Some(root_page) = PageNumber::new(root_page_i32 as u32) else {
+                    continue;
+                };
+                dropped_slots.push(root_page.get());
+                let mut pending = vec![TeardownTask::Subtree(root_page)];
+                while !pending.is_empty() {
+                    let mut cursor =
+                        Self::new_pager_btree_cursor(cx, txn, root_page, is_table).await?;
+                    cursor
+                        .free_subtree_pages_bounded(cx, &mut pending, usize::MAX)
+                        .await?;
+                }
+            }
+
+            if !txn.auto_vacuum_mode().uses_pointer_map() {
+                return Ok(());
+            }
+
+            dropped_slots.sort_unstable();
+            dropped_slots.dedup();
+            for dst_u32 in dropped_slots {
+                let Some(max_live_i32) = self.max_persistent_main_root_page() else {
+                    break;
+                };
+                let max_live_u32 = max_live_i32 as u32;
+                if max_live_u32 <= dst_u32 {
+                    break;
+                }
+                let src = PageNumber::new(max_live_u32).ok_or_else(|| {
+                    FrankenError::internal("invalid source root page during auto_vacuum drop")
+                })?;
+                let dst = PageNumber::new(dst_u32).ok_or_else(|| {
+                    FrankenError::internal("invalid destination root page during auto_vacuum drop")
+                })?;
+                let claimed = txn.claim_specific_free_page(dst)?;
+                if !claimed {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "dropped root slot {} was not free during auto_vacuum root compaction",
+                            dst.get()
+                        ),
+                    });
+                }
+                fsqlite_btree::freelist::ptrmap_relocate_root_page(
+                    cx,
+                    &mut TransactionPageIo::new(txn),
+                    src,
+                    dst,
+                    usable_size,
+                )
+                .await?;
+                self.update_sqlite_master_rootpage_in_txn(cx, txn, max_live_i32, dst_u32 as i32)
+                    .await?;
+                self.rebind_persistent_root_in_schema(max_live_i32, dst_u32 as i32);
+                self.db
+                    .borrow_mut()
+                    .rename_table_root(max_live_i32, dst_u32 as i32);
+                txn.free_page(cx, src).await?;
+                relocated_any = true;
+            }
+
+            let new_lrp = self
+                .max_persistent_main_root_page()
+                .map_or(1_u32, |rp| (rp as u32).max(1));
+            let mode = txn.auto_vacuum_mode();
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
+            let mut page1_bytes = page1.as_ref().to_vec();
+            if page1_bytes.len() >= DATABASE_HEADER_SIZE {
+                let mut hdr_bytes = [0u8; DATABASE_HEADER_SIZE];
+                hdr_bytes.copy_from_slice(&page1_bytes[..DATABASE_HEADER_SIZE]);
+                if let Ok(mut hdr) = DatabaseHeader::from_bytes(&hdr_bytes) {
+                    hdr.largest_root_page = new_lrp;
+                    hdr.incremental_vacuum =
+                        u32::from(mode == fsqlite_types::AutoVacuumMode::Incremental);
+                    if let Ok(encoded) = hdr.to_bytes() {
+                        page1_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
+                        txn.write_page(cx, PageNumber::ONE, &page1_bytes).await?;
+                    }
+                }
+            }
+            txn.set_auto_vacuum_state(mode, new_lrp);
+            Ok(())
+        })
+        .await?;
+
+        if relocated_any {
+            self.rebuild_schema_indices();
+            self.discard_cached_vdbe_engine();
+            self.clear_compilation_reuse_caches();
+        }
+        Ok(())
     }
 
     // ── sqlite_master helpers (bd-1b5e / 5A.2) ─────────────────────────
@@ -69567,12 +70241,23 @@ impl Connection {
             let mut guard = self.active_txn.borrow_mut();
             let finalize_err = if let Some(txn) = guard.as_mut() {
                 if result.is_ok() {
-                    // bd-no6zz: an in-doubt attempt is settled, not dropped.
-                    let commit_result = match txn.commit(&cx).await {
-                        Err(error) if txn.pager_commit_state().retains_commit_obligation() => {
-                            settle_failed_commit_obligation(txn, &cx, error).await
+                    let av_result = if !self.suppress_auto_vacuum_commit.get() {
+                        Self::maybe_run_auto_vacuum_full_before_commit(&cx, txn).await
+                    } else {
+                        Ok(())
+                    };
+                    // bd-no6zz: an in-doubt attempt is settled, not rolled back.
+                    let commit_result = match av_result {
+                        Ok(()) => match txn.commit(&cx).await {
+                            Err(error) if txn.pager_commit_state().retains_commit_obligation() => {
+                                settle_failed_commit_obligation(txn, &cx, error).await
+                            }
+                            other => other,
+                        },
+                        Err(av_err) => {
+                            let _ = txn.rollback(&cx).await;
+                            Err(av_err)
                         }
-                        other => other,
                     };
                     match commit_result {
                         Ok(()) => {
@@ -73210,18 +73895,37 @@ impl Connection {
                     // have materialized root pages in the MemDatabase that do NOT
                     // correspond to real pager pages; skip those.
                     if !is_virtual && table.root_page > 0 {
-                        for index in &table.indexes {
-                            self.free_btree_pages(index.root_page, false)
+                        if self.is_auto_vacuum_enabled_on_main().await? {
+                            let mut dropped_roots: Vec<(i32, bool)> = table
+                                .indexes
+                                .iter()
+                                .filter(|idx| idx.root_page > 0)
+                                .map(|idx| (idx.root_page, false))
+                                .collect();
+                            dropped_roots.push((table.root_page, !table.without_rowid));
+                            self.free_btree_pages_and_compact_roots_for_auto_vacuum(&dropped_roots)
+                                .await
+                                .map_err(|e| {
+                                    Self::attribute_teardown_memory_error(e, "DROP TABLE", obj_name)
+                                })?;
+                        } else {
+                            for index in &table.indexes {
+                                self.free_btree_pages(index.root_page, false)
+                                    .await
+                                    .map_err(|e| {
+                                        Self::attribute_teardown_memory_error(
+                                            e,
+                                            "DROP TABLE",
+                                            obj_name,
+                                        )
+                                    })?;
+                            }
+                            self.free_btree_pages(table.root_page, true)
                                 .await
                                 .map_err(|e| {
                                     Self::attribute_teardown_memory_error(e, "DROP TABLE", obj_name)
                                 })?;
                         }
-                        self.free_btree_pages(table.root_page, true)
-                            .await
-                            .map_err(|e| {
-                                Self::attribute_teardown_memory_error(e, "DROP TABLE", obj_name)
-                            })?;
                     }
                     // Drop the in-memory MemDatabase roots after the persistent
                     // catalog rows and on-disk pages are gone.
@@ -73351,9 +74055,19 @@ impl Connection {
                     // interpreted as main-pager roots. Persistent indexes are
                     // returned to the pager freelist as usual.
                     if !dropped_temp {
-                        self.free_btree_pages(root_page, false).await.map_err(|e| {
-                            Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
-                        })?;
+                        if self.is_auto_vacuum_enabled_on_main().await? {
+                            self.free_btree_pages_and_compact_roots_for_auto_vacuum(&[(
+                                root_page, false,
+                            )])
+                            .await
+                            .map_err(|e| {
+                                Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
+                            })?;
+                        } else {
+                            self.free_btree_pages(root_page, false).await.map_err(|e| {
+                                Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
+                            })?;
+                        }
                     }
                     self.db.borrow_mut().destroy_table(root_page);
                 }
@@ -76230,18 +76944,29 @@ impl Connection {
             let ddl = self.original_ddl_sql.borrow().clone();
 
             if let Some(target) = target_reservation.as_ref() {
+                let mut into_header = source_header.clone();
+                if let Some(pending_av) = self.pending_auto_vacuum.get() {
+                    into_header.largest_root_page = u32::from(pending_av.uses_pointer_map());
+                    into_header.incremental_vacuum =
+                        u32::from(pending_av == fsqlite_types::AutoVacuumMode::Incremental);
+                }
                 crate::vacuum::persist_compacted_database(
                     &cx,
                     target,
                     &schema,
                     &db,
-                    &source_header,
+                    &into_header,
                     &extra_master_entries,
                     &ddl,
                 )
                 .await
             } else if let Some(rebuild_target) = rebuild_target.as_ref() {
                 let mut rebuilt_header = source_header.clone();
+                if let Some(pending_av) = self.pending_auto_vacuum.get() {
+                    rebuilt_header.largest_root_page = u32::from(pending_av.uses_pointer_map());
+                    rebuilt_header.incremental_vacuum =
+                        u32::from(pending_av == fsqlite_types::AutoVacuumMode::Incremental);
+                }
                 rebuilt_header.change_counter =
                     rebuilt_header.change_counter.wrapping_add(1).max(1);
                 rebuilt_header.schema_cookie = rebuilt_header.schema_cookie.wrapping_add(1).max(1);
@@ -76432,6 +77157,7 @@ impl Connection {
             drop(_cleanup_mask);
             self.rebind_after_committed_vacuum(&cx, restore_hydrated_rows)
                 .await?;
+            self.pending_auto_vacuum.set(None);
             return Ok(());
         }
 
@@ -83970,6 +84696,14 @@ impl Connection {
                 snapshot.as_ref().map(|snapshot| snapshot.schema_generation),
             )
         };
+        if !self.suppress_auto_vacuum_commit.get() {
+            let mut txn_guard = self.active_txn.borrow_mut();
+            if let Some(txn) = txn_guard.as_mut()
+                && txn.has_pending_writes()
+            {
+                Self::maybe_run_auto_vacuum_full_before_commit(cx, txn).await?;
+            }
+        }
         let (txn_has_pending_writes, pending_conflict_pages) = {
             let txn_guard = self.active_txn.borrow();
             let txn_has_pending_writes = txn_guard
@@ -85972,7 +86706,7 @@ impl Connection {
                 total_pages,
                 header.freelist_trunk,
                 header.freelist_count,
-                header.largest_root_page != 0,
+                header.largest_root_page,
                 active_state.as_ref().map(|(fl, _)| fl.as_slice()),
             )
             .await?;
@@ -87816,9 +88550,10 @@ impl Connection {
         total_pages: u32,
         freelist_trunk: u32,
         freelist_count: u32,
-        auto_vacuum_enabled: bool,
+        largest_root_page: u32,
         live_freelist: Option<&[PageNumber]>,
     ) -> Result<()> {
+        let auto_vacuum_enabled = largest_root_page != 0;
         let schema = self.integrity_schema();
         if !quick {
             for table in &schema {
@@ -87850,6 +88585,65 @@ impl Connection {
                 Some(self),
             )
             .await?;
+            if auto_vacuum_enabled && total_pages > 0 {
+                let usable_size = page_size.usable(reserved_per_page);
+                let mut roots = Vec::new();
+                for row in master_rows {
+                    if let Some(SqliteValue::Integer(rp)) = row.get(3)
+                        && *rp > 0
+                        && let Ok(rp_u32) = u32::try_from(*rp)
+                        && let Some(pg) = PageNumber::new(rp_u32)
+                    {
+                        roots.push(pg);
+                    }
+                }
+                let expected_largest_root = roots.iter().map(|p| p.get()).max().unwrap_or(1);
+                if expected_largest_root != largest_root_page {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "max rootpage ({expected_largest_root}) disagrees with header ({largest_root_page})"
+                        ),
+                    });
+                }
+                let freelist_pages: Vec<PageNumber> = if let Some(live) = live_freelist {
+                    live.iter()
+                        .copied()
+                        .filter(|p| p.get() <= total_pages)
+                        .collect()
+                } else {
+                    let mut collected = Vec::new();
+                    let mut next_trunk = PageNumber::new(freelist_trunk);
+                    while let Some(trunk_page) = next_trunk {
+                        collected.push(trunk_page);
+                        let page = txn.get_page(cx, trunk_page).await?;
+                        let usable = usize::try_from(usable_size)
+                            .unwrap_or(usize::MAX)
+                            .min(page.as_ref().len());
+                        let trunk = fsqlite_btree::freelist::FreelistTrunk::parse(
+                            &page.as_ref()[..usable],
+                        )
+                        .map_err(|err| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "freelist trunk page {} is malformed: {err}",
+                                trunk_page.get()
+                            ),
+                        })?;
+                        collected.extend(trunk.leaf_pages);
+                        next_trunk = trunk.next_trunk;
+                    }
+                    collected
+                };
+                fsqlite_btree::freelist::ptrmap_verify_all_invariants(
+                    cx,
+                    &TransactionPageIo::new(txn),
+                    &roots,
+                    &freelist_pages,
+                    total_pages,
+                    usable_size,
+                    page_size.get(),
+                )
+                .await?;
+            }
         } else {
             // quick_check: walk every B-tree page to validate headers, cell
             // pointers, and freeblock chains without tracking page ownership
@@ -88681,6 +89475,16 @@ impl Connection {
         if pragma_name == "mmap_size" {
             return self.execute_pragma_mmap_size(pragma, result_columns).await;
         }
+        if pragma_name == "auto_vacuum" {
+            return self
+                .execute_pragma_auto_vacuum(pragma, pragma_schema.as_deref(), result_columns)
+                .await;
+        }
+        if pragma_name == "incremental_vacuum" {
+            return self
+                .execute_pragma_incremental_vacuum(pragma, pragma_schema.as_deref())
+                .await;
+        }
         if matches!(pragma_name.as_str(), "cache_size" | "default_cache_size") {
             let mut next_state = self.pragma_state.borrow().clone();
             let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut next_state, pragma)?;
@@ -89037,16 +89841,32 @@ impl Connection {
             name.as_str(),
             "page_count" | "freelist_count" | "schema_version" | "encoding"
         ) {
+            let active_writer_counts = self
+                .active_txn
+                .borrow()
+                .as_ref()
+                .filter(|txn| txn.is_writer())
+                .map(|txn| (txn.live_db_size(), txn.live_freelist_pages().len()));
             let header = self.pragma_database_header().await?;
             let value = match name.as_str() {
                 "page_count" => {
-                    SqliteValue::Integer(header.as_ref().map_or(1, |hdr| i64::from(hdr.page_count)))
+                    let count = active_writer_counts
+                        .map(|(db_size, _)| i64::from(db_size.max(1)))
+                        .unwrap_or_else(|| {
+                            header.as_ref().map_or(1, |hdr| i64::from(hdr.page_count))
+                        });
+                    SqliteValue::Integer(count)
                 }
-                "freelist_count" => SqliteValue::Integer(
-                    header
-                        .as_ref()
-                        .map_or(0, |hdr| i64::from(hdr.freelist_count)),
-                ),
+                "freelist_count" => {
+                    let count = active_writer_counts
+                        .map(|(_, free_len)| i64::try_from(free_len).unwrap_or(i64::MAX))
+                        .unwrap_or_else(|| {
+                            header
+                                .as_ref()
+                                .map_or(0, |hdr| i64::from(hdr.freelist_count))
+                        });
+                    SqliteValue::Integer(count)
+                }
                 "schema_version" => SqliteValue::Integer(i64::from(self.schema_cookie())),
                 "encoding" => {
                     let encoding = match header
@@ -113709,6 +114529,7 @@ impl Connection {
                     pragma_state.user_version = i64::from(header.user_version.cast_signed());
                     pragma_state.application_id = i64::from(header.application_id.cast_signed());
                     pragma_state.default_cache_size = i64::from(header.default_cache_size);
+                    pragma_state.auto_vacuum = header.auto_vacuum_mode().as_pragma_int();
                 }
                 // bd-#70 wedge extension: raise the finalized commit clock floor
                 // even on the schema-only fast path so plan-cache epoch lookups
@@ -113756,6 +114577,7 @@ impl Connection {
             } else {
                 0
             };
+            let header_auto_vacuum = header.auto_vacuum_mode().as_pragma_int();
             let eligible_preserved_live_vtab_keys = self
                 .pending_local_live_vtab_keys_for_reload(bound_visible_commit_seq, schema_cookie);
 
@@ -114834,6 +115656,9 @@ impl Connection {
                 pragma_state.user_version = i64::from(user_version.cast_signed());
                 pragma_state.application_id = i64::from(application_id.cast_signed());
                 pragma_state.default_cache_size = i64::from(default_cache_size);
+                if schema_cookie != 0 || header_auto_vacuum != 0 {
+                    pragma_state.auto_vacuum = header_auto_vacuum;
+                }
             }
             let old_schema_cookie = *self.schema_cookie.borrow();
             *self.schema_cookie.borrow_mut() = schema_cookie;
@@ -151378,15 +152203,16 @@ fn statement_writes_under_query_only(statement: &Statement) -> bool {
     ) || matches!(
         statement,
         Statement::Pragma(pragma)
-            if pragma.value.is_some()
-                && [
-                    "user_version",
-                    "application_id",
-                    "schema_version",
-                    "auto_vacuum",
-                ]
-                .iter()
-                .any(|name| pragma.name.name.eq_ignore_ascii_case(name))
+            if pragma.name.name.eq_ignore_ascii_case("incremental_vacuum")
+                || (pragma.value.is_some()
+                    && [
+                        "user_version",
+                        "application_id",
+                        "schema_version",
+                        "auto_vacuum",
+                    ]
+                    .iter()
+                    .any(|name| pragma.name.name.eq_ignore_ascii_case(name)))
     )
 }
 

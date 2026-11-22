@@ -1305,6 +1305,55 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     let page_size_usize = page_size.as_usize();
     let usable_size = page_size.usable(header_template.reserved_per_page);
     let full_page_size = page_size.get();
+    let auto_vacuum_mode = header_template.auto_vacuum_mode();
+    let uses_pointer_map = auto_vacuum_mode.uses_pointer_map();
+    let mut preallocated_table_roots: HashMap<usize, PageNumber> = HashMap::new();
+    let mut preallocated_index_roots: HashMap<(usize, usize), PageNumber> = HashMap::new();
+    let mut largest_root_page: u32 = if uses_pointer_map { 1 } else { 0 };
+    if uses_pointer_map {
+        txn.set_auto_vacuum_state(auto_vacuum_mode, 1);
+        // Pass 1 (bd-1q134): in auto-vacuum mode, allocate every table and index
+        // root page before inserting any rows so all roots sit contiguously in
+        // `3..=largest_root_page` (skipping pointer-map/lock-byte pages) and no
+        // non-root data or overflow page is ever placed below `largest_root_page`.
+        for (table_idx, table) in schema.iter().enumerate() {
+            if db.get_table(table.root_page).is_none() {
+                continue;
+            }
+            let table_root = txn.allocate_page(cx).await?;
+            txn.write_ptrmap_entry(
+                cx,
+                table_root,
+                fsqlite_types::PtrMapEntry {
+                    kind: fsqlite_types::PtrMapType::RootPage,
+                    parent: None,
+                },
+            )
+            .await?;
+            largest_root_page = largest_root_page.max(table_root.get());
+            preallocated_table_roots.insert(table_idx, table_root);
+            for (idx_pos, index) in table.indexes.iter().enumerate() {
+                let is_expression_index =
+                    index.columns.is_empty() && !index.key_expressions.is_empty();
+                if index.columns.is_empty() && !is_expression_index {
+                    continue;
+                }
+                let idx_root = txn.allocate_page(cx).await?;
+                txn.write_ptrmap_entry(
+                    cx,
+                    idx_root,
+                    fsqlite_types::PtrMapEntry {
+                        kind: fsqlite_types::PtrMapType::RootPage,
+                        parent: None,
+                    },
+                )
+                .await?;
+                largest_root_page = largest_root_page.max(idx_root.get());
+                preallocated_index_roots.insert((table_idx, idx_pos), idx_root);
+            }
+        }
+        txn.set_auto_vacuum_state(auto_vacuum_mode, largest_root_page);
+    }
 
     // Track (type, name, tbl_name, root_page, create_sql) for sqlite_master entries.
     // Extended from just tables to also include indexes, views, and triggers.
@@ -1313,7 +1362,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     let mut master_entries: Vec<SqliteMasterEntry> = Vec::new();
 
     // Write each table's data into its own B-tree.
-    for table in schema {
+    for (table_idx, table) in schema.iter().enumerate() {
         let Some(mem_table) = db.get_table(table.root_page) else {
             continue;
         };
@@ -1347,8 +1396,13 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             None
         };
 
-        // Allocate a fresh root page for this table in the on-disk file.
-        let root_page = txn.allocate_page(cx).await?;
+        // Allocate a fresh root page for this table in the on-disk file (or use
+        // the pre-allocated contiguous root in auto-vacuum mode).
+        let root_page = if let Some(&pre) = preallocated_table_roots.get(&table_idx) {
+            pre
+        } else {
+            txn.allocate_page(cx).await?
+        };
 
         if let Some(pk) = without_rowid_pk.as_ref() {
             // Index root (0x0A), not a table root (0x0D). Flipping only the
@@ -1529,7 +1583,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
         // root pages that must contain valid B-tree data. Skipping them causes
         // "wrong # of entries in index" and "page N: never used" errors when
         // stock SQLite runs integrity_check (issue #55).
-        for index in &table.indexes {
+        for (idx_pos, index) in table.indexes.iter().enumerate() {
             let is_expression_index = index.columns.is_empty() && !index.key_expressions.is_empty();
             if index.columns.is_empty() && !is_expression_index {
                 continue;
@@ -1551,7 +1605,11 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 Vec::new()
             };
             // Allocate and initialize root page as leaf index page (0x0A).
-            let idx_root = txn.allocate_page(cx).await?;
+            let idx_root = if let Some(&pre) = preallocated_index_roots.get(&(table_idx, idx_pos)) {
+                pre
+            } else {
+                txn.allocate_page(cx).await?
+            };
             init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size).await?;
 
             // Parse the partial index WHERE clause (if any) so we can skip
@@ -1952,20 +2010,56 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     // Fix up the database header on page 1: update page_count,
     // change_counter, and schema_cookie so sqlite3 validates the file.
     {
+        if uses_pointer_map {
+            let live_free = txn.live_freelist_pages();
+            if !live_free.is_empty() {
+                let orig_db_size = txn.live_db_size();
+                let outcome = fsqlite_btree::freelist::ptrmap_compact_full(
+                    cx,
+                    &mut TransactionPageIo::new(&mut txn),
+                    orig_db_size,
+                    largest_root_page,
+                    &live_free,
+                    usable_size,
+                    full_page_size,
+                )
+                .await?;
+                if outcome.pages_reclaimed > 0 {
+                    txn.apply_auto_vacuum_truncation(
+                        outcome.new_db_size,
+                        outcome.remaining_freelist,
+                        &outcome.relocated_src_pages,
+                    )?;
+                }
+            }
+        }
+
         let mut hdr_page = txn.get_page(cx, PageNumber::ONE).await?.into_vec();
 
-        // Discover the current page count by allocating one more page.
-        // The extra page is included in the commit (the pager does not
-        // support free_page), so the exported file has one trailing empty
-        // page. This is benign: SQLite tolerates pages beyond the last
-        // B-tree node, and the page_count header excludes it.
-        let next_page = txn.allocate_page(cx).await?.get();
-        let max_page = next_page.saturating_sub(1).max(1);
+        // In auto-vacuum mode, never allocate a dummy trailing page because
+        // every page in `2..=page_count` must have a valid pointer-map entry
+        // and be reachable or on the freelist.
+        let max_page = if uses_pointer_map {
+            txn.live_db_size().max(1)
+        } else {
+            // Discover the current page count by allocating one more page.
+            // The extra page is included in the commit (the pager does not
+            // support free_page), so the exported file has one trailing empty
+            // page. This is benign: SQLite tolerates pages beyond the last
+            // B-tree node, and the page_count header excludes it.
+            let next_page = txn.allocate_page(cx).await?.get();
+            next_page.saturating_sub(1).max(1)
+        };
 
         let mut final_header = header_template.clone();
         final_header.page_count = max_page;
         final_header.freelist_trunk = 0;
         final_header.freelist_count = 0;
+        if uses_pointer_map {
+            final_header.largest_root_page = largest_root_page;
+            final_header.incremental_vacuum =
+                u32::from(auto_vacuum_mode == fsqlite_types::AutoVacuumMode::Incremental);
+        }
         final_header.change_counter = final_header.change_counter.max(1);
         final_header.schema_cookie = final_header.schema_cookie.max(1);
         final_header.version_valid_for = final_header.change_counter;

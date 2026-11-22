@@ -822,7 +822,7 @@ INSERT INTO t(a, b) VALUES ('big', zeroblob(1000000));",
 }
 
 #[test]
-fn auto_vacuum_databases_are_refused_and_left_intact() {
+fn auto_vacuum_databases_accept_writes_and_pass_stock_integrity_check() {
     for (name, setup) in [
         ("auto_vacuum_full", "PRAGMA auto_vacuum = FULL;"),
         (
@@ -830,8 +830,7 @@ fn auto_vacuum_databases_are_refused_and_left_intact() {
             "PRAGMA auto_vacuum = INCREMENTAL;",
         ),
     ] {
-        let mut case = Case::new(name, setup, base_table(300, "randomblob(x % 700)"), DML);
-        case.expect_refusal = true;
+        let case = Case::new(name, setup, base_table(300, "randomblob(x % 700)"), DML);
         run_case(&case);
     }
 }

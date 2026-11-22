@@ -224,6 +224,12 @@ pub struct TransactionFrameBatch {
     /// write intent, so batches of one group-commit epoch never conflict on
     /// them.
     pub route_dependencies: Vec<TransactionRouteDependency>,
+    /// bd-1q134: When `Some(new_db_size)`, this batch explicitly shrinks the
+    /// database to `new_db_size` pages via `auto_vacuum = FULL` or
+    /// `PRAGMA incremental_vacuum`. The WAL commit frame's `db_size_if_commit`
+    /// and durability certificate must publish `new_db_size` directly instead of
+    /// clamping upward with `max(current_db_size, ...)`.
+    pub explicit_db_size_shrink: Option<u32>,
 }
 
 /// bd-1epn5: a right-edge append's dependency on the route to its leaf.
@@ -306,6 +312,7 @@ impl TransactionFrameBatch {
             consumed_freelist_pages: Vec::new(),
             consumed_durable_freelist_pages: Vec::new(),
             route_dependencies: Vec::new(),
+            explicit_db_size_shrink: None,
         }
     }
 
@@ -316,6 +323,13 @@ impl TransactionFrameBatch {
         route_dependencies: Vec<TransactionRouteDependency>,
     ) -> Self {
         self.route_dependencies = route_dependencies;
+        self
+    }
+
+    /// Mark this batch as an explicit auto-vacuum shrink to `new_db_size` pages (bd-1q134).
+    #[must_use]
+    pub const fn with_explicit_db_size_shrink(mut self, new_db_size: Option<u32>) -> Self {
+        self.explicit_db_size_shrink = new_db_size;
         self
     }
 

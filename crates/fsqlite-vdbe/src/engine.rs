@@ -5039,12 +5039,33 @@ impl PageWriter for SharedTxnPageIo {
         self.txn.borrow_mut().note_freed_page_zeroed(page_no);
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         let page_size = self.txn.borrow().page_size().as_usize();
         let page_data = normalize_owned_page_data(page_size, data)?;
-        self.write_page_internal(cx, page_no, page_data).await
+        let ptrmap_sizes = self.txn.borrow().pointer_map_page_sizes();
+        let sync_bytes = if let Some((usable_size, full_page_size)) = ptrmap_sizes
+            && !fsqlite_types::is_ptrmap_page(page_no, usable_size, full_page_size)
+        {
+            Some((page_data.clone(), usable_size))
+        } else {
+            None
+        };
+        self.write_page_internal(cx, page_no, page_data).await?;
+        if let Some((written, usable_size)) = sync_bytes {
+            fsqlite_btree::freelist::ptrmap_sync_btree_page_children_on_txn(
+                cx,
+                &mut *self.txn.borrow_mut(),
+                page_no,
+                written.as_bytes(),
+                usable_size,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn write_page_data(
         &mut self,
         cx: &Cx,
@@ -5053,7 +5074,26 @@ impl PageWriter for SharedTxnPageIo {
     ) -> Result<()> {
         let page_size = self.txn.borrow().page_size().as_usize();
         let page_data = normalize_page_data_to_size(page_size, data)?;
-        self.write_page_internal(cx, page_no, page_data).await
+        let ptrmap_sizes = self.txn.borrow().pointer_map_page_sizes();
+        let sync_bytes = if let Some((usable_size, full_page_size)) = ptrmap_sizes
+            && !fsqlite_types::is_ptrmap_page(page_no, usable_size, full_page_size)
+        {
+            Some((page_data.clone(), usable_size))
+        } else {
+            None
+        };
+        self.write_page_internal(cx, page_no, page_data).await?;
+        if let Some((written, usable_size)) = sync_bytes {
+            fsqlite_btree::freelist::ptrmap_sync_btree_page_children_on_txn(
+                cx,
+                &mut *self.txn.borrow_mut(),
+                page_no,
+                written.as_bytes(),
+                usable_size,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn try_mutate_staged_page_data(
@@ -5061,6 +5101,9 @@ impl PageWriter for SharedTxnPageIo {
         page_no: PageNumber,
         f: &mut dyn FnMut(&mut PageData),
     ) -> bool {
+        if self.txn.borrow().pointer_map_page_sizes().is_some() {
+            return false;
+        }
         if let Some(ctx) = self.concurrent_context() {
             let has_staged_write = {
                 let handle = ctx.handle.lock();
@@ -5383,6 +5426,43 @@ impl PageWriter for SharedTxnPageIo {
             Some(_) | None => Ok(false),
         };
         std::future::ready(claimed)
+    }
+
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        self.txn.borrow().pointer_map_page_sizes()
+    }
+
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn read_ptrmap_entry(
+        &self,
+        cx: &Cx,
+        child_page: PageNumber,
+    ) -> Result<fsqlite_types::PtrMapEntry> {
+        self.txn.borrow().read_ptrmap_entry(cx, child_page).await
+    }
+
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn write_ptrmap_entry(
+        &mut self,
+        cx: &Cx,
+        child_page: PageNumber,
+        entry: fsqlite_types::PtrMapEntry,
+    ) -> Result<()> {
+        self.txn
+            .borrow_mut()
+            .write_ptrmap_entry(cx, child_page, entry)
+            .await
+    }
+
+    async fn write_raw_page_data(
+        &mut self,
+        cx: &Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> Result<()> {
+        let page_size = self.txn.borrow().page_size().as_usize();
+        let page_data = normalize_page_data_to_size(page_size, data)?;
+        self.write_page_internal(cx, page_no, page_data).await
     }
 }
 
@@ -7062,6 +7142,11 @@ enum MemDbUndoOp {
         root_page: i32,
         table: MemTable,
     },
+    RenameTableRoot {
+        old_root: i32,
+        new_root: i32,
+        prev_next_root_page: i32,
+    },
     ClearTable {
         root_page: i32,
         table: MemTable,
@@ -7095,6 +7180,16 @@ impl MemDbUndoOp {
             }
             Self::DestroyTable { root_page, table } | Self::ClearTable { root_page, table } => {
                 db.tables.insert(root_page, table);
+            }
+            Self::RenameTableRoot {
+                old_root,
+                new_root,
+                prev_next_root_page,
+            } => {
+                if let Some(table) = db.tables.remove(&new_root) {
+                    db.tables.insert(old_root, table);
+                }
+                db.next_root_page = prev_next_root_page;
             }
             Self::BumpRowid {
                 root_page,
@@ -7368,6 +7463,27 @@ impl MemDatabase {
     pub fn destroy_table(&mut self, root_page: i32) {
         if let Some(table) = self.tables.remove(&root_page) {
             self.push_undo(MemDbUndoOp::DestroyTable { root_page, table });
+        }
+    }
+
+    /// Re-key an existing in-memory table mirror from `old_root` to `new_root`
+    /// (used when `auto_vacuum` root compaction relocates `largest_root_page`
+    /// into a dropped root slot) while preserving savepoint/transaction undo.
+    pub fn rename_table_root(&mut self, old_root: i32, new_root: i32) {
+        if old_root == new_root {
+            return;
+        }
+        if let Some(table) = self.tables.remove(&old_root) {
+            let prev_next_root_page = self.next_root_page;
+            if new_root >= self.next_root_page {
+                self.next_root_page = new_root + 1;
+            }
+            self.tables.insert(new_root, table);
+            self.push_undo(MemDbUndoOp::RenameTableRoot {
+                old_root,
+                new_root,
+                prev_next_root_page,
+            });
         }
     }
 
