@@ -99,12 +99,16 @@ impl Connection {
             // At the limit the error is the last rowid already recorded. A
             // different structural failure before the limit belongs to the
             // same grouped SQL row as the preceding rowid findings.
-            if reports.findings.len() < *remaining && let Err(error) = structural {
+            if reports.findings.len() < *remaining && let Err(error) = &structural {
                 reports.findings.push(error.to_string());
             }
             *remaining -= reports.findings.len();
             rows.push(format!("*** in database {schema} ***\n{}", reports.findings.join("\n")));
-            return Ok(());
+            // Ordering errors alone leave the completed tree walk readable.
+            // SQLite spends any remaining budget on stored row constraints.
+            if *remaining == 0 || structural.is_err() {
+                return Ok(());
+            }
         }
         let result = match structural {
             Err(error) => Err(error),

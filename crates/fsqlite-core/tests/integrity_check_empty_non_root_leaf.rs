@@ -417,6 +417,60 @@ fn bd_vojth_rowid_reports_match_stock_across_attached_databases() {
 }
 
 #[test]
+fn bd_vojth_checks_stored_rows_after_rowid_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    for damaged in ["t", "q"] {
+        let path = dir.path().join(format!("{damaged}.db"));
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        stock
+            .execute_batch(
+                "CREATE TABLE t(x CHECK(x>0)); CREATE TABLE q(x);
+                 PRAGMA ignore_check_constraints=ON;
+                 INSERT INTO t VALUES(1),(-2),(-3),(4);
+                 INSERT INTO q VALUES(1),(2),(3),(4);",
+            )
+            .unwrap();
+        let root: usize = stock
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name=?1",
+                [damaged],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(stock);
+        let mut image = std::fs::read(&path).unwrap();
+        let page = (root - 1) * header_page_size(&image);
+        assert_eq!(image[page], 0x0d);
+        image[page + 10..page + 14].rotate_left(2);
+        std::fs::write(&path, image).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for kind in ["quick_check", "integrity_check"] {
+                for limit in 1..=4 {
+                    let sql = format!("PRAGMA {kind}({limit})");
+                    let oracle = stock_reports(&path, &sql);
+                    assert!(oracle[0].contains("Rowid 3 out of order"));
+                    assert_eq!(oracle.len(), limit.min(3));
+                    assert!(
+                        oracle[1..]
+                            .iter()
+                            .all(|s| s == "CHECK constraint failed in t")
+                    );
+                    for prepared in [false, true] {
+                        assert_eq!(
+                            native_reports(&conn, &sql, prepared).await,
+                            oracle,
+                            "{damaged}: {sql}"
+                        );
+                    }
+                }
+            }
+            conn.close().await.unwrap();
+        });
+    }
+}
+
+#[test]
 fn bd_vojth_rowid_and_orphan_share_one_structural_report() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mixed.db");
