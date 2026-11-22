@@ -47,8 +47,8 @@ use fsqlite_types::record::{
 use fsqlite_types::value::SqliteValue;
 
 use crate::connection::{
-    Connection, ImplicitAutoindexSlot, affinity_char_to_type, codegen_error_to_franken,
-    collect_primary_key_desc_flags, column_def_is_exact_integer, implicit_autoindex_layout,
+    Connection, ImplicitAutoindexSlot, affinity_char_to_type,
+    column_def_is_exact_integer, implicit_autoindex_layout,
     validate_builtin_persisted_index_expr_functions,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -57,11 +57,11 @@ use crate::connection::{
     qualified_unique_constraint_label, unshadowed_hidden_rowid_alias,
 };
 use fsqlite_types::{
-    DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize, without_rowid_storage_order,
+    DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize,
 };
 use fsqlite_vdbe::codegen::{
     CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
-    bind_explicit_index, without_rowid_pk_indices,
+    bind_explicit_index,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -1559,9 +1559,10 @@ where
             // serialized record. Leading-PK tables give the identity permutation
             // (physical == declared), so this is a no-op for them. bd-w4pr1.31:
             // the record leaves VIRTUAL generated columns out, as stock's does.
-            let mut storage_order = without_rowid_storage_order(&pk.indices, table.columns.len());
-            storage_order
-                .retain(|&declared_idx| !table.columns[declared_idx].is_virtual_generated());
+            let mut storage_order = pk.indices.clone();
+            storage_order.extend((0..table.columns.len()).filter(|col| {
+                !pk.indices.contains(col) && !table.columns[*col].is_virtual_generated()
+            }));
             let mut pk_rows: Vec<Vec<SqliteValue>> = mem_table
                 .iter_rows()
                 .map(|(_synthetic_rowid, values)| {
@@ -1710,8 +1711,9 @@ where
                 .as_deref()
                 .map(fsqlite_parser::expr::parse_expr)
                 .transpose()
-                .ok()
-                .flatten()
+                .map_err(|error| FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid predicate for index `{}`: {error}", index.name),
+                })?
                 .map(|mut predicate| {
                     fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
                     predicate
@@ -1770,16 +1772,14 @@ where
                 let mut index_collations: Vec<Option<String>> = (0..key_terms)
                     .map(|term| index.key_collations.get(term).cloned().flatten())
                     .collect();
-                // GH #340: metadata for the row-locator suffix. A rowid table's
-                // suffix is one synthetic integer, so one ASC/BINARY entry
-                // describes it. A WITHOUT ROWID table's suffix is its whole
-                // primary key, and each of those columns carries its own
-                // declared direction and collation — the single trailing entry
-                // that used to be pushed here described a rowid this branch
-                // does not write.
-                if let Some(pk) = without_rowid_pk.as_ref() {
-                    index_desc_flags.extend(pk.desc_flags.iter().copied());
-                    index_collations.extend(pk.collations.iter().cloned());
+                // The payload and the comparator must use the same locator.
+                let mut suffix_columns = Vec::new();
+                if let Some(pk) = &without_rowid_pk {
+                    for slot in index.without_rowid_locator_slots(table, &pk.indices, &pk.collations) {
+                        suffix_columns.push(pk.indices[slot]);
+                        index_desc_flags.push(pk.desc_flags[slot]);
+                        index_collations.push(pk.collations[slot].clone());
+                    }
                 } else {
                     index_desc_flags.push(false);
                     index_collations.push(None);
@@ -1914,12 +1914,8 @@ where
                         } else {
                             values
                         };
-                        // For partial indexes, skip rows that don't match
-                        // the WHERE predicate. If evaluation fails, include
-                        // the row (safe default).
-                        if let Some(ref predicate) = partial_predicate
-                            && let Ok(result) = eval_join_expr(predicate, eval_row, &col_map)
-                            && !is_sqlite_truthy(&result)
+                        if let Some(predicate) = &partial_predicate
+                            && !is_sqlite_truthy(&eval_join_expr(predicate, eval_row, &col_map)?)
                         {
                             continue;
                         }
@@ -1945,14 +1941,8 @@ where
                                 }
                             }
                         }
-                        // GH #340: append the row locator. A rowid table
-                        // appends its rowid; a WITHOUT ROWID table appends
-                        // every primary-key column in declared PK order, which
-                        // is the only way the entry can identify its row —
-                        // there is no rowid to point at. This matches the
-                        // ordinary index-backfill path.
-                        if let Some(pk) = without_rowid_pk.as_ref() {
-                            for &col_idx in &pk.indices {
+                        if table.without_rowid {
+                            for &col_idx in &suffix_columns {
                                 key_values.push(
                                     values.get(col_idx).cloned().unwrap_or(SqliteValue::Null),
                                 );
@@ -2602,9 +2592,6 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 struct WithoutRowidPkLayout {
     /// Declared-order column positions of the primary key.
-    ///
-    /// `without_rowid_pk_indices` guarantees these are the *leading* columns,
-    /// which is what makes "key = leading N columns" well defined.
     indices: Vec<usize>,
     /// One flag per PK column: true when that column is declared `DESC`.
     desc_flags: Vec<bool>,
@@ -2622,77 +2609,24 @@ struct WithoutRowidPkLayout {
 /// another is precisely how an image ends up contradicting itself and failing
 /// `quick_check` — the failure class GH #340 was filed for.
 ///
-/// Collations mirror the runtime table-cursor registration, which takes the
-/// *column's* declared `COLLATE` (see the `without_rowid` branch that builds
-/// `index_collations_by_root_page` in `connection.rs`). A `COLLATE` written on
-/// the PK term itself is not consulted there, so it is not consulted here
-/// either; diverging would make the rebuilt order disagree with the order the
-/// engine uses to read it back. That inherited limitation is the runtime's,
-/// not one introduced by this repair.
-///
-/// Refuses rather than guesses. An unparseable DDL, a PK this builder cannot
-/// place, or a direction vector whose arity disagrees with the key all produce
-/// a typed refusal, because the alternative is a silently mis-ordered image
-/// that still passes as "successful VACUUM".
+/// Like the integrity reader, resolve effective collations on the PK terms,
+/// including table-level overrides of the columns' declared collations.
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn resolve_without_rowid_pk_layout(
     table: &TableSchema,
     create_sql: &str,
 ) -> Result<WithoutRowidPkLayout> {
-    // Leading-PK placement is fsqlite's storage rule for WITHOUT ROWID tables.
-    // Reuse the codegen helper that already owns it instead of restating it:
-    // two copies of this rule silently drifting apart is a worse failure than
-    // the one being fixed.
-    let indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
-
-    let Some(Statement::CreateTable(create)) = parse_single_statement(create_sql) else {
-        return Err(FrankenError::not_implemented(format!(
-            "WITHOUT ROWID table `{}` cannot be rebuilt: its CREATE TABLE text does not parse, \
-             so the primary-key direction its b-tree must be keyed by is unknown",
-            table.name
-        )));
-    };
-    let CreateTableBody::Columns {
-        columns: column_defs,
-        constraints,
-    } = &create.body
-    else {
-        return Err(FrankenError::not_implemented(format!(
-            "WITHOUT ROWID table `{}` cannot be rebuilt from a CREATE TABLE ... AS SELECT form: \
-             it declares no primary-key columns to key the table b-tree by",
-            table.name
-        )));
-    };
-
-    let desc_flags = collect_primary_key_desc_flags(column_defs, constraints)
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    if desc_flags.len() != indices.len() {
-        return Err(FrankenError::not_implemented(format!(
-            "WITHOUT ROWID table `{}` declares {} primary-key column(s) but its CREATE TABLE text \
-             yields {} sort direction(s); refusing to rebuild rather than key the table b-tree by \
-             a direction vector that does not describe it",
-            table.name,
-            indices.len(),
-            desc_flags.len()
-        )));
-    }
-
-    let collations = indices
-        .iter()
-        .map(|&col_idx| {
-            table
-                .columns
-                .get(col_idx)
-                .and_then(|column| column.collation.clone())
+    let primary = Connection::without_rowid_primary_key_from_ddl(table, create_sql)?;
+    let indices = primary.columns.iter().map(|name| {
+        table.column_index(name).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("unknown primary-key column {name} of {}", table.name),
         })
-        .collect();
-
+    }).collect::<Result<Vec<_>>>()?;
+    let desc_flags = (0..indices.len()).map(|slot| primary.key_term_descending(slot)).collect();
     Ok(WithoutRowidPkLayout {
         indices,
         desc_flags,
-        collations,
+        collations: primary.key_collations,
     })
 }
 

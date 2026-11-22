@@ -10603,7 +10603,7 @@ impl PreparedStatement<'_> {
                     let victim_table = fast_path.table_name.clone();
                     *self.conn.last_replace_victims.borrow_mut() = replace_victims;
                     self.conn
-                        .enforce_fk_on_replace_victims(&victim_table)
+                        .enforce_fk_on_replace_victims(&QualifiedName::bare(victim_table))
                         .await?;
                 }
                 if track_last_insert_rowid && let Some(last_insert_rowid) = last_insert_rowid {
@@ -11458,6 +11458,10 @@ struct DifferentialRegistry {
 struct TriggerDef {
     name: String,
     table_name: String,
+    table_schema: Option<String>,
+    // An unqualified TEMP trigger keeps the table it resolved at CREATE time
+    // even if another schema later shadows that name.
+    bound_table_schema: String,
     timing: fsqlite_ast::TriggerTiming,
     event: fsqlite_ast::TriggerEvent,
     #[allow(dead_code)] // SQLite-only: always true; retained for display/roundtrip fidelity.
@@ -11476,6 +11480,8 @@ impl TriggerDef {
         Self {
             name: stmt.name.name.clone(),
             table_name: stmt.table.clone(),
+            table_schema: stmt.table_schema.clone(),
+            bound_table_schema: stmt.table_schema.clone().unwrap_or_else(|| "main".to_owned()),
             timing: stmt.timing,
             event: stmt.event.clone(),
             for_each_row: stmt.for_each_row,
@@ -13229,6 +13235,7 @@ enum SnapshotSchemaState {
 struct SchemaSnapshot {
     schema: Vec<TableSchema>,
     temp_table_names: HashSet<String>,
+    temp_table_sql: HashMap<i32, String>,
     // TEMP has no pager header: retain its transactional default here.
     // The independent runtime cache suggestion deliberately survives rollback.
     temp_default_cache_size: i64,
@@ -14301,6 +14308,7 @@ struct TimeTravelImage {
 struct TimeTravelCatalog {
     schema: Vec<TableSchema>,
     temp_table_names: HashSet<String>,
+    temp_table_sql: HashMap<i32, String>,
     shadowed_main_tables: HashMap<String, TableSchema>,
     rowid_alias_columns: HashMap<String, usize>,
 }
@@ -15176,6 +15184,8 @@ pub struct Connection {
     /// `TEMP` tables are never written to the main `sqlite_master`, mirroring
     /// the `TriggerDef::temporary` precedent.
     temp_table_names: TxnRestorableCell<HashSet<String>>,
+    /// Original CREATE statements of connection-local tables and indexes, keyed by TEMP root.
+    temp_table_sql: TxnRestorableCell<HashMap<i32, String>>,
     /// Whether the connection's `TEMP` database handle has been lazily opened
     /// (matching SQLite's `db->aDb[1].pBt != 0`: set when a TEMP object is
     /// created or `sqlite_temp_master` is consulted, cleared when
@@ -17652,6 +17662,7 @@ impl Connection {
             schema: TxnRestorableCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: TxnRestorableCell::new(HashSet::new()),
+            temp_table_sql: TxnRestorableCell::new(HashMap::new()),
             temp_db_initialized: Cell::new(false),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
             materialized_temp_root_pages: RefCell::new(HashSet::new()),
@@ -18326,6 +18337,7 @@ impl Connection {
             schema: TxnRestorableCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: TxnRestorableCell::new(HashSet::new()),
+            temp_table_sql: TxnRestorableCell::new(HashMap::new()),
             temp_db_initialized: Cell::new(false),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
             materialized_temp_root_pages: RefCell::new(HashSet::new()),
@@ -28589,6 +28601,7 @@ impl Connection {
     /// `PRAGMA temp_store` switches storage mode outside a transaction
     /// (matching stock SQLite's `changeTempStorage` semantics).
     fn reset_all_temp_objects_for_mode_change(&self) {
+        self.temp_table_sql.borrow_mut().clear();
         let temp_names: HashSet<String> = {
             let mut names = self.temp_table_names.borrow_mut();
             std::mem::take(&mut *names)
@@ -29698,6 +29711,7 @@ impl Connection {
         let catalog = TimeTravelCatalog {
             schema: self.schema.borrow().clone(),
             temp_table_names: self.temp_table_names.borrow().clone(),
+            temp_table_sql: self.temp_table_sql.borrow().clone(),
             shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
             rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
         };
@@ -29722,6 +29736,7 @@ impl Connection {
         let previous = TimeTravelCatalog {
             schema: self.schema.replace(catalog.schema),
             temp_table_names: self.temp_table_names.replace(catalog.temp_table_names),
+            temp_table_sql: self.temp_table_sql.replace(catalog.temp_table_sql),
             shadowed_main_tables: self
                 .shadowed_main_tables
                 .replace(catalog.shadowed_main_tables),
@@ -45884,7 +45899,7 @@ impl Connection {
                     for (row_rowid, old_values, new_values) in &trigger_rows {
                         if boxed_future(|| {
                             self.fire_before_triggers(
-                                table_name,
+                                &effective_update.table.name,
                                 &update_event,
                                 Some(old_values),
                                 Some(new_values),
@@ -46072,7 +46087,7 @@ impl Connection {
                 // UPDATE OR REPLACE may implicitly delete a different row.
                 // Apply inbound FK effects for that exact victim before the
                 // existing parent UPDATE actions and AFTER UPDATE processing.
-                boxed_future(|| self.enforce_fk_on_replace_victims(table_name)).await?;
+                boxed_future(|| self.enforce_fk_on_replace_victims(&effective_update.table.name)).await?;
 
                 // bd-c1vth: when the program updated no row (UPDATE OR IGNORE
                 // skipped it on a conflict, or a BEFORE trigger removed it), no
@@ -46101,7 +46116,7 @@ impl Connection {
                     for (row_rowid, old_values, new_values) in &trigger_rows {
                         if let Err(error) = boxed_future(|| {
                             self.fire_after_triggers(
-                                table_name,
+                                &effective_update.table.name,
                                 &update_event,
                                 Some(old_values),
                                 Some(new_values),
@@ -46408,7 +46423,7 @@ impl Connection {
                     for (old_rowid, old_values) in &trigger_old_rows {
                         if boxed_future(|| {
                             self.fire_before_triggers(
-                                table_name,
+                                &effective_delete.table.name,
                                 &delete_event,
                                 Some(old_values),
                                 None,
@@ -46521,7 +46536,7 @@ impl Connection {
                         for (old_rowid, old_values) in &trigger_old_rows {
                             if let Err(error) = boxed_future(|| {
                                 self.fire_after_triggers(
-                                    table_name,
+                                    &effective_delete.table.name,
                                     &delete_event,
                                     Some(old_values),
                                     None,
@@ -46598,7 +46613,7 @@ impl Connection {
                     for (old_rowid, old_values) in &trigger_old_rows {
                         if let Err(error) = boxed_future(|| {
                             self.fire_after_triggers(
-                                table_name,
+                                &effective_delete.table.name,
                                 &delete_event,
                                 Some(old_values),
                                 None,
@@ -73801,6 +73816,7 @@ impl Connection {
                         schema.push(table_schema);
                     }
                     self.temp_table_names.borrow_mut().insert(name_lc.clone());
+                    self.temp_table_sql.borrow_mut().insert(rp, create_sql);
                     self.rebuild_schema_indices();
                     // TEMP tables are connection-local: never written to the
                     // main sqlite_master (mirrors the TEMP trigger precedent).
@@ -74282,6 +74298,13 @@ impl Connection {
                     // every one without touching the main pager freelist.
                     // Outside any transaction or savepoint, bypass undo_log so
                     // any VFS spill file closes and unlinks immediately.
+                    {
+                        let mut ddl = self.temp_table_sql.borrow_mut();
+                        ddl.remove(&table.root_page);
+                        for index in &table.indexes {
+                            ddl.remove(&index.root_page);
+                        }
+                    }
                     let in_txn_or_savepoint = self.in_transaction.get()
                         || !self.savepoints.borrow().is_empty()
                         || self.internal_statement_savepoint_depth.get() > 0;
@@ -74536,20 +74559,16 @@ impl Connection {
                     // TEMP indexes are MemDatabase-only and must never be
                     // interpreted as main-pager roots. Persistent indexes are
                     // returned to the pager freelist as usual.
-                    if !dropped_temp {
-                        if self.is_auto_vacuum_enabled_on_main().await? {
-                            self.free_btree_pages_and_compact_roots_for_auto_vacuum(&[(
-                                root_page, false,
-                            )])
+                    if dropped_temp {
+                        self.temp_table_sql.borrow_mut().remove(&root_page);
+                    } else if self.is_auto_vacuum_enabled_on_main().await? {
+                        self.free_btree_pages_and_compact_roots_for_auto_vacuum(&[(root_page, false)])
                             .await
-                            .map_err(|e| {
-                                Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
-                            })?;
-                        } else {
-                            self.free_btree_pages(root_page, false).await.map_err(|e| {
-                                Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
-                            })?;
-                        }
+                            .map_err(|e| Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name))?;
+                    } else {
+                        self.free_btree_pages(root_page, false).await.map_err(|e| {
+                            Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
+                        })?;
                     }
                     self.db.borrow_mut().destroy_table(root_page);
                 }
@@ -75045,7 +75064,13 @@ impl Connection {
         // root to the wrong definition. Parse and rewrite before mutating any
         // in-memory schema so unsupported legacy DDL fails without residue.
         let rewritten_target_create_sql = if alters_temp_table {
-            None
+            let schema = self.schema.borrow();
+            let root = schema.iter().find(|table| table.name.eq_ignore_ascii_case(&old_name))
+                .map(|table| table.root_page);
+            root.and_then(|root| self.temp_table_sql.borrow().get(&root).cloned())
+                .map(|sql| rewrite_create_table_sql_for_alter(
+                    &sql, &old_name, &alter.action, added_column_source,
+                )).transpose()?
         } else {
             let original_sql = self
                 .original_ddl_sql
@@ -75070,6 +75095,7 @@ impl Connection {
             schema
                 .iter()
                 .filter(|table| !table.name.eq_ignore_ascii_case(&old_name))
+                .filter(|table| self.temp_table_names.borrow().contains(&table.name.to_ascii_lowercase()) == alters_temp_table)
                 .filter(|table| {
                     table.foreign_keys.iter().any(|foreign_key| {
                         if !foreign_key.parent_table.eq_ignore_ascii_case(&old_name) {
@@ -75087,16 +75113,20 @@ impl Connection {
                         }
                     })
                 })
-                .map(|table| table.name.clone())
+                .map(|table| (table.name.clone(), table.root_page))
                 .collect::<Vec<_>>()
         };
         let rewritten_dependent_create_sql = {
             let original_ddl = self.original_ddl_sql.borrow();
             dependent_table_names
                 .iter()
-                .map(|dependent_table_name| {
-                    let original_sql = original_ddl
-                        .get(&dependent_table_name.to_ascii_lowercase())
+                .map(|(dependent_table_name, root)| {
+                    let temp_ddl = self.temp_table_sql.borrow();
+                    let original_sql = if alters_temp_table {
+                        temp_ddl.get(root)
+                    } else {
+                        original_ddl.get(&dependent_table_name.to_ascii_lowercase())
+                    }
                         .ok_or_else(|| {
                             FrankenError::Internal(format!(
                                 "cannot safely rewrite foreign key in `{dependent_table_name}` \
@@ -75144,8 +75174,15 @@ impl Connection {
                         name: table_name.clone(),
                     })?;
                 let views = self.views.borrow();
-                let name_conflicts =
-                    schema_table_index_or_view_name_exists(&schema, &views, new_name);
+                let name_conflicts = if alters_temp_table {
+                    let temp = self.temp_table_names.borrow();
+                    schema.iter().filter(|t| temp.contains(&t.name.to_ascii_lowercase())).any(|t| {
+                        t.name.eq_ignore_ascii_case(new_name)
+                            || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(new_name))
+                    }) || views.iter().any(|v| v.temporary && v.name.eq_ignore_ascii_case(new_name))
+                } else {
+                    schema_table_index_or_view_name_exists(&schema, &views, new_name)
+                };
                 drop(views);
                 if name_conflicts {
                     // Stock sqlite3 reports SQLITE_ERROR with this exact message
@@ -75157,6 +75194,16 @@ impl Connection {
                     // "internal error:" under SQLITE_INTERNAL. bd-3nppp.
                     return Err(FrankenError::FunctionError(format!(
                         "there is already another table or index with this name: {new_name}"
+                    )));
+                }
+                // SQLite reparses TEMP triggers during a rename and rejects a
+                // same-named target explicitly pinned to a different database.
+                if alters_temp_table && let Some(trigger) = self.triggers.borrow().iter().find(|t|
+                    t.temporary && t.table_name.eq_ignore_ascii_case(&old_name)
+                        && t.table_schema.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("main"))
+                ) {
+                    return Err(FrankenError::FunctionError(format!(
+                        "error in trigger {} after rename: ", trigger.name
                     )));
                 }
                 let mut renamed_table = schema[table_idx].clone();
@@ -75182,7 +75229,7 @@ impl Connection {
                     ));
                 }
                 for (idx, dependent_table) in schema.iter().enumerate() {
-                    if idx == table_idx {
+                    if idx == table_idx || !rewritten_dependent_create_sql.contains_key(&dependent_table.name.to_ascii_lowercase()) {
                         continue;
                     }
                     let mut updated_table = dependent_table.clone();
@@ -75200,9 +75247,9 @@ impl Connection {
                 }
                 drop(schema);
                 dependent_view_sql_updates =
-                    self.rename_dependent_views_for_table_rename(&old_name, new_name);
+                    self.rename_dependent_views_for_table_rename(&old_name, new_name, alters_temp_table);
                 dependent_trigger_sql_updates =
-                    self.rename_dependent_triggers_for_table_rename(&old_name, new_name);
+                    self.rename_dependent_triggers_for_table_rename(&old_name, new_name, alters_temp_table);
                 renamed_table
             }
             AlterTableAction::RenameColumn { old, new } => {
@@ -75285,7 +75332,7 @@ impl Connection {
                     }
                 }
                 for (idx, dependent_table) in schema.iter().enumerate() {
-                    if idx == table_idx {
+                    if idx == table_idx || !rewritten_dependent_create_sql.contains_key(&dependent_table.name.to_ascii_lowercase()) {
                         continue;
                     }
                     let mut updated_table = dependent_table.clone();
@@ -75309,12 +75356,14 @@ impl Connection {
                     old,
                     new,
                     &mut column_source_catalog,
+                    alters_temp_table,
                 );
                 dependent_trigger_sql_updates = self.rename_dependent_triggers_for_column_rename(
                     &renamed_table.name,
                     old,
                     new,
                     &column_source_catalog,
+                    alters_temp_table,
                 );
                 renamed_table
             }
@@ -75935,15 +75984,15 @@ impl Connection {
                         .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
                 });
                 // Remove indexes that reference the dropped column.
-                let dropped_indexes: Vec<String> = table
+                let dropped_indexes: Vec<_> = table
                     .indexes
                     .iter()
                     .filter(|idx| idx.columns.iter().any(|c| c.eq_ignore_ascii_case(col_name)))
-                    .map(|idx| idx.name.clone())
+                    .map(|idx| (idx.root_page, idx.name.clone()))
                     .collect();
                 table
                     .indexes
-                    .retain(|idx| !dropped_indexes.contains(&idx.name));
+                    .retain(|idx| !dropped_indexes.iter().any(|(root, _)| *root == idx.root_page));
 
                 // Remove FKs that reference the dropped column, and adjust
                 // column indices for remaining FKs whose child_columns point
@@ -75967,7 +76016,8 @@ impl Connection {
                 let table_clone = table.clone();
                 // Drop the schema borrow before calling delete_sqlite_master_row.
                 drop(schema);
-                if let Some(&alias_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
+                let rowid_alias = self.rowid_alias_columns.borrow().get(&tbl_key).copied();
+                if let Some(alias_idx) = rowid_alias {
                     if alias_idx == col_idx {
                         self.rowid_alias_columns.borrow_mut().remove(&tbl_key);
                     } else if alias_idx > col_idx {
@@ -75977,9 +76027,12 @@ impl Connection {
                             .insert(tbl_key, alias_idx - 1);
                     }
                 }
-                for idx_name in &dropped_indexes {
-                    self.delete_sqlite_master_typed_row("index", idx_name)
-                        .await?;
+                for (root, idx_name) in &dropped_indexes {
+                    if alters_temp_table {
+                        self.temp_table_sql.borrow_mut().remove(root);
+                    } else {
+                        self.delete_sqlite_master_typed_row("index", idx_name).await?;
+                    }
                 }
                 // Physically rewrite stored rows to drop the column's record slot
                 // so trailing columns realign on read (the read path decodes by
@@ -76003,26 +76056,6 @@ impl Connection {
             return Err(FrankenError::Internal(
                 "injected ALTER DROP COLUMN failure after storage rewrite".to_owned(),
             ));
-        }
-
-        if alters_temp_table
-            && matches!(
-                alter.action,
-                AlterTableAction::DropColumn(_) | AlterTableAction::AddColumn(_)
-            )
-        {
-            // TEMP schema and rows are connection-local. There is deliberately
-            // no main-catalog sqlite_master row to update; the column change has
-            // already been applied to `self.schema` and (for ADD COLUMN) the
-            // existing rows padded in the MemDatabase above. Trying the
-            // main-catalog master path is what previously turned every TEMP DROP
-            // COLUMN into a late "sqlite_master entry not found" error — and, once
-            // bd-kyhpi stopped ADD COLUMN from faulting earlier on the sentinel
-            // root_page, every TEMP ADD COLUMN too (bd-0i8ll).
-            self.rebuild_schema_indices();
-            self.validate_schema_index();
-            self.note_temp_schema_change();
-            return Ok(());
         }
 
         if let AlterTableAction::RenameTo(new_name) = &alter.action {
@@ -76072,6 +76105,48 @@ impl Connection {
                 |index| self.index_is_implicit_autoindex(&index.name, &new_schema.name),
             )
         });
+
+        if alters_temp_table {
+            let mut temp_sql = self.temp_table_sql.borrow_mut();
+            temp_sql.insert(new_schema.root_page, create_sql);
+            if matches!(alter.action, AlterTableAction::RenameTo(_) | AlterTableAction::RenameColumn { .. }) {
+                for index in &new_schema.indexes {
+                    if let Some(sql) = temp_sql.get_mut(&index.root_page) {
+                        *sql = render_create_index_sql(index, &new_schema.name);
+                    }
+                }
+            }
+            for (_, dependent) in &dependent_table_schema_updates {
+                if let Some(sql) = rewritten_dependent_create_sql.get(&dependent.name.to_ascii_lowercase()) {
+                    temp_sql.insert(dependent.root_page, sql.clone());
+                }
+            }
+            if let AlterTableAction::RenameTo(new_name) = &alter.action {
+                let old_key = old_name.to_ascii_lowercase();
+                let new_key = new_name.to_ascii_lowercase();
+                let mut names = self.temp_table_names.borrow_mut();
+                names.remove(&old_key);
+                names.insert(new_key.clone());
+                let mut schema = self.schema.borrow_mut();
+                let mut shadowed = self.shadowed_main_tables.borrow_mut();
+                if let Some(position) = schema.iter().position(|table| {
+                    table.root_page != new_schema.root_page && table.name.eq_ignore_ascii_case(new_name)
+                }) {
+                    shadowed.insert(new_key, schema.remove(position));
+                }
+                if let Some(main) = shadowed.remove(&old_key) {
+                    if let Some(column) = main.columns.iter().position(|col| col.is_ipk) {
+                        self.rowid_alias_columns.borrow_mut().insert(old_key, column);
+                    }
+                    schema.push(main);
+                }
+            }
+            drop(temp_sql);
+            self.rebuild_schema_indices();
+            self.validate_schema_index();
+            self.note_temp_schema_change();
+            return Ok(());
+        }
 
         if matches!(alter.action, AlterTableAction::RenameTo(_)) {
             // Preserve the table rowid while changing name/tbl_name/sql.
@@ -76350,9 +76425,9 @@ impl Connection {
         // 6) Follow the rename through any dependent views/triggers, mirroring
         //    the generic path (usually a no-op for an FTS5 table).
         let dependent_view_sql_updates =
-            self.rename_dependent_views_for_table_rename(old_name, new_name);
+            self.rename_dependent_views_for_table_rename(old_name, new_name, false);
         let dependent_trigger_sql_updates =
-            self.rename_dependent_triggers_for_table_rename(old_name, new_name);
+            self.rename_dependent_triggers_for_table_rename(old_name, new_name, false);
         for (view_name, view_sql) in &dependent_view_sql_updates {
             self.update_sqlite_master_typed_sql("view", view_name, view_sql)
                 .await?;
@@ -76377,12 +76452,19 @@ impl Connection {
         &self,
         old_name: &str,
         new_name: &str,
+        temp_only: bool,
     ) -> Vec<(String, String)> {
         let mut updates = Vec::new();
         let mut views = self.views.borrow_mut();
-        for view in views.iter_mut() {
-            if rename_table_refs_in_select(&mut view.query, old_name, new_name) && !view.temporary {
-                updates.push((view.name.clone(), render_create_view_sql(view)));
+        let target = TableRenameTarget::new(old_name, temp_only);
+        for view in views.iter_mut().filter(|view| !temp_only || view.temporary) {
+            if rename_table_refs_in_select(&mut view.query, &target, new_name) {
+                let sql = render_create_view_sql(view);
+                if view.temporary {
+                    view.temp_create_sql = Some(sql);
+                } else {
+                    updates.push((view.name.clone(), sql));
+                }
             }
         }
         updates
@@ -76392,17 +76474,21 @@ impl Connection {
         &self,
         old_name: &str,
         new_name: &str,
+        temp_only: bool,
     ) -> Vec<(String, String, String)> {
         let mut updates = Vec::new();
         let mut triggers = self.triggers.borrow_mut();
-        for trigger in triggers.iter_mut() {
+        let target = TableRenameTarget::new(old_name, temp_only);
+        for trigger in triggers.iter_mut().filter(|trigger| !temp_only || trigger.temporary) {
             // A savepoint's schema snapshot may share this definition: the
             // rename edits this connection's copy, and a rollback restores
             // the shared original.
             let trigger = Arc::make_mut(trigger);
-            let mut changed = if trigger.table_name.eq_ignore_ascii_case(old_name) {
+            let mut changed = if trigger.table_name.eq_ignore_ascii_case(old_name)
+                && target.matches_schema(trigger.table_schema.as_deref()) {
                 trigger.table_name.clear();
                 trigger.table_name.push_str(new_name);
+                trigger.bound_table_schema = target.schema.to_owned();
                 true
             } else {
                 false
@@ -76410,14 +76496,14 @@ impl Connection {
             if let Some(when_clause) = &mut trigger.when_clause {
                 changed |= rename_table_refs_in_expr(
                     when_clause,
-                    old_name,
+                    &target,
                     new_name,
                     &HashSet::new(),
                     false,
                 );
             }
             for statement in &mut trigger.body {
-                changed |= rename_table_refs_in_statement(statement, old_name, new_name);
+                changed |= rename_table_refs_in_statement(statement, &target, new_name);
             }
             if changed {
                 trigger.create_sql = render_create_trigger_sql(trigger);
@@ -76554,6 +76640,7 @@ impl Connection {
         old_column: &str,
         new_column: &str,
         source_catalog: &mut ColumnRenameSourceCatalog,
+        temp_only: bool,
     ) -> Vec<(String, String)> {
         let mut views = self.views.borrow_mut();
         for view in views.iter() {
@@ -76566,7 +76653,7 @@ impl Connection {
         let mut changed_views = HashSet::new();
         for _ in 0..=views.len() {
             let mut pass_changed = false;
-            for view in views.iter_mut() {
+            for view in views.iter_mut().filter(|view| !temp_only || view.temporary) {
                 let view_changed = rename_column_refs_in_select_for_table(
                     &mut view.query,
                     table_name,
@@ -76582,6 +76669,9 @@ impl Connection {
                 pass_changed |= status_changed;
                 if view_changed {
                     changed_views.insert(view.name.to_ascii_lowercase());
+                    if view.temporary {
+                        view.temp_create_sql = Some(render_create_view_sql(view));
+                    }
                 }
             }
             if !pass_changed {
@@ -76604,14 +76694,16 @@ impl Connection {
         old_column: &str,
         new_column: &str,
         source_catalog: &ColumnRenameSourceCatalog,
+        temp_only: bool,
     ) -> Vec<(String, String, String)> {
         let mut updates = Vec::new();
         let mut triggers = self.triggers.borrow_mut();
-        for trigger in triggers.iter_mut() {
+        for trigger in triggers.iter_mut().filter(|trigger| !temp_only || trigger.temporary) {
             // As in the table rename: a snapshot keeps the original.
             let trigger = Arc::make_mut(trigger);
             let mut changed = false;
-            let trigger_target_matches = trigger.table_name.eq_ignore_ascii_case(table_name);
+            let trigger_target_matches = trigger.table_name.eq_ignore_ascii_case(table_name)
+                && source_catalog.matches_target_schema(trigger.table_schema.as_deref());
             if trigger_target_matches {
                 changed |= rename_trigger_event_columns(&mut trigger.event, old_column, new_column);
             }
@@ -76690,6 +76782,7 @@ impl Connection {
         }
         ColumnRenameSourceCatalog {
             renamed_table: table_name.to_ascii_lowercase(),
+            target_is_temp: self.temp_table_names.borrow().contains(&table_name.to_ascii_lowercase()),
             known_tables,
             tables_with_old_column,
             view_outputs: HashMap::new(),
@@ -78142,7 +78235,9 @@ impl Connection {
                 stored_stmt.if_not_exists = false;
                 stored_stmt.to_string()
             });
-        if !target_is_temp {
+        if target_is_temp {
+            self.temp_table_sql.borrow_mut().insert(root_page, create_sql);
+        } else {
             self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)
                 .await?;
         }
@@ -78531,6 +78626,13 @@ impl Connection {
                     .as_deref()
                     .is_none_or(|s| s.eq_ignore_ascii_case("temp")));
 
+        let mut bound_table_schema = stmt.table_schema.clone().unwrap_or_else(|| {
+            if is_temp_trigger {
+                self.visible_trigger_target_schema(table_name).to_owned()
+            } else {
+                "main".to_owned()
+            }
+        });
         let (table_exists, view_exists, missing_table_label) = if is_temp_trigger {
             match stmt.table_schema.as_deref() {
                 None => {
@@ -78555,6 +78657,7 @@ impl Connection {
                             if at || av {
                                 tbl = at;
                                 vw = av;
+                                bound_table_schema = schema;
                                 break;
                             }
                         }
@@ -78669,6 +78772,7 @@ impl Connection {
             });
         let mut trigger_def = TriggerDef::from_create_statement(stmt, create_sql.clone());
         trigger_def.temporary = is_temp_trigger;
+        trigger_def.bound_table_schema = bound_table_schema;
         self.triggers.borrow_mut().push(Arc::new(trigger_def));
         self.rebuild_schema_indices();
 
@@ -78690,20 +78794,18 @@ impl Connection {
     /// visible to generated columns (see [`Self::before_update_new_loaded_columns`]).
     fn make_trigger_frame(
         &self,
-        table_name: &str,
+        target: &QualifiedName,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
         old_rowid: Option<i64>,
         new_rowid: Option<i64>,
         new_loaded: Option<&[bool]>,
     ) -> Result<TriggerFrame> {
-        let schema = self.schema.borrow();
-        let table_schema = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+        let stored = self.trigger_target_table(&target.name, target.schema.as_deref())
             .ok_or_else(|| FrankenError::NoSuchTable {
-                name: table_name.to_owned(),
+                name: target.name.clone(),
             })?;
+        let table_schema = &*stored;
         let column_names = table_schema
             .columns
             .iter()
@@ -78824,17 +78926,14 @@ impl Connection {
     /// column is loaded or the table has no generated column.
     fn before_update_new_loaded_columns(
         &self,
-        table_name: &str,
+        target: &QualifiedName,
         assigned_columns: &[String],
         triggers: &[Arc<TriggerDef>],
     ) -> Option<Vec<bool>> {
         if assigned_columns.is_empty() {
             return None;
         }
-        let schema = self.schema.borrow();
-        let table = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(table_name))?;
+        let table = self.trigger_target_table(&target.name, target.schema.as_deref())?;
         if !table
             .columns
             .iter()
@@ -80115,7 +80214,7 @@ impl Connection {
             return Ok(());
         }
         *self.last_replace_victims.borrow_mut() = victims;
-        self.enforce_fk_on_replace_victims(table_name).await
+        self.enforce_fk_on_replace_victims(&QualifiedName::bare(table_name)).await
     }
 
     /// Apply inbound FK semantics for exact rows deleted by VDBE REPLACE
@@ -80128,7 +80227,8 @@ impl Connection {
     /// statement's own AFTER triggers. This method is invoked before those
     /// AFTER triggers, so firing the victim triggers here preserves that
     /// ordering.
-    async fn enforce_fk_on_replace_victims(&self, table_name: &str) -> Result<()> {
+    async fn enforce_fk_on_replace_victims(&self, target: &QualifiedName) -> Result<()> {
+        let table_name = target.name.as_str();
         let victims = std::mem::take(&mut *self.last_replace_victims.borrow_mut());
         if victims.is_empty() {
             return Ok(());
@@ -80184,7 +80284,7 @@ impl Connection {
                 // OLD.rowid resolves to the deleted victim's rowid so it works on
                 // tables without an INTEGER PRIMARY KEY column. (GH #205)
                 self.fire_before_triggers(
-                    table_name,
+                    target,
                     &delete_event,
                     Some(&victim.values),
                     None,
@@ -80193,7 +80293,7 @@ impl Connection {
                 )
                 .await?;
                 self.fire_after_triggers(
-                    table_name,
+                    target,
                     &delete_event,
                     Some(&victim.values),
                     None,
@@ -80742,6 +80842,36 @@ impl Connection {
                 || self.views.borrow().iter().any(|view| view.temporary))
     }
 
+    fn visible_trigger_target_schema(&self, name: &str) -> &'static str {
+        if self.temp_table_names.borrow().contains(&name.to_ascii_lowercase())
+            || self.view_index_for_scope(name, PragmaSchemaScope::Temp).is_some() {
+            "temp"
+        } else {
+            "main"
+        }
+    }
+
+    fn trigger_matches_target(&self, trigger: &TriggerDef, name: &str, schema: Option<&str>) -> bool {
+        trigger.table_name.eq_ignore_ascii_case(name)
+            && trigger.bound_table_schema.eq_ignore_ascii_case(
+                schema.unwrap_or_else(|| self.visible_trigger_target_schema(name))
+            )
+    }
+
+    fn trigger_target_table(&self, name: &str, schema: Option<&str>) -> Option<std::cell::Ref<'_, TableSchema>> {
+        if schema.is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
+            && let Ok(main) = std::cell::Ref::filter_map(self.shadowed_main_tables.borrow(), |tables| {
+                tables.get(&name.to_ascii_lowercase())
+            }) {
+            return Some(main);
+        }
+        if schema.is_some_and(|schema| !schema.eq_ignore_ascii_case(self.visible_trigger_target_schema(name))) {
+            return None;
+        }
+        let index = self.schema_index_of(name)?;
+        std::cell::Ref::filter_map(self.schema.borrow(), |tables| tables.get(index)).ok()
+    }
+
     /// bd-w78tx: stock compiles every trigger a DML statement can fire while
     /// it prepares the statement, whatever the trigger's WHEN clause, and
     /// refuses the statement when the WHEN or the body of one of them names a
@@ -80779,7 +80909,7 @@ impl Connection {
             .triggers
             .borrow()
             .iter()
-            .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&target.name));
+            .any(|trigger| self.trigger_matches_target(trigger, &target.name, target.schema.as_deref()));
         // A DELETE, UPDATE, or DO UPDATE upsert of a parent takes foreign-key actions.
         let takes_fk_actions = match statement {
             Statement::Update(_) | Statement::Delete(_) => true,
@@ -80832,8 +80962,8 @@ impl Connection {
             (TriggerTiming::InsteadOf, &firing.event),
             (TriggerTiming::After, &firing.event),
         ];
-        let before = self.triggers_in_groups(&firing.table, &before_groups);
-        let after = self.triggers_in_groups(&firing.table, &after_groups);
+        let before = self.triggers_in_groups(firing, &before_groups);
+        let after = self.triggers_in_groups(firing, &after_groups);
         let mut fk_actions = if self.fk_cascade_propagation_enabled() {
             self.foreign_key_action_firings(&firing.table, &firing.event, compiled)
         } else {
@@ -80860,14 +80990,14 @@ impl Connection {
     /// group newest first, each trigger once.
     fn triggers_in_groups(
         &self,
-        table: &str,
+        firing: &DmlTriggerFiring,
         groups: &[(fsqlite_ast::TriggerTiming, &fsqlite_ast::TriggerEvent)],
     ) -> Vec<Arc<TriggerDef>> {
         let triggers = self.triggers.borrow();
         let mut ordered: Vec<Arc<TriggerDef>> = Vec::new();
         for (timing, event) in groups {
             for trigger in triggers.iter().rev() {
-                if trigger.table_name.eq_ignore_ascii_case(table)
+                if self.trigger_matches_target(trigger, &firing.table, firing.schema.as_deref())
                     && trigger.timing == *timing
                     && trigger_event_matches(&trigger.event, event)
                     && !ordered.iter().any(|seen| Arc::ptr_eq(seen, trigger))
@@ -80932,6 +81062,7 @@ impl Connection {
                 };
                 firings.push(DmlTriggerFiring {
                     table: child.name.clone(),
+                    schema: None,
                     event,
                     upsert_updates: Vec::new(),
                     replace_deletes: false,
@@ -81012,7 +81143,10 @@ impl Connection {
                 let (bound, _) = bind_trigger_body_statement(statement, frame, !trigger.temporary);
                 self.trigger_names_result(trigger, self.validate_trigger_statement_names(&bound))?;
             }
-            if let Some(firing) = DmlTriggerFiring::of(statement, recursive_triggers) {
+            if let Some(mut firing) = DmlTriggerFiring::of(statement, recursive_triggers) {
+                if !trigger.temporary && firing.schema.is_none() {
+                    firing.schema = Some("main".to_owned());
+                }
                 self.validate_firing_trigger_programs(&firing, recursive_triggers, compiled)?;
             }
         }
@@ -81052,20 +81186,14 @@ impl Connection {
             if trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf {
                 (self.view_trigger_column_names(&trigger.table_name).ok()?, None, false)
             } else {
-                let key = trigger.table_name.to_ascii_lowercase();
-                let shadowed = self.shadowed_main_tables.borrow();
-                let schema = self.schema.borrow();
-                let table = shadowed
-                    .get(&key)
-                    .filter(|_| !trigger.temporary)
-                    .or_else(|| schema.get(self.schema_index_of(&trigger.table_name)?))?;
+                let table = self.trigger_target_table(&trigger.table_name, Some(&trigger.bound_table_schema))?;
                 (
                     table
                         .columns
                         .iter()
                         .map(|column| column.name.clone())
                         .collect::<Vec<_>>(),
-                    self.rowid_alias_columns.borrow().get(&key).copied(),
+                    table.columns.iter().position(|col| col.is_ipk),
                     !table.without_rowid,
                 )
             };
@@ -81679,7 +81807,7 @@ impl Connection {
     /// operation should be skipped entirely.
     async fn fire_before_triggers(
         &self,
-        table_name: &str,
+        target: &QualifiedName,
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
@@ -81702,7 +81830,7 @@ impl Connection {
             .iter()
             .rev()
             .filter(|t| {
-                t.table_name.eq_ignore_ascii_case(table_name)
+                self.trigger_matches_target(t, &target.name, target.schema.as_deref())
                     && t.timing == fsqlite_ast::TriggerTiming::Before
                     && trigger_event_matches(&t.event, event)
             })
@@ -81717,12 +81845,12 @@ impl Connection {
         let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
         let new_loaded = match event {
             fsqlite_ast::TriggerEvent::Update(assigned_columns) => {
-                self.before_update_new_loaded_columns(table_name, assigned_columns, &matching)
+                self.before_update_new_loaded_columns(target, assigned_columns, &matching)
             }
             fsqlite_ast::TriggerEvent::Insert | fsqlite_ast::TriggerEvent::Delete => None,
         };
         let base_frame = self.make_trigger_frame(
-            table_name,
+            target,
             old_values,
             new_values,
             old_rowid,
@@ -81790,7 +81918,7 @@ impl Connection {
     /// Fire AFTER triggers for a DML event on a table.
     async fn fire_after_triggers(
         &self,
-        table_name: &str,
+        target: &QualifiedName,
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
@@ -81811,7 +81939,7 @@ impl Connection {
             .iter()
             .rev()
             .filter(|t| {
-                t.table_name.eq_ignore_ascii_case(table_name)
+                self.trigger_matches_target(t, &target.name, target.schema.as_deref())
                     && t.timing == fsqlite_ast::TriggerTiming::After
                     && trigger_event_matches(&t.event, event)
             })
@@ -81825,7 +81953,7 @@ impl Connection {
 
         let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
         let base_frame =
-            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid, None)?;
+            self.make_trigger_frame(target, old_values, new_values, old_rowid, new_rowid, None)?;
         for trigger in matching {
             // PRAGMA recursive_triggers (default OFF): when disabled, the
             // same trigger cannot re-enter itself (checked by trigger NAME,
@@ -82042,7 +82170,7 @@ impl Connection {
         let mut returning_rows = Vec::new();
         for new_values in &new_rows {
             let skipped = self
-                .fire_instead_of_triggers(&view_name, &column_names, &event, None, Some(new_values))
+                .fire_instead_of_triggers(&insert.table, &column_names, &event, None, Some(new_values))
                 .await?;
             // bd-1mcjr M3: a RAISE(IGNORE) row is skipped — emit no RETURNING row.
             if !skipped && !insert.returning.is_empty() {
@@ -82129,7 +82257,7 @@ impl Connection {
             }
             let skipped = self
                 .fire_instead_of_triggers(
-                    &view_name,
+                    &update.table.name,
                     &column_names,
                     &event,
                     Some(&old_values),
@@ -82179,7 +82307,7 @@ impl Connection {
         let mut returning_rows = Vec::new();
         for (_old_rowid, old_values) in &old_rows {
             let skipped = self
-                .fire_instead_of_triggers(&view_name, &column_names, &event, Some(old_values), None)
+                .fire_instead_of_triggers(&delete.table.name, &column_names, &event, Some(old_values), None)
                 .await?;
             // RETURNING references the deleted (OLD) row; a RAISE(IGNORE) row is
             // skipped and emits no RETURNING row (bd-1mcjr M3).
@@ -82312,12 +82440,13 @@ impl Connection {
     /// which emits no RETURNING row for an ignored row (bd-1mcjr M3).
     async fn fire_instead_of_triggers(
         &self,
-        view_name: &str,
+        target: &QualifiedName,
         column_names: &[String],
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<bool> {
+        let view_name = target.name.as_str();
         // Reverse-creation (LIFO, newest first) order to match C SQLite — see
         // fire_before_triggers (bd-5vr3b). Stable across reopen because
         // `self.triggers` is always in creation order.
@@ -82326,7 +82455,7 @@ impl Connection {
             .iter()
             .rev()
             .filter(|trigger| {
-                trigger.table_name.eq_ignore_ascii_case(view_name)
+                self.trigger_matches_target(trigger, &target.name, target.schema.as_deref())
                     && trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf
                     && trigger_event_matches(&trigger.event, event)
             })
@@ -83717,7 +83846,7 @@ impl Connection {
         let views = self.views.borrow();
         let triggers = self.triggers.borrow();
         let temp_table_names = self.temp_table_names.borrow();
-        let ddl_cache = self.original_ddl_sql.borrow();
+        let ddl_cache = self.temp_table_sql.borrow();
         let mut rows = Vec::new();
 
         for table in schema.iter() {
@@ -83732,11 +83861,11 @@ impl Connection {
                 .contains(&table.name.to_ascii_lowercase());
 
             let table_sql = ddl_cache
-                .get(&table.name.to_ascii_lowercase())
+                .get(&table.root_page)
                 .cloned()
                 .unwrap_or_else(|| {
                     render_create_table_sql(table, is_autoincrement, |index| {
-                        let original_sql = ddl_cache.get(&index.name.to_ascii_lowercase());
+                        let original_sql = ddl_cache.get(&index.root_page);
                         is_implicit_autoindex_entry(
                             &index.name,
                             &table.name,
@@ -83754,7 +83883,7 @@ impl Connection {
             ]);
 
             for index in &table.indexes {
-                let original_sql = ddl_cache.get(&index.name.to_ascii_lowercase());
+                let original_sql = ddl_cache.get(&index.root_page);
                 let index_sql = if is_implicit_autoindex_entry(
                     &index.name,
                     &table.name,
@@ -83781,7 +83910,6 @@ impl Connection {
             let view_sql = view
                 .temp_create_sql
                 .clone()
-                .or_else(|| ddl_cache.get(&view.name.to_ascii_lowercase()).cloned())
                 .unwrap_or_else(|| format!("CREATE VIEW {}", view.name));
             rows.push(vec![
                 SqliteValue::Text("view".into()),
@@ -83920,6 +84048,7 @@ impl Connection {
             SnapshotSchemaState::Copied(Box::new(SchemaSnapshot {
                 schema: self.schema.borrow().clone(),
                 temp_table_names: self.temp_table_names.borrow().clone(),
+                temp_table_sql: self.temp_table_sql.borrow().clone(),
                 temp_default_cache_size: self.pragma_state.borrow().temp_default_cache_size,
                 shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
                 views: self.views.borrow().clone(),
@@ -83957,6 +84086,7 @@ impl Connection {
         }
         self.schema.arm();
         self.temp_table_names.arm();
+        self.temp_table_sql.arm();
         self.shadowed_main_tables.arm();
         self.views.arm();
         self.triggers.arm();
@@ -83974,6 +84104,7 @@ impl Connection {
     fn end_transaction_catalog_cells(&self) {
         self.schema.end_txn();
         self.temp_table_names.end_txn();
+        self.temp_table_sql.end_txn();
         self.shadowed_main_tables.end_txn();
         self.views.end_txn();
         self.triggers.end_txn();
@@ -84032,6 +84163,7 @@ impl Connection {
                 // value at the first change; the others still hold it.
                 let schema_restored = self.schema.restore_before_txn();
                 self.temp_table_names.restore_before_txn();
+                self.temp_table_sql.restore_before_txn();
                 self.shadowed_main_tables.restore_before_txn();
                 let views_restored = self.views.restore_before_txn();
                 let triggers_restored = self.triggers.restore_before_txn();
@@ -84072,6 +84204,7 @@ impl Connection {
         (*self.schema.borrow_mut()).clone_from(&state.schema);
         *self.schema_by_name.borrow_mut() = new_schema_by_name;
         (*self.temp_table_names.borrow_mut()).clone_from(&state.temp_table_names);
+        (*self.temp_table_sql.borrow_mut()).clone_from(&state.temp_table_sql);
         self.pragma_state.borrow_mut().temp_default_cache_size = state.temp_default_cache_size;
         (*self.shadowed_main_tables.borrow_mut()).clone_from(&state.shadowed_main_tables);
         (*self.views.borrow_mut()).clone_from(&state.views);
@@ -88295,15 +88428,16 @@ impl Connection {
     /// Read the actual declaration so a table-level COLLATE override is not
     /// lost through the compact TableSchema's column-name-only PK metadata.
     fn integrity_without_rowid_primary_key(&self, table: &TableSchema) -> Result<IndexSchema> {
-        let sql = self
-            .original_ddl_sql
-            .borrow()
-            .get(&table.name.to_ascii_lowercase())
-            .cloned()
+        let sql = self.temp_table_sql.borrow().get(&table.root_page).cloned()
+            .or_else(|| self.original_ddl_sql.borrow().get(&table.name.to_ascii_lowercase()).cloned())
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!("WITHOUT ROWID table `{}` has no stored definition", table.name),
             })?;
-        let statement = parse_single_statement(&sql)?;
+        Self::without_rowid_primary_key_from_ddl(table, &sql)
+    }
+
+    pub(crate) fn without_rowid_primary_key_from_ddl(table: &TableSchema, sql: &str) -> Result<IndexSchema> {
+        let statement = parse_single_statement(sql)?;
         let Statement::CreateTable(create) = statement else {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!("WITHOUT ROWID table `{}` has an invalid definition", table.name),
@@ -89220,16 +89354,13 @@ impl Connection {
             // secondary index already stores that column under the same collation.
             // A table-level PRIMARY KEY may override the declared column collation.
             let mut suffix = Vec::new();
-            for (slot, &column) in storage_order[..primary.key_term_count()].iter().enumerate() {
+            let pk_columns = &storage_order[..primary.key_term_count()];
+            for slot in index.without_rowid_locator_slots(table, pk_columns, &primary.key_collations) {
+                let column = pk_columns[slot];
                 let pk_collation = primary.key_term_collation(slot);
-                let covered = columns.iter().zip(&collations).any(|(key_col, coll)| {
-                    *key_col == Some(column) && implicit_autoindex_collations_match(coll.as_deref(), pk_collation)
-                });
-                if !covered {
-                    suffix.push(column);
-                    descending.push(primary.key_term_descending(slot));
-                    collations.push(pk_collation.map(str::to_owned));
-                }
+                suffix.push(column);
+                descending.push(primary.key_term_descending(slot));
+                collations.push(pk_collation.map(str::to_owned));
             }
             let root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
             let mut expected = Vec::new();
@@ -92683,77 +92814,20 @@ impl Connection {
                             // a NULL name, matching stock. The trailing rowid entry
                             // (index_xinfo only) uses the key-term count as seqno.
                             let key_count = idx.key_term_count();
-                            let resolve_term = |term_sql: &str| -> Option<(i64, String)> {
-                                let trimmed = term_sql.trim();
-                                let bytes = trimmed.as_bytes();
-                                let unquoted = if bytes.len() >= 2
-                                    && matches!(
-                                        (bytes[0], bytes[bytes.len() - 1]),
-                                        (b'"', b'"') | (b'`', b'`') | (b'[', b']')
-                                    ) {
-                                    &trimmed[1..trimmed.len() - 1]
-                                } else {
-                                    trimmed
-                                };
-                                // Direct match: a bare (optionally quoted) column
-                                // identifier.
-                                let position = table
-                                    .columns
-                                    .iter()
-                                    .position(|c| c.name.eq_ignore_ascii_case(unquoted))
-                                    // A COLLATE-decorated bare column (e.g.
-                                    // `b COLLATE NOCASE`) is still a column key term
-                                    // in stock: it resolves to cid>=0 + name and the
-                                    // collation is surfaced separately by
-                                    // index_xinfo's `coll`. Only a genuine expression
-                                    // (`a+1`, `lower(b)`) stays cid=-2/NULL. Such a
-                                    // term reaches here as its full SQL fragment
-                                    // (an expression-mode index stringifies every
-                                    // term, bd-ivy5h), so the direct match misses it;
-                                    // parse and peel COLLATE wrappers to the
-                                    // underlying column, mirroring
-                                    // `explicit_index_simple_column_name`.
-                                    .or_else(|| {
-                                        let expr =
-                                            fsqlite_parser::expr::parse_expr(trimmed).ok()?;
-                                        let mut cur = &expr;
-                                        loop {
-                                            match cur {
-                                                Expr::Collate { expr: inner, .. } => {
-                                                    cur = inner.as_ref();
-                                                }
-                                                Expr::Column(col_ref, _)
-                                                    if col_ref.table.is_none() =>
-                                                {
-                                                    break table.columns.iter().position(|c| {
-                                                        c.name.eq_ignore_ascii_case(
-                                                            col_ref.column.as_ref(),
-                                                        )
-                                                    });
-                                                }
-                                                _ => break None,
-                                            }
-                                        }
-                                    });
-                                position.map(|p| {
-                                    (
-                                        i64::try_from(p).unwrap_or(-1),
-                                        table.columns[p].name.clone(),
-                                    )
-                                })
-                            };
                             let mut rows: Vec<Row> = (0..key_count)
                                 .map(|seq| {
-                                    let term_sql = idx.key_term_sql(seq).unwrap_or_default();
-                                    let (cid, name) = match resolve_term(term_sql) {
-                                        Some((cid, name)) => (cid, SqliteValue::Text(name.into())),
+                                    let column = idx.key_term_column(table, seq);
+                                    let (cid, name) = match column {
+                                        Some(col) => (i64::try_from(col).unwrap_or(-1), SqliteValue::Text(table.columns[col].name.clone().into())),
                                         None => (-2, SqliteValue::Null),
                                     };
                                     let seqno =
                                         SqliteValue::Integer(i64::try_from(seq).unwrap_or(0));
                                     if is_xinfo {
                                         let desc = i64::from(idx.key_term_descending(seq));
-                                        let coll = idx.key_term_collation(seq).unwrap_or("BINARY");
+                                        let coll = idx.key_term_collation(seq)
+                                            .or_else(|| column.and_then(|col| table.columns[col].collation.as_deref()))
+                                            .unwrap_or("BINARY");
                                         Row {
                                             values: vec![
                                                 seqno,
@@ -92771,35 +92845,19 @@ impl Connection {
                                     }
                                 })
                                 .collect();
-                            if is_xinfo
-                                && table.without_rowid
-                                && self
-                                    .table_execution_metadata()
-                                    .wr_index_suffix_roots
-                                    .contains(&table.root_page)
-                            {
-                                let pk = without_rowid_pk_indices(table)
-                                    .map_err(codegen_error_to_franken)?;
-                                let metadata = self.table_execution_metadata();
-                                for (suffix_position, column) in
-                                    without_rowid_index_appended_pk(table, idx, &pk)
-                                        .into_iter()
-                                        .enumerate()
-                                {
+                            if is_xinfo && table.without_rowid {
+                                let primary = self.integrity_without_rowid_primary_key(table)?;
+                                let pk = primary.columns.iter().map(|name| {
+                                    table.column_index(name).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                        detail: format!("unknown primary-key column {name} of {}", table.name),
+                                    })
+                                }).collect::<Result<Vec<_>>>()?;
+                                for slot in idx.without_rowid_locator_slots(table, &pk, &primary.key_collations) {
+                                    let column = pk[slot];
                                     let definition = &table.columns[column];
-                                    let sequence = key_count + suffix_position;
-                                    let desc = metadata
-                                        .index_desc_flags_by_root_page
-                                        .get(&idx.root_page)
-                                        .and_then(|flags| flags.get(sequence))
-                                        .copied()
-                                        .unwrap_or(false);
-                                    let collation = metadata
-                                        .index_collations_by_root_page
-                                        .get(&idx.root_page)
-                                        .and_then(|collations| collations.get(sequence))
-                                        .and_then(Option::as_deref)
-                                        .unwrap_or("BINARY");
+                                    let sequence = rows.len();
+                                    let desc = primary.key_term_descending(slot);
+                                    let collation = primary.key_term_collation(slot).unwrap_or("BINARY");
                                     rows.push(Row {
                                         values: vec![
                                             SqliteValue::Integer(
@@ -92873,7 +92931,8 @@ impl Connection {
                         continue;
                     }
                     // PK columns (in declaration order) resolved to storage cids.
-                    let pk_cids: Vec<usize> = pk_cols
+                    let primary = self.integrity_without_rowid_primary_key(table)?;
+                    let pk_cids: Vec<usize> = primary.columns
                         .iter()
                         .filter_map(|name| {
                             table
@@ -92886,13 +92945,7 @@ impl Connection {
                     // registry (bd-w9r11 / GH#222/#223) — the same source the
                     // storage-metadata path honors so the b-tree compares in PK
                     // direction. Absent/legacy snapshots fall back to all-ascending.
-                    let pk_desc_flags: Vec<bool> = self
-                        .without_rowid_pk_desc
-                        .borrow()
-                        .get(&table.name.to_ascii_lowercase())
-                        .filter(|flags| flags.len() == pk_cids.len())
-                        .cloned()
-                        .unwrap_or_else(|| vec![false; pk_cids.len()]);
+                    let pk_desc_flags = (0..pk_cids.len()).map(|slot| primary.key_term_descending(slot));
                     // index_info reports only the key columns; index_xinfo appends
                     // the remaining (covered) table columns with key=0 (desc=0).
                     let mut entries: Vec<(usize, bool, bool)> = pk_cids
@@ -92901,8 +92954,8 @@ impl Connection {
                         .map(|(&cid, desc)| (cid, true, desc))
                         .collect();
                     if is_xinfo {
-                        for cid in 0..table.columns.len() {
-                            if !pk_cids.contains(&cid) {
+                        for (cid, column) in table.columns.iter().enumerate() {
+                            if !pk_cids.contains(&cid) && !column.is_virtual_generated() {
                                 entries.push((cid, false, false));
                             }
                         }
@@ -92916,7 +92969,11 @@ impl Connection {
                             let cid_val = SqliteValue::Integer(i64::try_from(cid).unwrap_or(-1));
                             let name = SqliteValue::Text(col.name.clone().into());
                             if is_xinfo {
-                                let coll = col.collation.as_deref().unwrap_or("BINARY");
+                                let coll = if is_key {
+                                    primary.key_term_collation(seq)
+                                } else {
+                                    col.collation.as_deref()
+                                }.unwrap_or("BINARY");
                                 Row {
                                     values: vec![
                                         seqno,
@@ -142832,7 +142889,7 @@ fn schema_table_index_or_view_name_exists(
 fn render_create_view_sql(view: &ViewDef) -> String {
     fsqlite_ast::CreateViewStatement {
         if_not_exists: false,
-        temporary: view.temporary,
+        temporary: false,
         name: QualifiedName::bare(view.name.clone()),
         columns: view.columns.clone(),
         query: view.query.clone(),
@@ -142843,11 +142900,11 @@ fn render_create_view_sql(view: &ViewDef) -> String {
 fn render_create_trigger_sql(trigger: &TriggerDef) -> String {
     fsqlite_ast::CreateTriggerStatement {
         if_not_exists: false,
-        temporary: trigger.temporary,
+        temporary: false,
         name: QualifiedName::bare(trigger.name.clone()),
         timing: trigger.timing,
         event: trigger.event.clone(),
-        table_schema: None,
+        table_schema: trigger.table_schema.clone(),
         table: trigger.table_name.clone(),
         for_each_row: trigger.for_each_row,
         when: trigger.when_clause.clone(),
@@ -142875,7 +142932,22 @@ impl TableRenameScope {
     }
 }
 
-fn rename_table_refs_in_statement(statement: &mut Statement, old: &str, new: &str) -> bool {
+struct TableRenameTarget<'a> {
+    name: &'a str,
+    schema: &'static str,
+}
+
+impl<'a> TableRenameTarget<'a> {
+    fn new(name: &'a str, temporary: bool) -> Self {
+        Self { name, schema: if temporary { "temp" } else { "main" } }
+    }
+
+    fn matches_schema(&self, schema: Option<&str>) -> bool {
+        schema.is_none_or(|schema| schema.eq_ignore_ascii_case(self.schema))
+    }
+}
+
+fn rename_table_refs_in_statement(statement: &mut Statement, old: &TableRenameTarget<'_>, new: &str) -> bool {
     let mut changed = false;
     match statement {
         Statement::Select(select) => rename_table_refs_in_select(select, old, new),
@@ -142888,7 +142960,7 @@ fn rename_table_refs_in_statement(statement: &mut Statement, old: &str, new: &st
         }
         Statement::CreateView(view) => rename_table_refs_in_select(&mut view.query, old, new),
         Statement::CreateIndex(index) => {
-            if index.table.eq_ignore_ascii_case(old) {
+            if index.table.eq_ignore_ascii_case(old.name) {
                 index.table.clear();
                 index.table.push_str(new);
                 changed = true;
@@ -142907,13 +142979,13 @@ fn rename_table_refs_in_statement(statement: &mut Statement, old: &str, new: &st
     }
 }
 
-fn rename_table_refs_in_select(select: &mut SelectStatement, old: &str, new: &str) -> bool {
+fn rename_table_refs_in_select(select: &mut SelectStatement, old: &TableRenameTarget<'_>, new: &str) -> bool {
     rename_table_refs_in_select_with_hidden(select, old, new, &HashSet::new())
 }
 
 fn rename_table_refs_in_select_with_hidden(
     select: &mut SelectStatement,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> bool {
@@ -142961,7 +143033,7 @@ fn rename_table_refs_in_select_with_hidden(
 
 fn rename_table_refs_in_with_clause(
     with: &mut fsqlite_ast::WithClause,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> (bool, HashSet<String>) {
@@ -142977,13 +143049,13 @@ fn rename_table_refs_in_with_clause(
 
 fn rename_table_refs_in_insert_statement(
     insert: &mut InsertStatement,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
 ) -> bool {
     let old_alias_present = insert
         .alias
         .as_deref()
-        .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+        .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name));
     let renamed_target = rename_qualified_table_name(&mut insert.table, old, new, &HashSet::new());
     let mut changed = renamed_target;
     let hidden_tables = if let Some(with) = &mut insert.with {
@@ -143058,7 +143130,7 @@ fn rename_table_refs_in_insert_statement(
 
 fn rename_table_refs_in_update_statement(
     update: &mut fsqlite_ast::UpdateStatement,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
 ) -> bool {
     let mut changed = false;
@@ -143135,7 +143207,7 @@ fn rename_table_refs_in_update_statement(
 
 fn rename_table_refs_in_delete_statement(
     delete: &mut fsqlite_ast::DeleteStatement,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
 ) -> bool {
     let mut changed = false;
@@ -143180,7 +143252,7 @@ fn rename_table_refs_in_delete_statement(
 
 fn rename_table_refs_in_select_core(
     core: &mut SelectCore,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> TableRenameScope {
@@ -143271,7 +143343,7 @@ fn rename_table_refs_in_select_core(
 
 fn rename_table_refs_in_table_or_subquery(
     source: &mut TableOrSubquery,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> TableRenameScope {
@@ -143280,7 +143352,7 @@ fn rename_table_refs_in_table_or_subquery(
         TableOrSubquery::Table { name, alias, .. } => {
             scope.old_alias_present = alias
                 .as_deref()
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name));
             if rename_qualified_table_name(name, old, new, hidden_tables) {
                 scope.changed = true;
                 scope.renamed_unaliased_source = alias.is_none();
@@ -143291,7 +143363,7 @@ fn rename_table_refs_in_table_or_subquery(
                 rename_table_refs_in_select_with_hidden(query, old, new, hidden_tables);
             scope.old_alias_present = alias
                 .as_deref()
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name));
         }
         TableOrSubquery::TableFunction { args, alias, .. } => {
             for expr in args {
@@ -143299,7 +143371,7 @@ fn rename_table_refs_in_table_or_subquery(
             }
             scope.old_alias_present = alias
                 .as_deref()
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name));
         }
         TableOrSubquery::ParenJoin(from_clause) => {
             scope.merge(rename_table_refs_in_table_or_subquery(
@@ -143330,14 +143402,14 @@ fn rename_table_refs_in_table_or_subquery(
 
 fn rename_table_refs_in_qualified_table_ref(
     table: &mut fsqlite_ast::QualifiedTableRef,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
 ) -> TableRenameScope {
     let mut scope = TableRenameScope {
         old_alias_present: table
             .alias
             .as_deref()
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(old)),
+            .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name)),
         ..TableRenameScope::default()
     };
     if rename_qualified_table_name(&mut table.name, old, new, &HashSet::new()) {
@@ -143349,11 +143421,12 @@ fn rename_table_refs_in_qualified_table_ref(
 
 fn rename_qualified_table_name(
     name: &mut QualifiedName,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> bool {
-    if !qualified_relation_matches_unhidden_name(name, old, hidden_tables) {
+    if !old.matches_schema(name.schema.as_deref())
+        || !qualified_relation_matches_unhidden_name(name, old.name, hidden_tables) {
         return false;
     }
     name.name.clear();
@@ -143363,7 +143436,7 @@ fn rename_qualified_table_name(
 
 fn rename_table_refs_in_result_column(
     column: &mut ResultColumn,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143381,7 +143454,7 @@ fn rename_table_refs_in_result_column(
 
 fn rename_table_refs_in_expr(
     expr: &mut Expr,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143393,10 +143466,11 @@ fn rename_table_refs_in_expr(
         | Expr::Raise { .. } => false,
         Expr::Column(col_ref, _) => {
             if rename_qualifiers
+                && old.matches_schema(col_ref.schema.as_deref())
                 && col_ref
                     .table
                     .as_deref()
-                    .is_some_and(|table| table.eq_ignore_ascii_case(old))
+                    .is_some_and(|table| table.eq_ignore_ascii_case(old.name))
             {
                 col_ref.table = Some(Arc::from(new));
                 true
@@ -143513,7 +143587,7 @@ fn rename_table_refs_in_expr(
 
 fn rename_table_refs_in_window_spec(
     window: &mut WindowSpec,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143533,7 +143607,7 @@ fn rename_table_refs_in_window_spec(
 
 fn rename_table_refs_in_frame_spec(
     frame: &mut FrameSpec,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143546,7 +143620,7 @@ fn rename_table_refs_in_frame_spec(
 
 fn rename_table_refs_in_frame_bound(
     bound: &mut FrameBound,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143652,12 +143726,17 @@ impl ColumnRenameOutputSources {
 
 struct ColumnRenameSourceCatalog {
     renamed_table: String,
+    target_is_temp: bool,
     known_tables: HashSet<String>,
     tables_with_old_column: HashSet<String>,
     view_outputs: HashMap<String, ColumnRenameOutputStatus>,
 }
 
 impl ColumnRenameSourceCatalog {
+    fn matches_target_schema(&self, schema: Option<&str>) -> bool {
+        TableRenameTarget::new(&self.renamed_table, self.target_is_temp).matches_schema(schema)
+    }
+
     fn set_view_output_status(
         &mut self,
         view_name: &str,
@@ -143725,7 +143804,7 @@ impl ColumnRenameSourceCatalog {
         if let Some(status) = self.view_outputs.get(&key) {
             return *status;
         }
-        if key == self.renamed_table {
+        if key == self.renamed_table && self.matches_target_schema(name.schema.as_deref()) {
             ColumnRenameOutputStatus::renamed()
         } else if self.tables_with_old_column.contains(&key) || !self.known_tables.contains(&key) {
             ColumnRenameOutputStatus::old()
@@ -144600,7 +144679,8 @@ fn collect_column_rename_bindings_from_table_or_subquery_with_outer(
                     bindings.add_matching_binding(&name.name);
                 }
             }
-            if qualified_relation_matches_unhidden_name(name, table_name, hidden_tables) {
+            if source_catalog.matches_target_schema(name.schema.as_deref())
+                && qualified_relation_matches_unhidden_name(name, table_name, hidden_tables) {
                 bindings.add_matching_binding(alias.as_deref().unwrap_or(&name.name));
                 if alias.is_none() {
                     bindings.add_matching_binding(table_name);
@@ -144741,7 +144821,8 @@ fn rename_column_refs_in_insert_for_table(
     source_catalog: &ColumnRenameSourceCatalog,
 ) -> bool {
     let mut changed = false;
-    let target_matches = qualified_relation_matches_name(&insert.table, table_name);
+    let target_matches = source_catalog.matches_target_schema(insert.table.schema.as_deref())
+        && qualified_relation_matches_name(&insert.table, table_name);
     let hidden_tables = if let Some(with) = &mut insert.with {
         let (with_changed, hidden) = rename_column_refs_in_with_clause_for_table(
             with,
@@ -144971,7 +145052,8 @@ fn rename_column_refs_in_update_for_table(
         bindings.add_source();
     }
     bindings.add_source_alias_or_name(update.table.alias.as_deref(), &update.table.name.name);
-    if qualified_relation_matches_name(&update.table.name, table_name) {
+    if source_catalog.matches_target_schema(update.table.name.schema.as_deref())
+        && qualified_relation_matches_name(&update.table.name, table_name) {
         bindings.add_matching_binding(
             update
                 .table
@@ -145122,7 +145204,8 @@ fn rename_column_refs_in_delete_for_table(
         bindings.add_source();
     }
     bindings.add_source_alias_or_name(delete.table.alias.as_deref(), &delete.table.name.name);
-    if qualified_relation_matches_name(&delete.table.name, table_name) {
+    if source_catalog.matches_target_schema(delete.table.name.schema.as_deref())
+        && qualified_relation_matches_name(&delete.table.name, table_name) {
         bindings.add_matching_binding(
             delete
                 .table
@@ -150661,10 +150744,7 @@ fn evaluate_having_value(
             } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
                 SqliteValue::Text(v.to_text().into())
             } else if upper.contains("BLOB") || upper.is_empty() {
-                match v {
-                    SqliteValue::Blob(_) => v,
-                    _ => SqliteValue::Blob(v.to_text().into_bytes().into()),
-                }
+                v.cast_to_blob_in(statement_text_encoding())
             } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
                 SqliteValue::Float(v.to_float())
             } else {
@@ -170254,6 +170334,7 @@ struct TriggerRelationChecks {
 /// as the triggers and foreign-key actions they can fire see them.
 struct DmlTriggerFiring {
     table: String,
+    schema: Option<String>,
     event: fsqlite_ast::TriggerEvent,
     /// The UPDATE triggers an upsert's DO UPDATE can fire.
     upsert_updates: Vec<fsqlite_ast::TriggerEvent>,
@@ -170305,6 +170386,7 @@ impl DmlTriggerFiring {
         };
         Some(Self {
             table: target.name.clone(),
+            schema: target.schema.clone(),
             event,
             upsert_updates,
             replace_deletes,
@@ -178116,19 +178198,8 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
         // NB: an EMPTY CAST type name (`CAST(x AS)`) is NOT BLOB — it has
         // NUMERIC affinity (SQLite's sqlite3AffinityType default) and falls
         // through to the NUMERIC branch below. bd-errmsg-parity-batch4-deqcb.
-        match val {
-            SqliteValue::Blob(_) => val,
-            text_or_number => {
-                // A persisted index predicate casts to BLOB in the database
-                // encoding. Raw record projections already contain those bytes.
-                let encoding = INDEX_EXPRESSION_ENCODING.get().unwrap_or(TextEncoding::Utf8);
-                let text = match text_or_number {
-                    SqliteValue::Text(text) => text,
-                    other => other.to_text().into(),
-                };
-                SqliteValue::Blob(text.to_record_text_bytes(encoding).into_owned().into())
-            }
-        }
+        // The byte-preserving integrity projection supplies its own encoding.
+        val.cast_to_blob_in(INDEX_EXPRESSION_ENCODING.get().unwrap_or(db_encoding))
     } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
         match val {
             SqliteValue::Float(_) => val,
@@ -205688,12 +205759,12 @@ mod tests {
 
             let event = fsqlite_ast::TriggerEvent::Insert;
             let positive_new = [SqliteValue::Integer(7)];
-            conn.fire_before_triggers("t", &event, None, Some(&positive_new), None, None)
+            conn.fire_before_triggers(&QualifiedName::bare("t"), &event, None, Some(&positive_new), None, None)
                 .await
                 .unwrap();
 
             let non_positive_new = [SqliteValue::Integer(0)];
-            conn.fire_before_triggers("t", &event, None, Some(&non_positive_new), None, None)
+            conn.fire_before_triggers(&QualifiedName::bare("t"), &event, None, Some(&non_positive_new), None, None)
                 .await
                 .unwrap();
 
@@ -205719,7 +205790,7 @@ mod tests {
             let event = fsqlite_ast::TriggerEvent::Update(vec!["id".to_owned()]);
             let old_row = [SqliteValue::Integer(3)];
             let new_row = [SqliteValue::Integer(9)];
-            conn.fire_after_triggers("t", &event, Some(&old_row), Some(&new_row), None, None)
+            conn.fire_after_triggers(&QualifiedName::bare("t"), &event, Some(&old_row), Some(&new_row), None, None)
                 .await
                 .unwrap();
 
@@ -207503,13 +207574,13 @@ mod tests {
             // Calls with no matching trigger do not recurse and must remain no-ops.
             set_trigger_depth_limit_override(Some(0));
             let before = conn
-                .fire_before_triggers("missing", &event, None, None, None, None)
+                .fire_before_triggers(&QualifiedName::bare("missing"), &event, None, None, None, None)
                 .await;
             let after = conn
-                .fire_after_triggers("missing", &event, None, None, None, None)
+                .fire_after_triggers(&QualifiedName::bare("missing"), &event, None, None, None, None)
                 .await;
             let instead_of = conn
-                .fire_instead_of_triggers("missing_view", &[], &event, None, None)
+                .fire_instead_of_triggers(&QualifiedName::bare("missing_view"), &[], &event, None, None)
                 .await;
             set_trigger_depth_limit_override(None);
 

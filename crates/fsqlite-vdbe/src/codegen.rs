@@ -542,6 +542,44 @@ impl IndexSchema {
         self.key_collations.get(key_pos).and_then(|c| c.as_deref())
     }
 
+    /// The table column stored by a bare or COLLATE-decorated index term.
+    /// An expression such as `k+0` cannot stand in for the stored column.
+    #[must_use]
+    pub fn key_term_column(&self, table: &TableSchema, slot: usize) -> Option<usize> {
+        if self.key_expressions.is_empty() {
+            return table.column_index(self.columns.get(slot)?);
+        }
+        let expr = parse_sql_expr(self.key_expressions.get(slot)?).ok()?;
+        table.column_index(explicit_index_simple_column_name(&expr)?)
+    }
+
+    /// Ordinals of PRIMARY KEY terms appended to this WITHOUT ROWID index.
+    /// A matching column can supply the locator only under the same collation.
+    #[must_use]
+    pub fn without_rowid_locator_slots(
+        &self,
+        table: &TableSchema,
+        pk_columns: &[usize],
+        pk_collations: &[Option<String>],
+    ) -> Vec<usize> {
+        let terms: Vec<_> = (0..self.key_term_count())
+            .map(|slot| {
+                let column = self.key_term_column(table, slot);
+                let collation = self.key_term_collation(slot)
+                    .or_else(|| column.and_then(|col| table.columns[col].collation.as_deref()))
+                    .unwrap_or("BINARY");
+                (column, collation)
+            })
+            .collect();
+        pk_columns.iter().enumerate().filter_map(|(slot, &column)| {
+            let collation = pk_collations.get(slot).and_then(Option::as_deref).unwrap_or("BINARY");
+            let covered = terms.iter().any(|&(key_column, key_collation)| {
+                key_column == Some(column) && key_collation.eq_ignore_ascii_case(collation)
+            });
+            (!covered).then_some(slot)
+        }).collect()
+    }
+
     /// Whether planner / lookup fast paths may safely treat this as a simple
     /// non-partial column index.
     #[must_use]
