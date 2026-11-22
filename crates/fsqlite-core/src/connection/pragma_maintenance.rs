@@ -150,7 +150,11 @@ impl Connection {
             // unqualified check. A capped report cannot hide a locked file.
             return self.with_integrity_txn(async |_, _| Ok(())).await;
         }
-        let mut reports = IntegrityRowidReports { limit: *remaining, findings: Vec::new() };
+        let mut reports = IntegrityCheckReports {
+            limit: *remaining,
+            quick_index_counts: quick.then(Vec::new),
+            ..Default::default()
+        };
         // TEMP uses connection-local memory roots. Their numeric identifiers
         // do not address pages in the main pager.
         let temp = schema == "temp";
@@ -174,6 +178,14 @@ impl Connection {
             // Ordering errors alone leave the completed tree walk readable.
             // SQLite spends any remaining budget on stored row constraints.
             if *remaining == 0 || structural.is_err() {
+                return Ok(());
+            }
+        }
+        if structural.is_ok() && let Some(count_errors) = reports.quick_index_counts {
+            let n = count_errors.len().min(*remaining);
+            rows.extend(count_errors.into_iter().take(n));
+            *remaining -= n;
+            if *remaining == 0 {
                 return Ok(());
             }
         }
