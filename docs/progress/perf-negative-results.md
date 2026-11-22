@@ -94,6 +94,28 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - FEC OFF BY DEFAULT (owner decision, landed as 7d15bd341; a cost removed from the default commit, not a win against stock): WAL-FEC repair-symbol generation is opt-in on every API (bd-71vt5, bd-yt7te)
+
+- Decision: bd-71vt5 (2026-11-17), kept on 2026-11-21 after bd-1hi.11 made a writable open repair damaged WAL frames
+  from the symbols. Generation runs only for a database opted in with `PRAGMA raptorq_repair_symbols = N > 0`.
+- Touched:
+  - `crates/fsqlite-wal/src/{lib.rs,wal_fec.rs}`: DEFAULT_RAPTORQ_REPAIR_SYMBOLS 2 -> 0.
+  - `crates/fsqlite-core/src/connection.rs`: no worker or sidecar at budget 0. A connection that cannot run the worker
+    now refuses the opt-in, and refuses an opted-in database at open, instead of skipping generation.
+  - Tests in fsqlite-core, fsqlite-cli, fsqlite and fsqlite-c-api; README (opt-in, and repair at open once opted in).
+- Measured (single-writer lane round 9, base 4c729b0cf):
+  - Shape: CLI one-row autocommit INSERTs at synchronous=FULL; per commit = (N1200 - N200)/1000; 7 rotated reps, perf
+    stat. Arms from one rch job on hz2: main 419dc3522daaac25 and the change 139017b30211f4fa. Stock sqlite3 3.54.1
+    ran live, and main ran twice as A/A.
+  - User instructions: 246.4k -> 177.7k on tmpfs (x12.2 -> x8.8 stock), and 318.0k -> 177.2k on disk (x15.8 -> x8.8).
+    The disk figure is approximate: main's A/A pair was 4.4% apart there, because the worker runs on background threads.
+  - CPU: 172.7 -> 116.6 us on tmpfs, 402 -> 286 us on disk.
+  - Syscalls: 37.7 -> 27.8 on tmpfs, 39.4 -> 27.8 on disk.
+  - -wal-fec written over 1,200 commits: 3.9-10.2 MB -> none.
+  - Wall time per commit is unchanged within noise (generation runs after the fsync), so no time claim is made.
+- Retry condition for default-on (from the decision): generation's per-commit cost below about 5% of a FULL commit,
+  or the owner asks for self-healing by default.
+
 ## 2026-11-22 - WIN (landed as d95fb43fb; inside its prediction on rowid_lookups_200k, x5.86 -> x5.44 stock 3.54.1 in instructions): a table descent reuses the clean pages its previous descent left on the cursor's stack, as stock's moveToRoot keeps the root (bd-t0g9w, read/seek rounds 9-10, lever PR1)
 
 - Target: the scorecard's worst row, rowid_lookups_200k (200k random rowid probes into a depth-3 table; x5.83 stock
