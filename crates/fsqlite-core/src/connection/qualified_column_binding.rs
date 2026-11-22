@@ -299,8 +299,9 @@ struct QualifiedColumnBinder<'a> {
     pass: BindPass,
     /// FROM items of each enclosing query, outermost first.
     scopes: Vec<Vec<BindingSource>>,
-    /// Lowercased CTE names in scope, per WITH clause.
-    ctes: Vec<Vec<String>>,
+    /// The CTEs in scope, per WITH clause: lowercased name and the columns
+    /// it exposes when they are known (see [`cte_known_columns`]).
+    ctes: Vec<Vec<(String, Option<Vec<String>>)>>,
     next_id: usize,
     three_part_refs: usize,
     unresolved_relation: bool,
@@ -405,26 +406,33 @@ impl<'a> QualifiedColumnBinder<'a> {
         let Some(with) = with else {
             return false;
         };
-        let names: Vec<String> = with
+        let ctes: Vec<(String, Option<Vec<String>>)> = with
             .ctes
             .iter()
-            .map(|cte| cte.name.to_ascii_lowercase())
+            .map(|cte| (cte.name.to_ascii_lowercase(), cte_known_columns(cte)))
             .collect();
-        for name in &names {
+        for (name, _) in &ctes {
             self.take_name(name);
         }
-        self.ctes.push(names);
+        self.ctes.push(ctes);
         for cte in &mut with.ctes {
             self.select(&mut cte.query);
         }
         true
     }
 
-    fn is_cte(&self, name: &str) -> bool {
+    /// The relation a CTE in scope named `name` binds as, the innermost WITH
+    /// first; `None` when no CTE has the name. A CTE belongs to no database.
+    fn cte_relation(&self, name: &str) -> Option<QualifiedColumnRelation> {
         self.ctes
             .iter()
+            .rev()
             .flatten()
-            .any(|cte| cte.eq_ignore_ascii_case(name))
+            .find(|(cte, _)| cte.eq_ignore_ascii_case(name))
+            .map(|(_, columns)| QualifiedColumnRelation {
+                columns: columns.clone(),
+                ..QualifiedColumnRelation::default()
+            })
     }
 
     fn select(&mut self, select: &mut SelectStatement) {
@@ -736,8 +744,13 @@ impl<'a> QualifiedColumnBinder<'a> {
     ) {
         let id = self.next_id;
         self.next_id += 1;
-        let relation = if name.schema.is_none() && self.is_cte(&name.name) {
-            QualifiedColumnRelation::default()
+        let cte = name
+            .schema
+            .is_none()
+            .then(|| self.cte_relation(&name.name))
+            .flatten();
+        let relation = if let Some(cte) = cte {
+            cte
         } else if let Some(relation) = self.catalog.relation(name.schema.as_deref(), &name.name) {
             relation
         } else {
@@ -1260,6 +1273,34 @@ fn compound_order_column(expr: &mut Expr) -> Option<&mut ColumnRef> {
 
 /// Whether `statement` has a three-part column reference, or a query whose
 /// FROM items (with an UPDATE's target) share a name one of them qualifies.
+/// bd-x5eqm: the columns a CTE exposes, when the binder can name them: its
+/// column list, or else its first core's result names where each result is a
+/// plain column or carries an alias. `None` (every column taken to exist)
+/// otherwise. With the columns known, `c.x` over a CTE `c` and a table also
+/// addressed as `c` that both have `x` is ambiguous, as in stock's
+/// `lookupName`; a recursive arm's `FROM c, main.c` reached no other check.
+fn cte_known_columns(cte: &fsqlite_ast::Cte) -> Option<Vec<String>> {
+    if !cte.columns.is_empty() {
+        return Some(cte.columns.clone());
+    }
+    let SelectCore::Select { columns, .. } = &cte.query.body.select else {
+        return None;
+    };
+    columns
+        .iter()
+        .map(|column| match column {
+            ResultColumn::Expr {
+                alias: Some(alias), ..
+            } => Some(alias.clone()),
+            ResultColumn::Expr {
+                expr: Expr::Column(column, _),
+                alias: None,
+            } => Some(column.column.to_string()),
+            ResultColumn::Expr { .. } | ResultColumn::Star | ResultColumn::TableStar(_) => None,
+        })
+        .collect()
+}
+
 fn statement_needs_binding(statement: &Statement) -> bool {
     match statement {
         Statement::Select(select) => select_needs_binding(select),
@@ -1757,6 +1798,34 @@ mod tests {
         assert_eq!(
             bind("SELECT users.name FROM main.users JOIN temp.users USING (name)")
                 .expect("USING coalesces the column"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cte_with_known_columns_shares_a_table_qualifier() {
+        // bd-x5eqm: a recursive arm's `FROM t, main.t`, a column list or an
+        // alias naming the CTE's columns.
+        assert_eq!(
+            bind_error(
+                "WITH RECURSIVE t(x) AS (SELECT 1 UNION ALL \
+                 SELECT t.x + 1 FROM t, main.t WHERE t.x < 3) SELECT x FROM t"
+            ),
+            "ambiguous column name: t.x"
+        );
+        assert_eq!(
+            bind_error("WITH t AS (SELECT 1 AS x) SELECT t.x FROM main.t, t"),
+            "ambiguous column name: t.x"
+        );
+        // A CTE without the column leaves the qualifier to the table; one
+        // whose column names are not known here is taken to have every
+        // column, so the table's still binds.
+        assert_eq!(
+            bind("WITH t(y) AS (SELECT 1) SELECT t.x FROM t, main.t").expect("binds"),
+            None
+        );
+        assert_eq!(
+            bind("WITH t AS (SELECT 1 + 1) SELECT t.x FROM t, main.t").expect("binds"),
             None
         );
     }

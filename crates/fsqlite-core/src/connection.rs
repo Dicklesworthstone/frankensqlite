@@ -46981,7 +46981,25 @@ impl Connection {
                         where_clause,
                     } = &mut upsert.action
                     {
+                        // bd-4l4y3: the existing row, then `excluded`.
+                        let target = TableOrSubquery::Table {
+                            name: insert.table.clone(),
+                            alias: insert.alias.clone(),
+                            index_hint: None,
+                            time_travel: None,
+                        };
+                        let excluded = TableOrSubquery::Table {
+                            name: insert.table.clone(),
+                            alias: Some("excluded".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        };
+                        let set_scope = row_value_set_scope(target, Some(excluded), None);
                         for assignment in assignments {
+                            // bd-4l4y3: `SET (n, c) = (SELECT ...)` assigns a
+                            // row value here as in UPDATE.
+                            self.lower_row_value_set_subquery(assignment, &set_scope, params)
+                                .await?;
                             rewrite_dml_in_expr(
                                 &mut assignment.value,
                                 self,
@@ -47044,7 +47062,19 @@ impl Connection {
                 // also forces eager IN rewrite so the attached-child execution
                 // path receives only local literals instead of outer-table
                 // references it cannot resolve.
+                // bd-4l4y3: what a SET source's correlated names see: the
+                // target, then the UPDATE's FROM.
+                let set_scope = row_value_set_scope(
+                    dml_target_source(&update.table),
+                    None,
+                    update.from.as_ref(),
+                );
                 for assignment in &mut update.assignments {
+                    // bd-4l4y3: a FROM-less or uncorrelated source becomes the
+                    // row value it assigns; a `*`, compound or VALUES source
+                    // needs no column-by-column projection then.
+                    self.lower_row_value_set_subquery(assignment, &set_scope, params)
+                        .await?;
                     // bd-22jvi: a row-value SET whose RHS is directly a
                     // multi-column subquery — `SET (a, b) = (SELECT a, b FROM
                     // ...)` — accepts a row value, so the uncorrelated-subquery
@@ -53471,8 +53501,11 @@ impl Connection {
         if self.insert_targets_live_fts5_command_column(insert) {
             return Ok(true);
         }
+        // bd-x5eqm: DML on a view runs its INSTEAD OF triggers (or stock's
+        // refusal) in the dispatcher; table bytecode finds no such table.
         Ok(self.targets_shadowed_main(&insert.table)
             || self.main_target_is_temp_only(&insert.table)
+            || self.view_index_of(&insert.table.name).is_some()
             || fts5_maintenance_insert_command(insert).is_some()
             || self.attached_target_schema(&insert.table)?.is_some())
     }
@@ -53484,6 +53517,7 @@ impl Connection {
         let registry = self.attached_schemas.borrow();
         Ok(self.targets_shadowed_main(&update.table.name)
             || self.main_target_is_temp_only(&update.table.name)
+            || self.view_index_of(&update.table.name.name).is_some()
             || determine_attached_update_schema(update, &registry)?.is_some())
     }
 
@@ -53494,6 +53528,7 @@ impl Connection {
         let registry = self.attached_schemas.borrow();
         Ok(self.targets_shadowed_main(&delete.table.name)
             || self.main_target_is_temp_only(&delete.table.name)
+            || self.view_index_of(&delete.table.name.name).is_some()
             || determine_attached_delete_schema(delete, &registry)?.is_some())
     }
 
@@ -56808,6 +56843,37 @@ impl Connection {
                     )?;
                     self.validate_select_index_hints(select, spelling)?;
                 }
+                // bd-u01ku: VALUES rows, then the upserts, then RETURNING (a
+                // SELECT source's calls are resolved with the SELECT above).
+                let values = match &insert.source {
+                    InsertSource::Values(rows) => rows.iter().flatten().collect::<Vec<_>>(),
+                    InsertSource::Select(_) | InsertSource::DefaultValues => Vec::new(),
+                };
+                let upserts = insert.upsert.iter().flat_map(|upsert| {
+                    let target_where = upsert
+                        .target
+                        .as_ref()
+                        .and_then(|target| target.where_clause.as_ref());
+                    let (assignments, action_where): (&[fsqlite_ast::Assignment], _) =
+                        match &upsert.action {
+                            fsqlite_ast::UpsertAction::Update {
+                                assignments,
+                                where_clause,
+                            } => (assignments.as_slice(), where_clause.as_deref()),
+                            fsqlite_ast::UpsertAction::Nothing => (&[], None),
+                        };
+                    target_where
+                        .into_iter()
+                        .chain(assignments.iter().map(|assignment| &assignment.value))
+                        .chain(action_where)
+                });
+                for expr in values
+                    .into_iter()
+                    .chain(upserts)
+                    .chain(result_column_exprs(&insert.returning))
+                {
+                    validate_function_call_modifiers_in_expr(expr)?;
+                }
                 Ok(())
             }
             Statement::CreateTable(create) => {
@@ -56860,6 +56926,16 @@ impl Connection {
                         Self::validate_update_target_columns(table_schema, &update.assignments)?;
                     }
                 }
+                // bd-u01ku: SET values, then WHERE, then RETURNING.
+                for expr in update
+                    .assignments
+                    .iter()
+                    .map(|assignment| &assignment.value)
+                    .chain(update.where_clause.iter())
+                    .chain(result_column_exprs(&update.returning))
+                {
+                    validate_function_call_modifiers_in_expr(expr)?;
+                }
                 // bd-wlo29 L10: a forced partial INDEXED BY on the UPDATE target
                 // must be covered by the statement WHERE, exactly like a SELECT
                 // source. The schema borrow above is scoped so this can re-borrow.
@@ -56891,6 +56967,14 @@ impl Connection {
                 // parent check wrongly disabled the truncate with fk OFF, so frank
                 // erred on an uncovered forced partial index where stock silently
                 // truncates. Gate the parent check on FK enforcement.
+                // bd-u01ku: WHERE, then RETURNING.
+                for expr in delete
+                    .where_clause
+                    .iter()
+                    .chain(result_column_exprs(&delete.returning))
+                {
+                    validate_function_call_modifiers_in_expr(expr)?;
+                }
                 let uses_truncate_opt = delete.where_clause.is_none()
                     && delete.returning.is_empty()
                     && !(self.fk_enforcement_enabled()
@@ -82893,6 +82977,114 @@ impl Connection {
     /// compiles the LIMIT 1 and stops at its first row (bd-9gl3w). bd-b887p:
     /// shared by the per-row probes and the folds of uncorrelated EXISTS;
     /// bd-wp9s1: and of scalar subqueries.
+    /// bd-4l4y3: the value of a `SET (c1, ..., cn) = (subquery)` assignment,
+    /// in an UPDATE or an upsert's DO UPDATE, as the row value it assigns.
+    /// Stock assigns the subquery's first row, NULLs when it has none, after
+    /// checking its width against the targets once its names resolve ("2
+    /// columns assigned 3 values").
+    ///
+    /// - A FROM-less `SELECT e1, ..., en` (no WHERE, GROUP BY, HAVING, ORDER
+    ///   BY, LIMIT, WITH, compound, aggregate or window function) is the row
+    ///   value `(e1, ..., en)`, which may read the row or `excluded`.
+    /// - An uncorrelated subquery of any shape (`*`, a compound, VALUES) runs
+    ///   here, once per execution, as the rewrite folds a scalar subquery: the
+    ///   row value of its first row.
+    ///
+    /// Any other subquery (a correlated one with a FROM, or one with a
+    /// placeholder while preparing) is left for the UPDATE lowering, which
+    /// projects it column by column; its names are resolved first against
+    /// `scope`, the FROM items the assignment sees, so a name nothing
+    /// supplies is stock's "no such column" rather than a NULL.
+    async fn lower_row_value_set_subquery(
+        &self,
+        assignment: &mut fsqlite_ast::Assignment,
+        scope: &FromClause,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<()> {
+        let fsqlite_ast::AssignmentTarget::ColumnList(targets) = &assignment.target else {
+            return Ok(());
+        };
+        let Expr::Subquery(subquery, span) = &assignment.value else {
+            return Ok(());
+        };
+        let span = *span;
+        if let Some(values) = self.fromless_single_row_values(subquery) {
+            assignment.value = Expr::RowValue(values, span);
+            return Ok(());
+        }
+        if rewrite_probe_is_correlated(self, subquery)
+            || (params.is_none() && select_contains_any_placeholder(subquery))
+        {
+            let check = select_of_result_exprs(
+                vec![Expr::Exists {
+                    subquery: subquery.clone(),
+                    not: false,
+                    span,
+                }],
+                Some(scope.clone()),
+            );
+            return self.validate_select_column_references(&check);
+        }
+        let mut probe = (**subquery).clone();
+        self.limit_probe_to_its_first_row(&mut probe);
+        let rows = Box::pin(self.execute_statement(&Statement::Select(probe), params)).await?;
+        let width = self.select_result_column_count(subquery, &[], &mut Vec::new());
+        if width != targets.len() {
+            return Err(FrankenError::FunctionError(format!(
+                "{} columns assigned {width} values",
+                targets.len()
+            )));
+        }
+        let first = rows.into_iter().next();
+        let values = (0..width)
+            .map(|index| {
+                let value = first
+                    .as_ref()
+                    .and_then(|row| row.values.get(index))
+                    .map_or(Literal::Null, sqlite_value_to_literal);
+                Expr::Literal(value, span)
+            })
+            .collect();
+        assignment.value = Expr::RowValue(values, span);
+        Ok(())
+    }
+
+    /// The result expressions of a FROM-less single-row `SELECT e1, ..., en`
+    /// that is exactly the row value `(e1, ..., en)` (bd-4l4y3).
+    fn fromless_single_row_values(&self, select: &SelectStatement) -> Option<Vec<Expr>> {
+        if select.with.is_some()
+            || !select.body.compounds.is_empty()
+            || !select.order_by.is_empty()
+            || select.limit.is_some()
+            || has_window_functions(select)
+            || self.has_implicit_aggregation_with_registry(select)
+        {
+            return None;
+        }
+        let SelectCore::Select {
+            columns,
+            from: None,
+            where_clause: None,
+            group_by,
+            having: None,
+            windows,
+            ..
+        } = &select.body.select
+        else {
+            return None;
+        };
+        if !group_by.is_empty() || !windows.is_empty() {
+            return None;
+        }
+        columns
+            .iter()
+            .map(|column| match column {
+                ResultColumn::Expr { expr, .. } => Some(expr.clone()),
+                ResultColumn::Star | ResultColumn::TableStar(_) => None,
+            })
+            .collect()
+    }
+
     fn limit_probe_to_its_first_row(&self, probe: &mut SelectStatement) {
         if probe.limit.is_some() {
             return;
@@ -83604,17 +83796,13 @@ impl Connection {
         }
         let bound = bind_placeholders_in_select_for_fallback(select, params)?;
         let cx = self.op_cx_after_background_status();
-        let implicit_agg = self.has_implicit_aggregation_with_registry(select) && !has_group_by(select);
         let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
-        if self.select_requires_grouped_window_pipeline(select) {
-            self.execute_group_by_window_select(&cx, &bound, None).await
-        } else if has_group_by(select) || implicit_agg || has_ordered_aggregate(select) {
-            self.execute_group_by_join_select(&cx, &bound, None).await
-        } else if has_window_functions(select) {
-            self.execute_window_select(&bound, None).await
-        } else {
-            self.execute_join_select(&bound, None).await
-        }
+        // bd-x5eqm: route by shape, FROM-less and VALUES bodies included. The
+        // join evaluator refuses a FROM-less body ("JOIN on non-SELECT
+        // core"), which `WITH c AS (SELECT 7) SELECT (SELECT x FROM c),
+        // (SELECT y FROM aux.w)` reached.
+        self.execute_interpreted_select_by_shape(&cx, select, &bound)
+            .await
     }
 
     // ── Transaction control ──────────────────────────────────────────────
@@ -169914,6 +170102,15 @@ fn foreign_key_parent_key_assigned(
 
 /// `SELECT <exprs> [FROM <from>]`, the shape a trigger body statement's
 /// expressions are checked in (bd-nf30k).
+/// The expressions of a result-column list (a RETURNING clause), `*` and
+/// `t.*` left out.
+fn result_column_exprs(columns: &[ResultColumn]) -> impl Iterator<Item = &Expr> {
+    columns.iter().filter_map(|column| match column {
+        ResultColumn::Expr { expr, .. } => Some(expr),
+        ResultColumn::Star | ResultColumn::TableStar(_) => None,
+    })
+}
+
 fn select_of_result_exprs(exprs: Vec<Expr>, from: Option<FromClause>) -> SelectStatement {
     SelectStatement {
         with: None,
@@ -169977,6 +170174,34 @@ fn dml_where_select(
 }
 
 /// A DML target as the FROM item its expressions resolve against.
+/// bd-4l4y3: the FROM items a row-value SET source's correlated names see:
+/// the DML target, an upsert's `excluded` row, an UPDATE's own FROM, joined
+/// as stock lists them.
+fn row_value_set_scope(
+    target: TableOrSubquery,
+    excluded: Option<TableOrSubquery>,
+    update_from: Option<&FromClause>,
+) -> FromClause {
+    let cross = |table: TableOrSubquery| fsqlite_ast::JoinClause {
+        join_type: fsqlite_ast::JoinType {
+            natural: false,
+            kind: fsqlite_ast::JoinKind::Cross,
+        },
+        table,
+        constraint: None,
+    };
+    let mut from = FromClause {
+        source: target,
+        joins: Vec::new(),
+    };
+    from.joins.extend(excluded.map(&cross));
+    if let Some(update_from) = update_from {
+        from.joins.push(cross(update_from.source.clone()));
+        from.joins.extend(update_from.joins.iter().cloned());
+    }
+    from
+}
+
 fn dml_target_source(table: &fsqlite_ast::QualifiedTableRef) -> TableOrSubquery {
     TableOrSubquery::Table {
         name: table.name.clone(),
