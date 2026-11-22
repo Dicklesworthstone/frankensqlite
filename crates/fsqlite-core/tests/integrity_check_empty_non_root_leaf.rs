@@ -430,7 +430,7 @@ fn bd_vojth_checks_stored_rows_after_rowid_findings() {
                  INSERT INTO q VALUES(1),(2),(3),(4);",
             )
             .unwrap();
-        let root: usize = stock
+        let root: u32 = stock
             .query_row(
                 "SELECT rootpage FROM sqlite_schema WHERE name=?1",
                 [damaged],
@@ -439,7 +439,7 @@ fn bd_vojth_checks_stored_rows_after_rowid_findings() {
             .unwrap();
         drop(stock);
         let mut image = std::fs::read(&path).unwrap();
-        let page = (root - 1) * header_page_size(&image);
+        let page = usize::try_from(root - 1).unwrap() * header_page_size(&image);
         assert_eq!(image[page], 0x0d);
         image[page + 10..page + 14].rotate_left(2);
         std::fs::write(&path, image).unwrap();
