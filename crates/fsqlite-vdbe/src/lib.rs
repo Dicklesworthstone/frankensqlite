@@ -3465,7 +3465,14 @@ pub mod temp_store {
     impl Drop for TrackedTempFile {
         fn drop(&mut self) {
             if !self.closed.swap(true, Ordering::AcqRel) {
-                let cx = Cx::new();
+                // Drop may follow statement cancellation. The spill file still needs
+                // its one close/unlink attempt before we retire its accounting.
+                let cx = Cx::detached_rebind();
+                #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+                if let Some(native_task_cx) = asupersync::Cx::current() {
+                    cx.set_native_cx(native_task_cx);
+                }
+                let _mask = cx.masked();
                 let _ = self.inner.close(&cx);
                 self.stats.record_file_closed();
             }
