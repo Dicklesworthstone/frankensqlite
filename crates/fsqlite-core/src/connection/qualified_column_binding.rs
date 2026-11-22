@@ -163,7 +163,9 @@ impl Connection {
         &self,
         statement: &Statement,
     ) -> Result<Option<Statement>> {
-        let bound = if statement_needs_binding(statement) {
+        let bound = if statement_needs_binding(statement)
+            || statement_shares_a_name_across_queries(statement)
+        {
             bind_schema_qualified_columns_with(self, statement)?
         } else {
             None
@@ -268,7 +270,11 @@ fn bind_schema_qualified_columns_with(
         .table_star_groups
         .iter()
         .any(|group| group.len() > 1);
-    if binder.three_part_refs == 0 && !splits_table_star && binder.true_false_rewrites == 0 {
+    if binder.three_part_refs == 0
+        && !splits_table_star
+        && binder.true_false_rewrites == 0
+        && binder.needs_alias.is_empty()
+    {
         return Ok(None);
     }
     binder.assign_aliases();
@@ -1366,10 +1372,21 @@ impl<'a> QualifiedColumnBinder<'a> {
         match self.pass {
             BindPass::Bind => {
                 self.take_name(table);
-                if matches!(lookup, Lookup::Ambiguous) {
-                    self.fail(FrankenError::AmbiguousColumn {
+                match lookup {
+                    Lookup::Ambiguous => self.fail(FrankenError::AmbiguousColumn {
                         name: format!("{table}.{}", column.column),
-                    });
+                    }),
+                    // bd-cxe6r: the item lookupName chose may share its name
+                    // with another item the reference sees: an inner item
+                    // without the column (the reference moved outward), or a
+                    // DML target beside a FROM item that has it. The other
+                    // resolvers take the nearest item of the name, so the
+                    // chosen one (or the capturing target's sharers) gets a
+                    // synthetic alias and the reference follows it.
+                    Lookup::Bound { scope, id } if self.nearest_item_misleads(scope, id, table) => {
+                        self.note_shared_name(scope, id);
+                    }
+                    Lookup::Bound { .. } | Lookup::Missing => {}
                 }
             }
             BindPass::Rewrite => {
@@ -1529,6 +1546,31 @@ impl<'a> QualifiedColumnBinder<'a> {
     /// form is only unambiguous when no other item visible at the reference
     /// (in that scope or any query nested between) answers to the same name;
     /// otherwise the item needs a synthetic alias.
+    /// bd-cxe6r: whether a resolver that takes the nearest item addressed as
+    /// `table` would miss the item `table.column` bound to (`scope`, `id`):
+    /// an inner query has an item of the name (without the column), or the
+    /// bound item is a FROM item beside a DML target of the name.
+    fn nearest_item_misleads(&self, scope: usize, id: usize, table: &str) -> bool {
+        let addressed = |source: &BindingSource| {
+            source
+                .addressed_as()
+                .is_some_and(|name| name.eq_ignore_ascii_case(table))
+        };
+        let nearest = self
+            .scopes
+            .iter()
+            .rposition(|s| s.sources.iter().any(addressed));
+        if nearest != Some(scope) {
+            return true;
+        }
+        let bound_is_target = self.source(scope, id).is_target;
+        !bound_is_target
+            && self.scopes[scope]
+                .sources
+                .iter()
+                .any(|source| source.is_target && addressed(source))
+    }
+
     fn note_shared_name(&mut self, scope: usize, id: usize) {
         let source = self.source(scope, id);
         let Some(name) = source.addressed_as() else {
@@ -1648,6 +1690,129 @@ fn cte_known_columns(cte: &fsqlite_ast::Cte) -> Option<Vec<String>> {
             ResultColumn::Expr { .. } | ResultColumn::Star | ResultColumn::TableStar(_) => None,
         })
         .collect()
+}
+
+/// bd-cxe6r: whether a query nested in `statement` has a FROM item addressed
+/// by a name an item of an enclosing query also has. A qualified reference
+/// there can bind to the enclosing item (lookupName moves outward when the
+/// inner item lacks the column), which only the binder tells apart.
+fn statement_shares_a_name_across_queries(statement: &Statement) -> bool {
+    let mut enclosing = Vec::new();
+    match statement {
+        Statement::Select(select) => select_shares_a_name(select, &mut enclosing),
+        Statement::Update(update) => {
+            enclosing.push(
+                update
+                    .table
+                    .alias
+                    .as_deref()
+                    .unwrap_or(&update.table.name.name)
+                    .to_ascii_lowercase(),
+            );
+            if let Some(from) = &update.from {
+                let mut names = Vec::new();
+                collect_from_names(from, &mut names);
+                enclosing.extend(names.iter().map(|(name, _)| name.to_ascii_lowercase()));
+            }
+            update
+                .assignments
+                .iter()
+                .map(|assignment| &assignment.value)
+                .chain(update.where_clause.iter())
+                .any(|expr| expr_shares_a_name(expr, &mut enclosing))
+        }
+        Statement::Delete(delete) => {
+            enclosing.push(
+                delete
+                    .table
+                    .alias
+                    .as_deref()
+                    .unwrap_or(&delete.table.name.name)
+                    .to_ascii_lowercase(),
+            );
+            delete
+                .where_clause
+                .as_ref()
+                .is_some_and(|expr| expr_shares_a_name(expr, &mut enclosing))
+        }
+        _ => false,
+    }
+}
+
+fn select_shares_a_name(select: &SelectStatement, enclosing: &mut Vec<String>) -> bool {
+    // A CTE body sees no enclosing query's items.
+    if select.with.as_ref().is_some_and(|with| {
+        with.ctes
+            .iter()
+            .any(|cte| select_shares_a_name(&cte.query, &mut Vec::new()))
+    }) {
+        return true;
+    }
+    std::iter::once(&select.body.select)
+        .chain(select.body.compounds.iter().map(|(_, core)| core))
+        .any(|core| core_shares_a_name(core, enclosing))
+}
+
+fn core_shares_a_name(core: &SelectCore, enclosing: &mut Vec<String>) -> bool {
+    let SelectCore::Select {
+        columns,
+        from,
+        where_clause,
+        having,
+        ..
+    } = core
+    else {
+        return false;
+    };
+    let mut names = Vec::new();
+    if let Some(from) = from {
+        collect_from_names(from, &mut names);
+        if names
+            .iter()
+            .any(|(name, _)| enclosing.iter().any(|outer| outer.eq_ignore_ascii_case(name)))
+        {
+            return true;
+        }
+        // A FROM subquery sees the enclosing queries, not its siblings.
+        if from_subqueries_share_a_name(from, enclosing) {
+            return true;
+        }
+    }
+    let depth = enclosing.len();
+    enclosing.extend(names.iter().map(|(name, _)| name.to_ascii_lowercase()));
+    let shares = columns.iter().any(|column| match column {
+        ResultColumn::Expr { expr, .. } => expr_shares_a_name(expr, enclosing),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }) || where_clause
+        .as_deref()
+        .into_iter()
+        .chain(having.as_deref())
+        .any(|expr| expr_shares_a_name(expr, enclosing));
+    enclosing.truncate(depth);
+    shares
+}
+
+fn from_subqueries_share_a_name(from: &FromClause, enclosing: &mut Vec<String>) -> bool {
+    std::iter::once(&from.source)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .any(|source| match source {
+            TableOrSubquery::Subquery { query, .. } => select_shares_a_name(query, enclosing),
+            TableOrSubquery::ParenJoin(inner) => from_subqueries_share_a_name(inner, enclosing),
+            TableOrSubquery::Table { .. } | TableOrSubquery::TableFunction { .. } => false,
+        })
+}
+
+/// Whether a subquery of `expr` shares a name with `enclosing` (the queries
+/// around it, innermost last).
+fn expr_shares_a_name(expr: &Expr, enclosing: &mut Vec<String>) -> bool {
+    expr_contains_subquery_match(expr, &mut |subquery| {
+        let select = match subquery {
+            SubqueryExprRef::Scalar(select)
+            | SubqueryExprRef::Exists(select)
+            | SubqueryExprRef::In(select) => select,
+        };
+        select_shares_a_name(select, enclosing)
+    })
 }
 
 fn statement_needs_binding(statement: &Statement) -> bool {
@@ -1975,7 +2140,9 @@ mod tests {
 
     fn bind(sql: &str) -> Result<Option<String>> {
         let statement = parse_single_statement(sql)?;
-        if !statement_needs_binding(&statement) {
+        if !statement_needs_binding(&statement)
+            && !statement_shares_a_name_across_queries(&statement)
+        {
             return Ok(None);
         }
         bind_schema_qualified_columns_with(&Catalog, &statement)
@@ -2197,6 +2364,27 @@ mod tests {
         );
         assert_eq!(
             bind("WITH t AS (SELECT 1 + 1) SELECT t.x FROM t, main.t").expect("binds"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_qualifier_whose_inner_item_lacks_the_column_binds_the_enclosing_item() {
+        // bd-cxe6r: the inner `users AS t` has no x, so lookupName moves out
+        // to the enclosing `t`, which gets a synthetic alias.
+        assert_eq!(
+            bind("SELECT (SELECT t.x FROM users AS t) FROM t")
+                .expect("binds")
+                .as_deref(),
+            Some(r#"SELECT (SELECT "t@main".x FROM users AS t) FROM t AS "t@main""#)
+        );
+        // The inner item has the column: it binds there, and nothing moves.
+        assert_eq!(
+            bind("SELECT (SELECT t.x FROM t) FROM t").expect("binds"),
+            None
+        );
+        assert_eq!(
+            bind("SELECT (SELECT u.name FROM users AS u) FROM t AS u").expect("binds"),
             None
         );
     }
