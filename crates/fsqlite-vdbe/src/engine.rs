@@ -11830,6 +11830,7 @@ impl VdbeEngine {
     async fn rollback_pending_insert_after_index_conflict(
         &mut self,
         require_pending_table_insert: bool,
+        statement_failed: bool,
     ) -> Result<Option<(i32, i64)>> {
         let entries = self.take_pending_idx_entries();
         for (idx_cid, idx_key) in entries {
@@ -11887,14 +11888,31 @@ impl VdbeEngine {
         // the next NewRowid would skip past a rowid no row ever occupied. The
         // NOT NULL / CHECK discards never reach this function because they fail
         // before the table insert.
-        if tsc.last_alloc_rowid == rollback.rowid {
+        let is_implicit_alloc = tsc.last_alloc_rowid > 0 && tsc.last_alloc_rowid == rollback.rowid;
+        if is_implicit_alloc {
             tsc.last_alloc_landed = false;
         }
         if tsc.last_successful_insert_rowid == Some(rollback.rowid) {
             tsc.last_successful_insert_rowid = None;
         }
+        let rollback_root_page = tsc.root_page;
         let rollback_cursor_id = rollback.cursor_id;
         let rollback_rowid = rollback.rowid;
+        // bd-u65rh: if this provisional row came from an explicit-rowid insert
+        // (or a rowid-changing UPDATE), rewind the explicit floor bump it just
+        // recorded (subject to stock's AUTOINCREMENT-OR-IGNORE burn rule).
+        if !is_implicit_alloc
+            && let Some(allocator) = self.concurrent_rowid_allocator.as_ref()
+            && let Ok(key) =
+                Self::concurrent_rowid_key(self.concurrent_rowid_schema_epoch, rollback_root_page)
+        {
+            allocator.rewind_unlanded_explicit(
+                self.concurrent_rowid_session_id,
+                key,
+                rollback_rowid,
+                statement_failed,
+            );
+        }
         self.changes = self.changes.checked_sub(1).ok_or_else(|| {
             FrankenError::internal("secondary-index rollback underflowed change counter")
         })?;
@@ -12434,9 +12452,12 @@ impl VdbeEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn bump_concurrent_storage_rowid_floor(
         allocator: &ConcurrentRowIdAllocator,
         schema_epoch: SchemaEpoch,
+        session_id: u64,
+        statement: u64,
         root_page: i32,
         mode: RowIdMode,
         autoinc_max: i64,
@@ -12454,19 +12475,21 @@ impl VdbeEngine {
         };
         let visible_max = table_max.max(autoinc_max).max(rowid);
         let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
-        // bd-i3csr.4: this floor is what `bump_explicit(key, rowid)` would
-        // set, so the bump is not called (it was a second lock and lookup per
-        // row). `visible_max >= rowid` leaves the table's next rowid at or above
-        // `rowid + 1` (or exhausted, which the bump also leaves alone) and an
-        // AUTOINCREMENT high-water at or above `rowid`, and creates a missing
-        // entry. (The session's claim on the table was recorded before the
-        // row was written, bd-hi7qg; see the Insert arm.)
-        allocator.ensure_table_floor(
+        // bd-i3csr.4 / bd-u65rh / bd-failed-insert-rowid-floor-l53w4: attribute
+        // the explicit-rowid floor bump to `(session_id, statement)` so a
+        // statement rollback, savepoint rollback, full rollback, or
+        // secondary-index conflict rewinds the tip and AUTOINCREMENT high-water
+        // when no peer intervened.
+        allocator.bump_explicit_floor_for_statement(
             key,
             (visible_max > 0).then(|| RowId::new(visible_max)),
             autoinc_max,
             mode,
+            session_id,
+            statement,
+            rowid,
         );
+        sc.rowid_claimed = true;
         Ok(())
     }
 
@@ -15284,10 +15307,14 @@ impl VdbeEngine {
                                             DecodeCacheInvalidationReason::WriteMutation,
                                         );
                                         if let Some(allocator) = concurrent_allocator.as_ref() {
+                                            let session_id = self.concurrent_rowid_session_id;
+                                            let statement = self.concurrent_rowid_statement;
                                             lean_future(|| {
                                                 Self::bump_concurrent_storage_rowid_floor(
                                                     allocator,
                                                     concurrent_schema_epoch,
+                                                    session_id,
+                                                    statement,
                                                     root_page,
                                                     rowid_mode,
                                                     autoinc_max,
@@ -15373,7 +15400,9 @@ impl VdbeEngine {
                                                 .fetch_add(1, AtomicOrdering::Relaxed);
                                         }
                                     }
-                                    if rowid == sc.last_alloc_rowid {
+                                    let is_implicit_alloc =
+                                        sc.last_alloc_rowid > 0 && rowid == sc.last_alloc_rowid;
+                                    if is_implicit_alloc {
                                         sc.last_alloc_landed = true;
                                     }
                                     invalidate_storage_cursor_row_cache_with_reason(
@@ -15381,11 +15410,22 @@ impl VdbeEngine {
                                         self.collect_vdbe_metrics,
                                         DecodeCacheInvalidationReason::WriteMutation,
                                     );
-                                    if let Some(allocator) = concurrent_allocator.as_ref() {
+                                    // An implicit-rowid insert (`NewRowid`) already
+                                    // reserved `rowid` in `allocator` and recorded its
+                                    // session/statement ownership; only explicit-rowid
+                                    // writes (and random-rowid fallbacks) need a floor
+                                    // bump here.
+                                    if !is_implicit_alloc
+                                        && let Some(allocator) = concurrent_allocator.as_ref()
+                                    {
+                                        let session_id = self.concurrent_rowid_session_id;
+                                        let statement = self.concurrent_rowid_statement;
                                         lean_future(|| {
                                             Self::bump_concurrent_storage_rowid_floor(
                                                 allocator,
                                                 concurrent_schema_epoch,
+                                                session_id,
+                                                statement,
                                                 root_page,
                                                 rowid_mode,
                                                 autoinc_max,
@@ -16078,6 +16118,7 @@ impl VdbeEngine {
                                                 let removed = match lean_future(|| {
                                                     self.rollback_pending_insert_after_index_conflict(
                                                         true,
+                                                        false,
                                                     )
                                                 })
                                                 .await
@@ -16194,6 +16235,7 @@ impl VdbeEngine {
                                                 if let Err(error) = lean_future(|| {
                                                     self.rollback_pending_insert_after_index_conflict(
                                                         false,
+                                                        true,
                                                     )
                                                 })
                                                 .await
@@ -30630,7 +30672,7 @@ mod tests {
         }));
         engine.push_pending_idx_entry(1, index_key.clone());
 
-        run_async(engine.rollback_pending_insert_after_index_conflict(true))
+        run_async(engine.rollback_pending_insert_after_index_conflict(true, false))
             .expect("rollback should remove provisional row and tracked index entries");
 
         let table_cursor = engine.storage_cursors.get_mut(&0).unwrap();

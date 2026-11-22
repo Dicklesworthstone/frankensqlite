@@ -71,14 +71,26 @@ struct TableAllocatorState {
     mode: RowIdMode,
     /// High-water mark for AUTOINCREMENT `sqlite_sequence` persistence.
     autoincrement_high_water: i64,
+    /// Operation depth on this table: incremented by 1 on every reservation,
+    /// session explicit-floor bump, exhaustion observation, or external floor
+    /// advance; decremented only when a session proves it owns the entire
+    /// contiguous suffix since its mark (`state.depth == mark_depth + ops`).
+    ///
+    /// Unlike `next_rowid` arithmetic alone, `depth` proves ownership across
+    /// arbitrary explicit-rowid jumps (`bump_explicit_floor_for_statement`),
+    /// jumps to `EXHAUSTED_NEXT_ROWID`, and sub-tip explicit writes by a
+    /// concurrent peer (bd-u65rh / bd-failed-insert-rowid-floor-l53w4).
+    depth: u64,
 }
 
 impl TableAllocatorState {
     /// Raise the state to the floor `derived` (a [`Self::new`] from the
     /// table's largest rowid) describes: the next rowid and an AUTOINCREMENT
-    /// high-water never fall.
+    /// high-water never fall. Returns `true` if either watermark advanced.
     #[inline]
-    fn raise_to(&mut self, derived: &Self, mode: RowIdMode) {
+    fn raise_to(&mut self, derived: &Self, mode: RowIdMode) -> bool {
+        let prev_next = self.next_rowid;
+        let prev_hw = self.autoincrement_high_water;
         self.next_rowid = max_rowid_tip(self.next_rowid, derived.next_rowid);
         self.mode = mode;
         if mode == RowIdMode::AutoIncrement {
@@ -88,17 +100,20 @@ impl TableAllocatorState {
         } else {
             self.autoincrement_high_water = 0;
         }
+        self.next_rowid != prev_next || self.autoincrement_high_water != prev_hw
     }
 
-    /// Reserve `count` rowids from the tip, returning the range and the
-    /// AUTOINCREMENT high-water just before.
+    /// Reserve `count` rowids from the tip, returning the range, the
+    /// AUTOINCREMENT high-water just before, and the operation depth just
+    /// before.
     fn reserve(
         &mut self,
         key: AllocatorKey,
         count: u32,
-    ) -> Result<(RangeReservation, i64), RowIdAllocError> {
+    ) -> Result<(RangeReservation, i64, u64), RowIdAllocError> {
         let start = self.next_rowid;
         let prior_high_water = self.autoincrement_high_water;
+        let prior_depth = self.depth;
 
         // In concurrent mode, rowids are always in [1, MAX].  If the allocator
         // wrapped past MAX (via `wrapping_add`), `start` becomes negative and
@@ -131,6 +146,7 @@ impl TableAllocatorState {
         // Advance.  When we allocate exactly through MAX, wrapping_add sends
         // next_rowid to i64::MIN, which the `start < 1` guard catches next time.
         self.next_rowid = start.wrapping_add(count_i64);
+        self.depth = self.depth.wrapping_add(1);
 
         // Update AUTOINCREMENT high-water (last allocated rowid in range).
         if self.mode == RowIdMode::AutoIncrement {
@@ -153,6 +169,7 @@ impl TableAllocatorState {
                 count,
             },
             prior_high_water,
+            prior_depth,
         ))
     }
 
@@ -186,6 +203,7 @@ impl TableAllocatorState {
             next_rowid: next,
             mode,
             autoincrement_high_water: high_water,
+            depth: 0,
         }
     }
 }
@@ -369,69 +387,119 @@ pub struct ConcurrentRowIdAllocator {
     write_generation: Arc<AtomicU64>,
 }
 
-/// One session's reservations on one table (bd-gh-147, bd-8a8pr).
-#[derive(Debug, Clone, Copy)]
-struct SessionReservations {
-    /// Rowids reserved and not yet rolled back.
-    count: i64,
-    /// `(next_rowid, autoincrement_high_water)` just before this session's
-    /// first reservation on the table (when `count == 0`). When a savepoint or
-    /// transaction mark had `sp_count == 0`, `ensure_table_floor` may have
-    /// advanced `state.next_rowid` to the committed B-tree tip between the
-    /// mark and that first reservation; rewinding to `first_prior` reclaims
-    /// the session's contiguous tail back to that post-floor tip.
-    first_prior: (i64, i64),
-    /// `(next_rowid, autoincrement_high_water)` just before this session's
-    /// latest reservation on the table: what
-    /// [`ConcurrentRowIdAllocator::rewind_unlanded_one`] restores an
-    /// AUTOINCREMENT table's high-water to when that reservation is the one it
-    /// gives back.
-    last_prior: (i64, i64),
-    /// bd-8a8pr: `(statement, next_rowid, autoincrement_high_water, count)`
-    /// just before that statement's first reservation on the table, taken
-    /// lazily by [`ConcurrentRowIdAllocator::allocate_one_for_statement`]:
-    /// where a rolled-back statement rewinds to. A later statement's first
-    /// reservation replaces it, so only the latest statement can rewind.
-    statement: Option<(u64, i64, i64, i64)>,
+/// Snapshot of a table's allocator state just before an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorTableState {
+    /// The table had no entry in `tables` before this operation; rewinding back
+    /// to this state removes the entry so the next insert re-derives the tip
+    /// from the table's live `max(rowid)` and `sqlite_sequence`.
+    Absent,
+    /// The table already existed in `tables` at `(next_rowid, high_water, depth)`.
+    Present {
+        next_rowid: i64,
+        high_water: i64,
+        depth: u64,
+    },
 }
 
-/// Rewind `state` to `(mark_next, mark_high_water)` when its tip sits exactly
-/// `count_since` rowids past `mark_next`: that proves every rowid reserved
-/// since the mark is one of the `count_since` this session is giving back, so
-/// no other writer's rowid is reissued. Otherwise the gap stays.
-fn rewind_reserved_tail(
-    state: &mut TableAllocatorState,
-    mark_next: i64,
-    mark_high_water: i64,
-    count_since: i64,
-) {
-    // Use the reservation path's exact-through-MAX encoding, but only after
-    // proving the count fits the remaining positive domain. Plain signed
-    // addition panics at the final rowid; unchecked wrapping alone could turn
-    // an invalid count into ownership proof.
-    if count_since > 0
-        && mark_next > 0
-        && count_since <= i64::MAX - mark_next + 1
-        && state.next_rowid == mark_next.wrapping_add(count_since)
-    {
-        state.next_rowid = mark_next;
-        if state.mode == RowIdMode::AutoIncrement {
-            state.autoincrement_high_water = mark_high_water;
+impl PriorTableState {
+    const fn depth(self) -> u64 {
+        match self {
+            Self::Absent => 0,
+            Self::Present { depth, .. } => depth,
         }
     }
+}
+
+/// The session's most recent single-row operation on a table, used by
+/// [`ConcurrentRowIdAllocator::rewind_unlanded_one`] and
+/// [`ConcurrentRowIdAllocator::rewind_unlanded_explicit`] when a provisional
+/// row is discarded by a constraint or secondary-index conflict.
+#[derive(Debug, Clone, Copy)]
+struct LastSessionOp {
+    rowid: i64,
+    is_explicit: bool,
+    prior: PriorTableState,
+}
+
+/// One session's tracked allocations and explicit-rowid bumps on one table
+/// (bd-gh-147, bd-8a8pr, bd-u65rh).
+#[derive(Debug, Clone, Copy)]
+struct SessionReservations {
+    /// Number of un-rewound operations (implicit reservations and explicit
+    /// floor bumps) this session has contributed to `TableAllocatorState::depth`.
+    ops: u64,
+    /// Table state just before this session's first un-rewound operation on
+    /// the table (when `ops == 0`). When a savepoint or transaction mark had
+    /// `sp_ops == 0`, rewinding to `first_prior` reclaims this session's entire
+    /// contiguous suffix back to the state immediately before it touched the
+    /// table (or removes the entry if this session created it via an explicit
+    /// bump).
+    first_prior: PriorTableState,
+    /// Most recent single-row operation on this table, cleared once consumed
+    /// by `rewind_unlanded_one` / `rewind_unlanded_explicit`.
+    last_op: Option<LastSessionOp>,
+    /// bd-8a8pr / bd-u65rh: `(statement, prior_state, prior_ops)` just before
+    /// that statement's first reservation or explicit bump on the table. A
+    /// later statement's first operation replaces it, so only the latest
+    /// statement can rewind.
+    statement: Option<(u64, PriorTableState, u64)>,
+}
+
+/// Rewind `tables[key]` to `target` when its operation depth sits exactly
+/// `ops_since` steps past `target.depth()`: that proves every mutation on
+/// `key` since `target` belongs to the `ops_since` this session is giving
+/// back, so no peer's implicit allocation, explicit rowid, or exhaustion
+/// observation is ever overwritten. Otherwise the gap stays.
+fn rewind_table_to_prior(
+    tables: &mut HashMap<AllocatorKey, TableAllocatorState, FixedState>,
+    key: AllocatorKey,
+    target: PriorTableState,
+    ops_since: u64,
+) -> bool {
+    if ops_since == 0 {
+        return false;
+    }
+    let Some(expected_depth) = target.depth().checked_add(ops_since) else {
+        return false;
+    };
+    let matches = tables
+        .get(&key)
+        .is_some_and(|state| state.depth == expected_depth);
+    if !matches {
+        return false;
+    }
+    match target {
+        PriorTableState::Absent => {
+            tables.remove(&key);
+        }
+        PriorTableState::Present {
+            next_rowid,
+            high_water,
+            depth,
+        } => {
+            if let Some(state) = tables.get_mut(&key) {
+                state.next_rowid = next_rowid;
+                if state.mode == RowIdMode::AutoIncrement {
+                    state.autoincrement_high_water = high_water;
+                }
+                state.depth = depth;
+            }
+        }
+    }
+    true
 }
 
 /// A savepoint-time mark of the allocator state relevant to one session.
 ///
 /// Taken at `SAVEPOINT` (and at `BEGIN`, bd-gwoit) and consumed by
 /// [`ConcurrentRowIdAllocator::rewind_to_mark`] on `ROLLBACK TO` (and on a
-/// full `ROLLBACK`). Entries are
-/// `(key, next_rowid, autoincrement_high_water, session_reservation_count)`
-/// snapshotted at mark time.
+/// full `ROLLBACK`). Entries are `(key, prior_state, session_ops)` snapshotted
+/// at mark time.
 #[derive(Debug, Clone)]
 pub struct RowidAllocSavepointMark {
     session_id: u64,
-    entries: Vec<(AllocatorKey, i64, i64, i64)>,
+    entries: Vec<(AllocatorKey, PriorTableState, u64)>,
 }
 
 impl RowidAllocSavepointMark {
@@ -466,44 +534,39 @@ impl ConcurrentRowIdAllocator {
         }
     }
 
-    /// Record that `session_id` reserved `count` rowids for `key` (bd-gh-147),
-    /// the table's tip and high-water having been `prior` just before.
-    /// Called by the reservation path so a later savepoint rewind can prove the
-    /// contiguous tail belongs entirely to this session. With a `statement`
-    /// (non-zero), the first reservation that statement makes on `key` also
-    /// marks where its rollback rewinds to (bd-8a8pr).
-    fn note_session_reservation(
-        &self,
+    /// Record one depth-advancing operation by `session_id` on `key`, the
+    /// table having been at `prior` just before. Called while holding
+    /// `session_reservations` (lock order: `session_reservations` -> `tables`
+    /// -> `claims`) so mutating `tables` and recording session ownership are
+    /// atomic with respect to `mark_savepoint` and `rewind_*`.
+    fn note_session_op_locked(
+        session_reservations: &mut HashMap<(u64, AllocatorKey), SessionReservations, FixedState>,
         session_id: u64,
         key: AllocatorKey,
-        count: i64,
-        prior: (i64, i64),
+        prior: PriorTableState,
+        last_op: Option<LastSessionOp>,
         statement: u64,
     ) {
-        if count <= 0 {
-            return;
-        }
-        let mut session_reservations = self.session_reservations.lock();
         let entry = session_reservations
             .entry((session_id, key))
             .or_insert(SessionReservations {
-                count: 0,
+                ops: 0,
                 first_prior: prior,
-                last_prior: prior,
+                last_op,
                 statement: None,
             });
-        if entry.count == 0 {
+        if entry.ops == 0 {
             entry.first_prior = prior;
         }
-        entry.last_prior = prior;
+        entry.last_op = last_op;
         if statement != 0
             && entry
                 .statement
                 .is_none_or(|(marked, ..)| marked != statement)
         {
-            entry.statement = Some((statement, prior.0, prior.1, entry.count));
+            entry.statement = Some((statement, prior, entry.ops));
         }
-        entry.count += count;
+        entry.ops += 1;
     }
 
     /// Snapshot the allocator state for `session_id` at a `SAVEPOINT` boundary.
@@ -514,14 +577,17 @@ impl ConcurrentRowIdAllocator {
         let entries = tables
             .iter()
             .map(|(key, state)| {
-                let count = session_reservations
+                let ops = session_reservations
                     .get(&(session_id, *key))
-                    .map_or(0, |reservations| reservations.count);
+                    .map_or(0, |reservations| reservations.ops);
                 (
                     *key,
-                    state.next_rowid,
-                    state.autoincrement_high_water,
-                    count,
+                    PriorTableState::Present {
+                        next_rowid: state.next_rowid,
+                        high_water: state.autoincrement_high_water,
+                        depth: state.depth,
+                    },
+                    ops,
                 )
             })
             .collect();
@@ -531,88 +597,63 @@ impl ConcurrentRowIdAllocator {
         }
     }
 
-    /// Rewind the allocator to `mark` on `ROLLBACK TO` (bd-gh-147).
+    /// Rewind the allocator to `mark` on `ROLLBACK TO` (bd-gh-147, bd-u65rh).
     ///
-    /// For each table captured at mark time, the shared `next_rowid` is rewound
-    /// to the savepoint value ONLY when the allocator's current tip is exactly
-    /// where this session's contiguous reservations since the mark end
-    /// (`current == sp_next + my_count_since_mark`). That equality proves no
-    /// other writer reserved a rowid in `[sp_next, current)`, so the rewind can
-    /// never reissue another writer's id; if a peer intervened the gap is kept.
-    /// The session reservation count is reset to the mark value either way,
-    /// because every reservation since the mark has been rolled back.
+    /// For each table touched by this session since `mark`, the shared state is
+    /// rewound ONLY when the table's operation depth sits exactly
+    /// `my_ops_since_mark` past the rewind target's depth. That equality proves
+    /// no other writer allocated, bumped an explicit rowid, or observed
+    /// exhaustion in between, so the rewind can never reissue or collide with
+    /// another writer's id; if a peer intervened the gap is kept. The session's
+    /// tracked op count is restored to the mark value either way.
     pub fn rewind_to_mark(&self, mark: &RowidAllocSavepointMark) {
         let mut session_reservations = self.session_reservations.lock();
         let mut tables = self.tables.lock();
-        // bd-elcjy: a table whose first allocation happened AFTER the SAVEPOINT
-        // is absent from `mark.entries`, so the original loop never rewound it
-        // (the GH#147 fresh-table subcase: a post-rollback INSERT reused the
-        // advanced tip). Treat every such table this session has reserved as if
-        // the mark had captured it just before the session's first reservation
-        // there (`first_prior`) with a zero reservation count, then run it
-        // through the identical CAS-guarded rewind. Not a tip derived from the
-        // table's visible rows: those include the session's own uncommitted
-        // rows, and a floor raised past them pinned the rewind above the
-        // aborted rowids (bead .33).
+        // bd-elcjy / bd-u65rh: a table whose first allocation or explicit bump
+        // happened AFTER the SAVEPOINT is absent from `mark.entries`. Treat
+        // every such table as if the mark captured `first_prior` with zero ops
+        // and run it through the identical depth-guarded rewind.
         let marked: HashSet<AllocatorKey> = mark.entries.iter().map(|&(key, ..)| key).collect();
-        let absent_entries: Vec<(AllocatorKey, i64, i64, i64)> = session_reservations
+        let absent_entries: Vec<(AllocatorKey, PriorTableState, u64)> = session_reservations
             .iter()
             .filter(|((session, key), _)| *session == mark.session_id && !marked.contains(key))
             .filter(|((_, key), _)| tables.contains_key(key))
-            .map(|((_, key), reservations)| {
-                let (prior_next, prior_high_water) = reservations.first_prior;
-                (*key, prior_next, prior_high_water, 0)
-            })
+            .map(|((_, key), reservations)| (*key, reservations.first_prior, 0))
             .collect();
-        for &(key, sp_next, sp_high_water, sp_count) in
-            mark.entries.iter().chain(absent_entries.iter())
-        {
-            let (current_count, first_prior) = session_reservations
+        for &(key, sp_prior, sp_ops) in mark.entries.iter().chain(absent_entries.iter()) {
+            let (current_ops, first_prior) = session_reservations
                 .get(&(mark.session_id, key))
-                .map_or((0, (sp_next, sp_high_water)), |reservations| {
-                    (reservations.count, reservations.first_prior)
+                .map_or((0, sp_prior), |reservations| {
+                    (reservations.ops, reservations.first_prior)
                 });
-            if let Some(state) = tables.get_mut(&key) {
-                // bd-hi7qg: with no claim at mark time, the tail to give back
-                // starts at the tip just before this session's first
-                // reservation. A tip a quiescent allocation lowered after the
-                // mark (only on a Normal table) can sit below `sp_next`; the
-                // mark would then prove a tail a peer holds.
-                let (target_next, target_high_water) = if sp_count == 0 && current_count > 0 {
-                    let next = if state.mode == RowIdMode::Normal {
-                        first_prior.0
-                    } else {
-                        max_rowid_tip(sp_next, first_prior.0)
-                    };
-                    (next, sp_high_water.max(first_prior.1))
-                } else {
-                    (sp_next, sp_high_water)
-                };
-                rewind_reserved_tail(
-                    state,
-                    target_next,
-                    target_high_water,
-                    current_count - sp_count,
-                );
+            let ops_since = current_ops.saturating_sub(sp_ops);
+            if ops_since > 0 {
+                // When this session had 0 ops on `key` at mark time, every op
+                // it performed began at `first_prior` (capturing any peer
+                // floor advance, quiescent lowering, or fresh creation that
+                // occurred before this session first touched `key`).
+                let target = if sp_ops == 0 { first_prior } else { sp_prior };
+                rewind_table_to_prior(&mut tables, key, target, ops_since);
             }
-            // Every reservation since the mark was rolled back — restore the
+            // Every operation since the mark was rolled back — restore the
             // session's tracked count regardless of whether the tip rewound.
-            if sp_count == 0 {
+            if sp_ops == 0 {
                 session_reservations.remove(&(mark.session_id, key));
             } else if let Some(reservations) = session_reservations.get_mut(&(mark.session_id, key))
             {
-                reservations.count = sp_count;
+                reservations.ops = sp_ops;
+                reservations.last_op = None;
                 reservations.statement = None;
             }
         }
     }
 
-    /// Reclaim a single un-landed rowid `unlanded_rowid` that `session_id`
-    /// allocated at the tail of `key` and then discarded (e.g. `INSERT OR
-    /// IGNORE` / `ON CONFLICT DO NOTHING` / `ON CONFLICT DO UPDATE` where the
-    /// newly-allocated rowid was never stored, or the failing row of an `OR
-    /// FAIL` statement). An AUTOINCREMENT table gets it back only when it is
-    /// the session's latest reservation there, whose prior high-water is
+    /// Reclaim a single un-landed implicit rowid `unlanded_rowid` that
+    /// `session_id` allocated at the tail of `key` and then discarded (e.g.
+    /// `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` / `ON CONFLICT DO UPDATE`
+    /// where the newly-allocated rowid was never stored, or the failing row of
+    /// an `OR FAIL` statement). An AUTOINCREMENT table gets it back only when
+    /// it is the session's latest operation there, whose prior high-water is
     /// known; callers pass one only for a failed statement, whose
     /// `sqlite_sequence` update stock never runs.
     pub fn rewind_unlanded_one(&self, session_id: u64, key: AllocatorKey, unlanded_rowid: i64) {
@@ -624,39 +665,101 @@ impl ConcurrentRowIdAllocator {
         let Some(reservations) = session_reservations.get_mut(&(session_id, key)) else {
             return;
         };
-        if reservations.count <= 0 {
+        if reservations.ops == 0 {
             return;
         }
-        if let Some(state) = tables.get_mut(&key)
+        let mut rewound = false;
+        if let Some(last) = reservations.last_op
+            && !last.is_explicit
+            && last.rowid == unlanded_rowid
+        {
+            rewound = rewind_table_to_prior(&mut tables, key, last.prior, 1);
+            reservations.last_op = None;
+        } else if let Some(state) = tables.get_mut(&key)
+            && state.mode == RowIdMode::Normal
             && state.next_rowid == unlanded_rowid.wrapping_add(1)
+            && reservations
+                .first_prior
+                .depth()
+                .checked_add(reservations.ops)
+                == Some(state.depth)
         {
-            match state.mode {
-                RowIdMode::Normal => state.next_rowid = unlanded_rowid,
-                RowIdMode::AutoIncrement if reservations.last_prior.0 == unlanded_rowid => {
-                    state.next_rowid = unlanded_rowid;
-                    state.autoincrement_high_water = reservations.last_prior.1;
-                }
-                RowIdMode::AutoIncrement => {}
+            state.next_rowid = unlanded_rowid;
+            state.depth -= 1;
+            rewound = true;
+        }
+        if rewound {
+            reservations.ops -= 1;
+            if let Some((_, _, stmt_mark_ops)) = reservations.statement
+                && reservations.ops == stmt_mark_ops
+            {
+                reservations.statement = None;
             }
-        }
-        reservations.count -= 1;
-        if let Some((_, _, _, stmt_mark_count)) = reservations.statement
-            && reservations.count == stmt_mark_count
-        {
-            reservations.statement = None;
-        }
-        if reservations.count == 0 {
-            session_reservations.remove(&(session_id, key));
+            if reservations.ops == 0 {
+                session_reservations.remove(&(session_id, key));
+            }
         }
     }
 
-    /// bd-8a8pr: give back the rowids the rolled-back statement `statement`
-    /// reserved, for every table where nothing else reserved one since its
-    /// first reservation there (the same proof as [`Self::rewind_to_mark`]).
-    /// Stock recomputes `max(rowid) + 1`, so a statement that failed part-way
-    /// leaves no gap; neither does this, unless another writer allocated in
-    /// between. A table the statement shared with a nested statement keeps the
-    /// nested statement's mark instead, and keeps its gap.
+    /// bd-u65rh: reclaim a single provisional explicit-rowid bump on `key`
+    /// whose table row was just removed after a secondary-index conflict
+    /// (`OR IGNORE` on a normal table, or `OR FAIL` / `OR ABORT` on either
+    /// normal or `AUTOINCREMENT` tables).
+    ///
+    /// On an `AUTOINCREMENT` table, stock burns an explicit rowid discarded by
+    /// a succeeding `OR IGNORE` statement (updating `sqlite_sequence`), so
+    /// `!statement_failed` leaves the tip and high-water intact there.
+    pub fn rewind_unlanded_explicit(
+        &self,
+        session_id: u64,
+        key: AllocatorKey,
+        unlanded_rowid: i64,
+        statement_failed: bool,
+    ) {
+        let mut session_reservations = self.session_reservations.lock();
+        let mut tables = self.tables.lock();
+        let Some(reservations) = session_reservations.get_mut(&(session_id, key)) else {
+            return;
+        };
+        if reservations.ops == 0 {
+            return;
+        }
+        let Some(last) = reservations.last_op else {
+            return;
+        };
+        if !last.is_explicit || last.rowid != unlanded_rowid {
+            return;
+        }
+        if !statement_failed
+            && tables
+                .get(&key)
+                .is_some_and(|state| state.mode == RowIdMode::AutoIncrement)
+        {
+            return;
+        }
+        let rewound = rewind_table_to_prior(&mut tables, key, last.prior, 1);
+        reservations.last_op = None;
+        if rewound {
+            reservations.ops -= 1;
+            if let Some((_, _, stmt_mark_ops)) = reservations.statement
+                && reservations.ops == stmt_mark_ops
+            {
+                reservations.statement = None;
+            }
+            if reservations.ops == 0 {
+                session_reservations.remove(&(session_id, key));
+            }
+        }
+    }
+
+    /// bd-8a8pr / bd-u65rh: give back the implicit reservations and explicit
+    /// floor bumps the rolled-back statement `statement` made, for every table
+    /// where nothing else touched the table since its first operation there
+    /// (the same depth proof as [`Self::rewind_to_mark`]). Stock recomputes
+    /// `max(rowid) + 1`, so a statement that failed part-way leaves no gap;
+    /// neither does this, unless another writer intervened in between. A table
+    /// the statement shared with a nested statement keeps the nested
+    /// statement's mark instead, and keeps its gap.
     pub fn rewind_statement(&self, session_id: u64, statement: u64) {
         if statement == 0 {
             return;
@@ -667,24 +770,18 @@ impl ConcurrentRowIdAllocator {
             if session != session_id {
                 return true;
             }
-            let Some((marked, mark_next, mark_high_water, mark_count)) = reservations.statement
-            else {
+            let Some((marked, mark_prior, mark_ops)) = reservations.statement else {
                 return true;
             };
             if marked != statement {
                 return true;
             }
-            if let Some(state) = tables.get_mut(&key) {
-                rewind_reserved_tail(
-                    state,
-                    mark_next,
-                    mark_high_water,
-                    reservations.count - mark_count,
-                );
-            }
-            reservations.count = mark_count;
+            let ops_since = reservations.ops.saturating_sub(mark_ops);
+            rewind_table_to_prior(&mut tables, key, mark_prior, ops_since);
+            reservations.ops = mark_ops;
+            reservations.last_op = None;
             reservations.statement = None;
-            mark_count > 0
+            mark_ops > 0
         });
     }
 
@@ -746,11 +843,72 @@ impl ConcurrentRowIdAllocator {
         self.raise_epoch(key);
         let mut tables = self.tables.lock();
         match tables.get_mut(&key) {
-            Some(state) => state.raise_to(&derived, mode),
+            Some(state) => {
+                if state.raise_to(&derived, mode) {
+                    state.depth = state.depth.wrapping_add(1);
+                }
+            }
             None => {
                 tables.insert(key, derived);
             }
         }
+    }
+
+    /// Raise a table's floor past an explicit-rowid write attributed to
+    /// `(session_id, statement)` so a failed statement, `ROLLBACK TO`, full
+    /// `ROLLBACK`, or secondary-index conflict can safely rewind it when no
+    /// peer intervened (bd-u65rh, bd-failed-insert-rowid-floor-l53w4).
+    ///
+    /// Always advances `TableAllocatorState::depth` (even if `explicit_rowid`
+    /// sits below the current tip) so a concurrent peer inserting a sub-tip
+    /// explicit rowid blocks an earlier writer from rewinding past that row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bump_explicit_floor_for_statement(
+        &self,
+        key: AllocatorKey,
+        max_committed_rowid: Option<RowId>,
+        sqlite_sequence_seq: i64,
+        mode: RowIdMode,
+        session_id: u64,
+        statement: u64,
+        explicit_rowid: i64,
+    ) {
+        let mut derived = TableAllocatorState::new(max_committed_rowid, sqlite_sequence_seq, mode);
+        self.raise_epoch(key);
+        let mut session_reservations = self.session_reservations.lock();
+        let mut tables = self.tables.lock();
+        let prior = match tables.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                let prior = PriorTableState::Present {
+                    next_rowid: state.next_rowid,
+                    high_water: state.autoincrement_high_water,
+                    depth: state.depth,
+                };
+                state.raise_to(&derived, mode);
+                state.depth = state.depth.wrapping_add(1);
+                prior
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                derived.depth = 1;
+                entry.insert(derived);
+                PriorTableState::Absent
+            }
+        };
+        record_claim(&mut self.claims.lock(), key, session_id);
+        drop(tables);
+        Self::note_session_op_locked(
+            &mut session_reservations,
+            session_id,
+            key,
+            prior,
+            Some(LastSessionOp {
+                rowid: explicit_rowid,
+                is_explicit: true,
+                prior,
+            }),
+            statement,
+        );
     }
 
     /// Record that `session_id` holds a claim on `key` until it ends
@@ -791,11 +949,14 @@ impl ConcurrentRowIdAllocator {
         let derived = TableAllocatorState::new(max_rowid, sqlite_sequence_seq, mode);
         let floor = derived.next_rowid;
         self.raise_epoch(key);
+        let mut session_reservations = self.session_reservations.lock();
         let mut tables = self.tables.lock();
         let state = match tables.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => {
                 let state = entry.into_mut();
-                state.raise_to(&derived, mode);
+                if state.raise_to(&derived, mode) {
+                    state.depth = state.depth.wrapping_add(1);
+                }
                 state
             }
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(derived),
@@ -820,13 +981,23 @@ impl ConcurrentRowIdAllocator {
         }
         record_claim(&mut claims, key, session_id);
         drop(claims);
-        let (reservation, prior_high_water) = state.reserve(key, 1)?;
+        let (reservation, prior_high_water, prior_depth) = state.reserve(key, 1)?;
         drop(tables);
-        self.note_session_reservation(
+        let prior = PriorTableState::Present {
+            next_rowid: reservation.start_rowid.get(),
+            high_water: prior_high_water,
+            depth: prior_depth,
+        };
+        Self::note_session_op_locked(
+            &mut session_reservations,
             session_id,
             key,
-            i64::from(reservation.count),
-            (reservation.start_rowid.get(), prior_high_water),
+            prior,
+            Some(LastSessionOp {
+                rowid: reservation.start_rowid.get(),
+                is_explicit: false,
+                prior,
+            }),
             statement,
         );
         Ok(reservation.start_rowid)
@@ -863,24 +1034,25 @@ impl ConcurrentRowIdAllocator {
         count: u32,
     ) -> Result<RangeReservation, RowIdAllocError> {
         self.reserve_range_reporting_prior(key, count, 0)
-            .map(|(reservation, _)| reservation)
+            .map(|(reservation, _, _)| reservation)
     }
 
     /// [`Self::reserve_range`] by `claimant` (0 without a session), also
-    /// returning the AUTOINCREMENT high-water the table had just before (its
-    /// tip before is the range's start).
+    /// returning the AUTOINCREMENT high-water and operation depth the table had
+    /// just before (its tip before is the range's start).
     fn reserve_range_reporting_prior(
         &self,
         key: AllocatorKey,
         count: u32,
         claimant: u64,
-    ) -> Result<(RangeReservation, i64), RowIdAllocError> {
+    ) -> Result<(RangeReservation, i64, u64), RowIdAllocError> {
         if count == 0 {
             return Ok((
                 RangeReservation {
                     start_rowid: RowId::new(1),
                     count: 0,
                 },
+                0,
                 0,
             ));
         }
@@ -922,13 +1094,24 @@ impl ConcurrentRowIdAllocator {
         session_id: u64,
         statement: u64,
     ) -> Result<RowId, RowIdAllocError> {
-        let (reservation, prior_high_water) =
+        let mut session_reservations = self.session_reservations.lock();
+        let (reservation, prior_high_water, prior_depth) =
             self.reserve_range_reporting_prior(key, 1, session_id)?;
-        self.note_session_reservation(
+        let prior = PriorTableState::Present {
+            next_rowid: reservation.start_rowid.get(),
+            high_water: prior_high_water,
+            depth: prior_depth,
+        };
+        Self::note_session_op_locked(
+            &mut session_reservations,
             session_id,
             key,
-            i64::from(reservation.count),
-            (reservation.start_rowid.get(), prior_high_water),
+            prior,
+            Some(LastSessionOp {
+                rowid: reservation.start_rowid.get(),
+                is_explicit: false,
+                prior,
+            }),
             statement,
         );
         Ok(reservation.start_rowid)
@@ -941,13 +1124,31 @@ impl ConcurrentRowIdAllocator {
         count: u32,
         session_id: u64,
     ) -> Result<RangeReservation, RowIdAllocError> {
-        let (reservation, prior_high_water) =
+        if count == 0 {
+            return Ok(RangeReservation {
+                start_rowid: RowId::new(1),
+                count: 0,
+            });
+        }
+        let mut session_reservations = self.session_reservations.lock();
+        let (reservation, prior_high_water, prior_depth) =
             self.reserve_range_reporting_prior(key, count, session_id)?;
-        self.note_session_reservation(
+        let prior = PriorTableState::Present {
+            next_rowid: reservation.start_rowid.get(),
+            high_water: prior_high_water,
+            depth: prior_depth,
+        };
+        let last_op = (count == 1).then_some(LastSessionOp {
+            rowid: reservation.start_rowid.get(),
+            is_explicit: false,
+            prior,
+        });
+        Self::note_session_op_locked(
+            &mut session_reservations,
             session_id,
             key,
-            i64::from(reservation.count),
-            (reservation.start_rowid.get(), prior_high_water),
+            prior,
+            last_op,
             0,
         );
         Ok(reservation)
@@ -985,6 +1186,7 @@ impl ConcurrentRowIdAllocator {
         if state.mode == RowIdMode::AutoIncrement {
             state.autoincrement_high_water = state.autoincrement_high_water.max(r);
         }
+        state.depth = state.depth.wrapping_add(1);
 
         let next_after = state.next_rowid;
         drop(tables);
@@ -2328,5 +2530,252 @@ mod tests {
         );
         alloc.rewind_to_mark(&mark);
         assert_eq!(alloc.next_rowid(&k), Some(101));
+    }
+
+    /// bd-u65rh / bd-failed-insert-rowid-floor-l53w4: explicit-rowid floor
+    /// bumps rewind cleanly on statement rollback, savepoint rollback, full
+    /// rollback, fresh-table creation, exhaustion (`RowId::MAX`), and unlanded
+    /// secondary-index conflict, while preserving the gap whenever a concurrent
+    /// peer allocates, writes a sub-tip explicit rowid, or observes exhaustion.
+    #[test]
+    fn explicit_floor_bumps_rewind_alone_and_keep_gap_when_peer_intervenes() {
+        let (session_a, session_b) = (10u64, 20u64);
+        let k = key(1, 1);
+
+        // 1. Statement rewind restores both Normal and AutoIncrement tips &
+        // high-water marks (including from EXHAUSTED_NEXT_ROWID).
+        for mode in [RowIdMode::Normal, RowIdMode::AutoIncrement] {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 2, mode);
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(90001)),
+                2,
+                mode,
+                session_a,
+                1,
+                90001,
+            );
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(90002)),
+                2,
+                mode,
+                session_a,
+                1,
+                90002,
+            );
+            assert_eq!(alloc.next_rowid(&k), Some(90003));
+            alloc.rewind_statement(session_a, 1);
+            assert_eq!(alloc.next_rowid(&k), Some(3), "{mode:?} statement rewind");
+            if mode == RowIdMode::AutoIncrement {
+                assert_eq!(alloc.autoincrement_high_water(&k), Some(2));
+            }
+            assert_eq!(alloc.session_reservation_len(), 0);
+
+            // Exhausting explicit RowId::MAX rewinds back to 3.
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::MAX),
+                2,
+                mode,
+                session_a,
+                2,
+                i64::MAX,
+            );
+            assert_eq!(alloc.next_rowid(&k), Some(EXHAUSTED_NEXT_ROWID));
+            alloc.rewind_statement(session_a, 2);
+            assert_eq!(
+                alloc.next_rowid(&k),
+                Some(3),
+                "{mode:?} rewind from MAX exhaustion"
+            );
+            if mode == RowIdMode::AutoIncrement {
+                assert_eq!(alloc.autoincrement_high_water(&k), Some(2));
+            }
+        }
+
+        // 2. Fresh table (absent from `tables` before the explicit bump):
+        // rewinding removes the entry so the next insert re-reads max(rowid).
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let mark = alloc.mark_savepoint(session_a);
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(7)),
+                1,
+                RowIdMode::AutoIncrement,
+                session_a,
+                1,
+                7,
+            );
+            assert_eq!(alloc.next_rowid(&k), Some(8));
+            alloc.rewind_to_mark(&mark);
+            assert!(
+                !alloc.is_initialized(&k),
+                "fresh-table explicit bump rollback must remove the uninitialized entry"
+            );
+            assert_eq!(alloc.session_reservation_len(), 0);
+        }
+
+        // 3. Peer allocates an implicit rowid after A's explicit bump: A's
+        // rewind keeps the gap and never reissues the peer's rowid.
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 0, RowIdMode::Normal);
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(90001)),
+                0,
+                RowIdMode::Normal,
+                session_a,
+                1,
+                90001,
+            );
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_b).unwrap().get(),
+                90002
+            );
+            alloc.rewind_statement(session_a, 1);
+            assert_eq!(
+                alloc.next_rowid(&k),
+                Some(90003),
+                "peer allocation 90002 must keep the gap"
+            );
+        }
+
+        // 4. Peer writes a sub-tip explicit rowid (500 < 90002) while A's
+        // explicit bump is active: A's rewind must NOT rewind back to 3 over
+        // the peer's row 500.
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 0, RowIdMode::Normal);
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(90001)),
+                0,
+                RowIdMode::Normal,
+                session_a,
+                1,
+                90001,
+            );
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(500)),
+                0,
+                RowIdMode::Normal,
+                session_b,
+                1,
+                500,
+            );
+            alloc.rewind_statement(session_a, 1);
+            assert_eq!(
+                alloc.next_rowid(&k),
+                Some(90002),
+                "sub-tip peer explicit write 500 must block rewind below it"
+            );
+        }
+
+        // 5. Peer gets Exhausted after A bumped to RowId::MAX and falls back to
+        // inserting a random rowid (which calls bump_explicit_floor_for_statement
+        // with `is_implicit_alloc == false`): A must not un-exhaust the table
+        // while the peer holds that random rowid.
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 0, RowIdMode::Normal);
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::MAX),
+                0,
+                RowIdMode::Normal,
+                session_a,
+                1,
+                i64::MAX,
+            );
+            assert_eq!(
+                alloc.allocate_one_for_session(k, session_b),
+                Err(RowIdAllocError::Exhausted)
+            );
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(42_424)),
+                0,
+                RowIdMode::Normal,
+                session_b,
+                1,
+                42_424,
+            );
+            alloc.rewind_statement(session_a, 1);
+            assert_eq!(
+                alloc.next_rowid(&k),
+                Some(EXHAUSTED_NEXT_ROWID),
+                "peer random-rowid insert after exhaustion must prevent un-exhausting"
+            );
+        }
+
+        // 6. Unlanded explicit rowid (OR FAIL vs OR IGNORE on Normal and
+        // AutoIncrement): OR FAIL rewinds both; OR IGNORE rewinds Normal and
+        // burns AutoIncrement (matching stock).
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(1)), 1, RowIdMode::AutoIncrement);
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(10)),
+                1,
+                RowIdMode::AutoIncrement,
+                session_a,
+                1,
+                10,
+            );
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(90001)),
+                1,
+                RowIdMode::AutoIncrement,
+                session_a,
+                1,
+                90001,
+            );
+            // OR IGNORE (!statement_failed) keeps AutoIncrement bump.
+            alloc.rewind_unlanded_explicit(session_a, k, 90001, false);
+            assert_eq!(alloc.next_rowid(&k), Some(90002));
+            assert_eq!(alloc.autoincrement_high_water(&k), Some(90001));
+            // OR FAIL (statement_failed) rewinds AutoIncrement bump back to 11.
+            alloc.rewind_unlanded_explicit(session_a, k, 90001, true);
+            assert_eq!(alloc.next_rowid(&k), Some(11));
+            assert_eq!(alloc.autoincrement_high_water(&k), Some(10));
+        }
+
+        // 7. Nested savepoint after a rolled-back statement still rewinds the
+        // earlier statement's explicit bump cleanly.
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(1)), 1, RowIdMode::AutoIncrement);
+            let sp = alloc.mark_savepoint(session_a);
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(100)),
+                1,
+                RowIdMode::AutoIncrement,
+                session_a,
+                1,
+                100,
+            );
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(90001)),
+                1,
+                RowIdMode::AutoIncrement,
+                session_a,
+                2,
+                90001,
+            );
+            alloc.rewind_statement(session_a, 2);
+            assert_eq!(alloc.next_rowid(&k), Some(101));
+            alloc.rewind_to_mark(&sp);
+            assert_eq!(alloc.next_rowid(&k), Some(2));
+            assert_eq!(alloc.autoincrement_high_water(&k), Some(1));
+        }
     }
 }
