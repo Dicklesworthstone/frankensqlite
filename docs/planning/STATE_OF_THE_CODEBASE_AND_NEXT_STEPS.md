@@ -21,6 +21,14 @@ processes read all three rows in index order and passed `integrity_check`
 on both files. Both readers also recovered every byte of a separate
 1,048,577-byte mixed-byte BLOB through the index (`bd-46l13`).
 
+Both shells dumped and restored the mixed-byte database on Linux
+`4ab88f36f`. For all four combinations of dumper and restorer, both
+engines read the original 1,048,577 bytes through the restored index.
+A separate compound INSERT produced NULL, integer, real, quoted Unicode
+text and a BLOB with embedded zeros. Across both database creators,
+dumpers and restorers, both readers recovered the expected storage
+classes, values and index order after an UPDATE.
+
 The previous CLI also reported `ok` on three saved corrupt WAL databases.
 On `4ab88f36f` (Linux build `30097323753219356`), both `integrity_check`
 and `quick_check` identified a stock-reported rowid on each file. On eight
@@ -50,6 +58,14 @@ readers reopened both database origins with the committed value and
 preserved the previous value in all four creator/writer combinations. A
 new writer then committed successfully. Global commit identity and the
 other cross-process authority requirements remain on `bd-zywqc.20`.
+
+A different stale-writer schedule can lose committed data. On
+`07da95426`, the `bd-p9wzl` investigator reproduced a stock writer
+merging leaves while a FrankenSQLite transaction held an older snapshot.
+FrankenSQLite acknowledged its subsequent commit, but a fresh reader
+could not find the inserted row. Both engines reported `integrity_check=ok`.
+The issue also records a lost update and a missing index entry. Verifying
+the fix for that schedule takes priority over a throughput claim.
 
 The September GH407 count query now returns the expected integer 1 on both
 engines. A separate wrong-answer path remained in forced partial indexes. An

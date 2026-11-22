@@ -588,6 +588,19 @@ jobs:
             --test indexed_by_partial_predicate_gh173_oracle \
             --test indexed_by_partial_predicate_wlo29_oracle
 
+      - name: Compound writes, grouped queries, sorter spill and B-tree integrity
+        run: |
+          cargo test --locked -p fsqlite-core \
+            --test bd_wiffk_with_insert_compound_source_oracle \
+            --test bd_4uurt_prepared_group_by_having_oracle \
+            --test bd_gjor8_having_nested_row_value_oracle \
+            --test bd_ukvhn_group_by_collated_key_spelling_oracle \
+            --test bd_zjocc_time_travel_history_semantics \
+            --test bd_dwjnq_5_temp_store_oracle \
+            --test bd_w4pr1_13_1_sync_lane_boundary_oracle \
+            --test integrity_check_empty_non_root_leaf
+          cargo test --locked -p fsqlite --test agg_index_range_oracle
+
       # GH#404: fsqlite-written FTS5 %_data must be stock-verifiable (stock
       # `PRAGMA integrity_check` + stock MATCH parity on a multi-leaf corpus).
       # bd-kon3m: the legacy-contentless automerge keeper that sat outside every
