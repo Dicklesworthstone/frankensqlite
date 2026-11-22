@@ -82376,6 +82376,7 @@ impl Connection {
                         rows: TriggerBodyTemplate::frame_rows(frame),
                         statement,
                         keys,
+                        kernel: RefCell::new(insert_batch::TriggerBodyKernelSlot::Pending),
                     });
                     let mut templates = self.trigger_body_templates.borrow_mut();
                     templates.retain(|kept| kept.schema_generation == schema_generation);
@@ -82399,10 +82400,13 @@ impl Connection {
     ///
     /// `statement` already carries the firing statement's conflict override
     /// (bd-nn29x): the caller applies [`apply_trigger_conflict_override`], or
-    /// takes a [`TriggerBodyTemplate`] that applied it when it bound.
+    /// takes a [`TriggerBodyTemplate`] that applied it when it bound. A
+    /// template's statement may run through its kernel (bd-fpr5g lever 3b,
+    /// see [`Self::execute_trigger_template_statement`]).
     async fn execute_bound_trigger_statement(
         &self,
         statement: &Statement,
+        template: Option<&TriggerBodyTemplate>,
         params: &[SqliteValue],
     ) -> Result<TriggerStatementOutcome> {
         if let Some((directive, predicate)) = trigger_statement_raise_directive(statement) {
@@ -82517,9 +82521,14 @@ impl Connection {
         );
         let previous_total_changes = self.total_changes.get();
         let previous_trigger_step_changes = self.trigger_step_changes.get();
-        let result = self
-            .execute_statement(statement, (!params.is_empty()).then_some(params))
-            .await;
+        let params = (!params.is_empty()).then_some(params);
+        let result = match template {
+            Some(template) => {
+                self.execute_trigger_template_statement(template, statement, params)
+                    .await
+            }
+            None => self.execute_statement(statement, params).await.map(drop),
+        };
         if counts_changes {
             let step_total_delta = self
                 .total_changes
@@ -82530,6 +82539,47 @@ impl Connection {
         }
         result?;
         Ok(TriggerStatementOutcome::Continue)
+    }
+
+    /// bd-fpr5g lever 3b: run a template's statement through its kernel when
+    /// it has one that is current and the connection's state allows it, and
+    /// through the ordinary dispatcher otherwise. The first ordinary run that
+    /// succeeds captures the kernel (or finds the statement's shape refused),
+    /// so a template's first firing and any firing after its program went
+    /// stale take every validation the dispatcher makes.
+    async fn execute_trigger_template_statement(
+        &self,
+        template: &TriggerBodyTemplate,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<()> {
+        let kernel = match &*template.kernel.borrow() {
+            insert_batch::TriggerBodyKernelSlot::Ready(kernel) => Some(Rc::clone(kernel)),
+            insert_batch::TriggerBodyKernelSlot::Pending
+            | insert_batch::TriggerBodyKernelSlot::Refused => None,
+        };
+        let allowed = self.trigger_body_kernel_allowed();
+        if let Some(kernel) = kernel
+            && allowed
+        {
+            if self.trigger_body_kernel_is_current(&kernel) {
+                return self
+                    .execute_trigger_body_kernel(&kernel, statement, params)
+                    .await;
+            }
+            *template.kernel.borrow_mut() = insert_batch::TriggerBodyKernelSlot::Pending;
+        }
+        self.execute_statement(statement, params).await?;
+        if allowed
+            && matches!(
+                *template.kernel.borrow(),
+                insert_batch::TriggerBodyKernelSlot::Pending
+            )
+        {
+            let captured = self.capture_trigger_body_kernel(statement, params);
+            *template.kernel.borrow_mut() = captured;
+        }
+        Ok(())
     }
 
     /// Fire BEFORE triggers for a DML event on a table.
@@ -82633,7 +82683,11 @@ impl Connection {
                     pin_main_relations,
                 );
                 match self
-                    .execute_bound_trigger_statement(bound_stmt.statement(), &bound_params)
+                    .execute_bound_trigger_statement(
+                        bound_stmt.statement(),
+                        bound_stmt.template(),
+                        &bound_params,
+                    )
                     .await
                     .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
@@ -82724,7 +82778,11 @@ impl Connection {
                     pin_main_relations,
                 );
                 match self
-                    .execute_bound_trigger_statement(bound_stmt.statement(), &bound_params)
+                    .execute_bound_trigger_statement(
+                        bound_stmt.statement(),
+                        bound_stmt.template(),
+                        &bound_params,
+                    )
                     .await
                     .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
@@ -83258,7 +83316,11 @@ impl Connection {
                     pin_main_relations,
                 );
                 match self
-                    .execute_bound_trigger_statement(bound_stmt.statement(), &bound_params)
+                    .execute_bound_trigger_statement(
+                        bound_stmt.statement(),
+                        bound_stmt.template(),
+                        &bound_params,
+                    )
                     .await
                     .map_err(|error| trigger_body_missing_table_error(error, &trigger, stmt))?
                 {
@@ -172085,6 +172147,8 @@ struct TriggerBodyTemplate {
     /// The bound statement, with the firing statement's conflict override.
     statement: Statement,
     keys: Vec<(Option<String>, String)>,
+    /// bd-fpr5g lever 3b: the statement's compiled program, once captured.
+    kernel: RefCell<insert_batch::TriggerBodyKernelSlot>,
 }
 
 impl TriggerBodyTemplate {
@@ -172144,6 +172208,13 @@ impl BoundTriggerStatement {
         match self {
             Self::Template(template) => &template.statement,
             Self::Owned(statement) => statement,
+        }
+    }
+
+    fn template(&self) -> Option<&TriggerBodyTemplate> {
+        match self {
+            Self::Template(template) => Some(template),
+            Self::Owned(_) => None,
         }
     }
 }

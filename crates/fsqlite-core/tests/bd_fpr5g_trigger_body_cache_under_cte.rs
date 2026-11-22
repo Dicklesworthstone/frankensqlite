@@ -24,6 +24,12 @@
 //! savepoint) leaves the trigger as it was, a committed one rewrites it, and
 //! `recursive_triggers` OFF stops only the trigger re-entering itself, while ON
 //! lets it recurse.
+//!
+//! Lever 3b runs a bound INSERT, UPDATE or DELETE through its compiled program
+//! after its first firing (the kernel in connection/insert_batch.rs, whose lib
+//! tests count the kernel runs). The last keeper holds what that kernel must
+//! give up or keep: a trigger on its target, foreign keys turned on, a failing
+//! firing, conflict overrides, rollback, and a TEMP target.
 
 use fsqlite_core::connection::{
     Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
@@ -413,6 +419,160 @@ fn bound_trigger_bodies_follow_conflict_overrides_and_schema_changes() {
                         "file_backed={file_backed}: fsqlite must refuse `{failing}`"
                     );
                 } else if sql.starts_with("SELECT") {
+                    assert_eq!(
+                        fsqlite_rows(&conn, sql).await,
+                        stock_rows(&stock, sql),
+                        "file_backed={file_backed}: {sql}"
+                    );
+                } else {
+                    stock.execute_batch(sql).unwrap();
+                    conn.execute(sql)
+                        .await
+                        .unwrap_or_else(|e| panic!("file_backed={file_backed}: {sql}: {e}"));
+                }
+            }
+        }
+    });
+}
+
+/// Lever 3b runs a parameter-bound body INSERT, UPDATE or DELETE through its
+/// compiled program after the statement's first firing, without the
+/// dispatcher's validation and rewriting, while the program is still the one
+/// the dispatcher would run and the connection's state lets the shortcut
+/// stand. Every result here is stock's, on `:memory:` and on a file; the `!`
+/// statements must fail on both engines. The negatives are what a kernel that
+/// cached its program and ran it unconditionally gets wrong:
+/// - a trigger created on the UPDATE's target must fire on every later firing
+///   (the UPDATE arm's tail does not fire triggers, so that target leaves the
+///   kernel);
+/// - foreign keys turned on, without a schema change, must be enforced on the
+///   body's UPDATE of a child row;
+/// - a body UPDATE that fails on one firing refuses the whole statement and
+///   leaves no row behind, and the change counters stay stock's;
+/// - the firing statement's OR IGNORE / OR REPLACE reaches the body, REPLACE
+///   deleting the conflicting row;
+/// - work done through the kernel inside a transaction or a savepoint rolls
+///   back;
+/// - a TEMP trigger's unqualified target becomes a new TEMP table.
+const KERNEL_SCRIPT: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)",
+    "CREATE TABLE lg(k, m)",
+    "CREATE TABLE u(k TEXT PRIMARY KEY, c INTEGER)",
+    "CREATE TABLE ulog(k, c)",
+    "CREATE TABLE par(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE ch(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES par(id))",
+    "INSERT INTO u VALUES ('even', 0), ('odd', 0)",
+    "INSERT INTO par VALUES (1), (2)",
+    "INSERT INTO ch VALUES (1, 1)",
+    "CREATE TRIGGER ti AFTER INSERT ON t WHEN NEW.n % 7 <> 3 BEGIN \
+       INSERT INTO lg VALUES (NEW.id, NEW.n > 10); \
+       UPDATE u SET c = c + 1 WHERE k = CASE WHEN NEW.n % 2 = 0 THEN 'even' ELSE 'odd' END; \
+       DELETE FROM lg WHERE k = NEW.id - 20; \
+       UPDATE ch SET pid = CASE WHEN NEW.n % 2 = 0 THEN 2 ELSE 1 END WHERE id = 1; \
+     END",
+    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 60) \
+     INSERT INTO t SELECT i, i FROM s",
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM lg ORDER BY rowid",
+    "SELECT * FROM u ORDER BY k",
+    "SELECT * FROM ch",
+    // A body UPDATE that fails on its 15th firing.
+    "CREATE TABLE t2(id INTEGER PRIMARY KEY, n INTEGER)",
+    "CREATE TRIGGER t2i AFTER INSERT ON t2 BEGIN \
+       UPDATE u SET k = CASE WHEN NEW.n = 15 THEN 'odd' ELSE k END WHERE k = 'even'; \
+       INSERT INTO lg VALUES (NEW.id + 1000, -NEW.n); \
+     END",
+    "!WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 30) \
+     INSERT INTO t2 SELECT i, i FROM s",
+    "SELECT count(*) FROM t2",
+    "SELECT count(*), sum(m) FROM lg",
+    "SELECT * FROM u ORDER BY k",
+    "SELECT total_changes()",
+    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 30) \
+     INSERT OR IGNORE INTO t2 SELECT i, i FROM s",
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM u ORDER BY k",
+    "SELECT count(*), sum(m) FROM lg",
+    "DELETE FROM t2",
+    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 30) \
+     INSERT OR REPLACE INTO t2 SELECT i, i FROM s",
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM u ORDER BY k",
+    "SELECT count(*), sum(m) FROM lg",
+    "UPDATE u SET k = 'even', c = 0 WHERE k = 'odd'",
+    "INSERT INTO u VALUES ('odd', 0)",
+    // A trigger on the body UPDATE's target.
+    "CREATE TRIGGER tu AFTER UPDATE ON u BEGIN INSERT INTO ulog VALUES (NEW.k, NEW.c); END",
+    "WITH RECURSIVE s(i) AS (SELECT 61 UNION ALL SELECT i + 1 FROM s WHERE i < 80) \
+     INSERT INTO t SELECT i, i FROM s",
+    "SELECT * FROM ulog ORDER BY rowid",
+    "SELECT * FROM u ORDER BY k",
+    "SELECT * FROM ch",
+    // Foreign keys turned on: the body's UPDATE of ch must find its parent.
+    "DELETE FROM par WHERE id = 2",
+    "PRAGMA foreign_keys = ON",
+    "!INSERT INTO t VALUES (82, 82)",
+    "SELECT count(*) FROM t",
+    "SELECT * FROM ch",
+    "SELECT count(*), sum(m) FROM lg",
+    "INSERT INTO t VALUES (83, 83)",
+    "SELECT * FROM ch",
+    "PRAGMA foreign_keys = OFF",
+    "INSERT INTO par VALUES (2)",
+    // Rolled back with the transaction, and to a savepoint.
+    "BEGIN",
+    "WITH RECURSIVE s(i) AS (SELECT 100 UNION ALL SELECT i + 1 FROM s WHERE i < 140) \
+     INSERT INTO t SELECT i, i FROM s",
+    "SELECT count(*), sum(m) FROM lg",
+    "ROLLBACK",
+    "SELECT count(*), sum(m) FROM lg",
+    "SELECT * FROM u ORDER BY k",
+    "BEGIN",
+    "INSERT INTO t VALUES (199, 199)",
+    "SAVEPOINT a",
+    "WITH RECURSIVE s(i) AS (SELECT 200 UNION ALL SELECT i + 1 FROM s WHERE i < 210) \
+     INSERT INTO t SELECT i, i FROM s",
+    "ROLLBACK TO a",
+    "RELEASE a",
+    "INSERT INTO t VALUES (211, 211)",
+    "COMMIT",
+    "SELECT * FROM lg ORDER BY rowid DESC LIMIT 4",
+    "SELECT * FROM u ORDER BY k",
+    "SELECT count(*) FROM ulog",
+    // A TEMP trigger whose unqualified target becomes a TEMP table.
+    "CREATE TEMP TRIGGER tt AFTER INSERT ON t BEGIN INSERT INTO lg VALUES (NEW.id, 'temp'); END",
+    "WITH RECURSIVE s(i) AS (SELECT 300 UNION ALL SELECT i + 1 FROM s WHERE i < 310) \
+     INSERT INTO t SELECT i, i FROM s",
+    "CREATE TEMP TABLE lg(k, m)",
+    "WITH RECURSIVE s(i) AS (SELECT 311 UNION ALL SELECT i + 1 FROM s WHERE i < 320) \
+     INSERT INTO t SELECT i, i FROM s",
+    "SELECT * FROM temp.lg ORDER BY rowid",
+    "SELECT count(*) FROM main.lg WHERE m = 'temp'",
+    "SELECT count(*), sum(k) FROM main.lg",
+    "PRAGMA integrity_check",
+];
+
+#[test]
+fn kernel_run_trigger_bodies_follow_targets_pragmas_failures_and_rollback() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let conn = Connection::open(&database_path(&dir, file_backed))
+                .await
+                .unwrap();
+            for sql in KERNEL_SCRIPT {
+                if let Some(failing) = sql.strip_prefix('!') {
+                    assert!(
+                        stock.execute_batch(failing).is_err(),
+                        "stock must refuse `{failing}`"
+                    );
+                    assert!(
+                        conn.execute(failing).await.is_err(),
+                        "file_backed={file_backed}: fsqlite must refuse `{failing}`"
+                    );
+                } else if sql.starts_with("SELECT") || sql.starts_with("PRAGMA integrity") {
                     assert_eq!(
                         fsqlite_rows(&conn, sql).await,
                         stock_rows(&stock, sql),
