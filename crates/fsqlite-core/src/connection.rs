@@ -88098,7 +88098,7 @@ impl Connection {
                     detail: format!("Tree {} page {}: inconsistent B-tree page type", root_page.get(), page_no.get()),
                 });
             }
-            tree_is_table.get_or_insert(page_type.is_table());
+            tree_is_table.get_or_insert_with(|| page_type.is_table());
             let mut previous_key = lower_key;
             let mut next_tasks = Vec::new();
             for (cell_idx, cell_pointer) in cell_pointers.iter().enumerate() {
