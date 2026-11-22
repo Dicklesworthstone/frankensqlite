@@ -89162,7 +89162,8 @@ impl Connection {
                         let raw = if encoding == TextEncoding::Utf8 {
                             None
                         } else {
-                            project(parse_record(&payload), TextEncoding::Utf8, false)?.filter(|other| *other != key)
+                            let raw_values = parse_record_with_encoding(&payload, TextEncoding::Utf8);
+                            project(raw_values, TextEncoding::Utf8, false)?.filter(|other| *other != key)
                         };
                         expected.push((position, key, raw));
                     }
