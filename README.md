@@ -662,7 +662,7 @@ Each cursor maintains a stack of `(page_number, cell_index)` pairs representing 
 
 Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. In default file-backed concurrent transactions, when the transaction is the sole active local transaction and its snapshot is current, allocation reuses committed free pages at or below the current database size. Freelist reuse under sustained concurrent overlap is regression-kept: `page_count` growth stays bounded under racing writer churn (the unbounded-EOF-growth defect tracked in [#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302) is fixed). `VACUUM` rebuilds the database and can reclaim space, but the current insertion-based builder can retain pages freed during its own construction or leave trailing pages, and page 1 of the rebuilt image may report a zero `freelist_count` that disagrees with the freelist actually present. The result is a valid, integrity-checkable database; the current builder does not promise a zero-freelist, header-consistent, or fixed-point compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
 
-`PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not supported as durable settings. The mode currently changes connection-local readback only and returns to `NONE` after reopen; FrankenSQLite does not yet write the pointer-map pages required to enable either mode safely ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)). An existing database that stock SQLite created with auto-vacuum enabled opens and reads normally, but every write to it fails with a "not implemented" error naming `auto_vacuum`: writing it without maintaining its pointer map would corrupt it for stock SQLite (bd-1q134, bd-w4pr1.1). To make such a file writable, run `PRAGMA auto_vacuum = NONE; VACUUM;` on it with stock `sqlite3`.
+FrankenSQLite reads and writes databases created by either engine with `auto_vacuum=FULL` or `INCREMENTAL`. Set the mode before creating the first table. To enable it on a populated database in `NONE` mode, set `PRAGMA auto_vacuum=FULL` or `INCREMENTAL` and run `VACUUM` on the same connection. The mode persists when either engine reopens the file. FULL reclaims free pages at commit. In INCREMENTAL mode, run `PRAGMA incremental_vacuum` to reclaim them.
 
 ---
 
@@ -1697,11 +1697,11 @@ Each pointer-map page holds `usable_size / 5` entries (819 entries for
 4096-byte pages). Pointer-map pages recur at regular intervals: pages 2, 822,
 1642, ... (group size = entries_per_page + 1 = 820).
 
-The format above describes SQLite's on-disk contract, not a current
-FrankenSQLite feature. FrankenSQLite does not yet create or maintain
-pointer-map pages or relocate pages for auto-vacuum. Setting
-`auto_vacuum = FULL` or `auto_vacuum = INCREMENTAL` is currently
-connection-local and is not persisted in the database header ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)).
+FrankenSQLite maintains these pointer maps when it writes auto-vacuum
+databases. On Linux, both engines reopened the same file after FrankenSQLite
+created an overflow index, deleted its largest row, and reclaimed the free
+pages. Both reported `integrity_check=ok` and `quick_check=ok`.
+See the [cross-engine results for FULL and INCREMENTAL modes](docs/planning/STATE_OF_THE_CODEBASE_AND_NEXT_STEPS.md#compound-writes-and-historical-reads-2026-11-21).
 
 ---
 
