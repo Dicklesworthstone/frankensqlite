@@ -573,6 +573,20 @@ fn partial_integrity_checks_resolve_tables_in_sqlite_search_order() {
                    INSERT INTO temp_violation VALUES('A'); PRAGMA case_sensitive_like=ON";
         stock.execute_batch(ddl).unwrap();
         native.execute_batch(ddl).await.unwrap();
+        // Both attached tables violate CHECK. The order of tables inside one
+        // schema is unspecified. Compare every finding before isolating the
+        // schema boundary for a capped check below.
+        for prepared in [false, true] {
+            let sql = "PRAGMA integrity_check";
+            let mut expected = stock_connection_reports(&stock, sql);
+            let mut actual = native_reports(&native, sql, prepared).await;
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected);
+        }
+        // Leave exactly one invalid table in the first attachment. The fourth
+        // result can then only come from that database on either engine.
+        stock.execute("DELETE FROM First.t", []).unwrap();
         for kind in ["integrity_check", "quick_check"] {
             for limit in [2, 3, 4] {
                 let sql = format!("PRAGMA {kind}({limit})");
@@ -580,6 +594,9 @@ fn partial_integrity_checks_resolve_tables_in_sqlite_search_order() {
                 assert_eq!(oracle.len(), limit);
                 if limit >= 3 {
                     assert_eq!(oracle[2], "CHECK constraint failed in temp_violation");
+                }
+                if limit == 4 {
+                    assert_eq!(oracle[3], "CHECK constraint failed in child");
                 }
                 for prepared in [false, true] {
                     assert_eq!(native_reports(&native, &sql, prepared).await, oracle, "{sql}");
