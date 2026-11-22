@@ -207,7 +207,7 @@ fn create_stock_table(path: &std::path::Path, first_rowid: i64, count: i64) -> u
 fn cross_table_divider(bytes: &mut [u8], root: u32, cross_upper: bool) -> (u32, usize, i64, usize) {
     let page_size = header_page_size(bytes);
     let usable_size = u32::try_from(page_size - usize::from(bytes[20])).unwrap();
-    let mut pending = vec![(root, None::<i64>, None::<i64>, 1_usize)];
+    let mut pending = vec![(root, None, None, 1_usize)];
     while let Some((page_no, lower, upper, depth)) = pending.pop() {
         let start = (usize::try_from(page_no).unwrap() - 1) * page_size;
         let page = &bytes[start..start + page_size];
@@ -216,7 +216,9 @@ fn cross_table_divider(bytes: &mut [u8], root: u32, cross_upper: bool) -> (u32, 
         let pointers = fsqlite_btree::read_cell_pointers(page, &header, offset).unwrap();
         if header.page_type.is_leaf() {
             let bound = if cross_upper { upper } else { lower };
-            let Some(bound) = bound else { continue };
+            let Some((bound, divider_page, divider_cell)) = bound else {
+                continue;
+            };
             let cell_idx = if cross_upper { pointers.len() - 1 } else { 0 };
             let pointer = usize::from(pointers[cell_idx]);
             let (_, payload_len_bytes) = read_varint(&page[pointer..]).unwrap();
@@ -230,11 +232,17 @@ fn cross_table_divider(bytes: &mut [u8], root: u32, cross_upper: bool) -> (u32, 
             assert_eq!(new_len, old_len, "fixture must preserve cell size");
             bytes[start + rowid_offset..start + rowid_offset + new_len]
                 .copy_from_slice(&encoded_bytes[..new_len]);
-            return (page_no, cell_idx, new_rowid, depth);
+            // The left-child maximum is checked on the leaf. For a
+            // too-small right-child minimum, SQLite reports the separator.
+            return if cross_upper {
+                (page_no, cell_idx, new_rowid, depth)
+            } else {
+                (divider_page, divider_cell, bound, depth)
+            };
         }
         let mut next = Vec::new();
         let mut previous = lower;
-        for pointer in pointers {
+        for (cell_idx, pointer) in pointers.into_iter().enumerate() {
             let cell = fsqlite_btree::CellRef::parse(
                 page,
                 usize::from(pointer),
@@ -242,14 +250,14 @@ fn cross_table_divider(bytes: &mut [u8], root: u32, cross_upper: bool) -> (u32, 
                 usable_size,
             )
             .unwrap();
-            let rowid = cell.rowid.unwrap();
+            let divider = (cell.rowid.unwrap(), page_no, cell_idx);
             next.push((
                 cell.left_child.unwrap().get(),
                 previous,
-                Some(rowid),
+                Some(divider),
                 depth + 1,
             ));
-            previous = Some(rowid);
+            previous = Some(divider);
         }
         next.push((
             header.right_child.unwrap().get(),
@@ -283,7 +291,7 @@ fn bd_3koph_table_subtree_bounds_match_stock() {
                     let stock = stock_reports(&path, pragma);
                     assert!(
                         stock.iter().any(|line| line.contains(&diagnostic)),
-                        "stock must identify the altered leaf cell: {stock:?}"
+                        "stock must identify the expected rowid boundary ({diagnostic}): {stock:?}"
                     );
                 }
                 asupersync::test_utils::run_test(|| async {

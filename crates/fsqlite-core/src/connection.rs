@@ -87223,7 +87223,7 @@ impl Connection {
     ) -> Result<()> {
         #[derive(Clone)]
         enum IntegrityKey {
-            Rowid(i64),
+            Rowid { value: i64, page: PageNumber, cell: usize },
             Index(Arc<[SqliteValue]>),
         }
 
@@ -87246,7 +87246,7 @@ impl Connection {
         let root_page = page_no;
         let compare_keys = |lhs: &IntegrityKey, rhs: &IntegrityKey| {
             match (lhs, rhs, index_order) {
-                (IntegrityKey::Rowid(lhs), IntegrityKey::Rowid(rhs), _) => Some(lhs.cmp(rhs)),
+                (IntegrityKey::Rowid { value: lhs, .. }, IntegrityKey::Rowid { value: rhs, .. }, _) => Some(lhs.cmp(rhs)),
                 (IntegrityKey::Index(lhs), IntegrityKey::Index(rhs), Some((connection, index, key_fields))) => {
                     let (lhs, rhs) = if let Some(key_fields) = key_fields {
                         (lhs.get(..key_fields)?, rhs.get(..key_fields)?)
@@ -87375,9 +87375,10 @@ impl Connection {
                 })?;
 
                 let current_key = if check_key_order && page_is_table {
-                    Some(IntegrityKey::Rowid(cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    let value = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!("Tree {} page {} cell {cell_idx}: missing rowid", root_page.get(), page_no.get()),
-                    })?))
+                    })?;
+                    Some(IntegrityKey::Rowid { value, page: page_no, cell: cell_idx })
                 } else if check_key_order && index_order.is_some() {
                     let mut payload = cell.local_payload(page_bytes).to_vec();
                     if let Some(first_overflow) = cell.overflow_page {
@@ -87413,20 +87414,30 @@ impl Connection {
                     });
                     let above_upper = upper_key.as_ref().is_some_and(|upper| {
                         let order = compare_keys(key, upper);
-                        if matches!(key, IntegrityKey::Rowid(_)) {
+                        if matches!(key, IntegrityKey::Rowid { .. }) {
                             !matches!(order, Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
                         } else {
                             order != Some(std::cmp::Ordering::Less)
                         }
                     });
                     if below_lower || above_upper {
-                        let key_description = match key {
-                            IntegrityKey::Rowid(rowid) => format!("Rowid {rowid}"),
-                            IntegrityKey::Index(_) => "index key".to_owned(),
+                        // Stock checks rowids from right to left. When the right
+                        // key is too small, it reports the preceding key, which
+                        // may be a divider inherited several levels above.
+                        let reported = match (previous_key.as_ref(), key) {
+                            (Some(prior @ IntegrityKey::Rowid { .. }), IntegrityKey::Rowid { .. })
+                                if below_lower => prior,
+                            _ => key,
                         };
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!("Tree {} page {} cell {cell_idx}: {key_description} out of order ({owner})", root_page.get(), page_no.get()),
-                        });
+                        let detail = match reported {
+                            IntegrityKey::Rowid { value, page, cell } => format!(
+                                "Tree {} page {} cell {cell}: Rowid {value} out of order", root_page.get(), page.get()
+                            ),
+                            IntegrityKey::Index(_) => format!(
+                                "Tree {} page {} cell {cell_idx}: index key out of order ({owner})", root_page.get(), page_no.get()
+                            ),
+                        };
+                        return Err(FrankenError::DatabaseCorrupt { detail });
                     }
                 }
 
