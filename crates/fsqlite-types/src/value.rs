@@ -1392,6 +1392,18 @@ impl SqliteValue {
         }
     }
 
+    /// SQL `CAST(value AS BLOB)` uses the database encoding for text and
+    /// the text representation of numbers. Existing BLOBs retain their bytes.
+    #[must_use]
+    pub fn cast_to_blob_in(self, encoding: TextEncoding) -> Self {
+        let text = match self {
+            Self::Null | Self::Blob(_) => return self,
+            Self::Text(text) => text,
+            number => SmallText::from(number.to_text()),
+        };
+        Self::Blob(Arc::from(text.to_record_text_bytes(encoding)))
+    }
+
     /// SQL `self || rhs`.
     ///
     /// NULL if either operand is NULL; otherwise TEXT holding the text bytes of

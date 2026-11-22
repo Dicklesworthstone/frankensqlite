@@ -163,6 +163,74 @@ fn bd_gu1bi_utf8_cast_blob_expression_index_integrity_matches_stock() {
     });
 }
 
+#[test]
+fn cast_blob_writes_searchable_index_entries_in_the_database_encoding() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (encoding, header) in [("UTF-8", 1), ("UTF-16le", 2), ("UTF-16be", 3)] {
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            oracle
+                .execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE seed(x)"))
+                .unwrap();
+            let blob: String = oracle
+                .query_row("SELECT hex(CAST('café🎵' AS BLOB))", [], |r| r.get(0))
+                .unwrap();
+            let predicate = format!("CAST(y AS BLOB) = x'{blob}'");
+            let schema = "CREATE TABLE t(k INTEGER PRIMARY KEY, y TEXT) WITHOUT ROWID";
+            for native_origin in [false, true] {
+                let path = dir.path().join(format!("{encoding}-{native_origin}.db"));
+                let init = format!("PRAGMA encoding='{encoding}'; {schema}");
+                if !native_origin {
+                    rusqlite::Connection::open(&path)
+                        .unwrap()
+                        .execute_batch(&init)
+                        .unwrap();
+                }
+                let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+                if native_origin {
+                    db.execute(&init).await.unwrap();
+                }
+                db.execute("INSERT INTO t VALUES(1,'café🎵'),(2,'other')")
+                    .await
+                    .unwrap();
+                db.execute(&format!("CREATE INDEX p ON t(k) WHERE {predicate}"))
+                    .await
+                    .unwrap();
+                db.execute("CREATE INDEX e ON t(CAST(y AS BLOB))")
+                    .await
+                    .unwrap();
+                db.execute("UPDATE t SET y='other' WHERE k=1").await.unwrap();
+                db.execute("UPDATE t SET y='café🎵' WHERE k=2").await.unwrap();
+                db.execute("INSERT INTO t VALUES(3,'café🎵')").await.unwrap();
+                db.close().await.unwrap();
+
+                assert_eq!(header_text_encoding(&path), header);
+                let stock = rusqlite::Connection::open(&path).unwrap();
+                for index in ["p", "e"] {
+                    let sql = format!(
+                        "SELECT k FROM t INDEXED BY {index} WHERE {predicate} ORDER BY k"
+                    );
+                    let mut stmt = stock.prepare(&sql).unwrap();
+                    let keys = stmt
+                        .query_map([], |r| r.get::<_, i64>(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    assert_eq!(keys, [2, 3], "{encoding} {native_origin} {index}");
+                }
+                let verdict: String = stock
+                    .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(verdict, "ok", "{encoding} {native_origin}");
+                drop(stock);
+                let reopened = Connection::open(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(integrity_check(&reopened).await, ["ok"]);
+                reopened.close().await.unwrap();
+            }
+        }
+    });
+}
+
 // --- P2: stock-legal unpaired surrogate in a plain-indexed column ----------
 
 /// UTF-16le fixture with an unpaired high surrogate (U+D800) in an indexed TEXT

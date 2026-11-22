@@ -150580,10 +150580,7 @@ fn evaluate_having_value(
             } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
                 SqliteValue::Text(v.to_text().into())
             } else if upper.contains("BLOB") || upper.is_empty() {
-                match v {
-                    SqliteValue::Blob(_) => v,
-                    _ => SqliteValue::Blob(v.to_text().into_bytes().into()),
-                }
+                v.cast_to_blob_in(statement_text_encoding())
             } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
                 SqliteValue::Float(v.to_float())
             } else {
@@ -178035,19 +178032,8 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
         // NB: an EMPTY CAST type name (`CAST(x AS)`) is NOT BLOB — it has
         // NUMERIC affinity (SQLite's sqlite3AffinityType default) and falls
         // through to the NUMERIC branch below. bd-errmsg-parity-batch4-deqcb.
-        match val {
-            SqliteValue::Blob(_) => val,
-            text_or_number => {
-                // A persisted index predicate casts to BLOB in the database
-                // encoding. Raw record projections already contain those bytes.
-                let encoding = INDEX_EXPRESSION_ENCODING.get().unwrap_or(TextEncoding::Utf8);
-                let text = match text_or_number {
-                    SqliteValue::Text(text) => text,
-                    other => other.to_text().into(),
-                };
-                SqliteValue::Blob(text.to_record_text_bytes(encoding).into_owned().into())
-            }
-        }
+        // The byte-preserving integrity projection supplies its own encoding.
+        val.cast_to_blob_in(INDEX_EXPRESSION_ENCODING.get().unwrap_or(db_encoding))
     } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
         match val {
             SqliteValue::Float(_) => val,

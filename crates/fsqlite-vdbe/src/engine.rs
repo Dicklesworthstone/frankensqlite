@@ -26073,11 +26073,7 @@ fn sql_cast(val: SqliteValue, target: i32, text_encoding: TextEncoding) -> Sqlit
         (other, _) => other,
     };
     match target_byte {
-        b'A' | b'a' => SqliteValue::Blob(match val {
-            SqliteValue::Blob(b) => b,
-            SqliteValue::Text(s) => Arc::from(s.as_bytes_direct()),
-            other => Arc::from(other.to_text().into_bytes()),
-        }),
+        b'A' | b'a' => val.cast_to_blob_in(text_encoding),
         b'B' | b'b' => {
             // C SQLite changes the storage-class tag without validating or
             // replacing the BLOB payload. On a UTF-8 DB the bytes are retained
