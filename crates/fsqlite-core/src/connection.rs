@@ -46742,6 +46742,9 @@ impl Connection {
                 // A later ATTACH inherits main's current mode, including a
                 // setting made by a schema-qualified PRAGMA main.secure_delete.
                 attached_connection.inherit_secure_delete(self);
+                // SQLite's busy handler belongs to the outer connection.
+                attached_connection.pragma_state.borrow_mut().busy_timeout_ms =
+                    self.pragma_state.borrow().busy_timeout_ms;
                 self.attached_schemas
                     .borrow_mut()
                     .attach(attach.schema.clone(), path)?;
@@ -90041,6 +90044,12 @@ impl Connection {
             let mut state = self.pragma_state.borrow_mut();
             fsqlite_vdbe::pragma::apply_connection_pragma(&mut state, pragma)?
         };
+        if pragma_name == "busy_timeout" && pragma.value.is_some() {
+            let timeout = self.pragma_state.borrow().busy_timeout_ms;
+            for child in self.attached_connections.borrow().values() {
+                child.pragma_state.borrow_mut().busy_timeout_ms = timeout;
+            }
+        }
         if pragma_name == "secure_delete" && pragma.value.is_some() {
             self.apply_secure_delete_policy_to_held_txns();
             if pragma.name.schema.is_none() {

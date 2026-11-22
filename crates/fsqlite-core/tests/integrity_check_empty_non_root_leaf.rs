@@ -406,7 +406,18 @@ fn bd_vojth_rowid_reports_match_stock_across_attached_databases() {
                     assert_eq!(native_reports(&conn, &qualified, prepared).await, oracle);
                 }
             }
-            holder.execute_batch("ROLLBACK").unwrap();
+            // Release the lock immediately after our check, with a fallback
+            // before a fresh child's 5 s default expires. A child that ignores
+            // the connection's timeout can then return a false success.
+            let (release, requested) = std::sync::mpsc::channel::<()>();
+            let unlock = std::thread::spawn(move || {
+                let _ = requested.recv_timeout(std::time::Duration::from_secs(2));
+                holder.execute_batch("ROLLBACK").unwrap();
+            });
+            let result = native_check(&conn, "PRAGMA quick_check(1)", true).await;
+            let _ = release.send(());
+            unlock.join().unwrap();
+            assert!(result.unwrap_err().is_transient());
             assert_eq!(
                 native_reports(&conn, "PRAGMA quick_check(1)", false).await,
                 stock_connection_reports(&reader, "PRAGMA quick_check(1)")
