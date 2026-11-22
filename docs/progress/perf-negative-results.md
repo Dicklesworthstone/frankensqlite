@@ -94,6 +94,67 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - REJECTED on two kill lines (callgrind one-key cost +73.8 Ir a statement against +60; its own keeper red: an admitted one-key count over a TEXT column takes a different plan bound than literal), with multicol_eq_1000 x7.20 -> x5.37 stock 3.54.1 and its cpu and cycles replicated WINs: a literal SELECT of aggregates or columns over ANDed integer keys runs parameterized only when its keys are exactly an ascending index prefix (bd-w4pr1.13.18, read/seek round 10, lever L5 v3)
+
+- Target: multicol_eq_1000 of the read sweep (`SELECT count(*), sum(val) FROM s WHERE g = <int> AND h = <int>`, 1,000
+  distinct literal pairs, each its own autocommit statement). Retry of L5 v2 (2026-11-15 entry below), whose keeper
+  kill line fired on a bare column beside an aggregate over a key left beside the index prefix.
+- Touched (never committed to main; patch `scratchpad rs9/l5v3_v1_p1.patch` of the read/seek lane, applied in a
+  scratch worktree as `lane-l5v3-r10`): `crates/fsqlite-core/src/connection/literal_params.rs` (the first key stays
+  `key_column`, further keys in `more_key_columns: Vec<String>`, `aggregate: bool`; a list mixing aggregates and
+  columns stays text), `crates/fsqlite-core/src/connection.rs` (`literal_statement_may_run_parameterized`: an
+  aggregate or ANDed keys also need a rowid table with no partial index and either the rowid alias alone or distinct
+  keys that are exactly the leading columns of an ascending plain-column index), the bd_5310l keeper (access path of
+  the `?N` form equals the literal form's for 11 admitted shapes; 6 shapes kept as text; a negative control).
+- Ledger preflight: L5 v1 and v2 (below), L2, bd-5310l's entries.
+- Prediction (bd-w4pr1.13.18, round 9, restated for main 579ab83ce + bd-t0g9w PR1 and stock 3.54.1 before the build,
+  2026-11-21): multicol_eq_1000 -80k to -110k instructions a statement; one-key controls +0.00% to +0.05%; callgrind
+  one-key cost +10 to +50 Ir. Kill: multicol under -60k; the one-key cost above +60 Ir; a control above its band in
+  both runs; a replicated layout-averaged LOSE; multicol cpu not a replicated WIN; a keeper red; an answer differing.
+- Result. Parent = main 579ab83ce + PR1 (commit 9061b48d4), lever = parent + v3, one rch job (layout_shuffle_pair.sh,
+  K=6, ovh-a; parent fsqlite-cargo 474a19910ebe247f, lever cf7b64bc0bec5f9b). rs10/sweep354_probe.py (rs9/sweep.py
+  with the stock arm SQLite 3.54.1), arms P/L/Q x 6 layouts, 7 reps, two runs (both valid, max null |z| 2.53 / 2.17),
+  thinkstation1, powersave, io_uring refused. Answers equal stock on every row. Instructions, median of the layouts'
+  minima, run 1 / run 2:
+
+  | row | stock 3.54.1 | parent | L5 v3 |
+  |---|---|---|---|
+  | multicol_eq_1000 | 54.4M | 392.0M (x7.20) | 291.7M (x5.36); -100.3M / -99.9M, -100k a statement |
+  | point_rowid_2000 (band 0.2%) | 41.2M | 175.2M | +0.105% / +0.116% |
+  | point_hot_2000 (band 0.2%) | 40.2M | 164.6M | +0.138% / +0.231% |
+  | point_sec_key_2000 (band 0.35%) | 64.4M | 263.9M | +0.076% / +0.089% |
+  | insert_literal_400 (band 0.3%) | 8.7M | 72.4M | -0.007% / +0.054% |
+  | orderby_page_500x20, rowid_lookups_200k (band 0.05%) | 69.0M / 459.2M | 281.4M / 2,498.6M | +0.008% / 0.000% |
+
+  - Time (bd-es2im layout-averaged): multicol_eq_1000 cpu 0.747 / 0.735 and cycles 0.715 / 0.711, replicated WINs;
+    every other row a replicated TIE (single-run LOSEs: point_hot cycles run 2, point_sec_key cpu run 1,
+    insert_literal cycles run 1).
+  - Callgrind of point_rowid_2000's statements 100-300 on the two fsqlite-cargo ELFs ((n300 - n100) / 200):
+    `parameterize_literal_statement` 2,217.7 -> 2,282.5 Ir (+64.8), `literal_statement_may_run_parameterized` 859.5 ->
+    868.5 (+9.0), together +73.8; the whole statement 92,374 -> 92,515 (+141). Self diff: `Scan::key_filter` -163,
+    the new `Scan::key_term` +115, `parameterize_literal_statement` +69, `Scan::result_column` +44, admission +11,
+    drop glue +6.
+  - Kill line 2 (one-key cost above +60) CROSSED.
+  - Keeper line CROSSED (rch, vmi1152480, the lever tree 7659bc151 = 579ab83ce + PR1 + v3): bd_5310l
+    `literal_statements_run_identically_parameterized_as_text_and_on_stock` fails at line 1054, "the bound form of an
+    admitted shape takes its literal plan", on `SELECT count(*) FROM sk WHERE t = 13` (t TEXT, index sk_t). Literal:
+    OpenRead sk_t, SeekGE, Column, AggStep COUNT, Next, then OpenRead sk, Rewind, Column, AggStep COUNT, Next (a
+    stepped count plus a fallback scan). Bound: OpenRead sk_t, SeekGE, IdxCountBefore, ResultRow (bd-zgbhb's
+    exact-prefix count). So "an exact index prefix leaves codegen no choice a literal could steer" is false for a
+    one-key aggregate on this TEXT column. The other keepers in the step passed: bd_79p0a 3/3, bd_d4rbi, and the PS
+    set (bd_9zuif 4, bd_tj811 2, bd_xml0z 3, boundary_duplication_census 5, fast_path_separation 38, gh525 3,
+    prepared_hit_rate_proof 8, gh239 6, cross-process staleness).
+  - REJECTED; nothing landed.
+  - MISSED: point_rowid / point_hot +0.10% to +0.23% against +0.00% to +0.05% (inside their bands).
+- Also run (scratch worktree, rch): clippy -D warnings fsqlite-core + fsqlite, all targets, clean.
+- Retry condition: an L5 v4 whose one-key statement costs at most +60 Ir in callgrind (statements 100-300 of
+  point_rowid_2000), measured before any time run. The one-key path is the cost: `key_term` and `result_column` replace
+  `key_filter` for every statement, aggregate or not. A one-key column SELECT should take v2's / main's path
+  unchanged, and only a statement whose result list opens with an aggregate, or that has a second `AND k = int`,
+  should pay the new scan. The admission must also refuse a one-key aggregate on a column whose literal and bound
+  plans differ (observed: TEXT affinity, sk.t), or the keeper's access-path equality must hold on every admitted
+  affinity before any time run.
+
 ## 2026-11-22 - WIN (landed as 18c00643a; under its prediction on instructions, inside every kill line): MakeRecord's serializer keeps a record's layouts in a stack array and writes the record through one slice, without its layout SmallVec; bulk -288.4M Ir and its cycles a replicated WIN (bd-w4pr1.13, bulk-write round 16, lever MR)
 
 - Target: the 4-column MakeRecord of bulk_insert_1M_one_txn. Callgrind on 94395a013 (100k rows): the serializer
