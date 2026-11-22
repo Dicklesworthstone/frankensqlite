@@ -179566,7 +179566,7 @@ mod tests {
     use crate::region::RegionKind;
     use fsqlite_ast::{
         CreateTableBody, Expr, FunctionArgs, JoinKind, Literal, OrderingTerm, PlaceholderType,
-        ResultColumn, SelectCore, SortDirection, Span, Statement, WindowReference, WindowSpec,
+        QualifiedName, ResultColumn, SelectCore, SortDirection, Span, Statement, WindowReference, WindowSpec,
     };
     use fsqlite_btree::BtreeCursorOps;
     use fsqlite_error::{FrankenError, Result};
