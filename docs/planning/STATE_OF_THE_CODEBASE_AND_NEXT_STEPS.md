@@ -29,6 +29,14 @@ text and a BLOB with embedded zeros. Across both database creators,
 dumpers and restorers, both readers recovered the expected storage
 classes, values and index order after an UPDATE.
 
+On Linux `585ef19cb`, the same forced-spill index workload succeeded on
+stock-created FULL and INCREMENTAL auto-vacuum databases. After deletion,
+FULL shrank from 517 pages to 4. INCREMENTAL kept 513 pages on its
+freelist until explicit reclamation reduced the file to 4 pages. Both
+readers passed `integrity_check` and `quick_check`. All six core
+auto-vacuum oracle tests and both stock-database write guards passed
+(`bd-1q134`).
+
 The previous CLI also reported `ok` on three saved corrupt WAL databases.
 On `4ab88f36f` (Linux build `30097323753219356`), both `integrity_check`
 and `quick_check` identified a stock-reported rowid on each file. On eight
@@ -56,8 +64,13 @@ FrankenSQLite rejected it at COMMIT with a page-2 snapshot conflict. Both
 readers reopened both database origins with the committed value and
 `integrity_check=ok`. Killing a writer after its uncommitted UPDATE also
 preserved the previous value in all four creator/writer combinations. A
-new writer then committed successfully. Global commit identity and the
-other cross-process authority requirements remain on `bd-zywqc.20`.
+new writer then committed successfully. On `585ef19cb` two separate
+writers starting from maximum rowid 1 both received 2 from
+`INSERT ... RETURNING id`. Across both database origins, both commit
+orders and plain or explicit concurrent BEGIN, the first commit succeeded
+and the second raised a page-2 snapshot conflict. A fresh retry returned
+3. Both engines reopened both rows. Process-shared implicit rowid
+allocation and global commit identity remain on `bd-zywqc.20`.
 
 A different stale-writer schedule can lose committed data. On
 `07da95426`, the `bd-p9wzl` investigator reproduced a stock writer
