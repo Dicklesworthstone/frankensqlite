@@ -94,6 +94,32 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-22 - REJECTED on its GAIN kill line (reused INSERT -6.3% Ir against -10%); point SELECT -22.2%: sqlite3_step runs the statement sqlite3_prepare_v2 compiled instead of parsing and preparing the SQL again (bd-e64z4 part 2, single-writer lane round 10, lever L3)
+
+- Target: `crates/fsqlite-c-api/src/lib.rs`. prepare_v2 compiled the statement only to read its column count and
+  dropped it; every sqlite3_step ran `Connection::execute_with_params` / `query_with_params` on the SQL text, a second
+  parse and prepared-cache lookup per step. L3 keeps the `PreparedStatement` in the handle (its borrow widened to
+  'static: sqlite3_close refuses while a statement is registered, and finalize drops it before the release) and step
+  runs it.
+- Prediction (bead, before the build): user Ir per call -12 to -30% (autocommit INSERT, prepare/bind/step/finalize),
+  -20 to -40% (reused INSERT), -15 to -40% (point SELECT); GAIN kill under -10% on the reused INSERT.
+- Result: dlopen driver cdrv, per call = (N1300 - N300) / 1000, perf stat, 7 rotated reps on thinkstation1. Arms from
+  one rch job on vmi1153651: main ad5f63595 (710c5d129880ee42) and L3 (c38c7ce161101eeb). Stock libsqlite3 3.54.1 was
+  live in the same invocation, and main ran twice as A/A (within 0.15%). Results: autocommit INSERT 197,402 -> 188,234
+  (-4.6%; x10.98 -> x10.47 stock); reused INSERT 168,526 -> 157,852 (-6.3%; x14.96 -> x14.02); point SELECT
+  62,372 -> 48,503 (-22.2%; x3.94 -> x3.06). Kernel Ir -3.0 / -3.5 / -39.8%; statx -2 per call on each mode. All 58
+  fsqlite-c-api tests passed.
+- Why it is small: on a reused INSERT the second parse plus prepared-cache hit is about 10.7k Ir of about 168k. Only
+  the short SELECT shows the double work clearly.
+- Defect found in L3 v1: a statement held across PRAGMA reverse_unordered_selects keeps its first program (with the
+  pragma on, L3 reads 1 2 3, while stock and main read 3 2 1; stock expires statements after a flag pragma). v2
+  recompiles a kept statement after any PRAGMA the handle runs. Its keeper, test_prepared_statements_follow_pragmas_and_peer_ddl,
+  pins stock's answers and also holds an INSERT across another connection's CREATE INDEX.
+- Kept: v1 dea847726 (clone frankensqlite-s10e) and v2 d6c1d13a1 (clone frankensqlite-s10c,
+  `scripts/lane_r10/l3.patch` there); v2 was not built.
+- Retry condition: a C API workload dominated by statement setup (the SELECT shape decides), or a commit path cut far
+  enough that the second parse is above 10% of a reused INSERT. Take v2, not v1, either way.
+
 ## 2026-11-22 - REJECTED on its time kill line (update_10pct_300k cpu a replicated layout-averaged LOSE, +6.2% / +12.5%, at identical instructions and cycles:u), every instruction line inside its prediction: a join or derived-table projection that is the joined row moves the row into the result instead of copying it (bd-w4pr1.12, serial read lane round 13, lever DS)
 
 - Target: gb_id's outer aggregate over its 1M-row derived table. On d52d8908b execute_join_select cost 355.1M outside
