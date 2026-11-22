@@ -22,6 +22,9 @@
 //! - S3: Rapid schema changes (ALTER TABLE) with cached queries
 //! - S4: View + trigger interaction under concurrent DDL
 //! - S5: Schema cache coherence after concurrent DDL storm
+//! - S6/S7 (bd-mc5pp): a schema change against a same-process `BEGIN
+//!   IMMEDIATE` writer waits it out within busy_timeout, or is refused at once
+//!   at busy_timeout 0
 #![recursion_limit = "512"]
 // Each worker drives its thread-local, non-Sync connection to completion on
 // the same OS thread. Requiring these futures to be Send would reject the
@@ -857,4 +860,363 @@ fn s5_schema_coherence_after_storm() {
     let receipt = env::var(SCHEMA_STORM_RECEIPT_ENV)
         .expect("supervised schema-storm child must receive a completion receipt token");
     println!("{SCHEMA_STORM_RECEIPT_PREFIX}{receipt}");
+}
+
+// ─── S6/S7: Schema change against a same-process IMMEDIATE writer ──
+
+/// How long the holder keeps its `BEGIN IMMEDIATE` transaction open.
+#[derive(Clone, Copy)]
+enum HolderRelease {
+    After(Duration),
+    WhenSchemaChangeReturns,
+}
+
+/// One holder and one schema-changing connection, both in this process.
+struct SameProcessHoldOutcome {
+    schema_change: Result<(), FrankenError>,
+    schema_change_started: Duration,
+    schema_change_returned: Duration,
+    holder_commit: Result<(), FrankenError>,
+    holder_commit_started: Duration,
+    holder_commit_returned: Duration,
+    holder_row_present: bool,
+    new_table_present: bool,
+    integrity: String,
+}
+
+enum SameProcessHoldReport {
+    Holder {
+        commit: Result<(), FrankenError>,
+        started: Duration,
+        returned: Duration,
+    },
+    SchemaChange {
+        result: Result<(), FrankenError>,
+        started: Duration,
+        returned: Duration,
+    },
+}
+
+/// bd-mc5pp: connection A runs `BEGIN IMMEDIATE`, writes and holds RESERVED
+/// until `release`; connection B of the same process, with `busy_timeout_ms`,
+/// meanwhile runs `schema_change` (statements in order, rolled back on
+/// error). The statements create table `b_new`.
+fn schema_change_against_same_process_holder(
+    busy_timeout_ms: u64,
+    schema_change: &'static [&'static str],
+    release: HolderRelease,
+) -> SameProcessHoldOutcome {
+    let dir = test_tmpdir();
+    let path = dir
+        .path()
+        .join("same_process_hold.db")
+        .to_str()
+        .expect("path")
+        .to_owned();
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(&path).await.expect("open seed");
+        conn.execute("PRAGMA journal_mode=WAL").await.expect("wal");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .expect("create t");
+        conn.execute("INSERT INTO t VALUES (1, 'seed')")
+            .await
+            .expect("seed t");
+        conn.close().await.expect("close seed");
+    });
+
+    let origin = Instant::now();
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let (returned_tx, returned_rx) = mpsc::channel::<()>();
+    let (report_tx, report_rx) = mpsc::channel::<SameProcessHoldReport>();
+    let holder = {
+        let path = path.clone();
+        let report_tx = report_tx.clone();
+        std::thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async {
+                let a = Connection::open(&path).await.expect("open holder");
+                a.execute("BEGIN IMMEDIATE").await.expect("holder begin");
+                a.execute("INSERT INTO t VALUES (2, 'holder')")
+                    .await
+                    .expect("holder write");
+                held_tx.send(()).expect("report RESERVED held");
+                match release {
+                    HolderRelease::After(hold) => std::thread::sleep(hold),
+                    HolderRelease::WhenSchemaChangeReturns => {
+                        returned_rx
+                            .recv_timeout(Duration::from_secs(30))
+                            .expect("the schema change returns while RESERVED is held");
+                    }
+                }
+                let started = origin.elapsed();
+                let commit = a.execute("COMMIT").await.map(|_| ());
+                let returned = origin.elapsed();
+                if commit.is_err() {
+                    let _ = a.execute("ROLLBACK").await;
+                }
+                report_tx
+                    .send(SameProcessHoldReport::Holder {
+                        commit,
+                        started,
+                        returned,
+                    })
+                    .expect("report holder commit");
+                a.close().await.expect("close holder");
+            });
+        })
+    };
+    let writer = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async {
+                let b = Connection::open(&path).await.expect("open schema writer");
+                b.execute(&format!("PRAGMA busy_timeout={busy_timeout_ms}"))
+                    .await
+                    .expect("busy_timeout");
+                b.query("SELECT count(*) FROM t")
+                    .await
+                    .expect("schema writer warms its schema");
+                held_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("holder takes RESERVED");
+                let started = origin.elapsed();
+                let mut result = Ok(());
+                for sql in schema_change {
+                    if let Err(error) = b.execute(sql).await {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                let returned = origin.elapsed();
+                if result.is_err() {
+                    let _ = b.execute("ROLLBACK").await;
+                }
+                let _ = returned_tx.send(());
+                report_tx
+                    .send(SameProcessHoldReport::SchemaChange {
+                        result,
+                        started,
+                        returned,
+                    })
+                    .expect("report schema change");
+                b.close().await.expect("close schema writer");
+            });
+        })
+    };
+
+    let mut holder_report = None;
+    let mut schema_report = None;
+    for _ in 0..2 {
+        match report_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("both connections finish: a same-process lock-order hang otherwise")
+        {
+            report @ SameProcessHoldReport::Holder { .. } => holder_report = Some(report),
+            report @ SameProcessHoldReport::SchemaChange { .. } => schema_report = Some(report),
+        }
+    }
+    holder.join().expect("holder thread");
+    writer.join().expect("schema writer thread");
+    let Some(SameProcessHoldReport::Holder {
+        commit: holder_commit,
+        started: holder_commit_started,
+        returned: holder_commit_returned,
+    }) = holder_report
+    else {
+        panic!("missing holder report");
+    };
+    let Some(SameProcessHoldReport::SchemaChange {
+        result: schema_change,
+        started: schema_change_started,
+        returned: schema_change_returned,
+    }) = schema_report
+    else {
+        panic!("missing schema change report");
+    };
+
+    let verdict = std::sync::Mutex::new(None);
+    asupersync::test_utils::run_test(|| async {
+        let verify = Connection::open(&path).await.expect("open verifier");
+        let holder_rows = verify
+            .query("SELECT v FROM t WHERE id = 2")
+            .await
+            .expect("read holder row");
+        let tables = verify
+            .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'b_new'")
+            .await
+            .expect("read schema");
+        let integrity = verify
+            .query("PRAGMA integrity_check")
+            .await
+            .expect("integrity_check");
+        let integrity = format!("{:?}", integrity[0].values()[0]);
+        verify.close().await.expect("close verifier");
+        *verdict.lock().expect("verdict") =
+            Some((holder_rows.len() == 1, tables.len() == 1, integrity));
+    });
+    let (holder_row_present, new_table_present, integrity) = verdict
+        .into_inner()
+        .expect("verdict")
+        .expect("the verifier ran");
+    SameProcessHoldOutcome {
+        schema_change,
+        schema_change_started,
+        schema_change_returned,
+        holder_commit,
+        holder_commit_started,
+        holder_commit_returned,
+        holder_row_present,
+        new_table_present,
+        integrity,
+    }
+}
+
+fn print_same_process_hold(label: &str, outcome: &SameProcessHoldOutcome) {
+    eprintln!(
+        "{label}: schema change {:?} in [{:?}, {:?}], holder commit {:?} in [{:?}, {:?}], \
+         holder row {}, b_new {}, integrity {}",
+        outcome.schema_change.as_ref().map_err(ToString::to_string),
+        outcome.schema_change_started,
+        outcome.schema_change_returned,
+        outcome.holder_commit.as_ref().map_err(ToString::to_string),
+        outcome.holder_commit_started,
+        outcome.holder_commit_returned,
+        outcome.holder_row_present,
+        outcome.new_table_present,
+        outcome.integrity,
+    );
+}
+
+/// bd-mc5pp negative keeper: a legitimate same-process wait. A holds RESERVED
+/// for 300 ms; B's schema change at busy_timeout 5000 waits it out. As an
+/// autocommit statement it then commits, as stock does. A fix that refuses B
+/// at once fails here, and so does the inversion this guards against: B
+/// waiting inside its commit while holding the registry guard A's COMMIT
+/// needs, so A's COMMIT stalls and B times out at 5 s with Busy.
+///
+/// The explicit form waits the same way, but its COMMIT may then be refused
+/// with BusySnapshot: a schema change whose snapshot a peer's commit overtook
+/// must not commit (bd-4iaoi), and an explicit COMMIT surfaces that
+/// first-committer-wins conflict to the application (GH #327) instead of
+/// retrying it. Plain Busy, a stall of the holder, or a return before the
+/// holder's COMMIT fails it.
+#[test]
+fn s6_schema_change_waits_out_a_same_process_immediate_writer() {
+    const HOLD: Duration = Duration::from_millis(300);
+    for (label, schema_change, explicit) in [
+        (
+            "S6 autocommit",
+            &["CREATE TABLE b_new (x INTEGER)"][..],
+            false,
+        ),
+        (
+            "S6 explicit",
+            &["BEGIN", "CREATE TABLE b_new (x INTEGER)", "COMMIT"][..],
+            true,
+        ),
+    ] {
+        let outcome = schema_change_against_same_process_holder(
+            5_000,
+            schema_change,
+            HolderRelease::After(HOLD),
+        );
+        print_same_process_hold(label, &outcome);
+        assert!(
+            outcome.holder_commit.is_ok(),
+            "{label}: holder COMMIT failed: {:?}",
+            outcome.holder_commit
+        );
+        let waited_out = if explicit {
+            matches!(
+                outcome.schema_change,
+                Ok(()) | Err(FrankenError::BusySnapshot { .. })
+            )
+        } else {
+            outcome.schema_change.is_ok()
+        };
+        assert!(
+            waited_out,
+            "{label}: a 300 ms same-process hold must be waited out at busy_timeout 5000, got {:?} after {:?}",
+            outcome.schema_change,
+            outcome
+                .schema_change_returned
+                .saturating_sub(outcome.schema_change_started)
+        );
+        assert_eq!(
+            outcome.new_table_present,
+            outcome.schema_change.is_ok(),
+            "{label}: b_new is present exactly when the schema change committed"
+        );
+        assert!(
+            outcome.schema_change_returned >= outcome.holder_commit_started,
+            "{label}: the schema change committed while the holder still held RESERVED"
+        );
+        assert!(
+            outcome.schema_change_returned < outcome.schema_change_started + Duration::from_secs(3),
+            "{label}: the schema change waited past the holder's release: {:?}",
+            outcome
+                .schema_change_returned
+                .saturating_sub(outcome.schema_change_started)
+        );
+        assert!(
+            outcome.holder_commit_returned < outcome.holder_commit_started + Duration::from_secs(2),
+            "{label}: the holder's COMMIT stalled behind the waiting schema change: {:?}",
+            outcome
+                .holder_commit_returned
+                .saturating_sub(outcome.holder_commit_started)
+        );
+        assert!(outcome.holder_row_present, "{label}: holder row lost");
+        assert_eq!(outcome.integrity, "Text(\"ok\")", "{label}: integrity");
+    }
+}
+
+/// bd-mc5pp: the same at busy_timeout 0. B is refused with Busy at once, as
+/// stock refuses it, while A keeps RESERVED until B has returned; A then
+/// commits normally.
+#[test]
+fn s7_schema_change_without_busy_timeout_refuses_at_once() {
+    for (label, schema_change) in [
+        ("S7 autocommit", &["CREATE TABLE b_new (x INTEGER)"][..]),
+        (
+            "S7 explicit",
+            &["BEGIN", "CREATE TABLE b_new (x INTEGER)", "COMMIT"][..],
+        ),
+    ] {
+        let outcome = schema_change_against_same_process_holder(
+            0,
+            schema_change,
+            HolderRelease::WhenSchemaChangeReturns,
+        );
+        print_same_process_hold(label, &outcome);
+        assert!(
+            matches!(outcome.schema_change, Err(FrankenError::Busy)),
+            "{label}: busy_timeout 0 must refuse with Busy, got {:?}",
+            outcome.schema_change
+        );
+        assert!(
+            outcome.schema_change_returned < outcome.schema_change_started + Duration::from_secs(1),
+            "{label}: busy_timeout 0 waited {:?}",
+            outcome
+                .schema_change_returned
+                .saturating_sub(outcome.schema_change_started)
+        );
+        assert!(
+            outcome.holder_commit.is_ok(),
+            "{label}: holder COMMIT failed: {:?}",
+            outcome.holder_commit
+        );
+        assert!(
+            outcome.holder_commit_returned < outcome.holder_commit_started + Duration::from_secs(2),
+            "{label}: the holder's COMMIT stalled: {:?}",
+            outcome
+                .holder_commit_returned
+                .saturating_sub(outcome.holder_commit_started)
+        );
+        assert!(outcome.holder_row_present, "{label}: holder row lost");
+        assert!(
+            !outcome.new_table_present,
+            "{label}: refused b_new committed"
+        );
+        assert_eq!(outcome.integrity, "Text(\"ok\")", "{label}: integrity");
+    }
 }

@@ -455,6 +455,11 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         )
     }
 
+    fn external_wal_append_blocked_by_local_transaction(&self) -> bool {
+        self.inner
+            .external_wal_append_blocked_by_local_transaction()
+    }
+
     fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
         GLOBAL_VFS_METRICS
             .unlock_ops

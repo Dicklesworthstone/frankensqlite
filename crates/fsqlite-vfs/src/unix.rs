@@ -837,6 +837,13 @@ struct InodeInfo {
     /// Number of handles holding a RESERVED lock (at most 1 from the OS
     /// perspective, but tracked for reference-counting).
     n_reserved: u32,
+    /// bd-mc5pp: whether the RESERVED claim counted by `n_reserved` was
+    /// acquired inside an external append or maintenance attempt (held only
+    /// for that bounded window) rather than as a transaction-level lock
+    /// (`BEGIN IMMEDIATE`/`EXCLUSIVE`, an escalated or serialized writer),
+    /// which its owner keeps across statements. Cleared when `n_reserved`
+    /// returns to zero.
+    reserved_by_attempt: bool,
     /// Number of handles holding a PENDING lock.
     n_pending: u32,
     /// Number of interrupted SHARED acquisitions that still retain their
@@ -887,6 +894,7 @@ impl InodeInfo {
             n_shared: 0,
             n_wal_lifetime: 0,
             n_reserved: 0,
+            reserved_by_attempt: false,
             n_pending: 0,
             n_transient_shared_pending: 0,
             n_exclusive: 0,
@@ -2193,6 +2201,8 @@ impl Vfs for UnixVfs {
             external_shared_snapshot_attempt: None,
             external_maintenance_attempt: None,
             external_append_attempt: None,
+            main_lock_refused_by_local_transaction: false,
+            external_append_blocked_by_local_transaction: false,
             delete_on_close,
             closed: false,
             inode_key,
@@ -2678,6 +2688,13 @@ pub struct UnixFile {
     external_shared_snapshot_attempt: Option<UnixExternalSharedSnapshotAttempt>,
     external_maintenance_attempt: Option<UnixExternalMaintenanceAttempt>,
     external_append_attempt: Option<UnixExternalAppendAttempt>,
+    /// Whether the last [`VfsFile::lock`] call returned `Busy` because another
+    /// handle of this process holds RESERVED as a transaction-level lock (see
+    /// `InodeInfo::reserved_by_attempt`).
+    main_lock_refused_by_local_transaction: bool,
+    /// bd-mc5pp: whether the last `lock_external_wal_append` was refused at
+    /// RESERVED by a transaction-level lock of another handle of this process.
+    external_append_blocked_by_local_transaction: bool,
     delete_on_close: bool,
     closed: bool,
     inode_key: InodeKey,
@@ -2944,6 +2961,7 @@ impl UnixFile {
             }
             if info.n_reserved == 1 {
                 posix_unlock(&*info.file, RESERVED_BYTE, 1)?;
+                info.reserved_by_attempt = false;
             }
             info.n_reserved -= 1;
             *lock_level = LockLevel::Shared;
@@ -4214,6 +4232,8 @@ impl UnixFile {
             external_shared_snapshot_attempt: None,
             external_maintenance_attempt: None,
             external_append_attempt: None,
+            main_lock_refused_by_local_transaction: false,
+            external_append_blocked_by_local_transaction: false,
             delete_on_close: false,
             closed: false,
             inode_key: self.inode_key,
@@ -4263,6 +4283,9 @@ impl UnixFile {
             external_shared_snapshot_attempt: self.external_shared_snapshot_attempt.take(),
             external_maintenance_attempt: self.external_maintenance_attempt.take(),
             external_append_attempt: self.external_append_attempt.take(),
+            main_lock_refused_by_local_transaction: self.main_lock_refused_by_local_transaction,
+            external_append_blocked_by_local_transaction: self
+                .external_append_blocked_by_local_transaction,
             delete_on_close: self.delete_on_close,
             closed: false,
             inode_key: self.inode_key,
@@ -4308,6 +4331,8 @@ impl UnixFile {
             external_shared_snapshot_attempt: None,
             external_maintenance_attempt: None,
             external_append_attempt: None,
+            main_lock_refused_by_local_transaction: false,
+            external_append_blocked_by_local_transaction: false,
             delete_on_close: false,
             closed: false,
             inode_key: self.inode_key,
@@ -4810,6 +4835,7 @@ impl VfsFile for UnixFile {
 
     fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
         checkpoint_or_abort_if_cancel_published(cx)?;
+        self.main_lock_refused_by_local_transaction = false;
         if self.takes_no_locks() {
             return Self::refuse_write_lock_without_locking(level);
         }
@@ -4819,6 +4845,7 @@ impl VfsFile for UnixFile {
         let mut backoff = Duration::from_millis(1);
         loop {
             let mut native_contention = None;
+            let mut refused_by_local_transaction = false;
             // The first attempt follows the entry check with no wait between
             // them. Every retry follows a backoff sleep and takes the full
             // checkpoint.
@@ -4968,6 +4995,7 @@ impl VfsFile for UnixFile {
                 if self.lock_level < LockLevel::Reserved && level >= LockLevel::Reserved {
                     if info.n_reserved > 0 {
                         // Another handle in this process already holds RESERVED.
+                        refused_by_local_transaction = !info.reserved_by_attempt;
                         return Self::return_after_main_lock_failure(
                             &mut info,
                             &mut self.lock_level,
@@ -5008,6 +5036,8 @@ impl VfsFile for UnixFile {
                         }
                     }
                     info.n_reserved = next_reserved;
+                    info.reserved_by_attempt = self.external_append_attempt.is_some()
+                        || self.external_maintenance_attempt.is_some();
                     self.lock_level = LockLevel::Reserved;
                 }
 
@@ -5119,6 +5149,8 @@ impl VfsFile for UnixFile {
                 // Local owners must run on their executor to make progress. A
                 // synchronous VFS wait here would prevent that handoff. All
                 // partial acquisition/error cleanup above retains its exact owner.
+                self.main_lock_refused_by_local_transaction =
+                    refused_by_local_transaction && matches!(error, FrankenError::Busy);
                 return Err(error);
             };
             debug_assert!(matches!(error, FrankenError::Busy));
@@ -5251,7 +5283,12 @@ impl VfsFile for UnixFile {
         // Concurrent commits use the same main-before-WAL order as
         // IMMEDIATE transactions and every maintenance/checkpoint path.
         // Waiting here must leave WRITE available to the RESERVED owner.
-        self.lock(cx, LockLevel::Reserved)?;
+        self.external_append_blocked_by_local_transaction = false;
+        if let Err(error) = self.lock(cx, LockLevel::Reserved) {
+            self.external_append_blocked_by_local_transaction =
+                self.main_lock_refused_by_local_transaction;
+            return Err(error);
+        }
         if self.acquire_external_wal_slot(cx, WAL_WRITE_LOCK)?
             && let Some(attempt) = self.external_append_attempt.as_mut()
         {
@@ -5262,6 +5299,10 @@ impl VfsFile for UnixFile {
             .expect("successful append acquisition retains its exact attempt")
             .acquisition_complete = true;
         Ok(())
+    }
+
+    fn external_wal_append_blocked_by_local_transaction(&self) -> bool {
+        self.external_append_blocked_by_local_transaction
     }
 
     fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
@@ -8374,6 +8415,15 @@ mod tests {
                         } else {
                             result.expect("try-once may succeed when the main fence is free");
                         }
+                        if operation == "append" {
+                            // bd-mc5pp: RESERVED is held by the parent process,
+                            // so a refusal here is native, never a local
+                            // transaction.
+                            assert!(
+                                !file.external_wal_append_blocked_by_local_transaction(),
+                                "a refusal by another process is not a local transaction's"
+                            );
+                        }
                         assert_eq!(file.busy_timeout_ms, 10_000, "preserve configured policy");
                         RESERVED_LOCK_WAIT_OBSERVER.with(|slot| {
                             assert!(slot.borrow_mut().take().is_some());
@@ -8525,6 +8575,73 @@ mod tests {
         file.close(&cx).unwrap();
     }
 
+    /// bd-mc5pp: an append refused at RESERVED is classified by the holder's
+    /// kind, both ways. A sibling holding RESERVED for its own append attempt
+    /// is not a local transaction, so the flush keeps waiting for it; a sibling
+    /// holding RESERVED as a transaction-level lock is, so the flush fails its
+    /// epoch. The inode records the kind with the claim and clears it with the
+    /// claim, and an attempt that finds RESERVED already held does not relabel
+    /// it.
+    #[test]
+    fn bd_mc5pp_append_refusal_is_classified_by_reserved_holder_kind() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("wal-append-holder-kind.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let reserved_kind = |handle: &UnixFile| {
+            let info = handle.inode_info_ref().lock().unwrap();
+            (info.n_reserved, info.reserved_by_attempt)
+        };
+        file.lock_external_shared_snapshot(&cx).unwrap();
+
+        // The sibling holds RESERVED only for its own append window.
+        peer.lock_external_wal_append(&cx).expect("sibling append");
+        assert_eq!(reserved_kind(&peer), (1, true));
+        assert!(matches!(
+            file.lock_external_wal_append(&cx),
+            Err(FrankenError::Busy)
+        ));
+        assert!(
+            !file.external_wal_append_blocked_by_local_transaction(),
+            "a sibling's append window is not a transaction-level lock"
+        );
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        peer.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(
+            reserved_kind(&peer),
+            (0, false),
+            "the kind leaves with the claim"
+        );
+
+        // The sibling holds RESERVED as a transaction-level lock.
+        peer.lock(&cx, LockLevel::Reserved).unwrap();
+        assert_eq!(reserved_kind(&peer), (1, false));
+        assert!(matches!(
+            file.lock_external_wal_append(&cx),
+            Err(FrankenError::Busy)
+        ));
+        assert!(
+            file.external_wal_append_blocked_by_local_transaction(),
+            "a sibling's transaction-level RESERVED blocks the append"
+        );
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        // The holder's own append finds RESERVED already held and keeps its kind.
+        peer.lock_external_wal_append(&cx)
+            .expect("holder's own append");
+        assert_eq!(reserved_kind(&peer), (1, false));
+        peer.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(peer.lock_level, LockLevel::Reserved);
+
+        peer.unlock(&cx, LockLevel::None).unwrap();
+        assert_eq!(reserved_kind(&peer), (0, false));
+        file.lock_external_wal_append(&cx)
+            .expect("append once the sibling released RESERVED");
+        assert!(!file.external_wal_append_blocked_by_local_transaction());
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        peer.close(&cx).unwrap();
+    }
+
     #[test]
     fn wal_append_partial_acquisition_and_deferred_close_preserve_owners() {
         let cx = Cx::new();
@@ -8555,6 +8672,10 @@ mod tests {
             file.lock_external_wal_append(&cx),
             Err(FrankenError::Busy)
         ));
+        assert!(
+            !file.external_wal_append_blocked_by_local_transaction(),
+            "bd-mc5pp: a sibling's WAL WRITE slot is not a transaction-level lock"
+        );
         let refused = file
             .external_append_attempt
             .expect("retain refused attempt");
@@ -8587,6 +8708,10 @@ mod tests {
             file.lock_external_wal_append(&cx),
             Err(FrankenError::Busy)
         ));
+        assert!(
+            file.external_wal_append_blocked_by_local_transaction(),
+            "bd-mc5pp: a sibling's transaction-level RESERVED blocks the append"
+        );
         assert!(!file.external_append_attempt.unwrap().write_acquired);
         assert!(
             !file.owns_external_wal_append_write(&cx).unwrap(),
@@ -8613,6 +8738,10 @@ mod tests {
         peer.close(&cx).unwrap();
         file.lock_external_wal_append(&cx)
             .expect("retry after blocker leaves");
+        assert!(
+            !file.external_wal_append_blocked_by_local_transaction(),
+            "a successful append clears the classification"
+        );
 
         let inode = Arc::clone(file.inode_info_ref());
         let mut deferred = file.take_for_deferred_cleanup();

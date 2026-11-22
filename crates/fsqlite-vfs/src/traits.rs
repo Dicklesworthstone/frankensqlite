@@ -1469,6 +1469,23 @@ pub trait VfsFile: Send + Sync {
     /// through [`Self::restore_external_wal_append_attempt`].
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()>;
 
+    /// Whether the last [`Self::lock_external_wal_append`] on this handle was
+    /// refused because another handle of this process holds RESERVED as a
+    /// transaction-level lock (`BEGIN IMMEDIATE`/`EXCLUSIVE`, an escalated or
+    /// serialized writer), which its owner keeps across statements. A sibling
+    /// holding RESERVED or the WAL WRITE slot only for its own append or
+    /// maintenance window is not one, and neither is another process.
+    ///
+    /// bd-mc5pp: the group-commit flush may run under a caller's commit
+    /// registry guard, and a transaction-level holder can be waiting for that
+    /// guard at its own COMMIT. Such a refusal must not be waited out inside
+    /// the flush; the caller's retry, which releases the guard, does the
+    /// waiting instead. Backends without in-process lock ownership report
+    /// false.
+    fn external_wal_append_blocked_by_local_transaction(&self) -> bool {
+        false
+    }
+
     /// Whether this handle owns a complete, fresh physical append WRITE claim.
     ///
     /// This query never acquires a lock, maps SHM, or creates a file. True

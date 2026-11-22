@@ -795,6 +795,11 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         self.inner.lock_external_wal_append(cx)
     }
 
+    fn external_wal_append_blocked_by_local_transaction(&self) -> bool {
+        self.inner
+            .external_wal_append_blocked_by_local_transaction()
+    }
+
     fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
         self.inner.restore_external_wal_append_attempt(cx)
     }

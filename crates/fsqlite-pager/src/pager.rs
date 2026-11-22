@@ -371,6 +371,13 @@ const PHYSICAL_WRITER_CHECKPOINT_SCENARIO_ID: &str = "parallel_wal_checkpoint_co
 const FLUSH_BUSY_HANDOFF_BASE_SPINS: u32 = 64;
 const FLUSH_BUSY_HANDOFF_MAX_SPINS: u32 = 2_048;
 const FLUSH_BUSY_HANDOFF_YIELD_EVERY: u32 = 4;
+/// bd-mc5pp: physical retries a group-commit flush spends on an append lock
+/// refused by a transaction-level RESERVED of another handle of this process
+/// before it fails the epoch with Busy: ten attempts in all, the bound every
+/// refusal had before 48b26924c. The caller's COMMIT or statement retry then
+/// waits out the rest of its busy budget without holding the commit registry
+/// guard.
+const FLUSH_LOCAL_TRANSACTION_REFUSAL_RETRIES: u32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FlushBusyRetryWait {
@@ -27610,6 +27617,10 @@ where
                         inner_lock_wait_us = elapsed_profile_us(t_inner_lock_start);
                         (inner.commit_seq, inner.checkpoint_active)
                     };
+                    // bd-mc5pp: set when this attempt's append lock was refused
+                    // by a transaction-level lock of another handle of this
+                    // process.
+                    let mut append_blocked_by_local_transaction = false;
                     flush_result = async {
                         let t_excl_start = phase_timing.then(Instant::now);
                         // Arm cleanup before acquiring either native WRITE or
@@ -27633,9 +27644,15 @@ where
                             // and error merge as append errors below. Otherwise
                             // a Busy plus failed Drop restore could retry while
                             // its own queued cleanup still owns this window.
-                            shared_db_file_write(&db_file, cx)
-                                .await?
-                                .lock_external_wal_append(cx)?;
+                            let mut append_handle = shared_db_file_write(&db_file, cx).await?;
+                            if let Err(error) = append_handle.lock_external_wal_append(cx) {
+                                append_blocked_by_local_transaction =
+                                    matches!(error, FrankenError::Busy)
+                                        && append_handle
+                                            .external_wal_append_blocked_by_local_transaction();
+                                return Err(error);
+                            }
+                            drop(append_handle);
                             exclusive_lock_us = elapsed_profile_us(t_excl_start);
                             let backend = wal_backend_handle(wal_backend)?;
                             #[cfg(test)]
@@ -28360,6 +28377,24 @@ where
                                 break;
                             }
                             retry_attempt = retry_attempt.saturating_add(1);
+                            if append_blocked_by_local_transaction {
+                                // bd-mc5pp: the holder is a transaction of
+                                // another connection of this process, which
+                                // may be waiting at its COMMIT for the commit
+                                // registry guard our caller holds. Waiting it
+                                // out here holds that guard for the whole
+                                // budget. Hand off briefly, as before
+                                // 48b26924c, then fail the epoch: the caller's
+                                // COMMIT or statement retry backs off without
+                                // the guard and retries within busy_timeout.
+                                if retry_attempt > FLUSH_LOCAL_TRANSACTION_REFUSAL_RETRIES {
+                                    break;
+                                }
+                                perform_flush_busy_retry_handoff(flush_busy_retry_wait(retry_attempt));
+                                asupersync::runtime::yield_now().await;
+                                GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
+                                continue;
+                            }
                             if retry_attempt <= FLUSH_BUSY_HANDOFF_YIELD_EVERY {
                                 perform_flush_busy_retry_handoff(flush_busy_retry_wait(retry_attempt));
                                 // A sibling on this executor may own the lock
@@ -38272,6 +38307,9 @@ mod tests {
         external_snapshot_acquire_failures: Arc<AtomicUsize>,
         external_maintenance_acquire_failures: Arc<AtomicUsize>,
         external_append_acquire_failures: Arc<AtomicUsize>,
+        /// bd-mc5pp: report injected append refusals as refused by a
+        /// transaction-level lock of another handle of this process.
+        external_append_failures_by_local_transaction: Arc<AtomicBool>,
         external_append_restore_failures: Arc<AtomicUsize>,
         external_restore_failures: Arc<AtomicUsize>,
         external_restore_publication_probe: Arc<Mutex<Option<Weak<PublishedPagerState>>>>,
@@ -38294,6 +38332,7 @@ mod tests {
                 external_snapshot_acquire_failures: Arc::new(AtomicUsize::new(0)),
                 external_maintenance_acquire_failures: Arc::new(AtomicUsize::new(0)),
                 external_append_acquire_failures: Arc::new(AtomicUsize::new(0)),
+                external_append_failures_by_local_transaction: Arc::new(AtomicBool::new(false)),
                 external_append_restore_failures: Arc::new(AtomicUsize::new(0)),
                 external_restore_failures: Arc::new(AtomicUsize::new(0)),
                 external_restore_publication_probe: Arc::new(Mutex::new(None)),
@@ -38367,9 +38406,14 @@ mod tests {
         external_snapshot_prior_level: Option<LockLevel>,
         external_maintenance_prior_level: Option<LockLevel>,
         external_append_prior_level: Option<LockLevel>,
+        /// Whether the last observed append attempt was refused by injection.
+        last_append_refused: bool,
         external_snapshot_acquire_failures: Arc<AtomicUsize>,
         external_maintenance_acquire_failures: Arc<AtomicUsize>,
         external_append_acquire_failures: Arc<AtomicUsize>,
+        /// bd-mc5pp: report injected append refusals as refused by a
+        /// transaction-level lock of another handle of this process.
+        external_append_failures_by_local_transaction: Arc<AtomicBool>,
         external_append_restore_failures: Arc<AtomicUsize>,
         external_restore_failures: Arc<AtomicUsize>,
         external_restore_publication_probe: Arc<Mutex<Option<Weak<PublishedPagerState>>>>,
@@ -38443,6 +38487,10 @@ mod tests {
                     external_append_acquire_failures: Arc::clone(
                         &self.external_append_acquire_failures,
                     ),
+                    external_append_failures_by_local_transaction: Arc::clone(
+                        &self.external_append_failures_by_local_transaction,
+                    ),
+                    last_append_refused: false,
                     external_append_restore_failures: Arc::clone(
                         &self.external_append_restore_failures,
                     ),
@@ -38577,12 +38625,21 @@ mod tests {
             }
             let prior_level = *self.observed_lock_level.lock().unwrap();
             self.external_append_prior_level = Some(prior_level);
+            self.last_append_refused = false;
             self.inner.lock_external_wal_append(cx)?;
             *self.observed_lock_level.lock().unwrap() = prior_level.max(LockLevel::Reserved);
             if consume_observed_lock_failure(&self.external_append_acquire_failures) {
+                self.last_append_refused = true;
                 return Err(FrankenError::Busy);
             }
             Ok(())
+        }
+
+        fn external_wal_append_blocked_by_local_transaction(&self) -> bool {
+            self.last_append_refused
+                && self
+                    .external_append_failures_by_local_transaction
+                    .load(AtomicOrdering::Acquire)
         }
 
         fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
@@ -50060,6 +50117,84 @@ mod tests {
                     pager.group_commit_queue.rooted_finalization_attempts.load(AtomicOrdering::Acquire),
                     0
                 );
+            }
+        });
+    }
+
+    /// bd-mc5pp: an append lock refused by a transaction-level lock of another
+    /// handle of this process is not waited out inside the flush, where the
+    /// caller may hold the commit registry guard its holder is waiting for.
+    /// After ten attempts the epoch fails with Busy with almost all of a 30 s
+    /// budget left, so the caller's retry waits instead; fewer refusals still
+    /// commit. Every other refusal keeps the shared-budget wait
+    /// (`test_group_commit_busy_retries_share_admission_budget`).
+    #[test]
+    fn test_group_commit_local_transaction_refusals_fail_the_epoch_after_bounded_handoff() {
+        asupersync::test_utils::run_test(|| async {
+            let attempts = usize::try_from(FLUSH_LOCAL_TRANSACTION_REFUSAL_RETRIES).unwrap() + 1;
+            for (failures, expect_commit) in [(15_usize, false), (3_usize, true)] {
+                let vfs = ObservedLockVfs::new();
+                let path = PathBuf::from(format!("/group-commit-in-process-{failures}.db"));
+                let pager = vfs.open_file_backed_pager(&path).await.unwrap();
+                let cx = Cx::new();
+                let (backend, frames, _begin_calls, batch_calls, sync_calls) =
+                    MockWalBackend::new_with_sync_tracking();
+                pager.set_wal_backend(Box::new(backend)).unwrap();
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                pager.set_vfs_busy_timeout_ms(&cx, 30_000).await;
+                let baseline = *vfs.observed_lock_level.lock().unwrap();
+                vfs.observed_unlock_trace_ids.lock().unwrap().clear();
+                vfs.external_append_failures_by_local_transaction
+                    .store(true, AtomicOrdering::Release);
+                vfs.external_append_acquire_failures
+                    .store(failures, AtomicOrdering::Release);
+                let page = PageNumber::new(2).unwrap();
+                let mut write_set = HashMap::new();
+                write_set.insert(
+                    page,
+                    StagedPage::from_bytes(&pager.pool, &vec![0x55; PageSize::DEFAULT.as_usize()])
+                        .unwrap(),
+                );
+                let started = Instant::now();
+                let result = SimpleTransaction::<ObservedLockVfs>::commit_wal_group_commit(
+                    &cx,
+                    &pager.wal_backend,
+                    &pager.inner,
+                    &write_set,
+                    &[page],
+                    &[],
+                    &pager.group_commit_queue,
+                )
+                .await;
+                let elapsed = started.elapsed();
+                if expect_commit {
+                    result.expect("a few in-process refusals still let the flush commit");
+                    assert_eq!(
+                        vfs.external_append_acquire_failures.load(AtomicOrdering::Acquire),
+                        0
+                    );
+                    assert_eq!(vfs.observed_unlock_trace_ids.lock().unwrap().len(), failures + 1);
+                    assert_eq!(frames.lock().unwrap().len(), 1);
+                    assert_eq!(*batch_calls.lock().unwrap(), 1);
+                    assert_eq!(*sync_calls.lock().unwrap(), 1);
+                } else {
+                    assert!(matches!(result, Err(FrankenError::Busy)), "{result:?}");
+                    assert_eq!(
+                        vfs.external_append_acquire_failures.load(AtomicOrdering::Acquire),
+                        failures - attempts,
+                        "ten attempts, then the epoch fails"
+                    );
+                    assert_eq!(vfs.observed_unlock_trace_ids.lock().unwrap().len(), attempts);
+                    assert!(frames.lock().unwrap().is_empty());
+                    assert_eq!(*batch_calls.lock().unwrap(), 0);
+                    assert_eq!(*sync_calls.lock().unwrap(), 0);
+                    assert!(
+                        elapsed < Duration::from_secs(5),
+                        "an in-process refusal is not waited out in the flush: {elapsed:?}"
+                    );
+                }
+                assert_eq!(*vfs.observed_lock_level.lock().unwrap(), baseline);
+                assert!(pager.group_commit_queue.pending_external_unlocks.lock().unwrap().is_empty());
             }
         });
     }
