@@ -40157,26 +40157,38 @@ fn is_exact_equality_seek_value(value: &Expr, table: &TableSchema, column: &str)
 }
 
 /// Whether `expr` is a constant expression a b-tree probe can take as its
-/// key: `col = -5`, `rowid = ?1 + 1`, `name = lower('X')` (bd-aavtp).
+/// key: `col = -5`, `rowid = ?1 + 1`, `name = lower('X')` (bd-aavtp), or a
+/// substituted correlated outer value (`BoundOuterValue`) nested inside a
+/// `BinaryOp`, deterministic `FunctionCall`, or non-`Plus` `UnaryOp` such as
+/// `t.b = u.b + 1` or `t.a = abs(u.a)` (bd-rnw24).
 ///
-/// It is built from literals, numbered or named parameters and deterministic
-/// scalar calls, so it has one value for the whole statement. It has no
-/// affinity of its own (no CAST at the root) and no collation (no COLLATE
-/// anywhere), so `col = expr` applies the column's affinity and collation to
-/// it exactly as to a bind parameter. The seek paths treat it as one: a value
-/// whose storage class is known only at run time, coerced or checked there.
-/// Anonymous parameters stay out: their slots follow emission order, and a
-/// seek emits its key before the rest of the WHERE.
+/// It is built from literals, numbered or named parameters, nested
+/// `BoundOuterValue`s, and deterministic scalar calls, so it has one value for
+/// the whole probe invocation. It has no affinity of its own (no `CAST` or
+/// bare `BoundOuterValue` at the root) and no collation (no `COLLATE`
+/// anywhere, and no root `UnaryOp::Plus` / `CAST` chain over a
+/// `BoundOuterValue`, which inherits the outer column's declared collation per
+/// [`declared_collation_source_expr`]), so `col = expr` applies the column's
+/// affinity and collation to it exactly as to a bind parameter. The seek paths
+/// treat it as one: a value whose storage class is known only at run time,
+/// coerced or checked there. Anonymous parameters stay out: their slots follow
+/// emission order, and a seek emits its key before the rest of the WHERE.
 fn is_constant_seek_key_expr(expr: &Expr) -> bool {
     !matches!(
         expr,
-        Expr::Literal(..) | Expr::Placeholder(..) | Expr::Cast { .. }
+        Expr::Literal(..)
+            | Expr::Placeholder(..)
+            | Expr::BoundOuterValue { .. }
+            | Expr::Cast { .. }
+    ) && !matches!(
+        declared_collation_source_expr(expr),
+        Expr::BoundOuterValue { .. }
     ) && constant_seek_key_operand(expr)
 }
 
 fn constant_seek_key_operand(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(..) => true,
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } => true,
         Expr::Placeholder(placeholder, _) => {
             !matches!(placeholder, fsqlite_ast::PlaceholderType::Anonymous)
         }
@@ -40194,7 +40206,8 @@ fn constant_seek_key_operand(expr: &Expr) -> bool {
             ..
         } => {
             // `likely(x)` and its kin are skipped when SQLite computes an
-            // operand's affinity, so `likely(CAST(...))` would carry one.
+            // operand's affinity and collation, so `likely(CAST(...))` or
+            // `likely(u.a)` would carry one.
             order_by.is_empty()
                 && !["likely", "unlikely", "likelihood"]
                     .iter()
@@ -58433,6 +58446,220 @@ mod tests {
         };
         assert!(
             extract_exists_rowid_probe(&nested_bound_rowid_eq, inner_table, Some("s")).is_none(),
+        );
+    }
+
+    /// bd-rnw24: a `BoundOuterValue` nested under a `BinaryOp`, deterministic
+    /// `FunctionCall` (other than `likely`/`unlikely`/`likelihood`), or
+    /// non-`Plus` `UnaryOp` has no affinity or collation of its own and IS
+    /// admitted as a constant seek key; a bare `BoundOuterValue`, unary `+`
+    /// over it, root `CAST`, `COLLATE`, and `likely` stay rejected.
+    #[test]
+    fn nested_bound_outer_value_expressions_are_seek_keys_but_bare_and_uplus_stay_out() {
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        with_connection_function_registry_context(
+            Some(Arc::new(registry)),
+            Vec::new(),
+            true,
+            true,
+            || {
+                let bound_nc = Expr::BoundOuterValue {
+                    value: SqliteValue::Text("abc".into()),
+                    collation: BoundCollation::Named("NOCASE".to_owned()),
+                    affinity: Some(TypeAffinity::Text),
+                    span: Span::ZERO,
+                };
+                let bound_int = Expr::BoundOuterValue {
+                    value: SqliteValue::Integer(7),
+                    collation: BoundCollation::Binary,
+                    affinity: Some(TypeAffinity::Integer),
+                    span: Span::ZERO,
+                };
+
+                // Rejected at root (carry outer affinity and/or collation, or non-deterministic):
+                let uplus = Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::Plus,
+                    expr: Box::new(bound_nc.clone()),
+                    span: Span::ZERO,
+                };
+                let double_uplus = Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::Plus,
+                    expr: Box::new(uplus.clone()),
+                    span: Span::ZERO,
+                };
+                let root_cast = Expr::Cast {
+                    expr: Box::new(bound_nc.clone()),
+                    type_name: fsqlite_ast::TypeName {
+                        name: "TEXT".to_owned(),
+                        arg1: None,
+                        arg2: None,
+                    },
+                    span: Span::ZERO,
+                };
+                let uplus_cast = Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::Plus,
+                    expr: Box::new(root_cast.clone()),
+                    span: Span::ZERO,
+                };
+                let likely_call = Expr::FunctionCall {
+                    name: "likely".to_owned(),
+                    args: FunctionArgs::List(vec![bound_int.clone()]),
+                    distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                    over: None,
+                    span: Span::ZERO,
+                };
+                let random_call = Expr::FunctionCall {
+                    name: "random".to_owned(),
+                    args: FunctionArgs::List(Vec::new()),
+                    distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                    over: None,
+                    span: Span::ZERO,
+                };
+                let collated_concat = Expr::BinaryOp {
+                    left: Box::new(Expr::Collate {
+                        expr: Box::new(bound_nc.clone()),
+                        collation: "NOCASE".to_owned(),
+                        span: Span::ZERO,
+                    }),
+                    op: AstBinaryOp::Concat,
+                    right: Box::new(Expr::Literal(Literal::String(String::new()), Span::ZERO)),
+                    span: Span::ZERO,
+                };
+                for rejected in [
+                    &bound_nc,
+                    &bound_int,
+                    &uplus,
+                    &double_uplus,
+                    &root_cast,
+                    &uplus_cast,
+                    &likely_call,
+                    &random_call,
+                    &collated_concat,
+                ] {
+                    assert!(
+                        !is_constant_seek_key_expr(rejected),
+                        "must reject seek key {rejected:?}"
+                    );
+                    assert!(
+                        !is_simple_constant(rejected),
+                        "must reject simple constant {rejected:?}"
+                    );
+                }
+
+                // Admitted (constant for one probe, no own affinity or collation):
+                let add_one = Expr::BinaryOp {
+                    left: Box::new(bound_int.clone()),
+                    op: AstBinaryOp::Add,
+                    right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                    span: Span::ZERO,
+                };
+                let concat_empty = Expr::BinaryOp {
+                    left: Box::new(bound_nc.clone()),
+                    op: AstBinaryOp::Concat,
+                    right: Box::new(Expr::Literal(Literal::String(String::new()), Span::ZERO)),
+                    span: Span::ZERO,
+                };
+                let negate = Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::Negate,
+                    expr: Box::new(bound_int.clone()),
+                    span: Span::ZERO,
+                };
+                let bitnot = Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::BitNot,
+                    expr: Box::new(bound_int.clone()),
+                    span: Span::ZERO,
+                };
+                let abs_call = Expr::FunctionCall {
+                    name: "abs".to_owned(),
+                    args: FunctionArgs::List(vec![bound_int.clone()]),
+                    distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                    over: None,
+                    span: Span::ZERO,
+                };
+                let lower_call = Expr::FunctionCall {
+                    name: "lower".to_owned(),
+                    args: FunctionArgs::List(vec![bound_nc]),
+                    distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                    over: None,
+                    span: Span::ZERO,
+                };
+                let cast_plus_zero = Expr::BinaryOp {
+                    left: Box::new(root_cast),
+                    op: AstBinaryOp::Add,
+                    right: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+                    span: Span::ZERO,
+                };
+                for admitted in [
+                    &add_one,
+                    &concat_empty,
+                    &negate,
+                    &bitnot,
+                    &abs_call,
+                    &lower_call,
+                    &cast_plus_zero,
+                ] {
+                    assert!(
+                        is_constant_seek_key_expr(admitted),
+                        "must admit seek key {admitted:?}"
+                    );
+                    assert!(
+                        is_simple_constant(admitted),
+                        "must admit simple constant {admitted:?}"
+                    );
+                    assert!(
+                        is_rowid_range_constant(admitted),
+                        "must admit rowid range constant {admitted:?}"
+                    );
+                    assert!(
+                        is_index_range_constant(admitted),
+                        "must admit index range constant {admitted:?}"
+                    );
+                }
+
+                // Verify composite index prefix extracts BOTH keys for
+                // `conversation_id = 1 AND idx = <outer> + 1`.
+                let schema = test_schema_with_composite_prefix_index();
+                let table = &schema[0];
+                let composite_where = Expr::BinaryOp {
+                    left: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column(
+                            ColumnRef::bare("conversation_id"),
+                            Span::ZERO,
+                        )),
+                        op: AstBinaryOp::Eq,
+                        right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                        span: Span::ZERO,
+                    }),
+                    op: AstBinaryOp::And,
+                    right: Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column(ColumnRef::bare("idx"), Span::ZERO)),
+                        op: AstBinaryOp::Eq,
+                        right: Box::new(add_one),
+                        span: Span::ZERO,
+                    }),
+                    span: Span::ZERO,
+                };
+                let prefix = extract_index_equality_prefix_exprs(
+                    &table.indexes[0],
+                    table,
+                    None,
+                    Some(&composite_where),
+                );
+                assert_eq!(
+                    prefix.len(),
+                    2,
+                    "composite index must seek both conversation_id and idx"
+                );
+            },
         );
     }
 
