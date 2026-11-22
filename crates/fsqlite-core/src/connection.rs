@@ -89967,11 +89967,16 @@ impl Connection {
             // A table-level PRIMARY KEY may override the declared column collation.
             let mut suffix = Vec::new();
             let pk_columns = &storage_order[..primary.key_term_count()];
+            // SQLite's convertToWithoutRowidTable leaves appended PK fields
+            // ASC on implicit UNIQUE autoindexes (bAscKeyBug, ticket
+            // bba7b69f9849b5bf); explicit CREATE INDEX inherits PK direction.
+            let inherits_pk_direction =
+                parse_autoindex_ordinal(&index.name, &table.name).is_none();
             for slot in index.without_rowid_locator_slots(table, pk_columns, &primary.key_collations) {
                 let column = pk_columns[slot];
                 let pk_collation = primary.key_term_collation(slot);
                 suffix.push(column);
-                descending.push(primary.key_term_descending(slot));
+                descending.push(inherits_pk_direction && primary.key_term_descending(slot));
                 collations.push(pk_collation.map(str::to_owned));
             }
             let root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
@@ -93489,11 +93494,17 @@ impl Connection {
                                         detail: format!("unknown primary-key column {name} of {}", table.name),
                                     })
                                 }).collect::<Result<Vec<_>>>()?;
+                                // SQLite's convertToWithoutRowidTable leaves appended PK
+                                // fields ASC on implicit UNIQUE autoindexes (bAscKeyBug,
+                                // ticket bba7b69f9849b5bf), whereas explicit CREATE INDEX
+                                // inherits the declared PK direction (bd-l7z39).
+                                let inherits_pk_direction =
+                                    parse_autoindex_ordinal(&idx.name, &table.name).is_none();
                                 for slot in idx.without_rowid_locator_slots(table, &pk, &primary.key_collations) {
                                     let column = pk[slot];
                                     let definition = &table.columns[column];
                                     let sequence = rows.len();
-                                    let desc = primary.key_term_descending(slot);
+                                    let desc = inherits_pk_direction && primary.key_term_descending(slot);
                                     let collation = primary.key_term_collation(slot).unwrap_or("BINARY");
                                     rows.push(Row {
                                         values: vec![

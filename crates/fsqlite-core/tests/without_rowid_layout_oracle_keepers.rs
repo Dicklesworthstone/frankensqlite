@@ -461,3 +461,243 @@ fn without_rowid_migration_churn_keeps_every_auxiliary_root_accounted_for() {
         );
     });
 }
+
+fn stock_pragma_rows(stock: &rusqlite::Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
+    let mut stmt = stock.prepare(sql).expect("stock prepare");
+    let ncols = stmt.column_count();
+    stmt.query_map([], |row| {
+        (0..ncols)
+            .map(|col| match row.get_ref(col)? {
+                rusqlite::types::ValueRef::Integer(i) => Ok(SqliteValue::Integer(i)),
+                rusqlite::types::ValueRef::Text(s) => {
+                    Ok(SqliteValue::Text(std::str::from_utf8(s).unwrap().into()))
+                }
+                rusqlite::types::ValueRef::Null => Ok(SqliteValue::Null),
+                other => panic!("unexpected pragma value {other:?}"),
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()
+    })
+    .expect("stock query_map")
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .expect("stock collect")
+}
+
+/// bd-l7z39: live stock 3.54.1 differential keeper for `PRAGMA index_xinfo`
+/// and `PRAGMA index_info` across WITHOUT ROWID primary keys with table-level
+/// COLLATE/DESC overrides, inline UNIQUE autoindexes, expression indexes,
+/// column-level vs table-level COLLATE overrides, file-backed reopens, ATTACHed
+/// schemas, and an ordinary rowid-table negative (which MUST keep cid=-1).
+#[test]
+fn bd_l7z39_index_xinfo_and_index_info_without_rowid_pk_collation_desc_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stock_path = dir.path().join("stock_l7z39.db");
+        let native_path = dir.path().join("native_l7z39.db");
+        let stock_aux_path = dir.path().join("stock_l7z39_aux.db");
+        let native_aux_path = dir.path().join("native_l7z39_aux.db");
+
+        let ddls = [
+            // Exact bd-l7z39 schema: WITHOUT ROWID PK with table-level COLLATE NOCASE DESC.
+            "CREATE TABLE t(v TEXT, k TEXT, id INTEGER, PRIMARY KEY(k COLLATE NOCASE DESC, id)) WITHOUT ROWID;",
+            "CREATE INDEX ix ON t(k COLLATE BINARY, v);",
+            "CREATE INDEX iy ON t(id, k COLLATE NOCASE DESC);",
+            "CREATE INDEX iz ON t(k COLLATE NOCASE ASC, id);",
+            "CREATE INDEX iexpr ON t(lower(k), v);",
+            // Column-level COLLATE RTRIM overridden by table-level PK COLLATE NOCASE DESC,
+            // plus an inline UNIQUE constraint to verify autoindex locator layout.
+            "CREATE TABLE t2(v TEXT UNIQUE, k TEXT COLLATE RTRIM, id INTEGER, PRIMARY KEY(k COLLATE NOCASE DESC, id)) WITHOUT ROWID;",
+            "CREATE INDEX ix2 ON t2(k, v);",
+            "CREATE INDEX iy2 ON t2(id, k COLLATE NOCASE DESC);",
+            // Ordinary rowid-table negative: MUST still append trailing cid=-1 rowid in index_xinfo.
+            "CREATE TABLE r(v TEXT, k TEXT, id INTEGER, PRIMARY KEY(k COLLATE NOCASE DESC, id));",
+            "CREATE INDEX r_ix ON r(k COLLATE BINARY, v);",
+            "CREATE INDEX r_iy ON r(id, k COLLATE NOCASE DESC);",
+            // Seed rows (including two NULLs in t2.v so sqlite_autoindex_t2_1
+            // must order by the appended PK column under SQLite's bAscKeyBug).
+            "INSERT INTO t VALUES('a', 'b', 1), ('b', 'A', 2), ('c', 'c', 3);",
+            "INSERT INTO t2 VALUES(NULL, 'b', 1), (NULL, 'A', 2), ('uniq', 'c', 3);",
+        ];
+
+        let probes = [
+            // WITHOUT ROWID secondary indexes (index_xinfo + index_info)
+            "PRAGMA index_xinfo(ix);",
+            "PRAGMA index_info(ix);",
+            "PRAGMA index_xinfo(iy);",
+            "PRAGMA index_info(iy);",
+            "PRAGMA index_xinfo(iz);",
+            "PRAGMA index_info(iz);",
+            "PRAGMA index_xinfo(iexpr);",
+            "PRAGMA index_info(iexpr);",
+            // WITHOUT ROWID PK by table name and autoindex name
+            "PRAGMA index_xinfo(t);",
+            "PRAGMA index_info(t);",
+            "PRAGMA index_xinfo(sqlite_autoindex_t_1);",
+            "PRAGMA index_info(sqlite_autoindex_t_1);",
+            // Column-level vs table-level COLLATE override + inline UNIQUE autoindex
+            "PRAGMA index_xinfo(ix2);",
+            "PRAGMA index_info(ix2);",
+            "PRAGMA index_xinfo(iy2);",
+            "PRAGMA index_info(iy2);",
+            "PRAGMA index_xinfo(t2);",
+            "PRAGMA index_info(t2);",
+            "PRAGMA index_xinfo(sqlite_autoindex_t2_1);",
+            "PRAGMA index_info(sqlite_autoindex_t2_1);",
+            "PRAGMA index_xinfo(sqlite_autoindex_t2_2);",
+            "PRAGMA index_info(sqlite_autoindex_t2_2);",
+            // Ordinary rowid-table negative
+            "PRAGMA index_xinfo(r_ix);",
+            "PRAGMA index_info(r_ix);",
+            "PRAGMA index_xinfo(r_iy);",
+            "PRAGMA index_info(r_iy);",
+            "PRAGMA index_xinfo(sqlite_autoindex_r_1);",
+            "PRAGMA index_info(sqlite_autoindex_r_1);",
+        ];
+
+        // Phase 1: create in file-backed databases, check live before close.
+        let stock = rusqlite::Connection::open(&stock_path).expect("stock open");
+        let native = Connection::open(native_path.to_str().expect("utf8"))
+            .await
+            .expect("native open");
+        for ddl in ddls {
+            stock.execute_batch(ddl).expect("stock ddl");
+            native.execute(ddl).await.expect("native ddl");
+        }
+        // Verify rowid-table negative actually has cid=-1 while WITHOUT ROWID does NOT.
+        let r_ix_xinfo = stock_pragma_rows(&stock, "PRAGMA index_xinfo(r_ix);");
+        assert!(
+            r_ix_xinfo
+                .last()
+                .is_some_and(|row| row.get(1) == Some(&SqliteValue::Integer(-1))),
+            "rowid-table negative must end with cid=-1: {r_ix_xinfo:?}"
+        );
+        for wr_idx in ["PRAGMA index_xinfo(ix);", "PRAGMA index_xinfo(iy);"] {
+            let wr_rows = stock_pragma_rows(&stock, wr_idx);
+            assert!(
+                wr_rows
+                    .iter()
+                    .all(|row| row.get(1) != Some(&SqliteValue::Integer(-1))),
+                "WITHOUT ROWID {wr_idx} must never contain cid=-1: {wr_rows:?}"
+            );
+        }
+
+        for sql in probes {
+            let expected = stock_pragma_rows(&stock, sql);
+            assert!(!expected.is_empty(), "stock returned no rows for {sql}");
+            let actual: Vec<Vec<SqliteValue>> = native
+                .query(sql)
+                .await
+                .expect("native query")
+                .iter()
+                .map(row_values)
+                .collect();
+            assert_eq!(actual, expected, "live create mismatch for {sql}");
+        }
+        drop(stock);
+        native.close().await.expect("native close");
+
+        // Phase 2: reopen BOTH fsqlite-created file AND stock-created file in fsqlite,
+        // plus ATTACHed aux schema.
+        for (label, path) in [
+            ("reopen-native-file", &native_path),
+            ("open-stock-file", &stock_path),
+        ] {
+            let stock_check = rusqlite::Connection::open(path).expect("stock reopen");
+            let native_check = Connection::open(path.to_str().expect("utf8"))
+                .await
+                .expect("native reopen");
+            for sql in probes {
+                let expected = stock_pragma_rows(&stock_check, sql);
+                let actual: Vec<Vec<SqliteValue>> = native_check
+                    .query(sql)
+                    .await
+                    .expect("native reopen query")
+                    .iter()
+                    .map(row_values)
+                    .collect();
+                assert_eq!(actual, expected, "{label} mismatch for {sql}");
+            }
+            // Also verify PRAGMA integrity_check agrees ("ok") on stock-created
+            // file opened in fsqlite AND after VACUUM INTO opened in stock!
+            if label == "open-stock-file" {
+                let ic: Vec<Vec<SqliteValue>> = native_check
+                    .query("PRAGMA integrity_check;")
+                    .await
+                    .expect("native ic")
+                    .iter()
+                    .map(row_values)
+                    .collect();
+                assert_eq!(
+                    ic,
+                    vec![vec![SqliteValue::Text("ok".into())]],
+                    "native integrity_check on stock-created file with bAscKeyBug UNIQUE autoindex"
+                );
+                let vacuum_copy = dir.path().join("vacuumed_from_stock.db");
+                native_check
+                    .execute(&format!("VACUUM INTO '{}';", vacuum_copy.display()))
+                    .await
+                    .expect("vacuum into");
+                let stock_vacuum =
+                    rusqlite::Connection::open(&vacuum_copy).expect("stock open vacuumed");
+                let stock_ic = stock_pragma_rows(&stock_vacuum, "PRAGMA integrity_check;");
+                assert_eq!(
+                    stock_ic,
+                    vec![vec![SqliteValue::Text("ok".into())]],
+                    "stock integrity_check on fsqlite VACUUM INTO copy with bAscKeyBug UNIQUE autoindex"
+                );
+            }
+            native_check.close().await.expect("close reopen");
+        }
+
+        // Phase 3: ATTACHed database + TEMP table coverage.
+        let stock_outer = rusqlite::Connection::open(&stock_aux_path).expect("stock outer");
+        let native_outer = Connection::open(native_aux_path.to_str().expect("utf8"))
+            .await
+            .expect("native outer");
+        stock_outer
+            .execute_batch(&format!(
+                "ATTACH DATABASE '{}' AS aux; \
+                 CREATE TEMP TABLE tw(v TEXT, k TEXT, id INTEGER, PRIMARY KEY(k COLLATE NOCASE DESC, id)) WITHOUT ROWID; \
+                 CREATE INDEX temp.tw_ix ON tw(k COLLATE BINARY, v); \
+                 CREATE INDEX temp.tw_iy ON tw(id, k COLLATE NOCASE DESC);",
+                stock_path.display()
+            ))
+            .expect("stock attach+temp");
+        native_outer
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS aux;",
+                native_path.display()
+            ))
+            .await
+            .expect("native attach");
+        for sql in [
+            "CREATE TEMP TABLE tw(v TEXT, k TEXT, id INTEGER, PRIMARY KEY(k COLLATE NOCASE DESC, id)) WITHOUT ROWID;",
+            "CREATE INDEX temp.tw_ix ON tw(k COLLATE BINARY, v);",
+            "CREATE INDEX temp.tw_iy ON tw(id, k COLLATE NOCASE DESC);",
+        ] {
+            native_outer.execute(sql).await.expect("native temp ddl");
+        }
+        for sql in [
+            "PRAGMA aux.index_xinfo(ix);",
+            "PRAGMA aux.index_info(ix);",
+            "PRAGMA aux.index_xinfo(iy);",
+            "PRAGMA aux.index_info(iy);",
+            "PRAGMA aux.index_xinfo(r_ix);",
+            "PRAGMA temp.index_xinfo(tw_ix);",
+            "PRAGMA temp.index_info(tw_ix);",
+            "PRAGMA temp.index_xinfo(tw_iy);",
+            "PRAGMA temp.index_info(tw_iy);",
+        ] {
+            let expected = stock_pragma_rows(&stock_outer, sql);
+            assert!(!expected.is_empty(), "stock empty for {sql}");
+            let actual: Vec<Vec<SqliteValue>> = native_outer
+                .query(sql)
+                .await
+                .expect("native attach/temp query")
+                .iter()
+                .map(row_values)
+                .collect();
+            assert_eq!(actual, expected, "attach/temp mismatch for {sql}");
+        }
+        native_outer.close().await.expect("close outer");
+    });
+}

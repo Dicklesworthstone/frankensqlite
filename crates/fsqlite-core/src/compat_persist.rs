@@ -1775,9 +1775,15 @@ where
                 // The payload and the comparator must use the same locator.
                 let mut suffix_columns = Vec::new();
                 if let Some(pk) = &without_rowid_pk {
+                    // SQLite's convertToWithoutRowidTable leaves appended PK
+                    // fields ASC on implicit UNIQUE autoindexes (bAscKeyBug,
+                    // ticket bba7b69f9849b5bf); explicit CREATE INDEX inherits
+                    // the declared PK direction (bd-l7z39).
+                    let inherits_pk_direction =
+                        parse_autoindex_ordinal(&index.name, &table.name).is_none();
                     for slot in index.without_rowid_locator_slots(table, &pk.indices, &pk.collations) {
                         suffix_columns.push(pk.indices[slot]);
-                        index_desc_flags.push(pk.desc_flags[slot]);
+                        index_desc_flags.push(inherits_pk_direction && pk.desc_flags[slot]);
                         index_collations.push(pk.collations[slot].clone());
                     }
                 } else {
