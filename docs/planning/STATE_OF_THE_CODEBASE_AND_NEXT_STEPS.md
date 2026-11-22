@@ -44,8 +44,27 @@ constructed databases, all 16 checks matched SQLite's tree, page, cell and
 signed rowid. This includes right children whose first key is too small,
 where SQLite reports the preceding divider. All five regression tests
 passed, including healthy collated and WITHOUT ROWID trees (`bd-3koph`).
-One saved file contains two independent errors. SQLite reports both at a
-limit of two. FrankenSQLite currently reports one (`bd-vojth`).
+One saved file contains two independent errors. On November 22 the Linux
+CLI from `f0479acb4` (RCH build `30097323753219668`) reported both in
+SQLite's order at a limit of two. All 108 comparisons across the three
+saved WAL families matched SQLite 3.54.1, including capped checks across
+two attached copies. A migration that repaired an orphan but left a rowid
+error kept its backup and withheld its completion marker (`bd-vojth`).
+
+On `6afdf69c3`, all 144 table-specific checks matched SQLite 3.54.1,
+including missing names, TEMP shadowing and tables shared by attachments.
+The preceding implementation disagreed in 104 cases. In 56 further checks,
+both engines reported stored CHECK violations in main, TEMP and attachment
+order and stopped at the requested limit. Eight releasing-lock cases
+also verified that the aggregate check honors the connection's busy
+timeout even after main has filled the error limit.
+
+The same CLI matched SQLite on ten attached-database `secure_delete`
+cases, including ON, OFF, FAST, a held writer and a later attachment.
+After checkpoint and close, the free space in each database file retained
+or erased the deleted marker as SQLite did. Both readers also recovered
+the surviving rows after rollback in all eight combinations of database
+creator, writer and journal mode (`bd-d4fr8`).
 
 ## Compatibility and concurrent writers, 2026-11-20 through 2026-11-21
 
