@@ -31,11 +31,6 @@ impl Connection {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             for schema in attached_schemas {
-                // N caps all findings, not just structural errors, across
-                // the entire traversal. Do not reset the budget per schema.
-                if remaining == 0 {
-                    break;
-                }
                 self.with_attached_connection_async(&schema, async |child| {
                     child.collect_integrity_findings(&schema, quick, None, &mut remaining, &mut failures)
                         .await
@@ -90,6 +85,11 @@ impl Connection {
         remaining: &mut usize,
         rows: &mut Vec<String>,
     ) -> Result<()> {
+        if *remaining == 0 {
+            // SQLite still opens a reader on every database named by the
+            // unqualified check. A capped report cannot hide a locked file.
+            return self.with_integrity_txn(async |_, _| Ok(())).await;
+        }
         let mut reports = IntegrityRowidReports { limit: *remaining, findings: Vec::new() };
         let structural = self.validate_database_integrity_reporting(quick, &mut reports).await;
         if let Err(error) = &structural && error.is_transient() {

@@ -160,17 +160,22 @@ fn stock_connection_reports(conn: &rusqlite::Connection, pragma: &str) -> Vec<St
         .expect("read stock reports")
 }
 
-async fn native_reports(conn: &Connection, pragma: &str, prepared: bool) -> Vec<String> {
-    let rows = if prepared {
-        conn.prepare(pragma)
-            .await
-            .expect("prepare native check")
-            .query()
-            .await
-            .expect("run prepared native check")
+async fn native_check(
+    conn: &Connection,
+    pragma: &str,
+    prepared: bool,
+) -> fsqlite_error::Result<Vec<fsqlite_core::connection::Row>> {
+    if prepared {
+        conn.prepare(pragma).await?.query().await
     } else {
-        conn.query(pragma).await.expect("run direct native check")
-    };
+        conn.query(pragma).await
+    }
+}
+
+async fn native_reports(conn: &Connection, pragma: &str, prepared: bool) -> Vec<String> {
+    let rows = native_check(conn, pragma, prepared)
+        .await
+        .expect("run native check");
     rows.iter()
         .map(|row| match &row.values()[0] {
             SqliteValue::Text(text) => text.to_string(),
@@ -373,6 +378,39 @@ fn bd_vojth_rowid_reports_match_stock_across_attached_databases() {
                     "{sql}, prepared={prepared}"
                 );
             }
+        }
+        // Linux OFD pager locks conflict with stock's POSIX byte-range
+        // locks even when each engine opens its handle in this process.
+        #[cfg(target_os = "linux")]
+        {
+            let reader = rusqlite::Connection::open(&main).unwrap();
+            reader.execute(attach, [second]).unwrap();
+            reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+            conn.execute("PRAGMA busy_timeout=0").await.unwrap();
+            let holder = rusqlite::Connection::open(second).unwrap();
+            holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            for kind in ["integrity_check", "quick_check"] {
+                let sql = format!("PRAGMA {kind}(1)");
+                let error = reader
+                    .query_row(&sql, [], |row| row.get::<_, String>(0))
+                    .unwrap_err();
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                );
+                let qualified = format!("PRAGMA main.{kind}(1)");
+                let oracle = stock_connection_reports(&reader, &qualified);
+                for prepared in [false, true] {
+                    let error = native_check(&conn, &sql, prepared).await.unwrap_err();
+                    assert!(error.is_transient(), "{sql}: {error}");
+                    assert_eq!(native_reports(&conn, &qualified, prepared).await, oracle);
+                }
+            }
+            holder.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(
+                native_reports(&conn, "PRAGMA quick_check(1)", false).await,
+                stock_connection_reports(&reader, "PRAGMA quick_check(1)")
+            );
         }
         conn.close().await.unwrap();
     });
