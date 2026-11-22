@@ -1042,7 +1042,7 @@ impl Connection {
                 // as -1 when the rowid will be auto-assigned (it is not yet
                 // known). Match that. (GH #205)
                 if Box::pin(self.fire_before_triggers(
-                    table_name,
+                    &insert.table,
                     &insert_event,
                     None,
                     Some(new_values),
@@ -1097,7 +1097,7 @@ impl Connection {
                 }
                 for (row, rowid) in live_insert_rows.iter().zip(inserted_rowids.iter()) {
                     if let Err(error) = Box::pin(self.fire_after_triggers(
-                        table_name,
+                        &insert.table,
                         &insert_event,
                         None,
                         Some(&row.values),
@@ -1188,7 +1188,7 @@ impl Connection {
                     Some(fsqlite_ast::ConflictAction::Abort),
                 );
                 Box::pin(self.fire_before_triggers(
-                    table_name,
+                    &insert.table,
                     &update_event,
                     Some(old_row),
                     Some(new_row),
@@ -1321,7 +1321,7 @@ impl Connection {
         // validation and AFTER INSERT processing. Only a program that
         // deleted rows left victims; without any the boxed pass is skipped.
         if !self.last_replace_victims.borrow().is_empty() {
-            Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
+            Box::pin(self.enforce_fk_on_replace_victims(&insert.table)).await?;
         }
 
         // bd-d8s37: an UPSERT checks the row the write program produced.
@@ -1413,7 +1413,7 @@ impl Connection {
             let after_insert_rowid = self.current_last_insert_rowid();
             for new_values in &trigger_new_rows {
                 if let Err(error) = Box::pin(self.fire_after_triggers(
-                    table_name,
+                    &insert.table,
                     &insert_event,
                     None,
                     Some(new_values),
@@ -1440,7 +1440,7 @@ impl Connection {
                 Some(fsqlite_ast::ConflictAction::Abort),
             );
             if let Err(error) = Box::pin(self.fire_after_triggers(
-                table_name,
+                &insert.table,
                 &update_event,
                 Some(old_row),
                 Some(new_row),

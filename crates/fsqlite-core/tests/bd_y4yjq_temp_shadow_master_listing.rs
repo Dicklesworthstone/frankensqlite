@@ -43,7 +43,6 @@ fn temp_renames_preserve_the_persistent_table_and_its_dependents_after_reopen() 
                 "INSERT INTO temp.t VALUES('temp-row')",
                 "CREATE TEMP VIEW pinned AS SELECT m FROM main.t",
                 "CREATE TEMP VIEW follows AS SELECT * FROM temp.t",
-                "CREATE TEMP TRIGGER pinned_tr AFTER INSERT ON main.t BEGIN SELECT NEW.m; END",
                 "SAVEPOINT s",
                 "ALTER TABLE temp.t RENAME COLUMN u TO j",
                 "ALTER TABLE temp.t RENAME TO scratch",
@@ -57,13 +56,17 @@ fn temp_renames_preserve_the_persistent_table_and_its_dependents_after_reopen() 
             assert_eq!(fq(&db, "SELECT m FROM pinned").await, main_row);
             let pinned_sql = fq(&db, "SELECT sql FROM sqlite_temp_master WHERE name='pinned'").await;
             assert_eq!(pinned_sql, [vec!["text:CREATE VIEW pinned AS SELECT m FROM main.t".to_owned()]]);
-            assert_eq!(fq(&db, "SELECT tbl_name FROM sqlite_temp_master WHERE name='pinned_tr'").await,
-                [vec!["text:t".to_owned()]]);
             assert_eq!(fq(&db, main_schema).await, original);
             db.execute("ROLLBACK TO s").await.unwrap();
             db.execute("RELEASE s").await.unwrap();
             assert_eq!(fq(&db, "SELECT u FROM temp.t INDEXED BY local_i").await, one_temp);
             assert_eq!(fq(&db, "SELECT u FROM follows").await, one_temp);
+            db.execute("SAVEPOINT pinned_trigger").await.unwrap();
+            db.execute("CREATE TEMP TRIGGER pinned_tr AFTER INSERT ON main.t BEGIN SELECT NEW.m; END").await.unwrap();
+            assert!(db.execute("ALTER TABLE temp.t RENAME TO scratch").await.is_err());
+            assert_eq!(fq(&db, "SELECT u FROM temp.t").await, one_temp);
+            db.execute("ROLLBACK TO pinned_trigger").await.unwrap();
+            db.execute("RELEASE pinned_trigger").await.unwrap();
             db.execute("ALTER TABLE temp.t RENAME COLUMN u TO j").await.unwrap();
             db.execute("ALTER TABLE temp.t RENAME TO scratch").await.unwrap();
             assert_eq!(fq(&db, "SELECT j FROM scratch").await, one_temp);
@@ -78,6 +81,34 @@ fn temp_renames_preserve_the_persistent_table_and_its_dependents_after_reopen() 
                 [vec!["int:123".to_owned()], vec!["int:456".to_owned()]]);
             assert_eq!(rq(&stock, "PRAGMA integrity_check"), [vec!["text:ok".to_owned()]]);
         }
+    });
+}
+
+#[test]
+fn before_and_after_triggers_follow_their_table_across_a_temp_shadow() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE t(x TEXT)", "CREATE TABLE audit(v TEXT)",
+            "CREATE TRIGGER m AFTER INSERT ON t BEGIN INSERT INTO audit VALUES('main:'||NEW.x); END",
+            "CREATE TEMP TRIGGER early BEFORE INSERT ON t BEGIN INSERT INTO audit VALUES('early:'||NEW.x); END",
+            "CREATE TEMP TABLE t(y TEXT)",
+            "CREATE TEMP TRIGGER late AFTER INSERT ON t BEGIN INSERT INTO audit VALUES('temp:'||NEW.y); END",
+            "CREATE TEMP TRIGGER pin BEFORE INSERT ON main.t BEGIN INSERT INTO audit VALUES('pin:'||NEW.x); END",
+            "INSERT INTO temp.t VALUES('a')", "INSERT INTO main.t VALUES('b')", "INSERT INTO t VALUES('c')",
+        ] {
+            ex(&f, &r, sql).await;
+        }
+        // SQLite may change the order of same-timing sibling triggers. Check
+        // exactly which bodies fired and which owner's NEW columns they read.
+        let sql = "SELECT v FROM audit ORDER BY v";
+        let expected = rq(&r, sql);
+        assert_eq!(expected.len(), 5);
+        assert_eq!(fq(&f, sql).await, expected);
+        assert_eq!(fq(&f, "SELECT x FROM main.t").await, [vec!["text:b".to_owned()]]);
+        assert_eq!(fq(&f, "SELECT y FROM temp.t ORDER BY y").await,
+            [vec!["text:a".to_owned()], vec!["text:c".to_owned()]]);
     });
 }
 

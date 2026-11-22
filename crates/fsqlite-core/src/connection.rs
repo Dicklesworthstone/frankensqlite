@@ -10560,7 +10560,7 @@ impl PreparedStatement<'_> {
                     let victim_table = fast_path.table_name.clone();
                     *self.conn.last_replace_victims.borrow_mut() = replace_victims;
                     self.conn
-                        .enforce_fk_on_replace_victims(&victim_table)
+                        .enforce_fk_on_replace_victims(&QualifiedName::bare(victim_table))
                         .await?;
                 }
                 if track_last_insert_rowid && let Some(last_insert_rowid) = last_insert_rowid {
@@ -11416,6 +11416,9 @@ struct TriggerDef {
     name: String,
     table_name: String,
     table_schema: Option<String>,
+    // An unqualified TEMP trigger keeps the table it resolved at CREATE time
+    // even if another schema later shadows that name.
+    bound_table_schema: String,
     timing: fsqlite_ast::TriggerTiming,
     event: fsqlite_ast::TriggerEvent,
     #[allow(dead_code)] // SQLite-only: always true; retained for display/roundtrip fidelity.
@@ -11435,6 +11438,7 @@ impl TriggerDef {
             name: stmt.name.name.clone(),
             table_name: stmt.table.clone(),
             table_schema: stmt.table_schema.clone(),
+            bound_table_schema: stmt.table_schema.clone().unwrap_or_else(|| "main".to_owned()),
             timing: stmt.timing,
             event: stmt.event.clone(),
             for_each_row: stmt.for_each_row,
@@ -45852,7 +45856,7 @@ impl Connection {
                     for (row_rowid, old_values, new_values) in &trigger_rows {
                         if boxed_future(|| {
                             self.fire_before_triggers(
-                                table_name,
+                                &effective_update.table.name,
                                 &update_event,
                                 Some(old_values),
                                 Some(new_values),
@@ -46040,7 +46044,7 @@ impl Connection {
                 // UPDATE OR REPLACE may implicitly delete a different row.
                 // Apply inbound FK effects for that exact victim before the
                 // existing parent UPDATE actions and AFTER UPDATE processing.
-                boxed_future(|| self.enforce_fk_on_replace_victims(table_name)).await?;
+                boxed_future(|| self.enforce_fk_on_replace_victims(&effective_update.table.name)).await?;
 
                 // bd-c1vth: when the program updated no row (UPDATE OR IGNORE
                 // skipped it on a conflict, or a BEFORE trigger removed it), no
@@ -46069,7 +46073,7 @@ impl Connection {
                     for (row_rowid, old_values, new_values) in &trigger_rows {
                         if let Err(error) = boxed_future(|| {
                             self.fire_after_triggers(
-                                table_name,
+                                &effective_update.table.name,
                                 &update_event,
                                 Some(old_values),
                                 Some(new_values),
@@ -46376,7 +46380,7 @@ impl Connection {
                     for (old_rowid, old_values) in &trigger_old_rows {
                         if boxed_future(|| {
                             self.fire_before_triggers(
-                                table_name,
+                                &effective_delete.table.name,
                                 &delete_event,
                                 Some(old_values),
                                 None,
@@ -46489,7 +46493,7 @@ impl Connection {
                         for (old_rowid, old_values) in &trigger_old_rows {
                             if let Err(error) = boxed_future(|| {
                                 self.fire_after_triggers(
-                                    table_name,
+                                    &effective_delete.table.name,
                                     &delete_event,
                                     Some(old_values),
                                     None,
@@ -46566,7 +46570,7 @@ impl Connection {
                     for (old_rowid, old_values) in &trigger_old_rows {
                         if let Err(error) = boxed_future(|| {
                             self.fire_after_triggers(
-                                table_name,
+                                &effective_delete.table.name,
                                 &delete_event,
                                 Some(old_values),
                                 None,
@@ -74514,20 +74518,14 @@ impl Connection {
                     // returned to the pager freelist as usual.
                     if dropped_temp {
                         self.temp_table_sql.borrow_mut().remove(&root_page);
-                    } else {
-                        if self.is_auto_vacuum_enabled_on_main().await? {
-                            self.free_btree_pages_and_compact_roots_for_auto_vacuum(&[(
-                                root_page, false,
-                            )])
+                    } else if self.is_auto_vacuum_enabled_on_main().await? {
+                        self.free_btree_pages_and_compact_roots_for_auto_vacuum(&[(root_page, false)])
                             .await
-                            .map_err(|e| {
-                                Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
-                            })?;
-                        } else {
-                            self.free_btree_pages(root_page, false).await.map_err(|e| {
-                                Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
-                            })?;
-                        }
+                            .map_err(|e| Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name))?;
+                    } else {
+                        self.free_btree_pages(root_page, false).await.map_err(|e| {
+                            Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
+                        })?;
                     }
                     self.db.borrow_mut().destroy_table(root_page);
                 }
@@ -75153,6 +75151,16 @@ impl Connection {
                     // "internal error:" under SQLITE_INTERNAL. bd-3nppp.
                     return Err(FrankenError::FunctionError(format!(
                         "there is already another table or index with this name: {new_name}"
+                    )));
+                }
+                // SQLite reparses TEMP triggers during a rename and rejects a
+                // same-named target explicitly pinned to a different database.
+                if alters_temp_table && let Some(trigger) = self.triggers.borrow().iter().find(|t|
+                    t.temporary && t.table_name.eq_ignore_ascii_case(&old_name)
+                        && t.table_schema.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("main"))
+                ) {
+                    return Err(FrankenError::FunctionError(format!(
+                        "error in trigger {} after rename: ", trigger.name
                     )));
                 }
                 let mut renamed_table = schema[table_idx].clone();
@@ -76437,6 +76445,7 @@ impl Connection {
                 && target.matches_schema(trigger.table_schema.as_deref()) {
                 trigger.table_name.clear();
                 trigger.table_name.push_str(new_name);
+                trigger.bound_table_schema = target.schema.to_owned();
                 true
             } else {
                 false
@@ -78536,6 +78545,13 @@ impl Connection {
                     .as_deref()
                     .is_none_or(|s| s.eq_ignore_ascii_case("temp")));
 
+        let mut bound_table_schema = stmt.table_schema.clone().unwrap_or_else(|| {
+            if is_temp_trigger {
+                self.visible_trigger_target_schema(table_name).to_owned()
+            } else {
+                "main".to_owned()
+            }
+        });
         let (table_exists, view_exists, missing_table_label) = if is_temp_trigger {
             match stmt.table_schema.as_deref() {
                 None => {
@@ -78560,6 +78576,7 @@ impl Connection {
                             if at || av {
                                 tbl = at;
                                 vw = av;
+                                bound_table_schema = schema;
                                 break;
                             }
                         }
@@ -78674,6 +78691,7 @@ impl Connection {
             });
         let mut trigger_def = TriggerDef::from_create_statement(stmt, create_sql.clone());
         trigger_def.temporary = is_temp_trigger;
+        trigger_def.bound_table_schema = bound_table_schema;
         self.triggers.borrow_mut().push(Arc::new(trigger_def));
         self.rebuild_schema_indices();
 
@@ -78695,20 +78713,18 @@ impl Connection {
     /// visible to generated columns (see [`Self::before_update_new_loaded_columns`]).
     fn make_trigger_frame(
         &self,
-        table_name: &str,
+        target: &QualifiedName,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
         old_rowid: Option<i64>,
         new_rowid: Option<i64>,
         new_loaded: Option<&[bool]>,
     ) -> Result<TriggerFrame> {
-        let schema = self.schema.borrow();
-        let table_schema = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+        let stored = self.trigger_target_table(&target.name, target.schema.as_deref())
             .ok_or_else(|| FrankenError::NoSuchTable {
-                name: table_name.to_owned(),
+                name: target.name.clone(),
             })?;
+        let table_schema = &*stored;
         let column_names = table_schema
             .columns
             .iter()
@@ -78829,17 +78845,14 @@ impl Connection {
     /// column is loaded or the table has no generated column.
     fn before_update_new_loaded_columns(
         &self,
-        table_name: &str,
+        target: &QualifiedName,
         assigned_columns: &[String],
         triggers: &[Arc<TriggerDef>],
     ) -> Option<Vec<bool>> {
         if assigned_columns.is_empty() {
             return None;
         }
-        let schema = self.schema.borrow();
-        let table = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(table_name))?;
+        let table = self.trigger_target_table(&target.name, target.schema.as_deref())?;
         if !table
             .columns
             .iter()
@@ -80120,7 +80133,7 @@ impl Connection {
             return Ok(());
         }
         *self.last_replace_victims.borrow_mut() = victims;
-        self.enforce_fk_on_replace_victims(table_name).await
+        self.enforce_fk_on_replace_victims(&QualifiedName::bare(table_name)).await
     }
 
     /// Apply inbound FK semantics for exact rows deleted by VDBE REPLACE
@@ -80133,7 +80146,8 @@ impl Connection {
     /// statement's own AFTER triggers. This method is invoked before those
     /// AFTER triggers, so firing the victim triggers here preserves that
     /// ordering.
-    async fn enforce_fk_on_replace_victims(&self, table_name: &str) -> Result<()> {
+    async fn enforce_fk_on_replace_victims(&self, target: &QualifiedName) -> Result<()> {
+        let table_name = target.name.as_str();
         let victims = std::mem::take(&mut *self.last_replace_victims.borrow_mut());
         if victims.is_empty() {
             return Ok(());
@@ -80189,7 +80203,7 @@ impl Connection {
                 // OLD.rowid resolves to the deleted victim's rowid so it works on
                 // tables without an INTEGER PRIMARY KEY column. (GH #205)
                 self.fire_before_triggers(
-                    table_name,
+                    target,
                     &delete_event,
                     Some(&victim.values),
                     None,
@@ -80198,7 +80212,7 @@ impl Connection {
                 )
                 .await?;
                 self.fire_after_triggers(
-                    table_name,
+                    target,
                     &delete_event,
                     Some(&victim.values),
                     None,
@@ -80747,6 +80761,36 @@ impl Connection {
                 || self.views.borrow().iter().any(|view| view.temporary))
     }
 
+    fn visible_trigger_target_schema(&self, name: &str) -> &'static str {
+        if self.temp_table_names.borrow().contains(&name.to_ascii_lowercase())
+            || self.view_index_for_scope(name, PragmaSchemaScope::Temp).is_some() {
+            "temp"
+        } else {
+            "main"
+        }
+    }
+
+    fn trigger_matches_target(&self, trigger: &TriggerDef, name: &str, schema: Option<&str>) -> bool {
+        trigger.table_name.eq_ignore_ascii_case(name)
+            && trigger.bound_table_schema.eq_ignore_ascii_case(
+                schema.unwrap_or_else(|| self.visible_trigger_target_schema(name))
+            )
+    }
+
+    fn trigger_target_table(&self, name: &str, schema: Option<&str>) -> Option<std::cell::Ref<'_, TableSchema>> {
+        if schema.is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
+            && let Ok(main) = std::cell::Ref::filter_map(self.shadowed_main_tables.borrow(), |tables| {
+                tables.get(&name.to_ascii_lowercase())
+            }) {
+            return Some(main);
+        }
+        if schema.is_some_and(|schema| !schema.eq_ignore_ascii_case(self.visible_trigger_target_schema(name))) {
+            return None;
+        }
+        let index = self.schema_index_of(name)?;
+        std::cell::Ref::filter_map(self.schema.borrow(), |tables| tables.get(index)).ok()
+    }
+
     /// bd-w78tx: stock compiles every trigger a DML statement can fire while
     /// it prepares the statement, whatever the trigger's WHEN clause, and
     /// refuses the statement when the WHEN or the body of one of them names a
@@ -80784,7 +80828,7 @@ impl Connection {
             .triggers
             .borrow()
             .iter()
-            .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&target.name));
+            .any(|trigger| self.trigger_matches_target(trigger, &target.name, target.schema.as_deref()));
         // A DELETE, UPDATE, or DO UPDATE upsert of a parent takes foreign-key actions.
         let takes_fk_actions = match statement {
             Statement::Update(_) | Statement::Delete(_) => true,
@@ -80837,8 +80881,8 @@ impl Connection {
             (TriggerTiming::InsteadOf, &firing.event),
             (TriggerTiming::After, &firing.event),
         ];
-        let before = self.triggers_in_groups(&firing.table, &before_groups);
-        let after = self.triggers_in_groups(&firing.table, &after_groups);
+        let before = self.triggers_in_groups(firing, &before_groups);
+        let after = self.triggers_in_groups(firing, &after_groups);
         let mut fk_actions = if self.fk_cascade_propagation_enabled() {
             self.foreign_key_action_firings(&firing.table, &firing.event, compiled)
         } else {
@@ -80865,14 +80909,14 @@ impl Connection {
     /// group newest first, each trigger once.
     fn triggers_in_groups(
         &self,
-        table: &str,
+        firing: &DmlTriggerFiring,
         groups: &[(fsqlite_ast::TriggerTiming, &fsqlite_ast::TriggerEvent)],
     ) -> Vec<Arc<TriggerDef>> {
         let triggers = self.triggers.borrow();
         let mut ordered: Vec<Arc<TriggerDef>> = Vec::new();
         for (timing, event) in groups {
             for trigger in triggers.iter().rev() {
-                if trigger.table_name.eq_ignore_ascii_case(table)
+                if self.trigger_matches_target(trigger, &firing.table, firing.schema.as_deref())
                     && trigger.timing == *timing
                     && trigger_event_matches(&trigger.event, event)
                     && !ordered.iter().any(|seen| Arc::ptr_eq(seen, trigger))
@@ -80937,6 +80981,7 @@ impl Connection {
                 };
                 firings.push(DmlTriggerFiring {
                     table: child.name.clone(),
+                    schema: None,
                     event,
                     upsert_updates: Vec::new(),
                     replace_deletes: false,
@@ -81017,7 +81062,10 @@ impl Connection {
                 let (bound, _) = bind_trigger_body_statement(statement, frame, !trigger.temporary);
                 self.trigger_names_result(trigger, self.validate_trigger_statement_names(&bound))?;
             }
-            if let Some(firing) = DmlTriggerFiring::of(statement, recursive_triggers) {
+            if let Some(mut firing) = DmlTriggerFiring::of(statement, recursive_triggers) {
+                if !trigger.temporary && firing.schema.is_none() {
+                    firing.schema = Some("main".to_owned());
+                }
                 self.validate_firing_trigger_programs(&firing, recursive_triggers, compiled)?;
             }
         }
@@ -81057,20 +81105,14 @@ impl Connection {
             if trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf {
                 (self.view_trigger_column_names(&trigger.table_name).ok()?, None, false)
             } else {
-                let key = trigger.table_name.to_ascii_lowercase();
-                let shadowed = self.shadowed_main_tables.borrow();
-                let schema = self.schema.borrow();
-                let table = shadowed
-                    .get(&key)
-                    .filter(|_| !trigger.temporary)
-                    .or_else(|| schema.get(self.schema_index_of(&trigger.table_name)?))?;
+                let table = self.trigger_target_table(&trigger.table_name, Some(&trigger.bound_table_schema))?;
                 (
                     table
                         .columns
                         .iter()
                         .map(|column| column.name.clone())
                         .collect::<Vec<_>>(),
-                    self.rowid_alias_columns.borrow().get(&key).copied(),
+                    table.columns.iter().position(|col| col.is_ipk),
                     !table.without_rowid,
                 )
             };
@@ -81684,7 +81726,7 @@ impl Connection {
     /// operation should be skipped entirely.
     async fn fire_before_triggers(
         &self,
-        table_name: &str,
+        target: &QualifiedName,
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
@@ -81707,7 +81749,7 @@ impl Connection {
             .iter()
             .rev()
             .filter(|t| {
-                t.table_name.eq_ignore_ascii_case(table_name)
+                self.trigger_matches_target(t, &target.name, target.schema.as_deref())
                     && t.timing == fsqlite_ast::TriggerTiming::Before
                     && trigger_event_matches(&t.event, event)
             })
@@ -81722,12 +81764,12 @@ impl Connection {
         let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
         let new_loaded = match event {
             fsqlite_ast::TriggerEvent::Update(assigned_columns) => {
-                self.before_update_new_loaded_columns(table_name, assigned_columns, &matching)
+                self.before_update_new_loaded_columns(target, assigned_columns, &matching)
             }
             fsqlite_ast::TriggerEvent::Insert | fsqlite_ast::TriggerEvent::Delete => None,
         };
         let base_frame = self.make_trigger_frame(
-            table_name,
+            target,
             old_values,
             new_values,
             old_rowid,
@@ -81795,7 +81837,7 @@ impl Connection {
     /// Fire AFTER triggers for a DML event on a table.
     async fn fire_after_triggers(
         &self,
-        table_name: &str,
+        target: &QualifiedName,
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
@@ -81816,7 +81858,7 @@ impl Connection {
             .iter()
             .rev()
             .filter(|t| {
-                t.table_name.eq_ignore_ascii_case(table_name)
+                self.trigger_matches_target(t, &target.name, target.schema.as_deref())
                     && t.timing == fsqlite_ast::TriggerTiming::After
                     && trigger_event_matches(&t.event, event)
             })
@@ -81830,7 +81872,7 @@ impl Connection {
 
         let _materialized_scope = MaterializedBindingsVisibilityGuard::for_trigger_scope(self);
         let base_frame =
-            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid, None)?;
+            self.make_trigger_frame(target, old_values, new_values, old_rowid, new_rowid, None)?;
         for trigger in matching {
             // PRAGMA recursive_triggers (default OFF): when disabled, the
             // same trigger cannot re-enter itself (checked by trigger NAME,
@@ -82047,7 +82089,7 @@ impl Connection {
         let mut returning_rows = Vec::new();
         for new_values in &new_rows {
             let skipped = self
-                .fire_instead_of_triggers(&view_name, &column_names, &event, None, Some(new_values))
+                .fire_instead_of_triggers(&insert.table, &column_names, &event, None, Some(new_values))
                 .await?;
             // bd-1mcjr M3: a RAISE(IGNORE) row is skipped — emit no RETURNING row.
             if !skipped && !insert.returning.is_empty() {
@@ -82134,7 +82176,7 @@ impl Connection {
             }
             let skipped = self
                 .fire_instead_of_triggers(
-                    &view_name,
+                    &update.table.name,
                     &column_names,
                     &event,
                     Some(&old_values),
@@ -82184,7 +82226,7 @@ impl Connection {
         let mut returning_rows = Vec::new();
         for (_old_rowid, old_values) in &old_rows {
             let skipped = self
-                .fire_instead_of_triggers(&view_name, &column_names, &event, Some(old_values), None)
+                .fire_instead_of_triggers(&delete.table.name, &column_names, &event, Some(old_values), None)
                 .await?;
             // RETURNING references the deleted (OLD) row; a RAISE(IGNORE) row is
             // skipped and emits no RETURNING row (bd-1mcjr M3).
@@ -82317,12 +82359,13 @@ impl Connection {
     /// which emits no RETURNING row for an ignored row (bd-1mcjr M3).
     async fn fire_instead_of_triggers(
         &self,
-        view_name: &str,
+        target: &QualifiedName,
         column_names: &[String],
         event: &fsqlite_ast::TriggerEvent,
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<bool> {
+        let view_name = target.name.as_str();
         // Reverse-creation (LIFO, newest first) order to match C SQLite — see
         // fire_before_triggers (bd-5vr3b). Stable across reopen because
         // `self.triggers` is always in creation order.
@@ -82331,7 +82374,7 @@ impl Connection {
             .iter()
             .rev()
             .filter(|trigger| {
-                trigger.table_name.eq_ignore_ascii_case(view_name)
+                self.trigger_matches_target(trigger, &target.name, target.schema.as_deref())
                     && trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf
                     && trigger_event_matches(&trigger.event, event)
             })
@@ -170210,6 +170253,7 @@ struct TriggerRelationChecks {
 /// as the triggers and foreign-key actions they can fire see them.
 struct DmlTriggerFiring {
     table: String,
+    schema: Option<String>,
     event: fsqlite_ast::TriggerEvent,
     /// The UPDATE triggers an upsert's DO UPDATE can fire.
     upsert_updates: Vec<fsqlite_ast::TriggerEvent>,
@@ -170261,6 +170305,7 @@ impl DmlTriggerFiring {
         };
         Some(Self {
             table: target.name.clone(),
+            schema: target.schema.clone(),
             event,
             upsert_updates,
             replace_deletes,
@@ -205633,12 +205678,12 @@ mod tests {
 
             let event = fsqlite_ast::TriggerEvent::Insert;
             let positive_new = [SqliteValue::Integer(7)];
-            conn.fire_before_triggers("t", &event, None, Some(&positive_new), None, None)
+            conn.fire_before_triggers(&QualifiedName::bare("t"), &event, None, Some(&positive_new), None, None)
                 .await
                 .unwrap();
 
             let non_positive_new = [SqliteValue::Integer(0)];
-            conn.fire_before_triggers("t", &event, None, Some(&non_positive_new), None, None)
+            conn.fire_before_triggers(&QualifiedName::bare("t"), &event, None, Some(&non_positive_new), None, None)
                 .await
                 .unwrap();
 
@@ -205664,7 +205709,7 @@ mod tests {
             let event = fsqlite_ast::TriggerEvent::Update(vec!["id".to_owned()]);
             let old_row = [SqliteValue::Integer(3)];
             let new_row = [SqliteValue::Integer(9)];
-            conn.fire_after_triggers("t", &event, Some(&old_row), Some(&new_row), None, None)
+            conn.fire_after_triggers(&QualifiedName::bare("t"), &event, Some(&old_row), Some(&new_row), None, None)
                 .await
                 .unwrap();
 
@@ -207448,13 +207493,13 @@ mod tests {
             // Calls with no matching trigger do not recurse and must remain no-ops.
             set_trigger_depth_limit_override(Some(0));
             let before = conn
-                .fire_before_triggers("missing", &event, None, None, None, None)
+                .fire_before_triggers(&QualifiedName::bare("missing"), &event, None, None, None, None)
                 .await;
             let after = conn
-                .fire_after_triggers("missing", &event, None, None, None, None)
+                .fire_after_triggers(&QualifiedName::bare("missing"), &event, None, None, None, None)
                 .await;
             let instead_of = conn
-                .fire_instead_of_triggers("missing_view", &[], &event, None, None)
+                .fire_instead_of_triggers(&QualifiedName::bare("missing_view"), &[], &event, None, None)
                 .await;
             set_trigger_depth_limit_override(None);
 
