@@ -74,8 +74,11 @@ attached copy, then reopened the files after each engine ran `REINDEX`.
 The cases cover rowid and WITHOUT ROWID tables, ordinary and expression
 indexes, and a healthy partial index. Twelve further checks matched the
 order and limits for a table with two short indexes and a CHECK violation
-(`bd-rhhl9`). On the same damaged files, full `integrity_check` diagnoses
-the rowid case but can still return `ok` for a WITHOUT ROWID table.
+(`bd-rhhl9`). Full `integrity_check` also detects a short secondary index
+on WITHOUT ROWID tables as of `5b42b1ebf`. All 240 cases covering database
+origin, table scope, limits and repair passed. An equal-size index that
+omits a qualifying row is a separate failure. On both database origins,
+SQLite named the missing rows and FrankenSQLite still returned `ok`.
 
 ## Compatibility and concurrent writers, 2026-11-20 through 2026-11-21
 
