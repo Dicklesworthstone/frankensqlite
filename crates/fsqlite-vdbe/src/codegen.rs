@@ -2629,6 +2629,7 @@ pub enum CollationSemantics {
 }
 
 /// Configuration for the code generator.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CodegenContext {
     /// The database text encoding. When not UTF-8, codegen disables the
@@ -2665,6 +2666,10 @@ pub struct CodegenContext {
     /// (`Last`/`Prev` instead of `Rewind`/`Next`). Only unordered scans are
     /// affected; a query with an ORDER BY keeps its required order (GH #236).
     pub reverse_unordered_selects: bool,
+    /// `PRAGMA ignore_check_constraints`: when true, DML codegen skips emitting
+    /// CHECK constraint evaluations, matching stock SQLite's `SQLITE_IgnoreChecks`
+    /// (bd-hja9y).
+    pub ignore_check_constraints: bool,
     /// bd-i3csr.2: the declared columns of the table-valued function an
     /// `INSERT ... SELECT` reads, when the connection has admitted that
     /// function and will open its instance on the program's source cursor
@@ -27791,6 +27796,7 @@ pub fn codegen_insert(
     schema: &[TableSchema],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    b.set_ignore_check_constraints(ctx.ignore_check_constraints);
     let table = find_table(schema, &stmt.table.name)?;
     if table.without_rowid {
         return codegen_insert_without_rowid(b, stmt, table, schema, ctx);
@@ -29982,6 +29988,7 @@ pub fn codegen_update(
     schema: &[TableSchema],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    b.set_ignore_check_constraints(ctx.ignore_check_constraints);
     let table_name = table_name_from_qualified(&stmt.table);
     let table = find_table(schema, table_name)?;
     if table.without_rowid {
@@ -36271,6 +36278,10 @@ fn emit_check_constraints(
     ignore_label: Option<Label>,
 ) {
     const SQLITE_CONSTRAINT: i32 = 19;
+
+    if b.ignore_check_constraints() {
+        return;
+    }
 
     for check in &table.check_constraints {
         let Some(expr) = parse_table_expr(&check.expr, table) else {

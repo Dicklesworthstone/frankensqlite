@@ -588,6 +588,9 @@ pub struct ProgramBuilder {
     /// bd-5bq6u: true when this statement is `OR FAIL`, whose semantics keep the
     /// rows already written when a later row violates a constraint.
     preserves_rows_on_constraint: bool,
+    /// bd-hja9y: true when `PRAGMA ignore_check_constraints = ON` is active for
+    /// this compilation, suppressing CHECK constraint bytecode emission.
+    ignore_check_constraints: bool,
     /// bd-01uq7: MemDatabase-backed (TEMP) table roots whose written rows carry
     /// computed VIRTUAL generated values instead of leaving those columns out.
     materialized_virtual_generated_roots: Vec<i32>,
@@ -622,6 +625,7 @@ impl ProgramBuilder {
             schema_evaluation_context: None,
             generated_column_emission: None,
             preserves_rows_on_constraint: false,
+            ignore_check_constraints: false,
             materialized_virtual_generated_roots: Vec::new(),
             hoisted_literals: Vec::new(),
             parallel_aggregate: None,
@@ -688,6 +692,18 @@ impl ProgramBuilder {
             .checked_add(count)
             .expect("auxiliary cursor identifier overflow");
         base
+    }
+
+    /// Configure whether CHECK constraint bytecode emission is suppressed
+    /// (`PRAGMA ignore_check_constraints = ON`, bd-hja9y).
+    pub fn set_ignore_check_constraints(&mut self, ignore: bool) {
+        self.ignore_check_constraints = ignore;
+    }
+
+    /// Whether CHECK constraint bytecode emission is suppressed for this program.
+    #[must_use]
+    pub const fn ignore_check_constraints(&self) -> bool {
+        self.ignore_check_constraints
     }
 
     /// Emit a complete schema-owned expression under `context`.
@@ -1823,6 +1839,12 @@ pub mod pragma {
         /// its full-table scan in reverse. Consumed by codegen via
         /// `CodegenContext::reverse_unordered_selects` (GH #236 / bd-3gk2x).
         pub reverse_unordered_selects: bool,
+        /// `PRAGMA ignore_check_constraints` toggle (default OFF). When ON,
+        /// CHECK constraints are not evaluated during DML (`INSERT`, `UPDATE`,
+        /// `UPSERT DO UPDATE`, `REPLACE`) or `PRAGMA integrity_check` /
+        /// `quick_check`, matching stock SQLite's `SQLITE_IgnoreChecks`
+        /// (bd-hja9y).
+        pub ignore_check_constraints: bool,
         /// `PRAGMA locking_mode` (`normal` or `exclusive`; default `normal`).
         /// Set/readback surface only.
         pub locking_mode: String,
@@ -1889,6 +1911,7 @@ pub mod pragma {
                 checkpoint_fullfsync: false,
                 automatic_index: true,
                 reverse_unordered_selects: false,
+                ignore_check_constraints: false,
                 locking_mode: "normal".to_owned(),
                 secure_delete: 0,
                 temp_secure_delete: None,
@@ -2022,6 +2045,12 @@ pub mod pragma {
         if name.eq_ignore_ascii_case("reverse_unordered_selects") {
             return apply_bool_toggle(&mut state.reverse_unordered_selects, stmt);
         }
+        if name.eq_ignore_ascii_case("ignore_check_constraints") {
+            return Ok(apply_sqlite_flag_bool(
+                &mut state.ignore_check_constraints,
+                stmt,
+            ));
+        }
         if name.eq_ignore_ascii_case("soft_heap_limit") {
             return Ok(apply_soft_heap_limit(stmt));
         }
@@ -2073,6 +2102,51 @@ pub mod pragma {
                 *flag = enabled;
                 Ok(PragmaOutput::Bool(enabled))
             }
+        }
+    }
+
+    /// Stock SQLite `PragTyp_FLAG` boolean toggle (`sqlite3GetBoolean(z, 0)`):
+    /// bare queries return the current 0/1 flag; assignments evaluate `expr`
+    /// with SQLite's permissive flag-pragma rules (leading ASCII digits ->
+    /// `atoi != 0`; `"on"`/`"yes"`/`"true"` -> `true`; anything else -> `false`)
+    /// without raising an error on non-boolean tokens.
+    fn apply_sqlite_flag_bool(flag: &mut bool, stmt: &PragmaStatement) -> PragmaOutput {
+        match &stmt.value {
+            None => PragmaOutput::Bool(*flag),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_sqlite_flag_bool(expr);
+                *flag = enabled;
+                PragmaOutput::Bool(enabled)
+            }
+        }
+    }
+
+    fn parse_sqlite_flag_bool(expr: &Expr) -> bool {
+        fn from_text(s: &str) -> bool {
+            let bytes = s.as_bytes();
+            if let Some(&first) = bytes.first()
+                && first.is_ascii_digit()
+            {
+                let digits_end = bytes
+                    .iter()
+                    .position(|b| !b.is_ascii_digit())
+                    .unwrap_or(bytes.len());
+                return s[..digits_end].parse::<i64>().map_or_else(
+                    |_| bytes[..digits_end].iter().any(|&b| b != b'0'),
+                    |n| n != 0,
+                );
+            }
+            s.eq_ignore_ascii_case("on")
+                || s.eq_ignore_ascii_case("yes")
+                || s.eq_ignore_ascii_case("true")
+        }
+
+        match expr {
+            Expr::Literal(Literal::Integer(n), _) => *n > 0,
+            Expr::Literal(Literal::True, _) => true,
+            Expr::Literal(Literal::String(s), _) => from_text(s),
+            Expr::Column(col, _) => from_text(&col.column),
+            _ => false,
         }
     }
 
@@ -5198,6 +5272,42 @@ mod tests {
             Bool(false)
         );
         assert!(!state.reverse_unordered_selects);
+    }
+
+    #[test]
+    fn test_connection_pragma_ignore_check_constraints_bd_hja9y() {
+        use pragma::PragmaOutput::Bool;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints"),
+            Bool(false)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = ON"),
+            Bool(true)
+        );
+        assert!(state.ignore_check_constraints);
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = 'bogus'"),
+            Bool(false)
+        );
+        assert!(!state.ignore_check_constraints);
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = YES"),
+            Bool(true)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = NO"),
+            Bool(false)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = 2"),
+            Bool(true)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints(0)"),
+            Bool(false)
+        );
     }
 
     #[test]

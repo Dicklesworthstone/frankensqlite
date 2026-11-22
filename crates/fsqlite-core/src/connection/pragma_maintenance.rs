@@ -254,9 +254,18 @@ impl Connection {
                 .map(|column| column.name.as_str())
                 .collect();
             let strict_types = self.integrity_check_strict_type_predicates(table, local).await?;
+            // bd-hja9y: stock SQLite's `PRAGMA integrity_check` / `quick_check`
+            // suppresses CHECK verification while `SQLITE_IgnoreChecks` is ON
+            // (`sqlite3.c`: `if( pTab->pCheck && (db->flags & SQLITE_IgnoreChecks)==0 )`),
+            // while still checking NOT NULL and STRICT types.
+            let check_constraints = if self.pragma_state.borrow().ignore_check_constraints {
+                &[][..]
+            } else {
+                table.check_constraints.as_slice()
+            };
             if not_null.is_empty()
                 && strict_types.is_empty()
-                && table.check_constraints.is_empty()
+                && check_constraints.is_empty()
             {
                 continue;
             }
@@ -267,8 +276,7 @@ impl Connection {
                 .map(|column| format!("typeof({}) = 'null'", quote_identifier(column)))
                 .chain(strict_types.iter().map(|(predicate, _)| predicate.clone()))
                 .chain(
-                    table
-                        .check_constraints
+                    check_constraints
                         .iter()
                         .map(|check| format!("NOT ({})", check.expr)),
                 )

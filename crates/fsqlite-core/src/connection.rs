@@ -7109,6 +7109,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
                 | "automatic_index"
                 | "cache_spill"
                 | "reverse_unordered_selects"
+                | "ignore_check_constraints"
         )
     {
         return &[];
@@ -7184,6 +7185,11 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     // (suppressed by the has_value gate above); GH #236.
     if name_is("reverse_unordered_selects") {
         return &["reverse_unordered_selects"];
+    }
+    // `ignore_check_constraints`: one row on a bare query, none on assignment
+    // (suppressed by the has_value gate above); bd-hja9y.
+    if name_is("ignore_check_constraints") {
+        return &["ignore_check_constraints"];
     }
 
     // Header, integrity, and standard introspection PRAGMAs.
@@ -7633,6 +7639,7 @@ fn pragma_attached_scope_is_global(name: &str) -> bool {
         "cell_size_check",
         "checkpoint_fullfsync",
         "automatic_index",
+        "ignore_check_constraints",
         "threads",
         "compile_options",
         "database_list",
@@ -13953,6 +13960,10 @@ struct CompiledCacheEntry {
     /// under. A cached program encodes the scan direction, so a lookup under a
     /// different setting must miss and recompile (GH #236 / bd-3gk2x).
     reverse_unordered_selects: bool,
+    /// The `ignore_check_constraints` pragma value the program was compiled
+    /// under. A cached DML program either emits or omits CHECK evaluation, so
+    /// a lookup under a different setting must miss and recompile (bd-hja9y).
+    ignore_check_constraints: bool,
 }
 
 /// How many statement trees of each kind [`RenderedStatements`] keeps.
@@ -41682,6 +41693,7 @@ impl Connection {
         schema_generation: u64,
         function_registry_generation: u64,
         reverse_unordered_selects: bool,
+        ignore_check_constraints: bool,
     ) -> u64 {
         use std::hash::BuildHasher;
         // bd-#70: db_generation (memdb_visible_commit_seq) and the finalized
@@ -41698,26 +41710,36 @@ impl Connection {
         // Conservative wedge: any commit invalidates non-direct-DML plans.
         // Future optimization: narrow by `pages_read_set ∩ pages_written_set`
         // so a commit that only touches unrelated pages leaves the plan live.
-        // reverse_unordered_selects changes the emitted scan direction, so it
-        // must partition the compiled-program cache: ON and OFF get distinct
-        // keys, otherwise a program compiled under one setting could be reused
-        // stale after the pragma is toggled (GH #236 / bd-3gk2x).
+        // reverse_unordered_selects and ignore_check_constraints change the
+        // emitted bytecode, so they partition the compiled-program cache: ON
+        // and OFF get distinct keys, otherwise a program compiled under one
+        // setting could be reused stale after the pragma is toggled
+        // (GH #236 / bd-3gk2x / bd-hja9y).
         foldhash::fast::FixedState::default().hash_one((
             sql,
             schema_cookie,
             schema_generation,
             function_registry_generation,
             reverse_unordered_selects,
+            ignore_check_constraints,
         ))
     }
 
     fn prepared_cache_key(&self, sql: &str) -> u64 {
+        let (reverse_unordered_selects, ignore_check_constraints) = {
+            let state = self.pragma_state.borrow();
+            (
+                state.reverse_unordered_selects,
+                state.ignore_check_constraints,
+            )
+        };
         Self::prepared_cache_key_for(
             sql,
             self.schema_cookie(),
             self.schema_generation(),
             self.function_registry_generation(),
-            self.pragma_state.borrow().reverse_unordered_selects,
+            reverse_unordered_selects,
+            ignore_check_constraints,
         )
     }
 
@@ -42418,10 +42440,19 @@ impl Connection {
 
     /// Look up a cached compiled VdbeProgram by SQL hash.
     fn lookup_compiled_cache(&self, key: u64, sql: &str) -> Option<Arc<CompiledCacheEntry>> {
-        let reverse_unordered_selects = self.pragma_state.borrow().reverse_unordered_selects;
+        let (reverse_unordered_selects, ignore_check_constraints) = {
+            let state = self.pragma_state.borrow();
+            (
+                state.reverse_unordered_selects,
+                state.ignore_check_constraints,
+            )
+        };
         let mut cache = self.compiled_cache.borrow_mut();
         let entry = cache.get(&key)?;
-        if entry.sql == sql && entry.reverse_unordered_selects == reverse_unordered_selects {
+        if entry.sql == sql
+            && entry.reverse_unordered_selects == reverse_unordered_selects
+            && entry.ignore_check_constraints == ignore_check_constraints
+        {
             Some(Arc::clone(entry))
         } else {
             None
@@ -42484,12 +42515,19 @@ impl Connection {
         sql: &str,
         program: VdbeProgram,
     ) -> Arc<CompiledCacheEntry> {
-        let reverse_unordered_selects = self.pragma_state.borrow().reverse_unordered_selects;
+        let (reverse_unordered_selects, ignore_check_constraints) = {
+            let state = self.pragma_state.borrow();
+            (
+                state.reverse_unordered_selects,
+                state.ignore_check_constraints,
+            )
+        };
         let mut cache = self.compiled_cache.borrow_mut();
         let entry = Arc::new(CompiledCacheEntry {
             sql: sql.to_owned(),
             program: Arc::new(program),
             reverse_unordered_selects,
+            ignore_check_constraints,
         });
         cache.put(key, Arc::clone(&entry));
         entry
@@ -46926,6 +46964,7 @@ impl Connection {
                 // A later ATTACH inherits main's current mode, including a
                 // setting made by a schema-qualified PRAGMA main.secure_delete.
                 attached_connection.inherit_secure_delete(self);
+                attached_connection.inherit_ignore_check_constraints(self);
                 // SQLite's busy handler belongs to the outer connection.
                 let timeout = self.pragma_state.borrow().busy_timeout_ms;
                 if attached_connection.pragma_state.borrow().busy_timeout_ms != timeout {
@@ -76311,7 +76350,11 @@ impl Connection {
                 // column with a CHECK constraint (`sqlite3AlterFinishAddColumn`)
                 // and aborts with "CHECK constraint failed" if any existing row
                 // violates the new constraint, leaving the schema unchanged.
-                if !added_check_exprs.is_empty() {
+                // Under `PRAGMA ignore_check_constraints = ON`, stock's nested
+                // `pragma_quick_check` skips CHECK constraints (bd-hja9y).
+                if !added_check_exprs.is_empty()
+                    && !self.pragma_state.borrow().ignore_check_constraints
+                {
                     self.rebuild_schema_indices();
                     self.clear_compilation_reuse_caches();
                     self.table_execution_metadata_cache.borrow_mut().take();
@@ -91268,6 +91311,16 @@ impl Connection {
                 }
             }
         }
+        // bd-hja9y: `PRAGMA ignore_check_constraints = ...` is a connection-wide
+        // compile-time flag (`SQLITE_IgnoreChecks`) whose stock `PragTyp_FLAG`
+        // handler emits `OP_Expire` so held prepared statements re-prepare with
+        // the new CHECK policy across main, TEMP, and every attached schema.
+        if pragma_name == "ignore_check_constraints" && pragma.value.is_some() {
+            self.expire_prepared_statements_for_pragma_flag();
+            for child in self.attached_connections.borrow().values() {
+                child.inherit_ignore_check_constraints(self);
+            }
+        }
 
         if fsqlite_vdbe::pragma::is_writable_schema_reset(pragma) {
             let cx = self.op_cx()?;
@@ -94615,6 +94668,23 @@ impl Connection {
     fn inherit_secure_delete(&self, parent: &Self) {
         self.pragma_state.borrow_mut().secure_delete = parent.pragma_state.borrow().secure_delete;
         self.apply_secure_delete_policy_to_held_txns();
+    }
+
+    /// Expire held prepared statements and clear compilation caches after a
+    /// codegen-affecting flag pragma changes (mirroring stock SQLite's
+    /// `OP_Expire` in `PragTyp_FLAG`, bd-hja9y).
+    fn expire_prepared_statements_for_pragma_flag(&self) {
+        self.schema_generation
+            .set(self.schema_generation.get().wrapping_add(1));
+        self.local_ddl_epoch
+            .set(self.local_ddl_epoch.get().wrapping_add(1));
+        self.clear_compilation_reuse_caches();
+    }
+
+    fn inherit_ignore_check_constraints(&self, parent: &Self) {
+        let ignore = parent.pragma_state.borrow().ignore_check_constraints;
+        self.pragma_state.borrow_mut().ignore_check_constraints = ignore;
+        self.expire_prepared_statements_for_pragma_flag();
     }
 
     /// bd-i2u1c: stock applies a changed `PRAGMA secure_delete` to the very
@@ -113043,6 +113113,7 @@ impl Connection {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
             text_encoding: self.db_text_encoding.get(),
+            ignore_check_constraints: self.pragma_state.borrow().ignore_check_constraints,
             insert_select_function_columns: self.insert_select_function_columns(&insert),
             ..CodegenContext::default()
         };
@@ -113209,6 +113280,7 @@ impl Connection {
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
+            ignore_check_constraints: self.pragma_state.borrow().ignore_check_constraints,
             ..CodegenContext::default()
         };
         let temp_roots = self.temp_storage_roots();
