@@ -11750,6 +11750,19 @@ enum TriggerStatementOutcome {
     SkipDml,
 }
 
+/// Result of building a conflict-lookup predicate for one UNIQUE index against
+/// an attempted UPSERT row.
+enum UpsertIndexConflictMatch {
+    /// A key expression or partial-index predicate could not be parsed or
+    /// evaluated.
+    Indeterminate,
+    /// The attempted row definitely cannot conflict on this index (partial
+    /// predicate evaluated false/NULL, or a key term evaluated to NULL).
+    CannotConflict,
+    /// Exact WHERE predicate matching an existing row with the same key.
+    Matched(Box<Expr>),
+}
+
 /// bd-bwm0x: Result of probing whether an attempted upsert row conflicts on one
 /// ON CONFLICT clause's conflict target. Used to route multi-clause upserts to
 /// the taken clause for BEFORE/AFTER UPDATE trigger firing, mirroring the VDBE
@@ -64426,18 +64439,22 @@ impl Connection {
     }
 
     /// bd-bwm0x: Probe whether the attempted upsert row conflicts on ONE ON
-    /// CONFLICT clause's conflict `target`, locating the existing row (and its
-    /// rowid on rowid tables). See [`UpsertConflictProbe`] for the tri-state
-    /// result; the row lookup mirrors the DO UPDATE trigger snapshot collector.
+    /// bd-bwm0x / bd-d8s37: Probe whether the attempted upsert row conflicts on
+    /// ONE ON CONFLICT clause's conflict `target`, locating the existing row
+    /// (and its rowid on rowid tables). Supports plain column targets, rowid /
+    /// WITHOUT ROWID primary keys, expression and partial UNIQUE indexes, and
+    /// targetless `ON CONFLICT DO UPDATE` (probing the primary key and every
+    /// UNIQUE index on the table). See [`UpsertConflictProbe`] for the
+    /// tri-state result.
     async fn probe_upsert_conflict_row(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         target: Option<&fsqlite_ast::UpsertTarget>,
         attempted: &[SqliteValue],
-        params: Option<&[SqliteValue]>,
+        _params: Option<&[SqliteValue]>,
     ) -> Result<UpsertConflictProbe> {
         let table_name = &insert.table.name;
-        let (column_names, is_rowid_table, ipk_idx) = {
+        let table = {
             let schema = self.schema.borrow();
             let Some(table) = schema
                 .iter()
@@ -64445,19 +64462,115 @@ impl Connection {
             else {
                 return Ok(UpsertConflictProbe::Indeterminate);
             };
-            let names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-            let ipk = table.columns.iter().position(|c| c.is_ipk);
-            (names, !table.without_rowid, ipk)
+            table.clone()
         };
-        if attempted.len() != column_names.len() {
+        if attempted.len() != table.columns.len() {
             return Ok(UpsertConflictProbe::Indeterminate);
         }
 
-        let Some(match_where) =
-            Self::build_upsert_conflict_match_expr(&column_names, ipk_idx, target, attempted)
-        else {
-            return Ok(UpsertConflictProbe::Indeterminate);
-        };
+        let is_rowid_table = !table.without_rowid;
+        let ipk_idx = table.columns.iter().position(|c| c.is_ipk);
+        let table_label = insert.alias.as_deref().unwrap_or(table_name).to_owned();
+        let mut candidate_predicates = Vec::new();
+        let mut saw_indeterminate = false;
+
+        match target {
+            Some(target) => {
+                if fsqlite_vdbe::codegen::upsert_target_matches_rowid_primary_key(&table, target) {
+                    if let Some(ipk) = ipk_idx {
+                        if let Some(expr) =
+                            Self::build_upsert_column_group_match_expr(&table, &[ipk], attempted)
+                        {
+                            candidate_predicates.push(expr);
+                        }
+                    } else {
+                        saw_indeterminate = true;
+                    }
+                } else if fsqlite_vdbe::codegen::upsert_target_matches_without_rowid_primary_key(
+                    &table, target,
+                ) {
+                    if let Some(pk_indices) = table.primary_key_constraints.first().and_then(|g| {
+                        g.iter()
+                            .map(|name| table.column_index(name))
+                            .collect::<Option<Vec<_>>>()
+                    }) {
+                        if let Some(expr) = Self::build_upsert_column_group_match_expr(
+                            &table,
+                            &pk_indices,
+                            attempted,
+                        ) {
+                            candidate_predicates.push(expr);
+                        }
+                    } else {
+                        saw_indeterminate = true;
+                    }
+                } else if let Some((_, index)) =
+                    fsqlite_vdbe::codegen::find_upsert_target_index(&table, Some(target))
+                {
+                    match self.build_upsert_index_conflict_match_expr(
+                        &table,
+                        &table_label,
+                        index,
+                        attempted,
+                    ) {
+                        UpsertIndexConflictMatch::Matched(expr) => {
+                            candidate_predicates.push(*expr);
+                        }
+                        UpsertIndexConflictMatch::CannotConflict => {}
+                        UpsertIndexConflictMatch::Indeterminate => saw_indeterminate = true,
+                    }
+                } else {
+                    let column_names: Vec<String> =
+                        table.columns.iter().map(|c| c.name.clone()).collect();
+                    if let Some(expr) = Self::build_upsert_conflict_match_expr(
+                        &column_names,
+                        ipk_idx,
+                        Some(target),
+                        attempted,
+                    ) {
+                        candidate_predicates.push(expr);
+                    } else {
+                        saw_indeterminate = true;
+                    }
+                }
+            }
+            None => {
+                // Targetless `ON CONFLICT DO UPDATE` catches a conflict on the
+                // table's PRIMARY KEY or any UNIQUE index.
+                if !table.without_rowid {
+                    if let Some(ipk) = ipk_idx
+                        && let Some(expr) =
+                            Self::build_upsert_column_group_match_expr(&table, &[ipk], attempted)
+                    {
+                        candidate_predicates.push(expr);
+                    }
+                } else if let Some(pk_indices) =
+                    table.primary_key_constraints.first().and_then(|g| {
+                        g.iter()
+                            .map(|name| table.column_index(name))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    && let Some(expr) =
+                        Self::build_upsert_column_group_match_expr(&table, &pk_indices, attempted)
+                {
+                    candidate_predicates.push(expr);
+                }
+                for index in table.indexes.iter().filter(|idx| idx.is_unique) {
+                    match self.build_upsert_index_conflict_match_expr(
+                        &table,
+                        &table_label,
+                        index,
+                        attempted,
+                    ) {
+                        UpsertIndexConflictMatch::Matched(expr) => {
+                            candidate_predicates.push(*expr);
+                        }
+                        UpsertIndexConflictMatch::CannotConflict => {}
+                        UpsertIndexConflictMatch::Indeterminate => saw_indeterminate = true,
+                    }
+                }
+            }
+        }
 
         // Locate the conflicting existing row (if any). Rowid tables project the
         // implicit rowid via the shadow-aware alias, mirroring the UPDATE trigger
@@ -64483,49 +64596,203 @@ impl Connection {
         } else {
             vec![ResultColumn::Star]
         };
-        let sel =
-            Self::build_single_table_select(&table_ref, projected, Some(&match_where), &[], None);
-        let matched = self
-            .execute_statement(&Statement::Select(sel), params)
-            .await?;
-        let Some(first) = matched.into_iter().next() else {
-            return Ok(UpsertConflictProbe::NoConflict);
-        };
-        let values = first.values();
-        let (rowid, old_values): (Option<i64>, Vec<SqliteValue>) = if is_rowid_table {
-            let rowid = match values.first() {
-                Some(SqliteValue::Integer(n)) => Some(*n),
-                _ => None,
+
+        for match_where in &candidate_predicates {
+            let sel = Self::build_single_table_select(
+                &table_ref,
+                projected.clone(),
+                Some(match_where),
+                &[],
+                None,
+            );
+            let matched = self
+                .execute_statement(&Statement::Select(sel), None)
+                .await?;
+            let Some(first) = matched.into_iter().next() else {
+                continue;
             };
-            (
-                rowid,
-                values
-                    .get(1..)
-                    .map(<[SqliteValue]>::to_vec)
-                    .unwrap_or_default(),
-            )
-        } else {
-            (None, values.to_vec())
-        };
-        if old_values.len() != column_names.len() {
-            return Ok(UpsertConflictProbe::Indeterminate);
+            let values = first.values();
+            let (rowid, old_values): (Option<i64>, Vec<SqliteValue>) = if is_rowid_table {
+                let rowid = match values.first() {
+                    Some(SqliteValue::Integer(n)) => Some(*n),
+                    _ => None,
+                };
+                (
+                    rowid,
+                    values
+                        .get(1..)
+                        .map(<[SqliteValue]>::to_vec)
+                        .unwrap_or_default(),
+                )
+            } else {
+                (None, values.to_vec())
+            };
+            if old_values.len() != table.columns.len() {
+                return Ok(UpsertConflictProbe::Indeterminate);
+            }
+            return Ok(UpsertConflictProbe::Conflict { rowid, old_values });
         }
-        Ok(UpsertConflictProbe::Conflict { rowid, old_values })
+
+        if saw_indeterminate {
+            Ok(UpsertConflictProbe::Indeterminate)
+        } else {
+            Ok(UpsertConflictProbe::NoConflict)
+        }
     }
 
-    /// bd-y7old / bd-bwm0x: Given the conflicting existing row (`rowid`,
-    /// `old_values`) a taken DO UPDATE clause updates, compute
+    /// Build a `col_0 = lit_0 AND ...` predicate for a non-null column group.
+    /// Returns `None` if any column value in `attempted` is NULL (NULL never
+    /// conflicts on a PK/UNIQUE constraint in SQLite).
+    fn build_upsert_column_group_match_expr(
+        table: &TableSchema,
+        col_indices: &[usize],
+        attempted: &[SqliteValue],
+    ) -> Option<Expr> {
+        if col_indices.is_empty() {
+            return None;
+        }
+        let mut predicate: Option<Expr> = None;
+        for &idx in col_indices {
+            let col = table.columns.get(idx)?;
+            let val = attempted.get(idx)?;
+            if val.is_null() {
+                return None;
+            }
+            let eq = Expr::BinaryOp {
+                left: Box::new(Expr::Column(
+                    fsqlite_ast::ColumnRef::bare(col.name.clone()),
+                    fsqlite_ast::Span::new(0, 0),
+                )),
+                op: fsqlite_ast::BinaryOp::Eq,
+                right: Box::new(value_to_literal_expr(val.clone())),
+                span: fsqlite_ast::Span::new(0, 0),
+            };
+            predicate = Some(match predicate {
+                Some(existing) => Expr::BinaryOp {
+                    left: Box::new(existing),
+                    op: fsqlite_ast::BinaryOp::And,
+                    right: Box::new(eq),
+                    span: fsqlite_ast::Span::new(0, 0),
+                },
+                None => eq,
+            });
+        }
+        predicate
+    }
+
+    /// Build a WHERE predicate matching an existing row that would conflict
+    /// with `attempted` on a UNIQUE `index` (plain, expression, collated, or
+    /// partial).
+    fn build_upsert_index_conflict_match_expr(
+        &self,
+        table: &TableSchema,
+        table_label: &str,
+        index: &fsqlite_vdbe::codegen::IndexSchema,
+        attempted: &[SqliteValue],
+    ) -> UpsertIndexConflictMatch {
+        let key_terms = index.key_term_count();
+        if key_terms == 0 {
+            return UpsertIndexConflictMatch::CannotConflict;
+        }
+        let col_map: Vec<(String, String, bool)> = table
+            .columns
+            .iter()
+            .map(|c| (table_label.to_owned(), c.name.clone(), false))
+            .collect();
+
+        let mut predicate: Option<Expr> = None;
+        if let Some(pred_sql) = index.where_clause.as_deref() {
+            let Ok(pred_expr) = fsqlite_parser::expr::parse_expr(pred_sql) else {
+                return UpsertIndexConflictMatch::Indeterminate;
+            };
+            let Ok(pred_val) = self.eval_join_expr_with_registry(&pred_expr, attempted, &col_map)
+            else {
+                return UpsertIndexConflictMatch::Indeterminate;
+            };
+            if pred_val.is_null() || !is_sqlite_truthy(&pred_val) {
+                return UpsertIndexConflictMatch::CannotConflict;
+            }
+            predicate = Some(pred_expr);
+        }
+
+        for key_pos in 0..key_terms {
+            let (key_expr, key_val) = if index.has_plain_column_key() {
+                let Some(col_name) = index.columns.get(key_pos) else {
+                    return UpsertIndexConflictMatch::Indeterminate;
+                };
+                let Some(col_idx) = table.column_index(col_name) else {
+                    return UpsertIndexConflictMatch::Indeterminate;
+                };
+                let Some(val) = attempted.get(col_idx).cloned() else {
+                    return UpsertIndexConflictMatch::Indeterminate;
+                };
+                (
+                    Expr::Column(
+                        fsqlite_ast::ColumnRef::bare(col_name.clone()),
+                        fsqlite_ast::Span::new(0, 0),
+                    ),
+                    val,
+                )
+            } else {
+                let Some(expr_sql) = index.key_term_sql(key_pos) else {
+                    return UpsertIndexConflictMatch::Indeterminate;
+                };
+                let Ok(expr) = fsqlite_parser::expr::parse_expr(expr_sql) else {
+                    return UpsertIndexConflictMatch::Indeterminate;
+                };
+                let Ok(val) = self.eval_join_expr_with_registry(&expr, attempted, &col_map) else {
+                    return UpsertIndexConflictMatch::Indeterminate;
+                };
+                (expr, val)
+            };
+            if key_val.is_null() {
+                return UpsertIndexConflictMatch::CannotConflict;
+            }
+            let lhs = if let Some(collation) = index.key_term_collation(key_pos) {
+                Expr::Collate {
+                    expr: Box::new(key_expr),
+                    collation: collation.to_owned(),
+                    span: fsqlite_ast::Span::new(0, 0),
+                }
+            } else {
+                key_expr
+            };
+            let eq = Expr::BinaryOp {
+                left: Box::new(lhs),
+                op: fsqlite_ast::BinaryOp::Eq,
+                right: Box::new(value_to_literal_expr(key_val)),
+                span: fsqlite_ast::Span::new(0, 0),
+            };
+            predicate = Some(match predicate {
+                Some(existing) => Expr::BinaryOp {
+                    left: Box::new(existing),
+                    op: fsqlite_ast::BinaryOp::And,
+                    right: Box::new(eq),
+                    span: fsqlite_ast::Span::new(0, 0),
+                },
+                None => eq,
+            });
+        }
+        predicate.map_or(UpsertIndexConflictMatch::CannotConflict, |expr| {
+            UpsertIndexConflictMatch::Matched(Box::new(expr))
+        })
+    }
+
+    /// bd-y7old / bd-bwm0x / bd-d8s37: Given the conflicting existing row
+    /// (`rowid`, `old_values`) a taken DO UPDATE clause updates, compute
     /// `(rowid, old_row, new_row, where_true)` so the INSERT dispatch can fire
-    /// BEFORE/AFTER UPDATE triggers around the VDBE apply. Returns `Ok(None)` when
-    /// the SET / WHERE cannot be evaluated by the interpreted evaluator (e.g. a
-    /// correlated `excluded.*` subquery) — the caller then keeps its prior
-    /// (VDBE-only) behavior rather than erroring.
+    /// BEFORE/AFTER UPDATE triggers and enforce parent-side ON UPDATE FK
+    /// actions around the VDBE apply. Returns `Ok(None)` when the SET / WHERE
+    /// cannot be evaluated — the caller then keeps its prior (VDBE-only)
+    /// behavior rather than erroring.
     ///
     /// `new_row` / `where_true` reuse the same interpreted SET evaluation the plain
-    /// UPDATE trigger snapshot uses (`eval_join_expr`), with a column map that
-    /// resolves unqualified / target-table columns against the existing row;
-    /// `excluded.*` references are spliced to the attempted-insert literals.
-    fn compute_upsert_update_row(
+    /// UPDATE trigger snapshot uses (with scalar-subquery support and column
+    /// affinity coercion), with a column map that resolves unqualified /
+    /// target-table columns against the existing row; `excluded.*` references
+    /// are spliced to the attempted-insert literals.
+    #[allow(clippy::too_many_arguments)]
+    async fn compute_upsert_update_row(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         assignments: &[fsqlite_ast::Assignment],
@@ -64536,7 +64803,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<UpsertUpdatePlan>> {
         let table_name = &insert.table.name;
-        let column_names: Vec<String> = {
+        let (column_names, column_affinities, ipk_idx): (Vec<String>, Vec<char>, Option<usize>) = {
             let schema = self.schema.borrow();
             let Some(table) = schema
                 .iter()
@@ -64544,7 +64811,11 @@ impl Connection {
             else {
                 return Ok(None);
             };
-            table.columns.iter().map(|c| c.name.clone()).collect()
+            (
+                table.columns.iter().map(|c| c.name.clone()).collect(),
+                table.columns.iter().map(|c| c.affinity).collect(),
+                table.columns.iter().position(|c| c.is_ipk),
+            )
         };
 
         // Column map over the EXISTING row only. `excluded.*` references are
@@ -64578,28 +64849,31 @@ impl Connection {
             (assignments.to_vec(), do_update_where.cloned())
         };
 
+        let resolve_target_idx = |name: &str| -> Option<usize> {
+            find_column_index_case_insensitive(&column_names, name)
+                .or_else(|| is_hidden_rowid_alias_name(name).then_some(ipk_idx).flatten())
+        };
+
         // NEW = existing row with the SET assignments applied. SQLite evaluates
         // every SET RHS against the ORIGINAL row, so `old_values` is not mutated
-        // between assignments. An evaluation failure (e.g. a correlated
-        // `excluded.*` subquery in the SET that the interpreted evaluator does not
-        // support) falls back to `Ok(None)`: the VDBE program still applies the
-        // upsert correctly; only the trigger OLD/NEW snapshot is unavailable, so
-        // the caller keeps its prior (VDBE-only) behavior rather than erroring.
+        // between assignments.
         let mut new_values = old_values.clone();
         for assignment in &bound_assignments {
             match &assignment.target {
                 fsqlite_ast::AssignmentTarget::Column(name) => {
-                    let Some(idx) = find_column_index_case_insensitive(&column_names, name) else {
+                    let Some(idx) = resolve_target_idx(name) else {
                         return Ok(None);
                     };
                     let mut value_expr = assignment.value.clone();
                     substitute_excluded_columns_in_expr(&mut value_expr, &column_names, attempted);
-                    let Ok(value) =
-                        self.eval_join_expr_with_registry(&value_expr, &old_values, &col_map)
+                    let Ok(value) = self
+                        .eval_expr_with_subqueries(&value_expr, &old_values, &col_map, None)
+                        .await
                     else {
                         return Ok(None);
                     };
-                    new_values[idx] = value;
+                    new_values[idx] =
+                        value.apply_affinity(affinity_char_to_type(column_affinities[idx]));
                 }
                 fsqlite_ast::AssignmentTarget::ColumnList(names) => {
                     let value_exprs: Vec<Expr> = match &assignment.value {
@@ -64608,8 +64882,7 @@ impl Connection {
                         _ => return Ok(None),
                     };
                     for (name, mut value_expr) in names.iter().zip(value_exprs) {
-                        let Some(idx) = find_column_index_case_insensitive(&column_names, name)
-                        else {
+                        let Some(idx) = resolve_target_idx(name) else {
                             return Ok(None);
                         };
                         substitute_excluded_columns_in_expr(
@@ -64617,12 +64890,14 @@ impl Connection {
                             &column_names,
                             attempted,
                         );
-                        let Ok(value) =
-                            self.eval_join_expr_with_registry(&value_expr, &old_values, &col_map)
+                        let Ok(value) = self
+                            .eval_expr_with_subqueries(&value_expr, &old_values, &col_map, None)
+                            .await
                         else {
                             return Ok(None);
                         };
-                        new_values[idx] = value;
+                        new_values[idx] =
+                            value.apply_affinity(affinity_char_to_type(column_affinities[idx]));
                     }
                 }
             }
@@ -64631,8 +64906,9 @@ impl Connection {
         let where_true = match bound_where {
             Some(mut where_expr) => {
                 substitute_excluded_columns_in_expr(&mut where_expr, &column_names, attempted);
-                let Ok(value) =
-                    self.eval_join_expr_with_registry(&where_expr, &old_values, &col_map)
+                let Ok(value) = self
+                    .eval_expr_with_subqueries(&where_expr, &old_values, &col_map, None)
+                    .await
                 else {
                     return Ok(None);
                 };
@@ -64646,19 +64922,8 @@ impl Connection {
 
     /// bd-bwm0x: Route a (single-row) upsert to the ON CONFLICT clause the VDBE
     /// would apply, and return that TAKEN clause's `UPDATE OF` columns plus its
-    /// OLD/NEW plan for BEFORE/AFTER UPDATE trigger firing.
-    ///
-    /// Mirrors the VDBE clause routing (bd-aap9u/xa2qv): each clause probes its own
-    /// conflict target in written order, and the first clause whose target is
-    /// violated is applied. Returns `Ok(None)` — the caller then keeps its prior
-    /// VDBE-only trigger behavior (BEFORE INSERT fired; AFTER INSERT decided by the
-    /// affected-row count) — when:
-    ///   * no clause's target conflicts (a plain insert),
-    ///   * the taken clause is DO NOTHING (no update triggers; the VDBE writes no
-    ///     row, so the affected==0 path already suppresses AFTER INSERT),
-    ///   * an indeterminate conflict target is reached before any conflict (routing
-    ///     cannot know which clause the VDBE picks), or
-    ///   * the taken DO UPDATE clause's OLD/NEW cannot be evaluated.
+    /// OLD/NEW plan for BEFORE/AFTER UPDATE trigger firing and parent-side FK
+    /// actions.
     async fn route_upsert_conflict(
         &self,
         insert: &fsqlite_ast::InsertStatement,
@@ -64686,15 +64951,17 @@ impl Connection {
                     else {
                         return Ok(None);
                     };
-                    let plan = self.compute_upsert_update_row(
-                        insert,
-                        assignments,
-                        where_clause.as_deref(),
-                        rowid,
-                        old_values,
-                        attempted,
-                        params,
-                    )?;
+                    let plan = self
+                        .compute_upsert_update_row(
+                            insert,
+                            assignments,
+                            where_clause.as_deref(),
+                            rowid,
+                            old_values,
+                            attempted,
+                            params,
+                        )
+                        .await?;
                     return Ok(plan
                         .map(|plan| (Self::assignment_target_column_names(assignments), plan)));
                 }
@@ -80260,9 +80527,15 @@ impl Connection {
             .borrow()
             .iter()
             .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&target.name));
-        // Only a DELETE or an UPDATE of a parent takes foreign-key actions.
-        let takes_fk_actions = matches!(statement, Statement::Update(_) | Statement::Delete(_))
-            && self.fk_cascade_propagation_enabled()
+        // A DELETE, UPDATE, or DO UPDATE upsert of a parent takes foreign-key actions.
+        let takes_fk_actions = match statement {
+            Statement::Update(_) | Statement::Delete(_) => true,
+            Statement::Insert(insert) => insert
+                .upsert
+                .iter()
+                .any(|clause| matches!(clause.action, fsqlite_ast::UpsertAction::Update { .. })),
+            _ => false,
+        } && self.fk_cascade_propagation_enabled()
             && self.table_is_foreign_key_parent(&target.name);
         if !target_has_triggers && !takes_fk_actions {
             return Ok(());
@@ -80308,11 +80581,16 @@ impl Connection {
         ];
         let before = self.triggers_in_groups(&firing.table, &before_groups);
         let after = self.triggers_in_groups(&firing.table, &after_groups);
-        let fk_actions = if self.fk_cascade_propagation_enabled() {
+        let mut fk_actions = if self.fk_cascade_propagation_enabled() {
             self.foreign_key_action_firings(&firing.table, &firing.event, compiled)
         } else {
             Vec::new()
         };
+        if self.fk_cascade_propagation_enabled() {
+            for update in &firing.upsert_updates {
+                fk_actions.extend(self.foreign_key_action_firings(&firing.table, update, compiled));
+            }
+        }
         for trigger in &before {
             self.validate_trigger_program(trigger, recursive_triggers, compiled)?;
         }

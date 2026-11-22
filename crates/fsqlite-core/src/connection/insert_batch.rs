@@ -768,13 +768,21 @@ impl Connection {
                 fsqlite_ast::TriggerTiming::After,
                 &coarse_update_event,
             ));
+        // bd-d8s37: a conflicting DO UPDATE on a foreign-key parent table must
+        // enforce ON UPDATE RESTRICT / NO ACTION and execute ON UPDATE CASCADE /
+        // SET NULL / SET DEFAULT before the parent's AFTER UPDATE triggers fire.
+        let table_has_upsert_fk_parent_work = is_do_update_upsert
+            && self.fk_cascade_propagation_enabled()
+            && self.table_is_foreign_key_parent(table_name);
         // The conflict/OLD-NEW plan is needed whenever a conflicting row
-        // would change which triggers fire: BEFORE/AFTER UPDATE must fire
-        // for the update, and AFTER INSERT must be SUPPRESSED because no
-        // insert happened — the latter matters even with no UPDATE triggers
-        // (stock fires only BEFORE INSERT on a conflict/update path).
-        let upsert_needs_conflict_plan =
-            is_do_update_upsert && (has_after_insert || table_has_upsert_update_trigger);
+        // would change which triggers fire or enforce parent-side FK actions:
+        // BEFORE/AFTER UPDATE must fire for the update, AFTER INSERT must be
+        // SUPPRESSED because no insert happened, and parent-side ON UPDATE FK
+        // checks/cascades must run on the updated parent key.
+        let upsert_needs_conflict_plan = is_do_update_upsert
+            && (has_after_insert
+                || table_has_upsert_update_trigger
+                || table_has_upsert_fk_parent_work);
         if is_live_vtab {
             if !insert.returning.is_empty() {
                 return Err(FrankenError::NotImplemented(
@@ -1199,6 +1207,21 @@ impl Connection {
             return Ok(Vec::new());
         }
 
+        // bd-d8s37: Parent-side FK enforcement for a conflicting DO UPDATE arm.
+        // Run AFTER BEFORE UPDATE triggers (so trigger-side child edits are
+        // observed) and BEFORE writing the parent row (so ON UPDATE RESTRICT
+        // rejects cleanly without mutating the table).
+        let mut pending_upsert_fk_actions = Vec::new();
+        if table_has_upsert_fk_parent_work
+            && let Some((_, old_row, new_row, true)) = &upsert_update_plan
+        {
+            pending_upsert_fk_actions =
+                Box::pin(self.check_fk_on_update(table_name, old_row, new_row)).await?;
+            if !pending_upsert_fk_actions.is_empty() {
+                self.ensure_trigger_program_admission_available()?;
+            }
+        }
+
         // Phase 5B.2 (bd-1yi8): INSERT OR REPLACE / INSERT OR IGNORE
         // routes through VDBE which has UPSERT semantics in the
         // Insert opcode (table_move_to + delete + insert). The
@@ -1334,6 +1357,19 @@ impl Connection {
             // Ordinary INSERT and UPSERT shapes without a precise receipt keep
             // their established enforcement. Never check a skipped row.
             Box::pin(self.enforce_fk_on_insert(insert, table_name, params)).await?;
+        }
+
+        // bd-d8s37: SQLite's parent ON UPDATE FK programs (CASCADE / SET NULL /
+        // SET DEFAULT) observe the updated parent row and run BEFORE the
+        // parent's RETURNING projection and AFTER UPDATE triggers.
+        if affected > 0 && !pending_upsert_fk_actions.is_empty() {
+            let _do_update_clause = DmlConflictClauseGuard::new(
+                &self.dml_conflict_clause,
+                Some(fsqlite_ast::ConflictAction::Abort),
+            );
+            for action in &pending_upsert_fk_actions {
+                Box::pin(self.execute_fk_update_action(action)).await?;
+            }
         }
 
         let rows = if let Some(projection) = &returning_projection {
