@@ -24179,6 +24179,13 @@ impl Connection {
                         self.ensure_attached_child_transaction(&target_schema).await?;
                     }
                     let mut rewritten = pragma.clone();
+                    let integrity_table = if pragma.name.name.eq_ignore_ascii_case("integrity_check")
+                        || pragma.name.name.eq_ignore_ascii_case("quick_check")
+                    {
+                        pragma_maintenance::integrity_check_table_scope(pragma.value.as_ref())
+                    } else {
+                        None
+                    };
                     rewritten.name.schema = pragma
                         .name
                         .name
@@ -24208,7 +24215,15 @@ impl Connection {
                             conn.execute_statement(&Statement::Pragma(rewritten), params)
                                 .await
                         })
-                        .await?;
+                        .await
+                        .map_err(|error| match &integrity_table {
+                            Some(table) => {
+                                let registry = self.attached_schemas.borrow();
+                                let schema = registry.find(&target_schema).map_or(target_schema.as_str(), |db| db.schema.as_str());
+                                qualify_missing_table_error(error, table, schema)
+                            }
+                            None => error,
+                        })?;
                     if pragma.name.name.eq_ignore_ascii_case("table_list") {
                         for row in &mut rows {
                             if let Some(schema) = row.values.get_mut(0) {
@@ -87018,12 +87033,13 @@ impl Connection {
     }
 
     pub(crate) async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
-        self.validate_database_integrity_reporting(quick, &mut IntegrityRowidReports::default()).await
+        self.validate_database_integrity_reporting(quick, None, &mut IntegrityRowidReports::default()).await
     }
 
     async fn validate_database_integrity_reporting(
         &self,
         quick: bool,
+        only_table: Option<&str>,
         reports: &mut IntegrityRowidReports,
     ) -> Result<()> {
         let active_state = self.integrity_active_state();
@@ -87054,6 +87070,7 @@ impl Connection {
                 header.freelist_count,
                 header.largest_root_page,
                 active_state.as_ref().map(|(fl, _)| fl.as_slice()),
+                only_table,
                 reports,
             )
             .await?;
@@ -88709,6 +88726,32 @@ impl Connection {
             }
         }
 
+        Self::walk_integrity_table_roots(
+            cx, txn, page_size, reserved_per_page, total_pages, schema,
+            Some(&mut *owners), integrity_connection.is_some(), integrity_connection, reports,
+        )
+        .await?;
+
+        if !skip_orphan_scan && let Some(page_no) = owners.first_unowned(total_pages, page_size)? {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("page {} is never used", page_no.get()),
+            });
+        }
+        Ok(())
+    }
+
+    async fn walk_integrity_table_roots(
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        total_pages: u32,
+        schema: &[TableSchema],
+        mut owners: Option<&mut PageOwnershipSink<'_>>,
+        check_key_order: bool,
+        integrity_connection: Option<&Self>,
+        reports: &mut IntegrityRowidReports,
+    ) -> Result<()> {
         for table in schema {
             if table.root_page <= 0 {
                 continue;
@@ -88733,8 +88776,8 @@ impl Connection {
                     total_pages,
                     table_root,
                     &format!("table `{}` root", table.name),
-                    Some(&mut *owners),
-                    integrity_connection.is_some(),
+                    owners.as_deref_mut(),
+                    check_key_order,
                     primary_order,
                     reports,
                 )
@@ -88752,19 +88795,13 @@ impl Connection {
                     total_pages,
                     index_root,
                     &format!("index `{}` root", index.name),
-                    Some(&mut *owners),
-                    integrity_connection.is_some(),
+                    owners.as_deref_mut(),
+                    check_key_order,
                     integrity_connection.map(|connection| (connection, index, None)),
                     reports,
                 )
                 .await?;
             }
-        }
-
-        if !skip_orphan_scan && let Some(page_no) = owners.first_unowned(total_pages, page_size)? {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("page {} is never used", page_no.get()),
-            });
         }
 
         Ok(())
@@ -88906,10 +88943,14 @@ impl Connection {
         freelist_count: u32,
         largest_root_page: u32,
         live_freelist: Option<&[PageNumber]>,
+        only_table: Option<&str>,
         reports: &mut IntegrityRowidReports,
     ) -> Result<()> {
         let auto_vacuum_enabled = largest_root_page != 0;
-        let schema = self.integrity_schema();
+        let mut schema = self.integrity_schema();
+        if let Some(name) = only_table {
+            schema.retain(|table| table.name.eq_ignore_ascii_case(name));
+        }
         if !quick {
             for table in &schema {
                 self.validate_table_index_runtime_dependencies(table)?;
@@ -88922,7 +88963,17 @@ impl Connection {
             Some(self.column_defaults_by_root_page())
         };
 
-        if !quick {
+        if only_table.is_some_and(|name| !is_sqlite_schema_name(name)) {
+            // A partial check owns only the named table and its indexes.
+            // Pages belonging to any other tree cannot be classified as orphans.
+            let mut map = HashMap::new();
+            let mut owners = PageOwnershipSink::Resident(&mut map);
+            Self::walk_integrity_table_roots(
+                cx, txn, page_size, reserved_per_page, total_pages, &schema,
+                Some(&mut owners), true, (!quick).then_some(self), reports,
+            )
+            .await?;
+        } else if !quick {
             let mut owner_map = HashMap::new();
             let mut owners = PageOwnershipSink::Resident(&mut owner_map);
             Self::validate_page_ownership_in_txn(
@@ -88933,7 +88984,7 @@ impl Connection {
                 total_pages,
                 freelist_trunk,
                 freelist_count,
-                auto_vacuum_enabled,
+                auto_vacuum_enabled || only_table.is_some(),
                 &schema,
                 live_freelist,
                 &mut owners,
@@ -88941,7 +88992,7 @@ impl Connection {
                 reports,
             )
             .await?;
-            if auto_vacuum_enabled && total_pages > 0 {
+            if auto_vacuum_enabled && only_table.is_none() && total_pages > 0 {
                 let usable_size = page_size.usable(reserved_per_page);
                 let mut roots = Vec::new();
                 for row in master_rows {

@@ -7,6 +7,7 @@ impl Connection {
     pub(super) async fn integrity_check_strict_type_predicates(
         &self,
         table: &TableSchema,
+        scope: PragmaSchemaScope,
     ) -> Result<Vec<(String, String)>> {
         if !table.strict {
             return Ok(Vec::new());
@@ -15,10 +16,11 @@ impl Connection {
         // Use the declared type, not its affinity: INT and INTEGER share an
         // affinity but SQLite distinguishes them in integrity diagnostics.
         // xinfo includes generated columns, which table_info would omit.
-        // Qualifying main is essential when a TEMP table shadows this table.
+        // Resolve metadata in the same database as the rows under inspection.
+        let schema = if scope == PragmaSchemaScope::Temp { "temp" } else { "main" };
         let metadata = self
             .query(&format!(
-                "PRAGMA main.table_xinfo({})",
+                "PRAGMA {schema}.table_xinfo({})",
                 quote_identifier(&table.name)
             ))
             .await?;

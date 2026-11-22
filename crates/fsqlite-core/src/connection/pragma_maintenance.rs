@@ -13,8 +13,22 @@ impl Connection {
         let scope = integrity_check_table_scope(pragma.value.as_ref());
         let mut failures = Vec::new();
         let mut remaining = max_errors;
-        self.collect_integrity_findings("main", quick, scope.as_deref(), &mut remaining, &mut failures)
+        let namespace = pragma_schema_scope(pragma);
+        let schema = match scope.as_deref() {
+            Some(table) => self.integrity_table_database(table, namespace)?,
+            None if namespace == PragmaSchemaScope::Temp => "temp".to_owned(),
+            None => "main".to_owned(),
+        };
+        if is_builtin_schema(&schema) {
+            self.collect_integrity_findings(&schema, quick, scope.as_deref(), &mut remaining, &mut failures)
+                .await?;
+        } else {
+            self.with_attached_connection_async(&schema, async |child| {
+                child.collect_integrity_findings(&schema, quick, scope.as_deref(), &mut remaining, &mut failures)
+                    .await
+            })
             .await?;
+        }
 
         // Qualified attached PRAGMAs already delegate to their child Connection.
         // Unqualified whole-database checks must also visit every attachment;
@@ -63,7 +77,12 @@ impl Connection {
         // only makes the condition discoverable so a user knows the one-time
         // first-open migration will reclaim it. Appended AFTER the verdict, so
         // an oracle that reads the first row still observes "ok".
-        for shadow in self.orphaned_fts5_content_shadow_names() {
+        for shadow in self.orphaned_fts5_content_shadow_names().into_iter().filter(|shadow| {
+            schema == "main" && scope.as_deref().is_none_or(|table| {
+                shadow.eq_ignore_ascii_case(table)
+                    || shadow.strip_suffix("_content").is_some_and(|name| name.eq_ignore_ascii_case(table))
+            })
+        }) {
             rows.push(Row {
                 values: vec![SqliteValue::Text(
                     format!(
@@ -75,6 +94,41 @@ impl Connection {
             });
         }
         Ok(rows)
+    }
+
+    fn integrity_table_database(&self, table: &str, scope: PragmaSchemaScope) -> Result<String> {
+        let contains = |conn: &Self, local_scope| {
+            conn.table_exists_for_scope(table, local_scope)
+                || conn.view_index_for_scope(table, local_scope).is_some()
+        };
+        if scope != PragmaSchemaScope::Main
+            && (contains(self, PragmaSchemaScope::Temp)
+                || canonical_sqlite_temp_schema_name(table).is_some()
+                || (scope == PragmaSchemaScope::Temp && is_sqlite_schema_name(table)))
+        {
+            return Ok("temp".to_owned());
+        }
+        if scope != PragmaSchemaScope::Temp
+            && (is_sqlite_schema_name(table) || contains(self, PragmaSchemaScope::Main))
+        {
+            return Ok("main".to_owned());
+        }
+        if scope == PragmaSchemaScope::Unqualified {
+            let children = self.attached_connections.borrow();
+            for alias in self.attached_schemas.borrow().all_schemas() {
+                if let Some(child) = children.get(&attached_schema_key(alias))
+                    && contains(child, PragmaSchemaScope::Main)
+                {
+                    return Ok(alias.to_owned());
+                }
+            }
+        }
+        let name = match scope {
+            PragmaSchemaScope::Main => format!("main.{table}"),
+            PragmaSchemaScope::Temp => format!("temp.{table}"),
+            PragmaSchemaScope::Unqualified => table.to_owned(),
+        };
+        Err(FrankenError::NoSuchTable { name })
     }
 
     async fn collect_integrity_findings(
@@ -91,7 +145,14 @@ impl Connection {
             return self.with_integrity_txn(async |_, _| Ok(())).await;
         }
         let mut reports = IntegrityRowidReports { limit: *remaining, findings: Vec::new() };
-        let structural = self.validate_database_integrity_reporting(quick, &mut reports).await;
+        // TEMP uses connection-local memory roots. Their numeric identifiers
+        // do not address pages in the main pager.
+        let temp = schema == "temp";
+        let structural = if temp {
+            Ok(())
+        } else {
+            self.validate_database_integrity_reporting(quick, scope, &mut reports).await
+        };
         if let Err(error) = &structural && error.is_transient() {
             return structural;
         }
@@ -112,7 +173,7 @@ impl Connection {
         }
         let result = match structural {
             Err(error) => Err(error),
-            Ok(()) => self.integrity_check_row_constraints(scope, *remaining).await,
+            Ok(()) => self.integrity_check_row_constraints(scope, *remaining, temp).await,
         };
         match result {
             Ok(findings) => {
@@ -144,27 +205,19 @@ impl Connection {
         &self,
         only_table: Option<&str>,
         budget: usize,
+        temp: bool,
     ) -> Result<Vec<String>> {
-        let tables = {
-            let temp_table_names = self.temp_table_names.borrow();
-            let mut tables: Vec<TableSchema> = self
-                .schema
-                .borrow()
-                .iter()
-                .filter(|table| !temp_table_names.contains(&table.name.to_ascii_lowercase()))
-                .cloned()
-                .collect();
-            tables.extend(self.shadowed_main_tables.borrow().values().cloned());
-            tables.retain(|table| {
-                table.root_page > 0
-                    && only_table.is_none_or(|name| table.name.eq_ignore_ascii_case(name))
-            });
-            tables
-        };
+        let local = if temp { PragmaSchemaScope::Temp } else { PragmaSchemaScope::Main };
+        let tables = self.pragma_table_schemas_for_scope(local);
         let mut reports = Vec::new();
         for table in &tables {
             if reports.len() >= budget {
                 break;
+            }
+            if (!temp && table.root_page <= 0)
+                || only_table.is_some_and(|name| !table.name.eq_ignore_ascii_case(name))
+            {
+                continue;
             }
             let primary_key = if table.without_rowid || table.strict {
                 table.primary_key_constraints.first().cloned().unwrap_or_default()
@@ -183,7 +236,7 @@ impl Connection {
                 })
                 .map(|column| column.name.as_str())
                 .collect();
-            let strict_types = self.integrity_check_strict_type_predicates(table).await?;
+            let strict_types = self.integrity_check_strict_type_predicates(table, local).await?;
             if not_null.is_empty()
                 && strict_types.is_empty()
                 && table.check_constraints.is_empty()
@@ -204,9 +257,9 @@ impl Connection {
                 )
                 .collect();
             let sql = format!(
-                "SELECT {} FROM main.{} NOT INDEXED WHERE {} LIMIT {}",
+                "SELECT {} FROM {} NOT INDEXED WHERE {} LIMIT {}",
                 predicates.join(", "),
-                quote_identifier(&table.name),
+                pragma_qualified_relation(local, &table.name),
                 predicates
                     .iter()
                     .map(|predicate| format!("({predicate})"))
@@ -401,7 +454,7 @@ fn integrity_check_error_limit(value: Option<&fsqlite_ast::PragmaValue>) -> usiz
 }
 
 /// `PRAGMA integrity_check(T)` / `('T')` limits the check to one table.
-fn integrity_check_table_scope(value: Option<&fsqlite_ast::PragmaValue>) -> Option<String> {
+pub(super) fn integrity_check_table_scope(value: Option<&fsqlite_ast::PragmaValue>) -> Option<String> {
     let (fsqlite_ast::PragmaValue::Assign(expr) | fsqlite_ast::PragmaValue::Call(expr)) = value?;
     match expr {
         Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(col_ref.column.to_string()),

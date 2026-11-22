@@ -475,10 +475,100 @@ fn bd_vojth_checks_stored_rows_after_rowid_findings() {
                         );
                     }
                 }
+                for table in ["t", "q", "sqlite_schema"] {
+                    let sql = format!("PRAGMA {kind}({table})");
+                    let oracle = stock_reports(&path, &sql);
+                    for prepared in [false, true] {
+                        assert_eq!(
+                            native_reports(&conn, &sql, prepared).await,
+                            oracle,
+                            "{damaged}: {sql}"
+                        );
+                    }
+                }
             }
             conn.close().await.unwrap();
         });
     }
+}
+
+#[test]
+fn partial_integrity_checks_resolve_tables_in_sqlite_search_order() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, invalid) in [("main", 2), ("First", 1), ("second", 3)] {
+        let conn = rusqlite::Connection::open(dir.path().join(name)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(x CHECK(x>0)); CREATE VIEW v AS SELECT * FROM t;
+             PRAGMA ignore_check_constraints=ON;",
+        )
+        .unwrap();
+        if name != "main" {
+            conn.execute_batch("CREATE TABLE child(x CHECK(x>0))")
+                .unwrap();
+        }
+        for _ in 0..invalid {
+            conn.execute("INSERT INTO t VALUES(-1)", []).unwrap();
+            if name != "main" {
+                conn.execute("INSERT INTO child VALUES(-1)", []).unwrap();
+            }
+        }
+    }
+    let main = dir.path().join("main");
+    let stock = rusqlite::Connection::open(&main).unwrap();
+    asupersync::test_utils::run_test(|| async {
+        let native = Connection::open(main.to_str().unwrap()).await.unwrap();
+        for schema in ["First", "second"] {
+            let sql = format!("ATTACH ?1 AS {schema}");
+            let path = dir.path().join(schema);
+            let path = path.to_str().unwrap();
+            stock.execute(&sql, [path]).unwrap();
+            native
+                .execute_with_params(&sql, &[SqliteValue::Text(path.into())])
+                .await
+                .unwrap();
+        }
+        for temp in [false, true] {
+            if temp {
+                let ddl =
+                    "CREATE TEMP TABLE t(label TEXT NOT NULL); INSERT INTO temp.t VALUES('ok')";
+                stock.execute_batch(ddl).unwrap();
+                native.execute_batch(ddl).await.unwrap();
+            }
+            for kind in ["integrity_check", "quick_check"] {
+                for (schema, target) in [
+                    ("", "t"),
+                    ("main.", "t"),
+                    ("", "child"),
+                    ("fIrSt.", "child"),
+                    ("second.", "child"),
+                    ("main.", "v"),
+                    ("", "sqlite_schema"),
+                    ("temp.", "sqlite_schema"),
+                    ("", "absent"),
+                    ("main.", "absent"),
+                    ("first.", "absent"),
+                    ("temp.", "t"),
+                ] {
+                    let sql = format!("PRAGMA {schema}{kind}('{target}')");
+                    let oracle = stock.prepare(&sql);
+                    for prepared in [false, true] {
+                        if let Err(error) = &oracle {
+                            let actual = native_check(&native, &sql, prepared).await.unwrap_err();
+                            assert_eq!(actual.to_string(), error.to_string(), "{sql}");
+                        } else {
+                            let expected = stock_connection_reports(&stock, &sql);
+                            assert_eq!(
+                                native_reports(&native, &sql, prepared).await,
+                                expected,
+                                "{sql}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        native.close().await.unwrap();
+    });
 }
 
 #[test]
