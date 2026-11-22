@@ -47407,8 +47407,10 @@ impl Connection {
                         for assignment in assignments {
                             // bd-4l4y3: `SET (n, c) = (SELECT ...)` assigns a
                             // row value here as in UPDATE.
-                            self.lower_row_value_set_subquery(assignment, &set_scope, params)
-                                .await?;
+                            self.lower_row_value_set_subquery(
+                                assignment, &set_scope, params, true,
+                            )
+                            .await?;
                             rewrite_dml_in_expr(
                                 &mut assignment.value,
                                 self,
@@ -47481,8 +47483,9 @@ impl Connection {
                 for assignment in &mut update.assignments {
                     // bd-4l4y3: a FROM-less or uncorrelated source becomes the
                     // row value it assigns; a `*`, compound or VALUES source
-                    // needs no column-by-column projection then.
-                    self.lower_row_value_set_subquery(assignment, &set_scope, params)
+                    // needs no column-by-column projection then. bd-b1qin: so
+                    // does a correlated source the projection cannot read.
+                    self.lower_row_value_set_subquery(assignment, &set_scope, params, false)
                         .await?;
                     // bd-22jvi: a row-value SET whose RHS is directly a
                     // multi-column subquery — `SET (a, b) = (SELECT a, b FROM
@@ -84495,15 +84498,26 @@ impl Connection {
     ///   row value of its first row.
     ///
     /// Any other subquery (a correlated one with a FROM, or one with a
-    /// placeholder while preparing) is left for the UPDATE lowering, which
-    /// projects it column by column; its names are resolved first against
+    /// placeholder while preparing) has its names resolved first against
     /// `scope`, the FROM items the assignment sees, so a name nothing
-    /// supplies is stock's "no such column" rather than a NULL.
+    /// supplies is stock's "no such column" rather than a NULL, and then its
+    /// width checked. bd-b1qin: then
+    /// - a source the compiled scalar subquery answers one column at a time
+    ///   (one base table, explicit result columns, an ORDER BY that names no
+    ///   result position or alias) is left to UPDATE's column-by-column
+    ///   projection, and in an upsert becomes the row value of those
+    ///   projections;
+    /// - any other source (`*`, a compound, a join, a derived table, GROUP
+    ///   BY) in an UPDATE becomes the row value of `(WITH ... SELECT ci ...)`
+    ///   projections of its first row ([`row_value_set_cte_projections`]),
+    ///   which the UPDATE reads row by row through the SELECT path; an
+    ///   upsert's compiled DO UPDATE cannot read those, so it is refused.
     async fn lower_row_value_set_subquery(
         &self,
         assignment: &mut fsqlite_ast::Assignment,
         scope: &FromClause,
         params: Option<&[SqliteValue]>,
+        in_upsert: bool,
     ) -> Result<()> {
         let fsqlite_ast::AssignmentTarget::ColumnList(targets) = &assignment.target else {
             return Ok(());
@@ -84516,9 +84530,8 @@ impl Connection {
             assignment.value = Expr::RowValue(values, span);
             return Ok(());
         }
-        if rewrite_probe_is_correlated(self, subquery)
-            || (params.is_none() && select_contains_any_placeholder(subquery))
-        {
+        let correlated = rewrite_probe_is_correlated(self, subquery);
+        if correlated || (params.is_none() && select_contains_any_placeholder(subquery)) {
             let check = select_of_result_exprs(
                 vec![Expr::Exists {
                     subquery: subquery.clone(),
@@ -84527,7 +84540,34 @@ impl Connection {
                 }],
                 Some(scope.clone()),
             );
-            return self.validate_select_column_references(&check);
+            self.validate_select_column_references(&check)?;
+            let width = self.select_result_column_count(subquery, &[], &mut Vec::new());
+            if width != targets.len() {
+                return Err(FrankenError::FunctionError(format!(
+                    "{} columns assigned {width} values",
+                    targets.len()
+                )));
+            }
+            if !correlated {
+                // Preparing: the execution binds the parameters and folds
+                // this source as below.
+                return Ok(());
+            }
+            if let Some(columns) = self.row_value_set_column_projections(subquery, span) {
+                if in_upsert {
+                    assignment.value = Expr::RowValue(columns, span);
+                }
+                return Ok(());
+            }
+            if in_upsert {
+                return Err(FrankenError::NotImplemented(
+                    "a row-value DO UPDATE SET from a correlated subquery that is not one \
+                     SELECT of one table with explicit result columns"
+                        .to_owned(),
+                ));
+            }
+            assignment.value = Expr::RowValue(row_value_set_cte_projections(subquery, width, span), span);
+            return Ok(());
         }
         let mut probe = (**subquery).clone();
         self.limit_probe_to_its_first_row(&mut probe);
@@ -84551,6 +84591,87 @@ impl Connection {
             .collect();
         assignment.value = Expr::RowValue(values, span);
         Ok(())
+    }
+
+    /// bd-b1qin: the scalar subqueries that read a row-value SET source one
+    /// column at a time, `(SELECT ei FROM ... )` for each result column `ei`
+    /// with the FROM, WHERE, ORDER BY and LIMIT kept, when the compiled
+    /// scalar subquery answers each of them and each reads the source's first
+    /// row: one base table, explicit result columns with no window function
+    /// and aggregates in all of them or none, and an ORDER BY that names no
+    /// result position or alias (a projection keeps only its own column).
+    /// `None` otherwise.
+    fn row_value_set_column_projections(
+        &self,
+        subquery: &SelectStatement,
+        span: fsqlite_ast::Span,
+    ) -> Option<Vec<Expr>> {
+        if !subquery.body.compounds.is_empty()
+            || !scalar_subquery_answered_by_table_scan(subquery, self)
+        {
+            return None;
+        }
+        let SelectCore::Select { columns, .. } = &subquery.body.select else {
+            return None;
+        };
+        let aliases: Vec<&str> = columns
+            .iter()
+            .filter_map(|column| match column {
+                ResultColumn::Expr {
+                    alias: Some(alias), ..
+                } => Some(alias.as_str()),
+                _ => None,
+            })
+            .collect();
+        let order_by_names_a_result = subquery.order_by.iter().any(|term| {
+            let mut expr = &term.expr;
+            while let Expr::Collate { expr: inner, .. } = expr {
+                expr = inner;
+            }
+            match expr {
+                Expr::Literal(Literal::Integer(_), _) => true,
+                Expr::Column(column, _) => {
+                    column.table.is_none()
+                        && aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(&column.column))
+                }
+                _ => false,
+            }
+        });
+        if order_by_names_a_result {
+            return None;
+        }
+        if !columns
+            .iter()
+            .all(|column| matches!(column, ResultColumn::Expr { .. }))
+            || has_window_functions(subquery)
+        {
+            return None;
+        }
+        // A bare column beside an aggregate reads the aggregate's row, which
+        // its projection alone does not find.
+        let aggregates = columns
+            .iter()
+            .filter(|column| {
+                matches!(column, ResultColumn::Expr { expr, .. }
+                    if self.expr_contains_aggregate_with_registry(expr))
+            })
+            .count();
+        if aggregates != 0 && aggregates != columns.len() {
+            return None;
+        }
+        let projections = columns
+            .iter()
+            .map(|column| {
+                let mut projection = subquery.clone();
+                if let SelectCore::Select { columns, .. } = &mut projection.body.select {
+                    *columns = vec![column.clone()];
+                }
+                Expr::Subquery(Box::new(projection), span)
+            })
+            .collect();
+        Some(projections)
     }
 
     /// The result expressions of a FROM-less single-row `SELECT e1, ..., en`
@@ -172524,6 +172645,63 @@ fn result_column_exprs(columns: &[ResultColumn]) -> impl Iterator<Item = &Expr> 
         ResultColumn::Expr { expr, .. } => Some(expr),
         ResultColumn::Star | ResultColumn::TableStar(_) => None,
     })
+}
+
+/// bd-b1qin: the row value `SET (c1, ..., cn) = (subquery)` assigns, for a
+/// correlated subquery the compiled scalar subquery cannot read one column at
+/// a time (`*`, a compound, a join, a derived table, GROUP BY, ...). Element
+/// `i` is `(WITH <name>(c1, ..., cn) AS (subquery) SELECT ci FROM <name>
+/// LIMIT 1)`: the `i`-th value of the subquery's first row, NULL when it has
+/// none, as stock assigns. The CTE's column list names the values by
+/// position, so duplicate or unnamed result columns cannot clash; its name is
+/// one the subquery does not mention.
+fn row_value_set_cte_projections(
+    subquery: &SelectStatement,
+    width: usize,
+    span: fsqlite_ast::Span,
+) -> Vec<Expr> {
+    let text = subquery.to_string().to_ascii_lowercase();
+    let mut name = "fsqlite_row_value_set".to_owned();
+    let mut suffix = 0_usize;
+    while text.contains(&name) {
+        suffix += 1;
+        name = format!("fsqlite_row_value_set_{suffix}");
+    }
+    let columns: Vec<String> = (1..=width).map(|index| format!("c{index}")).collect();
+    columns
+        .iter()
+        .map(|column| {
+            let mut projection = select_of_result_exprs(
+                vec![Expr::Column(
+                    fsqlite_ast::ColumnRef::bare(column.as_str()),
+                    span,
+                )],
+                Some(FromClause {
+                    source: TableOrSubquery::Table {
+                        name: QualifiedName::bare(name.clone()),
+                        alias: None,
+                        index_hint: None,
+                        time_travel: None,
+                    },
+                    joins: Vec::new(),
+                }),
+            );
+            projection.with = Some(fsqlite_ast::WithClause {
+                recursive: false,
+                ctes: vec![fsqlite_ast::Cte {
+                    name: name.clone(),
+                    columns: columns.clone(),
+                    materialized: None,
+                    query: subquery.clone(),
+                }],
+            });
+            projection.limit = Some(fsqlite_ast::LimitClause {
+                limit: Expr::Literal(Literal::Integer(1), span),
+                offset: None,
+            });
+            Expr::Subquery(Box::new(projection), span)
+        })
+        .collect()
 }
 
 fn select_of_result_exprs(exprs: Vec<Expr>, from: Option<FromClause>) -> SelectStatement {
