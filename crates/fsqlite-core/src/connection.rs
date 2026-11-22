@@ -50560,7 +50560,7 @@ enum PageOwnershipSink<'a> {
 struct IntegrityCheckReports {
     limit: usize,
     findings: Vec<String>,
-    quick_index_counts: Option<Vec<String>>,
+    index_counts: Vec<String>,
 }
 
 impl IntegrityCheckReports {
@@ -88989,8 +88989,12 @@ impl Connection {
                 table_count = Some(entries);
             }
 
+            // Full rowid checks already reconcile each secondary key below.
+            // WITHOUT ROWID tables and quick checks also need a verdict when
+            // an otherwise well-formed index is missing records.
+            let compare_counts = check_key_order && (integrity_connection.is_none() || table.without_rowid);
             let mut indexes = table.indexes.iter();
-            while let Some(index) = if reports.quick_index_counts.is_some() {
+            while let Some(index) = if compare_counts && reports.limit > 0 {
                 indexes.next_back()
             } else {
                 indexes.next()
@@ -89011,12 +89015,17 @@ impl Connection {
                     reports,
                 )
                 .await?;
-                if let Some(count_errors) = &mut reports.quick_index_counts
-                    && count_errors.len() < reports.limit
+                if compare_counts
                     && index.where_clause.is_none()
                     && table_count.is_some_and(|expected| expected != index_count)
                 {
-                    count_errors.push(format!("wrong # of entries in index {}", index.name));
+                    let detail = format!("wrong # of entries in index {}", index.name);
+                    if reports.limit == 0 {
+                        return Err(FrankenError::DatabaseCorrupt { detail });
+                    }
+                    if reports.index_counts.len() < reports.limit {
+                        reports.index_counts.push(detail);
+                    }
                 }
             }
         }
