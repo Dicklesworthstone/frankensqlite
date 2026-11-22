@@ -11415,6 +11415,7 @@ struct DifferentialRegistry {
 struct TriggerDef {
     name: String,
     table_name: String,
+    table_schema: Option<String>,
     timing: fsqlite_ast::TriggerTiming,
     event: fsqlite_ast::TriggerEvent,
     #[allow(dead_code)] // SQLite-only: always true; retained for display/roundtrip fidelity.
@@ -11433,6 +11434,7 @@ impl TriggerDef {
         Self {
             name: stmt.name.name.clone(),
             table_name: stmt.table.clone(),
+            table_schema: stmt.table_schema.clone(),
             timing: stmt.timing,
             event: stmt.event.clone(),
             for_each_row: stmt.for_each_row,
@@ -75931,15 +75933,15 @@ impl Connection {
                         .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
                 });
                 // Remove indexes that reference the dropped column.
-                let dropped_indexes: Vec<String> = table
+                let dropped_indexes: Vec<_> = table
                     .indexes
                     .iter()
                     .filter(|idx| idx.columns.iter().any(|c| c.eq_ignore_ascii_case(col_name)))
-                    .map(|idx| idx.name.clone())
+                    .map(|idx| (idx.root_page, idx.name.clone()))
                     .collect();
                 table
                     .indexes
-                    .retain(|idx| !dropped_indexes.contains(&idx.name));
+                    .retain(|idx| !dropped_indexes.iter().any(|(root, _)| *root == idx.root_page));
 
                 // Remove FKs that reference the dropped column, and adjust
                 // column indices for remaining FKs whose child_columns point
@@ -75963,7 +75965,8 @@ impl Connection {
                 let table_clone = table.clone();
                 // Drop the schema borrow before calling delete_sqlite_master_row.
                 drop(schema);
-                if let Some(&alias_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
+                let rowid_alias = self.rowid_alias_columns.borrow().get(&tbl_key).copied();
+                if let Some(alias_idx) = rowid_alias {
                     if alias_idx == col_idx {
                         self.rowid_alias_columns.borrow_mut().remove(&tbl_key);
                     } else if alias_idx > col_idx {
@@ -75973,9 +75976,12 @@ impl Connection {
                             .insert(tbl_key, alias_idx - 1);
                     }
                 }
-                for idx_name in &dropped_indexes {
-                    self.delete_sqlite_master_typed_row("index", idx_name)
-                        .await?;
+                for (root, idx_name) in &dropped_indexes {
+                    if alters_temp_table {
+                        self.temp_table_sql.borrow_mut().remove(root);
+                    } else {
+                        self.delete_sqlite_master_typed_row("index", idx_name).await?;
+                    }
                 }
                 // Physically rewrite stored rows to drop the column's record slot
                 // so trailing columns realign on read (the read path decodes by
@@ -76399,8 +76405,9 @@ impl Connection {
     ) -> Vec<(String, String)> {
         let mut updates = Vec::new();
         let mut views = self.views.borrow_mut();
+        let target = TableRenameTarget::new(old_name, temp_only);
         for view in views.iter_mut().filter(|view| !temp_only || view.temporary) {
-            if rename_table_refs_in_select(&mut view.query, old_name, new_name) {
+            if rename_table_refs_in_select(&mut view.query, &target, new_name) {
                 let sql = render_create_view_sql(view);
                 if view.temporary {
                     view.temp_create_sql = Some(sql);
@@ -76420,12 +76427,14 @@ impl Connection {
     ) -> Vec<(String, String, String)> {
         let mut updates = Vec::new();
         let mut triggers = self.triggers.borrow_mut();
+        let target = TableRenameTarget::new(old_name, temp_only);
         for trigger in triggers.iter_mut().filter(|trigger| !temp_only || trigger.temporary) {
             // A savepoint's schema snapshot may share this definition: the
             // rename edits this connection's copy, and a rollback restores
             // the shared original.
             let trigger = Arc::make_mut(trigger);
-            let mut changed = if trigger.table_name.eq_ignore_ascii_case(old_name) {
+            let mut changed = if trigger.table_name.eq_ignore_ascii_case(old_name)
+                && target.matches_schema(trigger.table_schema.as_deref()) {
                 trigger.table_name.clear();
                 trigger.table_name.push_str(new_name);
                 true
@@ -76435,14 +76444,14 @@ impl Connection {
             if let Some(when_clause) = &mut trigger.when_clause {
                 changed |= rename_table_refs_in_expr(
                     when_clause,
-                    old_name,
+                    &target,
                     new_name,
                     &HashSet::new(),
                     false,
                 );
             }
             for statement in &mut trigger.body {
-                changed |= rename_table_refs_in_statement(statement, old_name, new_name);
+                changed |= rename_table_refs_in_statement(statement, &target, new_name);
             }
             if changed {
                 trigger.create_sql = render_create_trigger_sql(trigger);
@@ -76641,7 +76650,8 @@ impl Connection {
             // As in the table rename: a snapshot keeps the original.
             let trigger = Arc::make_mut(trigger);
             let mut changed = false;
-            let trigger_target_matches = trigger.table_name.eq_ignore_ascii_case(table_name);
+            let trigger_target_matches = trigger.table_name.eq_ignore_ascii_case(table_name)
+                && source_catalog.matches_target_schema(trigger.table_schema.as_deref());
             if trigger_target_matches {
                 changed |= rename_trigger_event_columns(&mut trigger.event, old_column, new_column);
             }
@@ -76720,6 +76730,7 @@ impl Connection {
         }
         ColumnRenameSourceCatalog {
             renamed_table: table_name.to_ascii_lowercase(),
+            target_is_temp: self.temp_table_names.borrow().contains(&table_name.to_ascii_lowercase()),
             known_tables,
             tables_with_old_column,
             view_outputs: HashMap::new(),
@@ -142754,7 +142765,7 @@ fn schema_table_index_or_view_name_exists(
 fn render_create_view_sql(view: &ViewDef) -> String {
     fsqlite_ast::CreateViewStatement {
         if_not_exists: false,
-        temporary: view.temporary,
+        temporary: false,
         name: QualifiedName::bare(view.name.clone()),
         columns: view.columns.clone(),
         query: view.query.clone(),
@@ -142765,11 +142776,11 @@ fn render_create_view_sql(view: &ViewDef) -> String {
 fn render_create_trigger_sql(trigger: &TriggerDef) -> String {
     fsqlite_ast::CreateTriggerStatement {
         if_not_exists: false,
-        temporary: trigger.temporary,
+        temporary: false,
         name: QualifiedName::bare(trigger.name.clone()),
         timing: trigger.timing,
         event: trigger.event.clone(),
-        table_schema: None,
+        table_schema: trigger.table_schema.clone(),
         table: trigger.table_name.clone(),
         for_each_row: trigger.for_each_row,
         when: trigger.when_clause.clone(),
@@ -142797,7 +142808,22 @@ impl TableRenameScope {
     }
 }
 
-fn rename_table_refs_in_statement(statement: &mut Statement, old: &str, new: &str) -> bool {
+struct TableRenameTarget<'a> {
+    name: &'a str,
+    schema: &'static str,
+}
+
+impl<'a> TableRenameTarget<'a> {
+    fn new(name: &'a str, temporary: bool) -> Self {
+        Self { name, schema: if temporary { "temp" } else { "main" } }
+    }
+
+    fn matches_schema(&self, schema: Option<&str>) -> bool {
+        schema.is_none_or(|schema| schema.eq_ignore_ascii_case(self.schema))
+    }
+}
+
+fn rename_table_refs_in_statement(statement: &mut Statement, old: &TableRenameTarget<'_>, new: &str) -> bool {
     let mut changed = false;
     match statement {
         Statement::Select(select) => rename_table_refs_in_select(select, old, new),
@@ -142810,7 +142836,7 @@ fn rename_table_refs_in_statement(statement: &mut Statement, old: &str, new: &st
         }
         Statement::CreateView(view) => rename_table_refs_in_select(&mut view.query, old, new),
         Statement::CreateIndex(index) => {
-            if index.table.eq_ignore_ascii_case(old) {
+            if index.table.eq_ignore_ascii_case(old.name) {
                 index.table.clear();
                 index.table.push_str(new);
                 changed = true;
@@ -142829,13 +142855,13 @@ fn rename_table_refs_in_statement(statement: &mut Statement, old: &str, new: &st
     }
 }
 
-fn rename_table_refs_in_select(select: &mut SelectStatement, old: &str, new: &str) -> bool {
+fn rename_table_refs_in_select(select: &mut SelectStatement, old: &TableRenameTarget<'_>, new: &str) -> bool {
     rename_table_refs_in_select_with_hidden(select, old, new, &HashSet::new())
 }
 
 fn rename_table_refs_in_select_with_hidden(
     select: &mut SelectStatement,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> bool {
@@ -142883,7 +142909,7 @@ fn rename_table_refs_in_select_with_hidden(
 
 fn rename_table_refs_in_with_clause(
     with: &mut fsqlite_ast::WithClause,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> (bool, HashSet<String>) {
@@ -142899,13 +142925,13 @@ fn rename_table_refs_in_with_clause(
 
 fn rename_table_refs_in_insert_statement(
     insert: &mut InsertStatement,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
 ) -> bool {
     let old_alias_present = insert
         .alias
         .as_deref()
-        .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+        .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name));
     let renamed_target = rename_qualified_table_name(&mut insert.table, old, new, &HashSet::new());
     let mut changed = renamed_target;
     let hidden_tables = if let Some(with) = &mut insert.with {
@@ -142980,7 +143006,7 @@ fn rename_table_refs_in_insert_statement(
 
 fn rename_table_refs_in_update_statement(
     update: &mut fsqlite_ast::UpdateStatement,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
 ) -> bool {
     let mut changed = false;
@@ -143057,7 +143083,7 @@ fn rename_table_refs_in_update_statement(
 
 fn rename_table_refs_in_delete_statement(
     delete: &mut fsqlite_ast::DeleteStatement,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
 ) -> bool {
     let mut changed = false;
@@ -143102,7 +143128,7 @@ fn rename_table_refs_in_delete_statement(
 
 fn rename_table_refs_in_select_core(
     core: &mut SelectCore,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> TableRenameScope {
@@ -143193,7 +143219,7 @@ fn rename_table_refs_in_select_core(
 
 fn rename_table_refs_in_table_or_subquery(
     source: &mut TableOrSubquery,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> TableRenameScope {
@@ -143202,7 +143228,7 @@ fn rename_table_refs_in_table_or_subquery(
         TableOrSubquery::Table { name, alias, .. } => {
             scope.old_alias_present = alias
                 .as_deref()
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name));
             if rename_qualified_table_name(name, old, new, hidden_tables) {
                 scope.changed = true;
                 scope.renamed_unaliased_source = alias.is_none();
@@ -143213,7 +143239,7 @@ fn rename_table_refs_in_table_or_subquery(
                 rename_table_refs_in_select_with_hidden(query, old, new, hidden_tables);
             scope.old_alias_present = alias
                 .as_deref()
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name));
         }
         TableOrSubquery::TableFunction { args, alias, .. } => {
             for expr in args {
@@ -143221,7 +143247,7 @@ fn rename_table_refs_in_table_or_subquery(
             }
             scope.old_alias_present = alias
                 .as_deref()
-                .is_some_and(|alias| alias.eq_ignore_ascii_case(old));
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name));
         }
         TableOrSubquery::ParenJoin(from_clause) => {
             scope.merge(rename_table_refs_in_table_or_subquery(
@@ -143252,14 +143278,14 @@ fn rename_table_refs_in_table_or_subquery(
 
 fn rename_table_refs_in_qualified_table_ref(
     table: &mut fsqlite_ast::QualifiedTableRef,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
 ) -> TableRenameScope {
     let mut scope = TableRenameScope {
         old_alias_present: table
             .alias
             .as_deref()
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(old)),
+            .is_some_and(|alias| alias.eq_ignore_ascii_case(old.name)),
         ..TableRenameScope::default()
     };
     if rename_qualified_table_name(&mut table.name, old, new, &HashSet::new()) {
@@ -143271,11 +143297,12 @@ fn rename_table_refs_in_qualified_table_ref(
 
 fn rename_qualified_table_name(
     name: &mut QualifiedName,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
 ) -> bool {
-    if !qualified_relation_matches_unhidden_name(name, old, hidden_tables) {
+    if !old.matches_schema(name.schema.as_deref())
+        || !qualified_relation_matches_unhidden_name(name, old.name, hidden_tables) {
         return false;
     }
     name.name.clear();
@@ -143285,7 +143312,7 @@ fn rename_qualified_table_name(
 
 fn rename_table_refs_in_result_column(
     column: &mut ResultColumn,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143303,7 +143330,7 @@ fn rename_table_refs_in_result_column(
 
 fn rename_table_refs_in_expr(
     expr: &mut Expr,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143315,10 +143342,11 @@ fn rename_table_refs_in_expr(
         | Expr::Raise { .. } => false,
         Expr::Column(col_ref, _) => {
             if rename_qualifiers
+                && old.matches_schema(col_ref.schema.as_deref())
                 && col_ref
                     .table
                     .as_deref()
-                    .is_some_and(|table| table.eq_ignore_ascii_case(old))
+                    .is_some_and(|table| table.eq_ignore_ascii_case(old.name))
             {
                 col_ref.table = Some(Arc::from(new));
                 true
@@ -143435,7 +143463,7 @@ fn rename_table_refs_in_expr(
 
 fn rename_table_refs_in_window_spec(
     window: &mut WindowSpec,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143455,7 +143483,7 @@ fn rename_table_refs_in_window_spec(
 
 fn rename_table_refs_in_frame_spec(
     frame: &mut FrameSpec,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143468,7 +143496,7 @@ fn rename_table_refs_in_frame_spec(
 
 fn rename_table_refs_in_frame_bound(
     bound: &mut FrameBound,
-    old: &str,
+    old: &TableRenameTarget<'_>,
     new: &str,
     hidden_tables: &HashSet<String>,
     rename_qualifiers: bool,
@@ -143574,12 +143602,17 @@ impl ColumnRenameOutputSources {
 
 struct ColumnRenameSourceCatalog {
     renamed_table: String,
+    target_is_temp: bool,
     known_tables: HashSet<String>,
     tables_with_old_column: HashSet<String>,
     view_outputs: HashMap<String, ColumnRenameOutputStatus>,
 }
 
 impl ColumnRenameSourceCatalog {
+    fn matches_target_schema(&self, schema: Option<&str>) -> bool {
+        TableRenameTarget::new(&self.renamed_table, self.target_is_temp).matches_schema(schema)
+    }
+
     fn set_view_output_status(
         &mut self,
         view_name: &str,
@@ -143647,7 +143680,7 @@ impl ColumnRenameSourceCatalog {
         if let Some(status) = self.view_outputs.get(&key) {
             return *status;
         }
-        if key == self.renamed_table {
+        if key == self.renamed_table && self.matches_target_schema(name.schema.as_deref()) {
             ColumnRenameOutputStatus::renamed()
         } else if self.tables_with_old_column.contains(&key) || !self.known_tables.contains(&key) {
             ColumnRenameOutputStatus::old()
@@ -144522,7 +144555,8 @@ fn collect_column_rename_bindings_from_table_or_subquery_with_outer(
                     bindings.add_matching_binding(&name.name);
                 }
             }
-            if qualified_relation_matches_unhidden_name(name, table_name, hidden_tables) {
+            if source_catalog.matches_target_schema(name.schema.as_deref())
+                && qualified_relation_matches_unhidden_name(name, table_name, hidden_tables) {
                 bindings.add_matching_binding(alias.as_deref().unwrap_or(&name.name));
                 if alias.is_none() {
                     bindings.add_matching_binding(table_name);
@@ -144663,7 +144697,8 @@ fn rename_column_refs_in_insert_for_table(
     source_catalog: &ColumnRenameSourceCatalog,
 ) -> bool {
     let mut changed = false;
-    let target_matches = qualified_relation_matches_name(&insert.table, table_name);
+    let target_matches = source_catalog.matches_target_schema(insert.table.schema.as_deref())
+        && qualified_relation_matches_name(&insert.table, table_name);
     let hidden_tables = if let Some(with) = &mut insert.with {
         let (with_changed, hidden) = rename_column_refs_in_with_clause_for_table(
             with,
@@ -144893,7 +144928,8 @@ fn rename_column_refs_in_update_for_table(
         bindings.add_source();
     }
     bindings.add_source_alias_or_name(update.table.alias.as_deref(), &update.table.name.name);
-    if qualified_relation_matches_name(&update.table.name, table_name) {
+    if source_catalog.matches_target_schema(update.table.name.schema.as_deref())
+        && qualified_relation_matches_name(&update.table.name, table_name) {
         bindings.add_matching_binding(
             update
                 .table
@@ -145044,7 +145080,8 @@ fn rename_column_refs_in_delete_for_table(
         bindings.add_source();
     }
     bindings.add_source_alias_or_name(delete.table.alias.as_deref(), &delete.table.name.name);
-    if qualified_relation_matches_name(&delete.table.name, table_name) {
+    if source_catalog.matches_target_schema(delete.table.name.schema.as_deref())
+        && qualified_relation_matches_name(&delete.table.name, table_name) {
         bindings.add_matching_binding(
             delete
                 .table

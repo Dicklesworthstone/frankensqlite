@@ -41,6 +41,9 @@ fn temp_renames_preserve_the_persistent_table_and_its_dependents_after_reopen() 
                 "CREATE TEMP TABLE t(u TEXT PRIMARY KEY)",
                 "CREATE INDEX temp.local_i ON t(u)",
                 "INSERT INTO temp.t VALUES('temp-row')",
+                "CREATE TEMP VIEW pinned AS SELECT m FROM main.t",
+                "CREATE TEMP VIEW follows AS SELECT * FROM temp.t",
+                "CREATE TEMP TRIGGER pinned_tr AFTER INSERT ON main.t BEGIN SELECT NEW.m; END",
                 "SAVEPOINT s",
                 "ALTER TABLE temp.t RENAME COLUMN u TO j",
                 "ALTER TABLE temp.t RENAME TO scratch",
@@ -49,10 +52,18 @@ fn temp_renames_preserve_the_persistent_table_and_its_dependents_after_reopen() 
             }
             let one_temp = vec![vec!["text:temp-row".to_owned()]];
             assert_eq!(fq(&db, "SELECT j FROM temp.scratch INDEXED BY local_i").await, one_temp);
+            assert_eq!(fq(&db, "SELECT * FROM follows").await, one_temp);
+            let main_row = vec![vec!["int:123".to_owned()]];
+            assert_eq!(fq(&db, "SELECT m FROM pinned").await, main_row);
+            let pinned_sql = fq(&db, "SELECT sql FROM sqlite_temp_master WHERE name='pinned'").await;
+            assert_eq!(pinned_sql, [vec!["text:CREATE VIEW pinned AS SELECT m FROM main.t".to_owned()]]);
+            assert_eq!(fq(&db, "SELECT tbl_name FROM sqlite_temp_master WHERE name='pinned_tr'").await,
+                [vec!["text:t".to_owned()]]);
             assert_eq!(fq(&db, main_schema).await, original);
             db.execute("ROLLBACK TO s").await.unwrap();
             db.execute("RELEASE s").await.unwrap();
             assert_eq!(fq(&db, "SELECT u FROM temp.t INDEXED BY local_i").await, one_temp);
+            assert_eq!(fq(&db, "SELECT u FROM follows").await, one_temp);
             db.execute("ALTER TABLE temp.t RENAME COLUMN u TO j").await.unwrap();
             db.execute("ALTER TABLE temp.t RENAME TO scratch").await.unwrap();
             assert_eq!(fq(&db, "SELECT j FROM scratch").await, one_temp);
