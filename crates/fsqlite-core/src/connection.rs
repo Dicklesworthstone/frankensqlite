@@ -87351,12 +87351,13 @@ impl Connection {
                         ),
                     })?;
 
-            if check_key_order && tree_is_table.is_some_and(|is_table| is_table != page_type.is_table()) {
+            let page_is_table = page_type.is_table();
+            if check_key_order && tree_is_table.is_some_and(|is_table| is_table != page_is_table) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("Tree {} page {}: inconsistent B-tree page type", root_page.get(), page_no.get()),
                 });
             }
-            tree_is_table.get_or_insert(page_type.is_table());
+            tree_is_table.get_or_insert(page_is_table);
             let mut previous_key = lower_key;
             let mut next_tasks = Vec::new();
             for (cell_idx, cell_pointer) in cell_pointers.iter().enumerate() {
@@ -87373,7 +87374,7 @@ impl Connection {
                     ),
                 })?;
 
-                let current_key = if check_key_order && page_type.is_table() {
+                let current_key = if check_key_order && page_is_table {
                     Some(IntegrityKey::Rowid(cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!("Tree {} page {} cell {cell_idx}: missing rowid", root_page.get(), page_no.get()),
                     })?))
@@ -87439,7 +87440,7 @@ impl Connection {
                     });
                 }
                 if let Some(first_overflow) = cell.overflow_page
-                    && !(check_key_order && !page_type.is_table() && index_order.is_some())
+                    && !(check_key_order && !page_is_table && index_order.is_some())
                 {
                     next_tasks.push(WalkTask::Overflow {
                         first_overflow,
