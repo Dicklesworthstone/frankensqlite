@@ -190,6 +190,21 @@ fn cast_blob_writes_searchable_index_entries_in_the_database_encoding() {
                 if native_origin {
                     db.execute(&init).await.unwrap();
                 }
+                let sql = "SELECT CAST(?1 AS BLOB)";
+                let prepared = db.prepare(sql).await.unwrap();
+                for (native, reference) in [
+                    (SqliteValue::from("café🎵"), rusqlite::types::Value::Text("café🎵".to_owned())),
+                    (SqliteValue::Integer(-12), rusqlite::types::Value::Integer(-12)),
+                    (SqliteValue::Float(1.25), rusqlite::types::Value::Real(1.25)),
+                    (SqliteValue::from(vec![0, 255]), rusqlite::types::Value::Blob(vec![0, 255])),
+                    (SqliteValue::Null, rusqlite::types::Value::Null),
+                ] {
+                    let expected: Option<Vec<u8>> = oracle.query_row(sql, [reference], |row| row.get(0)).unwrap();
+                    let result = prepared.query_with_params(&[native]).await.unwrap();
+                    assert_eq!(result.len(), 1);
+                    assert_eq!(result[0].values(), &[expected.map_or(SqliteValue::Null, SqliteValue::from)]);
+                }
+                drop(prepared);
                 db.execute("INSERT INTO t VALUES(1,'café🎵'),(2,'other')")
                     .await
                     .unwrap();
