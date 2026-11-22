@@ -32,6 +32,7 @@
 )]
 
 mod conformal_retry;
+mod cte_cursor_budget;
 mod insert_batch;
 mod literal_params;
 mod pragma_maintenance;
@@ -57088,6 +57089,8 @@ impl Connection {
     fn validate_statement_select_relations(&self, statement: &Statement) -> Result<()> {
         match statement {
             Statement::Select(select) => {
+                // bd-u01ku: stock's cursor budget at a CTE expansion.
+                Self::validate_cte_cursor_budget(select)?;
                 self.ensure_referenced_vtabs_available(select)?;
                 SelectRelationResolver::new(self).validate_select(select)
             }
