@@ -608,6 +608,58 @@ fn partial_integrity_checks_resolve_tables_in_sqlite_search_order() {
 }
 
 #[test]
+fn quick_check_counts_unconditional_index_entries_in_the_selected_database() {
+    let dir = tempfile::tempdir().unwrap();
+    for without_rowid in [false, true] {
+        let path = dir.path().join(format!("index-count-{without_rowid}.db"));
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        let layout = if without_rowid { " WITHOUT ROWID" } else { "" };
+        stock
+            .execute_batch(&format!(
+                "PRAGMA page_size=512;
+                 CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER){layout};
+                 CREATE TABLE q(y);
+                 WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<900)
+                 INSERT INTO t SELECT n*3,n FROM seq;
+                 CREATE INDEX a ON t(x) WHERE x<>2;
+                 CREATE INDEX b ON t(x+1) WHERE x<>3;
+                 CREATE INDEX partial_idx ON t(x) WHERE x<100;
+                 PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema SET sql='CREATE INDEX a ON t(x)' WHERE name='a';
+                 UPDATE sqlite_schema SET sql='CREATE INDEX b ON t(x+1)' WHERE name='b';
+                 PRAGMA writable_schema=RESET;"
+            ))
+            .unwrap();
+        let first = "wrong # of entries in index b";
+        let second = "wrong # of entries in index a";
+        assert_eq!(
+            stock_connection_reports(&stock, "PRAGMA quick_check(t)"),
+            [first, second]
+        );
+        asupersync::test_utils::run_test(|| async {
+            let native = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for sql in [
+                "PRAGMA quick_check", "PRAGMA quick_check(1)", "PRAGMA quick_check(2)",
+                "PRAGMA quick_check(t)", "PRAGMA main.quick_check(q)",
+            ] {
+                let oracle = stock_connection_reports(&stock, sql);
+                for prepared in [false, true] {
+                    assert_eq!(native_reports(&native, sql, prepared).await, oracle, "{sql}");
+                }
+            }
+            native.close().await.unwrap();
+        });
+        stock.execute_batch("REINDEX a; REINDEX b;").unwrap();
+        assert_eq!(stock_connection_reports(&stock, "PRAGMA quick_check(t)"), ["ok"]);
+        asupersync::test_utils::run_test(|| async {
+            let native = Connection::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(native_reports(&native, "PRAGMA quick_check(t)", false).await, ["ok"]);
+            native.close().await.unwrap();
+        });
+    }
+}
+
+#[test]
 fn bd_vojth_rowid_and_orphan_share_one_structural_report() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mixed.db");

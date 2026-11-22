@@ -50554,15 +50554,16 @@ enum PageOwnershipSink<'a> {
     },
 }
 
-/// PRAGMAs collect independent rowid findings up to their SQL error limit.
-/// Internal validators use the default (zero budget) and fail on the first.
+/// SQL checks collect findings up to their requested limit. Internal validators
+/// use the default (zero budget) and fail on the first structural error.
 #[derive(Default)]
-struct IntegrityRowidReports {
+struct IntegrityCheckReports {
     limit: usize,
     findings: Vec<String>,
+    quick_index_counts: Option<Vec<String>>,
 }
 
-impl IntegrityRowidReports {
+impl IntegrityCheckReports {
     fn check(
         &mut self,
         upper: &mut Option<(i64, bool)>,
@@ -87220,7 +87221,7 @@ impl Connection {
                 active_state.as_ref().map(|(fl, _)| fl.as_slice()),
                 &mut owners,
                 None,
-                &mut IntegrityRowidReports::default(),
+                &mut IntegrityCheckReports::default(),
             )
             .await
         })
@@ -87228,14 +87229,14 @@ impl Connection {
     }
 
     pub(crate) async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
-        self.validate_database_integrity_reporting(quick, None, &mut IntegrityRowidReports::default()).await
+        self.validate_database_integrity_reporting(quick, None, &mut IntegrityCheckReports::default()).await
     }
 
     async fn validate_database_integrity_reporting(
         &self,
         quick: bool,
         only_table: Option<&str>,
-        reports: &mut IntegrityRowidReports,
+        reports: &mut IntegrityCheckReports,
     ) -> Result<()> {
         let active_state = self.integrity_active_state();
         self.with_integrity_txn(async |cx, txn| {
@@ -87342,7 +87343,7 @@ impl Connection {
                     None,
                     &mut owners,
                     None,
-                    &mut IntegrityRowidReports::default(),
+                    &mut IntegrityCheckReports::default(),
                 )
                 .await?;
 
@@ -88514,8 +88515,8 @@ impl Connection {
         mut owners: Option<&mut PageOwnershipSink<'_>>,
         check_key_order: bool,
         index_order: Option<(&Self, &IndexSchema, Option<usize>)>,
-        reports: &mut IntegrityRowidReports,
-    ) -> Result<()> {
+        reports: &mut IntegrityCheckReports,
+    ) -> Result<u64> {
         enum WalkTask {
             Btree {
                 page_no: PageNumber,
@@ -88545,6 +88546,7 @@ impl Connection {
         };
         let mut upper_rowid = None;
         let mut tree_is_table = None;
+        let mut entries = 0_u64;
         let mut pending = vec![WalkTask::Btree {
             page_no,
             owner: owner.to_owned(),
@@ -88650,6 +88652,11 @@ impl Connection {
                     })?;
 
             let page_is_table = page_type.is_table();
+            // Interior table cells are dividers. Interior index cells store
+            // records, including those in the primary tree of a WITHOUT ROWID table.
+            if !page_is_table || page_type.is_leaf() {
+                entries += u64::from(header.cell_count);
+            }
             if check_key_order && tree_is_table.is_some_and(|is_table| is_table != page_is_table) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("Tree {} page {}: inconsistent B-tree page type", root_page.get(), page_no.get()),
@@ -88769,7 +88776,7 @@ impl Connection {
             }
         }
 
-        Ok(())
+        Ok(entries)
     }
 
     /// Prove every page in the image is owned by exactly one structure.
@@ -88797,7 +88804,7 @@ impl Connection {
         live_freelist: Option<&[PageNumber]>,
         owners: &mut PageOwnershipSink<'_>,
         integrity_connection: Option<&Self>,
-        reports: &mut IntegrityRowidReports,
+        reports: &mut IntegrityCheckReports,
     ) -> Result<()> {
         if total_pages == 0 {
             return Ok(());
@@ -88945,13 +88952,15 @@ impl Connection {
         mut owners: Option<&mut PageOwnershipSink<'_>>,
         check_key_order: bool,
         integrity_connection: Option<&Self>,
-        reports: &mut IntegrityRowidReports,
+        reports: &mut IntegrityCheckReports,
     ) -> Result<()> {
         for table in schema {
             if table.root_page <= 0 {
                 continue;
             }
             let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+            let mut table_count = None;
+            let root_label = if owners.is_some() { " root" } else { "" };
             if table_root != PageNumber::ONE {
                 let primary_index = if table.without_rowid {
                     integrity_connection
@@ -88963,39 +88972,52 @@ impl Connection {
                 let primary_order = primary_index.as_ref().and_then(|index| {
                     integrity_connection.map(|connection| (connection, index, Some(index.key_term_count())))
                 });
-                Self::walk_integrity_btree_pages(
+                let entries = Self::walk_integrity_btree_pages(
                     cx,
                     txn,
                     page_size,
                     reserved_per_page,
                     total_pages,
                     table_root,
-                    &format!("table `{}` root", table.name),
+                    &format!("table `{}`{root_label}", table.name),
                     owners.as_deref_mut(),
                     check_key_order,
                     primary_order,
                     reports,
                 )
                 .await?;
+                table_count = Some(entries);
             }
 
-            for index in &table.indexes {
+            let mut indexes = table.indexes.iter();
+            while let Some(index) = if reports.quick_index_counts.is_some() {
+                indexes.next_back()
+            } else {
+                indexes.next()
+            } {
                 let index_root =
                     page_number_from_schema_root(index.root_page, &index.name, "index")?;
-                Self::walk_integrity_btree_pages(
+                let index_count = Self::walk_integrity_btree_pages(
                     cx,
                     txn,
                     page_size,
                     reserved_per_page,
                     total_pages,
                     index_root,
-                    &format!("index `{}` root", index.name),
+                    &format!("index `{}`{root_label}", index.name),
                     owners.as_deref_mut(),
                     check_key_order,
                     integrity_connection.map(|connection| (connection, index, None)),
                     reports,
                 )
                 .await?;
+                if let Some(count_errors) = &mut reports.quick_index_counts
+                    && count_errors.len() < reports.limit
+                    && index.where_clause.is_none()
+                    && table_count.is_some_and(|expected| expected != index_count)
+                {
+                    count_errors.push(format!("wrong # of entries in index {}", index.name));
+                }
             }
         }
 
@@ -89109,7 +89131,7 @@ impl Connection {
             None,
             &mut owners,
             None,
-            &mut IntegrityRowidReports::default(),
+            &mut IntegrityCheckReports::default(),
         )
         .await?;
 
@@ -89139,7 +89161,7 @@ impl Connection {
         largest_root_page: u32,
         live_freelist: Option<&[PageNumber]>,
         only_table: Option<&str>,
-        reports: &mut IntegrityRowidReports,
+        reports: &mut IntegrityCheckReports,
     ) -> Result<()> {
         let auto_vacuum_enabled = largest_root_page != 0;
         let mut schema = self.integrity_schema();
@@ -89266,47 +89288,11 @@ impl Connection {
                 reports,
             )
             .await?;
-            for table in &schema {
-                if table.root_page <= 0 {
-                    continue;
-                }
-                let table_root =
-                    page_number_from_schema_root(table.root_page, &table.name, "table")?;
-                if table_root != PageNumber::ONE {
-                    Self::walk_integrity_btree_pages(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        total_pages,
-                        table_root,
-                        &format!("table `{}`", table.name),
-                        None,
-                        true,
-                        None,
-                        reports,
-                    )
-                    .await?;
-                }
-                for index in &table.indexes {
-                    let index_root =
-                        page_number_from_schema_root(index.root_page, &index.name, "index")?;
-                    Self::walk_integrity_btree_pages(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        total_pages,
-                        index_root,
-                        &format!("index `{}`", index.name),
-                        None,
-                        true,
-                        None,
-                        reports,
-                    )
-                    .await?;
-                }
-            }
+            Self::walk_integrity_table_roots(
+                cx, txn, page_size, reserved_per_page, total_pages, &schema,
+                None, true, None, reports,
+            )
+            .await?;
         }
 
         // Cursor-based consistency checks assume each tree is ordered.
@@ -290261,7 +290247,7 @@ mod pager_routing_tests {
                     Some(&free),
                     &mut owners,
                     None,
-                    &mut super::IntegrityRowidReports::default(),
+                    &mut super::IntegrityCheckReports::default(),
                 )
                 .await
                 .unwrap_err();
