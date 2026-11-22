@@ -13186,6 +13186,7 @@ enum SnapshotSchemaState {
 struct SchemaSnapshot {
     schema: Vec<TableSchema>,
     temp_table_names: HashSet<String>,
+    temp_table_sql: HashMap<i32, String>,
     // TEMP has no pager header: retain its transactional default here.
     // The independent runtime cache suggestion deliberately survives rollback.
     temp_default_cache_size: i64,
@@ -14258,6 +14259,7 @@ struct TimeTravelImage {
 struct TimeTravelCatalog {
     schema: Vec<TableSchema>,
     temp_table_names: HashSet<String>,
+    temp_table_sql: HashMap<i32, String>,
     shadowed_main_tables: HashMap<String, TableSchema>,
     rowid_alias_columns: HashMap<String, usize>,
 }
@@ -15133,6 +15135,8 @@ pub struct Connection {
     /// `TEMP` tables are never written to the main `sqlite_master`, mirroring
     /// the `TriggerDef::temporary` precedent.
     temp_table_names: TxnRestorableCell<HashSet<String>>,
+    /// Original CREATE statements of connection-local tables and indexes, keyed by TEMP root.
+    temp_table_sql: TxnRestorableCell<HashMap<i32, String>>,
     /// Whether the connection's `TEMP` database handle has been lazily opened
     /// (matching SQLite's `db->aDb[1].pBt != 0`: set when a TEMP object is
     /// created or `sqlite_temp_master` is consulted, cleared when
@@ -17609,6 +17613,7 @@ impl Connection {
             schema: TxnRestorableCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: TxnRestorableCell::new(HashSet::new()),
+            temp_table_sql: TxnRestorableCell::new(HashMap::new()),
             temp_db_initialized: Cell::new(false),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
             materialized_temp_root_pages: RefCell::new(HashSet::new()),
@@ -18283,6 +18288,7 @@ impl Connection {
             schema: TxnRestorableCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: TxnRestorableCell::new(HashSet::new()),
+            temp_table_sql: TxnRestorableCell::new(HashMap::new()),
             temp_db_initialized: Cell::new(false),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
             materialized_temp_root_pages: RefCell::new(HashSet::new()),
@@ -28546,6 +28552,7 @@ impl Connection {
     /// `PRAGMA temp_store` switches storage mode outside a transaction
     /// (matching stock SQLite's `changeTempStorage` semantics).
     fn reset_all_temp_objects_for_mode_change(&self) {
+        self.temp_table_sql.borrow_mut().clear();
         let temp_names: HashSet<String> = {
             let mut names = self.temp_table_names.borrow_mut();
             std::mem::take(&mut *names)
@@ -29655,6 +29662,7 @@ impl Connection {
         let catalog = TimeTravelCatalog {
             schema: self.schema.borrow().clone(),
             temp_table_names: self.temp_table_names.borrow().clone(),
+            temp_table_sql: self.temp_table_sql.borrow().clone(),
             shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
             rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
         };
@@ -29679,6 +29687,7 @@ impl Connection {
         let previous = TimeTravelCatalog {
             schema: self.schema.replace(catalog.schema),
             temp_table_names: self.temp_table_names.replace(catalog.temp_table_names),
+            temp_table_sql: self.temp_table_sql.replace(catalog.temp_table_sql),
             shadowed_main_tables: self
                 .shadowed_main_tables
                 .replace(catalog.shadowed_main_tables),
@@ -73758,6 +73767,7 @@ impl Connection {
                         schema.push(table_schema);
                     }
                     self.temp_table_names.borrow_mut().insert(name_lc.clone());
+                    self.temp_table_sql.borrow_mut().insert(rp, create_sql);
                     self.rebuild_schema_indices();
                     // TEMP tables are connection-local: never written to the
                     // main sqlite_master (mirrors the TEMP trigger precedent).
@@ -74239,6 +74249,13 @@ impl Connection {
                     // every one without touching the main pager freelist.
                     // Outside any transaction or savepoint, bypass undo_log so
                     // any VFS spill file closes and unlinks immediately.
+                    {
+                        let mut ddl = self.temp_table_sql.borrow_mut();
+                        ddl.remove(&table.root_page);
+                        for index in &table.indexes {
+                            ddl.remove(&index.root_page);
+                        }
+                    }
                     let in_txn_or_savepoint = self.in_transaction.get()
                         || !self.savepoints.borrow().is_empty()
                         || self.internal_statement_savepoint_depth.get() > 0;
@@ -74493,7 +74510,9 @@ impl Connection {
                     // TEMP indexes are MemDatabase-only and must never be
                     // interpreted as main-pager roots. Persistent indexes are
                     // returned to the pager freelist as usual.
-                    if !dropped_temp {
+                    if dropped_temp {
+                        self.temp_table_sql.borrow_mut().remove(&root_page);
+                    } else {
                         if self.is_auto_vacuum_enabled_on_main().await? {
                             self.free_btree_pages_and_compact_roots_for_auto_vacuum(&[(
                                 root_page, false,
@@ -75002,7 +75021,13 @@ impl Connection {
         // root to the wrong definition. Parse and rewrite before mutating any
         // in-memory schema so unsupported legacy DDL fails without residue.
         let rewritten_target_create_sql = if alters_temp_table {
-            None
+            let schema = self.schema.borrow();
+            let root = schema.iter().find(|table| table.name.eq_ignore_ascii_case(&old_name))
+                .map(|table| table.root_page);
+            root.and_then(|root| self.temp_table_sql.borrow().get(&root).cloned())
+                .map(|sql| rewrite_create_table_sql_for_alter(
+                    &sql, &old_name, &alter.action, added_column_source,
+                )).transpose()?
         } else {
             let original_sql = self
                 .original_ddl_sql
@@ -75976,6 +76001,9 @@ impl Connection {
             // COLUMN into a late "sqlite_master entry not found" error — and, once
             // bd-kyhpi stopped ADD COLUMN from faulting earlier on the sentinel
             // root_page, every TEMP ADD COLUMN too (bd-0i8ll).
+            if let Some(sql) = rewritten_target_create_sql {
+                self.temp_table_sql.borrow_mut().insert(new_schema.root_page, sql);
+            }
             self.rebuild_schema_indices();
             self.validate_schema_index();
             self.note_temp_schema_change();
@@ -78061,7 +78089,9 @@ impl Connection {
                 stored_stmt.if_not_exists = false;
                 stored_stmt.to_string()
             });
-        if !target_is_temp {
+        if target_is_temp {
+            self.temp_table_sql.borrow_mut().insert(root_page, create_sql);
+        } else {
             self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)
                 .await?;
         }
@@ -83636,7 +83666,7 @@ impl Connection {
         let views = self.views.borrow();
         let triggers = self.triggers.borrow();
         let temp_table_names = self.temp_table_names.borrow();
-        let ddl_cache = self.original_ddl_sql.borrow();
+        let ddl_cache = self.temp_table_sql.borrow();
         let mut rows = Vec::new();
 
         for table in schema.iter() {
@@ -83651,11 +83681,11 @@ impl Connection {
                 .contains(&table.name.to_ascii_lowercase());
 
             let table_sql = ddl_cache
-                .get(&table.name.to_ascii_lowercase())
+                .get(&table.root_page)
                 .cloned()
                 .unwrap_or_else(|| {
                     render_create_table_sql(table, is_autoincrement, |index| {
-                        let original_sql = ddl_cache.get(&index.name.to_ascii_lowercase());
+                        let original_sql = ddl_cache.get(&index.root_page);
                         is_implicit_autoindex_entry(
                             &index.name,
                             &table.name,
@@ -83673,7 +83703,7 @@ impl Connection {
             ]);
 
             for index in &table.indexes {
-                let original_sql = ddl_cache.get(&index.name.to_ascii_lowercase());
+                let original_sql = ddl_cache.get(&index.root_page);
                 let index_sql = if is_implicit_autoindex_entry(
                     &index.name,
                     &table.name,
@@ -83700,7 +83730,6 @@ impl Connection {
             let view_sql = view
                 .temp_create_sql
                 .clone()
-                .or_else(|| ddl_cache.get(&view.name.to_ascii_lowercase()).cloned())
                 .unwrap_or_else(|| format!("CREATE VIEW {}", view.name));
             rows.push(vec![
                 SqliteValue::Text("view".into()),
@@ -83839,6 +83868,7 @@ impl Connection {
             SnapshotSchemaState::Copied(Box::new(SchemaSnapshot {
                 schema: self.schema.borrow().clone(),
                 temp_table_names: self.temp_table_names.borrow().clone(),
+                temp_table_sql: self.temp_table_sql.borrow().clone(),
                 temp_default_cache_size: self.pragma_state.borrow().temp_default_cache_size,
                 shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
                 views: self.views.borrow().clone(),
@@ -83876,6 +83906,7 @@ impl Connection {
         }
         self.schema.arm();
         self.temp_table_names.arm();
+        self.temp_table_sql.arm();
         self.shadowed_main_tables.arm();
         self.views.arm();
         self.triggers.arm();
@@ -83893,6 +83924,7 @@ impl Connection {
     fn end_transaction_catalog_cells(&self) {
         self.schema.end_txn();
         self.temp_table_names.end_txn();
+        self.temp_table_sql.end_txn();
         self.shadowed_main_tables.end_txn();
         self.views.end_txn();
         self.triggers.end_txn();
@@ -83951,6 +83983,7 @@ impl Connection {
                 // value at the first change; the others still hold it.
                 let schema_restored = self.schema.restore_before_txn();
                 self.temp_table_names.restore_before_txn();
+                self.temp_table_sql.restore_before_txn();
                 self.shadowed_main_tables.restore_before_txn();
                 let views_restored = self.views.restore_before_txn();
                 let triggers_restored = self.triggers.restore_before_txn();
@@ -83991,6 +84024,7 @@ impl Connection {
         (*self.schema.borrow_mut()).clone_from(&state.schema);
         *self.schema_by_name.borrow_mut() = new_schema_by_name;
         (*self.temp_table_names.borrow_mut()).clone_from(&state.temp_table_names);
+        (*self.temp_table_sql.borrow_mut()).clone_from(&state.temp_table_sql);
         self.pragma_state.borrow_mut().temp_default_cache_size = state.temp_default_cache_size;
         (*self.shadowed_main_tables.borrow_mut()).clone_from(&state.shadowed_main_tables);
         (*self.views.borrow_mut()).clone_from(&state.views);
@@ -88214,15 +88248,16 @@ impl Connection {
     /// Read the actual declaration so a table-level COLLATE override is not
     /// lost through the compact TableSchema's column-name-only PK metadata.
     fn integrity_without_rowid_primary_key(&self, table: &TableSchema) -> Result<IndexSchema> {
-        let sql = self
-            .original_ddl_sql
-            .borrow()
-            .get(&table.name.to_ascii_lowercase())
-            .cloned()
+        let sql = self.temp_table_sql.borrow().get(&table.root_page).cloned()
+            .or_else(|| self.original_ddl_sql.borrow().get(&table.name.to_ascii_lowercase()).cloned())
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!("WITHOUT ROWID table `{}` has no stored definition", table.name),
             })?;
-        let statement = parse_single_statement(&sql)?;
+        Self::without_rowid_primary_key_from_ddl(table, &sql)
+    }
+
+    pub(crate) fn without_rowid_primary_key_from_ddl(table: &TableSchema, sql: &str) -> Result<IndexSchema> {
+        let statement = parse_single_statement(sql)?;
         let Statement::CreateTable(create) = statement else {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!("WITHOUT ROWID table `{}` has an invalid definition", table.name),
@@ -89139,16 +89174,13 @@ impl Connection {
             // secondary index already stores that column under the same collation.
             // A table-level PRIMARY KEY may override the declared column collation.
             let mut suffix = Vec::new();
-            for (slot, &column) in storage_order[..primary.key_term_count()].iter().enumerate() {
+            let pk_columns = &storage_order[..primary.key_term_count()];
+            for slot in index.without_rowid_locator_slots(table, pk_columns, &primary.key_collations) {
+                let column = pk_columns[slot];
                 let pk_collation = primary.key_term_collation(slot);
-                let covered = columns.iter().zip(&collations).any(|(key_col, coll)| {
-                    *key_col == Some(column) && implicit_autoindex_collations_match(coll.as_deref(), pk_collation)
-                });
-                if !covered {
-                    suffix.push(column);
-                    descending.push(primary.key_term_descending(slot));
-                    collations.push(pk_collation.map(str::to_owned));
-                }
+                suffix.push(column);
+                descending.push(primary.key_term_descending(slot));
+                collations.push(pk_collation.map(str::to_owned));
             }
             let root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
             let mut expected = Vec::new();
@@ -92602,77 +92634,20 @@ impl Connection {
                             // a NULL name, matching stock. The trailing rowid entry
                             // (index_xinfo only) uses the key-term count as seqno.
                             let key_count = idx.key_term_count();
-                            let resolve_term = |term_sql: &str| -> Option<(i64, String)> {
-                                let trimmed = term_sql.trim();
-                                let bytes = trimmed.as_bytes();
-                                let unquoted = if bytes.len() >= 2
-                                    && matches!(
-                                        (bytes[0], bytes[bytes.len() - 1]),
-                                        (b'"', b'"') | (b'`', b'`') | (b'[', b']')
-                                    ) {
-                                    &trimmed[1..trimmed.len() - 1]
-                                } else {
-                                    trimmed
-                                };
-                                // Direct match: a bare (optionally quoted) column
-                                // identifier.
-                                let position = table
-                                    .columns
-                                    .iter()
-                                    .position(|c| c.name.eq_ignore_ascii_case(unquoted))
-                                    // A COLLATE-decorated bare column (e.g.
-                                    // `b COLLATE NOCASE`) is still a column key term
-                                    // in stock: it resolves to cid>=0 + name and the
-                                    // collation is surfaced separately by
-                                    // index_xinfo's `coll`. Only a genuine expression
-                                    // (`a+1`, `lower(b)`) stays cid=-2/NULL. Such a
-                                    // term reaches here as its full SQL fragment
-                                    // (an expression-mode index stringifies every
-                                    // term, bd-ivy5h), so the direct match misses it;
-                                    // parse and peel COLLATE wrappers to the
-                                    // underlying column, mirroring
-                                    // `explicit_index_simple_column_name`.
-                                    .or_else(|| {
-                                        let expr =
-                                            fsqlite_parser::expr::parse_expr(trimmed).ok()?;
-                                        let mut cur = &expr;
-                                        loop {
-                                            match cur {
-                                                Expr::Collate { expr: inner, .. } => {
-                                                    cur = inner.as_ref();
-                                                }
-                                                Expr::Column(col_ref, _)
-                                                    if col_ref.table.is_none() =>
-                                                {
-                                                    break table.columns.iter().position(|c| {
-                                                        c.name.eq_ignore_ascii_case(
-                                                            col_ref.column.as_ref(),
-                                                        )
-                                                    });
-                                                }
-                                                _ => break None,
-                                            }
-                                        }
-                                    });
-                                position.map(|p| {
-                                    (
-                                        i64::try_from(p).unwrap_or(-1),
-                                        table.columns[p].name.clone(),
-                                    )
-                                })
-                            };
                             let mut rows: Vec<Row> = (0..key_count)
                                 .map(|seq| {
-                                    let term_sql = idx.key_term_sql(seq).unwrap_or_default();
-                                    let (cid, name) = match resolve_term(term_sql) {
-                                        Some((cid, name)) => (cid, SqliteValue::Text(name.into())),
+                                    let column = idx.key_term_column(table, seq);
+                                    let (cid, name) = match column {
+                                        Some(col) => (i64::try_from(col).unwrap_or(-1), SqliteValue::Text(table.columns[col].name.clone().into())),
                                         None => (-2, SqliteValue::Null),
                                     };
                                     let seqno =
                                         SqliteValue::Integer(i64::try_from(seq).unwrap_or(0));
                                     if is_xinfo {
                                         let desc = i64::from(idx.key_term_descending(seq));
-                                        let coll = idx.key_term_collation(seq).unwrap_or("BINARY");
+                                        let coll = idx.key_term_collation(seq)
+                                            .or_else(|| column.and_then(|col| table.columns[col].collation.as_deref()))
+                                            .unwrap_or("BINARY");
                                         Row {
                                             values: vec![
                                                 seqno,
@@ -92690,35 +92665,19 @@ impl Connection {
                                     }
                                 })
                                 .collect();
-                            if is_xinfo
-                                && table.without_rowid
-                                && self
-                                    .table_execution_metadata()
-                                    .wr_index_suffix_roots
-                                    .contains(&table.root_page)
-                            {
-                                let pk = without_rowid_pk_indices(table)
-                                    .map_err(codegen_error_to_franken)?;
-                                let metadata = self.table_execution_metadata();
-                                for (suffix_position, column) in
-                                    without_rowid_index_appended_pk(table, idx, &pk)
-                                        .into_iter()
-                                        .enumerate()
-                                {
+                            if is_xinfo && table.without_rowid {
+                                let primary = self.integrity_without_rowid_primary_key(table)?;
+                                let pk = primary.columns.iter().map(|name| {
+                                    table.column_index(name).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                        detail: format!("unknown primary-key column {name} of {}", table.name),
+                                    })
+                                }).collect::<Result<Vec<_>>>()?;
+                                for slot in idx.without_rowid_locator_slots(table, &pk, &primary.key_collations) {
+                                    let column = pk[slot];
                                     let definition = &table.columns[column];
-                                    let sequence = key_count + suffix_position;
-                                    let desc = metadata
-                                        .index_desc_flags_by_root_page
-                                        .get(&idx.root_page)
-                                        .and_then(|flags| flags.get(sequence))
-                                        .copied()
-                                        .unwrap_or(false);
-                                    let collation = metadata
-                                        .index_collations_by_root_page
-                                        .get(&idx.root_page)
-                                        .and_then(|collations| collations.get(sequence))
-                                        .and_then(Option::as_deref)
-                                        .unwrap_or("BINARY");
+                                    let sequence = rows.len();
+                                    let desc = primary.key_term_descending(slot);
+                                    let collation = primary.key_term_collation(slot).unwrap_or("BINARY");
                                     rows.push(Row {
                                         values: vec![
                                             SqliteValue::Integer(
@@ -92792,7 +92751,8 @@ impl Connection {
                         continue;
                     }
                     // PK columns (in declaration order) resolved to storage cids.
-                    let pk_cids: Vec<usize> = pk_cols
+                    let primary = self.integrity_without_rowid_primary_key(table)?;
+                    let pk_cids: Vec<usize> = primary.columns
                         .iter()
                         .filter_map(|name| {
                             table
@@ -92805,13 +92765,7 @@ impl Connection {
                     // registry (bd-w9r11 / GH#222/#223) — the same source the
                     // storage-metadata path honors so the b-tree compares in PK
                     // direction. Absent/legacy snapshots fall back to all-ascending.
-                    let pk_desc_flags: Vec<bool> = self
-                        .without_rowid_pk_desc
-                        .borrow()
-                        .get(&table.name.to_ascii_lowercase())
-                        .filter(|flags| flags.len() == pk_cids.len())
-                        .cloned()
-                        .unwrap_or_else(|| vec![false; pk_cids.len()]);
+                    let pk_desc_flags = (0..pk_cids.len()).map(|slot| primary.key_term_descending(slot));
                     // index_info reports only the key columns; index_xinfo appends
                     // the remaining (covered) table columns with key=0 (desc=0).
                     let mut entries: Vec<(usize, bool, bool)> = pk_cids
@@ -92820,8 +92774,8 @@ impl Connection {
                         .map(|(&cid, desc)| (cid, true, desc))
                         .collect();
                     if is_xinfo {
-                        for cid in 0..table.columns.len() {
-                            if !pk_cids.contains(&cid) {
+                        for (cid, column) in table.columns.iter().enumerate() {
+                            if !pk_cids.contains(&cid) && !column.is_virtual_generated() {
                                 entries.push((cid, false, false));
                             }
                         }
@@ -92835,7 +92789,11 @@ impl Connection {
                             let cid_val = SqliteValue::Integer(i64::try_from(cid).unwrap_or(-1));
                             let name = SqliteValue::Text(col.name.clone().into());
                             if is_xinfo {
-                                let coll = col.collation.as_deref().unwrap_or("BINARY");
+                                let coll = if is_key {
+                                    primary.key_term_collation(seq)
+                                } else {
+                                    col.collation.as_deref()
+                                }.unwrap_or("BINARY");
                                 Row {
                                     values: vec![
                                         seqno,

@@ -17,6 +17,81 @@ fn row_values(row: &Row) -> Vec<SqliteValue> {
 }
 
 #[test]
+fn vacuum_preserves_overlapping_without_rowid_index_fields() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let copy = dir.path().join("copy.db");
+        let stock = rusqlite::Connection::open(&source).unwrap();
+        stock.execute_batch(
+            "CREATE TABLE t(v TEXT,k TEXT,id INT,PRIMARY KEY(k COLLATE NOCASE DESC,id)) WITHOUT ROWID;
+             CREATE INDEX partial ON t(k COLLATE NOCASE,id) WHERE v='include';
+             CREATE INDEX expr ON t(k COLLATE BINARY,length(v));
+             INSERT INTO t VALUES('include','a',1),('include','Z',2),('exclude','b',3);",
+        ).unwrap();
+        drop(stock);
+        let db = Connection::open(source.to_str().unwrap()).await.unwrap();
+        db.execute(&format!("VACUUM INTO '{}'", copy.display())).await.unwrap();
+        db.close().await.unwrap();
+        for path in [&source, &copy] {
+            let stock = rusqlite::Connection::open(path).unwrap();
+            let verdict: String = stock.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+            assert_eq!(verdict, "ok");
+            for (sql, expected) in [
+                ("SELECT group_concat(id) FROM (SELECT id FROM t INDEXED BY partial WHERE v='include' ORDER BY id)", "1,2"),
+                ("SELECT group_concat(id) FROM (SELECT id FROM t INDEXED BY expr WHERE length(v)=7 ORDER BY id)", "1,2,3"),
+            ] {
+                let ids: String = stock.query_row(sql, [], |r| r.get(0)).unwrap();
+                assert_eq!(ids, expected, "{sql}");
+            }
+        }
+    });
+}
+
+#[test]
+fn index_xinfo_uses_the_owning_tables_primary_key_declaration() {
+    asupersync::test_utils::run_test(|| async {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let db = Connection::open(":memory:").await.unwrap();
+        for sql in [
+            "CREATE TABLE t(v TEXT,k TEXT,id INT,PRIMARY KEY(k COLLATE NOCASE DESC,id)) WITHOUT ROWID",
+            "CREATE INDEX ix ON t(k COLLATE BINARY,v)",
+            "CREATE INDEX iy ON t(id,k COLLATE NOCASE DESC)",
+            "CREATE TEMP TABLE t(u TEXT,y TEXT,PRIMARY KEY(u COLLATE RTRIM)) WITHOUT ROWID",
+            "CREATE INDEX temp.iz ON t(u COLLATE BINARY)",
+            "SAVEPOINT s",
+            "ALTER TABLE temp.t ADD COLUMN extra TEXT",
+            "ROLLBACK TO s",
+            "RELEASE s",
+        ] {
+            stock.execute_batch(sql).unwrap();
+            db.execute(sql).await.unwrap();
+        }
+        for sql in [
+            "PRAGMA main.index_xinfo(ix)", "PRAGMA main.index_xinfo(iy)",
+            "PRAGMA main.index_xinfo(t)", "PRAGMA temp.index_xinfo(t)", "PRAGMA temp.index_xinfo(iz)",
+            "SELECT sql FROM sqlite_temp_master WHERE type='table' AND name='t'",
+            "SELECT sql FROM sqlite_temp_master WHERE type='index' AND name='iz'",
+        ] {
+            let mut stmt = stock.prepare(sql).unwrap();
+            let n = stmt.column_count();
+            let expected = stmt.query_map([], |r| {
+                (0..n).map(|column| match r.get_ref(column)? {
+                    rusqlite::types::ValueRef::Integer(i) => Ok(SqliteValue::Integer(i)),
+                    rusqlite::types::ValueRef::Text(s) => Ok(SqliteValue::Text(std::str::from_utf8(s).unwrap().into())),
+                    rusqlite::types::ValueRef::Null => Ok(SqliteValue::Null),
+                    value => panic!("unexpected catalog value {value:?}"),
+                }).collect::<rusqlite::Result<Vec<_>>>()
+            }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert!(!expected.is_empty(), "{sql}");
+            let actual = db.query(sql).await.unwrap();
+            assert_eq!(actual.iter().map(row_values).collect::<Vec<_>>(), expected, "{sql}");
+        }
+        db.close().await.unwrap();
+    });
+}
+
+#[test]
 fn test_without_rowid_hfdt_overlapping_unique_round_trips_sparse_ordinal() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
