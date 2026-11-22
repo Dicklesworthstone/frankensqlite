@@ -759,6 +759,43 @@ fn bd_3koph_healthy_multilevel_collated_trees_match_stock() {
 }
 
 #[test]
+fn without_rowid_index_on_forward_generated_columns_matches_stock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forward-generated.db");
+    let stock = rusqlite::Connection::open(&path).unwrap();
+    stock.execute_batch(
+        "CREATE TABLE t(k INTEGER PRIMARY KEY, total AS (a+a+b), b AS (a+1),
+                        a AS (base+1), base INTEGER) WITHOUT ROWID;
+         INSERT INTO t(k,base) VALUES(4,10),(9,NULL),(12,20);
+         CREATE INDEX totals ON t(total) WHERE b IS NOT NULL;"
+    ).unwrap();
+    for damaged in [false, true] {
+        if damaged {
+            stock.execute_batch(
+                "PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema SET sql='CREATE INDEX totals ON t(total+5) WHERE b IS NOT NULL'
+                 WHERE name='totals';
+                 PRAGMA writable_schema=RESET;"
+            ).unwrap();
+        }
+        let expected = stock_connection_reports(&stock, "PRAGMA integrity_check(t)");
+        if damaged {
+            assert_eq!(expected, ["row 1 missing from index totals", "row 3 missing from index totals"]);
+        } else {
+            assert_eq!(expected, ["ok"]);
+        }
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for prepared in [false, true] {
+                assert_eq!(native_reports(&conn, "PRAGMA integrity_check(t)", prepared).await, expected);
+                assert_eq!(native_reports(&conn, "PRAGMA quick_check(t)", prepared).await, ["ok"]);
+            }
+            conn.close().await.unwrap();
+        });
+    }
+}
+
+#[test]
 fn without_rowid_partial_blob_cast_uses_database_encoding() {
     let dir = tempfile::tempdir().unwrap();
     for (encoding, mixed) in [
