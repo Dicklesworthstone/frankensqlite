@@ -11,6 +11,65 @@
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
+#[test]
+fn temp_renames_preserve_the_persistent_table_and_its_dependents_after_reopen() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for native_origin in [false, true] {
+            let path = dir.path().join(format!("rename-{native_origin}.db"));
+            let persistent = [
+                "CREATE TABLE t(m INTEGER PRIMARY KEY)",
+                "INSERT INTO t VALUES(123)",
+                "CREATE TABLE audit(i INTEGER)",
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(NEW.m); END",
+                "CREATE VIEW main_view AS SELECT m FROM t",
+                "CREATE TABLE child(k INT REFERENCES t(m))",
+            ];
+            if native_origin {
+                let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+                for sql in persistent { db.execute(sql).await.unwrap(); }
+                db.close().await.unwrap();
+            } else {
+                let db = rusqlite::Connection::open(&path).unwrap();
+                for sql in persistent { db.execute_batch(sql).unwrap(); }
+            }
+            let main_schema = "SELECT type,name,tbl_name,sql FROM main.sqlite_master ORDER BY type,name";
+            let original = rq(&rusqlite::Connection::open(&path).unwrap(), main_schema);
+            assert_eq!(original.len(), 5);
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for sql in [
+                "CREATE TEMP TABLE t(u TEXT PRIMARY KEY)",
+                "CREATE INDEX temp.local_i ON t(u)",
+                "INSERT INTO temp.t VALUES('temp-row')",
+                "SAVEPOINT s",
+                "ALTER TABLE temp.t RENAME COLUMN u TO j",
+                "ALTER TABLE temp.t RENAME TO scratch",
+            ] {
+                db.execute(sql).await.unwrap();
+            }
+            let one_temp = vec![vec!["text:temp-row".to_owned()]];
+            assert_eq!(fq(&db, "SELECT j FROM temp.scratch INDEXED BY local_i").await, one_temp);
+            assert_eq!(fq(&db, main_schema).await, original);
+            db.execute("ROLLBACK TO s").await.unwrap();
+            db.execute("RELEASE s").await.unwrap();
+            assert_eq!(fq(&db, "SELECT u FROM temp.t INDEXED BY local_i").await, one_temp);
+            db.execute("ALTER TABLE temp.t RENAME COLUMN u TO j").await.unwrap();
+            db.execute("ALTER TABLE temp.t RENAME TO scratch").await.unwrap();
+            assert_eq!(fq(&db, "SELECT j FROM scratch").await, one_temp);
+            assert_eq!(fq(&db, "SELECT m FROM t").await, [vec!["int:123".to_owned()]]);
+            db.close().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(rq(&stock, main_schema), original);
+            stock.execute("INSERT INTO t VALUES(456)", []).unwrap();
+            assert_eq!(rq(&stock, "SELECT i FROM audit"), [vec!["int:456".to_owned()]]);
+            assert_eq!(rq(&stock, "SELECT m FROM main_view ORDER BY m"),
+                [vec!["int:123".to_owned()], vec!["int:456".to_owned()]]);
+            assert_eq!(rq(&stock, "PRAGMA integrity_check"), [vec!["text:ok".to_owned()]]);
+        }
+    });
+}
+
 fn tag_f(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_owned(),

@@ -75052,6 +75052,7 @@ impl Connection {
             schema
                 .iter()
                 .filter(|table| !table.name.eq_ignore_ascii_case(&old_name))
+                .filter(|table| self.temp_table_names.borrow().contains(&table.name.to_ascii_lowercase()) == alters_temp_table)
                 .filter(|table| {
                     table.foreign_keys.iter().any(|foreign_key| {
                         if !foreign_key.parent_table.eq_ignore_ascii_case(&old_name) {
@@ -75069,16 +75070,20 @@ impl Connection {
                         }
                     })
                 })
-                .map(|table| table.name.clone())
+                .map(|table| (table.name.clone(), table.root_page))
                 .collect::<Vec<_>>()
         };
         let rewritten_dependent_create_sql = {
             let original_ddl = self.original_ddl_sql.borrow();
             dependent_table_names
                 .iter()
-                .map(|dependent_table_name| {
-                    let original_sql = original_ddl
-                        .get(&dependent_table_name.to_ascii_lowercase())
+                .map(|(dependent_table_name, root)| {
+                    let temp_ddl = self.temp_table_sql.borrow();
+                    let original_sql = if alters_temp_table {
+                        temp_ddl.get(root)
+                    } else {
+                        original_ddl.get(&dependent_table_name.to_ascii_lowercase())
+                    }
                         .ok_or_else(|| {
                             FrankenError::Internal(format!(
                                 "cannot safely rewrite foreign key in `{dependent_table_name}` \
@@ -75126,8 +75131,15 @@ impl Connection {
                         name: table_name.clone(),
                     })?;
                 let views = self.views.borrow();
-                let name_conflicts =
-                    schema_table_index_or_view_name_exists(&schema, &views, new_name);
+                let name_conflicts = if alters_temp_table {
+                    let temp = self.temp_table_names.borrow();
+                    schema.iter().filter(|t| temp.contains(&t.name.to_ascii_lowercase())).any(|t| {
+                        t.name.eq_ignore_ascii_case(new_name)
+                            || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(new_name))
+                    }) || views.iter().any(|v| v.temporary && v.name.eq_ignore_ascii_case(new_name))
+                } else {
+                    schema_table_index_or_view_name_exists(&schema, &views, new_name)
+                };
                 drop(views);
                 if name_conflicts {
                     // Stock sqlite3 reports SQLITE_ERROR with this exact message
@@ -75164,7 +75176,7 @@ impl Connection {
                     ));
                 }
                 for (idx, dependent_table) in schema.iter().enumerate() {
-                    if idx == table_idx {
+                    if idx == table_idx || !rewritten_dependent_create_sql.contains_key(&dependent_table.name.to_ascii_lowercase()) {
                         continue;
                     }
                     let mut updated_table = dependent_table.clone();
@@ -75182,9 +75194,9 @@ impl Connection {
                 }
                 drop(schema);
                 dependent_view_sql_updates =
-                    self.rename_dependent_views_for_table_rename(&old_name, new_name);
+                    self.rename_dependent_views_for_table_rename(&old_name, new_name, alters_temp_table);
                 dependent_trigger_sql_updates =
-                    self.rename_dependent_triggers_for_table_rename(&old_name, new_name);
+                    self.rename_dependent_triggers_for_table_rename(&old_name, new_name, alters_temp_table);
                 renamed_table
             }
             AlterTableAction::RenameColumn { old, new } => {
@@ -75267,7 +75279,7 @@ impl Connection {
                     }
                 }
                 for (idx, dependent_table) in schema.iter().enumerate() {
-                    if idx == table_idx {
+                    if idx == table_idx || !rewritten_dependent_create_sql.contains_key(&dependent_table.name.to_ascii_lowercase()) {
                         continue;
                     }
                     let mut updated_table = dependent_table.clone();
@@ -75291,12 +75303,14 @@ impl Connection {
                     old,
                     new,
                     &mut column_source_catalog,
+                    alters_temp_table,
                 );
                 dependent_trigger_sql_updates = self.rename_dependent_triggers_for_column_rename(
                     &renamed_table.name,
                     old,
                     new,
                     &column_source_catalog,
+                    alters_temp_table,
                 );
                 renamed_table
             }
@@ -75987,29 +76001,6 @@ impl Connection {
             ));
         }
 
-        if alters_temp_table
-            && matches!(
-                alter.action,
-                AlterTableAction::DropColumn(_) | AlterTableAction::AddColumn(_)
-            )
-        {
-            // TEMP schema and rows are connection-local. There is deliberately
-            // no main-catalog sqlite_master row to update; the column change has
-            // already been applied to `self.schema` and (for ADD COLUMN) the
-            // existing rows padded in the MemDatabase above. Trying the
-            // main-catalog master path is what previously turned every TEMP DROP
-            // COLUMN into a late "sqlite_master entry not found" error — and, once
-            // bd-kyhpi stopped ADD COLUMN from faulting earlier on the sentinel
-            // root_page, every TEMP ADD COLUMN too (bd-0i8ll).
-            if let Some(sql) = rewritten_target_create_sql {
-                self.temp_table_sql.borrow_mut().insert(new_schema.root_page, sql);
-            }
-            self.rebuild_schema_indices();
-            self.validate_schema_index();
-            self.note_temp_schema_change();
-            return Ok(());
-        }
-
         if let AlterTableAction::RenameTo(new_name) = &alter.action {
             let old_key = old_name.to_ascii_lowercase();
             let new_key = new_name.to_ascii_lowercase();
@@ -76057,6 +76048,48 @@ impl Connection {
                 |index| self.index_is_implicit_autoindex(&index.name, &new_schema.name),
             )
         });
+
+        if alters_temp_table {
+            let mut temp_sql = self.temp_table_sql.borrow_mut();
+            temp_sql.insert(new_schema.root_page, create_sql);
+            if matches!(alter.action, AlterTableAction::RenameTo(_) | AlterTableAction::RenameColumn { .. }) {
+                for index in &new_schema.indexes {
+                    if let Some(sql) = temp_sql.get_mut(&index.root_page) {
+                        *sql = render_create_index_sql(index, &new_schema.name);
+                    }
+                }
+            }
+            for (_, dependent) in &dependent_table_schema_updates {
+                if let Some(sql) = rewritten_dependent_create_sql.get(&dependent.name.to_ascii_lowercase()) {
+                    temp_sql.insert(dependent.root_page, sql.clone());
+                }
+            }
+            if let AlterTableAction::RenameTo(new_name) = &alter.action {
+                let old_key = old_name.to_ascii_lowercase();
+                let new_key = new_name.to_ascii_lowercase();
+                let mut names = self.temp_table_names.borrow_mut();
+                names.remove(&old_key);
+                names.insert(new_key.clone());
+                let mut schema = self.schema.borrow_mut();
+                let mut shadowed = self.shadowed_main_tables.borrow_mut();
+                if let Some(position) = schema.iter().position(|table| {
+                    table.root_page != new_schema.root_page && table.name.eq_ignore_ascii_case(new_name)
+                }) {
+                    shadowed.insert(new_key, schema.remove(position));
+                }
+                if let Some(main) = shadowed.remove(&old_key) {
+                    if let Some(column) = main.columns.iter().position(|col| col.is_ipk) {
+                        self.rowid_alias_columns.borrow_mut().insert(old_key, column);
+                    }
+                    schema.push(main);
+                }
+            }
+            drop(temp_sql);
+            self.rebuild_schema_indices();
+            self.validate_schema_index();
+            self.note_temp_schema_change();
+            return Ok(());
+        }
 
         if matches!(alter.action, AlterTableAction::RenameTo(_)) {
             // Preserve the table rowid while changing name/tbl_name/sql.
@@ -76335,9 +76368,9 @@ impl Connection {
         // 6) Follow the rename through any dependent views/triggers, mirroring
         //    the generic path (usually a no-op for an FTS5 table).
         let dependent_view_sql_updates =
-            self.rename_dependent_views_for_table_rename(old_name, new_name);
+            self.rename_dependent_views_for_table_rename(old_name, new_name, false);
         let dependent_trigger_sql_updates =
-            self.rename_dependent_triggers_for_table_rename(old_name, new_name);
+            self.rename_dependent_triggers_for_table_rename(old_name, new_name, false);
         for (view_name, view_sql) in &dependent_view_sql_updates {
             self.update_sqlite_master_typed_sql("view", view_name, view_sql)
                 .await?;
@@ -76362,12 +76395,18 @@ impl Connection {
         &self,
         old_name: &str,
         new_name: &str,
+        temp_only: bool,
     ) -> Vec<(String, String)> {
         let mut updates = Vec::new();
         let mut views = self.views.borrow_mut();
-        for view in views.iter_mut() {
-            if rename_table_refs_in_select(&mut view.query, old_name, new_name) && !view.temporary {
-                updates.push((view.name.clone(), render_create_view_sql(view)));
+        for view in views.iter_mut().filter(|view| !temp_only || view.temporary) {
+            if rename_table_refs_in_select(&mut view.query, old_name, new_name) {
+                let sql = render_create_view_sql(view);
+                if view.temporary {
+                    view.temp_create_sql = Some(sql);
+                } else {
+                    updates.push((view.name.clone(), sql));
+                }
             }
         }
         updates
@@ -76377,10 +76416,11 @@ impl Connection {
         &self,
         old_name: &str,
         new_name: &str,
+        temp_only: bool,
     ) -> Vec<(String, String, String)> {
         let mut updates = Vec::new();
         let mut triggers = self.triggers.borrow_mut();
-        for trigger in triggers.iter_mut() {
+        for trigger in triggers.iter_mut().filter(|trigger| !temp_only || trigger.temporary) {
             // A savepoint's schema snapshot may share this definition: the
             // rename edits this connection's copy, and a rollback restores
             // the shared original.
@@ -76539,6 +76579,7 @@ impl Connection {
         old_column: &str,
         new_column: &str,
         source_catalog: &mut ColumnRenameSourceCatalog,
+        temp_only: bool,
     ) -> Vec<(String, String)> {
         let mut views = self.views.borrow_mut();
         for view in views.iter() {
@@ -76551,7 +76592,7 @@ impl Connection {
         let mut changed_views = HashSet::new();
         for _ in 0..=views.len() {
             let mut pass_changed = false;
-            for view in views.iter_mut() {
+            for view in views.iter_mut().filter(|view| !temp_only || view.temporary) {
                 let view_changed = rename_column_refs_in_select_for_table(
                     &mut view.query,
                     table_name,
@@ -76567,6 +76608,9 @@ impl Connection {
                 pass_changed |= status_changed;
                 if view_changed {
                     changed_views.insert(view.name.to_ascii_lowercase());
+                    if view.temporary {
+                        view.temp_create_sql = Some(render_create_view_sql(view));
+                    }
                 }
             }
             if !pass_changed {
@@ -76589,10 +76633,11 @@ impl Connection {
         old_column: &str,
         new_column: &str,
         source_catalog: &ColumnRenameSourceCatalog,
+        temp_only: bool,
     ) -> Vec<(String, String, String)> {
         let mut updates = Vec::new();
         let mut triggers = self.triggers.borrow_mut();
-        for trigger in triggers.iter_mut() {
+        for trigger in triggers.iter_mut().filter(|trigger| !temp_only || trigger.temporary) {
             // As in the table rename: a snapshot keeps the original.
             let trigger = Arc::make_mut(trigger);
             let mut changed = false;
