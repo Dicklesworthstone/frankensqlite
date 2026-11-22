@@ -15543,7 +15543,7 @@ impl VdbeEngine {
                                             let unique_label = if rowid_conflict {
                                                 None
                                             } else {
-                                                db.get_table(root)
+                                                self.db.as_ref().and_then(|db| db.get_table(root))
                                                     .map(|table| table.find_unique_conflict_label(&mem_op_cx, &values))
                                                     .transpose()?
                                                     .flatten()
