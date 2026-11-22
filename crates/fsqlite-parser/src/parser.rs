@@ -294,8 +294,8 @@ pub(crate) struct HeightTracked<T> {
 pub struct Parser {
     pub(crate) tokens: Vec<Token>,
     // The source text, kept only where token spelling matters: cache PRAGMAs
-    // interpret a number's spelling, not the decoded value, and a virtual
-    // table's module arguments are their source text, as in stock. Only
+    // interpret a number's spelling, virtual table modules receive their
+    // argument text, and ATTACH retains the case of keyword aliases. Only
     // from_sql can retain it; caller-built token streams have already lost
     // e.g. the distinction between 1e3 and 1000.0.
     source_sql: Option<String>,
@@ -388,11 +388,12 @@ impl Parser {
 
     fn preserve_source_where_needed(&mut self, sql: &str) {
         // Ordinary SQL does not need a second copy of its source text.
-        if self
-            .tokens
-            .iter()
-            .any(|token| matches!(token.kind, TokenKind::KwPragma | TokenKind::KwVirtual))
-        {
+        if self.tokens.iter().any(|token| {
+            matches!(
+                token.kind,
+                TokenKind::KwPragma | TokenKind::KwVirtual | TokenKind::KwAttach
+            )
+        }) {
             self.source_sql = Some(sql.to_owned());
         }
     }
@@ -2718,7 +2719,17 @@ impl Parser {
         let _ = self.eat_kw(&TokenKind::KwDatabase);
         let expr = self.parse_expr()?;
         self.expect_kw(&TokenKind::KwAs)?;
-        let schema = self.parse_identifier()?;
+        let alias_pos = self.pos;
+        let mut schema = self.parse_identifier()?;
+        // Keyword tokens carry only their kind. Database names also appear
+        // in database_list, grouped integrity findings and SQL diagnostics.
+        let token = &self.tokens[alias_pos];
+        if token.kind.keyword_str().is_some()
+            && let Some(sql) = &self.source_sql
+            && let Some(spelling) = sql.get(token.span.start as usize..token.span.end as usize)
+        {
+            spelling.clone_into(&mut schema);
+        }
         Ok(Statement::Attach(AttachStatement { expr, schema }))
     }
 
@@ -9830,11 +9841,19 @@ mod tests {
 
     #[test]
     fn test_attach_database() {
-        let stmt = parse_one("ATTACH DATABASE 'other.db' AS other");
-        if let Statement::Attach(a) = stmt {
-            assert_eq!(a.schema, "other");
-        } else {
-            unreachable!("expected Attach");
+        for (spelling, expected) in [
+            ("other", "other"),
+            ("FiRst", "FiRst"),
+            ("LaSt", "LaSt"),
+            ("\"FiRst\"", "FiRst"),
+            ("'FiRst''Db'", "FiRst'Db"),
+        ] {
+            let Statement::Attach(attach) =
+                parse_one(&format!("ATTACH DATABASE 'other.db' AS {spelling}"))
+            else {
+                unreachable!("expected Attach");
+            };
+            assert_eq!(attach.schema, expected);
         }
     }
 
