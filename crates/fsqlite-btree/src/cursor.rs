@@ -40,7 +40,8 @@ use fsqlite_types::serial_type::{
 use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::value::binary_text_cmp;
 use fsqlite_types::{
-    PageData, PageNumber, SecureDeleteMode, SqliteValue, TextEncoding, WitnessKey,
+    PageData, PageNumber, PtrMapEntry, PtrMapType, SecureDeleteMode, SqliteValue, TextEncoding,
+    WitnessKey, is_ptrmap_page, ptrmap_entry_offset, ptrmap_lock_byte_page, ptrmap_page_for,
 };
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -477,6 +478,71 @@ pub trait PageWriter: PageReader {
     ) -> impl Future<Output = Result<bool>> + 'a {
         async { Ok(false) }
     }
+
+    /// Returns `Some((usable_size, full_page_size))` when auto-vacuum pointer
+    /// maps are active for this writer, or `None` for ordinary `NONE` databases.
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Read the 5-byte pointer-map entry for `child_page`.
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _child_page: PageNumber,
+    ) -> impl Future<Output = Result<PtrMapEntry>> + 'a {
+        async { Err(FrankenError::Unsupported) }
+    }
+
+    /// Write the 5-byte pointer-map entry for `child_page`.
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _child_page: PageNumber,
+        _entry: PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
+    }
+
+    /// Write raw page bytes without B-tree child pointer-map inspection
+    /// (used for overflow pages and auto-vacuum page relocations).
+    fn write_raw_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        self.write_page_data(cx, page_no, data)
+    }
+
+    /// Write an overflow page and, when pointer maps are enabled and
+    /// `prev_overflow` is `Some(prev)`, update `page_no`'s pointer-map entry to
+    /// `(PtrMapType::Overflow2, Some(prev))`.
+    fn write_overflow_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+        prev_overflow: Option<PageNumber>,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.write_raw_page_data(cx, page_no, data).await?;
+            if self.pointer_map_page_sizes().is_some()
+                && let Some(prev) = prev_overflow
+            {
+                self.write_ptrmap_entry(
+                    cx,
+                    page_no,
+                    PtrMapEntry {
+                        kind: PtrMapType::Overflow2,
+                        parent: Some(prev),
+                    },
+                )
+                .await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -584,25 +650,53 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
         self.txn.secure_delete_mode()
     }
 
-    fn write_page<'a>(
-        &'a mut self,
-        cx: &'a Cx,
-        page_no: PageNumber,
-        data: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + 'a {
-        self.txn.write_page(cx, page_no, data)
+    async fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.txn.write_page(cx, page_no, data).await?;
+        if let Some((usable_size, page_size)) = self.txn.pointer_map_page_sizes()
+            && !is_ptrmap_page(page_no, usable_size, page_size)
+        {
+            crate::freelist::ptrmap_sync_btree_page_children_on_txn(
+                cx,
+                self.txn,
+                page_no,
+                data,
+                usable_size,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
-    fn write_page_data<'a>(
-        &'a mut self,
-        cx: &'a Cx,
+    async fn write_page_data(
+        &mut self,
+        cx: &Cx,
         page_no: PageNumber,
         data: PageData,
-    ) -> impl Future<Output = Result<()>> + 'a {
-        self.txn.write_page_data(cx, page_no, data)
+    ) -> Result<()> {
+        let ptrmap_sizes = self.txn.pointer_map_page_sizes();
+        if let Some((usable_size, page_size)) = ptrmap_sizes
+            && !is_ptrmap_page(page_no, usable_size, page_size)
+        {
+            let cloned = data.clone();
+            self.txn.write_page_data(cx, page_no, data).await?;
+            crate::freelist::ptrmap_sync_btree_page_children_on_txn(
+                cx,
+                self.txn,
+                page_no,
+                cloned.as_bytes(),
+                usable_size,
+            )
+            .await?;
+            Ok(())
+        } else {
+            self.txn.write_page_data(cx, page_no, data).await
+        }
     }
 
     fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
+        if self.txn.pointer_map_page_sizes().is_some() {
+            return None;
+        }
         <T as TransactionHandle>::try_take_staged_page_data(self.txn, page_no)
     }
 
@@ -611,6 +705,9 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
         page_no: PageNumber,
         f: &mut dyn FnMut(&mut PageData),
     ) -> bool {
+        if self.txn.pointer_map_page_sizes().is_some() {
+            return false;
+        }
         <T as TransactionHandle>::try_mutate_staged_page_data(self.txn, page_no, f)
     }
 
@@ -649,6 +746,36 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
         self.txn.record_write_witness(cx, key);
     }
+
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        self.txn.pointer_map_page_sizes()
+    }
+
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        cx: &'a Cx,
+        child_page: PageNumber,
+    ) -> impl Future<Output = Result<PtrMapEntry>> + 'a {
+        self.txn.read_ptrmap_entry(cx, child_page)
+    }
+
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        child_page: PageNumber,
+        entry: PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        self.txn.write_ptrmap_entry(cx, child_page, entry)
+    }
+
+    fn write_raw_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        self.txn.write_page_data(cx, page_no, data)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +795,8 @@ pub struct MemPageStore {
     page_size: u32,
     page_slots: Vec<u8>,
     secure_delete_mode: SecureDeleteMode,
+    pointer_map_enabled: bool,
+    free_pages: Vec<PageNumber>,
 }
 
 impl MemPageStore {
@@ -682,7 +811,133 @@ impl MemPageStore {
             page_size,
             page_slots: Vec::new(),
             secure_delete_mode: SecureDeleteMode::Off,
+            pointer_map_enabled: false,
+            free_pages: Vec::new(),
         }
+    }
+
+    /// Create a new page store with pointer-map maintenance active (`bd-1q134`),
+    /// pre-initializing pointer-map page 2 and root page 3 as an empty leaf table.
+    #[must_use]
+    pub fn with_pointer_map_leaf_table(page_size: u32) -> (Self, PageNumber) {
+        let mut store = Self::new(page_size);
+        store.pointer_map_enabled = true;
+        // Initialize page 2 (first pointer-map page) with zeros.
+        let pm2 = PageNumber::new(2).expect("2 is non-zero");
+        store.pages.insert(2, vec![0_u8; page_size as usize]);
+        store.set_page_slot_present(pm2, true);
+        // Initialize page 3 as the table root and record its RootPage ptrmap entry.
+        let root = PageNumber::new(3).expect("3 is non-zero");
+        store.init_leaf_table_root(root);
+        store.write_ptrmap_entry_sync(
+            root,
+            PtrMapEntry {
+                kind: PtrMapType::RootPage,
+                parent: None,
+            },
+        );
+        (store, root)
+    }
+
+    /// Return the current highest page number in the store.
+    #[must_use]
+    pub fn max_page_number(&self) -> u32 {
+        self.pages.keys().copied().max().unwrap_or(0)
+    }
+
+    /// Return all currently freed pages recorded while pointer-map mode is enabled.
+    #[must_use]
+    pub fn free_pages_snapshot(&self) -> &[PageNumber] {
+        &self.free_pages
+    }
+
+    /// Truncate all pages strictly above `new_db_size` and replace `free_pages`.
+    pub fn truncate_to_db_size(&mut self, new_db_size: u32, remaining_freelist: Vec<PageNumber>) {
+        self.pages.retain(|&pgno, _| pgno <= new_db_size);
+        self.shared_pages
+            .get_mut()
+            .retain(|&pgno, _| pgno <= new_db_size);
+        if (new_db_size as usize) < self.page_slots.len() {
+            self.page_slots.truncate(new_db_size as usize);
+        }
+        self.free_pages = remaining_freelist;
+    }
+
+    fn write_ptrmap_entry_sync(&mut self, child_page: PageNumber, entry: PtrMapEntry) {
+        if !self.pointer_map_enabled {
+            return;
+        }
+        let ps = self.page_size;
+        let Some(pm_page) = ptrmap_page_for(child_page, ps, ps) else {
+            return;
+        };
+        let Some(offset) = ptrmap_entry_offset(child_page, ps, ps) else {
+            return;
+        };
+        let off = offset as usize;
+        let encoded = entry.encode();
+        self.shared_pages.get_mut().remove(&pm_page.get());
+        let page = self
+            .pages
+            .entry(pm_page.get())
+            .or_insert_with(|| vec![0_u8; ps as usize]);
+        if page.len() < off + 5 {
+            page.resize(ps as usize, 0);
+        }
+        page[off..off + 5].copy_from_slice(&encoded);
+        self.set_page_slot_present(pm_page, true);
+    }
+
+    fn sync_btree_page_children_sync(&mut self, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        if !self.pointer_map_enabled {
+            return Ok(());
+        }
+        let ps = self.page_size;
+        if is_ptrmap_page(page_no, ps, ps) {
+            return Ok(());
+        }
+        let hdr_off = cell::header_offset_for_page(page_no);
+        if data.len() < hdr_off + 8 || BtreePageType::from_flag(data[hdr_off]).is_none() {
+            return Ok(());
+        }
+        let children = crate::freelist::ptrmap_collect_btree_page_children(page_no, data, ps)?;
+        for (child_pg, child_kind) in children {
+            self.write_ptrmap_entry_sync(
+                child_pg,
+                PtrMapEntry {
+                    kind: child_kind,
+                    parent: Some(page_no),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn write_raw_bytes_sync(&mut self, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        let page_size = self.page_size as usize;
+        if data.len() > page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "test page store refused oversized page write: {} > {}",
+                    data.len(),
+                    page_size
+                ),
+            });
+        }
+        let pgno = page_no.get();
+        self.shared_pages.get_mut().remove(&pgno);
+        let copy_len = data.len().min(page_size);
+        if let Some(existing) = self.pages.get_mut(&pgno) {
+            existing.resize(page_size, 0);
+            existing[..copy_len].copy_from_slice(&data[..copy_len]);
+            existing[copy_len..].fill(0);
+        } else {
+            let mut page = vec![0_u8; page_size];
+            page[..copy_len].copy_from_slice(&data[..copy_len]);
+            self.pages.insert(pgno, page);
+        }
+        self.set_page_slot_present(page_no, true);
+        Ok(())
     }
 
     /// Select the cell-erasure policy for cursors backed by this store.
@@ -846,29 +1101,8 @@ impl PageWriter for MemPageStore {
         data: &'a [u8],
     ) -> impl Future<Output = Result<()>> + 'a {
         async move {
-            let page_size = self.page_size as usize;
-            if data.len() > page_size {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "test page store refused oversized page write: {} > {}",
-                        data.len(),
-                        page_size
-                    ),
-                });
-            }
-            let pgno = page_no.get();
-            self.shared_pages.get_mut().remove(&pgno);
-            let copy_len = data.len().min(page_size);
-            if let Some(existing) = self.pages.get_mut(&pgno) {
-                existing.resize(page_size, 0);
-                existing[..copy_len].copy_from_slice(&data[..copy_len]);
-                existing[copy_len..].fill(0);
-            } else {
-                let mut page = vec![0_u8; page_size];
-                page[..copy_len].copy_from_slice(&data[..copy_len]);
-                self.pages.insert(pgno, page);
-            }
-            self.set_page_slot_present(page_no, true);
+            self.write_raw_bytes_sync(page_no, data)?;
+            self.sync_btree_page_children_sync(page_no, data)?;
             Ok(())
         }
     }
@@ -914,8 +1148,18 @@ impl PageWriter for MemPageStore {
                 self.shared_pages.get_mut().remove(&pgno);
             }
             self.set_page_slot_present(page_no, true);
+            self.sync_btree_page_children_sync(page_no, raw)?;
             Ok(())
         }
+    }
+
+    fn write_raw_page_data<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move { self.write_raw_bytes_sync(page_no, data.as_bytes()) }
     }
 
     fn allocate_page<'a>(
@@ -923,7 +1167,18 @@ impl PageWriter for MemPageStore {
         _cx: &'a Cx,
     ) -> impl Future<Output = Result<PageNumber>> + 'a {
         async move {
-            let next = self
+            if self.pointer_map_enabled
+                && let Some(reused) = self.free_pages.pop()
+            {
+                self.shared_pages.get_mut().remove(&reused.get());
+                self.pages
+                    .insert(reused.get(), vec![0u8; self.page_size as usize]);
+                self.set_page_slot_present(reused, true);
+                return Ok(reused);
+            }
+            let ps = self.page_size;
+            let lock_byte = ptrmap_lock_byte_page(ps);
+            let mut next = self
                 .pages
                 .keys()
                 .copied()
@@ -931,9 +1186,26 @@ impl PageWriter for MemPageStore {
                 .unwrap_or(1)
                 .checked_add(1)
                 .ok_or(FrankenError::DatabaseFull)?;
+            loop {
+                if next == lock_byte {
+                    next = next.checked_add(1).ok_or(FrankenError::DatabaseFull)?;
+                    continue;
+                }
+                if self.pointer_map_enabled
+                    && let Some(pg) = PageNumber::new(next)
+                    && is_ptrmap_page(pg, ps, ps)
+                {
+                    self.shared_pages.get_mut().remove(&next);
+                    self.pages.insert(next, vec![0u8; ps as usize]);
+                    self.set_page_slot_present(pg, true);
+                    next = next.checked_add(1).ok_or(FrankenError::DatabaseFull)?;
+                    continue;
+                }
+                break;
+            }
             let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
             self.shared_pages.get_mut().remove(&next);
-            self.pages.insert(next, vec![0u8; self.page_size as usize]);
+            self.pages.insert(next, vec![0u8; ps as usize]);
             self.set_page_slot_present(pgno, true);
             Ok(pgno)
         }
@@ -946,9 +1218,72 @@ impl PageWriter for MemPageStore {
     ) -> impl Future<Output = Result<()>> + 'a {
         async move {
             let pgno = page_no.get();
+            if self.pointer_map_enabled {
+                if is_ptrmap_page(page_no, self.page_size, self.page_size) {
+                    return Ok(());
+                }
+                if !self.free_pages.contains(&page_no) {
+                    self.free_pages.push(page_no);
+                }
+                self.write_ptrmap_entry_sync(
+                    page_no,
+                    PtrMapEntry {
+                        kind: PtrMapType::FreePage,
+                        parent: None,
+                    },
+                );
+                return Ok(());
+            }
             self.shared_pages.get_mut().remove(&pgno);
             self.pages.remove(&pgno);
             self.set_page_slot_present(page_no, false);
+            Ok(())
+        }
+    }
+
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        self.pointer_map_enabled
+            .then_some((self.page_size, self.page_size))
+    }
+
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        child_page: PageNumber,
+    ) -> impl Future<Output = Result<PtrMapEntry>> + 'a {
+        async move {
+            if !self.pointer_map_enabled {
+                return Err(FrankenError::Unsupported);
+            }
+            let ps = self.page_size;
+            let pm_page = ptrmap_page_for(child_page, ps, ps).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("page {} has no pointer-map page", child_page.get()),
+                }
+            })?;
+            let offset = ptrmap_entry_offset(child_page, ps, ps).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("page {} has no pointer-map offset", child_page.get()),
+                }
+            })? as usize;
+            let bytes =
+                self.pages
+                    .get(&pm_page.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("missing pointer-map page {}", pm_page.get()),
+                    })?;
+            PtrMapEntry::decode(&bytes[offset..offset + 5])
+        }
+    }
+
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        child_page: PageNumber,
+        entry: PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.write_ptrmap_entry_sync(child_page, entry);
             Ok(())
         }
     }

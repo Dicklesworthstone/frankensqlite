@@ -1633,6 +1633,80 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         Ok(true)
     }
 
+    /// Effective `PRAGMA auto_vacuum` mode active for this transaction (bd-1q134).
+    fn auto_vacuum_mode(&self) -> fsqlite_types::AutoVacuumMode {
+        fsqlite_types::AutoVacuumMode::None
+    }
+
+    /// Current `largest_root_page` header value for this transaction (0 when
+    /// `auto_vacuum = NONE`).
+    fn largest_root_page(&self) -> u32 {
+        0
+    }
+
+    /// Returns `Some((usable_size, full_page_size))` when pointer-map maintenance
+    /// is active for this transaction, or `None` when `auto_vacuum = NONE`.
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Update transaction-local auto-vacuum mode and `largest_root_page`
+    /// (e.g. when initializing an empty database, toggling `FULL <-> INCREMENTAL`,
+    /// or packing/compacting root pages).
+    fn set_auto_vacuum_state(
+        &mut self,
+        _mode: fsqlite_types::AutoVacuumMode,
+        _largest_root_page: u32,
+    ) {
+    }
+
+    /// Read the 5-byte pointer-map entry for `child_page` when pointer maps are enabled.
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _child_page: PageNumber,
+    ) -> impl Future<Output = Result<fsqlite_types::PtrMapEntry>> + 'a {
+        async { Err(FrankenError::Unsupported) }
+    }
+
+    /// Write the 5-byte pointer-map entry for `child_page` when pointer maps are enabled.
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _child_page: PageNumber,
+        _entry: fsqlite_types::PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
+    }
+
+    /// Ensure `ptrmap_page` is allocated and zero-initialized if not yet present.
+    fn ensure_ptrmap_page_initialized<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _ptrmap_page: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
+    }
+
+    /// Claim a specific free page number (from transaction-local `freed_pages`
+    /// or the pager freelist) without allocating an arbitrary page. Returns
+    /// `Ok(true)` if `page_no` was free and claimed, `Ok(false)` otherwise.
+    fn claim_specific_free_page(&mut self, _page_no: PageNumber) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Record an explicit auto-vacuum / incremental-vacuum truncation to
+    /// `new_db_size` pages with the exact surviving freelist and relocated
+    /// source pages (added to MVCC conflict tracking).
+    fn apply_auto_vacuum_truncation(
+        &mut self,
+        _new_db_size: u32,
+        _remaining_freelist: Vec<PageNumber>,
+        _relocated_src_pages: &[PageNumber],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Roll back this transaction, discarding the write-set.
     ///
     /// Rollback is infallible in the MVCC model (we simply discard the
@@ -2602,6 +2676,71 @@ impl TransactionHandle for TransactionKind {
 
     fn rollback_to_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
         dispatch_transaction_kind!(self, txn => txn.rollback_to_savepoint(cx, name))
+    }
+
+    fn auto_vacuum_mode(&self) -> fsqlite_types::AutoVacuumMode {
+        dispatch_transaction_kind!(self, txn => txn.auto_vacuum_mode())
+    }
+
+    fn largest_root_page(&self) -> u32 {
+        dispatch_transaction_kind!(self, txn => txn.largest_root_page())
+    }
+
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        dispatch_transaction_kind!(self, txn => txn.pointer_map_page_sizes())
+    }
+
+    fn set_auto_vacuum_state(
+        &mut self,
+        mode: fsqlite_types::AutoVacuumMode,
+        largest_root_page: u32,
+    ) {
+        dispatch_transaction_kind!(self, txn => txn.set_auto_vacuum_state(mode, largest_root_page));
+    }
+
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        cx: &'a Cx,
+        child_page: PageNumber,
+    ) -> impl Future<Output = Result<fsqlite_types::PtrMapEntry>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.read_ptrmap_entry(cx, child_page).await) }
+    }
+
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        child_page: PageNumber,
+        entry: fsqlite_types::PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            dispatch_transaction_kind!(self, txn => txn.write_ptrmap_entry(cx, child_page, entry).await)
+        }
+    }
+
+    fn ensure_ptrmap_page_initialized<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        ptrmap_page: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            dispatch_transaction_kind!(self, txn => txn.ensure_ptrmap_page_initialized(cx, ptrmap_page).await)
+        }
+    }
+
+    fn claim_specific_free_page(&mut self, page_no: PageNumber) -> Result<bool> {
+        dispatch_transaction_kind!(self, txn => txn.claim_specific_free_page(page_no))
+    }
+
+    fn apply_auto_vacuum_truncation(
+        &mut self,
+        new_db_size: u32,
+        remaining_freelist: Vec<PageNumber>,
+        relocated_src_pages: &[PageNumber],
+    ) -> Result<()> {
+        dispatch_transaction_kind!(
+            self,
+            txn => txn.apply_auto_vacuum_truncation(new_db_size, remaining_freelist, relocated_src_pages)
+        )
     }
 }
 

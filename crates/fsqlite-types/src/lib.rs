@@ -1571,6 +1571,396 @@ impl DatabaseHeader {
     pub const fn set_db_file_id(&mut self, id: [u8; 16]) {
         self.db_file_id = id;
     }
+
+    /// Derive the effective [`AutoVacuumMode`] encoded in this header
+    /// (bytes 52..56 `largest_root_page` and bytes 64..68 `incremental_vacuum`).
+    #[must_use]
+    pub const fn auto_vacuum_mode(&self) -> AutoVacuumMode {
+        AutoVacuumMode::from_header_fields(self.largest_root_page, self.incremental_vacuum)
+    }
+}
+
+/// SQLite `PRAGMA auto_vacuum` mode encoded in the database file header (§1.3.14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum AutoVacuumMode {
+    /// `0` / `NONE`: no pointer-map pages (`largest_root_page == 0`).
+    #[default]
+    None = 0,
+    /// `1` / `FULL`: pointer-map pages maintained; commit automatically relocates
+    /// and truncates free pages (`largest_root_page != 0 && incremental_vacuum == 0`).
+    Full = 1,
+    /// `2` / `INCREMENTAL`: pointer-map pages maintained; free pages stay on the
+    /// freelist until reclaimed via `PRAGMA incremental_vacuum[(N)]`
+    /// (`largest_root_page != 0 && incremental_vacuum != 0`).
+    Incremental = 2,
+}
+
+impl AutoVacuumMode {
+    /// Decode from database header fields `largest_root_page` (bytes 52..56)
+    /// and `incremental_vacuum` (bytes 64..68).
+    #[must_use]
+    pub const fn from_header_fields(largest_root_page: u32, incremental_vacuum: u32) -> Self {
+        if largest_root_page == 0 {
+            Self::None
+        } else if incremental_vacuum == 0 {
+            Self::Full
+        } else {
+            Self::Incremental
+        }
+    }
+
+    /// Decode from SQLite integer pragma code (`0`, `1`, `2`).
+    #[must_use]
+    pub const fn from_pragma_int(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::Full),
+            2 => Some(Self::Incremental),
+            _ => None,
+        }
+    }
+
+    /// Encode as SQLite integer pragma code (`0`, `1`, or `2`).
+    #[must_use]
+    pub const fn as_pragma_int(self) -> i64 {
+        self as i64
+    }
+
+    /// Whether pointer-map pages are active (`Full` or `Incremental`).
+    #[must_use]
+    pub const fn uses_pointer_map(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Pointer-map entry size in bytes (§11.6).
+pub const PTRMAP_ENTRY_SIZE_BYTES: u32 = 5;
+
+/// Byte offset of SQLite's 1 GiB pending-byte lock region.
+const PTRMAP_PENDING_BYTE_OFFSET: u32 = 0x4000_0000;
+
+/// Pointer-map entry type code (§11.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PtrMapType {
+    /// Root b-tree page, parent must be 0.
+    RootPage = 1,
+    /// Freelist page, parent must be 0.
+    FreePage = 2,
+    /// First overflow page, parent is owning b-tree page.
+    Overflow1 = 3,
+    /// Subsequent overflow page, parent is previous overflow page.
+    Overflow2 = 4,
+    /// Non-root b-tree page, parent is b-tree parent page.
+    Btree = 5,
+}
+
+impl PtrMapType {
+    fn from_code(code: u8) -> std::result::Result<Self, fsqlite_error::FrankenError> {
+        match code {
+            1 => Ok(Self::RootPage),
+            2 => Ok(Self::FreePage),
+            3 => Ok(Self::Overflow1),
+            4 => Ok(Self::Overflow2),
+            5 => Ok(Self::Btree),
+            _ => Err(fsqlite_error::FrankenError::DatabaseCorrupt {
+                detail: format!("invalid pointer-map type code: {code}"),
+            }),
+        }
+    }
+}
+
+/// Parsed 5-byte pointer-map entry (§11.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtrMapEntry {
+    pub kind: PtrMapType,
+    pub parent: Option<PageNumber>,
+}
+
+impl PtrMapEntry {
+    /// Decode one 5-byte pointer-map entry.
+    pub fn decode(bytes: &[u8]) -> std::result::Result<Self, fsqlite_error::FrankenError> {
+        if bytes.len() < PTRMAP_ENTRY_SIZE_BYTES as usize {
+            return Err(fsqlite_error::FrankenError::DatabaseCorrupt {
+                detail: "pointer-map entry too small".to_owned(),
+            });
+        }
+
+        let kind = PtrMapType::from_code(bytes[0])?;
+        let parent_raw = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        let parent = PageNumber::new(parent_raw);
+
+        match kind {
+            PtrMapType::RootPage | PtrMapType::FreePage => {
+                if parent_raw != 0 {
+                    return Err(fsqlite_error::FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "pointer-map type {:?} must have parent 0, got {}",
+                            kind, parent_raw
+                        ),
+                    });
+                }
+            }
+            PtrMapType::Overflow1 | PtrMapType::Overflow2 | PtrMapType::Btree => {
+                if parent.is_none() {
+                    return Err(fsqlite_error::FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "pointer-map type {:?} requires non-zero parent page",
+                            kind
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(Self { kind, parent })
+    }
+
+    /// Encode one 5-byte pointer-map entry.
+    #[must_use]
+    pub fn encode(self) -> [u8; PTRMAP_ENTRY_SIZE_BYTES as usize] {
+        let mut out = [0u8; PTRMAP_ENTRY_SIZE_BYTES as usize];
+        out[0] = self.kind as u8;
+        let parent = self.parent.map_or(0u32, PageNumber::get);
+        out[1..5].copy_from_slice(&parent.to_be_bytes());
+        out
+    }
+}
+
+/// 1-based page number of SQLite's reserved pending-byte (lock-byte) page.
+#[must_use]
+pub const fn ptrmap_lock_byte_page(page_size: u32) -> u32 {
+    (PTRMAP_PENDING_BYTE_OFFSET / page_size) + 1
+}
+
+/// Number of pointer-map entries per pointer-map page for a usable page size.
+#[must_use]
+pub const fn ptrmap_entries_per_page(usable_size: u32) -> u32 {
+    usable_size / PTRMAP_ENTRY_SIZE_BYTES
+}
+
+/// Pointer-map group size = entries per page + the pointer-map page itself.
+#[must_use]
+pub const fn ptrmap_group_size(usable_size: u32) -> u32 {
+    ptrmap_entries_per_page(usable_size) + 1
+}
+
+#[must_use]
+const fn compute_ptrmap_page(pgno: u32, usable_size: u32, page_size: u32) -> u32 {
+    if pgno < 2 {
+        return 0;
+    }
+    let group = ptrmap_group_size(usable_size);
+    if group == 0 {
+        return 0;
+    }
+    let i_ptr_map = (pgno - 2) / group;
+    let mut ret = (i_ptr_map * group) + 2;
+    let pending_byte_page = ptrmap_lock_byte_page(page_size);
+    if ret == pending_byte_page {
+        ret += 1;
+    }
+    ret
+}
+
+/// Whether `pgno` is itself a pointer-map page.
+#[must_use]
+pub const fn is_ptrmap_page(pgno: PageNumber, usable_size: u32, page_size: u32) -> bool {
+    let raw = pgno.get();
+    if raw < 2 {
+        return false;
+    }
+    compute_ptrmap_page(raw, usable_size, page_size) == raw
+}
+
+/// Pointer-map page that stores metadata for `pgno`.
+///
+/// Returns `None` when `pgno` is itself a pointer-map page or `< 3`.
+#[must_use]
+pub const fn ptrmap_page_for(
+    pgno: PageNumber,
+    usable_size: u32,
+    page_size: u32,
+) -> Option<PageNumber> {
+    if is_ptrmap_page(pgno, usable_size, page_size) {
+        return None;
+    }
+    let raw = pgno.get();
+    if raw < 3 {
+        return None;
+    }
+    let ptrmap = compute_ptrmap_page(raw, usable_size, page_size);
+    if ptrmap == 0 {
+        return None;
+    }
+    PageNumber::new(ptrmap)
+}
+
+/// Byte offset of `pgno`'s 5-byte pointer-map entry within its pointer-map page.
+///
+/// Returns `None` when `pgno` is itself a pointer-map page, `< 3`, or the
+/// reserved pending-byte page.
+#[must_use]
+pub const fn ptrmap_entry_offset(
+    pgno: PageNumber,
+    usable_size: u32,
+    page_size: u32,
+) -> Option<u32> {
+    let pending_byte_page = ptrmap_lock_byte_page(page_size);
+    if pgno.get() == pending_byte_page {
+        return None;
+    }
+    let Some(ptrmap_page) = ptrmap_page_for(pgno, usable_size, page_size) else {
+        return None;
+    };
+    if pgno.get() <= ptrmap_page.get() {
+        return None;
+    }
+    let index = pgno.get() - ptrmap_page.get() - 1;
+    Some(index * PTRMAP_ENTRY_SIZE_BYTES)
+}
+
+/// Lowest non-pointer-map, non-lock-byte page number strictly greater than `after`.
+#[must_use]
+pub const fn ptrmap_next_data_page(
+    after: u32,
+    usable_size: u32,
+    page_size: u32,
+) -> Option<PageNumber> {
+    let lock_byte = ptrmap_lock_byte_page(page_size);
+    let mut candidate = after.saturating_add(1);
+    while candidate > after {
+        if let Some(pg) = PageNumber::new(candidate)
+            && candidate != lock_byte
+            && !is_ptrmap_page(pg, usable_size, page_size)
+        {
+            return Some(pg);
+        }
+        let next = candidate.saturating_add(1);
+        if next == candidate {
+            return None;
+        }
+        candidate = next;
+    }
+    None
+}
+
+/// Highest non-pointer-map, non-lock-byte page number strictly less than `below`
+/// (returning at least `1` when `below > 1`).
+#[must_use]
+pub const fn ptrmap_prev_data_page(below: u32, usable_size: u32, page_size: u32) -> u32 {
+    if below <= 1 {
+        return 0;
+    }
+    let lock_byte = ptrmap_lock_byte_page(page_size);
+    let mut candidate = below - 1;
+    while candidate > 1 {
+        if let Some(pg) = PageNumber::new(candidate)
+            && candidate != lock_byte
+            && !is_ptrmap_page(pg, usable_size, page_size)
+        {
+            return candidate;
+        }
+        candidate -= 1;
+    }
+    1
+}
+
+/// Count of pointer-map pages in `1..=n` when auto-vacuum is enabled.
+#[must_use]
+pub const fn ptrmap_page_count_up_to(n: u32, usable_size: u32, page_size: u32) -> u32 {
+    if n < 2 {
+        return 0;
+    }
+    let group = ptrmap_group_size(usable_size);
+    if group == 0 {
+        return 0;
+    }
+    let k_max = (n - 2) / group;
+    let lock_byte = ptrmap_lock_byte_page(page_size);
+    let mut count = k_max + 1;
+    if 2 + k_max * group == lock_byte && n == lock_byte {
+        count -= 1;
+    }
+    count
+}
+
+/// Count of non-pointer-map, non-lock-byte pages in `1..=n` (always includes page 1 for `n >= 1`).
+#[must_use]
+pub const fn ptrmap_data_page_count_up_to(n: u32, usable_size: u32, page_size: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let pm = ptrmap_page_count_up_to(n, usable_size, page_size);
+    let lock_byte = ptrmap_lock_byte_page(page_size);
+    let lb = if n >= lock_byte { 1 } else { 0 };
+    n - pm - lb
+}
+
+/// Compute SQLite's exact post-truncation `final_db_size` for `auto_vacuum = FULL`.
+///
+/// Given `orig_db_size`, `free_count` free non-ptrmap pages in `1..=orig_db_size`,
+/// and `largest_root_page` (minimum non-relocatable page), returns the smallest
+/// valid database page count `n >= largest_root_page.max(1)` that can hold all
+/// remaining live pages without leaving trailing pointer-map or lock-byte pages.
+#[must_use]
+pub const fn ptrmap_final_db_size(
+    orig_db_size: u32,
+    free_count: u32,
+    largest_root_page: u32,
+    usable_size: u32,
+    page_size: u32,
+) -> u32 {
+    if orig_db_size <= 1 {
+        return orig_db_size;
+    }
+    let total_data = ptrmap_data_page_count_up_to(orig_db_size, usable_size, page_size);
+    let live_data = if total_data > free_count {
+        let rem = total_data - free_count;
+        if rem == 0 { 1 } else { rem }
+    } else {
+        1
+    };
+    let floor = if largest_root_page > 1 {
+        largest_root_page
+    } else {
+        1
+    };
+    if floor >= orig_db_size {
+        return orig_db_size;
+    }
+    let mut lo = floor;
+    let mut hi = orig_db_size;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if ptrmap_data_page_count_up_to(mid, usable_size, page_size) >= live_data {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let lock_byte = ptrmap_lock_byte_page(page_size);
+    while lo > 1 {
+        let is_special = lo == lock_byte
+            || matches!(PageNumber::new(lo), Some(pg) if is_ptrmap_page(pg, usable_size, page_size));
+        if !is_special {
+            break;
+        }
+        // Only step down if doing so keeps all live data pages covered and stays >= floor.
+        if lo > floor && ptrmap_data_page_count_up_to(lo - 1, usable_size, page_size) >= live_data {
+            lo -= 1;
+        } else {
+            let next = lo.saturating_add(1);
+            lo = if next < orig_db_size {
+                next
+            } else {
+                orig_db_size
+            };
+            break;
+        }
+    }
+    lo
 }
 
 /// Maximum number of fragmented free bytes allowed on a B-tree page header.
