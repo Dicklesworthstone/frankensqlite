@@ -48484,7 +48484,7 @@ impl Connection {
         source_rows: &'a [Row],
     ) -> Pin<Box<dyn Future<Output = Result<InsertSelectReplayOutcome>> + 'a>> {
         Box::pin(async move {
-            let outcome = self.execute_insert_select_row_stream(insert, async |emitter| {
+            let outcome = self.execute_insert_select_row_stream(insert, true, async |emitter| {
                 for row in source_rows {
                     emitter.emit_row(row.values()).await?;
                 }
@@ -48516,7 +48516,7 @@ impl Connection {
         // Per-row replay already updates total_changes and excludes REPLACE's
         // implicit deletes; only the statement count is accumulated here.
         // Boxing retains the indirection needed by recursive row replay.
-        let outcome = Box::pin(self.execute_insert_select_row_stream(insert, async |emitter| {
+        let outcome = Box::pin(self.execute_insert_select_row_stream(insert, true, async |emitter| {
             for morsel in &morsels {
                 for row in &morsel.rows {
                     emitter.emit_row(row).await?;
@@ -51013,9 +51013,15 @@ impl PageOwnershipSink<'_> {
 }
 
 impl Connection {
+    /// Replays the rows `producer` emits through the one-row INSERT
+    /// template. `source_rows_materialized` says the producer emits rows that
+    /// were all evaluated before the stream started (a materialized SELECT
+    /// chunk, VALUES, morsels), so nothing is read between rows; only such a
+    /// SELECT-fed stream may run the compiled-row kernel (bd-fpr5g lever 5).
     async fn execute_insert_select_row_stream<F>(
         &self,
         insert: &fsqlite_ast::InsertStatement,
+        source_rows_materialized: bool,
         mut producer: F,
     ) -> Result<InsertSelectReplayOutcome>
     where
@@ -51043,7 +51049,7 @@ impl Connection {
                 let _fk_parent_validation_cache =
                     self.enter_fk_parent_validation_cache_scope(&insert.table.name);
                 let compiled_insert = self
-                    .prepare_compiled_insert_replay(insert, &insert_sql)
+                    .prepare_compiled_insert_replay(insert, &insert_sql, source_rows_materialized)
                     .await?;
                 let prepared = if collect_returning || compiled_insert.is_some() {
                     None
@@ -51179,7 +51185,7 @@ impl Connection {
         let source_is_unwritten = self.insert_select_source_is_unwritten(insert, select_stmt);
         let mut streamed = false;
         let outcome = self
-            .execute_insert_select_row_stream(insert, async |emitter| {
+            .execute_insert_select_row_stream(insert, false, async |emitter| {
                 if source_is_unwritten {
                     streamed = self
                         .try_stream_single_table_select_rows_in_chunks(

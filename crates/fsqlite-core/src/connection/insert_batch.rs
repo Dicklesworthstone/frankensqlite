@@ -52,6 +52,10 @@ thread_local! {
     /// Trigger body statements this thread ran through a kernel, for the lib
     /// tests that prove the kernel path is the one taken.
     static TRIGGER_BODY_KERNEL_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Rows this thread replayed through a compiled INSERT row program
+    /// (`execute_compiled_insert_replay_row` with its identity unchanged), for
+    /// the lib tests of which streams take it (bd-fpr5g lever 5).
+    static COMPILED_INSERT_REPLAY_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a trigger body template's statement runs through a kernel.
@@ -219,13 +223,25 @@ impl Connection {
         &self,
         original: &fsqlite_ast::InsertStatement,
         row_sql: &str,
+        source_rows_materialized: bool,
     ) -> Result<Option<CompiledInsertReplay>> {
         // Keep SELECT streaming, UPSERT OLD/NEW routing, non-row-local
         // RETURNING, virtual tables, and attached/TEMP ownership on their established
         // paths. FAIL/ROLLBACK also retain their historical replay entry until
         // their independently nested failure boundaries have a fast-path proof.
         // This is a positive admission rule, not a global fallback bypass.
-        if !matches!(&original.source, InsertSource::Values(rows) if rows.len() > 1)
+        //
+        // bd-fpr5g lever 5: a SELECT source is admitted when the stream's rows
+        // were all evaluated before it started (a materialized chunk): such a
+        // row is the same input as an evaluated VALUES row, and nothing is read
+        // between rows. A stream whose producer reads its source while rows are
+        // inserted keeps the prepared replay.
+        let source_admitted = match &original.source {
+            InsertSource::Values(rows) => rows.len() > 1,
+            InsertSource::Select(_) => source_rows_materialized,
+            InsertSource::DefaultValues => false,
+        };
+        if !source_admitted
             || original.with.is_some()
             || !reusable_insert_returning(&original.returning)
             || !original.upsert.is_empty()
@@ -243,7 +259,10 @@ impl Connection {
             || self.has_live_vtab_instance(&original.table.name)
             || self.view_index_of(&original.table.name).is_some()
             || self.targets_shadowed_main(&original.table)
-            || !self.temp_storage_roots().is_empty()
+            || self
+                .temp_table_names
+                .borrow()
+                .contains(&original.table.name.to_ascii_lowercase())
             || !self.active_txn_is_open_or_borrowed()
             || self.internal_statement_savepoint_depth.get() == 0
         {
@@ -279,6 +298,22 @@ impl Connection {
         let identity = self.insert_replay_identity();
         let program = self.compile_table_insert(insert, None).await?;
         if self.insert_replay_identity() != identity {
+            return Ok(None);
+        }
+        // bd-fpr5g lever 5: TEMP tables and materialized WITH / view bindings
+        // are MemDatabase roots from the connection's TEMP namespace, which no
+        // main root shares, and the routing and index suppression a compile
+        // applies under them touch only those roots. A main target's template
+        // (whose CHECK, DEFAULT and generated expressions read no table) opens
+        // none of them, so their presence leaves its program as it is. Checked
+        // here rather than assumed: a template that would open one stays on the
+        // prepared replay.
+        let temp_roots = self.temp_storage_roots();
+        if !temp_roots.is_empty()
+            && program
+                .storage_root_usages()
+                .any(|usage| temp_roots.contains(&usage.root_page))
+        {
             return Ok(None);
         }
         Ok(Some(CompiledInsertReplay {
@@ -319,6 +354,8 @@ impl Connection {
                     "compiled INSERT row lost its statement",
                 ));
             };
+            #[cfg(test)]
+            COMPILED_INSERT_REPLAY_ROWS.with(|rows| rows.set(rows.get() + 1));
             self.clear_table_program_error_state();
             self.forget_constraint_failure_action_at_top_level();
             self.sync_change_tracking_context();
@@ -2062,6 +2099,137 @@ mod trigger_body_kernel_runs {
                         + 1000 * i64::try_from(range.len()).unwrap()
                 ]
             );
+        });
+    }
+}
+
+/// bd-fpr5g lever 5: which INSERT ... SELECT streams into a table with
+/// triggers replay their rows through the compiled row program.
+#[cfg(test)]
+mod compiled_insert_replay_rows {
+    use super::*;
+
+    fn replayed_rows() -> u64 {
+        COMPILED_INSERT_REPLAY_ROWS.with(std::cell::Cell::get)
+    }
+
+    async fn ints(conn: &Connection, sql: &str) -> Vec<i64> {
+        conn.query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error}"))
+            .iter()
+            .flat_map(|row| row.values().to_vec())
+            .map(|value| match value {
+                SqliteValue::Integer(n) => n,
+                other => panic!("{sql}: {other:?}"),
+            })
+            .collect()
+    }
+
+    const SETUP: &[&str] = &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)",
+        "CREATE TABLE lg(k, m)",
+        "CREATE TRIGGER ti AFTER INSERT ON t WHEN NEW.n % 7 <> 3 BEGIN \
+           INSERT INTO lg VALUES (NEW.id, NEW.n * 2); END",
+        "CREATE TABLE src(i INTEGER PRIMARY KEY, n INTEGER)",
+        "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 300) \
+         INSERT INTO src SELECT i, i FROM s",
+    ];
+
+    /// Rows and log entries `t` and `lg` hold, as (count, sum) pairs.
+    async fn totals(conn: &Connection) -> Vec<i64> {
+        let mut out = ints(conn, "SELECT count(*), sum(n) FROM t").await;
+        out.extend(ints(conn, "SELECT count(*), sum(m) FROM lg").await);
+        out
+    }
+
+    /// The totals after `range` went into t (and fired the trigger).
+    fn expected(range: impl Iterator<Item = i64> + Clone) -> Vec<i64> {
+        let fired = range.clone().filter(|n| n % 7 != 3);
+        let count = |it: &mut dyn Iterator<Item = i64>| i64::try_from(it.count()).unwrap();
+        vec![
+            count(&mut range.clone()),
+            range.sum(),
+            count(&mut fired.clone()),
+            fired.map(|n| n * 2).sum(),
+        ]
+    }
+
+    #[test]
+    fn a_materialized_select_source_replays_through_the_compiled_row() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("replay.db");
+            for path in [":memory:".to_owned(), file.to_string_lossy().into_owned()] {
+                let conn = Connection::open(&path).await.unwrap();
+                for sql in SETUP {
+                    conn.execute(sql).await.unwrap();
+                }
+                // A projected expression keeps the streaming producer out: the
+                // SELECT is materialized, then replayed.
+                let before = replayed_rows();
+                conn.execute("INSERT INTO t SELECT i, n + 0 FROM src WHERE i <= 200")
+                    .await
+                    .unwrap();
+                assert_eq!(replayed_rows() - before, 200, "{path}: materialized SELECT");
+                assert_eq!(totals(&conn).await, expected(1..=200), "{path}");
+
+                // Bare columns of one table: the streaming producer emits the
+                // rows while the stream runs, and they keep the prepared replay.
+                conn.execute("CREATE TABLE src2(i INTEGER PRIMARY KEY, n INTEGER)")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO src2 SELECT i + 200, n + 200 FROM src WHERE i <= 50")
+                    .await
+                    .unwrap();
+                let before = replayed_rows();
+                conn.execute("INSERT INTO t SELECT i, n FROM src2").await.unwrap();
+                assert_eq!(replayed_rows() - before, 0, "{path}: streamed SELECT");
+                assert_eq!(totals(&conn).await, expected(1..=250), "{path}");
+            }
+        });
+    }
+
+    #[test]
+    fn temp_roots_keep_the_compiled_row_unless_the_target_is_temp() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            for sql in SETUP {
+                conn.execute(sql).await.unwrap();
+            }
+            // A TEMP table elsewhere and a CTE source (a materialized binding
+            // while the statement runs): both are temp roots, and the
+            // template's program opens neither.
+            conn.execute("CREATE TEMP TABLE scratch(x)").await.unwrap();
+            let before = replayed_rows();
+            conn.execute(
+                "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 120) \
+                 INSERT INTO t SELECT i, i FROM s",
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed_rows() - before, 120, "CTE source with a TEMP table present");
+            assert_eq!(totals(&conn).await, expected(1..=120));
+
+            // A TEMP target keeps the prepared replay.
+            conn.execute("CREATE TEMP TABLE tt(id INTEGER PRIMARY KEY, n INTEGER)")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TEMP TRIGGER tti AFTER INSERT ON tt BEGIN \
+                   INSERT INTO lg VALUES (NEW.id, 0); END",
+            )
+            .await
+            .unwrap();
+            let before = replayed_rows();
+            conn.execute("INSERT INTO tt SELECT i, n + 0 FROM src WHERE i <= 30")
+                .await
+                .unwrap();
+            assert_eq!(replayed_rows() - before, 0, "TEMP target");
+            assert_eq!(ints(&conn, "SELECT count(*), sum(n) FROM tt").await, vec![30, 465]);
+            let mut want = expected(1..=120);
+            want[2] += 30;
+            assert_eq!(totals(&conn).await, want);
         });
     }
 }

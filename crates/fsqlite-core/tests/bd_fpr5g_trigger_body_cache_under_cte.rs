@@ -38,6 +38,12 @@
 //! under: outside the bodies, from the firing table's own trigger with
 //! recursion off and on, after a DROP / CREATE / CREATE INDEX, and after a
 //! savepoint rollback and a failed statement.
+//!
+//! Lever 5 runs the outer INSERT ... SELECT replay of a materialized SELECT,
+//! and of a stream while temp roots exist, through GH#516's compiled row
+//! program; its keeper replays across a chunk boundary, through RAISE,
+//! conflict overrides, a source-writing trigger, a view read in a body and a
+//! rollback.
 
 use fsqlite_core::connection::{
     Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
@@ -739,6 +745,82 @@ fn trigger_new_rows_hold_every_omitted_columns_default() {
     let _serial = serial();
     asupersync::test_utils::run_test(|| async {
         assert_marked_script_matches_stock(DEFAULT_ROW_SCRIPT, "default row").await;
+    });
+}
+
+/// Lever 5 replays a SELECT-fed stream whose rows were materialized, and a
+/// stream while temp roots exist, through the compiled row program
+/// (connection/insert_batch.rs's lib tests count which streams do). Each
+/// replayed row must still do what the prepared replay did: across the
+/// 10,000-row chunk boundary, with BEFORE triggers that RAISE(IGNORE) or
+/// RAISE(ABORT), OR IGNORE and OR REPLACE, a trigger that writes the source
+/// table (within one chunk), a CTE source with a TEMP table present, a body
+/// that reads a view (a materialized binding while it runs), and a rollback.
+const REPLAY_SCRIPT: &[&str] = &[
+    "CREATE TABLE src(i INTEGER PRIMARY KEY, n INTEGER, tag TEXT)",
+    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 10020) \
+     INSERT INTO src SELECT i, i, 'g' || (i % 3) FROM s",
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, tag TEXT)",
+    "CREATE TABLE lg(k, m)",
+    "CREATE TRIGGER tb BEFORE INSERT ON t WHEN NEW.n % 1000 = 999 BEGIN \
+       SELECT RAISE(IGNORE); END",
+    "CREATE TRIGGER ti AFTER INSERT ON t WHEN NEW.n % 5 = 0 BEGIN \
+       INSERT INTO lg VALUES (NEW.id, NEW.n * 2); END",
+    "INSERT INTO t SELECT i, n + 0, tag FROM src",
+    "SELECT changes(), total_changes()",
+    "SELECT count(*), sum(id), sum(n) FROM t",
+    "SELECT count(*), sum(k), sum(m) FROM lg",
+    "INSERT OR IGNORE INTO t SELECT i, n + 1, 'x' FROM src WHERE i % 10 = 0",
+    "SELECT changes(), total_changes()",
+    "INSERT OR REPLACE INTO t SELECT i, n + 2, 'r' FROM src WHERE i % 7 = 0 AND i < 500",
+    "SELECT changes(), total_changes()",
+    "SELECT count(*), sum(n), sum(tag = 'r') FROM t",
+    "SELECT count(*), sum(m) FROM lg",
+    // A trigger that writes the source table, within one chunk.
+    "CREATE TABLE t2(id INTEGER PRIMARY KEY, n INTEGER, tag TEXT)",
+    "CREATE TRIGGER t2i AFTER INSERT ON t2 WHEN NEW.n % 5 = 0 BEGIN \
+       UPDATE src SET tag = 'seen' WHERE i = NEW.id + 1; \
+       INSERT INTO src VALUES (NEW.id + 100000, 0, 'new'); END",
+    "INSERT INTO t2 SELECT i, n + 0, tag FROM src WHERE i <= 500",
+    "SELECT count(*), sum(tag = 'seen') FROM t2",
+    "SELECT count(*), sum(tag = 'seen'), sum(tag = 'new') FROM src",
+    "CREATE TRIGGER t2a BEFORE INSERT ON t2 WHEN NEW.id = 777 BEGIN \
+       SELECT RAISE(ABORT, 'stop at 777'); END",
+    "!INSERT INTO t2 SELECT i, n + 0, tag FROM src WHERE i > 500 AND i <= 1000",
+    "SELECT count(*), sum(n) FROM t2",
+    "SELECT count(*), sum(tag = 'new') FROM src",
+    // A CTE source while a TEMP table exists; the body reads a view.
+    "CREATE TEMP TABLE scratch(x)",
+    "INSERT INTO scratch VALUES (1)",
+    "CREATE TABLE t3(id INTEGER PRIMARY KEY, n INTEGER)",
+    "CREATE TABLE l3(id, c)",
+    "CREATE VIEW v3 AS SELECT count(*) AS c, sum(n) AS s FROM t3",
+    "CREATE TRIGGER t3i AFTER INSERT ON t3 BEGIN \
+       INSERT INTO l3 SELECT NEW.id, c * 1000 + s FROM v3; END",
+    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 400) \
+     INSERT INTO t3 SELECT i, i FROM s",
+    "SELECT count(*), sum(n) FROM t3",
+    "SELECT count(*), sum(c) FROM l3",
+    "SELECT * FROM scratch",
+    // The rollback runs without the TEMP table: on main (eb7cd85b2, before
+    // this lever) a ROLLBACK after CTE-fed INSERTs into a table with a trigger
+    // empties a TEMP table, a separate defect reported by trig lane round 2.
+    "DROP TABLE scratch",
+    "BEGIN",
+    "WITH RECURSIVE s(i) AS (SELECT 401 UNION ALL SELECT i + 1 FROM s WHERE i < 600) \
+     INSERT INTO t3 SELECT i, i FROM s",
+    "SELECT count(*), sum(c) FROM l3",
+    "ROLLBACK",
+    "SELECT count(*), sum(n) FROM t3",
+    "SELECT count(*), sum(c) FROM l3",
+    "PRAGMA integrity_check",
+];
+
+#[test]
+fn replayed_select_rows_follow_chunks_raises_conflicts_and_temp_roots() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        assert_marked_script_matches_stock(REPLAY_SCRIPT, "replay").await;
     });
 }
 
