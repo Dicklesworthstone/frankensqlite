@@ -8129,9 +8129,23 @@ impl TableRowSink<'_, '_> {
 }
 
 /// A resolved FROM source during view-decltype resolution: the effective
-/// source name (alias or table name) plus its output columns as
-/// `(column name, decltype)`.
-type ResolvedViewFromSource = (Option<String>, Vec<(String, Option<String>)>);
+/// source name (alias or table name) and its named output columns.
+type ResolvedViewFromSource = (Option<String>, Vec<(String, ViewColumnType)>);
+
+#[derive(Clone, Default)]
+struct ViewColumnType {
+    declaration: Option<String>,
+    affinity: Option<TypeAffinity>,
+}
+
+impl ViewColumnType {
+    fn from_column(column: &ColumnInfo) -> Self {
+        Self {
+            declaration: column.type_name.clone(),
+            affinity: Some(affinity_char_to_type(column.affinity)),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct RecursiveCteDirectEvalPlan {
@@ -58416,7 +58430,7 @@ impl Connection {
         query: &'view SelectStatement,
         outer_ctes: &[&'view [fsqlite_ast::Cte]],
         depth: usize,
-    ) -> Vec<Option<String>> {
+    ) -> Vec<ViewColumnType> {
         // Guard against a pathological source cycle; real views are acyclic.
         if depth > 16 {
             return Vec::new();
@@ -58431,27 +58445,28 @@ impl Connection {
         // Each FROM source resolved to (effective name = alias or table name,
         // its output columns as (name, decltype)).
         let mut sources: Vec<ResolvedViewFromSource> = Vec::new();
+        let mut joined_columns = Vec::new();
         if let Some(from_clause) = from {
-            for source in std::iter::once(&from_clause.source)
-                .chain(from_clause.joins.iter().map(|join| &join.table))
+            if let Some(source) =
+                self.resolve_from_source_decltypes(&from_clause.source, &visible_ctes, depth)
             {
+                joined_columns.clone_from(&source.1);
+                sources.push(source);
+            }
+            for join in &from_clause.joins {
                 if let Some(resolved) =
-                    self.resolve_from_source_decltypes(source, &visible_ctes, depth)
+                    self.resolve_from_source_decltypes(&join.table, &visible_ctes, depth)
                 {
+                    merge_view_join_column_decltypes(&mut joined_columns, &resolved.1, join);
                     sources.push(resolved);
                 }
             }
         }
-        let mut out: Vec<Option<String>> = Vec::with_capacity(columns.len());
+        let mut out = Vec::with_capacity(columns.len());
         for column in columns {
             match column {
                 ResultColumn::Star => {
-                    if sources.is_empty() {
-                        return Vec::new();
-                    }
-                    for (_, cols) in &sources {
-                        out.extend(cols.iter().map(|(_, decltype)| decltype.clone()));
-                    }
+                    out.extend(joined_columns.iter().map(|(_, decltype)| decltype.clone()));
                 }
                 ResultColumn::TableStar(qualifier) => {
                     match sources.iter().find(|(name, _)| {
@@ -58467,9 +58482,13 @@ impl Connection {
                 ResultColumn::Expr { expr, .. } => {
                     let decltype = match expr {
                         Expr::Column(col_ref, _) => {
-                            Self::resolve_view_column_ref_decltype(col_ref, &sources)
+                            Self::resolve_view_column_ref_decltype(
+                                col_ref,
+                                &sources,
+                                &joined_columns,
+                            )
                         }
-                        _ => None,
+                        _ => ViewColumnType::default(),
                     };
                     out.push(decltype);
                 }
@@ -58509,7 +58528,7 @@ impl Connection {
                     );
                     let columns = names
                         .into_iter()
-                        .zip(types.into_iter().chain(std::iter::repeat(None)))
+                        .zip(types.into_iter().chain(std::iter::repeat_with(ViewColumnType::default)))
                         .collect();
                     return Some((effective, columns));
                 }
@@ -58526,7 +58545,7 @@ impl Connection {
                 let cols = names
                     .into_iter()
                     .enumerate()
-                    .map(|(i, n)| (n, types.get(i).cloned().flatten()))
+                    .map(|(i, n)| (n, types.get(i).cloned().unwrap_or_default()))
                     .collect();
                 Some((alias.clone(), cols))
             }
@@ -58538,7 +58557,7 @@ impl Connection {
         &self,
         relation: &QualifiedName,
         depth: usize,
-    ) -> Option<Vec<(String, Option<String>)>> {
+    ) -> Option<Vec<(String, ViewColumnType)>> {
         let name = &relation.name;
         if let Some(schema) = relation.schema.as_deref() {
             if schema.eq_ignore_ascii_case("main") {
@@ -58560,20 +58579,8 @@ impl Connection {
         {
             return Some(columns);
         }
-        let attached = self
-            .attached_schemas
-            .borrow()
-            .all_schemas()
-            .into_iter()
-            .skip(2)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        attached.iter().find_map(|schema| {
-            self.with_attached_connection(schema, |child| {
-                Ok(child.view_local_relation_decltypes(name, PragmaSchemaScope::Main, depth))
-            })
-            .ok()
-            .flatten()
+        self.first_attached_catalog_match(|child| {
+            child.view_local_relation_decltypes(name, PragmaSchemaScope::Main, depth)
         })
     }
 
@@ -58582,12 +58589,15 @@ impl Connection {
         name: &str,
         scope: PragmaSchemaScope,
         depth: usize,
-    ) -> Option<Vec<(String, Option<String>)>> {
+    ) -> Option<Vec<(String, ViewColumnType)>> {
         if is_schema_relation_in_scope(name, scope) {
             return Some(
                 sqlite_master_column_infos()
                     .into_iter()
-                    .map(|column| (column.name, column.type_name))
+                    .map(|column| {
+                        let column_type = ViewColumnType::from_column(&column);
+                        (column.name, column_type)
+                    })
                     .collect(),
             );
         }
@@ -58595,7 +58605,7 @@ impl Connection {
             table
                 .columns
                 .iter()
-                .map(|column| (column.name.clone(), column.type_name.clone()))
+                .map(|column| (column.name.clone(), ViewColumnType::from_column(column)))
                 .collect()
         }) {
             return Some(columns);
@@ -58609,7 +58619,7 @@ impl Connection {
         Some(
             names
                 .into_iter()
-                .zip(types.into_iter().chain(std::iter::repeat(None)))
+                .zip(types.into_iter().chain(std::iter::repeat_with(ViewColumnType::default)))
                 .collect(),
         )
     }
@@ -58617,7 +58627,8 @@ impl Connection {
     fn resolve_view_column_ref_decltype(
         col_ref: &ColumnRef,
         sources: &[ResolvedViewFromSource],
-    ) -> Option<String> {
+        joined_columns: &[(String, ViewColumnType)],
+    ) -> ViewColumnType {
         let column = col_ref.column.as_ref();
         match col_ref.table.as_deref() {
             Some(qualifier) => sources
@@ -58629,14 +58640,12 @@ impl Connection {
                 .and_then(|(_, cols)| {
                     cols.iter()
                         .find(|(cn, _)| cn.eq_ignore_ascii_case(column))
-                        .and_then(|(_, dt)| dt.clone())
                 }),
-            None => sources
+            None => joined_columns
                 .iter()
-                .flat_map(|(_, cols)| cols.iter())
-                .find(|(cn, _)| cn.eq_ignore_ascii_case(column))
-                .and_then(|(_, dt)| dt.clone()),
+                .find(|(cn, _)| cn.eq_ignore_ascii_case(column)),
         }
+        .map_or_else(ViewColumnType::default, |(_, column_type)| column_type.clone())
     }
 
     /// Persistent views resolve their own relations in their owning catalog.
@@ -58675,13 +58684,15 @@ impl Connection {
         // source) falls back to all-empty types rather than misaligning.
         let mut decltypes = self.view_result_column_decltypes(&query, &[], 0);
         if decltypes.len() != names.len() {
-            decltypes = vec![None; names.len()];
+            decltypes = vec![ViewColumnType::default(); names.len()];
         }
         names
             .into_iter()
             .zip(decltypes)
             .enumerate()
-            .map(|(cid, (name, decltype))| pragma_catalog_column_row(cid, name, decltype, is_xinfo))
+            .map(|(cid, (name, column_type))| {
+                pragma_catalog_column_row(cid, name, column_type.declaration, is_xinfo)
+            })
             .collect()
     }
 
@@ -60230,43 +60241,78 @@ impl Connection {
             requested_scope
         };
 
-        if let Some(columns) = self.table_column_names_for_scope(relation_name, scope) {
+        if let Some(columns) =
+            self.local_relation_result_column_names(relation_name, scope, active_ctes)
+        {
+            return columns;
+        }
+        if requested_scope == PragmaSchemaScope::Unqualified
+            && let Some(columns) = self.first_attached_catalog_match(|child| {
+                child.local_relation_result_column_names(
+                    relation_name,
+                    PragmaSchemaScope::Main,
+                    active_ctes,
+                )
+            })
+        {
             return columns;
         }
 
-        if let Some(i) = self.view_index_for_scope(relation_name, scope) {
-            let views = self.views.borrow();
-            if let Some(view) = views.get(i) {
-                if !view.columns.is_empty() {
-                    return Self::deduplicate_relation_column_names(view.columns.clone());
-                }
-                let mut query = view.query.clone();
-                let temporary = view.temporary;
-                drop(views);
-                // A stored view body has its own lexical scope. CTEs visible at
-                // the use site must not leak into its result-column inference.
-                // Persistent views are also owned by MAIN and must not derive
-                // their `*` metadata from a connection-local TEMP shadow.
-                if !temporary {
-                    qualify_persistent_view_relations(&mut query);
-                }
-                // bd-5haia: a `SELECT *` chain recurses here once per view.
-                // Re-entering a view still being inferred is a cycle (the
-                // statement's relation pass reports it); fall back to the
-                // body's syntactic names, as the CTE branch does, instead of
-                // recursing without end.
-                let Some(_inference) = ViewColumnNameInference::enter(self, i) else {
-                    return Self::deduplicate_relation_column_names(infer_select_column_names(
-                        &query,
-                    ));
-                };
-                return Self::deduplicate_relation_column_names(with_view_expansion_stack(|| {
-                    self.select_result_column_names(&query, &[], active_ctes)
-                }));
-            }
-        }
-
         vec![relation_name.to_owned()]
+    }
+
+    fn local_relation_result_column_names(
+        &self,
+        relation_name: &str,
+        scope: PragmaSchemaScope,
+        active_ctes: &mut Vec<usize>,
+    ) -> Option<Vec<String>> {
+        if let Some(columns) = self.table_column_names_for_scope(relation_name, scope) {
+            return Some(columns);
+        }
+        let index = self.view_index_for_scope(relation_name, scope)?;
+        let views = self.views.borrow();
+        let view = views.get(index)?;
+        if !view.columns.is_empty() {
+            return Some(Self::deduplicate_relation_column_names(view.columns.clone()));
+        }
+        let mut query = view.query.clone();
+        let temporary = view.temporary;
+        drop(views);
+        // A stored view starts a new CTE scope and a persistent view uses
+        // its owning catalog even when it has a same-named TEMP source.
+        if !temporary {
+            qualify_persistent_view_relations(&mut query);
+        }
+        // bd-5haia: re-entering an active view implies a cycle. The relation
+        // pass reports it, so return syntactic names here without recursing.
+        let Some(_inference) = ViewColumnNameInference::enter(self, index) else {
+            return Some(Self::deduplicate_relation_column_names(
+                infer_select_column_names(&query),
+            ));
+        };
+        Some(Self::deduplicate_relation_column_names(
+            with_view_expansion_stack(|| self.select_result_column_names(&query, &[], active_ctes)),
+        ))
+    }
+
+    fn first_attached_catalog_match<T>(
+        &self,
+        mut read: impl FnMut(&Self) -> Option<T>,
+    ) -> Option<T> {
+        let schemas = self
+            .attached_schemas
+            .borrow()
+            .all_schemas()
+            .into_iter()
+            .skip(2)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        schemas.iter().find_map(|schema| {
+            self.with_attached_connection(schema, |child| Ok(read(child)))
+                .ok()
+                .flatten()
+        })
     }
 
     fn cte_result_column_names(
@@ -129289,6 +129335,45 @@ fn find_cte_definition<'a>(
             .find(|cte| cte.name.eq_ignore_ascii_case(name))
             .map(|cte| (owner, cte))
     })
+}
+
+fn merge_view_join_column_decltypes(
+    joined: &mut Vec<(String, ViewColumnType)>,
+    right: &[(String, ViewColumnType)],
+    join: &fsqlite_ast::JoinClause,
+) {
+    let left_width = joined.len();
+    for (name, decltype) in right {
+        let merges = join.join_type.natural
+            || matches!(&join.constraint, Some(JoinConstraint::Using(columns))
+                if columns.iter().any(|column| column.eq_ignore_ascii_case(name)));
+        if merges
+            && let Some((_, left_type)) = joined[..left_width]
+                .iter_mut()
+                .find(|(column, _)| column.eq_ignore_ascii_case(name))
+        {
+            match join.join_type.kind {
+                JoinKind::Right => left_type.clone_from(decltype),
+                JoinKind::Full => {
+                    // SQLite gives the merged expression the left column's
+                    // affinity and derives its displayed type from that affinity.
+                    left_type.declaration = left_type.affinity.map(|affinity| {
+                        match affinity {
+                            TypeAffinity::Blob => "BLOB",
+                            TypeAffinity::Text => "TEXT",
+                            TypeAffinity::Numeric => "NUM",
+                            TypeAffinity::Integer => "INT",
+                            TypeAffinity::Real => "REAL",
+                        }
+                        .to_owned()
+                    });
+                }
+                _ => {}
+            }
+        } else {
+            joined.push((name.clone(), decltype.clone()));
+        }
+    }
 }
 
 /// Views and SQLite's schema tables share the same constraint-free PRAGMA

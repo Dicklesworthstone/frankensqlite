@@ -622,6 +622,69 @@ fn view_cte_wildcard_uses_its_definition_scope() {
 }
 
 #[test]
+fn pragma_view_star_preserves_decltypes_and_catalog_order() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "ATTACH ':memory:' AS aux",
+            "ATTACH ':memory:' AS later",
+            "CREATE TABLE aux.remote_only(a INTEGER,b BLOB)",
+            "CREATE TABLE later.remote_only(ignored TEXT)",
+            "CREATE TEMP VIEW implicit_aux AS SELECT * FROM remote_only",
+            "CREATE TABLE lhs(a TEXT,b VARCHAR(4))",
+            "CREATE TABLE rhs(a INT,c BLOB)",
+            "CREATE VIEW v_using AS SELECT *,a AS merged,lhs.a AS lhs_a,rhs.a AS rhs_a \
+             FROM lhs LEFT JOIN rhs USING(a)",
+            "CREATE VIEW v_natural AS SELECT *,a AS merged FROM lhs NATURAL JOIN rhs",
+            "CREATE VIEW v_right AS SELECT *,a AS merged FROM lhs RIGHT JOIN rhs USING(a)",
+            "CREATE VIEW v_full AS SELECT *,a AS merged FROM lhs FULL JOIN rhs USING(a)",
+            "CREATE TABLE affinities(a VARCHAR(11), r DOUBLE, n DECIMAL(6,2), i BIGINT, b)",
+            "CREATE TABLE other_affinities(a INT,r INT,n INT,i INT,b INT)",
+            "CREATE VIEW v_full_affinities AS SELECT * FROM affinities FULL JOIN other_affinities \
+             USING(a,r,n,i,b)",
+            "CREATE TABLE strict_left(a ANY) STRICT",
+            "CREATE VIEW v_full_strict_any AS SELECT * FROM strict_left FULL JOIN rhs USING(a)",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+        let mut diffs = Vec::new();
+        for sql in [
+            "PRAGMA table_info('implicit_aux')",
+            "SELECT name,type FROM pragma_table_xinfo('implicit_aux','temp') ORDER BY cid",
+            "PRAGMA table_info('v_using')",
+            "SELECT name,type FROM pragma_table_xinfo('v_natural') ORDER BY cid",
+            "SELECT name,type FROM pragma_table_info('v_right') ORDER BY cid",
+            "SELECT name,type FROM pragma_table_info('v_full') ORDER BY cid",
+            "SELECT name,type FROM pragma_table_info('v_full_affinities') ORDER BY cid",
+            "SELECT name,type FROM pragma_table_xinfo('v_full_strict_any') ORDER BY cid",
+        ] {
+            let stock = rq(&r, sql);
+            assert!(!stock.is_empty() && stock != vec![vec!["ERR"]], "stock: {sql}");
+            let direct = fq(&f, sql).await;
+            let prepared = match f.prepare(sql).await {
+                Ok(statement) => statement.query().await.map(|rows| {
+                    rows.iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect::<Vec<Vec<String>>>()
+                }),
+                Err(error) => Err(error),
+            };
+            if direct != stock || prepared.as_ref().ok() != Some(&stock) {
+                diffs.push(format!(
+                    "{sql}: direct={direct:?}, prepared={prepared:?}, stock={stock:?}"
+                ));
+            }
+        }
+        f.execute("DETACH later").await.unwrap();
+        f.execute("DETACH aux").await.unwrap();
+        f.close().await.unwrap();
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    });
+}
+
+#[test]
 fn gh512_pragma_table_info_quoted_and_parenthesized_pk_ordinals() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
