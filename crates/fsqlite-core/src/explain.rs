@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fsqlite_types::opcode::{Opcode, P4};
+use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_vdbe::VdbeProgram;
 
 // ---------------------------------------------------------------------------
@@ -588,6 +588,210 @@ pub fn program_seeks_without_rowid_pk_on_table(program: &VdbeProgram, table_name
     }
     ops.iter().any(|op| {
         matches!(op.opcode, Opcode::NoConflict | Opcode::NotFound) && table_cursors.contains(&op.p1)
+    })
+}
+
+/// bd-r39kx: whether a comparison exits the walk `cursor` starts at
+/// `rewind_addr` once the value `reader` loads from the cursor passes an
+/// upper bound: right after the `Rewind`, the register `reader` loads (it
+/// returns the destination register of a matching opcode) is the LEFT operand
+/// (`P3`) of a `Ge` or `Gt` that jumps to the `Rewind`'s exit, as `x < ?` /
+/// `x <= ?` compile; only NULL tests may come between.
+fn walk_exits_at_upper_bound(
+    ops: &[VdbeOp],
+    rewind_addr: usize,
+    cursor: i32,
+    reader: impl Fn(&VdbeOp) -> Option<i32>,
+) -> bool {
+    let exit = ops[rewind_addr].p2;
+    let mut loaded: Option<i32> = None;
+    for op in &ops[rewind_addr + 1..] {
+        if op.p1 == cursor
+            && let Some(register) = reader(op)
+        {
+            loaded = Some(register);
+            continue;
+        }
+        match op.opcode {
+            Opcode::IsNull | Opcode::NotNull => {}
+            Opcode::Ge | Opcode::Gt => return loaded == Some(op.p3) && op.p2 == exit,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Opcodes whose `P1` is a cursor that they position or walk.
+fn positions_cursor(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::Rewind
+            | Opcode::Last
+            | Opcode::Next
+            | Opcode::Prev
+            | Opcode::SeekGE
+            | Opcode::SeekGT
+            | Opcode::SeekLE
+            | Opcode::SeekLT
+            | Opcode::NoConflict
+            | Opcode::NotFound
+            | Opcode::NotExists
+            | Opcode::Count
+    )
+}
+
+/// bd-r39kx: whether the program walks `table_name` up to a rowid bound.
+///
+/// The walk starts at its first row and leaves at an upper bound on the rowid
+/// (`Rewind`, `Rowid`, `Ge`/`Gt` to the exit), touching no index: stock's
+/// `SEARCH t USING INTEGER PRIMARY KEY (rowid<?)`.
+#[must_use]
+pub fn program_walks_rowid_up_to_bound(program: &VdbeProgram, table_name: &str) -> bool {
+    let ops = program.ops();
+    let mut table_cursor = None;
+    for op in ops {
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            match &op.p4 {
+                P4::Table(name) if name == table_name && table_cursor.is_none() => {
+                    table_cursor = Some(op.p1);
+                }
+                P4::Table(_) | P4::Index(_) => return false,
+                _ => {}
+            }
+        }
+    }
+    let Some(cursor) = table_cursor else {
+        return false;
+    };
+    let mut rewinds = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.p1 == cursor && matches!(op.opcode, Opcode::Rewind | Opcode::Last));
+    let (Some((rewind_addr, rewind)), None) = (rewinds.next(), rewinds.next()) else {
+        return false;
+    };
+    rewind.opcode == Opcode::Rewind
+        && !ops.iter().any(|op| {
+            op.p1 == cursor
+                && matches!(
+                    op.opcode,
+                    Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+                )
+        })
+        && walk_exits_at_upper_bound(ops, rewind_addr, cursor, |op| {
+            (op.opcode == Opcode::Rowid).then_some(op.p2)
+        })
+}
+
+/// How a program walks its one index (bd-r39kx).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexWalkKind {
+    /// From one end to the other.
+    Whole,
+    /// From its first entry until the leading key column passes a bound.
+    BoundedAbove,
+    /// Reads the first or last non-NULL key into a single `min`/`max`.
+    Extremum,
+    /// Counts its entries (`Count`).
+    Count,
+}
+
+/// An index a program walks rather than seeks (bd-r39kx).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexWalk {
+    /// The index walked.
+    pub index_name: String,
+    /// No `IdxRowid` on the index feeds a `SeekRowid` into the table.
+    pub covering: bool,
+    /// How the walk runs.
+    pub kind: IndexWalkKind,
+}
+
+/// bd-r39kx: the one index a program walks rather than seeks, if any.
+///
+/// The program opens one index and positions it only with a `Rewind` or
+/// `Last` (or counts it with `Count`), and reaches its table, if at all, only
+/// by `IdxRowid` + `SeekRowid`. Stock describes
+/// that as one row for the source: `SCAN t USING [COVERING] INDEX i`, `SEARCH
+/// t USING [COVERING] INDEX i (a<?)` for a walk that stops at an upper bound
+/// on the leading column, `SEARCH t USING COVERING INDEX i` for a `min` or
+/// `max` read. `None` for any other shape (a seek, two indexes, a table
+/// walked on its own), which keeps the existing rendering.
+#[must_use]
+pub fn program_index_walk(program: &VdbeProgram) -> Option<IndexWalk> {
+    let ops = program.ops();
+    let mut index: Option<(i32, &str)> = None;
+    let mut table_cursor: Option<i32> = None;
+    for op in ops {
+        if !matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            continue;
+        }
+        match &op.p4 {
+            P4::Index(name) if index.is_none() => index = Some((op.p1, name.as_str())),
+            P4::Table(_) if table_cursor.is_none() => table_cursor = Some(op.p1),
+            P4::Index(_) | P4::Table(_) => return None,
+            _ => {}
+        }
+    }
+    let (cursor, index_name) = index?;
+    // The table is only looked up by the rowids the index yields, and the
+    // index is never seeked.
+    let mut rowid_from_index = false;
+    let mut table_lookup = false;
+    for op in ops {
+        if op.opcode == Opcode::SeekRowid && Some(op.p1) == table_cursor {
+            table_lookup |= rowid_from_index;
+        } else if positions_cursor(op.opcode)
+            && (Some(op.p1) == table_cursor
+                || (op.p1 == cursor
+                    && !matches!(
+                        op.opcode,
+                        Opcode::Rewind | Opcode::Last | Opcode::Next | Opcode::Prev | Opcode::Count
+                    )))
+        {
+            return None;
+        }
+        rowid_from_index = op.opcode == Opcode::IdxRowid && op.p1 == cursor;
+    }
+    let covering = !table_lookup;
+    let positions: Vec<(usize, Opcode)> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| {
+            op.p1 == cursor && matches!(op.opcode, Opcode::Rewind | Opcode::Last | Opcode::Count)
+        })
+        .map(|(addr, op)| (addr, op.opcode))
+        .collect();
+    let [(position_addr, position)] = positions[..] else {
+        return None;
+    };
+    let extremum_steps = ops
+        .iter()
+        .filter(|op| op.opcode == Opcode::AggStep)
+        .map(|op| match &op.p4 {
+            P4::FuncName(name) | P4::FuncNameCollated(name, _) => {
+                name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")
+            }
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    let kind = if position == Opcode::Count {
+        IndexWalkKind::Count
+    } else if extremum_steps == [true] {
+        IndexWalkKind::Extremum
+    } else if position == Opcode::Rewind
+        && walk_exits_at_upper_bound(ops, position_addr, cursor, |op| {
+            (op.opcode == Opcode::Column && op.p2 == 0).then_some(op.p3)
+        })
+    {
+        IndexWalkKind::BoundedAbove
+    } else {
+        IndexWalkKind::Whole
+    };
+    Some(IndexWalk {
+        index_name: index_name.to_owned(),
+        covering,
+        kind,
     })
 }
 

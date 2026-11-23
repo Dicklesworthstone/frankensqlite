@@ -114421,11 +114421,16 @@ impl Connection {
                                 ) {
                                     return vec![to_row(2, 0, 0, detail)];
                                 }
-                                // bd-r39kx: a rowid range the program seeks.
-                                if crate::explain::program_seeks_rowid_range_on_table(
+                                // bd-r39kx: a rowid range the program seeks,
+                                // or walks from the first row to an upper
+                                // bound.
+                                if (crate::explain::program_seeks_rowid_range_on_table(
                                     &program,
                                     &directive.table_name,
-                                ) && let Some(detail) =
+                                ) || crate::explain::program_walks_rowid_up_to_bound(
+                                    &program,
+                                    &directive.table_name,
+                                )) && let Some(detail) =
                                     rowid_range_eqp_detail(select, &self.schema.borrow())
                                 {
                                     let mut rows = vec![to_row(2, 0, 0, detail)];
@@ -114639,11 +114644,31 @@ impl Connection {
                     if simple_top_level_select
                         && let Some(table_name) =
                             single_table_source_name_from_core(&select.body.select)
-                        && crate::explain::program_seeks_rowid_range_on_table(&program, table_name)
+                        && (crate::explain::program_seeks_rowid_range_on_table(
+                            &program, table_name,
+                        ) || crate::explain::program_walks_rowid_up_to_bound(
+                            &program, table_name,
+                        ))
                         && let Some(detail) = rowid_range_eqp_detail(select, &self.schema.borrow())
                     {
                         let mut rows = vec![to_row(2, 0, 0, detail)];
                         if program_sorts_for_order_by(select, &program) {
+                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
+                        }
+                        return rows;
+                    }
+
+                    // bd-r39kx: one index walked from an end (to an upper
+                    // bound, or for a min/max or a count), its table reached
+                    // only by the rowids it yields: stock's one row for the
+                    // source.
+                    if simple_top_level_select
+                        && let Some(walk) = crate::explain::program_index_walk(&program)
+                        && let Some(detail) =
+                            index_walk_eqp_detail(select, &walk, &self.schema.borrow())
+                    {
+                        let mut rows = vec![to_row(2, 0, 0, detail)];
+                        if !aggregate && program_sorts_for_order_by(select, &program) {
                             rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
                         }
                         return rows;
@@ -155136,6 +155161,68 @@ fn rowid_range_eqp_detail(select: &SelectStatement, schema: &[TableSchema]) -> O
     Some(format!(
         "SEARCH {displayed} USING INTEGER PRIMARY KEY ({terms})"
     ))
+}
+
+/// bd-r39kx: stock's one row for a plain single-table SELECT whose program
+/// walks one index from an end (`crate::explain::program_index_walk`), named
+/// by the table's alias when it has one:
+/// - a walk of the whole index, with no WHERE: `SCAN t USING [COVERING] INDEX
+///   i` (an ORDER BY or GROUP BY the index order serves);
+/// - a walk that stops at an upper bound on the leading column: `SEARCH t
+///   USING [COVERING] INDEX i (a<?)`, the bounds read from the WHERE;
+/// - a `min` or `max` read at one end, or a count of the entries, with no
+///   WHERE: `SEARCH t USING COVERING INDEX i` / `SCAN t USING COVERING INDEX
+///   i`.
+///
+/// `None` for a WITHOUT ROWID table, an index on an expression, or a WHERE
+/// the walk does not account for, which keeps the generic rendering.
+fn index_walk_eqp_detail(
+    select: &SelectStatement,
+    walk: &crate::explain::IndexWalk,
+    schema: &[TableSchema],
+) -> Option<String> {
+    use crate::explain::IndexWalkKind;
+    let (table, alias, where_clause) = single_table_select_source(select, schema)?;
+    if table.without_rowid {
+        return None;
+    }
+    let index = table
+        .indexes
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(&walk.index_name))?;
+    let displayed = alias.unwrap_or(&table.name);
+    let using = if walk.covering {
+        "COVERING INDEX"
+    } else {
+        "INDEX"
+    };
+    match walk.kind {
+        IndexWalkKind::Whole if where_clause.is_none() => {
+            Some(format!("SCAN {displayed} USING {using} {}", index.name))
+        }
+        IndexWalkKind::Count if walk.covering && where_clause.is_none() => Some(format!(
+            "SCAN {displayed} USING COVERING INDEX {}",
+            index.name
+        )),
+        IndexWalkKind::Extremum if walk.covering && where_clause.is_none() => Some(format!(
+            "SEARCH {displayed} USING COVERING INDEX {}",
+            index.name
+        )),
+        IndexWalkKind::BoundedAbove => {
+            let terms = index_seek_eqp_range_key_terms(
+                where_clause,
+                &table.name,
+                alias,
+                index.columns.first()?,
+            )?;
+            // The walk starts at the first entry: a lower bound is the
+            // residual's, so stock names the upper bound only.
+            (terms.ends_with("<?") && !terms.contains('>')).then(|| {
+                format!("SEARCH {displayed} USING {using} {} ({terms})", index.name)
+            })
+        }
+        IndexWalkKind::Whole | IndexWalkKind::Count | IndexWalkKind::Extremum => None,
+    }
 }
 
 /// bd-r39kx: whether the program sorts for the SELECT's ORDER BY, which stock

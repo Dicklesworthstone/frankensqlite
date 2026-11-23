@@ -77,7 +77,7 @@
     {
       "fixture_id": "010_index_and_ordering",
       "parser_blake3": "9ce893e331af5f254139ae7f99e84f5594a6e72e6acf452cc9086ec98c0d0f54",
-      "planner_blake3": "7124f1080ed02bd6a489e355a460cc3f01332429d6168914575b68b047160eff",
+      "planner_blake3": "bf297443ca2bad9d19360d940319a47845987c898a1efe13834b1c2276c78ace",
       "execution_blake3": "1c661774bb5f44e6274ca6258392e6a701c827e3e0142db9f06a56a0aec82662",
       "statement_count": 7,
       "query_count": 2
@@ -149,7 +149,7 @@
     {
       "fixture_id": "019_null_unique_edge",
       "parser_blake3": "1f9448ce7c553b383849154f916af15f1139382156bf35d84d28033e0abeb360",
-      "planner_blake3": "dd90f18f8ef14b712400a60438975e3b6ada05bf5f17249b62dc85a952e6aeb0",
+      "planner_blake3": "b43c2528c4d059be971fd0ce8c73cd112db78bdf39d1e89ce0c127cad89d6313",
       "execution_blake3": "acaa3f0699261949b139ea095bf75dead899d03c08fe3a97cdcc0ae5891a9f86",
       "statement_count": 7,
       "query_count": 2
@@ -245,7 +245,7 @@
     {
       "fixture_id": "031_insert_conflict",
       "parser_blake3": "73be0f023363e8385a204ed125efdef2ab0c30c6a812629a12ee0b7342cfe937",
-      "planner_blake3": "8335f9da8c022a987aae0302cf42acc8851e4689c0283c159863622e4eba4b10",
+      "planner_blake3": "f1729e2451faa5f90335aceeacd4e2b0725bd1c967792250d133e40871000df1",
       "execution_blake3": "a846384aa3080ca413f8a0306e5673c5b85291e628d7088b1e91b334c0683407",
       "statement_count": 16,
       "query_count": 6

@@ -8,6 +8,14 @@
 //! on `:memory:` and on a file, and returns the same rows. Negatives: a real
 //! full scan still prints `SCAN t`, a seek that looks the row up is not
 //! `COVERING`, and an ORDER BY the index already satisfies adds no sorter row.
+//!
+//! Round 12 (SQL lane): a walk from the first row that stops at an upper
+//! bound prints `(rowid<?)` / `(a<?)`; a min or max read at one end of an
+//! index is `SEARCH t USING COVERING INDEX ta`; a count of the index's
+//! entries and a walk of the whole index are one row, `SCAN <t or alias>
+//! USING [COVERING] INDEX ta`, where fsqlite printed `SCAN INDEX ta ...` (and
+//! a separate `SCAN t` when it looked rows up). Negative: a whole-index walk
+//! that looks the row up is not `COVERING`.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -52,6 +60,23 @@ const SHAPES: &[&str] = &[
     "SELECT * FROM t",
     "SELECT * FROM t WHERE id = 2",
     "SELECT * FROM t WHERE a + 0 = 20",
+    // Round 12: walks from the first row that stop at an upper bound.
+    "SELECT * FROM t WHERE id < 3",
+    "SELECT * FROM t WHERE id <= 3",
+    "SELECT * FROM t WHERE a < 25",
+    "SELECT * FROM t WHERE a <= 25",
+    "SELECT id FROM t WHERE a < 25",
+    // min and max at one end of an index, and a count of its entries.
+    "SELECT max(a) FROM t",
+    "SELECT min(a) FROM t",
+    "SELECT count(*) FROM t",
+    // Whole-index walks for an ORDER BY or a GROUP BY, covering or looking
+    // the row up, by the table or its alias.
+    "SELECT a FROM t ORDER BY a",
+    "SELECT a FROM t AS q ORDER BY a DESC",
+    "SELECT * FROM t ORDER BY a",
+    "SELECT * FROM t AS q ORDER BY a",
+    "SELECT a, count(*) FROM t GROUP BY a",
 ];
 
 /// Stock's text for the slice, pinned so a change in the oracle shows here.
@@ -78,6 +103,19 @@ const PINNED: &[(&str, &[&str])] = &[
     ),
     ("SELECT * FROM t WHERE a = 20 ORDER BY id", &["SEARCH t USING INDEX ta (a=?)"]),
     ("SELECT * FROM t", &["SCAN t"]),
+    (
+        "SELECT * FROM t WHERE id <= 3",
+        &["SEARCH t USING INTEGER PRIMARY KEY (rowid<?)"],
+    ),
+    ("SELECT * FROM t WHERE a < 25", &["SEARCH t USING INDEX ta (a<?)"]),
+    (
+        "SELECT id FROM t WHERE a < 25",
+        &["SEARCH t USING COVERING INDEX ta (a<?)"],
+    ),
+    ("SELECT max(a) FROM t", &["SEARCH t USING COVERING INDEX ta"]),
+    ("SELECT count(*) FROM t", &["SCAN t USING COVERING INDEX ta"]),
+    ("SELECT a FROM t AS q ORDER BY a DESC", &["SCAN q USING COVERING INDEX ta"]),
+    ("SELECT * FROM t ORDER BY a", &["SCAN t USING INDEX ta"]),
 ];
 
 async fn frank_eqp(conn: &Connection, sql: &str) -> Vec<String> {
