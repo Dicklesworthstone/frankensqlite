@@ -16,7 +16,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1799,6 +1799,20 @@ struct WalFecRepairOrder {
     issued: AtomicUsize,
     ready: AtomicUsize,
     finished: Mutex<BTreeSet<usize>>,
+    /// Bumped for every WAL frame a ready turn's range reads (bd-b1gy3), so a
+    /// producer waiting behind that turn can tell a long encode from an owner
+    /// that has stopped running its worker. Only compared for change.
+    progress: AtomicU64,
+}
+
+impl WalFecRepairOrder {
+    /// Changes whenever a turn retires or a ready turn's range reads a frame.
+    fn progress_mark(&self) -> (usize, u64) {
+        (
+            self.ready.load(Ordering::Acquire),
+            self.progress.load(Ordering::Relaxed),
+        )
+    }
 }
 
 fn repair_order_for_path(path: &Path) -> Arc<WalFecRepairOrder> {
@@ -2007,6 +2021,9 @@ struct WalFecRepairWorkerState {
     diagnostics: Arc<WalFecRepairDiagnostics>,
     /// Sidecar group map carried between committed ranges (bd-sid3o).
     sidecar_cache: Arc<Mutex<Option<CommittedRangeSidecarCache>>>,
+    /// The order whose earlier turn the head range is waiting for, while it
+    /// waits (bd-b1gy3).
+    turn_wait: Arc<Mutex<Option<Arc<WalFecRepairOrder>>>>,
 }
 
 impl WalFecRepairWorkerState {
@@ -2054,6 +2071,8 @@ pub struct WalFecRepairPipeline {
     canceled_jobs: Arc<AtomicUsize>,
     max_pending_jobs: Arc<AtomicUsize>,
     worker_failure: Arc<Mutex<Option<String>>>,
+    /// See [`WalFecRepairWorkerState::turn_wait`].
+    turn_wait: Arc<Mutex<Option<Arc<WalFecRepairOrder>>>>,
     worker: Option<AsyncJoinHandle<()>>,
     /// Retained clone of the worker's child cancellation scope.
     ///
@@ -2120,6 +2139,7 @@ impl WalFecRepairPipeline {
         let canceled_jobs = Arc::new(AtomicUsize::new(0));
         let max_pending_jobs = Arc::new(AtomicUsize::new(0));
         let worker_failure = Arc::new(Mutex::new(None));
+        let turn_wait = Arc::new(Mutex::new(None));
         let diagnostics = Arc::new(WalFecRepairDiagnostics {
             pipeline_id: NEXT_WAL_FEC_PIPELINE_ID.fetch_add(1, Ordering::Relaxed),
             queue_capacity: config.queue_capacity,
@@ -2136,6 +2156,7 @@ impl WalFecRepairPipeline {
             worker_failure: Arc::clone(&worker_failure),
             diagnostics: Arc::clone(&diagnostics),
             sidecar_cache: Arc::new(Mutex::new(None)),
+            turn_wait: Arc::clone(&turn_wait),
         };
 
         // bd-gwoi0: `create_child_for_spawn` is the spawn-correct primitive for a
@@ -2176,6 +2197,7 @@ impl WalFecRepairPipeline {
             canceled_jobs,
             max_pending_jobs,
             worker_failure,
+            turn_wait,
             worker: Some(worker_handle),
             worker_cx: Some(worker_cx),
         })
@@ -2240,7 +2262,38 @@ impl WalFecRepairPipeline {
     /// Wait until queue drains or timeout expires.
     #[must_use]
     pub async fn flush(&self, cx: &Cx, timeout: Duration) -> bool {
+        self.drain(cx, timeout, None).await
+    }
+
+    /// [`Self::flush`], except that it also gives up once the queue's head
+    /// range has waited `stall` for another producer's earlier repair turn
+    /// while that turn made no progress: it neither retired nor read a frame
+    /// (bd-b1gy3).
+    ///
+    /// Turns are ordered per database path across the process, and a turn
+    /// retires only when its owner's worker task runs, on the owner's runtime.
+    /// An owner whose thread stops polling that runtime (an application thread
+    /// blocked after a commit, a connection parked between durability and
+    /// publication) holds every later producer's ranges until it runs again.
+    /// A close waiting out a plain flush behind it took its whole timeout. A
+    /// range given up this way is canceled by the caller: it appends nothing,
+    /// its turn retires in order once the earlier one does, and restart
+    /// catch-up regenerates its groups from the WAL. A head range whose
+    /// earlier turn keeps progressing, or that is not waiting for a turn at
+    /// all, is waited for as by [`Self::flush`].
+    #[must_use]
+    pub async fn flush_unless_turn_stalls(
+        &self,
+        cx: &Cx,
+        timeout: Duration,
+        stall: Duration,
+    ) -> bool {
+        self.drain(cx, timeout, Some(stall)).await
+    }
+
+    async fn drain(&self, cx: &Cx, timeout: Duration, stall: Option<Duration>) -> bool {
         let deadline = Instant::now() + timeout;
+        let mut stalled_since = None::<((usize, u64), Instant)>;
         loop {
             if lock_unpoisoned(&self.worker_failure).is_some() {
                 return false;
@@ -2248,8 +2301,29 @@ impl WalFecRepairPipeline {
             if self.pending_jobs.load(Ordering::SeqCst) == 0 {
                 return true;
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return false;
+            }
+            if let Some(stall) = stall {
+                let mark = lock_unpoisoned(&self.turn_wait)
+                    .as_ref()
+                    .map(|order| order.progress_mark());
+                match (mark, stalled_since) {
+                    (Some(mark), Some((seen, since))) if mark == seen => {
+                        if now.duration_since(since) >= stall {
+                            debug!(
+                                pipeline_id = self.diagnostics.pipeline_id,
+                                pending_jobs = self.pending_jobs.load(Ordering::SeqCst),
+                                stall_ms = stall.as_millis(),
+                                "wal-fec flush gives up behind another producer's stalled repair turn"
+                            );
+                            return false;
+                        }
+                    }
+                    (Some(mark), _) => stalled_since = Some((mark, now)),
+                    (None, _) => stalled_since = None,
+                }
             }
             if cx.checkpoint().is_err() {
                 return false;
@@ -2424,6 +2498,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                     WalFecPipelineMessage::Shutdown => unreachable!(),
                 };
                 let work = Arc::new(work);
+                let mut waiting_for_turn = false;
                 let outcome = loop {
                     if state.cancel_flag.load(Ordering::Acquire) || worker_cx.checkpoint().is_err()
                     {
@@ -2432,8 +2507,35 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                     if let WalFecPipelineMessage::Committed(ordered) = work.as_ref()
                         && !ordered.turn.is_ready()
                     {
+                        if !waiting_for_turn {
+                            // bd-b1gy3: lets a flush tell this wait from work.
+                            *lock_unpoisoned(&state.turn_wait) =
+                                Some(Arc::clone(&ordered.turn.order));
+                            waiting_for_turn = true;
+                        }
                         // Leave the caller's blocking pool available to the
                         // earlier producer and to primary database I/O.
+                        asupersync::time::sleep(
+                            asupersync::time::wall_now(),
+                            Duration::from_millis(1),
+                        )
+                        .await;
+                        continue;
+                    }
+                    if waiting_for_turn {
+                        lock_unpoisoned(&state.turn_wait).take();
+                        waiting_for_turn = false;
+                    }
+                    // bd-b1gy3 keeper: hold this ready turn before it reads a
+                    // frame, as if its owner's runtime had stopped. Absent
+                    // from a default build.
+                    #[cfg(any(test, feature = "fault-injection"))]
+                    if let WalFecPipelineMessage::Committed(ordered) = work.as_ref()
+                        && crate::fault_hooks::wal_fec_repair_worker_parks(
+                            state.diagnostics.pipeline_id,
+                            &ordered.range.wal_path,
+                        )
+                    {
                         asupersync::time::sleep(
                             asupersync::time::wall_now(),
                             Duration::from_millis(1),
@@ -2470,6 +2572,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                                         per_symbol_delay,
                                         &diagnostics,
                                         &sidecar_cache,
+                                        &ordered.turn.order.progress,
                                     )
                                 }
                                 WalFecPipelineMessage::Shutdown => unreachable!(),
@@ -2490,6 +2593,9 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                     }
                     break outcome;
                 };
+                if waiting_for_turn {
+                    lock_unpoisoned(&state.turn_wait).take();
+                }
 
                 drop(work);
                 state.pending_jobs.fetch_sub(1, Ordering::SeqCst);
@@ -2774,6 +2880,8 @@ impl WalFecSourceWal {
 /// Read only the admitted interval, validating the rolling checksum against
 /// both anchors captured by the WAL writer. A NORMAL sync may cover several
 /// transactions; their commit markers, rather than queue messages, define K.
+/// Every frame read bumps `progress`, the range's turn order's heartbeat
+/// (bd-b1gy3).
 fn process_committed_wal_range(
     range: &WalFecCommittedRange,
     cx: &Cx,
@@ -2781,6 +2889,7 @@ fn process_committed_wal_range(
     per_symbol_delay: Duration,
     diagnostics: &WalFecRepairDiagnostics,
     sidecar_cache: &Mutex<Option<CommittedRangeSidecarCache>>,
+    progress: &AtomicU64,
 ) -> Result<WalFecWorkOutcome> {
     if range.end_frame_no == 0 {
         return reclaim_retired_fec_on_open(range, cx, cancel_flag);
@@ -2831,6 +2940,7 @@ fn process_committed_wal_range(
         if cancel_flag.load(Ordering::Acquire) || cx.checkpoint().is_err() {
             return Ok(WalFecWorkOutcome::Canceled);
         }
+        progress.fetch_add(1, Ordering::Relaxed);
         source.read_exact_at(&mut frame, offset)?;
         offset = offset
             .checked_add(frame_bytes)
@@ -5348,6 +5458,7 @@ mod tests {
             issued: AtomicUsize::new(usize::MAX - 1),
             ready: AtomicUsize::new(usize::MAX - 1),
             finished: Mutex::new(BTreeSet::new()),
+            progress: AtomicU64::new(0),
         });
         let final_turn = WalFecRepairTurn::new(Arc::clone(&order)).unwrap();
         assert!(final_turn.is_ready());
@@ -5355,6 +5466,99 @@ mod tests {
         drop(final_turn);
         assert_eq!(order.ready.load(Ordering::Acquire), usize::MAX);
         assert!(WalFecRepairTurn::new(order).is_none());
+    }
+
+    /// bd-b1gy3: a flush whose head range waits behind another producer's
+    /// turn gives up after the stall bound only while that turn neither
+    /// retires nor reads; behind a turn that keeps progressing it waits, as a
+    /// plain flush does, and then drains.
+    #[test]
+    fn test_flush_unless_turn_stalls_gives_up_only_behind_a_stalled_foreign_turn() {
+        const STALL: Duration = Duration::from_millis(200);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let cx = Cx::default();
+            let dir = tempdir().expect("tempdir");
+            let wal_path = dir.path().join("b1gy3.db-wal");
+            // Repair budget 0: once its turn is ready the range completes
+            // without reading the (absent) WAL.
+            let range = WalFecCommittedRange {
+                wal_path: wal_path.clone(),
+                header: WalHeader {
+                    magic: 0,
+                    format_version: 0,
+                    page_size: 4096,
+                    checkpoint_seq: 0,
+                    salts: WalSalts { salt1: 1, salt2: 2 },
+                    checksum: SqliteWalChecksum::default(),
+                },
+                start_frame_no: 1,
+                end_frame_no: 1,
+                previous_checksum: SqliteWalChecksum::default(),
+                end_checksum: SqliteWalChecksum::default(),
+                repair_symbols: 0,
+            };
+            let start = || {
+                WalFecRepairPipeline::start(
+                    &handle,
+                    &cx,
+                    WalFecRepairPipelineConfig {
+                        queue_capacity: 4,
+                        per_symbol_delay: Duration::ZERO,
+                    },
+                )
+                .expect("start pipeline")
+            };
+
+            // An earlier producer's turn that never advances.
+            let stalled = WalFecRepairTurn::new(repair_order_for_path(&wal_path)).unwrap();
+            let mut pipeline = start();
+            let producer = pipeline.producer().unwrap();
+            assert!(producer.try_reserve().unwrap().submit(range.clone()));
+            let began = Instant::now();
+            assert!(
+                !pipeline
+                    .flush_unless_turn_stalls(&cx, Duration::from_secs(30), STALL)
+                    .await,
+                "a flush behind a stalled foreign turn must give up"
+            );
+            let waited = began.elapsed();
+            assert!(
+                waited >= STALL && waited < Duration::from_secs(10),
+                "gave up after {waited:?}, not after the {STALL:?} stall bound"
+            );
+            assert_eq!(pipeline.stats().pending_jobs, 1, "the range was waiting");
+            pipeline.cancel();
+            let stats = pipeline.shutdown(&cx).await.expect("shutdown");
+            assert_eq!((stats.canceled_jobs, stats.completed_jobs), (1, 0));
+            drop(stalled);
+
+            // An earlier turn that keeps reading frames, then retires.
+            let busy = WalFecRepairTurn::new(repair_order_for_path(&wal_path)).unwrap();
+            let mut pipeline = start();
+            let producer = pipeline.producer().unwrap();
+            assert!(producer.try_reserve().unwrap().submit(range.clone()));
+            let worker = std::thread::spawn(move || {
+                for _ in 0..30 {
+                    busy.order.progress.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                drop(busy);
+            });
+            assert!(
+                pipeline
+                    .flush_unless_turn_stalls(&cx, Duration::from_secs(30), STALL)
+                    .await,
+                "a flush behind a progressing turn must wait for it and drain"
+            );
+            worker.join().expect("progressing turn");
+            let stats = pipeline.shutdown(&cx).await.expect("shutdown");
+            assert_eq!((stats.canceled_jobs, stats.completed_jobs), (0, 1));
+        });
     }
 
     #[test]
@@ -7168,6 +7372,7 @@ mod tests {
                 Duration::ZERO,
                 &diagnostics,
                 cache,
+                &AtomicU64::new(0),
             )
             .expect("process committed range");
             assert_eq!(outcome, WalFecWorkOutcome::Completed);
@@ -7247,9 +7452,16 @@ mod tests {
         // A failed or canceled range leaves no cache behind.
         let range = commit(&mut wal, 24);
         cancel.store(true, Ordering::SeqCst);
-        let outcome =
-            process_committed_wal_range(&range, &cx, &cancel, Duration::ZERO, &diagnostics, &cache)
-                .unwrap();
+        let outcome = process_committed_wal_range(
+            &range,
+            &cx,
+            &cancel,
+            Duration::ZERO,
+            &diagnostics,
+            &cache,
+            &AtomicU64::new(0),
+        )
+        .unwrap();
         assert_eq!(outcome, WalFecWorkOutcome::Canceled);
         cancel.store(false, Ordering::SeqCst);
         let before = loads();
@@ -7314,6 +7526,7 @@ mod tests {
                 Duration::ZERO,
                 &diagnostics,
                 cache,
+                &AtomicU64::new(0),
             )
             .expect("process committed range");
             assert_eq!(outcome, WalFecWorkOutcome::Completed);
@@ -7546,6 +7759,7 @@ mod tests {
             Duration::ZERO,
             &diagnostics,
             &Mutex::new(None),
+            &AtomicU64::new(0),
         )
         .expect("an oversized commit is skipped, not fatal");
         assert_eq!(outcome, WalFecWorkOutcome::Completed);

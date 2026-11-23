@@ -333,6 +333,16 @@ use crate::wal_adapter::{PathRefreshingWalBackend, WalBackendAdapter};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 const WRITE_COORDINATOR_SERVICE_BEAD_ID: &str = "bd-2jpu6.4";
 
+/// bd-b1gy3: how long a closing connection's WAL-FEC flush waits behind
+/// another connection's repair turn that neither retires nor reads a frame.
+/// Turns are ordered per database across the process and retire only when
+/// their owner's runtime runs its worker; an owner whose thread stopped
+/// polling it held every later close for two 30 s flush timeouts. The close
+/// then cancels its waiting ranges, which restart catch-up regenerates. An
+/// earlier turn that is still encoding keeps the close waiting.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+const WAL_FEC_CLOSE_TURN_STALL: Duration = Duration::from_secs(1);
+
 #[cfg(not(target_arch = "wasm32"))]
 type WriteCoordinatorShutdownTx = asupersync::channel::oneshot::Sender<()>;
 #[cfg(target_arch = "wasm32")]
@@ -31455,8 +31465,12 @@ impl Connection {
             // once the worker has drained, admit the deferred durable tail so
             // it is repaired now rather than by the next open's catch-up.
             // Frames a NORMAL-sync commit has not yet fsynced stay with
-            // catch-up, exactly as when no admission was deferred.
-            if pipeline.flush(&cx, Duration::from_secs(30)).await
+            // catch-up, exactly as when no admission was deferred. Neither
+            // flush waits on another connection's stalled repair turn
+            // (bd-b1gy3, see WAL_FEC_CLOSE_TURN_STALL).
+            if pipeline
+                .flush_unless_turn_stalls(&cx, Duration::from_secs(30), WAL_FEC_CLOSE_TURN_STALL)
+                .await
                 && let Err(error) = self.pager.set_wal_fec_producer(&cx, Some(producer)).await
             {
                 tracing::warn!(%error, "WAL-FEC close-time admission failed; restart catch-up covers the tail");
@@ -31482,7 +31496,12 @@ impl Connection {
         if let Some(mut pipeline) = self.wal_fec_pipeline.get_mut().take() {
             // Flush and stop the worker explicitly before the region drain, so
             // pending FEC work completes rather than being cancelled by it.
-            if !pipeline.flush(&cx, Duration::from_secs(30)).await {
+            // Work stuck behind another connection's stalled repair turn is
+            // canceled instead and left to restart catch-up (bd-b1gy3).
+            if !pipeline
+                .flush_unless_turn_stalls(&cx, Duration::from_secs(30), WAL_FEC_CLOSE_TURN_STALL)
+                .await
+            {
                 pipeline.cancel();
             }
             match pipeline.shutdown(&cx).await {

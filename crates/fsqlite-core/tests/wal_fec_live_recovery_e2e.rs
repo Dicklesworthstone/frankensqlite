@@ -538,3 +538,185 @@ fn test_e2e_default_database_writes_no_sidecar_and_loses_a_damaged_commit() {
         }
     });
 }
+
+/// Whether a `.wal-fec` group protects one-based WAL frame `frame_no`.
+#[cfg(feature = "fault-injection")]
+fn sidecar_covers(sidecar: &Path, frame_no: u32) -> bool {
+    sidecar.exists()
+        && scan_wal_fec(sidecar)
+            .expect("scan sidecar")
+            .groups
+            .iter()
+            .any(|g| {
+                g.meta.start_frame_no <= frame_no && frame_no < g.meta.start_frame_no + g.meta.k_source
+            })
+}
+
+/// bd-b1gy3 keeper, deterministic. Repair turns are ordered per database path
+/// across the process, and a turn retires only when its owner's worker task
+/// runs. Connection A commits on an opted-in database while a fault hook
+/// parks A's repair worker before it reads A's range, so A's turn neither
+/// retires nor moves the order's progress counter until the release: an owner
+/// whose runtime has stopped, made deterministic. Connection B, on another
+/// thread, commits behind it, and its repair waits for A's turn. B's close
+/// must finish in seconds; without the fix it waits out two 30 s flush
+/// timeouts. B's commit must stay repairable: once A runs again and closes, a
+/// writable open's catch-up writes B's groups, and a damaged frame of B's
+/// commit heals on the next open.
+///
+/// Feature-gated, so no default suite runs it. Run it explicitly:
+///
+/// `cargo test -p fsqlite-core --features fault-injection --test wal_fec_live_recovery_e2e test_e2e_close_behind_a_parked_repair_turn_is_bounded_and_stays_repairable`
+#[cfg(feature = "fault-injection")]
+#[test]
+fn test_e2e_close_behind_a_parked_repair_turn_is_bounded_and_stays_repairable() {
+    use fsqlite_wal::fault_hooks;
+    use std::time::{Duration, Instant};
+    const CLOSE_BOUND: Duration = Duration::from_secs(5);
+    let _session = fault_hooks::FaultInjectionSessionLock::new()
+        .lock()
+        .expect("fault-injection session");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("parked_peer.db");
+    let wal = wal_path(&db);
+    let sidecar = wal_fec_path_for_wal(&wal);
+    run_with_repair_pool(async {
+        let setup = open_wal_db(&db).await;
+        opt_in(&setup, 2).await;
+        setup
+            .execute("CREATE TABLE a(id INTEGER PRIMARY KEY, pad BLOB);")
+            .await
+            .unwrap();
+        setup
+            .execute("CREATE TABLE b(id INTEGER PRIMARY KEY, pad BLOB);")
+            .await
+            .unwrap();
+        setup.close_without_checkpoint().await.unwrap();
+    });
+    fault_hooks::arm_wal_fec_repair_worker_park(
+        fault_hooks::FaultHookArm::new("bd-b1gy3", "parked_repair_turn", "close_liveness"),
+        &wal,
+    );
+
+    let (a_parked_tx, a_parked_rx) = std::sync::mpsc::channel::<()>();
+    let (a_release_tx, a_release_rx) = std::sync::mpsc::channel::<()>();
+    let a_db = db.clone();
+    let a = std::thread::spawn(move || {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("A's runtime");
+        let conn = runtime.block_on(async {
+            let conn = open_wal_db(&a_db).await;
+            conn.execute("INSERT INTO a VALUES (1, zeroblob(3000));")
+                .await
+                .unwrap();
+            conn
+        });
+        a_parked_tx.send(()).unwrap();
+        let _ = a_release_rx.recv();
+        runtime.block_on(async move { conn.close_without_checkpoint().await })
+    });
+    a_parked_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("A commits");
+
+    let mut b_commit = None;
+    let mut b_close = None;
+    run_with_repair_pool(async {
+        let conn = open_wal_db(&db).await;
+        conn.execute("BEGIN;").await.unwrap();
+        for id in 1..=6 {
+            conn.execute(&format!("INSERT INTO b VALUES ({id}, zeroblob(3000));"))
+                .await
+                .unwrap();
+        }
+        conn.execute("COMMIT;").await.unwrap();
+        let commit = *wal_commit_frames(&wal).last().expect("B's commit frame");
+        // B's worker runs while this loop sleeps; its range still waits.
+        for _ in 0..20 {
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50))
+                .await;
+        }
+        assert!(
+            !sidecar_covers(&sidecar, commit),
+            "the shape is not populated: B's commit (frame {commit}) was repaired while A's \
+             worker was parked"
+        );
+        let began = Instant::now();
+        conn.close_without_checkpoint().await.unwrap();
+        b_close = Some(began.elapsed());
+        b_commit = Some(commit);
+    });
+    let (b_commit, b_close) = (b_commit.unwrap(), b_close.unwrap());
+    eprintln!("bd-b1gy3 close behind a parked repair turn: {b_close:?}");
+    assert!(
+        b_close < CLOSE_BOUND,
+        "B's close took {b_close:?} behind A's parked repair turn (bound {CLOSE_BOUND:?})"
+    );
+    assert!(
+        !sidecar_covers(&sidecar, b_commit),
+        "B's close gave up its waiting range: nothing was appended for it"
+    );
+    assert!(
+        fault_hooks::wal_fec_repair_worker_park_held(),
+        "the park must still hold A's repair worker after B's close"
+    );
+
+    fault_hooks::release_wal_fec_repair_worker_park();
+    a_release_tx.send(()).unwrap();
+    a.join()
+        .expect("A's thread")
+        .expect("A closes once its worker is released");
+
+    run_with_repair_pool(async {
+        // A writable open's catch-up covers the frames B's close left.
+        let conn = Connection::open(db.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM b;").await.unwrap()[0].values(),
+            &[SqliteValue::Integer(6)]
+        );
+        conn.close_without_checkpoint().await.unwrap();
+    });
+    let commits = wal_commit_frames(&wal);
+    let previous = commits
+        .iter()
+        .copied()
+        .filter(|frame| *frame < b_commit)
+        .max()
+        .expect("A's commit precedes B's");
+    let damaged = b_commit - 1;
+    assert!(damaged > previous, "B's commit spans several frames: {commits:?}");
+    assert!(
+        sidecar_covers(&sidecar, damaged),
+        "catch-up must write B's repair groups"
+    );
+    // End state: B's cancelled range was deferred, not dropped. After both
+    // closes and one writable open, every committed frame (B's commit frame
+    // included) is repaired.
+    let last_commit = *commits.last().expect("commit frames");
+    let unrepaired: Vec<u32> = (1..=last_commit)
+        .filter(|frame| !sidecar_covers(&sidecar, *frame))
+        .collect();
+    assert!(
+        unrepaired.is_empty(),
+        "every committed frame must be repaired after the catch-up open; unrepaired \
+         {unrepaired:?} of 1..={last_commit} (B's commit frame {b_commit})"
+    );
+    corrupt_wal_frame_payload(&wal, damaged, 512);
+    // Remove stale -shm so recovery scans from WAL cleanly.
+    let _ = fs::remove_file(shm_path(&db));
+    run_with_repair_pool(async {
+        let conn = Connection::open(db.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            conn.query("SELECT COUNT(*) FROM b;").await.unwrap()[0].values(),
+            &[SqliteValue::Integer(6)],
+            "B's damaged commit heals from the regenerated symbols"
+        );
+        assert_eq!(
+            conn.query("PRAGMA integrity_check;").await.unwrap()[0].values(),
+            &[SqliteValue::Text("ok".into())]
+        );
+        conn.close_without_checkpoint().await.unwrap();
+    });
+}

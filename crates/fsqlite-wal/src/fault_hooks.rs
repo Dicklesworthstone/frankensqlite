@@ -7,6 +7,7 @@
 //! preserving the original process-global behavior for unscoped callers.
 
 use std::mem;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, LockResult, Mutex, MutexGuard};
 use std::thread::{self, ThreadId};
 
@@ -52,6 +53,18 @@ struct CountdownFaultArm {
     remaining_invocations: u32,
 }
 
+/// bd-b1gy3: a WAL-FEC repair worker held before it reads a committed range;
+/// see [`arm_wal_fec_repair_worker_park`].
+#[derive(Debug, Clone)]
+struct RepairWorkerPark {
+    arm: FaultHookArm,
+    /// The armed WAL, canonicalized.
+    wal_path: PathBuf,
+    /// The pipeline that took the park. Every other pipeline passes.
+    pipeline_id: Option<usize>,
+    released: bool,
+}
+
 #[derive(Debug, Default)]
 struct WalFaultHookState {
     next_trigger_seq: u64,
@@ -59,6 +72,7 @@ struct WalFaultHookState {
     sync_failure: Option<FaultHookArm>,
     append_busy: Option<CountdownFaultArm>,
     crash_header_truncate: Option<FaultHookArm>,
+    repair_worker_park: Option<RepairWorkerPark>,
     records: Vec<FaultInjectionRecord>,
 }
 
@@ -262,6 +276,82 @@ pub(crate) fn maybe_inject_sync_failure(frame_count_before: usize, flags: SyncFl
     let detail = format!("frame_count_before={frame_count_before} flags={flags:?}");
     record_trigger(&mut state, &arm, "wal_sync_failure", detail);
     Err(fault_error("wal_sync_failure", &arm))
+}
+
+/// bd-b1gy3: hold the first WAL-FEC repair worker that reaches a committed
+/// range of `wal_path` with its repair turn ready, before it reads a frame,
+/// until [`release_wal_fec_repair_worker_park`] or [`clear`].
+///
+/// While it is held, that producer's turn neither retires nor moves the
+/// order's progress counter. That is the state of a producer whose runtime
+/// has stopped being polled, made deterministic. The worker still honours
+/// cancellation. Only the first pipeline to arrive takes the park.
+///
+/// Unlike the append hooks, the park is not scoped to a session's thread:
+/// the repair worker never runs on the arming thread. It is scoped by the
+/// WAL path and the pipeline instead.
+pub fn arm_wal_fec_repair_worker_park(arm: FaultHookArm, wal_path: &Path) {
+    let wal_path = std::fs::canonicalize(wal_path).unwrap_or_else(|_| wal_path.to_path_buf());
+    let mut state = WAL_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.repair_worker_park = Some(RepairWorkerPark {
+        arm,
+        wal_path,
+        pipeline_id: None,
+        released: false,
+    });
+}
+
+/// Let the worker held by [`arm_wal_fec_repair_worker_park`] go on.
+pub fn release_wal_fec_repair_worker_park() {
+    let mut state = WAL_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(park) = state.repair_worker_park.as_mut() {
+        park.released = true;
+    }
+}
+
+/// Whether a repair worker has taken the armed park (and it is not yet
+/// released).
+#[must_use]
+pub fn wal_fec_repair_worker_park_held() -> bool {
+    let state = WAL_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+        .repair_worker_park
+        .as_ref()
+        .is_some_and(|park| park.pipeline_id.is_some() && !park.released)
+}
+
+/// Asked by the repair worker of `pipeline_id` before it reads a committed
+/// range of `wal_path` whose turn is ready: whether to wait instead.
+pub(crate) fn wal_fec_repair_worker_parks(pipeline_id: usize, wal_path: &Path) -> bool {
+    let mut state = WAL_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(park) = state.repair_worker_park.as_ref() else {
+        return false;
+    };
+    if park.released {
+        return false;
+    }
+    if let Some(holder) = park.pipeline_id {
+        return holder == pipeline_id;
+    }
+    let path = std::fs::canonicalize(wal_path).unwrap_or_else(|_| wal_path.to_path_buf());
+    if path != park.wal_path {
+        return false;
+    }
+    let arm = park.arm.clone();
+    if let Some(park) = state.repair_worker_park.as_mut() {
+        park.pipeline_id = Some(pipeline_id);
+    }
+    let detail = format!("pipeline_id={pipeline_id} wal={}", path.display());
+    record_trigger(&mut state, &arm, "wal_fec_repair_worker_park", detail);
+    true
 }
 
 fn record_trigger(
@@ -1177,5 +1267,65 @@ mod tests {
         let records = take_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].run_id, "second");
+    }
+
+    /// bd-b1gy3: the repair-worker park holds exactly the first pipeline that
+    /// reaches the armed WAL, lets every other pipeline and WAL through, and
+    /// holds nothing once released or cleared.
+    #[test]
+    fn test_repair_worker_park_holds_only_the_first_pipeline_on_the_armed_wal() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        let dir = tempfile::tempdir().unwrap();
+        let armed = dir.path().join("armed.db-wal");
+        let other = dir.path().join("other.db-wal");
+        std::fs::write(&armed, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+
+        assert!(!wal_fec_repair_worker_parks(7, &armed), "nothing is armed");
+        arm_wal_fec_repair_worker_park(arm("park"), &armed);
+        assert!(!wal_fec_repair_worker_park_held());
+        assert!(
+            !wal_fec_repair_worker_parks(7, &other),
+            "another WAL passes"
+        );
+        assert!(!wal_fec_repair_worker_park_held());
+        // The path is compared canonically, so a non-canonical spelling of
+        // the armed WAL is the same WAL.
+        let spelled = dir.path().join(".").join("armed.db-wal");
+        assert!(
+            wal_fec_repair_worker_parks(7, &spelled),
+            "the first arrival takes it"
+        );
+        assert!(wal_fec_repair_worker_park_held());
+        assert!(
+            wal_fec_repair_worker_parks(7, &armed),
+            "the holder stays held"
+        );
+        assert!(
+            !wal_fec_repair_worker_parks(8, &armed),
+            "another pipeline passes"
+        );
+        let records = take_records();
+        assert_eq!(records.len(), 1, "taking the park records once");
+        assert_eq!(records[0].point, "wal_fec_repair_worker_park");
+        assert!(records[0].detail.contains("pipeline_id=7"));
+
+        release_wal_fec_repair_worker_park();
+        assert!(!wal_fec_repair_worker_park_held());
+        assert!(
+            !wal_fec_repair_worker_parks(7, &armed),
+            "a released park holds nothing"
+        );
+
+        arm_wal_fec_repair_worker_park(arm("park"), &armed);
+        assert!(wal_fec_repair_worker_parks(9, &armed));
+        clear();
+        assert!(
+            !wal_fec_repair_worker_parks(9, &armed),
+            "clear drops the park"
+        );
     }
 }
