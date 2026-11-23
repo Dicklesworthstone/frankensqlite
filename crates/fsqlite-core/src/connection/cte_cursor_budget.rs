@@ -136,32 +136,46 @@ impl CursorBudget {
 
     /// `sqlite3SrcListAssignCursors`: one cursor per FROM item, recursing
     /// into a subquery item's FROM list (its last arm's, the one stock links
-    /// the subquery to). A parenthesized join is a list of its own items.
+    /// the subquery to). A leading parenthesized join or redundant parens
+    /// around a single item splice into the enclosing FROM list (0 extra
+    /// cursors); a non-leading multi-item parenthesized join becomes an
+    /// `SF_NestedFrom` subquery and takes one cursor of its own before its
+    /// inner items (`sqlite3.c`: case 115 + `sqlite3SrcListAssignCursors`).
     fn assign_cursors(&mut self, from: &FromClause) {
         if !self.preassigned.insert(std::ptr::from_ref(from)) {
             return;
         }
-        for source in std::iter::once(&from.source).chain(from.joins.iter().map(|join| &join.table))
-        {
-            match source {
-                TableOrSubquery::ParenJoin(inner) => self.assign_cursors(inner),
-                TableOrSubquery::Subquery { query, .. } => {
-                    self.cursors += 1;
-                    let last_arm = query
-                        .body
-                        .compounds
-                        .last()
-                        .map_or(&query.body.select, |(_, core)| core);
-                    if let SelectCore::Select {
-                        from: Some(inner), ..
-                    } = last_arm
-                    {
-                        self.assign_cursors(inner);
-                    }
-                }
-                TableOrSubquery::Table { .. } | TableOrSubquery::TableFunction { .. } => {
+        self.assign_source_cursors(&from.source, true);
+        for join in &from.joins {
+            self.assign_source_cursors(&join.table, false);
+        }
+    }
+
+    fn assign_source_cursors(&mut self, source: &TableOrSubquery, is_leading: bool) {
+        match source {
+            TableOrSubquery::ParenJoin(inner) => {
+                let unwrapped = super::unwrap_single_item_paren_join(inner);
+                if !is_leading && !unwrapped.joins.is_empty() {
                     self.cursors += 1;
                 }
+                self.assign_cursors(unwrapped);
+            }
+            TableOrSubquery::Subquery { query, .. } => {
+                self.cursors += 1;
+                let last_arm = query
+                    .body
+                    .compounds
+                    .last()
+                    .map_or(&query.body.select, |(_, core)| core);
+                if let SelectCore::Select {
+                    from: Some(inner), ..
+                } = last_arm
+                {
+                    self.assign_cursors(inner);
+                }
+            }
+            TableOrSubquery::Table { .. } | TableOrSubquery::TableFunction { .. } => {
+                self.cursors += 1;
             }
         }
     }
@@ -678,5 +692,51 @@ mod tests {
         );
         assert!(budget("WITH c(x) AS (SELECT 1) SELECT x FROM main.c").is_ok());
         assert!(budget("SELECT 1").is_ok());
+    }
+
+    #[test]
+    fn non_first_paren_join_cursor_budget_boundaries() {
+        let with_outer = |n: usize, outer: &str| {
+            let mut ctes = vec!["c0 AS (SELECT 1 AS x)".to_owned()];
+            for i in 1..n {
+                ctes.push(format!("c{i} AS (SELECT x FROM c{})", i - 1));
+            }
+            format!(
+                "WITH {} {}",
+                ctes.join(", "),
+                outer.replace("{last}", &format!("c{}", n - 1))
+            )
+        };
+        let non_first = "SELECT x FROM base JOIN ({last} JOIN base AS b2)";
+        let double_wrapped = "SELECT x FROM base JOIN (({last} JOIN base AS b2))";
+        let two_nested = "SELECT x FROM base JOIN (base AS b2 JOIN ({last} JOIN base AS b3))";
+        let leading = "SELECT x FROM ({last} JOIN base AS b2) JOIN base";
+        let single_item = "SELECT x FROM base JOIN ({last})";
+
+        assert!(budget(&with_outer(996, non_first)).is_ok());
+        assert!(matches!(
+            budget(&with_outer(997, non_first)),
+            Err(FrankenError::ViewNestingTooDeep { .. })
+        ));
+        assert!(budget(&with_outer(996, double_wrapped)).is_ok());
+        assert!(matches!(
+            budget(&with_outer(997, double_wrapped)),
+            Err(FrankenError::ViewNestingTooDeep { .. })
+        ));
+        assert!(budget(&with_outer(994, two_nested)).is_ok());
+        assert!(matches!(
+            budget(&with_outer(995, two_nested)),
+            Err(FrankenError::ViewNestingTooDeep { .. })
+        ));
+        assert!(budget(&with_outer(997, leading)).is_ok());
+        assert!(matches!(
+            budget(&with_outer(998, leading)),
+            Err(FrankenError::ViewNestingTooDeep { .. })
+        ));
+        assert!(budget(&with_outer(998, single_item)).is_ok());
+        assert!(matches!(
+            budget(&with_outer(999, single_item)),
+            Err(FrankenError::ViewNestingTooDeep { .. })
+        ));
     }
 }

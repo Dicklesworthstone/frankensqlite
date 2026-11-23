@@ -51418,6 +51418,7 @@ impl Connection {
                     self.join_table_supports_hidden_rowid_for_binding(name),
                 ),
                 col_names,
+                paren_join_meta: None,
             })
         };
 
@@ -59727,8 +59728,12 @@ impl Connection {
         visible_ctes: &[fsqlite_ast::Cte],
         active_ctes: &mut Vec<String>,
     ) -> Vec<String> {
-        let mut names =
-            self.table_or_subquery_result_column_names(&from.source, visible_ctes, active_ctes);
+        let mut names = match &from.source {
+            TableOrSubquery::ParenJoin(inner) => {
+                self.from_clause_result_column_names(inner, visible_ctes, active_ctes)
+            }
+            other => self.table_or_subquery_result_column_names(other, visible_ctes, active_ctes),
+        };
         for join in &from.joins {
             let right_names =
                 self.table_or_subquery_result_column_names(&join.table, visible_ctes, active_ctes);
@@ -59756,6 +59761,98 @@ impl Connection {
         names
     }
 
+    /// Column names exposed by a non-leading multi-item parenthesized join
+    /// (`SF_NestedFrom` subquery in SQLite's `selectExpander`). Matches
+    /// `sqlite3.c:155856-155979`: when `joins[k]` has USING/NATURAL, its
+    /// `bUsingTerm` columns are emitted immediately before source `k`'s own
+    /// columns, and the underlying left/right occurrences are marked
+    /// `bNoExpand`.
+    fn nested_from_clause_result_column_names(
+        &self,
+        from: &FromClause,
+        visible_ctes: &[fsqlite_ast::Cte],
+        active_ctes: &mut Vec<String>,
+    ) -> Vec<String> {
+        let effective = flatten_leading_paren_join_from(from);
+        let all_sources: Vec<&TableOrSubquery> = std::iter::once(&effective.source)
+            .chain(effective.joins.iter().map(|join| &join.table))
+            .collect();
+        let source_names: Vec<Vec<String>> = all_sources
+            .iter()
+            .map(|source| {
+                self.table_or_subquery_result_column_names(source, visible_ctes, active_ctes)
+            })
+            .collect();
+        let mut step_using_cols: Vec<Vec<String>> = Vec::with_capacity(effective.joins.len());
+        let mut left_names = source_names.first().cloned().unwrap_or_default();
+        for (join_idx, join) in effective.joins.iter().enumerate() {
+            let right_names = &source_names[join_idx + 1];
+            let using_cols = if join.join_type.natural {
+                right_names
+                    .iter()
+                    .filter(|right_name| {
+                        left_names
+                            .iter()
+                            .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else if let Some(JoinConstraint::Using(cols)) = join.constraint.as_ref() {
+                cols.clone()
+            } else {
+                Vec::new()
+            };
+            for right_name in right_names {
+                if !using_cols
+                    .iter()
+                    .any(|using_col| using_col.eq_ignore_ascii_case(right_name))
+                {
+                    left_names.push(right_name.clone());
+                }
+            }
+            step_using_cols.push(using_cols);
+        }
+
+        let mut emitted_using_terms: Vec<String> = Vec::new();
+        let mut out = Vec::new();
+        for (k, cols) in source_names.iter().enumerate() {
+            let next_using = step_using_cols.get(k).map(Vec::as_slice).unwrap_or(&[]);
+            for u_name in next_using {
+                if !emitted_using_terms
+                    .iter()
+                    .any(|seen| seen.eq_ignore_ascii_case(u_name))
+                {
+                    emitted_using_terms.push(u_name.clone());
+                    out.push(u_name.clone());
+                }
+            }
+            let own_right_using = if k > 0 {
+                step_using_cols.get(k - 1).map(Vec::as_slice).unwrap_or(&[])
+            } else {
+                &[]
+            };
+            for col_name in cols {
+                let suppressed = own_right_using
+                    .iter()
+                    .any(|u| u.eq_ignore_ascii_case(col_name))
+                    || next_using.iter().any(|u| u.eq_ignore_ascii_case(col_name))
+                    || emitted_using_terms
+                        .iter()
+                        .any(|u| u.eq_ignore_ascii_case(col_name))
+                    || step_using_cols
+                        .get(k + 1..)
+                        .unwrap_or(&[])
+                        .iter()
+                        .flatten()
+                        .any(|u| u.eq_ignore_ascii_case(col_name));
+                if !suppressed {
+                    out.push(col_name.clone());
+                }
+            }
+        }
+        out
+    }
+
     fn named_source_result_column_count(
         &self,
         from: &FromClause,
@@ -59774,12 +59871,9 @@ impl Connection {
         visible_ctes: &[fsqlite_ast::Cte],
         active_ctes: &mut Vec<String>,
     ) -> Option<Vec<String>> {
-        std::iter::once(&from.source)
-            .chain(from.joins.iter().map(|join| &join.table))
-            .find(|source| source_matches_name(source, source_name))
-            .map(|source| {
-                self.table_or_subquery_result_column_names(source, visible_ctes, active_ctes)
-            })
+        find_named_source(from, source_name).map(|source| {
+            self.table_or_subquery_result_column_names(source, visible_ctes, active_ctes)
+        })
     }
 
     fn table_function_result_column_names(&self, name: &str) -> Option<Vec<String>> {
@@ -59883,7 +59977,20 @@ impl Connection {
                 .table_function_result_column_names(name)
                 .unwrap_or_else(|| vec![name.clone()]),
             TableOrSubquery::ParenJoin(from) => {
-                self.from_clause_result_column_names(from, visible_ctes, active_ctes)
+                let unwrapped = unwrap_single_item_paren_join(from);
+                if unwrapped.joins.is_empty() {
+                    self.table_or_subquery_result_column_names(
+                        &unwrapped.source,
+                        visible_ctes,
+                        active_ctes,
+                    )
+                } else {
+                    self.nested_from_clause_result_column_names(
+                        unwrapped,
+                        visible_ctes,
+                        active_ctes,
+                    )
+                }
             }
         }
     }
@@ -59898,11 +60005,10 @@ impl Connection {
         col_map: &[(String, String, bool)],
         qualifier: &QualifiedName,
     ) -> Vec<ResultColumn> {
-        let matching_labels: Vec<String> = sources
-            .iter()
-            .filter(|source| source_matches_name(source, qualifier))
-            .filter_map(|source| source_projection_label(source))
-            .collect();
+        let mut matching_labels = Vec::new();
+        for source in sources {
+            collect_matching_source_labels(source, qualifier, &mut matching_labels);
+        }
         if matching_labels.is_empty() {
             return Vec::new();
         }
@@ -97532,10 +97638,15 @@ impl Connection {
             .flat_map(|col| match col {
                 ResultColumn::Star => col_map
                     .iter()
-                    .filter(|(_, _, hidden)| !*hidden)
-                    .map(|(tbl, c, _)| ResultColumn::Expr {
+                    .enumerate()
+                    .filter(|(idx, (_, _, hidden))| !*hidden && !using_skip_indices.contains(idx))
+                    .map(|(_, (tbl, c, _))| ResultColumn::Expr {
                         expr: Expr::Column(
-                            ColumnRef::qualified(tbl.clone(), c.clone()),
+                            if tbl.is_empty() {
+                                ColumnRef::bare(c.clone())
+                            } else {
+                                ColumnRef::qualified(tbl.clone(), c.clone())
+                            },
                             Span::new(0, 0),
                         ),
                         alias: None,
@@ -98850,8 +98961,27 @@ impl Connection {
         else {
             return Ok(());
         };
+        self.validate_from_clause_using_columns(from, &visible_ctes)
+    }
+
+    fn validate_from_clause_using_columns(
+        &self,
+        from: &FromClause,
+        visible_ctes: &[fsqlite_ast::Cte],
+    ) -> Result<()> {
+        let validate_nested = |source: &TableOrSubquery| -> Result<()> {
+            if let TableOrSubquery::ParenJoin(inner) = source {
+                let unwrapped = unwrap_single_item_paren_join(inner);
+                if !unwrapped.joins.is_empty() {
+                    let effective = flatten_leading_paren_join_from(unwrapped);
+                    self.validate_from_clause_using_columns(&effective, visible_ctes)?;
+                }
+            }
+            Ok(())
+        };
+        validate_nested(&from.source)?;
         let mut left_visible_names =
-            self.source_column_names_for_join_layout(&from.source, &visible_ctes);
+            self.source_column_names_for_join_layout(&from.source, visible_ctes);
         // Stock `sqlite3ProcessJoin`: with a RIGHT or FULL JOIN in the FROM, a
         // USING term coalesces every left source that has the column, so each
         // of them after the first must itself be joined USING that column.
@@ -98866,7 +98996,8 @@ impl Connection {
             left_sources.push((left_visible_names.clone(), Vec::new()));
         }
         for join in &from.joins {
-            let right_names = self.source_column_names_for_join_layout(&join.table, &visible_ctes);
+            validate_nested(&join.table)?;
+            let right_names = self.source_column_names_for_join_layout(&join.table, visible_ctes);
             if !join.join_type.natural
                 && let Some(JoinConstraint::Using(cols)) = join.constraint.as_ref()
             {
@@ -98919,6 +99050,164 @@ impl Connection {
         Ok(())
     }
 
+    /// Build the exact `SF_NestedFrom` column layout metadata for a non-first
+    /// multi-item parenthesized join without executing its rows. Used by
+    /// `build_join_col_map`, `build_join_using_skip_indices`,
+    /// `build_join_using_column_projections`, `build_join_col_collations`,
+    /// `build_join_col_affinities`, and `build_join_declared_blob_columns` so
+    /// every metadata pass matches `materialize_paren_join_from` index-for-index.
+    fn build_paren_join_source_meta(
+        &self,
+        from: &FromClause,
+        visible_ctes: &[fsqlite_ast::Cte],
+        schema: &[TableSchema],
+    ) -> ParenJoinSourceMeta {
+        let effective = flatten_leading_paren_join_from(from);
+        let all_sources: Vec<&TableOrSubquery> = std::iter::once(&effective.source)
+            .chain(effective.joins.iter().map(|join| &join.table))
+            .collect();
+        let mut table_sources: Vec<JoinTableSource> = Vec::with_capacity(all_sources.len());
+        for &source in &all_sources {
+            let effective_source = match source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        source
+                    }
+                }
+                other => other,
+            };
+            match effective_source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    let meta = self.build_paren_join_source_meta(unwrapped, visible_ctes, schema);
+                    let visible_names = meta
+                        .visible_columns
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: "paren_join".to_owned(),
+                        table_name: String::new(),
+                        alias: None,
+                        col_names: visible_names,
+                        hidden_rowid_projection: None,
+                        paren_join_meta: Some(meta),
+                    });
+                }
+                TableOrSubquery::Table { name, alias, .. } => {
+                    let col_names =
+                        self.source_column_names_for_join_layout(effective_source, visible_ctes);
+                    table_sources.push(JoinTableSource {
+                        binding_name: Some(name.clone()),
+                        scan_cache_key: join_scan_cache_key(name),
+                        table_name: name.name.clone(),
+                        alias: alias.clone(),
+                        hidden_rowid_projection: join_hidden_rowid_projection(
+                            &col_names,
+                            self.table_binding_supports_hidden_rowid_for_scan(name),
+                        ),
+                        col_names,
+                        paren_join_meta: None,
+                    });
+                }
+                TableOrSubquery::Subquery { alias, .. } => {
+                    let col_names =
+                        self.source_column_names_for_join_layout(effective_source, visible_ctes);
+                    let label = alias.clone().unwrap_or_else(|| "subquery".to_owned());
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: format!("subquery:{label}"),
+                        table_name: label,
+                        alias: alias.clone(),
+                        col_names,
+                        hidden_rowid_projection: None,
+                        paren_join_meta: None,
+                    });
+                }
+                TableOrSubquery::TableFunction { name, alias, .. } => {
+                    let col_names =
+                        self.source_column_names_for_join_layout(effective_source, visible_ctes);
+                    let hidden_rowid_projection = join_hidden_rowid_projection(&col_names, true);
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: format!("table_function:{}", name.to_ascii_lowercase()),
+                        table_name: name.clone(),
+                        alias: alias.clone(),
+                        col_names,
+                        hidden_rowid_projection,
+                        paren_join_meta: None,
+                    });
+                }
+            }
+        }
+
+        let mut col_map = Vec::new();
+        for src in &table_sources {
+            src.append_col_map(&mut col_map);
+        }
+        let mut col_collations = Vec::with_capacity(col_map.len());
+        for (index, &source) in all_sources.iter().enumerate() {
+            if let Some(meta) = &table_sources[index].paren_join_meta {
+                col_collations.extend(meta.col_collations.iter().cloned());
+                continue;
+            }
+            let effective_source = match source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        source
+                    }
+                }
+                other => other,
+            };
+            let mut source_collations =
+                table_or_subquery_result_collations(effective_source, schema);
+            source_collations.resize(table_sources[index].col_names.len(), None);
+            source_collations.truncate(table_sources[index].col_names.len());
+            col_collations.extend(source_collations);
+            if table_sources[index].hidden_rowid_projection.is_some() {
+                col_collations.push(None);
+            }
+        }
+        let col_affinities = col_affinities_for_sources(&all_sources, &table_sources, schema);
+        let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
+        declared_blob_columns.extend(typeless_base_table_columns(
+            &all_sources,
+            &table_sources,
+            schema,
+        ));
+        let using_skip_indices = collect_join_using_skip_indices(&table_sources, &effective.joins);
+        let coalesced_star_indices =
+            collect_join_coalesced_star_indices(&table_sources, &effective.joins);
+        let using_column_projections = build_join_using_column_projections_from_sources(
+            &table_sources,
+            &effective.joins,
+            &col_map,
+            &col_collations,
+            &col_affinities,
+        );
+
+        finalize_nested_from_layout(
+            &table_sources,
+            &effective.joins,
+            col_map,
+            col_collations,
+            col_affinities,
+            declared_blob_columns,
+            using_skip_indices,
+            coalesced_star_indices,
+            using_column_projections,
+            None,
+        )
+        .0
+    }
+
     fn build_join_using_skip_indices(&self, select: &SelectStatement) -> HashSet<usize> {
         self.build_join_using_skip_indices_with_outer_ctes(select, &[])
     }
@@ -98939,55 +99228,79 @@ impl Connection {
         else {
             return skip;
         };
+        let schema = self.schema.borrow().clone();
 
-        // Per-source column-name slices in col_map order (hidden rowid columns
-        // are appended after the visible columns, but never participate in
-        // USING/NATURAL coalescing, so we track only the visible names while
-        // advancing the running offset past every appended col_map entry).
+        // Per-source visible `(name, slot_offset)` pairs in col_map order
+        // (hidden rowid columns and inner ParenJoin skipped slots advance the
+        // running offset while never participating in outer USING/NATURAL
+        // matching).
         let mut offset = 0usize;
         let mut left_visible_names: Vec<String> = Vec::new();
-        let record_source =
-            |source: &TableOrSubquery, offset: &mut usize| -> (usize, Vec<String>) {
-                let names = self.source_column_names_for_join_layout(source, &visible_ctes);
-                let start = *offset;
-                *offset += names.len();
-                if self
-                    .hidden_rowid_projection_for_source(source, &names)
-                    .is_some()
-                {
-                    *offset += 1;
+        let record_source = |source: &TableOrSubquery,
+                             offset: &mut usize,
+                             skip: &mut HashSet<usize>|
+         -> (usize, Vec<(String, usize)>) {
+            let effective_source = match source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        let start = *offset;
+                        let meta =
+                            self.build_paren_join_source_meta(unwrapped, &visible_ctes, &schema);
+                        skip.extend(meta.using_skip_indices.iter().map(|idx| start + idx));
+                        *offset += meta.col_map.len();
+                        return (start, meta.visible_columns);
+                    }
                 }
-                (start, names)
+                other => other,
             };
+            let names = self.source_column_names_for_join_layout(effective_source, &visible_ctes);
+            let start = *offset;
+            *offset += names.len();
+            if self
+                .hidden_rowid_projection_for_source(effective_source, &names)
+                .is_some()
+            {
+                *offset += 1;
+            }
+            let visible = names
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| (name, i))
+                .collect();
+            (start, visible)
+        };
 
-        let (_, primary_names) = record_source(&from.source, &mut offset);
-        left_visible_names.extend(primary_names);
+        let (_, primary_visible) = record_source(&from.source, &mut offset, &mut skip);
+        left_visible_names.extend(primary_visible.into_iter().map(|(name, _)| name));
 
         for join in &from.joins {
-            let (right_start, right_names) = record_source(&join.table, &mut offset);
+            let (right_start, right_visible) = record_source(&join.table, &mut offset, &mut skip);
             let using_cols: Vec<String> = if join.join_type.natural {
-                right_names
+                right_visible
                     .iter()
-                    .filter(|right_name| {
+                    .filter(|(right_name, _)| {
                         left_visible_names
                             .iter()
                             .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
                     })
-                    .cloned()
+                    .map(|(right_name, _)| right_name.clone())
                     .collect()
             } else if let Some(JoinConstraint::Using(cols)) = join.constraint.as_ref() {
                 cols.clone()
             } else {
                 Vec::new()
             };
-            for (i, right_name) in right_names.iter().enumerate() {
+            for (right_name, rel_slot) in right_visible {
                 if using_cols
                     .iter()
-                    .any(|using_col| using_col.eq_ignore_ascii_case(right_name))
+                    .any(|using_col| using_col.eq_ignore_ascii_case(&right_name))
                 {
-                    skip.insert(right_start + i);
+                    skip.insert(right_start + rel_slot);
                 } else {
-                    left_visible_names.push(right_name.clone());
+                    left_visible_names.push(right_name);
                 }
             }
         }
@@ -99018,100 +99331,67 @@ impl Connection {
             .with
             .as_ref()
             .map_or_else(Vec::new, |with| with.ctes.clone());
-        let col_map = self.build_join_col_map(select);
-        let mut offset = 0usize;
-        let record_source =
-            |source: &TableOrSubquery, offset: &mut usize| -> (usize, Vec<String>) {
-                let names = self.source_column_names_for_join_layout(source, &visible_ctes);
-                let start = *offset;
-                *offset += names.len();
-                if self
-                    .hidden_rowid_projection_for_source(source, &names)
-                    .is_some()
-                {
-                    *offset += 1;
-                }
-                (start, names)
-            };
-        let column_projection = |index: usize| {
-            col_map.get(index).map(|_| JoinUsingProjection {
-                value_indices: smallvec::smallvec![index],
-                collation: column_collations
-                    .get(index)
-                    .cloned()
-                    .flatten()
-                    .map_or(BoundCollation::Binary, BoundCollation::Named),
-                affinity: column_affinities
-                    .get(index)
-                    .copied()
-                    .unwrap_or(TypeAffinity::Blob),
-            })
-        };
-
-        let (primary_start, primary_names) = record_source(&from.source, &mut offset);
-        let mut visible = primary_names
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, name)| {
-                column_projection(primary_start + index).map(|projection| (name, projection))
-            })
-            .collect::<Vec<_>>();
-        let mut projections = HashMap::new();
-
-        for join in &from.joins {
-            let (right_start, right_names) = record_source(&join.table, &mut offset);
-            let using_columns = if join.join_type.natural {
-                right_names
-                    .iter()
-                    .filter(|right_name| {
-                        visible
-                            .iter()
-                            .any(|(left_name, _)| left_name.eq_ignore_ascii_case(right_name))
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            } else if let Some(JoinConstraint::Using(columns)) = join.constraint.as_ref() {
-                columns.clone()
-            } else {
-                Vec::new()
-            };
-
-            for (right_index, right_name) in right_names.into_iter().enumerate() {
-                let Some(right_projection) = column_projection(right_start + right_index) else {
-                    continue;
-                };
-                if !using_columns
-                    .iter()
-                    .any(|using_name| using_name.eq_ignore_ascii_case(&right_name))
-                {
-                    visible.push((right_name, right_projection));
-                    continue;
-                }
-                let Some(left_position) = visible
-                    .iter()
-                    .position(|(left_name, _)| left_name.eq_ignore_ascii_case(&right_name))
-                else {
-                    continue;
-                };
-                let left_projection = visible[left_position].1.clone();
-                let projection = match join.join_type.kind {
-                    JoinKind::Right => right_projection,
-                    JoinKind::Full => {
-                        let mut value_indices = left_projection.value_indices.clone();
-                        value_indices.extend(right_projection.value_indices);
-                        JoinUsingProjection {
-                            value_indices,
-                            collation: BoundCollation::Unspecified,
-                            affinity: TypeAffinity::Blob,
-                        }
+        let schema = self.schema.borrow().clone();
+        let all_sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .collect();
+        let mut table_sources = Vec::with_capacity(all_sources.len());
+        for &source in &all_sources {
+            let effective_source = match source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        source
                     }
-                    JoinKind::Cross | JoinKind::Inner | JoinKind::Left => left_projection,
-                };
-                visible[left_position].1 = projection.clone();
-                projections.insert(right_name.to_ascii_lowercase(), projection);
+                }
+                other => other,
+            };
+            match effective_source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    let meta = self.build_paren_join_source_meta(unwrapped, &visible_ctes, &schema);
+                    let visible_names = meta
+                        .visible_columns
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: "paren_join".to_owned(),
+                        table_name: String::new(),
+                        alias: None,
+                        col_names: visible_names,
+                        hidden_rowid_projection: None,
+                        paren_join_meta: Some(meta),
+                    });
+                }
+                _ => {
+                    let names =
+                        self.source_column_names_for_join_layout(effective_source, &visible_ctes);
+                    let hidden_rowid_projection =
+                        self.hidden_rowid_projection_for_source(effective_source, &names);
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: String::new(),
+                        table_name: String::new(),
+                        alias: None,
+                        col_names: names,
+                        hidden_rowid_projection,
+                        paren_join_meta: None,
+                    });
+                }
             }
         }
-        projections
+        let col_map = self.build_join_col_map(select);
+        build_join_using_column_projections_from_sources(
+            &table_sources,
+            &from.joins,
+            &col_map,
+            column_collations,
+            column_affinities,
+        )
     }
 
     fn build_join_col_collations(&self, select: &SelectStatement) -> Vec<Option<String>> {
@@ -99192,8 +99472,24 @@ impl Connection {
         let mut offset = 0usize;
         for source in std::iter::once(&from.source).chain(from.joins.iter().map(|join| &join.table))
         {
-            let column_names = self.source_column_names_for_join_layout(source, &visible_ctes);
-            if let TableOrSubquery::Table { name, .. } = source
+            let effective_source = match source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        let meta =
+                            self.build_paren_join_source_meta(unwrapped, &visible_ctes, &schema);
+                        declared.extend(meta.declared_blob_columns.iter().map(|idx| offset + idx));
+                        offset += meta.col_map.len();
+                        continue;
+                    }
+                }
+                other => other,
+            };
+            let column_names =
+                self.source_column_names_for_join_layout(effective_source, &visible_ctes);
+            if let TableOrSubquery::Table { name, .. } = effective_source
                 && !visible_ctes
                     .iter()
                     .any(|cte| cte.name.eq_ignore_ascii_case(&name.name))
@@ -99209,7 +99505,7 @@ impl Connection {
             }
             offset += column_names.len();
             if self
-                .hidden_rowid_projection_for_source(source, &column_names)
+                .hidden_rowid_projection_for_source(effective_source, &column_names)
                 .is_some()
             {
                 offset += 1;
@@ -99269,13 +99565,26 @@ impl Connection {
         visible_ctes: &[fsqlite_ast::Cte],
         schema: &[TableSchema],
     ) {
-        let column_names = self.source_column_names_for_join_layout(source, visible_ctes);
-        let mut source_collations = table_or_subquery_result_collations(source, schema);
+        let effective_source = match source {
+            TableOrSubquery::ParenJoin(inner) => {
+                let unwrapped = unwrap_single_item_paren_join(inner);
+                if unwrapped.joins.is_empty() {
+                    &unwrapped.source
+                } else {
+                    let meta = self.build_paren_join_source_meta(unwrapped, visible_ctes, schema);
+                    collations.extend(meta.col_collations);
+                    return;
+                }
+            }
+            other => other,
+        };
+        let column_names = self.source_column_names_for_join_layout(effective_source, visible_ctes);
+        let mut source_collations = table_or_subquery_result_collations(effective_source, schema);
         source_collations.resize(column_names.len(), None);
         source_collations.truncate(column_names.len());
         collations.extend(source_collations);
         if self
-            .hidden_rowid_projection_for_source(source, &column_names)
+            .hidden_rowid_projection_for_source(effective_source, &column_names)
             .is_some()
         {
             collations.push(None);
@@ -99289,31 +99598,56 @@ impl Connection {
         visible_ctes: &[fsqlite_ast::Cte],
         schema: &[TableSchema],
     ) {
-        let column_names = self.source_column_names_for_join_layout(source, visible_ctes);
-        let mut source_affinities = table_or_subquery_result_affinities(source, schema);
+        let effective_source = match source {
+            TableOrSubquery::ParenJoin(inner) => {
+                let unwrapped = unwrap_single_item_paren_join(inner);
+                if unwrapped.joins.is_empty() {
+                    &unwrapped.source
+                } else {
+                    let meta = self.build_paren_join_source_meta(unwrapped, visible_ctes, schema);
+                    affinities.extend(meta.col_affinities);
+                    return;
+                }
+            }
+            other => other,
+        };
+        let column_names = self.source_column_names_for_join_layout(effective_source, visible_ctes);
+        let mut source_affinities = table_or_subquery_result_affinities(effective_source, schema);
         source_affinities.resize(column_names.len(), TypeAffinity::Blob);
         source_affinities.truncate(column_names.len());
         affinities.extend(source_affinities);
         if self
-            .hidden_rowid_projection_for_source(source, &column_names)
+            .hidden_rowid_projection_for_source(effective_source, &column_names)
             .is_some()
         {
             affinities.push(TypeAffinity::Integer);
         }
     }
 
-    /// Add column map entries for a single FROM source (table or subquery).
+    /// Add column map entries for a single FROM source (table, subquery,
+    /// table-valued function, or parenthesized join).
     fn col_map_for_source(
         &self,
         source: &TableOrSubquery,
         visible_ctes: &[fsqlite_ast::Cte],
         col_map: &mut Vec<(String, String, bool)>,
     ) {
+        if let TableOrSubquery::ParenJoin(inner) = source {
+            let unwrapped = unwrap_single_item_paren_join(inner);
+            if unwrapped.joins.is_empty() {
+                self.col_map_for_source(&unwrapped.source, visible_ctes, col_map);
+            } else {
+                let schema = self.schema.borrow().clone();
+                let meta = self.build_paren_join_source_meta(unwrapped, visible_ctes, &schema);
+                col_map.extend(meta.col_map);
+            }
+            return;
+        }
         let label = match source {
             TableOrSubquery::Table { name, alias, .. } => alias.as_deref().unwrap_or(&name.name),
             TableOrSubquery::Subquery { alias, .. } => alias.as_deref().unwrap_or("subquery"),
             TableOrSubquery::TableFunction { name, alias, .. } => alias.as_deref().unwrap_or(name),
-            _ => return,
+            TableOrSubquery::ParenJoin(_) => unreachable!(),
         };
         let column_names = self.source_column_names_for_join_layout(source, visible_ctes);
         for column_name in &column_names {
@@ -100602,20 +100936,38 @@ impl Connection {
     ) -> HashSet<usize> {
         let modules = self.vtab_modules.borrow();
         let defaults = shared_default_vtab_module_registry();
-        sources
-            .iter()
-            .filter_map(|source| {
-                let TableOrSubquery::TableFunction { name, alias, .. } = source else {
-                    return None;
-                };
-                let module = name.to_ascii_uppercase();
-                if !matches!(module.as_str(), "JSON_EACH" | "JSON_TREE")
-                    || !Arc::ptr_eq(modules.get(&module)?, defaults.get(&module)?)
-                {
-                    return None;
+        let mut labels = Vec::new();
+        fn collect_json_labels<'a>(
+            source: &'a TableOrSubquery,
+            modules: &HashMap<String, Arc<dyn VtabModuleFactory>>,
+            defaults: &HashMap<String, Arc<dyn VtabModuleFactory>>,
+            out: &mut Vec<&'a str>,
+        ) {
+            match source {
+                TableOrSubquery::TableFunction { name, alias, .. } => {
+                    let module = name.to_ascii_uppercase();
+                    if matches!(module.as_str(), "JSON_EACH" | "JSON_TREE")
+                        && let (Some(current), Some(default)) =
+                            (modules.get(&module), defaults.get(&module))
+                        && Arc::ptr_eq(current, default)
+                    {
+                        out.push(alias.as_deref().unwrap_or(name));
+                    }
                 }
-                Some(alias.as_deref().unwrap_or(name))
-            })
+                TableOrSubquery::ParenJoin(from) => {
+                    collect_json_labels(&from.source, modules, defaults, out);
+                    for join in &from.joins {
+                        collect_json_labels(&join.table, modules, defaults, out);
+                    }
+                }
+                TableOrSubquery::Table { .. } | TableOrSubquery::Subquery { .. } => {}
+            }
+        }
+        for source in sources {
+            collect_json_labels(source, &modules, defaults, &mut labels);
+        }
+        labels
+            .into_iter()
             .flat_map(|label| {
                 col_map
                     .iter()
@@ -111226,6 +111578,510 @@ impl Connection {
         Some(reordered)
     }
 
+    /// Materialize a non-first multi-item `TableOrSubquery::ParenJoin` into
+    /// its combined rows and `SF_NestedFrom` layout metadata (bd-v57jp).
+    ///
+    /// Flattening `o LEFT JOIN (p JOIN q ON ...)` into flat joins is unsound
+    /// because an unmatched `p` row must null-extend both `p` and `q`, and an
+    /// inner `USING` must only match columns inside the parentheses. Instead,
+    /// evaluate the inner FROM clause recursively as a nested join and pack
+    /// the resulting rows + per-column constituent metadata into a single
+    /// `JoinTableSource`.
+    #[allow(clippy::too_many_lines)]
+    async fn materialize_paren_join_from(
+        &self,
+        from: &FromClause,
+        visible_ctes: &[fsqlite_ast::Cte],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<(ParenJoinSourceMeta, Vec<Vec<SqliteValue>>)> {
+        let effective = flatten_leading_paren_join_from(from);
+        self.validate_from_clause_using_columns(&effective, visible_ctes)?;
+
+        let all_sources: Vec<&TableOrSubquery> = std::iter::once(&effective.source)
+            .chain(effective.joins.iter().map(|join| &join.table))
+            .collect();
+        let mut table_sources: Vec<JoinTableSource> = Vec::with_capacity(all_sources.len());
+        let mut preloaded: Vec<Option<Vec<Vec<SqliteValue>>>> = Vec::with_capacity(all_sources.len());
+
+        for &raw_source in &all_sources {
+            let source = match raw_source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        raw_source
+                    }
+                }
+                other => other,
+            };
+            match source {
+                TableOrSubquery::Table { name, alias, .. } => {
+                    let mut active_ctes = Vec::new();
+                    let col_names = self.table_or_subquery_result_column_names(
+                        source,
+                        visible_ctes,
+                        &mut active_ctes,
+                    );
+                    if col_names.is_empty() {
+                        return Err(FrankenError::Internal(format!(
+                            "table not found: {}",
+                            name.name
+                        )));
+                    }
+                    table_sources.push(JoinTableSource {
+                        binding_name: Some(name.clone()),
+                        scan_cache_key: join_scan_cache_key(name),
+                        table_name: name.name.clone(),
+                        alias: alias.clone(),
+                        hidden_rowid_projection: join_hidden_rowid_projection(
+                            &col_names,
+                            self.table_binding_supports_hidden_rowid_for_scan(name),
+                        ),
+                        col_names,
+                        paren_join_meta: None,
+                    });
+                    preloaded.push(None);
+                }
+                TableOrSubquery::Subquery { query, alias } => {
+                    let col_names = Self::deduplicate_relation_column_names(
+                        self.select_result_column_names(query, visible_ctes, &mut Vec::new()),
+                    );
+                    let label = alias.clone().unwrap_or_else(|| "subquery".to_owned());
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: format!("subquery:{label}"),
+                        table_name: label,
+                        alias: alias.clone(),
+                        col_names,
+                        hidden_rowid_projection: None,
+                        paren_join_meta: None,
+                    });
+                    preloaded.push(Some(Vec::new()));
+                }
+                TableOrSubquery::TableFunction { name, alias, .. } => {
+                    let col_names = self
+                        .table_function_result_column_names(name)
+                        .ok_or_else(|| {
+                            FrankenError::NotImplemented(format!(
+                                "table-valued function {name} is not supported",
+                            ))
+                        })?;
+                    let hidden_rowid_projection = join_hidden_rowid_projection(&col_names, true);
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: format!("table_function:{}", name.to_ascii_lowercase()),
+                        table_name: name.clone(),
+                        alias: alias.clone(),
+                        col_names,
+                        hidden_rowid_projection,
+                        paren_join_meta: None,
+                    });
+                    preloaded.push(Some(Vec::new()));
+                }
+                TableOrSubquery::ParenJoin(_) => {
+                    table_sources.push(JoinTableSource {
+                        binding_name: None,
+                        scan_cache_key: "paren_join".to_owned(),
+                        table_name: String::new(),
+                        alias: None,
+                        col_names: Vec::new(),
+                        hidden_rowid_projection: None,
+                        paren_join_meta: None,
+                    });
+                    preloaded.push(Some(Vec::new()));
+                }
+            }
+        }
+
+        let is_outer =
+            |kind: JoinKind| matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full);
+        let has_outer_join = effective
+            .joins
+            .iter()
+            .any(|join| is_outer(join.join_type.kind));
+        let pinned_tvf: Vec<bool> = if has_outer_join {
+            let labels: Vec<Option<String>> = all_sources
+                .iter()
+                .map(|source| source_projection_label(source))
+                .collect();
+            let column_names: Vec<&[String]> = table_sources
+                .iter()
+                .map(|src| src.col_names.as_slice())
+                .collect();
+            table_function_source_dependencies(&all_sources, &labels, &column_names)
+                .iter()
+                .enumerate()
+                .map(|(index, reads)| {
+                    reads.iter().any(|&read| {
+                        read > index && is_outer(effective.joins[read - 1].join_type.kind)
+                    })
+                })
+                .collect()
+        } else {
+            vec![false; all_sources.len()]
+        };
+        let lateral_tvf: Vec<bool> = all_sources
+            .iter()
+            .enumerate()
+            .map(|(index, src)| {
+                let effective_src = match src {
+                    TableOrSubquery::ParenJoin(inner) => {
+                        let unwrapped = unwrap_single_item_paren_join(inner);
+                        if unwrapped.joins.is_empty() {
+                            &unwrapped.source
+                        } else {
+                            *src
+                        }
+                    }
+                    other => *other,
+                };
+                index > 0
+                    && !pinned_tvf[index]
+                    && matches!(effective_src, TableOrSubquery::TableFunction { args, .. }
+                        if args.iter().any(expr_references_any_column))
+            })
+            .collect();
+
+        for (i, pre) in preloaded.iter_mut().enumerate() {
+            if pre.is_none() {
+                continue;
+            }
+            let effective_src = match all_sources[i] {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        all_sources[i]
+                    }
+                }
+                other => other,
+            };
+            match effective_src {
+                TableOrSubquery::Subquery { query, .. } => {
+                    let subquery_statement = Statement::Select(query.as_ref().clone());
+                    let rows =
+                        lean_future(|| self.execute_statement(&subquery_statement, params)).await?;
+                    let row_data: Vec<Vec<SqliteValue>> =
+                        rows.into_iter().map(|r| r.values).collect();
+                    let resolved = Self::deduplicate_relation_column_names(
+                        self.select_result_column_names(query, visible_ctes, &mut Vec::new()),
+                    );
+                    if !resolved.is_empty() {
+                        table_sources[i].col_names = resolved;
+                    } else {
+                        let width = row_data.first().map_or(0, Vec::len);
+                        table_sources[i].col_names =
+                            (0..width).map(|j| format!("_c{j}")).collect();
+                    }
+                    *pre = Some(row_data);
+                }
+                TableOrSubquery::TableFunction { name, args, .. } => {
+                    if lateral_tvf[i] || pinned_tvf[i] {
+                        continue;
+                    }
+                    let include_hidden_rowid = table_sources[i].hidden_rowid_projection.is_some();
+                    *pre = Some(
+                        lean_future(|| {
+                            self.execute_table_function_rows(
+                                name,
+                                args,
+                                params,
+                                include_hidden_rowid,
+                            )
+                        })
+                        .await?,
+                    );
+                }
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    let (meta, rows) = Box::pin(self.materialize_paren_join_from(
+                        unwrapped,
+                        visible_ctes,
+                        params,
+                    ))
+                    .await?;
+                    table_sources[i].col_names = meta
+                        .visible_columns
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    table_sources[i].paren_join_meta = Some(meta);
+                    *pre = Some(rows);
+                }
+                TableOrSubquery::Table { .. } => {}
+            }
+        }
+
+        let mut col_map: Vec<(String, String, bool)> = Vec::new();
+        for src in &table_sources {
+            src.append_col_map(&mut col_map);
+        }
+        let schema_snapshot = self.schema.borrow().clone();
+        let mut col_collations = Vec::with_capacity(col_map.len());
+        for (index, &source) in all_sources.iter().enumerate() {
+            if let Some(meta) = &table_sources[index].paren_join_meta {
+                col_collations.extend(meta.col_collations.iter().cloned());
+                continue;
+            }
+            let effective_source = match source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        source
+                    }
+                }
+                other => other,
+            };
+            let mut source_collations =
+                table_or_subquery_result_collations(effective_source, &schema_snapshot);
+            source_collations.resize(table_sources[index].col_names.len(), None);
+            source_collations.truncate(table_sources[index].col_names.len());
+            col_collations.extend(source_collations);
+            if table_sources[index].hidden_rowid_projection.is_some() {
+                col_collations.push(None);
+            }
+        }
+        let col_affinities =
+            col_affinities_for_sources(&all_sources, &table_sources, &schema_snapshot);
+        let using_column_projections = build_join_using_column_projections_from_sources(
+            &table_sources,
+            &effective.joins,
+            &col_map,
+            &col_collations,
+            &col_affinities,
+        );
+        let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
+        declared_blob_columns.extend(typeless_base_table_columns(
+            &all_sources,
+            &table_sources,
+            &schema_snapshot,
+        ));
+        let using_skip_indices = collect_join_using_skip_indices(&table_sources, &effective.joins);
+        let coalesced_star_indices =
+            collect_join_coalesced_star_indices(&table_sources, &effective.joins);
+        let using_skip: Option<&HashSet<usize>> =
+            (!using_skip_indices.is_empty()).then_some(&using_skip_indices);
+
+        let _join_eval_collation_guard =
+            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: declared_blob_columns.clone(),
+                column_collations: col_collations.clone(),
+                column_affinities: col_affinities.clone(),
+                using_column_projections: using_column_projections.clone(),
+                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+            });
+        let _using_skip_guard = using_skip.map(JoinUsingSkipGuard::push);
+
+        let mut fts5_rank_table_names = Vec::new();
+        for src in &table_sources {
+            if src.local_table_binding().is_some() && self.has_live_fts5_instance(&src.table_name) {
+                fts5_rank_table_names.push(src.table_name.as_str());
+                if let Some(alias) = src.alias.as_deref() {
+                    fts5_rank_table_names.push(alias);
+                }
+            }
+        }
+        validate_join_select_column_references(
+            &[],
+            &effective.joins,
+            &all_sources,
+            None,
+            &col_map,
+            using_skip,
+            &fts5_rank_table_names,
+        )?;
+
+        let mut scanned_cache: HashMap<String, Vec<Vec<SqliteValue>>> = HashMap::new();
+        let mut table_rows: Vec<Vec<Vec<SqliteValue>>> = Vec::with_capacity(table_sources.len());
+        for (i, src) in table_sources.iter().enumerate() {
+            if let Some(rows) = preloaded[i].take() {
+                table_rows.push(rows);
+            } else if let Some(cached) = scanned_cache.get(&src.scan_cache_key) {
+                table_rows.push(cached.clone());
+            } else {
+                let mut row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src)
+                {
+                    row_data
+                } else if let Some(result) =
+                    lean_future(|| self.try_scan_join_source_from_pager(src, None)).await
+                {
+                    result?
+                } else {
+                    let scan_sql = build_join_scan_sql(src);
+                    let _tt_guard = (!self.memdb_rows_loaded.get())
+                        .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
+                    let rows = lean_future(|| self.query(&scan_sql)).await?;
+                    rows.into_iter().map(|r| r.values).collect()
+                };
+                let scan_width = src.scan_width();
+                for row in &mut row_data {
+                    if row.len() != scan_width {
+                        row.resize(scan_width, SqliteValue::Null);
+                    }
+                }
+                if table_sources[i + 1..]
+                    .iter()
+                    .any(|later| later.scan_cache_key.eq(&src.scan_cache_key))
+                {
+                    scanned_cache.insert(src.scan_cache_key.clone(), row_data.clone());
+                }
+                table_rows.push(row_data);
+            }
+        }
+
+        let primary_width = table_sources[0].scan_width();
+        let mut combined: Vec<Vec<SqliteValue>> = std::mem::take(&mut table_rows[0])
+            .into_iter()
+            .map(|mut row| {
+                row.resize(primary_width, SqliteValue::Null);
+                row
+            })
+            .collect();
+        let primary_null_extendable = effective
+            .joins
+            .iter()
+            .any(|j| matches!(j.join_type.kind, JoinKind::Right | JoinKind::Full));
+
+        for (join_idx, join) in effective.joins.iter().enumerate() {
+            let right_rows = &table_rows[join_idx + 1];
+            let right_width = table_sources[join_idx + 1].scan_width();
+            let current_width: usize = table_sources[..=join_idx]
+                .iter()
+                .map(JoinTableSource::scan_width)
+                .sum();
+            let right_using_skip = table_sources[join_idx + 1]
+                .paren_join_meta
+                .as_ref()
+                .map(|meta| &meta.using_skip_indices);
+
+            let natural_constraint;
+            let resolved_on_constraint;
+            let effective_constraint = if join.join_type.natural {
+                let left_cols: Vec<&str> = table_sources[..=join_idx]
+                    .iter()
+                    .flat_map(JoinTableSource::visible_column_names)
+                    .collect();
+                let right_src = &table_sources[join_idx + 1];
+                let shared: Vec<String> = right_src
+                    .visible_column_names()
+                    .into_iter()
+                    .filter(|c| left_cols.iter().any(|l| l.eq_ignore_ascii_case(c)))
+                    .map(str::to_owned)
+                    .collect();
+                natural_constraint = JoinConstraint::Using(shared);
+                Some(&natural_constraint)
+            } else if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
+                if expr_has_any_subquery(on_expr) {
+                    let resolved = lean_future(|| {
+                        self.pre_resolve_non_correlated_subqueries_in_expr(on_expr, params)
+                    })
+                    .await?;
+                    resolved_on_constraint = JoinConstraint::On(resolved);
+                    Some(&resolved_on_constraint)
+                } else {
+                    join.constraint.as_ref()
+                }
+            } else {
+                join.constraint.as_ref()
+            };
+
+            let using_left_slots = match effective_constraint {
+                Some(JoinConstraint::Using(cols)) if primary_null_extendable => {
+                    join_using_left_coalesce_slots(&table_sources, join_idx, cols)
+                }
+                _ => None,
+            };
+
+            if lateral_tvf[join_idx + 1] {
+                let effective_src = match all_sources[join_idx + 1] {
+                    TableOrSubquery::ParenJoin(inner) => &unwrap_single_item_paren_join(inner).source,
+                    other => other,
+                };
+                let (tvf_name, tvf_args) = match effective_src {
+                    TableOrSubquery::TableFunction { name, args, .. } => {
+                        (name.as_str(), args.as_slice())
+                    }
+                    _ => unreachable!("lateral_tvf flag implies a TableFunction source"),
+                };
+                let include_hidden_rowid = table_sources[join_idx + 1]
+                    .hidden_rowid_projection
+                    .is_some();
+                combined = lean_future(|| {
+                    self.execute_lateral_table_function_join(
+                        &combined,
+                        tvf_name,
+                        tvf_args,
+                        right_width,
+                        current_width,
+                        include_hidden_rowid,
+                        join.join_type.kind,
+                        effective_constraint,
+                        &col_map,
+                        using_left_slots.as_deref(),
+                    )
+                })
+                .await?;
+                continue;
+            }
+
+            let on_has_correlated_subquery = matches!(
+                effective_constraint,
+                Some(JoinConstraint::On(expr)) if expr_has_any_subquery(expr)
+            );
+            if on_has_correlated_subquery {
+                let on_expr = match effective_constraint {
+                    Some(JoinConstraint::On(e)) => e.clone(),
+                    _ => unreachable!("on_has_correlated_subquery implies On constraint"),
+                };
+                combined = lean_future(|| {
+                    self.execute_single_join_with_correlated_subqueries(
+                        &combined,
+                        right_rows,
+                        right_width,
+                        current_width,
+                        join.join_type.kind,
+                        &on_expr,
+                        &col_map,
+                    )
+                })
+                .await?;
+            } else {
+                combined = self.with_fallback_function_registry(|| {
+                    execute_single_join(
+                        &combined,
+                        right_rows,
+                        right_width,
+                        current_width,
+                        join.join_type.kind,
+                        effective_constraint,
+                        &col_map,
+                        using_left_slots.as_deref(),
+                        using_skip,
+                        right_using_skip,
+                    )
+                })?;
+            }
+        }
+
+        let (meta, finalized_rows) = finalize_nested_from_layout(
+            &table_sources,
+            &effective.joins,
+            col_map,
+            col_collations,
+            col_affinities,
+            declared_blob_columns,
+            using_skip_indices,
+            coalesced_star_indices,
+            using_column_projections,
+            Some(combined),
+        );
+        Ok((meta, finalized_rows.unwrap_or_default()))
+    }
+
     /// Execute a SELECT with JOINs using in-memory nested-loop evaluation.
     ///
     /// Loads each table's rows independently, then combines them according to
@@ -111268,9 +112124,20 @@ impl Connection {
         let mut preloaded: Vec<Option<Vec<Vec<SqliteValue>>>> = Vec::new();
 
         // Helper closure: resolve a TableOrSubquery into a JoinTableSource
-        // and optional preloaded rows (for subqueries/table functions).
+        // and optional preloaded rows (for subqueries/table functions/paren joins).
         let resolve_source =
-            |source: &TableOrSubquery| -> Result<(JoinTableSource, Option<Vec<Vec<SqliteValue>>>)> {
+            |raw_source: &TableOrSubquery| -> Result<(JoinTableSource, Option<Vec<Vec<SqliteValue>>>)> {
+                let source = match raw_source {
+                    TableOrSubquery::ParenJoin(inner) => {
+                        let unwrapped = unwrap_single_item_paren_join(inner);
+                        if unwrapped.joins.is_empty() {
+                            &unwrapped.source
+                        } else {
+                            raw_source
+                        }
+                    }
+                    other => other,
+                };
                 match source {
                     TableOrSubquery::Table { name, alias, .. } => {
                         let mut active_ctes = Vec::new();
@@ -111296,6 +112163,7 @@ impl Connection {
                                     self.table_binding_supports_hidden_rowid_for_scan(name),
                                 ),
                                 col_names,
+                                paren_join_meta: None,
                             },
                             None,
                         ))
@@ -111313,6 +112181,7 @@ impl Connection {
                                 alias: alias.clone(),
                                 col_names,
                                 hidden_rowid_projection: None,
+                                paren_join_meta: None,
                             },
                             // Rows will be loaded after dropping schema borrow.
                             Some(Vec::new()),
@@ -111338,12 +112207,22 @@ impl Connection {
                                 alias: alias.clone(),
                                 col_names,
                                 hidden_rowid_projection,
+                                paren_join_meta: None,
                             },
                             Some(Vec::new()),
                         ))
                     }
-                    _ => Err(FrankenError::NotImplemented(
-                        "only named tables, table-valued functions, and subqueries are supported in JOIN".to_owned(),
+                    TableOrSubquery::ParenJoin(_) => Ok((
+                        JoinTableSource {
+                            binding_name: None,
+                            scan_cache_key: "paren_join".to_owned(),
+                            table_name: String::new(),
+                            alias: None,
+                            col_names: Vec::new(),
+                            hidden_rowid_projection: None,
+                            paren_join_meta: None,
+                        },
+                        Some(Vec::new()),
                     )),
                 }
             };
@@ -111419,7 +112298,18 @@ impl Connection {
             .collect();
         for (i, pre) in preloaded.iter_mut().enumerate() {
             if pre.is_some() {
-                match all_sources[i] {
+                let effective_src = match all_sources[i] {
+                    TableOrSubquery::ParenJoin(inner) => {
+                        let unwrapped = unwrap_single_item_paren_join(inner);
+                        if unwrapped.joins.is_empty() {
+                            &unwrapped.source
+                        } else {
+                            all_sources[i]
+                        }
+                    }
+                    other => other,
+                };
+                match effective_src {
                     TableOrSubquery::Subquery { query, .. } => {
                         let subquery_statement = Statement::Select(query.as_ref().clone());
                         let rows =
@@ -111462,28 +112352,53 @@ impl Connection {
                             .await?,
                         );
                     }
-                    _ => {}
+                    TableOrSubquery::ParenJoin(inner) => {
+                        let unwrapped = unwrap_single_item_paren_join(inner);
+                        let (meta, rows) = Box::pin(self.materialize_paren_join_from(
+                            unwrapped,
+                            &visible_ctes,
+                            params,
+                        ))
+                        .await?;
+                        table_sources[i].col_names = meta
+                            .visible_columns
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        table_sources[i].paren_join_meta = Some(meta);
+                        *pre = Some(rows);
+                    }
+                    TableOrSubquery::Table { .. } => {}
                 }
             }
         }
 
         // ── 2. Build the combined column map ──
-        // col_map entries: (table_label, col_name, combined_index)
+        // col_map entries: (table_label, col_name, is_hidden_rowid)
         let mut col_map: Vec<(String, String, bool)> = Vec::new();
         for src in &table_sources {
-            let label = src.alias.as_deref().unwrap_or(&src.table_name);
-            for col_name in &src.col_names {
-                col_map.push((label.to_owned(), col_name.clone(), false));
-            }
-            if src.hidden_rowid_projection.is_some() {
-                col_map.push((label.to_owned(), "rowid".to_owned(), true));
-            }
+            src.append_col_map(&mut col_map);
         }
         let schema_snapshot = self.schema.borrow().clone();
         let mut col_collations = Vec::with_capacity(col_map.len());
         for (index, source) in all_sources.iter().enumerate() {
+            if let Some(meta) = &table_sources[index].paren_join_meta {
+                col_collations.extend(meta.col_collations.iter().cloned());
+                continue;
+            }
+            let effective_source = match source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        *source
+                    }
+                }
+                other => *other,
+            };
             let mut source_collations =
-                table_or_subquery_result_collations(source, &schema_snapshot);
+                table_or_subquery_result_collations(effective_source, &schema_snapshot);
             source_collations.resize(table_sources[index].col_names.len(), None);
             source_collations.truncate(table_sources[index].col_names.len());
             col_collations.extend(source_collations);
@@ -111493,8 +112408,13 @@ impl Connection {
         }
         let col_affinities =
             col_affinities_for_sources(&all_sources, &table_sources, &schema_snapshot);
-        let using_column_projections =
-            self.build_join_using_column_projections(select, &col_collations, &col_affinities);
+        let using_column_projections = build_join_using_column_projections_from_sources(
+            &table_sources,
+            &from.joins,
+            &col_map,
+            &col_collations,
+            &col_affinities,
+        );
         let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
         declared_blob_columns.extend(typeless_base_table_columns(
             &all_sources,
@@ -111517,6 +112437,7 @@ impl Connection {
         } else {
             Some(&using_skip_indices)
         };
+        let _using_skip_guard = using_skip.map(JoinUsingSkipGuard::push);
         let mut fts5_rank_table_names = Vec::new();
         for src in &table_sources {
             if src.local_table_binding().is_some() && self.has_live_fts5_instance(&src.table_name) {
@@ -111927,14 +112848,14 @@ impl Connection {
             let effective_constraint = if join.join_type.natural {
                 let left_cols: Vec<&str> = table_sources[..=join_idx]
                     .iter()
-                    .flat_map(|s| s.col_names.iter().map(String::as_str))
+                    .flat_map(JoinTableSource::visible_column_names)
                     .collect();
                 let right_src = &table_sources[join_idx + 1];
                 let shared: Vec<String> = right_src
-                    .col_names
-                    .iter()
-                    .filter(|c| left_cols.iter().any(|l| l.eq_ignore_ascii_case(c.as_str())))
-                    .cloned()
+                    .visible_column_names()
+                    .into_iter()
+                    .filter(|c| left_cols.iter().any(|l| l.eq_ignore_ascii_case(c)))
+                    .map(str::to_owned)
                     .collect();
                 natural_constraint = JoinConstraint::Using(shared);
                 Some(&natural_constraint)
@@ -112044,6 +112965,10 @@ impl Connection {
                 })
                 .await?;
             } else {
+                let right_using_skip = table_sources[join_idx + 1]
+                    .paren_join_meta
+                    .as_ref()
+                    .map(|meta| &meta.using_skip_indices);
                 combined = self.with_fallback_function_registry(|| {
                     execute_single_join(
                         &combined,
@@ -112054,6 +112979,8 @@ impl Connection {
                         effective_constraint,
                         &col_map,
                         using_left_slots.as_deref(),
+                        using_skip,
+                        right_using_skip,
                     )
                 })?;
             }
@@ -112072,7 +112999,7 @@ impl Connection {
                 None
             } else {
                 let mut bindings = JoinExprBindings::default();
-                bindings.bind_expr(where_expr, &col_map, None);
+                bindings.bind_expr(where_expr, &col_map, using_skip);
                 Some(JoinExprBindingsGuard::push(bindings))
             };
 
@@ -112143,7 +113070,7 @@ impl Connection {
                     .enumerate()
                     .filter(|(idx, (_, _, hidden))| !hidden && !using_skip_indices.contains(idx))
                     .map(|(idx, (tbl, c, _))| {
-                        let column = if coalesced_star_indices.contains(&idx) {
+                        let column = if coalesced_star_indices.contains(&idx) || tbl.is_empty() {
                             ColumnRef::bare(c.clone())
                         } else {
                             ColumnRef::qualified(tbl.clone(), c.clone())
@@ -112327,11 +113254,33 @@ impl Connection {
                     ResultColumn::TableStar(table_name) => {
                         let mut offset = 0;
                         for (source, src) in all_sources.iter().zip(&table_sources) {
-                            if source_matches_name(source, table_name) {
+                            let width = src.scan_width();
+                            if src.paren_join_meta.is_some() {
+                                let mut matching_labels = Vec::new();
+                                collect_matching_source_labels(
+                                    source,
+                                    table_name,
+                                    &mut matching_labels,
+                                );
+                                if !matching_labels.is_empty() {
+                                    for idx in offset..offset + width {
+                                        if let Some((tbl, _, hidden)) = col_map.get(idx)
+                                            && !*hidden
+                                            && matching_labels
+                                                .iter()
+                                                .any(|label| label.eq_ignore_ascii_case(tbl))
+                                        {
+                                            values.push(
+                                                row.get(idx).cloned().unwrap_or(SqliteValue::Null),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if source_contains_named_source(source, table_name) {
                                 values
                                     .extend_from_slice(&row[offset..offset + src.col_names.len()]);
                             }
-                            offset += src.scan_width();
+                            offset += width;
                         }
                     }
                     ResultColumn::Expr { expr, .. } => {
@@ -112569,12 +113518,18 @@ impl Connection {
                 let passes = match constraint {
                     None => true,
                     Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &scratch, col_map)?,
-                    Some(JoinConstraint::Using(cols)) => eval_using_constraint(
-                        cols,
-                        &scratch,
-                        col_map,
-                        left_width,
-                        using_left_slots,
+                    Some(JoinConstraint::Using(cols)) => with_current_join_using_skip_indices(
+                        |left_skip| {
+                            eval_using_constraint(
+                                cols,
+                                &scratch,
+                                col_map,
+                                left_width,
+                                using_left_slots,
+                                left_skip,
+                                None,
+                            )
+                        },
                     ),
                 };
                 if passes {
@@ -118668,11 +119623,7 @@ fn in_rhs_donor_explicit_collations(
             ResultColumn::TableStar(table) => {
                 let width = from
                     .as_ref()
-                    .and_then(|from| {
-                        std::iter::once(&from.source)
-                            .chain(from.joins.iter().map(|join| &join.table))
-                            .find(|source| source_matches_name(source, table))
-                    })
+                    .and_then(|from| find_named_source(from, table))
                     .map(|source| {
                         table_or_subquery_result_collations(source, schemas)
                             .len()
@@ -118747,9 +119698,7 @@ fn select_core_result_collation_candidates(
             }
             ResultColumn::TableStar(table) => {
                 if let Some(from_clause) = from {
-                    let expanded = std::iter::once(&from_clause.source)
-                        .chain(from_clause.joins.iter().map(|join| &join.table))
-                        .find(|source| source_matches_name(source, table))
+                    let expanded = find_named_source(from_clause, table)
                         .map(|source| table_or_subquery_result_collations(source, schemas))
                         .unwrap_or_default();
                     if expanded.is_empty() {
@@ -119065,6 +120014,10 @@ fn col_affinities_for_sources(
 ) -> Vec<TypeAffinity> {
     let mut affinities = Vec::new();
     for (source, table_source) in sources.iter().zip(table_sources) {
+        if let Some(meta) = &table_source.paren_join_meta {
+            affinities.extend(meta.col_affinities.iter().copied());
+            continue;
+        }
         let mut source_affinities = table_or_subquery_result_affinities(source, schemas);
         source_affinities.resize(table_source.col_names.len(), TypeAffinity::Blob);
         source_affinities.truncate(table_source.col_names.len());
@@ -119091,7 +120044,23 @@ fn typeless_base_table_columns(
     let mut declared = HashSet::new();
     let mut offset = 0usize;
     for (source, table_source) in sources.iter().zip(table_sources) {
-        if let TableOrSubquery::Table { name, .. } = source
+        if let Some(meta) = &table_source.paren_join_meta {
+            declared.extend(meta.declared_blob_columns.iter().map(|idx| offset + idx));
+            offset += table_source.scan_width();
+            continue;
+        }
+        let effective_source = match source {
+            TableOrSubquery::ParenJoin(inner) => {
+                let unwrapped = unwrap_single_item_paren_join(inner);
+                if unwrapped.joins.is_empty() {
+                    &unwrapped.source
+                } else {
+                    *source
+                }
+            }
+            other => *other,
+        };
+        if let TableOrSubquery::Table { name, .. } = effective_source
             && let Some(schema) = schemas
                 .iter()
                 .find(|schema| schema.name.eq_ignore_ascii_case(&name.name))
@@ -119556,11 +120525,7 @@ impl<'a> CteResultMetadataResolver<'a> {
                 ResultColumn::TableStar(table_name) => {
                     let expanded = from
                         .as_ref()
-                        .and_then(|from_clause| {
-                            std::iter::once(&from_clause.source)
-                                .chain(from_clause.joins.iter().map(|join| &join.table))
-                                .find(|source| source_matches_name(source, table_name))
-                        })
+                        .and_then(|from_clause| find_named_source(from_clause, table_name))
                         .map(|source| self.resolve_source_metadata(source, outer_lookup))
                         .unwrap_or_default();
                     if expanded.names.is_empty() {
@@ -120171,9 +121136,7 @@ fn select_core_result_affinities(core: &SelectCore, schemas: &[TableSchema]) -> 
             }
             ResultColumn::TableStar(table) => {
                 if let Some(from_clause) = from {
-                    let expanded = std::iter::once(&from_clause.source)
-                        .chain(from_clause.joins.iter().map(|join| &join.table))
-                        .find(|source| source_matches_name(source, table))
+                    let expanded = find_named_source(from_clause, table)
                         .map(|source| table_or_subquery_result_affinities(source, schemas))
                         .unwrap_or_default();
                     if expanded.is_empty() {
@@ -128858,22 +129821,82 @@ fn cte_self_reference_error(cte: &fsqlite_ast::Cte) -> Option<String> {
         .then(|| format!("multiple recursive references: {name}"))
 }
 
-/// How many of `core`'s own FROM items, a parenthesized join's included,
-/// name the relation `name` without a schema (bd-tmbbn).
+/// Unwrap redundant parentheses around a single FROM item: `(p)` -> `p`,
+/// `((p JOIN q))` -> `p JOIN q`. Matches SQLite's `seltablist ::= stl_prefix
+/// LP seltablist RP` rule (`sqlite3.c` case 115), which unwraps `nSrc == 1`
+/// without introducing an `SF_NestedFrom` subquery.
+pub(crate) fn unwrap_single_item_paren_join(mut from: &FromClause) -> &FromClause {
+    while from.joins.is_empty() {
+        if let TableOrSubquery::ParenJoin(inner) = &from.source {
+            from = inner;
+        } else {
+            break;
+        }
+    }
+    from
+}
+
+fn unwrap_single_item_paren_join_mut(from: &mut FromClause) -> &mut FromClause {
+    if !from.joins.is_empty() || !matches!(from.source, TableOrSubquery::ParenJoin(_)) {
+        return from;
+    }
+    match &mut from.source {
+        TableOrSubquery::ParenJoin(inner) => unwrap_single_item_paren_join_mut(inner),
+        _ => unreachable!("checked ParenJoin above"),
+    }
+}
+
+/// Flatten any leading `ParenJoin`s inside `from` (e.g. `((p JOIN q) JOIN r)`
+/// -> `p JOIN q JOIN r`), leaving non-leading `ParenJoin`s intact because they
+/// regroup joins and materialize as nested FROM subqueries.
+fn flatten_leading_paren_join_from(from: &FromClause) -> FromClause {
+    let mut clause = from.clone();
+    loop {
+        match clause.source {
+            TableOrSubquery::ParenJoin(inner) => {
+                let FromClause { source, mut joins } = *inner;
+                joins.append(&mut clause.joins);
+                clause = FromClause { source, joins };
+            }
+            source => {
+                clause.source = source;
+                break;
+            }
+        }
+    }
+    clause
+}
+
+/// How many of `core`'s own FROM items (including a leading parenthesized join
+/// or redundant parens around a single item, but NOT a non-leading multi-item
+/// parenthesized join, which stock SQLite turns into an `SF_NestedFrom`
+/// subquery) name the relation `name` without a schema (bd-tmbbn, bd-v57jp).
 fn select_core_direct_references(core: &SelectCore, name: &str) -> usize {
+    fn count_source(source: &TableOrSubquery, is_leading: bool, name: &str) -> usize {
+        match source {
+            TableOrSubquery::Table {
+                name: qualified, ..
+            } => usize::from(
+                qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name),
+            ),
+            TableOrSubquery::ParenJoin(inner) => {
+                let unwrapped = unwrap_single_item_paren_join(inner);
+                if is_leading || unwrapped.joins.is_empty() {
+                    count(unwrapped, name)
+                } else {
+                    0
+                }
+            }
+            TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => 0,
+        }
+    }
     fn count(from: &FromClause, name: &str) -> usize {
-        std::iter::once(&from.source)
-            .chain(from.joins.iter().map(|join| &join.table))
-            .map(|source| match source {
-                TableOrSubquery::Table {
-                    name: qualified, ..
-                } => usize::from(
-                    qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name),
-                ),
-                TableOrSubquery::ParenJoin(inner) => count(inner, name),
-                TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => 0,
-            })
-            .sum()
+        count_source(&from.source, true, name)
+            + from
+                .joins
+                .iter()
+                .map(|join| count_source(&join.table, false, name))
+                .sum::<usize>()
     }
     match core {
         SelectCore::Select {
@@ -128883,22 +129906,32 @@ fn select_core_direct_references(core: &SelectCore, name: &str) -> usize {
     }
 }
 
-/// Rename `core`'s own FROM items that name `name` to a name no reference
-/// matches, so a search finds only its other references (bd-tmbbn).
+/// Rename `core`'s own direct FROM items that name `name` to a name no
+/// reference matches, so a search finds only its other references (bd-tmbbn,
+/// bd-v57jp). Non-leading multi-item parenthesized joins are NOT direct FROM
+/// references in stock SQLite (`SF_NestedFrom`), so they stay unhidden and
+/// surface `"multiple recursive references"`.
 fn hide_select_core_direct_references(core: &mut SelectCore, name: &str) {
-    fn hide(from: &mut FromClause, name: &str) {
-        for source in std::iter::once(&mut from.source)
-            .chain(from.joins.iter_mut().map(|join| &mut join.table))
-        {
-            match source {
-                TableOrSubquery::Table {
-                    name: qualified, ..
-                } if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name) => {
-                    "\u{0}".clone_into(&mut qualified.name);
-                }
-                TableOrSubquery::ParenJoin(inner) => hide(inner, name),
-                _ => {}
+    fn hide_source(source: &mut TableOrSubquery, is_leading: bool, name: &str) {
+        match source {
+            TableOrSubquery::Table {
+                name: qualified, ..
+            } if qualified.schema.is_none() && qualified.name.eq_ignore_ascii_case(name) => {
+                "\u{0}".clone_into(&mut qualified.name);
             }
+            TableOrSubquery::ParenJoin(inner) => {
+                let unwrapped = unwrap_single_item_paren_join_mut(inner);
+                if is_leading || unwrapped.joins.is_empty() {
+                    hide(unwrapped, name);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn hide(from: &mut FromClause, name: &str) {
+        hide_source(&mut from.source, true, name);
+        for join in &mut from.joins {
+            hide_source(&mut join.table, false, name);
         }
     }
     if let SelectCore::Select {
@@ -130024,9 +131057,7 @@ fn expand_named_source_column_names(
         || QualifiedName::bare(source_name),
         |(schema_name, table_name)| QualifiedName::qualified(schema_name, table_name),
     );
-    std::iter::once(&from.source)
-        .chain(from.joins.iter().map(|join| &join.table))
-        .find(|source| source_matches_name(source, &source_name))
+    find_named_source(from, &source_name)
         .map(|source| expand_table_or_subquery_column_names(source, schema))
 }
 
@@ -130112,6 +131143,55 @@ fn source_matches_name(source: &TableOrSubquery, target: &QualifiedName) -> bool
                 )
         }
         TableOrSubquery::ParenJoin(_) => false,
+    }
+}
+
+/// Find the leaf FROM source matching `target`, descending through any
+/// `TableOrSubquery::ParenJoin` wrappers.
+fn find_named_source<'a>(
+    from: &'a FromClause,
+    target: &QualifiedName,
+) -> Option<&'a TableOrSubquery> {
+    fn find_in_source<'a>(
+        source: &'a TableOrSubquery,
+        target: &QualifiedName,
+    ) -> Option<&'a TableOrSubquery> {
+        match source {
+            TableOrSubquery::ParenJoin(inner) => find_named_source(inner, target),
+            _ if source_matches_name(source, target) => Some(source),
+            _ => None,
+        }
+    }
+    std::iter::once(&from.source)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .find_map(|source| find_in_source(source, target))
+}
+
+fn source_contains_named_source(source: &TableOrSubquery, target: &QualifiedName) -> bool {
+    match source {
+        TableOrSubquery::ParenJoin(inner) => find_named_source(inner, target).is_some(),
+        _ => source_matches_name(source, target),
+    }
+}
+
+fn collect_matching_source_labels(
+    source: &TableOrSubquery,
+    target: &QualifiedName,
+    out: &mut Vec<String>,
+) {
+    match source {
+        TableOrSubquery::ParenJoin(inner) => {
+            collect_matching_source_labels(&inner.source, target, out);
+            for join in &inner.joins {
+                collect_matching_source_labels(&join.table, target, out);
+            }
+        }
+        _ if source_matches_name(source, target) => {
+            if let Some(label) = source_projection_label(source) {
+                out.push(label);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -174365,6 +175445,23 @@ fn emit_like_expr(
 //  JOIN helpers
 // ──────────────────────────────────────────────────────────────────────────
 
+/// Materialized layout metadata for a non-first multi-item `ParenJoin`
+/// (`SF_NestedFrom` subquery in SQLite's `selectExpander`). All indices are
+/// 0-based relative to the start of this source's slice in the outer join row.
+#[derive(Clone)]
+struct ParenJoinSourceMeta {
+    col_map: Vec<(String, String, bool)>,
+    col_collations: Vec<Option<String>>,
+    col_affinities: Vec<TypeAffinity>,
+    declared_blob_columns: HashSet<usize>,
+    using_skip_indices: HashSet<usize>,
+    coalesced_star_indices: HashSet<usize>,
+    using_column_projections: HashMap<String, JoinUsingProjection>,
+    /// Exposed visible columns `(column_name, slot_index_in_col_map)` in
+    /// `SELECT *` / `USING` / `NATURAL` visibility order.
+    visible_columns: Vec<(String, usize)>,
+}
+
 /// Metadata for a table participating in a JOIN.
 #[derive(Clone)]
 struct JoinTableSource {
@@ -174374,11 +175471,16 @@ struct JoinTableSource {
     alias: Option<String>,
     col_names: Vec<String>,
     hidden_rowid_projection: Option<String>,
+    paren_join_meta: Option<ParenJoinSourceMeta>,
 }
 
 impl JoinTableSource {
     fn scan_width(&self) -> usize {
-        self.col_names.len() + usize::from(self.hidden_rowid_projection.is_some())
+        if let Some(meta) = &self.paren_join_meta {
+            meta.col_map.len()
+        } else {
+            self.col_names.len() + usize::from(self.hidden_rowid_projection.is_some())
+        }
     }
 
     fn local_table_binding(&self) -> Option<&QualifiedName> {
@@ -174386,6 +175488,447 @@ impl JoinTableSource {
             .as_ref()
             .filter(|name| name.schema.as_deref().is_none_or(is_builtin_schema))
     }
+
+    fn visible_columns(&self) -> Vec<(&str, usize)> {
+        if let Some(meta) = &self.paren_join_meta {
+            meta.visible_columns
+                .iter()
+                .map(|(name, slot)| (name.as_str(), *slot))
+                .collect()
+        } else {
+            self.col_names
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| (name.as_str(), idx))
+                .collect()
+        }
+    }
+
+    fn visible_column_names(&self) -> Vec<&str> {
+        if let Some(meta) = &self.paren_join_meta {
+            meta.visible_columns
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect()
+        } else {
+            self.col_names.iter().map(String::as_str).collect()
+        }
+    }
+
+    fn visible_column_offset(&self, col_name: &str) -> Option<usize> {
+        if let Some(meta) = &self.paren_join_meta {
+            meta.visible_columns
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(col_name))
+                .map(|(_, slot)| *slot)
+        } else {
+            self.col_names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(col_name))
+        }
+    }
+
+    fn append_col_map(&self, col_map: &mut Vec<(String, String, bool)>) {
+        if let Some(meta) = &self.paren_join_meta {
+            col_map.extend(meta.col_map.iter().cloned());
+            return;
+        }
+        let label = self.alias.as_deref().unwrap_or(&self.table_name);
+        for col_name in &self.col_names {
+            col_map.push((label.to_owned(), col_name.clone(), false));
+        }
+        if self.hidden_rowid_projection.is_some() {
+            col_map.push((label.to_owned(), "rowid".to_owned(), true));
+        }
+    }
+}
+
+/// Shift all slot indices inside a `JoinUsingProjection` by `offset`.
+fn shift_join_using_projection(
+    projection: &JoinUsingProjection,
+    offset: usize,
+) -> JoinUsingProjection {
+    JoinUsingProjection {
+        value_indices: projection
+            .value_indices
+            .iter()
+            .map(|idx| idx + offset)
+            .collect(),
+        collation: projection.collation.clone(),
+        affinity: projection.affinity,
+    }
+}
+
+/// Shared USING/NATURAL column projection builder over already-resolved
+/// `JoinTableSource`s (supports both flat sources and nested `ParenJoin`
+/// sources carrying `ParenJoinSourceMeta`).
+fn build_join_using_column_projections_from_sources(
+    table_sources: &[JoinTableSource],
+    joins: &[JoinClause],
+    col_map: &[(String, String, bool)],
+    column_collations: &[Option<String>],
+    column_affinities: &[TypeAffinity],
+) -> HashMap<String, JoinUsingProjection> {
+    if table_sources.is_empty() {
+        return HashMap::new();
+    }
+    let column_projection = |index: usize, source: &JoinTableSource, rel_slot: usize| {
+        if let Some(meta) = &source.paren_join_meta
+            && let Some((_, col_name, _)) = meta.col_map.get(rel_slot)
+            && let Some(inner_proj) = meta
+                .using_column_projections
+                .get(&col_name.to_ascii_lowercase())
+        {
+            return Some(shift_join_using_projection(inner_proj, index - rel_slot));
+        }
+        col_map.get(index).map(|_| JoinUsingProjection {
+            value_indices: smallvec::smallvec![index],
+            collation: column_collations
+                .get(index)
+                .cloned()
+                .flatten()
+                .map_or(BoundCollation::Binary, BoundCollation::Named),
+            affinity: column_affinities
+                .get(index)
+                .copied()
+                .unwrap_or(TypeAffinity::Blob),
+        })
+    };
+
+    let mut offset = 0usize;
+    let primary = &table_sources[0];
+    let mut visible: Vec<(String, JoinUsingProjection)> = primary
+        .visible_columns()
+        .into_iter()
+        .filter_map(|(name, rel_slot)| {
+            column_projection(offset + rel_slot, primary, rel_slot)
+                .map(|projection| (name.to_owned(), projection))
+        })
+        .collect();
+    let mut projections: HashMap<String, JoinUsingProjection> = HashMap::new();
+    // Seed unambiguous inner USING projections from `ParenJoin` sources;
+    // any column later seen in another source without an outer USING is
+    // removed so ambiguous bare references never resolve silently.
+    let mut inherited_using_keys: Vec<String> = Vec::new();
+    if let Some(meta) = &primary.paren_join_meta {
+        for (key, proj) in &meta.using_column_projections {
+            projections.insert(key.clone(), shift_join_using_projection(proj, offset));
+            inherited_using_keys.push(key.clone());
+        }
+    }
+    offset += primary.scan_width();
+
+    for (join_idx, join) in joins.iter().enumerate() {
+        let Some(right_src) = table_sources.get(join_idx + 1) else {
+            break;
+        };
+        let right_start = offset;
+        let right_visible = right_src.visible_columns();
+        let using_columns: Vec<String> = if join.join_type.natural {
+            right_visible
+                .iter()
+                .filter(|(right_name, _)| {
+                    visible
+                        .iter()
+                        .any(|(left_name, _)| left_name.eq_ignore_ascii_case(right_name))
+                })
+                .map(|(right_name, _)| (*right_name).to_owned())
+                .collect()
+        } else if let Some(JoinConstraint::Using(columns)) = join.constraint.as_ref() {
+            columns.clone()
+        } else {
+            Vec::new()
+        };
+
+        for (right_name, rel_slot) in right_visible {
+            let Some(right_projection) =
+                column_projection(right_start + rel_slot, right_src, rel_slot)
+            else {
+                continue;
+            };
+            let key = right_name.to_ascii_lowercase();
+            if !using_columns
+                .iter()
+                .any(|using_name| using_name.eq_ignore_ascii_case(right_name))
+            {
+                let already_visible = visible
+                    .iter()
+                    .any(|(left_name, _)| left_name.eq_ignore_ascii_case(right_name));
+                if already_visible {
+                    // Ambiguous across outer sources: never mask ambiguity with
+                    // an inherited inner ParenJoin USING projection.
+                    if inherited_using_keys.iter().any(|k| k == &key) {
+                        projections.remove(&key);
+                    }
+                } else if let Some(meta) = &right_src.paren_join_meta
+                    && let Some(inner_proj) = meta.using_column_projections.get(&key)
+                {
+                    projections.insert(
+                        key.clone(),
+                        shift_join_using_projection(inner_proj, right_start),
+                    );
+                    inherited_using_keys.push(key);
+                }
+                visible.push((right_name.to_owned(), right_projection));
+                continue;
+            }
+            let Some(left_position) = visible
+                .iter()
+                .position(|(left_name, _)| left_name.eq_ignore_ascii_case(right_name))
+            else {
+                continue;
+            };
+            let left_projection = visible[left_position].1.clone();
+            let projection = match join.join_type.kind {
+                JoinKind::Right => right_projection,
+                JoinKind::Full => {
+                    let mut value_indices = left_projection.value_indices.clone();
+                    value_indices.extend(right_projection.value_indices);
+                    JoinUsingProjection {
+                        value_indices,
+                        collation: BoundCollation::Unspecified,
+                        affinity: TypeAffinity::Blob,
+                    }
+                }
+                JoinKind::Cross | JoinKind::Inner | JoinKind::Left => left_projection,
+            };
+            visible[left_position].1 = projection.clone();
+            inherited_using_keys.retain(|k| k != &key);
+            projections.insert(key, projection);
+        }
+        offset += right_src.scan_width();
+    }
+    projections
+}
+
+/// Transform an inner `FromClause`'s raw join layout (and optional materialized
+/// rows) into SQLite's `SF_NestedFrom` layout (`sqlite3.c:155856-155979`).
+///
+/// Both metadata-only layout builders (`build_paren_join_source_meta`) and the
+/// runtime materializer (`materialize_paren_join_from`) call this exact helper
+/// so column indices can never drift between `build_join_col_map` and
+/// `execute_join_select`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn finalize_nested_from_layout(
+    table_sources: &[JoinTableSource],
+    joins: &[JoinClause],
+    inner_col_map: Vec<(String, String, bool)>,
+    inner_col_collations: Vec<Option<String>>,
+    inner_col_affinities: Vec<TypeAffinity>,
+    inner_declared_blob_columns: HashSet<usize>,
+    inner_using_skip_indices: HashSet<usize>,
+    inner_coalesced_star_indices: HashSet<usize>,
+    inner_using_column_projections: HashMap<String, JoinUsingProjection>,
+    mut rows: Option<Vec<Vec<SqliteValue>>>,
+) -> (ParenJoinSourceMeta, Option<Vec<Vec<SqliteValue>>>) {
+    let step_using_cols = join_source_using_columns(table_sources, joins);
+    let any_inner_using = step_using_cols.iter().any(|cols| !cols.is_empty());
+
+    if !any_inner_using {
+        let visible_columns = inner_col_map
+            .iter()
+            .enumerate()
+            .filter(|&(idx, (_, _, hidden))| !*hidden && !inner_using_skip_indices.contains(&idx))
+            .map(|(idx, (_, name, _))| (name.clone(), idx))
+            .collect();
+        return (
+            ParenJoinSourceMeta {
+                col_map: inner_col_map,
+                col_collations: inner_col_collations,
+                col_affinities: inner_col_affinities,
+                declared_blob_columns: inner_declared_blob_columns,
+                using_skip_indices: inner_using_skip_indices,
+                coalesced_star_indices: inner_coalesced_star_indices,
+                using_column_projections: inner_using_column_projections,
+                visible_columns,
+            },
+            rows,
+        );
+    }
+
+    // Compute each inner source's slice `[start..end)` in `inner_col_map`.
+    let mut source_ranges = Vec::with_capacity(table_sources.len());
+    let mut cursor = 0usize;
+    for src in table_sources {
+        let width = src.scan_width();
+        source_ranges.push((cursor, cursor + width));
+        cursor += width;
+    }
+
+    // Describe how each output slot in the SF_NestedFrom row is populated from
+    // an inner joined row: either copying an existing inner slot or evaluating
+    // a synthetic `bUsingTerm` projection (`coalesce` / left / right).
+    enum SlotSource {
+        Copy(usize),
+        Projection(JoinUsingProjection),
+    }
+
+    let mut slot_sources: Vec<SlotSource> = Vec::with_capacity(inner_col_map.len() + 4);
+    let mut out_col_map: Vec<(String, String, bool)> = Vec::with_capacity(inner_col_map.len() + 4);
+    let mut out_col_collations: Vec<Option<String>> = Vec::with_capacity(inner_col_map.len() + 4);
+    let mut out_col_affinities: Vec<TypeAffinity> = Vec::with_capacity(inner_col_map.len() + 4);
+    let mut out_declared_blob_columns: HashSet<usize> = HashSet::new();
+    let mut out_using_skip_indices: HashSet<usize> = HashSet::new();
+    let mut out_coalesced_star_indices: HashSet<usize> = HashSet::new();
+    let mut out_using_column_projections: HashMap<String, JoinUsingProjection> = HashMap::new();
+    let mut emitted_using_terms: Vec<String> = Vec::new();
+    // Map each inner slot to its new output slot so nested projections that
+    // remain un-superseded can be remapped cleanly.
+    let mut inner_to_outer_slot: Vec<usize> = vec![0; inner_col_map.len()];
+
+    for (k, &(start, end)) in source_ranges.iter().enumerate() {
+        // `step_using_cols[k + 1]` is the USING/NATURAL list of `joins[k]`,
+        // matching `pFrom[1].u3.pUsing` at `sqlite3.c:155856-155874`.
+        let next_using: &[&str] = step_using_cols
+            .get(k + 1)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for &u_name in next_using {
+            if emitted_using_terms
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(u_name))
+            {
+                continue;
+            }
+            emitted_using_terms.push(u_name.to_owned());
+            let key = u_name.to_ascii_lowercase();
+            let Some(proj) = inner_using_column_projections.get(&key) else {
+                continue;
+            };
+            let out_idx = out_col_map.len();
+            let collation = match &proj.collation {
+                BoundCollation::Named(name) => Some(name.clone()),
+                BoundCollation::Binary | BoundCollation::Unspecified => None,
+            };
+            out_col_map.push((String::new(), u_name.to_owned(), false));
+            out_col_collations.push(collation);
+            out_col_affinities.push(proj.affinity);
+            if proj.value_indices.len() == 1
+                && inner_declared_blob_columns.contains(&proj.value_indices[0])
+            {
+                out_declared_blob_columns.insert(out_idx);
+            }
+            out_using_column_projections.insert(
+                key,
+                JoinUsingProjection {
+                    value_indices: smallvec::smallvec![out_idx],
+                    collation: proj.collation.clone(),
+                    affinity: proj.affinity,
+                },
+            );
+            slot_sources.push(SlotSource::Projection(proj.clone()));
+        }
+
+        let own_right_using: &[&str] = step_using_cols.get(k).map(Vec::as_slice).unwrap_or(&[]);
+        let later_using = step_using_cols.get(k + 1..).unwrap_or(&[]);
+        for inner_idx in start..end {
+            let (mut tbl, col, hidden) = inner_col_map[inner_idx].clone();
+            let out_idx = out_col_map.len();
+            inner_to_outer_slot[inner_idx] = out_idx;
+
+            let skipped = inner_using_skip_indices.contains(&inner_idx)
+                || (!hidden
+                    && (own_right_using
+                        .iter()
+                        .any(|u| u.eq_ignore_ascii_case(&col))
+                        || next_using.iter().any(|u| u.eq_ignore_ascii_case(&col))
+                        || emitted_using_terms
+                            .iter()
+                            .any(|u| u.eq_ignore_ascii_case(&col))
+                        || later_using
+                            .iter()
+                            .flatten()
+                            .any(|u| u.eq_ignore_ascii_case(&col))));
+            // If a deeper `ParenJoin`'s synthetic `bUsingTerm` (`tbl == ""`)
+            // was superseded by this level's `USING`, rename its internal
+            // marker so `ColumnRef::qualified("", col)` always targets the
+            // active synthetic slot.
+            if skipped && tbl.is_empty() {
+                "\u{0}using".clone_into(&mut tbl);
+            }
+
+            out_col_map.push((tbl, col, hidden));
+            out_col_collations.push(inner_col_collations.get(inner_idx).cloned().flatten());
+            out_col_affinities.push(
+                inner_col_affinities
+                    .get(inner_idx)
+                    .copied()
+                    .unwrap_or(TypeAffinity::Blob),
+            );
+            if inner_declared_blob_columns.contains(&inner_idx) {
+                out_declared_blob_columns.insert(out_idx);
+            }
+            if skipped {
+                out_using_skip_indices.insert(out_idx);
+            } else if inner_coalesced_star_indices.contains(&inner_idx) {
+                out_coalesced_star_indices.insert(out_idx);
+            }
+            slot_sources.push(SlotSource::Copy(inner_idx));
+        }
+    }
+
+    // Preserve any un-superseded projections from deeper nested `ParenJoin`s,
+    // remapped to their new output slot positions.
+    for (key, proj) in &inner_using_column_projections {
+        if out_using_column_projections.contains_key(key) {
+            continue;
+        }
+        let remapped = proj
+            .value_indices
+            .iter()
+            .filter_map(|&inner_idx| inner_to_outer_slot.get(inner_idx).copied())
+            .collect::<SmallVec<[usize; 4]>>();
+        if !remapped.is_empty() {
+            out_using_column_projections.insert(
+                key.clone(),
+                JoinUsingProjection {
+                    value_indices: remapped,
+                    collation: proj.collation.clone(),
+                    affinity: proj.affinity,
+                },
+            );
+        }
+    }
+
+    if let Some(ref mut row_vec) = rows {
+        let mut rebuilt = Vec::with_capacity(row_vec.len());
+        for inner_row in row_vec.drain(..) {
+            let mut out_row = Vec::with_capacity(slot_sources.len());
+            for src in &slot_sources {
+                match src {
+                    SlotSource::Copy(idx) => {
+                        out_row.push(inner_row.get(*idx).cloned().unwrap_or(SqliteValue::Null));
+                    }
+                    SlotSource::Projection(proj) => {
+                        out_row.push(proj.value(&inner_row));
+                    }
+                }
+            }
+            rebuilt.push(out_row);
+        }
+        *row_vec = rebuilt;
+    }
+
+    let visible_columns = out_col_map
+        .iter()
+        .enumerate()
+        .filter(|&(idx, (_, _, hidden))| !*hidden && !out_using_skip_indices.contains(&idx))
+        .map(|(idx, (_, name, _))| (name.clone(), idx))
+        .collect();
+
+    (
+        ParenJoinSourceMeta {
+            col_map: out_col_map,
+            col_collations: out_col_collations,
+            col_affinities: out_col_affinities,
+            declared_blob_columns: out_declared_blob_columns,
+            using_skip_indices: out_using_skip_indices,
+            coalesced_star_indices: out_coalesced_star_indices,
+            using_column_projections: out_using_column_projections,
+            visible_columns,
+        },
+        rows,
+    )
 }
 
 /// The column names each FROM source's own join matches by USING, indexed like
@@ -174406,18 +175949,18 @@ fn join_source_using_columns<'a>(
             break;
         };
         let cols = if join.join_type.natural {
-            right_src
-                .col_names
+            let left_visible: Vec<&str> = table_sources[..=join_idx]
                 .iter()
+                .flat_map(JoinTableSource::visible_column_names)
+                .collect();
+            right_src
+                .visible_column_names()
+                .into_iter()
                 .filter(|right_col| {
-                    table_sources[..=join_idx].iter().any(|source| {
-                        source
-                            .col_names
-                            .iter()
-                            .any(|left_col| left_col.eq_ignore_ascii_case(right_col))
-                    })
+                    left_visible
+                        .iter()
+                        .any(|left_col| left_col.eq_ignore_ascii_case(right_col))
                 })
-                .map(String::as_str)
                 .collect()
         } else if let Some(JoinConstraint::Using(cols)) = &join.constraint {
             cols.iter().map(String::as_str).collect()
@@ -174437,12 +175980,15 @@ fn collect_join_using_skip_indices(
     let using_columns = join_source_using_columns(table_sources, joins);
     let mut offset = 0;
     for (source, cols) in table_sources.iter().zip(&using_columns) {
-        for (i, col_name) in source.col_names.iter().enumerate() {
+        if let Some(meta) = &source.paren_join_meta {
+            using_skip_indices.extend(meta.using_skip_indices.iter().map(|idx| offset + idx));
+        }
+        for (col_name, slot) in source.visible_columns() {
             if cols
                 .iter()
                 .any(|using_col| using_col.eq_ignore_ascii_case(col_name))
             {
-                using_skip_indices.insert(offset + i);
+                using_skip_indices.insert(offset + slot);
             }
         }
         offset += source.scan_width();
@@ -174460,6 +176006,13 @@ fn collect_join_coalesced_star_indices(
     joins: &[JoinClause],
 ) -> HashSet<usize> {
     let mut coalesced = HashSet::new();
+    let mut base_offset = 0;
+    for source in table_sources {
+        if let Some(meta) = &source.paren_join_meta {
+            coalesced.extend(meta.coalesced_star_indices.iter().map(|idx| base_offset + idx));
+        }
+        base_offset += source.scan_width();
+    }
     // `joins[k]` brings in `table_sources[k + 1]`, so the sources left of the
     // last RIGHT/FULL join (stock's JT_LTORJ) are `table_sources[..=k]`.
     let Some(last_right_join) = joins
@@ -174472,13 +176025,13 @@ fn collect_join_coalesced_star_indices(
     let mut offset = 0;
     for (source_idx, source) in table_sources.iter().enumerate().take(last_right_join + 1) {
         let later_using = using_columns.get(source_idx + 1..).unwrap_or(&[]);
-        for (i, col_name) in source.col_names.iter().enumerate() {
+        for (col_name, slot) in source.visible_columns() {
             if later_using
                 .iter()
                 .flatten()
                 .any(|using_col| using_col.eq_ignore_ascii_case(col_name))
             {
-                coalesced.insert(offset + i);
+                coalesced.insert(offset + slot);
             }
         }
         offset += source.scan_width();
@@ -174505,11 +176058,7 @@ fn join_using_left_coalesce_slots(
             let mut group = SmallVec::new();
             let mut offset = 0;
             for source in left_sources {
-                if let Some(position) = source
-                    .col_names
-                    .iter()
-                    .position(|name| name.eq_ignore_ascii_case(col_name))
-                {
+                if let Some(position) = source.visible_column_offset(col_name) {
                     group.push(offset + position);
                 }
                 offset += source.scan_width();
@@ -174611,6 +176160,9 @@ fn join_source_keep_masks(
         .iter()
         .zip(rowid_aliases)
         .map(|(source, rowid_alias)| {
+            if source.paren_join_meta.is_some() {
+                return None;
+            }
             let mask: Vec<bool> = source
                 .col_names
                 .iter()
@@ -175773,6 +177325,35 @@ fn for_each_function_call_in_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
     }
 }
 
+thread_local! {
+    static CURRENT_JOIN_USING_SKIP_INDICES: RefCell<Vec<Arc<HashSet<usize>>>> = const { RefCell::new(Vec::new()) };
+}
+
+struct JoinUsingSkipGuard;
+
+impl JoinUsingSkipGuard {
+    fn push(skip: &HashSet<usize>) -> Self {
+        CURRENT_JOIN_USING_SKIP_INDICES.with(|stack| {
+            stack.borrow_mut().push(Arc::new(skip.clone()));
+        });
+        Self
+    }
+}
+
+impl Drop for JoinUsingSkipGuard {
+    fn drop(&mut self) {
+        let popped = CURRENT_JOIN_USING_SKIP_INDICES.with(|stack| stack.borrow_mut().pop());
+        drop(popped);
+    }
+}
+
+fn with_current_join_using_skip_indices<T>(
+    f: impl FnOnce(Option<&HashSet<usize>>) -> T,
+) -> T {
+    let current = CURRENT_JOIN_USING_SKIP_INDICES.with(|stack| stack.borrow().last().cloned());
+    f(current.as_deref())
+}
+
 fn resolve_join_expr_column_index(
     col_ref: &ColumnRef,
     col_map: &[(String, String, bool)],
@@ -175785,7 +177366,14 @@ fn resolve_join_expr_column_index(
 
     #[cfg(test)]
     FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(counter.get().wrapping_add(1)));
-    find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None)
+    with_current_join_using_skip_indices(|using_skip| {
+        find_col_in_map(
+            col_map,
+            col_ref.table.as_deref(),
+            &col_ref.column,
+            using_skip,
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -176153,7 +177741,15 @@ fn resolve_hash_join_column_index(
     let Expr::Column(col_ref, _) = expr else {
         return None;
     };
-    find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None).ok()
+    with_current_join_using_skip_indices(|using_skip| {
+        find_col_in_map(
+            col_map,
+            col_ref.table.as_deref(),
+            &col_ref.column,
+            using_skip,
+        )
+        .ok()
+    })
 }
 
 fn try_extract_equi_join_pair(
@@ -176814,6 +178410,8 @@ fn execute_single_join(
     constraint: Option<&JoinConstraint>,
     col_map: &[(String, String, bool)],
     using_left_slots: Option<&[SmallVec<[usize; 4]>]>,
+    left_using_skip: Option<&HashSet<usize>>,
+    right_using_skip: Option<&HashSet<usize>>,
 ) -> Result<Vec<Vec<SqliteValue>>> {
     let combined_width = left_width + right_width;
 
@@ -176823,7 +178421,7 @@ fn execute_single_join(
     let _bindings_guard = match constraint {
         Some(JoinConstraint::On(expr)) if !expr_has_any_subquery(expr) => {
             let mut bindings = JoinExprBindings::default();
-            bindings.bind_expr(expr, col_map, None);
+            bindings.bind_expr(expr, col_map, left_using_skip);
             Some(JoinExprBindingsGuard::push(bindings))
         }
         _ => None,
@@ -176872,7 +178470,14 @@ fn execute_single_join(
     // Combined-row (left, right) indices of each USING term; the left index is
     // the first coalesce() slot when `using_left_slots` is given.
     let using_indices = if let Some(JoinConstraint::Using(cols)) = constraint {
-        using_term_indices(cols, col_map, left_width, using_left_slots)
+        using_term_indices(
+            cols,
+            col_map,
+            left_width,
+            using_left_slots,
+            left_using_skip,
+            right_using_skip,
+        )
     } else {
         None
     };
@@ -176931,7 +178536,15 @@ fn execute_single_join(
                 Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &scratch, col_map)?,
                 Some(JoinConstraint::Using(cols)) => using_indices.as_deref().map_or_else(
                     || {
-                        eval_using_constraint(cols, &scratch, col_map, left_width, using_left_slots)
+                        eval_using_constraint(
+                            cols,
+                            &scratch,
+                            col_map,
+                            left_width,
+                            using_left_slots,
+                            left_using_skip,
+                            right_using_skip,
+                        )
                     },
                     |indices| eval_using_constraint_terms(indices, using_left_slots, &scratch),
                 ),
@@ -177762,6 +179375,8 @@ fn using_term_indices(
     col_map: &[(String, String, bool)],
     left_width: usize,
     left_slots: Option<&[SmallVec<[usize; 4]>]>,
+    left_skip: Option<&HashSet<usize>>,
+    right_skip: Option<&HashSet<usize>>,
 ) -> Option<Vec<(usize, usize)>> {
     cols.iter()
         .enumerate()
@@ -177770,12 +179385,24 @@ fn using_term_indices(
                 Some(slots) => slots.get(term)?.first().copied()?,
                 None => col_map[..left_width]
                     .iter()
-                    .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))?,
+                    .enumerate()
+                    .find(|(idx, (_, name, hidden))| {
+                        !*hidden
+                            && !left_skip.is_some_and(|s| s.contains(idx))
+                            && name.eq_ignore_ascii_case(col_name)
+                    })
+                    .map(|(idx, _)| idx)?,
             };
             let right_idx = col_map[left_width..]
                 .iter()
-                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))?;
-            Some((left_idx, left_width + right_idx))
+                .enumerate()
+                .find(|(rel_idx, (_, name, hidden))| {
+                    !*hidden
+                        && !right_skip.is_some_and(|s| s.contains(rel_idx))
+                        && name.eq_ignore_ascii_case(col_name)
+                })
+                .map(|(rel_idx, _)| left_width + rel_idx)?;
+            Some((left_idx, right_idx))
         })
         .collect()
 }
@@ -177800,8 +179427,10 @@ fn eval_using_constraint(
     col_map: &[(String, String, bool)],
     left_width: usize,
     left_slots: Option<&[SmallVec<[usize; 4]>]>,
+    left_skip: Option<&HashSet<usize>>,
+    right_skip: Option<&HashSet<usize>>,
 ) -> bool {
-    using_term_indices(cols, col_map, left_width, left_slots)
+    using_term_indices(cols, col_map, left_width, left_slots, left_skip, right_skip)
         .is_some_and(|indices| eval_using_constraint_terms(&indices, left_slots, combined_row))
 }
 
@@ -181185,7 +182814,9 @@ fn eval_join_expr_with_using(
     col_map: &[(String, String, bool)],
     using_skip: Option<&HashSet<usize>>,
 ) -> Result<SqliteValue> {
-    let _ = using_skip;
+    let _skip_guard = using_skip
+        .filter(|skip| !skip.is_empty())
+        .map(JoinUsingSkipGuard::push);
     eval_join_expr(expr, row, col_map)
 }
 
@@ -181204,7 +182835,7 @@ fn validate_join_select_column_references(
             validate_join_column_references(
                 expr,
                 col_map,
-                None,
+                using_skip,
                 &match_table_names,
                 fts5_rank_table_names,
             )?;
@@ -181233,7 +182864,7 @@ fn validate_join_select_column_references(
             ResultColumn::TableStar(name) => {
                 if !sources
                     .iter()
-                    .any(|source| source_matches_name(source, name))
+                    .any(|source| source_contains_named_source(source, name))
                 {
                     return Err(FrankenError::FunctionError(format!(
                         "no such table: {name}"
@@ -181611,13 +183242,23 @@ fn validate_join_frame_bound_column_references(
 /// argument may name: each FROM table's own name, as stock's hidden column is
 /// named after the table (an alias does not rename it).
 fn join_match_table_names<'a>(sources: &[&'a TableOrSubquery]) -> Vec<&'a str> {
-    sources
-        .iter()
-        .filter_map(|source| match source {
-            TableOrSubquery::Table { name, .. } => Some(name.name.as_str()),
-            _ => None,
-        })
-        .collect()
+    fn collect<'a>(source: &'a TableOrSubquery, out: &mut Vec<&'a str>) {
+        match source {
+            TableOrSubquery::Table { name, .. } => out.push(name.name.as_str()),
+            TableOrSubquery::ParenJoin(from) => {
+                collect(&from.source, out);
+                for join in &from.joins {
+                    collect(&join.table, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = Vec::new();
+    for source in sources {
+        collect(source, &mut names);
+    }
+    names
 }
 
 fn is_join_match_table_operand(expr: &Expr, table_names: &[&str]) -> bool {
