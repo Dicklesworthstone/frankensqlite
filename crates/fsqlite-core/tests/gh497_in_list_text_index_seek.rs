@@ -266,6 +266,225 @@ fn text_in_list_seeks_the_index_and_matches_stock() {
     });
 }
 
+/// bd-xz5f4: the direct COUNT(*) lane must use comparison affinity, not the
+/// REAL column's storage affinity, when building its literal membership set.
+#[test]
+fn direct_count_in_list_preserves_numeric_probe_precision() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = if file_backed {
+                dir.path().join("count-affinity.db").to_str().unwrap().to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let frank = Connection::open(&path).await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            for affinity in ["REAL", "INTEGER", "NUMERIC"] {
+                let table = format!("keys_{affinity}");
+                for sql in [
+                    format!("CREATE TABLE {table}(id INTEGER PRIMARY KEY, k {affinity})"),
+                    format!("CREATE INDEX {table}_k ON {table}(k)"),
+                    format!(
+                        "INSERT INTO {table} VALUES \
+                         (1,9007199254740992),(2,9007199254740993), \
+                         (3,9223372036854775807),(4,9223372036854775808.0), \
+                         (5,-9223372036854775808),(6,-9007199254740993), \
+                         (7,1),(8,1.0),(9,1.5),(10,NULL),(11,'word'),(12,X'31')"
+                    ),
+                ] {
+                    frank.execute(&sql).await.unwrap();
+                    stock.execute_batch(&sql).unwrap();
+                }
+                // HAVING uses the connection evaluator and hydrates the row
+                // mirror. The following direct queries can then take the
+                // HashSet count lane instead of only exercising VDBE codegen.
+                let warm = format!(
+                    "SELECT id FROM {table} GROUP BY id HAVING count(*) > 0"
+                );
+                assert_eq!(
+                    frank_rows(&frank.query(&warm).await.unwrap()),
+                    stock_rows(&stock, &warm, &[])
+                );
+                for members in [
+                    "9007199254740993",
+                    "'9007199254740993'",
+                    "9007199254740992,9007199254740993",
+                    "9007199254740992.0,'9007199254740993',NULL",
+                    "9223372036854775807",
+                    "'9223372036854775807'",
+                    "9223372036854775808.0",
+                    "'-9223372036854775808'",
+                    "'-9007199254740993'",
+                    "1,1.0,'1',NULL,1",
+                    "1.5,'word',X'31'",
+                    "NULL,NULL",
+                ] {
+                    let sql = format!("SELECT count(*) FROM {table} WHERE k IN ({members})");
+                    let expected = stock_rows(&stock, &sql, &[]);
+                    assert_eq!(
+                        frank_rows(&frank.query(&sql).await.unwrap()),
+                        expected,
+                        "direct file_backed={file_backed}: {sql}"
+                    );
+                    assert_eq!(
+                        frank_rows(&frank.prepare(&sql).await.unwrap().query().await.unwrap()),
+                        expected,
+                        "prepared file_backed={file_backed}: {sql}"
+                    );
+                }
+                let sql = format!("SELECT count(*) FROM {table} WHERE k IN (?1, ?2, NULL)");
+                let prepared = frank.prepare(&sql).await.unwrap();
+                for params in [
+                    vec![
+                        SqliteValue::Integer(9_007_199_254_740_993),
+                        SqliteValue::Text("9007199254740993".into()),
+                    ],
+                    vec![
+                        SqliteValue::Integer(i64::MAX),
+                        SqliteValue::Text(i64::MAX.to_string().into()),
+                    ],
+                    vec![SqliteValue::Integer(i64::MIN), SqliteValue::Null],
+                    vec![SqliteValue::Integer(1), SqliteValue::Float(1.0)],
+                ] {
+                    let expected = stock_rows(&stock, &sql, &params);
+                    assert_eq!(
+                        frank_rows(&frank.query_with_params(&sql, &params).await.unwrap()),
+                        expected,
+                        "bound direct file_backed={file_backed}: {sql}, {params:?}"
+                    );
+                    assert_eq!(
+                        frank_rows(&prepared.query_with_params(&params).await.unwrap()),
+                        expected,
+                        "bound prepared file_backed={file_backed}: {sql}, {params:?}"
+                    );
+                }
+            }
+            frank.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn direct_count_in_list_preserves_aggregate_filter_and_window() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = if file_backed {
+                dir.path().join("count-filter.db").to_str().unwrap().to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let frank = Connection::open(&path).await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE filtered(id INTEGER PRIMARY KEY, k REAL)",
+                "CREATE INDEX filtered_k ON filtered(k)",
+                "INSERT INTO filtered VALUES (1,1),(2,1),(3,2),(4,NULL),(5,2),(6,3)",
+            ] {
+                frank.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            let warm = "SELECT id FROM filtered GROUP BY id HAVING count(*) > 0";
+            assert_eq!(
+                frank_rows(&frank.query(warm).await.unwrap()),
+                stock_rows(&stock, warm, &[])
+            );
+            for sql in [
+                "SELECT count(*) FILTER (WHERE 0) FROM filtered WHERE k IN (1,2)",
+                "SELECT count(*) FILTER (WHERE NULL) FROM filtered WHERE k IN (1,2)",
+                "SELECT count(*) FILTER (WHERE id % 2 = 0) FROM filtered WHERE k IN (1,2)",
+                "SELECT count(*) FILTER (WHERE k < 2) FROM filtered WHERE k IN (1,1.0,2,NULL)",
+                "SELECT count(*) FILTER (WHERE 1) FROM filtered WHERE k IN (NULL)",
+                "SELECT count(*) OVER () FROM filtered WHERE k IN (1,2)",
+                "SELECT count(*) FILTER (WHERE id % 2 = 0) OVER () FROM filtered WHERE k IN (1,2)",
+            ] {
+                let expected = stock_rows(&stock, sql, &[]);
+                assert_eq!(
+                    frank_rows(&frank.query(sql).await.unwrap()),
+                    expected,
+                    "direct file_backed={file_backed}: {sql}"
+                );
+                assert_eq!(
+                    frank_rows(&frank.prepare(sql).await.unwrap().query().await.unwrap()),
+                    expected,
+                    "prepared file_backed={file_backed}: {sql}"
+                );
+            }
+            frank.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn direct_count_in_list_honors_an_overridden_binary_collation() {
+    struct AsciiFoldBinary;
+
+    impl fsqlite_func::collation::CollationFunction for AsciiFoldBinary {
+        fn name(&self) -> &str {
+            "BINARY"
+        }
+
+        fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+            left.iter()
+                .map(u8::to_ascii_lowercase)
+                .cmp(right.iter().map(u8::to_ascii_lowercase))
+        }
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = if file_backed {
+                dir.path().join("count-collation.db").to_str().unwrap().to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let frank = Connection::open(&path).await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE labels(id INTEGER PRIMARY KEY, k TEXT)",
+                "INSERT INTO labels VALUES (1,'A'),(2,'a'),(3,'b'),(4,NULL)",
+            ] {
+                frank.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            let warm = "SELECT id FROM labels GROUP BY id HAVING count(*) > 0";
+            assert_eq!(
+                frank_rows(&frank.query(warm).await.unwrap()),
+                stock_rows(&stock, warm, &[])
+            );
+            for overridden in [false, true] {
+                if overridden {
+                    frank.register_collation_function(AsciiFoldBinary);
+                }
+                for members in ["'a'", "'A','B'", "'A','a','B',NULL"] {
+                    let sql = format!("SELECT count(*) FROM labels WHERE k IN ({members})");
+                    // The application override has SQLite's ASCII NOCASE
+                    // semantics; use that built-in as an independent oracle.
+                    let oracle_sql = if overridden {
+                        format!("SELECT count(*) FROM labels WHERE k COLLATE NOCASE IN ({members})")
+                    } else {
+                        sql.clone()
+                    };
+                    let expected = stock_rows(&stock, &oracle_sql, &[]);
+                    assert_eq!(
+                        frank_rows(&frank.query(&sql).await.unwrap()),
+                        expected,
+                        "direct file_backed={file_backed}, overridden={overridden}: {sql}"
+                    );
+                    assert_eq!(
+                        frank_rows(&frank.prepare(&sql).await.unwrap().query().await.unwrap()),
+                        expected,
+                        "prepared file_backed={file_backed}, overridden={overridden}: {sql}"
+                    );
+                }
+            }
+            frank.close().await.unwrap();
+        }
+    });
+}
+
 /// bd-in-or-index-scan-fs7nd: selective IN/OR predicates must seek REAL,
 /// NUMERIC and TEXT indexes for both row-producing and aggregate queries.
 /// Mixed storage classes, numeric aliases and NULLs exercise the probe set's

@@ -26048,6 +26048,8 @@ impl Connection {
             name,
             args: FunctionArgs::Star,
             distinct: false,
+            filter: None,
+            over: None,
             ..
         } = expr
         else {
@@ -26119,7 +26121,7 @@ impl Connection {
         {
             return Ok(None);
         }
-        let (root_page, col_idx, rowid_alias_column_index, column_affinity) = {
+        let (root_page, col_idx, rowid_alias_column_index, comparison_affinity) = {
             let schema = self.schema.borrow();
             let table = schema
                 .iter()
@@ -26139,6 +26141,7 @@ impl Connection {
                 .collation
                 .as_deref()
                 .is_some_and(|collation| !collation.eq_ignore_ascii_case("BINARY"))
+                || !lock_unpoisoned(&self.collation_registry).uses_builtin_implementation("BINARY")
             {
                 return Ok(None);
             }
@@ -26151,7 +26154,11 @@ impl Connection {
                 table.root_page,
                 col_idx,
                 rowid_alias,
-                Self::type_affinity_for_direct_insert(column.affinity),
+                TypeAffinity::comparison_affinity(
+                    Self::type_affinity_for_direct_insert(column.affinity),
+                    TypeAffinity::Blob,
+                )
+                .unwrap_or(TypeAffinity::Blob),
             )
         };
         let mut set: std::collections::HashSet<SqliteValueHashable> =
@@ -26170,11 +26177,11 @@ impl Connection {
                 Literal::False => SqliteValue::Integer(0),
                 _ => return Ok(None),
             };
-            // C SQLite applies the column's affinity to both sides of an
-            // `x IN (...)` comparison, so `n IN ('1')` (INTEGER column) matches
-            // `n = 1` and `label IN (1)` (TEXT column) matches `label = '1'`.
-            // The probed column value below is coerced with the same affinity.
-            let sv = sv.apply_affinity(column_affinity);
+            // IN-list members have no affinity. The column contributes its
+            // comparison affinity: INTEGER and REAL both apply NUMERIC, so an
+            // integer probe beyond 2^53 must not round to a neighboring REAL
+            // key (bd-xz5f4). TEXT still converts numbers to their text form.
+            let sv = sv.apply_affinity(comparison_affinity);
             set.insert(SqliteValueHashable(sv));
         }
         if set.is_empty() {
@@ -26196,7 +26203,7 @@ impl Connection {
                         col_idx,
                         rowid_alias_column_index,
                     )
-                    .apply_affinity(column_affinity);
+                    .apply_affinity(comparison_affinity);
                     set.contains(&SqliteValueHashable(val))
                 })
                 .count(),
