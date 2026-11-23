@@ -7658,6 +7658,34 @@ enum PragmaSchemaScope {
     Temp,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PragmaCatalogObject {
+    Relation,
+    Index,
+}
+
+fn pragma_catalog_object(name: &str) -> Option<PragmaCatalogObject> {
+    if ["index_info", "index_xinfo"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        Some(PragmaCatalogObject::Index)
+    } else if [
+        "table_info",
+        "table_xinfo",
+        "index_list",
+        "foreign_key_list",
+        "foreign_key_check",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        Some(PragmaCatalogObject::Relation)
+    } else {
+        None
+    }
+}
+
 fn pragma_schema_scope(pragma: &fsqlite_ast::PragmaStatement) -> PragmaSchemaScope {
     match pragma.name.schema.as_deref() {
         Some(schema) if schema.eq_ignore_ascii_case("main") => PragmaSchemaScope::Main,
@@ -24529,17 +24557,12 @@ impl Connection {
                     } else {
                         None
                     };
-                    rewritten.name.schema = pragma
-                        .name
-                        .name
-                        .eq_ignore_ascii_case("table_list")
-                        .then(|| {
-                            // An attached schema is the delegated connection's
-                            // `main`; retaining that scope prevents its
-                            // connection-local TEMP catalog from leaking into
-                            // `PRAGMA aux.table_list`.
-                            "main".to_owned()
-                        });
+                    // The named attachment is the child connection's main
+                    // catalog. Keep qualified introspection in that catalog.
+                    rewritten.name.schema =
+                        (pragma.name.name.eq_ignore_ascii_case("table_list")
+                            || pragma_catalog_object(&pragma.name.name).is_some())
+                        .then(|| "main".to_owned());
                     let mut rows = self
                         .with_attached_connection_async(&target_schema, async |conn| {
                             if cache_header_write_forbidden {
@@ -91964,6 +91987,70 @@ impl Connection {
 
     // ── PRAGMA handling ────────────────────────────────────────────────
 
+    async fn find_pragma_catalog(
+        &self,
+        mut matches: impl FnMut(&Self, PragmaSchemaScope) -> bool,
+    ) -> Result<Option<String>> {
+        for (name, scope) in [("temp", PragmaSchemaScope::Temp), ("main", PragmaSchemaScope::Main)] {
+            if matches(self, scope) {
+                return Ok(Some(name.to_owned()));
+            }
+        }
+        let attached = self.attached_schemas.borrow().all_schemas().into_iter()
+            .skip(2).map(str::to_owned).collect::<Vec<_>>();
+        for name in attached {
+            let found = self.with_attached_connection_async(&name, async |child| {
+                child.background_status()?;
+                child.settle_pending_transaction_cleanup().await?;
+                let cx = child.op_cx_after_background_status();
+                child.refresh_prepared_schema_state(&cx, true).await?;
+                Ok(matches(child, PragmaSchemaScope::Main))
+            }).await?;
+            if found {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn resolve_named_pragma_catalog(
+        &self,
+        object: PragmaCatalogObject,
+        name: &str,
+    ) -> Result<Option<String>> {
+        if object == PragmaCatalogObject::Index {
+            // A named index in any schema wins before the WITHOUT ROWID
+            // table-name fallback, even if that table is in TEMP or main.
+            let index_schema = self.find_pragma_catalog(|conn, scope| {
+                conn.pragma_table_schemas_for_scope(scope).iter().any(|table| {
+                    table.indexes.iter().any(|index| index.name.eq_ignore_ascii_case(name))
+                        || (table.without_rowid
+                            && parse_autoindex_ordinal(name, &table.name).is_some_and(|ordinal| {
+                                pragma_without_rowid_pk_ordinal(table) == Some(ordinal)
+                            }))
+                })
+            }).await?;
+            if index_schema.is_some() {
+                return Ok(index_schema);
+            }
+        }
+        self.find_pragma_catalog(|conn, scope| {
+            // Even an indexless or FK-free local relation stops the lookup.
+            conn.table_exists_for_scope(name, scope) || conn.view_index_for_scope(name, scope).is_some()
+        }).await
+    }
+
+    async fn execute_pragma_in_attached_catalog(
+        &self,
+        schema: &str,
+        mut pragma: fsqlite_ast::PragmaStatement,
+    ) -> Result<Vec<Row>> {
+        pragma.name.schema = Some("main".to_owned());
+        self.with_attached_connection_async(schema, async move |child| {
+            child.execute_statement(&Statement::Pragma(pragma), None).await
+        }).await
+    }
+
     fn pragma_table_schemas_for_scope(&self, scope: PragmaSchemaScope) -> Vec<TableSchema> {
         let temp_names = self.temp_table_names.borrow();
         let schema = self.schema.borrow();
@@ -92036,9 +92123,23 @@ impl Connection {
     ///   Inspect/reset JIT scaffold metrics and cache state.
     #[allow(clippy::too_many_lines)]
     async fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<Vec<Row>> {
+        let pragma_name = pragma.name.name.to_ascii_lowercase();
+        let mut qualified = None;
+        if pragma.name.schema.is_none()
+            && let Some(object) = pragma_catalog_object(&pragma_name)
+            && let Some(argument) = pragma.value.as_ref().and_then(pragma_identifier_text)
+            && let Some(schema) = self.resolve_named_pragma_catalog(object, argument).await?
+        {
+            if !is_builtin_schema(&schema) {
+                return self.execute_pragma_in_attached_catalog(&schema, pragma.clone()).await;
+            }
+            let mut routed = pragma.clone();
+            routed.name.schema = Some(schema);
+            qualified = Some(routed);
+        }
+        let pragma = qualified.as_ref().unwrap_or(pragma);
         let result_columns = pragma_result_columns(pragma);
         // First try connection-level knobs (journal_mode, synchronous, etc.).
-        let pragma_name = pragma.name.name.to_ascii_lowercase();
         let pragma_schema = pragma
             .name
             .schema
@@ -94306,8 +94407,9 @@ impl Connection {
                     // reports one row per view OUTPUT column
                     // (bd-pragma-table-info-view-decltype-moufi).
                     None => {
+                        let scope = pragma_schema_scope(pragma);
                         let view = self
-                            .view_index_for_scope(&table_name, pragma_schema_scope(pragma))
+                            .view_index_for_scope(&table_name, scope)
                             .and_then(|idx| self.views.borrow().get(idx).cloned());
                         match view {
                             Some(view) => {
@@ -94317,13 +94419,20 @@ impl Connection {
                                 // fails here as it does when selected from.
                                 SelectRelationResolver::new(self).validate_local_catalog_relation(
                                     &table_name,
-                                    pragma_schema_scope(pragma),
+                                    scope,
                                     "main",
                                     || table_name.clone(),
                                 )?;
+                                // A TEMP view may refer to main tables. Its
+                                // own catalog does not constrain its sources.
+                                let source_tables = if scope == PragmaSchemaScope::Temp {
+                                    Cow::Owned(self.pragma_table_schemas_for_scope(PragmaSchemaScope::Unqualified))
+                                } else {
+                                    Cow::Borrowed(tables.as_slice())
+                                };
                                 Ok(self.build_view_table_info_rows(
                                     &view,
-                                    &tables,
+                                    &source_tables,
                                     full_name == "table_xinfo",
                                 ))
                             }
@@ -94398,15 +94507,7 @@ impl Connection {
                         // auto-index number missing from the persisted set, spliced
                         // into creation order so the reversal matches stock's
                         // ordering. (GH #344 / bd-sn184)
-                        if t.without_rowid {
-                            let persisted: std::collections::BTreeSet<usize> = t
-                                .indexes
-                                .iter()
-                                .filter_map(|idx| parse_autoindex_ordinal(&idx.name, &t.name))
-                                .collect();
-                            if let Some(pk_ordinal) =
-                                (1..=persisted.len() + 1).find(|n| !persisted.contains(n))
-                            {
+                        if let Some(pk_ordinal) = pragma_without_rowid_pk_ordinal(t) {
                                 let name = format!("sqlite_autoindex_{}_{pk_ordinal}", t.name);
                                 let pos = entries
                                     .iter()
@@ -94416,7 +94517,6 @@ impl Connection {
                                     })
                                     .unwrap_or(entries.len());
                                 entries.insert(pos, (name, 1, "pk", 0, false));
-                            }
                         }
 
                         // Stock lists `Table.pIndex`: newest first, except that
@@ -94580,14 +94680,7 @@ impl Connection {
                     }
                     // The PK auto-index ordinal is the one number missing from the
                     // persisted auto-index set — the same choice index_list makes.
-                    let persisted: std::collections::BTreeSet<usize> = table
-                        .indexes
-                        .iter()
-                        .filter_map(|idx| parse_autoindex_ordinal(&idx.name, &table.name))
-                        .collect();
-                    let Some(pk_ordinal) =
-                        (1..=persisted.len() + 1).find(|n| !persisted.contains(n))
-                    else {
+                    let Some(pk_ordinal) = pragma_without_rowid_pk_ordinal(table) else {
                         continue;
                     };
                     let pk_name = format!("sqlite_autoindex_{}_{pk_ordinal}", table.name);
@@ -94691,6 +94784,7 @@ impl Connection {
                 // rather than silently returning zero rows. (GH #261)
                 if let Some(name) = &only_table
                     && !schema.iter().any(|t| t.name.eq_ignore_ascii_case(name))
+                    && self.view_index_for_scope(name, check_scope).is_none()
                 {
                     return Err(FrankenError::NoSuchTable { name: name.clone() });
                 }
@@ -103715,7 +103809,7 @@ impl Connection {
         } else {
             None
         };
-        let mut stmt = fsqlite_ast::PragmaStatement {
+        let stmt = fsqlite_ast::PragmaStatement {
             name: fsqlite_ast::QualifiedName {
                 schema,
                 name: pragma_name,
@@ -103728,11 +103822,7 @@ impl Connection {
             })
         })?;
         let rows = if let Some(attached) = attached {
-            stmt.name.schema = Some("main".to_owned());
-            self.with_attached_connection_async(&attached, async move |conn| {
-                conn.execute_statement(&Statement::Pragma(stmt), None).await
-            })
-            .await?
+            self.execute_pragma_in_attached_catalog(&attached, stmt).await?
         } else {
             self.execute_pragma(&stmt).await?
         };
@@ -146280,6 +146370,16 @@ fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> 
     (ordinal.to_string() == suffix).then_some(ordinal)
 }
 
+fn pragma_without_rowid_pk_ordinal(table: &TableSchema) -> Option<usize> {
+    if !table.without_rowid {
+        return None;
+    }
+    let persisted: std::collections::BTreeSet<_> = table.indexes.iter()
+        .filter_map(|index| parse_autoindex_ordinal(&index.name, &table.name))
+        .collect();
+    (1..=persisted.len() + 1).find(|ordinal| !persisted.contains(ordinal))
+}
+
 fn column_def_declared_collation(column: &fsqlite_ast::ColumnDef) -> Option<String> {
     // SQLite applies the final column COLLATE clause when a malformed-but-
     // accepted declaration repeats it. Use the same effective collation for
@@ -171179,19 +171279,20 @@ fn parse_pragma_float(value: &fsqlite_ast::PragmaValue, what: &str) -> Result<f6
 
 /// Parse a PRAGMA value as an uppercased identifier string.
 fn parse_pragma_identifier(value: &fsqlite_ast::PragmaValue, what: &str) -> Result<String> {
+    pragma_identifier_text(value)
+        .map(str::to_ascii_uppercase)
+        .ok_or_else(|| FrankenError::Internal(format!("PRAGMA {what} must be an identifier")))
+}
+
+fn pragma_identifier_text(value: &fsqlite_ast::PragmaValue) -> Option<&str> {
     let expr = match value {
         fsqlite_ast::PragmaValue::Assign(e) | fsqlite_ast::PragmaValue::Call(e) => e,
     };
-    let text = match expr {
-        Expr::Literal(Literal::String(s), _) => s.clone(),
-        Expr::Column(col_ref, _) if col_ref.table.is_none() => col_ref.column.to_string(),
-        _ => {
-            return Err(FrankenError::Internal(format!(
-                "PRAGMA {what} must be an identifier"
-            )));
-        }
-    };
-    Ok(text.to_ascii_uppercase())
+    match expr {
+        Expr::Literal(Literal::String(s), _) => Some(s),
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(&col_ref.column),
+        _ => None,
+    }
 }
 
 /// Parse a PRAGMA value as a checkpoint mode.

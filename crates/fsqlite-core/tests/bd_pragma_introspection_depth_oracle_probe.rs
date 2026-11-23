@@ -346,6 +346,129 @@ fn pragma_tvf_identifiers_stop_at_the_first_nul() {
 }
 
 #[test]
+fn unqualified_metadata_pragmas_follow_catalog_precedence() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "PRAGMA foreign_keys=OFF",
+            "ATTACH ':memory:' AS first_db",
+            "ATTACH ':memory:' AS second_db",
+            "CREATE TABLE first_db.only_attached(first_col INTEGER)",
+            "CREATE TABLE second_db.only_attached(second_col TEXT)",
+            "CREATE INDEX first_db.attached_idx ON only_attached(first_col)",
+            "CREATE INDEX second_db.attached_idx ON only_attached(second_col)",
+            "CREATE TABLE first_db.parent(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE first_db.orphan(fid INTEGER REFERENCES parent(id))",
+            "INSERT INTO first_db.orphan VALUES (123)",
+            "CREATE TABLE main.same_name(local_pk INTEGER PRIMARY KEY) WITHOUT ROWID",
+            "CREATE INDEX first_db.same_name ON orphan(fid)",
+            "CREATE TABLE first_db.wr(attached_pk INTEGER PRIMARY KEY, spare) WITHOUT ROWID",
+            "CREATE TABLE main.wr(local_col INTEGER)",
+            "CREATE TABLE main.view_shadow(main_col TEXT)",
+            "CREATE TEMP VIEW view_shadow AS SELECT 1 AS temp_col",
+            "CREATE TEMP VIEW temp_type AS SELECT local_col FROM main.wr",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+        let mut diffs = Vec::new();
+        for (setup, queries) in [
+            (None, &[
+                "PRAGMA table_info('only_attached')",
+                "PRAGMA index_info('attached_idx')",
+                "PRAGMA foreign_key_check('orphan')",
+                "SELECT name FROM pragma_table_info('only_attached',NULL)",
+                "SELECT name FROM pragma_table_xinfo('only_attached')",
+                "SELECT name FROM pragma_table_info('only_attached','second_db')",
+                "SELECT name FROM pragma_index_list('only_attached')",
+                "SELECT name FROM pragma_index_xinfo('attached_idx') WHERE key=1",
+                "SELECT name FROM pragma_index_info('same_name')",
+                "SELECT count(*) FROM pragma_index_info('wr')",
+                "SELECT name FROM pragma_index_info('wr','first_db')",
+                "SELECT name FROM pragma_index_info('sqlite_autoindex_wr_1')",
+                "SELECT \"from\" FROM pragma_foreign_key_list('orphan')",
+                "SELECT \"table\" FROM pragma_foreign_key_check('orphan')",
+                "SELECT count(*) FROM pragma_foreign_key_check()",
+                "SELECT name FROM pragma_table_info('view_shadow')",
+                "SELECT count(*) FROM pragma_foreign_key_check('view_shadow')",
+                    "SELECT type FROM pragma_table_info('temp_type')",
+            ][..]),
+            (Some("CREATE TEMP TABLE only_attached(temp_col INTEGER)"), &[
+                "SELECT name FROM pragma_table_info('only_attached')",
+                "SELECT count(*) FROM pragma_index_list('only_attached')",
+                "SELECT name FROM pragma_index_info('attached_idx')",
+                "SELECT name FROM pragma_table_info('only_attached','first_db')",
+            ][..]),
+            (Some("CREATE TEMP TABLE orphan(other_col INTEGER)"), &[
+                "SELECT count(*) FROM pragma_foreign_key_list('orphan')",
+                "SELECT count(*) FROM pragma_foreign_key_check('orphan')",
+                "SELECT \"table\" FROM pragma_foreign_key_check('orphan','first_db')",
+            ][..]),
+        ] {
+            if let Some(sql) = setup {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in queries {
+                let expected = rq(&r, sql);
+                assert_ne!(expected, vec![vec!["ERR"]], "stock: {sql}");
+                let direct = fq(&f, sql).await;
+                let prepared = match f.prepare(sql).await {
+                    Ok(statement) => statement.query().await.map(|rows| {
+                        rows.iter().map(|row| row.values().iter().map(tag_f).collect()).collect::<Vec<Vec<String>>>()
+                    }),
+                    Err(error) => Err(error),
+                };
+                if direct != expected || prepared.as_ref().ok() != Some(&expected) {
+                    diffs.push(format!("{sql}: direct={direct:?}, prepared={prepared:?}, stock={expected:?}"));
+                }
+            }
+        }
+        f.execute("DETACH second_db").await.unwrap();
+        f.execute("DETACH first_db").await.unwrap();
+        f.close().await.unwrap();
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    });
+}
+
+#[test]
+fn metadata_pragma_lookup_refreshes_an_attached_file_catalog() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let frank_path = dir.path().join("frank-catalog.db");
+        let stock_path = dir.path().join("stock-catalog.db");
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let attach = "ATTACH ?1 AS peer";
+        f.execute_with_params(attach, &[SqliteValue::from(frank_path.to_str().unwrap())])
+            .await.unwrap();
+        r.execute(attach, [stock_path.to_str().unwrap()]).unwrap();
+        let sql = "SELECT name FROM pragma_table_info('new_table')";
+        let held = f.prepare(sql).await.unwrap();
+        let mut stock_held = r.prepare(sql).unwrap();
+        assert!(held.query().await.unwrap().is_empty());
+        assert!(!stock_held.exists([]).unwrap());
+
+        let frank_peer = Connection::open(frank_path.to_str().unwrap()).await.unwrap();
+        let stock_peer = rusqlite::Connection::open(&stock_path).unwrap();
+        let ddl = "CREATE TABLE new_table(external_column INTEGER)";
+        frank_peer.execute(ddl).await.unwrap();
+        stock_peer.execute(ddl, []).unwrap();
+        frank_peer.close().await.unwrap();
+        let stock = stock_held.query_row([], |row| row.get::<_, String>(0)).unwrap();
+        assert_eq!(stock, "external_column");
+        assert_eq!(fq(&f, sql).await, vec![vec![format!("text:{stock}")]]);
+        let rows = held.query().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values(), &[SqliteValue::from(stock.as_str())]);
+        drop(held);
+        f.execute("DETACH peer").await.unwrap();
+        f.close().await.unwrap();
+    });
+}
+
+#[test]
 fn gh512_pragma_table_info_quoted_and_parenthesized_pk_ordinals() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
