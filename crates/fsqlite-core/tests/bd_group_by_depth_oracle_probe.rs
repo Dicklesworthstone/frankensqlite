@@ -70,6 +70,161 @@ fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 }
 
 #[test]
+fn group_by_rejects_unknown_columns_before_reading_rows() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let fpath = dir.path().join("frank-group-by-names.db");
+            let rpath = dir.path().join("sqlite-group-by-names.db");
+            let f = Connection::open(if file_backed {
+                fpath.to_str().unwrap()
+            } else {
+                ":memory:"
+            })
+            .await
+            .unwrap();
+            let r = if file_backed {
+                rusqlite::Connection::open(rpath).unwrap()
+            } else {
+                rusqlite::Connection::open_in_memory().unwrap()
+            };
+            let create = "CREATE TABLE t(k INTEGER)";
+            f.execute(create).await.unwrap();
+            r.execute(create, []).unwrap();
+            let mut mismatches = Vec::new();
+            for populated in [false, true] {
+                if populated {
+                    let insert = "INSERT INTO t VALUES (1),(1),(2)";
+                    f.execute(insert).await.unwrap();
+                    r.execute(insert, []).unwrap();
+                }
+                for sql in [
+                    "SELECT k,count(*) FROM t GROUP BY missing.k",
+                    "SELECT k,count(*) FROM t GROUP BY abs(missing.k)",
+                    "SELECT k,count(*) FROM t AS x GROUP BY t.k",
+                    "SELECT k,count(*) FROM t GROUP BY t.absent",
+                    "SELECT k,count(*) FROM t GROUP BY absent",
+                    "SELECT k,count(*) FROM t WHERE 0 GROUP BY missing.k",
+                ] {
+                    let Err(stock_error) = r.prepare(sql) else {
+                        panic!("stock must reject the name in {sql}");
+                    };
+                    let stock_message = match stock_error {
+                        rusqlite::Error::SqlInputError { msg, .. }
+                        | rusqlite::Error::SqliteFailure(_, Some(msg)) => msg,
+                        other => panic!("unexpected stock error for {sql}: {other}"),
+                    };
+                    assert!(stock_message.starts_with("no such column: "));
+                    let actual = f.query(sql).await.err().map(|error| error.to_string());
+                    if actual.as_deref() != Some(stock_message.as_str()) {
+                        mismatches.push(format!("direct {sql} on populated={populated}: {actual:?} vs {stock_message}"));
+                    }
+                    let prepared = f.prepare(sql).await.err().map(|error| error.to_string());
+                    if prepared.as_deref() != Some(stock_message.as_str()) {
+                        mismatches.push(format!("prepare {sql} on populated={populated}: {prepared:?} vs {stock_message}"));
+                    }
+                }
+                for sql in [
+                    "SELECT k AS label,count(*) FROM t GROUP BY label ORDER BY label",
+                    "SELECT k,count(*) FROM t AS x GROUP BY x.k ORDER BY x.k",
+                    "SELECT k,count(*) FROM t GROUP BY 1 ORDER BY 1",
+                    "SELECT rowid,count(*) FROM t GROUP BY _rowid_ ORDER BY rowid",
+                    "SELECT count(*) FROM t GROUP BY \"literal\"",
+                    "SELECT k,count(*) FROM t GROUP BY \"k\" ORDER BY k",
+                ] {
+                    let expected = rq(&r, sql);
+                    assert_eq!(fq(&f, sql).await, expected, "{sql}");
+                    let statement = f.prepare(sql).await.unwrap();
+                    let rows = statement.query().await.unwrap();
+                    let actual: Vec<Vec<String>> = rows
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect();
+                    assert_eq!(actual, expected, "{sql}");
+                }
+            }
+            f.close().await.unwrap();
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        }
+    });
+}
+
+#[test]
+fn prepared_group_by_retries_quoted_literals_and_rebinds_after_ddl() {
+    use rusqlite::config::DbConfig;
+
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = "SELECT count(*) FROM t GROUP BY \"label\" ORDER BY 1";
+        for setup in [
+            "CREATE TABLE t(k INTEGER)",
+            "INSERT INTO t VALUES (1),(1),(2)",
+        ] {
+            f.execute(setup).await.unwrap();
+            r.execute(setup, []).unwrap();
+        }
+        let held = f.prepare(sql).await.unwrap();
+        let mut stock_held = r.prepare(sql).unwrap();
+        assert_eq!(
+            held.query().await.unwrap()[0].values(),
+            &[SqliteValue::Integer(3)]
+        );
+        assert_eq!(stock_held.query_row([], |row| row.get::<_, i64>(0)).unwrap(), 3);
+
+        let named_sql = "SELECT \"a'b\", count(*) FROM t GROUP BY \"a'b\"";
+        let named = f.prepare(named_sql).await.unwrap();
+        let stock_named = r.prepare(named_sql).unwrap();
+        let stock_names: Vec<_> = stock_named.column_names().map(str::to_owned).collect();
+        assert_eq!(named.column_names(), stock_names);
+        assert_eq!(
+            named.query().await.unwrap()[0].values(),
+            &[SqliteValue::from("a'b"), SqliteValue::Integer(3)]
+        );
+        drop(named);
+
+        f.execute("PRAGMA fsqlite.dqs = OFF").await.unwrap();
+        r.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false).unwrap();
+        let Err(error) = f.prepare(sql).await else {
+            panic!("prepare succeeded while DQS was disabled");
+        };
+        assert_eq!(error.to_string(), "no such column: label");
+        assert!(r.prepare(sql).is_err());
+        let held_error = held.query().await.unwrap_err();
+        assert_eq!(held_error.to_string(), "no such column: label");
+        assert!(stock_held.query_row([], |row| row.get::<_, i64>(0)).is_err());
+        f.execute("PRAGMA fsqlite.dqs = ON").await.unwrap();
+        r.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, true).unwrap();
+
+        for change in [
+            "ALTER TABLE t ADD COLUMN label INTEGER",
+            "UPDATE t SET label=k",
+        ] {
+            f.execute(change).await.unwrap();
+            r.execute(change, []).unwrap();
+        }
+        let actual: Vec<_> = held
+            .query()
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect();
+        let expected: Vec<_> = stock_held
+            .query_map([], |row| row.get::<_, i64>(0).map(SqliteValue::Integer))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, [SqliteValue::Integer(1), SqliteValue::Integer(2)]);
+        drop(held);
+        f.close().await.unwrap();
+    });
+}
+
+#[test]
 fn group_by_depth_match_rusqlite_oracle() {
     let _serial = serial();
     asupersync::test_utils::run_test(|| async {

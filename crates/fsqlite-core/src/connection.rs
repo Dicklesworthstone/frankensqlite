@@ -32365,14 +32365,30 @@ impl Connection {
             FSQLITE_PREPARED_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
         }
         record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, lookup_start);
-        // bd-u608s: a prepare that fails on a missing target names it as the
-        // statement wrote it. Parsed again only on that error path.
-        let prepared = self.prepare_uncached(sql).await.map_err(|error| {
-            match parse_single_statement(sql) {
-                Ok(statement) => Self::qualify_missing_target_table(error, &statement),
-                Err(_) => error,
+        let mut effective_sql = Cow::Borrowed(sql);
+        let mut rewritten_names = HashSet::new();
+        let prepared = loop {
+            match self.prepare_uncached(&effective_sql, sql).await {
+                Ok(prepared) => break prepared,
+                Err(error) => {
+                    if self.dqs_enabled.get()
+                        && effective_sql.contains('"')
+                        && self.dqs_single_statement(&effective_sql)
+                        && let Some(rewritten) =
+                            Self::dqs_rewrite_once(&effective_sql, &error, &mut rewritten_names)
+                    {
+                        effective_sql = Cow::Owned(rewritten);
+                        continue;
+                    }
+                    // bd-u608s: a failed prepare names a missing target as it
+                    // appeared in the original statement.
+                    return Err(match parse_single_statement(sql) {
+                        Ok(statement) => Self::qualify_missing_target_table(error, &statement),
+                        Err(_) => error,
+                    });
+                }
             }
-        })?;
+        };
         let cache_insert_start = profile_enabled.then(Instant::now);
         // User module metadata callbacks may re-register a callable while
         // uncached preparation is in progress, advancing the registry
@@ -32393,7 +32409,12 @@ impl Connection {
         Ok(prepared)
     }
 
-    async fn prepare_uncached(&self, sql: &str) -> Result<PreparedStatement<'_>> {
+    async fn prepare_uncached(&self, sql: &str, original_sql: &str) -> Result<PreparedStatement<'_>> {
+        let name_source = if sql == original_sql {
+            None
+        } else {
+            Some(self.cached_parse_single(original_sql)?)
+        };
         for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
             let parsed = {
                 let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
@@ -32414,7 +32435,7 @@ impl Connection {
             // bd-nnnd8: a schema or control statement runs from its text at
             // each step, so none of the query preparation below applies.
             if is_prepared_schema_statement(parsed.as_ref()) {
-                return self.prepare_schema_statement(sql, parsed.as_ref());
+                return self.prepare_schema_statement(original_sql, parsed.as_ref());
             }
             // bd-at0bx: bind `schema.table.column` references before
             // validation and compilation, as the direct execute path does.
@@ -32510,7 +32531,13 @@ impl Connection {
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
             let prepared_result = self
-                .compile_and_wrap(&canonical_sql, sql, &statement, parsed)
+                .compile_and_wrap(
+                    &canonical_sql,
+                    original_sql,
+                    &statement,
+                    parsed,
+                    name_source.as_deref(),
+                )
                 .await;
 
             // User module metadata callbacks are deliberately reentrant and
@@ -32572,6 +32599,7 @@ impl Connection {
         // Safe: `dqs_rewrite_once` only splices when an actual double-quoted token
         // of that name exists, so a bare unquoted typo still errors.
         let msg = match err {
+            FrankenError::NoSuchColumn { name } => return Some(name.clone()),
             FrankenError::Internal(m)
             | FrankenError::NotImplemented(m)
             | FrankenError::FunctionError(m) => m.as_str(),
@@ -52865,26 +52893,29 @@ impl Connection {
         original_sql: &str,
         statement: &Statement,
         original_statement: &Statement,
+        name_source: Option<&Statement>,
     ) -> Result<PreparedStatement<'_>> {
         // Column metadata can invoke user vtab factories, which may re-register
         // modules or functions. Finish every callback-capable metadata lookup
         // before snapshotting the callable registry and its generation.
         let (mut prepared_column_names, mut result_column_widths) =
             self.prepared_statement_column_names(statement);
+        let source_statement = name_source.unwrap_or(original_statement);
         // A rewrite (a flattened FROM subquery) can spell out the `*` of the
         // statement the names overlay; count the original's columns then.
         if !result_column_widths_fit(
-            original_statement,
+            source_statement,
             &result_column_widths,
             prepared_column_names.len(),
         ) {
-            result_column_widths = self.prepared_statement_column_names(original_statement).1;
+            result_column_widths = self.prepared_statement_column_names(source_statement).1;
         }
         overlay_result_expression_source_names(
             &mut prepared_column_names,
             &result_column_widths,
-            original_statement,
+            source_statement,
             original_sql,
+            name_source.map_or(&[], |_| statement_result_columns(original_statement)),
         );
         let prepared_query_fast_path = self.prepared_query_fast_path(statement);
         let may_observe_change_tracking = self.statement_may_observe_change_tracking(statement);
@@ -92526,7 +92557,9 @@ impl Connection {
             "fsqlite.dqs" | "dqs" => {
                 if let Some(ref val) = pragma.value {
                     let enabled = parse_pragma_bool(val)?;
-                    self.dqs_enabled.set(enabled);
+                    if self.dqs_enabled.replace(enabled) != enabled {
+                        self.expire_prepared_statements_for_pragma_flag();
+                    }
                     Ok(vec![Row {
                         values: vec![SqliteValue::Integer(i64::from(enabled))],
                     }])
@@ -130818,21 +130851,27 @@ fn overlay_result_expression_source_names(
     widths: &[usize],
     original: &Statement,
     sql: &str,
+    effective_columns: &[ResultColumn],
 ) {
-    match original {
-        Statement::Select(select) => {
-            overlay_select_result_expression_source_names(names, widths, select, sql);
-        }
-        Statement::Insert(insert) => {
-            overlay_result_column_source_names(names, widths, &insert.returning, sql);
-        }
-        Statement::Update(update) => {
-            overlay_result_column_source_names(names, widths, &update.returning, sql);
-        }
-        Statement::Delete(delete) => {
-            overlay_result_column_source_names(names, widths, &delete.returning, sql);
-        }
-        _ => {}
+    overlay_result_column_source_names(
+        names,
+        widths,
+        statement_result_columns(original),
+        sql,
+        effective_columns,
+    );
+}
+
+fn statement_result_columns(statement: &Statement) -> &[ResultColumn] {
+    match statement {
+        Statement::Select(select) => match &select.body.select {
+            SelectCore::Select { columns, .. } => columns,
+            SelectCore::Values(_) => &[],
+        },
+        Statement::Insert(insert) => &insert.returning,
+        Statement::Update(update) => &update.returning,
+        Statement::Delete(delete) => &delete.returning,
+        _ => &[],
     }
 }
 
@@ -130841,16 +130880,7 @@ fn overlay_result_expression_source_names(
 /// `*` (it does not read the widths then), else when the widths are one per
 /// result column and account for every name.
 fn result_column_widths_fit(original: &Statement, widths: &[usize], name_count: usize) -> bool {
-    let columns: &[ResultColumn] = match original {
-        Statement::Select(select) => match &select.body.select {
-            SelectCore::Select { columns, .. } => columns,
-            SelectCore::Values(_) => return true,
-        },
-        Statement::Insert(insert) => &insert.returning,
-        Statement::Update(update) => &update.returning,
-        Statement::Delete(delete) => &delete.returning,
-        _ => return true,
-    };
+    let columns = statement_result_columns(original);
     !columns
         .iter()
         .any(|column| matches!(column, ResultColumn::Star | ResultColumn::TableStar(_)))
@@ -130869,7 +130899,7 @@ fn overlay_select_result_expression_source_names(
     let SelectCore::Select { columns, .. } = &select.body.select else {
         return;
     };
-    overlay_result_column_source_names(names, widths, columns, sql);
+    overlay_result_column_source_names(names, widths, columns, sql, &[]);
 }
 
 /// Name each unaliased, non-column result expression of `columns` (a SELECT
@@ -130881,6 +130911,7 @@ fn overlay_result_column_source_names(
     widths: &[usize],
     columns: &[ResultColumn],
     sql: &str,
+    effective_columns: &[ResultColumn],
 ) {
     let has_star = columns
         .iter()
@@ -130908,7 +130939,18 @@ fn overlay_result_column_source_names(
         let ResultColumn::Expr { expr, alias: None } = column else {
             continue;
         };
-        if matches!(expr, Expr::Column(..)) || (has_star && widths[index] != 1) {
+        // A quoted name that became a literal uses the original expression
+        // text for its label. Its rewritten span belongs to different SQL.
+        let became_literal = matches!(
+            effective_columns.get(index),
+            Some(ResultColumn::Expr {
+                expr: Expr::Literal(..),
+                ..
+            })
+        );
+        if (matches!(expr, Expr::Column(..)) && !became_literal)
+            || (has_star && widths[index] != 1)
+        {
             continue;
         }
         let tokens = tokens.get_or_insert_with(|| Lexer::tokenize(sql));
@@ -134780,18 +134822,15 @@ fn single_table_scan_source<'s, 'q>(
 /// source-layout diagnostics. CTE and derived-table scopes matter even when
 /// their bodies contain no scalar/EXISTS/IN expression node.
 fn select_requires_column_reference_preflight(select: &SelectStatement, conn: &Connection) -> bool {
-    // bd-x25ka(b): a HAVING clause is name/aggregate-resolved by stock at prepare
-    // (`HAVING nosuchcol` raises `no such column`), but the simple-query execution
-    // path never resolved it — only WHERE / JOIN-ON did (bd-kcvra). The full
-    // column-reference resolver DOES validate HAVING; run it whenever a HAVING is
-    // present so the dead-branch resolution errors surface like stock.
-    fn core_has_having(core: &SelectCore) -> bool {
+    // GROUP BY and HAVING bind names before execution. Grouping can otherwise
+    // accept a missing column when the scan produces no rows or lose its
+    // qualifier when the evaluator reports the error. Use the same resolver
+    // for both clauses so aliases and name errors are independent of row data.
+    fn core_has_grouping_clause(core: &SelectCore) -> bool {
         matches!(
             core,
-            SelectCore::Select {
-                having: Some(_),
-                ..
-            }
+            SelectCore::Select { group_by, having, .. }
+                if !group_by.is_empty() || having.is_some()
         )
     }
     // A window function's inline OVER (PARTITION BY / ORDER BY <col>) column
@@ -134806,11 +134845,11 @@ fn select_requires_column_reference_preflight(select: &SelectStatement, conn: &C
                 ResultColumn::Expr { expr, .. } if expr_has_window_function(expr))))
     }
     select.with.is_some()
-        || core_has_having(&select.body.select)
+        || core_has_grouping_clause(&select.body.select)
         || select_core_has_derived_source(&select.body.select)
         || core_has_window_function(&select.body.select)
         || select.body.compounds.iter().any(|(_, core)| {
-            core_has_having(core)
+            core_has_grouping_clause(core)
                 || select_core_has_derived_source(core)
                 || core_has_window_function(core)
         })
