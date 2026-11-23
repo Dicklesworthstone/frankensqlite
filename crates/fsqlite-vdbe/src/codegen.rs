@@ -32140,8 +32140,8 @@ fn index_eq_residual_seek_target<'a, 't>(
 type IndexEqSeekTarget<'a, 't> = (&'t IndexSchema, Vec<(&'a Expr, char)>, bool);
 
 /// [`index_eq_residual_seek_target`], extended (GH#434) to an index whose
-/// every key column is pinned by an equality with a literal, a numbered or
-/// named parameter, or a constant expression over those (bd-aavtp), such as
+/// every key column is pinned by an equality with a literal, a numbered
+/// parameter, or a constant expression over those (bd-aavtp), such as
 /// the autoindex of a composite PRIMARY KEY.
 ///
 /// Only the full key qualifies: the probe `(v1, ..., vn, i64::MIN)` then
@@ -32154,6 +32154,12 @@ fn index_key_eq_residual_seek_target<'a, 't>(
     table: &'t TableSchema,
     table_alias: Option<&str>,
 ) -> Option<IndexEqSeekTarget<'a, 't>> {
+    // Index probes can emit a later WHERE term before earlier parameters
+    // (GH #541). Raw anonymous/named parameters need source-order emission;
+    // Connection compilation canonicalizes them to numbered slots first.
+    if where_clause.is_some_and(expr_contains_non_numbered_placeholder) {
+        return None;
+    }
     if let Some((idx, target, aff, has_residual)) =
         index_eq_residual_seek_target(where_clause, table, table_alias)
     {
@@ -54725,6 +54731,122 @@ mod tests {
                 Opcode::Halt,
             ]
         ));
+    }
+
+    fn gh541_raw_text_key_dml_program(sql: &str) -> crate::VdbeProgram {
+        let mut schema = test_schema_with_text_index();
+        schema[0].columns = vec![
+            ColumnInfo::basic("k", 'B', false),
+            ColumnInfo::basic("a", 'B', false),
+            ColumnInfo::basic("v", 'B', false),
+        ];
+        schema[0].columns[1].notnull = true;
+        schema[0].primary_key_constraints = vec![vec!["k".to_owned()]];
+        schema[0].indexes[0].name = "sqlite_autoindex_t_1".to_owned();
+        schema[0].indexes[0].columns = vec!["k".to_owned()];
+        schema[0].indexes[0].key_expressions = vec!["k".to_owned()];
+        schema[0].indexes[0].is_unique = true;
+
+        let (statement, consumed) = parse_first_statement_with_tail(sql)
+            .expect("GH#541 DML must parse")
+            .expect("GH#541 SQL must contain a statement");
+        assert_eq!(consumed, sql.len(), "unparsed SQL: {sql}");
+        let mut builder = ProgramBuilder::new();
+        let ctx = CodegenContext::default();
+        // Exercise the exported code generators directly, before Connection
+        // compilation canonicalizes anonymous/named parameters to ?NNN.
+        match statement {
+            Statement::Update(stmt) => codegen_update(&mut builder, &stmt, &schema, &ctx),
+            Statement::Delete(stmt) => codegen_delete(&mut builder, &stmt, &schema, &ctx),
+            _ => panic!("expected UPDATE or DELETE: {sql}"),
+        }
+        .unwrap_or_else(|error| panic!("codegen failed for {sql}: {error}"));
+        builder
+            .finish()
+            .unwrap_or_else(|error| panic!("unresolved program for {sql}: {error}"))
+    }
+
+    #[test]
+    fn gh541_raw_dml_non_numbered_where_preserves_slots() {
+        for (sql, expected_slots) in [
+            ("UPDATE t SET v = ? WHERE a = ? AND k = ?", vec![2, 3, 1]),
+            ("UPDATE t SET v = 'new' WHERE a = ? AND k = ?", vec![1, 2]),
+            ("DELETE FROM t WHERE a = ? AND k = ?", vec![1, 2]),
+            ("DELETE FROM t WHERE a = :a AND k = :key", vec![1, 2]),
+        ] {
+            let program = gh541_raw_text_key_dml_program(sql);
+            let ops = program.ops();
+            let slots: Vec<i32> = ops
+                .iter()
+                .filter(|op| op.opcode == Opcode::Variable)
+                .map(|op| op.p1)
+                .collect();
+            assert_eq!(
+                slots, expected_slots,
+                "WHERE must retain textual bind slots, offset past SET parameters: {sql}"
+            );
+            let table_cursor = ops
+                .iter()
+                .find(|op| {
+                    op.opcode == Opcode::OpenWrite
+                        && matches!(&op.p4, P4::Table(name) if name == "t")
+                })
+                .expect("DML must open its target table")
+                .p1;
+            assert!(
+                ops.iter()
+                    .any(|op| op.opcode == Opcode::Rewind && op.p1 == table_cursor),
+                "raw non-numbered WHERE must keep the source-order table scan: {sql}"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+                "index probes require stable bind slots before reordering WHERE terms: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn gh541_numbered_dml_retains_text_key_seek() {
+        for (sql, expected_slots) in [
+            (
+                "UPDATE t SET v = ?1 WHERE a = ?2 AND k = ?3",
+                vec![3, 2, 3, 1],
+            ),
+            (
+                "UPDATE t SET v = 'new' WHERE a = ?1 AND k = ?2",
+                vec![2, 1, 2],
+            ),
+            ("DELETE FROM t WHERE a = ?1 AND k = ?2", vec![2, 1, 2]),
+        ] {
+            let program = gh541_raw_text_key_dml_program(sql);
+            let ops = program.ops();
+            let slots: Vec<i32> = ops
+                .iter()
+                .filter(|op| op.opcode == Opcode::Variable)
+                .map(|op| op.p1)
+                .collect();
+            assert_eq!(
+                slots, expected_slots,
+                "the index probe and residual must use the key's original bind slot: {sql}"
+            );
+            let index_cursor = ops
+                .iter()
+                .find(|op| {
+                    op.opcode == Opcode::OpenRead
+                        && matches!(&op.p4, P4::Index(name) if name == "sqlite_autoindex_t_1")
+                })
+                .expect("numbered DML must open the TEXT primary-key index")
+                .p1;
+            assert!(
+                ops.iter()
+                    .any(|op| op.opcode == Opcode::SeekGE && op.p1 == index_cursor),
+                "numbered parameters must retain the optimized index seek: {sql}"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+                "numbered DML must not scan the target table: {sql}"
+            );
+        }
     }
 
     #[test]
