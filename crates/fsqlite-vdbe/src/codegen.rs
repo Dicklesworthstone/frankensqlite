@@ -6105,13 +6105,15 @@ fn composite_equality_scan_extra_prefix<'e>(
 /// key bounds. A single-column ASC index stores one key value's entries in
 /// rowid order (the key is `(value, rowid)`), so the walk starts at the lower
 /// bound (descending: the upper) and leaves once the rowid passes the other,
-/// as stock does for `SEARCH ... USING INDEX i (a=? AND rowid>?)`. Both bounds
-/// are treated as inclusive here; the residual filter applies the exact
-/// predicate, so an exclusive bound's own rowid is still rejected there.
+/// as stock does for `SEARCH ... USING INDEX i (a=? AND rowid>?)`. Consumers
+/// retaining a residual filter may use an inclusive superset. A covering
+/// aggregate must apply the recorded inclusivity exactly (bd-qrn03).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct IndexEqRowidBounds {
     lower: Option<i64>,
     upper: Option<i64>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
 }
 
 impl IndexEqRowidBounds {
@@ -6131,6 +6133,8 @@ impl IndexEqRowidBounds {
                 .upper
                 .as_ref()
                 .and_then(|bound| integer_literal(bound.expr)),
+            lower_inclusive: range.lower.is_some_and(|bound| bound.inclusive),
+            upper_inclusive: range.upper.is_some_and(|bound| bound.inclusive),
         };
         (bounds.lower.is_some() || bounds.upper.is_some()).then_some(bounds)
     }
@@ -21817,6 +21821,47 @@ fn aggregate_index_prefix_residual_target<'t, 'e>(
     None
 }
 
+/// Whether the pinned equality prefix and rowid bounds enforce every WHERE
+/// conjunct, allowing a covering aggregate to omit the table read and filter.
+/// Only the exact equality terms selected for the probe are consumed here:
+/// a second equality on the same column may contradict the first. Rowid
+/// bounds must all be integer literals, with at most one per side. The
+/// residual extractor may merge repeated bounds or retain only a literal
+/// side, neither of which proves that the entire predicate was enforced.
+fn index_prefix_rowid_bounds_cover_where(
+    where_clause: Option<&Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+    prefix: &[&Expr],
+    bounds: IndexEqRowidBounds,
+) -> bool {
+    let Some(where_expr) = where_clause else {
+        return false;
+    };
+    if prefix.len() != index.key_term_count() {
+        return false;
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    let mut range = RowidRangeTarget::default();
+    for term in conjuncts {
+        let pins_key = prefix.iter().enumerate().any(|(pos, value)| {
+            extract_index_column_equality_expr(term, table, table_alias, &index.columns[pos])
+                .is_some_and(|probe| std::ptr::eq(probe, *value))
+                && index_equality_term_uses_key_collation(term, table, table_alias, index, pos)
+        });
+        if !pins_key && !collect_rowid_range_bounds(term, Some(table), table_alias, &mut range) {
+            return false;
+        }
+    }
+    [range.lower, range.upper]
+        .into_iter()
+        .flatten()
+        .all(|bound| matches!(bound.expr, Expr::Literal(Literal::Integer(_), _)))
+        && IndexEqRowidBounds::from_range(&range) == Some(bounds)
+}
+
 fn expr_contains_function_call(expr: &Expr) -> bool {
     match expr {
         // JSON operators are SQL-visible scalar function calls (`->`/`->>`)
@@ -24311,9 +24356,20 @@ fn codegen_select_aggregate(
     } else if let Some((idx_schema, prefix_exprs, rowid_bounds)) = index_prefix_residual_seek {
         // bd-agg-leading-eq-residual: seek the storage-class-exact equality-prefix block, then apply
         // the full WHERE per row so the residual predicate is enforced (no dropped-predicate bug),
-        // and accumulate. Always non-covering — the residual filter reads table columns.
+        // and accumulate. bd-qrn03: when the prefix and exact rowid bounds enforce every conjunct,
+        // covering aggregates read only the index; all other shapes retain the table filter.
         // bd-z3a05: `rowid_bounds` is set only when the prefix pins every key column, so the
         // next record field is the rowid and the block is in rowid order.
+        let covering = rowid_bounds.is_some_and(|bounds| {
+            index_prefix_rowid_bounds_cover_where(
+                where_clause,
+                table,
+                table_alias,
+                idx_schema,
+                &prefix_exprs,
+                bounds,
+            )
+        }) && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
         let idx_cursor = 1_i32;
         let duplicate_run_done = b.emit_label();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -24378,14 +24434,16 @@ fn codegen_select_aggregate(
             0,
         );
 
-        b.emit_op(
-            Opcode::OpenRead,
-            cursor,
-            table.root_page,
-            0,
-            P4::Table(table.name.clone()),
-            0,
-        );
+        if !covering {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+        }
         b.emit_op(
             Opcode::OpenRead,
             idx_cursor,
@@ -24395,7 +24453,13 @@ fn codegen_select_aggregate(
             0,
         );
         b.emit_jump_to_label(
-            Opcode::SeekGE,
+            if rowid_floor.is_some()
+                && rowid_bounds.is_some_and(|bounds| !bounds.lower_inclusive)
+            {
+                Opcode::SeekGT
+            } else {
+                Opcode::SeekGE
+            },
             idx_cursor,
             probe_record_reg,
             finalize_label,
@@ -24425,12 +24489,18 @@ fn codegen_select_aggregate(
 
         let skip_label = b.emit_label();
         let rowid_reg = b.alloc_reg();
-        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        if !covering || rowid_ceiling_reg.is_some() {
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        }
         // bd-z3a05: the block is in rowid order, so once an entry's rowid
         // passes the ceiling no later entry can satisfy the WHERE.
         if let Some(ceiling_reg) = rowid_ceiling_reg {
             b.emit_jump_to_label(
-                Opcode::Gt,
+                if rowid_bounds.is_some_and(|bounds| bounds.upper_inclusive) {
+                    Opcode::Gt
+                } else {
+                    Opcode::Ge
+                },
                 ceiling_reg,
                 rowid_reg,
                 duplicate_run_done,
@@ -24438,37 +24508,47 @@ fn codegen_select_aggregate(
                 0,
             );
         }
-        b.emit_jump_to_label(
-            Opcode::SeekRowid,
-            cursor,
-            rowid_reg,
-            skip_label,
-            P4::None,
-            0,
-        );
-        // Apply the whole WHERE — the prefix equalities are redundant with the
-        // seek but harmless; the residual conjuncts are the point.
-        if let Some(where_expr) = where_clause {
-            emit_where_filter(
+        if covering {
+            emit_aggregate_accumulate_body_covering(
                 b,
-                where_expr,
+                idx_cursor,
+                idx_schema,
+                table,
+                &agg_columns,
+                accum_base,
+            );
+        } else {
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                skip_label,
+                P4::None,
+                0,
+            );
+            // The prefix is redundant, but other conjuncts may require the table row.
+            if let Some(where_expr) = where_clause {
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    skip_label,
+                );
+            }
+            emit_aggregate_accumulate_body(
+                b,
                 cursor,
                 table,
                 table_alias,
                 schema,
-                skip_label,
+                &agg_columns,
+                accum_base,
+                bare_capture,
             );
         }
-        emit_aggregate_accumulate_body(
-            b,
-            cursor,
-            table,
-            table_alias,
-            schema,
-            &agg_columns,
-            accum_base,
-            bare_capture,
-        );
 
         b.resolve_label(skip_label);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]

@@ -70,7 +70,11 @@ async fn opens_index(c: &Connection, sql: &str, index: &str) -> bool {
 }
 
 async fn setup() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").await.unwrap();
+    setup_at(":memory:").await
+}
+
+async fn setup_at(path: &str) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(path).await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     let mut ddl = vec![
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT);".to_owned(),
@@ -218,11 +222,11 @@ async fn explain_ops(c: &Connection, sql: &str) -> Vec<(String, i64)> {
 }
 
 /// The field count of the index seek's probe record: the last `MakeRecord`
-/// before the first `SeekGE`/`SeekLE`.
+/// before the first range seek.
 fn seek_probe_fields(ops: &[(String, i64)]) -> Option<i64> {
     let seek = ops
         .iter()
-        .position(|(op, _)| op == "SeekGE" || op == "SeekLE")?;
+        .position(|(op, _)| matches!(op.as_str(), "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT"))?;
     ops[..seek]
         .iter()
         .rev()
@@ -231,10 +235,10 @@ fn seek_probe_fields(ops: &[(String, i64)]) -> Option<i64> {
 }
 
 /// Whether the walk leaves the key's block once the rowid passes a ceiling:
-/// an `IdxRowid` immediately followed by a `Gt` jump.
+/// an `IdxRowid` immediately followed by a `Gt` or `Ge` jump.
 fn has_rowid_ceiling(ops: &[(String, i64)]) -> bool {
     ops.windows(2)
-        .any(|pair| pair[0].0 == "IdxRowid" && pair[1].0 == "Gt")
+        .any(|pair| pair[0].0 == "IdxRowid" && matches!(pair[1].0.as_str(), "Gt" | "Ge"))
 }
 
 /// Whether the index seek's probe record carries a second field (the rowid
@@ -486,6 +490,163 @@ fn eq_rowid_bounded_aggregates_seek_the_index_and_match_sqlite() {
             "`{param}`"
         );
     });
+}
+
+/// bd-qrn03: when the equality prefix and exact rowid bounds enforce the
+/// entire WHERE, aggregates over the key columns or rowid need no table read.
+/// Bounds deliberately land on matching entries, so strict/inclusive mistakes
+/// change the oracle answer rather than only the generated plan.
+#[test]
+fn eq_rowid_bounded_covering_aggregates_avoid_table_reads() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("covering-rowid-bounds.db");
+        for path in [":memory:", path.to_str().unwrap()] {
+            assert_eq_rowid_bounded_covering_aggregates(path).await;
+        }
+    });
+}
+
+async fn assert_eq_rowid_bounded_covering_aggregates(path: &str) {
+    let (f, r) = setup_at(path).await;
+    let covering = [
+        ("SELECT count(*) FROM t WHERE a = 5 AND id > 105", "t_a"),
+        ("SELECT count(*) FROM t WHERE a = 5 AND id >= 105", "t_a"),
+        ("SELECT count(*) FROM t WHERE a = 5 AND id < 305", "t_a"),
+        ("SELECT count(*) FROM t WHERE a = 5 AND id <= 305", "t_a"),
+        (
+            "SELECT count(*), sum(id), min(id), max(id) FROM t \
+             WHERE a = 5 AND id > 105 AND id <= 305",
+            "t_a",
+        ),
+        (
+            "SELECT count(a), sum(a), count(DISTINCT a), sum(id) FROM t \
+             WHERE a = 5 AND id BETWEEN 105 AND 305",
+            "t_a",
+        ),
+        (
+            "SELECT count(*), sum(id) FROM t WHERE a = 5 AND id BETWEEN 305 AND 105",
+            "t_a",
+        ),
+        (
+            "SELECT count(*), sum(id) FROM t WHERE a = 99 AND id > 105",
+            "t_a",
+        ),
+        (
+            "SELECT count(*), sum(q.rowid) FROM t AS q \
+             WHERE 5 = q.a AND 105 < q.rowid AND 305 >= q.rowid",
+            "t_a",
+        ),
+        (
+            "SELECT count(x), min(x), max(x), sum(id) FROM t \
+             WHERE x = 'v3' AND id > 101 AND id < 304",
+            "t_x",
+        ),
+        (
+            "SELECT count(*), sum(a), sum(c), sum(id) FROM u \
+             WHERE a = 5 AND c = 3 AND id > 165 AND id <= 345",
+            "u_ac",
+        ),
+    ];
+    for (sql, index) in covering {
+        assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
+        let ops = explain_ops(&f, sql).await;
+        assert!(
+            opens_index(&f, sql, index).await,
+            "`{sql}` must seek {index}"
+        );
+        assert!(
+            !ops.iter().any(|(op, _)| op == "SeekRowid"),
+            "bd-qrn03: `{sql}` must accumulate from the index without a table lookup"
+        );
+        assert_eq!(
+            ops.iter().filter(|(op, _)| op == "OpenRead").count(),
+            1,
+            "bd-qrn03: `{sql}` must open only the covering index"
+        );
+    }
+
+    // Unenforced predicates, repeated bounds, contradictory equalities,
+    // and aggregates that need a non-key column keep the residual filter.
+    for sql in [
+        "SELECT count(*) FROM t WHERE a = 5 AND id > 105 AND c = 3",
+        "SELECT count(*) FROM t WHERE a = 5 AND id > 105 AND id >= 305",
+        "SELECT count(*) FROM t WHERE a = 5 AND id < 305 AND id <= 105",
+        "SELECT count(*) FROM t WHERE a = 5 AND a = 6 AND id > 105",
+        "SELECT sum(c), count(*) FROM t WHERE a = 5 AND id > 105",
+        "SELECT sum(id) FILTER (WHERE c = 3) FROM t WHERE a = 5 AND id > 105",
+    ] {
+        assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
+        assert!(
+            explain_ops(&f, sql)
+                .await
+                .iter()
+                .any(|(op, _)| op == "SeekRowid"),
+            "bd-qrn03: `{sql}` still needs the table row"
+        );
+    }
+
+    // Without equality on c, u_ac is ordered by c before rowid and
+    // cannot enforce the rowid bounds as a covering prefix walk.
+    let partial_prefix = "SELECT count(*), sum(id) FROM u WHERE a = 5 AND id > 105 AND id <= 305";
+    assert_eq!(
+        frank_rows(&f, partial_prefix).await,
+        sqlite_rows(&r, partial_prefix),
+        "`{partial_prefix}`"
+    );
+    assert!(!has_rowid_ceiling(&explain_ops(&f, partial_prefix).await));
+
+    // A partial index can supply the equality run, but c = 3 remains
+    // outside the exact prefix/bounds proof and must retain its filter.
+    for statement in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER)",
+        "CREATE INDEX p_a ON p(a) WHERE c = 3",
+        "INSERT INTO p SELECT id, a, c FROM t",
+    ] {
+        f.execute(statement).await.unwrap();
+        r.execute_batch(statement).unwrap();
+    }
+    let partial_index = "SELECT count(*) FROM p WHERE a = 5 AND id > 105 AND c = 3";
+    assert_eq!(
+        frank_rows(&f, partial_index).await,
+        sqlite_rows(&r, partial_index),
+        "`{partial_index}`"
+    );
+    assert!(opens_index(&f, partial_index, "p_a").await);
+    assert!(
+        explain_ops(&f, partial_index)
+            .await
+            .iter()
+            .any(|(op, _)| op == "SeekRowid"),
+        "bd-qrn03: `{partial_index}` must retain the residual table filter"
+    );
+
+    // An exclusive maximum bound cannot be implemented by incrementing
+    // the integer: it must reject the last representable rowid as well.
+    for statement in [
+        "CREATE TABLE edge (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE INDEX edge_a ON edge(a)",
+        "INSERT INTO edge VALUES (9223372036854775806, 5), (9223372036854775807, 5)",
+    ] {
+        f.execute(statement).await.unwrap();
+        r.execute_batch(statement).unwrap();
+    }
+    for sql in [
+        "SELECT count(*) FROM edge WHERE a = 5 AND id > 9223372036854775807",
+        "SELECT count(*) FROM edge WHERE a = 5 AND id >= 9223372036854775807",
+        "SELECT count(*) FROM edge WHERE a = 5 AND id < 9223372036854775807",
+        "SELECT count(*) FROM edge WHERE a = 5 AND id <= 9223372036854775807",
+    ] {
+        assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
+        assert!(
+            !explain_ops(&f, sql)
+                .await
+                .iter()
+                .any(|(op, _)| op == "SeekRowid"),
+            "bd-qrn03: `{sql}` must remain covering at the integer boundary"
+        );
+    }
+    f.close().await.unwrap();
 }
 
 /// The P4 operands of the program's `Int64` instructions.
