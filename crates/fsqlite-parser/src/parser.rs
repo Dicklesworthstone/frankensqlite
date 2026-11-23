@@ -1335,7 +1335,7 @@ impl Parser {
                 joins.push(JoinClause {
                     join_type: JoinType {
                         natural: false,
-                        kind: JoinKind::Cross,
+                        kind: JoinKind::Inner,
                     },
                     table,
                     constraint,
@@ -3476,7 +3476,7 @@ mod tests {
         values
     }
 
-    fn only_join(select: &SelectStatement) -> &JoinClause {
+    fn only_join(select: &SelectStatement, expected_kind: JoinKind) -> &JoinClause {
         let SelectCore::Select {
             from: Some(from), ..
         } = &select.body.select
@@ -3486,7 +3486,7 @@ mod tests {
         let [join] = from.joins.as_slice() else {
             panic!("expected exactly one join");
         };
-        assert_eq!(join.join_type.kind, JoinKind::Cross);
+        assert_eq!(join.join_type.kind, expected_kind);
         assert!(!join.join_type.natural);
         join
     }
@@ -3495,7 +3495,7 @@ mod tests {
     fn test_comma_join_accepts_on_constraint_and_consumes_full_statement() {
         let select = parse_full_select("SELECT * FROM a, b ON a.id = b.id");
         assert!(matches!(
-            &only_join(&select).constraint,
+            &only_join(&select, JoinKind::Inner).constraint,
             Some(JoinConstraint::On(Expr::BinaryOp {
                 op: fsqlite_ast::BinaryOp::Eq,
                 ..
@@ -3507,7 +3507,7 @@ mod tests {
     fn test_comma_join_accepts_using_constraint_and_consumes_full_statement() {
         let select = parse_full_select("SELECT * FROM a, b USING(id)");
         assert!(matches!(
-            &only_join(&select).constraint,
+            &only_join(&select, JoinKind::Inner).constraint,
             Some(JoinConstraint::Using(columns))
                 if columns.len() == 1 && columns[0] == "id"
         ));
@@ -3517,7 +3517,7 @@ mod tests {
     fn test_explicit_cross_join_accepts_on_constraint_and_consumes_full_statement() {
         let select = parse_full_select("SELECT * FROM a CROSS JOIN b ON a.id = b.id");
         assert!(matches!(
-            &only_join(&select).constraint,
+            &only_join(&select, JoinKind::Cross).constraint,
             Some(JoinConstraint::On(Expr::BinaryOp {
                 op: fsqlite_ast::BinaryOp::Eq,
                 ..
@@ -5673,13 +5673,14 @@ mod tests {
 
     #[test]
     fn test_parser_join_comma() {
-        // Comma-join is an implicit cross join.
+        // Comma-join is a reorderable inner join (`JT_INNER`), distinct from
+        // explicit `CROSS JOIN` (`JT_CROSS`, which locks join order).
         let stmt = parse_one("SELECT * FROM a, b WHERE a.id = b.a_id");
         if let Statement::Select(s) = stmt {
             if let SelectCore::Select { from, .. } = &s.body.select {
                 let from = from.as_ref().expect("FROM clause");
                 assert!(!from.joins.is_empty());
-                assert_eq!(from.joins[0].join_type.kind, JoinKind::Cross);
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Inner);
             } else {
                 unreachable!("expected Select core");
             }

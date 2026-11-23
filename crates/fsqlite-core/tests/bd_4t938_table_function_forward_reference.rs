@@ -49,7 +49,8 @@ const UNORDERED: &[&str] = &[
     "SELECT * FROM json_each(t.tags) AS j, t WHERE j.key = 0",
     "SELECT j.*, t.id FROM json_each(t.tags) AS j, t WHERE j.key = 0",
     "SELECT t.*, j.value FROM json_each(t.tags) AS j, t",
-    // An outer join pins `t` after the function: stock returns no rows.
+    // An outer join pins `t` after the function: stock 3.54.1 refuses with
+    // "table-function argument references tables to its right".
     "SELECT j.value, t.id FROM json_each(t.tags) AS j LEFT JOIN t",
 ];
 
@@ -89,7 +90,7 @@ async fn fq(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
                 .map(|r| r.values().iter().map(tag_f).collect())
                 .collect()
         })
-        .map_err(|e| format!("{e:?}"))
+        .map_err(|e| e.to_string())
 }
 
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {

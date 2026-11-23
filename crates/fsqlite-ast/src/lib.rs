@@ -1778,9 +1778,9 @@ pub struct JoinType {
 /// The kind of join.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JoinKind {
-    /// `,` or `CROSS JOIN`.
+    /// Explicit `CROSS JOIN` (prevents join reordering, SQLite's `JT_CROSS`).
     Cross,
-    /// `[INNER] JOIN`.
+    /// `,`, `JOIN`, or `INNER JOIN` (reorderable, SQLite's `JT_INNER`).
     Inner,
     /// `LEFT [OUTER] JOIN`.
     Left,

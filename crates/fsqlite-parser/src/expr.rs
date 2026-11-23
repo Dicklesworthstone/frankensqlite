@@ -3524,9 +3524,11 @@ impl<'a> ParseMachine<'a> {
         let join_type = if let Some(join_type) = self.parser.try_join_type()? {
             Some(join_type)
         } else if self.parser.eat_kind(&TokenKind::Comma) {
+            // SQLite treats `,` as `JT_INNER` (reorderable); only explicit
+            // `CROSS JOIN` sets `JT_CROSS` to lock join order (bd-hexz0).
             Some(JoinType {
                 natural: false,
-                kind: JoinKind::Cross,
+                kind: JoinKind::Inner,
             })
         } else {
             None

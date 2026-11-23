@@ -57491,6 +57491,10 @@ impl Connection {
                 Self::validate_cte_cursor_budget(select)?;
                 self.ensure_referenced_vtabs_available(select)?;
                 SelectRelationResolver::new(self).validate_select(select)?;
+                // bd-hexz0: stock 3.54.1 (`sqlite3SelectCheckOnClauses`)
+                // refuses table-function arguments that reference tables to
+                // their right across an outer join boundary.
+                self.validate_select_table_function_forward_refs(select, &[])?;
                 // bd-pn6az: stock flattens once the names resolve, then
                 // plans the join.
                 Self::validate_join_term_limits(select)
@@ -57499,6 +57503,7 @@ impl Connection {
                 if let InsertSource::Select(select) = &insert.source {
                     let scoped_select = insert_source_select_for_validation(insert, select);
                     SelectRelationResolver::new(self).validate_select(&scoped_select)?;
+                    self.validate_select_table_function_forward_refs(&scoped_select, &[])?;
                 }
                 if insert_dml_clauses_have_subquery_or_in_table(insert) {
                     SelectRelationResolver::new(self).validate_dml_insert_relations(insert)?;
@@ -57508,6 +57513,13 @@ impl Connection {
             Statement::Update(update) => {
                 if update_dml_clauses_have_subquery_or_in_table(update) {
                     SelectRelationResolver::new(self).validate_dml_update_relations(update)?;
+                }
+                if let Some(from) = &update.from {
+                    let visible_ctes = update
+                        .with
+                        .as_ref()
+                        .map_or_else(Vec::new, |with| with.ctes.clone());
+                    self.validate_from_clause_table_function_forward_refs(from, &visible_ctes)?;
                 }
                 Ok(())
             }
@@ -57520,6 +57532,7 @@ impl Connection {
             Statement::CreateTable(create) => {
                 if let CreateTableBody::AsSelect(select) = &create.body {
                     SelectRelationResolver::new(self).validate_select(select)?;
+                    self.validate_select_table_function_forward_refs(select, &[])?;
                 }
                 Ok(())
             }
@@ -111467,17 +111480,270 @@ impl Connection {
     /// sources in FROM order and binds a function's arguments only from
     /// sources to its left. When a function reads a later source of an
     /// all-inner FROM, rebuild the statement with the sources in dependency
-    /// order (stable, so the others keep their relative order): the joins
-    /// become cross joins with their ON terms moved into WHERE, which inner
-    /// joins allow, and `*` expands to qualified columns in the original order
-    /// so the result columns do not change (`tbl.*` names one source and keeps
-    /// its order). `None` when no function reads a later source, or the FROM
-    /// has an outer, NATURAL or USING join, a source without a distinct name,
-    /// or a dependency cycle.
+    /// bd-hexz0: SQLite 3.54.1's `sqlite3SelectCheckOnClauses` check for
+    /// table-valued function arguments referencing tables to their right across
+    /// an outer join (`sqlite3.c:157182-157215`).
     ///
-    /// The AST does not tell a comma from CROSS JOIN, so a CROSS JOIN is
-    /// reordered too, where stock keeps its order and runs the function
-    /// without the argument (no rows from json_each).
+    /// Specifically, for a table-valued function at FROM index `i`:
+    /// - If `i` lies to the left of any `RIGHT` or `FULL` join (`JT_LTORJ`), or
+    ///   is itself the RHS of a `RIGHT` or `FULL` join (`JT_RIGHT`), its
+    ///   arguments may not reference any table at index `> i`.
+    /// - Otherwise, if any outer join (`LEFT`/`RIGHT`/`FULL`) appears to its
+    ///   right at `joins[k]` (`k >= i`), its arguments may not reference any
+    ///   table at index `> k` (at or to the right of that outer join).
+    fn validate_select_table_function_forward_refs(
+        &self,
+        select: &SelectStatement,
+        outer_ctes: &[fsqlite_ast::Cte],
+    ) -> Result<()> {
+        let mut visible_ctes = outer_ctes.to_vec();
+        if let Some(with) = &select.with {
+            for cte in &with.ctes {
+                visible_ctes.push(cte.clone());
+            }
+            for cte in &with.ctes {
+                self.validate_select_table_function_forward_refs(&cte.query, &visible_ctes)?;
+            }
+        }
+        for core in std::iter::once(&select.body.select)
+            .chain(select.body.compounds.iter().map(|(_, core)| core))
+        {
+            match core {
+                SelectCore::Select {
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    having,
+                    windows,
+                    ..
+                } => {
+                    if let Some(from) = from {
+                        self.validate_from_clause_table_function_forward_refs(from, &visible_ctes)?;
+                    }
+                    for column in columns {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                        }
+                    }
+                    if let Some(expr) = where_clause {
+                        self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                    }
+                    for expr in group_by {
+                        self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                    }
+                    if let Some(expr) = having {
+                        self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                    }
+                    for window in windows {
+                        for expr in &window.spec.partition_by {
+                            self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                        }
+                        for term in &window.spec.order_by {
+                            self.validate_expr_table_function_forward_refs(
+                                &term.expr,
+                                &visible_ctes,
+                            )?;
+                        }
+                    }
+                }
+                SelectCore::Values(rows) => {
+                    for expr in rows.iter().flatten() {
+                        self.validate_expr_table_function_forward_refs(expr, &visible_ctes)?;
+                    }
+                }
+            }
+        }
+        for term in &select.order_by {
+            self.validate_expr_table_function_forward_refs(&term.expr, &visible_ctes)?;
+        }
+        if let Some(limit) = &select.limit {
+            self.validate_expr_table_function_forward_refs(&limit.limit, &visible_ctes)?;
+            if let Some(offset) = &limit.offset {
+                self.validate_expr_table_function_forward_refs(offset, &visible_ctes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_expr_table_function_forward_refs(
+        &self,
+        expr: &Expr,
+        visible_ctes: &[fsqlite_ast::Cte],
+    ) -> Result<()> {
+        let mut failure = None;
+        expr_contains_subquery_match(expr, &mut |subquery| {
+            let (SubqueryExprRef::Scalar(select)
+            | SubqueryExprRef::Exists(select)
+            | SubqueryExprRef::In(select)) = subquery;
+            match self.validate_select_table_function_forward_refs(select, visible_ctes) {
+                Ok(()) => false,
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            }
+        });
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn validate_from_clause_table_function_forward_refs(
+        &self,
+        from: &FromClause,
+        visible_ctes: &[fsqlite_ast::Cte],
+    ) -> Result<()> {
+        let effective = flatten_leading_paren_join_from(from);
+        let sources: Vec<&TableOrSubquery> = std::iter::once(&effective.source)
+            .chain(effective.joins.iter().map(|join| &join.table))
+            .collect();
+
+        for &raw_source in &sources {
+            let source = match raw_source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        raw_source
+                    }
+                }
+                other => other,
+            };
+            match source {
+                TableOrSubquery::Subquery { query, .. } => {
+                    self.validate_select_table_function_forward_refs(query, visible_ctes)?;
+                }
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    self.validate_from_clause_table_function_forward_refs(unwrapped, visible_ctes)?;
+                }
+                TableOrSubquery::TableFunction { args, .. } => {
+                    for arg in args {
+                        self.validate_expr_table_function_forward_refs(arg, visible_ctes)?;
+                    }
+                }
+                TableOrSubquery::Table { .. } => {}
+            }
+        }
+        for join in &effective.joins {
+            if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                self.validate_expr_table_function_forward_refs(expr, visible_ctes)?;
+            }
+        }
+
+        let is_outer =
+            |kind: JoinKind| matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full);
+        let is_right_or_full = |kind: JoinKind| matches!(kind, JoinKind::Right | JoinKind::Full);
+        let has_outer = effective
+            .joins
+            .iter()
+            .any(|join| is_outer(join.join_type.kind));
+        let has_cross = effective
+            .joins
+            .iter()
+            .any(|join| join.join_type.kind == JoinKind::Cross);
+
+        if effective.joins.is_empty()
+            || (!has_outer && !has_cross)
+            || !sources.iter().any(|source| {
+                let eff = match source {
+                    TableOrSubquery::ParenJoin(inner) => {
+                        let unwrapped = unwrap_single_item_paren_join(inner);
+                        if unwrapped.joins.is_empty() {
+                            &unwrapped.source
+                        } else {
+                            *source
+                        }
+                    }
+                    other => *other,
+                };
+                matches!(eff, TableOrSubquery::TableFunction { args, .. }
+                    if args.iter().any(expr_references_any_column))
+            })
+        {
+            return Ok(());
+        }
+
+        let labels: Vec<Option<String>> = sources
+            .iter()
+            .map(|source| source_projection_label(source))
+            .collect();
+        let column_names: Vec<Vec<String>> = sources
+            .iter()
+            .map(|source| self.source_column_names_for_join_layout(source, visible_ctes))
+            .collect();
+        let dependencies = table_function_source_dependencies(&sources, &labels, &column_names);
+
+        if has_outer {
+            for (index, reads) in dependencies.iter().enumerate() {
+                if reads.is_empty() {
+                    continue;
+                }
+                let left_of_right_join = effective.joins[index..]
+                    .iter()
+                    .any(|join| is_right_or_full(join.join_type.kind));
+                let rhs_of_right_join =
+                    index > 0 && is_right_or_full(effective.joins[index - 1].join_type.kind);
+                let max_allowed = if left_of_right_join || rhs_of_right_join {
+                    Some(index)
+                } else {
+                    effective.joins[index..]
+                        .iter()
+                        .position(|join| is_outer(join.join_type.kind))
+                        .map(|offset| index + offset)
+                };
+                if let Some(limit) = max_allowed
+                    && reads.iter().any(|&read| read > limit)
+                {
+                    return Err(FrankenError::FunctionError(
+                        "table-function argument references tables to its right".to_owned(),
+                    ));
+                }
+            }
+        }
+        if has_cross {
+            // SQLite `where.c:174694-174723`: a direct `CROSS JOIN t` puts `t`
+            // in `mUnusable` so `json_each` runs without the argument (`[]`),
+            // whereas a non-CROSS table after an intervening `CROSS JOIN`
+            // (`json_each(t.tags) CROSS JOIN u, t`) is NOT in `mUnusable` yet
+            // `hasRightCrossJoin` forbids placing `t` before the TVF, producing
+            // `"no query solution"` at prepare time.
+            for (index, reads) in dependencies.iter().enumerate() {
+                for &read in reads {
+                    if read > index
+                        && effective.joins[read - 1].join_type.kind != JoinKind::Cross
+                        && effective.joins[index..read - 1]
+                            .iter()
+                            .any(|join| join.join_type.kind == JoinKind::Cross)
+                    {
+                        return Err(FrankenError::FunctionError("no query solution".to_owned()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reorder a FROM clause where a table-valued function reads a later source
+    /// without crossing a `CROSS JOIN` or outer-join barrier (bd-4t938,
+    /// bd-hexz0).
+    ///
+    /// - Inner joins (`,`, `JOIN`, `INNER JOIN`, including `ON`, `USING`, and
+    ///   `NATURAL`) within any zone not separated by explicit `CROSS JOIN` or
+    ///   `RIGHT`/`FULL` joins are placed in dependency order.
+    /// - An `INNER` source to the right of a `LEFT JOIN`-RHS table function
+    ///   (with no `CROSS` or outer join between them) is hoisted to the start
+    ///   of its zone so the `LEFT JOIN` stays intact and the TVF runs with its
+    ///   source bound.
+    /// - `USING` / `NATURAL` join conditions on reordered joins move to `WHERE`
+    ///   (or `ON` on a preserved `LEFT JOIN`), `*` expands in original FROM
+    ///   order omitting right-side `USING` duplicates, and bare `USING` column
+    ///   references are qualified to their original left-side source so they do
+    ///   not become ambiguous.
+    /// - Explicit `CROSS JOIN` (`JoinKind::Cross`) locks join order, matching
+    ///   SQLite's `JT_CROSS`: a TVF reading across `CROSS JOIN` is not
+    ///   reordered and stays pinned (`pinned_tvf`).
+    #[allow(clippy::too_many_lines)]
     fn reorder_forward_table_function_sources(
         &self,
         select: &SelectStatement,
@@ -111487,23 +111753,22 @@ impl Connection {
             columns,
             from: Some(from),
             where_clause,
+            group_by,
+            having,
+            windows,
             ..
         } = &select.body.select
         else {
             return None;
         };
-        if from.joins.is_empty()
-            || from.joins.iter().any(|join| {
-                join.join_type.natural
-                    || !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross)
-                    || matches!(join.constraint, Some(JoinConstraint::Using(_)))
-            })
-        {
+        let effective = flatten_leading_paren_join_from(from);
+        if effective.joins.is_empty() {
             return None;
         }
-        let sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
-            .chain(from.joins.iter().map(|join| &join.table))
+        let sources: Vec<&TableOrSubquery> = std::iter::once(&effective.source)
+            .chain(effective.joins.iter().map(|join| &join.table))
             .collect();
+        let n = sources.len();
         if !sources.iter().any(|source| {
             matches!(source, TableOrSubquery::TableFunction { args, .. }
                 if args.iter().any(expr_references_any_column))
@@ -111542,78 +111807,535 @@ impl Connection {
         {
             return None;
         }
-        // The earliest source whose dependencies are placed goes next.
-        let mut order = Vec::with_capacity(sources.len());
-        let mut placed = vec![false; sources.len()];
-        while order.len() < sources.len() {
-            let next = (0..sources.len()).find(|&index| {
-                !placed[index] && dependencies[index].iter().all(|&read| placed[read])
-            })?;
-            placed[next] = true;
-            order.push(next);
-        }
 
-        let mut conjuncts: Vec<Expr> = from
+        // Partition `0..n` into zones that cannot be crossed by reordering:
+        // - Everything up to and including the RHS of the last RIGHT/FULL join
+        //   is locked in written order.
+        // - Every explicit `CROSS JOIN` (`JoinKind::Cross`) starts a new zone
+        //   (`hasRightCrossJoin` in SQLite `where.c:174694`).
+        let last_rf = effective
             .joins
             .iter()
-            .filter_map(|join| match &join.constraint {
-                Some(JoinConstraint::On(expr)) => Some(expr.clone()),
-                _ => None,
-            })
-            .collect();
+            .rposition(|join| matches!(join.join_type.kind, JoinKind::Right | JoinKind::Full));
+        let mut zones: Vec<(usize, usize, bool)> = Vec::new();
+        let mut cursor = if let Some(rf) = last_rf {
+            zones.push((0, rf + 1, true));
+            rf + 2
+        } else {
+            0
+        };
+        while cursor < n {
+            let start = cursor;
+            while cursor + 1 < n && effective.joins[cursor].join_type.kind != JoinKind::Cross {
+                cursor += 1;
+            }
+            zones.push((start, cursor, false));
+            cursor += 1;
+        }
+
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut reordered_zone_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut hoisted_inner: HashSet<usize> = HashSet::new();
+
+        for &(zone_start, zone_end, locked) in &zones {
+            let zone_len = zone_end - zone_start + 1;
+            if locked || zone_len <= 1 {
+                order.extend(zone_start..=zone_end);
+                continue;
+            }
+            let has_internal_forward = (zone_start..=zone_end).any(|idx| {
+                dependencies[idx]
+                    .iter()
+                    .any(|&read| read > idx && read <= zone_end)
+            });
+            if !has_internal_forward {
+                order.extend(zone_start..=zone_end);
+                continue;
+            }
+
+            // Inside an unlocked zone, every join is `Inner` or `Left`.
+            let has_left = (zone_start..zone_end)
+                .any(|k| effective.joins[k].join_type.kind == JoinKind::Left);
+            let zone_order: Vec<usize> = if !has_left {
+                // Pure inner-join zone: stable topological sort.
+                let mut placed = vec![false; n];
+                let mut seg = Vec::with_capacity(zone_len);
+                while seg.len() < zone_len {
+                    let next = (zone_start..=zone_end).find(|&idx| {
+                        !placed[idx]
+                            && dependencies[idx]
+                                .iter()
+                                .filter(|&&read| read >= zone_start && read <= zone_end)
+                                .all(|&read| placed[read])
+                    })?;
+                    placed[next] = true;
+                    seg.push(next);
+                }
+                seg
+            } else {
+                // Zone contains one or more `LEFT JOIN`s.
+                // 1. Identify any `Inner` sources that must be hoisted to
+                //    `zone_start` because a `LEFT JOIN`-RHS TVF (or a TVF
+                //    before a `LEFT JOIN`) depends on them across a `LEFT JOIN`
+                //    whose RHS is that TVF (`u LEFT JOIN j(t.tags) ON P, t`).
+                let mut to_hoist = vec![false; n];
+                for idx in zone_start..=zone_end {
+                    let is_left_rhs = idx > zone_start
+                        && effective.joins[idx - 1].join_type.kind == JoinKind::Left;
+                    if !is_left_rhs {
+                        continue;
+                    }
+                    for &read in &dependencies[idx] {
+                        if read > idx
+                            && read <= zone_end
+                            && effective.joins[read - 1].join_type.kind == JoinKind::Inner
+                            && !(idx..read)
+                                .any(|k| effective.joins[k].join_type.kind == JoinKind::Left)
+                        {
+                            to_hoist[read] = true;
+                        }
+                    }
+                }
+                // Propagate transitive dependencies of hoisted sources inside
+                // the zone (only inner sources may be hoisted).
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for idx in zone_start..=zone_end {
+                        if !to_hoist[idx] {
+                            continue;
+                        }
+                        for &read in &dependencies[idx] {
+                            if read >= zone_start
+                                && read <= zone_end
+                                && !to_hoist[read]
+                                && (read == zone_start
+                                    || effective.joins[read - 1].join_type.kind == JoinKind::Inner)
+                            {
+                                to_hoist[read] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+
+                // Order hoisted sources topologically first.
+                let hoisted_indices: Vec<usize> =
+                    (zone_start..=zone_end).filter(|&i| to_hoist[i]).collect();
+                let mut seg = Vec::with_capacity(zone_len);
+                let mut placed = vec![false; n];
+                while seg.len() < hoisted_indices.len() {
+                    let next = hoisted_indices.iter().copied().find(|&idx| {
+                        !placed[idx]
+                            && dependencies[idx]
+                                .iter()
+                                .filter(|&&read| to_hoist[read])
+                                .all(|&read| placed[read])
+                    })?;
+                    placed[next] = true;
+                    hoisted_inner.insert(next);
+                    seg.push(next);
+                }
+
+                // Order the remaining sources in the zone, keeping each
+                // `LEFT JOIN` RHS anchored in order while topologically sorting
+                // any contiguous non-hoisted inner run (both before the first
+                // `LEFT JOIN` and after any `LEFT JOIN` RHS).
+                let mut i = zone_start;
+                while i <= zone_end {
+                    if to_hoist[i] {
+                        i += 1;
+                        continue;
+                    }
+                    let is_left_rhs =
+                        i > zone_start && effective.joins[i - 1].join_type.kind == JoinKind::Left;
+                    if is_left_rhs {
+                        placed[i] = true;
+                        seg.push(i);
+                        i += 1;
+                        continue;
+                    }
+                    // Collect maximal contiguous run of non-hoisted inner
+                    // sources (stopping before any `LEFT JOIN` RHS).
+                    let mut run = vec![i];
+                    let mut j = i + 1;
+                    while j <= zone_end {
+                        if to_hoist[j] {
+                            j += 1;
+                            continue;
+                        }
+                        if effective.joins[j - 1].join_type.kind == JoinKind::Left {
+                            break;
+                        }
+                        run.push(j);
+                        j += 1;
+                    }
+                    let run_set: HashSet<usize> = run.iter().copied().collect();
+                    let mut run_placed = 0usize;
+                    while run_placed < run.len() {
+                        let next = run.iter().copied().find(|&idx| {
+                            !placed[idx]
+                                && dependencies[idx]
+                                    .iter()
+                                    .filter(|&&read| run_set.contains(&read))
+                                    .all(|&read| placed[read])
+                        })?;
+                        placed[next] = true;
+                        seg.push(next);
+                        run_placed += 1;
+                    }
+                    i = j;
+                }
+                seg
+            };
+
+            let zone_changed = zone_order
+                .iter()
+                .enumerate()
+                .any(|(offset, &orig)| orig != zone_start + offset);
+            if zone_changed {
+                reordered_zone_ranges.push((zone_start, zone_end));
+            }
+            order.extend(zone_order);
+        }
+
+        if reordered_zone_ranges.is_empty() {
+            return None;
+        }
+
+        // Verify every internal forward ref that belonged to a reordered zone
+        // now precedes its consumer.
+        let mut pos_of = vec![0usize; n];
+        for (pos, &orig) in order.iter().enumerate() {
+            pos_of[orig] = pos;
+        }
+        let in_reordered_zone = |idx: usize| -> bool {
+            reordered_zone_ranges
+                .iter()
+                .any(|&(s, e)| idx >= s && idx <= e)
+        };
+        let mut made_progress = false;
+        for (idx, reads) in dependencies.iter().enumerate() {
+            for &read in reads {
+                if read > idx && pos_of[read] < pos_of[idx] {
+                    made_progress = true;
+                }
+            }
+        }
+        if !made_progress {
+            return None;
+        }
+
+        // Compute USING / NATURAL column matches and star-skip mask in the
+        // ORIGINAL written FROM order before reordering.
+        let mut star_skipped: HashSet<(usize, String)> = HashSet::new();
+        let mut join_using_pairs: Vec<Vec<(String, usize)>> = vec![Vec::new(); n];
+        for (join_idx, join) in effective.joins.iter().enumerate() {
+            let right_idx = join_idx + 1;
+            let cols: Vec<String> = if join.join_type.natural {
+                column_names[right_idx]
+                    .iter()
+                    .filter(|right_col| {
+                        (0..=join_idx).any(|left_idx| {
+                            column_names[left_idx]
+                                .iter()
+                                .any(|left_col| left_col.eq_ignore_ascii_case(right_col))
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            } else if let Some(JoinConstraint::Using(cols)) = &join.constraint {
+                cols.clone()
+            } else {
+                Vec::new()
+            };
+            for col in cols {
+                let col_lower = col.to_ascii_lowercase();
+                let left_idx = (0..=join_idx).find(|&idx| {
+                    !star_skipped.contains(&(idx, col_lower.clone()))
+                        && column_names[idx]
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&col))
+                })?;
+                join_using_pairs[right_idx].push((col, left_idx));
+                star_skipped.insert((right_idx, col_lower));
+            }
+        }
+
+        let make_using_eq = |left_idx: usize, right_idx: usize, col: &str| -> Expr {
+            let left_label = labels[left_idx].as_deref().unwrap_or("");
+            let right_label = labels[right_idx].as_deref().unwrap_or("");
+            Expr::BinaryOp {
+                left: Box::new(Expr::Column(
+                    ColumnRef::qualified(left_label, col),
+                    Span::ZERO,
+                )),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Column(
+                    ColumnRef::qualified(right_label, col),
+                    Span::ZERO,
+                )),
+                span: Span::ZERO,
+            }
+        };
+
+        let mut conjuncts: Vec<Expr> = Vec::new();
+        let mut qualify_bare_using: HashMap<String, String> = HashMap::new();
+        let first_reordered_start = reordered_zone_ranges
+            .iter()
+            .map(|&(s, _)| s)
+            .min()
+            .unwrap_or(n);
+
+        // Build the reordered FROM clause and collect moved WHERE conjuncts.
+        let mut rebuilt_joins: Vec<JoinClause> = Vec::with_capacity(n - 1);
+        for (pos, &orig_idx) in order.iter().enumerate() {
+            if pos == 0 {
+                // If `orig_idx > 0` was moved to slot 0 (e.g. inner reorder or
+                // hoisted past a LEFT JOIN), its original join constraint moves
+                // into WHERE.
+                if orig_idx > 0 {
+                    let orig_join = &effective.joins[orig_idx - 1];
+                    if let Some(JoinConstraint::On(expr)) = &orig_join.constraint {
+                        conjuncts.push(expr.clone());
+                    }
+                    for (col, left_idx) in &join_using_pairs[orig_idx] {
+                        conjuncts.push(make_using_eq(*left_idx, orig_idx, col));
+                        if let Some(label) = labels[*left_idx].as_ref() {
+                            qualify_bare_using
+                                .entry(col.to_ascii_lowercase())
+                                .or_insert_with(|| label.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let zone_entry_cross = zones
+                .iter()
+                .any(|&(s, _, _)| s == pos && s > 0 && effective.joins[s - 1].join_type.kind == JoinKind::Cross);
+
+            if orig_idx > 0
+                && matches!(
+                    effective.joins[orig_idx - 1].join_type.kind,
+                    JoinKind::Left | JoinKind::Right | JoinKind::Full
+                )
+            {
+                let orig_join = &effective.joins[orig_idx - 1];
+                let convert_left_using = orig_join.join_type.kind == JoinKind::Left
+                    && !join_using_pairs[orig_idx].is_empty()
+                    && orig_idx > first_reordered_start;
+                if convert_left_using {
+                    let on_expr = join_using_pairs[orig_idx]
+                        .iter()
+                        .map(|(col, left_idx)| {
+                            if let Some(label) = labels[*left_idx].as_ref() {
+                                qualify_bare_using
+                                    .entry(col.to_ascii_lowercase())
+                                    .or_insert_with(|| label.clone());
+                            }
+                            make_using_eq(*left_idx, orig_idx, col)
+                        })
+                        .reduce(|left, right| Expr::BinaryOp {
+                            left: Box::new(left),
+                            op: BinaryOp::And,
+                            right: Box::new(right),
+                            span: Span::ZERO,
+                        });
+                    rebuilt_joins.push(JoinClause {
+                        join_type: fsqlite_ast::JoinType {
+                            natural: false,
+                            kind: JoinKind::Left,
+                        },
+                        table: sources[orig_idx].clone(),
+                        constraint: on_expr.map(JoinConstraint::On),
+                    });
+                } else {
+                    rebuilt_joins.push(orig_join.clone());
+                }
+            } else if !in_reordered_zone(orig_idx)
+                && !hoisted_inner.contains(&orig_idx)
+                && orig_idx == pos
+            {
+                let orig_join = &effective.joins[orig_idx - 1];
+                let convert_inner_using = !join_using_pairs[orig_idx].is_empty()
+                    && orig_idx > first_reordered_start;
+                if convert_inner_using {
+                    for (col, left_idx) in &join_using_pairs[orig_idx] {
+                        conjuncts.push(make_using_eq(*left_idx, orig_idx, col));
+                        if let Some(label) = labels[*left_idx].as_ref() {
+                            qualify_bare_using
+                                .entry(col.to_ascii_lowercase())
+                                .or_insert_with(|| label.clone());
+                        }
+                    }
+                    rebuilt_joins.push(JoinClause {
+                        join_type: fsqlite_ast::JoinType {
+                            natural: false,
+                            kind: orig_join.join_type.kind,
+                        },
+                        table: sources[orig_idx].clone(),
+                        constraint: None,
+                    });
+                } else {
+                    rebuilt_joins.push(orig_join.clone());
+                }
+            } else {
+                // Reordered inner/cross item: move any original ON/USING
+                // condition to WHERE and preserve `CROSS JOIN` if this slot is
+                // the entry into a cross-delimited zone.
+                if orig_idx > 0 {
+                    let orig_join = &effective.joins[orig_idx - 1];
+                    if let Some(JoinConstraint::On(expr)) = &orig_join.constraint {
+                        conjuncts.push(expr.clone());
+                    }
+                    for (col, left_idx) in &join_using_pairs[orig_idx] {
+                        conjuncts.push(make_using_eq(*left_idx, orig_idx, col));
+                        if let Some(label) = labels[*left_idx].as_ref() {
+                            qualify_bare_using
+                                .entry(col.to_ascii_lowercase())
+                                .or_insert_with(|| label.clone());
+                        }
+                    }
+                }
+                rebuilt_joins.push(JoinClause {
+                    join_type: fsqlite_ast::JoinType {
+                        natural: false,
+                        kind: if zone_entry_cross {
+                            JoinKind::Cross
+                        } else {
+                            JoinKind::Inner
+                        },
+                    },
+                    table: sources[orig_idx].clone(),
+                    constraint: None,
+                });
+            }
+        }
+
         conjuncts.extend(where_clause.as_deref().cloned());
-        let reordered_where = conjuncts.into_iter().reduce(|left, right| Expr::BinaryOp {
+        let mut reordered_where = conjuncts.into_iter().reduce(|left, right| Expr::BinaryOp {
             left: Box::new(left),
             op: BinaryOp::And,
             right: Box::new(right),
             span: Span::ZERO,
         });
-        let reordered_columns: Vec<ResultColumn> = columns
+
+        let mut reordered_columns: Vec<ResultColumn> = columns
             .iter()
             .flat_map(|column| match column {
                 ResultColumn::Star => labels
                     .iter()
-                    .flatten()
-                    .zip(&column_names)
-                    .flat_map(|(label, names)| {
-                        names.iter().map(|name| ResultColumn::Expr {
-                            expr: Expr::Column(
-                                ColumnRef::qualified(label.as_str(), name.as_str()),
-                                Span::ZERO,
-                            ),
-                            alias: None,
-                        })
+                    .enumerate()
+                    .flat_map(|(src_idx, label)| {
+                        let label = label.as_deref().unwrap_or("");
+                        column_names[src_idx]
+                            .iter()
+                            .filter(|name| {
+                                !star_skipped.contains(&(src_idx, name.to_ascii_lowercase()))
+                            })
+                            .map(|name| ResultColumn::Expr {
+                                expr: Expr::Column(
+                                    ColumnRef::qualified(label, name.as_str()),
+                                    Span::ZERO,
+                                ),
+                                alias: None,
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .collect(),
                 other => vec![other.clone()],
             })
             .collect();
+
+        let mut reordered_group_by = group_by.clone();
+        let mut reordered_having = having.as_deref().cloned();
+        let mut reordered_windows = windows.clone();
+        let mut reordered_order_by = select.order_by.clone();
+
+        if !qualify_bare_using.is_empty() {
+            let qualify_expr = |expr: &mut Expr, skip_aliases: Option<&HashSet<String>>| {
+                walk_expr_mut(expr, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |node, _| {
+                    if let Expr::Column(col_ref, _) = node
+                        && col_ref.table.is_none()
+                    {
+                        let key = col_ref.column.to_ascii_lowercase();
+                        if skip_aliases.is_some_and(|aliases| aliases.contains(&key)) {
+                            return true;
+                        }
+                        if let Some(label) = qualify_bare_using.get(&key) {
+                            col_ref.table = Some(Arc::from(label.as_str()));
+                        }
+                    }
+                    true
+                });
+            };
+
+            let explicit_aliases: HashSet<String> = columns
+                .iter()
+                .filter_map(|col| match col {
+                    ResultColumn::Expr {
+                        alias: Some(alias), ..
+                    } => Some(alias.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect();
+
+            for col in &mut reordered_columns {
+                if let ResultColumn::Expr { expr, .. } = col {
+                    qualify_expr(expr, None);
+                }
+            }
+            if let Some(expr) = reordered_where.as_mut() {
+                qualify_expr(expr, None);
+            }
+            for expr in &mut reordered_group_by {
+                qualify_expr(expr, None);
+            }
+            if let Some(expr) = reordered_having.as_mut() {
+                qualify_expr(expr, None);
+            }
+            for window in &mut reordered_windows {
+                for expr in &mut window.spec.partition_by {
+                    qualify_expr(expr, None);
+                }
+                for term in &mut window.spec.order_by {
+                    qualify_expr(&mut term.expr, None);
+                }
+            }
+            for term in &mut reordered_order_by {
+                qualify_expr(&mut term.expr, Some(&explicit_aliases));
+            }
+            for join in &mut rebuilt_joins {
+                if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                    qualify_expr(expr, None);
+                }
+            }
+        }
+
         let reordered_from = FromClause {
             source: sources[order[0]].clone(),
-            joins: order[1..]
-                .iter()
-                .map(|&index| JoinClause {
-                    join_type: fsqlite_ast::JoinType {
-                        natural: false,
-                        kind: JoinKind::Cross,
-                    },
-                    table: sources[index].clone(),
-                    constraint: None,
-                })
-                .collect(),
+            joins: rebuilt_joins,
         };
 
         let mut reordered = select.clone();
+        reordered.order_by = reordered_order_by;
         if let SelectCore::Select {
             columns,
             from,
             where_clause,
+            group_by,
+            having,
+            windows,
             ..
         } = &mut reordered.body.select
         {
             *columns = reordered_columns;
             *from = Some(reordered_from);
             *where_clause = reordered_where.map(Box::new);
+            *group_by = reordered_group_by;
+            *having = reordered_having.map(Box::new);
+            *windows = reordered_windows;
         }
         Some(reordered)
     }
@@ -111734,13 +112456,17 @@ impl Connection {
             }
         }
 
-        let is_outer =
-            |kind: JoinKind| matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full);
-        let has_outer_join = effective
+        let is_barrier = |kind: JoinKind| {
+            matches!(
+                kind,
+                JoinKind::Cross | JoinKind::Left | JoinKind::Right | JoinKind::Full
+            )
+        };
+        let has_barrier_join = effective
             .joins
             .iter()
-            .any(|join| is_outer(join.join_type.kind));
-        let pinned_tvf: Vec<bool> = if has_outer_join {
+            .any(|join| is_barrier(join.join_type.kind));
+        let pinned_tvf: Vec<bool> = if has_barrier_join {
             let labels: Vec<Option<String>> = all_sources
                 .iter()
                 .map(|source| source_projection_label(source))
@@ -111754,7 +112480,10 @@ impl Connection {
                 .enumerate()
                 .map(|(index, reads)| {
                     reads.iter().any(|&read| {
-                        read > index && is_outer(effective.joins[read - 1].join_type.kind)
+                        read > index
+                            && effective.joins[index..read]
+                                .iter()
+                                .any(|join| is_barrier(join.join_type.kind))
                     })
                 })
                 .collect()
@@ -112297,15 +113026,22 @@ impl Connection {
         // read, so it always materializes here: skipping it for a subquery
         // argument (`FROM json_each((SELECT tags FROM t))`) returned no rows.
         //
-        // bd-4t938: a function that reads a source an outer join pins after it
-        // (`FROM json_each(t.tags) AS j LEFT JOIN t`) cannot run after that
-        // source, even in stock, which then runs it without the argument:
-        // json_each and json_tree return no rows. Here any such function keeps
-        // its empty placeholder instead of failing on the unbound column.
-        let is_outer =
-            |kind: JoinKind| matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full);
-        let has_outer_join = from.joins.iter().any(|join| is_outer(join.join_type.kind));
-        let pinned_tvf: Vec<bool> = if has_outer_join {
+        // bd-4t938 / bd-hexz0: a function that reads a source pinned after an
+        // explicit `CROSS JOIN` (`FROM json_each(t.tags) AS j CROSS JOIN t`)
+        // cannot run after that source; SQLite runs it without the argument so
+        // json_each/json_tree return no rows (outer-join forward references are
+        // already rejected at prepare time with stock's error).
+        let is_barrier = |kind: JoinKind| {
+            matches!(
+                kind,
+                JoinKind::Cross | JoinKind::Left | JoinKind::Right | JoinKind::Full
+            )
+        };
+        let has_barrier_join = from
+            .joins
+            .iter()
+            .any(|join| is_barrier(join.join_type.kind));
+        let pinned_tvf: Vec<bool> = if has_barrier_join {
             let labels: Vec<Option<String>> = all_sources
                 .iter()
                 .map(|source| source_projection_label(source))
@@ -112318,9 +113054,12 @@ impl Connection {
                 .iter()
                 .enumerate()
                 .map(|(index, reads)| {
-                    reads
-                        .iter()
-                        .any(|&read| read > index && is_outer(from.joins[read - 1].join_type.kind))
+                    reads.iter().any(|&read| {
+                        read > index
+                            && from.joins[index..read]
+                                .iter()
+                                .any(|join| is_barrier(join.join_type.kind))
+                    })
                 })
                 .collect()
         } else {
@@ -112330,9 +113069,20 @@ impl Connection {
             .iter()
             .enumerate()
             .map(|(index, src)| {
+                let effective_src = match src {
+                    TableOrSubquery::ParenJoin(inner) => {
+                        let unwrapped = unwrap_single_item_paren_join(inner);
+                        if unwrapped.joins.is_empty() {
+                            &unwrapped.source
+                        } else {
+                            *src
+                        }
+                    }
+                    other => *other,
+                };
                 index > 0
                     && !pinned_tvf[index]
-                    && matches!(src, TableOrSubquery::TableFunction { args, .. }
+                    && matches!(effective_src, TableOrSubquery::TableFunction { args, .. }
                         if args.iter().any(expr_references_any_column))
             })
             .collect();
@@ -131244,9 +131994,10 @@ fn collect_matching_source_labels(
     }
 }
 
-/// bd-4t938: for each FROM source, the other sources its table-valued
-/// function arguments read (empty for a source that is not a function). A
-/// qualified reference names a source by its label; a bare one reads the only
+/// bd-4t938 / bd-hexz0: for each FROM source, the other sources its
+/// table-valued function arguments read (empty for a source that is not a
+/// function). A qualified reference names a source by its label (or a
+/// constituent table inside a parenthesized join); a bare one reads the only
 /// other source with that column. A reference that matches no source, or
 /// several, is left to ordinary resolution and its errors.
 fn table_function_source_dependencies<C: AsRef<[String]>>(
@@ -131258,7 +132009,18 @@ fn table_function_source_dependencies<C: AsRef<[String]>>(
         .iter()
         .enumerate()
         .map(|(index, source)| {
-            let TableOrSubquery::TableFunction { args, .. } = source else {
+            let effective_source = match source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let unwrapped = unwrap_single_item_paren_join(inner);
+                    if unwrapped.joins.is_empty() {
+                        &unwrapped.source
+                    } else {
+                        *source
+                    }
+                }
+                other => *other,
+            };
+            let TableOrSubquery::TableFunction { args, .. } = effective_source else {
                 return Vec::new();
             };
             let mut reads = Vec::new();
@@ -131277,6 +132039,11 @@ fn table_function_source_dependencies<C: AsRef<[String]>>(
                                     labels[other]
                                         .as_deref()
                                         .is_some_and(|label| label.eq_ignore_ascii_case(table))
+                                        || (matches!(sources[other], TableOrSubquery::ParenJoin(_))
+                                            && source_contains_named_source(
+                                                sources[other],
+                                                &QualifiedName::bare(table),
+                                            ))
                                 },
                             )
                     });
