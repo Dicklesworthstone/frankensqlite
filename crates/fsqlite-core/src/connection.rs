@@ -64987,10 +64987,14 @@ impl Connection {
     ) -> Result<Vec<SqliteValue>> {
         let mut values = Vec::with_capacity(default_sqls.len());
         for default_sql in default_sqls {
-            values.push(
-                self.evaluate_column_default_value(default_sql.as_deref())
-                    .await?,
-            );
+            // bd-fpr5g lever 2a: a column with no DEFAULT defaults to NULL,
+            // which needs none of the evaluator's boxed future (about 600
+            // instructions a column, on every row an INSERT with triggers or
+            // foreign keys snapshots).
+            values.push(match default_sql.as_deref() {
+                None => SqliteValue::Null,
+                Some(sql) => self.evaluate_column_default_value(Some(sql)).await?,
+            });
         }
         Ok(values)
     }

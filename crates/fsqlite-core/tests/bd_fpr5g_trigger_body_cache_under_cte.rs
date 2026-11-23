@@ -703,6 +703,45 @@ const SPARE_CURSOR_SCRIPT: &[&str] = &[
     "PRAGMA integrity_check",
 ];
 
+/// Lever 2a gives a column with no DEFAULT its NULL without the evaluator.
+/// The NEW row a trigger sees (BEFORE and AFTER, from VALUES, a SELECT,
+/// DEFAULT VALUES, and the foreign-key path) must still hold every omitted
+/// column's DEFAULT: a literal, an empty string, an explicit NULL, a quoted
+/// text, an expression, and a column with none.
+const DEFAULT_ROW_SCRIPT: &[&str] = &[
+    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+    "INSERT INTO p VALUES (1), (7)",
+    "CREATE TABLE d(id INTEGER PRIMARY KEY, none_ INTEGER, lit INTEGER DEFAULT 7, \
+       empty TEXT DEFAULT '', nul DEFAULT NULL, q TEXT DEFAULT 'q''s', e INTEGER DEFAULT (3 * 4), \
+       r INTEGER DEFAULT 7 REFERENCES p(id), last_none TEXT)",
+    "CREATE TABLE dl(tag, id, none_, lit, empty, nul, q, e, r, last_none, types)",
+    // (A BEFORE trigger's NEW.id for a rowid not yet chosen is not this
+    // lever's: the WHEN leaves that row out.)
+    "CREATE TRIGGER db BEFORE INSERT ON d WHEN NEW.id > 0 BEGIN INSERT INTO dl VALUES ('before', NEW.id, \
+       NEW.none_, NEW.lit, NEW.empty, NEW.nul, NEW.q, NEW.e, NEW.r, NEW.last_none, \
+       typeof(NEW.none_) || typeof(NEW.empty) || typeof(NEW.nul) || typeof(NEW.last_none)); END",
+    "CREATE TRIGGER da AFTER INSERT ON d BEGIN INSERT INTO dl VALUES ('after', NEW.id, \
+       NEW.none_, NEW.lit, NEW.empty, NEW.nul, NEW.q, NEW.e, NEW.r, NEW.last_none, \
+       typeof(NEW.none_) || typeof(NEW.empty) || typeof(NEW.nul) || typeof(NEW.last_none)); END",
+    "INSERT INTO d(id) VALUES (1), (2)",
+    "INSERT INTO d(id, lit, last_none) VALUES (3, 30, 'x')",
+    "INSERT INTO d(id, none_, nul) SELECT 10 + id, id, 'n' FROM p",
+    "INSERT INTO d DEFAULT VALUES",
+    "PRAGMA foreign_keys = ON",
+    "INSERT INTO d(id, e) VALUES (20, 99)",
+    "!INSERT INTO d(id, r) VALUES (21, 5)",
+    "SELECT * FROM dl ORDER BY rowid",
+    "SELECT * FROM d ORDER BY id",
+];
+
+#[test]
+fn trigger_new_rows_hold_every_omitted_columns_default() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        assert_marked_script_matches_stock(DEFAULT_ROW_SCRIPT, "default row").await;
+    });
+}
+
 #[test]
 fn spare_cursors_follow_self_writes_recursion_schema_changes_and_rollbacks() {
     let _serial = serial();
