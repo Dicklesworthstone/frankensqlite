@@ -94,6 +94,65 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-23 - WIN (landed as b9964a27f; inside every kill line, both instruction predictions missed): a rowid seek the cache answers on a resident cached leaf lands without a wait, and a probe scans the seek cache once; join_1M_to_pk_1000 -178.1M Ir, cpu 0.932 / 0.933 (bd-w4pr1.12, serial read lane round 13, lever SL2 v3)
+
+- Target: join_1M_to_pk_1000 (`SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`). Most of its 1M probes
+  into u are seek-cache hits on a cached leaf other than the cursor's own, which went through the async
+  table_move_to: try_table_seek_cache's load_page future and the seek wrappers, about 363 Ir a probe on b04628fe8
+  (the six functions that vanish from the lever's profile).
+- Retry of SL2 v2 (2026-11-21 entry, rejected at rowid_lookups_200k +1.75%). Its retry condition, met here: one slot
+  scan a probe with its answer handed to try_table_seek_cache, load_page's decode tail inlined, callgrind on
+  rowid_lookups (within +0.5%) and on the join (at least 100M) before any time run. PR1 (d95fb43fb, table descents
+  reuse the stack's clean pages) landed first, as the coordinator required.
+- Touched: `crates/fsqlite-btree/src/cursor.rs` only.
+  - try_table_seek_within_leaf: the newest slot on the current leaf first (SL1 v3); otherwise the first slot that
+    admits the target is answered synchronously when its leaf is resident (read_resident_btree_page_data), landing
+    as the cache hit in table_move_to lands. A per-cursor resident_seek_declined flag stops asking after the
+    reader's first refusal.
+  - The fast path's slot scan is kept in TableSeekCache as a 16 B hint (rowid, first admitting slot or none);
+    try_table_seek_cache starts there for that rowid (take_hint, used once); clear, push_front, the bench-only
+    front write and the test iter_mut drop it.
+  - load_page's tail in stack_entry_for_page, #[inline(always)] (with #[allow(clippy::inline_always)]).
+  - Keepers (btree lib): v2's test_try_table_seek_within_leaf_answers_resident_cached_leaves and
+    test_try_table_seek_within_leaf_hands_its_slot_scan_to_the_general_path (the general path starts at the
+    declined slot: a cache hit reading only its leaf; a hint for one rowid does not apply to another; a probe no
+    slot admits descends once; landings equal a reference cursor's).
+- Prediction (on the bead before the build): the join -180 to -280M Ir; rowid_lookups +0.0 to +0.25%; every other
+  row within +-0.1%; the join cpu a replicated WIN at 0.93 to 0.96. Kill: the join under 100M; rowid_lookups above
+  +0.5%; any other row beyond +-0.5% Ir; any replicated cycles or cpu LOSE; a keeper red or a mutant passing.
+- Result (b04628fe8 + diff 7c0a0dbe60bef144; one layout job on hz3, -j 2, K=6; parent fsqlite-cargo
+  63e323f2e4e6046b, lever 1e9a74882bd1f7b3; stock sqlite3 3.54.1 live; thinkstation1, load up to 31):
+  - Instructions (callgrind, single ELF, fresh copies of one database; answers equal): join 3,588.07M ->
+    3,410.00M (-178.1M, -4.96%; 1.9M short of the band); rowid_lookups_200k 2,485.81M -> 2,493.64M (+7.83M,
+    +0.315%, above the band, under the kill line). Judge Ir: memory_script_200k +0.36% (outside the +-0.1%
+    prediction, inside the kill line); every other row within +-0.02%.
+  - Why (cg_selfdiff per probe): on the join, try_table_seek_within_leaf +153.4 Ir while the async path vanishes
+    (table_seek_for_insert -181.1, load_page's future -62.0, the BtreeCursorOps / table_seek / CursorBackend
+    futures -102.8, finish_btree_op -17.4), with read_resident +13.4, the stack push / truncate +22.3,
+    is_page_dirty +14.6. On rowid_lookups the one scan runs in the fast path (+152.5) instead of
+    try_table_seek_cache (-117.4): the same scan costs ~35 Ir more there, plus load_page +5.1.
+  - vs stock 3.54.1: the join Ir x2.53 -> x2.40; cpu x2.22 -> x2.07 and x2.33 -> x2.17; cycles x2.30 -> x2.12 and
+    x2.39 -> x2.16.
+  - Time (runs 1 and 5 valid at max null |z| 1.58 / 1.75; runs 2-4 void at 3.15 / 4.23 / 6.82, the join a cycles
+    WIN in each): the join cpu 0.932 / 0.933 and cycles 0.921 / 0.905 WIN; no replicated LOSE. Single-run LOSEs,
+    not repeated: run 1 gb_id cpu 1.017 / cycles 1.033 at Ir 1.0000, gb_id_mod100k and rowid_lookups cpu; run 5
+    scan_filter_agg, gb_a_mod10, bulk_insert_1M_one_txn and memory_script_200k cpu.
+- Unit (b04628fe8 + the lever): btree lib 581 passed; m1 (hint one slot late) and m2 (hint not keyed by rowid) fail
+  the hand-off keeper with a descent ([2, 3] / [2, 4] read instead of the leaf alone); m3 (flag never set) fails
+  v2's keeper. Dropping the hint on push_front / clear is unobservable (every seek takes the hint before it changes
+  the slots): an equivalent mutant.
+- Gate (rch; b04628fe8 + diff 7c0a0dbe60bef144): clippy -D warnings btree, vdbe, core all targets clean; btree lib
+  581 passed; vdbe + core libs with golden_bytecode_snapshots and hot_arm_stream_reachability 5,480 passed; 28 core
+  join targets 105 passed; 69 core seek / rowid / cursor targets 175 passed; 25 e2e oracles 149 passed; the fsqlite
+  crate's 123 targets in 7 batches 1,105 passed; no failure. Three jobs were stopped by worker disk budgets or a
+  lost remote and rerun (no test had failed). rustfmt --check clean after wrapping two keeper assertions
+  (whitespace only, after the gate). ubs exit 0 (2,481 warnings against 2,426 on main's file: the keepers'
+  unwrap() / assert! setup). Landed on ad675517a: the commits since b04628fe8 touch core, codegen, pager and VFS,
+  not the cursor or its callers.
+- Retry / extend condition: the fast path's scan costs ~35 Ir a probe more than try_table_seek_cache's on
+  rowid_lookups_200k (+0.315%); a cheaper scan there (the admits test hoisted, slot 0 not tested twice) would take
+  the regression back under +0.1%. memory_script_200k's +0.36% was not attributed.
+
 ## 2026-11-23 - REJECTED on its GAIN kill line (-2.9k Ir per FULL autocommit INSERT against at least -3k; prediction -5k to -9k): under the WAL append gate, the cross-process conflict scan is skipped when no commit was published since the batch's snapshot (bd-fuwx0, single-writer lane round 12, lever O-B1, the under-gate half only)
 
 - Target: the autocommit one-row INSERT's commit path, #9 in bd-fuwx0's cost map. Under the gate,
