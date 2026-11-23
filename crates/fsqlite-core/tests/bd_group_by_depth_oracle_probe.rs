@@ -225,6 +225,49 @@ fn prepared_group_by_retries_quoted_literals_and_rebinds_after_ddl() {
 }
 
 #[test]
+fn quoted_group_by_fallback_preserves_columns_in_other_scopes() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for setup in [
+            "CREATE TABLE a(v TEXT, \"it’s '\" TEXT)",
+            "INSERT INTO a VALUES ('bound','left'),('bound','left')",
+            "CREATE TABLE b(k INTEGER)",
+            "INSERT INTO b VALUES (1),(2),(3)",
+        ] {
+            f.execute(setup).await.unwrap();
+            r.execute(setup, []).unwrap();
+        }
+        let mut diffs = Vec::new();
+        for sql in [
+            r#"SELECT "v",count(*) FROM a GROUP BY "v" UNION ALL SELECT "v",count(*) FROM b GROUP BY "v""#,
+            r#"SELECT "v",count(*) FROM b GROUP BY "v" UNION ALL SELECT a."v",count(*) FROM a GROUP BY a."v""#,
+            r#"SELECT "it’s '",count(*) FROM b GROUP BY "it’s '" UNION ALL SELECT "it’s '",count(*) FROM a GROUP BY "it’s '""#,
+            r#"SELECT "v",count(*) FROM a GROUP BY "v" UNION ALL SELECT "v" AS "v",count(*) FROM b GROUP BY "other", "v""#,
+        ] {
+            let expected = rq(&r, sql);
+            assert_eq!(expected.len(), 2, "stock control: {sql}");
+            let direct = fq(&f, sql).await;
+            if direct != expected {
+                diffs.push(format!("direct {sql}: {direct:?} vs {expected:?}"));
+            }
+            let prepared = match f.prepare(sql).await {
+                Ok(statement) => statement.query().await.map(|rows| {
+                    rows.iter().map(|row| row.values().iter().map(tag_f).collect()).collect::<Vec<Vec<String>>>()
+                }),
+                Err(error) => Err(error),
+            };
+            if prepared.as_ref().ok() != Some(&expected) {
+                diffs.push(format!("prepared {sql}: {prepared:?} vs {expected:?}"));
+            }
+        }
+        f.close().await.unwrap();
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    });
+}
+
+#[test]
 fn group_by_depth_match_rusqlite_oracle() {
     let _serial = serial();
     asupersync::test_utils::run_test(|| async {

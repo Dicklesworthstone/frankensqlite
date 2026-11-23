@@ -165,6 +165,109 @@ fn pragma_introspection_depth_match_rusqlite_oracle() {
 }
 
 #[test]
+fn pragma_tvf_positional_schema_selects_the_named_catalog() {
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let fpath = dir.path().join("frank-pragma-schema.db");
+            let f = Connection::open(if file_backed {
+                fpath.to_str().unwrap()
+            } else {
+                ":memory:"
+            })
+            .await
+            .unwrap();
+            let r = if file_backed {
+                rusqlite::Connection::open(dir.path().join("stock-pragma-schema.db")).unwrap()
+            } else {
+                rusqlite::Connection::open_in_memory().unwrap()
+            };
+            for sql in [
+                "CREATE TABLE t(m INTEGER)",
+                "CREATE TEMP TABLE t(p TEXT)",
+                "ATTACH ':memory:' AS aux",
+                "CREATE TABLE aux.t(a INTEGER,b TEXT GENERATED ALWAYS AS (a || 'x'))",
+                "CREATE INDEX aux.ai ON t(a)",
+                "CREATE INDEX temp.ai ON t(p)",
+                "CREATE TABLE aux.child(pid INTEGER REFERENCES t(a))",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in [
+                "SELECT name FROM pragma_table_info('t')",
+                "SELECT name FROM pragma_table_info('t',NULL)",
+                "SELECT name FROM pragma_table_info('t','main')",
+                "SELECT name FROM pragma_table_info('t','TEMP')",
+                "SELECT name FROM pragma_table_info('t','AuX')",
+                "SELECT name FROM pragma_table_info(x'74',x'617578')",
+                "SELECT name,hidden FROM pragma_table_xinfo('t','aux') ORDER BY cid",
+                "SELECT name FROM pragma_index_list('t','aux')",
+                "SELECT name FROM pragma_index_list('t','main')",
+                "SELECT name FROM pragma_index_info('ai','aux')",
+                "SELECT name FROM pragma_index_info('ai','temp')",
+                "SELECT name FROM pragma_index_xinfo('ai','aux') WHERE key=1",
+                "SELECT \"from\" FROM pragma_foreign_key_list('child','aux')",
+                "SELECT name FROM pragma_table_info(NULL,'aux')",
+            ] {
+                let expected = rq(&r, sql);
+                assert_ne!(expected, vec![vec!["ERR"]], "stock control: {sql}");
+                let direct = fq(&f, sql).await;
+                if direct != expected {
+                    diffs.push(format!("direct on file={file_backed}, {sql}: {direct:?} vs {expected:?}"));
+                }
+                let prepared = match f.prepare(sql).await {
+                    Ok(statement) => statement.query().await.map(|rows| {
+                        rows.iter().map(|row| row.values().iter().map(tag_f).collect()).collect::<Vec<Vec<String>>>()
+                    }),
+                    Err(error) => Err(error),
+                };
+                if prepared.as_ref().ok() != Some(&expected) {
+                    diffs.push(format!("prepared on file={file_backed}, {sql}: {prepared:?} vs {expected:?}"));
+                }
+            }
+            let sql = "SELECT name FROM pragma_table_info(?1,?2)";
+            let prepared = f.prepare(sql).await.unwrap();
+            let mut stock = r.prepare(sql).unwrap();
+            for schema in [Some("main"), Some("AuX"), None, Some("TEMP")] {
+                let expected = stock
+                    .query_row(("t", schema), |row| row.get::<_, String>(0))
+                    .unwrap();
+                let params = [
+                    SqliteValue::from("t"),
+                    schema.map_or(SqliteValue::Null, SqliteValue::from),
+                ];
+                let direct = f.query_with_params(sql, &params).await.unwrap();
+                let rows = prepared.query_with_params(&params).await.unwrap();
+                let expected = [SqliteValue::from(expected.as_str())];
+                assert_eq!(rows[0].values(), expected);
+                assert_eq!(direct[0].values(), expected);
+            }
+            for sql in [
+                "SELECT name FROM pragma_table_info('t','')",
+                "SELECT name FROM pragma_table_info('t',1)",
+                "SELECT name FROM pragma_table_info(NULL,'x''y')",
+                "SELECT name FROM pragma_table_info('t','fsqlite')",
+            ] {
+                let rusqlite::Error::SqliteFailure(_, Some(expected)) =
+                    r.query_row(sql, [], |row| row.get::<_, String>(0)).unwrap_err()
+                else {
+                    panic!("unexpected stock result for {sql}");
+                };
+                assert!(expected.starts_with("unknown database '"));
+                assert_eq!(f.query(sql).await.unwrap_err().to_string(), expected);
+                let stmt = f.prepare(sql).await.unwrap();
+                assert_eq!(stmt.query().await.unwrap_err().to_string(), expected);
+            }
+            drop(prepared);
+            f.close().await.unwrap();
+        }
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    });
+}
+
+#[test]
 fn gh512_pragma_table_info_quoted_and_parenthesized_pk_ordinals() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();

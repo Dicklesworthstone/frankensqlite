@@ -32375,7 +32375,7 @@ impl Connection {
                         && effective_sql.contains('"')
                         && self.dqs_single_statement(&effective_sql)
                         && let Some(rewritten) =
-                            Self::dqs_rewrite_once(&effective_sql, &error, &mut rewritten_names)
+                            self.dqs_rewrite_once(&effective_sql, &error, &mut rewritten_names)
                     {
                         effective_sql = Cow::Owned(rewritten);
                         continue;
@@ -32567,7 +32567,7 @@ impl Connection {
     // string") as a lazy, span-precise SQL-text rewrite-retry at the statement
     // entry: run normally; on a resolution error naming a double-quoted token,
     // splice that token's `"X"` -> `'X'` in the SQL text and re-dispatch. Bounded
-    // by the count of distinct double-quoted names; single-statement only (so a
+    // by the count of double-quoted tokens; single-statement only (so a
     // committed earlier statement is never re-executed); fails safe (any gap ->
     // the original error, never silent corruption). Shape 3 (INSERT VALUES("x")
     // -> silent NULL, no error to trigger the retry) is tracked by bd-82jdw.
@@ -32596,8 +32596,6 @@ impl Connection {
         // as a `FunctionError` (verbatim under SQLITE_ERROR, bd-6mj9n); the older
         // fromless/interpreted path uses Internal/NotImplemented. Match all three
         // so the DQS retry fires for FROM-table / WHERE / concat contexts too.
-        // Safe: `dqs_rewrite_once` only splices when an actual double-quoted token
-        // of that name exists, so a bare unquoted typo still errors.
         let msg = match err {
             FrankenError::NoSuchColumn { name } => return Some(name.clone()),
             FrankenError::Internal(m)
@@ -32651,19 +32649,37 @@ impl Connection {
 
     /// One DQS rewrite step.
     ///
-    /// If `err` names a double-quoted token not yet rewritten, splice that token
-    /// to a string literal and return the new SQL; otherwise None (surface the
-    /// original error).
+    /// Bind SELECT names again on the error path to locate the exact unresolved
+    /// token. The same spelling can bind normally in another query scope.
     fn dqs_rewrite_once(
+        &self,
         sql: &str,
         err: &FrankenError,
         rewritten: &mut HashSet<String>,
     ) -> Option<String> {
         let name = Self::dqs_missing_column_name(err)?;
+        let quoted = Self::double_quoted_identifier_tokens(sql);
+        if quoted.is_empty() {
+            return None;
+        }
+        if let Ok(statement) = self.cached_parse_single(sql)
+            && let Statement::Select(select) = statement.as_ref()
+        {
+            let mut resolver = SelectColumnReferenceResolver::new(self);
+            let result = self.with_fallback_function_registry(|| resolver.validate_select(select));
+            if let Err(FrankenError::NoSuchColumn { name }) = result {
+                let span = resolver.missing_bare_column_span?;
+                let &(start, end, _) = quoted.iter().find(|(start, end, text)| {
+                    *start == span.start && *end == span.end && text == &name
+                })?;
+                return Some(Self::splice_dqs_ranges(sql, &[(start, end)], &name));
+            }
+        }
+        // Some older codegen and DML paths have no SELECT expression location.
         if !rewritten.insert(name.clone()) {
             return None;
         }
-        let ranges: Vec<(u32, u32)> = Self::double_quoted_identifier_tokens(sql)
+        let ranges: Vec<(u32, u32)> = quoted
             .into_iter()
             .filter(|(_, _, n)| n == &name)
             .map(|(start, end, _)| (start, end))
@@ -32847,7 +32863,7 @@ impl Connection {
                 break 'dqs Err(first);
             }
             let mut rewritten = HashSet::new();
-            let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            let mut cur = match self.dqs_rewrite_once(sql, &first, &mut rewritten) {
                 Some(s) => s,
                 None => break 'dqs Err(first),
             };
@@ -32855,7 +32871,7 @@ impl Connection {
                 match self.query_impl(&cur).await {
                     Ok(v) => break 'dqs Ok(v),
                     Err(e) => {
-                        cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        cur = match self.dqs_rewrite_once(&cur, &e, &mut rewritten) {
                             Some(s) => s,
                             None => break 'dqs Err(e),
                         };
@@ -33070,7 +33086,7 @@ impl Connection {
                 break 'dqs Err(first);
             }
             let mut rewritten = HashSet::new();
-            let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            let mut cur = match self.dqs_rewrite_once(sql, &first, &mut rewritten) {
                 Some(s) => s,
                 None => break 'dqs Err(first),
             };
@@ -33078,7 +33094,7 @@ impl Connection {
                 match self.query_with_params_impl(&cur, params).await {
                     Ok(v) => break 'dqs Ok(v),
                     Err(e) => {
-                        cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        cur = match self.dqs_rewrite_once(&cur, &e, &mut rewritten) {
                             Some(s) => s,
                             None => break 'dqs Err(e),
                         };
@@ -33361,7 +33377,7 @@ impl Connection {
                 break 'dqs Err(first);
             }
             let mut rewritten = HashSet::new();
-            let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            let mut cur = match self.dqs_rewrite_once(sql, &first, &mut rewritten) {
                 Some(s) => s,
                 None => break 'dqs Err(first),
             };
@@ -33369,7 +33385,7 @@ impl Connection {
                 match self.execute_impl(&cur).await {
                     Ok(v) => break 'dqs Ok(v),
                     Err(e) => {
-                        cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        cur = match self.dqs_rewrite_once(&cur, &e, &mut rewritten) {
                             Some(s) => s,
                             None => break 'dqs Err(e),
                         };
@@ -33683,7 +33699,7 @@ impl Connection {
                 break 'dqs Err(first);
             }
             let mut rewritten = HashSet::new();
-            let mut cur = match Self::dqs_rewrite_once(sql, &first, &mut rewritten) {
+            let mut cur = match self.dqs_rewrite_once(sql, &first, &mut rewritten) {
                 Some(s) => s,
                 None => break 'dqs Err(first),
             };
@@ -33691,7 +33707,7 @@ impl Connection {
                 match self.execute_with_params_impl(&cur, params).await {
                     Ok(v) => break 'dqs Ok(v),
                     Err(e) => {
-                        cur = match Self::dqs_rewrite_once(&cur, &e, &mut rewritten) {
+                        cur = match self.dqs_rewrite_once(&cur, &e, &mut rewritten) {
                             Some(s) => s,
                             None => break 'dqs Err(e),
                         };
@@ -103634,10 +103650,9 @@ impl Connection {
         }
     }
 
-    /// bd-1hn48: execute a `pragma_<name>(arg)` table-valued function by
-    /// synthesizing the equivalent PRAGMA statement and reusing the existing
-    /// `execute_pragma` row generators. The single optional argument becomes the
-    /// pragma's call value (e.g. `pragma_table_info('t')` -> `PRAGMA table_info(t)`).
+    /// Run a PRAGMA table-valued function through the ordinary PRAGMA row
+    /// generators. For schema-aware functions, the second argument is the
+    /// database qualifier in `PRAGMA schema.name(arg)`.
     async fn execute_pragma_table_function_rows(
         &self,
         name: &str,
@@ -103647,38 +103662,52 @@ impl Connection {
         include_hidden_rowid: bool,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let pragma_name = name[7..].to_ascii_lowercase();
+        let empty_row = [];
+        let empty_col_map = [];
         let value = if let Some(arg) = args.first() {
-            let empty_row: Vec<SqliteValue> = Vec::new();
-            let empty_col_map: Vec<(String, String, bool)> = Vec::new();
             let arg_value = self
                 .eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)
                 .await?;
-            let arg_text =
-                arg_value
-                    .as_text_str()
-                    .map(str::to_owned)
-                    .or_else(|| match &arg_value {
-                        SqliteValue::Integer(n) => Some(n.to_string()),
-                        SqliteValue::Float(f) => Some(format!("{f}")),
-                        _ => None,
-                    });
-            arg_text.map(|s| {
+            (!arg_value.is_null()).then(|| {
                 fsqlite_ast::PragmaValue::Call(Expr::Literal(
-                    Literal::String(s),
+                    Literal::String(arg_value.to_text()),
                     fsqlite_ast::Span::ZERO,
                 ))
             })
         } else {
             None
         };
-        let stmt = fsqlite_ast::PragmaStatement {
+        let schema = if let Some(arg) = args.get(1)
+            && !pragma_table_function_is_no_arg(name)
+        {
+            let value = self
+                .eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)
+                .await?;
+            (!value.is_null()).then(|| value.to_text())
+        } else {
+            None
+        };
+        let mut stmt = fsqlite_ast::PragmaStatement {
             name: fsqlite_ast::QualifiedName {
-                schema: None,
+                schema,
                 name: pragma_name,
             },
             value,
         };
-        let rows = self.execute_pragma(&stmt).await?;
+        let attached = self.attached_target_schema(&stmt.name).map_err(|error| {
+            stmt.name.schema.as_ref().map_or(error, |schema| {
+                FrankenError::function_error(format!("unknown database '{}'", schema.replace('\'', "''")))
+            })
+        })?;
+        let rows = if let Some(attached) = attached {
+            stmt.name.schema = Some("main".to_owned());
+            self.with_attached_connection_async(&attached, async move |conn| {
+                conn.execute_statement(&Statement::Pragma(stmt), None).await
+            })
+            .await?
+        } else {
+            self.execute_pragma(&stmt).await?
+        };
         let mut out = Vec::with_capacity(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
             let mut values = row.values;
@@ -165231,6 +165260,7 @@ struct SelectColumnReferenceResolver<'connection, 'select> {
     validated_ctes: HashSet<SelectCteValidationKey>,
     view_state: Rc<RefCell<SelectViewValidationState>>,
     named_window_scopes: Vec<&'select [fsqlite_ast::WindowDef]>,
+    missing_bare_column_span: Option<Span>,
 }
 
 impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
@@ -165246,6 +165276,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             validated_ctes: HashSet::new(),
             view_state: Rc::new(RefCell::new(SelectViewValidationState::default())),
             named_window_scopes: Vec::new(),
+            missing_bare_column_span: None,
         }
     }
 
@@ -165264,6 +165295,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             validated_ctes: HashSet::new(),
             view_state,
             named_window_scopes: Vec::new(),
+            missing_bare_column_span: None,
         }
     }
 
@@ -166640,7 +166672,13 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             | Expr::Literal(_, _)
             | Expr::Raise { .. }
             | Expr::Placeholder(_, _) => Ok(()),
-            Expr::Column(column, _) => self.validate_column(column, scope, alias_use),
+            Expr::Column(column, span) => {
+                let result = self.validate_column(column, scope, alias_use);
+                if matches!(result, Err(FrankenError::NoSuchColumn { .. })) {
+                    self.missing_bare_column_span = column.table.is_none().then_some(*span);
+                }
+                result
+            }
             Expr::BinaryOp { left, right, .. }
             | Expr::JsonAccess {
                 expr: left,
