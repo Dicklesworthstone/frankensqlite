@@ -149,8 +149,9 @@ impl MigrationBackup {
     /// Main and WAL are verified before any destination is created, and their
     /// copied bytes must independently match this handle's receipt. SHM,
     /// journals, migration markers, and unlisted files are not restored.
-    /// Files are synced before return, with directory syncs on Unix. As with
-    /// capture, Windows has no portable directory-fsync guarantee here.
+    /// Files are synced before return, with directory `fsync` on Unix and a
+    /// best-effort directory-handle flush on Windows (Win32 publishes no
+    /// POSIX-equivalent crash-durability contract for directory flushes).
     ///
     /// `parent` must already exist in a trusted, cooperative namespace. This
     /// method neither replaces the live source nor changes its selector.
@@ -425,14 +426,12 @@ fn source_name(db_path: &str) -> Result<&str> {
         .ok_or_else(|| invalid_backup("database path has no filename"))
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    host_fs::open_file(path)?.sync_all()?;
-    // Match the native Windows VFS boundary: there is no portable directory
-    // fsync there. Per-file sync/atomic visibility is not a power-loss proof.
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+fn sync_directory(directory: &Path) -> Result<()> {
+    // `directory` is already a directory (the backup generation directory or
+    // its parent). Flush that directory itself — not its parent — through the
+    // VFS boundary (POSIX `fsync` on Unix; best-effort directory-handle flush
+    // on Windows).
+    host_fs::sync_directory(directory)
 }
 
 fn invalid_backup(detail: &str) -> FrankenError {
@@ -959,5 +958,21 @@ mod cancellation_tests {
             assert_eq!(host_fs::read(&migration_backup_receipt_path(&db)).unwrap(), before);
             previous.verify().unwrap();
         }
+    }
+
+    #[test]
+    fn sync_directory_targets_given_directory_not_its_parent() {
+        let parent = tempfile::tempdir().unwrap();
+        let generation = parent.path().join("generation-dir");
+        host_fs::create_dir_all(&generation).unwrap();
+        sync_directory(&generation).expect("sync_directory must succeed on existing directory");
+
+        let missing = parent.path().join("missing-generation-dir");
+        let err = sync_directory(&missing)
+            .expect_err("sync_directory must fail when target directory is absent");
+        assert!(
+            matches!(err, FrankenError::Io(ref io_err) if io_err.kind() == ErrorKind::NotFound),
+            "expected Io(NotFound) when target directory is missing, got {err:?}"
+        );
     }
 }

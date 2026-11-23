@@ -2223,27 +2223,18 @@ impl Vfs for UnixVfs {
         fs::remove_file(path).map_err(FrankenError::Io)?;
 
         if sync_dir {
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
             // A caller requesting a durable namespace deletion must learn if
             // the directory barrier failed. Silently swallowing this error
             // can leave a supposedly-removed rollback journal present after
             // a crash and turn a committed image into a rollback candidate.
-            File::open(parent)?.sync_all()?;
+            crate::host_fs::sync_parent_directory(path)?;
         }
 
         Ok(())
     }
 
     fn sync_parent_directory(&self, _cx: &Cx, path: &Path) -> Result<()> {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        crate::host_fs::sync_parent_directory(path)
     }
 
     fn access(&self, _cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {

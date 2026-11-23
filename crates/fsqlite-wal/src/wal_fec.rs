@@ -3895,7 +3895,11 @@ fn create_wal_fec_temporary(sidecar_path: &Path) -> Result<(PathBuf, fs::File)> 
 }
 
 fn sync_wal_fec_parent(sidecar_path: &Path) -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(feature = "native")]
+    {
+        fsqlite_vfs::host_fs::sync_parent_directory(sidecar_path)?;
+    }
+    #[cfg(all(not(feature = "native"), unix))]
     {
         let parent = sidecar_path
             .parent()
@@ -3903,7 +3907,7 @@ fn sync_wal_fec_parent(sidecar_path: &Path) -> Result<()> {
             .unwrap_or_else(|| Path::new("."));
         fs::File::open(parent)?.sync_all()?;
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(feature = "native"), not(unix)))]
     let _ = sidecar_path;
     Ok(())
 }

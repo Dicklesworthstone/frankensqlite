@@ -862,7 +862,11 @@ pub fn key_envelope_path_for_db(db_path: &Path) -> PathBuf {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn sync_parent_dir(path: &Path) -> fsqlite_error::Result<()> {
-    #[cfg(unix)]
+    #[cfg(feature = "native")]
+    {
+        fsqlite_vfs::host_fs::sync_parent_directory(path)?;
+    }
+    #[cfg(all(not(feature = "native"), unix))]
     {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
             && let Ok(dir) = std::fs::File::open(parent)
@@ -870,7 +874,7 @@ fn sync_parent_dir(path: &Path) -> fsqlite_error::Result<()> {
             dir.sync_all()?;
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(feature = "native"), not(unix)))]
     {
         let _ = path;
     }

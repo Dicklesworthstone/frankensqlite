@@ -33,9 +33,141 @@ pub mod host_fs {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     #[cfg(windows)]
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use tracing::debug;
+    #[cfg(windows)]
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_SUPPORTED, ERROR_WRITE_PROTECT,
+    };
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     use fsqlite_error::Result;
+
+    #[cfg(any(windows, test))]
+    const WIN32_ERROR_INVALID_FUNCTION: i32 = 1;
+    #[cfg(any(windows, test))]
+    const WIN32_ERROR_ACCESS_DENIED: i32 = 5;
+    #[cfg(any(windows, test))]
+    const WIN32_ERROR_INVALID_HANDLE: i32 = 6;
+    #[cfg(any(windows, test))]
+    const WIN32_ERROR_WRITE_PROTECT: i32 = 19;
+    #[cfg(any(windows, test))]
+    const WIN32_ERROR_NOT_SUPPORTED: i32 = 50;
+    #[cfg(any(windows, test))]
+    const WIN32_ERROR_INVALID_PARAMETER: i32 = 87;
+
+    #[cfg(windows)]
+    const _: () = {
+        assert!(WIN32_ERROR_INVALID_FUNCTION == ERROR_INVALID_FUNCTION as i32);
+        assert!(WIN32_ERROR_ACCESS_DENIED == ERROR_ACCESS_DENIED as i32);
+        assert!(WIN32_ERROR_INVALID_HANDLE == ERROR_INVALID_HANDLE as i32);
+        assert!(WIN32_ERROR_WRITE_PROTECT == ERROR_WRITE_PROTECT as i32);
+        assert!(WIN32_ERROR_NOT_SUPPORTED == ERROR_NOT_SUPPORTED as i32);
+        assert!(WIN32_ERROR_INVALID_PARAMETER == ERROR_INVALID_PARAMETER as i32);
+    };
+
+    #[cfg(any(windows, test))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WindowsDirSyncOutcome {
+        Flushed,
+        FlushedWithAddFileFallback,
+        SkippedUnsupportedOpen(i32),
+        SkippedUnsupportedFlush(i32),
+    }
+
+    #[cfg(any(windows, test))]
+    fn is_windows_dir_open_best_effort_code(code: i32) -> bool {
+        matches!(
+            code,
+            WIN32_ERROR_INVALID_FUNCTION
+                | WIN32_ERROR_ACCESS_DENIED
+                | WIN32_ERROR_WRITE_PROTECT
+                | WIN32_ERROR_NOT_SUPPORTED
+                | WIN32_ERROR_INVALID_PARAMETER
+        )
+    }
+
+    #[cfg(any(windows, test))]
+    fn is_windows_dir_flush_best_effort_code(code: i32) -> bool {
+        matches!(
+            code,
+            WIN32_ERROR_INVALID_FUNCTION
+                | WIN32_ERROR_ACCESS_DENIED
+                | WIN32_ERROR_INVALID_HANDLE
+                | WIN32_ERROR_WRITE_PROTECT
+                | WIN32_ERROR_NOT_SUPPORTED
+                | WIN32_ERROR_INVALID_PARAMETER
+        )
+    }
+
+    #[cfg(any(windows, test))]
+    fn sync_windows_directory_with_ops<H, OpenGeneric, OpenAddFile, Flush>(
+        open_generic_write: OpenGeneric,
+        open_add_file: OpenAddFile,
+        flush: Flush,
+    ) -> std::io::Result<WindowsDirSyncOutcome>
+    where
+        OpenGeneric: FnOnce() -> std::io::Result<H>,
+        OpenAddFile: FnOnce() -> std::io::Result<H>,
+        Flush: FnOnce(&H) -> std::io::Result<()>,
+    {
+        let (handle, used_fallback) = match open_generic_write() {
+            Ok(handle) => (handle, false),
+            Err(err) if err.raw_os_error() == Some(WIN32_ERROR_ACCESS_DENIED) => {
+                match open_add_file() {
+                    Ok(handle) => (handle, true),
+                    Err(fallback_err) => {
+                        if let Some(code) = fallback_err
+                            .raw_os_error()
+                            .filter(|&code| is_windows_dir_open_best_effort_code(code))
+                        {
+                            return Ok(WindowsDirSyncOutcome::SkippedUnsupportedOpen(code));
+                        }
+                        return Err(fallback_err);
+                    }
+                }
+            }
+            Err(err) => {
+                if let Some(code) = err
+                    .raw_os_error()
+                    .filter(|&code| is_windows_dir_open_best_effort_code(code))
+                {
+                    return Ok(WindowsDirSyncOutcome::SkippedUnsupportedOpen(code));
+                }
+                return Err(err);
+            }
+        };
+
+        match flush(&handle) {
+            Ok(()) => Ok(if used_fallback {
+                WindowsDirSyncOutcome::FlushedWithAddFileFallback
+            } else {
+                WindowsDirSyncOutcome::Flushed
+            }),
+            Err(err) => {
+                if let Some(code) = err
+                    .raw_os_error()
+                    .filter(|&code| is_windows_dir_flush_best_effort_code(code))
+                {
+                    Ok(WindowsDirSyncOutcome::SkippedUnsupportedFlush(code))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    fn parent_directory_of(path: &Path) -> &Path {
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            None if path.is_absolute() => path,
+            _ => Path::new("."),
+        }
+    }
 
     pub fn create_dir_all(path: &Path) -> Result<()> {
         std::fs::create_dir_all(path)?;
@@ -136,6 +268,96 @@ pub mod host_fs {
     /// authority namespace.
     pub fn open_existing_regular_file_no_follow(path: &Path) -> Result<File> {
         open_existing_regular_file_with_access(path, false)
+    }
+
+    /// Flush `directory` itself to stable storage.
+    ///
+    /// Callers must pass a directory path (for file paths whose containing
+    /// directory should be flushed, use [`sync_parent_directory`]).
+    ///
+    /// - **Unix:** opens the directory read-only and invokes `fsync` via
+    ///   [`File::sync_all`], propagating all I/O errors.
+    /// - **Windows:** performs a best-effort directory-handle flush via
+    ///   `CreateFileW` (`OpenOptions`) with `FILE_FLAG_BACKUP_SEMANTICS`,
+    ///   full sharing (`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`),
+    ///   and write access (`GENERIC_WRITE`, falling back to `FILE_ADD_FILE` on
+    ///   `ERROR_ACCESS_DENIED`), followed by `FlushFileBuffers` via
+    ///   [`File::sync_all`]. Read access is intentionally omitted because
+    ///   `FlushFileBuffers` only requires write access and read-only directory
+    ///   handles fail with `ERROR_ACCESS_DENIED`.
+    ///
+    ///   **Win32 contract caveat:** local NTFS accepts `FlushFileBuffers` on a
+    ///   writable directory handle without administrator privileges (matching
+    ///   MS-FSA §2.1.5.7 implementer behavior), but Microsoft does not publish
+    ///   a Win32 application contract proving POSIX-equivalent crash/power-loss
+    ///   durability across all filesystems. On non-NTFS volumes (FAT32/exFAT),
+    ///   network shares (SMB), read-only mounts, or restricted-ACL directories
+    ///   where opening or flushing a directory handle returns an unsupported or
+    ///   access-policy error (`ERROR_INVALID_FUNCTION`, `ERROR_ACCESS_DENIED`,
+    ///   `ERROR_INVALID_HANDLE` on flush, `ERROR_WRITE_PROTECT`,
+    ///   `ERROR_NOT_SUPPORTED`, `ERROR_INVALID_PARAMETER`), this helper logs at
+    ///   `debug` and returns `Ok(())` so commits and backups do not regress.
+    ///   Missing-path (`NotFound`) and hardware/media I/O failures propagate.
+    pub fn sync_directory(directory: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            File::open(directory)?.sync_all()?;
+        }
+        #[cfg(windows)]
+        {
+            let share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            let outcome = sync_windows_directory_with_ops(
+                || {
+                    OpenOptions::new()
+                        .write(true)
+                        .share_mode(share_mode)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                        .open(directory)
+                },
+                || {
+                    OpenOptions::new()
+                        .access_mode(FILE_ADD_FILE)
+                        .share_mode(share_mode)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                        .open(directory)
+                },
+                File::sync_all,
+            )?;
+            match outcome {
+                WindowsDirSyncOutcome::Flushed
+                | WindowsDirSyncOutcome::FlushedWithAddFileFallback => {}
+                WindowsDirSyncOutcome::SkippedUnsupportedOpen(code) => {
+                    debug!(
+                        target: "fsqlite_vfs::host_fs",
+                        path = %directory.display(),
+                        win32_error = code,
+                        "best-effort Windows directory open skipped (unsupported/ACL)"
+                    );
+                }
+                WindowsDirSyncOutcome::SkippedUnsupportedFlush(code) => {
+                    debug!(
+                        target: "fsqlite_vfs::host_fs",
+                        path = %directory.display(),
+                        win32_error = code,
+                        "best-effort Windows directory FlushFileBuffers skipped (unsupported/ACL)"
+                    );
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = directory;
+        }
+        Ok(())
+    }
+
+    /// Flush the parent directory containing `path`.
+    ///
+    /// Resolves `path`'s parent directory (falling back to `.` for bare
+    /// relative filenames and to `path` itself for an absolute root) and
+    /// delegates to [`sync_directory`].
+    pub fn sync_parent_directory(path: &Path) -> Result<()> {
+        sync_directory(parent_directory_of(path))
     }
 
     /// Open an existing, identity-checked WAL for synchronous guarded repair.
@@ -363,6 +585,229 @@ pub mod host_fs {
                 .collect();
             assert_eq!(staged.len(), 1);
             assert_eq!(std::fs::read(&staged[0]).unwrap(), b"partial new image");
+        }
+    }
+
+    #[cfg(test)]
+    mod directory_sync_tests {
+        use std::cell::Cell;
+        use std::io::ErrorKind;
+
+        use super::*;
+
+        struct DropFlag<'a>(&'a Cell<bool>);
+
+        impl Drop for DropFlag<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        fn open_err(code: i32) -> std::io::Result<u8> {
+            Err(std::io::Error::from_raw_os_error(code))
+        }
+
+        #[test]
+        fn parent_directory_of_resolves_nested_bare_empty_and_root_paths() {
+            assert_eq!(
+                parent_directory_of(Path::new("nested/dir/main.db")),
+                Path::new("nested/dir")
+            );
+            assert_eq!(parent_directory_of(Path::new("main.db")), Path::new("."));
+            assert_eq!(parent_directory_of(Path::new("")), Path::new("."));
+            #[cfg(unix)]
+            {
+                assert_eq!(parent_directory_of(Path::new("/main.db")), Path::new("/"));
+                assert_eq!(parent_directory_of(Path::new("/")), Path::new("/"));
+            }
+            #[cfg(windows)]
+            {
+                assert_eq!(
+                    parent_directory_of(Path::new(r"C:\main.db")),
+                    Path::new(r"C:\")
+                );
+                assert_eq!(parent_directory_of(Path::new(r"C:\")), Path::new(r"C:\"));
+            }
+        }
+
+        #[test]
+        fn sync_directory_flushes_target_and_not_its_parent() {
+            let root = tempfile::tempdir().expect("create temp dir");
+            let child_dir = root.path().join("generation");
+            std::fs::create_dir(&child_dir).expect("create child dir");
+            let file_path = child_dir.join("main.db");
+            std::fs::write(&file_path, b"payload").expect("write file");
+
+            sync_directory(&child_dir).expect("sync existing directory");
+            sync_parent_directory(&file_path).expect("sync existing parent directory");
+
+            // A missing directory inside an existing parent distinguishes
+            // syncing the directory itself from syncing its parent.
+            let missing_dir = root.path().join("missing-generation");
+            let dir_err = sync_directory(&missing_dir)
+                .expect_err("sync_directory must fail when target directory does not exist");
+            assert!(
+                matches!(&dir_err, fsqlite_error::FrankenError::Io(e) if e.kind() == ErrorKind::NotFound),
+                "expected NotFound for missing directory, got {dir_err:?}"
+            );
+            sync_parent_directory(&missing_dir)
+                .expect("sync_parent_directory resolves existing parent of missing child");
+
+            let missing_parent_child = missing_dir.join("main.db");
+            let parent_err = sync_parent_directory(&missing_parent_child)
+                .expect_err("sync_parent_directory must fail when parent does not exist");
+            assert!(
+                matches!(&parent_err, fsqlite_error::FrankenError::Io(e) if e.kind() == ErrorKind::NotFound),
+                "expected NotFound for missing parent, got {parent_err:?}"
+            );
+        }
+
+        #[test]
+        fn windows_dir_sync_policy_happy_path_and_add_file_fallback() {
+            let dropped_primary = Cell::new(false);
+            let fallback_called = Cell::new(false);
+            let flush_called = Cell::new(false);
+            let outcome = sync_windows_directory_with_ops(
+                || Ok(DropFlag(&dropped_primary)),
+                || {
+                    fallback_called.set(true);
+                    Ok(DropFlag(&dropped_primary))
+                },
+                |_handle| {
+                    flush_called.set(true);
+                    Ok(())
+                },
+            )
+            .expect("generic-write flush should succeed");
+            assert_eq!(outcome, WindowsDirSyncOutcome::Flushed);
+            assert!(!fallback_called.get());
+            assert!(flush_called.get());
+            assert!(dropped_primary.get(), "directory handle must be closed");
+
+            let dropped_fallback = Cell::new(false);
+            let fallback_used = Cell::new(false);
+            let outcome = sync_windows_directory_with_ops(
+                || {
+                    Err::<DropFlag<'_>, _>(std::io::Error::from_raw_os_error(
+                        WIN32_ERROR_ACCESS_DENIED,
+                    ))
+                },
+                || {
+                    fallback_used.set(true);
+                    Ok(DropFlag(&dropped_fallback))
+                },
+                |_handle| Ok(()),
+            )
+            .expect("FILE_ADD_FILE fallback flush should succeed");
+            assert_eq!(outcome, WindowsDirSyncOutcome::FlushedWithAddFileFallback);
+            assert!(fallback_used.get());
+            assert!(dropped_fallback.get(), "fallback handle must be closed");
+        }
+
+        #[test]
+        fn windows_dir_sync_policy_tolerates_unsupported_open_and_flush_errors() {
+            for code in [
+                WIN32_ERROR_INVALID_FUNCTION,
+                WIN32_ERROR_ACCESS_DENIED,
+                WIN32_ERROR_WRITE_PROTECT,
+                WIN32_ERROR_NOT_SUPPORTED,
+                WIN32_ERROR_INVALID_PARAMETER,
+            ] {
+                let flush_called = Cell::new(false);
+                let outcome = sync_windows_directory_with_ops(
+                    || open_err(code),
+                    || open_err(code),
+                    |_handle| {
+                        flush_called.set(true);
+                        Ok(())
+                    },
+                )
+                .expect("best-effort open error should degrade cleanly");
+                assert_eq!(outcome, WindowsDirSyncOutcome::SkippedUnsupportedOpen(code));
+                assert!(!flush_called.get());
+            }
+
+            for code in [
+                WIN32_ERROR_INVALID_FUNCTION,
+                WIN32_ERROR_ACCESS_DENIED,
+                WIN32_ERROR_INVALID_HANDLE,
+                WIN32_ERROR_WRITE_PROTECT,
+                WIN32_ERROR_NOT_SUPPORTED,
+                WIN32_ERROR_INVALID_PARAMETER,
+            ] {
+                let dropped = Cell::new(false);
+                let outcome = sync_windows_directory_with_ops(
+                    || Ok(DropFlag(&dropped)),
+                    || unreachable!("fallback open must not run when primary open succeeded"),
+                    |_handle| Err(std::io::Error::from_raw_os_error(code)),
+                )
+                .expect("best-effort flush error should degrade cleanly");
+                assert_eq!(
+                    outcome,
+                    WindowsDirSyncOutcome::SkippedUnsupportedFlush(code)
+                );
+                assert!(
+                    dropped.get(),
+                    "handle must be closed after skipped flush error"
+                );
+            }
+        }
+
+        #[test]
+        fn windows_dir_sync_policy_propagates_not_found_and_storage_io_errors() {
+            const WIN32_ERROR_FILE_NOT_FOUND: i32 = 2;
+            const WIN32_ERROR_PATH_NOT_FOUND: i32 = 3;
+            const WIN32_ERROR_CRC: i32 = 23;
+            const WIN32_ERROR_WRITE_FAULT: i32 = 29;
+            const WIN32_ERROR_DISK_FULL: i32 = 112;
+            const WIN32_ERROR_IO_DEVICE: i32 = 1117;
+
+            for code in [
+                WIN32_ERROR_FILE_NOT_FOUND,
+                WIN32_ERROR_PATH_NOT_FOUND,
+                WIN32_ERROR_INVALID_HANDLE,
+                WIN32_ERROR_WRITE_FAULT,
+                WIN32_ERROR_IO_DEVICE,
+            ] {
+                let err = sync_windows_directory_with_ops(
+                    || open_err(code),
+                    || unreachable!("fallback only runs on ERROR_ACCESS_DENIED"),
+                    |_handle| Ok(()),
+                )
+                .expect_err("fatal open error must propagate");
+                assert_eq!(err.raw_os_error(), Some(code));
+            }
+
+            let fallback_not_found = sync_windows_directory_with_ops(
+                || open_err(WIN32_ERROR_ACCESS_DENIED),
+                || open_err(WIN32_ERROR_PATH_NOT_FOUND),
+                |_handle| Ok(()),
+            )
+            .expect_err("NotFound on fallback open must propagate");
+            assert_eq!(
+                fallback_not_found.raw_os_error(),
+                Some(WIN32_ERROR_PATH_NOT_FOUND)
+            );
+
+            for code in [
+                WIN32_ERROR_CRC,
+                WIN32_ERROR_WRITE_FAULT,
+                WIN32_ERROR_DISK_FULL,
+                WIN32_ERROR_IO_DEVICE,
+            ] {
+                let dropped = Cell::new(false);
+                let err = sync_windows_directory_with_ops(
+                    || Ok(DropFlag(&dropped)),
+                    || unreachable!("fallback must not run when primary open succeeded"),
+                    |_handle| Err(std::io::Error::from_raw_os_error(code)),
+                )
+                .expect_err("hardware/media flush error must propagate");
+                assert_eq!(err.raw_os_error(), Some(code));
+                assert!(
+                    dropped.get(),
+                    "handle must be closed after fatal flush error"
+                );
+            }
         }
     }
 }

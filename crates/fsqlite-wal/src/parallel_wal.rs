@@ -3097,9 +3097,16 @@ pub fn write_segment(
         // already reported the epoch durable — silently losing committed
         // frames on the next `recover_segments`. Match SQLite, which fsyncs
         // the containing directory after creating a journal/WAL sidecar.
-        // Windows persists the directory entry together with the file and has
-        // no portable directory-fsync via a file handle, so this is Unix-only.
-        #[cfg(unix)]
+        // On Unix this fsyncs the containing directory; on Windows it performs
+        // a best-effort directory-handle flush (see `host_fs::sync_directory`).
+        #[cfg(feature = "native")]
+        {
+            fsqlite_vfs::host_fs::sync_parent_directory(&path).map_err(|err| match err {
+                fsqlite_error::FrankenError::Io(io_err) => io_err,
+                other => io::Error::other(other),
+            })?;
+        }
+        #[cfg(all(not(feature = "native"), unix))]
         {
             let parent = path.parent().unwrap_or_else(|| Path::new(""));
             let dir = if parent.as_os_str().is_empty() {
