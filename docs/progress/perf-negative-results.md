@@ -94,6 +94,41 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-23 - WIN (landed as 48b41a41e; inside its prediction): a statement's run of explicit-rowid floor bumps takes the tables lock alone after its first; bulk -206M Ir and a replicated cpu and cycles WIN against SQLite 3.54.1 live (bd-w4pr1.13, bulk-write round 17, lever FR)
+
+- Target: the explicit-rowid floor bump of bulk_insert_1M_one_txn.
+  - 61acfe86a (bd-u65rh, 2026-11-22) attributed every bump to (session, statement) so that rollbacks rewind it exactly.
+  - That raised the bump from 17.5M to 37.3M Ir per 100k rows: 373 a row, with three mutexes and three hash lookups per explicit-rowid row.
+  - Measured by callgrind of the 100k bulk row on a CLI whose sources equal main 4579ee0ba. Line by line per row: the async wrapper 79, `bump_explicit_floor_for_statement` 158, `note_session_op_locked` 75, `record_claim` 61.
+- Touched:
+  - `crates/fsqlite-mvcc/src/rowid_alloc.rs`:
+    - `TableAllocatorState::run`, an `ExplicitRun` holding the session, the statement, the depth after the run's first bump, and the last row's prior floor.
+    - A continuation bump (same session and statement, depth unchanged) raises the floor under the tables lock alone.
+    - Every other depth change, and every mark, rewind or `clear_session` of the session, ends the run.
+    - `rewind_unlanded_explicit` restores a run row's own prior floor.
+  - `crates/fsqlite-vdbe/src/engine.rs`: a synchronous floor raise for a row the cursor just appended (round 11's FB).
+  - Keepers:
+    - mvcc unit `explicit_run_raises_every_row_rewinds_exactly_and_ends_at_any_other_operation`, 7 scenarios;
+    - core `failed_insert_rowid_reuse_oracle::explicit_rowid_runs_raise_every_row_and_rewind_whole_beside_a_concurrent_peer`, two connections and a disjoint-leaf peer;
+    - two OR IGNORE / OR FAIL run-row cases in the stock-differential modes test.
+    - Mutants M1 (runs never end), M2 (a savepoint keeps the run), M3 (a later row does not raise the floor) and M4 (no run-row rewind) each turn them red (rc 101).
+- Ledger preflight:
+  - FB (2026-11-19). Its retry condition was "with the floor's per-row lock and table lookup in the same lever"; FR removes two of the three per-row locks and lookups.
+  - F2 (foldhash) is kept.
+  - No entry covered bd-u65rh's per-row attribution.
+- Prediction (on the bead before the build): bulk -200M to -280M Ir, cycles -3% to -6%, task-clock -2.5% to -5%; other rows within ±0.5% Ir.
+- Kill lines: bulk down less than 120M (1.7% of the row); any row up more than 0.5%; a replicated LOSE above 1%; a failing keeper or oracle; a surviving mutant.
+- Result:
+  - Setup: stock SQLite 3.54.1 live. Parent 4579ee0ba. One three-arm job on vmi1152480 (P_t / L_m2t / L_frt, the parent shared with lever MR2). Cargo ELFs: P d397eddd4281c2ce, L 452029373ca729c9. Two valid layout-averaged runs (null max |z| 2.09 and 1.88). Answers equal stock.
+  - Instructions (single ELF): bulk 6,979.6M -> 6,773.6M (-206.0M; x1.933 -> x1.876 against stock's 3,610.9M). memory_script +0.7M, update and delete unchanged, and every read row within ±0.02%. Callgrind of the 100k row: 705.8M -> 685.2M.
+  - Time (layout-averaged): bulk cpu 0.9785 / 0.9692, a replicated WIN (against stock x2.242 -> x2.194 and x2.238 -> x2.169). Cycles 0.9693 / 0.9660, a replicated WIN (x2.584 -> x2.505 and x2.572 -> x2.485). Every other row is a replicated TIE.
+  - Gate (rch, the measured tree):
+    - clippy -D warnings (mvcc and vdbe, all targets; the core test target): rc 0;
+    - fsqlite-mvcc lib 1689 passed, fsqlite-vdbe lib 1267, fsqlite-core lib 4208;
+    - the seven core rowid keepers all pass (failed_insert_rowid_reuse_oracle 4, bd_8a8pr 4, bd_elcjy 4, bd_hi7qg 3, bd_6i9c5 1, bd_i3csr_1 9, the concurrent rewind stress 1);
+    - ubs 0 critical.
+- Retry / next: none for this lever. The remaining floor cost is about 100-130 a row: the tables lock and lookup and the sync call. A per-cursor floor held as an atomic that peers fold in at allocation would remove those too, but it changes what a peer reads mid-statement, so it needs the two-writer keeper the coordinator named.
+
 ## 2026-11-23 - SMALL WIN (landed as b50d778c4; under its prediction, inside every kill line; instructions only, time a replicated TIE): the record writer stores a one-byte serial type straight into its header slot and encodes each payload inline (bd-w4pr1.13, bulk-write round 17, lever MR2)
 
 - Target: round 16's MR retry line. The 3-to-16-value MakeRecord writer `write_serialized_record_from_layouts` called `encode_serialized_value` out of line (400k calls, 110 a row) and wrote each header byte through a fresh sub-slice (about 65 a row).
