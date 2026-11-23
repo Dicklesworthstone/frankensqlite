@@ -12582,6 +12582,71 @@ impl VdbeEngine {
         } else {
             Self::storage_cursor_visible_max_rowid(sc).await?
         };
+        Self::raise_concurrent_storage_rowid_floor(
+            allocator,
+            schema_epoch,
+            session_id,
+            statement,
+            root_page,
+            mode,
+            autoinc_max,
+            sc,
+            table_max,
+            rowid,
+        )
+    }
+
+    /// [`Self::bump_concurrent_storage_rowid_floor`] for a row `sc` just
+    /// inserted as the table's rightmost (`last_successful_insert_rowid`),
+    /// whose largest rowid is then `rowid` itself: no walk, so no future
+    /// (bd-w4pr1.13; round 11's lever FB). `Ok(false)` leaves every other row
+    /// to the async bump.
+    #[allow(clippy::too_many_arguments)]
+    fn try_raise_concurrent_storage_rowid_floor_after_append(
+        allocator: &ConcurrentRowIdAllocator,
+        schema_epoch: SchemaEpoch,
+        session_id: u64,
+        statement: u64,
+        root_page: i32,
+        mode: RowIdMode,
+        autoinc_max: i64,
+        sc: &mut StorageCursor,
+        rowid: i64,
+    ) -> Result<bool> {
+        if sc.last_successful_insert_rowid != Some(rowid) {
+            return Ok(false);
+        }
+        Self::raise_concurrent_storage_rowid_floor(
+            allocator,
+            schema_epoch,
+            session_id,
+            statement,
+            root_page,
+            mode,
+            autoinc_max,
+            sc,
+            rowid,
+            rowid,
+        )?;
+        Ok(true)
+    }
+
+    /// Raise the shared rowid floor past `rowid`, which this session just
+    /// wrote through `sc`, on a table whose largest rowid it sees is
+    /// `table_max`.
+    #[allow(clippy::too_many_arguments)]
+    fn raise_concurrent_storage_rowid_floor(
+        allocator: &ConcurrentRowIdAllocator,
+        schema_epoch: SchemaEpoch,
+        session_id: u64,
+        statement: u64,
+        root_page: i32,
+        mode: RowIdMode,
+        autoinc_max: i64,
+        sc: &mut StorageCursor,
+        table_max: i64,
+        rowid: i64,
+    ) -> Result<()> {
         let visible_max = table_max.max(autoinc_max).max(rowid);
         let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
         // bd-i3csr.4 / bd-u65rh / bd-failed-insert-rowid-floor-l53w4: attribute
@@ -15534,20 +15599,32 @@ impl VdbeEngine {
                                     {
                                         let session_id = self.concurrent_rowid_session_id;
                                         let statement = self.concurrent_rowid_statement;
-                                        lean_future(|| {
-                                            Self::bump_concurrent_storage_rowid_floor(
-                                                allocator,
-                                                concurrent_schema_epoch,
-                                                session_id,
-                                                statement,
-                                                root_page,
-                                                rowid_mode,
-                                                autoinc_max,
-                                                sc,
-                                                rowid,
-                                            )
-                                        })
-                                        .await?;
+                                        if !Self::try_raise_concurrent_storage_rowid_floor_after_append(
+                                            allocator,
+                                            concurrent_schema_epoch,
+                                            session_id,
+                                            statement,
+                                            root_page,
+                                            rowid_mode,
+                                            autoinc_max,
+                                            sc,
+                                            rowid,
+                                        )? {
+                                            lean_future(|| {
+                                                Self::bump_concurrent_storage_rowid_floor(
+                                                    allocator,
+                                                    concurrent_schema_epoch,
+                                                    session_id,
+                                                    statement,
+                                                    root_page,
+                                                    rowid_mode,
+                                                    autoinc_max,
+                                                    sc,
+                                                    rowid,
+                                                )
+                                            })
+                                            .await?;
+                                        }
                                     }
                                     inserted_via_storage = true;
                                     inserted_root_page = Some(root_page);

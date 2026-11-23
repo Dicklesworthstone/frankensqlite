@@ -754,6 +754,39 @@ fn explicit_rowid_failed_statements_match_stock_across_modes() {
                 "SELECT rowid, a, b FROM n ORDER BY rowid",
             ],
         ),
+        // bd-w4pr1.13: a later row of a multi-row explicit statement (a run of
+        // the statement's first floor bump) discarded by a UNIQUE conflict
+        // gives its rowid back, under OR IGNORE and under OR FAIL.
+        (
+            "bd_w4pr1_13_run_row_or_ignore_explicit_txn",
+            &[
+                "CREATE TABLE n(a INT UNIQUE, b TEXT)",
+                "INSERT INTO n VALUES (7, 'seven')",
+            ],
+            &[
+                "BEGIN",
+                "INSERT OR IGNORE INTO n(rowid, a) VALUES (90001, 1), (90002, 2), (90003, 7)",
+                "INSERT INTO n(b) VALUES ('q')",
+                "SELECT last_insert_rowid()",
+                "COMMIT",
+                "SELECT rowid, a, b FROM n ORDER BY rowid",
+            ],
+        ),
+        (
+            "bd_w4pr1_13_run_row_or_fail_explicit_txn",
+            &[
+                "CREATE TABLE n(a INT UNIQUE, b TEXT)",
+                "INSERT INTO n VALUES (7, 'seven')",
+            ],
+            &[
+                "BEGIN",
+                "INSERT OR FAIL INTO n(rowid, a) VALUES (90001, 1), (90002, 2), (90003, 7), (90004, 4)",
+                "INSERT INTO n(b) VALUES ('q')",
+                "SELECT last_insert_rowid()",
+                "COMMIT",
+                "SELECT rowid, a, b FROM n ORDER BY rowid",
+            ],
+        ),
     ];
 
     let dir = tempfile::tempdir().expect("temp dir");
@@ -916,6 +949,99 @@ fn explicit_rowid_rollback_keeps_gap_when_concurrent_peer_intervenes() {
     });
 
     let stock = rusqlite::Connection::open(&path).expect("stock open");
+    let check = stock_query(&stock, "PRAGMA integrity_check");
+    assert_eq!(check, "PRAGMA integrity_check => ok [\"t:ok\"]");
+}
+
+/// bd-w4pr1.13: the peer-gap case above with multi-row statements, the shape
+/// of a bulk INSERT, whose later rows the allocator records as one run of the
+/// statement's first bump. Connection A's first statement appends explicit
+/// rowids 90001..90100 on the rightmost leaves (raising the floor on every
+/// row, so to 90101); peer B inserts explicit rowid 5 on the leftmost leaf
+/// (disjoint page locks; a short row, so the full leaf takes it without a
+/// split of the root A holds) and commits; A's second statement appends
+/// 95001..95009 and fails NOT NULL on 95010, and its rewind gives back that
+/// whole run, to 90101; A's ROLLBACK then keeps the gap, because B intervened.
+/// A's next implicit rowid is therefore 90101: not 90002 (a floor raised by
+/// each statement's first row only), nor 95010 (a run not given back).
+#[test]
+fn explicit_rowid_runs_raise_every_row_and_rewind_whole_beside_a_concurrent_peer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("explicit_run_floor.db");
+    let path_str = path.to_str().expect("utf-8 path").to_owned();
+
+    asupersync::test_utils::run_test(|| async move {
+        let a = Connection::open(&path_str).await.expect("open a");
+        a.execute_batch(
+            "PRAGMA journal_mode=WAL;\
+             CREATE TABLE u(id INTEGER PRIMARY KEY, pad TEXT NOT NULL);",
+        )
+        .await
+        .expect("schema");
+        let pad = "p".repeat(240);
+        a.execute("BEGIN").await.expect("seed begin");
+        for i in 1..=200_i64 {
+            a.execute(&format!("INSERT INTO u VALUES ({}, '{pad}')", i * 2))
+                .await
+                .expect("seed insert");
+        }
+        a.execute("COMMIT").await.expect("seed commit");
+
+        let b = Connection::open(&path_str).await.expect("open b");
+        a.execute("PRAGMA busy_timeout=2000").await.expect("a busy");
+        b.execute("PRAGMA busy_timeout=2000").await.expect("b busy");
+
+        a.execute("BEGIN CONCURRENT").await.expect("a begin");
+        b.execute("BEGIN CONCURRENT").await.expect("b begin");
+        a.execute(&format!(
+            "INSERT INTO u SELECT value, '{pad}' FROM generate_series(90001, 90100)"
+        ))
+        .await
+        .expect("a explicit run 90001..90100");
+        b.query("INSERT INTO u VALUES (5, 'b') RETURNING id")
+            .await
+            .expect("b disjoint explicit insert 5");
+        b.execute("COMMIT").await.expect("b commit 5");
+        assert!(
+            a.execute(&format!(
+                "INSERT INTO u SELECT value, CASE WHEN value = 95010 THEN NULL ELSE '{pad}' END \
+                 FROM generate_series(95001, 95010)"
+            ))
+            .await
+            .is_err(),
+            "NOT NULL must fail A's second statement"
+        );
+        a.execute("ROLLBACK").await.expect("a rollback");
+
+        // B holds a claim on the table, so no quiescent lowering hides the tip.
+        b.execute("BEGIN CONCURRENT").await.expect("b begin 2");
+        b.query("INSERT INTO u VALUES (7, 'b') RETURNING id")
+            .await
+            .expect("b disjoint explicit insert 7");
+        a.execute("BEGIN CONCURRENT").await.expect("a begin 2");
+        let a_rows = a
+            .query(&format!("INSERT INTO u(pad) VALUES ('{pad}') RETURNING id"))
+            .await
+            .expect("a implicit insert after the runs");
+        let a_id: i64 = match a_rows.first().and_then(|row| row.get(0)) {
+            Some(SqliteValue::Integer(id)) => *id,
+            other => panic!("unexpected a RETURNING id: {other:?}"),
+        };
+        assert_eq!(
+            a_id, 90101,
+            "every row of the first run raised the floor, and the failed second run was given back whole"
+        );
+        a.execute("COMMIT").await.expect("a commit 2");
+        b.execute("COMMIT").await.expect("b commit 2");
+        a.close().await.expect("close a");
+        b.close().await.expect("close b");
+    });
+
+    let stock = rusqlite::Connection::open(&path).expect("stock open");
+    assert_eq!(
+        stock_query(&stock, "SELECT count(*), count(DISTINCT id), max(id) FROM u"),
+        "SELECT count(*), count(DISTINCT id), max(id) FROM u => ok [\"i:203|i:203|i:90101\"]"
+    );
     let check = stock_query(&stock, "PRAGMA integrity_check");
     assert_eq!(check, "PRAGMA integrity_check => ok [\"t:ok\"]");
 }

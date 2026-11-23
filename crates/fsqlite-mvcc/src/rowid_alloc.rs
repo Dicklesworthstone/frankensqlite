@@ -81,9 +81,60 @@ struct TableAllocatorState {
     /// jumps to `EXHAUSTED_NEXT_ROWID`, and sub-tip explicit writes by a
     /// concurrent peer (bd-u65rh / bd-failed-insert-rowid-floor-l53w4).
     depth: u64,
+    /// The explicit-rowid run that made this table's latest operation, if any
+    /// (bd-w4pr1.13): see [`ExplicitRun`]. Cleared by every other change of
+    /// `depth`, so a run is live only while its operation is the table's last.
+    run: Option<ExplicitRun>,
+}
+
+/// A run of explicit-rowid floor bumps by one session and statement on one
+/// table with no other operation between them (bd-w4pr1.13): a bulk INSERT
+/// with explicit rowids. The run's first bump is a full operation (a `depth`
+/// step, a session op, a claim, a statement mark); every later bump of the
+/// run only raises the floor, under the tables lock alone, and is counted as
+/// part of that one operation. Every rewind treats the whole run as one
+/// operation, which gives the same result as one operation per row: a rewind
+/// to a point before the run gives back all of it, and no peer can operate
+/// inside it without ending it. The one per-row rewind, of a row discarded by
+/// a conflict, restores the floor from [`RunRow`].
+#[derive(Debug, Clone, Copy)]
+struct ExplicitRun {
+    session_id: u64,
+    statement: u64,
+    /// `TableAllocatorState::depth` right after the run's first bump.
+    depth: u64,
+    /// The run's latest bump after its first, with the floor just before it.
+    last: Option<RunRow>,
+}
+
+/// One later bump of an [`ExplicitRun`]: the explicit rowid and the floor the
+/// table had just before it, for
+/// [`ConcurrentRowIdAllocator::rewind_unlanded_explicit`].
+#[derive(Debug, Clone, Copy)]
+struct RunRow {
+    rowid: i64,
+    prior_next_rowid: i64,
+    prior_high_water: i64,
 }
 
 impl TableAllocatorState {
+    /// Whether the next explicit bump by `session_id` in `statement` extends
+    /// this table's live run: the run is that statement's and no operation
+    /// changed the table since it began.
+    #[inline]
+    fn continues_run(&self, session_id: u64, statement: u64) -> bool {
+        self.run.is_some_and(|run| {
+            run.session_id == session_id && run.statement == statement && run.depth == self.depth
+        })
+    }
+
+    /// End the session's run on this table, if it has one.
+    fn end_run_of(&mut self, session_id: u64) {
+        if self.run.is_some_and(|run| run.session_id == session_id) {
+            self.run = None;
+        }
+    }
+
     /// Raise the state to the floor `derived` (a [`Self::new`] from the
     /// table's largest rowid) describes: the next rowid and an AUTOINCREMENT
     /// high-water never fall. Returns `true` if either watermark advanced.
@@ -147,6 +198,7 @@ impl TableAllocatorState {
         // next_rowid to i64::MIN, which the `start < 1` guard catches next time.
         self.next_rowid = start.wrapping_add(count_i64);
         self.depth = self.depth.wrapping_add(1);
+        self.run = None;
 
         // Update AUTOINCREMENT high-water (last allocated rowid in range).
         if self.mode == RowIdMode::AutoIncrement {
@@ -204,6 +256,7 @@ impl TableAllocatorState {
             mode,
             autoincrement_high_water: high_water,
             depth: 0,
+            run: None,
         }
     }
 }
@@ -484,6 +537,7 @@ fn rewind_table_to_prior(
                     state.autoincrement_high_water = high_water;
                 }
                 state.depth = depth;
+                state.run = None;
             }
         }
     }
@@ -573,7 +627,12 @@ impl ConcurrentRowIdAllocator {
     #[must_use]
     pub fn mark_savepoint(&self, session_id: u64) -> RowidAllocSavepointMark {
         let session_reservations = self.session_reservations.lock();
-        let tables = self.tables.lock();
+        let mut tables = self.tables.lock();
+        // bd-w4pr1.13: a bump after the mark is an operation of its own, so a
+        // rewind to the mark counts it and gives it back.
+        for state in tables.values_mut() {
+            state.end_run_of(session_id);
+        }
         let entries = tables
             .iter()
             .map(|(key, state)| {
@@ -635,6 +694,9 @@ impl ConcurrentRowIdAllocator {
                 let target = if sp_ops == 0 { first_prior } else { sp_prior };
                 rewind_table_to_prior(&mut tables, key, target, ops_since);
             }
+            if let Some(state) = tables.get_mut(&key) {
+                state.end_run_of(mark.session_id);
+            }
             // Every operation since the mark was rolled back — restore the
             // session's tracked count regardless of whether the tip rewound.
             if sp_ops == 0 {
@@ -686,6 +748,7 @@ impl ConcurrentRowIdAllocator {
         {
             state.next_rowid = unlanded_rowid;
             state.depth -= 1;
+            state.run = None;
             rewound = true;
         }
         if rewound {
@@ -722,6 +785,26 @@ impl ConcurrentRowIdAllocator {
             return;
         };
         if reservations.ops == 0 {
+            return;
+        }
+        // bd-w4pr1.13: a later bump of this session's live run is no
+        // operation of its own; give back just its floor raise, the run (and
+        // its one operation, which owns the run's earlier rows) stays.
+        if let Some(state) = tables.get_mut(&key)
+            && let Some(run) = state.run.as_mut()
+            && run.session_id == session_id
+            && run.depth == state.depth
+            && let Some(row) = run.last
+            && row.rowid == unlanded_rowid
+        {
+            if !statement_failed && state.mode == RowIdMode::AutoIncrement {
+                return;
+            }
+            run.last = None;
+            state.next_rowid = row.prior_next_rowid;
+            if state.mode == RowIdMode::AutoIncrement {
+                state.autoincrement_high_water = row.prior_high_water;
+            }
             return;
         }
         let Some(last) = reservations.last_op else {
@@ -778,6 +861,9 @@ impl ConcurrentRowIdAllocator {
             }
             let ops_since = reservations.ops.saturating_sub(mark_ops);
             rewind_table_to_prior(&mut tables, key, mark_prior, ops_since);
+            if let Some(state) = tables.get_mut(&key) {
+                state.end_run_of(session_id);
+            }
             reservations.ops = mark_ops;
             reservations.last_op = None;
             reservations.statement = None;
@@ -794,6 +880,11 @@ impl ConcurrentRowIdAllocator {
         self.session_reservations
             .lock()
             .retain(|&(session, _), _| session != session_id);
+        // bd-w4pr1.13: a run's later bumps ride on the claim its first bump
+        // recorded, so the run ends with the claim.
+        for state in self.tables.lock().values_mut() {
+            state.end_run_of(session_id);
+        }
         self.claims.lock().retain(|_, claimants| {
             claimants.retain(|&claimant| claimant != session_id);
             !claimants.is_empty()
@@ -846,6 +937,7 @@ impl ConcurrentRowIdAllocator {
             Some(state) => {
                 if state.raise_to(&derived, mode) {
                     state.depth = state.depth.wrapping_add(1);
+                    state.run = None;
                 }
             }
             None => {
@@ -862,6 +954,12 @@ impl ConcurrentRowIdAllocator {
     /// Always advances `TableAllocatorState::depth` (even if `explicit_rowid`
     /// sits below the current tip) so a concurrent peer inserting a sub-tip
     /// explicit rowid blocks an earlier writer from rewinding past that row.
+    ///
+    /// bd-w4pr1.13: a bump that extends the statement's live [`ExplicitRun`]
+    /// on the table (no operation since the run's last bump) raises the floor
+    /// under the tables lock alone: the run's first bump already advanced the
+    /// depth, recorded the session's operation and statement mark, and the
+    /// claim. Every peer allocation still sees the raised floor at once.
     #[allow(clippy::too_many_arguments)]
     pub fn bump_explicit_floor_for_statement(
         &self,
@@ -875,6 +973,23 @@ impl ConcurrentRowIdAllocator {
     ) {
         let mut derived = TableAllocatorState::new(max_committed_rowid, sqlite_sequence_seq, mode);
         self.raise_epoch(key);
+        if statement != 0 {
+            let mut tables = self.tables.lock();
+            if let Some(state) = tables.get_mut(&key)
+                && state.continues_run(session_id, statement)
+            {
+                let row = RunRow {
+                    rowid: explicit_rowid,
+                    prior_next_rowid: state.next_rowid,
+                    prior_high_water: state.autoincrement_high_water,
+                };
+                state.raise_to(&derived, mode);
+                if let Some(run) = state.run.as_mut() {
+                    run.last = Some(row);
+                }
+                return;
+            }
+        }
         let mut session_reservations = self.session_reservations.lock();
         let mut tables = self.tables.lock();
         let prior = match tables.entry(key) {
@@ -887,10 +1002,22 @@ impl ConcurrentRowIdAllocator {
                 };
                 state.raise_to(&derived, mode);
                 state.depth = state.depth.wrapping_add(1);
+                state.run = (statement != 0).then_some(ExplicitRun {
+                    session_id,
+                    statement,
+                    depth: state.depth,
+                    last: None,
+                });
                 prior
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 derived.depth = 1;
+                derived.run = (statement != 0).then_some(ExplicitRun {
+                    session_id,
+                    statement,
+                    depth: 1,
+                    last: None,
+                });
                 entry.insert(derived);
                 PriorTableState::Absent
             }
@@ -956,6 +1083,7 @@ impl ConcurrentRowIdAllocator {
                 let state = entry.into_mut();
                 if state.raise_to(&derived, mode) {
                     state.depth = state.depth.wrapping_add(1);
+                    state.run = None;
                 }
                 state
             }
@@ -1187,6 +1315,7 @@ impl ConcurrentRowIdAllocator {
             state.autoincrement_high_water = state.autoincrement_high_water.max(r);
         }
         state.depth = state.depth.wrapping_add(1);
+        state.run = None;
 
         let next_after = state.next_rowid;
         drop(tables);
@@ -2776,6 +2905,174 @@ mod tests {
             alloc.rewind_to_mark(&sp);
             assert_eq!(alloc.next_rowid(&k), Some(2));
             assert_eq!(alloc.autoincrement_high_water(&k), Some(1));
+        }
+    }
+
+    /// bd-w4pr1.13: a statement's run of explicit-rowid bumps raises the floor
+    /// on every row (peers see it at once), rewinds exactly like one operation
+    /// per row, and ends at every operation between its rows, so no peer's
+    /// rewind can lower the floor under a later row of the run.
+    #[test]
+    fn explicit_run_raises_every_row_rewinds_exactly_and_ends_at_any_other_operation() {
+        let (a, b, c) = (10_u64, 20_u64, 30_u64);
+        let k = key(1, 1);
+        let bump = |alloc: &ConcurrentRowIdAllocator,
+                    mode: RowIdMode,
+                    session: u64,
+                    statement: u64,
+                    rowid: i64| {
+            alloc.bump_explicit_floor_for_statement(
+                k,
+                Some(RowId::new(rowid)),
+                2,
+                mode,
+                session,
+                statement,
+                rowid,
+            );
+        };
+
+        // 1. Every row of the run raises the floor; a discarded later row gives
+        // back just its raise (the high-water too); the statement's rewind
+        // gives back the whole run.
+        for mode in [RowIdMode::Normal, RowIdMode::AutoIncrement] {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 2, mode);
+            for rowid in 101..=110 {
+                bump(&alloc, mode, a, 1, rowid);
+                assert_eq!(
+                    alloc.next_rowid(&k),
+                    Some(rowid + 1),
+                    "{mode:?} row {rowid}"
+                );
+            }
+            alloc.rewind_unlanded_explicit(a, k, 109, true);
+            assert_eq!(
+                alloc.next_rowid(&k),
+                Some(111),
+                "{mode:?}: 109 is not the last row"
+            );
+            alloc.rewind_unlanded_explicit(a, k, 110, true);
+            assert_eq!(alloc.next_rowid(&k), Some(110), "{mode:?} discarded 110");
+            if mode == RowIdMode::AutoIncrement {
+                assert_eq!(alloc.autoincrement_high_water(&k), Some(109));
+            }
+            bump(&alloc, mode, a, 1, 110);
+            assert_eq!(alloc.next_rowid(&k), Some(111));
+            alloc.rewind_statement(a, 1);
+            assert_eq!(alloc.next_rowid(&k), Some(3), "{mode:?} statement rewind");
+            if mode == RowIdMode::AutoIncrement {
+                assert_eq!(alloc.autoincrement_high_water(&k), Some(2));
+            }
+            assert_eq!(alloc.session_reservation_len(), 0);
+        }
+
+        // 2. OR IGNORE burns a discarded explicit rowid on AUTOINCREMENT, also
+        // inside a run; OR FAIL gives it back.
+        {
+            let mode = RowIdMode::AutoIncrement;
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 2, mode);
+            bump(&alloc, mode, a, 1, 50);
+            bump(&alloc, mode, a, 1, 60);
+            alloc.rewind_unlanded_explicit(a, k, 60, false);
+            assert_eq!(alloc.next_rowid(&k), Some(61));
+            assert_eq!(alloc.autoincrement_high_water(&k), Some(60));
+            alloc.rewind_unlanded_explicit(a, k, 60, true);
+            assert_eq!(alloc.next_rowid(&k), Some(51));
+            assert_eq!(alloc.autoincrement_high_water(&k), Some(50));
+        }
+
+        // 3. A sub-tip row inside a run leaves the floor; giving it back too.
+        {
+            let mode = RowIdMode::Normal;
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 0, mode);
+            bump(&alloc, mode, a, 1, 100);
+            bump(&alloc, mode, a, 1, 50);
+            assert_eq!(alloc.next_rowid(&k), Some(101));
+            alloc.rewind_unlanded_explicit(a, k, 50, true);
+            assert_eq!(alloc.next_rowid(&k), Some(101));
+            alloc.rewind_statement(a, 1);
+            assert_eq!(alloc.next_rowid(&k), Some(3));
+        }
+
+        // 4. A peer allocating mid-run gets a rowid above the run's last row.
+        {
+            let mode = RowIdMode::Normal;
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 0, mode);
+            for rowid in 101..=200 {
+                bump(&alloc, mode, a, 1, rowid);
+            }
+            assert_eq!(
+                alloc.allocate_one_for_statement(k, b, 1).unwrap().get(),
+                201
+            );
+        }
+
+        // 5. A peer's operation ends the run, so A's next row is an operation
+        // of its own: the peer's later statement rewind cannot lower the
+        // floor under A's row 104, and no one is handed 104.
+        {
+            let mode = RowIdMode::Normal;
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 0, mode);
+            bump(&alloc, mode, a, 1, 101);
+            bump(&alloc, mode, a, 1, 102);
+            assert_eq!(
+                alloc.allocate_one_for_statement(k, b, 1).unwrap().get(),
+                103
+            );
+            bump(&alloc, mode, a, 1, 104);
+            alloc.rewind_statement(b, 1);
+            assert_eq!(
+                alloc.next_rowid(&k),
+                Some(105),
+                "B's rewind must keep A's row 104 below the floor"
+            );
+            let first = alloc.allocate_one_for_statement(k, c, 1).unwrap().get();
+            let second = alloc.allocate_one_for_statement(k, c, 1).unwrap().get();
+            assert_eq!((first, second), (105, 106));
+            // A's own rewind sees the peers' operations and keeps the gap.
+            alloc.rewind_statement(a, 1);
+            assert_eq!(alloc.next_rowid(&k), Some(107));
+        }
+
+        // 6. A savepoint ends the run: a bump after it, even under the same
+        // statement number, is given back by the rewind to the savepoint.
+        {
+            let mode = RowIdMode::Normal;
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 0, mode);
+            for rowid in 101..=103 {
+                bump(&alloc, mode, a, 1, rowid);
+            }
+            let mark = alloc.mark_savepoint(a);
+            for rowid in 104..=106 {
+                bump(&alloc, mode, a, 1, rowid);
+            }
+            assert_eq!(alloc.next_rowid(&k), Some(107));
+            alloc.rewind_to_mark(&mark);
+            assert_eq!(alloc.next_rowid(&k), Some(104));
+        }
+
+        // 7. A run never spans statements: the second statement's rewind gives
+        // back its own rows only, the transaction's mark all of them.
+        {
+            let mode = RowIdMode::Normal;
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            alloc.init_table(k, Some(RowId::new(2)), 0, mode);
+            let begin = alloc.mark_savepoint(a);
+            bump(&alloc, mode, a, 1, 101);
+            bump(&alloc, mode, a, 1, 102);
+            bump(&alloc, mode, a, 2, 103);
+            bump(&alloc, mode, a, 2, 104);
+            alloc.rewind_statement(a, 2);
+            assert_eq!(alloc.next_rowid(&k), Some(103));
+            alloc.rewind_to_mark(&begin);
+            assert_eq!(alloc.next_rowid(&k), Some(3));
+            assert_eq!(alloc.session_reservation_len(), 0);
         }
     }
 }
