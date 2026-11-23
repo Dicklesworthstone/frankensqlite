@@ -1197,15 +1197,22 @@ impl Connection {
         let table_has_upsert_fk_parent_work = is_do_update_upsert
             && self.fk_cascade_propagation_enabled()
             && self.table_is_foreign_key_parent(table_name);
+        // bd-jxurb: a DO UPDATE subquery the compiled program cannot answer
+        // is bound for each row's conflicting row, one row at a time.
+        let upsert_binds_subqueries = is_do_update_upsert
+            && !is_live_vtab
+            && self.upsert_has_uncompiled_correlated_subquery(insert);
         // The conflict/OLD-NEW plan is needed whenever a conflicting row
         // would change which triggers fire or enforce parent-side FK actions:
         // BEFORE/AFTER UPDATE must fire for the update, AFTER INSERT must be
         // SUPPRESSED because no insert happened, and parent-side ON UPDATE FK
-        // checks/cascades must run on the updated parent key.
+        // checks/cascades must run on the updated parent key; or when the
+        // conflicting row binds the DO UPDATE's subqueries.
         let upsert_needs_conflict_plan = is_do_update_upsert
             && (has_after_insert
                 || table_has_upsert_update_trigger
-                || table_has_upsert_fk_parent_work);
+                || table_has_upsert_fk_parent_work
+                || upsert_binds_subqueries);
         if is_live_vtab {
             if !insert.returning.is_empty() {
                 return Err(FrankenError::NotImplemented(
@@ -1542,6 +1549,25 @@ impl Connection {
             return Ok(Vec::new());
         }
 
+        // bd-jxurb: after BEFORE INSERT (whose effects a DO UPDATE sees), the
+        // subqueries the compiled DO UPDATE cannot answer take their values
+        // for this row, and the statement with those values is what the
+        // program is compiled from and what the routing below reads.
+        let bound_upsert;
+        let (statement, insert, precompiled) = if upsert_binds_subqueries {
+            let [attempted] = trigger_new_rows.as_slice() else {
+                return Err(FrankenError::internal(
+                    "an upsert binding its DO UPDATE subqueries needs exactly one attempted row",
+                ));
+            };
+            let bound =
+                Box::pin(self.bind_upsert_uncompiled_subqueries(insert, attempted, params)).await?;
+            bound_upsert = (Statement::Insert(bound.clone()), bound);
+            (&bound_upsert.0, &bound_upsert.1, None)
+        } else {
+            (statement, insert, precompiled)
+        };
+
         // bd-y7old / bd-bwm0x: a DO UPDATE upsert whose single attempted row
         // conflicts resolves to the UPDATE path. Determine the conflict +
         // OLD/NEW BEFORE running the VDBE program (which itself does the
@@ -1714,9 +1740,11 @@ impl Connection {
             // Resolved VALUES subqueries hold this execution's values.
             // A RETURNING snapshot also changes the compiled shape independently
             // of any original SQL text retained by the dispatcher.
+            // bd-jxurb: so do the values bound into an upsert's DO UPDATE.
             let _insert_cache_bypass = (insert_values_have_subquery(insert)
-                || snapshot_statement.is_some())
-            .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
+                || snapshot_statement.is_some()
+                || upsert_binds_subqueries)
+                .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
             arc_prog = self
                 .compile_with_cache(sql_key, &sql_text, async |conn| {
                     conn.compile_table_insert(compiled_insert, params).await
@@ -1898,6 +1926,372 @@ impl Connection {
         } else {
             Ok(rows)
         }
+    }
+
+    /// bd-jxurb: whether a DO UPDATE clause of `insert` holds, in its SET
+    /// values or its WHERE, a correlated subquery its compiled program
+    /// cannot answer: a scalar or EXISTS subquery over anything but one base
+    /// table (a derived table, a compound, a join, a CTE, GROUP BY, a view),
+    /// or a correlated IN subquery. The compiled DO UPDATE reads such a
+    /// subquery's first table, or NULL, so the dispatcher binds it instead
+    /// ([`Self::bind_upsert_uncompiled_subqueries`]).
+    pub(super) fn upsert_has_uncompiled_correlated_subquery(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> bool {
+        insert
+            .upsert
+            .iter()
+            .any(|clause| self.upsert_clause_has_uncompiled_correlated_subquery(clause))
+    }
+
+    fn upsert_clause_has_uncompiled_correlated_subquery(
+        &self,
+        clause: &fsqlite_ast::UpsertClause,
+    ) -> bool {
+        match &clause.action {
+            fsqlite_ast::UpsertAction::Update {
+                assignments,
+                where_clause,
+            } => {
+                assignments.iter().any(|assignment| {
+                    dml_expr_has_uncompiled_correlated_subquery(&assignment.value, self)
+                }) || where_clause.as_deref().is_some_and(|predicate| {
+                    dml_expr_has_uncompiled_correlated_subquery(predicate, self)
+                })
+            }
+            fsqlite_ast::UpsertAction::Nothing => false,
+        }
+    }
+
+    /// bd-jxurb: `insert` (one attempted row, `attempted`) with the
+    /// subqueries of [`Self::upsert_has_uncompiled_correlated_subquery`]
+    /// replaced by their values for that row, as stock evaluates them.
+    ///
+    /// The clause the row takes is the first whose conflict target an
+    /// existing row violates, as the program routes it. In that clause each
+    /// such subquery runs through the SELECT path with the existing row's
+    /// columns bound (their declared affinity and collation, as a column of
+    /// the target table carries) and `excluded`'s bound (no affinity and no
+    /// collation, as stock's excluded registers carry), and is replaced by
+    /// its value with the subquery's own result affinity; a row-value SET
+    /// source becomes the row value of its first row. A clause the row does
+    /// not take never runs its DO UPDATE, so its subqueries stay as they are,
+    /// but a row-value source the program cannot compile reads NULLs there.
+    ///
+    /// The placeholders are numbered first, so a subquery run alone binds the
+    /// statement's own parameter slots. A conflict target this probe cannot
+    /// locate (an expression or partial index, or an omitted target without
+    /// an INTEGER PRIMARY KEY) before the clause that needs binding is
+    /// refused rather than guessed.
+    pub(super) async fn bind_upsert_uncompiled_subqueries(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        attempted: &[SqliteValue],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<fsqlite_ast::InsertStatement> {
+        let mut bound =
+            canonicalize_insert_placeholders_with_state(insert, &mut BindParamState::default())?;
+        let mut taken = None;
+        for (index, clause) in insert.upsert.iter().enumerate() {
+            match self
+                .probe_upsert_conflict_row(insert, clause.target.as_ref(), attempted, params)
+                .await?
+            {
+                UpsertConflictProbe::NoConflict => {}
+                UpsertConflictProbe::Conflict { rowid, old_values } => {
+                    taken = Some((index, rowid, old_values));
+                    break;
+                }
+                UpsertConflictProbe::Indeterminate => {
+                    if insert.upsert[index..]
+                        .iter()
+                        .any(|clause| self.upsert_clause_has_uncompiled_correlated_subquery(clause))
+                    {
+                        return Err(FrankenError::NotImplemented(
+                            "an upsert DO UPDATE whose correlated subquery is not one SELECT of \
+                             one table, after a conflict target that is an expression or partial \
+                             index, or an omitted target on a table without an INTEGER PRIMARY KEY"
+                                .to_owned(),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+        let binding = match &taken {
+            Some((_, rowid, old_values)) => {
+                Some(self.upsert_row_binding(insert, *rowid, old_values, attempted)?)
+            }
+            None => None,
+        };
+        for (index, clause) in bound.upsert.iter_mut().enumerate() {
+            let fsqlite_ast::UpsertAction::Update {
+                assignments,
+                where_clause,
+            } = &mut clause.action
+            else {
+                continue;
+            };
+            let Some(binding) = binding
+                .as_ref()
+                .filter(|_| taken.as_ref().is_some_and(|(taken, _, _)| *taken == index))
+            else {
+                // Not this row's clause: its DO UPDATE never runs.
+                for assignment in assignments.iter_mut() {
+                    if let fsqlite_ast::AssignmentTarget::ColumnList(targets) = &assignment.target
+                        && targets.len() > 1
+                        && matches!(assignment.value, Expr::Subquery(..))
+                    {
+                        let span = assignment.value.span();
+                        assignment.value = Expr::RowValue(
+                            vec![Expr::Literal(Literal::Null, span); targets.len()],
+                            span,
+                        );
+                    }
+                }
+                continue;
+            };
+            // Stock tests the DO UPDATE's WHERE before it computes the SET.
+            if let Some(predicate) = where_clause.as_deref_mut() {
+                Box::pin(self.bind_upsert_subqueries_in_expr(predicate, binding, params)).await?;
+            }
+            for assignment in assignments.iter_mut() {
+                let row_value = matches!(
+                    &assignment.target,
+                    fsqlite_ast::AssignmentTarget::ColumnList(targets) if targets.len() > 1
+                );
+                if row_value && self.upsert_subquery_needs_binding(&assignment.value) {
+                    let source = std::mem::replace(
+                        &mut assignment.value,
+                        Expr::Literal(Literal::Null, Span::ZERO),
+                    );
+                    assignment.value =
+                        Box::pin(self.evaluate_bound_upsert_subquery(source, binding, true, params))
+                            .await?;
+                } else {
+                    Box::pin(self.bind_upsert_subqueries_in_expr(
+                        &mut assignment.value,
+                        binding,
+                        params,
+                    ))
+                    .await?;
+                }
+            }
+        }
+        Ok(bound)
+    }
+
+    /// bd-jxurb: a subquery node the compiled DO UPDATE cannot answer: a
+    /// scalar, EXISTS or IN subquery holding a correlated subquery its scan
+    /// does not answer (the node itself or one nested in it).
+    fn upsert_subquery_needs_binding(&self, expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Subquery(..)
+                | Expr::Exists { .. }
+                | Expr::In {
+                    set: InSet::Subquery(_),
+                    ..
+                }
+        ) && dml_expr_has_uncompiled_correlated_subquery(expr, self)
+    }
+
+    /// bd-jxurb: the names a DO UPDATE reads for the row it updates. The
+    /// target's columns (under the INSERT's alias, else its name) and its
+    /// rowid bind the existing row; `excluded.*` binds the attempted row and
+    /// is never reached unqualified (its entries are skipped as a USING
+    /// join's are).
+    fn upsert_row_binding(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        rowid: Option<i64>,
+        old_values: &[SqliteValue],
+        attempted: &[SqliteValue],
+    ) -> Result<UpsertRowBinding> {
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
+            .ok_or_else(|| {
+                FrankenError::internal("an upsert binding its DO UPDATE lost its target table")
+            })?;
+        if old_values.len() != table.columns.len() || attempted.len() != table.columns.len() {
+            return Err(FrankenError::internal(
+                "an upsert binding its DO UPDATE read a row of the wrong width",
+            ));
+        }
+        let label = insert.alias.as_deref().unwrap_or(&insert.table.name);
+        let mut binding = UpsertRowBinding::default();
+        for (column, value) in table.columns.iter().zip(old_values) {
+            binding.push(
+                (label.to_owned(), column.name.clone(), false),
+                Expr::BoundOuterValue {
+                    value: value.clone(),
+                    collation: BoundCollation::from_declared_name(column.collation.clone()),
+                    affinity: Some(affinity_char_to_type(column.affinity)),
+                    span: Span::ZERO,
+                },
+                false,
+            );
+        }
+        if let Some(rowid) = rowid {
+            binding.push(
+                (label.to_owned(), "rowid".to_owned(), true),
+                Expr::BoundOuterValue {
+                    value: SqliteValue::Integer(rowid),
+                    collation: BoundCollation::Binary,
+                    affinity: Some(TypeAffinity::Integer),
+                    span: Span::ZERO,
+                },
+                false,
+            );
+        }
+        for (column, value) in table.columns.iter().zip(attempted) {
+            binding.push(
+                ("excluded".to_owned(), column.name.clone(), false),
+                Expr::BoundOuterValue {
+                    value: value.clone(),
+                    collation: BoundCollation::Unspecified,
+                    affinity: None,
+                    span: Span::ZERO,
+                },
+                true,
+            );
+        }
+        Ok(binding)
+    }
+
+    /// bd-jxurb: replace each subquery node of `expr` the compiled DO UPDATE
+    /// cannot answer by its value for the bound row.
+    async fn bind_upsert_subqueries_in_expr(
+        &self,
+        expr: &mut Expr,
+        binding: &UpsertRowBinding,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<()> {
+        let mut nodes = Vec::new();
+        walk_expr_mut(expr, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |node, _| {
+            if self.upsert_subquery_needs_binding(node) {
+                nodes.push(node.clone());
+                return false;
+            }
+            true
+        });
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let mut values = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            values.push(
+                Box::pin(self.evaluate_bound_upsert_subquery(node, binding, false, params)).await?,
+            );
+        }
+        let mut values = values.into_iter();
+        walk_expr_mut(expr, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |node, _| {
+            if self.upsert_subquery_needs_binding(node) {
+                if let Some(value) = values.next() {
+                    *node = value;
+                }
+                return false;
+            }
+            true
+        });
+        Ok(())
+    }
+
+    /// bd-jxurb: the value of one subquery node for the bound row: a scalar
+    /// subquery's first row (NULL when it has none) with its result affinity,
+    /// a row-value source's first row as a row value, or an EXISTS or IN
+    /// node's truth value. Run through the SELECT path, which answers every
+    /// source shape.
+    async fn evaluate_bound_upsert_subquery(
+        &self,
+        mut node: Expr,
+        binding: &UpsertRowBinding,
+        row_value: bool,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Expr> {
+        {
+            let schema = self.schema.borrow();
+            let lookup = OuterReferenceLookup {
+                row: &binding.row,
+                col_map: &binding.col_map,
+                using_skip: Some(&binding.excluded),
+                replacement_exprs: Some(&binding.replacements),
+                column_collations: None,
+                column_affinities: None,
+                declared_blob_columns: None,
+                schema: &schema,
+                connection: Some(self),
+                probe_unqualified_external_ref: false,
+            };
+            substitute_outer_refs_in_expr_mut(
+                &mut node,
+                &lookup,
+                &[],
+                Some(&HashSet::new()),
+                &HashSet::new(),
+                &CteScopes::new(),
+            );
+        }
+        // Bound values identify no reusable program.
+        let _cache_bypass = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+        match node {
+            Expr::Subquery(subquery, span) => {
+                let donor = (*subquery).clone();
+                self.validate_select_column_references(&donor)?;
+                if !row_value {
+                    self.validate_scalar_subquery_column_count(&donor)?;
+                }
+                let mut probe = *subquery;
+                self.limit_probe_to_its_first_row(&mut probe);
+                let rows = Box::pin(self.execute_statement(&Statement::Select(probe), params)).await?;
+                self.materialize_scalar_subquery_in_operand(&donor, rows, span)
+            }
+            node => {
+                let span = node.span();
+                let probe = select_of_result_exprs(vec![node], None);
+                let rows = Box::pin(self.execute_statement(&Statement::Select(probe), params)).await?;
+                let value = rows
+                    .into_iter()
+                    .next()
+                    .and_then(|row| row.values.into_iter().next())
+                    .unwrap_or(SqliteValue::Null);
+                Ok(Expr::BoundOuterValue {
+                    value,
+                    collation: BoundCollation::Unspecified,
+                    affinity: None,
+                    span,
+                })
+            }
+        }
+    }
+}
+
+/// bd-jxurb: the existing row's and `excluded`'s names for an upsert's DO
+/// UPDATE, as a replacement lookup: `col_map[i]` is replaced by
+/// `replacements[i]` (`row[i]` is its value), and the `excluded` entries
+/// resolve only qualified.
+#[derive(Default)]
+struct UpsertRowBinding {
+    col_map: Vec<(String, String, bool)>,
+    row: Vec<SqliteValue>,
+    replacements: Vec<Expr>,
+    excluded: HashSet<usize>,
+}
+
+impl UpsertRowBinding {
+    fn push(&mut self, entry: (String, String, bool), replacement: Expr, excluded: bool) {
+        if excluded {
+            self.excluded.insert(self.col_map.len());
+        }
+        self.row.push(match &replacement {
+            Expr::BoundOuterValue { value, .. } => value.clone(),
+            _ => SqliteValue::Null,
+        });
+        self.col_map.push(entry);
+        self.replacements.push(replacement);
     }
 }
 

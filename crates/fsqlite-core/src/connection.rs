@@ -54775,10 +54775,13 @@ impl Connection {
         }
         // bd-x5eqm: DML on a view runs its INSTEAD OF triggers (or stock's
         // refusal) in the dispatcher; table bytecode finds no such table.
+        // bd-jxurb: so does an upsert whose DO UPDATE subqueries the
+        // dispatcher binds for each conflicting row.
         Ok(self.targets_shadowed_main(&insert.table)
             || self.main_target_is_temp_only(&insert.table)
             || self.view_index_of(&insert.table.name).is_some()
             || fts5_maintenance_insert_command(insert).is_some()
+            || self.upsert_has_uncompiled_correlated_subquery(insert)
             || self.attached_target_schema(&insert.table)?.is_some())
     }
 
@@ -85862,7 +85865,8 @@ impl Connection {
     ///   BY) in an UPDATE becomes the row value of `(WITH ... SELECT ci ...)`
     ///   projections of its first row ([`row_value_set_cte_projections`]),
     ///   which the UPDATE reads row by row through the SELECT path; an
-    ///   upsert's compiled DO UPDATE cannot read those, so it is refused.
+    ///   upsert's compiled DO UPDATE cannot read those, so the source is left
+    ///   for the dispatcher to bind for the row it changes (bd-jxurb).
     async fn lower_row_value_set_subquery(
         &self,
         assignment: &mut fsqlite_ast::Assignment,
@@ -85911,11 +85915,9 @@ impl Connection {
                 return Ok(());
             }
             if in_upsert {
-                return Err(FrankenError::NotImplemented(
-                    "a row-value DO UPDATE SET from a correlated subquery that is not one \
-                     SELECT of one table with explicit result columns"
-                        .to_owned(),
-                ));
+                // bd-jxurb: the dispatcher binds this source for the row the
+                // DO UPDATE changes (`bind_upsert_uncompiled_subqueries`).
+                return Ok(());
             }
             assignment.value = Expr::RowValue(row_value_set_cte_projections(subquery, width, span), span);
             return Ok(());
