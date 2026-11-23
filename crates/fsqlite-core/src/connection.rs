@@ -7641,6 +7641,7 @@ fn pragma_attached_scope_is_global(name: &str) -> bool {
         "checkpoint_fullfsync",
         "automatic_index",
         "ignore_check_constraints",
+        "reverse_unordered_selects",
         "threads",
         "compile_options",
         "database_list",
@@ -9501,6 +9502,7 @@ impl PreparedStatementTemplate {
             prepared_query_fast_path: self.prepared_query_fast_path.clone(),
             may_observe_change_tracking: self.may_observe_change_tracking,
             reprepared: RefCell::new(None),
+            reprepare_generation: Cell::new(0),
             conn,
         }
     }
@@ -9571,6 +9573,10 @@ pub struct PreparedStatement<'conn> {
     /// it replaces this one for every later execution and for the result
     /// column metadata; a further schema change replaces it in turn.
     reprepared: RefCell<Option<Rc<Self>>>,
+    /// Number of times this handle has transparently re-prepared (bd-w9s20).
+    /// Lets higher-level wrappers (e.g. `fsqlite::blocking::Statement`) refresh
+    /// cached column metadata in O(1) only when a re-prepare actually happened.
+    reprepare_generation: Cell<u64>,
     /// Reference to the parent Connection that prepared this statement.
     /// Used by `execute_with_params` to delegate DML execution through
     /// the Connection's full execution pipeline (triggers, constraints,
@@ -9859,6 +9865,8 @@ impl<'conn> PreparedStatement<'conn> {
             // running it, as stock swaps the new VM into the statement, so later
             // executions start from it instead of from the stale program.
             *self.reprepared.borrow_mut() = Some(Rc::clone(&reprepared));
+            self.reprepare_generation
+                .set(self.reprepare_generation.get().wrapping_add(1));
             match op(&reprepared).await {
                 Err(FrankenError::SchemaChanged)
                     if reprepared.schema_change_is_reprepareable() && can_retry() => {}
@@ -10340,6 +10348,7 @@ impl PreparedStatement<'_> {
             prepared_query_fast_path: self.prepared_query_fast_path.clone(),
             may_observe_change_tracking: self.may_observe_change_tracking,
             reprepared: RefCell::new(None),
+            reprepare_generation: Cell::new(0),
             conn: self.conn,
         }
     }
@@ -11370,6 +11379,25 @@ impl PreparedStatement<'_> {
             || self.column_names.clone(),
             |reprepared| reprepared.column_names.clone(),
         )
+    }
+
+    /// Number of transparent re-prepares performed on this handle so far
+    /// (bd-w9s20). Stays constant while the schema and statement-invalidating
+    /// pragma flags do not change.
+    #[must_use]
+    pub fn reprepare_count(&self) -> u64 {
+        self.reprepare_generation.get()
+    }
+
+    /// Opaque identity of the currently active compiled `VdbeProgram` backing
+    /// this handle (bd-w9s20). Unchanged across repeated executions that reuse
+    /// the compiled program; changes when the handle transparently re-prepares.
+    #[must_use]
+    pub fn program_identity(&self) -> usize {
+        if let Some(reprepared) = self.reprepared_statement() {
+            return reprepared.program_identity();
+        }
+        Arc::as_ptr(&self.program) as usize
     }
 
     /// Execute and return affected/output row count.
@@ -47073,6 +47101,7 @@ impl Connection {
                 // setting made by a schema-qualified PRAGMA main.secure_delete.
                 attached_connection.inherit_secure_delete(self);
                 attached_connection.inherit_ignore_check_constraints(self);
+                attached_connection.inherit_reverse_unordered_selects(self);
                 // SQLite's busy handler belongs to the outer connection.
                 let timeout = self.pragma_state.borrow().busy_timeout_ms;
                 if attached_connection.pragma_state.borrow().busy_timeout_ms != timeout {
@@ -52457,6 +52486,7 @@ impl Connection {
             prepared_query_fast_path: None,
             may_observe_change_tracking,
             reprepared: RefCell::new(None),
+            reprepare_generation: Cell::new(0),
             conn: self,
         })
     }
@@ -52504,6 +52534,7 @@ impl Connection {
             prepared_query_fast_path,
             may_observe_change_tracking,
             reprepared: RefCell::new(None),
+            reprepare_generation: Cell::new(0),
             conn: self,
         })
     }
@@ -52617,6 +52648,7 @@ impl Connection {
                     prepared_query_fast_path: None,
                     may_observe_change_tracking,
                     reprepared: RefCell::new(None),
+                    reprepare_generation: Cell::new(0),
                     conn: self,
                 })
             }
@@ -52684,6 +52716,7 @@ impl Connection {
                     prepared_query_fast_path,
                     may_observe_change_tracking,
                     reprepared: RefCell::new(None),
+                    reprepare_generation: Cell::new(0),
                     conn: self,
                 })
             }
@@ -52785,6 +52818,7 @@ impl Connection {
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
                         reprepared: RefCell::new(None),
+                        reprepare_generation: Cell::new(0),
                         conn: self,
                     })
                 } else {
@@ -52814,6 +52848,7 @@ impl Connection {
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
                         reprepared: RefCell::new(None),
+                        reprepare_generation: Cell::new(0),
                         conn: self,
                     })
                 }
@@ -52870,6 +52905,7 @@ impl Connection {
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
                         reprepared: RefCell::new(None),
+                        reprepare_generation: Cell::new(0),
                         conn: self,
                     })
                 } else {
@@ -52896,6 +52932,7 @@ impl Connection {
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
                         reprepared: RefCell::new(None),
+                        reprepare_generation: Cell::new(0),
                         conn: self,
                     })
                 }
@@ -52952,6 +52989,7 @@ impl Connection {
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
                         reprepared: RefCell::new(None),
+                        reprepare_generation: Cell::new(0),
                         conn: self,
                     })
                 } else {
@@ -52978,6 +53016,7 @@ impl Connection {
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
                         reprepared: RefCell::new(None),
+                        reprepare_generation: Cell::new(0),
                         conn: self,
                     })
                 }
@@ -53003,6 +53042,7 @@ impl Connection {
                 prepared_query_fast_path: None,
                 may_observe_change_tracking,
                 reprepared: RefCell::new(None),
+                reprepare_generation: Cell::new(0),
                 conn: self,
             }),
             _ => Err(FrankenError::NotImplemented(
@@ -56253,6 +56293,12 @@ impl Connection {
     }
 
     fn prepared_select_fast_path(&self, select: &SelectStatement) -> Option<PreparedQueryFastPath> {
+        // bd-w9s20: the direct MemDB scan fast paths iterate forward; when
+        // `PRAGMA reverse_unordered_selects = ON`, route through the compiled
+        // VDBE program so unordered scans honor the reversed direction.
+        if self.pragma_state.borrow().reverse_unordered_selects {
+            return None;
+        }
         let normalized = canonicalize_select_placeholders(select).ok()?;
         if [
             ("count", 0),
@@ -91512,6 +91558,16 @@ impl Connection {
                 child.inherit_ignore_check_constraints(self);
             }
         }
+        // bd-w9s20: `PRAGMA reverse_unordered_selects = ...` is a connection-wide
+        // compile-time flag (`SQLITE_ReverseOrder`) whose stock `PragTyp_FLAG`
+        // handler emits `OP_Expire` so held prepared statements re-prepare with
+        // the new scan direction across main, TEMP, and every attached schema.
+        if pragma_name == "reverse_unordered_selects" && pragma.value.is_some() {
+            self.expire_prepared_statements_for_pragma_flag();
+            for child in self.attached_connections.borrow().values() {
+                child.inherit_reverse_unordered_selects(self);
+            }
+        }
 
         if fsqlite_vdbe::pragma::is_writable_schema_reset(pragma) {
             let cx = self.op_cx()?;
@@ -94881,6 +94937,12 @@ impl Connection {
     fn inherit_ignore_check_constraints(&self, parent: &Self) {
         let ignore = parent.pragma_state.borrow().ignore_check_constraints;
         self.pragma_state.borrow_mut().ignore_check_constraints = ignore;
+        self.expire_prepared_statements_for_pragma_flag();
+    }
+
+    fn inherit_reverse_unordered_selects(&self, parent: &Self) {
+        let reverse = parent.pragma_state.borrow().reverse_unordered_selects;
+        self.pragma_state.borrow_mut().reverse_unordered_selects = reverse;
         self.expire_prepared_statements_for_pragma_flag();
     }
 

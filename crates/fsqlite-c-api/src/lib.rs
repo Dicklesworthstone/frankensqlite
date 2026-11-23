@@ -275,6 +275,15 @@ pub struct Sqlite3Stmt {
     db: *mut Sqlite3,
     sql: String,
     step_mode: PreparedStepMode,
+    /// Held engine prepared statement borrowing `(&*db).conn` (bd-w9s20).
+    ///
+    /// # Safety invariant
+    /// `db` points to a heap-boxed `Sqlite3` created in `sqlite3_open`.
+    /// `sqlite3_prepare_v2` increments `Sqlite3::active_statements` before
+    /// returning the handle, `sqlite3_close` refuses to drop `Sqlite3`
+    /// (`SQLITE_BUSY`) while `active_statements != 0`, and `sqlite3_finalize`
+    /// drops `prepared` before decrementing `active_statements`.
+    prepared: Option<fsqlite::PreparedStatement<'static>>,
     /// Cached rows from last execution.  `None` means not yet stepped.
     rows: Option<Vec<fsqlite::Row>>,
     /// Current row index (0-based, incremented by each `sqlite3_step`).
@@ -352,17 +361,18 @@ fn prepared_step_mode(statement: &Statement) -> PreparedStepMode {
     }
 }
 
-struct PreparedSqlInfo {
+struct PreparedSqlInfo<'conn> {
     consumed_sql: String,
     tail_offset: usize,
     step_mode: PreparedStepMode,
     column_count: c_int,
+    prepared: Option<fsqlite::PreparedStatement<'conn>>,
 }
 
-fn validate_and_classify_prepared_sql(
-    conn: &Connection,
+fn validate_and_classify_prepared_sql<'conn>(
+    conn: &'conn Connection,
     sql: &str,
-) -> Result<Option<PreparedSqlInfo>, FrankenError> {
+) -> Result<Option<PreparedSqlInfo<'conn>>, FrankenError> {
     let Some((statement, tail_offset)) =
         parse_first_statement_with_tail(sql).map_err(|err| FrankenError::ParseError {
             offset: err.span.start as usize,
@@ -373,11 +383,12 @@ fn validate_and_classify_prepared_sql(
     };
     let consumed_sql = &sql[..tail_offset];
     let step_mode = prepared_step_mode(&statement);
-    let column_count = if can_prepare_statement(&statement) {
+    let (column_count, prepared) = if can_prepare_statement(&statement) {
         let prepared = block_on(conn.prepare(consumed_sql))?;
-        c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX)
+        let column_count = c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX);
+        (column_count, Some(prepared))
     } else {
-        0
+        (0, None)
     };
 
     Ok(Some(PreparedSqlInfo {
@@ -385,6 +396,7 @@ fn validate_and_classify_prepared_sql(
         tail_offset,
         step_mode,
         column_count,
+        prepared,
     }))
 }
 
@@ -915,7 +927,13 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         *pz_tail = std::ptr::null();
     }
 
-    let handle = &*db;
+    // SAFETY: `db` is heap-allocated by `Box::into_raw` in `sqlite3_open`, so
+    // `handle.conn` remains at a stable address until `sqlite3_close`. Any
+    // `PreparedStatement<'static>` created from `&handle.conn` is kept alive
+    // only while `handle.active_statements > 0` (`sqlite3_close` returns
+    // `SQLITE_BUSY` otherwise) and is dropped in `sqlite3_finalize` before
+    // `release_statement()` decrements the count.
+    let handle: &'static Sqlite3 = &*db;
     let source = if n_byte < 0 {
         if let Ok(s) = CStr::from_ptr(sql).to_str() {
             s
@@ -961,6 +979,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
                 db,
                 sql: info.consumed_sql,
                 step_mode: info.step_mode,
+                prepared: info.prepared,
                 rows: None,
                 cursor: 0,
                 active_row: false,
@@ -1024,35 +1043,57 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
     if s.rows.is_none() {
         tracing::info!(target: "fsqlite.compat", sql = %s.sql, "sqlite3_step (first call)");
 
-        // Route through the parameterized entry points only when the statement
-        // actually has bind parameters, so unparameterized SQL keeps its exact
-        // prior behavior. Unbound slots default to NULL (SQLite semantics).
+        // Route through the held PreparedStatement when present (reusing the
+        // compiled program while unchanged and transparently re-preparing on
+        // schema or pragma invalidation, bd-w9s20). Statements that
+        // Connection::prepare does not yet compile fall back to Connection
+        // dispatch. Unbound slots default to NULL (SQLite semantics).
         let has_params = !s.bindings.is_empty();
-        let execute_result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match s.step_mode {
-                PreparedStepMode::Query => {
-                    if has_params {
-                        block_on(db.conn.query_with_params(&s.sql, &s.bindings)).map(Some)
-                    } else {
-                        block_on(db.conn.query(&s.sql)).map(Some)
+        let execute_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(ref prepared) = s.prepared {
+                match s.step_mode {
+                    PreparedStepMode::Query => {
+                        if has_params {
+                            block_on(prepared.query_with_params(&s.bindings)).map(Some)
+                        } else {
+                            block_on(prepared.query()).map(Some)
+                        }
+                    }
+                    PreparedStepMode::Execute => {
+                        if has_params {
+                            block_on(prepared.execute_with_params(&s.bindings)).map(|_| None)
+                        } else {
+                            block_on(prepared.execute()).map(|_| None)
+                        }
                     }
                 }
-                PreparedStepMode::Execute => {
-                    if has_params {
-                        block_on(db.conn.execute_with_params(&s.sql, &s.bindings)).map(|_| None)
-                    } else {
-                        block_on(db.conn.execute(&s.sql)).map(|_| None)
+            } else {
+                match s.step_mode {
+                    PreparedStepMode::Query => {
+                        if has_params {
+                            block_on(db.conn.query_with_params(&s.sql, &s.bindings)).map(Some)
+                        } else {
+                            block_on(db.conn.query(&s.sql)).map(Some)
+                        }
+                    }
+                    PreparedStepMode::Execute => {
+                        if has_params {
+                            block_on(db.conn.execute_with_params(&s.sql, &s.bindings)).map(|_| None)
+                        } else {
+                            block_on(db.conn.execute(&s.sql)).map(|_| None)
+                        }
                     }
                 }
-            }));
+            }
+        }));
 
         match execute_result {
             Ok(Ok(Some(rows))) => {
                 db.clear_error();
-                if s.column_count == 0
-                    && let Some(first) = rows.first()
-                {
-                    s.column_count = first.values().len() as c_int;
+                if let Some(ref prepared) = s.prepared {
+                    s.column_count = c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX);
+                } else if let Some(first) = rows.first() {
+                    s.column_count = c_int::try_from(first.values().len()).unwrap_or(c_int::MAX);
                 }
                 s.rows = Some(rows);
                 s.cursor = 0;
@@ -1062,6 +1103,9 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             }
             Ok(Ok(None)) => {
                 db.clear_error();
+                if let Some(ref prepared) = s.prepared {
+                    s.column_count = c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX);
+                }
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
                 s.active_row = false;
@@ -1070,6 +1114,9 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             }
             Ok(Err(ref e)) if matches!(e, FrankenError::QueryReturnedNoRows) => {
                 db.clear_error();
+                if let Some(ref prepared) = s.prepared {
+                    s.column_count = c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX);
+                }
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
                 s.active_row = false;
@@ -1145,15 +1192,19 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut Sqlite3Stmt) -> c_int {
 
     tracing::info!(target: "fsqlite.compat", "sqlite3_finalize");
 
-    let stmt = Box::from_raw(stmt);
+    let mut stmt = Box::from_raw(stmt);
     let rc = match stmt.last_step_code {
         SQLITE_ROW | SQLITE_DONE => SQLITE_OK,
         code => code,
     };
-    if !stmt.db.is_null() {
-        (&*stmt.db).release_statement();
-    }
+    let db = stmt.db;
+    // Drop the borrowed PreparedStatement BEFORE decrementing active_statements
+    // so sqlite3_close cannot free `Sqlite3` while `stmt.prepared` holds `&conn`.
+    stmt.prepared = None;
     drop(stmt);
+    if !db.is_null() {
+        (&*db).release_statement();
+    }
     rc
 }
 
@@ -3505,6 +3556,261 @@ mod tests {
             assert_eq!(sqlite3_column_int64(stmt, 0), 1);
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_bd_w9s20_c_api_held_select_star_reprepares_after_cross_and_same_conn_alter() {
+        unsafe fn exec(db: *mut Sqlite3, sql: &str) -> c_int {
+            let sql = CString::new(sql).unwrap();
+            sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut())
+        }
+        unsafe {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = CString::new(dir.path().join("w9s20_capi.db").to_str().unwrap()).unwrap();
+            let mut db_a: *mut Sqlite3 = ptr::null_mut();
+            let mut db_b: *mut Sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db_a), SQLITE_OK);
+            assert_eq!(
+                exec(
+                    db_a,
+                    "PRAGMA journal_mode=WAL;
+                     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+                     INSERT INTO t VALUES (1, 'x'), (2, 'y');
+                     CREATE TABLE empty_t(a INTEGER PRIMARY KEY, b TEXT);"
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db_b), SQLITE_OK);
+
+            // Prepare SELECT * on connection A before connection B alters the table.
+            let stmt = prepare(db_a, "SELECT * FROM t ORDER BY a;");
+            let empty_stmt = prepare(db_a, "SELECT * FROM empty_t ORDER BY a;");
+            assert_eq!(sqlite3_column_count(stmt), 2);
+            assert_eq!(sqlite3_column_count(empty_stmt), 2);
+
+            // Connection B adds column c DEFAULT 7 to both tables.
+            assert_eq!(
+                exec(
+                    db_b,
+                    "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7;
+                     ALTER TABLE empty_t ADD COLUMN c INTEGER DEFAULT 7;"
+                ),
+                SQLITE_OK
+            );
+
+            // Stepping A's held statement must re-prepare and expand `*` to 3 columns.
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(
+                sqlite3_column_count(stmt),
+                3,
+                "cross-connection ALTER TABLE ADD COLUMN must widen sqlite3_column_count"
+            );
+            assert_eq!(sqlite3_column_int64(stmt, 0), 1);
+            assert_eq!(
+                CStr::from_ptr(sqlite3_column_text(stmt, 1))
+                    .to_str()
+                    .unwrap(),
+                "x"
+            );
+            assert_eq!(sqlite3_column_int64(stmt, 2), 7);
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_count(stmt), 3);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 2);
+            assert_eq!(
+                CStr::from_ptr(sqlite3_column_text(stmt, 1))
+                    .to_str()
+                    .unwrap(),
+                "y"
+            );
+            assert_eq!(sqlite3_column_int64(stmt, 2), 7);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+
+            // Empty table also widens sqlite3_column_count to 3 after stepping.
+            assert_eq!(sqlite3_step(empty_stmt), SQLITE_DONE);
+            assert_eq!(
+                sqlite3_column_count(empty_stmt),
+                3,
+                "empty table cross-connection ALTER TABLE ADD COLUMN must widen sqlite3_column_count"
+            );
+
+            // Same-connection ALTER TABLE ADD COLUMN on A itself.
+            assert_eq!(
+                exec(db_a, "ALTER TABLE t ADD COLUMN d INTEGER DEFAULT 9;"),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(
+                sqlite3_column_count(stmt),
+                4,
+                "same-connection ALTER TABLE ADD COLUMN must widen sqlite3_column_count"
+            );
+            assert_eq!(sqlite3_column_int64(stmt, 3), 9);
+
+            assert_eq!(sqlite3_finalize(empty_stmt), SQLITE_OK);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db_b), SQLITE_OK);
+            assert_eq!(sqlite3_close(db_a), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_bd_w9s20_c_api_held_select_reprepares_on_reverse_unordered_selects() {
+        unsafe fn exec(db: *mut Sqlite3, sql: &str) -> c_int {
+            let sql = CString::new(sql).unwrap();
+            sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut())
+        }
+        unsafe fn collect_first_col(stmt: *mut Sqlite3Stmt) -> Vec<i64> {
+            let mut vals = Vec::new();
+            loop {
+                match sqlite3_step(stmt) {
+                    SQLITE_ROW => vals.push(sqlite3_column_int64(stmt, 0)),
+                    SQLITE_DONE => break,
+                    other => panic!("unexpected step code {other}"),
+                }
+            }
+            vals
+        }
+        unsafe {
+            let db = open_memory();
+            assert_eq!(
+                exec(
+                    db,
+                    "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+                     INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');"
+                ),
+                SQLITE_OK
+            );
+            let stmt_col = prepare(db, "SELECT a FROM t;");
+            let stmt_star = prepare(db, "SELECT * FROM t;");
+
+            assert_eq!(collect_first_col(stmt_col), vec![1, 2, 3]);
+            assert_eq!(collect_first_col(stmt_star), vec![1, 2, 3]);
+
+            assert_eq!(
+                exec(db, "PRAGMA reverse_unordered_selects = ON;"),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_reset(stmt_col), SQLITE_OK);
+            assert_eq!(sqlite3_reset(stmt_star), SQLITE_OK);
+            assert_eq!(
+                collect_first_col(stmt_col),
+                vec![3, 2, 1],
+                "held C API SELECT a must reverse when PRAGMA reverse_unordered_selects = ON"
+            );
+            assert_eq!(
+                collect_first_col(stmt_star),
+                vec![3, 2, 1],
+                "held C API SELECT * must reverse when PRAGMA reverse_unordered_selects = ON"
+            );
+
+            assert_eq!(
+                exec(db, "PRAGMA reverse_unordered_selects = OFF;"),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_reset(stmt_col), SQLITE_OK);
+            assert_eq!(sqlite3_reset(stmt_star), SQLITE_OK);
+            assert_eq!(collect_first_col(stmt_col), vec![1, 2, 3]);
+            assert_eq!(collect_first_col(stmt_star), vec![1, 2, 3]);
+
+            assert_eq!(sqlite3_finalize(stmt_star), SQLITE_OK);
+            assert_eq!(sqlite3_finalize(stmt_col), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_bd_w9s20_c_api_held_statement_reuses_program_without_schema_change() {
+        unsafe fn exec(db: *mut Sqlite3, sql: &str) -> c_int {
+            let sql = CString::new(sql).unwrap();
+            sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut())
+        }
+        unsafe {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = CString::new(dir.path().join("w9s20_reuse.db").to_str().unwrap()).unwrap();
+            let mut db_a: *mut Sqlite3 = ptr::null_mut();
+            let mut db_b: *mut Sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db_a), SQLITE_OK);
+            assert_eq!(
+                exec(
+                    db_a,
+                    "PRAGMA journal_mode=WAL;
+                     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+                     INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');"
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db_b), SQLITE_OK);
+
+            let stmt = prepare(db_a, "SELECT * FROM t;");
+            let initial_id = (*stmt)
+                .prepared
+                .as_ref()
+                .expect("held PreparedStatement")
+                .program_identity();
+            assert_eq!((*stmt).prepared.as_ref().unwrap().reprepare_count(), 0);
+
+            // Negative case: 5 reset+step cycles with NO schema/pragma change
+            // must reuse the exact same compiled program with 0 re-prepares.
+            for _ in 0..5 {
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                assert_eq!(sqlite3_column_count(stmt), 2);
+                assert_eq!(sqlite3_column_int64(stmt, 0), 1);
+                assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+                let prep = (*stmt).prepared.as_ref().unwrap();
+                assert_eq!(prep.reprepare_count(), 0);
+                assert_eq!(prep.program_identity(), initial_id);
+            }
+
+            // Cross-connection ALTER TABLE -> re-prepares ONCE, then reuses 4 times.
+            assert_eq!(
+                exec(db_b, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7;"),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_count(stmt), 3);
+            assert_eq!(sqlite3_column_int64(stmt, 2), 7);
+            assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+            let after_alter_id = (*stmt).prepared.as_ref().unwrap().program_identity();
+            assert_eq!((*stmt).prepared.as_ref().unwrap().reprepare_count(), 1);
+            assert_ne!(after_alter_id, initial_id);
+
+            for _ in 0..4 {
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                assert_eq!(sqlite3_column_count(stmt), 3);
+                assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+                let prep = (*stmt).prepared.as_ref().unwrap();
+                assert_eq!(prep.reprepare_count(), 1);
+                assert_eq!(prep.program_identity(), after_alter_id);
+            }
+
+            // PRAGMA reverse_unordered_selects = ON -> re-prepares ONCE, then reuses.
+            assert_eq!(
+                exec(db_a, "PRAGMA reverse_unordered_selects = ON;"),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_count(stmt), 3);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 3);
+            assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+            let after_pragma_id = (*stmt).prepared.as_ref().unwrap().program_identity();
+            assert_eq!((*stmt).prepared.as_ref().unwrap().reprepare_count(), 2);
+            assert_ne!(after_pragma_id, after_alter_id);
+
+            for _ in 0..4 {
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                assert_eq!(sqlite3_column_int64(stmt, 0), 3);
+                assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+                let prep = (*stmt).prepared.as_ref().unwrap();
+                assert_eq!(prep.reprepare_count(), 2);
+                assert_eq!(prep.program_identity(), after_pragma_id);
+            }
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db_b), SQLITE_OK);
+            assert_eq!(sqlite3_close(db_a), SQLITE_OK);
         }
     }
 }

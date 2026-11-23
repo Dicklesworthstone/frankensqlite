@@ -1528,11 +1528,13 @@ impl Connection {
         let slots = self.slots(sql);
         let stmt = block_on(self.as_async().prepare(sql))?;
         let names = stmt.column_names();
+        let reprepare_count = stmt.reprepare_count();
         Ok(Statement {
             conn: self,
             stmt: Box::new(stmt),
             slots,
             names,
+            reprepare_count,
         })
     }
 
@@ -1781,6 +1783,8 @@ impl Drop for Connection {
 trait EngineStatement {
     fn execute(&self, values: &[SqliteValue]) -> Result<usize>;
     fn query(&self, values: &[SqliteValue]) -> Result<Vec<crate::Row>>;
+    fn column_names(&self) -> Vec<String>;
+    fn reprepare_count(&self) -> u64;
 }
 
 impl EngineStatement for crate::PreparedStatement<'_> {
@@ -1791,6 +1795,14 @@ impl EngineStatement for crate::PreparedStatement<'_> {
     fn query(&self, values: &[SqliteValue]) -> Result<Vec<crate::Row>> {
         Ok(block_on(self.query_with_params(values))?)
     }
+
+    fn column_names(&self) -> Vec<String> {
+        Self::column_names(self)
+    }
+
+    fn reprepare_count(&self) -> u64 {
+        Self::reprepare_count(self)
+    }
 }
 
 /// A compiled statement.
@@ -1799,6 +1811,7 @@ pub struct Statement<'conn> {
     stmt: Box<dyn EngineStatement + 'conn>,
     slots: Rc<BindParameterSlots>,
     names: Vec<String>,
+    reprepare_count: u64,
 }
 
 impl fmt::Debug for Statement<'_> {
@@ -1811,10 +1824,23 @@ impl fmt::Debug for Statement<'_> {
 }
 
 impl Statement<'_> {
+    /// Refresh cached column labels if the inner `PreparedStatement`
+    /// transparently re-prepared on a schema or pragma change (bd-w9s20).
+    /// Steady-state cost is a single `u64` equality check.
+    fn sync_metadata_if_reprepared(&mut self) {
+        let current = self.stmt.reprepare_count();
+        if current != self.reprepare_count {
+            self.names = self.stmt.column_names();
+            self.reprepare_count = current;
+        }
+    }
+
     /// Run the statement with `params`; returns the number of rows changed.
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
         let values = params.bind_to(&self.slots)?;
-        self.stmt.execute(&values)
+        let result = self.stmt.execute(&values);
+        self.sync_metadata_if_reprepared();
+        result
     }
 
     /// Run an INSERT that must insert exactly one row; returns its rowid.
@@ -1828,7 +1854,9 @@ impl Statement<'_> {
     /// Run the query; step through its rows with [`Rows::next`].
     pub fn query<P: Params>(&mut self, params: P) -> Result<Rows<'_>> {
         let values = params.bind_to(&self.slots)?;
-        let rows = self.stmt.query(&values)?;
+        let result = self.stmt.query(&values);
+        self.sync_metadata_if_reprepared();
+        let rows = result?;
         Ok(Rows {
             stmt: self,
             pending: rows.into_iter(),
