@@ -688,6 +688,10 @@ fn compact_access_trace_without(
     write
 }
 
+/// The odd multiplier of [`ForgottenTracePages::home`] (MurmurHash3's
+/// `0x85EB_CA6B`), chosen apart from [`GOLDEN_RATIO_32`].
+const FORGOTTEN_TRACE_PAGE_HASH: u32 = 0x85EB_CA6B;
+
 /// Pages forgotten while an [`AccessTrace`] is sparse, waiting for its next
 /// compaction (bd-w4pr1.13.18, lever BF1).
 ///
@@ -700,7 +704,7 @@ fn compact_access_trace_without(
 struct ForgottenTracePages {
     keys: Box<[u32]>,
     cuts: Box<[u32]>,
-    /// `32 - log2(keys.len())`, for Fibonacci hashing of the page number.
+    /// `32 - log2(keys.len())`, for multiplicative hashing of the page number.
     shift: u32,
     len: usize,
 }
@@ -726,9 +730,18 @@ impl ForgottenTracePages {
         self.len.saturating_mul(2) >= self.keys.len()
     }
 
+    /// The slot a page's probe starts at: the top bits of the page number
+    /// times [`FORGOTTEN_TRACE_PAGE_HASH`].
+    ///
+    /// bd-w4pr1.13.18 (lever CP1): the multiplier must not be the flat page
+    /// table's [`GOLDEN_RATIO_32`]. The clean-buffer eviction walks the flat
+    /// table in slot order, so the pages forgotten between two compactions
+    /// are ordered by that table's hash and cover only part of its range.
+    /// Under the same multiplier their homes here crowded into part of this
+    /// table, and a compaction's probes ran several slots long at half load.
     #[inline]
     fn home(&self, key: u32) -> usize {
-        usize::try_from(key.wrapping_mul(0x9E37_79B9) >> self.shift).unwrap_or(0)
+        usize::try_from(key.wrapping_mul(FORGOTTEN_TRACE_PAGE_HASH) >> self.shift).unwrap_or(0)
     }
 
     /// The page's cut, if it is waiting.
@@ -9170,6 +9183,80 @@ mod tests {
             checks_while_waiting > 0,
             "victims must be compared while forgets wait"
         );
+    }
+
+    /// bd-w4pr1.13.18 (lever CP1): the forgotten-page table stays short to
+    /// probe for the pages an eviction run actually forgets. The clean-buffer
+    /// eviction walks the flat table in slot order, so between two compactions
+    /// the forgotten pages come from a part of the flat table's hash range.
+    /// Here, at the default trace bound (4,000 entries, 1,024 slots), 500 pages
+    /// drawn from half of a 16,384-slot flat table's range must probe like
+    /// random keys at half load (about 1.5 slots waiting, 2.5 not), in each of
+    /// eight windows. Homing them by the flat table's own multiplier gave
+    /// about 5.6 and 16.5.
+    #[test]
+    fn test_bd_w4pr1_13_18_forgotten_pages_from_one_flat_sweep_probe_short() {
+        let flat = FlatPageSlots::new(16_384);
+        assert_eq!(flat.slots.len(), 16_384);
+        let universe: Vec<PageNumber> = (1..=8_300_u32)
+            .map(|page| PageNumber::new(page).unwrap())
+            .collect();
+        let mut rng = 0x51F1_5EED_0C0F_FEE1_u64;
+        for window in 0..8_usize {
+            let start = (window * 2_048 + 777) & flat.mask;
+            let mut pool: Vec<PageNumber> = universe
+                .iter()
+                .copied()
+                .filter(|page| (flat.hash_pgno(page.get()).wrapping_sub(start) & flat.mask) < 8_192)
+                .collect();
+            let mut waiting = Vec::new();
+            while waiting.len() < 500 {
+                let pick = usize::try_from(bd_w4pr1_13_18_next(
+                    &mut rng,
+                    u64::try_from(pool.len()).unwrap(),
+                ))
+                .unwrap();
+                waiting.push(pool.swap_remove(pick));
+            }
+            let mut table = ForgottenTracePages::for_trace_bound(4_000);
+            assert_eq!(table.keys.len(), 1_024);
+            for (cut, &page) in waiting.iter().enumerate() {
+                table.insert(page, cut + 1);
+            }
+            assert!(!table.is_half_full());
+            let probes = |page: PageNumber| {
+                let mask = table.keys.len() - 1;
+                let mut slot = table.home(page.get());
+                let mut probed = 1_usize;
+                while table.keys[slot] != 0 && table.keys[slot] != page.get() {
+                    slot = (slot + 1) & mask;
+                    probed += 1;
+                }
+                probed
+            };
+            for (cut, &page) in waiting.iter().enumerate() {
+                assert_eq!(table.cut(page), Some(cut + 1), "window {window}");
+            }
+            let others: Vec<PageNumber> = universe
+                .iter()
+                .copied()
+                .filter(|page| !waiting.contains(page))
+                .step_by(15)
+                .take(500)
+                .collect();
+            assert_eq!(others.len(), 500);
+            for &page in &others {
+                assert_eq!(table.cut(page), None, "window {window}");
+            }
+            let mean = |pages: &[PageNumber]| {
+                pages.iter().map(|&page| probes(page)).sum::<usize>() as f64 / pages.len() as f64
+            };
+            let (waiting_mean, other_mean) = (mean(&waiting), mean(&others));
+            assert!(
+                waiting_mean <= 2.0 && other_mean <= 3.0,
+                "window {window}: mean probe {waiting_mean:.2} waiting, {other_mean:.2} not waiting"
+            );
+        }
     }
 
     #[test]
