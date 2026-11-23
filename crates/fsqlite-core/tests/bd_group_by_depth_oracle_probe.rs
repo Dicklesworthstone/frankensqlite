@@ -947,3 +947,143 @@ fn grouping_on_the_rowid_alias_streams_in_rowid_order_without_a_sorter() {
         );
     });
 }
+
+/// bd-ku484: a GROUP BY or ORDER BY whose sorter spills merges its runs
+/// over a winner tree, comparing two INTEGER heads in the first key column
+/// as integers. With a 16 KiB temporary budget (`PRAGMA cache_size = -16`)
+/// every statement's sorter writes dozens of runs. Each ordered answer
+/// equals stock's. A merge takes at most one head comparison per tree level
+/// per row, plus the tree's build, where scanning every run's head took one
+/// per run; a sorter over an INTEGER key never calls the record comparator
+/// in its merge. Rows with equal keys in different runs come out in scan
+/// order, as stock's merge gives them, so a merge that took a tie from the
+/// wrong run would reorder an answer. Keys holding NULLs, REALs or TEXT, and
+/// tied INTEGERs before a second key column, do call the comparator: those
+/// statements are the counter's non-vacuity controls. Every aggregate reads a column that varies inside
+/// its group, so no sorter folds its records into runs of copies instead of
+/// spilling. Every statement runs before the test fails, and the failure
+/// lists each one that broke.
+#[test]
+fn a_spilled_sort_merges_its_runs_by_integer_heads_in_a_winner_tree() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spilled-merge.db");
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        // `a` repeats 12 times per value, `n` holds NULLs, `m` mixes
+        // INTEGER, REAL, TEXT and NULL, and (id * 7919) % 12007 is unique
+        // (12007 is prime).
+        stock
+            .execute_batch(
+                "CREATE TABLE s(id INTEGER PRIMARY KEY, a INTEGER, n INTEGER, m, b TEXT, c REAL);\
+                 WITH RECURSIVE g(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM g WHERE v < 12000) \
+                 INSERT INTO s SELECT v, (v * 7919) % 1000, \
+                 CASE WHEN v % 97 = 0 THEN NULL ELSE v % 300 END, \
+                 CASE v % 4 WHEN 0 THEN v % 50 WHEN 1 THEN (v % 50) + 0.5 \
+                 WHEN 2 THEN 'm' || (v % 9) ELSE NULL END, \
+                 'row-' || ((v * 31) % 997), v * 1.5 FROM g;",
+            )
+            .unwrap();
+        let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+        f.set_reject_mem_fallback(true);
+        f.set_strict_mem_fallback_rejection(true);
+        f.execute("PRAGMA cache_size = -16").await.unwrap();
+        let mut failures: Vec<String> = Vec::new();
+        // (statement, whether its merge compares INTEGER heads only)
+        for (sql, integer_heads) in [
+            ("SELECT id % 1000, count(*), sum(a) FROM s GROUP BY id % 1000", true),
+            ("SELECT a, count(*), total(c) FROM s GROUP BY a", true),
+            ("SELECT (id * 7919) % 12007 AS k, a FROM s ORDER BY k", true),
+            ("SELECT (id * 7919) % 12007 AS k, a FROM s ORDER BY k DESC", true),
+            ("SELECT (id * 7919) % 12007 AS k, b FROM s ORDER BY k DESC NULLS FIRST", true),
+            // Ties across runs: each value of `a` is spread over the table, so
+            // its rows sit in many runs, and the order they come out in (scan
+            // order, stock's too) shows which run the merge takes a tie from.
+            ("SELECT a, id FROM s ORDER BY a", true),
+            ("SELECT a, id FROM s ORDER BY a DESC", true),
+            ("SELECT a, group_concat(id) FROM s GROUP BY a", true),
+            ("SELECT a, id FROM s ORDER BY a, id", false),
+            ("SELECT a, id FROM s ORDER BY a DESC, id", false),
+            ("SELECT n, count(*), sum(id) FROM s GROUP BY n", false),
+            ("SELECT m, count(*), sum(id) FROM s GROUP BY m", false),
+            ("SELECT b, id FROM s ORDER BY b, id", false),
+            ("SELECT c, id FROM s ORDER BY c DESC", false),
+        ] {
+            let expected = rq(&stock, sql);
+            if expected.len() < 2 {
+                failures.push(format!("{sql}: the fixture gives {} rows", expected.len()));
+                continue;
+            }
+            let prepared = match f.prepare(sql).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    failures.push(format!("{sql}: prepare: {error}"));
+                    continue;
+                }
+            };
+            let runs_before = f.temp_store_stats().sorter_spill_runs;
+            set_vdbe_metrics_enabled(true);
+            reset_vdbe_metrics();
+            let result = prepared.query().await;
+            let metrics = vdbe_metrics_snapshot();
+            set_vdbe_metrics_enabled(false);
+            let runs = f.temp_store_stats().sorter_spill_runs - runs_before;
+            let actual: Vec<Vec<String>> = match result {
+                Ok(rows) => rows
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect(),
+                Err(error) => {
+                    failures.push(format!("{sql}: query: {error}"));
+                    continue;
+                }
+            };
+            if actual != expected {
+                failures.push(format!(
+                    "{sql}: answered {} rows unlike stock's {} (first difference at row {:?})",
+                    actual.len(),
+                    expected.len(),
+                    actual.iter().zip(&expected).position(|(a, e)| a != e)
+                ));
+            }
+            if metrics.opcodes_executed_total == 0 {
+                failures.push(format!("{sql}: execution counters were inactive"));
+                continue;
+            }
+            if runs < 8 || metrics.sort_spill_pages_total == 0 {
+                failures.push(format!(
+                    "{sql}: its sorter must spill into many runs: {runs} runs, {} pages",
+                    metrics.sort_spill_pages_total
+                ));
+                continue;
+            }
+            // The runs on disk and the rows still in memory.
+            let leaves = (runs + 1).next_power_of_two();
+            let bound = metrics.sort_rows_total * u64::from(leaves.trailing_zeros()) + leaves;
+            let comparisons = metrics.sort_merge_comparisons_total;
+            let generic = metrics.sort_merge_generic_comparisons_total;
+            if comparisons == 0 || comparisons > bound {
+                failures.push(format!(
+                    "{sql}: {comparisons} merge comparisons for {} rows over {runs} runs, \
+                     at most {bound}",
+                    metrics.sort_rows_total
+                ));
+            }
+            if integer_heads && generic != 0 {
+                failures.push(format!(
+                    "{sql}: {generic} of {comparisons} merge comparisons called the comparator"
+                ));
+            }
+            if !integer_heads && generic == 0 {
+                failures.push(format!("{sql}: no merge comparison called the comparator"));
+            }
+        }
+        f.close().await.unwrap();
+        assert!(
+            failures.is_empty(),
+            "{} statement(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}

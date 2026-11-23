@@ -5111,6 +5111,8 @@ mod tests {
                 statement_duration_us_total: 3_400,
                 sort_rows_total: 0,
                 sort_spill_pages_total: 0,
+                sort_merge_comparisons_total: 0,
+                sort_merge_generic_comparisons_total: 0,
                 opcode_execution_totals: vec![
                     OpcodeExecutionCount {
                         opcode: "Column".to_owned(),

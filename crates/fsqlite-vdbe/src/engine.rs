@@ -2311,6 +2311,11 @@ struct SorterCursor {
     rows_sorted_total: u64,
     /// Total pages spilled to disk.
     spill_pages_total: u64,
+    /// Run-head comparisons made by merges of spilled runs (bd-ku484).
+    merge_comparisons_total: u64,
+    /// The share of `merge_comparisons_total` that went to
+    /// `compare_sorter_rows` rather than comparing two INTEGER heads.
+    merge_generic_comparisons_total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2446,6 +2451,8 @@ impl SorterCursor {
             next_source_sequence: 0,
             rows_sorted_total: 0,
             spill_pages_total: 0,
+            merge_comparisons_total: 0,
+            merge_generic_comparisons_total: 0,
         }
     }
 
@@ -3330,7 +3337,9 @@ impl SorterCursor {
             run_iters.push(RunIterator::from_memory(mem_rows));
         }
 
-        // K-way merge using a simple tournament approach.
+        // K-way merge over a winner tree (bd-ku484): the next row costs one
+        // head comparison per level of the tree, not one per run, and two
+        // INTEGER heads in the first key column compare as integers.
         let mut merged: Vec<SorterRow> = Vec::with_capacity(self.rows_sorted_total as usize);
 
         // Advance all iterators to their first element.
@@ -3338,6 +3347,23 @@ impl SorterCursor {
             iter.advance()?;
         }
 
+        let merge_order = SorterMergeOrder {
+            key_columns,
+            orders: &orders,
+            collations: &colls,
+            collation_registry: &coll_guard,
+            text_encoding,
+            first_descending: matches!(
+                orders.first(),
+                Some(SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst)
+            ),
+        };
+        let mut heads: Vec<SorterMergeHead> =
+            run_iters.iter().map(|run| merge_order.head(run)).collect();
+        let mut counts = SorterMergeCounts::default();
+        let mut tree = SorterMergeTree::new(run_iters.len(), &mut |left, right| {
+            merge_order.right_goes_first(&run_iters, &heads, left, right, &mut counts)
+        });
         let mut merge_steps: usize = 0;
         loop {
             if merge_steps.trailing_zeros() >= 8 && self.cx.is_cancel_requested() {
@@ -3348,41 +3374,25 @@ impl SorterCursor {
                 return Err(FrankenError::Abort);
             }
             merge_steps = merge_steps.saturating_add(1);
-            // Find the run with the smallest current element.
-            let mut best_idx: Option<usize> = None;
-            for (i, iter) in run_iters.iter().enumerate() {
-                let Some(row) = iter.current_values() else {
-                    continue;
-                };
-                if let Some(bi) = best_idx {
-                    if let Some(best_row) = run_iters[bi].current_values() {
-                        if compare_sorter_rows(
-                            row,
-                            best_row,
-                            key_columns,
-                            &orders,
-                            &colls,
-                            &coll_guard,
-                            text_encoding,
-                        ) == Ordering::Less
-                        {
-                            best_idx = Some(i);
-                        }
-                    }
-                } else {
-                    best_idx = Some(i);
-                }
-            }
-
-            let Some(idx) = best_idx else {
+            // The run whose head sorts first. An exhausted run is at the
+            // root only once every run is.
+            let idx = tree.root();
+            let Some(row) = run_iters.get_mut(idx).and_then(RunIterator::take_current) else {
                 break; // All runs exhausted.
             };
-
-            if let Some(row) = run_iters[idx].take_current() {
-                merged.push(row);
-            }
+            merged.push(row);
             run_iters[idx].advance()?;
+            heads[idx] = merge_order.head(&run_iters[idx]);
+            tree.replay(idx, &mut |left, right| {
+                merge_order.right_goes_first(&run_iters, &heads, left, right, &mut counts)
+            });
         }
+        self.merge_comparisons_total = self
+            .merge_comparisons_total
+            .saturating_add(counts.comparisons);
+        self.merge_generic_comparisons_total = self
+            .merge_generic_comparisons_total
+            .saturating_add(counts.generic);
 
         let merged_run_count = self.spill_runs.len() + 1;
         tracing::debug!(
@@ -3603,6 +3613,175 @@ impl RunIterator {
             }
         }
         Ok(())
+    }
+}
+
+/// A run's current row as a sorter merge compares it (bd-ku484).
+#[derive(Debug, Clone, Copy)]
+enum SorterMergeHead {
+    /// The run has no row left; it sorts after every other head.
+    Exhausted,
+    /// The first key column holds this INTEGER, complemented for a
+    /// descending column, so ascending order of these numbers is the key's
+    /// order.
+    Integer(i64),
+    /// The first key column holds anything else.
+    Other,
+}
+
+/// Head comparisons made by one merge, and how many of them called
+/// `compare_sorter_rows`.
+#[derive(Debug, Default, Clone, Copy)]
+struct SorterMergeCounts {
+    comparisons: u64,
+    generic: u64,
+}
+
+/// The order a sorter merge compares run heads in (bd-ku484): the order of
+/// `compare_sorter_rows`, with two INTEGER heads in the first key column
+/// compared as integers. That is the comparator's own answer for them: an
+/// INTEGER is never NULL and compares numerically under every collation, so
+/// the key order only reverses it for a descending column, which the
+/// complement does without overflow. Equal integers decide nothing when
+/// another key column follows; the comparator then compares the whole key.
+struct SorterMergeOrder<'a> {
+    key_columns: usize,
+    orders: &'a [SortKeyOrder],
+    collations: &'a [Option<String>],
+    collation_registry: &'a CollationRegistry,
+    text_encoding: TextEncoding,
+    /// Whether the first key column sorts descending.
+    first_descending: bool,
+}
+
+impl SorterMergeOrder<'_> {
+    fn head(&self, run: &RunIterator) -> SorterMergeHead {
+        match run.current_values() {
+            None => SorterMergeHead::Exhausted,
+            Some(values) => match values.first() {
+                Some(SqliteValue::Integer(key)) => {
+                    SorterMergeHead::Integer(if self.first_descending { !*key } else { *key })
+                }
+                _ => SorterMergeHead::Other,
+            },
+        }
+    }
+
+    /// Whether the head of run `right` sorts strictly before the head of
+    /// run `left`. A run past the end of `heads` is exhausted.
+    fn right_goes_first(
+        &self,
+        runs: &[RunIterator],
+        heads: &[SorterMergeHead],
+        left: usize,
+        right: usize,
+        counts: &mut SorterMergeCounts,
+    ) -> bool {
+        let head = |run: usize| {
+            heads
+                .get(run)
+                .copied()
+                .unwrap_or(SorterMergeHead::Exhausted)
+        };
+        match (head(left), head(right)) {
+            (_, SorterMergeHead::Exhausted) => false,
+            (SorterMergeHead::Exhausted, _) => true,
+            (SorterMergeHead::Integer(lhs), SorterMergeHead::Integer(rhs))
+                if lhs != rhs || self.key_columns <= 1 =>
+            {
+                counts.comparisons += 1;
+                rhs < lhs
+            }
+            _ => {
+                counts.comparisons += 1;
+                counts.generic += 1;
+                let (Some(lhs), Some(rhs)) = (
+                    runs.get(left).and_then(RunIterator::current_values),
+                    runs.get(right).and_then(RunIterator::current_values),
+                ) else {
+                    return false;
+                };
+                compare_sorter_rows(
+                    rhs,
+                    lhs,
+                    self.key_columns,
+                    self.orders,
+                    self.collations,
+                    self.collation_registry,
+                    self.text_encoding,
+                ) == Ordering::Less
+            }
+        }
+    }
+}
+
+/// A winner tree over the runs of a sorter merge (bd-ku484). Leaf `i` is
+/// run `i`, and leaves past the last run stand for exhausted runs. Every
+/// internal node holds whichever of its two children's runs has the head
+/// that sorts first, so the root holds the run the merge takes its next row
+/// from, and replacing that run's head re-decides only the nodes on its
+/// leaf's path to the root: one comparison per level, where scanning every
+/// run's head took one per run.
+///
+/// Every run under a node's left child has a lower index than every run
+/// under its right child, so the right child's run wins only when its head
+/// sorts strictly first. Equal heads therefore go to the lower run, the one
+/// spilled first, as the scan this replaces chose them; each run is sorted
+/// stably, so the merge gives the order one stable sort of all the rows
+/// gives.
+struct SorterMergeTree {
+    /// `nodes[1]` is the root, the children of `nodes[n]` are `nodes[2n]`
+    /// and `nodes[2n + 1]`, and `nodes[leaves + i]` is leaf `i`. `nodes[0]`
+    /// is unused.
+    nodes: Vec<usize>,
+    leaves: usize,
+}
+
+impl SorterMergeTree {
+    /// The tree over `runs` runs. `right_goes_first(left, right)` tells
+    /// whether run `right`'s head sorts strictly before run `left`'s.
+    fn new(runs: usize, right_goes_first: &mut impl FnMut(usize, usize) -> bool) -> Self {
+        let leaves = runs.max(1).next_power_of_two();
+        let mut nodes = vec![0; 2 * leaves];
+        for (leaf, node) in nodes[leaves..].iter_mut().enumerate() {
+            *node = leaf;
+        }
+        for node in (1..leaves).rev() {
+            nodes[node] = Self::winner(nodes[2 * node], nodes[2 * node + 1], right_goes_first);
+        }
+        Self { nodes, leaves }
+    }
+
+    fn winner(
+        left: usize,
+        right: usize,
+        right_goes_first: &mut impl FnMut(usize, usize) -> bool,
+    ) -> usize {
+        if right_goes_first(left, right) {
+            right
+        } else {
+            left
+        }
+    }
+
+    /// The run whose head sorts first.
+    fn root(&self) -> usize {
+        self.nodes[1]
+    }
+
+    /// Re-decide the nodes above leaf `run` after its head changed.
+    fn replay(&mut self, run: usize, right_goes_first: &mut impl FnMut(usize, usize) -> bool) {
+        // Leaf `run` is node `leaves + run`; its parent is half of that.
+        let leaf = self.leaves + run;
+        let mut node = leaf / 2;
+        while node > 0 {
+            self.nodes[node] = Self::winner(
+                self.nodes[2 * node],
+                self.nodes[2 * node + 1],
+                right_goes_first,
+            );
+            node /= 2;
+        }
     }
 }
 
@@ -8314,6 +8493,10 @@ pub fn reset_vdbe_jit_metrics() {
 static FSQLITE_SORT_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total pages spilled to disk by sorters.
 static FSQLITE_SORT_SPILL_PAGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total run-head comparisons made by merges of spilled sorter runs.
+static FSQLITE_SORT_MERGE_COMPARISONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// The merge comparisons that called the generic record comparator.
+static FSQLITE_SORT_MERGE_GENERIC_COMPARISONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total MVCC write-path executions that reused an already-owned page lock.
 static FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total MVCC write-path executions that acquired a page lock on first touch.
@@ -8448,6 +8631,11 @@ pub struct VdbeMetricsSnapshot {
     pub sort_rows_total: u64,
     /// Total pages spilled to disk by sorters.
     pub sort_spill_pages_total: u64,
+    /// Total run-head comparisons made by merges of spilled sorter runs.
+    pub sort_merge_comparisons_total: u64,
+    /// The merge comparisons that called the generic record comparator
+    /// (the rest compared two INTEGER heads).
+    pub sort_merge_generic_comparisons_total: u64,
     /// Dynamic opcode execution counts observed while metrics were enabled.
     pub opcode_execution_totals: Vec<OpcodeExecutionCount>,
     /// Total type-coercion attempts.
@@ -8590,6 +8778,10 @@ pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
             .load(AtomicOrdering::Relaxed),
         sort_rows_total: FSQLITE_SORT_ROWS_TOTAL.load(AtomicOrdering::Relaxed),
         sort_spill_pages_total: FSQLITE_SORT_SPILL_PAGES_TOTAL.load(AtomicOrdering::Relaxed),
+        sort_merge_comparisons_total: FSQLITE_SORT_MERGE_COMPARISONS_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        sort_merge_generic_comparisons_total: FSQLITE_SORT_MERGE_GENERIC_COMPARISONS_TOTAL
+            .load(AtomicOrdering::Relaxed),
         opcode_execution_totals,
         type_coercions_total: FSQLITE_VDBE_TYPE_COERCIONS_TOTAL.load(AtomicOrdering::Relaxed),
         type_coercion_changes_total: FSQLITE_VDBE_TYPE_COERCION_CHANGES_TOTAL
@@ -8738,6 +8930,8 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SORT_ROWS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SORT_SPILL_PAGES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SORT_MERGE_COMPARISONS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SORT_MERGE_GENERIC_COMPARISONS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_MVCC_TIER1_FIRST_TOUCH_WRITES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_MVCC_TIER2_COMMIT_SURFACE_WRITES_TOTAL.store(0, AtomicOrdering::Relaxed);
@@ -15154,9 +15348,19 @@ impl VdbeEngine {
                                 FSQLITE_SORT_ROWS_TOTAL.fetch_add(rows, AtomicOrdering::Relaxed);
                                 FSQLITE_SORT_SPILL_PAGES_TOTAL
                                     .fetch_add(spill_pages, AtomicOrdering::Relaxed);
+                                FSQLITE_SORT_MERGE_COMPARISONS_TOTAL.fetch_add(
+                                    sorter.merge_comparisons_total,
+                                    AtomicOrdering::Relaxed,
+                                );
+                                FSQLITE_SORT_MERGE_GENERIC_COMPARISONS_TOTAL.fetch_add(
+                                    sorter.merge_generic_comparisons_total,
+                                    AtomicOrdering::Relaxed,
+                                );
                             }
                             sorter.rows_sorted_total = 0;
                             sorter.spill_pages_total = 0;
+                            sorter.merge_comparisons_total = 0;
+                            sorter.merge_generic_comparisons_total = 0;
                             // Tracing span for sort observability.
                             let _span = tracing::debug_span!(
                                 "sort",
@@ -44552,6 +44756,137 @@ mod tests {
                 })
                 .collect();
             assert_eq!(sorted, expected, "{order:?}");
+        }
+    }
+
+    /// bd-ku484: the merge of spilled runs takes its next row from a winner
+    /// tree and compares two INTEGER heads in the first key column as
+    /// integers. Over runs of one row, of seven and of sixty-four rows (run
+    /// counts that are not powers of two, some with rows left in memory),
+    /// every key shape has to come out in the order one stable sort of all
+    /// the rows by `compare_sorter_rows` gives, ties included. A single
+    /// all-INTEGER key never calls the comparator; every shape takes at most
+    /// one comparison per tree level per row, plus the tree's build; a key
+    /// holding other values, or tied INTEGERs before a second key column,
+    /// does call it.
+    #[test]
+    fn test_sorter_merge_tree_gives_the_stable_order_and_compares_integer_heads_as_integers() {
+        type KeyOf = fn(i64) -> Vec<SqliteValue>;
+        let integer_key: KeyOf = |sequence| {
+            vec![SqliteValue::Integer(match sequence % 50 {
+                0 => i64::MIN,
+                25 => i64::MAX,
+                _ => (sequence * 37) % 13 - 6,
+            })]
+        };
+        let mixed_key: KeyOf = |sequence| {
+            vec![match sequence % 5 {
+                0 => SqliteValue::Null,
+                1 => SqliteValue::Float([0.5, 1.0, 2.0, 3.0][usize::try_from(sequence % 4).unwrap()]),
+                2 => SqliteValue::Text(format!("k{}", (sequence * 3) % 7).into()),
+                _ => SqliteValue::Integer((sequence * 37) % 4),
+            }]
+        };
+        let two_keys: KeyOf = |sequence| {
+            vec![
+                SqliteValue::Integer((sequence * 37) % 5),
+                SqliteValue::Text(format!("t{}", (sequence * 11) % 4).into()),
+            ]
+        };
+        let all_orders = [
+            SortKeyOrder::Asc,
+            SortKeyOrder::Desc,
+            SortKeyOrder::AscNullsLast,
+            SortKeyOrder::DescNullsFirst,
+        ];
+        // (label, key, orders, whether the merge may call the comparator)
+        let mut shapes: Vec<(&str, KeyOf, Vec<SortKeyOrder>, bool)> = Vec::new();
+        for order in all_orders {
+            shapes.push(("integer", integer_key, vec![order], false));
+            shapes.push(("mixed", mixed_key, vec![order], true));
+        }
+        shapes.push(("two keys", two_keys, vec![SortKeyOrder::Asc, SortKeyOrder::Desc], true));
+        shapes.push(("two keys", two_keys, vec![SortKeyOrder::Desc, SortKeyOrder::Asc], true));
+
+        let registry = CollationRegistry::new();
+        let rows: i64 = 300;
+        for (label, key_of, orders, generic_expected) in shapes {
+            let key_columns = orders.len();
+            let collations = vec![None; key_columns];
+            let mut expected: Vec<(Vec<SqliteValue>, i64)> =
+                (0..rows).map(|sequence| (key_of(sequence), sequence)).collect();
+            expected.sort_by(|(lhs, _), (rhs, _)| {
+                compare_sorter_rows(
+                    lhs,
+                    rhs,
+                    key_columns,
+                    &orders,
+                    &collations,
+                    &registry,
+                    TextEncoding::Utf8,
+                )
+            });
+            let expected: Vec<i64> = expected.into_iter().map(|(_, sequence)| sequence).collect();
+
+            for run_rows in [1_usize, 7, 64] {
+                let context = format!("{label} {orders:?}, {run_rows} rows to a run");
+                let mut sorter = SorterCursor::new(key_columns, orders.clone(), collations.clone());
+                let probe_key = key_of(1);
+                let mut probe_record = probe_key.clone();
+                probe_record.push(SqliteValue::Integer(1));
+                sorter.spill_threshold = if run_rows == 1 {
+                    1
+                } else {
+                    SorterCursor::estimate_row_size(&probe_key, &serialize_record(&probe_record))
+                        * run_rows
+                };
+                for sequence in 0..rows {
+                    let key = key_of(sequence);
+                    let mut record = key.clone();
+                    record.push(SqliteValue::Integer(sequence));
+                    sorter
+                        .insert_row(key, serialize_record(&record))
+                        .expect("insert should succeed");
+                }
+                let runs = sorter.spill_runs.len() + usize::from(!sorter.rows.is_empty());
+                assert!(sorter.spill_runs.len() >= 2, "{context}: only {runs} runs");
+                sorter.sort().expect("sort should succeed");
+
+                let sorted: Vec<i64> = sorter
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let record = parse_record(&row.blob).expect("sorted row should decode");
+                        record[key_columns].to_integer()
+                    })
+                    .collect();
+                assert_eq!(sorted, expected, "{context}");
+
+                let leaves = runs.next_power_of_two();
+                let levels = u64::from(leaves.trailing_zeros());
+                let bound = levels * u64::try_from(rows).unwrap() + u64::try_from(leaves).unwrap();
+                assert!(
+                    sorter.merge_comparisons_total > 0
+                        && sorter.merge_comparisons_total <= bound,
+                    "{context}: {} comparisons over {runs} runs, at most {bound}",
+                    sorter.merge_comparisons_total
+                );
+                if generic_expected {
+                    assert!(
+                        sorter.merge_generic_comparisons_total > 0,
+                        "{context}: the comparator was never called"
+                    );
+                } else {
+                    assert_eq!(
+                        sorter.merge_generic_comparisons_total, 0,
+                        "{context}: INTEGER heads went to the comparator"
+                    );
+                }
+                assert!(
+                    sorter.merge_generic_comparisons_total <= sorter.merge_comparisons_total,
+                    "{context}"
+                );
+            }
         }
     }
 
