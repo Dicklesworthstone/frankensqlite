@@ -623,6 +623,155 @@ fn gh462_an_in_process_peer_commit_inside_the_window_still_refuses_the_repairing
     });
 }
 
+/// bd-p8s92 residual: the GH#462 sparse archive (262,146 pages), opened
+/// schema-only so the WAL is header-less at the snapshot, with a writer A
+/// whose SQL writes ONLY page 1 (`PRAGMA application_id`). A peer commits
+/// page 1 (`PRAGMA user_version = 7`) inside A's window. B's change must
+/// never be lost: A's COMMIT is refused, or A's write lands on top of it.
+/// `damaged` names the reserved page on the durable freelist, so a repair is
+/// pending. A's COMMIT then also publishes it, and A's write set cannot be
+/// page 1 alone. A clean freelist leaves no repair, and A's write set is
+/// page 1 alone. `stock_peer` picks stock SQLite or a second fsqlite
+/// connection as the peer.
+///
+/// Stock's `quick_check` closes the test. Only an fsqlite commit publishes
+/// the pending repair: an fsqlite peer's commit, or A's. So when the archive
+/// is damaged, the peer is stock and A is refused, the reserved page is still
+/// on the freelist. Stock must then report that page and nothing else. In
+/// every other case it must report "ok".
+async fn p8s92_page_one_writer_beside_a_peer(damaged: bool, stock_peer: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("p8s92_archive.db");
+    let db_str = db_path.to_string_lossy().into_owned();
+    let seed = Connection::open(&db_str).await.unwrap();
+    seed.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
+    seed.execute("CREATE TABLE seed(x);").await.unwrap();
+    seed.execute("INSERT INTO seed VALUES (462), (463);")
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
+    let free: Vec<u32> = (3..=PAGE_COUNT)
+        .rev()
+        .filter(|page| damaged || *page != LOCK_BYTE_PAGE)
+        .collect();
+    extend_sparse_archive(&db_path, &free, 2);
+
+    let a = Connection::open_existing_schema_only(&db_str)
+        .await
+        .unwrap();
+    a.execute("BEGIN CONCURRENT;").await.unwrap();
+    assert_eq!(
+        scalar_i64(&a.query("SELECT COUNT(*) FROM seed;").await.unwrap()),
+        2
+    );
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal_len = std::fs::metadata(Path::new(&wal)).map_or(0, |m| m.len());
+    assert!(
+        wal_len < 32,
+        "the shape needs a header-less WAL at A's snapshot; the WAL is {wal_len} bytes"
+    );
+    if stock_peer {
+        let stock = rusqlite::Connection::open(&db_path).unwrap();
+        stock.pragma_update(None, "user_version", 7_i64).unwrap();
+    } else {
+        let peer = Connection::open_existing_schema_only(&db_str)
+            .await
+            .unwrap();
+        peer.execute("PRAGMA user_version = 7;").await.unwrap();
+        peer.close().await.unwrap();
+    }
+    let a_commit = match a.execute("PRAGMA application_id = 8;").await {
+        Ok(_) => a.execute("COMMIT;").await.map(|_| ()),
+        Err(error) => Err(error),
+    };
+    eprintln!("bd-p8s92 residual damaged={damaged} stock_peer={stock_peer} a_commit={a_commit:?}");
+    if a.in_transaction() {
+        a.execute("ROLLBACK;").await.unwrap();
+    }
+    a.close().await.unwrap();
+    let stock = rusqlite::Connection::open(&db_path).unwrap();
+    let user_version: i64 = stock
+        .query_row("PRAGMA user_version;", [], |row| row.get(0))
+        .unwrap();
+    let application_id: i64 = stock
+        .query_row("PRAGMA application_id;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        user_version, 7,
+        "LOST UPDATE: the peer's committed page 1 is gone (a_commit={a_commit:?})"
+    );
+    if a_commit.is_ok() {
+        assert_eq!(
+            application_id, 8,
+            "A committed, so its page 1 write must be there"
+        );
+    } else {
+        assert!(
+            matches!(
+                a_commit,
+                Err(fsqlite_error::FrankenError::BusySnapshot { .. })
+            ),
+            "a refused A answers BusySnapshot: {a_commit:?}"
+        );
+        assert_eq!(application_id, 0, "a refused A leaves no trace");
+    }
+    let quick: Vec<String> = stock
+        .prepare("PRAGMA quick_check(100);")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    eprintln!("bd-p8s92 residual damaged={damaged} stock_peer={stock_peer} quick_check={quick:?}");
+    let repair_pending = damaged && stock_peer && a_commit.is_err();
+    if repair_pending {
+        let reserved = LOCK_BYTE_PAGE.to_string();
+        assert!(
+            quick != ["ok"]
+                && quick.iter().all(|row| {
+                    row.split(|c: char| !c.is_ascii_digit())
+                        .any(|number| number == reserved)
+                }),
+            "with no fsqlite commit, stock may report only the archive's own reserved page \
+             {LOCK_BYTE_PAGE}: {quick:?}"
+        );
+    } else {
+        assert_eq!(quick, ["ok"], "the repair is published, or there was none");
+    }
+}
+
+/// bd-p8s92 residual (i): no repair is pending, so A's write set is page 1
+/// alone and the only thing standing between A and a lost update is the
+/// generation-change check on page 1 itself. Stock SQLite commits the peer's
+/// page 1.
+#[test]
+fn p8s92_clean_archive_page_one_writer_beside_a_stock_peer() {
+    asupersync::test_utils::run_test(|| p8s92_page_one_writer_beside_a_peer(false, true));
+}
+
+/// bd-p8s92 residual (i) with a second fsqlite connection as the peer: the
+/// peer's page-1 frame comes from fsqlite's own WAL writer, not stock's.
+#[test]
+fn p8s92_clean_archive_page_one_writer_beside_an_fsqlite_peer() {
+    asupersync::test_utils::run_test(|| p8s92_page_one_writer_beside_a_peer(false, false));
+}
+
+/// bd-p8s92 residual (ii): the trace that filed the bead. The reserved page
+/// on the freelist leaves a repair pending, which A's COMMIT also publishes,
+/// so the repaired freelist trunk pages join page 1 in A's write set. Stock
+/// is the peer.
+#[test]
+fn p8s92_repairing_archive_page_one_writer_beside_a_stock_peer() {
+    asupersync::test_utils::run_test(|| p8s92_page_one_writer_beside_a_peer(true, true));
+}
+
+/// bd-p8s92 residual (ii) with a second fsqlite connection as the peer.
+#[test]
+fn p8s92_repairing_archive_page_one_writer_beside_an_fsqlite_peer() {
+    asupersync::test_utils::run_test(|| p8s92_page_one_writer_beside_a_peer(true, false));
+}
+
 #[test]
 fn gh410_orphan_repair_and_write_churn_never_free_the_reserved_page() {
     asupersync::test_utils::run_test(|| async {
