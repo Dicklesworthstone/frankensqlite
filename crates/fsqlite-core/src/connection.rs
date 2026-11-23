@@ -58326,8 +58326,8 @@ impl Connection {
     fn select_result_column_names(
         &self,
         select: &SelectStatement,
-        outer_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        outer_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> Vec<String> {
         self.select_result_column_names_with_widths(select, outer_ctes, active_ctes)
             .0
@@ -58340,12 +58340,12 @@ impl Connection {
     fn select_result_column_names_with_widths(
         &self,
         select: &SelectStatement,
-        outer_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        outer_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> (Vec<String>, Vec<usize>) {
-        let mut visible_ctes = outer_ctes.to_vec();
+        let mut visible_ctes = Cow::Borrowed(outer_ctes);
         if let Some(with) = &select.with {
-            visible_ctes.extend(with.ctes.clone());
+            visible_ctes.to_mut().push(&with.ctes);
         }
 
         let SelectCore::Select { columns, from, .. } = &select.body.select else {
@@ -58492,24 +58492,14 @@ impl Connection {
             TableOrSubquery::Table { name, alias, .. } => {
                 let effective = alias.clone().or_else(|| Some(name.name.clone()));
                 if name.schema.is_none()
-                    && let Some((owner, cte)) = visible_ctes
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find_map(|(owner, scope)| {
-                            scope
-                                .iter()
-                                .rev()
-                                .find(|cte| cte.name.eq_ignore_ascii_case(&name.name))
-                                .map(|cte| (owner, cte))
-                        })
+                    && let Some((owner, cte)) = find_cte_definition(visible_ctes, &name.name)
                 {
                     // A reference in an inner query cannot change the names
                     // visible inside the CTE's definition.
                     let defining_ctes = &visible_ctes[..=owner];
                     let names = self.cte_result_column_names(
                         cte,
-                        &flatten_view_cte_scopes(defining_ctes),
+                        defining_ctes,
                         &mut Vec::new(),
                     );
                     let types = self.view_result_column_decltypes(
@@ -58529,7 +58519,7 @@ impl Connection {
             TableOrSubquery::Subquery { query, alias } => {
                 let names = self.select_result_column_names(
                     query,
-                    &flatten_view_cte_scopes(visible_ctes),
+                    visible_ctes,
                     &mut Vec::new(),
                 );
                 let types = self.view_result_column_decltypes(query, visible_ctes, depth + 1);
@@ -59492,12 +59482,13 @@ impl Connection {
         &self,
         select: &SelectStatement,
         outer_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        active_ctes: &mut Vec<usize>,
     ) -> usize {
-        let mut visible_ctes = outer_ctes.to_vec();
-        if let Some(with) = &select.with {
-            visible_ctes.extend(with.ctes.clone());
-        }
+        let local_ctes = select
+            .with
+            .as_ref()
+            .map_or(&[][..], |with| with.ctes.as_slice());
+        let visible_ctes = [outer_ctes, local_ctes];
 
         match &select.body.select {
             SelectCore::Values(rows) => rows.first().map_or(0, Vec::len),
@@ -59880,8 +59871,8 @@ impl Connection {
     fn from_clause_result_column_count(
         &self,
         from: &FromClause,
-        visible_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        visible_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> usize {
         self.from_clause_result_column_names(from, visible_ctes, active_ctes)
             .len()
@@ -59892,8 +59883,8 @@ impl Connection {
     fn from_clause_result_column_names(
         &self,
         from: &FromClause,
-        visible_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        visible_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> Vec<String> {
         let mut names = match &from.source {
             TableOrSubquery::ParenJoin(inner) => {
@@ -59937,8 +59928,8 @@ impl Connection {
     fn nested_from_clause_result_column_names(
         &self,
         from: &FromClause,
-        visible_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        visible_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> Vec<String> {
         let effective = flatten_leading_paren_join_from(from);
         let all_sources: Vec<&TableOrSubquery> = std::iter::once(&effective.source)
@@ -60024,8 +60015,8 @@ impl Connection {
         &self,
         from: &FromClause,
         source_name: &QualifiedName,
-        visible_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        visible_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> usize {
         self.named_source_result_column_names(from, source_name, visible_ctes, active_ctes)
             .map_or(1, |names| names.len().max(1))
@@ -60035,8 +60026,8 @@ impl Connection {
         &self,
         from: &FromClause,
         source_name: &QualifiedName,
-        visible_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        visible_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> Option<Vec<String>> {
         find_named_source(from, source_name).map(|source| {
             self.table_or_subquery_result_column_names(source, visible_ctes, active_ctes)
@@ -60091,8 +60082,8 @@ impl Connection {
     fn table_or_subquery_result_column_names(
         &self,
         source: &TableOrSubquery,
-        visible_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        visible_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> Vec<String> {
         match source {
             // `map_or_else` would build both closures at once and each wants
@@ -60202,16 +60193,13 @@ impl Connection {
         &self,
         relation_name: &str,
         requested_scope: PragmaSchemaScope,
-        visible_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        visible_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> Vec<String> {
         if requested_scope == PragmaSchemaScope::Unqualified
-            && let Some(cte) = visible_ctes
-                .iter()
-                .rev()
-                .find(|cte| cte.name.eq_ignore_ascii_case(relation_name))
+            && let Some((owner, cte)) = find_cte_definition(visible_ctes, relation_name)
         {
-            return self.cte_result_column_names(cte, visible_ctes, active_ctes);
+            return self.cte_result_column_names(cte, &visible_ctes[..=owner], active_ctes);
         }
 
         // The virtual schema tables are materialized only after statement
@@ -60284,16 +60272,15 @@ impl Connection {
     fn cte_result_column_names(
         &self,
         cte: &fsqlite_ast::Cte,
-        visible_ctes: &[fsqlite_ast::Cte],
-        active_ctes: &mut Vec<String>,
+        visible_ctes: &[&[fsqlite_ast::Cte]],
+        active_ctes: &mut Vec<usize>,
     ) -> Vec<String> {
         if !cte.columns.is_empty() {
             return Self::deduplicate_relation_column_names(cte.columns.clone());
         }
-        if active_ctes
-            .iter()
-            .any(|active_name| active_name.eq_ignore_ascii_case(&cte.name))
-        {
+        // An inner WITH can declare the same name as a different CTE on the stack.
+        let definition = std::ptr::from_ref(cte).addr();
+        if active_ctes.contains(&definition) {
             let inferred = Self::deduplicate_relation_column_names(infer_select_column_names(
                 &cte.query,
             ));
@@ -60303,7 +60290,7 @@ impl Connection {
             return inferred;
         }
 
-        active_ctes.push(cte.name.clone());
+        active_ctes.push(definition);
         // bd-6tmuj: a chain of CTEs recurses here once per level.
         let column_names =
             Self::deduplicate_relation_column_names(with_view_expansion_stack(|| {
@@ -99801,7 +99788,7 @@ impl Connection {
         visible_ctes: &[fsqlite_ast::Cte],
     ) -> Vec<String> {
         let mut active_ctes = Vec::new();
-        self.table_or_subquery_result_column_names(source, visible_ctes, &mut active_ctes)
+        self.table_or_subquery_result_column_names(source, &[visible_ctes], &mut active_ctes)
     }
 
     fn extend_join_source_collations(
@@ -111994,7 +111981,7 @@ impl Connection {
         let column_names: Vec<Vec<String>> = sources
             .iter()
             .map(|source| {
-                self.table_or_subquery_result_column_names(source, visible_ctes, &mut Vec::new())
+                self.table_or_subquery_result_column_names(source, &[visible_ctes], &mut Vec::new())
             })
             .collect();
         if column_names.iter().any(Vec::is_empty) {
@@ -112583,7 +112570,7 @@ impl Connection {
                     let mut active_ctes = Vec::new();
                     let col_names = self.table_or_subquery_result_column_names(
                         source,
-                        visible_ctes,
+                        &[visible_ctes],
                         &mut active_ctes,
                     );
                     if col_names.is_empty() {
@@ -112608,7 +112595,7 @@ impl Connection {
                 }
                 TableOrSubquery::Subquery { query, alias } => {
                     let col_names = Self::deduplicate_relation_column_names(
-                        self.select_result_column_names(query, visible_ctes, &mut Vec::new()),
+                        self.select_result_column_names(query, &[visible_ctes], &mut Vec::new()),
                     );
                     let label = alias.clone().unwrap_or_else(|| "subquery".to_owned());
                     table_sources.push(JoinTableSource {
@@ -112736,7 +112723,7 @@ impl Connection {
                     let row_data: Vec<Vec<SqliteValue>> =
                         rows.into_iter().map(|r| r.values).collect();
                     let resolved = Self::deduplicate_relation_column_names(
-                        self.select_result_column_names(query, visible_ctes, &mut Vec::new()),
+                        self.select_result_column_names(query, &[visible_ctes], &mut Vec::new()),
                     );
                     if !resolved.is_empty() {
                         table_sources[i].col_names = resolved;
@@ -113113,7 +113100,7 @@ impl Connection {
                         let mut active_ctes = Vec::new();
                         let col_names = self.table_or_subquery_result_column_names(
                             source,
-                            &visible_ctes,
+                            &[&visible_ctes],
                             &mut active_ctes,
                         );
                         if col_names.is_empty() {
@@ -113140,7 +113127,7 @@ impl Connection {
                     }
                     TableOrSubquery::Subquery { query, alias } => {
                         let col_names = Self::deduplicate_relation_column_names(
-                            self.select_result_column_names(query, &visible_ctes, &mut Vec::new()),
+                            self.select_result_column_names(query, &[&visible_ctes], &mut Vec::new()),
                         );
                         let label = alias.clone().unwrap_or_else(|| "subquery".to_owned());
                         Ok((
@@ -113309,7 +113296,7 @@ impl Connection {
                         let row_data: Vec<Vec<SqliteValue>> =
                             rows.into_iter().map(|r| r.values).collect();
                         let resolved = Self::deduplicate_relation_column_names(
-                            self.select_result_column_names(query, &visible_ctes, &mut Vec::new()),
+                            self.select_result_column_names(query, &[&visible_ctes], &mut Vec::new()),
                         );
                         if !resolved.is_empty() {
                             table_sources[i].col_names = resolved;
@@ -129291,8 +129278,17 @@ fn is_schema_relation_in_scope(name: &str, scope: PragmaSchemaScope) -> bool {
         || (scope != PragmaSchemaScope::Main && canonical_sqlite_temp_schema_name(name).is_some())
 }
 
-fn flatten_view_cte_scopes(scopes: &[&[fsqlite_ast::Cte]]) -> Vec<fsqlite_ast::Cte> {
-    scopes.iter().flat_map(|scope| scope.iter().cloned()).collect()
+fn find_cte_definition<'a>(
+    scopes: &[&'a [fsqlite_ast::Cte]],
+    name: &str,
+) -> Option<(usize, &'a fsqlite_ast::Cte)> {
+    scopes.iter().enumerate().rev().find_map(|(owner, scope)| {
+        scope
+            .iter()
+            .rev()
+            .find(|cte| cte.name.eq_ignore_ascii_case(name))
+            .map(|cte| (owner, cte))
+    })
 }
 
 /// Views and SQLite's schema tables share the same constraint-free PRAGMA
@@ -163176,7 +163172,7 @@ fn collect_compound_source_output_slots(
     connection: &Connection,
     source: &TableOrSubquery,
     visible_ctes: &[fsqlite_ast::Cte],
-    active_ctes: &mut Vec<String>,
+    active_ctes: &mut Vec<usize>,
     sources: &mut Vec<CompoundSourceProjection>,
     slots: &mut Vec<CompoundSourceOutputSlot>,
 ) -> Vec<usize> {
@@ -163196,7 +163192,7 @@ fn collect_compound_source_output_slots(
         qualifier: compound_source_qualifier(source),
     });
     let column_names =
-        connection.table_or_subquery_result_column_names(source, visible_ctes, active_ctes);
+        connection.table_or_subquery_result_column_names(source, &[visible_ctes], active_ctes);
     let first_slot = slots.len();
     slots.extend(
         column_names
@@ -163213,7 +163209,7 @@ fn collect_compound_from_output_slots(
     connection: &Connection,
     from: &FromClause,
     visible_ctes: &[fsqlite_ast::Cte],
-    active_ctes: &mut Vec<String>,
+    active_ctes: &mut Vec<usize>,
     sources: &mut Vec<CompoundSourceProjection>,
     slots: &mut Vec<CompoundSourceOutputSlot>,
 ) -> Vec<usize> {

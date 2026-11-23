@@ -569,6 +569,59 @@ fn pragma_introspects_schema_catalog_aliases_in_their_namespace() {
 }
 
 #[test]
+fn view_cte_wildcard_uses_its_definition_scope() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE origin(outer_key INTEGER)",
+            "INSERT INTO origin VALUES (1)",
+            "CREATE VIEW cte_star AS
+             WITH b AS (SELECT * FROM origin), c AS (SELECT * FROM b)
+             SELECT q.* FROM (
+                 WITH b AS (SELECT 'shadow' AS inner_key, 2 AS extra)
+                 SELECT * FROM c
+             ) AS q",
+            "CREATE VIEW cte_star_same_name AS WITH c AS (
+                 WITH c AS (SELECT * FROM origin) SELECT * FROM c
+             ) SELECT * FROM c",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+
+        let mut diffs = Vec::new();
+        for sql in [
+            "PRAGMA table_info('cte_star')",
+            "SELECT name, type FROM pragma_table_xinfo('cte_star')",
+            "SELECT * FROM cte_star",
+            "PRAGMA table_info('cte_star_same_name')",
+            "SELECT * FROM cte_star_same_name",
+        ] {
+            let expected = rq(&r, sql);
+            assert_eq!(expected.len(), 1, "stock: {sql}");
+            assert_ne!(expected, vec![vec!["ERR"]], "stock: {sql}");
+            let direct = fq(&f, sql).await;
+            let prepared = match f.prepare(sql).await {
+                Ok(statement) => statement.query().await.map(|rows| {
+                    rows.iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect::<Vec<Vec<String>>>()
+                }),
+                Err(error) => Err(error),
+            };
+            if direct != expected || prepared.as_ref().ok() != Some(&expected) {
+                diffs.push(format!(
+                    "{sql}: direct={direct:?}, prepared={prepared:?}, stock={expected:?}"
+                ));
+            }
+        }
+        f.close().await.unwrap();
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    });
+}
+
+#[test]
 fn gh512_pragma_table_info_quoted_and_parenthesized_pk_ordinals() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
