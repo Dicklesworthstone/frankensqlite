@@ -2394,6 +2394,7 @@ where
 /// `body_size` are their varint and payload sums. `buf` is sized once and every
 /// header byte and payload is written in place.
 #[inline]
+#[allow(clippy::cast_possible_truncation)]
 fn write_serialized_record_from_layouts<'a, I>(
     layouts: I,
     header_content_size: usize,
@@ -2414,7 +2415,13 @@ fn write_serialized_record_from_layouts<'a, I>(
     );
     let mut body_offset = header_size;
     for (value, serial_type, payload_len) in layouts {
-        header_offset += write_small_varint(&mut dst[header_offset..header_size], serial_type);
+        // The one-byte serial type is stored straight into its header slot.
+        header_offset += if serial_type <= 0x7F {
+            dst[header_offset] = serial_type as u8;
+            1
+        } else {
+            write_varint(&mut dst[header_offset..header_size], serial_type)
+        };
         let body_end = body_offset + payload_len;
         encode_serialized_value(value, payload_len, &mut dst[body_offset..body_end]);
         body_offset = body_end;
@@ -3097,7 +3104,11 @@ fn decode_big_endian_signed(bytes: &[u8]) -> i64 {
 }
 
 /// Encode a `SqliteValue` into its serial type byte representation.
-#[inline]
+///
+/// Always inlined: out of line, the record writer paid a call per value
+/// (about a third of a 4-column `MakeRecord`'s writer, bd-w4pr1.13 round 16).
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u8]) {
     debug_assert_eq!(buf.len(), payload_len);
     match value {
