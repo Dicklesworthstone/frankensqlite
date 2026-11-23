@@ -94,6 +94,38 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-23 - REJECTED on its time kill line (rowid_lookups_200k cycles a layout-averaged LOSE, 1.080 in the only valid run, 1.059 / 1.030 in two void runs, +7.5% at each of 8 heap offsets), with -32.0M Ir (-1.42%, x4.92 -> x4.85 stock 3.54.1) inside its prediction: the clean-buffer eviction walks an occupancy bitmap of the flat page table instead of every slot (bd-w4pr1.13.18, read/seek round 12, lever FS1)
+
+- Target: `ShardedPageCache::take_clean_buffer_from_flat_slots`, run on every page-cache eviction. Callgrind on main
+  e9dd4aa18: `take_clean_buffer`'s own code 414 Ir an eviction, about 233 of it the walk (16,384 flat slots, ~500
+  occupied at the default budget; every slot from the cursor read until an occupied one).
+- Touched (not landed; patch `scratchpad/pl12/fs1_v1.patch`, sha256 a504f167fa066573): `crates/fsqlite-pager/src/page_cache.rs`.
+  `FlatPageSlots.occupied`, one `AtomicU64` bit per slot, changed only under the slot's payload lock in the critical
+  section of the page-number transition it mirrors (insert, remove, clean take, arbitrary removal, clear);
+  `find_map_occupied_from` offers the occupied slots in the full walk's order; the walk's take checks the slot it
+  read before probing. Keepers: an occupancy / walk-order oracle (30,000 generated operations) and a twin cache
+  evicting by the old walk (same victim, bytes, cursor and residents every step); four planted mutants each failed.
+- Prediction (bead, before the build): rowid -30M to -46M Ir; cycles 0.96-0.995. Kill: rowid better by less than
+  25M; any row above +0.5% Ir; any replicated layout-averaged LOSE.
+- Result (one rch job on hz2; parent cargo ELF c16544c66fbc5a0c, lever e69aadfd8cc6e1eb; stock 3.54.1 live;
+  thinkstation1 at load 15-22): rowid 2,257.67M -> 2,225.68M Ir; `take_clean_buffer` own 414 -> 233 an eviction
+  (predicted 180-215); all-hits control +0.002%. Time, three runs (null max |z| 4.15 VOID, 2.84 valid, 18.46 VOID):
+  rowid cycles 1.059 / 1.080 LOSE / 1.030, cpu 1.045 / 1.047 LOSE / 1.044; every layout of the lever slower in every
+  run. Heap-offset probe (`scratchpad/pl12/heapshift_probe.py`, LD_PRELOAD malloc 0-3,584 B, 3 reps): lever slower at
+  every offset (1,649-1,706M against 1,510-1,570M cycles) with fewer L1d misses (114-117M against 121-123M) and fewer
+  L2 misses (8.4-9.4M against 10.3-11.8M). Not heap layout and not more misses. Not landed although only one run was
+  valid: every run and every layout showed the target row slower.
+- Why (diagnosis, not proven): the full walk's independent loads ran speculatively past the victim and warmed the next
+  victim's slot (about 17 slots on); the bitmap walk reaches the slot through a dependent chain (bitmap word, then
+  slot), so each take met a cold slot. Instructions are a poor proxy for this loop.
+- Retry condition: the same walk plus a software prefetch of the next victim's slot lines after each eviction (FS1 v2:
+  patch `scratchpad/pl12/fs1v2.patch`, sha256 7ede2dead05a13fa, prediction posted on the bead, never admitted on the
+  fleet in round 12), judged on rowid cycles first; any eviction-walk change must be judged on cycles first, since the
+  walk's memory side effect is part of its cost.
+- Related finding, measured separately as lever CP1 (bd-w4pr1.13.18, commit 3968ebfef on lane branch lane-cp1-r12,
+  landing gate pending): BF1's forgotten-page table hashed by the flat table's own multiplier, so pages forgotten in
+  flat-cursor order crowded its probes.
+
 ## 2026-11-23 - WIN (landed as e519bf9ed; inside its prediction; trig_cte x11.59 -> x10.45 stock 3.54.1 in instructions, alt_txn x3.06 -> x2.46): a retained cursor a program on another root displaces from the engine's slot is kept as a spare, and the next open of its root takes it back (bd-fpr5g, trig lane round 2, lever RC)
 
 - Target: programs on the connection's one cached VDBE engine number their target cursor 0, so an INSERT's trigger
