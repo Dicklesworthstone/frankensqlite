@@ -12275,6 +12275,14 @@ enum UpsertConflictProbe {
     },
 }
 
+/// Whether `execute_create_table` creates the table or only makes the checks
+/// stock's parser makes while it prepares the statement (bd-nnnd8).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreateTableRun {
+    Execute,
+    PrepareChecks,
+}
+
 /// bd-y7old / bd-bwm0x: `(rowid, old_row, new_row, where_true)` snapshot for firing
 /// BEFORE/AFTER UPDATE triggers around a conflicting DO UPDATE upsert's VDBE apply.
 /// `where_true` is the truthiness of the clause's `DO UPDATE ... WHERE` (always
@@ -32646,7 +32654,7 @@ impl Connection {
             // bd-nnnd8: a schema or control statement runs from its text at
             // each step, so none of the query preparation below applies.
             if is_prepared_schema_statement(parsed.as_ref()) {
-                return self.prepare_schema_statement(original_sql, parsed.as_ref());
+                return Box::pin(self.prepare_schema_statement(original_sql, parsed.as_ref())).await;
             }
             // bd-at0bx: bind `schema.table.column` references before
             // validation and compilation, as the direct execute path does.
@@ -45439,7 +45447,7 @@ impl Connection {
         }
         match statement {
             Statement::CreateTable(create) => {
-                boxed_future(|| self.execute_create_table(create)).await?;
+                boxed_future(|| self.execute_create_table(create, CreateTableRun::Execute)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
@@ -49021,7 +49029,7 @@ impl Connection {
         column_create.temporary = target_is_temp;
         column_create.name.schema = None;
         *self.pending_ddl_source.borrow_mut() = Some(create_sql);
-        Box::pin(self.execute_create_table(&column_create)).await?;
+        Box::pin(self.execute_create_table(&column_create, CreateTableRun::Execute)).await?;
         if !rows.is_empty() {
             if target_is_temp {
                 self.populate_newly_created_temp_table_rows(&table_name, rows)?;
@@ -53111,12 +53119,12 @@ impl Connection {
     /// and runs nothing: a statement dropped without a step changes nothing.
     /// Each step runs the statement from this text, as `Connection::query`
     /// runs it ([`Self::run_prepared_schema_statement`]).
-    fn prepare_schema_statement(
+    async fn prepare_schema_statement(
         &self,
         sql: &str,
         statement: &Statement,
     ) -> Result<PreparedStatement<'_>> {
-        if let Err(error) = self.validate_prepared_schema_statement(statement) {
+        if let Err(error) = Box::pin(self.validate_prepared_schema_statement(statement)).await {
             // A missing column named by a double-quoted token is retried as a
             // string literal by the DQS fallback when the statement runs, so
             // only the run can tell whether the error stands.
@@ -53159,18 +53167,50 @@ impl Connection {
     /// re-prepares the statement after a schema change; here the step runs
     /// the statement, whose executor raises the same errors.
     ///
-    /// CREATE TABLE, VIEW, INDEX and TRIGGER run the checks their executors
-    /// run first (one copy of each). DROP, ALTER TABLE, ANALYZE and REINDEX
+    /// CREATE TABLE (with a CREATE TABLE ... AS SELECT's SELECT), VIRTUAL
+    /// TABLE, VIEW, INDEX and TRIGGER run the checks their executors run first
+    /// (one copy of each). DROP, ALTER TABLE, ANALYZE and REINDEX
     /// report a name that resolves to nothing only where nothing else could
     /// resolve it: no attached database and no TEMP object. Anything those
     /// cases leave out is refused when the statement runs. Transaction
     /// control, savepoints, ATTACH, DETACH and VACUUM fail only when they
     /// run, in stock as here.
-    fn validate_prepared_schema_statement(&self, statement: &Statement) -> Result<()> {
+    async fn validate_prepared_schema_statement(&self, statement: &Statement) -> Result<()> {
         match statement {
             Statement::CreateTable(create) => {
                 if self.prepared_target_is_local(&create.name, statement)? {
-                    self.create_table_name_check(create)?;
+                    match &create.body {
+                        // The name, then the body: the executor's own checks.
+                        CreateTableBody::Columns { .. } => {
+                            Box::pin(
+                                self.execute_create_table(create, CreateTableRun::PrepareChecks),
+                            )
+                            .await?;
+                        }
+                        // A CREATE TABLE ... AS SELECT resolves its SELECT's
+                        // names while stock prepares it, after the table's
+                        // name (unless IF NOT EXISTS met the name).
+                        CreateTableBody::AsSelect(select) => {
+                            if !self.create_table_name_check(
+                                &create.name,
+                                create.temporary,
+                                create.if_not_exists,
+                            )? {
+                                self.validate_statement_select_structure(
+                                    statement,
+                                    RowValueSpelling::AsWritten,
+                                )?;
+                                // A simple SELECT's names are otherwise
+                                // resolved only when it is compiled.
+                                self.validate_select_column_references(select)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::CreateVirtualTable(create) => {
+                if self.prepared_target_is_local(&create.name, statement)? {
+                    self.create_table_name_check(&create.name, false, create.if_not_exists)?;
                 }
             }
             Statement::CreateView(create) => {
@@ -53298,19 +53338,23 @@ impl Connection {
     }
 
     /// bd-nnnd8: ALTER TABLE's prepare-time errors on an unqualified MAIN
-    /// table that is neither virtual, a view nor internal: the table is
-    /// missing, ADD COLUMN names an existing column, or RENAME TO takes the
-    /// name of a table, index or view. The messages are the ones
-    /// `execute_alter_table_impl` raises for the same lookups.
+    /// table that is neither a view nor internal: column DDL on a virtual
+    /// table, the table is missing, the column checks the executor makes
+    /// first (`alter_table_column_check`, and `drop_column_check` for DROP
+    /// COLUMN), or RENAME TO takes the name of a table, index or view. The
+    /// messages are the ones `execute_alter_table_impl` raises for the same
+    /// lookups.
     fn validate_prepared_alter(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
         let name = &alter.table.name;
         if alter.table.schema.is_some()
             || !self.prepared_names_resolve_locally()
             || (name.len() >= 7 && name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_"))
-            || self.table_name_is_virtual(name)
             || self.view_index_of(name).is_some()
         {
             return Ok(());
+        }
+        if self.table_name_is_virtual(name) {
+            return Self::alter_virtual_table_column_check(name, &alter.action);
         }
         let schema = self.schema.borrow();
         let Some(table) = schema
@@ -53319,18 +53363,11 @@ impl Connection {
         else {
             return Err(FrankenError::NoSuchTable { name: name.clone() });
         };
+        Self::alter_table_column_check(table, &alter.action)?;
+        if let AlterTableAction::DropColumn(column) = &alter.action {
+            Self::drop_column_check(table, column)?;
+        }
         match &alter.action {
-            AlterTableAction::AddColumn(column)
-                if table
-                    .columns
-                    .iter()
-                    .any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) =>
-            {
-                Err(FrankenError::FunctionError(format!(
-                    "duplicate column name: {}",
-                    column.name
-                )))
-            }
             AlterTableAction::RenameTo(new_name)
                 if schema_table_index_or_view_name_exists(
                     &schema,
@@ -58083,6 +58120,18 @@ impl Connection {
             }
             Statement::CreateTable(create) => {
                 if let CreateTableBody::AsSelect(select) = &create.body {
+                    // bd-nnnd8: stock checks the new table's name before its
+                    // SELECT (sqlite3StartTable runs first), and a name IF
+                    // NOT EXISTS meets leaves the SELECT unchecked.
+                    if matches!(self.attached_target_schema(&create.name), Ok(None))
+                        && self.create_table_name_check(
+                            &create.name,
+                            create.temporary,
+                            create.if_not_exists,
+                        )?
+                    {
+                        return Ok(());
+                    }
                     SelectRelationResolver::new(self).validate_select(select)?;
                     self.validate_select_table_function_forward_refs(select, &[])?;
                 }
@@ -65859,7 +65908,8 @@ impl Connection {
         // Besides keeping the parser/schema/catalog representations identical,
         // this is what makes `%_idx` and `%_config` real WITHOUT ROWID b-trees
         // with owned roots and primary-key metadata, exactly like stock SQLite.
-        self.execute_create_table(&create).await
+        self.execute_create_table(&create, CreateTableRun::Execute)
+            .await
     }
 
     /// `CREATE VIRTUAL TABLE ... USING rtree`: stock's rootpage=0 layout
@@ -65940,7 +65990,8 @@ impl Connection {
             // The ordinary CREATE TABLE stores the pending source verbatim, so
             // sqlite_schema carries stock's exact shadow-table text.
             *self.pending_ddl_source.borrow_mut() = Some(sql);
-            self.execute_create_table(&create).await?;
+            self.execute_create_table(&create, CreateTableRun::Execute)
+                .await?;
         }
         self.persist_rtree_shadow_writes(table_name).await?;
         self.increment_schema_cookie().await?;
@@ -75169,16 +75220,21 @@ impl Connection {
     /// reserved name, a table or view of the name, an index of the name.
     /// `Ok(true)` when IF NOT EXISTS met a table or view of the name, so the
     /// statement does nothing. Preparing the statement runs them too, where
-    /// stock raises them (bd-nnnd8).
-    fn create_table_name_check(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<bool> {
-        let table_name = &create.name.name;
+    /// stock raises them (bd-nnnd8). CREATE VIRTUAL TABLE makes the same
+    /// checks (stock's sqlite3VtabBeginParse starts with sqlite3StartTable).
+    fn create_table_name_check(
+        &self,
+        name: &QualifiedName,
+        temporary: bool,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        let table_name = &name.name;
 
         // As in stock's sqlite3StartTable, a TEMP table may only be qualified
         // with `temp`: `CREATE TEMP TABLE main.t(...)` is an error, checked
         // before anything else about the name.
-        if create.temporary
-            && create
-                .name
+        if temporary
+            && name
                 .schema
                 .as_deref()
                 .is_some_and(|schema| !schema.eq_ignore_ascii_case("temp"))
@@ -75199,9 +75255,8 @@ impl Connection {
             )));
         }
 
-        let target_is_temp = create.temporary
-            || create
-                .name
+        let target_is_temp = temporary
+            || name
                 .schema
                 .as_deref()
                 .is_some_and(|s| s.eq_ignore_ascii_case("temp"));
@@ -75227,7 +75282,7 @@ impl Connection {
                 main_exists
             };
             if conflict {
-                if create.if_not_exists {
+                if if_not_exists {
                     return Ok(true);
                 }
                 return Err(FrankenError::FunctionError(format!(
@@ -75249,7 +75304,7 @@ impl Connection {
             .view_index_for_scope(table_name, target_scope)
             .is_some()
         {
-            if create.if_not_exists {
+            if if_not_exists {
                 return Ok(true);
             }
             return Err(FrankenError::FunctionError(format!(
@@ -75268,10 +75323,19 @@ impl Connection {
 
     /// Process a CREATE TABLE statement: register the schema and create the
     /// in-memory table, and insert a row into sqlite_master on page 1.
+    ///
+    /// With [`CreateTableRun::PrepareChecks`] it makes only the checks stock's
+    /// parser makes while it prepares the statement (its name, and a column
+    /// list's body; a CREATE TABLE ... AS SELECT's SELECT is checked by its
+    /// caller) and changes nothing (bd-nnnd8).
     #[allow(clippy::too_many_lines)]
-    async fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
+    async fn execute_create_table(
+        &self,
+        create: &fsqlite_ast::CreateTableStatement,
+        run: CreateTableRun,
+    ) -> Result<()> {
         let table_name = create.name.name.clone();
-        if self.create_table_name_check(create)? {
+        if self.create_table_name_check(&create.name, create.temporary, create.if_not_exists)? {
             return Ok(());
         }
 
@@ -75377,9 +75441,10 @@ impl Connection {
                         .iter()
                         .any(|tc| matches!(tc.kind, TableConstraintKind::PrimaryKey { .. }));
                 if create.without_rowid && !has_primary_key {
-                    return Err(FrankenError::NotImplemented(
-                        "CREATE TABLE ... WITHOUT ROWID requires a PRIMARY KEY".to_owned(),
-                    ));
+                    // Stock's text (sqlite3EndTable), under SQLITE_ERROR.
+                    return Err(FrankenError::FunctionError(format!(
+                        "PRIMARY KEY missing on table {table_name}"
+                    )));
                 }
                 if create.without_rowid && is_autoincrement {
                     return Err(FrankenError::NotImplemented(
@@ -75387,15 +75452,6 @@ impl Connection {
                     ));
                 }
                 let primary_key_constraints = collect_primary_key_constraints(columns, constraints);
-                if create.without_rowid {
-                    self.without_rowid_pk_desc.borrow_mut().insert(
-                        name_lc.clone(),
-                        collect_primary_key_desc_flags(columns, constraints)
-                            .into_iter()
-                            .next()
-                            .unwrap_or_default(),
-                    );
-                }
 
                 let col_infos: Vec<ColumnInfo> = columns
                     .iter()
@@ -75693,12 +75749,44 @@ impl Connection {
                         )?;
                     }
                 }
+                // A table FOREIGN KEY names its own columns (stock's
+                // sqlite3CreateForeignKey, while it parses).
+                for constraint in constraints {
+                    if let TableConstraintKind::ForeignKey {
+                        columns: fk_columns,
+                        ..
+                    } = &constraint.kind
+                        && let Some(unknown) = fk_columns.iter().find(|fk_column| {
+                            !columns
+                                .iter()
+                                .any(|column| column.name.eq_ignore_ascii_case(fk_column))
+                        })
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "unknown column \"{unknown}\" in foreign key definition"
+                        )));
+                    }
+                }
                 // Derive SQLite's canonical declaration-slot layout once, then
                 // allocate roots only for materialized slots. A WITHOUT ROWID
                 // PRIMARY KEY still owns an ordinal even though its B-tree is
                 // the table root and no sqlite_schema index row is persisted.
                 let implicit_autoindex_slots =
                     implicit_autoindex_layout(columns, constraints, create.without_rowid)?;
+                // bd-nnnd8: every check stock's parser makes has run; a
+                // prepare stops here, before anything changes.
+                if run == CreateTableRun::PrepareChecks {
+                    return Ok(());
+                }
+                if create.without_rowid {
+                    self.without_rowid_pk_desc.borrow_mut().insert(
+                        name_lc.clone(),
+                        collect_primary_key_desc_flags(columns, constraints)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default(),
+                    );
+                }
                 let cx = self.op_cx()?;
                 // All validation that can reject the canonical layout must run
                 // before mutating connection-local schema maps.
@@ -75926,6 +76014,9 @@ impl Connection {
                 }
             }
             CreateTableBody::AsSelect(select_stmt) => {
+                if run == CreateTableRun::PrepareChecks {
+                    return Ok(());
+                }
                 if create.strict {
                     return Err(FrankenError::NotImplemented(
                         "CREATE TABLE ... AS SELECT ... STRICT is not yet supported".to_owned(),
@@ -75966,19 +76057,12 @@ impl Connection {
         let module_key = create.module.to_ascii_uppercase();
         let table_name = create.name.name.clone();
 
-        let schema = self.schema.borrow();
-        if schema
-            .iter()
-            .any(|t| t.name.eq_ignore_ascii_case(&table_name))
-        {
-            if create.if_not_exists {
-                return Ok(());
-            }
-            return Err(FrankenError::FunctionError(format!(
-                "table {table_name} already exists",
-            )));
+        // bd-nnnd8: CREATE TABLE's name checks (a reserved name, a table or
+        // view of the name, an index of the name), as stock's
+        // sqlite3VtabBeginParse makes them through sqlite3StartTable.
+        if self.create_table_name_check(&create.name, false, create.if_not_exists)? {
+            return Ok(());
         }
-        drop(schema);
         if self.has_staged_dropped_live_vtab(&table_name) {
             return Err(FrankenError::NotImplemented(format!(
                 "recreating live virtual table {table_name} in the same transaction after DROP is not yet supported",
@@ -76958,6 +77042,126 @@ impl Connection {
         self.execute_visible_alter_drop_column(alter).await
     }
 
+    /// The errors ALTER TABLE raises from `table`'s columns before it rewrites
+    /// anything: RENAME or DROP COLUMN of a missing column, ADD COLUMN of an
+    /// existing one, and (on a table with a rowid) a column named after a
+    /// rowid alias. Preparing the statement raises them too, where stock's
+    /// parser does (bd-nnnd8).
+    fn alter_table_column_check(table: &TableSchema, action: &AlterTableAction) -> Result<()> {
+        match action {
+            AlterTableAction::RenameColumn { old, .. } | AlterTableAction::DropColumn(old)
+                if !table
+                    .columns
+                    .iter()
+                    .any(|column| column.name.eq_ignore_ascii_case(old)) =>
+            {
+                return Err(FrankenError::FunctionError(format!(
+                    "no such column: \"{old}\""
+                )));
+            }
+            AlterTableAction::AddColumn(column)
+                if table
+                    .columns
+                    .iter()
+                    .any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) =>
+            {
+                // Stock reports this verbatim under SQLITE_ERROR, not as an
+                // internal error. bd-ttof2.
+                return Err(FrankenError::FunctionError(format!(
+                    "duplicate column name: {}",
+                    column.name
+                )));
+            }
+            AlterTableAction::RenameTo(_)
+            | AlterTableAction::RenameColumn { .. }
+            | AlterTableAction::AddColumn(_)
+            | AlterTableAction::DropColumn(_) => {}
+        }
+        // SQLite 3.54 (alter.c isRowidAlias): on a table with a rowid,
+        // ALTER TABLE refuses to add, drop, or rename a column to or from a
+        // rowid alias name (rowid, _rowid_, oid), naming the operation and
+        // the name as written. WITHOUT ROWID tables have no such alias.
+        if !table.without_rowid {
+            let refused = |operation: &str, name: &str| {
+                FrankenError::FunctionError(format!("cannot {operation} rowid alias: {name}"))
+            };
+            match action {
+                AlterTableAction::AddColumn(column) if is_hidden_rowid_alias_name(&column.name) => {
+                    return Err(refused("add", &column.name));
+                }
+                AlterTableAction::DropColumn(name) if is_hidden_rowid_alias_name(name) => {
+                    return Err(refused("drop", name));
+                }
+                AlterTableAction::RenameColumn { old, new } => {
+                    if is_hidden_rowid_alias_name(old) {
+                        return Err(refused("rename from", old));
+                    }
+                    if is_hidden_rowid_alias_name(new) {
+                        return Err(refused("rename to", new));
+                    }
+                }
+                AlterTableAction::RenameTo(_)
+                | AlterTableAction::AddColumn(_)
+                | AlterTableAction::DropColumn(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The errors DROP COLUMN raises from the column it drops: it is
+    /// missing, part of the PRIMARY KEY, UNIQUE, or the table's last column.
+    /// Returns its index. Preparing the statement raises them too (bd-nnnd8).
+    fn drop_column_check(table: &TableSchema, col_name: &str) -> Result<usize> {
+        let col_idx = table
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            .ok_or_else(|| FrankenError::FunctionError(format!("no such column: \"{col_name}\"")))?;
+        if table.primary_key_constraints.iter().any(|pk| {
+            pk.iter()
+                .any(|pk_col| pk_col.eq_ignore_ascii_case(col_name))
+        }) {
+            return Err(FrankenError::FunctionError(format!(
+                "cannot drop PRIMARY KEY column: \"{col_name}\""
+            )));
+        }
+
+        // A column-level UNIQUE constraint is part of the table
+        // definition, not a disposable user index. Silently deleting
+        // its autoindex would weaken the table's data contract.
+        if table.columns[col_idx].unique {
+            return Err(FrankenError::FunctionError(format!(
+                "cannot drop UNIQUE column: \"{col_name}\""
+            )));
+        }
+
+        // SQLite rule: cannot drop the last remaining column.
+        if table.columns.len() == 1 {
+            return Err(FrankenError::FunctionError(format!(
+                "cannot drop column \"{col_name}\": no other columns exist"
+            )));
+        }
+        Ok(col_idx)
+    }
+
+    /// The errors ALTER TABLE on a virtual table raises for column DDL
+    /// (GH #215 / bd-bzd19 L13). Preparing the statement raises them too
+    /// (bd-nnnd8).
+    fn alter_virtual_table_column_check(table_name: &str, action: &AlterTableAction) -> Result<()> {
+        match action {
+            AlterTableAction::RenameColumn { .. } => Err(FrankenError::FunctionError(format!(
+                "cannot rename columns of virtual table \"{table_name}\""
+            ))),
+            AlterTableAction::DropColumn(_) => Err(FrankenError::FunctionError(format!(
+                "cannot drop column from virtual table \"{table_name}\""
+            ))),
+            AlterTableAction::AddColumn(_) => Err(FrankenError::FunctionError(
+                "virtual tables may not be altered".to_owned(),
+            )),
+            AlterTableAction::RenameTo(_) => Ok(()),
+        }
+    }
+
     async fn execute_alter_table_impl(
         &self,
         alter: &fsqlite_ast::AlterTableStatement,
@@ -77001,24 +77205,7 @@ impl Connection {
         // `RENAME TO` is deliberately excluded — it is handled above (a live
         // FTS5 rename is supported; other vtabs already return Unsupported).
         if self.table_name_is_virtual(table_name) {
-            match &alter.action {
-                AlterTableAction::RenameColumn { .. } => {
-                    return Err(FrankenError::FunctionError(format!(
-                        "cannot rename columns of virtual table \"{table_name}\""
-                    )));
-                }
-                AlterTableAction::DropColumn(_) => {
-                    return Err(FrankenError::FunctionError(format!(
-                        "cannot drop column from virtual table \"{table_name}\""
-                    )));
-                }
-                AlterTableAction::AddColumn(_) => {
-                    return Err(FrankenError::FunctionError(
-                        "virtual tables may not be altered".to_owned(),
-                    ));
-                }
-                AlterTableAction::RenameTo(_) => {}
-            }
+            Self::alter_virtual_table_column_check(table_name, &alter.action)?;
         }
         // bd-alter-table-on-view: ALTER TABLE targeting a VIEW is a prepare-time
         // SQLITE_ERROR with a view-specific message — the object exists, it just
@@ -77065,67 +77252,7 @@ impl Connection {
                 .ok_or_else(|| FrankenError::NoSuchTable {
                     name: old_name.clone(),
                 })?;
-            match &alter.action {
-                AlterTableAction::RenameColumn { old, .. } | AlterTableAction::DropColumn(old)
-                    if !table
-                        .columns
-                        .iter()
-                        .any(|column| column.name.eq_ignore_ascii_case(old)) =>
-                {
-                    return Err(FrankenError::FunctionError(format!(
-                        "no such column: \"{old}\""
-                    )));
-                }
-                AlterTableAction::AddColumn(column)
-                    if table
-                        .columns
-                        .iter()
-                        .any(|existing| existing.name.eq_ignore_ascii_case(&column.name)) =>
-                {
-                    // Stock reports this verbatim under SQLITE_ERROR, not as an
-                    // internal error. bd-ttof2.
-                    return Err(FrankenError::FunctionError(format!(
-                        "duplicate column name: {}",
-                        column.name
-                    )));
-                }
-                AlterTableAction::RenameTo(_)
-                | AlterTableAction::RenameColumn { .. }
-                | AlterTableAction::AddColumn(_)
-                | AlterTableAction::DropColumn(_) => {}
-            }
-            // SQLite 3.54 (alter.c isRowidAlias): on a table with a rowid,
-            // ALTER TABLE refuses to add, drop, or rename a column to or from a
-            // rowid alias name (rowid, _rowid_, oid), naming the operation and
-            // the name as written. WITHOUT ROWID tables have no such alias.
-            if !table.without_rowid {
-                let refused = |operation: &str, name: &str| {
-                    FrankenError::FunctionError(format!(
-                        "cannot {operation} rowid alias: {name}"
-                    ))
-                };
-                match &alter.action {
-                    AlterTableAction::AddColumn(column)
-                        if is_hidden_rowid_alias_name(&column.name) =>
-                    {
-                        return Err(refused("add", &column.name));
-                    }
-                    AlterTableAction::DropColumn(name) if is_hidden_rowid_alias_name(name) => {
-                        return Err(refused("drop", name));
-                    }
-                    AlterTableAction::RenameColumn { old, new } => {
-                        if is_hidden_rowid_alias_name(old) {
-                            return Err(refused("rename from", old));
-                        }
-                        if is_hidden_rowid_alias_name(new) {
-                            return Err(refused("rename to", new));
-                        }
-                    }
-                    AlterTableAction::RenameTo(_)
-                    | AlterTableAction::AddColumn(_)
-                    | AlterTableAction::DropColumn(_) => {}
-                }
-            }
+            Self::alter_table_column_check(table, &alter.action)?;
         }
 
         // Preserve the parsed CREATE TABLE constraint vectors instead of
@@ -77345,10 +77472,12 @@ impl Connection {
                     .enumerate()
                     .any(|(idx, column)| idx != col_idx && column.name.eq_ignore_ascii_case(new))
                 {
-                    // Stock: SQLITE_ERROR verbatim, not an internal error.
-                    // bd-ttof2.
+                    // Stock: SQLITE_ERROR verbatim, not an internal error
+                    // (bd-ttof2), raised by the schema check of the renamed
+                    // table, which names it (bd-nnnd8).
                     return Err(FrankenError::FunctionError(format!(
-                        "duplicate column name: {new}"
+                        "error in table {} after rename: duplicate column name: {new}",
+                        table.name
                     )));
                 }
                 let mut renamed_table = table.clone();
@@ -77864,37 +77993,7 @@ impl Connection {
                     .ok_or_else(|| FrankenError::NoSuchTable {
                         name: table_name.clone(),
                     })?;
-                let col_idx = table
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                    .ok_or_else(|| {
-                        FrankenError::FunctionError(format!("no such column: \"{col_name}\""))
-                    })?;
-                if table.primary_key_constraints.iter().any(|pk| {
-                    pk.iter()
-                        .any(|pk_col| pk_col.eq_ignore_ascii_case(col_name))
-                }) {
-                    return Err(FrankenError::FunctionError(format!(
-                        "cannot drop PRIMARY KEY column: \"{col_name}\""
-                    )));
-                }
-
-                // A column-level UNIQUE constraint is part of the table
-                // definition, not a disposable user index. Silently deleting
-                // its autoindex would weaken the table's data contract.
-                if table.columns[col_idx].unique {
-                    return Err(FrankenError::FunctionError(format!(
-                        "cannot drop UNIQUE column: \"{col_name}\""
-                    )));
-                }
-
-                // SQLite rule: cannot drop the last remaining column.
-                if table.columns.len() == 1 {
-                    return Err(FrankenError::FunctionError(format!(
-                        "cannot drop column \"{col_name}\": no other columns exist"
-                    )));
-                }
+                let col_idx = Self::drop_column_check(table, col_name)?;
 
                 let index_references_dropped_column = |index: &IndexSchema| -> Result<bool> {
                     let key_expression_references_column =
@@ -247071,18 +247170,43 @@ mod without_rowid_runtime_tests {
 
     #[test]
     fn test_create_without_rowid_table_requires_primary_key() {
+        // Stock 3.54.1 refuses this at prepare with SQLITE_ERROR "PRIMARY KEY
+        // missing on table wr" and creates nothing (checked live below); since
+        // bd-nnnd8, fsqlite's prepare raises it too, and so does execute.
+        const SQL: &str = "CREATE TABLE wr (id INTEGER, payload TEXT) WITHOUT ROWID;";
+        const MESSAGE: &str = "PRIMARY KEY missing on table wr";
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let (stock_code, stock_message) = match stock.prepare(SQL).map(|_| ()) {
+            Err(
+                rusqlite::Error::SqliteFailure(error, Some(message))
+                | rusqlite::Error::SqlInputError {
+                    error, msg: message, ..
+                },
+            ) => (error.extended_code, message),
+            other => panic!("stock prepare: {other:?}"),
+        };
+        assert_eq!((stock_code, stock_message.as_str()), (1, MESSAGE), "stock");
+        let stock_objects: i64 = stock
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stock_objects, 0, "stock");
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            let err = conn
-                .execute("CREATE TABLE wr (id INTEGER, payload TEXT) WITHOUT ROWID;")
-                .await
-                .unwrap_err();
-            match err {
-                FrankenError::NotImplemented(message) => {
-                    assert!(message.contains("requires a PRIMARY KEY"));
-                }
-                other => panic!("unexpected error: {other:?}"),
+            let prepared = conn.prepare(SQL).await.map(|_| ()).unwrap_err();
+            let executed = conn.execute(SQL).await.unwrap_err();
+            for (when, err) in [("prepare", prepared), ("execute", executed)] {
+                assert!(
+                    matches!(err, FrankenError::FunctionError(_)),
+                    "{when}: {err:?}"
+                );
+                assert_eq!(err.error_code(), ErrorCode::Error, "{when}: {err:?}");
+                assert_eq!(err.to_string(), MESSAGE, "{when}");
             }
+            let rows = conn
+                .query("SELECT count(*) FROM sqlite_master")
+                .await
+                .unwrap();
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(0)]);
         });
     }
 

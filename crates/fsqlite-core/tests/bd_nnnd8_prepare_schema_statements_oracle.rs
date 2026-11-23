@@ -33,7 +33,14 @@
 //!   its step with the re-prepare's error, and a stepped CREATE must fail
 //!   when stepped again;
 //! - rendering the statement from its AST: the stored `sqlite_master.sql`
-//!   keeps the text as written.
+//!   keeps the text as written;
+//! - checking only names: a CREATE TABLE body error (a duplicate column, two
+//!   PRIMARY KEYs, AUTOINCREMENT off an INTEGER PRIMARY KEY, an unknown column
+//!   in a key, CHECK, generated column or FOREIGN KEY), a CREATE TABLE ... AS
+//!   SELECT's SELECT, a CREATE VIRTUAL TABLE name an index or view holds, and
+//!   an ALTER TABLE RENAME or DROP COLUMN of a missing, key or last column
+//!   fail at prepare and create nothing, while a RENAME COLUMN onto another
+//!   column's name fails at the step, as stock's do.
 
 use fsqlite_core::connection::{Connection, PreparedStatement};
 use fsqlite_types::value::SqliteValue;
@@ -787,6 +794,236 @@ const SCENARIOS: &[Scenario] = &[
             (
                 Probe::Run("SELECT * FROM s ORDER BY a"),
                 "rows=[[\"1\", \"'x'\"], [\"4\", \"'w'\"]]",
+            ),
+        ],
+    },
+    // Round 13: a CREATE TABLE's body and its AS SELECT's SELECT, a CREATE
+    // VIRTUAL TABLE's name and an ALTER TABLE's column, checked at prepare.
+    Scenario {
+        name: "CREATE TABLE body errors raise at prepare",
+        setup: T_SETUP,
+        probes: &[
+            (
+                Probe::Run("CREATE TABLE d1(x, x)"),
+                "prepare error: duplicate column name: x",
+            ),
+            (
+                Probe::Run("CREATE TABLE d2(x PRIMARY KEY, y PRIMARY KEY)"),
+                "prepare error: table \"d2\" has more than one primary key",
+            ),
+            (
+                Probe::Run("CREATE TABLE d2b(x, y, PRIMARY KEY(x), PRIMARY KEY(y))"),
+                "prepare error: table \"d2b\" has more than one primary key",
+            ),
+            (
+                Probe::Run("CREATE TABLE d3(x TEXT PRIMARY KEY AUTOINCREMENT)"),
+                "prepare error: AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY",
+            ),
+            (
+                Probe::Run("CREATE TABLE d15(x INTEGER PRIMARY KEY DESC AUTOINCREMENT)"),
+                "prepare error: AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY",
+            ),
+            (
+                Probe::Run("CREATE TABLE d6(x, PRIMARY KEY(nope))"),
+                "prepare error: no such column: nope",
+            ),
+            (
+                Probe::Run("CREATE TABLE d7(x, UNIQUE(nope))"),
+                "prepare error: no such column: nope",
+            ),
+            (
+                Probe::Run("CREATE TABLE d8(x CHECK(nope > 0))"),
+                "prepare error: no such column: nope",
+            ),
+            (
+                Probe::Run("CREATE TABLE d23(x, CHECK(nope))"),
+                "prepare error: no such column: nope",
+            ),
+            (
+                Probe::Run("CREATE TABLE d22(x CHECK((SELECT 1)))"),
+                "prepare error: subqueries prohibited in CHECK constraints",
+            ),
+            (
+                Probe::Run("CREATE TABLE d9(x DEFAULT (nope))"),
+                "prepare error: default value of column [x] is not constant",
+            ),
+            (
+                Probe::Run(
+                    "CREATE TABLE d10(x INTEGER PRIMARY KEY, FOREIGN KEY(nope) REFERENCES t(a))",
+                ),
+                "prepare error: unknown column \"nope\" in foreign key definition",
+            ),
+            (
+                Probe::Run("CREATE TABLE d11(x, y AS (nope))"),
+                "prepare error: no such column: nope",
+            ),
+            (
+                Probe::Run("CREATE TABLE d16(x, y AS (x), z AS (w))"),
+                "prepare error: no such column: w",
+            ),
+            (
+                Probe::Run("CREATE TABLE d21(x AS (1))"),
+                "prepare error: must have at least one non-generated column",
+            ),
+            (
+                Probe::Run("CREATE TABLE d12(x) WITHOUT ROWID"),
+                "prepare error: PRIMARY KEY missing on table d12",
+            ),
+            (
+                Probe::Run("CREATE TABLE d14(x, y AS (x) STORED PRIMARY KEY)"),
+                "prepare error: generated columns cannot be part of the PRIMARY KEY",
+            ),
+            (
+                Probe::Run("CREATE TABLE d17(x COLLATE nosuch)"),
+                "prepare error: no such collation sequence: nosuch",
+            ),
+            (
+                Probe::Run("CREATE TABLE d19(x) STRICT"),
+                "prepare error: missing datatype for d19.x",
+            ),
+            (
+                Probe::Run("CREATE TABLE d20(x FOO) STRICT"),
+                "prepare error: unknown datatype for d20.x: \"FOO\"",
+            ),
+            // Nothing was created by any of them.
+            (
+                Probe::Run("SELECT name FROM sqlite_master ORDER BY name"),
+                "rows=[[\"'t'\"]]",
+            ),
+            // A body stock accepts still prepares and runs.
+            (
+                Probe::Run(
+                    "CREATE TABLE d13(rowid INTEGER, x DEFAULT (abs(-1)), y, \
+                     FOREIGN KEY(y) REFERENCES t(a))",
+                ),
+                NO_ROWS,
+            ),
+            (Probe::Run("CREATE TABLE d25(k PRIMARY KEY, v) WITHOUT ROWID"), NO_ROWS),
+            (
+                Probe::Run("SELECT name FROM sqlite_master ORDER BY name"),
+                "rows=[[\"'d13'\"], [\"'d25'\"], [\"'t'\"]]",
+            ),
+        ],
+    },
+    Scenario {
+        name: "CREATE TABLE ... AS SELECT resolves its SELECT at prepare",
+        setup: T_SETUP,
+        probes: &[
+            (
+                Probe::Run("CREATE TABLE d4 AS SELECT nope FROM t"),
+                "prepare error: no such column: nope",
+            ),
+            (
+                Probe::Run("CREATE TABLE d5 AS SELECT * FROM missing"),
+                "prepare error: no such table: missing",
+            ),
+            (
+                Probe::Run("CREATE TABLE t AS SELECT * FROM missing"),
+                "prepare error: table t already exists",
+            ),
+            (
+                Probe::Run("SELECT name FROM sqlite_master ORDER BY name"),
+                "rows=[[\"'t'\"]]",
+            ),
+            (
+                Probe::Run("CREATE TABLE d24 AS SELECT a, b FROM t WHERE a > 1"),
+                NO_ROWS,
+            ),
+            (Probe::Run("SELECT * FROM d24"), "rows=[[\"2\", \"'y'\"]]"),
+        ],
+    },
+    Scenario {
+        name: "CREATE VIRTUAL TABLE takes no name a table, view or index holds",
+        setup: &[
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)",
+            "CREATE INDEX ib ON t(b)",
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE VIRTUAL TABLE ft USING fts5(body)",
+        ],
+        probes: &[
+            (
+                Probe::Run("CREATE VIRTUAL TABLE t USING fts5(body)"),
+                "prepare error: table t already exists",
+            ),
+            (
+                Probe::Run("CREATE VIRTUAL TABLE ib USING fts5(body)"),
+                "prepare error: there is already an index named ib",
+            ),
+            (
+                Probe::Run("CREATE VIRTUAL TABLE v USING fts5(body)"),
+                "prepare error: view v already exists",
+            ),
+            (
+                Probe::Run("CREATE VIRTUAL TABLE ft USING fts5(body)"),
+                "prepare error: table ft already exists",
+            ),
+            (
+                Probe::Run("CREATE VIRTUAL TABLE sqlite_x USING fts5(body)"),
+                "prepare error: object name reserved for internal use: sqlite_x",
+            ),
+            (
+                Probe::Run("CREATE VIRTUAL TABLE IF NOT EXISTS t USING fts5(body)"),
+                NO_ROWS,
+            ),
+            (
+                Probe::Run(
+                    "SELECT name FROM sqlite_master WHERE name NOT LIKE 'ft_%' ORDER BY name",
+                ),
+                "rows=[[\"'ft'\"], [\"'ib'\"], [\"'t'\"], [\"'v'\"]]",
+            ),
+        ],
+    },
+    Scenario {
+        name: "ALTER TABLE RENAME and DROP COLUMN check the column at prepare",
+        setup: &[
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c)",
+            "CREATE TABLE u(a, b UNIQUE, c)",
+            "CREATE TABLE one(a)",
+            "CREATE VIRTUAL TABLE ft USING fts5(body)",
+        ],
+        probes: &[
+            (
+                Probe::Run("ALTER TABLE t RENAME COLUMN nope TO z"),
+                "prepare error: no such column: \"nope\"",
+            ),
+            (
+                Probe::Run("ALTER TABLE t DROP COLUMN nope"),
+                "prepare error: no such column: \"nope\"",
+            ),
+            (
+                Probe::Run("ALTER TABLE t DROP COLUMN a"),
+                "prepare error: cannot drop PRIMARY KEY column: \"a\"",
+            ),
+            (
+                Probe::Run("ALTER TABLE u DROP COLUMN b"),
+                "prepare error: cannot drop UNIQUE column: \"b\"",
+            ),
+            (
+                Probe::Run("ALTER TABLE one DROP COLUMN a"),
+                "prepare error: cannot drop column \"a\": no other columns exist",
+            ),
+            (
+                Probe::Run("ALTER TABLE ft RENAME COLUMN nope TO z"),
+                "prepare error: cannot rename columns of virtual table \"ft\"",
+            ),
+            (
+                Probe::Run("ALTER TABLE ft DROP COLUMN body"),
+                "prepare error: cannot drop column from virtual table \"ft\"",
+            ),
+            // A new name another column holds is the step's error.
+            (
+                Probe::Run("ALTER TABLE t RENAME COLUMN b TO a"),
+                "step error: error in table t after rename: duplicate column name: a",
+            ),
+            (
+                Probe::Run("SELECT name FROM pragma_table_info('t') ORDER BY cid"),
+                "rows=[[\"'a'\"], [\"'b'\"], [\"'c'\"]]",
+            ),
+            (Probe::Run("ALTER TABLE t RENAME COLUMN b TO b2"), NO_ROWS),
+            (Probe::Run("ALTER TABLE t DROP COLUMN c"), NO_ROWS),
+            (
+                Probe::Run("SELECT name FROM pragma_table_info('t') ORDER BY cid"),
+                "rows=[[\"'a'\"], [\"'b2'\"]]",
             ),
         ],
     },
