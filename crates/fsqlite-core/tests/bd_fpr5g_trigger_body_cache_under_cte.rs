@@ -30,6 +30,14 @@
 //! tests count the kernel runs). The last keeper holds what that kernel must
 //! give up or keep: a trigger on its target, foreign keys turned on, a failing
 //! firing, conflict overrides, rollback, and a TEMP target.
+//!
+//! Lever RC (retained cursors) keeps the cursor a trigger body's program
+//! displaces from the engine's slot as a spare, which the next open of its
+//! root takes back (fsqlite-vdbe's lib test pins that). Its keeper writes the
+//! bodies' tables and the firing table from everywhere a spare could go stale
+//! under: outside the bodies, from the firing table's own trigger with
+//! recursion off and on, after a DROP / CREATE / CREATE INDEX, and after a
+//! savepoint rollback and a failed statement.
 
 use fsqlite_core::connection::{
     Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
@@ -552,39 +560,153 @@ const KERNEL_SCRIPT: &[&str] = &[
     "PRAGMA integrity_check",
 ];
 
+/// Runs `script` on stock and on fsqlite (`:memory:`, then a file). A step
+/// marked `!` must fail on both; a SELECT or `PRAGMA integrity_check` must
+/// answer as stock does; every other step must succeed on both.
+async fn assert_marked_script_matches_stock(script: &[&str], context: &str) {
+    for file_backed in [false, true] {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(&database_path(&dir, file_backed))
+            .await
+            .unwrap();
+        for sql in script {
+            if let Some(failing) = sql.strip_prefix('!') {
+                assert!(
+                    stock.execute_batch(failing).is_err(),
+                    "{context}: stock must refuse `{failing}`"
+                );
+                assert!(
+                    conn.execute(failing).await.is_err(),
+                    "{context}: file_backed={file_backed}: fsqlite must refuse `{failing}`"
+                );
+            } else if sql.starts_with("SELECT") || sql.starts_with("PRAGMA integrity") {
+                assert_eq!(
+                    fsqlite_rows(&conn, sql).await,
+                    stock_rows(&stock, sql),
+                    "{context}: file_backed={file_backed}: {sql}"
+                );
+            } else {
+                stock.execute_batch(sql).unwrap();
+                conn.execute(sql).await.unwrap_or_else(|e| {
+                    panic!("{context}: file_backed={file_backed}: {sql}: {e}")
+                });
+            }
+        }
+    }
+}
+
 #[test]
 fn kernel_run_trigger_bodies_follow_targets_pragmas_failures_and_rollback() {
     let _serial = serial();
     asupersync::test_utils::run_test(|| async {
-        for file_backed in [false, true] {
-            let stock = rusqlite::Connection::open_in_memory().unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let conn = Connection::open(&database_path(&dir, file_backed))
-                .await
-                .unwrap();
-            for sql in KERNEL_SCRIPT {
-                if let Some(failing) = sql.strip_prefix('!') {
-                    assert!(
-                        stock.execute_batch(failing).is_err(),
-                        "stock must refuse `{failing}`"
-                    );
-                    assert!(
-                        conn.execute(failing).await.is_err(),
-                        "file_backed={file_backed}: fsqlite must refuse `{failing}`"
-                    );
-                } else if sql.starts_with("SELECT") || sql.starts_with("PRAGMA integrity") {
-                    assert_eq!(
-                        fsqlite_rows(&conn, sql).await,
-                        stock_rows(&stock, sql),
-                        "file_backed={file_backed}: {sql}"
-                    );
-                } else {
-                    stock.execute_batch(sql).unwrap();
-                    conn.execute(sql)
-                        .await
-                        .unwrap_or_else(|e| panic!("file_backed={file_backed}: {sql}: {e}"));
-                }
-            }
-        }
+        assert_marked_script_matches_stock(KERNEL_SCRIPT, "kernel").await;
+    });
+}
+
+/// The engine keeps a retained cursor that a program on another root
+/// displaces from its slot as a spare, and the next open of that root takes it
+/// back (fsqlite-vdbe's lib test pins the mechanism). Every statement below
+/// that fires or follows a trigger reopens cursors the bodies displaced. A
+/// spare must never write over another cursor's work, so the steps write each
+/// table the bodies write from outside the bodies, write the firing table
+/// from its own trigger (recursive_triggers OFF and ON, an INSERT body and a
+/// DELETE of the row before), drop and create a body's table again, index
+/// it, and roll back to a savepoint and a failed statement between firings,
+/// inside one transaction (where spares live) and in autocommit.
+const SPARE_CURSOR_SCRIPT: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, n INTEGER)",
+    "CREATE TABLE lg(k, m)",
+    "CREATE TABLE u(k TEXT PRIMARY KEY, c INTEGER)",
+    "INSERT INTO u VALUES ('even', 0), ('odd', 0)",
+    "CREATE TRIGGER ti AFTER INSERT ON t WHEN NEW.n % 7 <> 3 BEGIN \
+       INSERT INTO lg VALUES (NEW.id, NEW.a = 'x' OR NEW.b = 'Y' OR NEW.n > 10); \
+       UPDATE u SET c = c + 1 WHERE k = CASE WHEN NEW.n % 2 = 0 THEN 'even' ELSE 'odd' END; \
+     END",
+    "BEGIN",
+    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 400) \
+     INSERT INTO t SELECT i, 'x' || (i % 10), 'y' || (i % 5), i FROM s",
+    // The bodies' tables written from outside them, between firings.
+    "INSERT INTO lg VALUES (-1, -1)",
+    "UPDATE u SET c = c + 1000 WHERE k = 'odd'",
+    "INSERT INTO t VALUES (401, 'x1', 'y1', 401)",
+    "DELETE FROM lg WHERE k % 50 = 0",
+    "WITH RECURSIVE s(i) AS (SELECT 402 UNION ALL SELECT i + 1 FROM s WHERE i < 700) \
+     INSERT INTO t SELECT i, 'x' || (i % 10), 'y' || (i % 5), i FROM s",
+    "SELECT count(*), sum(k), sum(m) FROM lg",
+    "SELECT * FROM u ORDER BY k",
+    "SELECT count(*), sum(id) FROM t",
+    // A body's table dropped and created again (its pages may serve the new
+    // table), then indexed, between firings.
+    "DROP TABLE lg",
+    "CREATE TABLE lg(k, m)",
+    "INSERT INTO t VALUES (701, 'x', 'Y', 701)",
+    "CREATE INDEX lg_k ON lg(k)",
+    "WITH RECURSIVE s(i) AS (SELECT 702 UNION ALL SELECT i + 1 FROM s WHERE i < 800) \
+     INSERT INTO t SELECT i, 'x' || (i % 10), 'y' || (i % 5), i FROM s",
+    "SELECT count(*), sum(k), sum(m) FROM lg",
+    "SELECT k FROM lg WHERE k BETWEEN 750 AND 760 ORDER BY k",
+    // Rolled back to a savepoint, and a statement failed in a body, between
+    // firings.
+    "SAVEPOINT a",
+    "WITH RECURSIVE s(i) AS (SELECT 801 UNION ALL SELECT i + 1 FROM s WHERE i < 850) \
+     INSERT INTO t SELECT i, 'x' || (i % 10), 'y' || (i % 5), i FROM s",
+    "ROLLBACK TO a",
+    "RELEASE a",
+    "CREATE TABLE ck(v INTEGER CHECK (v <> 250))",
+    "CREATE TRIGGER cki AFTER INSERT ON t WHEN NEW.id > 900 BEGIN \
+       INSERT INTO ck VALUES (NEW.id - 700); END",
+    "!WITH RECURSIVE s(i) AS (SELECT 901 UNION ALL SELECT i + 1 FROM s WHERE i < 1000) \
+     INSERT INTO t SELECT i, 'x' || (i % 10), 'y' || (i % 5), i FROM s",
+    "WITH RECURSIVE s(i) AS (SELECT 1001 UNION ALL SELECT i + 1 FROM s WHERE i < 1050) \
+     INSERT INTO t SELECT i, 'x' || (i % 10), 'y' || (i % 5), i FROM s",
+    "COMMIT",
+    "SELECT count(*), sum(k), sum(m) FROM lg",
+    "SELECT * FROM u ORDER BY k",
+    "SELECT count(*), sum(id), max(id) FROM t",
+    "SELECT count(*), sum(v) FROM ck",
+    "PRAGMA integrity_check",
+    // A body that writes the firing table: an INSERT of a row past the right
+    // edge (the outer rows that follow are no longer appends) and a DELETE of
+    // the row before.
+    "CREATE TABLE s2(id INTEGER PRIMARY KEY, n INTEGER)",
+    "CREATE TABLE s2log(id, n)",
+    "CREATE TRIGGER s2i AFTER INSERT ON s2 WHEN NEW.n > 0 BEGIN \
+       INSERT INTO s2 VALUES (NEW.id + 100000, NEW.n - 1); \
+       INSERT INTO s2log VALUES (NEW.id, NEW.n); \
+       DELETE FROM s2 WHERE id = NEW.id - 1 AND NEW.id % 5 = 0; \
+     END",
+    "BEGIN",
+    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 300) \
+     INSERT INTO s2 SELECT i, i % 4 FROM s",
+    "SELECT count(*), sum(id), sum(n) FROM s2",
+    "SELECT count(*), sum(id), sum(n) FROM s2log",
+    "COMMIT",
+    "PRAGMA recursive_triggers = ON",
+    "BEGIN",
+    "WITH RECURSIVE s(i) AS (SELECT 301 UNION ALL SELECT i + 1 FROM s WHERE i < 600) \
+     INSERT INTO s2 SELECT i, i % 4 FROM s",
+    "COMMIT",
+    "SELECT count(*), sum(id), sum(n) FROM s2",
+    "SELECT count(*), sum(id), sum(n) FROM s2log",
+    "SELECT id, n FROM s2 WHERE id > 300000 ORDER BY id LIMIT 5",
+    "PRAGMA recursive_triggers = OFF",
+    "INSERT INTO s2 VALUES (601, 3)",
+    "SELECT count(*), sum(id), sum(n) FROM s2",
+    "CREATE INDEX s2_n ON s2(n)",
+    "BEGIN",
+    "WITH RECURSIVE s(i) AS (SELECT 602 UNION ALL SELECT i + 1 FROM s WHERE i < 700) \
+     INSERT INTO s2 SELECT i, i % 4 FROM s",
+    "COMMIT",
+    "SELECT n, count(*), sum(id) FROM s2 GROUP BY n ORDER BY n",
+    "SELECT count(*), sum(id), sum(n) FROM s2log",
+    "PRAGMA integrity_check",
+];
+
+#[test]
+fn spare_cursors_follow_self_writes_recursion_schema_changes_and_rollbacks() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        assert_marked_script_matches_stock(SPARE_CURSOR_SCRIPT, "spare cursors").await;
     });
 }

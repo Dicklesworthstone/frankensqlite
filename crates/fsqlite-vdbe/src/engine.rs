@@ -310,6 +310,10 @@ const OPFLAG_HALT_PRIMARY_KEY: u16 = 0x02;
 /// (SQLITE_CONSTRAINT_PRIMARYKEY) instead of `UniqueViolation`.
 const OPFLAG_IDX_PRIMARY_KEY: u16 = 0x100;
 const STORAGE_CURSOR_LAYOUT_PREFIX_BYTES: usize = 256;
+/// bd-fpr5g: how many retained cursors displaced from their slots the engine
+/// keeps (`VdbeEngine::spare_storage_cursors`). An INSERT whose trigger body
+/// writes two tables, one of them indexed, needs three.
+const MAX_SPARE_STORAGE_CURSORS: usize = 8;
 #[cfg(test)]
 const VDBE_ENGINE_INLINE_SIZE_BUDGET_BYTES: usize = 3 * 1024;
 static BUILTIN_COLLATION_REGISTRY: LazyLock<CollationRegistry> =
@@ -9340,6 +9344,21 @@ pub struct VdbeEngine {
     /// as closed. Any `OpenWrite`, `take_transaction` and the next reset drop
     /// them.
     parked_read_cursor_ids: Vec<i32>,
+    /// bd-fpr5g: retained storage cursors whose slot a cursor on another root
+    /// took, oldest first, at most [`MAX_SPARE_STORAGE_CURSORS`]. Programs
+    /// that run one after another on this engine (an INSERT and the trigger
+    /// bodies it fires, or statements on several tables in one transaction)
+    /// number their cursors from 0, so each would otherwise drop the cursor
+    /// the previous one left in its slot, and the next statement on that
+    /// table would open a new cursor and seek again. An open of a root takes
+    /// its spare back into the slot and reuses it as `OpenWrite` reuses a
+    /// retained cursor. A root has at most one cursor in the engine while one
+    /// of them is a spare: none is kept while another slot holds that root,
+    /// and every open of the root takes the spare, so no other cursor writes
+    /// a root while its cursor is kept here. Spares go wherever retained
+    /// cursors go (a reset that keeps none, `take_transaction`), so they are
+    /// exactly as current as a retained cursor left in its slot.
+    spare_storage_cursors: Vec<StorageCursor>,
     /// bd-a3g0m: set once this execution opens a writable storage cursor, so
     /// no read cursor is parked from then on.
     writable_storage_cursor_opened: bool,
@@ -10121,6 +10140,7 @@ impl VdbeEngine {
             sorters: CursorSlots::new(),
             storage_cursors: CursorSlots::new(),
             parked_read_cursor_ids: Vec::new(),
+            spare_storage_cursors: Vec::new(),
             writable_storage_cursor_opened: false,
             pending_next_after_delete: CursorIdSet::default(),
             storage_cursors_enabled: true,
@@ -10477,6 +10497,7 @@ impl VdbeEngine {
             self.cursors.clear();
             self.sorters.clear();
             self.storage_cursors.clear();
+            self.spare_storage_cursors.clear();
             self.pending_next_after_delete.clear();
             self.storage_cursors_enabled = true;
             self.txn_page_io = None;
@@ -10814,6 +10835,94 @@ impl VdbeEngine {
                 .storage_cursors
                 .get(&cursor_id)
                 .is_some_and(|sc| !sc.writable)
+    }
+
+    /// bd-fpr5g: before `cursor_id` opens on `root_page` (which its slot does
+    /// not hold), take the spare on `root_page` out, keep the cursor in the
+    /// slot as a spare (only while cursors are retained), and put the spare
+    /// taken out, if any, into the slot, where `open_storage_cursor` reuses
+    /// it. Every open of a root not in its slot comes here, so a new cursor is
+    /// never made on a root that has a spare.
+    fn swap_spare_storage_cursor_into_slot(
+        &mut self,
+        cursor_id: i32,
+        root_page: i32,
+        has_txn: bool,
+    ) {
+        let spare = self
+            .spare_storage_cursors
+            .iter()
+            .position(|spare| spare.root_page == root_page)
+            .map(|at| self.spare_storage_cursors.remove(at));
+        if self.retain_storage_cursors_on_close
+            && let Some(displaced) = self.storage_cursors.remove(&cursor_id)
+        {
+            self.keep_spare_storage_cursor(displaced, has_txn);
+        }
+        let Some(spare) = spare else {
+            return;
+        };
+        // A spare is never kept while a slot holds its root; should a slot
+        // hold one anyway, the spare is dropped rather than made a second
+        // cursor on the root.
+        if self
+            .storage_cursors
+            .values()
+            .any(|held| held.root_page == root_page)
+        {
+            return;
+        }
+        tracing::trace!(
+            cursor_id,
+            page_id = root_page,
+            backend_kind = spare.cursor.kind_str(),
+            "open_storage_cursor: took back a spare retained cursor"
+        );
+        self.storage_cursors.insert(cursor_id, spare);
+        self.cursor_root_pages.insert(cursor_id, root_page);
+    }
+
+    /// bd-fpr5g: keep `displaced`, the retained cursor whose slot a cursor on
+    /// another root is taking, as a spare, unless it could not come back
+    /// safely: its backend is not the one this execution reuses (the
+    /// retained-cursor reuse refuses it), it holds an ephemeral index's
+    /// records outside its b-tree, or another slot (or spare) holds its root,
+    /// where a second cursor could write the root under it. Its unlanded
+    /// rowid goes back to the allocator as `OP_Close` gives it back. The
+    /// oldest spare makes room when there are
+    /// [`MAX_SPARE_STORAGE_CURSORS`].
+    fn keep_spare_storage_cursor(&mut self, mut displaced: StorageCursor, has_txn: bool) {
+        let backend_matches = if has_txn {
+            displaced.cursor.is_txn()
+        } else {
+            displaced.cursor.is_mem()
+        };
+        let root_page = displaced.root_page;
+        if !backend_matches
+            || displaced.staged_build.is_some()
+            || displaced.membership_set.is_some()
+            || self
+                .storage_cursors
+                .values()
+                .any(|held| held.root_page == root_page)
+            || self
+                .spare_storage_cursors
+                .iter()
+                .any(|spare| spare.root_page == root_page)
+        {
+            return;
+        }
+        Self::reclaim_unlanded_storage_cursor_rowid_with_allocator(
+            self.concurrent_rowid_allocator.as_deref(),
+            self.concurrent_rowid_schema_epoch,
+            self.concurrent_rowid_session_id,
+            &mut displaced,
+            false,
+        );
+        if self.spare_storage_cursors.len() >= MAX_SPARE_STORAGE_CURSORS {
+            self.spare_storage_cursors.remove(0);
+        }
+        self.spare_storage_cursors.push(displaced);
     }
 
     /// bd-a3g0m: drop every read cursor `OP_Close` parked.
@@ -12500,6 +12609,7 @@ impl VdbeEngine {
     pub fn take_transaction(&mut self) -> Result<Option<TransactionKind>> {
         // Drop all storage cursors first to release Rc references.
         self.storage_cursors.clear();
+        self.spare_storage_cursors.clear();
         self.parked_read_cursor_ids.clear();
         match self.txn_page_io.take() {
             Some(txn_page_io) => Ok(Some(txn_page_io.into_inner()?)),
@@ -12534,7 +12644,11 @@ impl VdbeEngine {
 
     /// bd-perf: Check if storage cursors are empty (for drain vs take decision).
     /// bd-a3g0m: a parked read cursor counts as closed.
+    /// bd-fpr5g: a spare cursor holds the transaction like a retained one.
     pub fn storage_cursors_empty(&self) -> bool {
+        if !self.spare_storage_cursors.is_empty() {
+            return false;
+        }
         if self.parked_read_cursor_ids.is_empty() {
             return self.storage_cursors.is_empty();
         }
@@ -22470,6 +22584,18 @@ impl VdbeEngine {
             if self.cursor_root_pages.get(&cursor_id).copied() != Some(root_page) {
                 self.storage_cursors.remove(&cursor_id);
             }
+        }
+        // bd-fpr5g: a retained cursor this slot holds on another root becomes
+        // a spare, and the spare on this root, if any, comes back into the
+        // slot for the reuse below. (The slot's own cursor decides, not
+        // `cursor_root_pages`, which can still name a root for an empty slot.)
+        if (self.retain_storage_cursors_on_close || !self.spare_storage_cursors.is_empty())
+            && self
+                .storage_cursors
+                .get(&cursor_id)
+                .is_none_or(|held| held.root_page != root_page)
+        {
+            self.swap_spare_storage_cursor_into_slot(cursor_id, root_page, has_txn);
         }
         if self.cursor_root_pages.get(&cursor_id).copied() == Some(root_page)
             && let Some(existing) = self.storage_cursors.get_mut(&cursor_id)
@@ -38066,6 +38192,155 @@ mod tests {
         allocator.clear_session(8);
         allocator.clear_session(10);
         assert_eq!(peer_allocates(11), 1);
+    }
+
+    /// bd-fpr5g: programs run one after another on the engine with retained
+    /// cursors (an INSERT, then the trigger bodies it fires) number their
+    /// cursors from 0. A retained cursor a program on another root displaces
+    /// is kept as a spare and taken back by the next open of its root, in
+    /// whatever slot. The mem backend makes reuse observable: its cursor holds
+    /// its own copy of the rows it inserted, which a new cursor (filled from
+    /// the empty `MemDatabase` table) does not have.
+    #[test]
+    fn test_displaced_retained_cursor_is_kept_as_a_spare_and_taken_back() {
+        let mut db = MemDatabase::new();
+        let roots: Vec<i32> = (0..10).map(|_| db.create_table(1)).collect();
+        let (r1, r2) = (roots[0], roots[1]);
+        // Insert `rowids` through cursor `slot` on `root`.
+        let insert = |slot: i32, root: i32, rowids: &[i32]| {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, slot, root, 0, P4::Int(1), 0);
+            for &rowid in rowids {
+                b.emit_op(Opcode::Integer, rowid, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 7, 2, 0, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+                b.emit_op(Opcode::Insert, slot, 3, 1, P4::None, 0);
+            }
+            b.emit_op(Opcode::Close, slot, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            b.finish().expect("program should build")
+        };
+        // Return every rowid cursor `slot` on `root` holds.
+        let scan = |slot: i32, root: i32| {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, slot, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, slot, 0, done, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Rowid, slot, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+            let next_target = i32::try_from(body).expect("small program");
+            b.emit_op(Opcode::Next, slot, next_target, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Close, slot, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            b.finish().expect("program should build")
+        };
+        let mut engine = VdbeEngine::new(8);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_retain_storage_cursors_on_close(true);
+        let run = |engine: &mut VdbeEngine, program: &VdbeProgram, retain: bool| -> Vec<i64> {
+            engine.reset_for_reuse_ex(
+                program.register_count(),
+                &Cx::new(),
+                PageSize::DEFAULT,
+                retain,
+            );
+            engine.set_reject_mem_fallback(false);
+            engine.set_retain_storage_cursors_on_close(retain);
+            assert_eq!(
+                run_async(engine.execute(program)).expect("program runs"),
+                ExecOutcome::Done
+            );
+            engine
+                .take_results()
+                .into_iter()
+                .map(|row| row.into_vec()[0].to_integer())
+                .collect()
+        };
+        let spare_roots = |engine: &VdbeEngine| -> Vec<i32> {
+            engine
+                .spare_storage_cursors
+                .iter()
+                .map(|spare| spare.root_page)
+                .collect()
+        };
+
+        run(&mut engine, &insert(0, r1, &[1, 2, 3]), true);
+        // Another root in slot 0: r1's cursor becomes a spare.
+        run(&mut engine, &insert(0, r2, &[10, 11]), true);
+        assert_eq!(spare_roots(&engine), vec![r1]);
+        assert!(!engine.storage_cursors_empty(), "a spare holds the engine");
+        // Back in slot 0, r1's cursor still holds its rows; r2's is the spare.
+        assert_eq!(run(&mut engine, &scan(0, r1), true), vec![1, 2, 3]);
+        assert_eq!(spare_roots(&engine), vec![r2]);
+        // A spare comes back into whatever slot opens its root.
+        assert_eq!(run(&mut engine, &scan(3, r2), true), vec![10, 11]);
+        assert!(spare_roots(&engine).is_empty());
+
+        // A reset that keeps no cursors drops the spares with them: r1's rows
+        // were only in its cursor.
+        run(&mut engine, &insert(0, roots[4], &[12]), true);
+        assert_eq!(spare_roots(&engine), vec![r1]);
+        assert!(run(&mut engine, &scan(0, r1), false).is_empty());
+        assert!(spare_roots(&engine).is_empty());
+        assert!(engine.storage_cursors_empty());
+
+        // Two cursors on one root: one is not kept while the other is still in
+        // a slot (the kept one could go stale under the other's writes); the
+        // last one is.
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 1, r1, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::OpenRead, 2, r1, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let two_on_r1 = b.finish().expect("program should build");
+        run(&mut engine, &two_on_r1, true);
+        run(&mut engine, &insert(1, roots[2], &[20]), true);
+        assert!(
+            !spare_roots(&engine).contains(&r1),
+            "slot 2 still holds r1, so slot 1's r1 cursor is not kept"
+        );
+        run(&mut engine, &insert(2, roots[3], &[30]), true);
+        assert_eq!(
+            spare_roots(&engine),
+            vec![r1],
+            "once no slot holds r1, its last cursor is kept"
+        );
+
+        // At most MAX_SPARE_STORAGE_CURSORS are kept, and the oldest goes
+        // first. Start from no cursors.
+        run(&mut engine, &scan(0, roots[9]), false);
+        for &root in &roots {
+            run(&mut engine, &insert(0, root, &[40]), true);
+        }
+        assert_eq!(
+            spare_roots(&engine),
+            roots[1..=MAX_SPARE_STORAGE_CURSORS],
+            "roots[0]'s cursor made room for roots[8]'s"
+        );
+        assert!(run(&mut engine, &scan(0, roots[0]), true).is_empty());
+        assert_eq!(spare_roots(&engine), roots[2..=9]);
+        // The spare a full set is asked for comes back before the displaced
+        // cursor makes room.
+        assert_eq!(run(&mut engine, &scan(0, roots[2]), true), vec![40]);
+
+        // take_transaction drops them as well.
+        assert!(!spare_roots(&engine).is_empty());
+        engine
+            .take_transaction()
+            .expect("no transaction to give back");
+        assert!(spare_roots(&engine).is_empty());
     }
 
     #[test]
