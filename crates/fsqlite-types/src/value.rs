@@ -2623,7 +2623,11 @@ pub fn format_sqlite_float_g(f: f64, precision: usize) -> String {
     let precision = precision.max(1);
     let generic_precision = i32::try_from(precision - 1).unwrap_or(i32::MAX);
     render_sqlite_float_decode(
-        &sqlite_float_decode(f, SqliteFloatRounding::Significant(precision)),
+        &sqlite_float_decode(
+            f,
+            SqliteFloatRounding::Significant(precision),
+            SQLITE_FLOAT_MAX_ROUND_DIGITS,
+        ),
         generic_precision,
     )
 }
@@ -2770,15 +2774,46 @@ pub enum SqliteFloatRounding {
 /// must handle non-finite spellings separately.
 #[must_use]
 pub fn sqlite_float_altform2_digits(f: f64, rounding: SqliteFloatRounding) -> (Vec<u8>, i32) {
+    sqlite_float_magnitude_digits(f, rounding, SQLITE_FLOAT_MAX_ROUND_DIGITS)
+}
+
+/// Rounded digits and scientific exponent for SQLite's `%e` and `%E`.
+///
+/// The requested fractional precision determines how many digits are initially
+/// converted. Plain printf caps the subsequent rounding at 16 significant
+/// digits, while alternate form 2 uses the full decoder limit.
+#[must_use]
+pub fn sqlite_float_exp_digits(f: f64, precision: usize, alternate_form2: bool) -> (Vec<u8>, i32) {
+    let max_round_digits = if alternate_form2 {
+        SQLITE_FLOAT_MAX_ROUND_DIGITS
+    } else {
+        16
+    };
+    sqlite_float_magnitude_digits(
+        f,
+        SqliteFloatRounding::Significant(precision.saturating_add(1)),
+        max_round_digits,
+    )
+}
+
+fn sqlite_float_magnitude_digits(
+    f: f64,
+    rounding: SqliteFloatRounding,
+    max_round_digits: usize,
+) -> (Vec<u8>, i32) {
     if !f.is_finite() || f == 0.0 {
         return (vec![b'0'], 0);
     }
-    let decoded = sqlite_float_decode(f, rounding);
+    let decoded = sqlite_float_decode(f, rounding, max_round_digits);
     (decoded.digits, decoded.decimal_point - 1)
 }
 
 /// Decode once, then round at the significant or fractional decimal position.
-fn sqlite_float_decode(f: f64, rounding: SqliteFloatRounding) -> SqliteFloatDecode {
+fn sqlite_float_decode(
+    f: f64,
+    rounding: SqliteFloatRounding,
+    max_round_digits: usize,
+) -> SqliteFloatDecode {
     let negative = f < 0.0;
     let r = if negative { -f } else { f };
     if r == 0.0 {
@@ -2837,8 +2872,8 @@ fn sqlite_float_decode(f: f64, rounding: SqliteFloatRounding) -> SqliteFloatDeco
         }
     };
 
-    if round_at > 0 && (round_at < digit_count || digit_count > SQLITE_FLOAT_MAX_ROUND_DIGITS) {
-        round_at = round_at.min(SQLITE_FLOAT_MAX_ROUND_DIGITS);
+    if round_at > 0 && (round_at < digit_count || digit_count > max_round_digits) {
+        round_at = round_at.min(max_round_digits);
         if round_at == SQLITE_FLOAT_SIGNIFICANT_DIGITS {
             round_at = sqlite_adjust_17_digit_rounding(
                 r,

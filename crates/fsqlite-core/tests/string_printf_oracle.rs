@@ -1,7 +1,7 @@
 #![recursion_limit = "512"]
 
 //! Differential oracle: string + printf functions vs rusqlite (bundled SQLite
-//! 3.53). A probe sweep found this surface stock-correct across 22 cases; this
+//! 3.54.1). A probe sweep found this surface stock-correct across 22 cases; this
 //! keeper locks it in.
 //!
 //! Covers substr with 1-based / zero / negative start, negative length, and
@@ -15,12 +15,71 @@ use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
 #[test]
+fn real_quote_and_printf_match_bundled_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = "SELECT quote(?1), unistr_quote(?1), printf('%!.20e', ?1), \
+                   printf('%!.15g', ?1), printf('%.20e', ?1), \
+                   printf('%#.0E', ?1), printf('%+30.20e', ?1)";
+        let mut statement = stock.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        let values = [
+            1.0 / 3.0,
+            2.5 / 3.0,
+            1e3 / 3.0,
+            2_f64.powi(63),
+            0.1,
+            1e-320,
+            f64::from_bits(1),
+            f64::MAX,
+            -0.0,
+            1e15 + 0.3,
+            123_456_789_012_345_680.0,
+            // SQLite caps plain %e at 16 significant digits after conversion.
+            // Rounding the binary value directly at 16 digits differs here.
+            f64::from_bits(0x3e28_858a_5e4e_2fff),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let mut mismatches = Vec::new();
+        for value in values {
+            let expected = statement
+                .query_row([value], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, String>(column).map(SqliteValue::from))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            let rows = frank
+                .query_with_params(sql, &[SqliteValue::Float(value)])
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values().len(), expected.len());
+            for (column, (actual, expected)) in
+                rows[0].values().iter().zip(&expected).enumerate()
+            {
+                if actual != expected {
+                    mismatches.push(format!(
+                        "bits={:016x} column={column} expected={expected:?} actual={actual:?}",
+                        value.to_bits(),
+                    ));
+                }
+            }
+        }
+        frank.close().await.unwrap();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    });
+}
+
+#[test]
 fn printf_altform2_float_rounding_matches_bundled_sqlite() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
         let version: String = r.query_row("SELECT sqlite_version()", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, "3.53.2", "review version-sensitive float conversion when the oracle changes");
+        assert_eq!(version, "3.54.1", "review version-sensitive float conversion when the oracle changes");
         let mut values = vec![
             0.0, -0.0, 0.1, -0.1, 1.0 / 3.0, 2.0 / 3.0, 1.0 / 7.0,
             0.5_f64.next_down(), 0.5, 0.5_f64.next_up(), -0.5,

@@ -30,6 +30,7 @@ use std::sync::Arc;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::value::{
     SqliteFloatRounding, format_sqlite_float, sql_like_cased, sqlite_float_altform2_digits,
+    sqlite_float_exp_digits,
 };
 use fsqlite_types::{SmallText, SqliteValue, TextEncoding};
 
@@ -3017,46 +3018,17 @@ fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> 
                 if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
                 {
                     result.extend_from_slice(s.as_bytes());
-                } else if alt_form2 {
-                    // Share the shell's binary-to-decimal conversion; %e
-                    // precision excludes its one leading significant digit.
-                    let (digits, exp) = sqlite_float_altform2_digits(
-                        val,
-                        SqliteFloatRounding::Significant(prec.saturating_add(1)),
+                } else {
+                    let (digits, exp) = sqlite_float_exp_digits(val, prec, alt_form2);
+                    let mut formatted = render_exponential(
+                        &digits,
+                        exp,
+                        spec == 'E',
+                        (!alt_form2).then_some(prec),
+                        alt_form,
                     );
-                    let mut formatted = altform2_render_exp(&digits, exp, spec == 'E');
                     if val.is_sign_negative() {
                         formatted = format!("-{formatted}");
-                    }
-                    result.extend_from_slice(
-                        finish_float_padding(
-                            &formatted, width, left_align, show_sign, space_sign, zero_pad,
-                        )
-                        .as_bytes(),
-                    );
-                } else {
-                    // Round the mantissa's exact ties away from zero (C SQLite)
-                    // instead of Rust's round-half-to-even, e.g.
-                    // printf('%.0e', 2.5) -> "3e+00" not "2e+00" (bd-o1tu1).
-                    // C SQLite's dtoa caps the mantissa at 16 significant digits
-                    // of the true value, then pads zeros beyond (bd-o8m86). Round
-                    // the mantissa to <=16 sig figs, then pad zeros to `prec`.
-                    let mant_prec = prec.min(FLOAT_SIG_DIGITS - 1);
-                    let raw = format_sci_round_half_away(val, mant_prec, spec == 'E');
-                    let mut formatted = normalize_exponent(&raw);
-                    if prec > mant_prec
-                        && let Some(e_pos) = formatted.find(['e', 'E'])
-                    {
-                        let (mant, exp_part) = formatted.split_at(e_pos);
-                        formatted = format!("{mant}{}{exp_part}", "0".repeat(prec - mant_prec));
-                    }
-                    // Alternate form (`#`) forces a decimal point in the mantissa,
-                    // e.g. '%#.0e' 3 -> "3.e+00".
-                    if alt_form && let Some(e_pos) = formatted.find(['e', 'E']) {
-                        let (mantissa, exp_part) = formatted.split_at(e_pos);
-                        if !mantissa.contains('.') {
-                            formatted = format!("{mantissa}.{exp_part}");
-                        }
                     }
                     result.extend_from_slice(
                         finish_float_padding(
@@ -3088,7 +3060,7 @@ fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> 
                     let use_exp_form =
                         exp < -4 || i64::from(exp) >= i64::try_from(sig).unwrap_or(i64::MAX);
                     let mut alt = if use_exp_form {
-                        altform2_render_exp(&digits, exp, spec == 'G')
+                        render_exponential(&digits, exp, spec == 'G', None, false)
                     } else {
                         altform2_render_fixed(&digits, exp, usize::MAX)
                     };
@@ -3574,24 +3546,29 @@ fn apply_int_precision(digits: &str, precision: Option<usize>) -> String {
     }
 }
 
-/// Render alt-form-2 significant `digits` as a `%e`/`%E` mantissa+exponent.
-///
-/// The first digit is at 10^`exp`. Emits `d.ddd` with trailing zeros stripped
-/// (>= 1 fractional digit kept) and a signed, >= 2-digit exponent. Unsigned — the
-/// caller prepends any `-`. e.g. `("666…629", -1)` -> "6.66…629e-01".
-fn altform2_render_exp(digits: &[u8], exp: i32, upper: bool) -> String {
+/// Render an unsigned mantissa and a signed exponent of at least two digits.
+/// A missing precision keeps the decoded digits and forces a fractional digit.
+fn render_exponential(
+    digits: &[u8],
+    exp: i32,
+    upper: bool,
+    precision: Option<usize>,
+    force_decimal: bool,
+) -> String {
     let e_char = if upper { 'E' } else { 'e' };
-    let mut mant = String::with_capacity(digits.len() + 2);
-    mant.push(char::from(digits[0]));
-    mant.push('.');
-    if digits.len() > 1 {
-        mant.extend(digits[1..].iter().map(|&b| char::from(b)));
-    } else {
-        mant.push('0');
+    let fraction = &digits[1..];
+    let precision = precision.unwrap_or_else(|| fraction.len().max(1));
+    let mut output = String::with_capacity(precision + 8);
+    output.push(char::from(digits[0]));
+    if precision > 0 || force_decimal {
+        output.push('.');
+        let written = fraction.len().min(precision);
+        output.extend(fraction[..written].iter().map(|&b| char::from(b)));
+        output.extend(std::iter::repeat_n('0', precision - written));
     }
-    let mant = altform2_trim_float(&mant);
     let sign = if exp < 0 { '-' } else { '+' };
-    format!("{mant}{e_char}{sign}{:02}", exp.unsigned_abs())
+    let _ = write!(output, "{e_char}{sign}{:02}", exp.unsigned_abs());
+    output
 }
 
 /// Render alt-form-2 significant `digits` in fixed (`%f`/`%g`) form.
@@ -3856,19 +3833,14 @@ fn format_fixed_round_half_away(val: f64, prec: usize) -> String {
 /// ZERO. A carry out of `[1, 10)` renormalizes the mantissa (e.g. `9.5` at
 /// precision 0 → `1e+01`) and bumps the exponent. Returns an un-normalized
 /// `d.ddde{exp}` string (sign included, exponent not zero-padded) that mirrors
-/// Rust's `{:e}`/`{:E}` output, so callers post-process it with
-/// `normalize_exponent` exactly as before.
-fn format_sci_round_half_away(val: f64, prec: usize, upper: bool) -> String {
-    let base = if upper {
-        format!("{val:.prec$E}")
-    } else {
-        format!("{val:.prec$e}")
-    };
+/// Rust's `{:e}` output, so callers can post-process it with
+/// `normalize_exponent`.
+fn format_sci_round_half_away(val: f64, prec: usize) -> String {
+    let base = format!("{val:.prec$e}");
     let mag = val.abs();
     if mag == 0.0 || !is_exact_sci_tie(mag, prec) {
         return base;
     }
-    let e_char = if upper { 'E' } else { 'e' };
     let src = format!("{mag:.p$e}", p = prec + 2);
     let Some((mant, exp_str)) = src.split_once('e') else {
         return base;
@@ -3896,7 +3868,7 @@ fn format_sci_round_half_away(val: f64, prec: usize, upper: bool) -> String {
         exp += 1;
     }
     let sign = if val.is_sign_negative() { "-" } else { "" };
-    format!("{sign}{mantissa}{e_char}{exp}")
+    format!("{sign}{mantissa}e{exp}")
 }
 
 /// Format a float using `%g`/`%G` semantics.
@@ -3922,7 +3894,7 @@ pub(crate) fn format_float_g(
     // exponent. The rounding may carry across a power of ten (e.g. `9.5` at 1
     // significant digit → `1e1`), and that rounded exponent — not the raw one —
     // selects fixed vs. exponential form below.
-    let sci = format_sci_round_half_away(val, sig_digits.saturating_sub(1), false);
+    let sci = format_sci_round_half_away(val, sig_digits.saturating_sub(1));
     let exp: i32 = sci
         .rsplit_once('e')
         .and_then(|(_, e)| e.parse().ok())
