@@ -94,6 +94,82 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-23 - REJECTED on its GAIN kill line (-2.9k Ir per FULL autocommit INSERT against at least -3k; prediction -5k to -9k): under the WAL append gate, the cross-process conflict scan is skipped when no commit was published since the batch's snapshot (bd-fuwx0, single-writer lane round 12, lever O-B1, the under-gate half only)
+
+- Target: the autocommit one-row INSERT's commit path, #9 in bd-fuwx0's cost map. Under the gate,
+  `conflicting_pages_since_batch_snapshots` made one boxed `conflicting_pages_since_snapshot` call per batch:
+  - candidate sort and dedup, a HashSet, a second (fast-returning) preflight;
+  - all for a horizon that, in a single writer, has not moved, so only the bd-o81ov EOF guard can answer.
+- Change: `WalBackend::conflict_horizon_unmoved_under_gate` (default false).
+  - The path-refreshing adapter and the WAL adapter answer true only in the states where that call passes its
+    pending-publication and recovery checks, takes `preflight_native_append`'s proven-baseline return, and finds
+    (commit_count, generation, last_commit_frame) not past the snapshot.
+  - The flush then skips the call when no conflict or route-watch page lies above the allocator base (the EOF
+    guard's only case). Every other case makes main's call.
+  - Files: `crates/fsqlite-pager/src/traits.rs`, `crates/fsqlite-pager/src/pager.rs`,
+    `crates/fsqlite-core/src/wal_adapter.rs`.
+- Not built: the bead's pre-gate half (skip the Phase-A conflict-page prediction, route-watch pages and baselines
+  when the horizon is unmoved before the gate), which was -5.8k of the band. It cannot keep outcomes identical:
+  - the prediction reads PagerInner's freelist (`freelist_metadata_dirty_with_inner`,
+    `durable_freelist_pages_with_inner`), which the file's in-process connections share and mutate without moving
+    the horizon (pager.rs 29964, 32975), so computing it later under the gate is not main's computation;
+  - `batch.conflict_pages` also feeds `conflicting_pages_across_group_commit_batches` and the bd-dk9ra refusal.
+  - The correction was posted on the bead before any measurement.
+- Arms: one rch job on vmi1153651, K=6 relinks each, the parent's 1955 source hashes checked against git.
+  - Parent: origin/main 8ad61918f. CLI 8c30aef350cefefa, mt-mvcc-bench da1a49513bda725b.
+  - Lever: the parent plus the patch. CLI e08f254f2240c31d, mt-mvcc-bench 90a02903fdf2968c.
+  - Stock: SQLite 3.54.1 (scripts/build_stock_sqlite3.sh) live in every run.
+- Result, exact counts (callgrind, whole process, io_uring refused, WAL on tmpfs, per unit = (N800 - N400)/400):
+  - FULL INSERT, 7 replicate pairs: parent median 180,407 (177,788 to 182,394), lever 176,915 (176,234 to
+    178,807).
+    - L - P: median -3,492 (-1.94%; x8.50 -> x8.34 stock's 21,224).
+    - The +/-2k spread is where the adaptive autocheckpoint runs: inside the run in 3 of 7 replicates per arm, at
+      close in 4. Grouped that way, the checkpoint-at-close replicates give -2.85k and the in-run ones -3.4k.
+    - The scan's own subtree went from 3,190 / 3,296 to 210 Ir per INSERT (-2.98k / -3.09k).
+  - Single runs: NORMAL -2,360 (-1.32%). txn10 -2,179 per transaction (-0.40%; x3.72 -> x3.71). Point SELECT +296.5
+    (+0.42%), and -217 on an A/A rerun: noise, since the change runs only under the append gate.
+- Result, perf stat instructions:u (the timing runs: io_uring allowed, 2 runs of 42 per arm, A/A at most +67 per
+  INSERT):
+  - FULL INSERT -2,856 / -2,888 per INSERT (-1.53% / -1.55%);
+  - NORMAL -2,934 / -2,967;
+  - txn10 -2,917 / -3,022 per commit;
+  - point -17 / -330 per SELECT (A/A -382 / -352).
+- Result, time (layout-averaged lines, K=6, two runs, both A/A valid):
+  - FULL INSERT: cpu TIE (-1.25%, -1.62%); cycles:u a replicated WIN (-1.42%, -2.04%). vs stock 3.54.1 on cpu:
+    x8.16 -> x8.06 and x7.89 -> x7.76.
+  - NORMAL and txn10: TIE.
+  - Point SELECT: cpu +2.43% LOSE in run 1 and +2.35% TIE in run 2, so not replicated.
+  - mt-mvcc-bench (--one-row-per-transaction, 200 rows per thread, 11 iters; stock is the bench's bundled 3.54.1):
+    - run 1 VOID: host load 43-50 from other projects, A/A 1.30 and 1.57;
+    - run 2: 4 writers L/P 1.007 TIE, 8 writers 0.980 TIE (A/A 0.995 and 0.980);
+    - no LOSE.
+- Why rejected: the precise estimators put the gain at -2.86k to -2.98k per FULL INSERT. Only the
+  checkpoint-mixed callgrind median (-3.49k) is past the line, and its per-replicate spread is larger than the
+  margin.
+- Gate on the lever (partial, since it does not land):
+  - clippy -D warnings (pager, core, all targets) clean;
+  - pager lib 1130 / 0, core lib 4203 / 0 (the bd-i0tn6 window test included);
+  - core keepers: one red, gh410 gh462_schema_only_readers_leave_repair_for_a_real_writer, with an identical
+    BusySnapshot on 8ad61918f;
+  - e2e cross-process batch: one red, the known bd-mc5pp;
+  - e2e concurrent batch: one red, the bd_3wop3_1_3 ordered-region timing assertion (see the bead).
+- Keepers (crates/fsqlite-core/tests/bd_fuwx0_lazy_conflict_validation.rs):
+  - the tests: a peer process commits a page the transaction wrote, also when both grow from the same end of file;
+    write skew in one process and across processes on one leaf; a read-only snapshot held across commits;
+  - 4/4 on main and on the lever; 3 of 3 red on a skip-all validation mutant.
+- Kept: commit 303c98293 on the local branch ob1-lazy-validation in /data/projects/frankensqlite-s10p (the patch
+  is scripts/lane_r12/lever_src.patch there). Evidence in the lane scratchpad's r12/ (cg/, cg_reps.txt,
+  cg_classes.txt, ir_abs.txt, time_verdict.txt, time1.json, time2.json, mt1b.json, mt2b.json).
+- Retry condition: together with a sound cut of the Phase-A prediction in the same commit-path lever.
+  - `freelist_metadata_dirty_with_inner` runs twice per commit, from `predicted_commit_pages_with_inner` and
+    `page_one_in_pending_commit_surface_with_inner`, without the early return that
+    `freelist_metadata_dirty_with_pending_free_pages` has. In r11's profile that is about 3.5k Ir of the
+    prediction's 4.7k.
+  - Computing it once, with inputs exact as of Phase A, would stack with this half.
+  - Or: an owner decision that -2.9k Ir (1.5%, a replicated cycles WIN) is worth one trait method.
+  - Do not retry the pre-gate skip of the prediction without carrying its Phase-A inputs (the PagerInner freelist
+    state and the read-cache images) into the batch.
+
 ## 2026-11-22 - WIN (landed as 986d2ca38; inside every kill line, prediction missed low by 1.0M on rowid_lookups_200k, x5.46 -> x4.94 stock 3.54.1 in instructions): an eviction on a sparse access trace waits for one batched compaction instead of searching and moving the whole trace (bd-w4pr1.13.18, read/seek round 11, lever BF1)
 
 - Target: `S3FifoEvictionTracker::forget`, run on every page-cache eviction. Callgrind on main 5aa8fd2f7: 1,587 per
