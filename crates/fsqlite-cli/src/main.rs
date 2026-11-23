@@ -1622,31 +1622,39 @@ where
     let rendered_names: Vec<_> = column_names
         .iter()
         .take(column_count)
-        .map(|name| expand_column_tabs(Cow::Borrowed(name.as_bytes())))
+        .map(|name| translate_column_line(name.as_bytes()).0)
         .collect();
 
     for (width, name) in widths.iter_mut().zip(&rendered_names) {
         *width = display_character_count(name);
     }
 
+    let mut has_multiline_row = false;
     let rendered_rows = rows
         .iter()
         .map(|row| {
-            row.values()
+            let mut height = 1;
+            let cells = row
+                .values()
                 .iter()
-                .map(|value| expand_column_tabs(render_display_value(value)))
-                .collect::<Vec<_>>()
+                .zip(&mut widths)
+                .map(|(value, width)| {
+                    let cell = ColumnCell::new(render_display_value(value));
+                    *width = (*width).max(display_character_count(&cell.first));
+                    for line in &cell.continuations {
+                        *width = (*width).max(display_character_count(line));
+                    }
+                    height = height.max(1 + cell.continuations.len());
+                    cell
+                })
+                .collect::<Vec<_>>();
+            has_multiline_row |= height > 1;
+            (cells, height)
         })
         .collect::<Vec<_>>();
 
-    for row in &rendered_rows {
-        for (index, value) in row.iter().enumerate() {
-            widths[index] = widths[index].max(display_character_count(value));
-        }
-    }
-
     if show_headers && !rendered_names.is_empty() {
-        write_column_line(&rendered_names, &widths, out)?;
+        write_column_line(rendered_names.iter().map(Cow::as_ref), &widths, out)?;
         let underline = widths
             .iter()
             .map(|width| "-".repeat(*width))
@@ -1655,8 +1663,13 @@ where
         writeln!(out, "{underline}")?;
     }
 
-    for row in rendered_rows {
-        write_column_line(&row, &widths, out)?;
+    for (index, (cells, height)) in rendered_rows.iter().enumerate() {
+        for line in 0..*height {
+            write_column_line(cells.iter().map(|cell| cell.line(line)), &widths, out)?;
+        }
+        if has_multiline_row && index + 1 < rendered_rows.len() {
+            writeln!(out)?;
+        }
     }
 
     Ok(())
@@ -1700,47 +1713,99 @@ fn display_character_count(value: &[u8]) -> usize {
     value.iter().filter(|&&byte| byte & 0xc0 != 0x80).count()
 }
 
-fn expand_column_tabs(value: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
-    if !value.contains(&b'\t') {
-        return value;
-    }
-    const TAB_STOP: usize = 8;
-    let mut output = Vec::with_capacity(value.len());
-    let mut column = 0;
-    for (index, part) in value.split(|&byte| byte == b'\t').enumerate() {
-        if index != 0 {
-            let spaces = TAB_STOP - column % TAB_STOP;
-            output.extend(std::iter::repeat_n(b' ', spaces));
-            column += spaces;
-        }
-        output.extend_from_slice(part);
-        let last_line = part
-            .rsplit(|&byte| byte == b'\n')
-            .next()
-            .unwrap_or_default();
-        if last_line.len() != part.len() {
-            column = 0;
-        }
-        // The stock tab scan advances once for the first byte of each
-        // fragment, even when the fragment begins with a continuation byte.
-        column += last_line
-            .split_first()
-            .map_or(0, |(_, remaining)| 1 + display_character_count(remaining));
-    }
-    Cow::Owned(output)
+struct ColumnCell<'a> {
+    first: Cow<'a, [u8]>,
+    continuations: Vec<Cow<'a, [u8]>>,
 }
 
-fn write_column_line<W: Write>(
-    values: &[Cow<'_, [u8]>],
+impl<'a> ColumnCell<'a> {
+    fn new(value: Cow<'a, [u8]>) -> Self {
+        // Only text and BLOB values can contain line breaks. The display
+        // renderer borrows those bytes and owns the generated numeric text.
+        let Cow::Borrowed(bytes) = value else {
+            return Self {
+                first: value,
+                continuations: Vec::new(),
+            };
+        };
+        let (first, mut tail) = translate_column_line(bytes);
+        let mut continuations = Vec::new();
+        while let Some(bytes) = tail {
+            let (line, rest) = translate_column_line(bytes);
+            continuations.push(line);
+            tail = rest;
+        }
+        Self {
+            first,
+            continuations,
+        }
+    }
+
+    fn line(&self, index: usize) -> &[u8] {
+        if index == 0 {
+            &self.first
+        } else {
+            self.continuations.get(index - 1).map_or(b"", Cow::as_ref)
+        }
+    }
+}
+
+fn translate_column_line(value: &[u8]) -> (Cow<'_, [u8]>, Option<&[u8]>) {
+    // The default sqlite3 column mode wraps at sixty display characters.
+    const WRAP_WIDTH: usize = 60;
+    const TAB_STOP: usize = 8;
+    let mut expanded = None;
+    let mut remaining = value;
+    let mut column = 0;
+    while column < WRAP_WIDTH {
+        let Some((&byte, tail)) = remaining.split_first() else {
+            break;
+        };
+        match byte {
+            b'\t' => {
+                let spaces = (TAB_STOP - column % TAB_STOP).min(WRAP_WIDTH - column);
+                let output = expanded.get_or_insert_with(|| {
+                    let consumed = value.len() - remaining.len();
+                    value[..consumed].to_vec()
+                });
+                output.extend(std::iter::repeat_n(b' ', spaces));
+                remaining = tail;
+                column += spaces;
+            }
+            b' '..=u8::MAX => {
+                // Stock consumes continuation bytes with the preceding byte,
+                // including runs that do not form a valid UTF-8 sequence.
+                let len = 1 + tail.iter().take_while(|&&byte| byte & 0xc0 == 0x80).count();
+                if let Some(output) = &mut expanded {
+                    output.extend_from_slice(&remaining[..len]);
+                }
+                remaining = &remaining[len..];
+                column += 1;
+            }
+            _ => break,
+        }
+    }
+    let consumed = value.len() - remaining.len();
+    let line = expanded.map_or(Cow::Borrowed(&value[..consumed]), Cow::Owned);
+    let tail = match remaining {
+        [b' '..=u8::MAX, ..] => remaining,
+        [] | [0, ..] => &[],
+        [b'\r', b'\n', tail @ ..] | [_, tail @ ..] => tail,
+    };
+    (line, (!tail.is_empty()).then_some(tail))
+}
+
+fn write_column_line<'a, W: Write>(
+    values: impl IntoIterator<Item = &'a [u8]>,
     widths: &[usize],
     out: &mut W,
 ) -> io::Result<()> {
-    for (index, value) in values.iter().enumerate() {
+    for (index, (value, width)) in values.into_iter().zip(widths).enumerate() {
         if index > 0 {
             out.write_all(OutputMode::Column.separator().as_bytes())?;
         }
         out.write_all(value)?;
-        let padding = widths[index].saturating_sub(display_character_count(value));
+        let padding = width.saturating_sub(display_character_count(value));
         write!(out, "{:padding$}", "")?;
     }
     writeln!(out)
@@ -5129,6 +5194,59 @@ SELECT 1 AS one, 'two,three' AS two;\n\
                   b       \n--------\n\x80\x81       b\n",
             )
             .await;
+        });
+    }
+
+    #[test]
+    fn test_column_mode_aligns_multiline_cells_and_keeps_logical_rows() {
+        asupersync::test_utils::run_test(|| async {
+            let script = concat!(
+                ".mode column\n",
+                "SELECT 'x' AS a, 'z'||char(13,10)||'q'||char(9)||'k' AS b, 'z' AS c\n",
+                "UNION ALL SELECT 'u', 'v', 'w';\n",
+                "SELECT 'a'||char(10)||'b' AS x, 'c'||char(13)||'d'||char(11)||'e' AS y;\n",
+                "SELECT 'a'||char(10) AS x, 'b' AS y;\n",
+                "SELECT 'a' AS 'x\nlonger', 'b' AS c;\n",
+                "SELECT x'61800a620963' AS a, 'end' AS b;\n",
+                ".headers off\n",
+                "SELECT 'foo'||char(10)||'bar' AS a, 'baz' AS b;\n",
+                ".mode list\n",
+                "SELECT 'x'||char(10)||'y' AS a, 'z' AS b;\n",
+            );
+            let expected =
+                b"a  b          c\n-  ---------  -\nx  z          z\n   q       k   \n\n\
+                             u  v          w\nx  y\n-  -\na  c\nb  d\n   e\nx  y\n-  -\na  b\n\
+                             x  c\n-  -\na  b\na          b  \n---------  ---\na\x80          end\n\
+                             b       c     \nfoo  baz\nbar     \nx\ny|z\n";
+            assert_display_script_matches_stock(script, expected).await;
+        });
+    }
+
+    #[test]
+    fn test_column_mode_wraps_at_sixty_display_characters() {
+        asupersync::test_utils::run_test(|| async {
+            let script = concat!(
+                ".headers off\n.mode column\n",
+                "SELECT replace(hex(zeroblob(31)), '0','é') AS x, 'end' AS y;\n",
+                "SELECT hex(zeroblob(29))||char(9)||'z' AS x, 'end' AS y;\n",
+                "SELECT hex(zeroblob(30))||char(9)||'z' AS x, 'end' AS y;\n",
+                "SELECT hex(zeroblob(31))||char(13,10)||'tail' AS x, 'end' AS y\n",
+                "UNION ALL SELECT 'last', 'row';\n",
+            );
+            let sixty_zeros = "0".repeat(60);
+            let expected = format!(
+                "{unicode}  end\néé{pad_two}\n\
+                 {short}    end\nz{pad_one}\n\
+                 {sixty_zeros}  end\nz{pad_one}\n\
+                 {sixty_zeros}  end\n00{pad_two}\ntail{pad_tail}\n\nlast{pad_last}row\n",
+                unicode = "é".repeat(60),
+                short = "0".repeat(58),
+                pad_one = " ".repeat(64),
+                pad_two = " ".repeat(63),
+                pad_tail = " ".repeat(61),
+                pad_last = " ".repeat(58),
+            );
+            assert_display_script_matches_stock(script, expected.as_bytes()).await;
         });
     }
 
