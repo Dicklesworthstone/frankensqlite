@@ -453,6 +453,176 @@ fn gh462_schema_only_readers_leave_repair_for_a_real_writer() {
     });
 }
 
+/// The GH#462 shape for the bd-70qrk negatives: a two-row seed whose sparse
+/// archive's freelist names the reserved page, opened schema-only (the WAL
+/// stays header-less and the repair pending), with a repairing transaction
+/// open: BEGIN CONCURRENT and an INSERT.
+async fn gh462_open_repairing_transaction(
+    dir: &tempfile::TempDir,
+) -> (std::path::PathBuf, Connection) {
+    let db_path = dir.path().join("gh462_window.db");
+    let db_str = db_path.to_string_lossy().into_owned();
+    let seed = Connection::open(&db_str).await.unwrap();
+    seed.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
+    seed.execute("CREATE TABLE seed(x);").await.unwrap();
+    seed.execute("INSERT INTO seed VALUES (462), (463);")
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
+    let free: Vec<u32> = (3..=PAGE_COUNT).rev().collect();
+    extend_sparse_archive(&db_path, &free, 2);
+    let conn = Connection::open_existing_schema_only(&db_str)
+        .await
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT;").await.unwrap();
+    conn.execute("INSERT INTO seed VALUES (464);").await.unwrap();
+    (db_path, conn)
+}
+
+/// The repairing COMMIT after a peer acted inside its window: refused with
+/// BusySnapshot, nothing of it applied, the repair still pending for the next
+/// writer, which then publishes it on top of the peer's state.
+async fn gh462_assert_refused_then_repaired(
+    conn: Connection,
+    db_path: &Path,
+    user_version: i64,
+    why: &str,
+) {
+    let refused = conn.execute("COMMIT;").await;
+    assert!(
+        matches!(
+            refused,
+            Err(fsqlite_error::FrankenError::BusySnapshot { .. })
+        ),
+        "{why}: the repairing COMMIT must be refused: {refused:?}"
+    );
+    if conn.in_transaction() {
+        conn.execute("ROLLBACK;").await.unwrap();
+    }
+    assert_eq!(
+        scalar_i64(&conn.query("PRAGMA user_version;").await.unwrap()),
+        user_version,
+        "{why}: the refused commit must not overwrite the peer's page 1"
+    );
+    assert_eq!(
+        scalar_i64(&conn.query("SELECT COUNT(*) FROM seed;").await.unwrap()),
+        2,
+        "{why}"
+    );
+    conn.execute("BEGIN IMMEDIATE;").await.unwrap();
+    conn.execute("COMMIT;").await.unwrap();
+    assert_eq!(
+        scalar_i64(&conn.query("PRAGMA fsqlite.repair_freelist;").await.unwrap()),
+        0,
+        "{why}: the eager writer must consume the pending repair"
+    );
+    assert_eq!(
+        scalar_i64(&conn.query("PRAGMA user_version;").await.unwrap()),
+        user_version,
+        "{why}"
+    );
+    assert_eq!(
+        texts(&conn.query("PRAGMA integrity_check;").await.unwrap()),
+        vec!["ok".to_owned()],
+        "{why}"
+    );
+    conn.close().await.unwrap();
+    let stock = rusqlite::Connection::open(db_path).unwrap();
+    let stock_user_version: i64 = stock
+        .query_row("PRAGMA user_version;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stock_user_version, user_version, "{why}");
+    let quick: String = stock
+        .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(quick, "ok", "{why}");
+}
+
+/// bd-70qrk negative: a COMMIT that writes the first header of a header-less
+/// WAL is not refused for that header alone (the GH#462 keeper above), but a
+/// real peer's commit in between still refuses it. Stock SQLite writes the
+/// header itself and commits page 1 (`PRAGMA user_version`, which changes no
+/// freelist byte) while the repairing transaction is open.
+#[test]
+fn gh462_a_peer_page_one_commit_still_refuses_the_repairing_commit() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = gh462_open_repairing_transaction(&dir).await;
+        {
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            stock.pragma_update(None, "user_version", 7_i64).unwrap();
+        }
+        gh462_assert_refused_then_repaired(conn, &db_path, 7, "stock page-1 commit").await;
+    });
+}
+
+/// bd-70qrk: a stock `wal_checkpoint(TRUNCATE)` inside the repairing
+/// transaction's window cannot restart the shared WAL index. The
+/// transaction's read holds its read mark, so stock answers busy and nothing
+/// moves: the index header the read bound is still the one at the repair's
+/// own header write, which is exactly what the fix checks. The COMMIT then
+/// publishes the repair. Red on a build without the fix (the GH#462
+/// refusal), green with it. It need not be red on the skip-check mutant: no
+/// foreign generation change can happen here, and the two peer-commit cases
+/// above and below cover the mutant.
+#[test]
+fn gh462_a_stock_wal_restart_cannot_run_inside_the_window() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = gh462_open_repairing_transaction(&dir).await;
+        let stock = rusqlite::Connection::open(&db_path).unwrap();
+        stock.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let (busy, log, copied): (i64, i64, i64) = stock
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            busy, 1,
+            "a stock restart must be refused while the repairing transaction reads \
+             (busy={busy} log={log} copied={copied})"
+        );
+        drop(stock);
+        conn.execute("COMMIT;").await.unwrap();
+        assert_eq!(
+            scalar_i64(&conn.query("PRAGMA fsqlite.repair_freelist;").await.unwrap()),
+            0,
+            "the commit published the pending repair"
+        );
+        assert_eq!(
+            scalar_i64(&conn.query("SELECT COUNT(*) FROM seed;").await.unwrap()),
+            3
+        );
+        assert_eq!(
+            texts(&conn.query("PRAGMA integrity_check;").await.unwrap()),
+            vec!["ok".to_owned()]
+        );
+        conn.close().await.unwrap();
+        let stock = rusqlite::Connection::open(&db_path).unwrap();
+        let quick: String = stock
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick, "ok");
+    });
+}
+
+/// bd-70qrk negative: an fsqlite connection in the same process commits page
+/// 1 inside the repairing transaction's window. The in-process publication
+/// path must refuse the repairing COMMIT the same way.
+#[test]
+fn gh462_an_in_process_peer_commit_inside_the_window_still_refuses_the_repairing_commit() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, conn) = gh462_open_repairing_transaction(&dir).await;
+        let peer = Connection::open_existing_schema_only(db_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        peer.execute("PRAGMA user_version = 7;").await.unwrap();
+        peer.close().await.unwrap();
+        gh462_assert_refused_then_repaired(conn, &db_path, 7, "in-process fsqlite peer").await;
+    });
+}
+
 #[test]
 fn gh410_orphan_repair_and_write_churn_never_free_the_reserved_page() {
     asupersync::test_utils::run_test(|| async {

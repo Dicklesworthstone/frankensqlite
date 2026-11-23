@@ -364,6 +364,12 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// and leaving the append gate and reports it only inside one, where
     /// nothing else can change the header.
     header_under_append_gate: Option<fsqlite_wal::wal_index::WalIndexHdr>,
+    /// bd-70qrk: set when this handle wrote the header of a WAL it found
+    /// header-less under the append gate while the shared WAL index still
+    /// held exactly the header its pinned read bound: (that read's generation,
+    /// the generation it wrote). See
+    /// `generation_changed_only_by_own_first_append_header`.
+    own_first_append_header: Option<(WalGenerationIdentity, WalGenerationIdentity)>,
     /// Active commit-published visibility plane for the current WAL generation.
     published_snapshot: WalPublishedSnapshot,
     /// Monotonic publication sequence assigned to the next published snapshot.
@@ -644,6 +650,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             refresh_before_append:true,
             append_baseline_proven_under_gate: false,
             header_under_append_gate: None,
+            own_first_append_header: None,
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
@@ -692,6 +699,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             refresh_before_append:true,
             append_baseline_proven_under_gate: false,
             header_under_append_gate: None,
+            own_first_append_header: None,
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
@@ -1626,7 +1634,41 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             }
         };
         let checkpoint_seq = self.wal.header().checkpoint_seq.wrapping_add(1);
-        self.wal.reset(cx, checkpoint_seq, salts, false).await
+        // bd-70qrk: the shared index header is the one this handle's pinned
+        // read bound, so nothing was published since that read began.
+        let unpublished_since_read = self
+            .native_read_binding
+            .as_ref()
+            .zip(self.read_snapshot.as_ref())
+            .filter(|(binding, _)| binding.header() == baseline)
+            .map(|(_, read)| read.generation);
+        self.wal.reset(cx, checkpoint_seq, salts, false).await?;
+        self.own_first_append_header =
+            unpublished_since_read.map(|read| (read, self.wal.generation_identity()));
+        Ok(())
+    }
+
+    /// bd-70qrk: whether `latest` differs from `snapshot` only by the header
+    /// this handle itself just wrote, under the append gate, to the header-less
+    /// WAL `snapshot` read.
+    ///
+    /// A header-less WAL has no salts, so every observation of one gets a new
+    /// identity (bd-yxqs9) and the first append's header always reads as a
+    /// generation change. The proof that no peer acted in between is the
+    /// shared WAL index: every publication rewrites its header (`iChange`,
+    /// `mxFrame`, the salts of a restart), and at the header write it still
+    /// held exactly the header `snapshot`'s pinned read bound, with no frame.
+    /// No writer but the gate holder can append to the new generation, and
+    /// nothing has been committed in it. Such a snapshot is still exact; its
+    /// conflicts are those of the new generation from its start.
+    fn generation_changed_only_by_own_first_append_header(
+        &self,
+        snapshot: TransactionConflictSnapshot,
+        latest: &WalPublicationSnapshot,
+    ) -> bool {
+        latest.last_commit_frame.is_none()
+            && latest.commit_count == snapshot.commit_count
+            && self.own_first_append_header == Some((snapshot.generation, latest.generation))
     }
 
     /// Inspect the live native prefix before conflict checks or candidate staging.
@@ -7444,9 +7486,28 @@ where
                 self.inner.refresh_published_snapshot(cx).await?
             };
             if latest.generation != snapshot.generation {
-                return Ok(self
-                    .conflicts_after_generation_change(cx, page_numbers, page_baselines)
-                    .await);
+                // bd-70qrk: the first append to a header-less WAL writes its
+                // header, so a transaction that began on that WAL always sees
+                // a new generation at its own COMMIT. Read as a peer's reset,
+                // it failed closed on every page it writes without a matching
+                // snapshot image (a pending freelist repair's trunks: GH#462).
+                if !self
+                    .inner
+                    .generation_changed_only_by_own_first_append_header(snapshot, &latest)
+                {
+                    return Ok(self
+                        .conflicts_after_generation_change(cx, page_numbers, page_baselines)
+                        .await);
+                }
+                let snapshot = TransactionConflictSnapshot {
+                    generation: latest.generation,
+                    last_commit_frame: None,
+                    ..snapshot
+                };
+                return self
+                    .inner
+                    .conflicting_pages_since_snapshot(cx, snapshot, page_numbers, page_baselines)
+                    .await;
             }
             self.inner
                 .conflicting_pages_since_snapshot(cx, snapshot, page_numbers, page_baselines)
