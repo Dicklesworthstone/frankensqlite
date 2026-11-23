@@ -2777,23 +2777,23 @@ pub fn sqlite_float_altform2_digits(f: f64, rounding: SqliteFloatRounding) -> (V
     sqlite_float_magnitude_digits(f, rounding, SQLITE_FLOAT_MAX_ROUND_DIGITS)
 }
 
-/// Rounded digits and scientific exponent for SQLite's `%e` and `%E`.
+/// Rounded magnitude digits and scientific exponent for SQLite printf.
 ///
-/// The requested fractional precision determines how many digits are initially
-/// converted. Plain printf caps the subsequent rounding at 16 significant
-/// digits, while alternate form 2 uses the full decoder limit.
+/// The requested rounding determines how many digits are initially converted.
+/// Plain printf caps subsequent rounding at 16 significant digits, while
+/// alternate form 2 uses the full decoder limit.
 #[must_use]
-pub fn sqlite_float_exp_digits(f: f64, precision: usize, alternate_form2: bool) -> (Vec<u8>, i32) {
+pub fn sqlite_float_printf_digits(
+    f: f64,
+    rounding: SqliteFloatRounding,
+    alternate_form2: bool,
+) -> (Vec<u8>, i32) {
     let max_round_digits = if alternate_form2 {
         SQLITE_FLOAT_MAX_ROUND_DIGITS
     } else {
         16
     };
-    sqlite_float_magnitude_digits(
-        f,
-        SqliteFloatRounding::Significant(precision.saturating_add(1)),
-        max_round_digits,
-    )
+    sqlite_float_magnitude_digits(f, rounding, max_round_digits)
 }
 
 fn sqlite_float_magnitude_digits(

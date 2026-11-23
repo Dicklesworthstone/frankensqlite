@@ -74,6 +74,53 @@ fn real_quote_and_printf_match_bundled_sqlite() {
 }
 
 #[test]
+fn printf_float_flags_match_bundled_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = "SELECT printf(?1, ?2), format(?1, ?2)";
+        let mut statement = stock.prepare(sql).unwrap();
+        let values = [
+            f64::INFINITY, f64::NEG_INFINITY, -0.0, -0.004, 9.99995, 1e50,
+            1.25, 0.1, 1234.5, f64::from_bits(1), f64::MAX,
+            250.0, -250.0,
+            f64::from_bits(0x3e28_858a_5e4e_2fff),
+        ];
+        let specs = [
+            "%0e", "%0E", "%0g", "%0G", "%0.2f", "%0!.0f", "%0!e",
+            "%0.0e", "%#0.0E", "%+016.2e", "%-016.2e", "% 0g", "%+ .1e",
+            "% +.1e", "%#.2f", "%+#.2f", "% #.2f", "%#g", "%#!g",
+            "%#!.5G", "%#!.1g", "%!,g", "%!.15g", "%.20e", "%!.20e",
+            "%0.1000g", "%.20g", "%#.25g", "%.20f", "%.0e",
+        ];
+        let mut mismatches = Vec::new();
+        for value in values {
+            for spec in specs {
+                let expected: String = statement
+                    .query_row(rusqlite::params![spec, value], |row| row.get(0))
+                    .unwrap();
+                let expected = SqliteValue::from(expected);
+                let rows = frank
+                    .query_with_params(sql, &[SqliteValue::from(spec), SqliteValue::Float(value)])
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values().len(), 2);
+                if rows[0].values().iter().any(|actual| actual != &expected) {
+                    mismatches.push(format!(
+                        "bits={:016x} spec={spec} expected={expected:?} actual={:?}",
+                        value.to_bits(),
+                        rows[0].values(),
+                    ));
+                }
+            }
+        }
+        frank.close().await.unwrap();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    });
+}
+
+#[test]
 fn printf_altform2_float_rounding_matches_bundled_sqlite() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
