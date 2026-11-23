@@ -94,6 +94,30 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-23 - SMALL WIN (landed as b50d778c4; under its prediction, inside every kill line; instructions only, time a replicated TIE): the record writer stores a one-byte serial type straight into its header slot and encodes each payload inline (bd-w4pr1.13, bulk-write round 17, lever MR2)
+
+- Target: round 16's MR retry line. The 3-to-16-value MakeRecord writer `write_serialized_record_from_layouts` called `encode_serialized_value` out of line (400k calls, 110 a row) and wrote each header byte through a fresh sub-slice (about 65 a row).
+- Touched: `crates/fsqlite-types/src/record.rs`.
+  - A serial type of at most 0x7F is stored as one byte at its header offset; larger ones keep `write_varint`.
+  - `encode_serialized_value` is `#[inline(always)]`.
+  - Byte output is unchanged.
+  - Keeper: round 16's `record::tests::test_record_writer_matches_the_file_format_byte_for_byte`, with two-byte serial types 128, 129 and 413. Mutant M4 (the one-byte form for every two-byte serial type) turns it red (rc 101).
+- Ledger preflight: not the 2026-05-06 "Direct INSERT text append force-inline annotation" REJECT. That was connection.rs's prepared direct-INSERT lane on comprehensive-bench; its retry condition, a whole-matrix judgement, is the layout-averaged judge.
+- Prediction (on the bead before the build): bulk -70M to -110M Ir, time -0.5% to -1.5%; memory_script -15M to -25M; update -2M to -3.5M; other rows within ±0.5%.
+- Kill lines: bulk under 40M (0.6% of the row, just above the codegen-only ±0.5%); any row up more than 0.5%; a replicated LOSE above 1%.
+- Result:
+  - Setup: stock SQLite 3.54.1 live. Parent 4579ee0ba. One three-arm job on vmi1152480, sharing its parent with lever FR. Cargo ELFs: P d397eddd4281c2ce, L ceb56df3ef6469c1.
+  - Instructions (single ELF):
+    - bulk 6,977.0M -> 6,931.6M: -45.4M by min, -45.9M by median; x1.933 -> x1.920 against stock's 3,610.9M.
+    - memory_script -10.3M, update -1.5M; delete and every read row unchanged.
+    - Callgrind of the 100k bulk row: 705.8M -> 701.2M. The writer went from 334 to 287 a row inclusive.
+  - Time (layout-averaged): five runs, of which three were void on host load (another project's burst; load 120 at 15:25Z) and two valid (null max |z| 2.35 and 2.75).
+    - Every row is a replicated TIE. Bulk cycles 1.0000 / 0.9921 (against stock x2.540 both ways in run d, x2.583 -> x2.562 in run e); cpu 0.9957 / 0.9933.
+    - The single-run LOSEs (gb_1000 cycles in run d, rowid_lookups cycles in run e, window_sum_over cpu in run d) are each TIE in the other run, at Ir 1.0000.
+  - Gate: clippy -D warnings on fsqlite-types (all targets) rc 0; fsqlite-types 593 passed, 0 failed; rustfmt clean; ubs 0 critical.
+- Lesson (the miss): the inlined encoder keeps its bodies (the TEXT payload copy stays a memcpy call), and the header-byte store saved less than the sub-slice was charged. About 46 a row came off, not 70-110.
+- Retry / next: the writer is 287 a row against stock's OP_MakeRecord body of about 237. What is left is per-value dispatch on the value's type and the TEXT copy, which a record-template lever on a prepared program could remove. Not the generic serializer again.
+
 ## 2026-11-23 - REJECTED on its time kill line (rowid_lookups_200k cycles a layout-averaged LOSE, 1.080 in the only valid run, 1.059 / 1.030 in two void runs, +7.5% at each of 8 heap offsets), with -32.0M Ir (-1.42%, x4.92 -> x4.85 stock 3.54.1) inside its prediction: the clean-buffer eviction walks an occupancy bitmap of the flat page table instead of every slot (bd-w4pr1.13.18, read/seek round 12, lever FS1)
 
 - Target: `ShardedPageCache::take_clean_buffer_from_flat_slots`, run on every page-cache eviction. Callgrind on main
