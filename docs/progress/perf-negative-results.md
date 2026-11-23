@@ -94,6 +94,154 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-23 - WIN (landed as e519bf9ed; inside its prediction; trig_cte x11.59 -> x10.45 stock 3.54.1 in instructions, alt_txn x3.06 -> x2.46): a retained cursor a program on another root displaces from the engine's slot is kept as a spare, and the next open of its root takes it back (bd-fpr5g, trig lane round 2, lever RC)
+
+- Target: programs on the connection's one cached VDBE engine number their target cursor 0, so an INSERT's trigger
+  body programs replaced the outer INSERT's retained cursor in slot 0 and each other's. Every statement opened a new
+  cursor (reading its root page and copying it) and lost its right-edge append. Callgrind on main eb7cd85b2, per
+  firing of the bead's body (d_both minus d_never, 1,714 firings): open_storage_cursor 13.6k (four opens),
+  table_insert_prechecked_absent 7.4k (two seeks for insert). The same displacement hit alt_txn (INSERTs
+  alternating two tables in one transaction): 4.9k open and 4.4k seek per statement.
+- Touched: `crates/fsqlite-vdbe/src/engine.rs` (`spare_storage_cursors`, at most 8, oldest dropped first;
+  `swap_spare_storage_cursor_into_slot`, `keep_spare_storage_cursor`; the reset that keeps no cursors,
+  `take_transaction` and `storage_cursors_empty` include the spares). An open of a root whose slot does not hold it
+  takes the root's spare into the slot, where OpenWrite's retained-cursor reuse refreshes it.
+- Soundness: while one of a root's cursors is a spare, the engine holds no other cursor on that root (a cursor is not
+  kept while another slot holds its root; every open of a root not in its slot takes the spare first; a spare is not
+  put back beside a slot holding its root), so nothing writes a root under its spare. Spares are dropped wherever
+  retained cursors are, so every existing invalidation covers them. Only cursors on the execution's reuse backend
+  are kept, never one holding an ephemeral index's records; a spare's unlanded rowid goes back as OP_Close's does.
+- Ledger preflight: the 2026-05-07 and 2026-05-08 retained direct-DML cursor rejections kept a connection-local
+  BtCursor for the direct-DML lanes; this lever stays inside the engine's existing retained-cursor reuse.
+- Keepers: fsqlite-vdbe lib `test_displaced_retained_cursor_is_kept_as_a_spare_and_taken_back` (mem backend, where a
+  cursor's own rows make reuse observable, with an in-test control that a new cursor lacks them; red on main's engine);
+  `bd_fpr5g_trigger_body_cache_under_cte` `spare_cursors_follow_self_writes_recursion_schema_changes_and_rollbacks`
+  (stock 3.54.1, :memory: and a file: the bodies' tables written from outside the bodies, the firing table written by
+  its own trigger with recursive_triggers OFF and ON, a body's table dropped / created / indexed between firings, a
+  savepoint rollback and a failed statement between firings, integrity_check).
+- Prediction (bead, before the build): trig_cte / trig_src / trig_values each -190M to -330M; alt_txn -110M to -180M;
+  every other row within +-0.5%. Kill: trig_cte gaining under 120M; any other row above +0.5% Ir; a replicated time
+  LOSE above 1%; answers; keepers.
+- Result. Arms in one rch job on hz2 (parent 297d47109 cargo link 78fc4582710dc3c2, lever b23287bdae273fe4; the
+  parent's 1,960 sources equal git, the lever differs only in engine.rs, equal to HEAD + patch). thinkstation1,
+  powersave, stock 3.54.1 (rl12/stock354) live, answers equal everywhere. Instructions:u, single ELFs, 5 reps, the A/A
+  copy within 0.09%:
+  - trig_cte_20000 2,664.1M -> 2,403.4M (-260.7M, -9.8%; x11.59 -> x10.45 stock), trig_src -260.2M (x9.34 -> x8.34),
+    trig_values -306.0M (x2.11 -> x1.85), alt_txn_20000 884.7M -> 711.2M (-173.5M, -19.6%; x3.06 -> x2.46).
+  - notrig_cte, ctl_insert_txn, ctl_select, sel_case within +-0.11%; upd_case_txn +5.8M (+0.33%), inside the +0.5%
+    line (about 290 per statement; not attributed).
+  - Callgrind, 2,000 rows: d_both -14.2k per firing, d_never -0.08M (no displacement, no change), alt_txn -7.8k per
+    statement.
+  - Time (bd-es2im layout-averaged, K=6, 7 reps): runs 1, 3 and 4 were VOID (P-vs-Q nulls |z| 4.97, 6.09,
+    9.93; other projects' rch jobs ran on this host, load 30-58 on 64 cores); runs 2 and 5 are valid (null max |z|
+    1.69 and 2.61). trig_cte cycles 0.815 / 0.813 (x26.5 -> x21.6 stock in run 2), trig_src 0.797 / 0.828,
+    trig_values 0.797 / 0.809, alt_txn 0.684 / 0.679 (x4.82 -> x3.30): replicated WINs, cpu likewise. Every other
+    row a replicated TIE; the one single-run LOSE is upd_case_txn cpu in run 2 (1.024; TIE in run 5).
+- Gate (rch; RC, 2a and lever 5 stacked on main 79c965065, in parts with test binaries built without debug
+  info, after a one-job gate passed rch's 20 GiB disk-growth budget): fsqlite-vdbe lib 1,268 passed;
+  fsqlite-core lib 4,210 passed, 0 failed; 40 trigger / conflict / RETURNING / GH#516 keeper targets and 8
+  e2e trigger targets, 247 passed, 0 failed; the fsqlite crate in 7 batches of 19, 125 binaries, 1,111 passed, 0 failed (batches 1-4 on the tree before the clippy rewrite, 5-7 on the final tree). clippy -D
+  warnings on both crates (all targets) clean after RC's swap condition was rewritten as is_none_or
+  (nonminimal_bool), re-checked on the final tree with the vdbe lib and the keeper file (9 passed).
+  rustfmt: ignored crates. ubs on engine.rs, insert_batch.rs and the keeper file: 0 critical.
+- Retry condition: none for this lever. Left on the row: the per-firing 4 KiB copy-on-write of the pages the body
+  statements write (PageData::as_bytes_mut, about 3 per firing; bd-yb70u), and lg's NewRowid `last` (2.1k-2.9k per
+  firing, a retained cursor does not remove it).
+
+## 2026-11-23 - WIN (landed as 4875034e9; inside its prediction; trig_src x9.34 -> x9.18 stock 3.54.1 in instructions): a column with no DEFAULT takes its NULL without the boxed default evaluator (bd-fpr5g, trig lane round 2, lever 2a)
+
+- Target: an INSERT whose target has triggers or foreign keys snapshots each row's NEW image from a row of the
+  columns' defaults; `evaluate_default_row_from_sqls` called `evaluate_column_default_value` for every column, which
+  boxes a future before it finds the column has no DEFAULT. Callgrind on main eb7cd85b2: 2.55k per inserted row on the
+  bead's 4-column table, 1.9k of it malloc / free.
+- Touched: `crates/fsqlite-core/src/connection.rs` (`evaluate_default_row_from_sqls`: a column with no DEFAULT takes
+  NULL directly). Keeper `bd_fpr5g_trigger_body_cache_under_cte` `trigger_new_rows_hold_every_omitted_columns_default`
+  (stock 3.54.1, :memory: and a file: BEFORE and AFTER NEW rows from VALUES, a SELECT, DEFAULT VALUES and the FK path
+  hold every omitted column's DEFAULT and NULL for one with none).
+- Ledger preflight: no entry on the default-row evaluation.
+- Prediction (bead, before the build): trig_cte / trig_src / trig_values each -38M to -50M; every other row within
+  +-0.1%. Kill: trig_src gaining under 20M; any other row above +0.1%; a replicated time LOSE above 1%.
+- Result (same job, host and stock as lever RC's entry; lever cargo link 0a53c9ae243852cf, differing from the parent
+  only in connection.rs): trig_cte -44.5M (x11.59 -> x11.39), trig_src -43.6M (x9.34 -> x9.18), trig_values -45.1M
+  (x2.11 -> x2.07); every other row within +-0.02%. Callgrind, 2,000 rows: -2.4k to -2.7k per inserted row.
+  - Time (bd-es2im layout-averaged, K=6, 7 reps): runs 1, 3 and 4 were VOID (P-vs-Q nulls |z| 4.97, 6.09,
+    9.93; other projects' rch jobs ran on this host, load 30-58 on 64 cores); runs 2 and 5 are valid (null max |z|
+    1.69 and 2.61). Every row a replicated TIE: the 1.8% instruction gain is inside the time noise. Single-run
+    LOSEs: trig_src cpu and cycles in run 2 (1.082 / 1.059; 0.967 / 0.992 in run 5), notrig_cte cycles and
+    upd_case_txn cpu in run 5; none replicated.
+- Gate: stacked with the other two landed levers; see lever RC entry.
+- Retry condition: none for this lever.
+
+## 2026-11-23 - WIN (landed as e502df9b6; inside its prediction on trig_src, beyond it on trig_cte; trig_cte x11.59 -> x10.19 stock 3.54.1 in instructions): an INSERT ... SELECT into a table with triggers replays its materialized rows, and replays while temp roots exist, through the compiled row program (bd-fpr5g, trig lane round 2, lever 5)
+
+- Target: GH#516's compiled-row kernel (`crates/fsqlite-core/src/connection/insert_batch.rs`) refused this bead's
+  scripts at two gates: a SELECT source (trig_src) and any temp root in the connection (trig_cte, whose recursive CTE
+  is a materialized binding while the statement runs), so every row went through `execute_prepared_with_params`.
+- Touched: `connection.rs` (`execute_insert_select_row_stream` gains `source_rows_materialized`: the materialized and
+  morsel producers pass true, the streaming producer false) and `insert_batch.rs` (`prepare_compiled_insert_replay`
+  admits a SELECT source only for materialized rows; the blanket temp-roots refusal becomes an explicit refusal of an
+  unqualified TEMP target plus a post-compile check that the template's program opens no temp root). The soundness
+  arguments for both gates were posted on bd-fpr5g before any code.
+- Keepers: insert_batch.rs `compiled_insert_replay_rows` (a #[cfg(test)] count of compiled rows: a materialized
+  SELECT source of 200 rows replays 200, a bare-column SELECT the streaming producer feeds replays 0, a CTE-fed
+  insert of 120 rows with a TEMP table present replays 120, a TEMP target 0); `bd_fpr5g_trigger_body_cache_under_cte`
+  `replayed_select_rows_follow_chunks_raises_conflicts_and_temp_roots` (stock 3.54.1, :memory: and a file).
+- Two pre-existing defects found while writing that keeper (main eb7cd85b2, both reproduced with main's CLI against
+  stock 3.54.1; both left out of the keeper and reported to the coordinator): an INSERT ... SELECT into a table with
+  row triggers reads its source in 10,000-row chunks, so a trigger that writes the source changes what later chunks
+  read (stock reads the whole SELECT first; repro scratchpad trig2/wl/srcwrite_probe_10005.sql); and a ROLLBACK after
+  CTE-fed INSERTs into a table with a trigger empties a TEMP table (trig2/wl/temp_rows_lost_on_rollback_repro.sql).
+- Prediction (bead, before the build): trig_src -120M to -200M; trig_cte -120M to -200M; every other row within
+  +-0.1%. Kill: trig_src (or, for gate 2, trig_cte) gaining under 60M; any other row above +0.1%; a replicated time
+  LOSE above 1%.
+- Result (same job, host and stock; lever cargo link 44a0a3614701ba99, differing from the parent only in the two
+  files): trig_src -160.2M (x9.34 -> x8.73), trig_cte -321.9M (x11.59 -> x10.19, beyond the band: about 16k a row
+  where 6k-10k was predicted); every other row within +-0.11%, the largest a decrease (sel_case -0.11%).
+  - Time (bd-es2im layout-averaged, K=6, 7 reps): runs 1, 3 and 4 were VOID (P-vs-Q nulls |z| 4.97, 6.09,
+    9.93; other projects' rch jobs ran on this host, load 30-58 on 64 cores); runs 2 and 5 are valid (null max |z|
+    1.69 and 2.61). trig_cte cycles 0.804 / 0.799 (x26.5 -> x21.3 stock in run 2), trig_src 0.796 / 0.822:
+    replicated WINs, cpu likewise. Every other row a replicated TIE. Single-run LOSEs: notrig_cte cpu in run 2
+    (1.027) and cycles in run 5 (1.024), never the same metric twice, on a row whose instructions are unchanged;
+    upd_case_txn cpu in run 2; sel_case cycles in run 5.
+- Gate: stacked with the other two landed levers; see lever RC entry.
+- Retry condition: none for this lever. Left on trig_cte: the per-firing hide / restore of the caller's materialized
+  binding (`MaterializedBindingsVisibilityGuard::hide_reserving` builds a set of every table and view name and
+  rebuilds the schema indices twice per firing, about 10k; trig_cte minus trig_src, callgrind).
+
+## 2026-11-23 - REJECTED on its regression kill line (trig_values_20000 +4.7M Ir, +0.19%, against +0.1%), with upd_case_txn_20000 -254.2M (x3.00 -> x2.56 stock 3.54.1) and sel_case_20000 -235.0M beyond its prediction: a CASE whose parts are plain counts as plain, so a statement holding one skips placeholder renumbering and the subquery rewrite (bd-fpr5g, trig lane round 2, lever 2b)
+
+- Target: bd-5310l's plain-statement predicates (`expr_is_plain` in `crates/fsqlite-core/src/connection.rs`) refused
+  any CASE. Callgrind on main eb7cd85b2, 2,000 statements in one transaction: an UPDATE with a CASE in SET spent 6.0k
+  per statement in `canonicalize_update_placeholders` (two renumberings, each a clone; 6.5% of the run), a point
+  SELECT with a CASE result column 9.7k in `rewrite_subqueries` (5.3%). That met the 2026-11-12 bd-5310l entry's
+  retry condition for widening to CASE (2% or more, and a keeper that the rewrite returns it unchanged).
+- Change: a CASE arm in `expr_is_plain` (operand, each WHEN and THEN, ELSE all plain), with the property test extended
+  by CASE values and a CASE filter, CASE negatives in the refusal test (anonymous / named placeholder, `x AND 0`, IN
+  list, row value, subquery inside the CASE), and a stock keeper binding every kind of placeholder inside CASE in
+  UPDATE, DELETE, INSERT and SELECT, ad hoc and prepared. All of them passed.
+- Prediction (bead, before the build): upd_case_txn -100M to -140M; sel_case -140M to -200M; every other row within
+  +-0.1%. Kill: upd_case_txn gaining under 50M; any other row above +0.1%; a replicated time LOSE above 1%.
+- Result. Arms in one rch job on hz2 (parent 297d47109 cargo link 78fc4582710dc3c2, lever c76c9f7337c9c9d4; the
+  parent's 1,960 sources equal git, the lever differs only in connection.rs, equal to HEAD + patch). thinkstation1,
+  powersave, stock 3.54.1 (rl12/stock354) live, answers equal everywhere. Instructions:u, single ELFs, 5 reps, the A/A
+  copy within 0.09%:
+  - upd_case_txn_20000 1,749.8M -> 1,495.5M (-254.2M, -14.5%; x3.00 -> x2.56 stock), sel_case_20000 3,584.1M ->
+    3,349.1M (-235.0M, -6.6%; x5.85 -> x5.47). Both beyond the band.
+  - trig_values_20000 2,462.8M -> 2,467.6M (+4.7M, +0.19%; reps 2,467.4-2,467.7M against 2,462.8-2,463.1M):
+    above the posted +0.1% line, so the lever is reverted under it. Every other row within +-0.05%.
+  - Time (bd-es2im layout-averaged, K=6, 7 reps): runs 1, 3 and 4 were VOID (P-vs-Q nulls |z| 4.97, 6.09,
+    9.93; other projects' rch jobs ran on this host, load 30-58 on 64 cores); runs 2 and 5 are valid (null max |z|
+    1.69 and 2.61). 2b's arms ran in runs 1-3 only (they were dropped once its instruction line had decided it),
+    so run 2 is its one valid run: upd_case_txn cycles 0.905 and sel_case 0.935 WIN there, every other row TIE. Not
+    replicated; the instruction line decides the lever.
+  - The trig_values increase depends on the statement count: on the same two ELFs, perf stat instructions:u on
+    trig_values_2000 is 250.33M -> 249.80M (-265 per statement; callgrind agrees, 251.58M -> 251.03M) and on
+    trig_values_20000 2,462.9M -> 2,467.4M (+230 per statement). So something in 2b's path costs more as statements
+    accumulate (a cache keyed by statement text is the first suspect); not attributed further.
+- Retry condition: find what grows with the statement count on trig_values (callgrind at 2,000 and 20,000 statements,
+  both arms) and remove it; then rebuild and re-measure with stock live, the same lines. The keepers and unit tests
+  above are ready to reuse.
+
 ## 2026-11-23 - WIN (landed as b9964a27f; inside every kill line, both instruction predictions missed): a rowid seek the cache answers on a resident cached leaf lands without a wait, and a probe scans the seek cache once; join_1M_to_pk_1000 -178.1M Ir, cpu 0.932 / 0.933 (bd-w4pr1.12, serial read lane round 13, lever SL2 v3)
 
 - Target: join_1M_to_pk_1000 (`SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`). Most of its 1M probes
