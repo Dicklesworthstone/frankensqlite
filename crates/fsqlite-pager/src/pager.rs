@@ -5256,6 +5256,15 @@ impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
         }
         restore_result
     }
+
+    /// bd-dd5bh: the database-file handle was not granted, so the append lock
+    /// was never requested and the VFS lock state is the captured baseline.
+    /// Release the window without waiting for the handle.
+    fn release_unrequested(&mut self) {
+        self.restored.store(true, AtomicOrdering::Release);
+        self.physical_lock_window.take();
+        self.armed = false;
+    }
 }
 
 impl<F: VfsFile + 'static> Drop for GroupCommitDbLockObligation<F> {
@@ -6030,6 +6039,45 @@ async fn cipher_write_page_batch<F: VfsFile>(
         .map(|(off, bytes)| (*off, bytes.as_slice()))
         .collect();
     file.write_page_batch(cx, &encrypted_refs).await
+}
+
+/// bd-dd5bh: [`shared_db_file_write`] for a COMMIT's lock acquisition, bounded
+/// by the statement's busy budget. Stock bounds every lock wait of a statement
+/// by `busy_timeout` and answers `SQLITE_BUSY`; another task of this process
+/// that keeps the handle (bd-2sf0f: one waiting for an I/O the kernel never
+/// completes) must not hold the COMMIT forever. Without a budget the wait is
+/// unbounded, as before.
+async fn shared_db_file_write_within_budget<'a, F: VfsFile>(
+    file: &'a SharedDbFile<F>,
+    cx: &Cx,
+) -> Result<asupersync::sync::RwLockWriteGuard<'a, F>> {
+    let Some(budget) = cx.busy_wait_budget() else {
+        return shared_db_file_write(file, cx).await;
+    };
+    // The handle's own fair acquisition is always polled first, so this never
+    // overtakes a queued holder (a try_write fast path did, and a churn of
+    // fresh connections then saw COMMITs of 7-15 s). The budget is read, and
+    // its clock armed, only once the acquisition has suspended: an
+    // uncontended COMMIT neither starts the statement's busy clock here nor
+    // pays for a timer.
+    let mut acquire = std::pin::pin!(shared_db_file_write(file, cx));
+    let mut expiry: Option<std::pin::Pin<Box<asupersync::time::Sleep>>> = None;
+    std::future::poll_fn(|task_cx| {
+        if let std::task::Poll::Ready(result) = acquire.as_mut().poll(task_cx) {
+            return std::task::Poll::Ready(result);
+        }
+        let expiry = expiry.get_or_insert_with(|| {
+            Box::pin(asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                budget.remaining(),
+            ))
+        });
+        if expiry.as_mut().poll(task_cx).is_ready() {
+            return std::task::Poll::Ready(Err(FrankenError::Busy));
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 async fn shared_db_lock_external_snapshot<F: VfsFile>(
@@ -27684,12 +27732,18 @@ where
                             flush_obligation.external_lock_state(),
                             physical_lock_window,
                         );
+                        let mut append_lock_requested = false;
                         let flush_io_result = async {
                             // Acquisition errors use the same awaited cleanup
                             // and error merge as append errors below. Otherwise
                             // a Busy plus failed Drop restore could retry while
                             // its own queued cleanup still owns this window.
-                            let mut append_handle = shared_db_file_write(&db_file, cx).await?;
+                            // bd-dd5bh: the handle is waited for no longer than
+                            // the statement's busy budget, as stock's busy
+                            // handler bounds a COMMIT's lock waits.
+                            let mut append_handle =
+                                shared_db_file_write_within_budget(&db_file, cx).await?;
+                            append_lock_requested = true;
                             if let Err(error) = append_handle.lock_external_wal_append(cx) {
                                 append_blocked_by_local_transaction =
                                     matches!(error, FrankenError::Busy)
@@ -28389,7 +28443,16 @@ where
                         // was cancelled. In particular, once the flush is
                         // durable, cancellation must not strand RESERVED or
                         // turn the completed epoch into Abort.
-                        let restore_result = db_lock_obligation.restore().await;
+                        // bd-dd5bh: when the handle was never granted, the
+                        // append lock was never requested and nothing changed;
+                        // restoring would wait without a budget for the same
+                        // handle.
+                        let restore_result = if append_lock_requested {
+                            db_lock_obligation.restore().await
+                        } else {
+                            db_lock_obligation.release_unrequested();
+                            Ok(())
+                        };
                         match (flush_io_result, restore_result) {
                             (Ok(()), Ok(())) => Ok(()),
                             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -50292,6 +50355,166 @@ mod tests {
             assert_eq!(*batch_calls.lock().unwrap(), 0);
             assert_eq!(*sync_calls.lock().unwrap(), 0);
             reader.rollback(&cx).await.unwrap();
+        });
+    }
+
+    /// bd-dd5bh: a COMMIT whose append acquisition finds the database-file
+    /// handle held by another task of this process returns Busy once its busy
+    /// budget is spent, as stock's busy handler bounds a COMMIT's lock waits,
+    /// and leaves nothing behind: the next COMMIT, with the handle free,
+    /// commits at once. Red on main, where that wait has no budget and the
+    /// first COMMIT never returns (the 5 s watchdog fails it). Negatives: a
+    /// holder that releases the handle inside the budget lets the waiting
+    /// COMMIT commit, after the release; with the handle free, the first
+    /// COMMIT is granted it at once and commits.
+    #[test]
+    fn bd_dd5bh_commit_returns_busy_when_the_db_file_handle_is_held_past_its_budget() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Holder {
+            /// Keeps the handle past the COMMIT's budget (a stalled holder).
+            Stalled,
+            /// Releases the handle well inside the COMMIT's budget.
+            ReleasesInBudget,
+            /// Nobody holds the handle.
+            Free,
+        }
+        /// Poll `future`, dropping `holder` once `hold` has passed.
+        async fn releasing_after<T, H>(
+            hold: Duration,
+            holder: H,
+            future: impl Future<Output = T>,
+        ) -> T {
+            let mut future = std::pin::pin!(future);
+            let mut timer =
+                std::pin::pin!(asupersync::time::sleep(asupersync::time::wall_now(), hold));
+            let mut holder = Some(holder);
+            std::future::poll_fn(|task_cx| {
+                if holder.is_some() && timer.as_mut().poll(task_cx).is_ready() {
+                    holder = None;
+                }
+                future.as_mut().poll(task_cx)
+            })
+            .await
+        }
+        async fn within<T>(limit: Duration, future: impl Future<Output = T>) -> Option<T> {
+            let mut future = std::pin::pin!(future);
+            let mut expiry =
+                std::pin::pin!(asupersync::time::sleep(asupersync::time::wall_now(), limit));
+            std::future::poll_fn(|task_cx| {
+                if let std::task::Poll::Ready(output) = future.as_mut().poll(task_cx) {
+                    return std::task::Poll::Ready(Some(output));
+                }
+                if expiry.as_mut().poll(task_cx).is_ready() {
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Pending
+            })
+            .await
+        }
+        const BUDGET: Duration = Duration::from_millis(50);
+        /// The in-budget holder's hold, and the budget its waiter gets.
+        const BRIEF_HOLD: Duration = Duration::from_millis(100);
+        const BRIEF_BUDGET: Duration = Duration::from_secs(2);
+        asupersync::test_utils::run_test(|| async {
+            for mode in [Holder::Stalled, Holder::ReleasesInBudget, Holder::Free] {
+                let vfs = ObservedLockVfs::new();
+                let pager = vfs
+                    .open_file_backed_pager(Path::new("/bd-dd5bh-held-handle.db"))
+                    .await
+                    .unwrap();
+                let cx = Cx::new();
+                let (backend, _frames, _begin_calls, batch_calls, _sync_calls) =
+                    MockWalBackend::new_with_sync_tracking();
+                pager.set_wal_backend(Box::new(backend)).unwrap();
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                let baseline = *vfs.observed_lock_level.lock().unwrap();
+                let page = PageNumber::new(2).unwrap();
+                let mut write_set = HashMap::new();
+                write_set.insert(
+                    page,
+                    StagedPage::from_bytes(&pager.pool, &vec![0x55; PageSize::DEFAULT.as_usize()])
+                        .unwrap(),
+                );
+                let commit = |budget: Duration| {
+                    let commit_cx = cx.clone().with_busy_wait_budget(BusyWaitBudget::new(budget));
+                    let pager = &pager;
+                    let write_set = &write_set;
+                    async move {
+                        SimpleTransaction::<ObservedLockVfs>::commit_wal_group_commit(
+                            &commit_cx,
+                            &pager.wal_backend,
+                            &pager.inner,
+                            write_set,
+                            &[page],
+                            &[],
+                            &pager.group_commit_queue,
+                        )
+                        .await
+                    }
+                };
+                let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+                let holder = if mode == Holder::Free {
+                    None
+                } else {
+                    Some(shared_db_file_write(&db_file, &cx).await.unwrap())
+                };
+                let started = Instant::now();
+                let first = if mode == Holder::ReleasesInBudget {
+                    within(
+                        Duration::from_secs(5),
+                        releasing_after(BRIEF_HOLD, holder, commit(BRIEF_BUDGET)),
+                    )
+                    .await
+                } else {
+                    let first = within(Duration::from_secs(5), commit(BUDGET)).await;
+                    drop(holder);
+                    first
+                };
+                let took = started.elapsed();
+                if mode == Holder::ReleasesInBudget {
+                    let first = first.unwrap_or_else(|| {
+                        panic!("the COMMIT behind a briefly held handle did not return within 5 s")
+                    });
+                    assert!(
+                        first.is_ok(),
+                        "a holder that releases inside the budget must let the COMMIT commit, \
+                         got {first:?}"
+                    );
+                    assert!(
+                        took >= BRIEF_HOLD,
+                        "the COMMIT committed before the holder released ({took:?})"
+                    );
+                    assert!(took < BRIEF_BUDGET, "the COMMIT waited out its budget ({took:?})");
+                } else if mode == Holder::Stalled {
+                    let first = first.unwrap_or_else(|| {
+                        panic!("the COMMIT behind a held handle did not return within 5 s")
+                    });
+                    assert!(
+                        matches!(first, Err(FrankenError::Busy)),
+                        "a COMMIT behind a held handle must answer Busy, got {first:?}"
+                    );
+                    assert!(
+                        took >= BUDGET,
+                        "Busy before the {BUDGET:?} budget was spent ({took:?})"
+                    );
+                    assert!(took < Duration::from_secs(2), "Busy only after {took:?}");
+                    assert_eq!(*batch_calls.lock().unwrap(), 0, "nothing may be appended");
+                    assert_eq!(*vfs.observed_lock_level.lock().unwrap(), baseline);
+                    // Nothing stranded: the window and the handle are free again.
+                    let retry = within(Duration::from_secs(5), commit(Duration::from_secs(1)))
+                        .await
+                        .expect("the COMMIT after the Busy did not return within 5 s");
+                    assert!(retry.is_ok(), "the COMMIT after the Busy failed: {retry:?}");
+                } else {
+                    let first = first.expect("an unheld COMMIT did not return within 5 s");
+                    assert!(first.is_ok(), "an unheld COMMIT failed: {first:?}");
+                    assert!(
+                        took < Duration::from_secs(1),
+                        "a free handle was not taken at once ({took:?})"
+                    );
+                }
+                assert_eq!(*batch_calls.lock().unwrap(), 1);
+            }
         });
     }
 
