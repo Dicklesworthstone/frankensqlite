@@ -7750,6 +7750,35 @@ fn pragma_table_function_is_no_arg(name: &str) -> bool {
         || pragma.eq_ignore_ascii_case("table_list")
 }
 
+// Call only after the source has resolved to a built-in PRAGMA table function.
+fn validate_pragma_table_function_arity(name: &str, count: usize) -> Result<()> {
+    let max = if name.eq_ignore_ascii_case("pragma_table_list") {
+        1
+    } else if pragma_table_function_is_no_arg(name) {
+        0
+    } else {
+        2
+    };
+    if count > max {
+        return Err(FrankenError::function_error(format!(
+            "too many arguments on {name}() - max {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn pragma_table_function_text(value: &SqliteValue) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    // SQLite constructs a PRAGMA from zero-terminated argument text.
+    let mut text = value.to_text();
+    if let Some(end) = text.find('\0') {
+        text.truncate(end);
+    }
+    Some(text)
+}
+
 struct HtmMetricsVtab;
 
 #[derive(Clone)]
@@ -103661,6 +103690,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         include_hidden_rowid: bool,
     ) -> Result<Vec<Vec<SqliteValue>>> {
+        validate_pragma_table_function_arity(name, args.len())?;
         let pragma_name = name[7..].to_ascii_lowercase();
         let empty_row = [];
         let empty_col_map = [];
@@ -103668,22 +103698,20 @@ impl Connection {
             let arg_value = self
                 .eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)
                 .await?;
-            (!arg_value.is_null()).then(|| {
+            pragma_table_function_text(&arg_value).map(|text| {
                 fsqlite_ast::PragmaValue::Call(Expr::Literal(
-                    Literal::String(arg_value.to_text()),
+                    Literal::String(text),
                     fsqlite_ast::Span::ZERO,
                 ))
             })
         } else {
             None
         };
-        let schema = if let Some(arg) = args.get(1)
-            && !pragma_table_function_is_no_arg(name)
-        {
+        let schema = if let Some(arg) = args.get(1) {
             let value = self
                 .eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)
                 .await?;
-            (!value.is_null()).then(|| value.to_text())
+            pragma_table_function_text(&value)
         } else {
             None
         };
@@ -163877,14 +163905,14 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         match source {
             TableOrSubquery::Table { name, .. } => self.validate_relation(name),
             TableOrSubquery::Subquery { query, .. } => self.validate_select(query),
-            TableOrSubquery::TableFunction { name, .. } => {
-                self.validate_table_function_source(name)
+            TableOrSubquery::TableFunction { name, args, .. } => {
+                self.validate_table_function_source(name, args.len())
             }
             TableOrSubquery::ParenJoin(from) => self.validate_from_sources(from),
         }
     }
 
-    fn validate_table_function_source(&self, name: &str) -> Result<()> {
+    fn validate_table_function_source(&self, name: &str, arg_count: usize) -> Result<()> {
         match self.unqualified_table_function_catalog_match(name)? {
             TableFunctionCatalogMatch::CallableVirtual => return Ok(()),
             TableFunctionCatalogMatch::Ordinary => {
@@ -163893,6 +163921,9 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                 )));
             }
             TableFunctionCatalogMatch::Missing => {}
+        }
+        if pragma_table_function_columns(name).is_some() {
+            return validate_pragma_table_function_arity(name, arg_count);
         }
         if self
             .connection

@@ -268,6 +268,84 @@ fn pragma_tvf_positional_schema_selects_the_named_catalog() {
 }
 
 #[test]
+fn pragma_tvf_rejects_extra_arguments_at_prepare() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        f.execute("CREATE TABLE t(k)").await.unwrap();
+        r.execute("CREATE TABLE t(k)", []).unwrap();
+        let mut diffs = Vec::new();
+        for sql in [
+            "SELECT * FROM pragma_table_info('t','main',NULL) WHERE 0",
+            "SELECT * FROM pragma_table_list('t',NULL)",
+            "SELECT * FROM pragma_compile_options(NULL)",
+            "SELECT * FROM PRAGMA_TABLE_XINFO('t','main',NULL)",
+            "SELECT * FROM (SELECT * FROM pragma_index_info('i','main',NULL))",
+            "WITH c AS (SELECT * FROM pragma_foreign_key_list('t','main',NULL)) SELECT * FROM c",
+            "SELECT 1 FROM t CROSS JOIN pragma_database_list(NULL) LIMIT 0",
+        ] {
+            let Err(error) = r.prepare(sql) else {
+                panic!("stock prepared an over-applied PRAGMA table function: {sql}");
+            };
+            let expected = match error {
+                rusqlite::Error::SqlInputError { msg, .. }
+                | rusqlite::Error::SqliteFailure(_, Some(msg)) => msg,
+                other => panic!("unexpected stock error for {sql}: {other}"),
+            };
+            assert!(expected.starts_with("too many arguments on "));
+            let prepared = f.prepare(sql).await.err().map(|error| error.to_string());
+            let direct = f.query(sql).await.err().map(|error| error.to_string());
+            if prepared.as_deref() != Some(expected.as_str())
+                || direct.as_deref() != Some(expected.as_str())
+            {
+                diffs.push(format!("{sql}: prepare={prepared:?}, direct={direct:?}, stock={expected}"));
+            }
+        }
+        for sql in [
+            "SELECT name FROM pragma_table_info('t','main')",
+            "SELECT name FROM pragma_table_list('t')",
+            "SELECT count(*) > 0 FROM pragma_compile_options()",
+        ] {
+            assert_eq!(fq(&f, sql).await, rq(&r, sql), "{sql}");
+        }
+        f.close().await.unwrap();
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    });
+}
+
+#[test]
+fn pragma_tvf_identifiers_stop_at_the_first_nul() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE t(m)",
+            "CREATE TEMP TABLE t(p)",
+            "ATTACH ':memory:' AS aux",
+            "CREATE TABLE aux.t(a)",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+        for (sql, name) in [
+            ("SELECT name FROM pragma_table_info('t' || char(0) || 'tail','main')", "m"),
+            ("SELECT name FROM pragma_table_info('t','temp' || char(0) || 'tail')", "p"),
+            ("SELECT name FROM pragma_table_info(x'74007461696c',x'617578007461696c')", "a"),
+        ] {
+            let expected = rq(&r, sql);
+            assert_eq!(expected, vec![vec![format!("text:{name}")]], "stock: {sql}");
+            assert_eq!(fq(&f, sql).await, expected, "direct: {sql}");
+            let statement = f.prepare(sql).await.unwrap();
+            let rows = statement.query().await.unwrap();
+            assert_eq!(rows.len(), 1, "prepared: {sql}");
+            assert_eq!(rows[0].values(), &[SqliteValue::from(name)], "prepared: {sql}");
+        }
+        f.execute("DETACH aux").await.unwrap();
+        f.close().await.unwrap();
+    });
+}
+
+#[test]
 fn gh512_pragma_table_info_quoted_and_parenthesized_pk_ordinals() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
