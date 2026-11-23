@@ -1619,9 +1619,14 @@ where
         .map(|row| row.values().len())
         .unwrap_or(column_names.len());
     let mut widths = vec![0usize; column_count];
+    let rendered_names: Vec<_> = column_names
+        .iter()
+        .take(column_count)
+        .map(|name| expand_column_tabs(Cow::Borrowed(name.as_bytes())))
+        .collect();
 
-    for (index, name) in column_names.iter().take(column_count).enumerate() {
-        widths[index] = widths[index].max(name.chars().count());
+    for (width, name) in widths.iter_mut().zip(&rendered_names) {
+        *width = display_character_count(name);
     }
 
     let rendered_rows = rows
@@ -1629,7 +1634,7 @@ where
         .map(|row| {
             row.values()
                 .iter()
-                .map(render_display_value)
+                .map(|value| expand_column_tabs(render_display_value(value)))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -1640,12 +1645,8 @@ where
         }
     }
 
-    if show_headers && !column_names.is_empty() {
-        let names: Vec<_> = column_names
-            .iter()
-            .map(|name| Cow::Borrowed(name.as_bytes()))
-            .collect();
-        write_column_line(&names, &widths, out)?;
+    if show_headers && !rendered_names.is_empty() {
+        write_column_line(&rendered_names, &widths, out)?;
         let underline = widths
             .iter()
             .map(|width| "-".repeat(*width))
@@ -1695,9 +1696,38 @@ where
 }
 
 fn display_character_count(value: &[u8]) -> usize {
-    // Lossy decoding is used only for alignment; output retains the original
-    // bytes, including invalid UTF-8.
-    String::from_utf8_lossy(value).chars().count()
+    // The stock column renderer counts UTF-8 leading bytes for field widths.
+    value.iter().filter(|&&byte| byte & 0xc0 != 0x80).count()
+}
+
+fn expand_column_tabs(value: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
+    if !value.contains(&b'\t') {
+        return value;
+    }
+    const TAB_STOP: usize = 8;
+    let mut output = Vec::with_capacity(value.len());
+    let mut column = 0;
+    for (index, part) in value.split(|&byte| byte == b'\t').enumerate() {
+        if index != 0 {
+            let spaces = TAB_STOP - column % TAB_STOP;
+            output.extend(std::iter::repeat_n(b' ', spaces));
+            column += spaces;
+        }
+        output.extend_from_slice(part);
+        let last_line = part
+            .rsplit(|&byte| byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        if last_line.len() != part.len() {
+            column = 0;
+        }
+        // The stock tab scan advances once for the first byte of each
+        // fragment, even when the fragment begins with a continuation byte.
+        column += last_line
+            .split_first()
+            .map_or(0, |(_, remaining)| 1 + display_character_count(remaining));
+    }
+    Cow::Owned(output)
 }
 
 fn write_column_line<W: Write>(
@@ -5054,6 +5084,52 @@ SELECT 1 AS one, 'two,three' AS two;\n\
             assert_eq!(system_sqlite3_stdout(script.as_bytes()), expected);
             eprintln!("event=display_bytes_stock_verified sqlite={version}");
         }
+    }
+
+    #[test]
+    fn test_returning_headers_and_column_tab_stops() {
+        asupersync::test_utils::run_test(|| async {
+            let script = concat!(
+                ".headers on\n",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, v REAL);\n",
+                "INSERT INTO t VALUES(4,'r',3.0) RETURNING id, name;\n",
+                ".mode line\n",
+                "UPDATE t SET v=4.0 WHERE id=4 RETURNING v;\n",
+                ".mode column\n",
+                "DELETE FROM t WHERE id=4 RETURNING *;\n",
+                "SELECT 'x' AS a, 'tab\there' AS b, 'z' AS c ",
+                "UNION ALL SELECT 'aaaa', 'à\tβ\t!', 'q';\n",
+                "SELECT 'a' AS 'a\tname', 'b' AS 'b\tname';\n",
+                ".headers off\n",
+                ".mode tabs\n",
+                "SELECT 'tab\there' AS a, 'z' AS b;\n",
+            );
+            let expected = concat!(
+                "id|name\n",
+                "4|r\n",
+                "    v = 4.0\n",
+                "id  name  v  \n",
+                "--  ----  ---\n",
+                "4   r     4.0\n",
+                "a     b                  c\n",
+                "----  -----------------  -\n",
+                "x     tab     here       z\n",
+                "aaaa  à       β       !  q\n",
+                "a       name  b       name\n",
+                "------------  ------------\n",
+                "a             b           \n",
+                "tab\there\tz\n",
+            );
+            assert_display_script_matches_stock(script, expected.as_bytes()).await;
+            assert_display_script_matches_stock(
+                ".mode column\n\
+                 SELECT 'x' AS a, x'61800962' AS b, 'z' AS c;\n\
+                 SELECT x'80810962' AS b;\n",
+                b"a  b          c\n-  ---------  -\nx  a\x80       b  z\n\
+                  b       \n--------\n\x80\x81       b\n",
+            )
+            .await;
+        });
     }
 
     #[test]
