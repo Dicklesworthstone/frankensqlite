@@ -40393,6 +40393,12 @@ fn extract_rowid_eq_residual_target<'a>(
     table_alias: Option<&str>,
 ) -> Option<&'a Expr> {
     let where_expr = where_clause?;
+    // As with indexed DML (GH#541), an extracted rowid probe must not claim
+    // an earlier conjunct's anonymous slot. Already-numbered bindings retain
+    // their seek; raw predicates stay in source order on the scan path.
+    if expr_contains_non_numbered_placeholder(where_expr) {
+        return None;
+    }
     let mut conjuncts = Vec::new();
     collect_conjunctive_terms(where_expr, &mut conjuncts);
     if conjuncts.len() < 2 {

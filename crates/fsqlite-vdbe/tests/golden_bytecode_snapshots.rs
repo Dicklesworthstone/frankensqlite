@@ -1,5 +1,6 @@
 use fsqlite_ast::{SelectStatement, Statement};
 use fsqlite_parser::parse_first_statement_with_tail;
+use fsqlite_types::opcode::{Opcode, VdbeOp};
 use fsqlite_vdbe::{
     ProgramBuilder,
     codegen::{
@@ -427,5 +428,106 @@ fn golden_vdbe_update_delete_where_bytecode_family() -> Result<(), String> {
     )?;
     insta::assert_snapshot!("delete_with_where_predicate", delete_where);
 
+    Ok(())
+}
+
+/// Compile the parser's raw AST, bypassing Connection's parameter
+/// canonicalization so these tests exercise the direct codegen contract.
+fn gh541_dml_ops(sql: &str) -> Result<Vec<VdbeOp>, String> {
+    let statement = parse_statement(sql)?;
+    let schema = snapshot_schema();
+    let mut builder = ProgramBuilder::new();
+    let ctx = CodegenContext::default();
+    match statement {
+        Statement::Update(stmt) => codegen_update(&mut builder, &stmt, &schema, &ctx),
+        Statement::Delete(stmt) => codegen_delete(&mut builder, &stmt, &schema, &ctx),
+        other => return Err(format!("expected UPDATE or DELETE, got {other:?}")),
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(builder
+        .finish()
+        .map_err(|error| error.to_string())?
+        .ops()
+        .to_vec())
+}
+
+#[test]
+fn gh541_raw_anonymous_rowid_dml_keeps_sql_order() -> Result<(), String> {
+    for (sql, expected_slots) in [
+        (
+            "UPDATE docs SET score = ? WHERE category_id = ? AND rowid = ?",
+            vec![2, 3, 1],
+        ),
+        (
+            "UPDATE docs SET score = 9 WHERE category_id = ? AND ? = rowid",
+            vec![1, 2],
+        ),
+        (
+            "UPDATE docs SET score = ? WHERE category_id = ? AND title = ? AND id = ?",
+            vec![2, 3, 4, 1],
+        ),
+        (
+            "DELETE FROM docs WHERE category_id = ? AND rowid = ?",
+            vec![1, 2],
+        ),
+        (
+            "DELETE FROM docs WHERE category_id = ? AND ? = rowid AND title = ?",
+            vec![1, 2, 3],
+        ),
+    ] {
+        let ops = gh541_dml_ops(sql)?;
+        let slots: Vec<_> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect();
+        assert_eq!(
+            slots, expected_slots,
+            "{sql}: an extracted rowid must not consume an earlier predicate's slot"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "{sql}: raw anonymous predicates must retain the textual scan until numbered"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn gh541_numbered_rowid_dml_retains_seek() -> Result<(), String> {
+    for (sql, expected_slots) in [
+        (
+            "UPDATE docs SET score = ?1 WHERE category_id = ?2 AND rowid = ?3",
+            vec![3, 2, 3, 1],
+        ),
+        (
+            "UPDATE docs SET score = ?1 WHERE category_id = ?2 AND title = ?3 AND id = ?4",
+            vec![4, 2, 3, 4, 1],
+        ),
+        (
+            "DELETE FROM docs WHERE category_id = ?1 AND rowid = ?2",
+            vec![2, 1, 2],
+        ),
+        (
+            "DELETE FROM docs WHERE category_id = ?1 AND ?2 = rowid AND title = ?3",
+            vec![2, 1, 2, 3],
+        ),
+    ] {
+        let ops = gh541_dml_ops(sql)?;
+        let slots: Vec<_> = ops
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect();
+        assert_eq!(
+            slots, expected_slots,
+            "{sql}: probe and residual bind slots"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekRowid)
+                && !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "{sql}: canonicalized parameters must retain the rowid seek"
+        );
+    }
     Ok(())
 }
