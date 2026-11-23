@@ -54817,17 +54817,25 @@ impl Connection {
         name: &str,
         scope: PragmaSchemaScope,
     ) -> Option<Vec<String>> {
+        self.with_local_table_schema(name, scope, |table| {
+            table.columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        })
+    }
+
+    fn with_local_table_schema<T>(
+        &self,
+        name: &str,
+        scope: PragmaSchemaScope,
+        read: impl FnOnce(&TableSchema) -> T,
+    ) -> Option<T> {
         let key = name.to_ascii_lowercase();
         if scope == PragmaSchemaScope::Main
             && let Some(table) = self.shadowed_main_tables.borrow().get(&key)
         {
-            return Some(
-                table
-                    .columns
-                    .iter()
-                    .map(|column| column.name.clone())
-                    .collect(),
-            );
+            return Some(read(table));
         }
         let index = self.schema_index_of(name)?;
         let is_temp = self.temp_table_names.borrow().contains(&key);
@@ -54836,13 +54844,7 @@ impl Connection {
         {
             return None;
         }
-        self.schema.borrow().get(index).map(|table| {
-            table
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect()
-        })
+        self.schema.borrow().get(index).map(read)
     }
 
     /// bd-1mcjr L9: the RAISE(IGNORE) row-skip filter rewrites the DML to
@@ -58409,32 +58411,10 @@ impl Connection {
     /// `VARCHAR(20)`, not its affinity), while any expression / literal /
     /// aggregate reports an empty type. Used by `PRAGMA table_info(<view>)`
     /// (bd-pragma-table-info-view-decltype-moufi).
-    ///
-    /// Only a single bare base table (no joins) is resolved to source-column
-    /// types; a join / subquery / nested view / table-function / FROM-less
-    /// SELECT yields an empty result, which the caller pads to all-empty types
-    /// to match the output column count. This closes the common
-    /// single-base-table view exactly and never emits a WRONG type — SQLite
-    /// itself reports an empty type for expression columns.
-    fn view_result_column_decltypes(
+    fn view_result_column_decltypes<'view>(
         &self,
-        query: &SelectStatement,
-        tables: &[TableSchema],
-    ) -> Vec<Option<String>> {
-        self.view_result_column_decltypes_at_depth(query, tables, 0)
-    }
-
-    /// bd-pragma-table-info-view-decltype-multisource: resolve each view output
-    /// column's declared type by walking the FROM clause across joins and
-    /// recursing into subquery / nested-view sources (mirroring the multi-source
-    /// NAME resolution and stock `sqlite3ColumnType`). A direct (possibly
-    /// qualified) column reference takes its source column's `type_name`
-    /// verbatim; an expression, or a column from an unresolved source (table
-    /// function / parenthesized join), yields `None` (empty type, like stock).
-    fn view_result_column_decltypes_at_depth(
-        &self,
-        query: &SelectStatement,
-        tables: &[TableSchema],
+        query: &'view SelectStatement,
+        outer_ctes: &[&'view [fsqlite_ast::Cte]],
         depth: usize,
     ) -> Vec<Option<String>> {
         // Guard against a pathological source cycle; real views are acyclic.
@@ -58444,6 +58424,10 @@ impl Connection {
         let SelectCore::Select { columns, from, .. } = &query.body.select else {
             return Vec::new();
         };
+        let mut visible_ctes = Cow::Borrowed(outer_ctes);
+        if let Some(with) = &query.with {
+            visible_ctes.to_mut().push(&with.ctes);
+        }
         // Each FROM source resolved to (effective name = alias or table name,
         // its output columns as (name, decltype)).
         let mut sources: Vec<ResolvedViewFromSource> = Vec::new();
@@ -58451,7 +58435,9 @@ impl Connection {
             for source in std::iter::once(&from_clause.source)
                 .chain(from_clause.joins.iter().map(|join| &join.table))
             {
-                if let Some(resolved) = self.resolve_from_source_decltypes(source, tables, depth) {
+                if let Some(resolved) =
+                    self.resolve_from_source_decltypes(source, &visible_ctes, depth)
+                {
                     sources.push(resolved);
                 }
             }
@@ -58496,54 +58482,57 @@ impl Connection {
     /// tables read the schema; nested views and subqueries recurse; other sources
     /// (table functions, parenthesized joins) return `None` so their columns stay
     /// unresolved (empty type).
-    fn resolve_from_source_decltypes(
+    fn resolve_from_source_decltypes<'view>(
         &self,
-        source: &TableOrSubquery,
-        tables: &[TableSchema],
+        source: &'view TableOrSubquery,
+        visible_ctes: &[&'view [fsqlite_ast::Cte]],
         depth: usize,
     ) -> Option<ResolvedViewFromSource> {
         match source {
             TableOrSubquery::Table { name, alias, .. } => {
                 let effective = alias.clone().or_else(|| Some(name.name.clone()));
-                if let Some(table) = tables
-                    .iter()
-                    .find(|t| t.name.eq_ignore_ascii_case(&name.name))
-                {
-                    let cols = table
-                        .columns
+                if name.schema.is_none()
+                    && let Some((owner, cte)) = visible_ctes
                         .iter()
-                        .map(|c| (c.name.clone(), c.type_name.clone()))
+                        .enumerate()
+                        .rev()
+                        .find_map(|(owner, scope)| {
+                            scope
+                                .iter()
+                                .rev()
+                                .find(|cte| cte.name.eq_ignore_ascii_case(&name.name))
+                                .map(|cte| (owner, cte))
+                        })
+                {
+                    // A reference in an inner query cannot change the names
+                    // visible inside the CTE's definition.
+                    let defining_ctes = &visible_ctes[..=owner];
+                    let names = self.cte_result_column_names(
+                        cte,
+                        &flatten_view_cte_scopes(defining_ctes),
+                        &mut Vec::new(),
+                    );
+                    let types = self.view_result_column_decltypes(
+                        &cte.query,
+                        defining_ctes,
+                        depth + 1,
+                    );
+                    let columns = names
+                        .into_iter()
+                        .zip(types.into_iter().chain(std::iter::repeat(None)))
                         .collect();
-                    return Some((effective, cols));
+                    return Some((effective, columns));
                 }
-                // Nested view: recurse into its SELECT (clone out of the borrow
-                // first so the recursion can re-borrow `self.views`).
-                let (view_query, view_names) = {
-                    let idx =
-                        self.view_index_for_scope(&name.name, PragmaSchemaScope::Unqualified)?;
-                    let views = self.views.borrow();
-                    let view = views.get(idx)?;
-                    let names = if view.columns.is_empty() {
-                        Self::deduplicate_relation_column_names(
-                            self.select_result_column_names(&view.query, &[], &mut Vec::new()),
-                        )
-                    } else {
-                        Self::deduplicate_relation_column_names(view.columns.clone())
-                    };
-                    (view.query.clone(), names)
-                };
-                let types =
-                    self.view_result_column_decltypes_at_depth(&view_query, tables, depth + 1);
-                let cols = view_names
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, n)| (n, types.get(i).cloned().flatten()))
-                    .collect();
-                Some((effective, cols))
+                let columns = self.view_relation_decltypes(name, depth + 1)?;
+                Some((effective, columns))
             }
             TableOrSubquery::Subquery { query, alias } => {
-                let names = self.select_result_column_names(query, &[], &mut Vec::new());
-                let types = self.view_result_column_decltypes_at_depth(query, tables, depth + 1);
+                let names = self.select_result_column_names(
+                    query,
+                    &flatten_view_cte_scopes(visible_ctes),
+                    &mut Vec::new(),
+                );
+                let types = self.view_result_column_decltypes(query, visible_ctes, depth + 1);
                 let cols = names
                     .into_iter()
                     .enumerate()
@@ -58553,6 +58542,86 @@ impl Connection {
             }
             _ => None,
         }
+    }
+
+    fn view_relation_decltypes(
+        &self,
+        relation: &QualifiedName,
+        depth: usize,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        let name = &relation.name;
+        if let Some(schema) = relation.schema.as_deref() {
+            if schema.eq_ignore_ascii_case("main") {
+                return self.view_local_relation_decltypes(name, PragmaSchemaScope::Main, depth);
+            }
+            if schema.eq_ignore_ascii_case("temp") {
+                return self.view_local_relation_decltypes(name, PragmaSchemaScope::Temp, depth);
+            }
+            return self
+                .with_attached_connection(schema, |child| {
+                    Ok(child.view_local_relation_decltypes(name, PragmaSchemaScope::Main, depth))
+                })
+                .ok()
+                .flatten();
+        }
+        if let Some(columns) = [PragmaSchemaScope::Temp, PragmaSchemaScope::Main]
+            .into_iter()
+            .find_map(|scope| self.view_local_relation_decltypes(name, scope, depth))
+        {
+            return Some(columns);
+        }
+        let attached = self
+            .attached_schemas
+            .borrow()
+            .all_schemas()
+            .into_iter()
+            .skip(2)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        attached.iter().find_map(|schema| {
+            self.with_attached_connection(schema, |child| {
+                Ok(child.view_local_relation_decltypes(name, PragmaSchemaScope::Main, depth))
+            })
+            .ok()
+            .flatten()
+        })
+    }
+
+    fn view_local_relation_decltypes(
+        &self,
+        name: &str,
+        scope: PragmaSchemaScope,
+        depth: usize,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        if is_schema_relation_in_scope(name, scope) {
+            return Some(
+                sqlite_master_column_infos()
+                    .into_iter()
+                    .map(|column| (column.name, column.type_name))
+                    .collect(),
+            );
+        }
+        if let Some(columns) = self.with_local_table_schema(name, scope, |table| {
+            table
+                .columns
+                .iter()
+                .map(|column| (column.name.clone(), column.type_name.clone()))
+                .collect()
+        }) {
+            return Some(columns);
+        }
+        let index = self.view_index_for_scope(name, scope)?;
+        let view = self.views.borrow().get(index).cloned()?;
+        let query = self.view_metadata_query(&view);
+        let names = self.view_metadata_names(&view, &query);
+        // The stored view body has its own lexical scope.
+        let types = self.view_result_column_decltypes(&query, &[], depth);
+        Some(
+            names
+                .into_iter()
+                .zip(types.into_iter().chain(std::iter::repeat(None)))
+                .collect(),
+        )
     }
 
     fn resolve_view_column_ref_decltype(
@@ -58580,63 +58649,49 @@ impl Connection {
         }
     }
 
-    /// Build the `PRAGMA table_info` / `table_xinfo` rows for a VIEW: one row
-    /// per view output column (cid, name, type, notnull, dflt_value, pk, and a
-    /// trailing `hidden` for `table_xinfo`). Views always report notnull=0,
-    /// dflt_value=NULL, pk=0, hidden=0; only the declared type varies (resolved
-    /// via `view_result_column_decltypes`). Column names come from an explicit
-    /// `CREATE VIEW v(...)` list when present, else the SELECT's own output
-    /// names. (bd-pragma-table-info-view-decltype-moufi)
-    fn build_view_table_info_rows(
-        &self,
-        view: &ViewDef,
-        tables: &[TableSchema],
-        is_xinfo: bool,
-    ) -> Vec<Row> {
-        let bound_query = self
-            .bind_schema_qualified_columns(&Statement::Select(view.query.clone()))
+    /// Persistent views resolve their own relations in their owning catalog.
+    /// An attachment's persistent views run on its child connection.
+    fn view_metadata_query(&self, view: &ViewDef) -> SelectStatement {
+        let mut query = view.query.clone();
+        if !view.temporary {
+            qualify_persistent_view_relations(&mut query);
+        }
+        let statement = Statement::Select(query);
+        let statement = self
+            .bind_schema_qualified_columns(&statement)
             .ok()
             .flatten()
-            .and_then(|stmt| match stmt {
-                Statement::Select(select) => Some(select),
-                _ => None,
-            });
-        let view_query = bound_query.as_ref().unwrap_or(&view.query);
-        let names: Vec<String> = if view.columns.is_empty() {
-            Self::deduplicate_relation_column_names(self.select_result_column_names(
-                view_query,
-                &[],
-                &mut Vec::new(),
-            ))
-        } else {
-            Self::deduplicate_relation_column_names(view.columns.clone())
+            .unwrap_or(statement);
+        let Statement::Select(query) = statement else {
+            unreachable!("binding a SELECT must return a SELECT");
         };
+        query
+    }
+
+    fn view_metadata_names(&self, view: &ViewDef, query: &SelectStatement) -> Vec<String> {
+        let columns = if view.columns.is_empty() {
+            self.select_result_column_names(query, &[], &mut Vec::new())
+        } else {
+            view.columns.clone()
+        };
+        Self::deduplicate_relation_column_names(columns)
+    }
+
+    fn build_view_table_info_rows(&self, view: &ViewDef, is_xinfo: bool) -> Vec<Row> {
+        let query = self.view_metadata_query(view);
+        let names = self.view_metadata_names(view, &query);
         // Decltypes are computed from the SELECT projection and must align by
         // position with `names`; a length mismatch (e.g. `*` over a non-simple
         // source) falls back to all-empty types rather than misaligning.
-        let mut decltypes = self.view_result_column_decltypes(view_query, tables);
+        let mut decltypes = self.view_result_column_decltypes(&query, &[], 0);
         if decltypes.len() != names.len() {
             decltypes = vec![None; names.len()];
         }
         names
-            .iter()
+            .into_iter()
             .zip(decltypes)
             .enumerate()
-            .map(|(i, (name, decltype))| {
-                let type_str = decltype.unwrap_or_default();
-                let mut values = vec![
-                    SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
-                    SqliteValue::Text(name.clone().into()),
-                    SqliteValue::Text(type_str.into()),
-                    SqliteValue::Integer(0),
-                    SqliteValue::Null,
-                    SqliteValue::Integer(0),
-                ];
-                if is_xinfo {
-                    values.push(SqliteValue::Integer(0));
-                }
-                Row { values }
-            })
+            .map(|(cid, (name, decltype))| pragma_catalog_column_row(cid, name, decltype, is_xinfo))
             .collect()
     }
 
@@ -60167,10 +60222,7 @@ impl Connection {
         // have the same layout unqualified or under `temp.` (bd-9gfen: a
         // nested scope bound no columns for them); `main.sqlite_temp_master`
         // is no table, as `builtin_schema_relation_exists` holds.
-        if is_sqlite_schema_name(relation_name)
-            || (requested_scope != PragmaSchemaScope::Main
-                && canonical_sqlite_temp_schema_name(relation_name).is_some())
-        {
+        if is_schema_relation_in_scope(relation_name, requested_scope) {
             return sqlite_master_column_infos()
                 .into_iter()
                 .map(|column| column.name)
@@ -92018,6 +92070,9 @@ impl Connection {
         object: PragmaCatalogObject,
         name: &str,
     ) -> Result<Option<String>> {
+        if is_schema_relation_in_scope(name, PragmaSchemaScope::Unqualified) {
+            return Ok(None);
+        }
         if object == PragmaCatalogObject::Index {
             // A named index in any schema wins before the WITHOUT ROWID
             // table-name fallback, even if that table is in TEMP or main.
@@ -94332,7 +94387,18 @@ impl Connection {
                     },
                     None => return Ok(Vec::new()),
                 };
-                let tables = self.pragma_table_schemas_for_scope(pragma_schema_scope(pragma));
+                let scope = pragma_schema_scope(pragma);
+                let is_xinfo = full_name == "table_xinfo";
+                if is_schema_relation_in_scope(&table_name, scope) {
+                    return Ok(sqlite_master_column_infos()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(cid, column)| {
+                            pragma_catalog_column_row(cid, column.name, column.type_name, is_xinfo)
+                        })
+                        .collect());
+                }
+                let tables = self.pragma_table_schemas_for_scope(scope);
                 let table = tables
                     .iter()
                     .find(|t| t.name.eq_ignore_ascii_case(&table_name));
@@ -94341,7 +94407,6 @@ impl Connection {
                         // table_xinfo extends table_info with a trailing `hidden`
                         // column: 0 normal, 2 VIRTUAL generated, 3 STORED
                         // generated (bd-ewj3w).
-                        let is_xinfo = full_name == "table_xinfo";
                         let pk_positions = self.compute_pk_positions(t);
                         // table_info omits generated columns (they surface only in
                         // table_xinfo) and renumbers cid over the remaining
@@ -94407,7 +94472,6 @@ impl Connection {
                     // reports one row per view OUTPUT column
                     // (bd-pragma-table-info-view-decltype-moufi).
                     None => {
-                        let scope = pragma_schema_scope(pragma);
                         let view = self
                             .view_index_for_scope(&table_name, scope)
                             .and_then(|idx| self.views.borrow().get(idx).cloned());
@@ -94423,18 +94487,7 @@ impl Connection {
                                     "main",
                                     || table_name.clone(),
                                 )?;
-                                // A TEMP view may refer to main tables. Its
-                                // own catalog does not constrain its sources.
-                                let source_tables = if scope == PragmaSchemaScope::Temp {
-                                    Cow::Owned(self.pragma_table_schemas_for_scope(PragmaSchemaScope::Unqualified))
-                                } else {
-                                    Cow::Borrowed(tables.as_slice())
-                                };
-                                Ok(self.build_view_table_info_rows(
-                                    &view,
-                                    &source_tables,
-                                    full_name == "table_xinfo",
-                                ))
+                                Ok(self.build_view_table_info_rows(&view, is_xinfo))
                             }
                             None => Ok(Vec::new()),
                         }
@@ -94508,15 +94561,15 @@ impl Connection {
                         // into creation order so the reversal matches stock's
                         // ordering. (GH #344 / bd-sn184)
                         if let Some(pk_ordinal) = pragma_without_rowid_pk_ordinal(t) {
-                                let name = format!("sqlite_autoindex_{}_{pk_ordinal}", t.name);
-                                let pos = entries
-                                    .iter()
-                                    .position(|(nm, _, _, _, _)| {
-                                        parse_autoindex_ordinal(nm, &t.name)
-                                            .is_some_and(|o| o > pk_ordinal)
-                                    })
-                                    .unwrap_or(entries.len());
-                                entries.insert(pos, (name, 1, "pk", 0, false));
+                            let name = format!("sqlite_autoindex_{}_{pk_ordinal}", t.name);
+                            let pos = entries
+                                .iter()
+                                .position(|(nm, _, _, _, _)| {
+                                    parse_autoindex_ordinal(nm, &t.name)
+                                        .is_some_and(|o| o > pk_ordinal)
+                                })
+                                .unwrap_or(entries.len());
+                            entries.insert(pos, (name, 1, "pk", 0, false));
                         }
 
                         // Stock lists `Table.pIndex`: newest first, except that
@@ -94785,6 +94838,7 @@ impl Connection {
                 if let Some(name) = &only_table
                     && !schema.iter().any(|t| t.name.eq_ignore_ascii_case(name))
                     && self.view_index_for_scope(name, check_scope).is_none()
+                    && !is_schema_relation_in_scope(name, check_scope)
                 {
                     return Err(FrankenError::NoSuchTable { name: name.clone() });
                 }
@@ -129232,6 +129286,37 @@ fn canonical_sqlite_temp_schema_name(name: &str) -> Option<&'static str> {
     }
 }
 
+fn is_schema_relation_in_scope(name: &str, scope: PragmaSchemaScope) -> bool {
+    is_sqlite_schema_name(name)
+        || (scope != PragmaSchemaScope::Main && canonical_sqlite_temp_schema_name(name).is_some())
+}
+
+fn flatten_view_cte_scopes(scopes: &[&[fsqlite_ast::Cte]]) -> Vec<fsqlite_ast::Cte> {
+    scopes.iter().flat_map(|scope| scope.iter().cloned()).collect()
+}
+
+/// Views and SQLite's schema tables share the same constraint-free PRAGMA
+/// column descriptor. `table_xinfo` adds the final hidden flag.
+fn pragma_catalog_column_row(
+    cid: usize,
+    name: String,
+    decltype: Option<String>,
+    is_xinfo: bool,
+) -> Row {
+    let mut values = vec![
+        SqliteValue::Integer(i64::try_from(cid).unwrap_or(0)),
+        SqliteValue::Text(name.into()),
+        SqliteValue::Text(decltype.unwrap_or_default().into()),
+        SqliteValue::Integer(0),
+        SqliteValue::Null,
+        SqliteValue::Integer(0),
+    ];
+    if is_xinfo {
+        values.push(SqliteValue::Integer(0));
+    }
+    Row { values }
+}
+
 fn is_internal_sqlite_table(name: &str) -> bool {
     is_sqlite_schema_name(name)
         || name.eq_ignore_ascii_case("sqlite_sequence")
@@ -129248,7 +129333,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             name: "type".to_owned(),
             affinity: 'B',
             is_ipk: false,
-            type_name: None,
+            type_name: Some("TEXT".to_owned()),
             notnull: false,
             unique: false,
             default_value: None,
@@ -129262,7 +129347,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             name: "name".to_owned(),
             affinity: 'B',
             is_ipk: false,
-            type_name: None,
+            type_name: Some("TEXT".to_owned()),
             notnull: false,
             unique: false,
             default_value: None,
@@ -129276,7 +129361,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             name: "tbl_name".to_owned(),
             affinity: 'B',
             is_ipk: false,
-            type_name: None,
+            type_name: Some("TEXT".to_owned()),
             notnull: false,
             unique: false,
             default_value: None,
@@ -129290,7 +129375,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             name: "rootpage".to_owned(),
             affinity: 'D',
             is_ipk: false,
-            type_name: None,
+            type_name: Some("INT".to_owned()),
             notnull: false,
             unique: false,
             default_value: None,
@@ -129304,7 +129389,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             name: "sql".to_owned(),
             affinity: 'B',
             is_ipk: false,
-            type_name: None,
+            type_name: Some("TEXT".to_owned()),
             notnull: false,
             unique: false,
             default_value: None,
@@ -164638,12 +164723,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         relation_name: &str,
         scope: PragmaSchemaScope,
     ) -> bool {
-        if is_sqlite_schema_name(relation_name) {
-            return true;
-        }
-        (scope == PragmaSchemaScope::Unqualified || scope == PragmaSchemaScope::Temp)
-            && (relation_name.eq_ignore_ascii_case("sqlite_temp_schema")
-                || relation_name.eq_ignore_ascii_case("sqlite_temp_master"))
+        is_schema_relation_in_scope(relation_name, scope)
     }
 
     fn local_table_exists(&self, relation_name: &str, scope: PragmaSchemaScope) -> bool {

@@ -469,6 +469,106 @@ fn metadata_pragma_lookup_refreshes_an_attached_file_catalog() {
 }
 
 #[test]
+fn pragma_view_metadata_uses_the_source_catalog() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE t(v INTEGER, main_only VARCHAR(20))",
+            "CREATE VIEW leaf AS SELECT v FROM t",
+            "CREATE VIEW nested AS SELECT v FROM leaf",
+            "CREATE VIEW wide AS SELECT * FROM t",
+            "CREATE TEMP TABLE t(v TEXT)",
+            "CREATE TEMP TABLE c(v TEXT)",
+            "CREATE TEMP VIEW leaf AS SELECT v FROM temp.t",
+            "CREATE TEMP VIEW explicit_main AS SELECT v FROM main.t",
+            "CREATE TEMP VIEW explicit_nested AS SELECT v FROM main.leaf",
+            "CREATE TEMP VIEW implicit_temp AS SELECT v FROM t",
+            "CREATE VIEW typed_cte AS WITH c AS (SELECT v FROM t) SELECT v FROM c",
+            "CREATE TABLE other_type(v TEXT)",
+            "CREATE VIEW shadowed_cte AS WITH b AS (SELECT v FROM t), c AS (SELECT v FROM b) \
+             SELECT q.v FROM (WITH b AS (SELECT v FROM other_type) SELECT v FROM c) AS q",
+            "ATTACH ':memory:' AS aux",
+            "CREATE TABLE aux.t(v REAL, attached_only BLOB)",
+            "CREATE VIEW aux.leaf AS SELECT * FROM t",
+            "CREATE TEMP VIEW explicit_aux AS SELECT * FROM aux.t",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+        let mut diffs = Vec::new();
+        for sql in [
+            "PRAGMA main.table_info('nested')",
+            "PRAGMA table_xinfo('explicit_main')",
+            "PRAGMA aux.table_info('leaf')",
+            "SELECT name,type FROM pragma_table_info('wide','main') ORDER BY cid",
+            "SELECT name,type FROM pragma_table_xinfo('explicit_nested')",
+            "SELECT name,type FROM pragma_table_info('implicit_temp')",
+            "SELECT name,type FROM pragma_table_info('typed_cte','main')",
+            "SELECT name,type FROM pragma_table_xinfo('shadowed_cte','main')",
+            "SELECT name,type FROM pragma_table_info('explicit_aux') ORDER BY cid",
+            "SELECT name,type FROM pragma_table_info('leaf')",
+            "SELECT name,type FROM pragma_table_info('leaf','main')",
+            "SELECT name,type FROM pragma_table_info('leaf','aux') ORDER BY cid",
+        ] {
+            let expected = rq(&r, sql);
+            assert!(!expected.is_empty() && expected != vec![vec!["ERR"]], "stock: {sql}");
+            let direct = fq(&f, sql).await;
+            let prepared = match f.prepare(sql).await {
+                Ok(statement) => statement.query().await.map(|rows| {
+                    rows.iter().map(|row| row.values().iter().map(tag_f).collect()).collect::<Vec<Vec<String>>>()
+                }),
+                Err(error) => Err(error),
+            };
+            if direct != expected || prepared.as_ref().ok() != Some(&expected) {
+                diffs.push(format!("{sql}: direct={direct:?}, prepared={prepared:?}, stock={expected:?}"));
+            }
+        }
+        f.execute("DETACH aux").await.unwrap();
+        f.close().await.unwrap();
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    });
+}
+
+#[test]
+fn pragma_introspects_schema_catalog_aliases_in_their_namespace() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let attach = "ATTACH ':memory:' AS aux";
+        f.execute(attach).await.unwrap();
+        r.execute(attach, []).unwrap();
+        let mut diffs = Vec::new();
+        for sql in [
+            "PRAGMA table_info('sqlite_schema')",
+            "PRAGMA table_xinfo('sqlite_temp_master')",
+            "PRAGMA aux.table_info('sqlite_master')",
+            "SELECT name,type FROM pragma_table_info('sqlite_schema','temp') ORDER BY cid",
+            "SELECT name,type,hidden FROM pragma_table_xinfo('sqlite_temp_schema','temp') ORDER BY cid",
+            "SELECT name,type FROM pragma_table_info('sqlite_master','aux') ORDER BY cid",
+            "SELECT count(*) FROM pragma_table_info('sqlite_temp_schema','main')",
+            "SELECT count(*) FROM pragma_table_xinfo('sqlite_temp_master','aux')",
+        ] {
+            let expected = rq(&r, sql);
+            assert!(!expected.is_empty() && expected != vec![vec!["ERR"]], "stock: {sql}");
+            let direct = fq(&f, sql).await;
+            let prepared = match f.prepare(sql).await {
+                Ok(statement) => statement.query().await.map(|rows| {
+                    rows.iter().map(|row| row.values().iter().map(tag_f).collect()).collect::<Vec<Vec<String>>>()
+                }),
+                Err(error) => Err(error),
+            };
+            if direct != expected || prepared.as_ref().ok() != Some(&expected) {
+                diffs.push(format!("{sql}: direct={direct:?}, prepared={prepared:?}, stock={expected:?}"));
+            }
+        }
+        f.execute("DETACH aux").await.unwrap();
+        f.close().await.unwrap();
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    });
+}
+
+#[test]
 fn gh512_pragma_table_info_quoted_and_parenthesized_pk_ordinals() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
