@@ -1892,7 +1892,7 @@ impl VirtualTableCursor for JsonEachCursor {
     }
 
     fn rowid(&self) -> Result<i64> {
-        Ok(self.rows.get(self.pos).map_or(0, |row| row.id))
+        json_table_cursor_rowid(self.pos, self.rows.len())
     }
 }
 
@@ -1961,8 +1961,17 @@ impl VirtualTableCursor for JsonTreeCursor {
     }
 
     fn rowid(&self) -> Result<i64> {
-        Ok(self.rows.get(self.pos).map_or(0, |row| row.id))
+        json_table_cursor_rowid(self.pos, self.rows.len())
     }
+}
+
+fn json_table_cursor_rowid(pos: usize, row_count: usize) -> Result<i64> {
+    if pos >= row_count {
+        return Ok(0);
+    }
+    i64::try_from(pos).map_err(|error| {
+        FrankenError::function_error(format!("JSON table rowid overflow: {error}"))
+    })
 }
 
 fn parse_json_text(input: &str) -> Result<Value> {
@@ -8459,6 +8468,51 @@ mod tests {
             values,
             vec![SqliteValue::Integer(10), SqliteValue::Integer(20)]
         );
+    }
+
+    #[test]
+    fn test_json_table_cursor_rowids_match_stock_and_reset_on_filter() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let cx = Cx::new();
+        let mut each = JsonEachCursor::default();
+        let mut tree = JsonTreeCursor::default();
+        let cursors: [(&str, &mut dyn VirtualTableCursor); 2] =
+            [("json_each", &mut each), ("json_tree", &mut tree)];
+        let nested = r#"{"a":[10,20,{"b":[30,40]}]}"#;
+        let args = [
+            (SqliteValue::from("[10,20,30]"), SqliteValue::from("$")),
+            (SqliteValue::from(nested), SqliteValue::from("$.a")),
+            (
+                SqliteValue::Blob(Arc::from(jsonb(nested).unwrap())),
+                SqliteValue::from("$.a[2].b"),
+            ),
+            (SqliteValue::from(nested), SqliteValue::from("$.absent")),
+            (SqliteValue::from("42"), SqliteValue::from("$")),
+        ];
+
+        for (name, cursor) in cursors {
+            for (input, root) in &args {
+                let args = [input.clone(), root.clone()];
+                let expected = stock_json_rows(
+                    &stock,
+                    &format!("SELECT rowid, value FROM {name}(?1, ?2)"),
+                    &args,
+                )
+                .unwrap();
+                cursor.filter(&cx, 0, None, &args).unwrap();
+                let mut actual = Vec::new();
+                while !cursor.eof() {
+                    let mut context = ColumnContext::new();
+                    cursor.column(&mut context, 1).unwrap();
+                    actual.push(vec![
+                        SqliteValue::Integer(cursor.rowid().unwrap()),
+                        context.take_value().unwrap(),
+                    ]);
+                    cursor.next(&cx).unwrap();
+                }
+                assert_eq!(actual, expected, "{name} input={input:?} root={root:?}");
+            }
+        }
     }
 
     #[test]
