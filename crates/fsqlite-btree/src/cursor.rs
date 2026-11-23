@@ -1864,6 +1864,13 @@ struct TableSeekCacheEntry {
 struct TableSeekCache {
     first: Option<TableSeekCacheEntry>,
     rest: Option<Box<[Option<TableSeekCacheEntry>; TABLE_SEEK_CACHE_SLOTS - 1]>>,
+    /// The answer of the slot scan [`BtCursor::try_table_seek_within_leaf`]
+    /// ran for a probe it then left to the general path: the probe's rowid
+    /// and the first slot that admits it (`TABLE_SEEK_CACHE_SLOTS` when none
+    /// does). [`BtCursor::try_table_seek_cache`] starts its scan there for
+    /// the same rowid, so a probe scans the slots once (bd-w4pr1.12, lever
+    /// SL2 v3). Every change to the slots drops it.
+    hint: Option<(i64, u8)>,
 }
 
 impl TableSeekCache {
@@ -1886,8 +1893,27 @@ impl TableSeekCache {
     /// Empty every slot; an allocation made for slots 1.. is kept.
     fn clear(&mut self) {
         self.first = None;
+        self.hint = None;
         if let Some(rest) = self.rest.as_mut() {
             rest.fill(None);
+        }
+    }
+
+    /// Record that no slot before `from` admits `rowid` (the `hint` field).
+    #[inline]
+    fn set_hint(&mut self, rowid: i64, from: usize) {
+        // Slot numbers stay below `TABLE_SEEK_CACHE_SLOTS`, far under u8::MAX;
+        // u8::MAX itself starts a scan past every slot.
+        self.hint = Some((rowid, u8::try_from(from).unwrap_or(u8::MAX)));
+    }
+
+    /// The slot a scan for `rowid` starts at: the recorded one when the hint
+    /// is for `rowid`, else 0. The hint is used once.
+    #[inline]
+    fn take_hint(&mut self, rowid: i64) -> usize {
+        match self.hint.take() {
+            Some((hinted, from)) if hinted == rowid => usize::from(from),
+            _ => 0,
         }
     }
 
@@ -1899,6 +1925,7 @@ impl TableSeekCache {
     /// The allocated slots in order, for tests that age the cached bounds.
     #[cfg(test)]
     fn iter_mut(&mut self) -> impl Iterator<Item = &mut Option<TableSeekCacheEntry>> {
+        self.hint = None;
         std::iter::once(&mut self.first)
             .chain(self.rest.iter_mut().flat_map(|rest| rest.iter_mut()))
     }
@@ -1926,6 +1953,7 @@ impl TableSeekCache {
     #[inline]
     fn push_front(&mut self, end: usize, entry: TableSeekCacheEntry) {
         debug_assert!(end < TABLE_SEEK_CACHE_SLOTS);
+        self.hint = None;
         if end > 0 {
             let rest = self
                 .rest
@@ -3137,6 +3165,13 @@ pub struct BtCursor<P> {
     /// Whether the last `index_insert` seek ran past the last cell of the
     /// rightmost leaf, i.e. the key sorts after every key already stored.
     last_index_insert_past_rightmost: bool,
+    /// Set the first time [`Self::try_table_seek_within_leaf`] finds a cached
+    /// leaf other than the current one that the reader does not hold
+    /// resident; from then on that fast path declines such leaves without
+    /// asking the reader again (bd-w4pr1.12, lever SL2 v3). A reader that
+    /// holds no resident images (a `:memory:` mirror, the default reader)
+    /// pays one failed lookup per cursor instead of one per probe.
+    resident_seek_declined: bool,
     /// `TABLE_SEEK_CACHE_SLOTS`-entry LRU of table-seek leaf anchors.
     ///
     /// Each slot remembers the rowid probe plus the leaf page/cell position
@@ -3327,6 +3362,7 @@ impl<P> BtCursor<P> {
             TABLE_SEEK_MRU_SHORT_CIRCUIT_HITS_FOR_BENCH
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.seek_cache.first = Some(entry);
+            self.seek_cache.hint = None;
             return;
         }
 
@@ -3736,6 +3772,7 @@ impl<P: PageReader> BtCursor<P> {
             last_known_depth: None,
             decoded_pages: DecodedPageMemo::default(),
             last_index_insert_past_rightmost: false,
+            resident_seek_declined: false,
             seek_cache: TableSeekCache::default(),
             row_image_epoch: 0,
         }
@@ -4605,6 +4642,23 @@ impl<P: PageReader> BtCursor<P> {
                     .await?
             }
         };
+        self.stack_entry_for_page(page_no, page_data)
+    }
+
+    /// The stack entry for page `page_no` read as `page_data`: its header
+    /// and checked cell pointers, decoded once per image (see
+    /// `DecodedPageMemo`). The tail of [`Self::load_page`], also used by the
+    /// synchronous seek-cache hit on a resident leaf in
+    /// [`Self::try_table_seek_within_leaf`]. Always inlined: SL2 v2 called it
+    /// out of line from `load_page` and paid about 83 instructions a load for
+    /// the split (callgrind of rowid_lookups_200k, bd-w4pr1.12).
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn stack_entry_for_page(
+        &mut self,
+        page_no: PageNumber,
+        page_data: PageData,
+    ) -> Result<StackEntry> {
         let mutation_counter = Self::page_mutation_counter(&page_data);
         // The same image decodes to the same header and the same checked
         // pointers; see `DecodedPageMemo`.
@@ -5313,8 +5367,10 @@ impl<P: PageReader> BtCursor<P> {
 
         // Only the slots whose landing admits the target are visited; the
         // scan for them is synchronous and reads the slots in place, so a
-        // probe no slot admits costs one pass and copies nothing.
-        let mut next_slot = 0;
+        // probe no slot admits costs one pass and copies nothing. A probe
+        // `try_table_seek_within_leaf` already scanned starts where that scan
+        // stopped (bd-w4pr1.12, lever SL2 v3).
+        let mut next_slot = self.seek_cache.take_hint(target_rowid);
         while let Some(slot_idx) = self.next_table_seek_slot(target_rowid, next_slot) {
             next_slot = slot_idx + 1;
             let Some(cached) = self.seek_cache[slot_idx] else {
@@ -6796,64 +6852,125 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Synchronous fast path of [`BtreeCursorOps::table_move_to`]: a rowid
-    /// seek that the most recent seek-cache slot answers on the leaf the
-    /// cursor is already on.
+    /// seek that the seek cache answers on a leaf the cursor already holds:
+    /// the leaf it stands on (the newest slot's, SL1 v3), or a cached leaf
+    /// its reader returns without a storage read
+    /// (`read_resident_btree_page_data`; bd-w4pr1.12, lever SL2 v3).
+    ///
+    /// The newest slot on the current leaf is tested first, as before. Only
+    /// when it does not answer does the first slot whose landing admits the
+    /// target (the slot `try_table_seek_cache` would try first) get a turn,
+    /// and only until the reader has once refused a resident image to this
+    /// cursor ([`Self::resident_seek_declined`]). The scan that finds that
+    /// slot is the probe's only one: a probe left to the general path hands
+    /// its answer on, and `try_table_seek_cache` starts there.
     ///
     /// Returns `Ok(None)` with the cursor untouched whenever the general path
-    /// is needed: btree debug tracing on, no landing remembered for the
-    /// current leaf, a leaf this transaction has written, a target outside the
-    /// rowids that landing recorded, or one the leaf cannot place (before its
-    /// first cell or past its last). Otherwise it does what that cache hit
-    /// does inside `table_move_to`: search the leaf, land on it as the
-    /// cursor's whole stack, remember the landing, record the point witness,
-    /// and refresh the depth gauge.
+    /// is needed: btree debug tracing on, no slot admitting the target, a
+    /// leaf this transaction has written, a leaf the reader does not hold,
+    /// or a target the leaf cannot place (before its first cell or past its
+    /// last). A resident read that fails returns its error, as the general
+    /// path would for that slot. Otherwise it does what that cache hit does
+    /// inside `table_move_to`: search the leaf, land on it as the cursor's
+    /// whole stack, remember the landing, record the point witness, and
+    /// refresh the depth gauge.
     pub fn try_table_seek_within_leaf(
         &mut self,
         cx: &Cx,
         target_rowid: i64,
     ) -> Result<Option<SeekResult>> {
-        let Some(cached) = self.seek_cache[0] else {
-            return Ok(None);
+        let admits = |cached: &TableSeekCacheEntry| {
+            !(target_rowid < cached.rowid && cached.cell_idx == 0)
+                && target_rowid >= cached.first_rowid
+                && target_rowid <= cached.last_rowid
         };
-        if (target_rowid < cached.rowid && cached.cell_idx == 0)
-            || target_rowid < cached.first_rowid
-            || target_rowid > cached.last_rowid
-        {
-            return Ok(None);
-        }
-        let Some(top) = self.stack.last() else {
-            return Ok(None);
+        let newest_on_top = self.seek_cache.first.filter(|cached| {
+            admits(cached)
+                && self
+                    .stack
+                    .last()
+                    .is_some_and(|top| top.page_no == cached.page_no)
+        });
+        let (slot_idx, cached) = if let Some(cached) = newest_on_top {
+            (0, cached)
+        } else {
+            // The probe's one slot scan. Whatever this path then decides, the
+            // general path starts its own scan where this one stopped
+            // (`TableSeekCache::take_hint`), so a probe no slot admits scans
+            // the slots once, as it did before this fast path looked past the
+            // newest slot (SL2 v2 scanned them twice: bd-w4pr1.12).
+            let slot = self.next_table_seek_slot(target_rowid, 0);
+            self.seek_cache
+                .set_hint(target_rowid, slot.unwrap_or(TABLE_SEEK_CACHE_SLOTS));
+            let Some(slot_idx) = slot else {
+                return Ok(None);
+            };
+            if self.resident_seek_declined {
+                return Ok(None);
+            }
+            let Some(cached) = self.seek_cache.get(slot_idx) else {
+                return Ok(None);
+            };
+            (slot_idx, cached)
         };
-        if top.page_no != cached.page_no
-            || !(top.header.page_type.is_leaf() && top.header.page_type.is_table())
-            || tracing::enabled!(target: "fsqlite.btree", Level::DEBUG)
+        if tracing::enabled!(target: "fsqlite.btree", Level::DEBUG)
             || self.pager.is_dirty(cached.page_no)
         {
             return Ok(None);
         }
+        let on_top = self
+            .stack
+            .last()
+            .is_some_and(|top| top.page_no == cached.page_no);
         observe_cursor_cancellation(cx)?;
-        let (idx, seek_result) = match Self::search_integer_key_table_leaf(cx, top, target_rowid)? {
-            BinarySearchResult::Found(idx) => (idx, SeekResult::Found),
-            BinarySearchResult::NotFound(idx) if idx > 0 && idx < top.header.cell_count => {
-                (idx, SeekResult::NotFound)
+        // The leaf the cursor stands on is searched in place; any other
+        // cached leaf only when the reader already holds its image.
+        let resident = if on_top {
+            None
+        } else {
+            let Some(page_data) = self.pager.read_resident_btree_page_data(cx, cached.page_no)
+            else {
+                self.resident_seek_declined = true;
+                return Ok(None);
+            };
+            Some(self.stack_entry_for_page(cached.page_no, page_data?)?)
+        };
+        let (idx, seek_result) = {
+            let Some(leaf) = resident.as_ref().or_else(|| self.stack.last()) else {
+                return Ok(None);
+            };
+            if !(leaf.header.page_type.is_leaf() && leaf.header.page_type.is_table()) {
+                return Ok(None);
             }
-            BinarySearchResult::NotFound(_) => return Ok(None),
+            match Self::search_integer_key_table_leaf(cx, leaf, target_rowid)? {
+                BinarySearchResult::Found(idx) => (idx, SeekResult::Found),
+                BinarySearchResult::NotFound(idx) if idx > 0 && idx < leaf.header.cell_count => {
+                    (idx, SeekResult::NotFound)
+                }
+                BinarySearchResult::NotFound(_) => return Ok(None),
+            }
         };
         instrumentation::record_operation(BtreeOpType::Seek);
         self.note_page_visit(cached.page_no);
-        if self.stack.len() > 1 {
-            let leaf = self
-                .stack
-                .pop()
-                .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        if let Some(mut leaf) = resident {
+            leaf.cell_idx = idx;
             self.stack.clear();
             self.stack.push(leaf);
-        }
-        if let Some(leaf) = self.stack.last_mut() {
-            leaf.cell_idx = idx;
+        } else {
+            if self.stack.len() > 1 {
+                let leaf = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+                self.stack.clear();
+                self.stack.push(leaf);
+            }
+            if let Some(leaf) = self.stack.last_mut() {
+                leaf.cell_idx = idx;
+            }
         }
         self.at_eof = false;
-        self.remember_table_cache_hit(0, target_rowid, cached.page_no, idx);
+        self.remember_table_cache_hit(slot_idx, target_rowid, cached.page_no, idx);
         self.record_point_witness(
             cx,
             WitnessKey::Cell {
@@ -25245,6 +25362,246 @@ mod tests {
                 "after commit",
             )
             .await;
+        });
+    }
+
+    /// bd-w4pr1.12 (lever SL2 v2): a seek-cache hit on a cached leaf other
+    /// than the cursor's own is answered without a wait when the reader holds
+    /// that leaf's image, landing exactly where `table_move_to` lands and
+    /// reading nothing through the async path. Declines leave the cursor
+    /// untouched: a slot whose bounds outlived its leaf's image, and a cached
+    /// leaf the reader does not hold. A resident read that fails returns the
+    /// error `table_move_to` returns for the same seek. Once the reader has
+    /// refused a resident image, the cursor stops asking for other cached
+    /// leaves, while its own leaf is still answered in place.
+    #[test]
+    fn test_try_table_seek_within_leaf_answers_resident_cached_leaves() {
+        run_async(async {
+            let page = seek_cache_leaf_page;
+            let first = seek_cache_leaf_first;
+            let leaves = 5;
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(seek_cache_slots_tree(leaves), pn(2), USABLE, true);
+            let store = SeekProbeStore::new(seek_cache_slots_tree(leaves));
+            store
+                .resident
+                .borrow_mut()
+                .extend((0..leaves).map(|i| page(i).get()));
+            let mut fast = BtCursor::new(store, pn(2), USABLE, true);
+            let position = |stamp: Option<CursorPositionStamp>| {
+                stamp.map(|stamp| (stamp.page_no(), stamp.cell_idx(), stamp.row_image_epoch()))
+            };
+
+            // Land on every leaf once (nothing cached admits these: each goes
+            // through the root), then move between cached leaves: middle
+            // keys, gaps and last keys, never twice in a row on one leaf.
+            let warm_up: Vec<i64> = (0..leaves).map(first).collect();
+            let cross = [
+                first(3) + 5,
+                first(0) + 2,
+                first(4) + 10,
+                first(1) + 7,
+                first(2) + 5,
+                first(0) + 10,
+                first(3) + 3,
+            ];
+            let mut answered = 0;
+            for (n, &target) in warm_up.iter().chain(cross.iter()).enumerate() {
+                let expected = reference.table_move_to(&cx, target).await.unwrap();
+                let before = fast.position_stamp();
+                fast.pager.clear_reads();
+                let result = match fast.try_table_seek_within_leaf(&cx, target).unwrap() {
+                    Some(result) => {
+                        // Answered from the resident image: no async read.
+                        assert!(fast.pager.read_pages().is_empty(), "target {target}");
+                        answered += 1;
+                        result
+                    }
+                    None => {
+                        assert_eq!(fast.position_stamp(), before, "target {target}");
+                        assert!(n < leaves, "a cross-leaf seek declined: target {target}");
+                        fast.table_move_to(&cx, target).await.unwrap()
+                    }
+                };
+                assert_eq!(result.is_found(), expected.is_found(), "target {target}");
+                assert_eq!(fast.eof(), reference.eof(), "target {target}");
+                assert_eq!(
+                    fast.current_page_path(),
+                    reference.current_page_path(),
+                    "target {target}"
+                );
+                assert_eq!(
+                    position(fast.position_stamp()),
+                    position(reference.position_stamp()),
+                    "target {target}"
+                );
+                assert_eq!(fast.seek_cache, reference.seek_cache, "target {target}");
+                assert_eq!(
+                    fast.rowid(&cx).await.unwrap(),
+                    reference.rowid(&cx).await.unwrap(),
+                    "target {target}"
+                );
+            }
+            assert_eq!(answered, cross.len());
+            assert_eq!(fast.witness_keys(), reference.witness_keys());
+
+            // A slot whose bounds outlived its leaf's image: leaf 2 now ends
+            // before the last rowid its slot recorded, so the first slot that
+            // admits that rowid cannot land it. Decline untouched; the general
+            // seek then lands where the reference lands.
+            let shrunk = build_leaf_table(&[(first(2), b"a"), (first(2) + 5, b"b")]);
+            reference.pager.pages.insert(page(2).get(), shrunk.clone());
+            fast.pager.inner.pages.insert(page(2).get(), shrunk);
+            let before = fast.position_stamp();
+            assert_eq!(
+                fast.try_table_seek_within_leaf(&cx, first(2) + 10).unwrap(),
+                None
+            );
+            assert_eq!(fast.position_stamp(), before);
+            let expected = reference.table_move_to(&cx, first(2) + 10).await.unwrap();
+            let result = fast.table_move_to(&cx, first(2) + 10).await.unwrap();
+            assert_eq!(result.is_found(), expected.is_found());
+            assert_eq!(fast.eof(), reference.eof());
+            assert_eq!(
+                position(fast.position_stamp()),
+                position(reference.position_stamp())
+            );
+            assert_eq!(fast.seek_cache, reference.seek_cache);
+
+            // A resident read that fails: the same failure as table_move_to's.
+            *fast.pager.resident_refusal.borrow_mut() = Some(page(4).get());
+            let before = fast.position_stamp();
+            let fast_error = fast
+                .try_table_seek_within_leaf(&cx, first(4) + 5)
+                .unwrap_err();
+            assert_eq!(fast.position_stamp(), before);
+            let general_error = fast.table_move_to(&cx, first(4) + 5).await.unwrap_err();
+            assert_eq!(fast_error.to_string(), general_error.to_string());
+            *fast.pager.resident_refusal.borrow_mut() = None;
+
+            // Land on leaf 0 through the general path, so leaf 1 is cached but
+            // not current, then take leaf 1 out of the reader's resident set:
+            // decline untouched.
+            assert!(fast.table_move_to(&cx, first(0)).await.unwrap().is_found());
+            fast.pager
+                .resident
+                .borrow_mut()
+                .retain(|&held| held != page(1).get());
+            let before = fast.position_stamp();
+            assert_eq!(
+                fast.try_table_seek_within_leaf(&cx, first(1) + 5).unwrap(),
+                None
+            );
+            assert_eq!(fast.position_stamp(), before);
+
+            // From then on another cached leaf declines although the reader
+            // holds it (leaf 3 is resident), while the cursor's own leaf is
+            // still answered in place.
+            fast.pager.clear_reads();
+            let before = fast.position_stamp();
+            assert_eq!(
+                fast.try_table_seek_within_leaf(&cx, first(3) + 5).unwrap(),
+                None
+            );
+            assert_eq!(fast.position_stamp(), before);
+            assert!(
+                fast.try_table_seek_within_leaf(&cx, first(0) + 5)
+                    .unwrap()
+                    .is_some_and(SeekResult::is_found)
+            );
+            assert!(fast.pager.read_pages().is_empty());
+        });
+    }
+
+    /// bd-w4pr1.12 (lever SL2 v3): a probe `try_table_seek_within_leaf`
+    /// leaves to the general path hands that path its slot scan. The general
+    /// path starts at the slot the fast path found and did not answer, so it
+    /// lands from the cache with no descent, and a hint left for one rowid
+    /// does not apply to another. Every landing equals a reference cursor's.
+    /// The reader holds nothing resident and tracks no dirty pages, so a
+    /// descent reads the root (page 2) and a cache hit reads only its leaf.
+    #[test]
+    fn test_try_table_seek_within_leaf_hands_its_slot_scan_to_the_general_path() {
+        run_async(async {
+            let page = seek_cache_leaf_page;
+            let first = seek_cache_leaf_first;
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(seek_cache_slots_tree(4), pn(2), USABLE, true);
+            let mut fast = BtCursor::new(
+                SeekProbeStore::new(seek_cache_slots_tree(4)),
+                pn(2),
+                USABLE,
+                true,
+            );
+            let position = |stamp: Option<CursorPositionStamp>| {
+                stamp.map(|stamp| (stamp.page_no(), stamp.cell_idx(), stamp.row_image_epoch()))
+            };
+            // Leaves 0 and 1 cached, leaf 1 current and newest.
+            for target in [first(0), first(1)] {
+                reference.table_move_to(&cx, target).await.unwrap();
+                fast.table_move_to(&cx, target).await.unwrap();
+            }
+
+            // Leaf 0's slot admits the target, but its leaf is not resident:
+            // the fast path declines, and the general path starts at that slot
+            // and lands from the cache (leaf 0's page only, no root).
+            let target = first(0) + 5;
+            let before = fast.position_stamp();
+            assert_eq!(fast.try_table_seek_within_leaf(&cx, target).unwrap(), None);
+            assert_eq!(fast.position_stamp(), before);
+            fast.pager.clear_reads();
+            let result = fast.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(
+                fast.pager.read_pages(),
+                vec![page(0)],
+                "a cache hit, no descent"
+            );
+            let expected = reference.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(result.is_found(), expected.is_found());
+            assert_eq!(
+                position(fast.position_stamp()),
+                position(reference.position_stamp())
+            );
+            assert_eq!(fast.seek_cache, reference.seek_cache);
+
+            // A probe no slot admits (leaf 3 was never visited) leaves a hint
+            // for its own rowid only: the next seek, for a rowid leaf 1's slot
+            // admits, still finds that slot and lands from the cache.
+            assert_eq!(
+                fast.try_table_seek_within_leaf(&cx, first(3) + 5).unwrap(),
+                None
+            );
+            fast.pager.clear_reads();
+            let target = first(1) + 5;
+            let result = fast.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(
+                fast.pager.read_pages(),
+                vec![page(1)],
+                "a cache hit, no descent"
+            );
+            let expected = reference.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(result.is_found(), expected.is_found());
+            assert_eq!(
+                position(fast.position_stamp()),
+                position(reference.position_stamp())
+            );
+            assert_eq!(fast.seek_cache, reference.seek_cache);
+
+            // The probe no slot admits, through both paths: one descent, the
+            // reference's landing.
+            let target = first(3) + 5;
+            assert_eq!(fast.try_table_seek_within_leaf(&cx, target).unwrap(), None);
+            fast.pager.clear_reads();
+            let result = fast.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(fast.pager.read_pages(), vec![pn(2), page(3)], "a descent");
+            let expected = reference.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(result.is_found(), expected.is_found());
+            assert_eq!(
+                position(fast.position_stamp()),
+                position(reference.position_stamp())
+            );
+            assert_eq!(fast.seek_cache, reference.seek_cache);
+            assert_eq!(fast.witness_keys(), reference.witness_keys());
         });
     }
 
