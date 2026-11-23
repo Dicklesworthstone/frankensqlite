@@ -60081,8 +60081,15 @@ impl Connection {
         // The virtual schema tables are materialized only after statement
         // dispatch. Metadata consumers that run before that boundary still
         // need the real catalog layout, especially for source columns used
-        // only by ORDER BY rather than projected into the result.
-        if is_sqlite_schema_name(relation_name) {
+        // only by ORDER BY rather than projected into the result. The TEMP
+        // catalog's legacy aliases `sqlite_temp_master` / `sqlite_temp_schema`
+        // have the same layout unqualified or under `temp.` (bd-9gfen: a
+        // nested scope bound no columns for them); `main.sqlite_temp_master`
+        // is no table, as `builtin_schema_relation_exists` holds.
+        if is_sqlite_schema_name(relation_name)
+            || (requested_scope != PragmaSchemaScope::Main
+                && canonical_sqlite_temp_schema_name(relation_name).is_some())
+        {
             return sqlite_master_column_infos()
                 .into_iter()
                 .map(|column| column.name)
