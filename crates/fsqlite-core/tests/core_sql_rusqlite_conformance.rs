@@ -3737,3 +3737,89 @@ fn pattern_scalar_functions_match_rusqlite() {
             .await;
     });
 }
+
+#[test]
+fn bd_pnrr8_not_exists_operator_precedence_matches_rusqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP).await;
+        let cases = [
+            QueryCase {
+                name: "additive and multiplicative tails with nonempty and empty subqueries",
+                sql: "SELECT NOT EXISTS (SELECT 1) + 1, NOT EXISTS (SELECT 1 WHERE 0) + 1, NOT EXISTS (SELECT 1 WHERE 0) * 3",
+            },
+            QueryCase {
+                name: "subtraction division and remainder tails",
+                sql: "SELECT NOT EXISTS (SELECT 1) - 1, NOT EXISTS (SELECT 1 WHERE 0) / 2, NOT EXISTS (SELECT 1) % 1",
+            },
+            QueryCase {
+                name: "relational and equality tails",
+                sql: "SELECT NOT EXISTS (SELECT 1) < 2, NOT EXISTS (SELECT 1) = 2, NOT EXISTS (SELECT 1 WHERE 0) >= 0",
+            },
+            QueryCase {
+                name: "bitwise and shift tails",
+                sql: "SELECT NOT EXISTS (SELECT 1) & 2, NOT EXISTS (SELECT 1) | 2, NOT EXISTS (SELECT 1 WHERE 0) << 2, NOT EXISTS (SELECT 1 WHERE 0) >> 1",
+            },
+            QueryCase {
+                name: "concatenation and explicit collation tails",
+                sql: "SELECT NOT EXISTS (SELECT 1) || 'x', NOT EXISTS (SELECT 1 WHERE 0) || 'x', NOT EXISTS (SELECT 1) COLLATE NOCASE LIKE '%'",
+            },
+            QueryCase {
+                name: "null postfix predicates",
+                sql: "SELECT NOT EXISTS (SELECT 1) IS NULL, NOT EXISTS (SELECT 1) IS NOT NULL, NOT EXISTS (SELECT 1 WHERE 0) ISNULL, NOT EXISTS (SELECT 1 WHERE 0) NOTNULL",
+            },
+            QueryCase {
+                name: "membership and range tails",
+                sql: "SELECT NOT EXISTS (SELECT 1) IN (0, 1), NOT EXISTS (SELECT 1) NOT IN (0, 1), NOT EXISTS (SELECT 1) BETWEEN 0 AND 1, NOT EXISTS (SELECT 1) NOT BETWEEN 0 AND 1",
+            },
+            QueryCase {
+                name: "pattern matching tails",
+                sql: "SELECT NOT EXISTS (SELECT 1) LIKE '%', NOT EXISTS (SELECT 1) NOT LIKE '%', NOT EXISTS (SELECT 1) GLOB '*', NOT EXISTS (SELECT 1) NOT GLOB '*'",
+            },
+            QueryCase {
+                name: "explicit grouping preserves caller intent",
+                sql: "SELECT (NOT EXISTS (SELECT 1)) + 1, NOT (EXISTS (SELECT 1) + 1), NOT (EXISTS (SELECT 1)), NOT EXISTS (SELECT 1 WHERE 0)",
+            },
+            QueryCase {
+                name: "logical operators bind outside NOT",
+                sql: "SELECT NOT EXISTS (SELECT 1) OR 1, NOT EXISTS (SELECT 1 WHERE 0) AND 0, NOT EXISTS (SELECT 1) + 1 OR 1",
+            },
+            QueryCase {
+                name: "repeated NOT preserves operand grouping",
+                sql: "SELECT NOT NOT EXISTS (SELECT 1) + 1, NOT NOT NOT EXISTS (SELECT 1 WHERE 0) + 1, NOT NOT EXISTS (SELECT 1)",
+            },
+            QueryCase {
+                name: "NOT EXISTS on the right of binary operators",
+                sql: "SELECT 5 + NOT EXISTS (SELECT 1) + 10, 1 = NOT EXISTS (SELECT 1) + 10, 0 OR NOT EXISTS (SELECT 1 WHERE 0) + 10, 1 AND NOT EXISTS (SELECT 1 WHERE 0) + 10",
+            },
+            QueryCase {
+                name: "correlated projection and arithmetic",
+                sql: "SELECT c.id, NOT EXISTS (SELECT 1 FROM flags f WHERE f.customer_id = c.id) + 1, (NOT EXISTS (SELECT 1 FROM flags f WHERE f.customer_id = c.id)) + 1 FROM customers c ORDER BY c.id",
+            },
+            QueryCase {
+                name: "correlated where predicate and null postfix",
+                sql: "SELECT c.id FROM customers c WHERE NOT EXISTS (SELECT 1 FROM flags f WHERE f.customer_id = c.id) IS NULL ORDER BY c.id",
+            },
+        ];
+        harness
+            .assert_queries_match("NOT EXISTS precedence", &cases)
+            .await;
+
+        for subquery in ["SELECT 1", "SELECT 1 WHERE 0"] {
+            for operator in [
+                "+", "-", "*", "/", "%", "||", "<<", ">>", "&", "|", "=", "!=", "<", "<=",
+                ">", ">=", "IS", "IS NOT", "AND", "OR", "LIKE", "GLOB",
+            ] {
+                for sql in [
+                    format!("SELECT NOT EXISTS ({subquery}) {operator} 2"),
+                    format!("SELECT 2 {operator} NOT EXISTS ({subquery}) + 1"),
+                ] {
+                    assert_eq!(
+                        harness.franken_query_rows(&sql).await,
+                        harness.sqlite_query_rows(&sql),
+                        "NOT EXISTS on either side of an operator: {sql}"
+                    );
+                }
+            }
+        }
+    });
+}
