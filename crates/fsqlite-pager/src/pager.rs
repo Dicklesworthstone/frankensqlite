@@ -12755,10 +12755,11 @@ async fn read_durable_page_under_gate<F: VfsFile>(
 /// gate, compare the publication against the CURRENT durable freelist:
 ///
 /// * RESURRECTION: a published page that is neither currently free nor freed
-///   by this batch was consumed by a peer — appending would re-publish it as
-///   free and a later begin-refresh would re-grant it (one physical page
-///   granted to multiple connections; ledger receipts on bd-0shxy: page 333
-///   granted 5x across 4 pagers via `alloc_freelist_gated`).
+///   by this batch needs proof that it is an unclaimed hole beyond the current
+///   durable extent. Otherwise it may have been consumed by a peer — appending
+///   would re-publish it as free and a later begin-refresh would re-grant it
+///   (one physical page granted to multiple connections; ledger receipts on
+///   bd-0shxy: page 333 granted 5x across 4 pagers via `alloc_freelist_gated`).
 /// * ERASURE: a currently free page that is neither in the publication nor
 ///   consumed by this batch would be silently dropped from the durable
 ///   freelist — a peer's newly freed page leaks as "never used".
@@ -12878,10 +12879,38 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
     // chain above for cycle detection, and exempt only the erasure arm below.
     let reserved_page = crate::journal::PENDING_BYTE_OFFSET / page_size as u64 + 1;
 
-    let mut offending: Vec<u32> = published_set
-        .iter()
-        .copied()
-        .filter(|page| !current.contains(page) && !freed.contains(page))
+    // bd-fwsyc: a peer's returned EOF lease can become durable during
+    // this batch's growth without being one of this transaction's frees.
+    // Prove those holes against the PHYSICAL tail while the append gate is
+    // held. Invalid header counts and pages with committed or sibling-batch
+    // ownership keep the existing fail-closed resurrection behavior.
+    let durable_db_size = u32::from_be_bytes(
+        page_one[28..32].try_into().expect("header database-size slice"),
+    );
+    let durable_extent_is_valid =
+        durable_db_size != 0 && page_one[24..28] == page_one[92..96];
+    let mut unexplained_pages = Vec::new();
+    for &page in &published_set {
+        if current.contains(&page) || freed.contains(&page) {
+            continue;
+        }
+        let unclaimed_eof_hole = durable_extent_is_valid
+            && page > durable_db_size
+            && page <= publication_db_size
+            && u64::from(page) != reserved_page
+            && !batches.iter().any(|other| {
+                !std::ptr::eq(other, batch)
+                    && (other.frames.iter().any(|frame| frame.page_number == page)
+                        || other.consumed_freelist_pages.contains(&page))
+            })
+            && wal.read_page_at_appended_tail(cx, page).await?.is_none();
+        if !unclaimed_eof_hole {
+            unexplained_pages.push(page);
+        }
+    }
+
+    let mut offending: Vec<u32> = unexplained_pages
+        .into_iter()
         .chain(current.iter().copied().filter(|page| {
             !published_set.contains(page)
                 && !consumed.contains(page)
@@ -25057,11 +25086,27 @@ where
         if inner.freelist_repair_pending || self.vacuum_override_freelist.is_some() {
             return true;
         }
+        // bd-fwsyc: a peer can return an unused EOF lease above the current
+        // durable extent. Growth makes those pages durable even when this
+        // transaction has no pending frees. Shrink can remove free pages too.
         if !pending_free_pages
             .iter()
             .any(|page| page.get() <= committed_db_size)
             && self.allocated_from_freelist.is_empty()
+            && (committed_db_size == inner.db_size
+                || !inner.freelist.iter().any(|page| {
+                    (page.get() <= inner.db_size) != (page.get() <= committed_db_size)
+                }))
         {
+            debug_assert_eq!(
+                self.committed_durable_freelist_pages_with_inner(inner),
+                Self::durable_freelist_pages_with_inner(
+                    inner,
+                    committed_db_size,
+                    pending_free_pages,
+                ),
+                "clean freelist fast path must preserve the durable page set"
+            );
             return false;
         }
 
@@ -53578,6 +53623,123 @@ mod tests {
     }
 
     #[test]
+    fn test_freelist_publication_proves_new_eof_holes_bd_fwsyc() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (pager, _) = test_pager().await;
+            let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+            let page_size = PageSize::DEFAULT;
+            let reserved = crate::journal::lock_byte_page(page_size);
+            for (case, durable_size, valid_for, leaf, publication_size, tail_frame, expected) in [
+                ("new_hole", 4_u32, 1_u32, 5_u32, 8_u32, false, vec![]),
+                ("current_extent", 5, 1, 5, 8, false, vec![5]),
+                ("zero_extent", 0, 1, 5, 8, false, vec![5, 7]),
+                ("stale_header", 4, 2, 5, 8, false, vec![5, 7]),
+                ("appended_frame", 4, 1, 5, 8, true, vec![5]),
+                ("outside_publication", 4, 1, 5, 4, false, vec![5, 7]),
+                ("reserved_page", 4, 1, reserved, reserved + 1, false, vec![reserved]),
+            ] {
+                let mut page_one = vec![0_u8; page_size.as_usize()];
+                page_one[24..28].copy_from_slice(&1_u32.to_be_bytes());
+                page_one[28..32].copy_from_slice(&durable_size.to_be_bytes());
+                page_one[92..96].copy_from_slice(&valid_for.to_be_bytes());
+                let (mut wal, frames, _, _) = MockWalBackend::new();
+                {
+                    let mut frames = frames.lock().unwrap();
+                    frames.push((1, page_one, durable_size));
+                    if tail_frame {
+                        frames.push((leaf, sample_page(0x61), publication_size));
+                    }
+                }
+
+                // The publisher writes its own new trunk (7), which lists
+                // the unwritten leaf. Neither is a transaction-local free.
+                let mut trunk = vec![0_u8; page_size.as_usize()];
+                trunk[4..8].copy_from_slice(&1_u32.to_be_bytes());
+                trunk[8..12].copy_from_slice(&leaf.to_be_bytes());
+                let batch = TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: 7,
+                    page_data: trunk,
+                    db_size_if_commit: publication_size,
+                }])
+                .with_freelist_publication(
+                    Some(vec![leaf, 7]),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                let offending = resurrected_or_erased_freelist_pages(
+                    &cx,
+                    &mut wal,
+                    &db_file,
+                    &PageCipherSlot::default(),
+                    page_size.as_usize(),
+                    &[batch],
+                )
+                .await
+                .unwrap();
+                assert_eq!(offending, expected, "case={case}");
+            }
+        });
+    }
+
+    #[test]
+    fn test_freelist_publication_rejects_sibling_leaf_claims_bd_fwsyc() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (pager, _) = test_pager().await;
+            let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+            let page_size = PageSize::DEFAULT.as_usize();
+            for (case, sibling_frame, consumed, expected) in [
+                ("disjoint_sibling", 8_u32, Vec::new(), Vec::new()),
+                ("sibling_writes_leaf", 5, Vec::new(), vec![5]),
+                ("sibling_consumes_leaf", 8, vec![5], vec![5]),
+            ] {
+                let mut page_one = vec![0_u8; page_size];
+                page_one[24..28].copy_from_slice(&1_u32.to_be_bytes());
+                page_one[28..32].copy_from_slice(&4_u32.to_be_bytes());
+                page_one[92..96].copy_from_slice(&1_u32.to_be_bytes());
+                let (mut wal, frames, _, _) = MockWalBackend::new();
+                frames.lock().unwrap().push((1, page_one, 4));
+
+                // Leaf 5 is published free but has no frame in this batch.
+                // A frame-overlap check alone cannot protect that leaf.
+                let mut trunk = vec![0_u8; page_size];
+                trunk[4..8].copy_from_slice(&1_u32.to_be_bytes());
+                trunk[8..12].copy_from_slice(&5_u32.to_be_bytes());
+                let publisher = TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: 7,
+                    page_data: trunk,
+                    db_size_if_commit: 8,
+                }])
+                .with_freelist_publication(
+                    Some(vec![5, 7]),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                let sibling = TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: sibling_frame,
+                    page_data: sample_page(0x62),
+                    db_size_if_commit: 8,
+                }])
+                .with_freelist_publication(None, Vec::new(), consumed, Vec::new());
+                let offending = resurrected_or_erased_freelist_pages(
+                    &cx,
+                    &mut wal,
+                    &db_file,
+                    &PageCipherSlot::default(),
+                    page_size,
+                    &[publisher, sibling],
+                )
+                .await
+                .unwrap();
+                assert_eq!(offending, expected, "case={case}");
+            }
+        });
+    }
+
+    #[test]
     fn test_ioq6x_intragroup_publication_header_wins_over_stale_grow() {
         // bd-ioq6x (GH#346): a group commit that mixes a freelist-publishing
         // batch (a DELETE that durably freed pages) with a later-appended
@@ -62816,6 +62978,87 @@ mod tests {
                 ),
                 "bead_id={BEAD_ID} case=returned_lease_holes_remain_durable_freelist_delta"
             );
+        });
+    }
+
+    #[test]
+    fn test_concurrent_growth_publishes_peer_lease_holes_bd_fwsyc() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let seeded_page = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, seeded_page, &sample_page(0x51)).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            let mut peer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let first_peer_page = peer.allocate_page(&cx).await.unwrap();
+            peer.write_page(&cx, first_peer_page, &sample_page(0x52)).await.unwrap();
+            let second_peer_page = peer.allocate_page(&cx).await.unwrap();
+            peer.write_page(&cx, second_peer_page, &sample_page(0x53)).await.unwrap();
+            let mut expected_free = peer.page_lease.clone();
+            assert!(!expected_free.is_empty(), "the peer must hold an unused EOF lease");
+
+            // Allocate past the peer's lease before it returns those pages.
+            let mut grow = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let high_page = grow.allocate_page(&cx).await.unwrap();
+            grow.write_page(&cx, high_page, &sample_page(0x54)).await.unwrap();
+            assert!(expected_free.iter().all(|page| {
+                page.get() > second_peer_page.get() && page.get() < high_page.get()
+            }));
+            assert!(grow.allocated_from_freelist.is_empty());
+            assert!(grow.pending_free_pages_for_commit().iter().all(|page| {
+                page.get() > high_page.get()
+            }));
+            peer.commit(&cx).await.unwrap();
+            {
+                let inner = pager.inner.lock().unwrap();
+                assert_eq!(inner.db_size, second_peer_page.get());
+                assert!(expected_free.iter().all(|page| inner.freelist.contains(page)));
+            }
+            grow.commit(&cx).await.unwrap();
+
+            // Read the committed header and trunk bytes, not the allocator's
+            // in-memory free list: the old fast path kept only the latter.
+            let inner = pager.inner.lock().unwrap();
+            let page_one = inner
+                .read_committed_page_copy(&cx, &pager.cache, &pager.wal_backend, PageNumber::ONE)
+                .await
+                .unwrap();
+            let header_bytes: [u8; DATABASE_HEADER_SIZE] =
+                page_one[..DATABASE_HEADER_SIZE].try_into().unwrap();
+            let header = DatabaseHeader::from_bytes(&header_bytes).unwrap();
+            let mut durable_free = load_freelist_from_committed_state(
+                &cx,
+                &inner,
+                &pager.cache,
+                &pager.wal_backend,
+                header.page_count,
+                header.freelist_trunk,
+                header.freelist_count,
+            )
+            .await
+            .unwrap();
+            expected_free.sort_unstable();
+            durable_free.sort_unstable();
+            assert_eq!(durable_free, expected_free, "peer lease holes must be serialized");
+            assert_eq!(header.page_count, high_page.get());
+            assert_eq!(u32::try_from(durable_free.len()).unwrap() + 5, header.page_count);
+            for (page, fill) in [
+                (seeded_page, 0x51),
+                (first_peer_page, 0x52),
+                (second_peer_page, 0x53),
+                (high_page, 0x54),
+            ] {
+                assert_eq!(
+                    inner
+                        .read_committed_page_copy(&cx, &pager.cache, &pager.wal_backend, page)
+                        .await
+                        .unwrap(),
+                    sample_page(fill),
+                    "free-list publication must preserve every committed data page"
+                );
+            }
         });
     }
 

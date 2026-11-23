@@ -6526,10 +6526,7 @@ mod tests {
                 "NOT EXISTS (SELECT 1) AND 0",
                 "(NOT EXISTS (SELECT 1)) AND 0",
             ),
-            (
-                "NOT EXISTS (SELECT 1) OR 1",
-                "(NOT EXISTS (SELECT 1)) OR 1",
-            ),
+            ("NOT EXISTS (SELECT 1) OR 1", "(NOT EXISTS (SELECT 1)) OR 1"),
             (
                 "2 + NOT EXISTS (SELECT 1) + 10",
                 "2 + (NOT (EXISTS (SELECT 1) + 10))",
