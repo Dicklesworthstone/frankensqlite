@@ -1494,3 +1494,386 @@ fn gh542_triggers_autoincrement_without_rowid_temp_parity() {
         );
     });
 }
+
+
+
+#[test]
+fn gh542_edge1_temp_parent_child_and_shadowing() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut diffs = Vec::new();
+        for (label, sql) in [
+            ("fk_on", "PRAGMA foreign_keys = ON"),
+            ("create_main_p", "CREATE TABLE p (id INTEGER PRIMARY KEY, k INT UNIQUE)"),
+            ("create_main_c", "CREATE TABLE c (id INTEGER PRIMARY KEY, pk INT REFERENCES p(k))"),
+            ("seed_main_p", "INSERT INTO p VALUES (1, 10)"),
+            ("seed_main_c", "INSERT INTO c VALUES (50, 10)"),
+            // TEMP parent + TEMP child referencing TEMP parent(k)
+            ("create_tp", "CREATE TEMP TABLE tp (id INTEGER PRIMARY KEY, k INT UNIQUE)"),
+            ("create_tc", "CREATE TEMP TABLE tc (id INTEGER PRIMARY KEY, pk INT REFERENCES tp(k))"),
+            ("seed_tp", "INSERT INTO tp VALUES (1, 100)"),
+            ("seed_tc", "INSERT INTO tc VALUES (70, 100)"),
+            // Single-row immediate FK failure on TEMP child
+            ("tc_imm_fail", "INSERT INTO tc(pk) VALUES (999)"),
+            // Upsert on TEMP parent modifying referenced key k (child tc references 100)
+            (
+                "tp_upsert_mod_pk",
+                "INSERT INTO tp(id, k) VALUES (1, 100) ON CONFLICT(id) DO UPDATE SET k = 200",
+            ),
+            // TEMP table `p` shadowing `main.p`, with NO temp child referencing it,
+            // plus an immediate FK to `tp(k)` so we can observe failing insert behavior.
+            (
+                "create_shadow_p",
+                "CREATE TEMP TABLE p (id INTEGER PRIMARY KEY, k INT UNIQUE, tpk INT REFERENCES tp(k))",
+            ),
+            ("seed_shadow_p", "INSERT INTO p VALUES (1, 10, 100)"),
+            // Failing insert into TEMP `p` with DO UPDATE SET k = 99 (main.c references main.p(k), NOT temp.p(k))
+            (
+                "shadow_p_upsert_fk_fail",
+                "INSERT INTO p(id, k, tpk) VALUES (2, 20, 999) ON CONFLICT(id) DO UPDATE SET k = 99",
+            ),
+            // Explicit main.p upsert modifying referenced parent key k (main.c references main.p(k))
+            (
+                "main_p_upsert_mod_pk",
+                "INSERT INTO main.p(id, k) VALUES (1, 10) ON CONFLICT(id) DO UPDATE SET k = 20",
+            ),
+            // A BEFORE INSERT trigger on main.p must not change TEMP p's immediate-FK preservation
+            (
+                "main_p_before_trig",
+                "CREATE TRIGGER tr_main_p BEFORE INSERT ON main.p BEGIN SELECT 1; END",
+            ),
+            (
+                "shadow_p_imm_fk_fail_with_main_trig",
+                "INSERT INTO p(id, k, tpk) VALUES (3, 30, 999)",
+            ),
+        ] {
+            step_exec(&f, &r, label, sql, &mut diffs).await;
+        }
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "Edge 1 (TEMP parent/child + shadowing) diffs:\n{}",
+            diffs.join("\n")
+        );
+    });
+}
+
+#[test]
+fn gh542_edge2_composite_pk_not_null_check_on_conflict_replace() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut diffs = Vec::new();
+        for (label, sql) in [
+            ("fk_on", "PRAGMA foreign_keys = ON"),
+            ("create_p", "CREATE TABLE p (id INTEGER PRIMARY KEY)"),
+            ("seed_p", "INSERT INTO p VALUES (1)"),
+            (
+                "create_comp_pk",
+                "CREATE TABLE c_pk (a INT, b INT, pid INT REFERENCES p(id), PRIMARY KEY (a, b) ON CONFLICT REPLACE)",
+            ),
+            ("seed_comp_pk", "INSERT INTO c_pk VALUES (1, 1, 1)"),
+            ("comp_pk_fk_fail_new", "INSERT INTO c_pk VALUES (2, 2, 999)"),
+            ("comp_pk_fk_fail_dup", "INSERT INTO c_pk VALUES (1, 1, 999)"),
+            (
+                "create_nn_rep",
+                "CREATE TABLE c_nn (id INTEGER PRIMARY KEY, x INT NOT NULL ON CONFLICT REPLACE DEFAULT 7, pid INT REFERENCES p(id))",
+            ),
+            ("seed_nn", "INSERT INTO c_nn(id, x, pid) VALUES (10, 5, 1)"),
+            ("nn_fk_fail_nonnull", "INSERT INTO c_nn(x, pid) VALUES (5, 999)"),
+            ("nn_fk_fail_null", "INSERT INTO c_nn(x, pid) VALUES (NULL, 999)"),
+            (
+                "create_chk",
+                "CREATE TABLE c_chk (id INTEGER PRIMARY KEY, x INT CHECK(x > 0), pid INT REFERENCES p(id))",
+            ),
+            ("seed_chk", "INSERT INTO c_chk(id, x, pid) VALUES (20, 5, 1)"),
+            ("chk_fk_fail_valid_x", "INSERT INTO c_chk(x, pid) VALUES (5, 999)"),
+            ("chk_fk_fail_bad_x", "INSERT INTO c_chk(x, pid) VALUES (-1, 999)"),
+        ] {
+            step_exec(&f, &r, label, sql, &mut diffs).await;
+        }
+        for tbl in ["c_pk", "c_nn", "c_chk"] {
+            let q = format!("SELECT count(*) FROM {tbl}");
+            assert_eq!(
+                f_query(&f, &q).await,
+                Ok(vec![vec!["int:1".to_owned()]]),
+                "table {tbl} must exist with 1 seeded row"
+            );
+            assert_eq!(r_query(&r, &q), Ok(vec![vec!["int:1".to_owned()]]));
+        }
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "Edge 2 (composite PK / NOT NULL / CHECK ON CONFLICT REPLACE) diffs:\n{}",
+            diffs.join("\n")
+        );
+    });
+}
+
+#[test]
+fn gh542_edge3_cte_and_scalar_subquery_values() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut diffs = Vec::new();
+        for (label, sql) in [
+            ("fk_on", "PRAGMA foreign_keys = ON"),
+            ("create_p", "CREATE TABLE p (id INTEGER PRIMARY KEY)"),
+            ("create_c", "CREATE TABLE c (id INTEGER PRIMARY KEY, v INT, pid INT REFERENCES p(id))"),
+            ("seed_p", "INSERT INTO p VALUES (1)"),
+            ("seed_c", "INSERT INTO c VALUES (10, 1, 1)"),
+            (
+                "cte_values_subquery_v",
+                "WITH cte AS (SELECT 1) INSERT INTO c(v, pid) VALUES ((SELECT * FROM cte), 999)",
+            ),
+            (
+                "cte_values_subquery_pid",
+                "WITH cte AS (SELECT 999) INSERT INTO c(v, pid) VALUES (1, (SELECT * FROM cte))",
+            ),
+            (
+                "scalar_subquery_values",
+                "INSERT INTO c(v, pid) VALUES (1, (SELECT 999))",
+            ),
+            (
+                "cte_insert_select",
+                "WITH cte AS (SELECT 1 AS v, 999 AS pid) INSERT INTO c(v, pid) SELECT v, pid FROM cte",
+            ),
+        ] {
+            step_exec(&f, &r, label, sql, &mut diffs).await;
+        }
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "Edge 3 (CTE + scalar subquery VALUES) diffs:\n{}",
+            diffs.join("\n")
+        );
+    });
+}
+
+#[test]
+fn gh542_edge4_pragma_defer_foreign_keys_autocommit_and_txn() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut diffs = Vec::new();
+        for (label, sql) in [
+            ("fk_on", "PRAGMA foreign_keys = ON"),
+            ("create_p", "CREATE TABLE p (id INTEGER PRIMARY KEY)"),
+            ("create_c", "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT REFERENCES p(id))"),
+            ("seed_p", "INSERT INTO p VALUES (1)"),
+            ("seed_c", "INSERT INTO c VALUES (10, 1)"),
+            // Autocommit with defer_foreign_keys = ON
+            ("defer_on_auto", "PRAGMA defer_foreign_keys = ON"),
+            ("auto_fk_fail_with_defer", "INSERT INTO c(pid) VALUES (999)"),
+            ("auto_fk_fail_after_first", "INSERT INTO c(pid) VALUES (999)"),
+            // Reset baseline and test inside BEGIN transaction
+            ("seed_c_2", "INSERT INTO c VALUES (20, 1)"),
+            ("begin_txn", "BEGIN"),
+            ("defer_on_txn", "PRAGMA defer_foreign_keys = ON"),
+            ("txn_fk_insert", "INSERT INTO c(pid) VALUES (999)"),
+            ("txn_commit_fail", "COMMIT"),
+            ("txn_rollback", "ROLLBACK"),
+            // After rollback, defer_foreign_keys should auto-reset to OFF
+            ("post_rollback_imm_fail", "INSERT INTO c(pid) VALUES (999)"),
+        ] {
+            step_exec(&f, &r, label, sql, &mut diffs).await;
+        }
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "Edge 4 (PRAGMA defer_foreign_keys autocommit vs txn) diffs:\n{}",
+            diffs.join("\n")
+        );
+    });
+}
+
+#[test]
+fn gh542_edge5_prepared_statement_across_create_drop_trigger() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut diffs = Vec::new();
+        for (label, sql) in [
+            ("fk_on", "PRAGMA foreign_keys = ON"),
+            ("create_p", "CREATE TABLE p (id INTEGER PRIMARY KEY)"),
+            ("create_c", "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT REFERENCES p(id))"),
+            ("seed_p", "INSERT INTO p VALUES (1)"),
+            ("seed_c", "INSERT INTO c VALUES (10, 1)"),
+        ] {
+            step_exec(&f, &r, label, sql, &mut diffs).await;
+        }
+
+        let sql = "INSERT INTO c(pid) VALUES (?1)";
+        let f_stmt = f.prepare(sql).await.expect("fsqlite prepare");
+        let mut r_stmt = r.prepare(sql).expect("rusqlite prepare");
+
+        let exec_pair = async |f_conn: &Connection,
+                               r_conn: &rusqlite::Connection,
+                               f_s: &fsqlite_core::connection::PreparedStatement,
+                               r_s: &mut rusqlite::Statement<'_>,
+                               label: &str,
+                               pid: i64,
+                               diffs: &mut Vec<String>| {
+            let f_ok = f_s
+                .execute_with_params(&[SqliteValue::Integer(pid)])
+                .await
+                .is_ok();
+            let r_ok = r_s.execute(rusqlite::params![pid]).is_ok();
+            let (f_sql_lir, f_api_lir, f_chg, f_tot) = f_counters(f_conn).await;
+            let (r_sql_lir, r_api_lir, r_chg, r_tot) = r_counters(r_conn);
+            let f_obs = StepObs {
+                ok: f_ok,
+                sql_last_insert_rowid: f_sql_lir,
+                api_last_insert_rowid: f_api_lir,
+                changes: f_chg,
+                total_changes: f_tot,
+            };
+            let r_obs = StepObs {
+                ok: r_ok,
+                sql_last_insert_rowid: r_sql_lir,
+                api_last_insert_rowid: r_api_lir,
+                changes: r_chg,
+                total_changes: r_tot,
+            };
+            if f_obs != r_obs {
+                diffs.push(format!(
+                    "  [{label}] prepared pid={pid}\n    frank={f_obs:?}\n    stock={r_obs:?}"
+                ));
+            }
+        };
+
+        exec_pair(&f, &r, &f_stmt, &mut r_stmt, "prep_before_trig", 999, &mut diffs).await;
+
+        step_exec(
+            &f,
+            &r,
+            "add_before_trig",
+            "CREATE TRIGGER tr_before BEFORE INSERT ON c BEGIN SELECT 1; END",
+            &mut diffs,
+        )
+        .await;
+        exec_pair(&f, &r, &f_stmt, &mut r_stmt, "prep_with_before_trig", 999, &mut diffs).await;
+
+        step_exec(&f, &r, "drop_before_trig", "DROP TRIGGER tr_before", &mut diffs).await;
+        step_exec(&f, &r, "reseed_c", "INSERT INTO c VALUES (20, 1)", &mut diffs).await;
+        step_exec(
+            &f,
+            &r,
+            "add_after_trig",
+            "CREATE TRIGGER tr_after AFTER INSERT ON c BEGIN SELECT 1; END",
+            &mut diffs,
+        )
+        .await;
+        exec_pair(&f, &r, &f_stmt, &mut r_stmt, "prep_with_after_trig", 999, &mut diffs).await;
+
+        step_exec(&f, &r, "drop_after_trig", "DROP TRIGGER tr_after", &mut diffs).await;
+        step_exec(&f, &r, "reseed_c_2", "INSERT INTO c VALUES (30, 1)", &mut diffs).await;
+        exec_pair(&f, &r, &f_stmt, &mut r_stmt, "prep_after_drop_trig", 999, &mut diffs).await;
+
+        drop(r_stmt);
+        drop(f_stmt);
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "Edge 5 (prepared stmt across CREATE/DROP TRIGGER) diffs:\n{}",
+            diffs.join("\n")
+        );
+    });
+}
+
+#[test]
+fn gh542_edge6_insert_or_conflict_clauses() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut diffs = Vec::new();
+        for (label, sql) in [
+            ("fk_on", "PRAGMA foreign_keys = ON"),
+            ("create_p", "CREATE TABLE p (id INTEGER PRIMARY KEY)"),
+            ("create_c", "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT REFERENCES p(id))"),
+            (
+                "create_crepl",
+                "CREATE TABLE crepl (id INTEGER PRIMARY KEY, u INT UNIQUE ON CONFLICT REPLACE, pid INT REFERENCES p(id))",
+            ),
+            ("seed_p", "INSERT INTO p VALUES (1)"),
+            ("seed_c", "INSERT INTO c VALUES (10, 1)"),
+            ("auto_or_ignore", "INSERT OR IGNORE INTO c(pid) VALUES (999)"),
+            ("auto_or_fail", "INSERT OR FAIL INTO c(pid) VALUES (999)"),
+            ("auto_or_rollback", "INSERT OR ROLLBACK INTO c(pid) VALUES (999)"),
+            ("auto_or_abort", "INSERT OR ABORT INTO c(pid) VALUES (999)"),
+            // Explicit OR ABORT on a table with UNIQUE ON CONFLICT REPLACE
+            ("seed_crepl", "INSERT INTO crepl VALUES (15, 1, 1)"),
+            ("crepl_plain_fk_fail", "INSERT INTO crepl(u, pid) VALUES (2, 999)"),
+            ("seed_crepl_2", "INSERT INTO crepl VALUES (16, 3, 1)"),
+            ("crepl_or_abort_fk_fail", "INSERT OR ABORT INTO crepl(u, pid) VALUES (4, 999)"),
+            // Inside explicit transaction
+            ("txn_begin_1", "BEGIN"),
+            ("txn_seed", "INSERT INTO c VALUES (20, 1)"),
+            ("txn_or_ignore", "INSERT OR IGNORE INTO c(pid) VALUES (999)"),
+            ("txn_or_fail", "INSERT OR FAIL INTO c(pid) VALUES (999)"),
+            ("txn_or_abort", "INSERT OR ABORT INTO c(pid) VALUES (999)"),
+            ("txn_or_rollback", "INSERT OR ROLLBACK INTO c(pid) VALUES (999)"),
+            // Verify whether the transaction is still open or was rolled back by INSERT OR ROLLBACK
+            ("post_or_rollback_rollback", "ROLLBACK"),
+        ] {
+            step_exec(&f, &r, label, sql, &mut diffs).await;
+        }
+        let fq = f_query(&f, "SELECT id FROM c ORDER BY id").await;
+        let rq = r_query(&r, "SELECT id FROM c ORDER BY id");
+        assert_eq!(fq, rq, "rows after INSERT OR ROLLBACK must match stock");
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "Edge 6 (INSERT OR IGNORE/FAIL/ROLLBACK/ABORT) diffs:\n{}",
+            diffs.join("\n")
+        );
+    });
+}
+
+#[test]
+fn gh542_edge7_mixed_deferred_and_immediate_fks() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut diffs = Vec::new();
+        for (label, sql) in [
+            ("fk_on", "PRAGMA foreign_keys = ON"),
+            ("create_p1", "CREATE TABLE p1 (id INTEGER PRIMARY KEY)"),
+            ("create_p2", "CREATE TABLE p2 (id INTEGER PRIMARY KEY)"),
+            ("seed_p1", "INSERT INTO p1 VALUES (1)"),
+            ("seed_p2", "INSERT INTO p2 VALUES (1)"),
+            (
+                "create_def_first",
+                "CREATE TABLE m_df (id INTEGER PRIMARY KEY, d INT REFERENCES p1(id) DEFERRABLE INITIALLY DEFERRED, i INT REFERENCES p2(id))",
+            ),
+            (
+                "create_imm_first",
+                "CREATE TABLE m_if (id INTEGER PRIMARY KEY, i INT REFERENCES p2(id), d INT REFERENCES p1(id) DEFERRABLE INITIALLY DEFERRED)",
+            ),
+            ("seed_df", "INSERT INTO m_df VALUES (10, 1, 1)"),
+            ("df_both_fail_auto", "INSERT INTO m_df(d, i) VALUES (999, 999)"),
+            ("df_imm_only_auto", "INSERT INTO m_df(d, i) VALUES (1, 999)"),
+            ("df_def_only_auto", "INSERT INTO m_df(d, i) VALUES (999, 1)"),
+            ("seed_if", "INSERT INTO m_if VALUES (30, 1, 1)"),
+            ("if_both_fail_auto", "INSERT INTO m_if(i, d) VALUES (999, 999)"),
+            ("if_imm_only_auto", "INSERT INTO m_if(i, d) VALUES (999, 1)"),
+            ("if_def_only_auto", "INSERT INTO m_if(i, d) VALUES (1, 999)"),
+            ("txn_begin", "BEGIN"),
+            ("txn_seed_df", "INSERT INTO m_df VALUES (50, 1, 1)"),
+            ("txn_df_both_fail", "INSERT INTO m_df(d, i) VALUES (999, 999)"),
+            ("txn_df_imm_only", "INSERT INTO m_df(d, i) VALUES (1, 999)"),
+            ("txn_df_def_only", "INSERT INTO m_df(d, i) VALUES (999, 1)"),
+            ("txn_commit_fail", "COMMIT"),
+            ("txn_rollback", "ROLLBACK"),
+        ] {
+            step_exec(&f, &r, label, sql, &mut diffs).await;
+        }
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "Edge 7 (mixed deferred + immediate FKs) diffs:\n{}",
+            diffs.join("\n")
+        );
+    });
+}

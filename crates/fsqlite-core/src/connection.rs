@@ -80915,20 +80915,68 @@ impl Connection {
     /// `ON CONFLICT ... DO UPDATE` clauses that touch a child/parent FK column
     /// or fire an `UPDATE` trigger open a statement journal and validate FKs
     /// after `OP_Insert`, so their failed insert updates `last_insert_rowid()`.
+    fn table_fk_keys_modified_by_update(
+        table: &TableSchema,
+        assignments: &[fsqlite_ast::Assignment],
+    ) -> Vec<usize> {
+        let assigned: Vec<usize> = assignments
+            .iter()
+            .flat_map(|assignment| match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => std::slice::from_ref(column),
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.as_slice(),
+            })
+            .filter_map(|name| {
+                table
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(name))
+                    .or_else(|| {
+                        is_hidden_rowid_alias_name(name)
+                            .then(|| table.columns.iter().position(|column| column.is_ipk))
+                            .flatten()
+                    })
+            })
+            .collect();
+        table
+            .foreign_keys
+            .iter()
+            .enumerate()
+            .filter(|(_, fk)| {
+                fk.child_columns
+                    .iter()
+                    .any(|column| assigned.contains(column))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     fn fk_parent_keys_modified_by_update(
         &self,
         parent_table_name: &str,
+        parent_schema: Option<&str>,
         assigned_cols: &[String],
     ) -> bool {
-        let schema = self.schema.borrow();
-        let parent_table = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(parent_table_name));
-        let implicit_parent_cols = Self::fk_implicit_parent_key_columns(parent_table);
+        let Some(parent_table) = self.local_dml_target_table(parent_table_name, parent_schema)
+        else {
+            return false;
+        };
+        let parent_is_temp = parent_schema.map_or_else(
+            || {
+                self.temp_table_names
+                    .borrow()
+                    .contains(&parent_table_name.to_ascii_lowercase())
+            },
+            |schema_name| schema_name.eq_ignore_ascii_case("temp"),
+        );
+        let implicit_parent_cols = Self::fk_implicit_parent_key_columns(Some(&parent_table));
         let ipk_col_name = parent_table
-            .and_then(|table| table.columns.iter().find(|col| col.is_ipk))
-            .map(|col| col.name.as_str());
-        schema.iter().any(|child| {
+            .columns
+            .iter()
+            .find(|col| col.is_ipk)
+            .map(|col| col.name.clone());
+        drop(parent_table);
+
+        let matches_child = |child: &TableSchema| {
             child.foreign_keys.iter().any(|fk| {
                 if !fk.parent_table.eq_ignore_ascii_case(parent_table_name) {
                     return false;
@@ -80941,12 +80989,36 @@ impl Connection {
                 parent_cols.iter().any(|pcol| {
                     assigned_cols.iter().any(|assigned| {
                         assigned.eq_ignore_ascii_case(pcol)
-                            || (ipk_col_name.is_some_and(|ipk| ipk.eq_ignore_ascii_case(pcol))
+                            || (ipk_col_name
+                                .as_deref()
+                                .is_some_and(|ipk| ipk.eq_ignore_ascii_case(pcol))
                                 && is_hidden_rowid_alias_name(assigned))
                     })
                 })
             })
-        })
+        };
+
+        let temp_names = self.temp_table_names.borrow();
+        let schema = self.schema.borrow();
+        if schema.iter().any(|child| {
+            let child_is_temp = temp_names.contains(&child.name.to_ascii_lowercase());
+            child_is_temp == parent_is_temp && matches_child(child)
+        }) {
+            return true;
+        }
+        drop(schema);
+        drop(temp_names);
+
+        if !parent_is_temp
+            && self
+                .shadowed_main_tables
+                .borrow()
+                .values()
+                .any(matches_child)
+        {
+            return true;
+        }
+        false
     }
 
     fn insert_immediate_fk_preserves_last_insert_rowid(
@@ -80970,38 +81042,57 @@ impl Connection {
             return false;
         }
         let table_name = insert.table.name.as_str();
+        let target_schema = insert
+            .table
+            .schema
+            .as_deref()
+            .unwrap_or_else(|| self.visible_trigger_target_schema(table_name));
         let insert_event = fsqlite_ast::TriggerEvent::Insert;
-        if self.has_matching_triggers(table_name, fsqlite_ast::TriggerTiming::Before, &insert_event)
-            || self.has_matching_triggers(
-                table_name,
-                fsqlite_ast::TriggerTiming::After,
-                &insert_event,
-            )
-        {
+        if self.has_matching_triggers_in_schema(
+            table_name,
+            target_schema,
+            fsqlite_ast::TriggerTiming::Before,
+            &insert_event,
+        ) || self.has_matching_triggers_in_schema(
+            table_name,
+            target_schema,
+            fsqlite_ast::TriggerTiming::After,
+            &insert_event,
+        ) {
             return false;
         }
         for clause in &insert.upsert {
             if let fsqlite_ast::UpsertAction::Update { assignments, .. } = &clause.action {
                 let assigned_cols = Self::assignment_target_column_names(assignments);
                 let update_event = fsqlite_ast::TriggerEvent::Update(assigned_cols.clone());
-                if self.has_matching_triggers(
+                let child_fk_modified = self
+                    .local_dml_target_table(table_name, Some(target_schema))
+                    .is_some_and(|table| {
+                        !Self::table_fk_keys_modified_by_update(&table, assignments).is_empty()
+                    });
+                if self.has_matching_triggers_in_schema(
                     table_name,
+                    target_schema,
                     fsqlite_ast::TriggerTiming::Before,
                     &update_event,
-                ) || self.has_matching_triggers(
+                ) || self.has_matching_triggers_in_schema(
                     table_name,
+                    target_schema,
                     fsqlite_ast::TriggerTiming::After,
                     &update_event,
-                ) || !self.fk_keys_modified_by_update(table_name, assignments).is_empty()
-                    || self.fk_parent_keys_modified_by_update(table_name, &assigned_cols)
+                ) || child_fk_modified
+                    || self.fk_parent_keys_modified_by_update(
+                        table_name,
+                        Some(target_schema),
+                        &assigned_cols,
+                    )
                 {
                     return false;
                 }
             }
         }
         if insert.or_conflict.is_none()
-            && let Some(table) =
-                self.local_dml_target_table(table_name, insert.table.schema.as_deref())
+            && let Some(table) = self.local_dml_target_table(table_name, Some(target_schema))
         {
             let has_schema_pk_or_unique_replace = table.columns.iter().any(|column| {
                 column.is_ipk
@@ -81224,35 +81315,7 @@ impl Connection {
         else {
             return Vec::new();
         };
-        let assigned: Vec<usize> = assignments
-            .iter()
-            .flat_map(|assignment| match &assignment.target {
-                fsqlite_ast::AssignmentTarget::Column(column) => std::slice::from_ref(column),
-                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.as_slice(),
-            })
-            .filter_map(|name| {
-                table
-                    .columns
-                    .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(name))
-                    .or_else(|| {
-                        is_hidden_rowid_alias_name(name)
-                            .then(|| table.columns.iter().position(|column| column.is_ipk))
-                            .flatten()
-                    })
-            })
-            .collect();
-        table
-            .foreign_keys
-            .iter()
-            .enumerate()
-            .filter(|(_, fk)| {
-                fk.child_columns
-                    .iter()
-                    .any(|column| assigned.contains(column))
-            })
-            .map(|(index, _)| index)
-            .collect()
+        Self::table_fk_keys_modified_by_update(table, assignments)
     }
 
     /// Check the child-side foreign keys of `row_values`, or only the keys at
@@ -81376,7 +81439,7 @@ impl Connection {
                     }
                     continue;
                 }
-                if fk.deferred {
+                if fk.deferred || self.defer_foreign_keys.get() {
                     autocommit_deferred_violation = true;
                     continue;
                 }
@@ -81437,7 +81500,7 @@ impl Connection {
                     }
                     continue;
                 }
-                if fk.deferred {
+                if fk.deferred || self.defer_foreign_keys.get() {
                     autocommit_deferred_violation = true;
                     continue;
                 }
@@ -81482,7 +81545,7 @@ impl Connection {
                     }
                     continue;
                 }
-                if fk.deferred {
+                if fk.deferred || self.defer_foreign_keys.get() {
                     autocommit_deferred_violation = true;
                     continue;
                 }
@@ -83272,6 +83335,21 @@ impl Connection {
     ) -> bool {
         self.triggers.borrow().iter().any(|trigger| {
             trigger.table_name.eq_ignore_ascii_case(table_name)
+                && trigger.timing == timing
+                && trigger_event_matches(&trigger.event, event)
+        })
+    }
+
+    fn has_matching_triggers_in_schema(
+        &self,
+        table_name: &str,
+        target_schema: &str,
+        timing: fsqlite_ast::TriggerTiming,
+        event: &fsqlite_ast::TriggerEvent,
+    ) -> bool {
+        self.triggers.borrow().iter().any(|trigger| {
+            trigger.table_name.eq_ignore_ascii_case(table_name)
+                && trigger.bound_table_schema.eq_ignore_ascii_case(target_schema)
                 && trigger.timing == timing
                 && trigger_event_matches(&trigger.event, event)
         })
