@@ -98484,6 +98484,7 @@ impl Connection {
         // Step 4c: Resolve GROUP BY alias references against SELECT-list aliases.
         let mut group_by_exprs = group_by_exprs.clone();
         resolve_group_by_aliases(&mut group_by_exprs, &expanded_columns, &col_map);
+        let keys_have_subqueries = group_by_exprs.iter().any(expr_has_any_subquery);
 
         // Build per-GROUP-BY-key collation info.
         let group_collations: Vec<Option<String>> = group_by_exprs
@@ -98530,12 +98531,16 @@ impl Connection {
                 let row_values = row.values;
                 let mut key = Vec::with_capacity(group_by_exprs.len());
                 for expr in &group_by_exprs {
-                    key.push(self.eval_join_expr_with_using_registry(
-                        expr,
-                        &row_values,
-                        &col_map,
-                        using_skip,
-                    )?);
+                    key.push(if keys_have_subqueries {
+                        self.eval_row_expr_allowing_subqueries_with_using(
+                            expr, &row_values, &col_map, using_skip,
+                        )
+                        .await?
+                    } else {
+                        self.eval_join_expr_with_using_registry(
+                            expr, &row_values, &col_map, using_skip,
+                        )?
+                    });
                 }
                 let key_hash = HashableJoinKey(
                     key.iter()
@@ -98561,12 +98566,16 @@ impl Connection {
             for row in join_rows {
                 let mut key = Vec::with_capacity(group_by_exprs.len());
                 for expr in &group_by_exprs {
-                    key.push(self.eval_join_expr_with_using_registry(
-                        expr,
-                        row.values(),
-                        &col_map,
-                        using_skip,
-                    )?);
+                    key.push(if keys_have_subqueries {
+                        self.eval_row_expr_allowing_subqueries_with_using(
+                            expr, row.values(), &col_map, using_skip,
+                        )
+                        .await?
+                    } else {
+                        self.eval_join_expr_with_using_registry(
+                            expr, row.values(), &col_map, using_skip,
+                        )?
+                    });
                 }
                 keyed_rows.push((key, row.values));
             }
@@ -104742,6 +104751,7 @@ impl Connection {
         // reference that doesn't match a table column, look for a matching
         // SELECT-list alias and replace with the underlying expression.
         resolve_group_by_aliases(&mut group_by_exprs, &expanded_columns, &col_map);
+        let keys_have_subqueries = group_by_exprs.iter().any(expr_has_any_subquery);
 
         let has_where = matches!(
             &select.body.select,
@@ -104911,7 +104921,10 @@ impl Connection {
             .collect();
         let minmax_bare_tracking =
             self.select_uses_builtin_minmax_bare_tracking_with_keys(select, &variant_group_keys);
+        // Subquery keys must bind the current outer row before forming the group.
+        // The context-free streaming accumulator cannot perform a nested SELECT.
         let simple_streaming_outputs = if minmax_bare_tracking.is_some()
+            || keys_have_subqueries
             || self.scalar_function_overridden.get()
             || self.custom_aggregate_registered.get()
         {
@@ -105001,7 +105014,12 @@ impl Connection {
         for row in raw_rows {
             let mut key = Vec::with_capacity(group_by_exprs.len());
             for expr in &group_by_exprs {
-                key.push(self.eval_join_expr_with_registry(expr, row.values(), &col_map)?);
+                key.push(if keys_have_subqueries {
+                    self.eval_row_expr_allowing_subqueries(expr, row.values(), &col_map)
+                        .await?
+                } else {
+                    self.eval_join_expr_with_registry(expr, row.values(), &col_map)?
+                });
             }
             keyed_rows.push((key, row.values));
         }

@@ -566,3 +566,48 @@ fn correlated_having_and_nested() {
               "nested two-level correlation").await;
     });
 }
+
+/// bd-scbik: each input row supplies the outer references in its GROUP BY
+/// keys, including keys reached through result aliases and JOIN ... USING.
+#[test]
+fn correlated_subqueries_in_grouping_keys() {
+    for file in [false, true] {
+        asupersync::test_utils::run_test(move || async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("groups.db");
+            let f = Connection::open(if file { path.to_str().unwrap() } else { ":memory:" })
+                .await
+                .unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE t(k INTEGER PRIMARY KEY, n INT, c TEXT)",
+                "INSERT INTO t VALUES (1,1,'x'),(2,2,'y'),(3,30,'z')",
+                "CREATE TABLE s(k, v)",
+                "INSERT INTO s VALUES (1,7),(1,73),(2,80)",
+            ] {
+                f.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            for sql in [
+                "SELECT count(*) FROM t GROUP BY EXISTS (SELECT 1 FROM s WHERE s.k = t.k)",
+                "SELECT count(*) FROM t GROUP BY NOT EXISTS (SELECT 1 FROM s WHERE s.k = t.k)",
+                "SELECT count(*) FROM t GROUP BY NOT EXISTS (SELECT 1 FROM s WHERE s.k = t.k) + k",
+                "SELECT count(*) FROM t GROUP BY (SELECT max(v) FROM s WHERE s.k = t.k)",
+                "SELECT EXISTS (SELECT 1 FROM s WHERE s.k = t.k) AS e, count(*) FROM t GROUP BY e",
+                "SELECT EXISTS (SELECT 1 FROM s WHERE s.k = t.k) AS e, count(*) FROM t GROUP BY e HAVING e ORDER BY e DESC",
+                "SELECT count(*) FROM t GROUP BY EXISTS (SELECT 1 FROM s WHERE s.k = 1)",
+                "SELECT count(*) FROM t LEFT JOIN s USING (k) GROUP BY EXISTS (SELECT 1 FROM t AS inner_t WHERE inner_t.k = s.v - 6)",
+            ] {
+                let expected = rq(&stock, sql);
+                assert_eq!(fq(&f, sql).await, expected, "direct, file={file}: {sql}");
+                let stmt = f.prepare(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+                let rows = stmt.query().await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+                let actual = rows
+                    .iter()
+                    .map(|r| r.values().iter().map(tag_f).collect::<Vec<_>>())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "prepared, file={file}: {sql}");
+            }
+        });
+    }
+}
