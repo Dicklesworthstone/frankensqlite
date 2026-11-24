@@ -3802,13 +3802,34 @@ fn configure_rusqlite_connection(
     )
 }
 
+/// Creates the stock schema and returns the setup connection with its settings. The caller keeps
+/// the connection open until every worker has finished: closing the last stock connection
+/// checkpoints and deletes the -wal (see the setup-connection note in `run_rusqlite`).
+fn prepare_rusqlite_schema(
+    path: &str,
+    threads: usize,
+    separate_tables: bool,
+    wal_autocheckpoint_pages: i64,
+    synchronous: SynchronousMode,
+) -> Result<(rusqlite::Connection, EffectiveSettings), String> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|error| format!("C SQLite init open failed: {error}"))?;
+    let settings = configure_rusqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)?;
+    conn.execute_batch(&create_tables_sql(threads, separate_tables))
+        .map_err(|error| format!("C SQLite init schema failed: {error}"))?;
+    Ok((conn, settings))
+}
+
+/// Creates the schema and returns the setup connection with its settings. The caller keeps the
+/// connection open until every worker has finished (see `run_fsqlite`), so both engines enter the
+/// timed window with the WAL already in place (bd-w4pr1.27).
 fn prepare_fsqlite_schema(
     path: &str,
     threads: usize,
     separate_tables: bool,
     wal_autocheckpoint_pages: i64,
     synchronous: SynchronousMode,
-) -> Result<EffectiveSettings, String> {
+) -> Result<(fsqlite::Connection, EffectiveSettings), String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (init): {error}"))?;
     let settings = configure_fsqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)?;
@@ -3818,7 +3839,7 @@ fn prepare_fsqlite_schema(
         fsqlite_e2e::block_on(conn.execute(&create_sql))
             .map_err(|error| format!("create table {table_name}: {error}"))?;
     }
-    Ok(settings)
+    Ok((conn, settings))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -4737,7 +4758,9 @@ fn run_fsqlite(
         .ok_or_else(|| "FrankenSQLite tempfile path is not UTF-8".to_owned())?
         .to_owned();
 
-    let init_settings = prepare_fsqlite_schema(
+    // Held open until every worker has finished: see the setup-connection note in
+    // `run_rusqlite` (bd-w4pr1.27).
+    let (init_conn, init_settings) = prepare_fsqlite_schema(
         &path,
         threads,
         separate_tables,
@@ -5014,6 +5037,7 @@ fn run_fsqlite(
     let worker_startup_elapsed = worker_startup_started.elapsed();
     let workload_started = publish_startup_decision(&startup_gate, true);
     let work = join_worker_handles("FrankenSQLite", handles, &init_settings)?;
+    drop(init_conn);
     let workload_elapsed = work
         .workload_finished
         .checked_duration_since(workload_started)
@@ -5062,14 +5086,21 @@ fn run_rusqlite(
         .ok_or_else(|| "C SQLite tempfile path is not UTF-8".to_owned())?
         .to_owned();
 
-    let init_settings = {
-        let conn = rusqlite::Connection::open(&path)
-            .map_err(|error| format!("C SQLite init open failed: {error}"))?;
-        let settings = configure_rusqlite_connection(&conn, wal_autocheckpoint_pages, synchronous)?;
-        conn.execute_batch(&create_tables_sql(threads, separate_tables))
-            .map_err(|error| format!("C SQLite init schema failed: {error}"))?;
-        settings
-    };
+    // Setup-connection lifecycle (bd-w4pr1.27, 2026-11-23). Both engines keep their setup
+    // connection open until every worker has finished, so each enters the timed window with the
+    // WAL already created and its header synced. Before this, the stock setup connection closed
+    // here: as the last connection it checkpointed and deleted the -wal, and the first worker
+    // COMMIT then re-created the WAL inside the timed window, paying a WAL-header fdatasync and a
+    // directory fdatasync (about 10 ms each on a disk; strace census of one round on
+    // thinkstation1). fsqlite keeps its -wal after close, so only stock paid them. That inflated
+    // fsqlite/stock on disk-backed TMPDIRs, e.g. 14.8x for one bulk writer.
+    let (init_conn, init_settings) = prepare_rusqlite_schema(
+        &path,
+        threads,
+        separate_tables,
+        wal_autocheckpoint_pages,
+        synchronous,
+    )?;
 
     let path = Arc::new(path);
     let startup_gate = Arc::new((Mutex::new(StartupGateState::default()), Condvar::new()));
@@ -5275,6 +5306,7 @@ fn run_rusqlite(
     let worker_startup_elapsed = worker_startup_started.elapsed();
     let workload_started = publish_startup_decision(&startup_gate, true);
     let work = join_worker_handles("C SQLite", handles, &init_settings)?;
+    drop(init_conn);
     let workload_elapsed = work
         .workload_finished
         .checked_duration_since(workload_started)
@@ -5401,6 +5433,15 @@ fn run(opts: Options) -> Result<(), String> {
     eprintln!("mt-mvcc-bench: settings contract: {SETTINGS_INTERPRETATION}");
     eprintln!("mt-mvcc-bench: accounting contract: {ACCOUNTING_INTERPRETATION}");
     eprintln!("mt-mvcc-bench: timing contract: {TIMING_INTERPRETATION}");
+    eprintln!(
+        "mt-mvcc-bench: setup lifecycle: each arm's setup connection stays open until its workers \
+         finish, so neither engine creates its WAL inside the timed window (bd-w4pr1.27)"
+    );
+    eprintln!(
+        "mt-mvcc-bench: connection teardown: every FrankenSQLite connection (setup, workers, \
+         verifier) ends through Drop, never an awaited close(), so no close-time checkpoint runs; \
+         WAL state left after a run is not part of the measurement"
+    );
     if wal_autocheckpoint_overridden {
         eprintln!(
             "mt-mvcc-bench: DIAGNOSTIC OVERRIDE wal_autocheckpoint={wal_autocheckpoint_pages} applied to BOTH \
@@ -5861,6 +5902,52 @@ fn run(opts: Options) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-w4pr1.27: while a runner holds its setup connection, both engines' databases already
+    /// have their -wal, so no worker COMMIT creates (and syncs) a WAL inside the timed window.
+    /// Negative case: dropping the last stock connection checkpoints and deletes the -wal, which
+    /// is exactly the in-window WAL creation the runners avoid by holding the connection.
+    #[test]
+    fn setup_connections_keep_the_wal_in_place_until_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal_of = |db: &Path| PathBuf::from(format!("{}-wal", db.display()));
+
+        let stock = dir.path().join("stock.db");
+        let (stock_conn, stock_settings) = prepare_rusqlite_schema(
+            stock.to_str().expect("utf-8 path"),
+            2,
+            true,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            SynchronousMode::Normal,
+        )
+        .expect("stock setup");
+        assert_eq!(stock_settings.journal_mode, "wal");
+        assert!(
+            wal_of(&stock).exists(),
+            "stock setup connection must leave its -wal in place while it is open"
+        );
+        drop(stock_conn);
+        assert!(
+            !wal_of(&stock).exists(),
+            "closing the last stock connection deletes the -wal; the runners must hold it"
+        );
+
+        let fsqlite = dir.path().join("fsqlite.db");
+        let (fsqlite_conn, fsqlite_settings) = prepare_fsqlite_schema(
+            fsqlite.to_str().expect("utf-8 path"),
+            2,
+            true,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            SynchronousMode::Normal,
+        )
+        .expect("fsqlite setup");
+        assert_eq!(fsqlite_settings.journal_mode, "wal");
+        assert!(
+            wal_of(&fsqlite).exists(),
+            "fsqlite setup connection must leave its -wal in place while it is open"
+        );
+        drop(fsqlite_conn);
+    }
 
     /// bd-i0tn6: the stage profiler's thread CPU clock counts running time,
     /// not sleeping time, and resolves millisecond spans. A wall-clock reading
