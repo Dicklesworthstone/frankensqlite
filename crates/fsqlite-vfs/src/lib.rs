@@ -290,10 +290,17 @@ pub mod host_fs {
     ///   writable directory handle without administrator privileges (matching
     ///   MS-FSA §2.1.5.7 implementer behavior), but Microsoft does not publish
     ///   a Win32 application contract proving POSIX-equivalent crash/power-loss
-    ///   durability across all filesystems. On non-NTFS volumes (FAT32/exFAT),
-    ///   network shares (SMB), read-only mounts, or restricted-ACL directories
-    ///   where opening or flushing a directory handle returns an unsupported or
-    ///   access-policy error (`ERROR_INVALID_FUNCTION`, `ERROR_ACCESS_DENIED`,
+    ///   durability across all filesystems. Published power-cut measurements of
+    ///   this exact call shape on NTFS found that the flush succeeds but writes
+    ///   no metadata for a newly created, renamed or deleted entry. Treat the
+    ///   Windows branch as API-contract alignment with the Unix side, not as a
+    ///   namespace-durability guarantee: on Windows a rename-over or delete is
+    ///   not known to survive a power loss because of this call.
+    ///
+    ///   On non-NTFS volumes (FAT32/exFAT), network shares (SMB), read-only
+    ///   mounts, or restricted-ACL directories where opening or flushing a
+    ///   directory handle returns an unsupported or access-policy error
+    ///   (`ERROR_INVALID_FUNCTION`, `ERROR_ACCESS_DENIED`,
     ///   `ERROR_INVALID_HANDLE` on flush, `ERROR_WRITE_PROTECT`,
     ///   `ERROR_NOT_SUPPORTED`, `ERROR_INVALID_PARAMETER`), this helper logs at
     ///   `debug` and returns `Ok(())` so commits and backups do not regress.

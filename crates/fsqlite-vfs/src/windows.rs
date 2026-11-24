@@ -1569,9 +1569,10 @@ impl Vfs for WindowsVfs {
 
     fn sync_parent_directory(&self, _cx: &Cx, path: &Path) -> Result<()> {
         // Attempt a best-effort parent-directory flush after rename-over
-        // commits, WAL/journal creation, and durable deletes. See
-        // `host_fs::sync_directory` for the Win32 contract caveat and
-        // non-NTFS/SMB/ACL fallback behavior.
+        // commits, WAL/journal creation, and durable deletes. This mirrors the
+        // Unix call; it is not a namespace-durability guarantee on Windows.
+        // See `host_fs::sync_directory` for the Win32 contract caveat, the
+        // power-cut measurements, and non-NTFS/SMB/ACL fallback behavior.
         let resolved = resolve_path(path)?;
         crate::host_fs::sync_parent_directory(&resolved)
     }
