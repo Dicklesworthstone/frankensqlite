@@ -40,9 +40,69 @@ enum Value {
     Number(Number),
     /// Exact decimal digits when a Number would round them or lose the sign of -0.
     IntegerText(String),
+    HexInteger(HexInteger),
     String(String),
     Array(Vec<Self>),
     Object(Object),
+}
+
+/// SQLite's INT5 uses the unsigned hexadecimal magnitude to choose the SQL
+/// storage class, even for negative values. Keep the original token so a
+/// JSONB round trip retains that distinction at the signed integer boundary.
+#[derive(Debug, Clone, PartialEq)]
+struct HexInteger {
+    token: String,
+    magnitude: Option<u64>,
+}
+
+impl HexInteger {
+    fn parse_value(token: &str) -> Option<Value> {
+        let unsigned = token.strip_prefix('-').unwrap_or(token);
+        let digits = unsigned
+            .strip_prefix("0x")
+            .or_else(|| unsigned.strip_prefix("0X"))?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let magnitude = u64::from_str_radix(digits, 16).ok();
+        if let Some(n) = magnitude {
+            if !token.starts_with('-') {
+                return Some(Value::Number(n.into()));
+            }
+            if n == 0 {
+                return Some(Value::IntegerText("-0".to_owned()));
+            }
+            if let Ok(int) = i64::try_from(n) {
+                return Some(Value::Number((-int).into()));
+            }
+        }
+        Some(Value::HexInteger(Self {
+            token: token.to_owned(),
+            magnitude,
+        }))
+    }
+
+    fn write_text(&self, out: &mut String) {
+        if self.token.starts_with('-') {
+            out.push('-');
+        }
+        if let Some(magnitude) = self.magnitude {
+            out.push_str(&magnitude.to_string());
+        } else {
+            out.push_str("9.0e999");
+        }
+    }
+
+    fn sql_value(&self) -> Result<SqliteValue> {
+        let magnitude = self.magnitude.ok_or_else(malformed_json)?;
+        let negative = self.token.starts_with('-');
+        Ok(if let Ok(int) = i64::try_from(magnitude) {
+            SqliteValue::Integer(if negative { -int } else { int })
+        } else {
+            let real = magnitude as f64;
+            SqliteValue::Float(if negative { -real } else { real })
+        })
+    }
 }
 
 impl Value {
@@ -922,10 +982,8 @@ fn translate_json5_number(token: &str) -> String {
         .strip_prefix("0x")
         .or_else(|| token.strip_prefix("0X"))
     {
-        if let Ok(value) = u128::from_str_radix(hex, 16) {
-            return value.to_string();
-        }
-        return token.to_owned();
+        return u64::from_str_radix(hex, 16)
+            .map_or_else(|_| "9.0e999".to_owned(), |value| value.to_string());
     }
     let mut out = String::with_capacity(token.len() + 2);
     let mut chars = token.chars().peekable();
@@ -980,6 +1038,7 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
         Value::IntegerText(digits) => out.push_str(digits),
+        Value::HexInteger(integer) => integer.write_text(out),
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 out.push_str(&number.to_string());
@@ -1124,7 +1183,7 @@ fn json_arrow_value(root: &Value, path: &str) -> Result<SqliteValue> {
 
 fn json_extract_single_path(root: &Value, path: &str) -> Result<SqliteValue> {
     let selected = resolve_path(root, path)?;
-    Ok(selected.map_or(SqliteValue::Null, json_to_sqlite_scalar))
+    selected.map_or(Ok(SqliteValue::Null), json_to_sqlite_scalar)
 }
 
 fn jsonb_extract_single_path_value(root: &Value, path: &str) -> Result<Value> {
@@ -1773,7 +1832,7 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
                     key: SqliteValue::Integer(index_i64),
                     value: json_value_column(item)?,
                     type_name: json_type_name(item),
-                    atom: json_atom_column(item),
+                    atom: json_atom_column(item)?,
                     id: next_id,
                     parent: SqliteValue::Null,
                     fullkey,
@@ -1789,7 +1848,7 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
                     key: SqliteValue::Text(key.as_str().into()),
                     value: json_value_column(item)?,
                     type_name: json_type_name(item),
-                    atom: json_atom_column(item),
+                    atom: json_atom_column(item)?,
                     id: next_id,
                     parent: SqliteValue::Null,
                     fullkey,
@@ -1807,7 +1866,7 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
                 key: SqliteValue::Null,
                 value: json_value_column(scalar)?,
                 type_name: json_type_name(scalar),
-                atom: json_atom_column(scalar),
+                atom: json_atom_column(scalar)?,
                 id: next_id,
                 parent: SqliteValue::Null,
                 fullkey: base_path.to_owned(),
@@ -2153,7 +2212,7 @@ impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisit
 fn parse_json5_text(input: &str) -> Result<Value> {
     let Json5Value(mut value) = json5::from_str(input)
         .map_err(|error| FrankenError::function_error(format!("invalid JSON5 input: {error}")))?;
-    if may_hold_integer_text(input) {
+    if may_hold_integer_text(input) || input.contains("0x") || input.contains("0X") {
         let mut remaining = input;
         restore_json5_integer_text(&mut value, &mut remaining);
     }
@@ -2182,6 +2241,8 @@ fn restore_json5_integer_text(value: &mut Value, input: &mut &str) {
                 let digits = token.strip_prefix('+').unwrap_or(token);
                 if integer_needs_text(digits) {
                     *value = Value::IntegerText(digits.to_owned());
+                } else if let Some(integer) = HexInteger::parse_value(digits) {
+                    *value = integer;
                 }
             }
         }
@@ -2255,6 +2316,9 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Bool(true) => append_jsonb_node(JSONB_TRUE_TYPE, &[], out),
         Value::Bool(false) => append_jsonb_node(JSONB_FALSE_TYPE, &[], out),
         Value::IntegerText(digits) => append_jsonb_node(JSONB_INT_TYPE, digits.as_bytes(), out),
+        Value::HexInteger(integer) => {
+            append_jsonb_node(JSONB_INT5_TYPE, integer.token.as_bytes(), out)
+        }
         Value::Number(number) => {
             // bd-t75hg: SQLite JSONB stores numeric payloads as the ASCII
             // text of the number (RFC-8259 text for INT/FLOAT), never as
@@ -2414,13 +2478,12 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
             if integer_needs_text(normalized) {
                 return Ok((Value::IntegerText(normalized.to_owned()), consumed));
             }
-            let number = if node_type == JSONB_INT5_TYPE
-                && let Some(hex) = normalized
-                    .strip_prefix("0x")
-                    .or_else(|| normalized.strip_prefix("0X"))
+            if node_type == JSONB_INT5_TYPE
+                && let Some(integer) = HexInteger::parse_value(normalized)
             {
-                i64::from_str_radix(hex, 16).ok().map(Number::from)
-            } else if let Ok(int) = normalized.parse::<i64>() {
+                return Ok((integer, consumed));
+            }
+            let number = if let Ok(int) = normalized.parse::<i64>() {
                 Some(Number::from(int))
             } else if let Ok(uint) = normalized.parse::<u64>() {
                 Some(Number::from(uint))
@@ -2984,13 +3047,13 @@ fn json_value_column(value: &Value) -> Result<SqliteValue> {
             encode_json_text("json table value encode failed", value)
                 .map(|encoded| SqliteValue::Text(encoded.into()))
         }
-        _ => Ok(json_to_sqlite_scalar(value)),
+        _ => json_to_sqlite_scalar(value),
     }
 }
 
-fn json_atom_column(value: &Value) -> SqliteValue {
+fn json_atom_column(value: &Value) -> Result<SqliteValue> {
     match value {
-        Value::Array(_) | Value::Object(_) => SqliteValue::Null,
+        Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Null),
         _ => json_to_sqlite_scalar(value),
     }
 }
@@ -3011,7 +3074,7 @@ fn append_tree_rows(
         key,
         value: json_value_column(value)?,
         type_name: json_type_name(value),
-        atom: json_atom_column(value),
+        atom: json_atom_column(value)?,
         id: current_id,
         parent: parent_id.map_or(SqliteValue::Null, SqliteValue::Integer),
         fullkey: fullkey.to_owned(),
@@ -3108,7 +3171,7 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::Null => "null",
         Value::Bool(true) => "true",
         Value::Bool(false) => "false",
-        Value::IntegerText(_) => "integer",
+        Value::IntegerText(_) | Value::HexInteger(_) => "integer",
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 "integer"
@@ -3129,8 +3192,9 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
-    match value {
+fn json_to_sqlite_scalar(value: &Value) -> Result<SqliteValue> {
+    Ok(match value {
+        Value::HexInteger(integer) => return integer.sql_value(),
         Value::Null => SqliteValue::Null,
         Value::Bool(true) => SqliteValue::Integer(1),
         Value::Bool(false) => SqliteValue::Integer(0),
@@ -3179,7 +3243,7 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
                 encode_json_text("json scalar encode", value).unwrap_or_else(|_| "null".to_owned());
             SqliteValue::Text(encoded.into())
         }
-    }
+    })
 }
 
 /// Convert a SQL REAL to a JSON value exactly as stock SQLite does:
@@ -4106,7 +4170,7 @@ impl JsonExtractFunc {
             let subtype = matches!(selected, Some(Value::Array(_) | Value::Object(_)))
                 .then_some(JSON_SUBTYPE);
             return Ok((
-                selected.map_or(SqliteValue::Null, json_to_sqlite_scalar),
+                selected.map_or(Ok(SqliteValue::Null), json_to_sqlite_scalar)?,
                 subtype,
             ));
         }
@@ -4166,7 +4230,7 @@ impl ScalarFunction for JsonbExtractFunc {
                 Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Blob(Arc::from(
                     encode_jsonb_root(&node)?.as_slice(),
                 ))),
-                _ => Ok(json_to_sqlite_scalar(&node)),
+                _ => json_to_sqlite_scalar(&node),
             };
         }
         let paths = collect_path_args(self.name(), args, 1)?;
@@ -6266,7 +6330,7 @@ mod tests {
                 value,
                 number_text_value(if negative { "-9e999" } else { "9e999" })
             );
-            let SqliteValue::Float(number) = json_to_sqlite_scalar(&value) else {
+            let SqliteValue::Float(number) = json_to_sqlite_scalar(&value).unwrap() else {
                 panic!("{input} must extract as a REAL");
             };
             assert!(number.is_infinite());
@@ -8922,7 +8986,7 @@ mod tests {
         // still a JSON real whose atom is 1.5.
         assert_eq!(super::json_type_name(&v_float), "real");
         assert_eq!(
-            super::json_to_sqlite_scalar(&v_float),
+            super::json_to_sqlite_scalar(&v_float).unwrap(),
             SqliteValue::Float(1.5)
         );
         assert!(path.is_none());
@@ -9358,6 +9422,73 @@ mod tests {
             "-",
         ] {
             assert!(!is_shortest_fixed_decimal(token.as_bytes()), "{token}");
+        }
+    }
+
+    #[test]
+    fn stock_hex_jsonb_preserves_sql_storage_class_and_round_trips() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        for raw in [
+            "0x1a",
+            "-0x0",
+            "-0X0001",
+            "+0x7fffffffffffffff",
+            "-0x7fffffffffffffff",
+            "0x8000000000000000",
+            "-0x8000000000000000",
+            "0x000ffffffffffffffff",
+            "-0xffffffffffffffff",
+            "0x10000000000000000",
+            "-0x10000000000000000",
+        ] {
+            let input = format!("[{raw}]");
+            let SqliteValue::Blob(stock_blob) =
+                stock_json_scalar(&stock, "SELECT jsonb(?1)", &[text(&input)])
+            else {
+                panic!("expected JSONB for {raw}");
+            };
+            let args = [SqliteValue::Blob(stock_blob.clone())];
+            let rendered = stock_json_scalar(&stock, "SELECT json(?1)", &args);
+            assert_eq!(
+                text(&json_from_jsonb(&stock_blob).unwrap()),
+                rendered,
+                "{raw}"
+            );
+            assert_eq!(text(&json(&input).unwrap()), rendered, "{raw}");
+            let decoded = decode_jsonb_root(&stock_blob).unwrap();
+            let rebound = SqliteValue::Blob(encode_jsonb_root(&decoded).unwrap().into());
+            assert_eq!(
+                stock_json_scalar(&stock, "SELECT json(?1)", &[rebound.clone()]),
+                rendered,
+                "{raw}"
+            );
+            let sql = "SELECT json_extract(?1,'$[0]')";
+            let expected = stock_json_rows(&stock, sql, &args);
+            let ours = json_extract_value(&decoded, &["$[0]"]);
+            let tree = json_tree_blob(&stock_blob, None);
+            if let Ok(rows) = expected {
+                let scalar = &rows[0][0];
+                for actual in [
+                    ours.unwrap(),
+                    json_extract(&input, &["$[0]"]).unwrap(),
+                    tree.unwrap()[1].atom.clone(),
+                    stock_json_scalar(&stock, sql, &[rebound]),
+                ] {
+                    assert_eq!(
+                        std::mem::discriminant(&actual),
+                        std::mem::discriminant(scalar),
+                        "{raw}"
+                    );
+                    assert_eq!(&actual, scalar, "{raw}");
+                }
+            } else {
+                assert!(ours.is_err() && tree.is_err(), "{raw}");
+                assert!(stock_json_rows(&stock, sql, &[rebound]).is_err(), "{raw}");
+            }
+            assert_eq!(
+                json_type_value(&decoded, Some("$[0]")).unwrap(),
+                Some("integer")
+            );
         }
     }
 
