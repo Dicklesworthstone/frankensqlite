@@ -8820,14 +8820,11 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// The append-gate double-consumption guard (bd-gh302/bd-0shxy) must
     /// only refuse durable-origin pops.
     durable_freelist_view: HashSet<u32>,
-    /// bd-iay3d: the first commit sequence of this pager's own WAL commit
-    /// that jumped past peer commits it never refreshed for (the
-    /// certificate's first sequence was above `commit_seq + 1`). `commit_seq`
-    /// now names the newest commit, but the freelist, `durable_freelist_view`
-    /// and the rest of the committed state still predate the peers' commits,
-    /// so while this is set the next refresh must not take its unchanged
-    /// early return. Cleared by a full refresh.
-    committed_state_behind_peer_commit: Option<CommitSeq>,
+    /// The commit clock alone cannot vouch for the cached allocator metadata
+    /// after an own commit jumped over a peer, or before a writable WAL open
+    /// has loaded the freelist through a pinned snapshot. Clear only after
+    /// the entire committed-state refresh succeeds.
+    committed_metadata_needs_refresh: bool,
     /// GH#410: the durable page-1 freelist metadata names more entries than
     /// this pager could legally load — e.g. an archive whose trunk chain
     /// records the reserved lock-byte page, a page beyond the file, or a
@@ -10880,7 +10877,7 @@ impl<F: VfsFile> PagerInner<F> {
                 commit_seq = self.commit_seq.get(),
                 "own WAL commit jumped past peer commits"
             );
-            self.committed_state_behind_peer_commit = Some(first_commit_seq);
+            self.committed_metadata_needs_refresh = true;
         }
     }
 
@@ -10978,7 +10975,7 @@ impl<F: VfsFile> PagerInner<F> {
             && probe.visible_commit_seq == self.commit_seq
             && probe.file_size == self.committed_db_file_size_bytes
             && !probe.durable_identity_changed
-            && self.committed_state_behind_peer_commit.is_none()
+            && !self.committed_metadata_needs_refresh
         {
             // Nothing was committed since this pager's view, so its extent is
             // the new generation's.
@@ -11184,7 +11181,7 @@ impl<F: VfsFile> PagerInner<F> {
         };
         self.committed_db_file_size_bytes = probe.file_size;
         self.committed_db_change_counter = probe.db_change_counter;
-        self.committed_state_behind_peer_commit = None;
+        self.committed_metadata_needs_refresh = false;
         let generation_moved = self.committed_wal_generation != probe.wal_generation;
         self.committed_wal_generation = probe.wal_generation;
         if generation_moved {
@@ -21592,6 +21589,8 @@ where
         } else {
             2
         };
+        let initial_journal_mode = Self::journal_mode_from_database_header(&header)?;
+        let defer_wal_freelist = initial_journal_mode == JournalMode::Wal;
         let freelist = if bootstrapped_from_live_wal_stub {
             Vec::new()
         } else {
@@ -21610,6 +21609,7 @@ where
                 db_size,
                 header.freelist_trunk,
                 header.freelist_count,
+                defer_wal_freelist,
             );
             with_main_shared_lock(
                 cx,
@@ -21627,6 +21627,7 @@ where
                         db_size,
                         freelist_trunk,
                         freelist_count,
+                        defer_wal_freelist,
                     ) = state;
                     Box::pin(async move {
                         if vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
@@ -21645,6 +21646,12 @@ where
                             || observed_header_bytes != *expected_header_bytes
                         {
                             return Err(FrankenError::BusyRecovery);
+                        }
+                        // A passive WAL checkpoint may copy page 1 and a trunk
+                        // in separate writes while we hold main-file SHARED.
+                        // Traverse both through the first bound WAL snapshot.
+                        if *defer_wal_freelist {
+                            return Ok(Vec::new());
                         }
                         load_freelist_from_disk(
                             cx,
@@ -21666,10 +21673,13 @@ where
         let reserved_per_page = header.reserved_per_page;
         let pointer_map =
             PointerMapState::from_header(header.largest_root_page, header.incremental_vacuum);
-        let initial_journal_mode = Self::journal_mode_from_database_header(&header)?;
         let freelist_count = freelist.len();
-        let open_freelist_entries_dropped = u32::try_from(freelist_count)
-            .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded));
+        let open_freelist_entries_dropped = if defer_wal_freelist {
+            0
+        } else {
+            u32::try_from(freelist_count)
+                .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded))
+        };
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
@@ -21706,7 +21716,7 @@ where
                 checkpoint_active: false,
                 access_mode: PagerAccessMode::Writable,
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
-                committed_state_behind_peer_commit: None,
+                committed_metadata_needs_refresh: defer_wal_freelist,
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
                 // GH#410: the durable chain named entries this load could not
@@ -22214,7 +22224,7 @@ where
                     .iter()
                     .map(|page: &PageNumber| page.get())
                     .collect(),
-                committed_state_behind_peer_commit: None,
+                committed_metadata_needs_refresh: false,
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
                 freelist_repair_pending: false,
@@ -22557,7 +22567,8 @@ where
                                 what: "database page count".to_owned(),
                                 value: db_pages.to_string(),
                             })?;
-                        let freelist = if *is_readonly {
+                        let journal_mode = Self::journal_mode_from_database_header(&header)?;
+                        let freelist = if *is_readonly || journal_mode == JournalMode::Wal {
                             Vec::new()
                         } else {
                             load_freelist_from_disk(
@@ -22596,8 +22607,13 @@ where
             2
         };
         let freelist_count = freelist.len();
-        let dropped = u32::try_from(freelist_count)
-            .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded));
+        let defer_wal_freelist = !is_readonly && journal_mode == JournalMode::Wal;
+        let dropped = if is_readonly || defer_wal_freelist {
+            0
+        } else {
+            u32::try_from(freelist_count)
+                .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded))
+        };
         {
             let mut inner = self
                 .inner
@@ -22615,6 +22631,8 @@ where
             inner.committed_db_change_counter = u64::from(header.change_counter);
             inner.durable_freelist_view = freelist.iter().map(|page| page.get()).collect();
             inner.freelist = freelist;
+            inner.committed_metadata_needs_refresh = defer_wal_freelist;
+            inner.wal_refresh_signature = None;
             inner.freelist_repair_pending = dropped > 0;
             inner.freelist_repair_dropped = dropped;
             self.cache.clear();
@@ -63201,6 +63219,59 @@ mod tests {
                 ),
                 "bead_id={BEAD_ID} case=returned_lease_holes_remain_durable_freelist_delta"
             );
+        });
+    }
+
+    #[test]
+    fn test_wal_open_validates_freelist_at_the_reader_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT;
+            for valid_wal_trunk in [true, false] {
+                let vfs = MemoryVfs::new();
+                let path = Path::new("/checkpoint-freelist.db");
+                let header = DatabaseHeader {
+                    page_size: ps,
+                    page_count: 2,
+                    write_version: 2,
+                    read_version: 2,
+                    freelist_trunk: 2,
+                    freelist_count: 1,
+                    ..DatabaseHeader::default()
+                };
+                let mut page_one = vec![0; ps.as_usize()];
+                page_one[..DATABASE_HEADER_SIZE].copy_from_slice(&header.to_bytes().unwrap());
+                // Freeze the image between the checkpoint's page-1 write and
+                // its trunk write. Only the committed WAL frame has page 2
+                // as the newly published header describes it.
+                let mut stale_trunk = vec![0; ps.as_usize()];
+                stale_trunk[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+                let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+                let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+                file.write(&cx, &page_one, 0).await.unwrap();
+                file.write(&cx, &stale_trunk, u64::from(ps.get())).await.unwrap();
+                file.close(&cx).unwrap();
+
+                let pager = SimplePager::open(vfs, path, ps).await.unwrap();
+                let (backend, frames, _, _) = MockWalBackend::new();
+                let committed_trunk = if valid_wal_trunk {
+                    vec![0; ps.as_usize()]
+                } else {
+                    stale_trunk
+                };
+                frames.lock().unwrap().push((2, committed_trunk, 2));
+                pager.set_wal_backend(Box::new(backend)).unwrap();
+                let refresh = pager.refresh_published_snapshot(&cx).await;
+                if valid_wal_trunk {
+                    assert_eq!(refresh.unwrap().freelist_count, 1);
+                    let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    assert_eq!(txn.allocate_page(&cx).await.unwrap().get(), 2);
+                    txn.rollback(&cx).await.unwrap();
+                } else {
+                    assert!(matches!(refresh, Err(FrankenError::DatabaseCorrupt { detail })
+                        if detail.contains("freelist trunk 2 leaf_count")));
+                }
+            }
         });
     }
 
