@@ -9444,6 +9444,10 @@ struct PreparedPrecompiledDml {
     /// meaningful for `kind == Insert`. Plain INSERTs (the hot path) leave this
     /// `false`, so the transaction-scoped FK parent-validation cache survives.
     insert_may_invalidate_fk_parent_cache: bool,
+    /// GH #542: `true` when C SQLite validates immediate child foreign keys
+    /// before `OP_Insert` (`usesStmtJournal == 0`), so an immediate child FK
+    /// violation leaves `last_insert_rowid()` unchanged.
+    preserve_last_insert_rowid_on_immediate_fk_failure: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -15680,6 +15684,11 @@ pub struct Connection {
     /// Error-time VDBE change tracking captured before higher layers decide
     /// whether a failing statement should preserve partial progress.
     last_table_program_error_state: RefCell<Option<TableProgramErrorState>>,
+    /// GH #542: whether the most recent `ForeignKeyViolation` raised during
+    /// statement-end FK revalidation came from a `DEFERRABLE INITIALLY
+    /// DEFERRED` constraint enforced at autocommit end rather than an immediate
+    /// foreign-key constraint.
+    last_fk_violation_was_deferred: Cell<bool>,
     /// bd-nn29x: the conflict algorithm the failing constraint check resolved
     /// to, recorded where the check failed and keyed to the error it raised,
     /// so every statement boundary that error unwinds through (a trigger body
@@ -18071,6 +18080,7 @@ impl Connection {
             total_changes: Cell::new(0),
             trigger_step_changes: Cell::new(0),
             last_table_program_error_state: RefCell::new(None),
+            last_fk_violation_was_deferred: Cell::new(false),
             constraint_failure_action: RefCell::new(None),
             dml_conflict_clause: Cell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
@@ -18746,6 +18756,7 @@ impl Connection {
             total_changes: Cell::new(0),
             trigger_step_changes: Cell::new(0),
             last_table_program_error_state: RefCell::new(None),
+            last_fk_violation_was_deferred: Cell::new(false),
             constraint_failure_action: RefCell::new(None),
             dml_conflict_clause: Cell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
@@ -38210,6 +38221,7 @@ impl Connection {
         dirty_table_name: Option<&str>,
         rollback_on_constraint_violation: bool,
         preserve_prior_changes_on_constraint_violation: bool,
+        preserve_last_insert_rowid_on_immediate_fk_failure: bool,
         skip_statement_savepoint_in_explicit_txn: bool,
         capture_time_travel_snapshot: bool,
         prebound_publication: Option<BoundPagerPublication>,
@@ -38274,6 +38286,7 @@ impl Connection {
                 async || {
                     self.with_statement_fk_validation_scope(
                         preserve_prior_changes_on_constraint_violation,
+                        preserve_last_insert_rowid_on_immediate_fk_failure,
                         execute_body,
                     )
                     .await
@@ -38283,6 +38296,7 @@ impl Connection {
         } else {
             self.with_statement_fk_validation_scope(
                 preserve_prior_changes_on_constraint_violation,
+                preserve_last_insert_rowid_on_immediate_fk_failure,
                 execute_body,
             )
             .await
@@ -38521,6 +38535,9 @@ impl Connection {
         }
         let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
             .then(fsqlite_types::sync_primitives::Instant::now);
+        let preserve_last_insert_rowid_on_immediate_fk_failure = stmt
+            .precompiled_dml()
+            .is_some_and(|dml| dml.preserve_last_insert_rowid_on_immediate_fk_failure);
         // Boxed: the general DML entry's 24 KB future would otherwise size the
         // direct paths that every prepared DML statement embeds.
         let outcome = Box::pin(self.execute_prepared_dml_entry(
@@ -38529,6 +38546,7 @@ impl Connection {
                 Some(table_name),
                 rollback_on_constraint_violation,
                 preserve_prior_changes_on_constraint_violation,
+                preserve_last_insert_rowid_on_immediate_fk_failure,
                 skip_statement_savepoint_in_explicit_txn,
                 capture_time_travel_snapshot,
                 prebound_publication,
@@ -38796,6 +38814,9 @@ impl Connection {
                     !Self::direct_simple_insert_prefers_reusable_table_program(direct)
                 })
         });
+        let preserve_last_insert_rowid_on_immediate_fk_failure = stmt
+            .precompiled_dml()
+            .is_some_and(|dml| dml.preserve_last_insert_rowid_on_immediate_fk_failure);
         // Boxed: the general DML entry's 24 KB future would otherwise size the
         // direct-insert path above.
         let outcome = Box::pin(self.execute_prepared_dml_entry(
@@ -38804,6 +38825,7 @@ impl Connection {
                 Some(table_name),
                 rollback_on_constraint_violation,
                 preserve_prior_changes_on_constraint_violation,
+                preserve_last_insert_rowid_on_immediate_fk_failure,
                 skip_statement_savepoint_in_explicit_txn,
                 capture_time_travel_snapshot,
                 prebound_publication,
@@ -41810,6 +41832,7 @@ impl Connection {
                         .map(|dispatch| dispatch.table_name.as_str()),
                     rollback_on_constraint_violation,
                     preserve_prior_changes_on_constraint_violation,
+                    false,
                     vdbe_skip_statement_savepoint_in_explicit_txn,
                     false,
                     entry_proof.publication,
@@ -41879,6 +41902,7 @@ impl Connection {
                             }),
                         rollback_on_constraint_violation,
                         preserve_prior_changes_on_constraint_violation,
+                        false,
                         vdbe_skip_statement_savepoint_in_explicit_txn,
                         false,
                         entry_proof.publication,
@@ -41965,6 +41989,7 @@ impl Connection {
                     }),
                 rollback_on_constraint_violation,
                 preserve_prior_changes_on_constraint_violation,
+                false,
                 vdbe_skip_statement_savepoint_in_explicit_txn,
                 false,
                 entry_proof.publication,
@@ -45080,8 +45105,17 @@ impl Connection {
             self.validate_dml_trigger_relations(statement)?;
             let preserve_constraint_failure_rows =
                 statement_preserves_prior_changes_on_constraint(statement);
+            let preserve_last_insert_rowid_on_immediate_fk_failure = match statement {
+                Statement::Insert(insert) => {
+                    self.insert_immediate_fk_preserves_last_insert_rowid(insert)
+                }
+                _ => false,
+            };
             return lean_future(|| {
-                self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+                self.with_statement_fk_validation_scope(
+                    preserve_constraint_failure_rows,
+                    preserve_last_insert_rowid_on_immediate_fk_failure,
+                    async || {
                     lean_future(|| {
                         self.execute_statement_dispatch_impl(
                             cx,
@@ -45092,7 +45126,8 @@ impl Connection {
                         )
                     })
                     .await
-                })
+                    },
+                )
             })
             .await
             .map_err(|error| Self::qualify_missing_target_table(error, statement));
@@ -47936,10 +47971,14 @@ impl Connection {
         // inner per-row statements keep their undo records for this one to unwind.
         self.db.borrow_mut().begin_statement();
         let outcome = self
-            .with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+            .with_statement_fk_validation_scope(
+                preserve_constraint_failure_rows,
+                false,
+                async || {
                 self.execute_insert_select_fallback_outcome_scoped(insert, select_stmt, params)
                     .await
-            })
+                },
+            )
             .await;
         let unwind = outcome.as_ref().is_err_and(|error| {
             !self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
@@ -51293,7 +51332,10 @@ impl Connection {
         let previous_changes = self.last_changes.get();
         let previous_total_changes = self.total_changes.get();
         let mut execute_rows = async || -> Result<InsertSelectReplayOutcome> {
-            self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+            self.with_statement_fk_validation_scope(
+                preserve_constraint_failure_rows,
+                false,
+                async || {
                 let _fk_parent_validation_cache =
                     self.enter_fk_parent_validation_cache_scope(&insert.table.name);
                 let compiled_insert = self
@@ -53327,6 +53369,8 @@ impl Connection {
                                 insert_may_invalidate_fk_parent_cache: insert.or_conflict
                                     == Some(fsqlite_ast::ConflictAction::Replace)
                                     || !insert.upsert.is_empty(),
+                                preserve_last_insert_rowid_on_immediate_fk_failure: self
+                                    .insert_immediate_fk_preserves_last_insert_rowid(insert),
                             }))
                         } else {
                             PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))
@@ -61681,7 +61725,10 @@ impl Connection {
         // writes unwind on ABORT/constraint failure in autocommit mode.
         let memdb_stmt_guard = MemDbStatementGuard::enter(&self.db);
         let result = self
-            .with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+            .with_statement_fk_validation_scope(
+                preserve_constraint_failure_rows,
+                false,
+                async || {
             let mut row_params = Vec::with_capacity(parameter_base + row_value_count);
             let mut statement_changes = 0usize;
             let mut returning_rows = Vec::new();
@@ -80864,12 +80911,124 @@ impl Connection {
         Some((parts.join(" AND "), values))
     }
 
+    /// GH #542: In C SQLite (`insert.c` / `fkey.c`), a single-row `INSERT`
+    /// that does not open a statement journal (`usesStmtJournal == 0`) checks
+    /// immediate child foreign keys *before* `OP_Insert` executes and halts on
+    /// violation, leaving `last_insert_rowid()` unchanged. Multi-row inserts,
+    /// `INSERT ... SELECT`, `RETURNING`, `BEFORE`/`AFTER INSERT` triggers,
+    /// `REPLACE` (statement-level or effective schema-level PK/UNIQUE), and
+    /// `ON CONFLICT ... DO UPDATE` clauses that touch a child/parent FK column
+    /// or fire an `UPDATE` trigger open a statement journal and validate FKs
+    /// after `OP_Insert`, so their failed insert updates `last_insert_rowid()`.
+    fn fk_parent_keys_modified_by_update(
+        &self,
+        parent_table_name: &str,
+        assigned_cols: &[String],
+    ) -> bool {
+        let schema = self.schema.borrow();
+        let parent_table = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(parent_table_name));
+        let implicit_parent_cols = Self::fk_implicit_parent_key_columns(parent_table);
+        let ipk_col_name = parent_table
+            .and_then(|table| table.columns.iter().find(|col| col.is_ipk))
+            .map(|col| col.name.as_str());
+        schema.iter().any(|child| {
+            child.foreign_keys.iter().any(|fk| {
+                if !fk.parent_table.eq_ignore_ascii_case(parent_table_name) {
+                    return false;
+                }
+                let parent_cols: &[String] = if fk.parent_columns.is_empty() {
+                    &implicit_parent_cols
+                } else {
+                    &fk.parent_columns
+                };
+                parent_cols.iter().any(|pcol| {
+                    assigned_cols.iter().any(|assigned| {
+                        assigned.eq_ignore_ascii_case(pcol)
+                            || (ipk_col_name.is_some_and(|ipk| ipk.eq_ignore_ascii_case(pcol))
+                                && is_hidden_rowid_alias_name(assigned))
+                    })
+                })
+            })
+        })
+    }
+
+    fn insert_immediate_fk_preserves_last_insert_rowid(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> bool {
+        if !insert.returning.is_empty()
+            || insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+        {
+            return false;
+        }
+        let is_single_row_values = match &insert.source {
+            fsqlite_ast::InsertSource::DefaultValues => true,
+            fsqlite_ast::InsertSource::Values(rows) => rows.len() == 1,
+            fsqlite_ast::InsertSource::Select(select) => {
+                select.body.compounds.is_empty()
+                    && matches!(&select.body.select, SelectCore::Values(rows) if rows.len() == 1)
+            }
+        };
+        if !is_single_row_values {
+            return false;
+        }
+        let table_name = insert.table.name.as_str();
+        let insert_event = fsqlite_ast::TriggerEvent::Insert;
+        if self.has_matching_triggers(table_name, fsqlite_ast::TriggerTiming::Before, &insert_event)
+            || self.has_matching_triggers(
+                table_name,
+                fsqlite_ast::TriggerTiming::After,
+                &insert_event,
+            )
+        {
+            return false;
+        }
+        for clause in &insert.upsert {
+            if let fsqlite_ast::UpsertAction::Update { assignments, .. } = &clause.action {
+                let assigned_cols = Self::assignment_target_column_names(assignments);
+                let update_event = fsqlite_ast::TriggerEvent::Update(assigned_cols.clone());
+                if self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::Before,
+                    &update_event,
+                ) || self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::After,
+                    &update_event,
+                ) || !self.fk_keys_modified_by_update(table_name, assignments).is_empty()
+                    || self.fk_parent_keys_modified_by_update(table_name, &assigned_cols)
+                {
+                    return false;
+                }
+            }
+        }
+        if insert.or_conflict.is_none()
+            && let Some(table) =
+                self.local_dml_target_table(table_name, insert.table.schema.as_deref())
+        {
+            let has_schema_pk_or_unique_replace = table.columns.iter().any(|column| {
+                column.is_ipk
+                    && column.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
+            }) || table.indexes.iter().any(|index| {
+                index.is_unique
+                    && index.conflict_action == Some(fsqlite_ast::ConflictAction::Replace)
+            });
+            if has_schema_pk_or_unique_replace {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Run internally row-replayed DML as one statement-end FK validation
     /// unit. Immediate NO ACTION checks observe the final image of the outer
     /// SQL statement, while RESTRICT remains immediate at the mutation point.
     async fn with_statement_fk_validation_scope<T, F>(
         &self,
         preserve_constraint_failure_rows: bool,
+        preserve_last_insert_rowid_on_immediate_fk_failure: bool,
         body: F,
     ) -> Result<T>
     where
@@ -80880,6 +81039,7 @@ impl Connection {
         }
 
         let outermost = self.statement_fk_validation_depth.get() == 0;
+        let previous_last_insert_rowid = outermost.then(|| self.current_last_insert_rowid());
         let mut suffix_guard = outermost.then(|| {
             StatementFkValidationSuffixGuard::new(
                 &self.statement_fk_validation_tables,
@@ -80933,6 +81093,7 @@ impl Connection {
         let retained_total_changes = self.total_changes.get();
         let retained_last_insert_rowid = self.current_last_insert_rowid();
 
+        self.last_fk_violation_was_deferred.set(false);
         let _rechecking_guard =
             BoolCellRestoreGuard::new(&self.statement_fk_validation_rechecking, true);
         let validation_result = async {
@@ -80963,9 +81124,16 @@ impl Connection {
         }
         .await;
         if let Err(error) = validation_result {
+            let error_last_insert_rowid = if preserve_last_insert_rowid_on_immediate_fk_failure
+                && !self.last_fk_violation_was_deferred.get()
+            {
+                previous_last_insert_rowid
+            } else {
+                (retained_changes > 0).then_some(retained_last_insert_rowid)
+            };
             self.record_fk_validation_error_state(
                 retained_changes,
-                (retained_changes > 0).then_some(retained_last_insert_rowid),
+                error_last_insert_rowid,
                 self.statement_fk_set_default_changes.get(),
             );
             return Err(error);
@@ -81173,6 +81341,12 @@ impl Connection {
         // bd-do0d6: record a deferred row at most once even if several of its
         // FKs are violated.
         let mut deferred_recorded = false;
+        // GH #542: in autocommit mode, a `DEFERRABLE INITIALLY DEFERRED` FK
+        // fails at statement end (after `OP_Insert`), whereas an immediate FK
+        // halts before `OP_Insert` on single-row inserts. Record an autocommit
+        // deferred violation and finish checking remaining immediate FKs first
+        // so immediate FKs always take precedence over deferred FKs.
+        let mut autocommit_deferred_violation = false;
 
         for (key_index, fk) in fk_defs.iter().enumerate() {
             if keys.is_some_and(|keys| !keys.contains(&key_index)) {
@@ -81207,6 +81381,11 @@ impl Connection {
                     }
                     continue;
                 }
+                if fk.deferred {
+                    autocommit_deferred_violation = true;
+                    continue;
+                }
+                self.last_fk_violation_was_deferred.set(false);
                 return Err(FrankenError::ForeignKeyViolation);
             };
 
@@ -81263,6 +81442,11 @@ impl Connection {
                     }
                     continue;
                 }
+                if fk.deferred {
+                    autocommit_deferred_violation = true;
+                    continue;
+                }
+                self.last_fk_violation_was_deferred.set(false);
                 return Err(FrankenError::ForeignKeyViolation);
             }
 
@@ -81303,11 +81487,20 @@ impl Connection {
                     }
                     continue;
                 }
+                if fk.deferred {
+                    autocommit_deferred_violation = true;
+                    continue;
+                }
+                self.last_fk_violation_was_deferred.set(false);
                 return Err(FrankenError::ForeignKeyViolation);
             }
             if let Some(cache_key) = cache_key {
                 self.fk_parent_validation_cache_insert(cache_key);
             }
+        }
+        if autocommit_deferred_violation {
+            self.last_fk_violation_was_deferred.set(true);
+            return Err(FrankenError::ForeignKeyViolation);
         }
         Ok(())
     }
@@ -81948,7 +82141,7 @@ impl Connection {
             return Ok(());
         }
 
-        self.with_statement_fk_validation_scope(false, async move || {
+        self.with_statement_fk_validation_scope(false, false, async move || {
             for victim in &victims {
                 for action in self
                     .check_fk_on_replace_victim(table_name, &victim.values)
