@@ -843,6 +843,7 @@ fn append_unique_constraint_key_component(
     key: &mut Vec<u8>,
     value: &SqliteValue,
     collation: Option<&str>,
+    encoding: TextEncoding,
 ) -> bool {
     if !unique_constraint_collation_is_indexable(collation) {
         return false;
@@ -886,9 +887,12 @@ fn append_unique_constraint_key_component(
                 key.extend_from_slice(&(trimmed.len() as u64).to_le_bytes());
                 key.extend_from_slice(trimmed);
             } else {
+                // BINARY compares stored code units. Distinct UTF-16 sequences
+                // can have the same UTF-8 projection (bd-gz5io).
+                let bytes = text.to_record_text_bytes(encoding);
                 #[allow(clippy::cast_possible_truncation)]
-                key.extend_from_slice(&(text_bytes.len() as u64).to_le_bytes());
-                key.extend_from_slice(text_bytes);
+                key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                key.extend_from_slice(&bytes);
             }
         }
         SqliteValue::Blob(bytes) => {
@@ -1233,6 +1237,7 @@ impl MemTable {
                     &self.read_row_values(cx, row)?,
                     &constraint.columns,
                     &constraint.collations,
+                    self.unique_key_encoding(),
                 ) {
                     index.entry(key).or_default().insert(row.rowid);
                 }
@@ -1295,6 +1300,7 @@ impl MemTable {
                     &row_values,
                     &constraint.columns,
                     &constraint.collations,
+                    self.unique_key_encoding(),
                 ) && !seen.insert(key)
                 {
                     return Ok(false);
@@ -1317,6 +1323,7 @@ impl MemTable {
                     &constraint.columns,
                     &constraint.collations,
                     &registry,
+                    self.unique_key_encoding(),
                 ) {
                     return Ok(false);
                 }
@@ -1336,6 +1343,7 @@ impl MemTable {
                     new_values,
                     &constraint.columns,
                     &constraint.collations,
+                    self.unique_key_encoding(),
                 ) && let Some(rowids) = index.get(&key)
                 {
                     conflicts.extend(rowids.iter().copied());
@@ -1356,6 +1364,7 @@ impl MemTable {
                     &constraint.columns,
                     &constraint.collations,
                     registry,
+                    self.unique_key_encoding(),
                 ) {
                     conflicts.insert(row.rowid);
                 }
@@ -1380,6 +1389,7 @@ impl MemTable {
                     new_values,
                     &constraint.columns,
                     &constraint.collations,
+                    self.unique_key_encoding(),
                 )
                 .is_some_and(|key| index.contains_key(&key))
             } else {
@@ -1397,6 +1407,7 @@ impl MemTable {
                         &constraint.columns,
                         &constraint.collations,
                         registry,
+                        self.unique_key_encoding(),
                     ) {
                         found = true;
                         break;
@@ -1782,10 +1793,17 @@ impl MemTable {
         self.insert(rowid, values);
     }
 
+    fn unique_key_encoding(&self) -> TextEncoding {
+        self.temp_spill
+            .as_ref()
+            .map_or(TextEncoding::Utf8, |spill| spill.text_encoding)
+    }
+
     fn unique_key_for_constraint(
         values: &[SqliteValue],
         columns: &[usize],
         collations: &[Option<String>],
+        encoding: TextEncoding,
     ) -> Option<Vec<u8>> {
         let mut key = Vec::with_capacity(columns.len() * 8);
         for (position, &col_idx) in columns.iter().enumerate() {
@@ -1794,7 +1812,7 @@ impl MemTable {
                 return None;
             }
             let collation = collations.get(position).and_then(|c| c.as_deref());
-            if !append_unique_constraint_key_component(&mut key, value, collation) {
+            if !append_unique_constraint_key_component(&mut key, value, collation, encoding) {
                 return None;
             }
         }
@@ -1807,6 +1825,7 @@ impl MemTable {
         columns: &[usize],
         collations: &[Option<String>],
         registry: &CollationRegistry,
+        encoding: TextEncoding,
     ) -> bool {
         for (position, &col_idx) in columns.iter().enumerate() {
             let Some(existing_value) = existing_values.get(col_idx) else {
@@ -1819,15 +1838,12 @@ impl MemTable {
                 return false;
             }
             let collation = collations.get(position).and_then(|c| c.as_deref());
-            // UNIQUE-constraint duplicate detection is an equality test, which is
-            // encoding-invariant (a == b in UTF-8 iff in UTF-16), so the DB
-            // encoding is irrelevant here (bd-bld9w.4).
             if cmp_values_collated(
                 existing_value,
                 new_value,
                 collation,
                 registry,
-                TextEncoding::Utf8,
+                encoding,
             ) != Ordering::Equal
             {
                 return false;
@@ -1857,6 +1873,7 @@ impl MemTable {
         if self.unique_constraints.iter().all(|constraint| constraint.index.is_none()) {
             return;
         }
+        let encoding = self.unique_key_encoding();
         for constraint in self.unique_constraints_mut() {
             let Some(index) = constraint.index.as_mut() else {
                 continue;
@@ -1865,6 +1882,7 @@ impl MemTable {
                 values,
                 &constraint.columns,
                 &constraint.collations,
+                encoding,
             ) else {
                 continue;
             };
@@ -1889,6 +1907,7 @@ impl MemTable {
                         values,
                         &constraint.columns,
                         &constraint.collations,
+                        self.unique_key_encoding(),
                     )
                 })
             })
@@ -1912,6 +1931,7 @@ impl MemTable {
         }
         debug_assert!(!self.has_spilled_rows(), "DDL hydrates before rebuilding UNIQUE indexes");
         let rows_ref = Arc::clone(&self.rows);
+        let encoding = self.unique_key_encoding();
         let constraints = Arc::make_mut(&mut self.unique_constraints);
         for constraint in constraints.iter_mut() {
             if let Some(index) = constraint.index.as_mut() {
@@ -1927,6 +1947,7 @@ impl MemTable {
                     &row.values,
                     &constraint.columns,
                     &constraint.collations,
+                    encoding,
                 ) {
                     index.entry(key).or_default().insert(row.rowid);
                 }
