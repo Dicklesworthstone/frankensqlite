@@ -8689,9 +8689,14 @@ impl<P: PageWriter> BtCursor<P> {
         cx: &Cx,
         pgno: PageNumber,
     ) -> Result<Option<PageNumber>> {
+        if pgno == PageNumber::ONE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "database header page used as an overflow page while freeing".to_owned(),
+            });
+        }
         let page = self.pager.read_page_data(cx, pgno).await?;
         let page_bytes = page.as_bytes();
-        if page_bytes.len() < 4 {
+        if page_bytes.len() < (self.usable_size as usize).max(4) {
             warn!(
                 page = pgno.get(),
                 page_len = page_bytes.len(),
@@ -8702,13 +8707,34 @@ impl<P: PageWriter> BtCursor<P> {
             });
         }
 
-        let next = u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
+        let next_raw =
+            u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
+        // Only zero terminates an overflow chain. Check the next link before
+        // freeing this page: PageNumber::new also rejects u32::MAX, which must
+        // report corruption rather than masquerade as a successful end.
+        let next = if next_raw == 0 {
+            None
+        } else {
+            let next_page =
+                PageNumber::new(next_raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid next overflow page number {next_raw} while freeing"),
+                })?;
+            if next_page == PageNumber::ONE || next_page == pgno {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "invalid overflow link from page {} to page {next_raw} while freeing",
+                        pgno.get()
+                    ),
+                });
+            }
+            Some(next_page)
+        };
         self.pager.free_page(cx, pgno).await?;
         // bd-pirr5 (GH#371): drop overflow pages from the pool as they are
         // freed too, so a large-value teardown stays within a bounded working
         // set (overflow pages dominate the size of the fts_messages case).
         self.pager.forget_page(pgno);
-        Ok(PageNumber::new(next))
+        Ok(next)
     }
 
     /// Free a whole overflow chain in one go, returning its length in pages.
@@ -21298,6 +21324,106 @@ mod tests {
                 reachable, all_pages,
                 "no unreachable pages should remain after collapsing the empty root"
             );
+        });
+    }
+
+    #[test]
+    fn test_delete_rejects_invalid_overflow_successors_before_freeing() {
+        run_async(async {
+            for link_kind in 0..3 {
+                let cx = Cx::new();
+                let root = pn(2);
+                let store = MemPageStore::with_empty_table(root, USABLE);
+                let mut cursor = BtCursor::new(store, root, USABLE, true);
+                cursor
+                    .table_insert(&cx, 1, &vec![0xCD; 3 * USABLE as usize])
+                    .await
+                    .unwrap();
+                assert!(cursor.table_move_to(&cx, 1).await.unwrap().is_found());
+                let top = cursor.stack.last().unwrap();
+                let first = cursor
+                    .parse_cell_at(top, top.cell_idx)
+                    .unwrap()
+                    .overflow_page
+                    .expect("fixture must have overflow pages");
+                let next_raw = match link_kind {
+                    0 => 1,
+                    1 => first.get(),
+                    _ => u32::MAX,
+                };
+                let mut damaged = cursor.pager.read_page(&cx, first).await.unwrap();
+                damaged[..4].copy_from_slice(&next_raw.to_be_bytes());
+                cursor.pager.write_page(&cx, first, &damaged).await.unwrap();
+                let pages_before: BTreeSet<_> = cursor.pager.pages.keys().copied().collect();
+
+                let result = cursor.delete(&cx).await;
+                assert!(
+                    matches!(&result, Err(FrankenError::DatabaseCorrupt { .. })),
+                    "next_raw={next_raw}: {result:?}"
+                );
+                // DELETE stages the leaf change before overflow cleanup; its
+                // caller rolls that back on error. The malformed overflow page
+                // itself must not be freed or modified before the error.
+                assert_eq!(
+                    cursor.pager.pages.keys().copied().collect::<BTreeSet<_>>(),
+                    pages_before,
+                    "invalid successor must be rejected before an overflow page is freed"
+                );
+                assert_eq!(cursor.pager.read_page(&cx, first).await.unwrap(), damaged);
+            }
+        });
+    }
+
+    #[test]
+    fn test_bounded_overflow_teardown_rejects_invalid_pages_before_freeing() {
+        run_async(async {
+            let cx = Cx::new();
+            for (page, length) in [
+                (PageNumber::ONE, USABLE as usize),
+                (pn(3), 0),
+                (pn(3), 3),
+                (pn(3), 4),
+                (pn(3), USABLE as usize - 1),
+            ] {
+                let mut store = MemPageStore::new(USABLE);
+                store.pages.insert(page.get(), vec![0; length]);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                let before = cursor.pager.pages.clone();
+                let mut pending = vec![TeardownTask::Overflow { page, visited: 1 }];
+                let result = cursor
+                    .free_subtree_pages_bounded(&cx, &mut pending, 1)
+                    .await;
+                assert!(
+                    matches!(&result, Err(FrankenError::DatabaseCorrupt { .. })),
+                    "page={page}, length={length}: {result:?}"
+                );
+                assert_eq!(
+                    cursor.pager.pages, before,
+                    "invalid overflow page must remain allocated and unchanged"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_free_overflow_page_accepts_valid_termination_and_page_numbers() {
+        run_async(async {
+            let cx = Cx::new();
+            for (next_raw, expected) in [
+                (0_u32, None),
+                (4, Some(pn(4))),
+                (u32::MAX - 1, Some(pn(u32::MAX - 1))),
+            ] {
+                let page = pn(3);
+                let mut bytes = vec![0; USABLE as usize];
+                bytes[..4].copy_from_slice(&next_raw.to_be_bytes());
+                let mut store = MemPageStore::new(USABLE);
+                store.pages.insert(page.get(), bytes);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                let next = cursor.free_overflow_page(&cx, page).await.unwrap();
+                assert_eq!(next, expected);
+                assert!(!cursor.pager.pages.contains_key(&page.get()));
+            }
         });
     }
 
