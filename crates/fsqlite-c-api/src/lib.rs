@@ -346,10 +346,10 @@ fn c_string_truncate_on_nul(value: &str) -> CString {
 }
 
 fn can_prepare_statement(statement: &Statement) -> bool {
-    matches!(
-        statement,
-        Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-    )
+    // bd-b8cfq: the core now prepares schema and control statements too.
+    // Use its validation before returning a handle; execution still occurs
+    // only at sqlite3_step. PRAGMA and EXPLAIN retain their dispatch paths.
+    !matches!(statement, Statement::Pragma(_) | Statement::Explain { .. })
 }
 
 fn prepared_step_mode(statement: &Statement) -> PreparedStepMode {
@@ -2527,6 +2527,225 @@ mod tests {
 
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    unsafe fn schema_exec_ok(db: *mut Sqlite3, sql: &str) {
+        let source = CString::new(sql).unwrap();
+        assert_eq!(
+            sqlite3_exec(db, source.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+            SQLITE_OK,
+            "{sql}: {}",
+            CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy()
+        );
+    }
+
+    unsafe fn schema_query_int(db: *mut Sqlite3, sql: &str) -> i64 {
+        let statement = prepare(db, sql);
+        assert_eq!(sqlite3_step(statement), SQLITE_ROW, "{sql}");
+        let value = sqlite3_column_int64(statement, 0);
+        assert_eq!(sqlite3_step(statement), SQLITE_DONE, "{sql}");
+        assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+        value
+    }
+
+    /// bd-b8cfq: these errors must be raised by the C prepare boundary,
+    /// before a caller can obtain a statement handle. Expected messages and
+    /// return codes were checked against the bundled SQLite 3.54.1 C API.
+    /// Each rejected prepare must leave the previous DML counters intact.
+    #[test]
+    fn test_prepare_schema_errors_match_stock_before_step() {
+        let cases = [
+            ("CREATE TABLE t(z)", "table t already exists"),
+            ("CREATE VIEW v AS SELECT 1", "view v already exists"),
+            ("CREATE TABLE ib(z)", "there is already an index named ib"),
+            ("CREATE INDEX ib ON t(b)", "index ib already exists"),
+            (
+                "CREATE INDEX ix ON missing(b)",
+                "no such table: main.missing",
+            ),
+            ("CREATE INDEX ix ON t(nosuch)", "no such column: nosuch"),
+            ("CREATE INDEX ix ON v(a)", "views may not be indexed"),
+            (
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+                "trigger tr already exists",
+            ),
+            (
+                "CREATE TRIGGER tr2 AFTER INSERT ON missing BEGIN SELECT 1; END",
+                "no such table: main.missing",
+            ),
+            (
+                "CREATE TRIGGER tr2 INSTEAD OF INSERT ON t BEGIN SELECT 1; END",
+                "cannot create INSTEAD OF trigger on table: t",
+            ),
+            (
+                "CREATE TABLE sqlite_x(a)",
+                "object name reserved for internal use: sqlite_x",
+            ),
+            (
+                "CREATE TEMP TABLE main.q(a)",
+                "temporary table name must be unqualified",
+            ),
+            ("CREATE TABLE aux.q(a)", "unknown database aux"),
+            ("DROP TABLE missing", "no such table: missing"),
+            ("DROP INDEX missing", "no such index: missing"),
+            ("DROP VIEW missing", "no such view: missing"),
+            ("DROP TRIGGER missing", "no such trigger: missing"),
+            ("DROP VIEW t", "use DROP TABLE to delete table t"),
+            ("DROP TABLE v", "use DROP VIEW to delete view v"),
+            ("ALTER TABLE missing ADD COLUMN c", "no such table: missing"),
+            ("ALTER TABLE t ADD COLUMN b", "duplicate column name: b"),
+            (
+                "ALTER TABLE t RENAME TO v",
+                "there is already another table or index with this name: v",
+            ),
+            ("ANALYZE missing", "no such table: missing"),
+            (
+                "REINDEX missing",
+                "unable to identify the object to be reindexed",
+            ),
+        ];
+        for file_backed in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = if file_backed {
+                CString::new(dir.path().join("prepare.db").to_str().unwrap()).unwrap()
+            } else {
+                CString::new(":memory:").unwrap()
+            };
+            unsafe {
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+                schema_exec_ok(
+                    db,
+                    "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); \
+                     INSERT INTO t VALUES(1, 'x'), (2, 'y'); \
+                     CREATE INDEX ib ON t(b); \
+                     CREATE VIEW v AS SELECT a, b FROM t; \
+                     CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;",
+                );
+                for (sql, expected) in cases {
+                    let source = CString::new(sql).unwrap();
+                    let mut statement = ptr::null_mut();
+                    let rc = sqlite3_prepare_v2(
+                        db,
+                        source.as_ptr(),
+                        -1,
+                        &mut statement,
+                        ptr::null_mut(),
+                    );
+                    let message = CStr::from_ptr(sqlite3_errmsg(db))
+                        .to_string_lossy()
+                        .into_owned();
+                    let no_statement = statement.is_null();
+                    if !no_statement {
+                        sqlite3_finalize(statement);
+                    }
+                    assert_eq!(rc, SQLITE_ERROR, "{sql}, file={file_backed}: {message}");
+                    assert_eq!(message, expected, "{sql}, file={file_backed}");
+                    assert!(no_statement, "a failed prepare returned a handle: {sql}");
+                    assert_eq!(sqlite3_changes(db), 2, "{sql}");
+                    assert_eq!(sqlite3_total_changes(db), 2, "{sql}");
+                }
+                assert_eq!(schema_query_int(db, "SELECT count(*) FROM t"), 2);
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    /// Preparing DDL and control statements validates them without applying
+    /// them. Dropping the prepared handle must not mutate schema, rows,
+    /// transaction state, or the set of attached databases.
+    #[test]
+    fn test_prepare_schema_statements_have_no_side_effects() {
+        unsafe {
+            let db = open_memory();
+            schema_exec_ok(
+                db,
+                "CREATE TABLE t(a, b); INSERT INTO t VALUES(1, 'x'), (2, 'y'); \
+                 CREATE INDEX ib ON t(b);",
+            );
+            for sql in [
+                "CREATE TABLE unseen(x)",
+                "CREATE TABLE copied AS SELECT * FROM t",
+                "CREATE INDEX ia ON t(a)",
+                "CREATE VIEW v AS SELECT * FROM t",
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+                "ALTER TABLE t ADD COLUMN c",
+                "ALTER TABLE t RENAME TO renamed",
+                "DROP TABLE t",
+                "DROP INDEX ib",
+                "BEGIN",
+                "SAVEPOINT sp",
+                "ATTACH ':memory:' AS aux",
+                "ANALYZE",
+                "REINDEX",
+            ] {
+                let statement = prepare(db, sql);
+                assert_eq!(sqlite3_column_count(statement), 0, "{sql}");
+                assert_eq!(sqlite3_finalize(statement), SQLITE_OK, "{sql}");
+            }
+            assert_eq!(
+                schema_query_int(db, "SELECT count(*) FROM sqlite_schema"),
+                2
+            );
+            assert_eq!(schema_query_int(db, "SELECT count(*) FROM t"), 2);
+            assert_eq!(
+                schema_query_int(db, "SELECT count(*) FROM pragma_table_info('t')"),
+                2
+            );
+            assert_eq!(
+                schema_query_int(db, "SELECT count(*) FROM pragma_database_list"),
+                1
+            );
+            schema_exec_ok(db, "BEGIN; ROLLBACK;");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// Held schema statements recheck the live schema when stepped. Bound
+    /// ATTACH arguments and transaction errors still belong to execution.
+    #[test]
+    fn test_prepare_schema_statements_revalidate_and_bind_at_step() {
+        unsafe {
+            let db = open_memory();
+            let statement = prepare(db, "CREATE TABLE held(a)");
+            schema_exec_ok(db, "CREATE TABLE held(b)");
+            assert_eq!(sqlite3_step(statement), SQLITE_ERROR);
+            assert_eq!(
+                CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap(),
+                "table held already exists"
+            );
+            assert_eq!(sqlite3_finalize(statement), SQLITE_ERROR);
+
+            let statement = prepare(db, "CREATE TABLE repeated(a)");
+            assert_eq!(sqlite3_step(statement), SQLITE_DONE);
+            assert_eq!(sqlite3_reset(statement), SQLITE_OK);
+            assert_eq!(sqlite3_step(statement), SQLITE_ERROR);
+            assert_eq!(sqlite3_finalize(statement), SQLITE_ERROR);
+
+            let statement = prepare(db, "ATTACH ?1 AS aux");
+            assert_eq!(sqlite3_bind_parameter_count(statement), 1);
+            let memory = CString::new(":memory:").unwrap();
+            assert_eq!(
+                sqlite3_bind_text(statement, 1, memory.as_ptr(), -1, None),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(statement), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(statement), SQLITE_OK);
+            assert_eq!(
+                schema_query_int(db, "SELECT count(*) FROM pragma_database_list"),
+                2
+            );
+            schema_exec_ok(db, "DETACH aux");
+
+            let statement = prepare(db, "COMMIT");
+            assert_eq!(sqlite3_step(statement), SQLITE_ERROR);
+            assert_eq!(
+                CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap(),
+                "cannot commit - no transaction is active"
+            );
+            assert_eq!(sqlite3_finalize(statement), SQLITE_ERROR);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
 
