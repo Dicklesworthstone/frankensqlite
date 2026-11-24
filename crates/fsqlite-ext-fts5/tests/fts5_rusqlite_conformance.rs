@@ -2627,6 +2627,35 @@ fn ascii_tokenizer_queries_match_rusqlite_reference() {
 }
 
 #[test]
+fn ascii_tokenizer_overrides_match_rusqlite_reference() {
+    let docs = [
+        Doc {
+            rowid: 1,
+            title: "",
+            body: "Co-op_XxÉé",
+        },
+        Doc {
+            rowid: 2,
+            title: "",
+            body: "co op x é",
+        },
+    ];
+    for tokenizer in ["ascii", "porter ascii"] {
+        let spec = format!(
+            r#"tokenize="{tokenizer} tokenchars '-_' separators 'xé' separators '_' tokenchars ''""#
+        );
+        let harness = Fts5ConformanceHarness::with_docs(&[&spec], &docs);
+        for query in [r#""co-op""#, "co", "op", "Éé", r#""co op""#] {
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                harness.sqlite_match_rowids(query),
+                "{tokenizer} MATCH {query}"
+            );
+        }
+    }
+}
+
+#[test]
 fn porter_unicode61_queries_match_rusqlite_reference() {
     let harness =
         Fts5ConformanceHarness::with_docs(PORTER_UNICODE61_OPTIONS, PORTER_UNICODE61_DOCS);

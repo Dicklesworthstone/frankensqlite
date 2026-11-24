@@ -4764,19 +4764,10 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
 #[derive(Debug, Default)]
 pub struct AsciiTokenizer;
 
-impl AsciiTokenizer {
-    #[inline]
-    fn normalized_token_char(ch: char) -> Option<char> {
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
-            Some(ch)
-        } else if ch.is_ascii_uppercase() {
-            Some(ch.to_ascii_lowercase())
-        } else if ch.is_ascii() {
-            None
-        } else {
-            Some(ch)
-        }
-    }
+/// SQLite applies ASCII overrides in declaration order, before case folding.
+/// Every non-ASCII codepoint remains a token character.
+struct ConfiguredAsciiTokenizer {
+    token_chars: [bool; 128],
 }
 
 impl Fts5Tokenizer for AsciiTokenizer {
@@ -4785,44 +4776,63 @@ impl Fts5Tokenizer for AsciiTokenizer {
     }
 
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
-        let mut token_start = None;
-        let mut token_buf: Option<String> = None;
+        visit_ascii_tokens(text, |byte| byte.is_ascii_alphanumeric(), sink);
+    }
+}
 
-        for (byte_idx, ch) in text.char_indices() {
-            if let Some(term_ch) = Self::normalized_token_char(ch) {
-                let start = if let Some(start) = token_start {
-                    start
-                } else {
-                    token_start = Some(byte_idx);
-                    token_buf = None;
-                    byte_idx
-                };
+impl Fts5Tokenizer for ConfiguredAsciiTokenizer {
+    fn name(&self) -> &'static str {
+        "ascii"
+    }
 
-                if term_ch != ch {
-                    let buf = token_buf.get_or_insert_with(|| {
-                        let mut folded = String::new();
-                        folded.push_str(&text[start..byte_idx]);
-                        folded
-                    });
-                    buf.push(term_ch);
-                } else if let Some(buf) = token_buf.as_mut() {
-                    buf.push(term_ch);
-                }
-            } else if let Some(start) = token_start.take() {
-                if let Some(buf) = token_buf.take() {
-                    sink(buf.as_str(), start, byte_idx, false);
-                } else {
-                    sink(&text[start..byte_idx], start, byte_idx, false);
-                }
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        visit_ascii_tokens(text, |byte| self.token_chars[usize::from(byte)], sink);
+    }
+}
+
+fn visit_ascii_tokens(
+    text: &str,
+    is_ascii_token: impl Fn(u8) -> bool,
+    sink: &mut dyn FnMut(&str, usize, usize, bool),
+) {
+    let mut token_start = None;
+    let mut token_buf: Option<String> = None;
+
+    for (byte_idx, ch) in text.char_indices() {
+        if !ch.is_ascii() || is_ascii_token(ch as u8) {
+            let term_ch = ch.to_ascii_lowercase();
+            let start = if let Some(start) = token_start {
+                start
+            } else {
+                token_start = Some(byte_idx);
+                token_buf = None;
+                byte_idx
+            };
+
+            if term_ch != ch {
+                let buf = token_buf.get_or_insert_with(|| {
+                    let mut folded = String::new();
+                    folded.push_str(&text[start..byte_idx]);
+                    folded
+                });
+                buf.push(term_ch);
+            } else if let Some(buf) = token_buf.as_mut() {
+                buf.push(term_ch);
+            }
+        } else if let Some(start) = token_start.take() {
+            if let Some(buf) = token_buf.take() {
+                sink(buf.as_str(), start, byte_idx, false);
+            } else {
+                sink(&text[start..byte_idx], start, byte_idx, false);
             }
         }
+    }
 
-        if let Some(start) = token_start {
-            if let Some(buf) = token_buf {
-                sink(buf.as_str(), start, text.len(), false);
-            } else {
-                sink(&text[start..], start, text.len(), false);
-            }
+    if let Some(start) = token_start {
+        if let Some(buf) = token_buf {
+            sink(buf.as_str(), start, text.len(), false);
+        } else {
+            sink(&text[start..], start, text.len(), false);
         }
     }
 }
@@ -5192,9 +5202,10 @@ fn latin_diacritic_base(ch: char) -> Option<char> {
     })
 }
 
-fn split_fts5_tokenizer_spec(spec: &str) -> Vec<String> {
+fn split_fts5_tokenizer_spec(spec: &str) -> Option<Vec<String>> {
     let mut parts = Vec::new();
     let mut current = String::new();
+    let mut started = false;
     let mut quote: Option<char> = None;
     let mut chars = spec.chars().peekable();
 
@@ -5211,21 +5222,27 @@ fn split_fts5_tokenizer_spec(spec: &str) -> Vec<String> {
                 current.push(ch);
             }
         } else if ch == '\'' || ch == '"' {
+            started = true;
             quote = Some(ch);
         } else if ch.is_ascii_whitespace() {
-            if !current.is_empty() {
+            if started {
+                started = false;
                 parts.push(std::mem::take(&mut current));
             }
         } else {
+            started = true;
             current.push(ch);
         }
     }
 
-    if !current.is_empty() {
+    if quote.is_some() {
+        return None;
+    }
+    if started {
         parts.push(current);
     }
 
-    parts
+    Some(parts)
 }
 
 fn take_tokenizer_option<'a>(parts: &'a [String], index: &mut usize) -> Option<(&'a str, &'a str)> {
@@ -5263,6 +5280,26 @@ fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Unicode61Tokenizer> 
     Some(tokenizer)
 }
 
+fn ascii_tokenizer_from_args(args: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
+    if args.is_empty() {
+        return Some(Box::new(AsciiTokenizer));
+    }
+    let mut token_chars = std::array::from_fn(|i| (i as u8).is_ascii_alphanumeric());
+    let mut index = 0;
+    while index < args.len() {
+        let (key, chars) = take_tokenizer_option(args, &mut index)?;
+        let include = match key.to_ascii_lowercase().as_str() {
+            "tokenchars" => true,
+            "separators" => false,
+            _ => return None,
+        };
+        for byte in chars.bytes().filter(u8::is_ascii) {
+            token_chars[usize::from(byte)] = include;
+        }
+    }
+    Some(Box::new(ConfiguredAsciiTokenizer { token_chars }))
+}
+
 fn trigram_tokenizer_from_args(args: &[String]) -> Option<TrigramTokenizer> {
     let mut tokenizer = TrigramTokenizer::default();
     let mut index = 0;
@@ -5292,7 +5329,7 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
 
     match name.as_str() {
         "unicode61" => Some(Box::new(unicode61_tokenizer_from_args(args)?)),
-        "ascii" => Some(Box::new(AsciiTokenizer)),
+        "ascii" => ascii_tokenizer_from_args(args),
         "porter" => {
             let inner = if args.is_empty() {
                 Box::new(Unicode61Tokenizer::new()) as Box<dyn Fts5Tokenizer>
@@ -5309,7 +5346,7 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
 /// Create a tokenizer by name with optional arguments.
 #[must_use]
 pub fn create_tokenizer(name: &str) -> Option<Box<dyn Fts5Tokenizer>> {
-    let parts = split_fts5_tokenizer_spec(name);
+    let parts = split_fts5_tokenizer_spec(name)?;
     create_tokenizer_from_parts(&parts)
 }
 
@@ -5428,10 +5465,7 @@ impl Fts5ExtensionApi {
         let _ = api.register_tokenizer("unicode61", |args| {
             Some(Box::new(unicode61_tokenizer_from_args(args)?))
         });
-        let _ = api.register_tokenizer("ascii", |args| {
-            args.is_empty()
-                .then_some(Box::new(AsciiTokenizer) as Box<dyn Fts5Tokenizer>)
-        });
+        let _ = api.register_tokenizer("ascii", ascii_tokenizer_from_args);
         let _ = api.register_tokenizer("porter", |args| {
             let inner = if args.is_empty() {
                 Box::new(Unicode61Tokenizer::new()) as Box<dyn Fts5Tokenizer>
@@ -5475,7 +5509,7 @@ impl Fts5ExtensionApi {
 
     #[must_use]
     pub fn create_tokenizer(&self, spec: &str) -> Option<Box<dyn Fts5Tokenizer>> {
-        let parts = split_fts5_tokenizer_spec(spec);
+        let parts = split_fts5_tokenizer_spec(spec)?;
         let name = parts.first()?;
         self.find_tokenizer(name)?.as_ref()(&parts[1..])
     }
@@ -17530,6 +17564,29 @@ mod tests {
         let tokens = tok.tokenize("Hello World 123");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
         assert_eq!(terms, vec!["hello", "world", "123"]);
+    }
+
+    #[test]
+    fn ascii_tokenizer_options_apply_in_order_in_both_factories() {
+        let api = Fts5ExtensionApi::with_builtins();
+        let spec = "ascii TokenChars '-_' separators 'xé' separators '_' tokenchars ''";
+        for tok in [
+            create_tokenizer(spec).unwrap(),
+            api.create_tokenizer(spec).unwrap(),
+        ] {
+            let tokens = tok.tokenize("Co-op_XxÉé");
+            assert_eq!(
+                tokens
+                    .iter()
+                    .map(|t| (t.term.as_str(), t.start, t.end))
+                    .collect::<Vec<_>>(),
+                [("co-op", 0, 5), ("x", 6, 7), ("Éé", 8, 12)]
+            );
+        }
+        for bad in ["ascii separators", "ascii unknown 1", "ascii tokenchars 'abc"] {
+            assert!(create_tokenizer(bad).is_none());
+            assert!(api.create_tokenizer(bad).is_none());
+        }
     }
 
     #[test]
