@@ -11052,8 +11052,7 @@ impl<F: VfsFile> PagerInner<F> {
                     cache,
                     wal_backend,
                     db_size,
-                    header.freelist_trunk,
-                    header.freelist_count,
+                    &header,
                 )
                 .await?
             };
@@ -11739,11 +11738,13 @@ fn return_pages_to_freelist(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_freelist_from_disk<F: VfsFile>(
     cx: &Cx,
     db_file: &F,
     page_cipher: &PageCipherSlot,
     page_size: PageSize,
+    reserved_per_page: u8,
     db_size: u32,
     first_trunk: u32,
     freelist_count: u32,
@@ -11753,8 +11754,10 @@ async fn load_freelist_from_disk<F: VfsFile>(
     }
 
     let ps = page_size.as_usize();
+    let max_leaf_entries = freelist_trunk_leaf_capacity(page_size, reserved_per_page);
     let mut visited: HashSet<u32> = HashSet::new();
-    let mut out: Vec<PageNumber> = Vec::with_capacity(freelist_count as usize);
+    // Reserve at most one trunk until the chain proves that more pages exist.
+    let mut out = Vec::with_capacity((freelist_count as usize).min(max_leaf_entries + 1));
     let mut trunk = first_trunk;
 
     while trunk != 0 && out.len() < freelist_count as usize {
@@ -11787,7 +11790,6 @@ async fn load_freelist_from_disk<F: VfsFile>(
 
         let next_trunk = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let leaf_count = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        let max_leaf_entries = (ps / 4).saturating_sub(2);
         if leaf_count > max_leaf_entries {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -11828,9 +11830,10 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
     cache: &ShardedPageCache,
     wal_backend: &SharedWalBackend,
     db_size: u32,
-    first_trunk: u32,
-    freelist_count: u32,
+    header: &DatabaseHeader,
 ) -> Result<Vec<PageNumber>> {
+    let first_trunk = header.freelist_trunk;
+    let freelist_count = header.freelist_count;
     if first_trunk == 0 || freelist_count == 0 {
         return Ok(Vec::new());
     }
@@ -11841,8 +11844,10 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
     }
 
     let ps = inner.page_size.as_usize();
+    let max_leaf_entries = freelist_trunk_leaf_capacity(inner.page_size, header.reserved_per_page);
     let mut visited: HashSet<u32> = HashSet::new();
-    let mut out: Vec<PageNumber> = Vec::with_capacity(freelist_count as usize);
+    // Reserve at most one trunk until the chain proves that more pages exist.
+    let mut out = Vec::with_capacity((freelist_count as usize).min(max_leaf_entries + 1));
     let mut trunk = first_trunk;
 
     while trunk != 0 && out.len() < freelist_count as usize {
@@ -11883,7 +11888,6 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
                 "DK9RA_O81OV FREELIST_TRUNK trunk={trunk} next={next_trunk} leaf_count={leaf_count} all_zero={all_zero}"
             );
         }
-        let max_leaf_entries = (ps / 4).saturating_sub(2);
         if leaf_count > max_leaf_entries {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -18434,6 +18438,7 @@ where
                     &*db_file,
                     &inner.page_cipher,
                     page_size,
+                    candidate.header.reserved_per_page,
                     new_page_count,
                     candidate.header.freelist_trunk,
                     candidate.header.freelist_count,
@@ -18833,6 +18838,7 @@ where
                 &*db_file_guard,
                 &page_cipher,
                 page_size,
+                header.reserved_per_page,
                 new_page_count,
                 header.freelist_trunk,
                 header.freelist_count,
@@ -21606,6 +21612,7 @@ where
                 file_size,
                 expected_header_bytes,
                 page_size,
+                header.reserved_per_page,
                 db_size,
                 header.freelist_trunk,
                 header.freelist_count,
@@ -21624,6 +21631,7 @@ where
                         file_size,
                         expected_header_bytes,
                         page_size,
+                        reserved_per_page,
                         db_size,
                         freelist_trunk,
                         freelist_count,
@@ -21658,6 +21666,7 @@ where
                             db_file,
                             &PageCipherSlot::default(),
                             *page_size,
+                            *reserved_per_page,
                             *db_size,
                             *freelist_trunk,
                             *freelist_count,
@@ -22576,6 +22585,7 @@ where
                                 db_file,
                                 page_cipher,
                                 header.page_size,
+                                header.reserved_per_page,
                                 db_size,
                                 header.freelist_trunk,
                                 header.freelist_count,
@@ -26429,6 +26439,7 @@ where
                         &*db_file,
                         &inner.page_cipher,
                         page_size,
+                        image[20], // reserved bytes in the peer's committed page 1
                         committed_db_size,
                         first_trunk,
                         freelist_count,
@@ -63223,6 +63234,68 @@ mod tests {
     }
 
     #[test]
+    fn freelist_trunks_respect_the_committed_reserved_bytes() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let ps = PageSize::new(512).unwrap();
+            // 512 - 32 reserved bytes - 8 trunk header bytes = 118 pointers.
+            for wal in [false, true] {
+                for leaf_count in [118_u32, 119] {
+                    let vfs = MemoryVfs::new();
+                    let path = Path::new("/freelist-reserved-tail.db");
+                    let page_count = leaf_count + 2;
+                    let mut header = DatabaseHeader {
+                        page_size: ps,
+                        page_count,
+                        write_version: if wal { 2 } else { 1 },
+                        read_version: if wal { 2 } else { 1 },
+                        reserved_per_page: 32,
+                        freelist_trunk: 2,
+                        freelist_count: leaf_count + 1,
+                        ..DatabaseHeader::default()
+                    };
+                    let mut page_one = vec![0; ps.as_usize()];
+                    page_one[..DATABASE_HEADER_SIZE].copy_from_slice(&header.to_bytes().unwrap());
+                    let mut trunk = vec![0; ps.as_usize()];
+                    trunk[4..8].copy_from_slice(&leaf_count.to_be_bytes());
+                    for (slot, page) in trunk[8..].chunks_exact_mut(4).zip(3..=page_count) {
+                        slot.copy_from_slice(&page.to_be_bytes());
+                    }
+                    let mut main_image = vec![0; page_count as usize * ps.as_usize()];
+                    if wal {
+                        // The old main header allows more pointers. A read using
+                        // its reserve count would accept the 119th WAL entry.
+                        header.reserved_per_page = 0;
+                    }
+                    main_image[..DATABASE_HEADER_SIZE].copy_from_slice(&header.to_bytes().unwrap());
+                    main_image[ps.as_usize()..2 * ps.as_usize()].copy_from_slice(&trunk);
+                    let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+                    let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+                    file.write(&cx, &main_image, 0).await.unwrap();
+                    file.close(&cx).unwrap();
+
+                    let result: Result<usize> = async {
+                        let pager = SimplePager::open(vfs, path, ps).await?;
+                        if wal {
+                            let (backend, frames, _, _) = MockWalBackend::new();
+                            frames.lock().unwrap().extend([(1, page_one, 0), (2, trunk, page_count)]);
+                            pager.set_wal_backend(Box::new(backend))?;
+                        }
+                        Ok(pager.refresh_published_snapshot(&cx).await?.freelist_count)
+                    }
+                    .await;
+                    if leaf_count == 118 {
+                        assert_eq!(result.unwrap(), 119, "wal={wal}");
+                    } else {
+                        assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { detail })
+                            if detail.contains("leaf_count 119 exceeds max 118")), "wal={wal}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn test_wal_open_validates_freelist_at_the_reader_snapshot() {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
@@ -63328,8 +63401,7 @@ mod tests {
                 &pager.cache,
                 &pager.wal_backend,
                 header.page_count,
-                header.freelist_trunk,
-                header.freelist_count,
+                &header,
             )
             .await
             .unwrap();
@@ -63412,8 +63484,7 @@ mod tests {
                 &pager.cache,
                 &pager.wal_backend,
                 header.page_count,
-                header.freelist_trunk,
-                header.freelist_count,
+                &header,
             )
             .await
             .unwrap();
