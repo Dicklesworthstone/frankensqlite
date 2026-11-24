@@ -94,6 +94,72 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-24 - REJECTED on its time kill line (gb_a_sum_c cycles a replicated layout-averaged LOSE, 1.0155 / 1.0243 at Ir 1.0000), with every statement row it targets a replicated WIN (txn point SELECT cpu x2.77 -> x2.04 / x2.09 stock 3.54.1, Ir -23.3%): an exact-guard per-connection cache of validated statements lets a repeated text statement skip its pre-dispatch rewrites and relation / semantic validation (bd-5310l, statement lane round 1)
+
+- Target: the text path's per-statement front end. On main 60386fa04 (user instructions an execution, stock 3.54.1
+  live): in-transaction point SELECT by rowid 50.59k against stock's 21.9k (x2.31), INSERT 36.85k (x2.69), UPDATE
+  43.72k (x2.57); autocommit SELECT 79.2k (x3.32). About 24k of the SELECT is the pre-dispatch block of
+  `execute_statement_once_after_background_status` (rewrites, then relation and semantic validation in the
+  registry-stability loop), which neither the parse cache nor the compiled cache skips.
+- Touched (not landed; patch `frankensqlite-perf-lnab/scripts/stmt1/lever.patch`, sha256 9618712ba04f25db, on
+  60386fa04): `crates/fsqlite-core/src/connection.rs`, and the keeper
+  `crates/fsqlite-core/tests/bd_5310l_validated_statement_cache_oracle.rs`. A 64-entry LRU keyed by the address of the
+  parse cache's `Arc<Statement>` (the entry holds the Arc, so an address is never reused under it). Guard, compared
+  before and after the schema refresh, which always runs: a catalog version (the sum of per-cell monotonic versions of
+  the connection's `TxnRestorableCell` catalog cells, bumped on borrow_mut, replace and the transaction restore), the
+  function registry generation, and foreign_keys. Eligible only at depth 0, for the statement the text entry point took
+  from the parse cache, when every rewrite is the identity, with no attached database, no application virtual-table
+  module, no live or dropped virtual-table instance, and no virtual-table callback entered during validation. Errors
+  are never cached, a mismatching entry is dropped at lookup, and the cookie-driven reuse-cache clear leaves it alone.
+- Keepers (both pass on the lever; K2 on vmi1152480, K3 on vmi1153651): a differential test against live rusqlite
+  3.54.1 with three arms (cached; an uncached reference kept ineligible by an ATTACHed database; stock), each statement
+  run three times, across DDL, savepoint rollback of ALTER, TEMP shadowing, views, foreign_keys flips on a
+  partial-index DELETE, recursive_triggers / case_sensitive_like / trusted_schema, ATTACH / DETACH, fts5, a function
+  re-registered from scalar to aggregate, an ICU collation load and `fsqlite_cache_pages()`: cached equals reference
+  on every outcome, and both match stock's rows, changes() and error outcomes (the one error-wording gap, "no such
+  column: c" where stock 3.54.1 adds " in <sql> at offset 7", is the uncached reference arm's too). Plus a counter test:
+  changing each guard input alone makes the next run a miss. Six planted mutants, in one runtime-selected build:
+  dropping the catalog version (m1) or the function generation (m2) is caught by the counter test only (no
+  SQL-visible difference found); dropping foreign_keys (m3: changes() 0 against 2 after `DELETE FROM p INDEXED BY
+  p_part`), the ATTACH bar (m4), the virtual-table bar (m5) or the callback witness (m6) is caught by both tests.
+- Found on the way: (1) the schema cookie is not a sound guard. A ROLLBACK of DDL restores the old cookie, so a plan
+  validated against the rolled-back schema would match again; hence the per-cell versions. (2) `Connection::open`
+  installs the engine's own FSQLITE_CACHE_PAGES module through the public `register_module`, so a flag set there is
+  set on every connection. The first build never engaged (its keeper's engagement assert failed); its core library
+  run, 4,215 passed, is for that non-engaged build and is not cited.
+- Prediction (bead, before the build): txn point SELECT -14% to -22% Ir, UPDATE -7% to -10%, INSERT -6% to -9%,
+  autocommit SELECT -10% to -14%, txn_1000x10_rows -2% to -5%. Kill lines: under 8% on the txn point SELECT; any
+  prepared-statement row more than 1% worse; any scorecard row with a replicated LOSE (judge v2b, stock live).
+- Result (one rch job AB2 on vmi1153651, base 60386fa04; parent cargo ELF 64815463aeeccccc, lever 0d135d37e2e496c4,
+  .text +8,064 B; six relinks per arm; measured on thinkstation1).
+  - Instructions an execution (single ELFs, stock live, every answer equal to stock's): txn point SELECT 50.67k ->
+    38.85k (-23.3%; x2.32 -> x1.78), INSERT -8.0% (x2.69 -> x2.47), UPDATE -8.7% (x2.58 -> x2.36), autocommit SELECT
+    -15.0% (x3.33 -> x2.83), autocommit INSERT / UPDATE within their spread; txn_1000x10_rows 645.0M -> 616.0M (-4.5%).
+  - Time on the statement rows (bd-es2im lines, the same six layouts, two valid runs, null max |z| 1.79 / 2.71, stock
+    live): every targeted row a replicated WIN in cpu and cycles. txn_select_2000 cpu 0.736 / 0.754 (x2.77 -> x2.04 /
+    x2.09 stock), cycles 0.644 / 0.652; auto_select_2000 cpu 0.817 / 0.808 (x5.09 -> x4.16 / x5.12 -> x4.14);
+    txn_update_2000 cpu 0.928 / 0.932; txn_insert_2000 cpu 0.929 / 0.951; txn_1000x10_rows cpu 0.955 / 0.971 (x9.50 ->
+    x9.08 / x8.96 -> x8.70); autocommit_5k_inserts a TIE.
+  - Scorecard (judge v2b, K=6, two valid runs, null max |z| 2.66 / 2.23, stock live): gb_a_sum_c cycles 1.0155 /
+    1.0243 LOSE / LOSE (T 1.48% / 1.00%) at Ir 1.0000; bulk_insert_1M_one_txn cycles 0.985 / 0.988 WIN / WIN; every
+    other row and metric a replicated TIE.
+- The LOSE, per layout (gb_a_sum_c cycles, M, s1..s6, run A): parent 3221 3356 3214 3238 3253 3356; null (the parent's
+  same ELFs) 3214 3327 3216 3211 3241 3336; lever 3222 3325 3293 3289 3318 3299. Run B shows the same split. The row
+  is bimodal by layout: the parent drew two slow layouts of six, the lever five. A counter probe (parent and lever s1,
+  s3, s2; 5 reps) reproduced the modes (s3: parent 3,213M, lever 3,307M) with branch misses (3.46-3.58M), L1i misses
+  (0.40-0.59M) and L1d misses (30.8-31.4M) flat across them, so the modes are not branch prediction or cache misses.
+  Not diagnosed further.
+- Not measured: the prepared-statement kill line (the lever's prepared-dml-probe build was lost when the disk
+  supervisor killed AB2 at 4h10m, rc 137, and was not rebuilt after the rejection); the gate battery (G1 was in flight
+  at the rejection; G2 and G3 were not run).
+- Retry condition (coordinator, 2026-11-24): (a) a revision with a smaller hot-path footprint, with fresh predictions;
+  or (b) bd-j0jc0 shows judge v2b's replication defective, and the lever is re-judged under the fixed gate with every
+  other verdict. judge v2b replicates on the same six layouts, so on a bimodal row one draw's slow-layout count can
+  move an arm about 2%. Do not re-roll it on new layouts alone.
+- Evidence: scratchpad (session 1f77802a) `stmt1/`: ab2_stmt_probe.txt, ab2_rows_probe.txt, judge/verdict_AB.txt,
+  judge/stmt_verdict.txt, judge/gb_frontend.txt, results/K2, results/K3, jobs.log; the arms are in arms/AB2 and
+  arms/AB2-L.
+
 ## 2026-11-24 - SMALL WIN (landed as ae029a9a4; inside every prediction line; instructions only, x4.92 -> x4.85 stock 3.54.1, time a replicated TIE): the forgotten-page table of the eviction trace hashes page numbers apart from the flat page table, so a compaction's probes stay short (bd-w4pr1.13.18, read/seek round 12, lever CP1)
 
 - Target: BF1's `ForgottenTracePages` probes in `AccessTrace::compact`. Callgrind on main e9dd4aa18: forget 331 Ir an
