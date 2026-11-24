@@ -995,6 +995,39 @@ impl MemTable {
         self.temp_spill = Some(TempTableSpillState::new(runtime, text_encoding));
     }
 
+    /// bd-rcirs: an ephemeral row buffer whose rows spill to a temp file under
+    /// `runtime`'s budget, as a `TEMP` table's do. Append rows with
+    /// [`Self::insert_checked`] under increasing rowids and read them back in
+    /// order with [`Self::rows_owned_in`].
+    #[must_use]
+    pub fn new_spilling_buffer(
+        num_columns: usize,
+        runtime: TempStoreRuntime,
+        text_encoding: TextEncoding,
+    ) -> Self {
+        let mut table = Self::new(num_columns);
+        table.configure_temp_spill(runtime, text_encoding);
+        table
+    }
+
+    /// bd-rcirs: the values of the rows at positions `range` (rowid order),
+    /// read back from the spill file where they were spilled. Positions past
+    /// the end are skipped.
+    pub fn rows_owned_in(
+        &self,
+        cx: &Cx,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<MemRowValues>> {
+        let mut out = Vec::with_capacity(range.len());
+        for pos in range {
+            match self.read_row_values_at(cx, pos)? {
+                Some(values) => out.push(values.into_owned()),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether any rows in this table currently reside in a spilled temp file.
     #[must_use]
     pub fn has_spilled_rows(&self) -> bool {
@@ -37334,6 +37367,52 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// bd-rcirs: the spilling row buffer gives every appended row back in
+    /// order, inline and spilled alike, whatever ranges it is read in. The
+    /// control buffer has a budget it never reaches, so it keeps every row
+    /// inline; the small one must spill and read the same rows back.
+    #[test]
+    fn test_memtable_spilling_buffer_reads_rows_back_in_order() {
+        use crate::temp_store::{OsTempFileBackend, TempStoreMode, TempStoreRuntime, TempStoreStats};
+        let cx = Cx::new();
+        let rows: Vec<MemRowValues> = (0..40_i64)
+            .map(|i| {
+                vec![
+                    SqliteValue::Integer(i),
+                    SqliteValue::Float(2.0 + f64::from(i32::try_from(i).unwrap())),
+                    SqliteValue::Text(SmallText::new(&format!("payload-{i:04}"))),
+                    if i % 3 == 0 {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Blob(vec![u8::try_from(i).unwrap(); 3].into())
+                    },
+                ]
+            })
+            .collect();
+        for (budget, must_spill) in [(256, true), (64 * 1024 * 1024, false)] {
+            let runtime = TempStoreRuntime::new(
+                TempStoreMode::File,
+                budget,
+                None,
+                Some(Arc::new(OsTempFileBackend)),
+                Arc::new(TempStoreStats::new()),
+            );
+            let mut buffer = MemTable::new_spilling_buffer(4, runtime, TextEncoding::Utf8);
+            for (rowid, values) in (1_i64..).zip(&rows) {
+                buffer.insert_checked(&cx, rowid, values.clone()).unwrap();
+            }
+            assert_eq!(buffer.has_spilled_rows(), must_spill, "budget {budget}");
+            assert_eq!(buffer.row_count(), rows.len());
+            let mut read = buffer.rows_owned_in(&cx, 0..15).unwrap();
+            read.extend(buffer.rows_owned_in(&cx, 15..38).unwrap());
+            read.extend(buffer.rows_owned_in(&cx, 38..60).unwrap());
+            // Debug text keeps the storage class: SqliteValue's own equality
+            // calls Integer(2) and Float(2.0) equal.
+            assert_eq!(format!("{read:?}"), format!("{rows:?}"), "budget {budget}");
+            assert!(buffer.rows_owned_in(&cx, 40..50).unwrap().is_empty());
+        }
     }
 
     #[test]

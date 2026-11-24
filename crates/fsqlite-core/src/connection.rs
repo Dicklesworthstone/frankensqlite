@@ -48128,6 +48128,13 @@ impl Connection {
         let keyset_rowid = self.insert_select_keyset_rowid(select_stmt);
         let source_changes = self.last_changes.get();
         let source_total = self.total_changes.get();
+        // bd-rcirs: when the target has a trigger, every chunk is read before
+        // the first row is inserted, as stock does, into a buffer that spills
+        // to a temp file under the temp_store budget, and the rows are inserted
+        // from it afterwards, a chunk at a time. A source of one short chunk is
+        // read whole anyway and is inserted directly.
+        let read_source_first = self.insert_select_target_has_triggers(insert);
+        let mut staged: Option<(Cx, MemTable)> = None;
         let mut after_rowid = None;
         let mut total_outcome = InsertSelectReplayOutcome::default();
         let mut offset: i64 = 0;
@@ -48169,18 +48176,60 @@ impl Connection {
                 }
             }
             let chunk_len = source_rows.len();
-            let chunk_outcome = self
-                .execute_insert_select_materialized_rows_outcome(insert, &source_rows)
-                .await?;
-            total_outcome.changes = total_outcome.changes.saturating_add(chunk_outcome.changes);
-            total_outcome
-                .returning_rows
-                .extend(chunk_outcome.returning_rows);
+            let last_chunk = (chunk_len as i64) < Self::INSERT_SELECT_CHUNK_SIZE;
+            if read_source_first && (staged.is_some() || !last_chunk) {
+                if staged.is_none() {
+                    let width = source_rows.first().map_or(0, |row| row.values.len());
+                    let buffer = MemTable::new_spilling_buffer(
+                        width,
+                        self.build_temp_store_runtime(),
+                        self.db_text_encoding.get(),
+                    );
+                    staged = Some((self.op_cx()?, buffer));
+                }
+                if let Some((cx, buffer)) = staged.as_mut() {
+                    for row in source_rows {
+                        let rowid = i64::try_from(buffer.row_count())
+                            .map_or(i64::MAX, |count| count.saturating_add(1));
+                        buffer.insert_checked(cx, rowid, row.values)?;
+                    }
+                }
+            } else {
+                let chunk_outcome = self
+                    .execute_insert_select_materialized_rows_outcome(insert, &source_rows)
+                    .await?;
+                total_outcome.changes =
+                    total_outcome.changes.saturating_add(chunk_outcome.changes);
+                total_outcome
+                    .returning_rows
+                    .extend(chunk_outcome.returning_rows);
+            }
             // source_rows is dropped here, freeing memory before the next chunk.
-            if (chunk_len as i64) < Self::INSERT_SELECT_CHUNK_SIZE {
+            if last_chunk {
                 break;
             }
             offset += Self::INSERT_SELECT_CHUNK_SIZE;
+        }
+        if let Some((cx, buffer)) = staged {
+            let chunk = usize::try_from(Self::INSERT_SELECT_CHUNK_SIZE).unwrap_or(usize::MAX);
+            let mut start = 0;
+            while start < buffer.row_count() {
+                let end = start.saturating_add(chunk).min(buffer.row_count());
+                let source_rows: Vec<Row> = buffer
+                    .rows_owned_in(&cx, start..end)?
+                    .into_iter()
+                    .map(|values| Row { values })
+                    .collect();
+                let chunk_outcome = self
+                    .execute_insert_select_materialized_rows_outcome(insert, &source_rows)
+                    .await?;
+                total_outcome.changes =
+                    total_outcome.changes.saturating_add(chunk_outcome.changes);
+                total_outcome
+                    .returning_rows
+                    .extend(chunk_outcome.returning_rows);
+                start = end;
+            }
         }
         // Each chunk set changes() to its own count; the statement's is the
         // sum (bd-qdve2).
@@ -52223,6 +52272,24 @@ impl Connection {
             && !Self::extract_table_names_from_select(select_stmt)
                 .iter()
                 .any(|source| source.eq_ignore_ascii_case(target))
+    }
+
+    /// bd-rcirs: whether the chunked INSERT ... SELECT fallback must read its
+    /// whole source before inserting: whenever the target has a trigger.
+    /// Stock reads the whole SELECT into a temporary table before the first
+    /// row whenever the target has INSERT triggers (insert.c, `useTempTable`),
+    /// so no inserted row sees what a trigger writes, however it reaches the
+    /// source: under any spelling of its name, through a view's INSTEAD OF
+    /// trigger, another table's trigger, a foreign-key action or a REPLACE.
+    /// Any trigger on the target counts, whatever its event or timing (an
+    /// upsert fires UPDATE triggers, a REPLACE DELETE ones): stock's rule or
+    /// wider, never narrower.
+    fn insert_select_target_has_triggers(&self, insert: &fsqlite_ast::InsertStatement) -> bool {
+        let target = &insert.table.name;
+        self.triggers
+            .borrow()
+            .iter()
+            .any(|trigger| trigger.table_name.eq_ignore_ascii_case(target))
     }
 
     /// bd-qdve2: the streaming INSERT ... SELECT source when it is a single
