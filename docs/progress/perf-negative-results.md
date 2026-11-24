@@ -257,10 +257,13 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
     other row and metric a replicated TIE.
 - The LOSE, per layout (gb_a_sum_c cycles, M, s1..s6, run A): parent 3221 3356 3214 3238 3253 3356; null (the parent's
   same ELFs) 3214 3327 3216 3211 3241 3336; lever 3222 3325 3293 3289 3318 3299. Run B shows the same split. The row
-  is bimodal by layout: the parent drew two slow layouts of six, the lever five. A counter probe (parent and lever s1,
-  s3, s2; 5 reps) reproduced the modes (s3: parent 3,213M, lever 3,307M) with branch misses (3.46-3.58M), L1i misses
-  (0.40-0.59M) and L1d misses (30.8-31.4M) flat across them, so the modes are not branch prediction or cache misses.
-  Not diagnosed further.
+  is bimodal by layout: the parent drew two slow layouts of six. The lever's layouts sit between the parent's clusters
+  (one fast, the rest at 3,289-3,325M), and 3 of 6 are above the 3,296M midpoint; this entry first said "the lever five".
+  A counter probe (parent and lever s1, s3, s2; 5 reps) reproduced the modes (s3: parent 3,213M, lever 3,307M) with
+  branch misses (3.46-3.58M), L1i misses (0.40-0.59M) and L1d misses (30.8-31.4M) flat across them, so the modes are
+  not branch prediction or cache misses. That first probe ran six events on Zen 3, so it was multiplexed (the NMI
+  watchdog holds a counter). Re-measured with at most five events and nothing multiplexed (bd-j0jc0): branch, L1i and
+  L1d stay flat, and so do op-cache misses, fetch stalls, BTB overrides and dispatch stalls. Not diagnosed further.
 - Not measured: the prepared-statement kill line (the lever's prepared-dml-probe build was lost when the disk
   supervisor killed AB2 at 4h10m, rc 137, and was not rebuilt after the rejection); the gate battery (G1 was in flight
   at the rejection; G2 and G3 were not run).
@@ -268,6 +271,12 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   or (b) bd-j0jc0 shows judge v2b's replication defective, and the lever is re-judged under the fixed gate with every
   other verdict. judge v2b replicates on the same six layouts, so on a bimodal row one draw's slow-layout count can
   move an arm about 2%. Do not re-roll it on new layouts alone.
+- Re-judge under bd-j0jc0 / bd-gvews (added 2026-11-24, later the same day). Condition (b) is met: a v2b A/A across
+  independent draws of identical code (main 60386fa04) gave replicated false verdicts in two of its three valid run
+  pairs. The consecutive pair E+F called scan_filter_agg cycles a WIN (0.9869 / 0.9871) and update_10pct_300k cpu a
+  LOSE (1.0428 / 1.0602, kernel time); C+F called gb_a_mod10 cycles a LOSE (1.0293 / 1.0316). The lever stays rejected
+  under v2b, and it is re-judged under the fixed gate (v2c, once its acceptance A/A passes) together with every other
+  v2b verdict.
 - Evidence: scratchpad (session 1f77802a) `stmt1/`: ab2_stmt_probe.txt, ab2_rows_probe.txt, judge/verdict_AB.txt,
   judge/stmt_verdict.txt, judge/gb_frontend.txt, results/K2, results/K3, jobs.log; the arms are in arms/AB2 and
   arms/AB2-L.
