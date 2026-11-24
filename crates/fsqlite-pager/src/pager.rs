@@ -8738,6 +8738,9 @@ async fn carry_refresh_state_past_own_flush<F: VfsFile>(
 }
 
 /// The inner mutable pager state protected by a mutex.
+// Four independent flags (writer_active, checkpoint_active,
+// committed_metadata_needs_refresh, freelist_repair_pending); not one state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
     db_file: SharedDbFile<F>,
