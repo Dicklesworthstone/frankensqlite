@@ -235,9 +235,15 @@ const STATEMENTS: &[(&str, &str)] = &[
         NO_ROWS,
     ),
     (READ, UNCHANGED),
-    // Parenthesized because of bd-pnrr8: fsqlite parses `NOT EXISTS (...) + 10`
-    // as `(NOT EXISTS (...)) + 10`, stock as `NOT (EXISTS (...) + 10)`. Once
-    // that is fixed, restore the unparenthesized probe (stock: 0 here).
+    // bd-pnrr8: `NOT EXISTS (...) + 10` is `NOT (EXISTS (...) + 10)`, 0 here;
+    // parenthesized, `(NOT EXISTS (...)) + 10` is 10.
+    (
+        "INSERT INTO t VALUES (2, 0, 'q') ON CONFLICT(k) DO UPDATE \
+         SET n = NOT EXISTS (SELECT 1 FROM (SELECT v FROM s WHERE s.k = excluded.k) WHERE v > 70) + 10",
+        NO_ROWS,
+    ),
+    (READ, "rows=[[\"1\", \"1\", \"'x'\"], [\"2\", \"0\", \"'y'\"]]"),
+    (RESET, NO_ROWS),
     (
         "INSERT INTO t VALUES (2, 0, 'q') ON CONFLICT(k) DO UPDATE \
          SET n = (NOT EXISTS (SELECT 1 FROM (SELECT v FROM s WHERE s.k = excluded.k) WHERE v > 70)) + 10",
