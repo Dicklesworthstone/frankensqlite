@@ -11919,9 +11919,17 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
         })?;
         out.push(trunk_page);
 
-        let buf = inner
-            .read_committed_page_copy(cx, cache, wal_backend, trunk_page)
-            .await?;
+        // A committed trunk must exist in the pinned snapshot. The general
+        // committed-page helper zero-fills missing pages for new allocations,
+        // which would make a missing trunk look like a valid empty trunk.
+        let buf = if inner.journal_mode == JournalMode::Wal
+            && let Some(data) = read_page_from_wal_backend(wal_backend, cx, trunk_page).await?
+        {
+            cache.record_external_read();
+            data
+        } else {
+            inner.read_page_copy_uncached(cx, trunk_page).await?
+        };
         if buf.len() < ps {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -63409,6 +63417,54 @@ mod tests {
                 } else {
                     assert!(matches!(refresh, Err(FrankenError::DatabaseCorrupt { detail })
                         if detail.contains("freelist trunk 2 leaf_count")));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_wal_freelist_trunk_requires_a_complete_committed_page() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT;
+            for main_trunk_bytes in [0, 8, ps.as_usize()] {
+                for wal_trunk_bytes in [None, Some(8), Some(ps.as_usize())] {
+                    let vfs = MemoryVfs::new();
+                    let path = Path::new("/missing-freelist-trunk.db");
+                    let header = DatabaseHeader {
+                        page_size: ps,
+                        page_count: 2,
+                        write_version: 2,
+                        read_version: 2,
+                        freelist_trunk: 2,
+                        freelist_count: 1,
+                        ..DatabaseHeader::default()
+                    };
+                    let mut image = vec![0; ps.as_usize() + main_trunk_bytes];
+                    image[..DATABASE_HEADER_SIZE]
+                        .copy_from_slice(&header.to_bytes().unwrap());
+                    let flags =
+                        VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+                    let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+                    file.write(&cx, &image, 0).await.unwrap();
+                    file.close(&cx).unwrap();
+
+                    let pager = SimplePager::open(vfs, path, ps).await.unwrap();
+                    let (backend, frames, _, _) = MockWalBackend::new();
+                    if let Some(bytes) = wal_trunk_bytes {
+                        frames.lock().unwrap().push((2, vec![0; bytes], 2));
+                    }
+                    pager.set_wal_backend(Box::new(backend)).unwrap();
+                    let refresh = pager.refresh_published_snapshot(&cx).await;
+                    if wal_trunk_bytes.unwrap_or(main_trunk_bytes) == ps.as_usize() {
+                        assert_eq!(refresh.unwrap().freelist_count, 1);
+                    } else {
+                        assert!(
+                            matches!(refresh, Err(FrankenError::DatabaseCorrupt { ref detail })
+                                if detail.contains("short read") && detail.contains("page 2")),
+                            "main_trunk_bytes={main_trunk_bytes}, wal_trunk_bytes={wal_trunk_bytes:?}"
+                        );
+                    }
                 }
             }
         });
