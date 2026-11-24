@@ -183314,16 +183314,9 @@ fn simple_match_fts5_expr(expr: &Fts5Expr, document: &str, columns: &[(String, S
             simple_match_fts5_expr(left, document, columns)
                 && !simple_match_fts5_expr(right, document, columns)
         }
-        Fts5Expr::Near(operands, _) => {
-            let doc_lower = document.to_lowercase();
-            operands.iter().all(|op| match op {
-                fsqlite_ext_fts5::Fts5NearOperand::Term(t) => simple_match_term(t, &doc_lower),
-                fsqlite_ext_fts5::Fts5NearOperand::Prefix(p) => simple_match_prefix(p, &doc_lower),
-                fsqlite_ext_fts5::Fts5NearOperand::Phrase(words) => {
-                    doc_lower.contains(&words.join(" ").to_lowercase())
-                }
-            })
-        }
+        Fts5Expr::Near(operands, _) => operands.iter().all(|operand| {
+            simple_match_fts5_expr(&Fts5Expr::from(operand.clone()), document, columns)
+        }),
         Fts5Expr::ColumnFilter(column_name, inner) => {
             let filtered_columns: Vec<(String, String)> = columns
                 .iter()

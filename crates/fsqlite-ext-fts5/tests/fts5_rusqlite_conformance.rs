@@ -3619,6 +3619,183 @@ fn invalid_match_syntax_errors_like_rusqlite_reference() {
 }
 
 #[test]
+fn multi_token_query_literals_match_rusqlite_reference() {
+    let texts = [
+        ("alpha beta gamma", ""),
+        ("beta alpha gamma", ""),
+        ("alpha gap beta gamma", ""),
+        ("alpha betamax gamma", ""),
+        ("alphabet beta gamma", ""),
+        ("alpha", "beta gamma"),
+        ("head alpha betamax gamma", ""),
+        ("head alpha gap betamax gamma", ""),
+    ];
+    let docs: Vec<_> = texts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (title, body))| Doc {
+            rowid: i64::try_from(i + 1).unwrap(),
+            title,
+            body,
+        })
+        .collect();
+    for options in [
+        &[][..],
+        &["tokenize='ascii'"][..],
+        &["tokenize='porter'"][..],
+        &["tokenize='unicode61 tokenchars _'"][..],
+    ] {
+        let harness = Fts5ConformanceHarness::with_docs(options, &docs);
+        let rows = harness
+            .franken
+            .encode_shadow_rows()
+            .expect("encode FTS5 segments");
+        let mut args = vec!["fts5", "main", "docs", "title", "body"];
+        args.extend_from_slice(options);
+        let reopened = Fts5Table::open_shadow_rows(&Cx::new(), &args, &rows)
+            .expect("reopen persisted FTS5 segments");
+        for query in [
+            "alpha_beta",
+            "alpha_beta*",
+            "alpha*beta",
+            "alpha * beta",
+            r#""alpha"*beta"#,
+            r#""alpha_beta"*"#,
+            r#""alpha beta" *"#,
+            "head + alpha_beta*",
+            "^alpha_beta*",
+            "NEAR(alpha_beta* gamma, 0)",
+            r#"NEAR("alpha beta"* gamma, 0)"#,
+            "title:alpha_beta*",
+            "alpha beta",
+            "alpha_beta OR alphabet",
+        ] {
+            let expected = harness.sqlite_match_rowids(query);
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                expected,
+                "{options:?} {query}"
+            );
+            let mut persisted: Vec<_> = reopened
+                .table
+                .search(query)
+                .expect("search persisted FTS5 index")
+                .into_iter()
+                .map(|(rowid, _)| rowid)
+                .collect();
+            persisted.sort_unstable();
+            assert_eq!(persisted, expected, "{options:?} persisted {query}");
+        }
+    }
+}
+
+#[test]
+fn zero_token_query_literals_match_rusqlite_reference() {
+    let docs = [
+        Doc {
+            rowid: 1,
+            title: "ABC DEF",
+            body: "",
+        },
+        Doc {
+            rowid: 2,
+            title: "ABC GHI DEF",
+            body: "",
+        },
+        Doc {
+            rowid: 3,
+            title: "abc",
+            body: "",
+        },
+        Doc {
+            rowid: 4,
+            title: "___",
+            body: "",
+        },
+        Doc {
+            rowid: 5,
+            title: "ABC def",
+            body: "",
+        },
+        Doc {
+            rowid: 6,
+            title: "\u{0300}",
+            body: "",
+        },
+        Doc {
+            rowid: 7,
+            title: "\u{0301}",
+            body: "",
+        },
+        Doc {
+            rowid: 8,
+            title: "\u{0305}",
+            body: "",
+        },
+    ];
+    for options in [
+        &["tokenize='unicode61 categories Lu'"][..],
+        &["tokenize='unicode61 categories Lu'", "detail=none"][..],
+        &["tokenize='unicode61 categories Mn remove_diacritics 1'"][..],
+        &["tokenize='unicode61 categories Mn remove_diacritics 2'"][..],
+        &[
+            "tokenize='unicode61 categories Mn remove_diacritics 2'",
+            "detail=none",
+        ][..],
+    ] {
+        let harness = Fts5ConformanceHarness::with_docs(options, &docs);
+        let rows = harness
+            .franken
+            .encode_shadow_rows()
+            .expect("encode FTS5 segments");
+        let mut args = vec!["fts5", "main", "docs", "title", "body"];
+        args.extend_from_slice(options);
+        let reopened = Fts5Table::open_shadow_rows(&Cx::new(), &args, &rows)
+            .expect("reopen persisted FTS5 segments");
+        for query in [
+            "abc",
+            "abc*",
+            "ABC",
+            r#""abc""#,
+            r#""ABC""#,
+            r#""ABC abc""#,
+            r#""abc DEF""#,
+            "ABC + abc",
+            "ABC + abc*",
+            "abc + DEF*",
+            "NEAR(ABC abc, 0)",
+            "NEAR(abc DEF, 0)",
+            "NEAR(abc def, 0)",
+            "___",
+            "___*",
+            "ABC + ___*",
+            r#""""#,
+            r#"""*"#,
+            "NEAR(ABC ___, 0)",
+            "\u{0300}",
+            "\u{0300}*",
+            "NEAR(abc \u{0300}, 0)",
+        ] {
+            let expected = harness.sqlite_match_rowids(query);
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                expected,
+                "{options:?} {query}"
+            );
+            let mut persisted: Vec<_> = reopened
+                .table
+                .search(query)
+                .expect("search persisted FTS5 index")
+                .into_iter()
+                .map(|(rowid, _)| rowid)
+                .collect();
+            persisted.sort_unstable();
+            assert_eq!(persisted, expected, "{options:?} persisted {query}");
+        }
+    }
+}
+
+#[test]
 fn tokenizer_queries_match_rusqlite_reference() {
     for case in TOKENIZER_CASES {
         let harness = Fts5ConformanceHarness::with_docs(case.options, case.docs);

@@ -5780,6 +5780,21 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
             continue;
         }
 
+        if ch == '*' {
+            let _ = chars.next();
+            let Some(previous) = tokens.last_mut() else {
+                return Err(Fts5QueryError::InvalidPhraseSyntax);
+            };
+            if !matches!(
+                previous.kind,
+                Fts5QueryTokenKind::Term | Fts5QueryTokenKind::Phrase
+            ) {
+                return Err(Fts5QueryError::InvalidPhraseSyntax);
+            }
+            previous.kind = Fts5QueryTokenKind::Prefix;
+            continue;
+        }
+
         if ch == '^' {
             let _ = chars.next();
             tokens.push(Fts5QueryToken {
@@ -5812,19 +5827,18 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
             if !closed {
                 return Err(Fts5QueryError::UnclosedPhrase);
             }
-            if !phrase.is_empty() {
-                tokens.push(Fts5QueryToken {
-                    kind: Fts5QueryTokenKind::Phrase,
-                    lexeme: phrase,
-                });
-            }
+            tokens.push(Fts5QueryToken {
+                kind: Fts5QueryTokenKind::Phrase,
+                lexeme: phrase,
+            });
             continue;
         }
 
         // Read a word.
         let mut word = String::new();
         while let Some(word_ch) = chars.peek().copied() {
-            if word_ch.is_ascii_whitespace() || matches!(word_ch, '(' | ')' | '"' | '+' | '^') {
+            if word_ch.is_ascii_whitespace() || matches!(word_ch, '(' | ')' | '"' | '+' | '^' | '*')
+            {
                 break;
             }
             let _ = chars.next();
@@ -5964,17 +5978,6 @@ fn push_query_word_tokens(word: &str, tokens: &mut Vec<Fts5QueryToken>) {
         return;
     }
 
-    if word.ends_with('*') {
-        let base = word.trim_end_matches('*');
-        if !base.is_empty() {
-            tokens.push(Fts5QueryToken {
-                kind: Fts5QueryTokenKind::Prefix,
-                lexeme: base.to_owned(),
-            });
-            return;
-        }
-    }
-
     let upper = word.to_ascii_uppercase();
     let kind = match upper.as_str() {
         "AND" => Fts5QueryTokenKind::And,
@@ -6096,6 +6099,7 @@ pub enum Fts5NearOperand {
     Term(String),
     Prefix(String),
     Phrase(Vec<String>),
+    PhrasePrefix(Vec<String>, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6142,16 +6146,10 @@ fn near_operand_from_token(token: &Fts5QueryToken) -> Option<Fts5NearOperand> {
         Fts5QueryTokenKind::Term if !token.lexeme.trim().is_empty() => {
             Some(Fts5NearOperand::Term(token.lexeme.trim().to_owned()))
         }
-        Fts5QueryTokenKind::Prefix if !token.lexeme.trim().is_empty() => {
-            Some(Fts5NearOperand::Prefix(token.lexeme.trim().to_owned()))
-        }
+        Fts5QueryTokenKind::Prefix => Some(Fts5NearOperand::Prefix(token.lexeme.trim().to_owned())),
         Fts5QueryTokenKind::Phrase => {
-            let terms: Vec<String> = token
-                .lexeme
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect();
-            (!terms.is_empty()).then_some(Fts5NearOperand::Phrase(terms))
+            let terms: Vec<String> = token.lexeme.split_whitespace().map(str::to_owned).collect();
+            Some(Fts5NearOperand::Phrase(terms))
         }
         _ => None,
     }
@@ -6175,15 +6173,12 @@ fn append_phrase_token(
             let phrase_words = token
                 .lexeme
                 .split_whitespace()
-                .map(str::to_lowercase)
+                .map(str::to_owned)
                 .collect::<Vec<_>>();
-            if phrase_words.is_empty() {
-                return Err(Fts5QueryError::InvalidPhraseSyntax);
-            }
             words.extend(phrase_words);
             Ok(())
         }
-        Fts5QueryTokenKind::Prefix if !token.lexeme.trim().is_empty() => {
+        Fts5QueryTokenKind::Prefix => {
             *prefix = Some(token.lexeme.trim().to_owned());
             Ok(())
         }
@@ -7319,23 +7314,57 @@ fn tokenize_query_leaf(tokenizer: &dyn Fts5Tokenizer, text: &str) -> Vec<String>
 }
 
 fn normalize_query_term_expr(term: String, tokenizer: &dyn Fts5Tokenizer) -> Fts5Expr {
-    let mut terms = tokenize_query_leaf(tokenizer, &term).into_iter();
-    let Some(first) = terms.next() else {
-        return Fts5Expr::Term(term.to_lowercase());
-    };
-
-    terms.fold(Fts5Expr::Term(first), |left, right| {
-        Fts5Expr::And(Box::new(left), Box::new(Fts5Expr::Term(right)))
-    })
+    let tokens = tokenizer.tokenize(&term);
+    let has_colocated_tokens = tokens.iter().any(|token| token.colocated);
+    let mut terms: Vec<_> = tokens.into_iter().map(|token| token.term).collect();
+    if has_colocated_tokens {
+        // Preserve the existing handling of custom tokenizer synonym groups.
+        let mut terms = terms.into_iter();
+        let first = terms.next().expect("a colocated token is present");
+        return terms.fold(Fts5Expr::Term(first), |left, right| {
+            Fts5Expr::And(Box::new(left), Box::new(Fts5Expr::Term(right)))
+        });
+    }
+    if terms.len() == 1 {
+        Fts5Expr::Term(terms.pop().unwrap_or_default())
+    } else {
+        Fts5Expr::Phrase(terms)
+    }
 }
 
 fn normalize_query_phrase_terms(phrase: &[String], tokenizer: &dyn Fts5Tokenizer) -> Vec<String> {
-    let joined = phrase.join(" ");
-    let terms = tokenize_query_leaf(tokenizer, &joined);
-    if terms.is_empty() {
-        phrase.iter().map(|term| term.to_lowercase()).collect()
+    tokenize_query_leaf(tokenizer, &phrase.join(" "))
+}
+
+fn query_phrase(mut terms: Vec<String>) -> Fts5NearOperand {
+    if terms.len() == 1 {
+        Fts5NearOperand::Term(terms.pop().unwrap_or_default())
     } else {
-        terms
+        Fts5NearOperand::Phrase(terms)
+    }
+}
+
+fn normalize_query_prefix(
+    mut words: Vec<String>,
+    prefix: String,
+    tokenizer: &dyn Fts5Tokenizer,
+) -> Fts5NearOperand {
+    let tokens = tokenizer.tokenize(&prefix);
+    let has_colocated_tokens = tokens.iter().any(|token| token.colocated);
+    let mut terms: Vec<_> = tokens.into_iter().map(|token| token.term).collect();
+    // Preserve existing custom-tokenizer synonym handling.
+    if has_colocated_tokens {
+        terms.truncate(1);
+    }
+    // FTS5 applies '*' only to the last token from the preceding string.
+    let Some(last) = terms.pop() else {
+        return query_phrase(words);
+    };
+    words.extend(terms);
+    if words.is_empty() {
+        Fts5NearOperand::Prefix(last)
+    } else {
+        Fts5NearOperand::PhrasePrefix(words, last)
     }
 }
 
@@ -7344,24 +7373,26 @@ fn normalize_near_operand_with_tokenizer(
     tokenizer: &dyn Fts5Tokenizer,
 ) -> Fts5NearOperand {
     match operand {
-        Fts5NearOperand::Term(term) => {
-            let terms = tokenize_query_leaf(tokenizer, &term);
-            match terms.as_slice() {
-                [] => Fts5NearOperand::Term(term.to_lowercase()),
-                [single] => Fts5NearOperand::Term(single.clone()),
-                _ => Fts5NearOperand::Phrase(terms),
-            }
-        }
-        Fts5NearOperand::Prefix(prefix) => {
-            let terms = tokenize_query_leaf(tokenizer, &prefix);
-            let normalized = terms
-                .first()
-                .cloned()
-                .unwrap_or_else(|| prefix.to_lowercase());
-            Fts5NearOperand::Prefix(normalized)
-        }
+        Fts5NearOperand::Term(term) => query_phrase(tokenize_query_leaf(tokenizer, &term)),
+        Fts5NearOperand::Prefix(prefix) => normalize_query_prefix(Vec::new(), prefix, tokenizer),
         Fts5NearOperand::Phrase(words) => {
-            Fts5NearOperand::Phrase(normalize_query_phrase_terms(&words, tokenizer))
+            query_phrase(normalize_query_phrase_terms(&words, tokenizer))
+        }
+        Fts5NearOperand::PhrasePrefix(words, prefix) => normalize_query_prefix(
+            normalize_query_phrase_terms(&words, tokenizer),
+            prefix,
+            tokenizer,
+        ),
+    }
+}
+
+impl From<Fts5NearOperand> for Fts5Expr {
+    fn from(operand: Fts5NearOperand) -> Self {
+        match operand {
+            Fts5NearOperand::Term(term) => Self::Term(term),
+            Fts5NearOperand::Prefix(prefix) => Self::Prefix(prefix),
+            Fts5NearOperand::Phrase(words) => Self::Phrase(words),
+            Fts5NearOperand::PhrasePrefix(words, prefix) => Self::PhrasePrefix(words, prefix),
         }
     }
 }
@@ -7369,26 +7400,16 @@ fn normalize_near_operand_with_tokenizer(
 fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Tokenizer) -> Fts5Expr {
     match expr {
         Fts5Expr::Term(term) => normalize_query_term_expr(term, tokenizer),
-        Fts5Expr::Prefix(prefix) => {
-            let terms = tokenize_query_leaf(tokenizer, &prefix);
-            let normalized = terms
-                .first()
-                .cloned()
-                .unwrap_or_else(|| prefix.to_lowercase());
-            Fts5Expr::Prefix(normalized)
-        }
+        Fts5Expr::Prefix(prefix) => normalize_query_prefix(Vec::new(), prefix, tokenizer).into(),
         Fts5Expr::Phrase(words) => {
-            Fts5Expr::Phrase(normalize_query_phrase_terms(&words, tokenizer))
+            query_phrase(normalize_query_phrase_terms(&words, tokenizer)).into()
         }
-        Fts5Expr::PhrasePrefix(words, prefix) => {
-            let normalized_words = normalize_query_phrase_terms(&words, tokenizer);
-            let terms = tokenize_query_leaf(tokenizer, &prefix);
-            let normalized_prefix = terms
-                .first()
-                .cloned()
-                .unwrap_or_else(|| prefix.to_lowercase());
-            Fts5Expr::PhrasePrefix(normalized_words, normalized_prefix)
-        }
+        Fts5Expr::PhrasePrefix(words, prefix) => normalize_query_prefix(
+            normalize_query_phrase_terms(&words, tokenizer),
+            prefix,
+            tokenizer,
+        )
+        .into(),
         Fts5Expr::And(left, right) => Fts5Expr::And(
             Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
             Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
@@ -7401,13 +7422,22 @@ fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Token
             Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
             Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
         ),
-        Fts5Expr::Near(operands, distance) => Fts5Expr::Near(
-            operands
+        Fts5Expr::Near(operands, distance) => {
+            let mut operands: Vec<_> = operands
                 .into_iter()
                 .map(|operand| normalize_near_operand_with_tokenizer(operand, tokenizer))
-                .collect(),
-            distance,
-        ),
+                .filter(
+                    |operand| !matches!(operand, Fts5NearOperand::Phrase(words) if words.is_empty()),
+                )
+                .collect();
+            if operands.len() > 1 {
+                Fts5Expr::Near(operands, distance)
+            } else {
+                operands
+                    .pop()
+                    .map_or_else(|| Fts5Expr::Phrase(Vec::new()), Fts5Expr::from)
+            }
+        }
         Fts5Expr::ColumnFilter(column_name, inner) => Fts5Expr::ColumnFilter(
             column_name,
             Box::new(normalize_query_expr_with_tokenizer(*inner, tokenizer)),
@@ -7792,6 +7822,7 @@ fn validate_detail_mode(
             validate_detail_mode(left, detail)?;
             validate_detail_mode(right, detail)
         }
+        Fts5Expr::Phrase(words) if words.is_empty() => Ok(()),
         Fts5Expr::Phrase(_) | Fts5Expr::PhrasePrefix(_, _) => {
             if detail == DetailMode::Full {
                 Ok(())
@@ -7995,6 +8026,9 @@ fn near_operand_spans(
             })
             .collect(),
         Fts5NearOperand::Phrase(words) => phrase_near_spans(index, words, allowed_columns),
+        Fts5NearOperand::PhrasePrefix(words, prefix) => {
+            phrase_prefix_spans(index, words, prefix, allowed_columns)
+        }
     }
 }
 
@@ -8512,6 +8546,9 @@ pub(crate) trait Fts5DoclistProvider {
             Fts5NearOperand::Term(term) => self.term_spans(term, allowed_columns),
             Fts5NearOperand::Prefix(prefix) => self.prefix_spans(prefix, allowed_columns),
             Fts5NearOperand::Phrase(words) => self.phrase_spans(words, allowed_columns),
+            Fts5NearOperand::PhrasePrefix(words, prefix) => {
+                self.phrase_prefix_spans(words, prefix, allowed_columns)
+            }
         }
     }
 
@@ -9284,6 +9321,10 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
                             }
                             Fts5NearOperand::Phrase(words) => {
                                 exact.extend(words.iter().cloned());
+                            }
+                            Fts5NearOperand::PhrasePrefix(words, prefix) => {
+                                exact.extend(words.iter().cloned());
+                                prefixes.insert(prefix.clone());
                             }
                         }
                     }
@@ -11015,6 +11056,11 @@ fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
         match operand {
             Fts5NearOperand::Term(term) | Fts5NearOperand::Prefix(term) => vec![term.clone()],
             Fts5NearOperand::Phrase(terms) => terms.clone(),
+            Fts5NearOperand::PhrasePrefix(words, prefix) => words
+                .iter()
+                .chain(std::iter::once(prefix))
+                .cloned()
+                .collect(),
         }
     }
 
@@ -11054,6 +11100,12 @@ fn extract_score_terms(expr: &Fts5Expr) -> Vec<Fts5ScoreTerm> {
             Fts5NearOperand::Phrase(terms) => {
                 terms.iter().cloned().map(Fts5ScoreTerm::Exact).collect()
             }
+            Fts5NearOperand::PhrasePrefix(words, prefix) => words
+                .iter()
+                .cloned()
+                .map(Fts5ScoreTerm::Exact)
+                .chain(std::iter::once(Fts5ScoreTerm::Prefix(prefix.clone())))
+                .collect(),
         }
     }
 
@@ -11171,6 +11223,11 @@ fn extract_highlight_terms(expr: &Fts5Expr) -> Vec<Fts5HighlightTerm> {
                 .iter()
                 .map(|term| Fts5HighlightTerm::exact(term))
                 .collect(),
+            Fts5NearOperand::PhrasePrefix(words, prefix) => words
+                .iter()
+                .map(|term| Fts5HighlightTerm::exact(term))
+                .chain(std::iter::once(Fts5HighlightTerm::prefix(prefix)))
+                .collect(),
         }
     }
 
@@ -11217,6 +11274,9 @@ fn extract_highlight_patterns(expr: &Fts5Expr) -> Vec<Fts5HighlightPattern> {
             }
             Fts5NearOperand::Phrase(terms) => {
                 vec![Fts5HighlightPattern::exact_phrase(terms)]
+            }
+            Fts5NearOperand::PhrasePrefix(words, prefix) => {
+                vec![Fts5HighlightPattern::phrase_prefix(words, prefix)]
             }
         }
     }
@@ -22890,10 +22950,13 @@ mod tests {
     }
 
     #[test]
-    fn test_query_empty_phrase_ignored() {
-        // Empty phrase (just "") should be ignored and result in EmptyQuery.
-        let err = parse_fts5_query(r#""""#).unwrap_err();
-        assert_eq!(err, Fts5QueryError::EmptyQuery);
+    fn test_query_empty_phrase_matches_no_documents() {
+        let tokens = parse_fts5_query(r#""""#).unwrap();
+        let expr = build_expr(&tokens).unwrap();
+        assert!(matches!(&expr, Fts5Expr::Phrase(words) if words.is_empty()));
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+        assert!(table.search(r#""""#).unwrap().is_empty());
     }
 
     #[test]
