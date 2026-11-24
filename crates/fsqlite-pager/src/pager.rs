@@ -63335,7 +63335,8 @@ mod tests {
                     page_one[..DATABASE_HEADER_SIZE].copy_from_slice(&header.to_bytes().unwrap());
                     let mut trunk = vec![0; ps.as_usize()];
                     trunk[4..8].copy_from_slice(&leaf_count.to_be_bytes());
-                    for (slot, page) in trunk[8..].chunks_exact_mut(4).zip(3..=page_count) {
+                    let (slots, _) = trunk[8..].as_chunks_mut::<4>();
+                    for (slot, page) in slots.iter_mut().zip(3..=page_count) {
                         slot.copy_from_slice(&page.to_be_bytes());
                     }
                     let mut main_image = vec![0; page_count as usize * ps.as_usize()];
