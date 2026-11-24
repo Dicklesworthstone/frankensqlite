@@ -3,8 +3,9 @@
 //! This module exposes lightweight process-local counters used by the
 //! `btree_op` tracing lane and bead-level telemetry verification.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use fsqlite_types::{PageNumber, sync_primitives::Instant};
@@ -1104,7 +1105,17 @@ static SWIZZLE_OUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ── Copy-heavy payload/cell kernel metrics (bd-db300.4.4.1) ─────────────────
 
-static BTREE_COPY_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Packed copy-profile instrumentation gate:
+/// - Bit 0 (`1`): process-wide enable flag (`set_btree_copy_profile_enabled`)
+/// - Bits `1..` (`+2` / `-2`): active thread-local override count
+///
+/// Fast path when disabled (normal execution): a single relaxed atomic load
+/// equal to `0` returns `false` without touching TLS.
+static BTREE_COPY_PROFILE_GATE: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static BTREE_COPY_PROFILE_THREAD_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
 static BTREE_LOCAL_PAYLOAD_COPY_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_LOCAL_PAYLOAD_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
 static BTREE_OWNED_PAYLOAD_MATERIALIZATION_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1162,7 +1173,22 @@ static BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_TIME_NS: AtomicU64 = AtomicU64::new(
 
 #[inline]
 pub(crate) fn copy_profile_enabled() -> bool {
-    BTREE_COPY_PROFILE_ENABLED.load(Ordering::Relaxed)
+    let gate = BTREE_COPY_PROFILE_GATE.load(Ordering::Relaxed);
+    if gate == 0 {
+        return false;
+    }
+    copy_profile_enabled_slow(gate)
+}
+
+#[cold]
+#[inline(never)]
+fn copy_profile_enabled_slow(gate: usize) -> bool {
+    if gate >= 2
+        && let Some(enabled) = BTREE_COPY_PROFILE_THREAD_OVERRIDE.with(Cell::get)
+    {
+        return enabled;
+    }
+    (gate & 1) != 0
 }
 
 /// Read the B-tree copy-profile instrumentation gate.
@@ -1220,7 +1246,38 @@ fn record_operation_cold(op_type: BtreeOpType) {
 }
 
 pub fn set_btree_copy_profile_enabled(enabled: bool) {
-    BTREE_COPY_PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
+    if enabled {
+        BTREE_COPY_PROFILE_GATE.fetch_or(1, Ordering::Relaxed);
+    } else {
+        BTREE_COPY_PROFILE_GATE.fetch_and(!1, Ordering::Relaxed);
+    }
+}
+
+/// Override B-tree copy-profile instrumentation on the current thread only.
+///
+/// Mirrors `fsqlite_types::record::set_record_profile_thread_override`: unit
+/// tests that assert exact process-global copy-profile counters can enable
+/// profiling on their own thread without turning on instrumentation for
+/// unrelated tests running concurrently on other threads.
+pub fn set_btree_copy_profile_thread_override(enabled: Option<bool>) {
+    BTREE_COPY_PROFILE_THREAD_OVERRIDE.with(|cell| {
+        let prev = cell.replace(enabled);
+        match (prev.is_some(), enabled.is_some()) {
+            (false, true) => {
+                BTREE_COPY_PROFILE_GATE.fetch_add(2, Ordering::Relaxed);
+            }
+            (true, false) => {
+                BTREE_COPY_PROFILE_GATE.fetch_sub(2, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Read the current thread's B-tree copy-profile override, if set.
+#[must_use]
+pub fn btree_copy_profile_thread_override() -> Option<bool> {
+    BTREE_COPY_PROFILE_THREAD_OVERRIDE.with(Cell::get)
 }
 
 /// Toggle the B-tree hot-path metrics gate.
@@ -2441,6 +2498,65 @@ mod tests {
         );
         assert!(after.overflow_chain_overflow_bytes > before.overflow_chain_overflow_bytes);
         assert!(after.overflow_page_reads > before.overflow_page_reads);
+    }
+
+    #[test]
+    fn copy_profile_thread_override_isolates_concurrent_threads() {
+        struct OverrideResetGuard(Option<bool>);
+        impl Drop for OverrideResetGuard {
+            fn drop(&mut self) {
+                super::set_btree_copy_profile_thread_override(self.0);
+            }
+        }
+
+        let _guard = super::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev_global = (super::BTREE_COPY_PROFILE_GATE.load(super::Ordering::Relaxed) & 1) != 0;
+        set_btree_copy_profile_enabled(false);
+        let _override_guard = OverrideResetGuard(super::btree_copy_profile_thread_override());
+        super::set_btree_copy_profile_thread_override(Some(true));
+        reset_btree_copy_profile();
+
+        assert!(super::btree_copy_profile_enabled());
+        // Sibling thread without an override must stay disabled and must not
+        // pollute global counters while the owning thread profiles.
+        let sibling_enabled = std::thread::spawn(|| {
+            let enabled = super::btree_copy_profile_enabled();
+            super::record_owned_payload_materialization(128);
+            enabled
+        })
+        .join()
+        .expect("sibling thread should finish cleanly");
+        assert!(!sibling_enabled);
+        assert_eq!(
+            btree_copy_profile_snapshot().owned_payload_materialization_calls,
+            0,
+            "unprofiled sibling thread must not pollute copy-profile counters"
+        );
+
+        // Owning thread records normally.
+        super::record_owned_payload_materialization(64);
+        assert_eq!(
+            btree_copy_profile_snapshot().owned_payload_materialization_calls,
+            1
+        );
+
+        // Explicit `Some(false)` suppresses global enable on the calling thread.
+        set_btree_copy_profile_enabled(true);
+        super::set_btree_copy_profile_thread_override(Some(false));
+        assert!(!super::btree_copy_profile_enabled());
+        super::record_owned_payload_materialization(64);
+        assert_eq!(
+            btree_copy_profile_snapshot().owned_payload_materialization_calls,
+            1
+        );
+
+        drop(_override_guard);
+        set_btree_copy_profile_enabled(prev_global);
+        if !prev_global {
+            assert!(!super::btree_copy_profile_enabled());
+        }
     }
 
     #[test]

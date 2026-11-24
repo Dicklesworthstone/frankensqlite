@@ -20,9 +20,7 @@
 use hashbrown::{HashMap, HashSet};
 use std::any::Any;
 use std::borrow::Cow;
-#[cfg(test)]
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -155,7 +153,7 @@ impl<V> CursorSlots<V> {
     }
 }
 use fsqlite_types::sync_primitives::{Duration, Instant};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use fsqlite_btree::cursor::{CursorPositionStamp, FirstIndexKeyIntegerLocalRunSegment};
@@ -520,7 +518,7 @@ fn transient_mem_root_pgno(root_pgno: PageNumber) -> PageNumber {
 
 #[inline]
 fn add_vdbe_counter(counter: &AtomicU64, delta: u64) {
-    if FSQLITE_VDBE_METRICS_ENABLED.load(AtomicOrdering::Relaxed) {
+    if vdbe_metrics_enabled() {
         counter.fetch_add(delta, AtomicOrdering::Relaxed);
     }
 }
@@ -7937,11 +7935,18 @@ static FSQLITE_VDBE_RESULT_BLOBS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_VDBE_RESULT_TEXT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Heap bytes for result-row BLOB values.
 static FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Whether VDBE execution metrics should be collected on the hot path.
+/// Packed gate for VDBE execution metrics collection:
+/// - Bit 0 (`1`): process-wide enable flag (`set_vdbe_metrics_enabled`)
+/// - Bits `1..` (`+2` / `-2`): active thread-local override count
 ///
 /// These counters are used only for diagnostics/tests today, so leave them
-/// disabled by default to keep shared-state bookkeeping off ordinary execute().
-static FSQLITE_VDBE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+/// disabled by default (`0`) to keep shared-state bookkeeping and TLS access
+/// off ordinary execute().
+static FSQLITE_VDBE_METRICS_GATE: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static FSQLITE_VDBE_METRICS_THREAD_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
 /// Monotonic program ID counter for tracing correlation.
 static VDBE_PROGRAM_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -8383,15 +8388,61 @@ pub struct VdbeMetricsSnapshot {
     pub page_data_motion: PageDataMotionMetricsSnapshot,
 }
 
-/// Enable/disable VDBE execution metrics collection.
+/// Enable/disable VDBE execution metrics collection process-wide.
 pub fn set_vdbe_metrics_enabled(enabled: bool) {
-    FSQLITE_VDBE_METRICS_ENABLED.store(enabled, AtomicOrdering::Relaxed);
+    if enabled {
+        FSQLITE_VDBE_METRICS_GATE.fetch_or(1, AtomicOrdering::Relaxed);
+    } else {
+        FSQLITE_VDBE_METRICS_GATE.fetch_and(!1, AtomicOrdering::Relaxed);
+    }
 }
 
-/// Current VDBE metrics collection flag.
+/// Override VDBE execution metrics collection on the current thread only.
+///
+/// Allows unit tests that assert exact `vdbe_metrics_snapshot()` deltas to
+/// enable metrics on their own thread without turning on instrumentation for
+/// unrelated tests running concurrently on sibling threads.
+pub fn set_vdbe_metrics_thread_override(enabled: Option<bool>) {
+    FSQLITE_VDBE_METRICS_THREAD_OVERRIDE.with(|cell| {
+        let prev = cell.replace(enabled);
+        match (prev.is_some(), enabled.is_some()) {
+            (false, true) => {
+                FSQLITE_VDBE_METRICS_GATE.fetch_add(2, AtomicOrdering::Relaxed);
+            }
+            (true, false) => {
+                FSQLITE_VDBE_METRICS_GATE.fetch_sub(2, AtomicOrdering::Relaxed);
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Read the current thread's VDBE metrics override, if set.
+#[must_use]
+pub fn vdbe_metrics_thread_override() -> Option<bool> {
+    FSQLITE_VDBE_METRICS_THREAD_OVERRIDE.with(Cell::get)
+}
+
+/// Current VDBE metrics collection flag for the calling thread.
+#[inline]
 #[must_use]
 pub fn vdbe_metrics_enabled() -> bool {
-    FSQLITE_VDBE_METRICS_ENABLED.load(AtomicOrdering::Relaxed)
+    let gate = FSQLITE_VDBE_METRICS_GATE.load(AtomicOrdering::Relaxed);
+    if gate == 0 {
+        return false;
+    }
+    vdbe_metrics_enabled_slow(gate)
+}
+
+#[cold]
+#[inline(never)]
+fn vdbe_metrics_enabled_slow(gate: usize) -> bool {
+    if gate >= 2
+        && let Some(enabled) = FSQLITE_VDBE_METRICS_THREAD_OVERRIDE.with(Cell::get)
+    {
+        return enabled;
+    }
+    (gate & 1) != 0
 }
 
 /// Read a point-in-time snapshot of VDBE execution metrics.
@@ -10119,7 +10170,8 @@ enum ColumnSubstrPrefixDirect {
 /// `Generic`, so one binary can time both paths
 /// (`fsqlite-core/benches/column_substr_prefix_whole_value_ab.rs`).
 #[cfg(feature = "bench-internals")]
-pub static COLUMN_SUBSTR_PREFIX_WHOLE_VALUE_DISABLED_FOR_BENCH: AtomicBool = AtomicBool::new(false);
+pub static COLUMN_SUBSTR_PREFIX_WHOLE_VALUE_DISABLED_FOR_BENCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[inline]
 fn column_substr_prefix_whole_value_enabled() -> bool {
@@ -26555,6 +26607,42 @@ mod tests {
         }
     }
 
+    struct BtreeCopyProfileThreadOverrideGuard {
+        previous: Option<bool>,
+    }
+
+    impl BtreeCopyProfileThreadOverrideGuard {
+        fn enabled() -> Self {
+            let previous = fsqlite_btree::btree_copy_profile_thread_override();
+            fsqlite_btree::set_btree_copy_profile_thread_override(Some(true));
+            Self { previous }
+        }
+    }
+
+    impl Drop for BtreeCopyProfileThreadOverrideGuard {
+        fn drop(&mut self) {
+            fsqlite_btree::set_btree_copy_profile_thread_override(self.previous);
+        }
+    }
+
+    struct VdbeMetricsThreadOverrideGuard {
+        previous: Option<bool>,
+    }
+
+    impl VdbeMetricsThreadOverrideGuard {
+        fn enabled() -> Self {
+            let previous = vdbe_metrics_thread_override();
+            set_vdbe_metrics_thread_override(Some(true));
+            Self { previous }
+        }
+    }
+
+    impl Drop for VdbeMetricsThreadOverrideGuard {
+        fn drop(&mut self) {
+            set_vdbe_metrics_thread_override(self.previous);
+        }
+    }
+
     struct CancelExecutionFunc {
         cx: Cx,
     }
@@ -39812,9 +39900,8 @@ mod tests {
         let _guard = VDBE_OBSERVABILITY_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_metrics_enabled = vdbe_metrics_enabled();
+        let _vdbe_metrics_guard = VdbeMetricsThreadOverrideGuard::enabled();
         reset_vdbe_metrics();
-        set_vdbe_metrics_enabled(true);
 
         let pager = MemoryMockMvccPager;
         let cx = Cx::new();
@@ -39891,7 +39978,6 @@ mod tests {
         let _txn = engine
             .take_transaction()
             .expect("take_transaction should succeed");
-        set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
 
     #[test]
@@ -40137,11 +40223,11 @@ mod tests {
         let (mut engine, conflict_key, _) = build_storage_index_engine_with_duplicate_prefixes();
         let iterations = 256;
         let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
+        let _copy_profile_guard = BtreeCopyProfileThreadOverrideGuard::enabled();
 
         let run_legacy = |cursor: &mut StorageCursor| {
             fsqlite_types::record::reset_record_profile();
             fsqlite_btree::reset_btree_copy_profile();
-            fsqlite_btree::set_btree_copy_profile_enabled(true);
             let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
             let mut matches = 0usize;
             for _ in 0..iterations {
@@ -40161,7 +40247,6 @@ mod tests {
         let run_scratch = |cursor: &mut StorageCursor| {
             fsqlite_types::record::reset_record_profile();
             fsqlite_btree::reset_btree_copy_profile();
-            fsqlite_btree::set_btree_copy_profile_enabled(true);
             let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
             let mut matches = 0usize;
             let mut payload_ptr = None;
@@ -40305,8 +40390,6 @@ mod tests {
             scratch_copy_profile.owned_payload_materialization_bytes,
             scratch_copy_profile.local_payload_copy_calls,
         );
-
-        fsqlite_btree::set_btree_copy_profile_enabled(false);
     }
 
     #[test]
@@ -40322,11 +40405,11 @@ mod tests {
         let miss_target = [SqliteValue::Integer(9)];
         let iterations = 128usize;
         let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
+        let _copy_profile_guard = BtreeCopyProfileThreadOverrideGuard::enabled();
 
         let run_legacy = |cursor: &mut StorageCursor| {
             fsqlite_types::record::reset_record_profile();
             fsqlite_btree::reset_btree_copy_profile();
-            fsqlite_btree::set_btree_copy_profile_enabled(true);
             let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
             let mut matches = 0usize;
             for _ in 0..iterations {
@@ -40354,7 +40437,6 @@ mod tests {
         let run_scratch = |cursor: &mut StorageCursor| {
             fsqlite_types::record::reset_record_profile();
             fsqlite_btree::reset_btree_copy_profile();
-            fsqlite_btree::set_btree_copy_profile_enabled(true);
             let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
             let mut matches = 0usize;
             let mut payload_capacity = None;
@@ -40551,8 +40633,6 @@ mod tests {
             target_capacity,
             current_capacity,
         );
-
-        fsqlite_btree::set_btree_copy_profile_enabled(false);
     }
 
     #[test]
@@ -47656,9 +47736,8 @@ mod tests {
         let _guard = VDBE_OBSERVABILITY_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_metrics_enabled = vdbe_metrics_enabled();
+        let _vdbe_metrics_guard = VdbeMetricsThreadOverrideGuard::enabled();
         reset_vdbe_metrics();
-        set_vdbe_metrics_enabled(true);
 
         let pager = MemoryMockMvccPager;
         let cx = Cx::new();
@@ -47707,8 +47786,53 @@ mod tests {
                 - before.page_data_motion.normalized_zero_fill_bytes_total,
             u64::try_from(PageSize::DEFAULT.as_usize() - expected.len()).unwrap()
         );
+    }
 
-        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    #[test]
+    fn test_vdbe_metrics_thread_override_isolates_concurrent_threads() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_global = (FSQLITE_VDBE_METRICS_GATE.load(AtomicOrdering::Relaxed) & 1) != 0;
+        set_vdbe_metrics_enabled(false);
+        let _vdbe_metrics_guard = VdbeMetricsThreadOverrideGuard::enabled();
+        reset_vdbe_metrics();
+
+        assert!(vdbe_metrics_enabled());
+        let before = vdbe_metrics_snapshot();
+        let sibling_enabled = std::thread::spawn(|| {
+            let enabled = vdbe_metrics_enabled();
+            let page = vec![0_u8; PageSize::DEFAULT.as_usize()];
+            normalize_owned_page_data(page.len(), &page)
+                .expect("sibling page normalization should succeed");
+            enabled
+        })
+        .join()
+        .expect("sibling thread should finish cleanly");
+        assert!(!sibling_enabled);
+        let after_sibling = vdbe_metrics_snapshot();
+        assert_eq!(
+            after_sibling
+                .page_data_motion
+                .normalized_payload_bytes_total
+                - before.page_data_motion.normalized_payload_bytes_total,
+            0,
+            "unprofiled sibling thread must not pollute VDBE page-data-motion counters"
+        );
+
+        let page = vec![0_u8; PageSize::DEFAULT.as_usize()];
+        normalize_owned_page_data(page.len(), &page)
+            .expect("owning thread page normalization should succeed");
+        let after_owner = vdbe_metrics_snapshot();
+        assert_eq!(
+            after_owner.page_data_motion.normalized_payload_bytes_total
+                - before.page_data_motion.normalized_payload_bytes_total,
+            u64::try_from(PageSize::DEFAULT.as_usize()).unwrap(),
+            "owning thread with override enabled must record VDBE metrics"
+        );
+
+        drop(_vdbe_metrics_guard);
+        set_vdbe_metrics_enabled(prev_global);
     }
 
     #[test]
