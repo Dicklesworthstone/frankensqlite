@@ -94,6 +94,41 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-24 - SMALL WIN (landed as ae029a9a4; inside every prediction line; instructions only, x4.92 -> x4.85 stock 3.54.1, time a replicated TIE): the forgotten-page table of the eviction trace hashes page numbers apart from the flat page table, so a compaction's probes stay short (bd-w4pr1.13.18, read/seek round 12, lever CP1)
+
+- Target: BF1's `ForgottenTracePages` probes in `AccessTrace::compact`. Callgrind on main e9dd4aa18: forget 331 Ir an
+  eviction, 252 of it the 375 compactions (126k each); 103.6k of a compaction's 121.7k own Ir were the probe loop of
+  `cut` (about 52 a scanned entry).
+- Cause: `home` hashed by the top bits of page * 0x9E37_79B9, the flat page table's multiplier (GOLDEN_RATIO_32,
+  whose slot is bits 16..29 of the same product). The clean-buffer eviction takes victims in flat-slot order, so the
+  ~500 pages forgotten between two compactions cover part of the flat table's hash range and their homes here crowd
+  into part of this table. Model (`scratchpad/pl12/sim_forgot_hash.py`): 3.7-8.4 probes a waiting page and 10-21 any
+  other, against 1.4 / 2.2 for random keys at that load. A correlated-hash defect, not a load-factor one.
+- Touched: `crates/fsqlite-pager/src/page_cache.rs`. `home` multiplies by `FORGOTTEN_TRACE_PAGE_HASH` = 0x85EB_CA6B
+  (MurmurHash3's odd constant). Same table size (8 KiB), same semantics. Keeper
+  `test_bd_w4pr1_13_18_forgotten_pages_from_one_flat_sweep_probe_short` (500 pages from half of a 16,384-slot flat
+  table's range, eight windows; mean probes at most 2.0 waiting / 3.0 not); planted mutant (the flat multiplier)
+  fails it at 7.36 / 17.57.
+- Prediction (bead, before the build): compaction 40k-60k; forget 120-190; rowid -27M to -42M Ir; scans -0.7M to
+  -1.6M; write rows +-0.3%; all-hits +-0.05%; rowid cycles TIE or WIN. Kill: rowid better by less than 15M; any row
+  above +0.5% Ir; any replicated LOSE.
+- Result (gate job j-...533 on vmi1227854, then arms job j-...722 on ovh-a, same patch and tree; parent cargo ELF
+  c34ec97d3d3ea6fd, lever 4ffeb19fa82996db; stock 3.54.1 live): rowid 2,257.68M -> 2,226.18M Ir (-31.5M, -1.39%);
+  forget 164 a call, compaction 52k; all-hits +0.0001%; judge minima rowid 2,267.3M -> 2,235.8M, scans -0.01% to
+  -0.08%, write rows 1.0000. Time (runs cp1j2 + cp1j3 valid, cp1j1 VOID): every row a replicated TIE; rowid cycles
+  0.975 WIN / 1.007 TIE. Answers equal stock everywhere. Every prediction line met.
+- Gate (3968ebfef, CP1 on origin/main 4579ee0ba; rch): clippy -D warnings fsqlite-pager all targets clean; pager lib
+  1,134 and core lib 4,208 + 1 passed; T3+XP 268, PS 184; the fsqlite crate in seven batches 877 / 37 / 36 / 57 / 45 /
+  35 / 24 passed, 0 failed (batch 4 with bd_w9s20_held_statement_reprepare_oracle, which round 12's target list had
+  missed); fsqlite-e2e 127 passed, with bd-ze4zu's one-table explicit-writers test red. That test was judged against
+  the parent in one rch job on vmi1149989 (both ELFs built there, 12 interleaved runs each): parent 9 of 12 failed,
+  CP1 8 of 12, same modes. rustfmt: ignored crate; ubs page_cache.rs 0 critical. Landed on origin/main fd696998f (no
+  commit between 4579ee0ba and it touches page_cache.rs).
+- Retry / next: the forget is 164 Ir a call after CP1, inside the 60-200 band BF1 aimed for; the miss path's larger
+  pieces are elsewhere (bd-w4pr1.13.18: the flight's waiter fanout, lever NW; the eviction walk, FS1 v2).
+- Note for the next lever on this table: any open-addressing table keyed by page number and filled in eviction order
+  must not share the flat table's multiplicative hash (or its bit range); a different multiplier is enough.
+
 ## 2026-11-23 - WIN (landed as 48b41a41e; inside its prediction): a statement's run of explicit-rowid floor bumps takes the tables lock alone after its first; bulk -206M Ir and a replicated cpu and cycles WIN against SQLite 3.54.1 live (bd-w4pr1.13, bulk-write round 17, lever FR)
 
 - Target: the explicit-rowid floor bump of bulk_insert_1M_one_txn.
