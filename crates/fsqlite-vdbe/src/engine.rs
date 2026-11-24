@@ -7253,6 +7253,33 @@ impl MemDatabase {
         }
     }
 
+    /// Create an empty in-memory database with undo logging disabled while a
+    /// mirror reload reconstructs tables and copies connection-local TEMP rows
+    /// (bd-cmsax / bd-732ft). Call [`Self::hand_undo_state_to`] on the replaced
+    /// database right before publishing this image so live transaction,
+    /// savepoint, and statement undo state survives the swap while the
+    /// reload's own construction never enters the undo log.
+    pub fn new_without_undo() -> Self {
+        Self {
+            tables: SwissIndex::new(),
+            next_root_page: 2, // Page 1 is reserved for sqlite_master.
+            undo_enabled: false,
+            undo_log: Vec::new(),
+            statement_undo_marks: Vec::new(),
+            in_explicit_txn: false,
+        }
+    }
+
+    /// Transfer live undo state (`undo_enabled`, `undo_log`,
+    /// `statement_undo_marks`, `in_explicit_txn`) to a freshly reconstructed
+    /// mirror `target` immediately before replacing `self` (bd-cmsax / bd-732ft).
+    pub fn hand_undo_state_to(&mut self, target: &mut Self) {
+        target.undo_enabled = self.undo_enabled;
+        target.undo_log = std::mem::take(&mut self.undo_log);
+        target.statement_undo_marks = std::mem::take(&mut self.statement_undo_marks);
+        target.in_explicit_txn = self.in_explicit_txn;
+    }
+
     /// Clone for a read-only snapshot (bd-jdjee).
     ///
     /// Tables share their row storage copy-on-write, so this costs O(tables),

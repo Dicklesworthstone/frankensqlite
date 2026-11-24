@@ -11967,6 +11967,36 @@ impl Drop for StatementSavepointDepthGuard<'_> {
     }
 }
 
+/// RAII guard for a nesting-aware `MemDatabase::begin_statement` /
+/// `end_statement` undo boundary (bd-cmsax). Calling [`finish`](Self::finish)
+/// closes the boundary with the chosen `unwind` decision; dropping without
+/// `finish` unwinds (`end_statement(true)`) so early `?` returns or cancelled
+/// futures cannot leave a stale mark on `MemDatabase::statement_undo_marks`.
+struct MemDbStatementGuard<'a> {
+    db: &'a Rc<RefCell<MemDatabase>>,
+    active: bool,
+}
+
+impl<'a> MemDbStatementGuard<'a> {
+    fn enter(db: &'a Rc<RefCell<MemDatabase>>) -> Self {
+        db.borrow_mut().begin_statement();
+        Self { db, active: true }
+    }
+
+    fn finish(mut self, unwind: bool) {
+        self.active = false;
+        self.db.borrow_mut().end_statement(unwind);
+    }
+}
+
+impl Drop for MemDbStatementGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.db.borrow_mut().end_statement(true);
+        }
+    }
+}
+
 /// The internal statement savepoint name
 /// `__fsqlite_stmt_{purpose}_{trace_id}_{suffix}`, written with `push_str`
 /// and `itoa`: through `format!` it cost about 900 instructions, once per
@@ -43060,6 +43090,14 @@ impl Connection {
         // cannot undo earlier statement effects.
         self.flush_pending_direct_write_runs(cx).await?;
         let savepoint_name = self.next_internal_savepoint_name(purpose);
+        // bd-cmsax: hold a nesting-aware MemDatabase statement undo mark for
+        // the lifetime of the internal statement savepoint. Outside an explicit
+        // transaction (`!in_explicit_txn`, e.g. autocommit row-stream replay or
+        // retained autocommit batches), an inner `_with_db` statement would
+        // otherwise see an empty `statement_undo_marks` stack and truncate its
+        // undo records on success, leaving `restore_snapshot`'s `rollback_to`
+        // with nothing to unwind for TEMP tables.
+        let memdb_stmt_guard = MemDbStatementGuard::enter(&self.db);
         let snapshot = self.statement_snapshot(schema_may_change);
         self.internal_statement_savepoint_depth.set(
             self.internal_statement_savepoint_depth
@@ -43185,6 +43223,7 @@ impl Connection {
                         )
                         .await);
                 }
+                memdb_stmt_guard.finish(false);
                 Ok(value)
             }
             Err(statement_error) => {
@@ -43235,6 +43274,7 @@ impl Connection {
                             )
                             .await);
                     }
+                    memdb_stmt_guard.finish(false);
                     return Err(statement_error);
                 }
 
@@ -43242,6 +43282,7 @@ impl Connection {
                 // (for example via trigger RAISE(ROLLBACK)). In that case,
                 // the outer rollback has already restored connection state.
                 if self.active_txn.borrow().is_none() {
+                    memdb_stmt_guard.finish(false);
                     return Err(statement_error);
                 }
 
@@ -43405,6 +43446,7 @@ impl Connection {
                     }
                 }
 
+                memdb_stmt_guard.finish(false);
                 Err(statement_error)
             }
         }
@@ -44747,18 +44789,27 @@ impl Connection {
                     })
                     | Statement::Reindex(_)
             );
+        let is_dml_statement = matches!(
+            statement.as_ref(),
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        );
+        let preserve_prior_changes_on_constraint_violation =
+            statement_preserves_prior_changes_on_constraint(statement.as_ref());
         let rollback_on_constraint_violation =
             statement_rolls_back_transaction_on_constraint(statement.as_ref());
+        // bd-cmsax: open a nesting-aware MemDatabase statement undo boundary
+        // for every DML statement on this path (CTE-fed INSERT/UPDATE/DELETE,
+        // row-replayed DML, and single-row DML with BEFORE/AFTER TEMP triggers)
+        // so inner VDBE statements never truncate their TEMP undo records while
+        // the outer autocommit DML statement is still in flight.
+        let memdb_stmt_guard = is_dml_statement.then(|| MemDbStatementGuard::enter(&self.db));
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(
                 &op_cx,
                 statement_kind,
-                statement_preserves_prior_changes_on_constraint(statement.as_ref()),
-                !matches!(
-                    statement.as_ref(),
-                    Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-                ),
+                preserve_prior_changes_on_constraint_violation,
+                !is_dml_statement,
                 async || {
                     self.execute_statement_dispatch_with_fk_scope(
                         &op_cx,
@@ -44784,20 +44835,27 @@ impl Connection {
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let mut preserved_constraint_failure_rows = false;
         let result = match result {
-            Ok(rows) => Ok(rows),
+            Ok(rows) => {
+                if let Some(guard) = memdb_stmt_guard {
+                    guard.finish(false);
+                }
+                Ok(rows)
+            }
             Err(error) => {
-                if matches!(
-                    statement.as_ref(),
-                    Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-                ) {
+                if is_dml_statement {
                     preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
-                        statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                        preserve_prior_changes_on_constraint_violation,
                         &error,
                         previous_changes,
                         previous_total_changes,
                         previous_trigger_step_changes,
                         previous_last_insert_rowid,
                     );
+                    if let Some(guard) = memdb_stmt_guard {
+                        let unwind = !preserved_constraint_failure_rows
+                            && !matches!(error, FrankenError::RaiseFail(_));
+                        guard.finish(unwind);
+                    }
                 }
                 match self
                     .maybe_rollback_transaction_for_conflict_action(
@@ -51281,7 +51339,12 @@ impl Connection {
             .await
         };
 
-        if !preserve_constraint_failure_rows
+        // bd-cmsax: hold a nesting-aware MemDatabase statement undo mark across
+        // the entire row-stream replay (after any CTE materialization and
+        // before per-row inner statements run) so inner row inserts and TEMP
+        // triggers retain their undo records in autocommit mode.
+        let memdb_stmt_guard = MemDbStatementGuard::enter(&self.db);
+        let outcome = if !preserve_constraint_failure_rows
             && self.active_txn.borrow().is_some()
             && self.internal_statement_savepoint_depth.get() == 0
         {
@@ -51289,7 +51352,12 @@ impl Connection {
                 .await
         } else {
             execute_rows().await
-        }
+        };
+        let unwind = outcome.as_ref().is_err_and(|error| {
+            !self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
+        });
+        memdb_stmt_guard.finish(unwind);
+        outcome
     }
 
     /// Source rows per batched replay statement (bd-i3csr). Below
@@ -61582,7 +61650,12 @@ impl Connection {
         };
         let _first_row_scope = self.returning_first_row_scope(has_returning);
 
-        self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+        // bd-cmsax: hold a nesting-aware MemDatabase statement undo boundary
+        // across all replayed UPDATE/DELETE rows so earlier rows' TEMP trigger
+        // writes unwind on ABORT/constraint failure in autocommit mode.
+        let memdb_stmt_guard = MemDbStatementGuard::enter(&self.db);
+        let result = self
+            .with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
             let mut row_params = Vec::with_capacity(parameter_base + row_value_count);
             let mut statement_changes = 0usize;
             let mut returning_rows = Vec::new();
@@ -61706,7 +61779,12 @@ impl Connection {
             self.record_statement_changes(statement_changes);
             Ok(returning_rows)
         })
-        .await
+        .await;
+        let unwind = result.as_ref().is_err_and(|error| {
+            !self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
+        });
+        memdb_stmt_guard.finish(unwind);
+        result
     }
 
     /// Pre-evaluate and inline scalar subqueries in `expr` that reference
@@ -118713,9 +118791,16 @@ impl Connection {
         let force_full_schema_reload = self.force_full_schema_reload_once.get();
         // bd-wjrs0: capture connection-local TEMP tables before the reset so
         // they (and their rows) survive — they are never in sqlite_master.
-        let mut new_db = MemDatabase::new();
+        // bd-cmsax / bd-732ft: keep reload construction out of the undo log and
+        // preserve the replaced database's live undo state across the swap.
+        let mut new_db = MemDatabase::new_without_undo();
         let captured_temp_tables = self.restore_temp_table_storage(cx, &mut new_db)?;
-        *self.db.borrow_mut() = new_db;
+        let displaced_db = {
+            let mut current_db = self.db.borrow_mut();
+            current_db.hand_undo_state_to(&mut new_db);
+            std::mem::replace(&mut *current_db, new_db)
+        };
+        drop(displaced_db);
         let mut new_schema = Vec::new();
         self.restore_temp_table_schemas(&mut new_schema, captured_temp_tables);
         *self.schema.borrow_mut() = new_schema;
@@ -119145,7 +119230,9 @@ impl Connection {
                 })
                 .collect();
             let mut new_schema: Vec<TableSchema> = Vec::new();
-            let mut new_db = MemDatabase::new();
+            // bd-cmsax / bd-732ft: keep reload construction out of the undo log;
+            // live undo state is handed over right before publishing `new_db`.
+            let mut new_db = MemDatabase::new_without_undo();
             let mut new_triggers = Vec::new();
             let mut new_views: Vec<ViewDef> = Vec::new();
             let mut pending_indexes: Vec<(String, String, i32, fsqlite_ast::CreateIndexStatement)> =
@@ -120012,13 +120099,20 @@ impl Connection {
 
             // Apply the reloaded state.
             //
-            // The old MemDatabase is dropped here, before anything else is
+            // Hand live transaction/savepoint/statement undo state into `new_db`
+            // before publishing it (bd-cmsax / bd-732ft), and drop the displaced
+            // old MemDatabase outside the RefCell borrow before anything else is
             // published. That drop is the only reentrancy hazard in this function
             // (a blocking worker's Drop can re-enter the Connection; see the
             // old-schema-fingerprint scoping comment above), so it must observe the
             // *old* schema/index pairs while they are still mutually consistent —
             // hence it runs before the atomic publish below.
-            *self.db.borrow_mut() = new_db;
+            let displaced_db = {
+                let mut current_db = self.db.borrow_mut();
+                current_db.hand_undo_state_to(&mut new_db);
+                std::mem::replace(&mut *current_db, new_db)
+            };
+            drop(displaced_db);
 
             // Preserve TEMP triggers across memdb reloads — they are connection-local
             // and not persisted to sqlite_master, so they would be lost if we simply
