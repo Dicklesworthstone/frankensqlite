@@ -11,6 +11,8 @@
 //!
 //! GH#541 also covers a TEXT PRIMARY KEY after another bound WHERE term:
 //! the index probe must keep the key's SQL-order slot even when emitted first.
+//! The same holds for an INTEGER PRIMARY KEY or `rowid` term, whose rowid
+//! seek is emitted first too.
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
@@ -393,7 +395,7 @@ async fn reset_text_pk(f: &Connection, r: &rusqlite::Connection) {
     }
 }
 
-async fn assert_text_pk_count(
+async fn assert_where_count(
     f: &Connection,
     r: &rusqlite::Connection,
     predicate: &str,
@@ -416,9 +418,10 @@ async fn assert_text_pk_count(
     );
 }
 
-async fn assert_text_pk_write(
+async fn assert_write(
     f: &Connection,
     r: &rusqlite::Connection,
+    state: &str,
     sql: &str,
     params: &[SqliteValue],
     expected: usize,
@@ -439,8 +442,8 @@ async fn assert_text_pk_write(
     );
     assert_eq!(affected, expected, "write count: {sql}, {params:?}");
     assert_eq!(
-        frank_state(f, TEXT_PK_STATE, 3).await,
-        sqlite_state(r, TEXT_PK_STATE, 3),
+        frank_state(f, state, 3).await,
+        sqlite_state(r, state, 3),
         "table state: {sql}, {params:?}"
     );
 }
@@ -473,13 +476,13 @@ async fn text_pk_write_matrix(wal: bool) {
             params.extend_from_slice(&where_params);
             for use_prepared in [false, true] {
                 reset_text_pk(&f, &r).await;
-                assert_text_pk_count(&f, &r, predicate, &where_params, 1).await;
+                assert_where_count(&f, &r, predicate, &where_params, 1).await;
                 let prepared = if use_prepared {
                     Some(f.prepare(&sql).await.unwrap())
                 } else {
                     None
                 };
-                assert_text_pk_write(&f, &r, &sql, &params, 1, prepared.as_ref()).await;
+                assert_write(&f, &r, TEXT_PK_STATE, &sql, &params, 1, prepared.as_ref()).await;
             }
         }
     }
@@ -565,22 +568,23 @@ async fn text_pk_write_matrix(wal: bool) {
         let where_params = text_params(where_values);
         for use_prepared in [false, true] {
             reset_text_pk(&f, &r).await;
-            assert_text_pk_count(&f, &r, predicate, &where_params, 1).await;
+            assert_where_count(&f, &r, predicate, &where_params, 1).await;
             let prepared = if use_prepared {
                 Some(f.prepare(sql).await.unwrap())
             } else {
                 None
             };
-            assert_text_pk_write(&f, &r, sql, &params, 1, prepared.as_ref()).await;
+            assert_write(&f, &r, TEXT_PK_STATE, sql, &params, 1, prepared.as_ref()).await;
         }
     }
     if wal {
         // Keep both the last DELETE and an UPDATE visible to the reopen check.
         let where_params = text_params(&["a2", "k2"]);
-        assert_text_pk_count(&f, &r, "a = ? AND k = ?", &where_params, 1).await;
-        assert_text_pk_write(
+        assert_where_count(&f, &r, "a = ? AND k = ?", &where_params, 1).await;
+        assert_write(
             &f,
             &r,
+            TEXT_PK_STATE,
             "UPDATE t SET v = ? WHERE a = ? AND k = ?",
             &text_params(&["persisted", "a2", "k2"]),
             1,
@@ -610,6 +614,93 @@ fn gh541_text_primary_key_parameter_order_memory() {
 #[test]
 fn gh541_text_primary_key_parameter_order_wal() {
     asupersync::test_utils::run_test(|| text_pk_write_matrix(true));
+}
+
+const ROWID_STATE: &str = "SELECT rowid, a, v FROM t";
+
+/// GH#541's rowid seeks. Through 0.4.4, an INTEGER PRIMARY KEY or `rowid`
+/// equality written after another anonymous `?` was bound to the wrong
+/// parameter slot: `UPDATE ... WHERE a = ? AND k = ?` changed 0 rows. The
+/// decoy (3, 7) swaps the target (7, 3)'s key and `a`, so a swapped binding
+/// shows up as a write to the wrong row rather than as a correct count.
+async fn rowid_write_matrix(ddl: &str, seed: &str, keys: &[&str]) {
+    let f = Connection::open(":memory:").await.unwrap();
+    let r = rusqlite::Connection::open_in_memory().unwrap();
+    f.execute(ddl).await.unwrap();
+    r.execute_batch(ddl).unwrap();
+    // The target row's key and `a` values; v is 'old' on every row.
+    let (k, a, v) = (
+        SqliteValue::Integer(7),
+        SqliteValue::Integer(3),
+        SqliteValue::Text("old".into()),
+    );
+    for key in keys {
+        // Each key-second shape sits beside its key-first twin.
+        let predicates = [
+            (format!("a = ? AND {key} = ?"), vec![a.clone(), k.clone()]),
+            (format!("{key} = ? AND a = ?"), vec![k.clone(), a.clone()]),
+            (
+                format!("a = ? AND v = ? AND {key} = ?"),
+                vec![a.clone(), v.clone(), k.clone()],
+            ),
+            (
+                format!("{key} = ? AND v = ? AND a = ?"),
+                vec![k.clone(), v.clone(), a.clone()],
+            ),
+            (format!("{key} = ?"), vec![k.clone()]),
+        ];
+        for (predicate, where_params) in &predicates {
+            for (prefix, bind_set) in [
+                ("UPDATE t SET v = ?", true),
+                ("UPDATE t SET v = 'x'", false),
+                ("DELETE FROM t", false),
+            ] {
+                let sql = format!("{prefix} WHERE {predicate}");
+                let mut params = if bind_set {
+                    text_params(&["x"])
+                } else {
+                    Vec::new()
+                };
+                params.extend_from_slice(where_params);
+                for use_prepared in [false, true] {
+                    for reset in ["DELETE FROM t", seed] {
+                        f.execute(reset).await.unwrap();
+                        r.execute_batch(reset).unwrap();
+                    }
+                    assert_where_count(&f, &r, predicate, where_params, 1).await;
+                    let prepared = if use_prepared {
+                        Some(f.prepare(&sql).await.unwrap())
+                    } else {
+                        None
+                    };
+                    assert_write(&f, &r, ROWID_STATE, &sql, &params, 1, prepared.as_ref()).await;
+                }
+            }
+        }
+    }
+    f.close().await.unwrap();
+}
+
+#[test]
+fn gh541_integer_primary_key_parameter_order() {
+    asupersync::test_utils::run_test(|| {
+        rowid_write_matrix(
+            "CREATE TABLE t (k INTEGER PRIMARY KEY, a INTEGER NOT NULL, v TEXT)",
+            "INSERT INTO t (k, a, v) VALUES (7, 3, 'old'), (3, 7, 'old')",
+            &["k", "rowid"],
+        )
+    });
+}
+
+#[test]
+fn gh541_rowid_parameter_order() {
+    asupersync::test_utils::run_test(|| {
+        rowid_write_matrix(
+            "CREATE TABLE t (a INTEGER NOT NULL, v TEXT)",
+            "INSERT INTO t (rowid, a, v) VALUES (7, 3, 'old'), (3, 7, 'old')",
+            &["rowid"],
+        )
+    });
 }
 
 #[test]
@@ -649,14 +740,23 @@ fn gh541_prepared_text_primary_key_rebinds_after_misses_and_schema_change() {
                             value.map_or(SqliteValue::Null, |text| SqliteValue::Text(text.into()))
                         })
                         .collect();
-                    assert_text_pk_count(&f, &r, "a = ? AND k = ?", &where_params, expected).await;
+                    assert_where_count(&f, &r, "a = ? AND k = ?", &where_params, expected).await;
                     let mut params = if deleting {
                         Vec::new()
                     } else {
                         vec![SqliteValue::Text(format!("new-{step}").into())]
                     };
                     params.extend_from_slice(&where_params);
-                    assert_text_pk_write(&f, &r, sql, &params, expected, Some(&prepared)).await;
+                    assert_write(
+                        &f,
+                        &r,
+                        TEXT_PK_STATE,
+                        sql,
+                        &params,
+                        expected,
+                        Some(&prepared),
+                    )
+                    .await;
                 }
             }
             f.close().await.unwrap();
