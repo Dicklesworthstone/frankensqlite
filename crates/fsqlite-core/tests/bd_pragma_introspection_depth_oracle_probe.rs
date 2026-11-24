@@ -645,6 +645,15 @@ fn pragma_view_star_preserves_decltypes_and_catalog_order() {
              USING(a,r,n,i,b)",
             "CREATE TABLE strict_left(a ANY) STRICT",
             "CREATE VIEW v_full_strict_any AS SELECT * FROM strict_left FULL JOIN rhs USING(a)",
+            "CREATE TABLE source_affinity(a, b VARCHAR(11), n DECIMAL(6, 2))",
+            "CREATE VIEW v_expr_affinity AS SELECT a,b,b COLLATE NOCASE AS folded,\
+             n COLLATE BINARY AS numeric_collate, CAST(1 AS INTEGER) AS i,\
+             CAST(1 AS DOUBLE) AS r, CAST(1 AS BLOB) AS bytes,\
+             CAST(1 AS VARCHAR(4)) COLLATE NOCASE AS cast_collate, +b AS no_affinity \
+             FROM source_affinity",
+            "CREATE VIEW v_nested_affinity AS SELECT inner_view.* FROM \
+             (SELECT * FROM v_expr_affinity) AS inner_view",
+            "CREATE VIEW v_strict_any AS SELECT a, a COLLATE BINARY AS collated FROM strict_left",
         ] {
             f.execute(sql).await.unwrap();
             r.execute(sql, []).unwrap();
@@ -659,6 +668,10 @@ fn pragma_view_star_preserves_decltypes_and_catalog_order() {
             "SELECT name,type FROM pragma_table_info('v_full') ORDER BY cid",
             "SELECT name,type FROM pragma_table_info('v_full_affinities') ORDER BY cid",
             "SELECT name,type FROM pragma_table_xinfo('v_full_strict_any') ORDER BY cid",
+            "PRAGMA table_info('source_affinity')",
+            "PRAGMA table_info('v_expr_affinity')",
+            "SELECT name,type FROM pragma_table_xinfo('v_nested_affinity') ORDER BY cid",
+            "PRAGMA table_xinfo('v_strict_any')",
         ] {
             let stock = rq(&r, sql);
             assert!(!stock.is_empty() && stock != vec![vec!["ERR"]], "stock: {sql}");

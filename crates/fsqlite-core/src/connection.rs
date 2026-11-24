@@ -8145,6 +8145,25 @@ impl ViewColumnType {
             affinity: Some(affinity_char_to_type(column.affinity)),
         }
     }
+
+    /// SQLite's `sqlite3SubqueryColumnTypes` keeps a source declaration
+    /// when it agrees with the expression's affinity.
+    fn displayed_declaration(self) -> Option<String> {
+        let affinity = self.affinity?;
+        let declaration = self
+            .declaration
+            .filter(|name| !name.is_empty() && TypeAffinity::from_type_name(name) == affinity);
+        Some(declaration.unwrap_or_else(|| {
+            match affinity {
+                TypeAffinity::Blob => "BLOB",
+                TypeAffinity::Text => "TEXT",
+                TypeAffinity::Numeric => "NUM",
+                TypeAffinity::Integer => "INT",
+                TypeAffinity::Real => "REAL",
+            }
+            .to_owned()
+        }))
+    }
 }
 
 #[derive(Clone)]
@@ -58487,12 +58506,8 @@ impl Connection {
         (resolved, widths)
     }
 
-    /// Resolve the declared SQL type (decltype) of each output column of a
-    /// view's SELECT, mirroring SQLite's `sqlite3ColumnType`: a direct column
-    /// reference reports the SOURCE column's declared type verbatim (e.g.
-    /// `VARCHAR(20)`, not its affinity), while any expression / literal /
-    /// aggregate reports an empty type. Used by `PRAGMA table_info(<view>)`
-    /// (bd-pragma-table-info-view-decltype-moufi).
+    /// Resolve the source declarations and expression affinities that
+    /// `PRAGMA table_info(<view>)` uses for each output column.
     fn view_result_column_decltypes<'view>(
         &self,
         query: &'view SelectStatement,
@@ -58548,17 +58563,7 @@ impl Connection {
                     }
                 }
                 ResultColumn::Expr { expr, .. } => {
-                    let decltype = match expr {
-                        Expr::Column(col_ref, _) => {
-                            Self::resolve_view_column_ref_decltype(
-                                col_ref,
-                                &sources,
-                                &joined_columns,
-                            )
-                        }
-                        _ => ViewColumnType::default(),
-                    };
-                    out.push(decltype);
+                    out.push(Self::resolve_view_expr_decltype(expr, &sources, &joined_columns));
                 }
             }
         }
@@ -58692,6 +58697,27 @@ impl Connection {
         )
     }
 
+    fn resolve_view_expr_decltype(
+        expr: &Expr,
+        sources: &[ResolvedViewFromSource],
+        joined_columns: &[(String, ViewColumnType)],
+    ) -> ViewColumnType {
+        match expr {
+            Expr::Column(col_ref, _) => {
+                Self::resolve_view_column_ref_decltype(col_ref, sources, joined_columns)
+            }
+            Expr::Cast { type_name, .. } => ViewColumnType {
+                declaration: None,
+                affinity: Some(cast_type_affinity(&type_name.name)),
+            },
+            Expr::Collate { expr, .. } => ViewColumnType {
+                declaration: None,
+                affinity: Self::resolve_view_expr_decltype(expr, sources, joined_columns).affinity,
+            },
+            _ => ViewColumnType::default(),
+        }
+    }
+
     fn resolve_view_column_ref_decltype(
         col_ref: &ColumnRef,
         sources: &[ResolvedViewFromSource],
@@ -58759,7 +58785,7 @@ impl Connection {
             .zip(decltypes)
             .enumerate()
             .map(|(cid, (name, column_type))| {
-                pragma_catalog_column_row(cid, name, column_type.declaration, is_xinfo)
+                pragma_catalog_column_row(cid, name, column_type.displayed_declaration(), is_xinfo)
             })
             .collect()
     }
@@ -85176,6 +85202,9 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        // Resolve names while FROM items are still views. The temporary
+        // tables used below have storage rowids that the views do not expose.
+        self.validate_select_column_references(select)?;
         let _mem_fallback_guard = self
             .disable_mem_fallback_rejection_for_internal_scope("select", "view_materialization")?;
         let result = {
@@ -129449,18 +129478,8 @@ fn merge_view_join_column_decltypes(
             match join.join_type.kind {
                 JoinKind::Right => left_type.clone_from(decltype),
                 JoinKind::Full => {
-                    // SQLite gives the merged expression the left column's
-                    // affinity and derives its displayed type from that affinity.
-                    left_type.declaration = left_type.affinity.map(|affinity| {
-                        match affinity {
-                            TypeAffinity::Blob => "BLOB",
-                            TypeAffinity::Text => "TEXT",
-                            TypeAffinity::Numeric => "NUM",
-                            TypeAffinity::Integer => "INT",
-                            TypeAffinity::Real => "REAL",
-                        }
-                        .to_owned()
-                    });
+                    // The merged expression inherits the left column's affinity.
+                    left_type.declaration = None;
                 }
                 _ => {}
             }

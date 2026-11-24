@@ -434,6 +434,65 @@ fn rowid_under_a_derived_table_resolves_like_stock() {
 }
 
 #[test]
+fn stored_views_expose_only_declared_rowid_columns() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("view-rowids.db");
+        for filename in [":memory:", path.to_str().unwrap()] {
+            let f = Connection::open(filename).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+                "INSERT INTO t VALUES (1),(7)",
+                "CREATE VIEW v AS SELECT id FROM t",
+                "CREATE VIEW vd AS SELECT DISTINCT id FROM v",
+                "CREATE VIEW bad AS SELECT rowid FROM vd",
+                "CREATE VIEW declared AS SELECT DISTINCT id AS rowid, id+1 AS oid, id+2 AS _rowid_ FROM t",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            let mut diffs = Vec::new();
+            for (sql, name) in [
+                ("SELECT rowid FROM v WHERE id=7", "rowid"),
+                ("SELECT oid FROM v WHERE 0", "oid"),
+                ("SELECT _rowid_ FROM vd", "_rowid_"),
+                ("SELECT d.rowid FROM vd AS d", "d.rowid"),
+                ("SELECT * FROM bad", "rowid"),
+            ] {
+                let expected = format!("no such column: {name}");
+                let stock = r.prepare(sql).unwrap_err().to_string();
+                assert!(stock.contains(&expected), "{filename}: {sql}: {stock}");
+                let direct = f.query(sql).await;
+                let prepared = f.prepare(sql).await.err().map(|error| error.to_string());
+                if !direct.as_ref().is_err_and(|error| error.to_string().contains(&expected))
+                    || !prepared.as_deref().is_some_and(|error| error.contains(&expected))
+                {
+                    diffs.push(format!("{filename}: {sql}: direct={direct:?}, prepare={prepared:?}"));
+                }
+            }
+            for sql in [
+                "SELECT rowid, oid, _rowid_ FROM declared ORDER BY rowid",
+                "SELECT b.rowid FROM vd JOIN t AS b ON b.id=vd.id ORDER BY b.rowid",
+            ] {
+                let stock = rq(&r, sql);
+                assert_eq!(stock.len(), 2, "{filename}: {sql}: {stock:?}");
+                let direct = fq(&f, sql).await;
+                let prepared = f.prepare(sql).await.unwrap().query().await.unwrap();
+                let prepared = prepared
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                    .collect::<Vec<_>>();
+                assert_eq!(direct, stock, "{filename}: {sql}");
+                assert_eq!(prepared, stock, "{filename}: {sql}");
+            }
+            f.close().await.unwrap();
+            assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+        }
+    });
+}
+
+#[test]
 fn correlated_having_and_nested() {
     asupersync::test_utils::run_test(|| async {
         agree(D, "SELECT cust, count(*) c FROM ord GROUP BY cust HAVING count(*) > (SELECT count(*) FROM ord o2 WHERE o2.cust = ord.cust AND o2.amt IS NULL) ORDER BY cust",
