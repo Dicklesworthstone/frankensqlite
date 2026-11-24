@@ -38,6 +38,8 @@ enum Value {
     Null,
     Bool(bool),
     Number(Number),
+    /// Exact decimal digits when a Number would round them or lose the sign of -0.
+    IntegerText(String),
     String(String),
     Array(Vec<Self>),
     Object(Object),
@@ -278,18 +280,17 @@ fn as_number_text(s: &str) -> Option<&str> {
 /// `Number` renders in Rust's shortest form, so a token needs its text when
 /// it overflows f64 (GH#212), or when it is a float (`.`, `e` or `E`) whose
 /// text is not that shortest form (bd-1nxwh). Integers fit i64/u64 and render
-/// as written. A token that is not an RFC 8259 number (`5.`, `01`) is left to
+/// as written. Integers outside serde's signed/unsigned range and integer -0
+/// also need their original digits. A non-RFC 8259 token (`5.`, `01`) is left to
 /// the strict parse to reject, so JSON5 input still reaches its fallback.
 ///
 /// Every number of every parsed document passes through here, so the common
-/// tokens are decided without parsing: an integer cannot overflow f64 below
-/// 309 digits, and [`is_shortest_fixed_decimal`] recognizes the usual decimal.
+/// tokens are decided without parsing: an integer shorter than 19 digits fits
+/// in i64, and [`is_shortest_fixed_decimal`] recognizes the usual decimal.
 fn number_token_needs_text(raw: &str) -> bool {
     let bytes = raw.as_bytes();
     if !bytes.iter().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
-        return bytes.len() > 300
-            && is_strict_json_number(raw)
-            && raw.parse::<f64>().is_ok_and(f64::is_infinite);
+        return integer_needs_text(raw);
     }
     if is_shortest_fixed_decimal(bytes) {
         return false;
@@ -299,6 +300,20 @@ fn number_token_needs_text(raw: &str) -> bool {
         Ok(value) => is_strict_json_number(raw) && !float_renders_as(value, raw),
         Err(_) => false,
     }
+}
+
+/// Decimal integer tokens that cannot round-trip through serde's i64/u64.
+fn integer_needs_text(raw: &str) -> bool {
+    raw == "-0"
+        || (raw.len() >= 20
+            && raw
+                .strip_prefix('-')
+                .unwrap_or(raw)
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            && is_strict_json_number(raw)
+            && raw.parse::<i64>().is_err()
+            && raw.parse::<u64>().is_err())
 }
 
 /// Whether `text` is a fixed-point decimal that is already the shortest
@@ -411,11 +426,7 @@ fn float_renders_as(value: f64, text: &str) -> bool {
 /// token was wrapped or a genuine string escaped, else `None`, so the common
 /// document is parsed as given without a copy.
 /// Whether `input` can hold a float token: a `.`, or an exponent marker right
-/// after a digit. Only a float can need its text kept
-/// ([`number_token_needs_text`]), except an integer long enough to overflow
-/// f64, which the strict parse rejects so the callers rewrite on that error.
-/// A document with no float or possible reserved string skips
-/// [`rewrite_number_text_tokens`]' scan.
+/// after a digit. Wide integers are checked separately.
 fn may_hold_float_token(input: &str) -> bool {
     let bytes = input.as_bytes();
     memchr::memchr(b'.', bytes).is_some()
@@ -423,11 +434,27 @@ fn may_hold_float_token(input: &str) -> bool {
             .any(|at| at > 0 && bytes[at - 1].is_ascii_digit())
 }
 
+/// A wide integer has at least 19 consecutive digits (negative i64 overflow
+/// starts at 19). Skip past the last non-digit in each candidate window.
+fn may_hold_integer_text(input: &str) -> bool {
+    if input.contains("-0") {
+        return true;
+    }
+    let mut bytes = input.as_bytes();
+    while let Some(window) = bytes.get(..19) {
+        let Some(last_non_digit) = window.iter().rposition(|b| !b.is_ascii_digit()) else {
+            return true;
+        };
+        bytes = &bytes[last_non_digit + 1..];
+    }
+    false
+}
+
 /// [`rewrite_number_text_tokens`] when the document may need it.
 fn number_text_rewrite_for_parse(input: &str) -> Option<String> {
     // The tag starts with NUL, which strict JSON can spell only as \u0000.
     // A float-free document can still contain genuine text needing escape.
-    if may_hold_float_token(input) || input.contains(r"\u0000") {
+    if may_hold_float_token(input) || may_hold_integer_text(input) || input.contains(r"\u0000") {
         rewrite_number_text_tokens(input)
     } else {
         None
@@ -952,6 +979,7 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
+        Value::IntegerText(digits) => out.push_str(digits),
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 out.push_str(&number.to_string());
@@ -1979,14 +2007,8 @@ fn parse_json_text(input: &str) -> Result<Value> {
     // `arbitrary_precision` off rejects; a float not in Rust's shortest form)
     // travel as tagged carriers (GH#212, bd-yalqc, bd-1nxwh).
     let rewritten = number_text_rewrite_for_parse(input);
-    match serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input)) {
-        Ok(value) => Ok(value),
-        // An integer that overflows f64 (no float token, so no rewrite yet).
-        Err(_) if rewritten.is_none() => rewrite_number_text_tokens(input)
-            .and_then(|rewritten| serde_json::from_str::<Value>(&rewritten).ok())
-            .ok_or_else(malformed_json),
-        Err(_) => Err(malformed_json()),
-    }
+    serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input))
+        .map_err(|_| malformed_json())
 }
 
 /// Deserialize JSON5 without letting serde_json turn infinite floats into null.
@@ -2095,6 +2117,10 @@ impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisit
     {
         Ok(if ESCAPE_STRINGS {
             json_string_value(value)
+        } else if let Some(raw) = as_number_text(&value)
+            && integer_needs_text(raw)
+        {
+            Value::IntegerText(raw.to_owned())
         } else {
             Value::String(value)
         })
@@ -2143,21 +2169,7 @@ fn parse_json_value_lenient(input: &str) -> Result<Value> {
     // `parse_json_text` (GH#212, bd-yalqc, bd-1nxwh). If the strict parse
     // fails, fall back to JSON5; on total failure report stock's
     // "malformed JSON".
-    let rewritten = number_text_rewrite_for_parse(input);
-    match serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input)) {
-        Ok(value) => Ok(value),
-        Err(_) => {
-            // An integer that overflows f64 (no float token, so no rewrite
-            // yet) parses once wrapped; anything else tries JSON5.
-            if rewritten.is_none()
-                && let Some(rewritten) = rewrite_number_text_tokens(input)
-                && let Ok(value) = serde_json::from_str::<Value>(&rewritten)
-            {
-                return Ok(value);
-            }
-            parse_json5_text(input).map_err(|_| malformed_json())
-        }
-    }
+    parse_json_text(input).or_else(|_| parse_json5_text(input).map_err(|_| malformed_json()))
 }
 
 fn encode_jsonb_root(value: &Value) -> Result<Vec<u8>> {
@@ -2171,6 +2183,7 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Null => append_jsonb_node(JSONB_NULL_TYPE, &[], out),
         Value::Bool(true) => append_jsonb_node(JSONB_TRUE_TYPE, &[], out),
         Value::Bool(false) => append_jsonb_node(JSONB_FALSE_TYPE, &[], out),
+        Value::IntegerText(digits) => append_jsonb_node(JSONB_INT_TYPE, digits.as_bytes(), out),
         Value::Number(number) => {
             // bd-t75hg: SQLite JSONB stores numeric payloads as the ASCII
             // text of the number (RFC-8259 text for INT/FLOAT), never as
@@ -2327,6 +2340,9 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
             } else {
                 text
             };
+            if integer_needs_text(normalized) {
+                return Ok((Value::IntegerText(normalized.to_owned()), consumed));
+            }
             let number = if node_type == JSONB_INT5_TYPE
                 && let Some(hex) = normalized
                     .strip_prefix("0x")
@@ -2338,10 +2354,8 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
             } else if let Ok(uint) = normalized.parse::<u64>() {
                 Some(Number::from(uint))
             } else {
-                // Stock keeps arbitrarily long integer text INT-typed; a
-                // value beyond u64 degrades to its nearest double, which
-                // preserves the numeric reading even though serde_json
-                // cannot carry the exact digits.
+                // Preserve the existing numeric fallback for non-decimal INT5
+                // spellings. Valid wide decimal integers were handled above.
                 normalized.parse::<f64>().ok().and_then(Number::from_f64)
             };
             Value::Number(number.ok_or_else(|| {
@@ -3023,6 +3037,7 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::Null => "null",
         Value::Bool(true) => "true",
         Value::Bool(false) => "false",
+        Value::IntegerText(_) => "integer",
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 "integer"
@@ -3048,6 +3063,12 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
         Value::Null => SqliteValue::Null,
         Value::Bool(true) => SqliteValue::Integer(1),
         Value::Bool(false) => SqliteValue::Integer(0),
+        Value::IntegerText(raw) if raw == "-0" => SqliteValue::Integer(0),
+        Value::IntegerText(raw) => {
+            // SQLite returns a REAL to SQL for JSON integers outside its i64
+            // range. Keep the exact digits until this conversion is requested.
+            SqliteValue::Float(raw.parse().expect("validated decimal integer"))
+        }
         Value::Number(number) => {
             if let Some(i) = number.as_i64() {
                 SqliteValue::Integer(i)
@@ -6955,13 +6976,11 @@ mod tests {
             call("json", vec![t("{\"a\":12345678901234567890}")]),
             "{\"a\":12345678901234567890}"
         );
-        // `[-0]` (JSON-integer negative zero): stock `json_extract('[-0]','$[0]')`
-        // -> `0`, but serde_json parses the literal `-0` as the float `-0.0`,
-        // which renders `-0`. Preserving integer negative-zero would require an
-        // integer/float distinction serde discards on parse; that is a separate
-        // pre-existing edge, NOT in scope for bd-yalqc (the non-finite fix), so
-        // the conformance entry is intentionally omitted here:
-        //   ck!("json_neg_zero", call("json_extract", vec![t("[-0]"), t("$[0]")]), "0");
+        ck!(
+            "json_neg_zero",
+            call("json_extract", vec![t("[-0]"), t("$[0]")]),
+            "0"
+        );
         // ── deeper batch ──
         ck!(
             "jx_true",
@@ -9241,17 +9260,18 @@ mod tests {
         }
         assert!(accepted > 40, "the fast path must cover the usual decimals");
 
-        // A document with no float skips the scan; an integer that overflows
-        // f64 still parses, through the strict parse's error path.
+        // Ordinary integers skip rewriting. A wide integer takes the exact
+        // decimal path even when the document contains no float marker.
         assert!(!may_hold_float_token(r#"{"name":"e","n":[1,2],"id":17}"#));
         assert!(may_hold_float_token("[1e5]"));
         assert!(may_hold_float_token("[0.5]"));
         let huge = format!("[1{}]", "0".repeat(400));
         assert!(!may_hold_float_token(&huge));
+        assert!(may_hold_integer_text(&huge));
         let parsed = parse_json_text(&huge).expect("an overflowing integer parses");
         assert_eq!(
             json_type_name(&parsed.as_array().expect("the parsed input is an array")[0]),
-            "real"
+            "integer"
         );
         assert!(parse_json_value_lenient(&huge).is_ok());
         for token in [
@@ -9267,6 +9287,54 @@ mod tests {
             "-",
         ] {
             assert!(!is_shortest_fixed_decimal(token.as_bytes()), "{token}");
+        }
+    }
+
+    #[test]
+    fn wide_decimal_integers_survive_edits_and_jsonb_round_trips() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let huge = "9".repeat(400);
+        for raw in [
+            "-0",
+            "0",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "9223372036854775808",
+            "18446744073709551615",
+            "18446744073709551616",
+            "123456789012345678901234567890",
+            huge.as_str(),
+        ] {
+            let doc = format!("[{raw}]");
+            let args = [SqliteValue::Text(doc.clone().into())];
+            let oracle = |sql| stock_json_scalar(&stock, sql, &args);
+            let scalar = json_extract(&doc, &["$[0]"]).unwrap();
+            let expected = oracle("SELECT json_extract(?1,'$[0]')");
+            assert_eq!(
+                std::mem::discriminant(&scalar),
+                std::mem::discriminant(&expected),
+                "{raw}: SQL storage class"
+            );
+            assert_eq!(scalar, expected, "{raw}");
+            assert_eq!(json_type(&doc, Some("$[0]")).unwrap(), Some("integer"));
+            let edited = json_set(&doc, &[("$[1]", SqliteValue::Integer(2))]).unwrap();
+            assert_eq!(
+                SqliteValue::Text(edited.into()),
+                oracle("SELECT json_set(?1,'$[1]',2)"),
+                "{raw}"
+            );
+            let blob = SqliteValue::Blob(jsonb(&doc).unwrap().into());
+            let stock_read = stock_json_rows(
+                &stock,
+                "SELECT json(?1), json_type(?1,'$[0]')",
+                &[blob],
+            )
+            .unwrap();
+            assert_eq!(stock_read, vec![vec![text(&doc), text("integer")]], "{raw}");
+            let SqliteValue::Blob(stock_blob) = oracle("SELECT jsonb(?1)") else {
+                panic!("expected stock JSONB for {raw}");
+            };
+            assert_eq!(json_from_jsonb(&stock_blob).unwrap(), doc, "{raw}");
         }
     }
 
