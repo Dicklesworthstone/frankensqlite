@@ -3,7 +3,9 @@
 //! bd-alter-table-on-view-wrong-message-qnw6g: ALTER TABLE targeting a VIEW must
 //! report the stock VIEW-specific SQLITE_ERROR message (the object exists, it just
 //! isn't alterable), not "no such table" from the tables-only schema lookup.
-//! Messages match stock sqlite3 3.46.1 verbatim.
+//! Messages match stock sqlite3 verbatim: RENAME COLUMN and DROP COLUMN name
+//! the view (`cannot rename columns of view "v"`, `cannot drop column from
+//! view "v"`) in 3.46.1 and 3.54.1 alike (bd-tk186).
 
 use fsqlite_core::connection::Connection;
 use fsqlite_error::FrankenError;
@@ -34,11 +36,11 @@ fn bd_qnw6g_alter_table_on_view_reports_view_message() {
         );
         assert_eq!(
             alter_error_message(&conn, "ALTER TABLE v RENAME COLUMN a TO b;").await,
-            "view v may not be altered"
+            "cannot rename columns of view \"v\""
         );
         assert_eq!(
             alter_error_message(&conn, "ALTER TABLE v DROP COLUMN a;").await,
-            "view v may not be altered"
+            "cannot drop column from view \"v\""
         );
 
         // A genuinely-missing table still reports "no such table" (regression guard).

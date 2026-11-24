@@ -54246,6 +54246,20 @@ impl Connection {
     /// lookups.
     fn validate_prepared_alter(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
         let name = &alter.table.name;
+        // bd-tk186: ALTER TABLE on a view is refused at prepare, as stock
+        // refuses it, unless an unqualified name meets a TEMP table first.
+        let view_scope = match alter.table.schema.as_deref() {
+            None if !self.temp_table_names.borrow().contains(&name.to_ascii_lowercase()) => {
+                Some(PragmaSchemaScope::Unqualified)
+            }
+            Some(schema) if schema.eq_ignore_ascii_case("main") => Some(PragmaSchemaScope::Main),
+            Some(schema) if schema.eq_ignore_ascii_case("temp") => Some(PragmaSchemaScope::Temp),
+            _ => None,
+        };
+        if let Some(view) = view_scope.and_then(|scope| self.view_index_for_scope(name, scope)) {
+            let view_name = self.views.borrow()[view].name.clone();
+            return Err(alter_view_error(&view_name, &alter.action));
+        }
         if alter.table.schema.is_some()
             || !self.prepared_names_resolve_locally()
             || (name.len() >= 7 && name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_"))
@@ -77140,6 +77154,15 @@ impl Connection {
         }
         // Legacy FTS5 fallback path.
         if !module_key.eq_ignore_ascii_case("FTS5") {
+            // bd-tk186: a module stock does not ship is stock's step-time
+            // "no such module: X"; one it ships keeps saying fsqlite has not
+            // implemented it (bd_t6sv2_14 pins that for fts3 and geopoly).
+            if !stock_ships_virtual_table_module(&create.module) {
+                return Err(FrankenError::function_error(format!(
+                    "no such module: {}",
+                    create.module
+                )));
+            }
             return Err(FrankenError::NotImplemented(format!(
                 "CREATE VIRTUAL TABLE USING {} is not supported — no module registered",
                 create.module
@@ -78264,23 +78287,12 @@ impl Connection {
         // bd-alter-table-on-view: ALTER TABLE targeting a VIEW is a prepare-time
         // SQLITE_ERROR with a view-specific message — the object exists, it just
         // isn't alterable — NOT "no such table" (which the tables-only schema
-        // lookup below would otherwise report). Messages match stock sqlite3
-        // 3.46.1 verbatim (FunctionError == SQLITE_ERROR, per the bd-3nppp
-        // verbatim-message discipline).
-        if self
-            .view_index_for_scope(table_name, PragmaSchemaScope::Unqualified)
-            .is_some()
-        {
-            return Err(match &alter.action {
-                AlterTableAction::AddColumn(_) => {
-                    FrankenError::function_error("Cannot add a column to a view")
-                }
-                AlterTableAction::RenameTo(_)
-                | AlterTableAction::RenameColumn { .. }
-                | AlterTableAction::DropColumn(_) => {
-                    FrankenError::function_error(format!("view {table_name} may not be altered"))
-                }
-            });
+        // lookup below would otherwise report). Messages are stock's
+        // (`alter_view_error`; FunctionError == SQLITE_ERROR, per the bd-3nppp
+        // verbatim-message discipline), and prepare raises them too.
+        if let Some(view) = self.view_index_for_scope(table_name, PragmaSchemaScope::Unqualified) {
+            let view_name = self.views.borrow()[view].name.clone();
+            return Err(alter_view_error(&view_name, &alter.action));
         }
         let old_name = table_name.clone();
         let targets_main_explicit = alter
@@ -135943,6 +135955,43 @@ fn is_prepared_schema_statement(statement: &Statement) -> bool {
             | Statement::Pragma(_)
             | Statement::Explain { .. }
     )
+}
+
+/// bd-tk186: stock 3.54.1's error for ALTER TABLE on the view `view` (its
+/// stored name), raised at prepare: RENAME COLUMN `cannot rename columns of
+/// view "v"`, DROP COLUMN `cannot drop column from view "v"`, ADD COLUMN
+/// "Cannot add a column to a view", RENAME TO "view v may not be altered".
+fn alter_view_error(view: &str, action: &AlterTableAction) -> FrankenError {
+    FrankenError::function_error(match action {
+        AlterTableAction::AddColumn(_) => "Cannot add a column to a view".to_owned(),
+        AlterTableAction::RenameColumn { .. } => {
+            format!("cannot rename columns of view \"{view}\"")
+        }
+        AlterTableAction::DropColumn(_) => format!("cannot drop column from view \"{view}\""),
+        AlterTableAction::RenameTo(_) => format!("view {view} may not be altered"),
+    })
+}
+
+/// bd-tk186: whether `module` names a virtual-table module stock 3.54.1
+/// ships with the options of the bundled oracle (`PRAGMA module_list`) or of
+/// the stock shell (geopoly). fsqlite reports one it has not implemented as
+/// not implemented; any other module is stock's "no such module".
+fn stock_ships_virtual_table_module(module: &str) -> bool {
+    const STOCK_MODULES: &[&str] = &[
+        "dbstat",
+        "fts3",
+        "fts3tokenize",
+        "fts4",
+        "fts4aux",
+        "fts5",
+        "fts5vocab",
+        "geopoly",
+        "rtree",
+        "rtree_i32",
+    ];
+    STOCK_MODULES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(module))
 }
 
 /// Statements whose source text is persisted (or spliced) into the schema as
