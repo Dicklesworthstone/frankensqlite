@@ -626,3 +626,96 @@ fn update_trigger_probe_sees_preceding_writes() {
         }
     });
 }
+
+/// A declared rowid, _rowid_ and oid may all hold the same ordinary value.
+/// Freezing qualifying rows must use the INTEGER PRIMARY KEY in that case.
+#[test]
+fn correlated_dml_uses_ipk_when_all_hidden_rowid_aliases_are_shadowed() {
+    const RESET: &str = "DROP TABLE IF EXISTS shadowed;
+        CREATE TABLE shadowed(rowid INT, id INTEGER PRIMARY KEY, _rowid_ INT, oid INT, v INT);
+        INSERT INTO shadowed VALUES (99,1,99,99,10),(99,2,99,99,20),(99,3,99,99,30);";
+    const ROWS: &str = "SELECT id,rowid,_rowid_,oid,v FROM shadowed ORDER BY id";
+    const QUERIES: &[(&str, bool)] = &[
+        ("DELETE FROM shadowed WHERE EXISTS (SELECT 1 FROM matching WHERE matching.x=shadowed.id)", false),
+        ("DELETE FROM shadowed AS d WHERE EXISTS (SELECT 1 FROM probe AS a JOIN probe AS b ON a.x=b.x WHERE a.x=d.id)", false),
+        ("DELETE FROM shadowed AS d WHERE NOT EXISTS (SELECT 1 FROM matching WHERE matching.x=d.id)", false),
+        ("DELETE FROM shadowed AS d WHERE EXISTS (SELECT 1 FROM probe WHERE probe.x<=d.id LIMIT 1 OFFSET 1)", false),
+        ("UPDATE shadowed SET v=100 WHERE EXISTS (SELECT 1 FROM matching WHERE matching.x=shadowed.id)", false),
+        ("UPDATE shadowed AS d SET v=v+1 WHERE d.id IN (SELECT a.x FROM probe AS a JOIN probe AS b ON a.x=b.x WHERE a.x=d.id)", false),
+        ("DELETE FROM shadowed AS d WHERE EXISTS (SELECT 1 FROM matching WHERE matching.x=d.id+100)", false),
+        ("DELETE FROM shadowed WHERE EXISTS (SELECT 1 FROM matching WHERE matching.x=shadowed.id) RETURNING id,v", true),
+        ("UPDATE shadowed SET v=100 WHERE EXISTS (SELECT 1 FROM matching WHERE matching.x=shadowed.id) RETURNING id,v", true),
+        // A supported single-table correlated probe retains its normal path.
+        ("DELETE FROM shadowed WHERE EXISTS (SELECT 1 FROM probe WHERE probe.x=shadowed.id)", false),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("locators.db");
+            let conn = Connection::open(if file_backed {
+                path.to_str().unwrap()
+            } else {
+                ":memory:"
+            }).await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let setup = "CREATE TABLE probe(x INTEGER); INSERT INTO probe VALUES (0),(2);
+                CREATE VIEW matching AS SELECT x FROM probe;";
+            conn.execute_batch(setup).await.unwrap();
+            stock.execute_batch(setup).unwrap();
+            for prepared in [false, true] {
+                for &(sql, returning) in QUERIES {
+                    conn.execute_batch(RESET).await.unwrap();
+                    stock.execute_batch(RESET).unwrap();
+                    if returning {
+                        let expected = rq(&stock, sql);
+                        let rows = if prepared {
+                            conn.prepare(sql).await.unwrap().query().await.unwrap()
+                        } else {
+                            conn.query(sql).await.unwrap()
+                        };
+                        let actual = rows.iter()
+                            .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                            .collect::<Vec<_>>();
+                        assert_eq!(actual, expected, "file={file_backed} prepared={prepared}: {sql}");
+                    } else {
+                        let expected = stock.execute(sql, []).unwrap();
+                        let actual = if prepared {
+                            conn.prepare(sql).await.unwrap().execute().await.unwrap()
+                        } else {
+                            conn.execute(sql).await.unwrap()
+                        };
+                        assert_eq!(actual, expected, "file={file_backed} prepared={prepared}: {sql}");
+                    }
+                    assert_eq!(fq(&conn, ROWS).await, rq(&stock, ROWS), "{sql}");
+                }
+            }
+            conn.close().await.unwrap();
+        }
+    });
+}
+
+/// With all aliases shadowed and no IPK, selecting the user rowid as a
+/// locator can delete unrelated rows. Reject the unsupported replay before
+/// it mutates anything.
+#[test]
+fn correlated_dml_without_an_accessible_row_key_preserves_rows() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shadowed(rowid INT, _rowid_ INT, oid INT, x INT);
+             INSERT INTO shadowed VALUES(99,99,99,1),(99,99,99,2);
+             CREATE TABLE s(x); INSERT INTO s VALUES(2);
+             CREATE VIEW v AS SELECT x FROM s;"
+        ).await.unwrap();
+        let query = "SELECT rowid,_rowid_,oid,x FROM shadowed ORDER BY x";
+        let before = fq(&conn, query).await;
+        for sql in [
+            "DELETE FROM shadowed WHERE EXISTS(SELECT 1 FROM v WHERE v.x=shadowed.x)",
+            "UPDATE shadowed SET x=3 WHERE EXISTS(SELECT 1 FROM v WHERE v.x=shadowed.x)",
+        ] {
+            let error = conn.execute(sql).await.expect_err("an inaccessible locator must be rejected");
+            assert!(matches!(error, fsqlite_error::FrankenError::NotImplemented(_)), "{error}");
+            assert_eq!(fq(&conn, query).await, before, "{sql}");
+        }
+    });
+}

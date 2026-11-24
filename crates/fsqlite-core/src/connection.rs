@@ -60571,17 +60571,14 @@ impl Connection {
     async fn select_matching_rowids(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
+        rowid_alias: &str,
         where_clause: Option<&Expr>,
         order_by: &[fsqlite_ast::OrderingTerm],
         limit: Option<&fsqlite_ast::LimitClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<i64>> {
-        let rowid_alias = self.ignore_skip_rowid_alias(&table_ref.name.name);
         let rowid_col = ResultColumn::Expr {
-            expr: Expr::Column(
-                fsqlite_ast::ColumnRef::bare(rowid_alias),
-                fsqlite_ast::Span::new(0, 0),
-            ),
+            expr: Self::build_limit_scope_projection_expr(table_ref, rowid_alias),
             alias: None,
         };
         let select = Self::build_single_table_select(
@@ -60601,24 +60598,6 @@ impl Connection {
                 _ => None,
             })
             .collect())
-    }
-
-    /// Build a `<rowid_alias> IN (<literals>)` predicate for a resolved rowid set.
-    fn rowid_in_list_where(&self, table_name: &str, rowids: &[i64]) -> Expr {
-        let rowid_literals: Vec<Expr> = rowids
-            .iter()
-            .map(|&i| Expr::Literal(Literal::Integer(i), fsqlite_ast::Span::new(0, 0)))
-            .collect();
-        let rowid_alias = self.ignore_skip_rowid_alias(table_name);
-        Expr::In {
-            expr: Box::new(Expr::Column(
-                fsqlite_ast::ColumnRef::bare(rowid_alias),
-                fsqlite_ast::Span::new(0, 0),
-            )),
-            not: false,
-            set: fsqlite_ast::InSet::List(rowid_literals),
-            span: fsqlite_ast::Span::new(0, 0),
-        }
     }
 
     /// VDBE codegen cannot lower a correlated subquery inside `IN (...)` in an
@@ -60649,7 +60628,7 @@ impl Connection {
         if !where_needs_select_path {
             return Ok(None);
         }
-        if !self.table_is_rowid_table(&table_ref.name.name) {
+        if self.with_dml_target_table(table_ref, |table| table.without_rowid)? {
             if !order_by.is_empty() || limit.is_some() {
                 return Ok(None);
             }
@@ -60661,12 +60640,25 @@ impl Connection {
                 })
                 .transpose();
         }
+        // All hidden rowid names may be ordinary user columns. Use the same
+        // true row locator as DML replay, including an INTEGER PRIMARY KEY.
+        // Re-reading a declared "rowid" would merge unrelated rows and could
+        // make a selective DELETE remove them all.
+        let rowid_alias = self
+            .dml_replay_locator_columns(table_ref)?
+            .and_then(|columns| columns.into_iter().next())
+            .ok_or_else(|| FrankenError::NotImplemented(
+                "correlated UPDATE/DELETE requires an accessible rowid or INTEGER PRIMARY KEY"
+                    .to_owned(),
+            ))?;
         let rowids = self
-            .select_matching_rowids(table_ref, where_clause, order_by, limit, params)
+            .select_matching_rowids(table_ref, &rowid_alias, where_clause, order_by, limit, params)
             .await?;
-        Ok(Some(
-            self.rowid_in_list_where(&table_ref.name.name, &rowids),
-        ))
+        Ok(Some(Self::build_limit_scope_filter_expr(
+            table_ref,
+            &rowid_alias,
+            &rowids,
+        )))
     }
 
     /// Freeze stable row locators for a multi-row UPDATE or DELETE before its
