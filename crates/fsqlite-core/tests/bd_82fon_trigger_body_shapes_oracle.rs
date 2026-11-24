@@ -70,7 +70,9 @@ fn stock_outcome(conn: &rusqlite::Connection, sql: &str) -> String {
 /// any other statement executed. fsqlite's `prepare()` takes SELECT, INSERT,
 /// UPDATE and DELETE (and PRAGMA), so a CREATE runs directly in both modes.
 async fn fsqlite_outcome(conn: &Connection, sql: &str, prepared: bool) -> String {
-    let query = sql.starts_with("SELECT") || sql.starts_with("WITH");
+    let query = sql.starts_with("SELECT")
+        || sql.starts_with("WITH")
+        || (!sql.starts_with("CREATE") && sql.contains(" RETURNING "));
     let preparable = query
         || ["INSERT", "UPDATE", "DELETE"]
             .iter()
@@ -377,6 +379,216 @@ fn a_reopened_trigger_body_keeps_its_double_quoted_strings_like_stock() {
                 expected,
                 "prepared={prepared}"
             );
+        }
+    });
+}
+
+/// bd-xyj6o: bare double-quoted names that resolve to no column fall back to
+/// string literals in trigger bodies across UPDATE SET, INSERT ... SELECT,
+/// WHERE, DELETE WHERE, UPSERT DO UPDATE SET/WHERE, and trigger WHEN clauses,
+/// while double-quoted names that DO resolve (target columns, FROM columns,
+/// NEW."col", OLD."col") keep resolving as columns.
+#[test]
+fn bd_xyj6o_trigger_body_dqs_set_select_where_and_negatives_match_stock() {
+    assert_script_matches_stock(&[
+        ("CREATE TABLE t(a)", OK),
+        ("INSERT INTO t VALUES (1)", OK),
+        ("CREATE TABLE o(z)", OK),
+        ("CREATE TABLE u(k INTEGER PRIMARY KEY, a)", OK),
+        ("INSERT INTO u VALUES (1, 'col_u')", OK),
+        // Exact bd-xyj6o repro: UPDATE SET + INSERT ... SELECT.
+        (
+            "CREATE TRIGGER tu AFTER INSERT ON o WHEN NEW.z = 1 BEGIN \
+             UPDATE t SET a = \"hello\"; \
+             INSERT INTO t SELECT \"world\"; END",
+            OK,
+        ),
+        ("INSERT INTO o VALUES (1)", OK),
+        (
+            "SELECT a, typeof(a) FROM t ORDER BY rowid",
+            "rows=[[\"'hello'\", \"'text'\"], [\"'world'\", \"'text'\"]]",
+        ),
+        // WHERE, target-column resolution ("a"), NEW."z", and mixed column+DQS
+        // in the same trigger body.
+        (
+            "CREATE TRIGGER tu2 AFTER INSERT ON o WHEN NEW.\"z\" = 2 BEGIN \
+             UPDATE t SET a = 'w' WHERE a = \"hello\"; \
+             INSERT INTO t SELECT \"a\" || 'x' FROM t WHERE a = \"world\"; \
+             INSERT INTO t VALUES (NEW.\"z\"); END",
+            OK,
+        ),
+        ("INSERT INTO o VALUES (2)", OK),
+        (
+            "SELECT a, typeof(a) FROM t ORDER BY rowid",
+            "rows=[[\"'w'\", \"'text'\"], [\"'world'\", \"'text'\"], \
+             [\"'worldx'\", \"'text'\"], [\"2\", \"'integer'\"]]",
+        ),
+        // Self-updating expression with resolving "a" and DQS "w", plus
+        // SELECT list concatenating DQS "nope" with NEW."z", plus DELETE WHERE.
+        (
+            "CREATE TRIGGER tu3 AFTER INSERT ON o WHEN NEW.z = 3 BEGIN \
+             UPDATE t SET a = \"a\" || '!' WHERE a = \"w\"; \
+             INSERT INTO t SELECT \"nope\" || NEW.\"z\"; \
+             DELETE FROM t WHERE a = \"worldx\"; END",
+            OK,
+        ),
+        ("INSERT INTO o VALUES (3)", OK),
+        (
+            "SELECT a, typeof(a) FROM t ORDER BY rowid",
+            "rows=[[\"'w!'\", \"'text'\"], [\"'world'\", \"'text'\"], \
+             [\"2\", \"'integer'\"], [\"'nope3'\", \"'text'\"]]",
+        ),
+        // Trigger WHEN clause with a bare double-quoted string literal, plus
+        // same name "a" acting as DQS string in outer FROM-less SELECT and as
+        // column u.a inside a scalar subquery in the same step, plus outer
+        // RETURNING observing the firing row.
+        (
+            "CREATE TRIGGER tu4 AFTER INSERT ON o WHEN NEW.\"z\" = \"go\" BEGIN \
+             INSERT INTO t SELECT \"a\" || ':' || (SELECT \"a\" FROM u WHERE k = 1); END",
+            OK,
+        ),
+        ("INSERT INTO o VALUES ('skip') RETURNING z", "rows=[[\"'skip'\"]]"),
+        ("INSERT INTO o VALUES ('go') RETURNING z", "rows=[[\"'go'\"]]"),
+        (
+            "SELECT a FROM t ORDER BY rowid",
+            "rows=[[\"'w!'\"], [\"'world'\"], [\"2\"], [\"'nope3'\"], [\"'a:col_u'\"]]",
+        ),
+        // UPSERT DO UPDATE SET + WHERE inside a trigger body.
+        (
+            "CREATE TRIGGER tu5 AFTER INSERT ON o WHEN NEW.z = 5 BEGIN \
+             INSERT INTO u(k, a) VALUES (1, 'ignored') \
+             ON CONFLICT(k) DO UPDATE SET a = \"upserted\" WHERE a = \"col_u\"; END",
+            OK,
+        ),
+        ("INSERT INTO o VALUES (5)", OK),
+        ("SELECT k, a FROM u ORDER BY k", "rows=[[\"1\", \"'upserted'\"]]"),
+        // OLD."a" resolves to OLD column on UPDATE triggers alongside DQS.
+        (
+            "CREATE TRIGGER tu_old AFTER UPDATE ON u BEGIN \
+             INSERT INTO t SELECT OLD.\"a\" || '->' || \"done\"; END",
+            OK,
+        ),
+        ("UPDATE u SET a = 'final' WHERE k = 1", OK),
+        (
+            "SELECT a FROM t WHERE a LIKE '%->%'",
+            "rows=[[\"'upserted->done'\"]]",
+        ),
+        // Dynamic schema evolution: adding column `hello` makes `"hello"`
+        // resolve to the column instead of falling back to `'hello'`.
+        ("CREATE TABLE evo(id INTEGER PRIMARY KEY, out_val TEXT)", OK),
+        ("INSERT INTO evo VALUES (1, 'init')", OK),
+        ("CREATE TABLE trig_evo(v INTEGER)", OK),
+        (
+            "CREATE TRIGGER tevo AFTER INSERT ON trig_evo BEGIN \
+             UPDATE evo SET out_val = \"dyn\" WHERE id = 1; END",
+            OK,
+        ),
+        ("INSERT INTO trig_evo VALUES (1)", OK),
+        ("SELECT out_val FROM evo WHERE id = 1", "rows=[[\"'dyn'\"]]"),
+        ("ALTER TABLE evo ADD COLUMN dyn TEXT DEFAULT 'from_col'", OK),
+        ("INSERT INTO trig_evo VALUES (2)", OK),
+        ("SELECT out_val FROM evo WHERE id = 1", "rows=[[\"'from_col'\"]]"),
+        // Negatives: unquoted missing column, unquoted missing column alongside
+        // a valid DQS literal, qualified NEW."missing", double-quoted LHS SET
+        // target, and RETURNING inside a trigger body.
+        ("CREATE TABLE n1(x)", OK),
+        (
+            "CREATE TRIGGER tn1 AFTER INSERT ON n1 BEGIN UPDATE t SET a = hello; END",
+            OK,
+        ),
+        ("INSERT INTO n1 VALUES (1)", "error: no such column: hello"),
+        ("CREATE TABLE n2(x)", OK),
+        (
+            "CREATE TRIGGER tn2 AFTER INSERT ON n2 BEGIN \
+             UPDATE t SET a = \"hello\" WHERE missing_unquoted = 1; END",
+            OK,
+        ),
+        (
+            "INSERT INTO n2 VALUES (1)",
+            "error: no such column: missing_unquoted",
+        ),
+        ("CREATE TABLE n3(x)", OK),
+        (
+            "CREATE TRIGGER tn3 AFTER INSERT ON n3 BEGIN \
+             INSERT INTO t SELECT NEW.\"missing\"; END",
+            OK,
+        ),
+        (
+            "INSERT INTO n3 VALUES (1)",
+            "error: no such column: NEW.missing",
+        ),
+        ("CREATE TABLE n4(x)", OK),
+        (
+            "CREATE TRIGGER tn4 AFTER INSERT ON n4 BEGIN \
+             UPDATE t SET \"missing_lhs\" = 1; END",
+            OK,
+        ),
+        (
+            "INSERT INTO n4 VALUES (1)",
+            "error: no such column: missing_lhs",
+        ),
+        (
+            "CREATE TRIGGER tn5 AFTER INSERT ON n4 BEGIN \
+             INSERT INTO t VALUES (1) RETURNING \"a\"; END",
+            "error: cannot use RETURNING in a trigger",
+        ),
+    ]);
+}
+
+/// bd-xyj6o reopen: file-backed database reopened cleanly still resolves
+/// trigger body UPDATE SET / INSERT ... SELECT / WHERE / WHEN DQS literals
+/// identically to stock SQLite 3.54.1.
+#[test]
+fn bd_xyj6o_reopened_trigger_body_dqs_set_select_where_matches_stock() {
+    const SETUP: &[&str] = &[
+        "CREATE TABLE t(a)",
+        "INSERT INTO t VALUES (1)",
+        "CREATE TABLE o(z)",
+        "CREATE TRIGGER tu AFTER INSERT ON o WHEN NEW.\"z\" = \"go\" BEGIN \
+         UPDATE t SET a = \"hello\"; \
+         INSERT INTO t SELECT \"world\"; \
+         UPDATE t SET a = \"a\" || '!' WHERE a = \"hello\"; END",
+    ];
+    const READ: &str = "SELECT a, typeof(a) FROM t ORDER BY rowid";
+    let dir = tempfile::tempdir().unwrap();
+    let stock_path = dir.path().join("bd_xyj6o_stock.db");
+    {
+        let stock = rusqlite::Connection::open(&stock_path).unwrap();
+        for sql in SETUP {
+            stock.execute_batch(sql).unwrap();
+        }
+    }
+    let stock = rusqlite::Connection::open(&stock_path).unwrap();
+    stock.execute_batch("INSERT INTO o VALUES ('go')").unwrap();
+    let expected = stock_outcome(&stock, READ);
+    assert_eq!(
+        expected,
+        "rows=[[\"'hello!'\", \"'text'\"], [\"'world'\", \"'text'\"]]",
+        "stock"
+    );
+    asupersync::test_utils::run_test(|| async {
+        for prepared in [false, true] {
+            let path = dir.path().join(format!("bd_xyj6o_fsqlite_{prepared}.db"));
+            let path = path.to_str().unwrap();
+            {
+                let conn = Connection::open(path).await.unwrap();
+                for sql in SETUP {
+                    conn.execute(sql).await.unwrap();
+                }
+                conn.close().await.unwrap();
+            }
+            let conn = Connection::open(path).await.unwrap();
+            assert_eq!(
+                fsqlite_outcome(&conn, "INSERT INTO o VALUES ('go')", prepared).await,
+                OK,
+                "prepared={prepared}"
+            );
+            assert_eq!(
+                fsqlite_outcome(&conn, READ, prepared).await,
+                expected,
+                "prepared={prepared}"
+            );
+            conn.close().await.unwrap();
         }
     });
 }

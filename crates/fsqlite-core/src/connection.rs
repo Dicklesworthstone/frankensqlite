@@ -11689,6 +11689,8 @@ struct DifferentialRegistry {
     fallback_invalidations_total: AtomicU64,
 }
 
+type DqsQuotedSpanList = Vec<(u32, u32)>;
+
 /// A stored trigger definition captured from `CREATE TRIGGER`.
 #[derive(Debug, Clone)]
 struct TriggerDef {
@@ -11704,22 +11706,27 @@ struct TriggerDef {
     for_each_row: bool,
     when_clause: Option<Expr>,
     body: Vec<Statement>,
+    /// Byte spans `(start, end)` in `when_clause` of bare double-quoted
+    /// identifier tokens from `create_sql`, eligible for SQLite DQS fallback
+    /// to string literals when they resolve to no column (bd-xyj6o).
+    dqs_quoted_when_spans: DqsQuotedSpanList,
+    /// Per-body-statement byte spans `(start, end)` of bare double-quoted
+    /// identifier tokens from `create_sql`, eligible for SQLite DQS fallback
+    /// to string literals when they resolve to no column (bd-xyj6o).
+    dqs_quoted_body_spans: Vec<DqsQuotedSpanList>,
     temporary: bool,
     create_sql: String,
 }
 
 impl TriggerDef {
-    /// `dqs`: whether double-quoted strings are on (see
-    /// [`Self::dqs_values_as_strings`]).
     fn from_create_statement(
         stmt: &fsqlite_ast::CreateTriggerStatement,
         create_sql: String,
-        dqs: bool,
     ) -> Self {
+        let mut when_clause = stmt.when.clone();
         let mut body = stmt.body.clone();
-        if dqs {
-            Self::dqs_values_as_strings(&mut body, &create_sql);
-        }
+        let (dqs_quoted_when_spans, dqs_quoted_body_spans) =
+            Self::collect_dqs_quoted_spans(when_clause.as_mut(), &mut body, &create_sql);
         Self {
             name: stmt.name.name.clone(),
             table_name: stmt.table.clone(),
@@ -11728,101 +11735,151 @@ impl TriggerDef {
             timing: stmt.timing,
             event: stmt.event.clone(),
             for_each_row: stmt.for_each_row,
-            when_clause: stmt.when.clone(),
+            when_clause,
             body,
+            dqs_quoted_when_spans,
+            dqs_quoted_body_spans,
             temporary: stmt.temporary,
             create_sql,
         }
     }
 
-    /// bd-82fon: a bare double-quoted name in a value of a body step's
-    /// `INSERT ... VALUES` row, outside any subquery, is the string literal
-    /// under double-quoted strings, as stock resolves it when the trigger
-    /// compiles: a VALUES row has no source, so the name can only be the
-    /// string (the bd-82jdw rule for a top-level INSERT). The body AST keeps
-    /// no quote marks, so the stored text is parsed again; its columns and the
-    /// body's are matched in one fixed walk order, and a value whose walk
-    /// differs is left alone.
-    fn dqs_values_as_strings(body: &mut [Statement], create_sql: &str) {
+    /// bd-82fon / bd-xyj6o: record the byte spans of every bare double-quoted
+    /// column reference in `when_clause` and each `body` step so compile-time
+    /// and runtime name resolution can fall back unresolved bare double-quoted
+    /// tokens to string literals under DQS without touching real columns,
+    /// qualified references (`NEW."z"`, `OLD."z"`, `t."a"`), or unquoted typos.
+    ///
+    /// The AST carries no quote marks, so `create_sql` is reparsed once and
+    /// matched against `when_clause`/`body` in one fixed pre-order walk (making
+    /// span recording immune to leading-whitespace offset shifts).
+    fn collect_dqs_quoted_spans(
+        when_clause: Option<&mut Expr>,
+        body: &mut [Statement],
+        create_sql: &str,
+    ) -> (DqsQuotedSpanList, Vec<DqsQuotedSpanList>) {
         if !create_sql.contains('"') {
-            return;
+            return (Vec::new(), Vec::new());
+        }
+        let quoted = Connection::double_quoted_identifier_tokens(create_sql);
+        if quoted.is_empty() {
+            return (Vec::new(), Vec::new());
         }
         let Ok(Statement::CreateTrigger(mut reparsed)) = parse_single_statement(create_sql)
         else {
-            return;
+            return (Vec::new(), Vec::new());
         };
-        if reparsed.body.len() != body.len() {
-            return;
-        }
-        let quoted = Connection::double_quoted_identifier_tokens(create_sql);
-        for (step, parsed_step) in body.iter_mut().zip(&mut reparsed.body) {
-            let (Statement::Insert(insert), Statement::Insert(parsed_insert)) = (step, parsed_step)
-            else {
-                continue;
-            };
-            let (
-                fsqlite_ast::InsertSource::Values(rows),
-                fsqlite_ast::InsertSource::Values(parsed_rows),
-            ) = (&mut insert.source, &mut parsed_insert.source)
-            else {
-                continue;
-            };
-            for (row, parsed_row) in rows.iter_mut().zip(parsed_rows) {
-                for (value, parsed_value) in row.iter_mut().zip(parsed_row) {
-                    // Each column of the parsed value in walk order: its name
-                    // when it is a bare double-quoted token.
-                    let mut parsed_columns: Vec<Option<String>> = Vec::new();
+        let is_bare_quoted = |column: &fsqlite_ast::ColumnRef, span: fsqlite_ast::Span| {
+            column.table.is_none()
+                && quoted.iter().any(|(start, end, name)| {
+                    *start == span.start
+                        && *end == span.end
+                        && name.as_str() == column.column.as_ref()
+                })
+        };
+        let when_spans = match (when_clause, reparsed.when.as_mut()) {
+            (Some(actual_when), Some(parsed_when)) => {
+                let mut parsed_columns: Vec<Option<String>> = Vec::new();
+                walk_expr_mut(
+                    parsed_when,
+                    UNPLACED_AGGREGATE_WALK_SITE,
+                    true,
+                    &mut |expr, _| {
+                        if let Expr::Column(column, span) = expr {
+                            parsed_columns.push(
+                                is_bare_quoted(column, *span).then(|| column.column.to_string()),
+                            );
+                        }
+                        true
+                    },
+                );
+                if parsed_columns.iter().all(Option::is_none) {
+                    Vec::new()
+                } else {
+                    let mut actual_columns: Vec<(Option<String>, u32, u32)> = Vec::new();
                     walk_expr_mut(
-                        parsed_value,
+                        actual_when,
                         UNPLACED_AGGREGATE_WALK_SITE,
-                        false,
+                        true,
                         &mut |expr, _| {
                             if let Expr::Column(column, span) = expr {
-                                let bare_quoted = column.table.is_none()
-                                    && quoted.iter().any(|(start, end, name)| {
-                                        *start == span.start
-                                            && *end == span.end
-                                            && name.as_str() == column.column.as_ref()
-                                    });
-                                parsed_columns
-                                    .push(bare_quoted.then(|| column.column.to_string()));
+                                actual_columns.push((
+                                    column.table.is_none().then(|| column.column.to_string()),
+                                    span.start,
+                                    span.end,
+                                ));
                             }
                             true
                         },
                     );
-                    if parsed_columns.iter().all(Option::is_none) {
-                        continue;
+                    if actual_columns.len() == parsed_columns.len() {
+                        parsed_columns
+                            .into_iter()
+                            .zip(actual_columns)
+                            .filter_map(|(parsed, (actual, start, end))| {
+                                match (parsed, actual) {
+                                    (Some(name), Some(actual_name)) if name == actual_name => {
+                                        Some((start, end))
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
                     }
-                    let mut columns = 0_usize;
-                    walk_expr_mut(value, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |expr, _| {
-                        columns += usize::from(matches!(expr, Expr::Column(..)));
-                        true
-                    });
-                    if columns != parsed_columns.len() {
-                        continue;
-                    }
-                    let mut index = 0_usize;
-                    walk_expr_mut(value, UNPLACED_AGGREGATE_WALK_SITE, false, &mut |expr, _| {
-                        let Expr::Column(column, span) = expr else {
-                            return true;
-                        };
-                        let quoted_name = parsed_columns.get_mut(index).and_then(Option::take);
-                        index += 1;
-                        match quoted_name {
-                            Some(name)
-                                if column.table.is_none()
-                                    && column.column.as_ref() == name.as_str() =>
-                            {
-                                let span = *span;
-                                *expr = Expr::Literal(Literal::String(name), span);
-                                false
-                            }
-                            _ => true,
-                        }
-                    });
                 }
             }
+            _ => Vec::new(),
+        };
+        if reparsed.body.len() != body.len() {
+            return (when_spans, Vec::new());
         }
+        let mut body_spans = Vec::with_capacity(body.len());
+        let mut any_body_quoted = false;
+        for (step, parsed_step) in body.iter_mut().zip(&mut reparsed.body) {
+            let mut parsed_columns: Vec<Option<String>> = Vec::new();
+            walk_statement_exprs_mut(parsed_step, &mut |expr, _| {
+                if let Expr::Column(column, span) = expr {
+                    parsed_columns
+                        .push(is_bare_quoted(column, *span).then(|| column.column.to_string()));
+                }
+                true
+            });
+            if parsed_columns.iter().all(Option::is_none) {
+                body_spans.push(Vec::new());
+                continue;
+            }
+            let mut actual_columns: Vec<(Option<String>, u32, u32)> = Vec::new();
+            walk_statement_exprs_mut(step, &mut |expr, _| {
+                if let Expr::Column(column, span) = expr {
+                    actual_columns.push((
+                        column.table.is_none().then(|| column.column.to_string()),
+                        span.start,
+                        span.end,
+                    ));
+                }
+                true
+            });
+            if actual_columns.len() != parsed_columns.len() {
+                body_spans.push(Vec::new());
+                continue;
+            }
+            let spans: Vec<(u32, u32)> = parsed_columns
+                .into_iter()
+                .zip(actual_columns)
+                .filter_map(|(parsed, (actual, start, end))| match (parsed, actual) {
+                    (Some(name), Some(actual_name)) if name == actual_name => Some((start, end)),
+                    _ => None,
+                })
+                .collect();
+            any_body_quoted |= !spans.is_empty();
+            body_spans.push(spans);
+        }
+        if !any_body_quoted {
+            body_spans.clear();
+        }
+        (when_spans, body_spans)
     }
 }
 
@@ -12125,11 +12182,11 @@ fn trigger_event_matches(
 /// join-evaluator fallback.
 async fn trigger_when_matches(
     connection: &Connection,
-    when_clause: Option<&Expr>,
+    trigger: &TriggerDef,
     frame: Option<&TriggerFrame>,
     pin_main_relations: bool,
 ) -> Result<bool> {
-    let Some(expr) = when_clause else {
+    let Some(expr) = trigger.when_clause.as_ref() else {
         return Ok(true);
     };
     let mut bound_expr = expr.clone();
@@ -12146,6 +12203,9 @@ async fn trigger_when_matches(
     let subquery_params = frame.map_or_else(Vec::new, |active_frame| {
         bind_trigger_when_expr(&mut bound_expr, active_frame)
     });
+    // bd-xyj6o: resolve unresolved bare double-quoted identifiers to string
+    // literals under DQS after NEW/OLD binding and relation qualification.
+    connection.resolve_trigger_when_dqs(trigger, &mut bound_expr);
     let params = (!subquery_params.is_empty()).then_some(subquery_params.as_slice());
     let row: [SqliteValue; 0] = [];
     let col_map: [(String, String, bool); 0] = [];
@@ -59700,8 +59760,19 @@ impl Connection {
     /// outer row with `BoundOuterValue`. The resolver still carries lexical
     /// scopes for subqueries nested inside that bound SELECT.
     fn validate_select_column_references(&self, select: &SelectStatement) -> Result<()> {
+        self.validate_select_column_references_with_span(select)
+            .map_err(|(err, _)| err)
+    }
+
+    fn validate_select_column_references_with_span(
+        &self,
+        select: &SelectStatement,
+    ) -> std::result::Result<(), (FrankenError, Option<Span>)> {
         self.with_fallback_function_registry(|| {
-            SelectColumnReferenceResolver::new(self).validate_select(select)
+            let mut resolver = SelectColumnReferenceResolver::new(self);
+            resolver
+                .validate_select(select)
+                .map_err(|err| (err, resolver.missing_bare_column_span))
         })
     }
 
@@ -80451,8 +80522,7 @@ impl Connection {
                 stored_stmt.temporary = false;
                 stored_stmt.to_string()
             });
-        let mut trigger_def =
-            TriggerDef::from_create_statement(stmt, create_sql.clone(), self.dqs_enabled.get());
+        let mut trigger_def = TriggerDef::from_create_statement(stmt, create_sql.clone());
         trigger_def.temporary = is_temp_trigger;
         trigger_def.bound_table_schema = bound_table_schema;
         self.triggers.borrow_mut().push(Arc::new(trigger_def));
@@ -83023,21 +83093,21 @@ impl Connection {
             if let Some(frame) = &frame {
                 let mut bound = when.clone();
                 bind_trigger_columns_in_expr(&mut bound, frame);
+                self.resolve_trigger_when_dqs(trigger, &mut bound);
                 let select =
                     select_of_result_exprs(vec![bound], Some(compile_check_empty_source()));
-                self.trigger_names_result(trigger, self.validate_trigger_select_names(&select))?;
+                self.validate_trigger_select_names(&select)?;
             }
         }
-        for statement in &trigger.body {
+        for (index, statement) in trigger.body.iter().enumerate() {
             resolver.validate_trigger_body_statement(statement)?;
             if let Some(frame) = &frame {
-                let (bound, _) = bind_trigger_body_statement(statement, frame, !trigger.temporary);
+                let (mut bound, _) =
+                    bind_trigger_body_statement(statement, frame, !trigger.temporary);
+                self.resolve_trigger_statement_dqs(trigger, index, &mut bound);
                 let bound_qualified = self.bind_schema_qualified_columns(&bound)?;
                 let check_stmt = bound_qualified.as_ref().unwrap_or(&bound);
-                self.trigger_names_result(
-                    trigger,
-                    self.validate_trigger_statement_names(check_stmt),
-                )?;
+                self.validate_trigger_statement_names(check_stmt)?;
             }
             if let Some(mut firing) = DmlTriggerFiring::of(statement, recursive_triggers) {
                 if !trigger.temporary && firing.schema.is_none() {
@@ -83049,28 +83119,68 @@ impl Connection {
         Ok(())
     }
 
-    /// A name check's outcome for `trigger`, except a missing column the
-    /// trigger spells in double quotes: stock reads a double-quoted name that
-    /// resolves to nothing as a string (SQLITE_DQS). fsqlite's retry for that
-    /// (bd-jcjkf) rewrites the text of the statement being run, never a
-    /// trigger's, so this check does not refuse for one.
-    fn trigger_names_result(&self, trigger: &TriggerDef, result: Result<()>) -> Result<()> {
-        let Err(error) = &result else {
-            return Ok(());
-        };
-        let missing = match error {
-            FrankenError::NoSuchColumn { name } => Some(name.clone()),
-            other => Self::dqs_missing_column_name(other),
-        };
-        if let Some(missing) = missing
-            && !missing.contains('.')
-            && Self::double_quoted_identifier_tokens(&trigger.create_sql)
-                .iter()
-                .any(|(_, _, name)| name.eq_ignore_ascii_case(&missing))
-        {
-            return Ok(());
+    /// bd-xyj6o: error-driven DQS fallback for a bound trigger WHEN expression.
+    /// When DQS is enabled and a bare double-quoted column reference in `when`
+    /// fails name resolution against the current schema, rewrite only that
+    /// exact token span to a string literal and re-check until resolution
+    /// succeeds or hits a non-DQS error (qualified ref or unquoted name).
+    fn resolve_trigger_when_dqs(&self, trigger: &TriggerDef, bound_when: &mut Expr) {
+        if !self.dqs_enabled.get() || trigger.dqs_quoted_when_spans.is_empty() {
+            return;
         }
-        result
+        for _ in 0..trigger.dqs_quoted_when_spans.len() {
+            let select =
+                select_of_result_exprs(vec![bound_when.clone()], Some(compile_check_empty_source()));
+            let Err((_, Some(missing_span))) =
+                self.validate_select_column_references_with_span(&select)
+            else {
+                return;
+            };
+            if !trigger
+                .dqs_quoted_when_spans
+                .contains(&(missing_span.start, missing_span.end))
+            {
+                return;
+            }
+            if !replace_bare_column_with_dqs_literal_in_expr(bound_when, missing_span) {
+                return;
+            }
+        }
+    }
+
+    /// bd-xyj6o: error-driven DQS fallback for bound trigger body step `index`.
+    /// Resolves only unresolved bare double-quoted column references in that
+    /// step (matching exact recorded spans from `create_sql`) to string
+    /// literals, leaving resolving columns, `NEW.*`/`OLD.*`, and unquoted names
+    /// untouched.
+    fn resolve_trigger_statement_dqs(
+        &self,
+        trigger: &TriggerDef,
+        index: usize,
+        bound_stmt: &mut Statement,
+    ) {
+        if !self.dqs_enabled.get() {
+            return;
+        }
+        let Some(quoted_spans) = trigger.dqs_quoted_body_spans.get(index) else {
+            return;
+        };
+        if quoted_spans.is_empty() {
+            return;
+        }
+        for _ in 0..quoted_spans.len() {
+            let Err((_, Some(missing_span))) =
+                self.validate_trigger_statement_names_with_span(bound_stmt)
+            else {
+                return;
+            };
+            if !quoted_spans.contains(&(missing_span.start, missing_span.end)) {
+                return;
+            }
+            if !replace_bare_column_with_dqs_literal_in_statement(bound_stmt, missing_span) {
+                return;
+            }
+        }
     }
 
     /// bd-nf30k: a frame for binding `trigger`'s WHEN and body as firing
@@ -83114,12 +83224,26 @@ impl Connection {
     /// UPDATE's FROM); an INSERT's columns and value counts against its
     /// target table, then its VALUES or SELECT.
     fn validate_trigger_statement_names(&self, statement: &Statement) -> Result<()> {
+        self.validate_trigger_statement_names_with_span(statement)
+            .map_err(|(err, _)| err)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_trigger_statement_names_with_span(
+        &self,
+        statement: &Statement,
+    ) -> std::result::Result<(), (FrankenError, Option<Span>)> {
+        let bound_qualified = self
+            .bind_schema_qualified_columns(statement)
+            .map_err(|err| (err, None))?;
+        let statement = bound_qualified.as_ref().unwrap_or(statement);
         match statement {
             Statement::Select(select) => {
-                self.validate_select_ordinals_and_hints(select)?;
-                self.validate_trigger_select_names(select)
+                self.validate_select_ordinals_and_hints(select)
+                    .map_err(|err| (err, None))?;
+                self.validate_trigger_select_names_with_span(select)
             }
-            Statement::Insert(insert) => self.validate_trigger_insert_names(insert),
+            Statement::Insert(insert) => self.validate_trigger_insert_names_with_span(insert),
             Statement::Update(update) => {
                 if with_defines_relation(update.with.as_ref(), &update.table.name) {
                     return Ok(());
@@ -83161,7 +83285,7 @@ impl Connection {
                     };
                     let mut select = select_of_result_exprs(values, Some(from.clone()));
                     select.with.clone_from(&update.with);
-                    self.validate_trigger_select_names(&select)?;
+                    self.validate_trigger_select_names_with_span(&select)?;
                     if let Some(columns) = &columns {
                         for name in Self::assignment_target_column_names(std::slice::from_ref(
                             assignment,
@@ -83169,9 +83293,12 @@ impl Connection {
                             if !columns.iter().any(|column| column.eq_ignore_ascii_case(&name))
                                 && !is_rowid_alias(&name)
                             {
-                                return Err(FrankenError::FunctionError(format!(
-                                    "no such column: {name}"
-                                )));
+                                return Err((
+                                    FrankenError::FunctionError(format!(
+                                        "no such column: {name}"
+                                    )),
+                                    None,
+                                ));
                             }
                         }
                     }
@@ -83183,7 +83310,7 @@ impl Connection {
                     update.limit.as_ref(),
                 );
                 select.with.clone_from(&update.with);
-                self.validate_trigger_select_names(&select)
+                self.validate_trigger_select_names_with_span(&select)
             }
             Statement::Delete(delete) => {
                 if with_defines_relation(delete.with.as_ref(), &delete.table.name) {
@@ -83199,7 +83326,7 @@ impl Connection {
                     delete.limit.as_ref(),
                 );
                 select.with.clone_from(&delete.with);
-                self.validate_trigger_select_names(&select)
+                self.validate_trigger_select_names_with_span(&select)
             }
             _ => Ok(()),
         }
@@ -83209,7 +83336,11 @@ impl Connection {
     /// VALUES rows or SELECT, then the number of values each row supplies,
     /// in stock's order and with its messages. A view or virtual target,
     /// whose columns stock resolves otherwise, is checked for its source only.
-    fn validate_trigger_insert_names(&self, insert: &fsqlite_ast::InsertStatement) -> Result<()> {
+    #[allow(clippy::too_many_lines)]
+    fn validate_trigger_insert_names_with_span(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> std::result::Result<(), (FrankenError, Option<Span>)> {
         if with_defines_relation(insert.with.as_ref(), &insert.table) {
             return Ok(());
         }
@@ -83219,10 +83350,13 @@ impl Connection {
                 if !columns.iter().any(|column| column.eq_ignore_ascii_case(name))
                     && !is_rowid_alias(name)
                 {
-                    return Err(FrankenError::FunctionError(format!(
-                        "table {} has no column named {name}",
-                        insert.table.name
-                    )));
+                    return Err((
+                        FrankenError::FunctionError(format!(
+                            "table {} has no column named {name}",
+                            insert.table.name
+                        )),
+                        None,
+                    ));
                 }
             }
         }
@@ -83232,15 +83366,16 @@ impl Connection {
                     let mut select =
                         select_of_result_exprs(row.clone(), Some(compile_check_empty_source()));
                     select.with.clone_from(&insert.with);
-                    self.validate_trigger_select_names(&select)?;
+                    self.validate_trigger_select_names_with_span(&select)?;
                 }
                 let width = rows.first().map(Vec::len);
                 width.filter(|width| rows.iter().all(|row| row.len() == *width))
             }
             InsertSource::Select(select) => {
                 let scoped = insert_source_select_for_validation(insert, select);
-                self.validate_select_ordinals_and_hints(&scoped)?;
-                self.validate_trigger_select_names(&scoped)?;
+                self.validate_select_ordinals_and_hints(&scoped)
+                    .map_err(|err| (err, None))?;
+                self.validate_trigger_select_names_with_span(&scoped)?;
                 select_exact_result_width(select)
             }
             InsertSource::DefaultValues => None,
@@ -83252,14 +83387,114 @@ impl Connection {
                 insert.columns.len()
             };
             if supplied != expected {
-                return Err(FrankenError::FunctionError(if insert.columns.is_empty() {
-                    format!(
-                        "table {} has {expected} columns but {supplied} values were supplied",
-                        insert.table.name
-                    )
-                } else {
-                    format!("{supplied} values for {expected} columns")
-                }));
+                return Err((
+                    FrankenError::FunctionError(if insert.columns.is_empty() {
+                        format!(
+                            "table {} has {expected} columns but {supplied} values were supplied",
+                            insert.table.name
+                        )
+                    } else {
+                        format!("{supplied} values for {expected} columns")
+                    }),
+                    None,
+                ));
+            }
+        }
+        if !insert.upsert.is_empty() {
+            let target_source = TableOrSubquery::Table {
+                name: insert.table.clone(),
+                alias: insert.alias.clone(),
+                index_hint: None,
+                time_travel: None,
+            };
+            let target_from = FromClause {
+                source: target_source,
+                joins: Vec::new(),
+            };
+            let excluded_source = TableOrSubquery::Table {
+                name: insert.table.clone(),
+                alias: Some("excluded".to_owned()),
+                index_hint: None,
+                time_travel: None,
+            };
+            let validate_upsert_select =
+                |select: &SelectStatement| -> std::result::Result<(), (FrankenError, Option<Span>)> {
+                    self.with_fallback_function_registry(|| {
+                        let mut resolver = SelectColumnReferenceResolver::new(self);
+                        if let Ok(excluded_scope) =
+                            resolver.build_dml_target_scope(1, &excluded_source)
+                        {
+                            resolver.outer_scopes.push(excluded_scope);
+                        }
+                        resolver
+                            .validate_select(select)
+                            .map_err(|err| (err, resolver.missing_bare_column_span))
+                    })?;
+                    validate_aggregate_window_misuse(select).map_err(|err| (err, None))
+                };
+            for upsert in &insert.upsert {
+                if let Some(target_where) = upsert
+                    .target
+                    .as_ref()
+                    .and_then(|target_clause| target_clause.where_clause.as_ref())
+                {
+                    let mut select = select_of_result_exprs(
+                        vec![target_where.clone()],
+                        Some(target_from.clone()),
+                    );
+                    select.with.clone_from(&insert.with);
+                    self.validate_trigger_select_names_with_span(&select)?;
+                }
+                if let fsqlite_ast::UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &upsert.action
+                {
+                    for assignment in assignments {
+                        let values = match (&assignment.target, &assignment.value) {
+                            (
+                                fsqlite_ast::AssignmentTarget::ColumnList(_),
+                                Expr::RowValue(values, _),
+                            ) => values.clone(),
+                            (
+                                fsqlite_ast::AssignmentTarget::ColumnList(_),
+                                Expr::Subquery(query, span),
+                            ) => vec![Expr::Exists {
+                                subquery: query.clone(),
+                                not: false,
+                                span: *span,
+                            }],
+                            _ => vec![assignment.value.clone()],
+                        };
+                        let mut select = select_of_result_exprs(values, Some(target_from.clone()));
+                        select.with.clone_from(&insert.with);
+                        validate_upsert_select(&select)?;
+                        if let Some((columns, _)) = &target {
+                            for name in Self::assignment_target_column_names(
+                                std::slice::from_ref(assignment),
+                            ) {
+                                if !columns.iter().any(|column| column.eq_ignore_ascii_case(&name))
+                                    && !is_rowid_alias(&name)
+                                {
+                                    return Err((
+                                        FrankenError::FunctionError(format!(
+                                            "no such column: {name}"
+                                        )),
+                                        None,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(where_expr) = where_clause {
+                        let mut select = select_of_result_exprs(
+                            vec![where_expr.as_ref().clone()],
+                            Some(target_from.clone()),
+                        );
+                        select.with.clone_from(&insert.with);
+                        validate_upsert_select(&select)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -83270,13 +83505,22 @@ impl Connection {
     /// whatever the shape: a statement's own simple shapes have their columns
     /// resolved when they execute, which a trigger's never may.
     fn validate_trigger_select_names(&self, select: &SelectStatement) -> Result<()> {
-        self.validate_select_column_references(select)?;
+        self.validate_trigger_select_names_with_span(select)
+            .map_err(|(err, _)| err)
+    }
+
+    fn validate_trigger_select_names_with_span(
+        &self,
+        select: &SelectStatement,
+    ) -> std::result::Result<(), (FrankenError, Option<Span>)> {
+        self.validate_select_column_references_with_span(select)?;
         // A trigger's text has not had its row values expanded.
         self.validate_statement_select_semantics(
             &Statement::Select(select.clone()),
             RowValueSpelling::AsWritten,
-        )?;
-        validate_aggregate_window_misuse(select)
+        )
+        .map_err(|err| (err, None))?;
+        validate_aggregate_window_misuse(select).map_err(|err| (err, None))
     }
 
     /// The column names of a DML target table, honoring a MAIN qualifier;
@@ -83508,6 +83752,7 @@ impl Connection {
         pin_main_relations: bool,
     ) -> (BoundTriggerStatement, Vec<SqliteValue>) {
         let conflict = self.dml_conflict_clause.get();
+        let dqs_enabled = self.dqs_enabled.get();
         if matches!(
             stmt,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -83523,6 +83768,7 @@ impl Connection {
                         index,
                         pin_main_relations,
                         conflict,
+                        dqs_enabled,
                         schema_generation,
                         frame,
                     )
@@ -83543,11 +83789,13 @@ impl Connection {
                         bind_trigger_columns_in_statement(&mut statement, frame);
                     });
                     apply_trigger_conflict_override(&mut statement, conflict);
+                    self.resolve_trigger_statement_dqs(trigger, index, &mut statement);
                     let template = Rc::new(TriggerBodyTemplate {
                         trigger: Arc::clone(trigger),
                         index,
                         pin_main_relations,
                         conflict,
+                        dqs_enabled,
                         schema_generation,
                         table_name: frame.table_name.clone(),
                         column_count: frame.column_names.len(),
@@ -83571,6 +83819,7 @@ impl Connection {
         }
         let (mut statement, params) = bind_trigger_body_statement(stmt, frame, pin_main_relations);
         apply_trigger_conflict_override(&mut statement, conflict);
+        self.resolve_trigger_statement_dqs(trigger, index, &mut statement);
         (BoundTriggerStatement::Owned(Box::new(statement)), params)
     }
 
@@ -83842,7 +84091,7 @@ impl Connection {
             let pin_main_relations = self.trigger_pins_main_relations(&trigger);
             if !trigger_when_matches(
                 self,
-                trigger.when_clause.as_ref(),
+                &trigger,
                 Some(&base_frame),
                 pin_main_relations,
             )
@@ -83937,7 +84186,7 @@ impl Connection {
             let pin_main_relations = self.trigger_pins_main_relations(&trigger);
             if !trigger_when_matches(
                 self,
-                trigger.when_clause.as_ref(),
+                &trigger,
                 Some(&base_frame),
                 pin_main_relations,
             )
@@ -84476,7 +84725,7 @@ impl Connection {
             let pin_main_relations = self.trigger_pins_main_relations(&trigger);
             if !trigger_when_matches(
                 self,
-                trigger.when_clause.as_ref(),
+                &trigger,
                 Some(&base_frame),
                 pin_main_relations,
             )
@@ -93185,6 +93434,7 @@ impl Connection {
                 if let Some(ref val) = pragma.value {
                     let enabled = parse_pragma_bool(val)?;
                     if self.dqs_enabled.replace(enabled) != enabled {
+                        self.trigger_relation_checks.borrow_mut().validated.clear();
                         self.expire_prepared_statements_for_pragma_flag();
                     }
                     Ok(vec![Row {
@@ -119611,7 +119861,6 @@ impl Connection {
                     new_triggers.push(Arc::new(TriggerDef::from_create_statement(
                         &stmt,
                         create_sql.to_string(),
-                        self.dqs_enabled.get(),
                     )));
                     continue;
                 }
@@ -135057,6 +135306,174 @@ const UNPLACED_AGGREGATE_WALK_SITE: AggregateWalkSite = AggregateWalkSite {
 };
 
 type ExprWalkVisit<'v> = dyn FnMut(&mut Expr, AggregateWalkSite) -> bool + 'v;
+
+/// Visit every expression of `stmt` (SELECT, INSERT, UPDATE, DELETE) in one
+/// fixed pre-order, entering nested subqueries (bd-xyj6o).
+fn walk_statement_exprs_mut(stmt: &mut Statement, visit: &mut ExprWalkVisit<'_>) {
+    match stmt {
+        Statement::Select(select) => walk_select_exprs_mut(select, visit),
+        Statement::Insert(insert) => {
+            if let Some(with) = &mut insert.with {
+                for cte in &mut with.ctes {
+                    walk_select_exprs_mut(&mut cte.query, visit);
+                }
+            }
+            match &mut insert.source {
+                InsertSource::Values(rows) => {
+                    for row in rows {
+                        for expr in row {
+                            walk_expr_mut(expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                        }
+                    }
+                }
+                InsertSource::Select(select) => walk_select_exprs_mut(select, visit),
+                InsertSource::DefaultValues => {}
+            }
+            for upsert in &mut insert.upsert {
+                if let Some(target) = &mut upsert.target {
+                    for indexed in &mut target.columns {
+                        walk_expr_mut(&mut indexed.expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                    }
+                    if let Some(where_expr) = &mut target.where_clause {
+                        walk_expr_mut(where_expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                    }
+                }
+                if let fsqlite_ast::UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &mut upsert.action
+                {
+                    for assignment in assignments {
+                        walk_expr_mut(
+                            &mut assignment.value,
+                            UNPLACED_AGGREGATE_WALK_SITE,
+                            true,
+                            visit,
+                        );
+                    }
+                    if let Some(where_expr) = where_clause {
+                        walk_expr_mut(where_expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                    }
+                }
+            }
+            for column in &mut insert.returning {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    walk_expr_mut(expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                }
+            }
+        }
+        Statement::Update(update) => {
+            if let Some(with) = &mut update.with {
+                for cte in &mut with.ctes {
+                    walk_select_exprs_mut(&mut cte.query, visit);
+                }
+            }
+            for assignment in &mut update.assignments {
+                walk_expr_mut(
+                    &mut assignment.value,
+                    UNPLACED_AGGREGATE_WALK_SITE,
+                    true,
+                    visit,
+                );
+            }
+            if let Some(from) = &mut update.from {
+                walk_from_exprs_mut(from, UNPLACED_AGGREGATE_WALK_SITE, visit);
+            }
+            if let Some(where_expr) = &mut update.where_clause {
+                walk_expr_mut(where_expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+            }
+            for term in &mut update.order_by {
+                walk_expr_mut(&mut term.expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+            }
+            if let Some(limit) = &mut update.limit {
+                walk_expr_mut(&mut limit.limit, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                if let Some(offset) = &mut limit.offset {
+                    walk_expr_mut(offset, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                }
+            }
+            for column in &mut update.returning {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    walk_expr_mut(expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                }
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(with) = &mut delete.with {
+                for cte in &mut with.ctes {
+                    walk_select_exprs_mut(&mut cte.query, visit);
+                }
+            }
+            if let Some(where_expr) = &mut delete.where_clause {
+                walk_expr_mut(where_expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+            }
+            for term in &mut delete.order_by {
+                walk_expr_mut(&mut term.expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+            }
+            if let Some(limit) = &mut delete.limit {
+                walk_expr_mut(&mut limit.limit, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                if let Some(offset) = &mut limit.offset {
+                    walk_expr_mut(offset, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                }
+            }
+            for column in &mut delete.returning {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    walk_expr_mut(expr, UNPLACED_AGGREGATE_WALK_SITE, true, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_bare_column_with_dqs_literal_in_expr(expr: &mut Expr, target_span: Span) -> bool {
+    let mut replaced = false;
+    walk_expr_mut(
+        expr,
+        UNPLACED_AGGREGATE_WALK_SITE,
+        true,
+        &mut |node, _| {
+            if replaced {
+                return false;
+            }
+            if let Expr::Column(column, span) = node
+                && column.table.is_none()
+                && *span == target_span
+            {
+                let name = column.column.to_string();
+                let span = *span;
+                *node = Expr::Literal(Literal::String(name), span);
+                replaced = true;
+                return false;
+            }
+            true
+        },
+    );
+    replaced
+}
+
+fn replace_bare_column_with_dqs_literal_in_statement(
+    stmt: &mut Statement,
+    target_span: Span,
+) -> bool {
+    let mut replaced = false;
+    walk_statement_exprs_mut(stmt, &mut |node, _| {
+        if replaced {
+            return false;
+        }
+        if let Expr::Column(column, span) = node
+            && column.table.is_none()
+            && *span == target_span
+        {
+            let name = column.column.to_string();
+            let span = *span;
+            *node = Expr::Literal(Literal::String(name), span);
+            replaced = true;
+            return false;
+        }
+        true
+    });
+    replaced
+}
 
 /// Visit every expression of `select` in one fixed pre-order: the WITH
 /// queries, each core (result list, FROM, WHERE, GROUP BY, HAVING, windows),
@@ -175622,6 +176039,7 @@ struct TriggerBodyTemplate {
     index: usize,
     pin_main_relations: bool,
     conflict: Option<fsqlite_ast::ConflictAction>,
+    dqs_enabled: bool,
     schema_generation: u64,
     table_name: String,
     column_count: usize,
@@ -175646,12 +176064,14 @@ impl TriggerBodyTemplate {
         ]
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fits(
         &self,
         trigger: &Arc<TriggerDef>,
         index: usize,
         pin_main_relations: bool,
         conflict: Option<fsqlite_ast::ConflictAction>,
+        dqs_enabled: bool,
         schema_generation: u64,
         frame: &TriggerFrame,
     ) -> bool {
@@ -175659,6 +176079,7 @@ impl TriggerBodyTemplate {
             && self.index == index
             && self.pin_main_relations == pin_main_relations
             && self.conflict == conflict
+            && self.dqs_enabled == dqs_enabled
             && self.schema_generation == schema_generation
             && self.rows == Self::frame_rows(frame)
             && self.column_count == frame.column_names.len()
