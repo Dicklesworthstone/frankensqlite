@@ -25225,8 +25225,61 @@ where
         if inner.freelist_repair_pending || self.vacuum_override_freelist.is_some() {
             return true;
         }
+        if self.durable_freelist_provably_unchanged_with_inner(inner, committed_db_size) {
+            debug_assert!(
+                self.committed_durable_freelist_pages_with_inner(inner)
+                    == self.predicted_durable_freelist_pages_with_inner(inner, committed_db_size),
+                "bd-fuwx0: the early return must give the full comparison's answer"
+            );
+            return false;
+        }
         self.committed_durable_freelist_pages_with_inner(inner)
             != self.predicted_durable_freelist_pages_with_inner(inner, committed_db_size)
+    }
+
+    /// bd-fuwx0: true only when the committed and predicted durable freelists
+    /// are provably equal, so [`Self::freelist_metadata_dirty_with_inner`]
+    /// can answer `false` without building both (two clones of
+    /// `inner.freelist`, a merge, a normalize and a filter each, on every
+    /// commit). `false` means "not proven" and the caller compares in full.
+    ///
+    /// Both lists are the strictly descending form of a set
+    /// ([`Self::durable_freelist_pages_with_inner`]: the restored pages are
+    /// merged into a copy of `inner.freelist` as a set union, and
+    /// `normalize_freelist` and the final filter keep the pages in
+    /// `(1, size]` other than the lock-byte page, sorted and deduplicated):
+    /// - committed = (F + allocated_from_freelist) in (1, inner.db_size];
+    /// - predicted = (F + freed_pages) in (1, committed_db_size],
+    ///
+    /// where F is `inner.freelist`. With no page allocated from the freelist
+    /// and no freed page at or below `committed_db_size`, both reduce to F
+    /// cut at their own size, and they differ exactly by the pages of F
+    /// between the two sizes. So the proof also needs F to hold no page in
+    /// (min, max] of `inner.db_size` and `committed_db_size`. That range is
+    /// empty when the transaction neither grows nor shrinks the database.
+    /// When it grows, F can hold a page there: an EOF reservation another
+    /// transaction returned, which becomes a hole this commit must publish
+    /// as free, so the full comparison answers `true`.
+    fn durable_freelist_provably_unchanged_with_inner(
+        &self,
+        inner: &PagerInner<V::File>,
+        committed_db_size: u32,
+    ) -> bool {
+        if !self.allocated_from_freelist.is_empty()
+            || self
+                .freed_pages
+                .iter()
+                .any(|page| page.get() <= committed_db_size)
+        {
+            return false;
+        }
+        let low = inner.db_size.min(committed_db_size);
+        let high = inner.db_size.max(committed_db_size);
+        low == high
+            || !inner
+                .freelist
+                .iter()
+                .any(|page| page.get() > low && page.get() <= high)
     }
 
     #[must_use]
@@ -25627,6 +25680,17 @@ where
     fn page_one_in_pending_commit_surface_with_inner(&self, inner: &PagerInner<V::File>) -> bool {
         let committed_db_size = self.committed_db_size_with_inner(inner);
         let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
+        self.page_one_in_pending_commit_surface_given_freelist_dirty(inner, freelist_dirty)
+    }
+
+    /// The rule of [`Self::page_one_in_pending_commit_surface_with_inner`]
+    /// for a caller that already holds `freelist_dirty` for this `inner`.
+    #[must_use]
+    fn page_one_in_pending_commit_surface_given_freelist_dirty(
+        &self,
+        inner: &PagerInner<V::File>,
+        freelist_dirty: bool,
+    ) -> bool {
         let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
 
         if self.journal_mode == JournalMode::Wal {
@@ -25639,11 +25703,19 @@ where
     fn predicted_commit_pages_with_inner(&self, inner: &PagerInner<V::File>) -> Vec<PageNumber> {
         let mut pages = self.write_pages_sorted.clone();
         let committed_db_size = self.committed_db_size_with_inner(inner);
-        let durable_freelist =
-            self.predicted_durable_freelist_pages_with_inner(inner, committed_db_size);
+        // bd-fuwx0: one answer serves the trunk rule here and the page-1 rule
+        // below. Both read this `self` and this locked `inner`, and nothing in
+        // between changes either, so a second evaluation could not differ.
         let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
+        // The predicted freelist is needed only for the trunk rule, which
+        // applies only when the metadata changes.
+        let durable_freelist = if freelist_dirty {
+            self.predicted_durable_freelist_pages_with_inner(inner, committed_db_size)
+        } else {
+            Vec::new()
+        };
 
-        if freelist_dirty && !durable_freelist.is_empty() {
+        if !durable_freelist.is_empty() {
             let max_leaf_entries = freelist_trunk_leaf_capacity(
                 inner.page_size,
                 commit_reserved_per_page(&self.write_set, inner.reserved_per_page),
@@ -25667,7 +25739,7 @@ where
             }
         }
 
-        if self.page_one_in_pending_commit_surface_with_inner(inner) {
+        if self.page_one_in_pending_commit_surface_given_freelist_dirty(inner, freelist_dirty) {
             pages.push(PageNumber::ONE);
         }
 
@@ -63672,6 +63744,187 @@ mod tests {
                 conflict_pages.contains(&page),
                 "bead_id={BEAD_ID} case=data_page_remains_cross_process_conflict"
             );
+        });
+    }
+
+    /// bd-fuwx0: `freelist_metadata_dirty_with_inner` answers as the full
+    /// comparison of the committed and predicted durable freelists on every
+    /// small state: freelists unsorted and with duplicates, pages allocated
+    /// from the freelist or freed, a grown, unchanged or shrunk size, and an
+    /// empty database. The states also check the early return's proof: with
+    /// nothing allocated from the freelist, no freed page in range and no
+    /// freelist page between the two sizes, the full comparison is clean,
+    /// and such states occur with the sizes equal and with them different.
+    /// Without the size range the condition is wrong: states where it holds
+    /// and the full comparison is dirty must occur too.
+    #[test]
+    fn test_freelist_metadata_dirty_early_return_matches_the_full_comparison_bd_fuwx0() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let inner_arc = Arc::clone(&txn.inner);
+            let mut inner = inner_arc.lock().unwrap();
+            assert!(!inner.freelist_repair_pending && txn.vacuum_override_freelist.is_none());
+            let saved_inner = (inner.freelist.clone(), inner.db_size, inner.next_page);
+            let saved_txn = (txn.allocated_from_freelist.clone(), txn.freed_pages.clone());
+            let page = |n: u32| PageNumber::new(n).unwrap();
+            let (mut checked, mut proven, mut proven_resized) = (0_u32, 0_u32, 0_u32);
+            let mut needs_size_range = 0_u32;
+            for mask in 0_u32..128 {
+                let descending: Vec<PageNumber> = (1..=7_u32)
+                    .rev()
+                    .filter(|n| mask & (1 << (n - 1)) != 0)
+                    .map(page)
+                    .collect();
+                let mut shuffled: Vec<PageNumber> = descending.iter().rev().copied().collect();
+                shuffled.extend(descending.first().copied());
+                for freelist in [descending, shuffled] {
+                    for allocated in [vec![], vec![page(3)], vec![page(6)]] {
+                        for freed in [vec![], vec![page(3)], vec![page(7)], vec![page(8)]] {
+                            for db_size in [0_u32, 2, 4, 5, 7] {
+                                for next_page in [db_size + 1, 9] {
+                                    inner.freelist.clone_from(&freelist);
+                                    inner.db_size = db_size;
+                                    inner.next_page = next_page;
+                                    txn.allocated_from_freelist.clone_from(&allocated);
+                                    txn.freed_pages.clone_from(&freed);
+                                    for committed_db_size in 0_u32..=8 {
+                                        let full = txn
+                                            .committed_durable_freelist_pages_with_inner(&inner)
+                                            != txn.predicted_durable_freelist_pages_with_inner(
+                                                &inner,
+                                                committed_db_size,
+                                            );
+                                        assert_eq!(
+                                            txn.freelist_metadata_dirty_with_inner(
+                                                &inner,
+                                                committed_db_size
+                                            ),
+                                            full,
+                                            "bead_id=bd-fuwx0 case=early_return_matches_full_comparison freelist={freelist:?} allocated={allocated:?} freed={freed:?} db_size={db_size} next_page={next_page} committed_db_size={committed_db_size}"
+                                        );
+                                        checked += 1;
+                                        let nothing_in_range = allocated.is_empty()
+                                            && freed.iter().all(|p| p.get() > committed_db_size);
+                                        let (low, high) = (
+                                            db_size.min(committed_db_size),
+                                            db_size.max(committed_db_size),
+                                        );
+                                        let between = freelist
+                                            .iter()
+                                            .any(|p| p.get() > low && p.get() <= high);
+                                        if nothing_in_range && !between {
+                                            assert!(
+                                                !full,
+                                                "bead_id=bd-fuwx0 case=proof_condition_is_clean freelist={freelist:?} db_size={db_size} committed_db_size={committed_db_size}"
+                                            );
+                                            proven += 1;
+                                            if committed_db_size != db_size {
+                                                proven_resized += 1;
+                                            }
+                                        } else if nothing_in_range && full {
+                                            needs_size_range += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (inner.freelist, inner.db_size, inner.next_page) = saved_inner;
+            (txn.allocated_from_freelist, txn.freed_pages) = saved_txn;
+            drop(inner);
+            txn.rollback(&cx).await.unwrap();
+            assert_eq!(checked, 128 * 2 * 3 * 4 * 5 * 2 * 9);
+            assert!(
+                proven > 0 && proven_resized > 0,
+                "bead_id=bd-fuwx0 case=proof_condition_occurs proven={proven} resized={proven_resized} of {checked}"
+            );
+            assert!(
+                needs_size_range > 0,
+                "bead_id=bd-fuwx0 case=size_range_is_needed of {checked}"
+            );
+        });
+    }
+
+    /// bd-fuwx0: a concurrent transaction that grows the file past the unused
+    /// lease pages a peer's commit returned to the freelist must publish them
+    /// as free. Nothing is allocated from the freelist and nothing is freed,
+    /// so this is the state an early return without the size range gets
+    /// wrong: the freelist metadata is dirty and the predicted commit pages
+    /// carry the new trunk, the highest returned page under the grown size.
+    #[test]
+    fn test_growth_past_a_peer_returned_lease_keeps_the_freelist_dirty_bd_fuwx0() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT.as_usize();
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let p2 = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, p2, &vec![0x21; ps]).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            // A concurrent transaction's second allocation takes a lease of
+            // PAGE_LEASE_BATCH_SIZE pages from EOF; the peer uses one of them.
+            let mut peer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let peer_first = peer.allocate_page(&cx).await.unwrap();
+            let peer_page = peer.allocate_page(&cx).await.unwrap();
+            for page in [peer_first, peer_page] {
+                peer.write_page(&cx, page, &vec![0x31; ps]).await.unwrap();
+            }
+            assert!(
+                !peer.page_lease.is_empty(),
+                "bead_id=bd-fuwx0 case=precondition_peer_holds_a_lease"
+            );
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let grown = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, grown, &vec![0x5A; ps]).await.unwrap();
+            peer.commit(&cx).await.unwrap();
+
+            let (db_size, committed_db_size, between, dirty, full) = {
+                let inner = txn.inner.lock().unwrap();
+                let committed_db_size = txn.committed_db_size_with_inner(&inner);
+                let between: Vec<PageNumber> = inner
+                    .freelist
+                    .iter()
+                    .copied()
+                    .filter(|p| p.get() > inner.db_size && p.get() <= committed_db_size)
+                    .collect();
+                let full = txn.committed_durable_freelist_pages_with_inner(&inner)
+                    != txn.predicted_durable_freelist_pages_with_inner(&inner, committed_db_size);
+                (
+                    inner.db_size,
+                    committed_db_size,
+                    between,
+                    txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size),
+                    full,
+                )
+            };
+            assert!(
+                txn.allocated_from_freelist.is_empty() && txn.freed_pages.is_empty(),
+                "bead_id=bd-fuwx0 case=precondition_nothing_allocated_from_freelist_or_freed"
+            );
+            assert!(
+                !between.is_empty(),
+                "bead_id=bd-fuwx0 case=precondition_returned_lease_between_sizes db_size={db_size} committed_db_size={committed_db_size} peer_page={peer_page:?} grown={grown:?}"
+            );
+            assert!(
+                full,
+                "bead_id=bd-fuwx0 case=full_comparison_dirty between={between:?}"
+            );
+            assert!(
+                dirty,
+                "bead_id=bd-fuwx0 case=growth_past_returned_lease_is_dirty between={between:?}"
+            );
+            let trunk = between.iter().copied().max().unwrap();
+            let predicted = txn.pending_commit_pages().unwrap();
+            assert!(
+                predicted.contains(&trunk) && predicted.contains(&grown),
+                "bead_id=bd-fuwx0 case=predicted_commit_pages_carry_the_new_trunk trunk={trunk:?} predicted={predicted:?}"
+            );
+            txn.rollback(&cx).await.unwrap();
         });
     }
 
