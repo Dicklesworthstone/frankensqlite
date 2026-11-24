@@ -6,6 +6,8 @@
 //! modes, schema validation, and secure-delete / contentless-delete /
 //! contentless-unindexed / insttoken / locale blob / tokendata configuration.
 
+mod unicode61_data;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::AsyncFnMut;
@@ -4691,24 +4693,56 @@ impl Unicode61Tokenizer {
         }
     }
 
-    fn is_token_char(&self, ch: char) -> bool {
-        if !self.token_chars.is_empty() && Self::option_contains(&self.token_chars, ch) {
-            return true;
+    fn is_token_char(&self, ch: char, categories: u32) -> bool {
+        // Tokenizer exceptions cannot turn a combining diacritic into a
+        // leading token character. Its base category can, e.g. categories Mn.
+        let in_category = if categories == DEFAULT_UNICODE61_CATEGORIES && ch.is_ascii() {
+            ch.is_ascii_alphanumeric()
+        } else {
+            categories & (1 << unicode61_data::category(ch)) != 0
+        };
+        if (self.token_chars.is_empty() && self.separators.is_empty())
+            || unicode61_combining_diacritic(ch)
+        {
+            return in_category;
         }
-        if !self.separators.is_empty() && Self::option_contains(&self.separators, ch) {
-            return false;
+        let extra = Self::option_contains(&self.token_chars, ch);
+        let separator = Self::option_contains(&self.separators, ch);
+        // Stock records non-ASCII exceptions relative to the base category.
+        // If both options name a character, only the exception that changes
+        // that base classification takes effect.
+        if !ch.is_ascii() && extra && separator {
+            !in_category
+        } else {
+            extra || (in_category && !separator)
         }
-        // The Combining Diacritical Marks block is category M. Rust's
-        // Alphabetic property also includes marks such as U+0345.
-        ch.is_alphanumeric() && !('\u{0300}'..='\u{036f}').contains(&ch)
     }
+}
 
-    fn normalized_char(&self, ch: char) -> char {
-        if self.remove_diacritics == 0 {
-            return ch;
+// Category 31 represents scalars that unicode61 admits for every nonempty
+// category selection. The default class set is L*, N* and Co.
+const DEFAULT_UNICODE61_CATEGORIES: u32 = (1 << 31) | (1 << 4) | (0b11111 << 6) | (0b111 << 14);
+
+fn unicode61_categories(spec: &str) -> Option<u32> {
+    let mut mask = 0;
+    for pattern in spec.split_ascii_whitespace() {
+        if pattern.len() != 2 || !pattern.is_ascii() {
+            return None;
         }
-        latin_diacritic_base(ch).unwrap_or(ch)
+        let mut selected = 0;
+        for (index, name) in unicode61_data::CATEGORY_NAMES.iter().enumerate() {
+            if pattern == *name
+                || (pattern.ends_with('*') && pattern.as_bytes()[0] == name.as_bytes()[0])
+            {
+                selected |= 1 << (index + 1);
+            }
+        }
+        if selected == 0 {
+            return None;
+        }
+        mask |= selected | (1 << 31);
     }
+    Some(mask)
 }
 
 /// Combining marks that unicode61 admits after a token character. Other
@@ -4727,22 +4761,20 @@ fn unicode61_combining_diacritic(ch: char) -> bool {
     )
 }
 
-impl Fts5Tokenizer for Unicode61Tokenizer {
-    fn name(&self) -> &'static str {
-        "unicode61"
-    }
-
-    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+impl Unicode61Tokenizer {
+    fn visit_with_categories(
+        &self,
+        text: &str,
+        categories: u32,
+        sink: &mut dyn FnMut(&str, usize, usize, bool),
+    ) {
         let mut token_start = None;
         let mut current_term = String::new();
         let mut borrowed_ascii_token = false;
 
         for (byte_idx, ch) in text.char_indices() {
             let diacritic = unicode61_combining_diacritic(ch);
-            if diacritic && token_start.is_none() {
-                continue;
-            }
-            if diacritic || self.is_token_char(ch) {
+            if (diacritic && token_start.is_some()) || self.is_token_char(ch, categories) {
                 if token_start.is_none() {
                     token_start = Some(byte_idx);
                     current_term.clear();
@@ -4758,12 +4790,12 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
                     }
                 }
                 if !diacritic || self.remove_diacritics == 0 {
-                    current_term.extend(self.normalized_char(ch).to_lowercase());
+                    current_term.push(unicode61_data::fold(ch, self.remove_diacritics));
                 }
             } else if let Some(start) = token_start.take() {
                 if borrowed_ascii_token {
                     sink(&text[start..byte_idx], start, byte_idx, false);
-                } else if !current_term.is_empty() {
+                } else {
                     sink(current_term.as_str(), start, byte_idx, false);
                     current_term.clear();
                 }
@@ -4774,10 +4806,36 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
         if let Some(start) = token_start {
             if borrowed_ascii_token {
                 sink(&text[start..], start, text.len(), false);
-            } else if !current_term.is_empty() {
+            } else {
                 sink(current_term.as_str(), start, text.len(), false);
             }
         }
+    }
+}
+
+impl Fts5Tokenizer for Unicode61Tokenizer {
+    fn name(&self) -> &'static str {
+        "unicode61"
+    }
+
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        self.visit_with_categories(text, DEFAULT_UNICODE61_CATEGORIES, sink);
+    }
+}
+
+struct CategorizedUnicode61Tokenizer {
+    tokenizer: Unicode61Tokenizer,
+    categories: u32,
+}
+
+impl Fts5Tokenizer for CategorizedUnicode61Tokenizer {
+    fn name(&self) -> &'static str {
+        "unicode61"
+    }
+
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        self.tokenizer
+            .visit_with_categories(text, self.categories, sink);
     }
 }
 
@@ -5279,15 +5337,26 @@ fn take_tokenizer_option<'a>(parts: &'a [String], index: &mut usize) -> Option<(
     Some((raw.as_str(), value.as_str()))
 }
 
-fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Unicode61Tokenizer> {
+fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
     let mut tokenizer = Unicode61Tokenizer::new();
+    let mut categories = DEFAULT_UNICODE61_CATEGORIES;
     let mut index = 0;
 
     while index < args.len() {
         let (key, value) = take_tokenizer_option(args, &mut index)?;
         match key.to_ascii_lowercase().as_str() {
-            "tokenchars" | "token_chars" => value.clone_into(&mut tokenizer.token_chars),
-            "separators" => value.clone_into(&mut tokenizer.separators),
+            "categories" => categories = unicode61_categories(value)?,
+            "tokenchars" | "token_chars" | "separators" => {
+                let (set, opposite) = if key.eq_ignore_ascii_case("separators") {
+                    (&mut tokenizer.separators, &mut tokenizer.token_chars)
+                } else {
+                    (&mut tokenizer.token_chars, &mut tokenizer.separators)
+                };
+                // ASCII exceptions are assigned in declaration order. For
+                // non-ASCII, preserve all exceptions for the final category set.
+                opposite.retain(|ch| !ch.is_ascii() || !value.contains(ch));
+                set.push_str(value);
+            }
             "remove_diacritics" => {
                 let remove_diacritics = value.parse::<u8>().ok()?;
                 if remove_diacritics > 2 {
@@ -5299,7 +5368,10 @@ fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Unicode61Tokenizer> 
         }
     }
 
-    Some(tokenizer)
+    Some(Box::new(CategorizedUnicode61Tokenizer {
+        tokenizer,
+        categories,
+    }))
 }
 
 fn ascii_tokenizer_from_args(args: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
@@ -5350,7 +5422,7 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
     let args = &parts[1..];
 
     match name.as_str() {
-        "unicode61" => Some(Box::new(unicode61_tokenizer_from_args(args)?)),
+        "unicode61" => unicode61_tokenizer_from_args(args),
         "ascii" => ascii_tokenizer_from_args(args),
         "porter" => {
             let inner = if args.is_empty() {
@@ -5484,9 +5556,7 @@ impl Fts5ExtensionApi {
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut api = Self::new();
-        let _ = api.register_tokenizer("unicode61", |args| {
-            Some(Box::new(unicode61_tokenizer_from_args(args)?))
-        });
+        let _ = api.register_tokenizer("unicode61", unicode61_tokenizer_from_args);
         let _ = api.register_tokenizer("ascii", ascii_tokenizer_from_args);
         let _ = api.register_tokenizer("porter", |args| {
             let inner = if args.is_empty() {

@@ -2608,6 +2608,59 @@ fn unicode61_combining_marks_match_rusqlite_reference() {
 }
 
 #[test]
+fn unicode61_category_selection_and_folding_match_stock() {
+    let docs = [
+        Doc {
+            rowid: 1,
+            title: "A.99",
+            body: "alpha_beta Καφές Việt Łódź ",
+        },
+        Doc {
+            rowid: 2,
+            title: "B_42",
+            body: "alpha beta καφέσ Viet Lodz",
+        },
+        Doc {
+            rowid: 3,
+            title: "C99",
+            body: "東京 पुस्तक A🧑B",
+        },
+    ];
+    for spec in [
+        "unicode61",
+        "unicode61 remove_diacritics 0",
+        "unicode61 remove_diacritics 2",
+        "unicode61 categories 'L* N* Co Pc'",
+        "unicode61 categories 'Nd'",
+        "unicode61 categories 'L* M*'",
+        "porter unicode61 categories 'L* N* Pc'",
+    ] {
+        let option = format!(r#"tokenize="{spec}""#);
+        let harness = Fts5ConformanceHarness::with_docs(&[&option], &docs);
+        for query in [
+            "alpha_beta",
+            "alpha",
+            "99",
+            "Καφές",
+            "καφέσ",
+            "Việt",
+            "viet",
+            "Łódź",
+            "Lodz",
+            "पुस्तक",
+            "東京",
+            "A🧑B",
+        ] {
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                harness.sqlite_match_rowids(query),
+                "{spec} MATCH {query}"
+            );
+        }
+    }
+}
+
+#[test]
 fn default_unicode61_separator_queries_match_rusqlite_reference() {
     let harness = Fts5ConformanceHarness::with_docs(&[], UNICODE61_DEFAULT_SEPARATOR_DOCS);
 
