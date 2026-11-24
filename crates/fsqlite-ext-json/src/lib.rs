@@ -2151,9 +2151,80 @@ impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisit
 }
 
 fn parse_json5_text(input: &str) -> Result<Value> {
-    json5::from_str::<Json5Value>(input)
-        .map(|value| value.0)
-        .map_err(|error| FrankenError::function_error(format!("invalid JSON5 input: {error}")))
+    let Json5Value(mut value) = json5::from_str(input)
+        .map_err(|error| FrankenError::function_error(format!("invalid JSON5 input: {error}")))?;
+    if may_hold_integer_text(input) {
+        let mut remaining = input;
+        restore_json5_integer_text(&mut value, &mut remaining);
+    }
+    Ok(value)
+}
+
+/// The JSON5 deserializer rounds a wide integer before calling our serde
+/// visitor. Recover its decimal spelling from the validated input. Members
+/// (including duplicate keys) are stored in source order, so consuming one
+/// token per key and per scalar leaf keeps tokens aligned with the value tree.
+fn restore_json5_integer_text(value: &mut Value, input: &mut &str) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                restore_json5_integer_text(item, input);
+            }
+        }
+        Value::Object(object) => {
+            for (_, item) in &mut object.members {
+                let _label = next_json5_atom(input);
+                restore_json5_integer_text(item, input);
+            }
+        }
+        _ => {
+            if let Some(token) = next_json5_atom(input) {
+                let digits = token.strip_prefix('+').unwrap_or(token);
+                if integer_needs_text(digits) {
+                    *value = Value::IntegerText(digits.to_owned());
+                }
+            }
+        }
+    }
+}
+
+/// Return a complete string, bare identifier, or scalar token from valid
+/// JSON5. Quoted text and comments are opaque, including any digits inside.
+fn next_json5_atom<'a>(input: &mut &'a str) -> Option<&'a str> {
+    let separator = |c| {
+        json5::char::is_json5_whitespace(c) || matches!(c, '[' | ']' | '{' | '}' | ',' | ':')
+    };
+    loop {
+        *input = input.trim_start_matches(separator);
+        if let Some(comment) = input.strip_prefix("//") {
+            let end = comment
+                .find(json5::char::is_json5_line_terminator)
+                .unwrap_or(comment.len());
+            *input = &comment[end..];
+        } else if let Some(comment) = input.strip_prefix("/*") {
+            *input = comment.split_once("*/")?.1;
+        } else {
+            break;
+        }
+    }
+    let mut chars = input.char_indices();
+    let (_, first) = chars.next()?;
+    let end = if matches!(first, '\'' | '"') {
+        loop {
+            let (at, c) = chars.next()?;
+            if c == first {
+                break at + 1;
+            }
+            if c == '\\' {
+                chars.next()?;
+            }
+        }
+    } else {
+        input.find(|c| separator(c) || c == '/').unwrap_or(input.len())
+    };
+    let (token, tail) = input.split_at(end);
+    *input = tail;
+    Some(token)
 }
 
 /// Parse JSON text, accepting JSON5 (unquoted keys, single quotes, trailing
@@ -9287,6 +9358,57 @@ mod tests {
             "-",
         ] {
             assert!(!is_shortest_fixed_decimal(token.as_bytes()), "{token}");
+        }
+    }
+
+    #[test]
+    fn relaxed_decimal_integers_retain_spelling_without_changing_other_json5_values() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let doc = concat!(
+            "{'Infinity':1, /* 18446744073709551616, } */ ",
+            r#"words:'escaped \' quote, // -0, [0]', control:'\v', "#,
+            "values:[{}, [], // 111111111111111111111 \u{2028}",
+            "+18446744073709551616,-9223372036854775809, -0, 0x1a, .5, Infinity, NaN,],",
+            "dup:18446744073709551617, dup:-0,}",
+        );
+        for path in [
+            "$.Infinity", "$.words", "$.control", "$.values[2]", "$.values[3]", "$.values[4]",
+            "$.values[5]", "$.values[6]", "$.values[7]", "$.values[8]", "$.dup",
+        ] {
+            let value = json_extract(doc, &[path]).unwrap();
+            let expected = stock_json_scalar(
+                &stock,
+                "SELECT json_extract(?1,?2)",
+                &[text(doc), text(path)],
+            );
+            assert_eq!(
+                std::mem::discriminant(&value),
+                std::mem::discriminant(&expected),
+                "{path}"
+            );
+            assert_eq!(value, expected, "{path}");
+        }
+        let value = parse_json5_text(doc).unwrap();
+        let Value::Object(object) = value else {
+            panic!("expected object");
+        };
+        let dup: Vec<_> = object
+            .iter()
+            .filter(|(key, _)| key == "dup")
+            .map(|(_, value)| encode_json_text("duplicate", value).unwrap())
+            .collect();
+        assert_eq!(dup, ["18446744073709551617", "-0"]);
+        for raw in ["+18446744073709551616", "-9223372036854775809", "-0"] {
+            let input = format!("{{n:{raw},}}");
+            let args = [text(&input)];
+            let expected = stock_json_scalar(&stock, "SELECT json_set(?1,'$.m',1)", &args);
+            let edited = json_set(&input, &[("$.m", SqliteValue::Integer(1))]).unwrap();
+            assert_eq!(text(&edited), expected, "{raw}");
+            let output = SqliteValue::Blob(jsonb(&input).unwrap().into());
+            assert_eq!(
+                stock_json_scalar(&stock, "SELECT json(?1)", &[output]),
+                stock_json_scalar(&stock, "SELECT json(?1)", &args)
+            );
         }
     }
 
