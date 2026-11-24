@@ -6949,6 +6949,9 @@ impl Drop for WalIndexRebuildDrain {
 #[derive(Debug, Default)]
 struct PagerMaintenanceGate {
     state: Mutex<PagerMaintenanceState>,
+    /// Advances after a durable whole-file VACUUM, under exclusive maintenance.
+    /// The shared WAL index can stay empty across this image replacement.
+    image_generation: AtomicU64,
     /// Exact identity-bound recovery owner (`0` means clean). Separately opened
     /// pagers share this atomic, and only the holder of the matching monotonic
     /// owner id may transition or clear the recovery barrier.
@@ -8825,6 +8828,8 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// has loaded the freelist through a pinned snapshot. Clear only after
     /// the entire committed-state refresh succeeds.
     committed_metadata_needs_refresh: bool,
+    /// Identity-wide image generation this handle last adopted.
+    image_generation: u64,
     /// GH#410: the durable page-1 freelist metadata names more entries than
     /// this pager could legally load — e.g. an archive whose trunk chain
     /// records the reserved lock-byte page, a page beyond the file, or a
@@ -8934,7 +8939,12 @@ impl<F: VfsFile> Drop for PagerInner<F> {
                 );
             }
             if pool_is_current {
-                disown_pages(ledger, self.abandoned_eof_reservations.drain(..));
+                let mut pages = ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Serialize this check and insertion with VACUUM's ledger clear.
+                // A late-closing peer must never return pages from the old image.
+                if !self.image_replaced_by_peer() {
+                    pages.extend(self.abandoned_eof_reservations.drain(..).map(PageNumber::get));
+                }
             } else {
                 self.abandoned_eof_reservations.clear();
             }
@@ -9187,6 +9197,15 @@ impl Drop for CommitAbandonmentCandidates<'_> {
 struct CommittedStateRefresh {
     wal_snapshot_initialized: bool,
     page_cache_invalidated: bool,
+}
+
+/// Publication targets for the handle adopting a replacement image. Its
+/// shrunken extent and cache invalidation must become visible together,
+/// before the local allocator records that it has completed the refresh.
+#[derive(Clone, Copy)]
+struct RefreshPublication<'a> {
+    pages: &'a PublishedPagerState,
+    snapshot: &'a RwLock<Arc<PagerCommittedSnapshot>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10379,6 +10398,10 @@ impl Drop for PendingGroupCommitLogicalCleanupClaim {
 }
 
 impl<F: VfsFile> PagerInner<F> {
+    fn image_replaced_by_peer(&self) -> bool {
+        self.image_generation != self.maintenance_gate.image_generation.load(AtomicOrdering::Acquire)
+    }
+
     fn adopt_orphaned_rollback_journal_recovery(&mut self) -> Result<()> {
         // Read-only pagers intentionally cannot perform durable journal replay.
         // Leave the identity-owned orphan receipt in the gate so a surviving
@@ -10763,7 +10786,8 @@ impl<F: VfsFile> PagerInner<F> {
             // top of the full-generation WAL commit count.
             && physical_wal_visible_commit_count != 0
             && wal_generation.is_some()
-            && self.committed_wal_generation == wal_generation;
+            && self.committed_wal_generation == wal_generation
+            && !self.image_replaced_by_peer();
         let (base_commit_seq, raw_base_change_counter) = if cached_wal_base_is_current {
             (previous_base_commit_seq, self.committed_db_change_counter)
         } else {
@@ -10905,12 +10929,14 @@ impl<F: VfsFile> PagerInner<F> {
         cx: &Cx,
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
+        publication: RefreshPublication<'_>,
         native_reader_prepared: bool,
     ) -> Result<CommittedStateRefresh> {
         self.refresh_committed_state_with_mode(
             cx,
             cache,
             wal_backend,
+            publication,
             CommittedStateRefreshMode::Normal,
             native_reader_prepared,
         )
@@ -10922,12 +10948,14 @@ impl<F: VfsFile> PagerInner<F> {
         cx: &Cx,
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
+        publication: RefreshPublication<'_>,
         native_reader_prepared: bool,
     ) -> Result<CommittedStateRefresh> {
         self.refresh_committed_state_with_mode(
             cx,
             cache,
             wal_backend,
+            publication,
             CommittedStateRefreshMode::PostRecovery,
             native_reader_prepared,
         )
@@ -10939,9 +10967,11 @@ impl<F: VfsFile> PagerInner<F> {
         cx: &Cx,
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
+        publication: RefreshPublication<'_>,
         mode: CommittedStateRefreshMode,
         native_reader_prepared: bool,
     ) -> Result<CommittedStateRefresh> {
+        let image_replaced = self.image_replaced_by_peer();
         let probe = self.probe_visible_commit_seq(cx, wal_backend, native_reader_prepared).await?;
         // GH#399: a WAL generation change — a peer process's RESTART/TRUNCATE
         // checkpoint, or a stock SQLite close that deleted the WAL — invalidates
@@ -10976,6 +11006,7 @@ impl<F: VfsFile> PagerInner<F> {
             && probe.file_size == self.committed_db_file_size_bytes
             && !probe.durable_identity_changed
             && !self.committed_metadata_needs_refresh
+            && !image_replaced
         {
             // Nothing was committed since this pager's view, so its extent is
             // the new generation's.
@@ -11081,6 +11112,16 @@ impl<F: VfsFile> PagerInner<F> {
         // an open that bootstrapped from a stale main-file stub learns it here.
         self.reserved_per_page = reserved_per_page;
         self.pointer_map = pointer_map;
+        if image_replaced {
+            // Page numbers in the old freelist and lease pool referred to a
+            // different B-tree layout. Do not re-park them when adopting the
+            // committed freelist below, even if the WAL generation is unchanged.
+            self.freelist.clear();
+            self.abandoned_eof_reservations.clear();
+            self.freelist_repair_pending = false;
+            self.freelist_repair_dropped = 0;
+            self.durable_db_size_floor = None;
+        }
         if freelist_entries_dropped > 0 && !self.access_mode.is_readonly() {
             self.freelist_repair_pending = true;
             self.freelist_repair_dropped = freelist_entries_dropped;
@@ -11091,7 +11132,8 @@ impl<F: VfsFile> PagerInner<F> {
         // databases can legitimately shrink via FULL commit or
         // PRAGMA incremental_vacuum, so accept authoritative header shrinks when
         // pointer maps are active.
-        self.db_size = if mode == CommittedStateRefreshMode::PostRecovery
+        self.db_size = if image_replaced
+            || mode == CommittedStateRefreshMode::PostRecovery
             || self.journal_mode != JournalMode::Wal
             || probe.native_db_size.is_some()
             || self.pointer_map.uses_pointer_map()
@@ -11101,7 +11143,7 @@ impl<F: VfsFile> PagerInner<F> {
             self.db_size.max(db_size)
         };
         let effective_db_size = self.db_size;
-        if wal_generation_changed {
+        if wal_generation_changed && !image_replaced {
             preserve_above_extent_at_generation_boundary(self);
         }
         self.next_page = if effective_db_size >= 2 {
@@ -11159,7 +11201,7 @@ impl<F: VfsFile> PagerInner<F> {
         // connection. In WAL mode this uses the latest visible page-1
         // durable header baseline plus the visible WAL commit horizon.
         let page_cache_invalidated =
-            probe.visible_commit_seq != self.commit_seq || probe.durable_identity_changed;
+            image_replaced || probe.visible_commit_seq != self.commit_seq || probe.durable_identity_changed;
         if page_cache_invalidated {
             cache.clear();
         }
@@ -11199,6 +11241,18 @@ impl<F: VfsFile> PagerInner<F> {
             probe.wal_visible_commit_count
         };
 
+        if image_replaced {
+            publication.pages.publish_replaced_image(cx, PublishedPagerUpdate {
+                visible_commit_seq: self.commit_seq,
+                db_size: self.db_size,
+                journal_mode: self.journal_mode,
+                freelist_count: self.freelist.len(),
+                checkpoint_active: self.checkpoint_active,
+            });
+            *publication.snapshot.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Arc::new(PagerCommittedSnapshot::from_inner(self));
+            self.image_generation = self.maintenance_gate.image_generation.load(AtomicOrdering::Acquire);
+        }
         Ok(CommittedStateRefresh {
             wal_snapshot_initialized: probe.wal_snapshot_initialized,
             page_cache_invalidated,
@@ -11334,11 +11388,8 @@ fn merge_descending_unique_freelists(left: &[PageNumber], right: &[PageNumber]) 
     merged
 }
 
-/// bd-ioq6x Face-2: append pages onto the shared per-file disowned-page ledger.
-/// Called from `PagerInner::drop` when a connection dies with a non-empty
-/// abandonment pool — the parked EOF holes are handed to a surviving connection
-/// instead of being silently discarded. Sync-mutex only, so it is safe to call
-/// from a `Drop` impl.
+/// Seed a disowned-page ledger for a reclamation test.
+#[cfg(test)]
 fn disown_pages(ledger: &Mutex<HashSet<u32>>, pages: impl IntoIterator<Item = PageNumber>) {
     let mut guard = ledger
         .lock()
@@ -14899,14 +14950,12 @@ impl PublishedPagerState {
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
         self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
         self.pages.clear();
-        self.finalize_publish(cx, update, 0, start, true);
-        // The exclusive maintenance fence makes this the one publication path
-        // allowed to authoritatively shrink the visible database image.
+        // Install the authoritative extent before finalize_publish releases
+        // the sequence guard. Its normal monotonic stores then preserve it.
         self.visible_commit_seq
             .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
-        self.page_plane_visible_commit_seq
-            .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
         self.db_size.store(update.db_size, AtomicOrdering::Release);
+        self.finalize_publish(cx, update, 0, start, true);
     }
 
     /// Publish commit: retain pages up to db_size, then bulk insert from write_set.
@@ -18636,6 +18685,12 @@ where
                 candidate.header.largest_root_page,
                 candidate.header.incremental_vacuum,
             );
+            // The journal is durably invalidated and exclusive maintenance
+            // still excludes every other transaction on this file identity.
+            inner.image_generation = inner.maintenance_gate.image_generation
+                .fetch_add(1, AtomicOrdering::AcqRel).wrapping_add(1);
+            inner.wal_refresh_signature = None;
+            inner.durable_db_size_floor = None;
             inner.db_size = new_page_count;
             inner.next_page = if new_page_count >= 2 {
                 new_page_count.saturating_add(1)
@@ -19281,6 +19336,10 @@ where
         Ok(())
     }
 
+    fn refresh_publication(&self) -> RefreshPublication<'_> {
+        RefreshPublication { pages: &self.published, snapshot: &self.committed_snapshot }
+    }
+
     /// Capture the current published pager metadata snapshot.
     #[must_use]
     pub fn published_snapshot(&self) -> PagerPublishedSnapshot {
@@ -19360,6 +19419,7 @@ where
                 && !inner.rollback_journal_recovery_state.is_pending()
                 && inner.commit_seq == previous.commit_seq
                 && current == Some(previous)
+                && !inner.image_replaced_by_peer()
         })
     }
 
@@ -19387,7 +19447,7 @@ where
         }
         inner.wal_refresh_signature = None;
         let refresh = inner
-            .refresh_committed_state(cx, &self.cache, &self.wal_backend, true)
+            .refresh_committed_state(cx, &self.cache, &self.wal_backend, self.refresh_publication(), true)
             .await?;
         inner.wal_refresh_signature = bound_signature.map(|signature| WalRefreshSignature {
             commit_seq: inner.commit_seq,
@@ -19426,6 +19486,7 @@ where
         let mut observed_header = None;
         if !returning_open
             && let Some(previous) = inner.wal_refresh_signature
+            && !inner.image_replaced_by_peer()
             && inner.active_transactions == 0
             && !inner.checkpoint_active
             && !inner.rollback_journal_recovery_state.is_pending()
@@ -19885,6 +19946,7 @@ where
         journal_path: &Path,
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
+        publication: RefreshPublication<'_>,
         group_commit_queue: &Arc<GroupCommitQueue>,
         begin_external_lock: Option<&mut BeginExternalLockState<V::File>>,
     ) -> Result<bool> {
@@ -20014,7 +20076,7 @@ where
                 )
             {
                 inner
-                    .refresh_committed_state_after_recovery(cx, cache, wal_backend, false)
+                    .refresh_committed_state_after_recovery(cx, cache, wal_backend, publication, false)
                     .await?;
             }
 
@@ -20609,7 +20671,7 @@ where
                     Ok(()) => {
                         self.prepare_runtime_native_reader(cx, maintenance_lease, inner, external_lock, false, None).await?;
                         inner
-                            .refresh_committed_state(cx, &self.cache, &self.wal_backend, true)
+                            .refresh_committed_state(cx, &self.cache, &self.wal_backend, self.refresh_publication(), true)
                             .await
                     }
                     Err(error) => Err(error),
@@ -20651,6 +20713,7 @@ where
                 &recovery_journal_path,
                 &self.cache,
                 &self.wal_backend,
+                self.refresh_publication(),
                 &self.group_commit_queue,
                 Some(&mut *external_lock),
             )
@@ -20697,7 +20760,7 @@ where
                 cx, maintenance_lease, inner, external_lock, reserve_writer, None,
             ).await {
                 Ok(()) => inner
-                    .refresh_committed_state_after_recovery(cx, &self.cache, &self.wal_backend, true)
+                    .refresh_committed_state_after_recovery(cx, &self.cache, &self.wal_backend, self.refresh_publication(), true)
                     .await,
                 Err(error) => Err(error),
             };
@@ -21745,6 +21808,7 @@ where
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
                 rollback_journal_recovery_owner: None,
                 rollback_journal_recovery_namespace: None,
+                image_generation: maintenance_gate.image_generation.load(AtomicOrdering::Acquire),
                 maintenance_gate,
                 rollback_recovery_pending,
                 commit_seq: initial_commit_seq,
@@ -22254,6 +22318,7 @@ where
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
                 rollback_journal_recovery_owner: None,
                 rollback_journal_recovery_namespace: None,
+                image_generation: maintenance_gate.image_generation.load(AtomicOrdering::Acquire),
                 maintenance_gate,
                 rollback_recovery_pending,
                 commit_seq: initial_commit_seq,
@@ -24289,6 +24354,7 @@ where
             &self.journal_path,
             &self.cache,
             &self.wal_backend,
+            RefreshPublication { pages: &self.published, snapshot: &self.committed_snapshot },
             &self.group_commit_queue,
             None,
         )
@@ -24320,7 +24386,7 @@ where
         .await?;
         self.cache.clear();
         inner
-            .refresh_committed_state_after_recovery(&cleanup_cx, &self.cache, &self.wal_backend, false)
+            .refresh_committed_state_after_recovery(&cleanup_cx, &self.cache, &self.wal_backend, RefreshPublication { pages: &self.published, snapshot: &self.committed_snapshot }, false)
             .await?;
         self.published.publish_clear_if(
             &cleanup_cx,
@@ -34485,7 +34551,7 @@ where
             // would leave a commit-sized race window.
             let commit_seq_before_refresh = inner.commit_seq;
             let refresh = match inner
-                .refresh_committed_state(cx, &self.cache, &self.wal_backend, false)
+                .refresh_committed_state(cx, &self.cache, &self.wal_backend, self.refresh_publication(), false)
                 .await
             {
                 Ok(refresh) => refresh,
@@ -69811,7 +69877,7 @@ mod tests {
             let previous_wal_visible_commit_count = inner.committed_wal_visible_commit_count;
 
             let err = inner
-                .refresh_committed_state(&cx, &pager.cache, &pager.wal_backend, false)
+                .refresh_committed_state(&cx, &pager.cache, &pager.wal_backend, pager.refresh_publication(), false)
                 .await
                 .expect_err("forced page-1 materialization failure should surface");
             assert!(
