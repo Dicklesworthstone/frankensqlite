@@ -264,3 +264,144 @@ fn before_insert_raise_ignore_returning() {
         assert_agree(&f, &r, "SELECT a,b FROM t ORDER BY a").await;
     });
 }
+
+// ---------------------------------------------------------------------------
+// bd-c1ktx: INSTEAD OF DELETE / UPDATE ... RETURNING on views and INSERT ...
+// SELECT from views must never synthesize a hidden `rowid` read from the view
+// (while an explicit `SELECT rowid FROM view` stays rejected like stock).
+// ---------------------------------------------------------------------------
+
+async fn run_bd_c1ktx_step(
+    f: &Connection,
+    r: &rusqlite::Connection,
+    sql: &str,
+    prepared: bool,
+    mode: &str,
+) {
+    let is_query = sql.starts_with("SELECT")
+        || (!sql.starts_with("CREATE") && sql.contains(" RETURNING "));
+    let is_preparable = is_query
+        || ["INSERT", "UPDATE", "DELETE"]
+            .iter()
+            .any(|verb| sql.starts_with(verb));
+
+    let f_res: Result<Vec<Vec<String>>, String> = match (prepared && is_preparable, is_query) {
+        (true, _) => match f.prepare(sql).await {
+            Ok(stmt) if is_query => stmt.query().await,
+            Ok(stmt) => stmt.execute().await.map(|_| Vec::new()),
+            Err(err) => Err(err),
+        },
+        (false, true) => f.query(sql).await,
+        (false, false) => f.execute(sql).await.map(|_| Vec::new()),
+    }
+    .map(|rows| {
+        let mut rendered: Vec<Vec<String>> = rows
+            .iter()
+            .map(|row| row.values().iter().map(tag_f).collect())
+            .collect();
+        if sql.contains(" RETURNING ") {
+            rendered.sort();
+        }
+        rendered
+    })
+    .map_err(|err| err.to_string());
+
+    let r_res: Result<Vec<Vec<String>>, String> = (|| -> rusqlite::Result<Vec<Vec<String>>> {
+        let mut stmt = r.prepare(sql)?;
+        let cols = stmt.column_count();
+        let mut rows = Vec::new();
+        let mut cursor = stmt.query([])?;
+        while let Some(row) = cursor.next()? {
+            rows.push(
+                (0..cols)
+                    .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                    .collect(),
+            );
+        }
+        if sql.contains(" RETURNING ") {
+            rows.sort();
+        }
+        Ok(rows)
+    })()
+    .map_err(|err| match err {
+        rusqlite::Error::SqliteFailure(_, Some(msg))
+        | rusqlite::Error::SqlInputError { msg, .. } => msg,
+        other => other.to_string(),
+    });
+
+    assert_eq!(
+        f_res, r_res,
+        "bd-c1ktx divergence ({mode}) on `{sql}`:\n  frank={f_res:?}\n  stock={r_res:?}"
+    );
+}
+
+#[test]
+fn bd_c1ktx_instead_of_view_delete_and_update_returning_and_insert_from_view_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let script: &[&str] = &[
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT)",
+            "CREATE TABLE audit_log(entry TEXT)",
+            "INSERT INTO items VALUES (1,'alpha'),(2,'beta'),(3,'gamma'),(4,'delta')",
+            "CREATE VIEW v_items AS SELECT id, label FROM items",
+            "CREATE TRIGGER v_items_del INSTEAD OF DELETE ON v_items BEGIN \
+             SELECT RAISE(IGNORE) WHERE OLD.id = 2; \
+             DELETE FROM items WHERE id = OLD.id; \
+             INSERT INTO audit_log(entry) VALUES ('del:' || OLD.id || ':' || OLD.label); END",
+            "CREATE TRIGGER v_items_upd INSTEAD OF UPDATE ON v_items BEGIN \
+             SELECT RAISE(IGNORE) WHERE NEW.label = 'skip'; \
+             UPDATE items SET label = NEW.label WHERE id = OLD.id; \
+             INSERT INTO audit_log SELECT 'upd:' || id || ':' || label FROM v_items WHERE id = OLD.id; END",
+            // Negative control: a view exposes no rowid (42435ff53 must remain intact).
+            "SELECT rowid FROM v_items",
+            // INSTEAD OF DELETE ... RETURNING (single row, RAISE(IGNORE) skip, and RETURNING *).
+            "DELETE FROM v_items WHERE id = 1 RETURNING id, label",
+            "DELETE FROM v_items WHERE id IN (2, 3) RETURNING *",
+            "SELECT id, label FROM items ORDER BY id",
+            "SELECT entry FROM audit_log ORDER BY entry",
+            // INSTEAD OF UPDATE ... RETURNING (sibling path, with RAISE(IGNORE) and
+            // an INSERT ... SELECT FROM view inside the INSTEAD OF trigger body).
+            "UPDATE v_items SET label = 'skip' WHERE id = 2 RETURNING id, label",
+            "UPDATE v_items SET label = upper(label) WHERE id IN (2, 4) RETURNING *, id + 10",
+            "SELECT id, label FROM items ORDER BY id",
+            "SELECT entry FROM audit_log ORDER BY entry",
+            // Direct INSERT ... SELECT from a SELECT * view and inside an AFTER INSERT trigger.
+            "CREATE TABLE t_src(val INTEGER)",
+            "CREATE TABLE src(seed INTEGER)",
+            "CREATE TABLE sink(val INTEGER)",
+            "CREATE VIEW v_star AS SELECT * FROM t_src",
+            "CREATE TRIGGER src_ai AFTER INSERT ON src BEGIN \
+             INSERT INTO sink SELECT val FROM v_star; END",
+            "INSERT INTO t_src(val) VALUES (43)",
+            "INSERT INTO sink SELECT val FROM v_star",
+            "INSERT INTO src(seed) VALUES (1)",
+            "SELECT val FROM sink ORDER BY val",
+        ];
+
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mode = format!(
+                    "{}/{}",
+                    if file_backed { "file" } else { "memory" },
+                    if prepared { "prepared" } else { "direct" }
+                );
+                let (f, r) = if file_backed {
+                    let fpath = dir.path().join("frank.db");
+                    let rpath = dir.path().join("stock.db");
+                    (
+                        Connection::open(fpath.to_str().unwrap()).await.unwrap(),
+                        rusqlite::Connection::open(&rpath).unwrap(),
+                    )
+                } else {
+                    (
+                        Connection::open(":memory:").await.unwrap(),
+                        rusqlite::Connection::open_in_memory().unwrap(),
+                    )
+                };
+                for sql in script {
+                    run_bd_c1ktx_step(&f, &r, sql, prepared, &mode).await;
+                }
+            }
+        }
+    });
+}

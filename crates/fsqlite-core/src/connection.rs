@@ -65982,9 +65982,9 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<(Option<i64>, Vec<SqliteValue>, Vec<SqliteValue>)>> {
         // Project the rowid alongside the row (rowid tables only; WITHOUT ROWID
-        // tables have no rowid) so the aliases resolve without an INTEGER PRIMARY
-        // KEY column, mirroring `collect_delete_trigger_rows`.
-        let is_rowid_table = {
+        // tables and views have no rowid) so the aliases resolve without an
+        // INTEGER PRIMARY KEY column, mirroring `collect_delete_trigger_rows`.
+        let is_rowid_table = !self.table_binding_resolves_to_view(&update.table.name) && {
             let schema = self.schema.borrow();
             schema
                 .iter()
@@ -66981,8 +66981,9 @@ impl Connection {
     ) -> Result<Vec<(Option<i64>, Vec<SqliteValue>)>> {
         // Project the rowid alongside the row so OLD.rowid/oid/_rowid_ resolve in
         // DELETE trigger bodies even on tables without an INTEGER PRIMARY KEY
-        // (GH #216). WITHOUT ROWID tables have no rowid, so fall back to `*`.
-        let is_rowid_table = {
+        // (GH #216). WITHOUT ROWID tables and views have no rowid, so fall back
+        // to `*`.
+        let is_rowid_table = !self.table_binding_resolves_to_view(&delete.table.name) && {
             let schema = self.schema.borrow();
             schema
                 .iter()
@@ -84539,12 +84540,29 @@ impl Connection {
         };
         let view_name = delete.table.name.name.clone();
         let column_names = self.view_trigger_column_names(&view_name)?;
-        let old_rows = self.collect_delete_trigger_rows(delete, params).await?;
+        // Views expose no hidden rowid (bd-c1ktx); read only the view's columns,
+        // mirroring `execute_instead_of_view_update`.
+        let matched_rows = self
+            .select_matching_rows(
+                &delete.table,
+                delete.where_clause.as_ref(),
+                &[],
+                None,
+                params,
+            )
+            .await?;
         let event = fsqlite_ast::TriggerEvent::Delete;
         let mut returning_rows = Vec::new();
-        for (_old_rowid, old_values) in &old_rows {
+        for row in &matched_rows {
+            let old_values = row.values();
             let skipped = self
-                .fire_instead_of_triggers(&delete.table.name, &column_names, &event, Some(old_values), None)
+                .fire_instead_of_triggers(
+                    &delete.table.name,
+                    &column_names,
+                    &event,
+                    Some(old_values),
+                    None,
+                )
                 .await?;
             // RETURNING references the deleted (OLD) row; a RAISE(IGNORE) row is
             // skipped and emits no RETURNING row (bd-1mcjr M3).
@@ -106069,7 +106087,93 @@ impl Connection {
                     && self.pending_memdb_direct_upserts.borrow().is_empty()))
     }
 
+    /// Whether `name` resolves to a view rather than a table (honoring SQLite's
+    /// schema resolution order: TEMP table > TEMP view > MAIN table > MAIN view
+    /// > attached schemas). Views expose no hidden `rowid`/`_rowid_`/`oid`.
+    fn table_binding_resolves_to_view(&self, name: &QualifiedName) -> bool {
+        match name.schema.as_deref() {
+            None => {
+                if self.table_exists_for_scope(&name.name, PragmaSchemaScope::Temp) {
+                    return false;
+                }
+                if self
+                    .view_index_for_scope(&name.name, PragmaSchemaScope::Temp)
+                    .is_some()
+                {
+                    return true;
+                }
+                if self.table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+                    || self.has_live_vtab_instance(&name.name)
+                {
+                    return false;
+                }
+                if self
+                    .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                    .is_some()
+                {
+                    return true;
+                }
+                let attached_order: Vec<String> = {
+                    let registry = self.attached_schemas.borrow();
+                    registry
+                        .all_schemas()
+                        .into_iter()
+                        .filter(|schema| !is_builtin_schema(schema))
+                        .map(str::to_owned)
+                        .collect()
+                };
+                for schema_name in attached_order {
+                    if let Ok(Some(is_view)) =
+                        self.with_attached_connection(&schema_name, |attached| {
+                            if attached.table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+                                || attached.has_live_vtab_instance(&name.name)
+                            {
+                                Ok(Some(false))
+                            } else if attached
+                                .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                                .is_some()
+                            {
+                                Ok(Some(true))
+                            } else {
+                                Ok(None)
+                            }
+                        })
+                    {
+                        return is_view;
+                    }
+                }
+                false
+            }
+            Some(schema) if schema.eq_ignore_ascii_case("main") => {
+                !self.table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+                    && self
+                        .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                        .is_some()
+            }
+            Some(schema) if schema.eq_ignore_ascii_case("temp") => {
+                !self.table_exists_for_scope(&name.name, PragmaSchemaScope::Temp)
+                    && self
+                        .view_index_for_scope(&name.name, PragmaSchemaScope::Temp)
+                        .is_some()
+            }
+            Some(schema) if is_builtin_schema(schema) => false,
+            Some(schema) => self
+                .with_attached_connection(schema, |attached| {
+                    Ok(
+                        !attached.table_exists_for_scope(&name.name, PragmaSchemaScope::Main)
+                            && attached
+                                .view_index_for_scope(&name.name, PragmaSchemaScope::Main)
+                                .is_some(),
+                    )
+                })
+                .unwrap_or(false),
+        }
+    }
+
     fn join_table_supports_hidden_rowid_for_binding(&self, name: &QualifiedName) -> bool {
+        if self.table_binding_resolves_to_view(name) {
+            return false;
+        }
         match name.schema.as_deref() {
             Some(schema_name) if !is_builtin_schema(schema_name) => self
                 .with_attached_connection(schema_name, |attached| {
@@ -227002,6 +227106,36 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn test_join_hidden_rowid_projection_skips_views_and_honors_temp_table_shadow() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE base_t (a INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIEW v_main AS SELECT a FROM base_t;")
+                .await
+                .unwrap();
+            conn.execute("CREATE TEMP VIEW v_temp AS SELECT a FROM base_t;")
+                .await
+                .unwrap();
+
+            assert!(conn.join_table_supports_hidden_rowid_for_binding(&QualifiedName::bare("base_t")));
+            assert!(!conn.join_table_supports_hidden_rowid_for_binding(&QualifiedName::bare("v_main")));
+            assert!(!conn.join_table_supports_hidden_rowid_for_binding(&QualifiedName::qualified("main", "v_main")));
+            assert!(!conn.join_table_supports_hidden_rowid_for_binding(&QualifiedName::bare("v_temp")));
+            assert!(!conn.join_table_supports_hidden_rowid_for_binding(&QualifiedName::qualified("temp", "v_temp")));
+
+            // A TEMP table with the same name shadows the MAIN view unqualified,
+            // while explicit `main.v_main` still resolves to the view.
+            conn.execute("CREATE TEMP TABLE v_main (a INTEGER);")
+                .await
+                .unwrap();
+            assert!(conn.join_table_supports_hidden_rowid_for_binding(&QualifiedName::bare("v_main")));
+            assert!(!conn.join_table_supports_hidden_rowid_for_binding(&QualifiedName::qualified("main", "v_main")));
+        });
     }
 
     #[test]
