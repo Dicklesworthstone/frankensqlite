@@ -2882,3 +2882,253 @@ fn gh399_tip_reader_slot_blocks_wal_reset_until_released() {
         assert_eq!(stale, 0, "the backfilled image is the v1 generation");
     });
 }
+
+/// bd-k8yl4: the newest committed image of every page in a stock-written WAL,
+/// with the WAL's page size. Frames count up to the last commit frame whose
+/// salts match the WAL header.
+fn k8yl4_committed_wal_pages(
+    wal: &std::path::Path,
+) -> (usize, std::collections::BTreeMap<u32, Vec<u8>>) {
+    let bytes = std::fs::read(wal).expect("read the WAL");
+    assert!(bytes.len() >= 32, "the WAL has a header");
+    let be = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+    let page_size = usize::try_from(be(8)).unwrap();
+    let (salt1, salt2) = (be(16), be(20));
+    let frame_bytes = 24 + page_size;
+    let mut pending = std::collections::BTreeMap::new();
+    let mut committed = std::collections::BTreeMap::new();
+    let mut at = 32;
+    while at + frame_bytes <= bytes.len() && be(at + 8) == salt1 && be(at + 12) == salt2 {
+        pending.insert(be(at), bytes[at + 24..at + frame_bytes].to_vec());
+        if be(at + 4) != 0 {
+            committed.append(&mut pending);
+        }
+        at += frame_bytes;
+    }
+    (page_size, committed)
+}
+
+fn k8yl4_wal_of(db: &std::path::Path) -> std::path::PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push("-wal");
+    std::path::PathBuf::from(name)
+}
+
+fn k8yl4_leaf_count(trunk_image: &[u8]) -> u32 {
+    u32::from_be_bytes(trunk_image[4..8].try_into().unwrap())
+}
+
+fn k8yl4_write_page(db: &std::path::Path, page_size: usize, pgno: u32, image: &[u8]) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(db)
+        .expect("open the image for an out-of-band page write");
+    let offset = (usize::try_from(pgno).unwrap() - 1) * page_size;
+    file.seek(SeekFrom::Start(u64::try_from(offset).unwrap()))
+        .unwrap();
+    file.write_all(image).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn k8yl4_stock_count_and_freelist(db: &std::path::Path) -> (i64, i64) {
+    let sqlite = rusqlite::Connection::open(db).expect("stock open");
+    let rows = sqlite
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .expect("stock count");
+    let free = sqlite
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .expect("stock freelist_count");
+    (rows, free)
+}
+
+const K8YL4_ROWS: i64 = 200;
+const K8YL4_KEPT: i64 = 20;
+
+/// bd-k8yl4: stock writes `src` in WAL mode with one table leaf per row,
+/// TRUNCATE-checkpoints it, then commits a DELETE that frees most leaves.
+/// The DELETE's page 1 and freelist trunk are committed in the WAL only, and
+/// the database file still holds the trunk page as the table leaf it was.
+/// Returns the open stock connection, the page size, the committed page 1,
+/// the first trunk and the freelist count it names, and the committed trunk.
+fn k8yl4_stock_delete_into_the_wal(
+    src: &std::path::Path,
+) -> (rusqlite::Connection, usize, Vec<u8>, u32, u32, Vec<u8>) {
+    let stock = rusqlite::Connection::open(src).expect("stock open");
+    stock
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, pad BLOB);",
+        )
+        .expect("stock schema");
+    stock
+        .execute_batch(&format!(
+            "BEGIN; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+             WHERE i < {K8YL4_ROWS}) INSERT INTO t SELECT i, zeroblob(3000) FROM n; COMMIT;"
+        ))
+        .expect("stock rows");
+    stock
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .expect("stock truncate checkpoint");
+    stock
+        .execute(&format!("DELETE FROM t WHERE id > {K8YL4_KEPT}"), [])
+        .expect("stock delete");
+    let (page_size, committed) = k8yl4_committed_wal_pages(&k8yl4_wal_of(src));
+    let page_one = committed
+        .get(&1)
+        .expect("the DELETE commits page 1 in the WAL")
+        .clone();
+    let trunk = u32::from_be_bytes(page_one[32..36].try_into().unwrap());
+    let free = u32::from_be_bytes(page_one[36..40].try_into().unwrap());
+    assert!(
+        trunk > 1 && free > 1,
+        "the DELETE must leave a freelist: trunk {trunk}, count {free}"
+    );
+    let committed_trunk = committed
+        .get(&trunk)
+        .expect("the trunk is committed in the WAL")
+        .clone();
+    assert!(
+        k8yl4_leaf_count(&committed_trunk) <= u32::try_from(page_size / 4 - 2).unwrap(),
+        "the committed trunk {trunk} is valid"
+    );
+    (stock, page_size, page_one, trunk, free, committed_trunk)
+}
+
+/// bd-k8yl4: an open in the middle of a PASSIVE checkpoint's backfill reads
+/// the freelist through the committed WAL snapshot, as stock does.
+///
+/// A checkpoint copies WAL pages into the database file in page order while
+/// readers keep their snapshots, so page 1 lands before any freelist trunk. A
+/// process that opens between those writes finds page 1 in the database file
+/// already naming the trunk the last commit made, while the file's copy of
+/// that trunk is still the table leaf it was before the commit freed it. The
+/// committed snapshot, which has both pages in the WAL, is consistent, and
+/// stock opens it. The open used to walk the trunk chain from the database
+/// file and refused the healthy database with `DatabaseCorrupt`
+/// (`freelist trunk T leaf_count ... exceeds max ...`); the cross-process churn battery
+/// hit that once under a peer's passive checkpoint (fixed by cee9f5c71).
+///
+/// The torn image is made deterministic: the files are copied after stock's
+/// DELETE, and only page 1 of the copy's database file is advanced to its
+/// committed WAL image.
+#[test]
+fn k8yl4_open_during_passive_backfill_reads_the_freelist_through_the_wal_snapshot() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("k8yl4-src.db");
+        let torn = dir.path().join("k8yl4-torn.db");
+        let oracle = dir.path().join("k8yl4-oracle.db");
+        let (stock, page_size, page_one, trunk, free, _) = k8yl4_stock_delete_into_the_wal(&src);
+        for copy in [&torn, &oracle] {
+            std::fs::copy(&src, copy).expect("copy the database file");
+            std::fs::copy(k8yl4_wal_of(&src), k8yl4_wal_of(copy)).expect("copy the WAL");
+            // The checkpoint's first backfill write, and nothing after it.
+            k8yl4_write_page(copy, page_size, 1, &page_one);
+        }
+        drop(stock);
+        let file = std::fs::read(&torn).expect("read the torn database file");
+        let trunk_offset = (usize::try_from(trunk).unwrap() - 1) * page_size;
+        let file_leaves = k8yl4_leaf_count(&file[trunk_offset..trunk_offset + page_size]);
+        assert!(
+            file_leaves > u32::try_from(page_size / 4 - 2).unwrap(),
+            "the shape is not populated: the database file's page {trunk} already reads as a \
+             trunk ({file_leaves} leaves)"
+        );
+
+        // Stock opens the torn image through the WAL snapshot.
+        assert_eq!(stock_integrity_report(&oracle), vec!["ok".to_owned()]);
+        assert_eq!(
+            k8yl4_stock_count_and_freelist(&oracle),
+            (K8YL4_KEPT, i64::from(free)),
+            "stock reads the committed snapshot"
+        );
+
+        let db = torn.to_string_lossy().into_owned();
+        let conn = Connection::open(&db).await.unwrap_or_else(|error| {
+            panic!(
+                "an open in the middle of a passive backfill must read page 1 and trunk {trunk} \
+                 from one committed snapshot, as stock does: {error:?}"
+            )
+        });
+        let rows = conn.query("SELECT COUNT(*) FROM t").await.expect("count");
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(K8YL4_KEPT));
+        let listed = conn.query("PRAGMA freelist_count").await.expect("freelist_count");
+        assert_eq!(listed[0].values()[0], SqliteValue::Integer(i64::from(free)));
+        conn.execute("BEGIN").await.expect("begin");
+        for id in (K8YL4_KEPT + 1)..=(K8YL4_KEPT + 10) {
+            conn.execute(&format!("INSERT INTO t VALUES ({id}, zeroblob(3000))"))
+                .await
+                .expect("insert after the torn open");
+        }
+        conn.execute("COMMIT").await.expect("commit after the torn open");
+        drop(conn);
+        assert_eq!(stock_integrity_report(&torn), vec!["ok".to_owned()]);
+        assert_eq!(k8yl4_stock_count_and_freelist(&torn).0, K8YL4_KEPT + 10);
+    });
+}
+
+/// bd-k8yl4 negative: deferring the open-time freelist walk to the first
+/// committed snapshot must not weaken it. A trunk whose leaf count is bad in
+/// the committed image itself (a checkpointed database file, no WAL frames,
+/// no checkpoint in flight) is still refused with `DatabaseCorrupt` naming
+/// that trunk, at the open or at the first statement, and stock's
+/// `integrity_check` reports the same image as damaged.
+#[test]
+fn k8yl4_a_bad_committed_freelist_trunk_is_still_refused() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("k8yl4-src.db");
+        let bad = dir.path().join("k8yl4-bad.db");
+        let bad_oracle = dir.path().join("k8yl4-bad-oracle.db");
+        let (stock, page_size, _, trunk, _, committed_trunk) =
+            k8yl4_stock_delete_into_the_wal(&src);
+        // Move the DELETE into the database file: it is now the committed image.
+        stock
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .expect("stock truncate checkpoint");
+        for copy in [&bad, &bad_oracle] {
+            std::fs::copy(&src, copy).expect("copy the checkpointed database");
+        }
+        drop(stock);
+        let file = std::fs::read(&bad).expect("read the checkpointed database file");
+        let trunk_offset = (usize::try_from(trunk).unwrap() - 1) * page_size;
+        assert_eq!(
+            &file[trunk_offset..trunk_offset + page_size],
+            committed_trunk.as_slice(),
+            "the checkpoint wrote the committed trunk {trunk} into the database file"
+        );
+        let mut image = committed_trunk;
+        image[4..8].copy_from_slice(&0x3E04_0000_u32.to_be_bytes());
+        for copy in [&bad, &bad_oracle] {
+            k8yl4_write_page(copy, page_size, trunk, &image);
+        }
+        assert_ne!(
+            stock_integrity_report(&bad_oracle),
+            vec!["ok".to_owned()],
+            "stock reports the bad trunk"
+        );
+        let db = bad.to_string_lossy().into_owned();
+        let refusal = match Connection::open(&db).await {
+            Err(error) => Some(error),
+            Ok(conn) => match conn.query("SELECT COUNT(*) FROM t").await {
+                Err(error) => Some(error),
+                Ok(_) => conn
+                    .execute(&format!(
+                        "INSERT INTO t VALUES ({}, zeroblob(3000))",
+                        K8YL4_ROWS + 1
+                    ))
+                    .await
+                    .err(),
+            },
+        };
+        assert!(
+            matches!(
+                &refusal,
+                Some(fsqlite_error::FrankenError::DatabaseCorrupt { detail })
+                    if detail.contains(&format!("freelist trunk {trunk}"))
+            ),
+            "a trunk that is bad in the committed image must still be refused: {refusal:?}"
+        );
+    });
+}
