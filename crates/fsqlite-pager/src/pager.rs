@@ -359,6 +359,9 @@ const GROUP_COMMIT_SPARSE_ARRIVAL_WAIT: Duration = Duration::from_micros(8);
 const GROUP_COMMIT_BALANCED_ARRIVAL_WAIT: Duration = LEGACY_GROUP_COMMIT_ARRIVAL_WAIT;
 const GROUP_COMMIT_BURST_ARRIVAL_WAIT: Duration = Duration::from_micros(40);
 const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "bounded_fair_commit_v1";
+/// bd-6a8a5: consecutive fruitless durable join waits after which the join
+/// budget stops shrinking (1/64 of the full budget).
+const DURABLE_JOIN_MAX_MISSES: u8 = 6;
 const SINGLE_WRITER_BATON_SPINS: u32 = 128;
 const SINGLE_WRITER_BATON_PARK: Duration = Duration::from_micros(50);
 const PHYSICAL_WRITER_LANE_RUN_ID: &str = "physical-writer-batching-lane";
@@ -431,6 +434,23 @@ struct ArrivalWaitObservation {
     /// writer takes a transaction lease on the file's maintenance gate before
     /// it can reach the group-commit queue (bd-w4pr1.7).
     peers_may_arrive: bool,
+    /// The pending frames reached the group's size limit (the size half of
+    /// `should_flush_now`, without its delay half).
+    frames_full: bool,
+    /// bd-6a8a5: set when the epoch's commits sync. Each epoch pays one WAL
+    /// sync, so a peer that joins this epoch instead of the next saves one.
+    durable_join: Option<DurableJoin>,
+}
+
+/// How a commit-sync epoch may wait for its file's peers (bd-6a8a5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableJoin {
+    /// Batches the epoch can hope to hold: the same-process transactions on
+    /// the file when the flushing commit entered the queue.
+    target: usize,
+    /// The longest it waits for them: half the queue's sync estimate, capped
+    /// by the queue's group delay.
+    budget: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +644,34 @@ fn decide_group_commit_arrival_wait(
             false,
         ),
         Some(observation) => {
+            // bd-6a8a5: an epoch whose commits sync pays one WAL sync for all
+            // its members, so a same-file peer that submits within the budget
+            // joins this sync instead of paying the next one. The budget is
+            // the wait's own bound and it comes before the group delay: a
+            // promoted epoch's members queued while the epoch before them
+            // synced, so its fill age is past the delay already, and without
+            // a wait the writers that sync released come back only after the
+            // promoted epoch has begun flushing. Only a full group (by
+            // frames) flushes at once.
+            if let Some(join) = observation.durable_join
+                && observation.peers_may_arrive
+                && !observation.frames_full
+                && join.target > observation.pending_batch_count
+                && !join.budget.is_zero()
+            {
+                return ArrivalWaitDecision::wait(
+                    control_epoch,
+                    join.budget,
+                    "durable_sync_join",
+                    observation.fill_age,
+                    queue_age_p95,
+                    fairness_budget,
+                    max_wait,
+                    CommitServiceMode::Throughput,
+                    false,
+                );
+            }
+
             if observation.should_flush_now {
                 let mode = if matches!(previous_mode, CommitServiceMode::Throughput)
                     || observation.pending_batch_count >= 3
@@ -899,13 +947,17 @@ impl<'a> PendingEpochWake<'a> {
     fn observe(
         mut self,
         guard: &mut std::sync::MutexGuard<'_, GroupCommitConsolidator>,
+        defer_promoted_flush: bool,
     ) -> Result<Option<WaitForEpochOutcome>> {
         let wait_result = self
             .wait_result
             .expect("pending epoch wake must remain armed until observation");
-        let outcome = self
-            .queue
-            .observe_epoch_outcome(guard, self.target_epoch, Some(wait_result));
+        let outcome = self.queue.observe_epoch_outcome(
+            guard,
+            self.target_epoch,
+            Some(wait_result),
+            defer_promoted_flush,
+        );
         // `observe_epoch_outcome` classifies every return path. Disarm before
         // propagating its stored Result so an epoch error is not double-counted
         // by this value's Drop implementation.
@@ -1389,6 +1441,14 @@ struct GroupCommitQueue {
     commit_service_control_epoch: AtomicU64,
     /// Last applied bounded-latency service mode for hysteresis.
     commit_service_mode: AtomicU8,
+    /// bd-6a8a5: moving average (1/8 weight per sample) of the WAL sync a
+    /// commit-sync epoch paid, in nanoseconds; 0 until the first one. It
+    /// bounds how long a durable epoch waits for peers to join its sync.
+    wal_sync_estimate_ns: AtomicU64,
+    /// bd-6a8a5: durable join waits in a row that ended with no new member;
+    /// each one halves the next budget (at most `DURABLE_JOIN_MAX_MISSES`
+    /// times), and a wait that gains a member restores it.
+    durable_join_misses: AtomicU8,
     /// WAL-owned lane-local staging state for prepared batches.
     parallel_wal_lanes: ParallelWalLaneStager<traits::PreparedWalFrameBatch>,
     /// External database-lock restorations whose owning flusher future was
@@ -1728,6 +1788,10 @@ enum WaitForEpochOutcome {
         batches: Vec<TransactionFrameBatch>,
         flush_epoch: u64,
     },
+    /// bd-6a8a5: this waiter claimed the promoted epoch's flusher vacancy and
+    /// left the epoch FILLING, so the members the last sync released can
+    /// still join it; the caller flushes it after its durable join wait.
+    ClaimedPromotedFlusher,
 }
 
 #[derive(Debug, Clone)]
@@ -1943,6 +2007,8 @@ impl GroupCommitQueue {
             epoch_waiters: KeyedWaitRegistry::new(),
             commit_service_control_epoch: AtomicU64::new(0),
             commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
+            wal_sync_estimate_ns: AtomicU64::new(0),
+            durable_join_misses: AtomicU8::new(0),
             parallel_wal_lanes: ParallelWalLaneStager::new(parallel_wal_control),
             pending_external_unlocks: Mutex::new(VecDeque::new()),
             external_unlock_claims_in_flight: AtomicUsize::new(0),
@@ -1993,6 +2059,46 @@ impl GroupCommitQueue {
     fn store_commit_service_mode(&self, mode: CommitServiceMode) {
         self.commit_service_mode
             .store(mode.as_u8(), AtomicOrdering::Relaxed);
+    }
+
+    /// Fold one commit-sync epoch's WAL sync time into the estimate.
+    fn record_wal_sync(&self, elapsed: Duration) {
+        let sample = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        // Flushes of one queue are serialized, so a load/store pair loses no
+        // sample that matters to an estimate.
+        let previous = self.wal_sync_estimate_ns.load(AtomicOrdering::Relaxed);
+        let next = if previous == 0 {
+            sample
+        } else {
+            previous - previous / 8 + sample / 8
+        };
+        self.wal_sync_estimate_ns
+            .store(next.max(1), AtomicOrdering::Relaxed);
+    }
+
+    /// How long a commit-sync epoch may wait for same-file peers to join it:
+    /// half its expected WAL sync, never more than `max_wait`, nothing
+    /// before the queue has timed a sync, and halved for every recent wait
+    /// no peer joined (bd-6a8a5). Peers that cannot arrive, such as writers
+    /// waiting for this epoch's own publication, so cost one full budget
+    /// and then a vanishing one.
+    fn durable_join_budget(&self, max_wait: Duration) -> Duration {
+        let estimate = self.wal_sync_estimate_ns.load(AtomicOrdering::Relaxed);
+        let misses = u32::from(self.durable_join_misses.load(AtomicOrdering::Relaxed));
+        std::cmp::min(Duration::from_nanos(estimate / 2), max_wait) / (1_u32 << misses)
+    }
+
+    /// Record whether a durable join wait gained a member.
+    fn record_durable_join(&self, gained_member: bool) {
+        if gained_member {
+            self.durable_join_misses.store(0, AtomicOrdering::Relaxed);
+        } else {
+            let misses = self.durable_join_misses.load(AtomicOrdering::Relaxed);
+            self.durable_join_misses.store(
+                misses.saturating_add(1).min(DURABLE_JOIN_MAX_MISSES),
+                AtomicOrdering::Relaxed,
+            );
+        }
     }
 
     fn record_prepared_batch(&self, prepared_batch: LaneStagedPreparedBatch) -> usize {
@@ -3467,6 +3573,10 @@ impl GroupCommitQueue {
         guard: &mut std::sync::MutexGuard<'_, GroupCommitConsolidator>,
         target_epoch: u64,
         pending_wake: Option<KeyedWaitResult>,
+        // bd-6a8a5: claim a promoted epoch's vacancy without beginning its
+        // flush (`ClaimedPromotedFlusher`), for a commit-sync waiter that
+        // waits for its file's peers before flushing.
+        defer_promoted_flush: bool,
     ) -> Result<Option<WaitForEpochOutcome>> {
         if let Some(error) = self.observe_failed_epoch(target_epoch) {
             return Err(error);
@@ -3512,6 +3622,9 @@ impl GroupCommitQueue {
                 current_epoch = guard.epoch(),
                 "waiter claimed promoted flusher vacancy"
             );
+            if defer_promoted_flush {
+                return Ok(Some(WaitForEpochOutcome::ClaimedPromotedFlusher));
+            }
             let batches = guard.begin_flush()?;
             return Ok(Some(WaitForEpochOutcome::TakeOverFlusher {
                 flush_epoch: guard.epoch(),
@@ -3535,7 +3648,7 @@ impl GroupCommitQueue {
         let mut pending_wake = None;
         loop {
             if let Some(outcome) =
-                self.observe_epoch_outcome(&mut guard, target_epoch, pending_wake.take())?
+                self.observe_epoch_outcome(&mut guard, target_epoch, pending_wake.take(), false)?
             {
                 return Ok(outcome);
             }
@@ -3563,7 +3676,7 @@ impl GroupCommitQueue {
         let mut pending_wake = None;
         loop {
             if let Some(outcome) =
-                self.observe_epoch_outcome(&mut guard, target_epoch, pending_wake.take())?
+                self.observe_epoch_outcome(&mut guard, target_epoch, pending_wake.take(), false)?
             {
                 return Ok(outcome);
             }
@@ -3571,7 +3684,7 @@ impl GroupCommitQueue {
             let slot = self.epoch_waiters.slot(target_epoch);
             let observed_generation = slot.generation();
             if let Some(outcome) =
-                self.observe_epoch_outcome(&mut guard, target_epoch, pending_wake.take())?
+                self.observe_epoch_outcome(&mut guard, target_epoch, pending_wake.take(), false)?
             {
                 return Ok(outcome);
             }
@@ -3611,6 +3724,7 @@ impl GroupCommitQueue {
         self: &Arc<Self>,
         cx: &Cx,
         target_epoch: u64,
+        defer_promoted_flush: bool,
     ) -> Result<WaitForEpochOutcome> {
         loop {
             // A pending exact-handle logical exit can itself depend on this
@@ -3668,7 +3782,7 @@ impl GroupCommitQueue {
                     .consolidator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                self.observe_epoch_outcome(&mut guard, target_epoch, None)?
+                self.observe_epoch_outcome(&mut guard, target_epoch, None, defer_promoted_flush)?
             };
             if let Some(outcome) = outcome {
                 return Ok(outcome);
@@ -3712,7 +3826,7 @@ impl GroupCommitQueue {
                     .consolidator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                pending_wake.observe(&mut guard)?
+                pending_wake.observe(&mut guard, defer_promoted_flush)?
             };
             if let Some(outcome) = outcome {
                 return Ok(outcome);
@@ -7300,6 +7414,21 @@ impl PagerMaintenanceLease {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_sole_owner(PagerMaintenanceLeaseKind::Transaction)
+    }
+
+    /// Same-process transactions admitted on this lease's file, this one
+    /// included; 0 for a lease that is not a transaction's (bd-6a8a5). Read
+    /// transactions count too, so a target built from it can only overstate
+    /// who may join a commit; the wait it bounds stops at its budget.
+    fn same_file_transactions(&self) -> usize {
+        if !matches!(self.kind, PagerMaintenanceLeaseKind::Transaction) {
+            return 0;
+        }
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_transactions
     }
 
     /// Temporarily turn this lease into the sole same-process maintenance
@@ -25960,6 +26089,19 @@ where
             .is_some_and(PagerMaintenanceLease::is_sole_transaction)
     }
 
+    /// How many batches a commit-sync epoch this transaction joins can hope
+    /// to hold: the same-process transactions on its file, this one included.
+    /// Zero when the commit does not sync (nothing to share) or the
+    /// transaction holds no lease (bd-6a8a5).
+    fn group_commit_durable_join_target(&self, sync_policy: WalCommitSyncPolicy) -> usize {
+        if !sync_policy.should_sync_on_commit() {
+            return 0;
+        }
+        self.maintenance_lease
+            .as_ref()
+            .map_or(0, PagerMaintenanceLease::same_file_transactions)
+    }
+
     fn publish_committed_state(&self, cx: &Cx, update: PublishedPagerUpdate) {
         // D1-CRITICAL Change 3: Use sharded publish_commit.
         self.published.publish_commit(cx, update, &self.write_set);
@@ -27013,6 +27155,7 @@ where
             &mut publication_authorization,
             None,
             true,
+            0,
         )
         .await
     }
@@ -27060,6 +27203,10 @@ where
         // (see `ArrivalWaitObservation::peers_may_arrive`): a flush it runs
         // then skips the arrival wait.
         peers_may_arrive: bool,
+        // bd-6a8a5: at commit sync, the same-process transactions on this
+        // file (this one included) an epoch it flushes may wait to gather;
+        // 0 when the commit does not sync.
+        durable_join_target: usize,
     ) -> Result<()> {
         let operation_cx = pager_busy_wait_cx(cx, inner_arc)?;
         let cx = &operation_cx;
@@ -27386,17 +27533,23 @@ where
                             .consolidator
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let max_wait = consolidator.max_group_delay();
                         let observation = if prefetched_flush.is_none() && needs_arrival_wait {
                             Some(ArrivalWaitObservation {
                                 pending_batch_count: consolidator.pending_batch_count(),
                                 should_flush_now: consolidator.should_flush_now(),
                                 fill_age: consolidator.fill_age(),
                                 peers_may_arrive,
+                                frames_full: consolidator.is_full(),
+                                durable_join: (durable_join_target > 1).then(|| DurableJoin {
+                                    target: durable_join_target,
+                                    budget: queue.durable_join_budget(max_wait),
+                                }),
                             })
                         } else {
                             None
                         };
-                        (observation, consolidator.max_group_delay())
+                        (observation, max_wait)
                     };
                     let fairness_budget =
                         commit_service_fairness_budget(queue.parallel_wal_control(), max_wait);
@@ -27418,6 +27571,14 @@ where
                 let arrival_wait_us = if !arrival_wait_decision.wait_budget.is_zero() {
                     let t_arrival_wait_start = Instant::now();
                     let deadline = t_arrival_wait_start + arrival_wait_decision.wait_budget;
+                    // A durable join ends when every peer it waits for is in
+                    // or the group is full, not at the group delay its
+                    // promoted epoch has already passed (bd-6a8a5).
+                    let durable_join_wait_target = (arrival_wait_decision.reason
+                        == "durable_sync_join")
+                        .then_some(durable_join_target);
+                    // (pending batches when the wait began, when it last looked)
+                    let mut durable_join_pending: Option<(usize, usize)> = None;
                     loop {
                         let should_flush = {
                             #[cfg(test)]
@@ -27428,13 +27589,25 @@ where
                                 .consolidator
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            consolidator.should_flush_now()
+                            match durable_join_wait_target {
+                                Some(target) => {
+                                    let pending = consolidator.pending_batch_count();
+                                    durable_join_pending
+                                        .get_or_insert((pending, pending))
+                                        .1 = pending;
+                                    consolidator.is_full() || pending >= target
+                                }
+                                None => consolidator.should_flush_now(),
+                            }
                         };
                         if should_flush || Instant::now() >= deadline {
                             break;
                         }
                         cx.checkpoint().map_err(|_| FrankenError::Abort)?;
                         asupersync::runtime::yield_now().await;
+                    }
+                    if let Some((at_start, last_seen)) = durable_join_pending {
+                        queue.record_durable_join(last_seen > at_start);
                     }
                     Instant::now()
                         .duration_since(t_arrival_wait_start)
@@ -28603,9 +28776,16 @@ where
                                 }
 
                                 if sync_policy.should_sync_on_commit() {
-                                    let t_sync_start = phase_timing.then(Instant::now);
+                                    // Timed always: the estimate bounds the
+                                    // durable-join wait (bd-6a8a5), and one
+                                    // clock read pair is noise against a sync.
+                                    let t_sync_start = Instant::now();
                                     wal.sync(&durability_cx)?;
-                                    wal_sync_us = elapsed_profile_us(t_sync_start);
+                                    let sync_elapsed = t_sync_start.elapsed();
+                                    queue.record_wal_sync(sync_elapsed);
+                                    if phase_timing {
+                                        wal_sync_us = sync_elapsed.as_micros() as u64;
+                                    }
                                     GLOBAL_CONSOLIDATION_METRICS
                                         .fsyncs_total
                                         .fetch_add(1, AtomicOrdering::Relaxed);
@@ -29105,7 +29285,11 @@ where
                 // flushing is queued for the promoted next epoch, so deriving
                 // `epoch_at_queue + 1` here can wake too early.
                 let t_waiter_start = phase_timing.then(Instant::now);
-                let wait_outcome = queue.wait_for_epoch_outcome_async(cx, target_epoch).await?;
+                // bd-6a8a5: a commit-sync waiter that takes over a promoted
+                // epoch leaves it FILLING and waits for its file's peers.
+                let wait_outcome = queue
+                    .wait_for_epoch_outcome_async(cx, target_epoch, durable_join_target > 1)
+                    .await?;
                 let waiter_epoch_wait_us = elapsed_profile_us(t_waiter_start);
 
                 match wait_outcome {
@@ -29187,6 +29371,16 @@ where
                             Some((batches, flush_epoch, flush_obligation)),
                         )
                         .await?;
+                    }
+                    WaitForEpochOutcome::ClaimedPromotedFlusher => {
+                        let _ = waiter_epoch_wait_us;
+                        // The epoch is still FILLING and this waiter owns its
+                        // flush, exactly as a first submitter owns a fresh
+                        // epoch's: the same obligation fails it if this
+                        // future is dropped before the flush begins.
+                        let filling_obligation =
+                            GroupCommitFillingObligation::new(queue, target_epoch);
+                        run_flusher_loop(true, true, Some(filling_obligation), None).await?;
                     }
                 }
             }
@@ -31328,6 +31522,7 @@ where
                     &mut wal_publication_authorization,
                     wal_attempt.as_ref(),
                     self.group_commit_peers_may_arrive(),
+                    self.group_commit_durable_join_target(wal_sync_policy),
                 )
                 .await;
                 record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
@@ -32278,6 +32473,7 @@ where
                         &mut wal_publication_authorization,
                         wal_attempt.as_ref(),
                         self.group_commit_peers_may_arrive(),
+                        self.group_commit_durable_join_target(wal_sync_policy),
                     )
                     .await;
                     inner = match inner_arc
@@ -50640,6 +50836,170 @@ mod tests {
         });
     }
 
+    /// bd-6a8a5 keeper: the flush-time stale-snapshot check validates EVERY
+    /// member of a group-commit epoch, not only the member that leads it. A
+    /// peer commits page 3 after every member pinned its snapshot; whichever
+    /// position the stale member holds in the epoch, the check names page 3,
+    /// and an epoch of fresh members names nothing. L1 makes multi-member
+    /// epochs the norm at synchronous=FULL, so a check that looked only at the
+    /// first member would let a stale later member overwrite the peer's commit
+    /// (planted mutant m4: `batches.iter().take(1)`).
+    #[test]
+    fn test_flush_stale_check_validates_every_member_of_the_epoch() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (mut backend, frames, _begin_calls, _batch_calls, _sync_calls) =
+                MockWalBackend::new_with_sync_tracking();
+            frames
+                .lock()
+                .unwrap()
+                .push((2, vec![0x11; PageSize::DEFAULT.as_usize()], 6));
+            let snapshot = mock_wal_publication_snapshot(&frames.lock().unwrap());
+            // A peer commits page 3 after every member below pinned `snapshot`.
+            frames
+                .lock()
+                .unwrap()
+                .push((3, vec![0x22; PageSize::DEFAULT.as_usize()], 6));
+            let member = |page: u32| {
+                attach_group_commit_conflict_metadata(
+                    TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: page,
+                        page_data: sample_page(u8::try_from(page).unwrap()),
+                        db_size_if_commit: 6,
+                    }]),
+                    &[PageNumber::new(page).unwrap()],
+                    Some(snapshot),
+                    &[],
+                    6,
+                )
+            };
+            let cases: [(&str, Vec<TransactionFrameBatch>, Vec<u32>); 5] = [
+                (
+                    "stale member after a fresh leader",
+                    vec![member(4), member(3)],
+                    vec![3],
+                ),
+                ("stale leader", vec![member(3), member(4)], vec![3]),
+                (
+                    "stale member in the middle",
+                    vec![member(4), member(3), member(5)],
+                    vec![3],
+                ),
+                (
+                    "stale member last of four",
+                    vec![member(4), member(5), member(6), member(3)],
+                    vec![3],
+                ),
+                ("every member fresh", vec![member(4), member(5)], Vec::new()),
+            ];
+            for (case, batches, expected) in cases {
+                let (conflicts, route_checks) =
+                    conflicting_pages_since_batch_snapshots(&cx, &mut backend, &batches)
+                        .await
+                        .unwrap();
+                assert_eq!(conflicts, expected, "{case}");
+                assert!(route_checks.is_empty(), "{case}");
+            }
+        });
+    }
+
+    /// bd-6a8a5 keeper, one level up from the one above: through the real
+    /// group-commit flush. A fresh member leads a promoted epoch; this
+    /// transaction joins it second, writing page 3 on a snapshot a peer
+    /// commit to page 3 has overtaken. The flush must refuse the epoch with
+    /// BusySnapshot on page 3 and append nothing. A flush that handed the
+    /// stale check only its leading member (planted mutant m4b) would append
+    /// both members and overwrite the peer's page.
+    #[test]
+    fn test_group_commit_flush_refuses_a_stale_member_behind_a_fresh_leader() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = ObservedLockVfs::new();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/group-commit-stale-second-member.db"))
+                .await
+                .unwrap();
+            let cx = Cx::new();
+            let (backend, frames, _begin_calls, batch_calls, sync_calls) =
+                MockWalBackend::new_with_sync_tracking();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            pager.set_vfs_busy_timeout_ms(&cx, 30_000).await;
+            // This transaction's snapshot, then a peer commit to page 3.
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let page = PageNumber::new(3).unwrap();
+            frames.lock().unwrap().push((
+                page.get(),
+                vec![0x71; PageSize::DEFAULT.as_usize()],
+                3,
+            ));
+            let frames_before = frames.lock().unwrap().len();
+
+            // A fresh member already leads the promoted epoch 2.
+            let queue = Arc::clone(&pager.group_commit_queue);
+            {
+                let mut consolidator = queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let first = consolidator
+                    .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 2,
+                        page_data: sample_page(0x52),
+                        db_size_if_commit: 3,
+                    }]))
+                    .unwrap();
+                assert_eq!(first.outcome, SubmitOutcome::Flusher);
+                let _ = consolidator.begin_flush().unwrap();
+                let leader = consolidator
+                    .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 2,
+                        page_data: sample_page(0x55),
+                        db_size_if_commit: 3,
+                    }]))
+                    .unwrap();
+                assert_eq!(leader.target_epoch, 2);
+                assert!(consolidator.complete_flush().unwrap());
+            }
+            queue.publish_completed_epoch(1, true);
+
+            let mut write_set = HashMap::new();
+            write_set.insert(
+                page,
+                StagedPage::from_bytes(&pager.pool, &vec![0x33; PageSize::DEFAULT.as_usize()])
+                    .unwrap(),
+            );
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(10),
+                SimpleTransaction::<ObservedLockVfs>::commit_wal_group_commit(
+                    &cx,
+                    &pager.wal_backend,
+                    &pager.inner,
+                    &write_set,
+                    &[page],
+                    &[page],
+                    &queue,
+                ),
+            )
+            .await
+            .expect("the stale member's commit must finish");
+            match result {
+                Err(FrankenError::BusySnapshot { conflicting_pages }) => {
+                    assert_eq!(conflicting_pages, "3");
+                }
+                other => panic!("the stale member must be refused on page 3, got {other:?}"),
+            }
+            assert_eq!(
+                frames.lock().unwrap().len(),
+                frames_before,
+                "a refused epoch appends no member"
+            );
+            assert_eq!(*batch_calls.lock().unwrap(), 0);
+            assert_eq!(*sync_calls.lock().unwrap(), 0);
+            reader.rollback(&cx).await.unwrap();
+        });
+    }
+
     #[test]
     fn test_group_commit_stale_snapshot_does_not_repeat_physical_attempt() {
         asupersync::test_utils::run_test(|| async {
@@ -51656,7 +52016,7 @@ mod tests {
             let waiter_result = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_secs(4),
-                queue.wait_for_epoch_outcome_async(&waiter_cx, target_epoch),
+                queue.wait_for_epoch_outcome_async(&waiter_cx, target_epoch, false),
             )
             .await;
             let publisher_result = publisher
@@ -51759,7 +52119,8 @@ mod tests {
 
             let slot = queue.epoch_waiters.slot(target_epoch);
             let waiter_cx = Cx::new();
-            let mut waiter = Box::pin(queue.wait_for_epoch_outcome_async(&waiter_cx, target_epoch));
+            let mut waiter =
+                Box::pin(queue.wait_for_epoch_outcome_async(&waiter_cx, target_epoch, false));
             let initial_poll = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_secs(2),
@@ -51873,7 +52234,7 @@ mod tests {
             let retry_result = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_secs(2),
-                queue.wait_for_epoch_outcome_async(&retry_cx, target_epoch),
+                queue.wait_for_epoch_outcome_async(&retry_cx, target_epoch, false),
             )
             .await;
             let cleanup_result = settle_identity_wide_group_commit_finalization(&queue).await;
@@ -51960,7 +52321,7 @@ mod tests {
             let waiter_result = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_secs(2),
-                queue.wait_for_epoch_outcome_async(&waiter_cx, target_epoch),
+                queue.wait_for_epoch_outcome_async(&waiter_cx, target_epoch, false),
             )
             .await;
             unrelated_root.release_after_terminal();
@@ -58275,7 +58636,7 @@ mod tests {
             ));
 
             let outcome = queue
-                .wait_for_epoch_outcome_async(&cx, 2)
+                .wait_for_epoch_outcome_async(&cx, 2, false)
                 .await
                 .expect("a promoted waiter must not depend on its exact logical cleanup");
             let WaitForEpochOutcome::TakeOverFlusher {
@@ -58296,6 +58657,103 @@ mod tests {
             drop(physical_owner);
             assert!(queue.resolve_one_pending_logical_cleanup().await.unwrap());
             assert_eq!(resolutions.load(AtomicOrdering::Acquire), 1);
+        });
+    }
+
+    /// bd-6a8a5: a commit-sync waiter that takes over a promoted epoch claims
+    /// its vacancy and leaves it FILLING, so a writer the last sync released
+    /// joins the same epoch; without the deferral the takeover begins the
+    /// flush at once and that writer lands in the next epoch.
+    #[test]
+    fn test_durable_waiter_claims_a_promoted_epoch_without_beginning_its_flush() {
+        fn promoted_queue() -> Arc<GroupCommitQueue> {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            {
+                let mut consolidator = queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let first = consolidator
+                    .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 1,
+                        page_data: sample_page(0x61),
+                        db_size_if_commit: 1,
+                    }]))
+                    .unwrap();
+                assert_eq!(first.outcome, SubmitOutcome::Flusher);
+                let _ = consolidator.begin_flush().unwrap();
+                let promoted = consolidator
+                    .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 2,
+                        page_data: sample_page(0x62),
+                        db_size_if_commit: 2,
+                    }]))
+                    .unwrap();
+                assert_eq!(promoted.target_epoch, 2);
+                assert!(consolidator.complete_flush().unwrap());
+            }
+            queue.publish_completed_epoch(1, true);
+            queue
+        }
+        fn submit_released_writer(queue: &GroupCommitQueue) -> fsqlite_wal::SubmitReceipt {
+            queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: 3,
+                    page_data: sample_page(0x63),
+                    db_size_if_commit: 3,
+                }]))
+                .unwrap()
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+
+            let deferred = promoted_queue();
+            let outcome = deferred
+                .wait_for_epoch_outcome_async(&cx, 2, true)
+                .await
+                .expect("a durable waiter claims the promoted epoch");
+            assert!(
+                matches!(outcome, WaitForEpochOutcome::ClaimedPromotedFlusher),
+                "{outcome:?}"
+            );
+            {
+                let consolidator = deferred
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(consolidator.phase(), ConsolidationPhase::Filling);
+                assert_eq!(consolidator.pending_batch_count(), 1);
+                assert!(
+                    !consolidator.has_flusher_vacancy(),
+                    "the claim is held: no second waiter may take the epoch over"
+                );
+            }
+            let joined = submit_released_writer(&deferred);
+            assert_eq!(joined.outcome, SubmitOutcome::Waiter);
+            assert_eq!(joined.target_epoch, 2, "the released writer joins epoch 2");
+            let flushed = deferred
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .begin_flush()
+                .unwrap();
+            assert_eq!(flushed.len(), 2, "one flush, one sync, both members");
+
+            let immediate = promoted_queue();
+            let outcome = immediate
+                .wait_for_epoch_outcome_async(&cx, 2, false)
+                .await
+                .expect("a waiter takes the promoted epoch over");
+            let WaitForEpochOutcome::TakeOverFlusher { batches, .. } = outcome else {
+                panic!("without the deferral the takeover begins the flush: {outcome:?}");
+            };
+            assert_eq!(batches.len(), 1);
+            let late = submit_released_writer(&immediate);
+            assert_eq!(late.target_epoch, 3, "the released writer waits for epoch 3");
         });
     }
 
@@ -58938,6 +59396,8 @@ mod tests {
                 should_flush_now: false,
                 fill_age,
                 peers_may_arrive: true,
+                frames_full: false,
+                durable_join: None,
             }),
             max_wait,
             fairness_budget,
@@ -58980,6 +59440,8 @@ mod tests {
                     should_flush_now,
                     fill_age,
                     peers_may_arrive,
+                    frames_full: false,
+                    durable_join: None,
                 }),
                 max_wait,
                 fairness_budget,
@@ -59010,6 +59472,142 @@ mod tests {
             flushable.reason, "queue_flushable",
             "a flushable queue reports why it flushes, alone or not"
         );
+    }
+
+    /// bd-6a8a5: a commit-sync epoch with fewer batches than its file has
+    /// transactions waits for them for its own budget, even a promoted epoch
+    /// whose fill age is past the group delay; a full group, an epoch every
+    /// peer is already in, a queue with no sync estimate yet, a sole
+    /// transaction and a commit that does not sync keep the existing policy.
+    #[test]
+    fn test_commit_service_policy_durable_sync_join_waits_for_file_peers() {
+        let max_wait = Duration::from_millis(1);
+        let fairness_budget = default_commit_service_fairness_budget(max_wait);
+        let budget = Duration::from_micros(600);
+        let decide = |pending_batch_count: usize,
+                      should_flush_now: bool,
+                      fill_age: Duration,
+                      peers_may_arrive: bool,
+                      frames_full: bool,
+                      durable_join: Option<DurableJoin>| {
+            decide_group_commit_arrival_wait(
+                Some(ArrivalWaitObservation {
+                    pending_batch_count,
+                    should_flush_now,
+                    fill_age,
+                    peers_may_arrive,
+                    frames_full,
+                    durable_join,
+                }),
+                max_wait,
+                fairness_budget,
+                fill_age,
+                CommitServiceMode::Balanced,
+                7,
+            )
+        };
+        let join = Some(DurableJoin { target: 8, budget });
+
+        // A promoted epoch: 4 of 8 batches in, queued 3 ms ago (past the
+        // 1 ms delay, so `should_flush_now` holds).
+        let promoted = decide(4, true, Duration::from_millis(3), true, false, join);
+        assert_eq!(promoted.reason, "durable_sync_join");
+        assert_eq!(promoted.wait_budget, budget);
+        assert_eq!(promoted.mode, CommitServiceMode::Throughput);
+
+        let fresh = decide(1, false, Duration::from_micros(2), true, false, join);
+        assert_eq!(fresh.reason, "durable_sync_join");
+        assert_eq!(fresh.wait_budget, budget);
+
+        let everyone_in = decide(8, true, Duration::from_millis(3), true, false, join);
+        assert_eq!(everyone_in.reason, "queue_flushable");
+        assert_eq!(everyone_in.wait_budget, Duration::ZERO);
+
+        let full = decide(4, true, Duration::from_millis(3), true, true, join);
+        assert_eq!(full.reason, "queue_flushable", "a full group flushes at once");
+        assert_eq!(full.wait_budget, Duration::ZERO);
+
+        let no_estimate = decide(
+            1,
+            false,
+            Duration::from_micros(2),
+            true,
+            false,
+            Some(DurableJoin {
+                target: 8,
+                budget: Duration::ZERO,
+            }),
+        );
+        assert_eq!(no_estimate.reason, "sparse_queue");
+
+        let alone = decide(1, false, Duration::from_micros(2), false, false, join);
+        assert_eq!(alone.reason, "sole_transaction");
+
+        let no_sync = decide(4, true, Duration::from_millis(3), true, false, None);
+        assert_eq!(no_sync.reason, "queue_flushable", "NORMAL keeps its policy");
+        let no_sync_sparse = decide(1, false, Duration::from_micros(2), true, false, None);
+        assert_eq!(no_sync_sparse.reason, "sparse_queue");
+        assert_eq!(no_sync_sparse.wait_budget, GROUP_COMMIT_SPARSE_ARRIVAL_WAIT);
+    }
+
+    /// bd-6a8a5: the sync estimate starts empty (no durable wait before the
+    /// first timed sync), follows the syncs it is fed, and the join budget is
+    /// half of it, capped by the group delay.
+    #[test]
+    fn test_group_commit_queue_durable_join_budget_tracks_half_the_sync() {
+        let queue = GroupCommitQueue::new(GroupCommitConfig::default());
+        let max_wait = Duration::from_millis(1);
+        assert_eq!(queue.durable_join_budget(max_wait), Duration::ZERO);
+        queue.record_wal_sync(Duration::from_micros(800));
+        assert_eq!(queue.durable_join_budget(max_wait), Duration::from_micros(400));
+        for _ in 0..200 {
+            queue.record_wal_sync(Duration::from_millis(6));
+        }
+        assert_eq!(
+            queue.durable_join_budget(max_wait),
+            max_wait,
+            "a slow disk's budget is the group delay"
+        );
+        // Fruitless joins halve the budget, at most DURABLE_JOIN_MAX_MISSES
+        // times; one join that gains a member restores it.
+        queue.record_durable_join(false);
+        queue.record_durable_join(false);
+        assert_eq!(queue.durable_join_budget(max_wait), max_wait / 4);
+        for _ in 0..20 {
+            queue.record_durable_join(false);
+        }
+        assert_eq!(
+            queue.durable_join_budget(max_wait),
+            max_wait / (1 << DURABLE_JOIN_MAX_MISSES)
+        );
+        queue.record_durable_join(true);
+        assert_eq!(queue.durable_join_budget(max_wait), max_wait);
+        for _ in 0..200 {
+            queue.record_wal_sync(Duration::from_micros(2));
+        }
+        assert!(
+            queue.durable_join_budget(max_wait) <= Duration::from_micros(2),
+            "a fast sync leaves almost nothing to wait for: {:?}",
+            queue.durable_join_budget(max_wait)
+        );
+    }
+
+    /// bd-6a8a5: a transaction lease counts every same-file transaction,
+    /// itself included; an open lease counts none.
+    #[test]
+    fn test_maintenance_lease_same_file_transactions_counts_the_gates_transactions() {
+        let gate = Arc::new(PagerMaintenanceGate::default());
+        let txn = gate.enter_transaction().unwrap();
+        assert_eq!(txn.same_file_transactions(), 1);
+        let peer = gate.enter_transaction().unwrap();
+        let other_gate = Arc::new(PagerMaintenanceGate::default());
+        let other = other_gate.enter_transaction().unwrap();
+        assert_eq!(txn.same_file_transactions(), 2);
+        assert_eq!(other.same_file_transactions(), 1);
+        drop(peer);
+        assert_eq!(txn.same_file_transactions(), 1);
+        let opener = gate.enter_open().unwrap();
+        assert_eq!(opener.same_file_transactions(), 0);
     }
 
     /// bd-w4pr1.7: only a transaction lease with no other transaction, opener
@@ -59064,6 +59662,8 @@ mod tests {
                 should_flush_now: false,
                 fill_age,
                 peers_may_arrive: true,
+                frames_full: false,
+                durable_join: None,
             }),
             max_wait,
             fairness_budget,
@@ -59102,6 +59702,8 @@ mod tests {
                 should_flush_now: false,
                 fill_age,
                 peers_may_arrive: true,
+                frames_full: false,
+                durable_join: None,
             }),
             max_wait,
             fairness_budget,
@@ -59170,6 +59772,8 @@ mod tests {
                 should_flush_now: false,
                 fill_age,
                 peers_may_arrive: true,
+                frames_full: false,
+                durable_join: None,
             }),
             max_wait,
             fairness_budget,

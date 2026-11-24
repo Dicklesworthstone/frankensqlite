@@ -160,6 +160,126 @@ impl SynchronousMode {
     }
 }
 
+/// How the stock arm opens each short transaction (bd-acuhw). `Deferred` is
+/// the v10 one-row contract's `BEGIN`; `Immediate` takes the write lock at
+/// `BEGIN IMMEDIATE`, as stock-SQLite OLTP writers usually do, so a writer
+/// waits in the busy handler before its first statement instead of at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StockBegin {
+    Deferred,
+    Immediate,
+}
+
+impl StockBegin {
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::Deferred => "BEGIN",
+            Self::Immediate => "BEGIN IMMEDIATE",
+        }
+    }
+}
+
+/// The OLTP short-transaction shape of the one-row mode (bd-acuhw): every
+/// transaction inserts `rows_per_transaction` consecutive rows of its writer.
+/// The defaults (one row, deferred `BEGIN`) are the v10 one-row contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShortTransactionShape {
+    rows_per_transaction: usize,
+    stock_begin: StockBegin,
+}
+
+impl Default for ShortTransactionShape {
+    fn default() -> Self {
+        Self {
+            rows_per_transaction: 1,
+            stock_begin: StockBegin::Deferred,
+        }
+    }
+}
+
+/// Process CPU and peak OS thread count of one arm's synchronized workload
+/// window, from the startup release to the last worker's join (bd-acuhw).
+/// The arms run one after another in this process, so the window's process
+/// CPU is the arm's: its writers plus every engine thread working for them.
+/// Diagnostics only: printed as `arm_cost`, nothing here feeds a verdict.
+mod arm_cost {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PEAK_OS_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The `Threads:` line of `/proc/self/status`: every thread of the
+    /// process, the engines' runtime and I/O workers included.
+    pub fn os_threads_now() -> Option<usize> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Threads:"))?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    pub fn reset() {
+        PEAK_OS_THREADS.store(0, Ordering::Relaxed);
+    }
+
+    /// Called by each writer as its work ends, while its peers and the
+    /// engine threads still run; the first writer to finish sees the peak.
+    pub fn note_os_threads() {
+        if let Some(threads) = os_threads_now() {
+            PEAK_OS_THREADS.fetch_max(threads, Ordering::Relaxed);
+        }
+    }
+
+    pub fn peak_os_threads() -> usize {
+        PEAK_OS_THREADS.load(Ordering::Relaxed)
+    }
+
+    /// Rows each transaction of the arm commits: the short-transaction
+    /// shape's count in one-row mode, the writer's whole share in bulk mode.
+    pub fn rows_per_transaction(
+        granularity: super::TransactionGranularity,
+        shape: super::ShortTransactionShape,
+        rows_per_thread: usize,
+    ) -> usize {
+        match granularity {
+            super::TransactionGranularity::OneRow => shape.rows_per_transaction,
+            super::TransactionGranularity::Bulk => rows_per_thread.max(1),
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    pub fn report(
+        engine: &str,
+        writers: usize,
+        rows_per_transaction: usize,
+        committed_rows: usize,
+        workload: std::time::Duration,
+        process_cpu_ns: u64,
+    ) {
+        let workload_ms = workload.as_secs_f64() * 1_000.0;
+        let cpu_ms = process_cpu_ns as f64 / 1_000_000.0;
+        let transactions = committed_rows / rows_per_transaction.max(1);
+        eprintln!(
+            "arm_cost engine={engine} threads={writers} rows_per_transaction={rows_per_transaction} \
+             committed_rows={committed_rows} transactions={transactions} \
+             workload_ms={workload_ms:.1} process_cpu_ms={cpu_ms:.1} cpu_cores={:.2} \
+             cpu_us_per_transaction={:.1} os_threads_peak={}",
+            if workload_ms > 0.0 {
+                cpu_ms / workload_ms
+            } else {
+                0.0
+            },
+            if transactions > 0 {
+                cpu_ms * 1_000.0 / transactions as f64
+            } else {
+                0.0
+            },
+            peak_os_threads(),
+        );
+    }
+}
+
 /// Wall-clock retry budget for one transaction attempt loop, scaled with the
 /// total offered work so a txn that legitimately waits behind a 64/128-writer
 /// convoy tail is not misreported as exhausted (bd-caa6u).
@@ -1559,6 +1679,9 @@ struct Options {
     /// deadline across every transaction attempted by a worker. When unset,
     /// the budget scales with threads x rows (bd-caa6u).
     retry_timeout_secs: Option<u64>,
+    /// One-row mode only: rows per transaction and the stock arm's BEGIN
+    /// (bd-acuhw).
+    short_transaction: ShortTransactionShape,
 }
 
 impl Default for Options {
@@ -1576,6 +1699,7 @@ impl Default for Options {
             transaction_granularity: TransactionGranularity::Bulk,
             synchronous: SynchronousMode::Normal,
             retry_timeout_secs: None,
+            short_transaction: ShortTransactionShape::default(),
         }
     }
 }
@@ -1586,7 +1710,8 @@ fn print_usage_and_exit(code: i32) -> ! {
          [--json-output=PATH] [--json-stdout] [--summary-md=PATH] [--history-json=PATH] \\\n\
          [--apples-to-apples] \\\n\
          [--separate-tables] [--one-row-per-transaction] [--retry-timeout-secs=N] \\\n\
-         [--synchronous=normal|full]\n\
+         [--synchronous=normal|full] [--rows-per-transaction=K] \\\n\
+         [--stock-begin=deferred|immediate]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
          --threads=1,2,4,8,16,32,64,128 --iters={DEFAULT_ITERS}\n\
@@ -1596,6 +1721,9 @@ fn print_usage_and_exit(code: i32) -> ! {
          counts above host available_parallelism are measured only as non-comparable diagnostics.\n\
          note: --one-row-per-transaction retries each complete one-row transaction and emits the\n\
          non-citable v10 report; the default bulk transaction retains the v7 analyzer contract.\n\
+         note: --rows-per-transaction=K (one-row mode only; K divides --rows-per-thread) makes every\n\
+         transaction insert K consecutive rows (bd-acuhw OLTP shape); --stock-begin=immediate opens\n\
+         the stock arm's transactions with BEGIN IMMEDIATE. The defaults are the v10 contract.\n\
          note: --rows-per-thread=0 reduces the run to shared-file worker open + synchronized start,\n\
          which is the minimal repro for the 13+ thread startup-open failure."
     );
@@ -1711,11 +1839,51 @@ where
                 opts.history_json = PathBuf::from(val);
                 history_json_explicit = true;
             }
+            "--rows-per-transaction" => {
+                let rows: usize = val.parse().map_err(|_| {
+                    ParseArgsError::Message(format!("invalid --rows-per-transaction: {val}"))
+                })?;
+                if rows == 0 {
+                    return Err(ParseArgsError::Message(
+                        "--rows-per-transaction must be >= 1".to_owned(),
+                    ));
+                }
+                opts.short_transaction.rows_per_transaction = rows;
+            }
+            "--stock-begin" => {
+                opts.short_transaction.stock_begin = match val.trim().to_ascii_lowercase().as_str()
+                {
+                    "deferred" => StockBegin::Deferred,
+                    "immediate" => StockBegin::Immediate,
+                    _ => {
+                        return Err(ParseArgsError::Message(format!(
+                            "invalid --stock-begin: {val}; expected deferred or immediate"
+                        )));
+                    }
+                };
+            }
             other => {
                 return Err(ParseArgsError::Message(format!(
                     "unknown argument: {other}"
                 )));
             }
+        }
+    }
+    if opts.short_transaction != ShortTransactionShape::default() {
+        if opts.transaction_granularity != TransactionGranularity::OneRow {
+            return Err(ParseArgsError::Message(
+                "--rows-per-transaction and --stock-begin need --one-row-per-transaction"
+                    .to_owned(),
+            ));
+        }
+        if !opts
+            .rows_per_thread
+            .is_multiple_of(opts.short_transaction.rows_per_transaction)
+        {
+            return Err(ParseArgsError::Message(format!(
+                "--rows-per-transaction={} must divide --rows-per-thread={}",
+                opts.short_transaction.rows_per_transaction, opts.rows_per_thread
+            )));
         }
     }
     if !history_json_explicit {
@@ -2007,12 +2175,13 @@ struct TransactionContractReceipt {
 
 fn transaction_contract_receipt(
     transaction_granularity: TransactionGranularity,
+    rows_per_transaction: usize,
     retry_policy: &RetryPolicyReceipt,
 ) -> Option<TransactionContractReceipt> {
     (transaction_granularity == TransactionGranularity::OneRow).then(|| {
         TransactionContractReceipt {
             granularity: transaction_granularity.label(),
-            rows_per_transaction: 1,
+            rows_per_transaction,
             prepared_statement_scope: "one successfully prepared statement per worker, reused across row transactions; transient preparation failures retry under the shared worker deadline",
             duplicate_after_ambiguous_commit_policy: "fail_closed; a duplicate is never accepted as proof of exact id+payload",
             csqlite_retry_unit: retry_policy.csqlite_retry_unit.clone(),
@@ -2021,10 +2190,13 @@ fn transaction_contract_receipt(
     })
 }
 
+/// `rows_per_transaction` is the shape the run was configured with; the
+/// receipt must carry exactly it, and it must divide the per-writer rows.
 fn transaction_contract_is_valid(
     schema_version: &str,
     transaction_granularity: TransactionGranularity,
     rows_per_thread: usize,
+    rows_per_transaction: usize,
     contract: Option<&TransactionContractReceipt>,
     configuration_receipts: &[ConfigurationReceipt],
 ) -> bool {
@@ -2036,8 +2208,10 @@ fn transaction_contract_is_valid(
             };
             if schema_version != REPORT_SCHEMA_V10
                 || rows_per_thread == 0
+                || rows_per_transaction == 0
+                || !rows_per_thread.is_multiple_of(rows_per_transaction)
                 || contract.granularity != TransactionGranularity::OneRow.label()
-                || contract.rows_per_transaction != 1
+                || contract.rows_per_transaction != rows_per_transaction
                 || contract.prepared_statement_scope
                     != "one successfully prepared statement per worker, reused across row transactions; transient preparation failures retry under the shared worker deadline"
                 || contract.duplicate_after_ambiguous_commit_policy
@@ -4405,6 +4579,7 @@ fn run_fsqlite_one_row_transactions(
     tid: usize,
     base: i64,
     rows_per_thread: usize,
+    rows_per_transaction: usize,
     worker_retry_deadline: OneRowWorkerRetryDeadline,
 ) -> Result<(usize, usize, u64), String> {
     use one_row_stage_profile as profile;
@@ -4420,6 +4595,7 @@ fn run_fsqlite_one_row_transactions(
         tid,
         base,
         rows_per_thread,
+        rows_per_transaction,
         worker_retry_deadline,
         &mut attempted_writes,
         &mut retried_transactions,
@@ -4441,22 +4617,32 @@ fn run_fsqlite_one_row_transactions_inner(
     tid: usize,
     base: i64,
     rows_per_thread: usize,
+    rows_per_transaction: usize,
     worker_retry_deadline: OneRowWorkerRetryDeadline,
     attempted_writes: &mut usize,
     retried_transactions: &mut usize,
     statements_executed: &mut u64,
 ) -> Result<(), String> {
     use one_row_stage_profile as profile;
-    for row_index in 0..rows_per_thread {
-        let row_index = i64::try_from(row_index)
-            .map_err(|_| format!("[fsqlite t{tid}] row index exceeds i64"))?;
-        let id = base
-            .checked_add(row_index)
+    let rows_per_transaction = rows_per_transaction.max(1);
+    for first_row in (0..rows_per_thread).step_by(rows_per_transaction) {
+        // `id` is the transaction's first row, named in its error messages.
+        let id = i64::try_from(first_row)
+            .ok()
+            .and_then(|first_row| base.checked_add(first_row))
             .ok_or_else(|| format!("[fsqlite t{tid}] row id overflow"))?;
-        let params = [
-            fsqlite::SqliteValue::Integer(id),
-            fsqlite::SqliteValue::Text(format!("tid{tid}_i{row_index}").into()),
-        ];
+        let mut row_params = Vec::with_capacity(rows_per_transaction);
+        for row_index in first_row..(first_row + rows_per_transaction).min(rows_per_thread) {
+            let row_index = i64::try_from(row_index)
+                .map_err(|_| format!("[fsqlite t{tid}] row index exceeds i64"))?;
+            let row_id = base
+                .checked_add(row_index)
+                .ok_or_else(|| format!("[fsqlite t{tid}] row id overflow"))?;
+            row_params.push([
+                fsqlite::SqliteValue::Integer(row_id),
+                fsqlite::SqliteValue::Text(format!("tid{tid}_i{row_index}").into()),
+            ]);
+        }
         let mut retry_budget = worker_retry_deadline.fsqlite_budget();
 
         loop {
@@ -4483,31 +4669,33 @@ fn run_fsqlite_one_row_transactions_inner(
                     ));
                 }
 
-                *attempted_writes = attempted_writes
-                    .checked_add(1)
-                    .ok_or_else(|| format!("[fsqlite t{tid}] write-attempt counter overflow"))?;
-                let insert_started = std::time::Instant::now();
-                let insert_cpu = profile::thread_cpu_ns();
-                let insert_result = stmt.execute_with_params(&params).await;
-                profile::add_cpu_since(&profile::INSERT_ON_CPU_NS, insert_cpu);
-                profile::add_since(&profile::INSERT_NS, insert_started);
-                match insert_result {
-                    Ok(affected) => {
-                        // Consume the affected-row result so this INSERT is
-                        // proven to have physically executed rather than a
-                        // future being constructed and dropped unpolled
-                        // (bd-h9pzn/bd-i8pt6).
-                        let _affected = affected;
-                        *statements_executed =
-                            statements_executed.checked_add(1).ok_or_else(|| {
-                                format!("[fsqlite t{tid}] executed-statement counter overflow")
-                            })?;
-                    }
-                    Err(error) => {
-                        return Ok(OneRowAttempt::RollbackRequired {
-                            stage: OneRowRetryStage::Insert,
-                            error,
-                        });
+                for params in &row_params {
+                    *attempted_writes = attempted_writes.checked_add(1).ok_or_else(|| {
+                        format!("[fsqlite t{tid}] write-attempt counter overflow")
+                    })?;
+                    let insert_started = std::time::Instant::now();
+                    let insert_cpu = profile::thread_cpu_ns();
+                    let insert_result = stmt.execute_with_params(params).await;
+                    profile::add_cpu_since(&profile::INSERT_ON_CPU_NS, insert_cpu);
+                    profile::add_since(&profile::INSERT_NS, insert_started);
+                    match insert_result {
+                        Ok(affected) => {
+                            // Consume the affected-row result so this INSERT is
+                            // proven to have physically executed rather than a
+                            // future being constructed and dropped unpolled
+                            // (bd-h9pzn/bd-i8pt6).
+                            let _affected = affected;
+                            *statements_executed =
+                                statements_executed.checked_add(1).ok_or_else(|| {
+                                    format!("[fsqlite t{tid}] executed-statement counter overflow")
+                                })?;
+                        }
+                        Err(error) => {
+                            return Ok(OneRowAttempt::RollbackRequired {
+                                stage: OneRowRetryStage::Insert,
+                                error,
+                            });
+                        }
                     }
                 }
 
@@ -4616,23 +4804,31 @@ fn run_rusqlite_one_row_transactions(
     tid: usize,
     base: i64,
     rows_per_thread: usize,
+    short_transaction: ShortTransactionShape,
     retry_timeout: Duration,
 ) -> Result<(usize, usize, u64), String> {
     let mut attempted_writes = 0usize;
     let mut retried_transactions = 0usize;
     let mut statements_executed = 0u64;
     let worker_retry_deadline = OneRowWorkerRetryDeadline::new(retry_timeout);
-    for row_index in 0..rows_per_thread {
-        let row_index = i64::try_from(row_index)
-            .map_err(|_| format!("[sqlite t{tid}] row index exceeds i64"))?;
-        let id = base
-            .checked_add(row_index)
-            .ok_or_else(|| format!("[sqlite t{tid}] row id overflow"))?;
-        let payload = format!("tid{tid}_i{row_index}");
+    let rows_per_transaction = short_transaction.rows_per_transaction.max(1);
+    let begin_sql = short_transaction.stock_begin.sql();
+    for first_row in (0..rows_per_thread).step_by(rows_per_transaction) {
+        let mut rows = Vec::with_capacity(rows_per_transaction);
+        for row_index in first_row..(first_row + rows_per_transaction).min(rows_per_thread) {
+            let row_index = i64::try_from(row_index)
+                .map_err(|_| format!("[sqlite t{tid}] row index exceeds i64"))?;
+            let row_id = base
+                .checked_add(row_index)
+                .ok_or_else(|| format!("[sqlite t{tid}] row id overflow"))?;
+            rows.push((row_id, format!("tid{tid}_i{row_index}")));
+        }
+        // The transaction's first row, named in BEGIN and COMMIT errors.
+        let id = rows.first().map_or(base, |(row_id, _)| *row_id);
         let mut retries = 0usize;
 
-        loop {
-            if let Err(error) = conn.execute_batch("BEGIN") {
+        'attempt: loop {
+            if let Err(error) = conn.execute_batch(begin_sql) {
                 if one_row_failure_disposition(
                     OneRowRetryStage::Begin,
                     csqlite_error_is_retryable(&error),
@@ -4653,45 +4849,49 @@ fn run_rusqlite_one_row_transactions(
                 ));
             }
 
-            attempted_writes = attempted_writes
-                .checked_add(1)
-                .ok_or_else(|| format!("[sqlite t{tid}] write-attempt counter overflow"))?;
-            match stmt.execute(rusqlite::params![id, &payload]) {
-                Ok(affected) => {
-                    // Consume the affected-row result so this INSERT is proven
-                    // to have physically executed rather than a future being
-                    // constructed and dropped unpolled (bd-h9pzn/bd-i8pt6).
-                    let _affected = affected;
-                    statements_executed = statements_executed.checked_add(1).ok_or_else(|| {
-                        format!("[sqlite t{tid}] executed-statement counter overflow")
-                    })?;
-                }
-                Err(error) => {
-                    conn.execute_batch("ROLLBACK").map_err(|rollback_error| {
-                        format!(
-                            "[sqlite t{tid}] one-row INSERT failed for id {id}: {error}; mandatory \
-                             rollback also failed: {rollback_error}"
-                        )
-                    })?;
-                    if one_row_failure_disposition(
-                        OneRowRetryStage::Insert,
-                        csqlite_error_is_retryable(&error),
-                        Some(true),
-                    ) == OneRowFailureDisposition::Retry
-                        && worker_retry_deadline.allows_retry(retries)
-                    {
-                        retries += 1;
-                        retried_transactions = retried_transactions
-                            .checked_add(1)
-                            .ok_or_else(|| format!("[sqlite t{tid}] retry counter overflow"))?;
-                        thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
-                        continue;
+            for (id, payload) in &rows {
+                attempted_writes = attempted_writes
+                    .checked_add(1)
+                    .ok_or_else(|| format!("[sqlite t{tid}] write-attempt counter overflow"))?;
+                match stmt.execute(rusqlite::params![id, payload]) {
+                    Ok(affected) => {
+                        // Consume the affected-row result so this INSERT is
+                        // proven to have physically executed rather than a
+                        // future being constructed and dropped unpolled
+                        // (bd-h9pzn/bd-i8pt6).
+                        let _affected = affected;
+                        statements_executed =
+                            statements_executed.checked_add(1).ok_or_else(|| {
+                                format!("[sqlite t{tid}] executed-statement counter overflow")
+                            })?;
                     }
-                    return Err(format!(
-                        "[sqlite t{tid}] one-row INSERT failed for id {id} after {retries} retries: \
-                         {error}; duplicate and constraint errors are fail-closed and are never \
-                         accepted as proof of the intended id+payload"
-                    ));
+                    Err(error) => {
+                        conn.execute_batch("ROLLBACK").map_err(|rollback_error| {
+                            format!(
+                                "[sqlite t{tid}] one-row INSERT failed for id {id}: {error}; \
+                                 mandatory rollback also failed: {rollback_error}"
+                            )
+                        })?;
+                        if one_row_failure_disposition(
+                            OneRowRetryStage::Insert,
+                            csqlite_error_is_retryable(&error),
+                            Some(true),
+                        ) == OneRowFailureDisposition::Retry
+                            && worker_retry_deadline.allows_retry(retries)
+                        {
+                            retries += 1;
+                            retried_transactions = retried_transactions
+                                .checked_add(1)
+                                .ok_or_else(|| format!("[sqlite t{tid}] retry counter overflow"))?;
+                            thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
+                            continue 'attempt;
+                        }
+                        return Err(format!(
+                            "[sqlite t{tid}] one-row INSERT failed for id {id} after {retries} \
+                             retries: {error}; duplicate and constraint errors are fail-closed \
+                             and are never accepted as proof of the intended id+payload"
+                        ));
+                    }
                 }
             }
 
@@ -4741,11 +4941,13 @@ fn open_fsqlite_worker(
     Ok((conn, settings))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_fsqlite(
     threads: usize,
     rows_per_thread: usize,
     separate_tables: bool,
     transaction_granularity: TransactionGranularity,
+    short_transaction: ShortTransactionShape,
     retry_timeout: Duration,
     wal_autocheckpoint_pages: i64,
     synchronous: SynchronousMode,
@@ -4850,11 +5052,13 @@ fn run_fsqlite(
                         tid,
                         base,
                         rows_per_thread,
+                        short_transaction.rows_per_transaction,
                         worker_retry_deadline,
                     )?;
                 let retried_operations = prepare_retries
                     .checked_add(transaction_retries)
                     .ok_or_else(|| format!("[fsqlite t{tid}] retry counter overflow"))?;
+                arm_cost::note_os_threads();
                 return Ok(WorkerWork {
                     settings,
                     attempted_writes,
@@ -4998,6 +5202,7 @@ fn run_fsqlite(
                 }
             };
 
+            arm_cost::note_os_threads();
             Ok(WorkerWork {
                 settings,
                 attempted_writes,
@@ -5035,8 +5240,14 @@ fn run_fsqlite(
     }
 
     let worker_startup_elapsed = worker_startup_started.elapsed();
+    arm_cost::reset();
+    let workload_cpu_started = one_row_stage_profile::process_cpu_ns();
     let workload_started = publish_startup_decision(&startup_gate, true);
     let work = join_worker_handles("FrankenSQLite", handles, &init_settings)?;
+    let workload_cpu_ns = one_row_stage_profile::delta(
+        workload_cpu_started,
+        one_row_stage_profile::process_cpu_ns(),
+    );
     drop(init_conn);
     let workload_elapsed = work
         .workload_finished
@@ -5046,6 +5257,14 @@ fn run_fsqlite(
     let (observed, integrity_check) =
         query_fsqlite_committed_state(path.as_str(), threads, separate_tables)?;
     let committed_state = build_committed_state_oracle(expected, observed, integrity_check);
+    arm_cost::report(
+        "fsqlite",
+        threads,
+        arm_cost::rows_per_transaction(transaction_granularity, short_transaction, rows_per_thread),
+        committed_state.observed_rows,
+        workload_elapsed,
+        workload_cpu_ns,
+    );
     let offered_writes = threads
         .checked_mul(rows_per_thread)
         .ok_or_else(|| "FrankenSQLite offered-write count overflow".to_owned())?;
@@ -5069,11 +5288,13 @@ fn run_fsqlite(
 
 // ─── C SQLite (rusqlite) workload ────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn run_rusqlite(
     threads: usize,
     rows_per_thread: usize,
     separate_tables: bool,
     transaction_granularity: TransactionGranularity,
+    short_transaction: ShortTransactionShape,
     retry_timeout: Duration,
     wal_autocheckpoint_pages: i64,
     synchronous: SynchronousMode,
@@ -5183,8 +5404,10 @@ fn run_rusqlite(
                         tid,
                         base,
                         rows_per_thread,
+                        short_transaction,
                         retry_timeout,
                     )?;
+                arm_cost::note_os_threads();
                 return Ok(WorkerWork {
                     settings,
                     attempted_writes,
@@ -5267,6 +5490,7 @@ fn run_rusqlite(
                 }
             }
 
+            arm_cost::note_os_threads();
             Ok(WorkerWork {
                 settings,
                 attempted_writes,
@@ -5304,8 +5528,14 @@ fn run_rusqlite(
     }
 
     let worker_startup_elapsed = worker_startup_started.elapsed();
+    arm_cost::reset();
+    let workload_cpu_started = one_row_stage_profile::process_cpu_ns();
     let workload_started = publish_startup_decision(&startup_gate, true);
     let work = join_worker_handles("C SQLite", handles, &init_settings)?;
+    let workload_cpu_ns = one_row_stage_profile::delta(
+        workload_cpu_started,
+        one_row_stage_profile::process_cpu_ns(),
+    );
     drop(init_conn);
     let workload_elapsed = work
         .workload_finished
@@ -5315,6 +5545,14 @@ fn run_rusqlite(
     let (observed, integrity_check) =
         query_rusqlite_committed_state(path.as_str(), threads, separate_tables)?;
     let committed_state = build_committed_state_oracle(expected, observed, integrity_check);
+    arm_cost::report(
+        "csqlite",
+        threads,
+        arm_cost::rows_per_transaction(transaction_granularity, short_transaction, rows_per_thread),
+        committed_state.observed_rows,
+        workload_elapsed,
+        workload_cpu_ns,
+    );
     let offered_writes = threads
         .checked_mul(rows_per_thread)
         .ok_or_else(|| "C SQLite offered-write count overflow".to_owned())?;
@@ -5415,8 +5653,14 @@ fn run(opts: Options) -> Result<(), String> {
         .map(|value| value.get());
 
     eprintln!(
-        "mt-mvcc-bench: rows_per_thread={} threads={:?} paired_rounds={} bootstrap_reps={} synchronous={} wal_autocheckpoint={} available_parallelism={available_parallelism:?} apples_to_apples={} separate_tables={} transaction_granularity={}",
+        "mt-mvcc-bench: rows_per_thread={} rows_per_transaction={} stock_begin={:?} threads={:?} paired_rounds={} bootstrap_reps={} synchronous={} wal_autocheckpoint={} available_parallelism={available_parallelism:?} apples_to_apples={} separate_tables={} transaction_granularity={}",
         opts.rows_per_thread,
+        arm_cost::rows_per_transaction(
+            opts.transaction_granularity,
+            opts.short_transaction,
+            opts.rows_per_thread,
+        ),
+        opts.short_transaction.stock_begin.sql(),
         opts.threads,
         opts.iters,
         CONTRACT_BOOTSTRAP_REPS,
@@ -5500,6 +5744,7 @@ fn run(opts: Options) -> Result<(), String> {
                     opts.rows_per_thread,
                     opts.separate_tables,
                     opts.transaction_granularity,
+                    opts.short_transaction,
                     retry_timeout,
                     wal_autocheckpoint_pages,
                     opts.synchronous,
@@ -5511,6 +5756,7 @@ fn run(opts: Options) -> Result<(), String> {
                     opts.rows_per_thread,
                     opts.separate_tables,
                     opts.transaction_granularity,
+                    opts.short_transaction,
                     retry_timeout,
                     wal_autocheckpoint_pages,
                     opts.synchronous,
@@ -5522,6 +5768,7 @@ fn run(opts: Options) -> Result<(), String> {
                     opts.rows_per_thread,
                     opts.separate_tables,
                     opts.transaction_granularity,
+                    opts.short_transaction,
                     retry_timeout,
                     wal_autocheckpoint_pages,
                     opts.synchronous,
@@ -5550,6 +5797,7 @@ fn run(opts: Options) -> Result<(), String> {
                     opts.rows_per_thread,
                     opts.separate_tables,
                     opts.transaction_granularity,
+                    opts.short_transaction,
                     retry_timeout,
                     wal_autocheckpoint_pages,
                     opts.synchronous,
@@ -5626,6 +5874,37 @@ fn run(opts: Options) -> Result<(), String> {
                     vdbe.mvcc_write_path.page_lock_waits_total,
                     vdbe.mvcc_write_path.page_lock_wait_time_ns_total / 1_000,
                 );
+                // bd-acuhw: how many transactions each group-commit epoch
+                // flushed. One epoch shares one append and, at FULL, one sync.
+                {
+                    let epochs: u64 = cons.flush_batch_size_histogram.iter().sum();
+                    let buckets = cons
+                        .flush_batch_size_histogram
+                        .iter()
+                        .enumerate()
+                        .map(|(bucket, count)| {
+                            let (low, high) = fsqlite_wal::flush_batch_size_bucket_bounds(bucket);
+                            if low == high {
+                                format!("{low}:{count}")
+                            } else if high == usize::MAX {
+                                format!("{low}+:{count}")
+                            } else {
+                                format!("{low}-{high}:{count}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    eprintln!(
+                        "group_commit_batches threads={n} epochs={epochs} \
+                         transactions_batched={} mean_batch={:.2} histogram={buckets}",
+                        cons.transactions_batched,
+                        if epochs > 0 {
+                            cons.transactions_batched as f64 / epochs as f64
+                        } else {
+                            0.0
+                        },
+                    );
+                }
                 // bd-i0tn6 scaling profile: every group-commit phase total and
                 // histogram, and where the one-row writers' wall time went.
                 if let Ok(json) = serde_json::to_string(&cons) {
@@ -5818,12 +6097,17 @@ fn run(opts: Options) -> Result<(), String> {
         .first()
         .and_then(|configuration| configuration.retry_policy.as_ref())
         .and_then(|retry_policy| {
-            transaction_contract_receipt(opts.transaction_granularity, retry_policy)
+            transaction_contract_receipt(
+                opts.transaction_granularity,
+                opts.short_transaction.rows_per_transaction,
+                retry_policy,
+            )
         });
     let transaction_contract_valid = transaction_contract_is_valid(
         report_schema,
         opts.transaction_granularity,
         opts.rows_per_thread,
+        opts.short_transaction.rows_per_transaction,
         transaction_contract.as_ref(),
         &configuration_receipts,
     );
@@ -6258,7 +6542,7 @@ mod tests {
         report.non_citable_reason = NON_CITABLE_REASON_V10;
         report.release_regression_scope = RELEASE_REGRESSION_SCOPE_V10;
         report.transaction_contract =
-            transaction_contract_receipt(TransactionGranularity::OneRow, &retry_policy);
+            transaction_contract_receipt(TransactionGranularity::OneRow, 1, &retry_policy);
         report.configuration_receipts = vec![configuration];
         report
     }
@@ -6484,6 +6768,7 @@ mod tests {
             report.schema_version,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
+            1,
             report.transaction_contract.as_ref(),
             &report.configuration_receipts,
         ));
@@ -6527,6 +6812,7 @@ mod tests {
             REPORT_SCHEMA_V7,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
+            1,
             report.transaction_contract.as_ref(),
             &report.configuration_receipts,
         ));
@@ -6534,6 +6820,7 @@ mod tests {
             REPORT_SCHEMA_V8,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
+            1,
             report.transaction_contract.as_ref(),
             &report.configuration_receipts,
         ));
@@ -6541,6 +6828,7 @@ mod tests {
             REPORT_SCHEMA_V9,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
+            1,
             None,
             &report.configuration_receipts,
         ));
@@ -6548,6 +6836,7 @@ mod tests {
             REPORT_SCHEMA_V10,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
+            1,
             None,
             &report.configuration_receipts,
         ));
@@ -6562,6 +6851,7 @@ mod tests {
             REPORT_SCHEMA_V10,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
+            1,
             report.transaction_contract.as_ref(),
             &invalid_configurations,
         ));
@@ -6576,6 +6866,7 @@ mod tests {
             REPORT_SCHEMA_V10,
             TransactionGranularity::OneRow,
             report.rows_per_thread,
+            1,
             report.transaction_contract.as_ref(),
             &missing_shared_deadline,
         ));
@@ -6595,8 +6886,43 @@ mod tests {
             REPORT_SCHEMA_V10,
             TransactionGranularity::OneRow,
             coordinated_drift.rows_per_thread,
+            1,
             coordinated_drift.transaction_contract.as_ref(),
             &coordinated_drift.configuration_receipts,
+        ));
+
+        // bd-acuhw: a receipt binds the rows per transaction the run was
+        // configured with, and that count must divide the per-writer rows.
+        let mut short = minimal_v10_one_row_report();
+        short.rows_per_thread = 10;
+        short
+            .transaction_contract
+            .as_mut()
+            .expect("test transaction contract")
+            .rows_per_transaction = 5;
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V10,
+            TransactionGranularity::OneRow,
+            short.rows_per_thread,
+            1,
+            short.transaction_contract.as_ref(),
+            &short.configuration_receipts,
+        ));
+        assert!(transaction_contract_is_valid(
+            REPORT_SCHEMA_V10,
+            TransactionGranularity::OneRow,
+            short.rows_per_thread,
+            5,
+            short.transaction_contract.as_ref(),
+            &short.configuration_receipts,
+        ));
+        assert!(!transaction_contract_is_valid(
+            REPORT_SCHEMA_V10,
+            TransactionGranularity::OneRow,
+            short.rows_per_thread + 1,
+            5,
+            short.transaction_contract.as_ref(),
+            &short.configuration_receipts,
         ));
     }
 
@@ -8184,6 +8510,7 @@ mod tests {
             rows_per_thread,
             true,
             TransactionGranularity::OneRow,
+            ShortTransactionShape::default(),
             retry_timeout,
             DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
             SynchronousMode::Normal,
@@ -8194,6 +8521,7 @@ mod tests {
             rows_per_thread,
             true,
             TransactionGranularity::OneRow,
+            ShortTransactionShape::default(),
             retry_timeout,
             DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
             SynchronousMode::Normal,
@@ -8211,6 +8539,91 @@ mod tests {
             assert_eq!(result.committed_state.expected_rows, 6, "{engine}");
             assert_eq!(result.committed_state.observed_rows, 6, "{engine}");
             assert_eq!(result.committed_state.integrity_check, ["ok"], "{engine}");
+        }
+    }
+
+    /// bd-acuhw: K-row short transactions on a shared table commit every
+    /// row exactly once on both engines, the stock arm opening each with
+    /// BEGIN IMMEDIATE; the work accounting sees K INSERTs per transaction.
+    #[test]
+    fn short_transactions_commit_exact_shared_table_state_on_both_engines() {
+        let threads = 3;
+        let rows_per_thread = 12;
+        let shape = ShortTransactionShape {
+            rows_per_transaction: 4,
+            stock_begin: StockBegin::Immediate,
+        };
+        let retry_timeout = fsqlite_retry_timeout(threads, rows_per_thread);
+        let sqlite = run_rusqlite(
+            threads,
+            rows_per_thread,
+            false,
+            TransactionGranularity::OneRow,
+            shape,
+            retry_timeout,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            SynchronousMode::Full,
+        )
+        .expect("C SQLite short-transaction workload must complete");
+        let fsqlite = run_fsqlite(
+            threads,
+            rows_per_thread,
+            false,
+            TransactionGranularity::OneRow,
+            shape,
+            retry_timeout,
+            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+            SynchronousMode::Full,
+        )
+        .expect("FrankenSQLite short-transaction workload must complete");
+
+        for (engine, result) in [("C SQLite", sqlite), ("FrankenSQLite", fsqlite)] {
+            assert!(
+                result.correctness_valid(),
+                "{engine} short-transaction state/oracle proof failed: {result:#?}"
+            );
+            assert_eq!(result.accounting.offered_writes, 36, "{engine}");
+            assert_eq!(result.accounting.succeeded_writes, 36, "{engine}");
+            assert!(result.accounting.statements_executed >= 36, "{engine}");
+            assert_eq!(result.committed_state.observed_rows, 36, "{engine}");
+            assert_eq!(result.committed_state.integrity_check, ["ok"], "{engine}");
+        }
+    }
+
+    #[test]
+    fn short_transaction_flags_need_one_row_mode_and_a_dividing_row_count() {
+        let parsed = parse_args_from([
+            "--one-row-per-transaction",
+            "--rows-per-thread=12",
+            "--rows-per-transaction=4",
+            "--stock-begin=immediate",
+        ])
+        .expect("a dividing short-transaction shape parses");
+        assert_eq!(
+            parsed.short_transaction,
+            ShortTransactionShape {
+                rows_per_transaction: 4,
+                stock_begin: StockBegin::Immediate,
+            }
+        );
+        assert_eq!(
+            parse_args_from(["--one-row-per-transaction"])
+                .expect("the v10 defaults parse")
+                .short_transaction,
+            ShortTransactionShape::default()
+        );
+        for bad in [
+            vec!["--rows-per-thread=12", "--rows-per-transaction=4"],
+            vec!["--stock-begin=immediate"],
+            vec![
+                "--one-row-per-transaction",
+                "--rows-per-thread=10",
+                "--rows-per-transaction=4",
+            ],
+            vec!["--one-row-per-transaction", "--rows-per-transaction=0"],
+            vec!["--one-row-per-transaction", "--stock-begin=exclusive"],
+        ] {
+            assert!(parse_args_from(bad.clone()).is_err(), "{bad:?}");
         }
     }
 

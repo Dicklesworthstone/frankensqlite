@@ -779,6 +779,7 @@ mod tests {
                 mean_us: 0,
             },
             wake_reasons: WakeReasonSnapshot::default(),
+            flush_batch_size_histogram: [0; fsqlite_wal::FLUSH_BATCH_SIZE_BUCKETS],
         };
 
         let sub_buckets =

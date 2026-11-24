@@ -749,6 +749,46 @@ pub struct ConsolidationMetrics {
     // ── Wake-reason accounting (bd-db300.3.8.1) ──
     /// Why waiters woke up during epoch wait.
     pub wake_reasons: WakeReasonCounters,
+
+    /// Epochs by the number of transactions they flushed (bd-acuhw): bucket
+    /// `i` counts the epochs whose batch count lies in the bounds
+    /// [`flush_batch_size_bucket_bounds`] gives for `i`.
+    pub flush_batch_size_buckets: [AtomicU64; FLUSH_BATCH_SIZE_BUCKETS],
+}
+
+/// Number of buckets in the flushed-epoch batch-size histogram: 1, 2, 3-4,
+/// 5-8, 9-16, 17-32, 33-64 and 65 or more transactions per epoch.
+pub const FLUSH_BATCH_SIZE_BUCKETS: usize = 8;
+
+/// Bucket of an epoch that flushed `batches` transactions (0 and 1 share the
+/// first bucket).
+#[must_use]
+pub const fn flush_batch_size_bucket(batches: usize) -> usize {
+    if batches <= 1 {
+        return 0;
+    }
+    // ceil(log2(batches)): 2 -> 1, 3-4 -> 2, 5-8 -> 3, ...
+    let bucket = (batches - 1).ilog2() as usize + 1;
+    if bucket >= FLUSH_BATCH_SIZE_BUCKETS {
+        FLUSH_BATCH_SIZE_BUCKETS - 1
+    } else {
+        bucket
+    }
+}
+
+/// Inclusive batch counts bucket `bucket` holds; the last bucket's upper
+/// bound is `usize::MAX`.
+#[must_use]
+pub const fn flush_batch_size_bucket_bounds(bucket: usize) -> (usize, usize) {
+    if bucket == 0 {
+        return (1, 1);
+    }
+    let low = (1_usize << (bucket - 1)) + 1;
+    if bucket + 1 >= FLUSH_BATCH_SIZE_BUCKETS {
+        (low, usize::MAX)
+    } else {
+        (low, 1_usize << bucket)
+    }
 }
 
 impl ConsolidationMetrics {
@@ -798,7 +838,14 @@ impl ConsolidationMetrics {
             hist_wal_sync: PhaseHistogram::new(),
             hist_full_commit: PhaseHistogram::new(),
             wake_reasons: WakeReasonCounters::new(),
+            flush_batch_size_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
+    }
+
+    /// Count one epoch that began flushing `batches` transactions.
+    pub fn record_flush_batch_size(&self, batches: usize) {
+        self.flush_batch_size_buckets[flush_batch_size_bucket(batches)]
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a completed group flush.
@@ -1003,6 +1050,9 @@ impl ConsolidationMetrics {
             hist_wal_sync: self.hist_wal_sync.percentiles(),
             hist_full_commit: self.hist_full_commit.percentiles(),
             wake_reasons: self.wake_reasons.snapshot(),
+            flush_batch_size_histogram: std::array::from_fn(|bucket| {
+                self.flush_batch_size_buckets[bucket].load(Ordering::Relaxed)
+            }),
         }
     }
 
@@ -1054,6 +1104,9 @@ impl ConsolidationMetrics {
         self.hist_wal_sync.reset();
         self.hist_full_commit.reset();
         self.wake_reasons.reset();
+        for bucket in &self.flush_batch_size_buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1110,6 +1163,9 @@ pub struct ConsolidationMetricsSnapshot {
     pub hist_full_commit: PhasePercentiles,
     // ── Wake reasons (bd-db300.3.8.1) ──
     pub wake_reasons: WakeReasonSnapshot,
+    /// Epochs by transactions flushed, in [`flush_batch_size_bucket`] buckets.
+    #[serde(default)]
+    pub flush_batch_size_histogram: [u64; FLUSH_BATCH_SIZE_BUCKETS],
 }
 
 impl ConsolidationMetricsSnapshot {
@@ -1502,6 +1558,13 @@ impl GroupCommitConsolidator {
         })
     }
 
+    /// Whether the pending frames reached `max_group_size`: the size half of
+    /// [`Self::should_flush_now`], without its delay half (bd-6a8a5).
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.pending_frame_count >= self.config.max_group_size
+    }
+
     /// Check whether the flusher should flush now.
     ///
     /// Returns `true` if:
@@ -1562,6 +1625,7 @@ impl GroupCommitConsolidator {
         self.epoch += 1;
 
         let batches: Vec<_> = self.pending_batches.drain(..).collect();
+        GLOBAL_CONSOLIDATION_METRICS.record_flush_batch_size(batches.len());
         let frame_count = self.pending_frame_count;
         self.pending_frame_count = 0;
 
@@ -2055,6 +2119,83 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_batch_size_histogram_buckets_by_transactions_per_epoch() {
+        // Every count lands in the bucket whose bounds hold it, and the
+        // buckets tile 1..=usize::MAX without gaps or overlaps.
+        for batches in 1..=300_usize {
+            let (low, high) = flush_batch_size_bucket_bounds(flush_batch_size_bucket(batches));
+            assert!(
+                (low..=high).contains(&batches),
+                "{batches} outside {low}..={high}"
+            );
+        }
+        for bucket in 1..FLUSH_BATCH_SIZE_BUCKETS {
+            assert_eq!(
+                flush_batch_size_bucket_bounds(bucket).0,
+                flush_batch_size_bucket_bounds(bucket - 1).1 + 1
+            );
+        }
+        let expected = [
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (8, 3),
+            (9, 4),
+            (64, 6),
+            (65, 7),
+            (10_000, 7),
+        ];
+        for (batches, bucket) in expected {
+            assert_eq!(flush_batch_size_bucket(batches), bucket, "{batches}");
+        }
+
+        // A recorded epoch counts once, in its own bucket only, and reset
+        // clears it.
+        let metrics = ConsolidationMetrics::new();
+        metrics.record_flush_batch_size(1);
+        metrics.record_flush_batch_size(3);
+        metrics.record_flush_batch_size(4);
+        metrics.record_flush_batch_size(40);
+        assert_eq!(
+            metrics.snapshot().flush_batch_size_histogram,
+            [1, 0, 2, 0, 0, 0, 1, 0]
+        );
+        metrics.reset();
+        assert_eq!(metrics.snapshot().flush_batch_size_histogram, [0; 8]);
+
+        // begin_flush records the epoch it takes. 40 batches (bucket 6) is a
+        // size no other test in this crate flushes, so a concurrent test's
+        // epochs cannot satisfy this.
+        with_global_consolidation_metrics(|| {
+            let mut c = GroupCommitConsolidator::new(GroupCommitConfig::default());
+            for i in 0..40_u32 {
+                c.submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: i + 1,
+                    page_data: sample_page(0),
+                    db_size_if_commit: if i == 39 { 40 } else { 0 },
+                }]))
+                .unwrap();
+            }
+            assert_eq!(
+                GLOBAL_CONSOLIDATION_METRICS
+                    .snapshot()
+                    .flush_batch_size_histogram[6],
+                0
+            );
+            assert_eq!(c.begin_flush().unwrap().len(), 40);
+            assert_eq!(
+                GLOBAL_CONSOLIDATION_METRICS
+                    .snapshot()
+                    .flush_batch_size_histogram[6],
+                1
+            );
+        });
+    }
+
+    #[test]
     fn test_consolidator_auto_transitions_complete_to_filling() {
         let mut c = GroupCommitConsolidator::new(GroupCommitConfig::default());
 
@@ -2101,6 +2242,7 @@ mod tests {
         assert!(!c.should_flush_now());
 
         // Submit 3rd frame — should flush now.
+        assert!(!c.is_full());
         c.submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
             page_number: 3,
             page_data: sample_page(2),
@@ -2108,6 +2250,23 @@ mod tests {
         }]))
         .unwrap();
         assert!(c.should_flush_now());
+        assert!(c.is_full());
+
+        // bd-6a8a5: an expired group delay makes the queue flushable without
+        // making it full.
+        let mut late = GroupCommitConsolidator::new(GroupCommitConfig {
+            max_group_size: 3,
+            max_group_delay: Duration::ZERO,
+            ..GroupCommitConfig::default()
+        });
+        late.submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 1,
+            page_data: sample_page(0),
+            db_size_if_commit: 1,
+        }]))
+        .unwrap();
+        assert!(late.should_flush_now());
+        assert!(!late.is_full());
     }
 
     #[test]
