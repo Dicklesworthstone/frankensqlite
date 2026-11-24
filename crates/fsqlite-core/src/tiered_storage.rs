@@ -27,6 +27,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::decode_proofs::{EcsDecodeProof, RejectedSymbol, SymbolDigest, SymbolRejectionReason};
 use crate::remote_effects::Executor as RemoteAdmissionExecutor;
+use crate::replication_sender::validate_codec_esi;
 
 const BEAD_ID: &str = "bd-1hi.29";
 const FETCH_SYMBOLS_COMPUTATION: &str = "fsqlite:tiered:fetch_symbols:v1";
@@ -448,7 +449,12 @@ impl TieredStorage {
         if let Some(proof) = recovered.decode_proof.clone() {
             self.record_decode_proof(proof);
         }
-        let write_back_count = self.write_back_repairs(&local_records, &fetched);
+        let write_back_count = self.write_back_repairs(
+            &local_records,
+            &fetched,
+            &merged,
+            recovered.decode_proof.as_ref(),
+        );
 
         Ok(FetchOutcome {
             bytes: recovered.bytes,
@@ -547,14 +553,38 @@ impl TieredStorage {
         })
     }
 
-    fn write_back_repairs(&mut self, local: &[SymbolRecord], fetched: &[SymbolRecord]) -> usize {
+    fn write_back_repairs(
+        &mut self,
+        local: &[SymbolRecord],
+        fetched: &[SymbolRecord],
+        merged: &[SymbolRecord],
+        decode_proof: Option<&EcsDecodeProof>,
+    ) -> usize {
+        // Successful systematic validation checked every merged record,
+        // including the repair tail. A fallback proof instead names the
+        // accepted subset. Bind admission to the exact selected record: an
+        // accepted ESI must not authorize a different fetched payload.
+        // Complete source runs can bypass decoding, but unsupported extras
+        // must not enter the cache and obstruct a later repair attempt.
+        let accepted_by_esi: BTreeMap<u32, &SymbolRecord> = merged
+            .iter()
+            .filter(|record| validate_codec_esi(record.esi).is_ok())
+            .filter(|record| {
+                decode_proof
+                    .is_none_or(|proof| proof.symbols_received.binary_search(&record.esi).is_ok())
+            })
+            .map(|record| (record.esi, record))
+            .collect();
         let local_by_esi: BTreeMap<u32, &SymbolRecord> =
             local.iter().map(|record| (record.esi, record)).collect();
         let mut repairs_by_esi = BTreeMap::<u32, SymbolRecord>::new();
         for record in fetched {
+            if accepted_by_esi.get(&record.esi).copied() != Some(record) {
+                continue;
+            }
             let needs_repair = match local_by_esi.get(&record.esi) {
                 None => true,
-                Some(existing) => !existing.verify_integrity() && record.verify_integrity(),
+                Some(existing) => prefer_symbol_record(existing, record),
             };
             if needs_repair {
                 merge_symbol_record_by_esi(&mut repairs_by_esi, record.clone());
@@ -660,8 +690,15 @@ fn derive_evict_key(segment_id: u64, records: &[SymbolRecord], ecs_epoch: u64) -
     IdempotencyKey::derive(ecs_epoch, &request_bytes)
 }
 
+fn symbol_record_is_intact(record: &SymbolRecord) -> bool {
+    // Public record fields can contain malformed remote responses. The checksum
+    // routine assumes the wire shape, so reject truncated payloads before it.
+    usize::try_from(record.oti.t).ok() == Some(record.symbol_data.len())
+        && record.verify_integrity()
+}
+
 fn prefer_symbol_record(existing: &SymbolRecord, candidate: &SymbolRecord) -> bool {
-    !existing.verify_integrity() && candidate.verify_integrity()
+    !symbol_record_is_intact(existing) && symbol_record_is_intact(candidate)
 }
 
 fn merge_symbol_record_by_esi(by_esi: &mut BTreeMap<u32, SymbolRecord>, record: SymbolRecord) {
@@ -1003,6 +1040,7 @@ fn collect_fallback_symbol_evidence(
         let rejection = if record.object_id != first.object_id
             || record.oti != first.oti
             || record.symbol_data.len() != symbol_size
+            || validate_codec_esi(record.esi).is_err()
         {
             Some(SymbolRejectionReason::FormatViolation)
         } else if !record.verify_integrity() {
@@ -1756,6 +1794,149 @@ mod tests {
             audit.iter().any(|entry| !entry.decode_success),
             "expected local failure proof before remote fallback success"
         );
+    }
+
+    #[test]
+    fn test_fetch_caches_only_accepted_fallback_symbols() {
+        let object_id = object_id_from_u64(0xEC5_0010);
+        let payload: Vec<u8> = (0_u16..513)
+            .map(|value| u8::try_from(value % 251).expect("value fits u8"))
+            .collect();
+        let mut records = make_symbol_records(object_id, &payload, 64, 16);
+        let canonical_oti = records[0].oti;
+        records.retain(|record| record.esi != 0);
+        for record in &mut records {
+            match record.esi {
+                9 => record.symbol_data[0] ^= 0x80,
+                10 => {
+                    *record = SymbolRecord::new(
+                        object_id,
+                        Oti {
+                            f: canonical_oti.f + 1,
+                            ..canonical_oti
+                        },
+                        record.esi,
+                        record.symbol_data.clone(),
+                        SymbolRecordFlags::empty(),
+                    );
+                    assert!(record.verify_integrity());
+                }
+                11 => {
+                    // Simulate a truncated response after valid encoding; the
+                    // safe constructor deliberately rejects this shape.
+                    record.symbol_data.truncate(63);
+                }
+                _ => {}
+            }
+        }
+        let unsupported_esis = [crate::replication_sender::MAX_REPLICATION_ESI + 1, u32::MAX];
+        for esi in unsupported_esis {
+            let unsupported = SymbolRecord::new(
+                object_id,
+                canonical_oti,
+                esi,
+                vec![0; 64],
+                SymbolRecordFlags::empty(),
+            );
+            assert!(unsupported.verify_integrity());
+            records.push(unsupported);
+        }
+
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, records);
+        let cx = Cx::<cap::All>::new();
+        let recovered = storage
+            .fetch_object(&cx, object_id, 1, Some(&mut remote), Some(remote_cap(19)))
+            .expect("valid repairs recover the erased source despite rejected extras");
+        assert_eq!(recovered.bytes, payload);
+        assert!(recovered.remote_used);
+        assert_eq!(recovered.write_back_count, 21);
+        let proof = recovered.decode_proof.expect("repair decode proof");
+        for (esi, reason) in [
+            (9, SymbolRejectionReason::HashMismatch),
+            (10, SymbolRejectionReason::FormatViolation),
+            (11, SymbolRejectionReason::FormatViolation),
+            (unsupported_esis[0], SymbolRejectionReason::FormatViolation),
+            (unsupported_esis[1], SymbolRejectionReason::FormatViolation),
+        ] {
+            assert!(
+                proof
+                    .rejected_symbols
+                    .contains(&RejectedSymbol { esi, reason })
+            );
+            assert!(!proof.symbols_received.contains(&esi));
+        }
+
+        let cached = storage.l2_records_for_object(object_id);
+        assert_eq!(cached.len(), 21);
+        assert!(cached.iter().all(|record| {
+            record.verify_integrity()
+                && record.oti == canonical_oti
+                && record.symbol_data.len() == 64
+                && ![9, 10, 11].contains(&record.esi)
+                && !unsupported_esis.contains(&record.esi)
+        }));
+        let local_replay = storage
+            .fetch_object(&cx, object_id, 2, Option::<&mut MockRemoteTier>::None, None)
+            .expect("only accepted repair symbols should suffice for local replay");
+        assert_eq!(local_replay.bytes, payload);
+        assert!(!local_replay.remote_used);
+        assert_eq!(remote.fetch_calls(), 1);
+    }
+
+    #[test]
+    fn test_fast_path_cache_preserves_selected_duplicate_records() {
+        let object_id = object_id_from_u64(0xEC5_0011);
+        let payload = b"selected-symbol-records";
+        let expected = make_symbol_records(object_id, payload, 8, 0);
+        let mut fetched = expected.clone();
+        let mut corrupt_first = expected[1].clone();
+        corrupt_first.symbol_data[0] ^= 0x80;
+        fetched.insert(1, corrupt_first);
+        let mut truncated_first = expected[1].clone();
+        truncated_first.symbol_data.truncate(7);
+        fetched.insert(1, truncated_first.clone());
+        let selected = expected.last().expect("nonempty fixture");
+        let mut different_payload = selected.symbol_data.clone();
+        different_payload[0] ^= 0x40;
+        let conflicting_duplicate = SymbolRecord::new(
+            object_id,
+            selected.oti,
+            selected.esi,
+            different_payload,
+            SymbolRecordFlags::empty(),
+        );
+        assert!(conflicting_duplicate.verify_integrity());
+        fetched.push(conflicting_duplicate);
+        for esi in [crate::replication_sender::MAX_REPLICATION_ESI + 1, u32::MAX] {
+            let unsupported = SymbolRecord::new(
+                object_id,
+                selected.oti,
+                esi,
+                vec![0; 8],
+                SymbolRecordFlags::empty(),
+            );
+            assert!(unsupported.verify_integrity());
+            fetched.push(unsupported);
+        }
+
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        storage.insert_l2_segment(421, vec![truncated_first]);
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, fetched);
+        let cx = Cx::<cap::All>::new();
+        let recovered = storage
+            .fetch_object(&cx, object_id, 1, Some(&mut remote), Some(remote_cap(20)))
+            .expect("selected intact systematic records should recover the object");
+        assert_eq!(recovered.bytes, payload);
+        assert_eq!(recovered.write_back_count, expected.len());
+        assert!(matches!(
+            recovered.read_path,
+            SymbolReadPath::SystematicFastPath
+        ));
+        assert!(recovered.decode_proof.is_none());
+        assert_eq!(storage.l2_records_for_object(object_id), expected);
     }
 
     #[test]
