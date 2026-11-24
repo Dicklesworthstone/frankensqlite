@@ -4698,7 +4698,9 @@ impl Unicode61Tokenizer {
         if !self.separators.is_empty() && Self::option_contains(&self.separators, ch) {
             return false;
         }
-        ch.is_alphanumeric()
+        // The Combining Diacritical Marks block is category M. Rust's
+        // Alphabetic property also includes marks such as U+0345.
+        ch.is_alphanumeric() && !('\u{0300}'..='\u{036f}').contains(&ch)
     }
 
     fn normalized_char(&self, ch: char) -> char {
@@ -4707,6 +4709,22 @@ impl Unicode61Tokenizer {
         }
         latin_diacritic_base(ch).unwrap_or(ch)
     }
+}
+
+/// Combining marks that unicode61 admits after a token character. Other
+/// combining marks follow the ordinary tokenizer character-class rules.
+fn unicode61_combining_diacritic(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0300}'..='\u{0304}'
+            | '\u{0306}'..='\u{030c}'
+            | '\u{030f}'
+            | '\u{0311}'
+            | '\u{031b}'
+            | '\u{0323}'..='\u{0328}'
+            | '\u{032d}'..='\u{032e}'
+            | '\u{0330}'..='\u{0331}'
+    )
 }
 
 impl Fts5Tokenizer for Unicode61Tokenizer {
@@ -4720,7 +4738,11 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
         let mut borrowed_ascii_token = false;
 
         for (byte_idx, ch) in text.char_indices() {
-            if self.is_token_char(ch) {
+            let diacritic = unicode61_combining_diacritic(ch);
+            if diacritic && token_start.is_none() {
+                continue;
+            }
+            if diacritic || self.is_token_char(ch) {
                 if token_start.is_none() {
                     token_start = Some(byte_idx);
                     current_term.clear();
@@ -4735,8 +4757,8 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
                         current_term.push_str(&text[start..byte_idx]);
                     }
                 }
-                for lc in self.normalized_char(ch).to_lowercase() {
-                    current_term.push(lc);
+                if !diacritic || self.remove_diacritics == 0 {
+                    current_term.extend(self.normalized_char(ch).to_lowercase());
                 }
             } else if let Some(start) = token_start.take() {
                 if borrowed_ascii_token {
@@ -17583,7 +17605,11 @@ mod tests {
                 [("co-op", 0, 5), ("x", 6, 7), ("Éé", 8, 12)]
             );
         }
-        for bad in ["ascii separators", "ascii unknown 1", "ascii tokenchars 'abc"] {
+        for bad in [
+            "ascii separators",
+            "ascii unknown 1",
+            "ascii tokenchars 'abc",
+        ] {
             assert!(create_tokenizer(bad).is_none());
             assert!(api.create_tokenizer(bad).is_none());
         }

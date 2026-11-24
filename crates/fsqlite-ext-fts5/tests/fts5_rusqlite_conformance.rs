@@ -2565,6 +2565,49 @@ fn unicode61_keep_diacritic_queries_match_rusqlite_reference() {
 }
 
 #[test]
+fn unicode61_combining_marks_match_rusqlite_reference() {
+    let docs = [
+        Doc {
+            rowid: 1,
+            title: "",
+            body: "re\u{301}sume\u{301} file",
+        },
+        Doc {
+            rowid: 2,
+            title: "",
+            body: "résumé file",
+        },
+        Doc {
+            rowid: 3,
+            title: "",
+            body: "\u{301}resume file",
+        },
+        Doc {
+            rowid: 4,
+            title: "",
+            body: "re sume file",
+        },
+    ];
+    for mode in [0, 1, 2] {
+        let spec = format!("tokenize='unicode61 remove_diacritics {mode}'");
+        let harness = Fts5ConformanceHarness::with_docs(&[&spec], &docs);
+        for query in [
+            "resume",
+            "résumé",
+            "re\u{301}sume\u{301}",
+            r#""resume file""#,
+            "sume",
+        ] {
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                harness.sqlite_match_rowids(query),
+                "{spec} MATCH {query}"
+            );
+        }
+    }
+}
+
+#[test]
 fn default_unicode61_separator_queries_match_rusqlite_reference() {
     let harness = Fts5ConformanceHarness::with_docs(&[], UNICODE61_DEFAULT_SEPARATOR_DOCS);
 
