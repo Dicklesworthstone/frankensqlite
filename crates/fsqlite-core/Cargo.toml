@@ -102,7 +102,7 @@ asupersync = { workspace = true }
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["collation"] }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }

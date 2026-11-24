@@ -926,6 +926,22 @@ impl UniqueConstraintState {
             primary_key: false,
         }
     }
+
+    /// Canonical keys describe the built-in comparators, even when an
+    /// application has registered a replacement under the same name.
+    /// Check the live registry on every lookup, since registrations can
+    /// change after the table or index was populated. Continue maintaining
+    /// these keys so a later registry replacement can safely reuse them.
+    fn index_for_registry(
+        &self,
+        registry: &CollationRegistry,
+    ) -> Option<&BTreeMap<Vec<u8>, BTreeSet<i64>>> {
+        self.index.as_ref().filter(|_| {
+            self.collations.iter().all(|collation| {
+                registry.uses_builtin_implementation(collation.as_deref().unwrap_or("BINARY"))
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -944,12 +960,12 @@ pub struct MemTable {
     /// Next auto-increment rowid.
     next_rowid: i64,
     /// UNIQUE constraints tracked for MemDatabase-side enforcement. Builtin
-    /// collations (`BINARY`, `NOCASE`, `RTRIM`) use canonical byte-key
-    /// indexes; other collations fall back to an exact row scan through the
-    /// shared collation registry. Shared copy-on-write like `rows`.
+    /// collations (`BINARY`, `NOCASE`, `RTRIM`) have canonical byte-key
+    /// indexes. Application collations, including replacements of built-in
+    /// names, use an exact row scan. Shared copy-on-write like `rows`.
     unique_constraints: Arc<Vec<UniqueConstraintState>>,
-    /// Shared collation registry consulted when a UNIQUE constraint uses a
-    /// non-builtin collation that cannot be normalized into a byte key.
+    /// Shared collation registry consulted before trusting canonical UNIQUE
+    /// keys and for exact comparisons when an application comparator is active.
     collation_registry: Arc<Mutex<CollationRegistry>>,
     /// Optional VFS temp-file spill controller (attached only to `TEMP` and
     /// ephemeral tables; `None` for ordinary main-DB mirrors).
@@ -1292,7 +1308,11 @@ impl MemTable {
     ) -> Result<bool> {
         // Normalization only; validity does not depend on the label.
         let constraint = UniqueConstraintState::new(cols.to_vec(), collations.to_vec(), None);
-        if constraint.index.is_some() {
+        let registry = self
+            .collation_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if constraint.index_for_registry(&registry).is_some() {
             let mut seen = HashSet::new();
             for row in self.rows.iter() {
                 let row_values = self.read_row_values(cx, row)?;
@@ -1309,10 +1329,6 @@ impl MemTable {
             return Ok(true);
         }
 
-        let registry = self
-            .collation_registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (idx, row) in self.rows.iter().enumerate() {
             let row_values = self.read_row_values(cx, row)?;
             for other in &self.rows[idx + 1..] {
@@ -1338,7 +1354,12 @@ impl MemTable {
         let mut conflicts = BTreeSet::new();
         let mut collations = None;
         for constraint in self.unique_constraints.iter() {
-            if let Some(index) = &constraint.index {
+            let registry = collations.get_or_insert_with(|| {
+                self.collation_registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            if let Some(index) = constraint.index_for_registry(registry) {
                 if let Some(key) = Self::unique_key_for_constraint(
                     new_values,
                     &constraint.columns,
@@ -1351,11 +1372,6 @@ impl MemTable {
                 continue;
             }
 
-            let registry = collations.get_or_insert_with(|| {
-                self.collation_registry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            });
             for row in self.rows.iter() {
                 let row_values = self.read_row_values(cx, row)?;
                 if Self::unique_constraint_matches_row(
@@ -1384,7 +1400,12 @@ impl MemTable {
     pub fn find_unique_conflict_label(&self, cx: &Cx, new_values: &[SqliteValue]) -> Result<Option<(&str, bool)>> {
         let mut collations = None;
         for constraint in self.unique_constraints.iter() {
-            let violated = if let Some(index) = &constraint.index {
+            let registry = collations.get_or_insert_with(|| {
+                self.collation_registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            let violated = if let Some(index) = constraint.index_for_registry(registry) {
                 Self::unique_key_for_constraint(
                     new_values,
                     &constraint.columns,
@@ -1393,11 +1414,6 @@ impl MemTable {
                 )
                 .is_some_and(|key| index.contains_key(&key))
             } else {
-                let registry = collations.get_or_insert_with(|| {
-                    self.collation_registry
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                });
                 let mut found = false;
                 for row in self.rows.iter() {
                     let row_values = self.read_row_values(cx, row)?;
@@ -1837,11 +1853,16 @@ impl MemTable {
             if existing_value.is_null() || new_value.is_null() {
                 return false;
             }
-            let collation = collations.get(position).and_then(|c| c.as_deref());
+            // The implicit collation is BINARY, which applications may also
+            // replace. Use the registry-aware comparator for that default.
+            let collation = collations
+                .get(position)
+                .and_then(|c| c.as_deref())
+                .unwrap_or("BINARY");
             if cmp_values_collated(
                 existing_value,
                 new_value,
-                collation,
+                Some(collation),
                 registry,
                 encoding,
             ) != Ordering::Equal
@@ -37578,6 +37599,68 @@ mod tests {
                 .unwrap(),
             vec![1],
             "builtin NOCASE unique indexes must normalize case-equivalent text"
+        );
+    }
+
+    #[test]
+    fn test_memtable_uniques_recheck_replaced_builtin_collation() {
+        struct ExactRtrim;
+
+        impl fsqlite_func::collation::CollationFunction for ExactRtrim {
+            fn name(&self) -> &str {
+                "rtrim"
+            }
+
+            fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
+                left.cmp(right)
+            }
+        }
+
+        let cx = Cx::new();
+        let registry = Arc::new(Mutex::new(CollationRegistry::new()));
+        let mut table = MemTable::new(1);
+        table.set_collation_registry(Arc::clone(&registry));
+        let collations = vec![Some("RTRIM".to_owned())];
+        table
+            .add_unique_column_group_labeled(
+                &cx,
+                vec![0],
+                collations.clone(),
+                Some("t.k".to_owned()),
+                true,
+            )
+            .unwrap();
+        table.insert(1, vec![SqliteValue::Text("key".into())]);
+        let padded_key = vec![SqliteValue::Text("key ".into())];
+        assert_eq!(table.find_unique_conflicts(&cx, &padded_key).unwrap(), [1]);
+
+        registry.lock().unwrap().register(ExactRtrim);
+        assert!(table.find_unique_conflicts(&cx, &padded_key).unwrap().is_empty());
+        assert_eq!(table.find_unique_conflict_label(&cx, &padded_key).unwrap(), None);
+        table.insert(2, padded_key.clone());
+        assert!(table.unique_column_group_is_valid(&cx, &[0], &collations).unwrap());
+        assert_eq!(table.find_unique_conflicts(&cx, &padded_key).unwrap(), [2]);
+        assert_eq!(
+            table.find_unique_conflict_label(&cx, &padded_key).unwrap(),
+            Some(("t.k", true))
+        );
+
+        table.pad_rows_to_column_count(&cx, 2, &SqliteValue::Integer(7)).unwrap();
+        assert_eq!(table.find_unique_conflicts(&cx, &padded_key).unwrap(), [2]);
+        table.insert(2, vec![SqliteValue::Text("moved".into()), SqliteValue::Integer(8)]);
+        assert!(table.delete_by_rowid(1));
+        table.insert(3, vec![SqliteValue::Text("key ".into()), SqliteValue::Integer(9)]);
+
+        // The canonical index remains complete while overridden, including
+        // changes to two rows sharing one built-in key and a DDL rebuild.
+        table.set_collation_registry(Arc::new(Mutex::new(CollationRegistry::new())));
+        assert_eq!(
+            table.find_unique_conflicts(&cx, &[SqliteValue::Text("key".into())]).unwrap(),
+            [3]
+        );
+        assert_eq!(
+            table.find_unique_conflicts(&cx, &[SqliteValue::Text("moved".into())]).unwrap(),
+            [2]
         );
     }
 
