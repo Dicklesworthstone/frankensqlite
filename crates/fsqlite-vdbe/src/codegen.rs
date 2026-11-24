@@ -21863,6 +21863,15 @@ fn index_prefix_rowid_bounds_cover_where(
 }
 
 fn expr_contains_function_call(expr: &Expr) -> bool {
+    expr_calls_function::<true>(expr)
+}
+
+// The scalar-IN operand router shares a narrower syntactic admission test
+// with the connection. Keep its treatment of pattern syntax in sync, while
+// semantic checks for stale index predicates and volatile projections include
+// every operator dispatched through an application function slot.
+fn expr_calls_function<const INCLUDE_PATTERN_OPERATORS: bool>(expr: &Expr) -> bool {
+    let contains = expr_calls_function::<INCLUDE_PATTERN_OPERATORS>;
     match expr {
         // JSON operators are SQL-visible scalar function calls (`->`/`->>`)
         // and can be replaced by an application registration. Their child
@@ -21872,24 +21881,18 @@ fn expr_contains_function_call(expr: &Expr) -> bool {
         | Expr::Exists {
             subquery: select, ..
         } => select_contains_function_call(select),
-        Expr::BinaryOp { left, right, .. } => {
-            expr_contains_function_call(left) || expr_contains_function_call(right)
-        }
+        Expr::BinaryOp { left, right, .. } => contains(left) || contains(right),
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::Collate { expr, .. } => expr_contains_function_call(expr),
+        | Expr::Collate { expr, .. } => contains(expr),
         Expr::Between {
             expr, low, high, ..
-        } => {
-            expr_contains_function_call(expr)
-                || expr_contains_function_call(low)
-                || expr_contains_function_call(high)
-        }
+        } => contains(expr) || contains(low) || contains(high),
         Expr::In { expr, set, .. } => {
-            expr_contains_function_call(expr)
+            contains(expr)
                 || match set {
-                    InSet::List(items) => items.iter().any(expr_contains_function_call),
+                    InSet::List(items) => items.iter().any(contains),
                     InSet::Subquery(select) => select_contains_function_call(select),
                     InSet::Table(_) => false,
                 }
@@ -21900,9 +21903,10 @@ fn expr_contains_function_call(expr: &Expr) -> bool {
             escape,
             ..
         } => {
-            expr_contains_function_call(expr)
-                || expr_contains_function_call(pattern)
-                || escape.as_deref().is_some_and(expr_contains_function_call)
+            INCLUDE_PATTERN_OPERATORS
+                || contains(expr)
+                || contains(pattern)
+                || escape.as_deref().is_some_and(contains)
         }
         Expr::Case {
             operand,
@@ -21910,15 +21914,13 @@ fn expr_contains_function_call(expr: &Expr) -> bool {
             else_expr,
             ..
         } => {
-            operand.as_deref().is_some_and(expr_contains_function_call)
-                || whens.iter().any(|(when_expr, then_expr)| {
-                    expr_contains_function_call(when_expr) || expr_contains_function_call(then_expr)
-                })
-                || else_expr
-                    .as_deref()
-                    .is_some_and(expr_contains_function_call)
+            operand.as_deref().is_some_and(contains)
+                || whens
+                    .iter()
+                    .any(|(when_expr, then_expr)| contains(when_expr) || contains(then_expr))
+                || else_expr.as_deref().is_some_and(contains)
         }
-        Expr::RowValue(items, _) => items.iter().any(expr_contains_function_call),
+        Expr::RowValue(items, _) => items.iter().any(contains),
         Expr::Literal(_, _)
         | Expr::BoundOuterValue { .. }
         | Expr::Column(_, _)
@@ -42927,12 +42929,12 @@ fn scalar_in_operand_metadata(
                 column,
                 ResultColumn::Expr { expr, .. }
                     if in_probe_expr_requires_semantic_fallback(expr)
-                        || expr_contains_function_call(expr)
+                        || expr_calls_function::<false>(expr)
             )
         })
         || where_clause.as_deref().is_some_and(|expr| {
             in_probe_expr_requires_semantic_fallback(expr)
-                || expr_contains_function_call(expr)
+                || expr_calls_function::<false>(expr)
                 || is_aggregate_expr(expr)
                 || expr_has_window(expr)
         })
@@ -60641,6 +60643,39 @@ mod tests {
             use_builtin_like_glob_semantics(),
             "the connection function context must restore its prior state"
         );
+    }
+
+    #[test]
+    fn pattern_overrides_exclude_stale_partial_indexes_from_aggregate_probes() {
+        let mut table = bd_2dgf5_table();
+        for predicate in [
+            "v LIKE 'x%'",
+            "v LIKE 'x!_%' ESCAPE '!'",
+            "v GLOB 'x*'",
+            "v MATCH 'x'",
+            "v REGEXP '^x'",
+            "CASE WHEN v NOT GLOB 'x*' THEN 0 ELSE 1 END",
+        ] {
+            table.indexes[0].where_clause = Some(predicate.to_owned());
+            let filter = expr_sql(&format!("k = 2 AND ({predicate})"));
+            let can_probe = || {
+                aggregate_index_prefix_residual_target(
+                    Some(&filter),
+                    &table,
+                    None,
+                    PrefixIndexShape::AnyPrefix,
+                    PrefixProbe::Literal,
+                )
+                .is_some()
+            };
+            assert!(
+                can_probe(),
+                "fixture should use partial index for {predicate}"
+            );
+            with_connection_function_context(Vec::new(), false, false, || {
+                assert!(!can_probe(), "stale partial index selected for {predicate}");
+            });
+        }
     }
 
     #[test]
