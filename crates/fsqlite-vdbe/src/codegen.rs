@@ -22811,7 +22811,7 @@ fn codegen_select_aggregate(
     }
 
     // Parse aggregate columns: extract function name, arg count, arg column index.
-    let mut agg_columns = parse_aggregate_columns(columns, table)?;
+    let mut agg_columns = parse_aggregate_columns(columns, table, table_alias)?;
 
     // Leaf-seek fast path for `MAX(rowid)` / `MIN(rowid)` with no WHERE/HAVING
     // (this function is only reached when GROUP BY is empty). Stock SQLite
@@ -24933,6 +24933,7 @@ fn push_bare_aggregate_expr(agg_cols: &mut Vec<AggColumn>, expr: Expr) {
 fn parse_aggregate_columns(
     columns: &[ResultColumn],
     table: &TableSchema,
+    table_alias: Option<&str>,
 ) -> Result<Vec<AggColumn>, CodegenError> {
     let mut agg_cols = Vec::with_capacity(columns.len());
     for col in columns {
@@ -24991,7 +24992,7 @@ fn parse_aggregate_columns(
                             // First argument: try column reference first,
                             // fall back to storing the expression for emit_expr.
                             let (col_idx, is_rowid, expr) =
-                                match resolve_column_ref(&exprs[0], table, None) {
+                                match resolve_column_ref(&exprs[0], table, table_alias) {
                                     Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
                                     Some(SortKeySource::Rowid) => (None, true, None),
                                     _ => (None, false, Some(Box::new(exprs[0].clone()))),
@@ -25031,24 +25032,26 @@ fn parse_aggregate_columns(
             ResultColumn::Expr { expr, .. } if is_aggregate_expr(expr) => {
                 // Expression wraps aggregate(s).  Try single-aggregate
                 // extraction first (fast path), then multi-aggregate.
-                let single_ok =
-                    if let Some((inner_agg, ref wrapper)) = extract_inner_aggregate(expr, table) {
-                        if is_aggregate_expr(wrapper) {
-                            // Wrapper still contains aggregates → need multi-agg path.
-                            false
-                        } else {
-                            agg_cols.push(AggColumn {
-                                wrapper_expr: Some(Box::new(wrapper.clone())),
-                                ..inner_agg
-                            });
-                            true
-                        }
-                    } else {
+                let single_ok = if let Some((inner_agg, ref wrapper)) =
+                    extract_inner_aggregate(expr, table, table_alias)
+                {
+                    if is_aggregate_expr(wrapper) {
+                        // Wrapper still contains aggregates → need multi-agg path.
                         false
-                    };
+                    } else {
+                        agg_cols.push(AggColumn {
+                            wrapper_expr: Some(Box::new(wrapper.clone())),
+                            ..inner_agg
+                        });
+                        true
+                    }
+                } else {
+                    false
+                };
                 if !single_ok {
                     // Multi-aggregate: e.g. MAX(x) - MIN(x).
-                    let (extracted, wrapper) = extract_all_inner_aggregates(expr, table);
+                    let (extracted, wrapper) =
+                        extract_all_inner_aggregates(expr, table, table_alias);
                     if extracted.is_empty() {
                         return Err(CodegenError::Unsupported(
                             "complex aggregate wrapper expression not supported without GROUP BY"
@@ -25271,7 +25274,11 @@ fn emit_multi_agg_wrapper(
 /// the codegen emitter will substitute with the accumulator register.
 ///
 /// Handles patterns like `COALESCE(MAX(x), 0)`, `ABS(SUM(x))`, etc.
-fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColumn, Expr)> {
+fn extract_inner_aggregate(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(AggColumn, Expr)> {
     if let Expr::FunctionCall {
         name: agg_name,
         args: agg_args,
@@ -25315,11 +25322,12 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                 collation: None,
             },
             FunctionArgs::List(exprs) => {
-                let (col_idx, is_rowid, a_expr) = match resolve_column_ref(&exprs[0], table, None) {
-                    Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
-                    Some(SortKeySource::Rowid) => (None, true, None),
-                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
-                };
+                let (col_idx, is_rowid, a_expr) =
+                    match resolve_column_ref(&exprs[0], table, table_alias) {
+                        Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
+                        Some(SortKeySource::Rowid) => (None, true, None),
+                        _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                    };
                 let extra: Vec<Expr> = exprs[1..].to_vec();
                 // bd-lgwjd(a): a single aggregate wrapped in an expression
                 // (`max(name)||''`) is lowered through THIS extractor; leaving
@@ -25365,7 +25373,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
             span,
         } => {
             for (i, arg) in exprs.iter().enumerate() {
-                if let Some((agg_col, new_arg)) = extract_inner_aggregate(arg, table) {
+                if let Some((agg_col, new_arg)) = extract_inner_aggregate(arg, table, table_alias) {
                     let mut new_exprs = exprs.clone();
                     new_exprs[i] = new_arg;
                     return Some((
@@ -25389,7 +25397,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
             right,
             span,
         } => {
-            if let Some((agg_col, new_left)) = extract_inner_aggregate(left, table) {
+            if let Some((agg_col, new_left)) = extract_inner_aggregate(left, table, table_alias) {
                 return Some((
                     agg_col,
                     Expr::BinaryOp {
@@ -25400,7 +25408,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     },
                 ));
             }
-            if let Some((agg_col, new_right)) = extract_inner_aggregate(right, table) {
+            if let Some((agg_col, new_right)) = extract_inner_aggregate(right, table, table_alias) {
                 return Some((
                     agg_col,
                     Expr::BinaryOp {
@@ -25417,7 +25425,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
             expr: inner,
             span,
         } => {
-            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
+            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table, table_alias) {
                 return Some((
                     agg_col,
                     Expr::UnaryOp {
@@ -25435,7 +25443,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
             span,
         } => {
             if let Some(b) = operand
-                && let Some((agg_col, new_base)) = extract_inner_aggregate(b, table)
+                && let Some((agg_col, new_base)) = extract_inner_aggregate(b, table, table_alias)
             {
                 return Some((
                     agg_col,
@@ -25448,7 +25456,8 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                 ));
             }
             for (i, (cond, val)) in whens.iter().enumerate() {
-                if let Some((agg_col, new_cond)) = extract_inner_aggregate(cond, table) {
+                if let Some((agg_col, new_cond)) = extract_inner_aggregate(cond, table, table_alias)
+                {
                     let mut new_whens = whens.clone();
                     new_whens[i].0 = new_cond;
                     return Some((
@@ -25461,7 +25470,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                         },
                     ));
                 }
-                if let Some((agg_col, new_val)) = extract_inner_aggregate(val, table) {
+                if let Some((agg_col, new_val)) = extract_inner_aggregate(val, table, table_alias) {
                     let mut new_whens = whens.clone();
                     new_whens[i].1 = new_val;
                     return Some((
@@ -25476,7 +25485,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                 }
             }
             if let Some(e) = else_expr
-                && let Some((agg_col, new_else)) = extract_inner_aggregate(e, table)
+                && let Some((agg_col, new_else)) = extract_inner_aggregate(e, table, table_alias)
             {
                 return Some((
                     agg_col,
@@ -25494,7 +25503,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
             not,
             span,
         } => {
-            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
+            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table, table_alias) {
                 return Some((
                     agg_col,
                     Expr::IsNull {
@@ -25510,7 +25519,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
             type_name,
             span,
         } => {
-            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
+            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table, table_alias) {
                 return Some((
                     agg_col,
                     Expr::Cast {
@@ -25526,7 +25535,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
             collation,
             span,
         } => {
-            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
+            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table, table_alias) {
                 return Some((
                     agg_col,
                     Expr::Collate {
@@ -25548,9 +25557,13 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
 ///
 /// Used for expressions like `MAX(x) - MIN(x)` that contain multiple
 /// aggregate calls.
-fn extract_all_inner_aggregates(expr: &Expr, table: &TableSchema) -> (Vec<AggColumn>, Expr) {
+fn extract_all_inner_aggregates(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> (Vec<AggColumn>, Expr) {
     let mut agg_cols = Vec::new();
-    let rewritten = rewrite_aggregates_recursive(expr, table, &mut agg_cols);
+    let rewritten = rewrite_aggregates_recursive(expr, table, table_alias, &mut agg_cols);
     (agg_cols, rewritten)
 }
 
@@ -25560,6 +25573,7 @@ fn extract_all_inner_aggregates(expr: &Expr, table: &TableSchema) -> (Vec<AggCol
 fn rewrite_aggregates_recursive(
     expr: &Expr,
     table: &TableSchema,
+    table_alias: Option<&str>,
     agg_cols: &mut Vec<AggColumn>,
 ) -> Expr {
     // If this node IS an aggregate function call, extract it entirely.
@@ -25608,11 +25622,12 @@ fn rewrite_aggregates_recursive(
             },
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             FunctionArgs::List(exprs) => {
-                let (col_idx, is_rowid, a_expr) = match resolve_column_ref(&exprs[0], table, None) {
-                    Some(SortKeySource::Column(i)) => (Some(i), false, None),
-                    Some(SortKeySource::Rowid) => (None, true, None),
-                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
-                };
+                let (col_idx, is_rowid, a_expr) =
+                    match resolve_column_ref(&exprs[0], table, table_alias) {
+                        Some(SortKeySource::Column(i)) => (Some(i), false, None),
+                        Some(SortKeySource::Rowid) => (None, true, None),
+                        _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                    };
                 let extra: Vec<Expr> = exprs[1..].to_vec();
                 // bd-lgwjd(a): resolve the aggregate-argument collation for MIN/MAX
                 // (and DISTINCT) here too — a multi-aggregate expression like
@@ -25661,9 +25676,19 @@ fn rewrite_aggregates_recursive(
             right,
             span,
         } => Expr::BinaryOp {
-            left: Box::new(rewrite_aggregates_recursive(left, table, agg_cols)),
+            left: Box::new(rewrite_aggregates_recursive(
+                left,
+                table,
+                table_alias,
+                agg_cols,
+            )),
             op: *op,
-            right: Box::new(rewrite_aggregates_recursive(right, table, agg_cols)),
+            right: Box::new(rewrite_aggregates_recursive(
+                right,
+                table,
+                table_alias,
+                agg_cols,
+            )),
             span: *span,
         },
         Expr::UnaryOp {
@@ -25672,7 +25697,12 @@ fn rewrite_aggregates_recursive(
             span,
         } => Expr::UnaryOp {
             op: *op,
-            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            expr: Box::new(rewrite_aggregates_recursive(
+                inner,
+                table,
+                table_alias,
+                agg_cols,
+            )),
             span: *span,
         },
         Expr::Between {
@@ -25682,9 +25712,24 @@ fn rewrite_aggregates_recursive(
             not,
             span,
         } => Expr::Between {
-            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
-            low: Box::new(rewrite_aggregates_recursive(low, table, agg_cols)),
-            high: Box::new(rewrite_aggregates_recursive(high, table, agg_cols)),
+            expr: Box::new(rewrite_aggregates_recursive(
+                inner,
+                table,
+                table_alias,
+                agg_cols,
+            )),
+            low: Box::new(rewrite_aggregates_recursive(
+                low,
+                table,
+                table_alias,
+                agg_cols,
+            )),
+            high: Box::new(rewrite_aggregates_recursive(
+                high,
+                table,
+                table_alias,
+                agg_cols,
+            )),
             not: *not,
             span: *span,
         },
@@ -25698,13 +25743,20 @@ fn rewrite_aggregates_recursive(
                 InSet::List(items) => InSet::List(
                     items
                         .iter()
-                        .map(|item| rewrite_aggregates_recursive(item, table, agg_cols))
+                        .map(|item| {
+                            rewrite_aggregates_recursive(item, table, table_alias, agg_cols)
+                        })
                         .collect(),
                 ),
                 other => other.clone(),
             };
             Expr::In {
-                expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+                expr: Box::new(rewrite_aggregates_recursive(
+                    inner,
+                    table,
+                    table_alias,
+                    agg_cols,
+                )),
                 set: rewritten_set,
                 not: *not,
                 span: *span,
@@ -25718,11 +25770,26 @@ fn rewrite_aggregates_recursive(
             not,
             span,
         } => Expr::Like {
-            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
-            pattern: Box::new(rewrite_aggregates_recursive(pattern, table, agg_cols)),
-            escape: escape
-                .as_deref()
-                .map(|expr| Box::new(rewrite_aggregates_recursive(expr, table, agg_cols))),
+            expr: Box::new(rewrite_aggregates_recursive(
+                inner,
+                table,
+                table_alias,
+                agg_cols,
+            )),
+            pattern: Box::new(rewrite_aggregates_recursive(
+                pattern,
+                table,
+                table_alias,
+                agg_cols,
+            )),
+            escape: escape.as_deref().map(|expr| {
+                Box::new(rewrite_aggregates_recursive(
+                    expr,
+                    table,
+                    table_alias,
+                    agg_cols,
+                ))
+            }),
             op: *op,
             not: *not,
             span: *span,
@@ -25733,21 +25800,31 @@ fn rewrite_aggregates_recursive(
             else_expr,
             span,
         } => Expr::Case {
-            operand: operand
-                .as_deref()
-                .map(|expr| Box::new(rewrite_aggregates_recursive(expr, table, agg_cols))),
+            operand: operand.as_deref().map(|expr| {
+                Box::new(rewrite_aggregates_recursive(
+                    expr,
+                    table,
+                    table_alias,
+                    agg_cols,
+                ))
+            }),
             whens: whens
                 .iter()
                 .map(|(when_expr, then_expr)| {
                     (
-                        rewrite_aggregates_recursive(when_expr, table, agg_cols),
-                        rewrite_aggregates_recursive(then_expr, table, agg_cols),
+                        rewrite_aggregates_recursive(when_expr, table, table_alias, agg_cols),
+                        rewrite_aggregates_recursive(then_expr, table, table_alias, agg_cols),
                     )
                 })
                 .collect(),
-            else_expr: else_expr
-                .as_deref()
-                .map(|expr| Box::new(rewrite_aggregates_recursive(expr, table, agg_cols))),
+            else_expr: else_expr.as_deref().map(|expr| {
+                Box::new(rewrite_aggregates_recursive(
+                    expr,
+                    table,
+                    table_alias,
+                    agg_cols,
+                ))
+            }),
             span: *span,
         },
         Expr::FunctionCall {
@@ -25761,7 +25838,7 @@ fn rewrite_aggregates_recursive(
         } => {
             let new_exprs: Vec<Expr> = exprs
                 .iter()
-                .map(|e| rewrite_aggregates_recursive(e, table, agg_cols))
+                .map(|e| rewrite_aggregates_recursive(e, table, table_alias, agg_cols))
                 .collect();
             Expr::FunctionCall {
                 name: name.clone(),
@@ -25778,7 +25855,12 @@ fn rewrite_aggregates_recursive(
             type_name,
             span,
         } => Expr::Cast {
-            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            expr: Box::new(rewrite_aggregates_recursive(
+                inner,
+                table,
+                table_alias,
+                agg_cols,
+            )),
             type_name: type_name.clone(),
             span: *span,
         },
@@ -25787,7 +25869,12 @@ fn rewrite_aggregates_recursive(
             collation,
             span,
         } => Expr::Collate {
-            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            expr: Box::new(rewrite_aggregates_recursive(
+                inner,
+                table,
+                table_alias,
+                agg_cols,
+            )),
             collation: collation.clone(),
             span: *span,
         },
@@ -25796,7 +25883,12 @@ fn rewrite_aggregates_recursive(
             not,
             span,
         } => Expr::IsNull {
-            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            expr: Box::new(rewrite_aggregates_recursive(
+                inner,
+                table,
+                table_alias,
+                agg_cols,
+            )),
             not: *not,
             span: *span,
         },
@@ -25806,15 +25898,25 @@ fn rewrite_aggregates_recursive(
             arrow,
             span,
         } => Expr::JsonAccess {
-            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
-            path: Box::new(rewrite_aggregates_recursive(path, table, agg_cols)),
+            expr: Box::new(rewrite_aggregates_recursive(
+                inner,
+                table,
+                table_alias,
+                agg_cols,
+            )),
+            path: Box::new(rewrite_aggregates_recursive(
+                path,
+                table,
+                table_alias,
+                agg_cols,
+            )),
             arrow: *arrow,
             span: *span,
         },
         Expr::RowValue(items, span) => Expr::RowValue(
             items
                 .iter()
-                .map(|item| rewrite_aggregates_recursive(item, table, agg_cols))
+                .map(|item| rewrite_aggregates_recursive(item, table, table_alias, agg_cols))
                 .collect(),
             *span,
         ),
@@ -47509,7 +47611,7 @@ fn emit_scalar_aggregate_subquery(
     _done_label: crate::Label,
 ) {
     // Parse the aggregate columns.
-    let Ok(agg_cols) = parse_aggregate_columns(columns, sub_ctx.table) else {
+    let Ok(agg_cols) = parse_aggregate_columns(columns, sub_ctx.table, sub_ctx.table_alias) else {
         return;
     };
 
@@ -65879,8 +65981,8 @@ mod tests {
                 assert!(test_failure(), "aggregate fixture must be a SELECT core");
                 return (stmt, Vec::new());
             };
-            let aggregates =
-                parse_aggregate_columns(columns, table).expect("aggregate fixture should parse");
+            let aggregates = parse_aggregate_columns(columns, table, None)
+                .expect("aggregate fixture should parse");
             (stmt, aggregates)
         }
 

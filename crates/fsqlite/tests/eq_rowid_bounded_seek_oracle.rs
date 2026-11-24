@@ -538,6 +538,16 @@ async fn assert_eq_rowid_bounded_covering_aggregates(path: &str) {
             "t_a",
         ),
         (
+            "SELECT count(q.a), sum(q.a), coalesce(sum(q.rowid), 0) FROM t AS q \
+             WHERE 5 = q.a AND 105 < q.rowid AND 305 >= q.rowid",
+            "t_a",
+        ),
+        (
+            "SELECT max(q.rowid) - min(q.rowid) FROM t AS q \
+             WHERE 5 = q.a AND 105 < q.rowid AND 305 >= q.rowid",
+            "t_a",
+        ),
+        (
             "SELECT count(x), min(x), max(x), sum(id) FROM t \
              WHERE x = 'v3' AND id > 101 AND id < 304",
             "t_x",
@@ -550,6 +560,15 @@ async fn assert_eq_rowid_bounded_covering_aggregates(path: &str) {
     ];
     for (sql, index) in covering {
         assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
+        let stmt = f.prepare(sql).await.unwrap();
+        let prepared_rows: Vec<Vec<String>> = stmt
+            .query()
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.values().iter().map(render).collect())
+            .collect();
+        assert_eq!(prepared_rows, sqlite_rows(&r, sql), "prepared `{sql}`");
         let ops = explain_ops(&f, sql).await;
         assert!(
             opens_index(&f, sql, index).await,
@@ -574,6 +593,7 @@ async fn assert_eq_rowid_bounded_covering_aggregates(path: &str) {
         "SELECT count(*) FROM t WHERE a = 5 AND id < 305 AND id <= 105",
         "SELECT count(*) FROM t WHERE a = 5 AND a = 6 AND id > 105",
         "SELECT sum(c), count(*) FROM t WHERE a = 5 AND id > 105",
+        "SELECT sum(q.c), count(*) FROM t AS q WHERE 5 = q.a AND 105 < q.rowid",
         "SELECT sum(id) FILTER (WHERE c = 3) FROM t WHERE a = 5 AND id > 105",
     ] {
         assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
@@ -745,5 +765,161 @@ fn eq_rowid_bounded_in_list_aggregates_seek_each_value_and_match_sqlite() {
             assert_eq!(frank_rows(&f, sql).await, sqlite_rows(&r, sql), "`{sql}`");
             assert!(!has_rowid_ceiling(&explain_ops(&f, sql).await), "`{sql}`");
         }
+    });
+}
+
+/// bd-qrn03 live A/B probe: 200k rows, 200 rows per key, stock SQLite live in
+/// the same invocation. Run under `--profile release-perf -- --ignored --nocapture`.
+#[test]
+#[ignore = "bd-qrn03 live A/B probe vs bundled rusqlite; run under --profile release-perf"]
+#[allow(clippy::cast_precision_loss)]
+fn eq_rowid_bounded_covering_count_ab_live() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn median(values: &mut [f64]) -> f64 {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for ddl in [
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, i INTEGER, c INTEGER)",
+            "CREATE INDEX s_i ON s(i)",
+        ] {
+            f.execute(ddl).await.unwrap();
+            r.execute_batch(ddl).unwrap();
+        }
+        f.execute("BEGIN").await.unwrap();
+        let f_ins = f
+            .prepare("INSERT INTO s(id, i, c) VALUES (?1, ?2, ?3)")
+            .await
+            .unwrap();
+        let r_tx = r.unchecked_transaction().unwrap();
+        {
+            let mut r_ins = r_tx
+                .prepare("INSERT INTO s(id, i, c) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for id in 1..=200_000_i64 {
+                let i = id % 1000;
+                let c = (id * 7) % 97;
+                f_ins
+                    .execute_with_params(&[
+                        SqliteValue::Integer(id),
+                        SqliteValue::Integer(i),
+                        SqliteValue::Integer(c),
+                    ])
+                    .await
+                    .unwrap();
+                r_ins.execute(rusqlite::params![id, i, c]).unwrap();
+            }
+        }
+        drop(f_ins);
+        f.execute("COMMIT").await.unwrap();
+        r_tx.commit().unwrap();
+
+        let count_sql = "SELECT count(*) FROM s WHERE i = 5 AND id > 100000";
+        let sum_sql = "SELECT sum(c) FROM s WHERE i = 5 AND id > 100000";
+        assert_eq!(frank_rows(&f, count_sql).await, sqlite_rows(&r, count_sql));
+        assert_eq!(frank_rows(&f, sum_sql).await, sqlite_rows(&r, sum_sql));
+        let count_ops = explain_ops(&f, count_sql).await;
+        assert!(
+            opens_index(&f, count_sql, "s_i").await
+                && !count_ops.iter().any(|(op, _)| op == "SeekRowid")
+                && count_ops.iter().filter(|(op, _)| op == "OpenRead").count() == 1,
+            "bd-qrn03 A/B: count(*) must use covering index s_i without SeekRowid"
+        );
+        let sum_ops = explain_ops(&f, sum_sql).await;
+        assert!(
+            sum_ops.iter().any(|(op, _)| op == "SeekRowid"),
+            "bd-qrn03 A/B: sum(c) must read table rows via SeekRowid"
+        );
+
+        let rounds = 11usize;
+        let iters = 200u64;
+        for (label, sql) in [
+            ("count(*) covering [200k rows, 200/key]", count_sql),
+            ("sum(c) table-read [200k rows, 200/key]", sum_sql),
+        ] {
+            let f_stmt = f.prepare(sql).await.unwrap();
+            let mut r_stmt = r.prepare(sql).unwrap();
+
+            // Warmup both engines.
+            for _ in 0..20 {
+                let _ = black_box(f_stmt.query().await.unwrap());
+                let _: i64 = black_box(r_stmt.query_row([], |row| row.get(0)).unwrap());
+            }
+
+            let mut f_prep = Vec::with_capacity(rounds);
+            let mut r_prep = Vec::with_capacity(rounds);
+            let mut f_direct = Vec::with_capacity(rounds);
+            let mut r_direct = Vec::with_capacity(rounds);
+
+            for round in 0..rounds {
+                if round % 2 == 0 {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = black_box(f_stmt.query().await.unwrap());
+                    }
+                    f_prep.push(t0.elapsed().as_nanos() as f64 / iters as f64);
+
+                    let t1 = Instant::now();
+                    for _ in 0..iters {
+                        let _: i64 = black_box(r_stmt.query_row([], |row| row.get(0)).unwrap());
+                    }
+                    r_prep.push(t1.elapsed().as_nanos() as f64 / iters as f64);
+
+                    let t2 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = black_box(f.query(sql).await.unwrap());
+                    }
+                    f_direct.push(t2.elapsed().as_nanos() as f64 / iters as f64);
+
+                    let t3 = Instant::now();
+                    for _ in 0..iters {
+                        let _: i64 = black_box(r.query_row(sql, [], |row| row.get(0)).unwrap());
+                    }
+                    r_direct.push(t3.elapsed().as_nanos() as f64 / iters as f64);
+                } else {
+                    let t1 = Instant::now();
+                    for _ in 0..iters {
+                        let _: i64 = black_box(r_stmt.query_row([], |row| row.get(0)).unwrap());
+                    }
+                    r_prep.push(t1.elapsed().as_nanos() as f64 / iters as f64);
+
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = black_box(f_stmt.query().await.unwrap());
+                    }
+                    f_prep.push(t0.elapsed().as_nanos() as f64 / iters as f64);
+
+                    let t3 = Instant::now();
+                    for _ in 0..iters {
+                        let _: i64 = black_box(r.query_row(sql, [], |row| row.get(0)).unwrap());
+                    }
+                    r_direct.push(t3.elapsed().as_nanos() as f64 / iters as f64);
+
+                    let t2 = Instant::now();
+                    for _ in 0..iters {
+                        let _ = black_box(f.query(sql).await.unwrap());
+                    }
+                    f_direct.push(t2.elapsed().as_nanos() as f64 / iters as f64);
+                }
+            }
+
+            let fp = median(&mut f_prep);
+            let rp = median(&mut r_prep);
+            let fd = median(&mut f_direct);
+            let rd = median(&mut r_direct);
+            eprintln!(
+                "bd-qrn03 A/B [{label}] sqlite={} | prepared: frank={fp:.1}ns stock={rp:.1}ns ratio={:.2}x | direct: frank={fd:.1}ns stock={rd:.1}ns ratio={:.2}x",
+                rusqlite::version(),
+                fp / rp,
+                fd / rd,
+            );
+        }
+        f.close().await.unwrap();
     });
 }
