@@ -100965,15 +100965,22 @@ impl Connection {
             return Ok(Vec::new());
         }
 
+        let mut outer_window_spec: Option<WindowSpec> = None;
         let (mut rows, group_has_input_for_windows) = match &bound.body.select {
             SelectCore::Values(value_rows) => {
                 let mut rows = Vec::with_capacity(value_rows.len());
                 for value_row in value_rows {
+                    let mut row_window_spec: Option<WindowSpec> = None;
                     let mut values = Vec::with_capacity(value_row.len());
                     for expr in value_row {
                         values.push(
-                            self.eval_fromless_window_expr(expr, &named_windows, true)
-                                .await?,
+                            self.eval_fromless_window_expr(
+                                expr,
+                                &named_windows,
+                                true,
+                                &mut row_window_spec,
+                            )
+                            .await?,
                         );
                     }
                     rows.push(Row { values });
@@ -101027,8 +101034,13 @@ impl Connection {
                         });
                     };
                     values.push(
-                        self.eval_fromless_window_expr(expr, &named_windows, row_included)
-                            .await?,
+                        self.eval_fromless_window_expr(
+                            expr,
+                            &named_windows,
+                            row_included,
+                            &mut outer_window_spec,
+                        )
+                        .await?,
                     );
                 }
                 (vec![Row { values }], row_included)
@@ -101061,6 +101073,7 @@ impl Connection {
                     effective,
                     &resolved_order_named_windows,
                     group_has_input_for_windows,
+                    &mut outer_window_spec,
                 )
                 .await?;
             }
@@ -101074,6 +101087,7 @@ impl Connection {
         expr: &Expr,
         named_windows: &NamedWindowSpecs<'_>,
         group_has_input: bool,
+        outer_window_spec: &mut Option<WindowSpec>,
     ) -> Result<SqliteValue> {
         let mut rewritten = expr.clone();
         while expr_has_window_function(&rewritten) {
@@ -101088,7 +101102,7 @@ impl Connection {
                     "window expression could not expose its first window call".to_owned(),
                 )
             })?;
-            let value = self
+            let (value, result_subtype, resolved_window) = self
                 .eval_fromless_window_call(
                     &name,
                     &args,
@@ -101098,8 +101112,34 @@ impl Connection {
                     group_has_input,
                 )
                 .await?;
+            let shares_outer_stage = match outer_window_spec.as_ref() {
+                None => {
+                    *outer_window_spec = Some(resolved_window);
+                    true
+                }
+                Some(first) => window_specs_share_outer_stage(
+                    WindowOuterStageSpec {
+                        partition_by: &first.partition_by,
+                        order_by_exprs: None,
+                        order_by_terms: &first.order_by,
+                        frame: first.frame.as_ref(),
+                    },
+                    WindowOuterStageSpec {
+                        partition_by: &resolved_window.partition_by,
+                        order_by_exprs: None,
+                        order_by_terms: &resolved_window.order_by,
+                        frame: resolved_window.frame.as_ref(),
+                    },
+                ),
+            };
+            let effective_subtype = if shares_outer_stage { result_subtype } else { 0 };
             let mut replaced = false;
-            rewritten = replace_first_window_with_literal(&rewritten, &value, &mut replaced);
+            rewritten = replace_first_window_with_literal_with_subtype(
+                &rewritten,
+                &value,
+                effective_subtype,
+                &mut replaced,
+            );
             if !replaced {
                 return Err(FrankenError::Internal(
                     "window expression replacement made no progress".to_owned(),
@@ -101159,9 +101199,15 @@ impl Connection {
         window: &WindowSpec,
         named_windows: &NamedWindowSpecs<'_>,
         group_has_input: bool,
-    ) -> Result<SqliteValue> {
-        let window = resolve_used_window_spec(window, named_windows)?;
+    ) -> Result<(SqliteValue, u32, WindowSpec)> {
+        let mut window = resolve_used_window_spec(window, named_windows)?;
         validate_window_frame_shape(&window)?;
+        if let Some(frame) = window.frame.take() {
+            window.frame = Some(
+                self.resolve_window_frame_offsets(&frame, window.order_by.len(), None)
+                    .await?,
+            );
+        }
         let quoted_args = self.window_args_quoting_varying_json(name, args);
         let args = quoted_args.as_ref().unwrap_or(args);
         let arg_exprs = match args {
@@ -101218,13 +101264,10 @@ impl Connection {
                     | "LEAD"
             );
         let (included, has_explicit_exclusion) = if frame_sensitive {
-            let frame = match window.frame.as_ref() {
-                Some(frame) => {
-                    self.resolve_window_frame_offsets(frame, window.order_by.len(), None)
-                        .await?
-                }
-                None => default_window_frame(!window.order_by.is_empty()),
-            };
+            let frame = window
+                .frame
+                .clone()
+                .unwrap_or_else(|| default_window_frame(!window.order_by.is_empty()));
             let order_by = window.order_by.clone();
             let order_keys = vec![order_values];
             let order_collations = window
@@ -101253,7 +101296,8 @@ impl Connection {
             (true, false)
         };
 
-        match upper.as_str() {
+        let result_subtype = builtin_window_result_json_subtype(name, is_builtin);
+        let value = match upper.as_str() {
             _ if !is_builtin && has_explicit_exclusion => {
                 let args_by_row = [arg_values];
                 let target_rows: &[usize] = if included && filter_matches {
@@ -101265,30 +101309,31 @@ impl Connection {
                     function.as_ref(),
                     &args_by_row,
                     target_rows,
-                )
+                )?
             }
             _ if !is_builtin => evaluate_single_row_window_lifecycle(
                 function.as_ref(),
                 included && filter_matches,
                 &arg_values,
-            ),
-            "ROW_NUMBER" | "RANK" | "DENSE_RANK" => Ok(SqliteValue::Integer(1)),
-            "PERCENT_RANK" => Ok(SqliteValue::Float(0.0)),
-            "CUME_DIST" => Ok(SqliteValue::Float(1.0)),
+            )?,
+            "ROW_NUMBER" | "RANK" | "DENSE_RANK" => SqliteValue::Integer(1),
+            "PERCENT_RANK" => SqliteValue::Float(0.0),
+            "CUME_DIST" => SqliteValue::Float(1.0),
             "NTH_VALUE" => {
                 let frame_rows = if included && filter_matches {
                     vec![arg_values.clone()]
                 } else {
                     Vec::new()
                 };
-                nth_value_from_frame_args(&arg_values, &frame_rows)
+                nth_value_from_frame_args(&arg_values, &frame_rows)?
             }
             _ => evaluate_single_row_window_lifecycle(
                 function.as_ref(),
                 (included || matches!(upper.as_str(), "NTILE" | "LAG" | "LEAD")) && filter_matches,
                 &arg_values,
-            ),
-        }
+            )?,
+        };
+        Ok((value, result_subtype, window))
     }
 
     /// Execute a FROM-less aggregate SELECT like `SELECT COUNT(*), SUM(NULL)`.
@@ -107764,6 +107809,37 @@ impl Connection {
 
         // ── Phase 3: Assemble final result rows ────────────────────────────
 
+        let win_result_subtypes: Vec<u32> = win_infos
+            .iter()
+            .enumerate()
+            .map(|(wi, info)| {
+                let base = builtin_window_result_json_subtype(&info.name, info.is_builtin);
+                if base == 0 {
+                    return 0;
+                }
+                if wi == 0
+                    || window_specs_share_outer_stage(
+                        WindowOuterStageSpec {
+                            partition_by: &win_infos[0].partition_by_source,
+                            order_by_exprs: Some(&win_infos[0].order_by_source),
+                            order_by_terms: &win_infos[0].order_by,
+                            frame: win_infos[0].frame.as_ref(),
+                        },
+                        WindowOuterStageSpec {
+                            partition_by: &info.partition_by_source,
+                            order_by_exprs: Some(&info.order_by_source),
+                            order_by_terms: &info.order_by,
+                            frame: info.frame.as_ref(),
+                        },
+                    )
+                {
+                    base
+                } else {
+                    0
+                }
+            })
+            .collect();
+
         let mut result_rows: Vec<Row> = Vec::with_capacity(total_rows);
         for ri in 0..total_rows {
             let mut vals: Vec<SqliteValue> = Vec::with_capacity(col_kinds.len());
@@ -107782,22 +107858,26 @@ impl Connection {
                     }
                     GbwColKind::WrappedWindow(win_indices, outer_expr) => {
                         // Replace each __win_result_N__ placeholder with its
-                        // computed window value, then evaluate the residual
-                        // scalar expression.
-                        let mut placeholder_col_map = Vec::with_capacity(win_indices.len());
-                        let mut win_row = Vec::with_capacity(win_indices.len());
-                        for (slot, &wi) in win_indices.iter().enumerate() {
-                            placeholder_col_map.push((
-                                String::new(),
-                                win_placeholder_name(slot),
-                                false,
-                            ));
-                            win_row.push(window_results[wi][ri].clone());
-                        }
-                        let val = self.eval_join_expr_with_registry(
+                        // computed window value (preserving JSON subtype for
+                        // outer-stage JSON windows), then evaluate the residual
+                        // scalar expression against the grouped row.
+                        let win_vals: Vec<SqliteValue> = win_indices
+                            .iter()
+                            .map(|&wi| window_results[wi][ri].clone())
+                            .collect();
+                        let win_subtypes: Vec<u32> = win_indices
+                            .iter()
+                            .map(|&wi| win_result_subtypes[wi])
+                            .collect();
+                        let substituted = substitute_placeholder_values_with_subtypes(
                             outer_expr,
-                            &win_row,
-                            &placeholder_col_map,
+                            &win_vals,
+                            &win_subtypes,
+                        );
+                        let val = self.eval_join_expr_with_registry(
+                            &substituted,
+                            &row_values[ri],
+                            &col_map,
                         )?;
                         vals.push(val);
                     }
@@ -108979,6 +109059,35 @@ impl Connection {
         if !output_reads_rows {
             row_values = WindowScanRows::Rows(Vec::new());
         }
+        let win_result_subtypes: Vec<u32> = (0..win_funcs.len())
+            .map(|wi| {
+                let base =
+                    builtin_window_result_json_subtype(&win_func_names[wi], win_is_builtin[wi]);
+                if base == 0 {
+                    return 0;
+                }
+                if wi == 0
+                    || window_specs_share_outer_stage(
+                        WindowOuterStageSpec {
+                            partition_by: &win_partition_by[0],
+                            order_by_exprs: None,
+                            order_by_terms: &win_order_by[0],
+                            frame: win_frame_specs[0].as_ref(),
+                        },
+                        WindowOuterStageSpec {
+                            partition_by: &win_partition_by[wi],
+                            order_by_exprs: None,
+                            order_by_terms: &win_order_by[wi],
+                            frame: win_frame_specs[wi].as_ref(),
+                        },
+                    )
+                {
+                    base
+                } else {
+                    0
+                }
+            })
+            .collect();
         // window_results is indexed by [func][raw_row_index].
         let mut result = Vec::with_capacity(total_rows);
         let mut result_raw_indices: Vec<usize> = Vec::with_capacity(total_rows);
@@ -109000,14 +109109,23 @@ impl Connection {
                     }
                     ColKind::WrappedWindow(win_indices, outer_expr) => {
                         // Substitute each window result into its placeholder
-                        // column and evaluate the outer expression.
+                        // column (preserving JSON subtype for outer-stage JSON
+                        // windows) and evaluate the outer expression.
                         let win_vals: Vec<SqliteValue> = win_indices
                             .iter()
                             .map(|&wi| {
                                 std::mem::replace(&mut window_results[wi][ri], SqliteValue::Null)
                             })
                             .collect();
-                        let substituted = substitute_placeholder_values(outer_expr, &win_vals);
+                        let win_subtypes: Vec<u32> = win_indices
+                            .iter()
+                            .map(|&wi| win_result_subtypes[wi])
+                            .collect();
+                        let substituted = substitute_placeholder_values_with_subtypes(
+                            outer_expr,
+                            &win_vals,
+                            &win_subtypes,
+                        );
                         values.push(
                             self.eval_row_expr_allowing_subqueries(
                                 &substituted,
@@ -110871,6 +110989,13 @@ impl Connection {
     }
 
     fn expr_result_json_subtype(&self, expr: &Expr) -> u32 {
+        #[cfg(feature = "ext-json")]
+        if matches!(
+            expr,
+            Expr::Literal(Literal::String(_), span) if *span == JSON_SUBTYPE_LITERAL_SPAN
+        ) {
+            return fsqlite_func::JSON_SUBTYPE;
+        }
         let (name, num_args) = match expr {
             Expr::FunctionCall { name, args, .. } => {
                 let num_args = match args {
@@ -124440,9 +124565,7 @@ fn validate_used_window_specs_in_expr(
                     .any(|term| expr_has_window_function(&term.expr))
                     || filter.as_deref().is_some_and(expr_has_window_function))
             {
-                return Err(FrankenError::FunctionError(
-                    "misuse of window function".to_owned(),
-                ));
+                return Err(window_misuse_error(expr));
             }
             if let Some(window) = over {
                 let resolved = resolve_used_window_spec(window, named_windows)?;
@@ -124459,9 +124582,7 @@ fn validate_used_window_specs_in_expr(
                         .any(|term| expr_has_window_function(&term.expr))
                     || filter.as_deref().is_some_and(expr_has_window_function)
                 {
-                    return Err(FrankenError::FunctionError(
-                        "misuse of window function".to_owned(),
-                    ));
+                    return Err(window_misuse_error(expr));
                 }
             }
             if let FunctionArgs::List(values) = args {
@@ -125933,14 +126054,137 @@ fn extract_inner_window_function(expr: &Expr) -> Option<ExtractedWindowFunction>
     }
 }
 
+/// Synthetic zero-length span attached to a string literal substituted from a
+/// builtin JSON window result (`json_group_array` / `json_group_object`) so
+/// outer JSON constructors embed rather than quote it (bd-0pj4x). Real parsed
+/// SQL string literals always span at least two bytes (`''`), so
+/// `u32::MAX..u32::MAX` never collides with parsed SQL or `Span::ZERO`, and
+/// `Span::len()` remains 0.
+#[cfg(feature = "ext-json")]
+const JSON_SUBTYPE_LITERAL_SPAN: Span = Span::new(u32::MAX, u32::MAX);
+
+#[cfg(feature = "ext-json")]
+fn builtin_window_result_json_subtype(name: &str, is_builtin: bool) -> u32 {
+    if is_builtin
+        && (name.eq_ignore_ascii_case("json_group_array")
+            || name.eq_ignore_ascii_case("json_group_object"))
+    {
+        fsqlite_func::JSON_SUBTYPE
+    } else {
+        0
+    }
+}
+
+#[cfg(not(feature = "ext-json"))]
+fn builtin_window_result_json_subtype(_name: &str, _is_builtin: bool) -> u32 {
+    0
+}
+
+fn window_result_literal_expr(value: &SqliteValue, subtype: u32, default_span: Span) -> Expr {
+    #[cfg(feature = "ext-json")]
+    let span = if subtype == fsqlite_func::JSON_SUBTYPE && matches!(value, SqliteValue::Text(_)) {
+        JSON_SUBTYPE_LITERAL_SPAN
+    } else {
+        default_span
+    };
+    #[cfg(not(feature = "ext-json"))]
+    let span = {
+        let _ = subtype;
+        default_span
+    };
+    Expr::Literal(sqlite_value_to_literal(value), span)
+}
+
+struct WindowOuterStageSpec<'a> {
+    partition_by: &'a [Expr],
+    order_by_exprs: Option<&'a [Expr]>,
+    order_by_terms: &'a [OrderingTerm],
+    frame: Option<&'a FrameSpec>,
+}
+
+fn frame_bounds_match(left: &FrameBound, right: &FrameBound) -> bool {
+    match (left, right) {
+        (FrameBound::UnboundedPreceding, FrameBound::UnboundedPreceding)
+        | (FrameBound::CurrentRow, FrameBound::CurrentRow)
+        | (FrameBound::UnboundedFollowing, FrameBound::UnboundedFollowing) => true,
+        (FrameBound::Preceding(a), FrameBound::Preceding(b))
+        | (FrameBound::Following(a), FrameBound::Following(b)) => exprs_match(a, b),
+        _ => false,
+    }
+}
+
+/// SQLite links all window functions whose partition, order, and frame match
+/// the first window into the outermost SELECT stage (`sqlite3WindowLink`),
+/// where their `JSON_SUBTYPE` reaches enclosing JSON constructors; windows with
+/// a different spec are rewritten into an inner subquery whose materialization
+/// drops the subtype (bd-0pj4x).
+fn window_specs_share_outer_stage(
+    first: WindowOuterStageSpec<'_>,
+    other: WindowOuterStageSpec<'_>,
+) -> bool {
+    if first.partition_by.len() != other.partition_by.len()
+        || first.order_by_terms.len() != other.order_by_terms.len()
+    {
+        return false;
+    }
+    if !first
+        .partition_by
+        .iter()
+        .zip(other.partition_by)
+        .all(|(a, b)| exprs_match(a, b))
+    {
+        return false;
+    }
+    for (idx, (left_term, right_term)) in first
+        .order_by_terms
+        .iter()
+        .zip(other.order_by_terms)
+        .enumerate()
+    {
+        if left_term.direction != right_term.direction || left_term.nulls != right_term.nulls {
+            return false;
+        }
+        let left_expr = first
+            .order_by_exprs
+            .and_then(|exprs| exprs.get(idx))
+            .unwrap_or(&left_term.expr);
+        let right_expr = other
+            .order_by_exprs
+            .and_then(|exprs| exprs.get(idx))
+            .unwrap_or(&right_term.expr);
+        if !exprs_match(left_expr, right_expr) {
+            return false;
+        }
+    }
+    let first_default = default_window_frame(!first.order_by_terms.is_empty());
+    let other_default = default_window_frame(!other.order_by_terms.is_empty());
+    let lf = first.frame.unwrap_or(&first_default);
+    let rf = other.frame.unwrap_or(&other_default);
+    let left_end = lf.end.as_ref().unwrap_or(&FrameBound::CurrentRow);
+    let right_end = rf.end.as_ref().unwrap_or(&FrameBound::CurrentRow);
+    lf.frame_type == rf.frame_type
+        && lf.exclude == rf.exclude
+        && frame_bounds_match(&lf.start, &rf.start)
+        && frame_bounds_match(left_end, right_end)
+}
+
 /// Replace the first window call in the current SELECT scope with a literal.
 ///
 /// Traversal order intentionally matches [`extract_inner_window_function`].
 /// Subqueries are separate SELECT scopes and are therefore left untouched.
-#[allow(clippy::too_many_lines)]
 fn replace_first_window_with_literal(
     expr: &Expr,
     value: &SqliteValue,
+    replaced: &mut bool,
+) -> Expr {
+    replace_first_window_with_literal_with_subtype(expr, value, 0, replaced)
+}
+
+#[allow(clippy::too_many_lines)]
+fn replace_first_window_with_literal_with_subtype(
+    expr: &Expr,
+    value: &SqliteValue,
+    subtype: u32,
     replaced: &mut bool,
 ) -> Expr {
     if *replaced || expr_folds_to_integer_zero_via_and(expr) {
@@ -125949,7 +126193,7 @@ fn replace_first_window_with_literal(
     match expr {
         Expr::FunctionCall { over: Some(_), .. } => {
             *replaced = true;
-            Expr::Literal(sqlite_value_to_literal(value), expr.span())
+            window_result_literal_expr(value, subtype, expr.span())
         }
         Expr::FunctionCall {
             name,
@@ -125964,8 +126208,8 @@ fn replace_first_window_with_literal(
                 FunctionArgs::List(values) => {
                     let mut rewritten = Vec::with_capacity(values.len());
                     for value_expr in values {
-                        rewritten.push(replace_first_window_with_literal(
-                            value_expr, value, replaced,
+                        rewritten.push(replace_first_window_with_literal_with_subtype(
+                            value_expr, value, subtype, replaced,
                         ));
                     }
                     FunctionArgs::List(rewritten)
@@ -125975,12 +126219,14 @@ fn replace_first_window_with_literal(
             let mut new_order_by = Vec::with_capacity(order_by.len());
             for term in order_by {
                 let mut term = term.clone();
-                term.expr = replace_first_window_with_literal(&term.expr, value, replaced);
+                term.expr = replace_first_window_with_literal_with_subtype(
+                    &term.expr, value, subtype, replaced,
+                );
                 new_order_by.push(term);
             }
             let new_filter = filter.as_ref().map(|predicate| {
-                Box::new(replace_first_window_with_literal(
-                    predicate, value, replaced,
+                Box::new(replace_first_window_with_literal_with_subtype(
+                    predicate, value, subtype, replaced,
                 ))
             });
             Expr::FunctionCall {
@@ -125999,9 +126245,13 @@ fn replace_first_window_with_literal(
             right,
             span,
         } => Expr::BinaryOp {
-            left: Box::new(replace_first_window_with_literal(left, value, replaced)),
+            left: Box::new(replace_first_window_with_literal_with_subtype(
+                left, value, subtype, replaced,
+            )),
             op: *op,
-            right: Box::new(replace_first_window_with_literal(right, value, replaced)),
+            right: Box::new(replace_first_window_with_literal_with_subtype(
+                right, value, subtype, replaced,
+            )),
             span: *span,
         },
         Expr::UnaryOp {
@@ -126010,7 +126260,9 @@ fn replace_first_window_with_literal(
             span,
         } => Expr::UnaryOp {
             op: *op,
-            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
+            expr: Box::new(replace_first_window_with_literal_with_subtype(
+                inner, value, subtype, replaced,
+            )),
             span: *span,
         },
         Expr::Between {
@@ -126020,9 +126272,15 @@ fn replace_first_window_with_literal(
             not,
             span,
         } => Expr::Between {
-            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
-            low: Box::new(replace_first_window_with_literal(low, value, replaced)),
-            high: Box::new(replace_first_window_with_literal(high, value, replaced)),
+            expr: Box::new(replace_first_window_with_literal_with_subtype(
+                inner, value, subtype, replaced,
+            )),
+            low: Box::new(replace_first_window_with_literal_with_subtype(
+                low, value, subtype, replaced,
+            )),
+            high: Box::new(replace_first_window_with_literal_with_subtype(
+                high, value, subtype, replaced,
+            )),
             not: *not,
             span: *span,
         },
@@ -126035,13 +126293,15 @@ fn replace_first_window_with_literal(
             if matches!(set, InSet::List(values) if values.is_empty()) {
                 return expr.clone();
             }
-            let new_inner = Box::new(replace_first_window_with_literal(inner, value, replaced));
+            let new_inner = Box::new(replace_first_window_with_literal_with_subtype(
+                inner, value, subtype, replaced,
+            ));
             let new_set = match set {
                 InSet::List(values) => {
                     let mut rewritten = Vec::with_capacity(values.len());
                     for value_expr in values {
-                        rewritten.push(replace_first_window_with_literal(
-                            value_expr, value, replaced,
+                        rewritten.push(replace_first_window_with_literal_with_subtype(
+                            value_expr, value, subtype, replaced,
                         ));
                     }
                     InSet::List(rewritten)
@@ -126063,11 +126323,17 @@ fn replace_first_window_with_literal(
             not,
             span,
         } => Expr::Like {
-            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
-            pattern: Box::new(replace_first_window_with_literal(pattern, value, replaced)),
-            escape: escape
-                .as_ref()
-                .map(|escape| Box::new(replace_first_window_with_literal(escape, value, replaced))),
+            expr: Box::new(replace_first_window_with_literal_with_subtype(
+                inner, value, subtype, replaced,
+            )),
+            pattern: Box::new(replace_first_window_with_literal_with_subtype(
+                pattern, value, subtype, replaced,
+            )),
+            escape: escape.as_ref().map(|escape| {
+                Box::new(replace_first_window_with_literal_with_subtype(
+                    escape, value, subtype, replaced,
+                ))
+            }),
             op: *op,
             not: *not,
             span: *span,
@@ -126079,18 +126345,24 @@ fn replace_first_window_with_literal(
             span,
         } => {
             let new_operand = operand.as_ref().map(|operand| {
-                Box::new(replace_first_window_with_literal(operand, value, replaced))
+                Box::new(replace_first_window_with_literal_with_subtype(
+                    operand, value, subtype, replaced,
+                ))
             });
             let mut new_whens = Vec::with_capacity(whens.len());
             for (condition, result) in whens {
                 new_whens.push((
-                    replace_first_window_with_literal(condition, value, replaced),
-                    replace_first_window_with_literal(result, value, replaced),
+                    replace_first_window_with_literal_with_subtype(
+                        condition, value, subtype, replaced,
+                    ),
+                    replace_first_window_with_literal_with_subtype(
+                        result, value, subtype, replaced,
+                    ),
                 ));
             }
             let new_else_expr = else_expr.as_ref().map(|else_expr| {
-                Box::new(replace_first_window_with_literal(
-                    else_expr, value, replaced,
+                Box::new(replace_first_window_with_literal_with_subtype(
+                    else_expr, value, subtype, replaced,
                 ))
             });
             Expr::Case {
@@ -126105,7 +126377,9 @@ fn replace_first_window_with_literal(
             type_name,
             span,
         } => Expr::Cast {
-            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
+            expr: Box::new(replace_first_window_with_literal_with_subtype(
+                inner, value, subtype, replaced,
+            )),
             type_name: type_name.clone(),
             span: *span,
         },
@@ -126114,7 +126388,9 @@ fn replace_first_window_with_literal(
             collation,
             span,
         } => Expr::Collate {
-            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
+            expr: Box::new(replace_first_window_with_literal_with_subtype(
+                inner, value, subtype, replaced,
+            )),
             collation: collation.clone(),
             span: *span,
         },
@@ -126123,7 +126399,9 @@ fn replace_first_window_with_literal(
             not,
             span,
         } => Expr::IsNull {
-            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
+            expr: Box::new(replace_first_window_with_literal_with_subtype(
+                inner, value, subtype, replaced,
+            )),
             not: *not,
             span: *span,
         },
@@ -126133,16 +126411,20 @@ fn replace_first_window_with_literal(
             arrow,
             span,
         } => Expr::JsonAccess {
-            expr: Box::new(replace_first_window_with_literal(inner, value, replaced)),
-            path: Box::new(replace_first_window_with_literal(path, value, replaced)),
+            expr: Box::new(replace_first_window_with_literal_with_subtype(
+                inner, value, subtype, replaced,
+            )),
+            path: Box::new(replace_first_window_with_literal_with_subtype(
+                path, value, subtype, replaced,
+            )),
             arrow: *arrow,
             span: *span,
         },
         Expr::RowValue(values, span) => {
             let mut rewritten = Vec::with_capacity(values.len());
             for value_expr in values {
-                rewritten.push(replace_first_window_with_literal(
-                    value_expr, value, replaced,
+                rewritten.push(replace_first_window_with_literal_with_subtype(
+                    value_expr, value, subtype, replaced,
                 ));
             }
             Expr::RowValue(rewritten, *span)
@@ -126176,8 +126458,8 @@ fn parse_win_placeholder_slot(name: &str) -> Option<usize> {
 /// with the ordered list of the extracted window function calls (one entry per
 /// placeholder slot).  Callers register each extracted window, compute its
 /// per-row result, then feed the values back through
-/// [`substitute_placeholder_values`] to evaluate the residual scalar
-/// expression.
+/// [`substitute_placeholder_values_with_subtypes`] to evaluate the residual
+/// scalar expression.
 ///
 /// Traversal order intentionally matches [`extract_inner_window_function`] and
 /// [`replace_first_window_with_literal`].  Subqueries are separate SELECT scopes
@@ -126413,16 +126695,23 @@ fn replace_windows_with_placeholders_rec(
 }
 
 /// Substitute every `__win_result_N__` placeholder column in `expr` with the
-/// corresponding literal value from `vals` (indexed by slot).  Placeholder
-/// columns whose slot is out of range are left untouched.
+/// corresponding literal value from `vals` (indexed by slot), tagging literals
+/// whose parallel entry in `subtypes` is `JSON_SUBTYPE` so enclosing JSON
+/// constructors embed rather than quote them (bd-0pj4x).  Placeholder columns
+/// whose slot is out of range are left untouched.
 #[allow(clippy::too_many_lines)]
-fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
+fn substitute_placeholder_values_with_subtypes(
+    expr: &Expr,
+    vals: &[SqliteValue],
+    subtypes: &[u32],
+) -> Expr {
     match expr {
         Expr::Column(cr, _) => {
             if let Some(slot) = parse_win_placeholder_slot(cr.column.as_ref())
                 && let Some(val) = vals.get(slot)
             {
-                return Expr::Literal(sqlite_value_to_literal(val), Span::new(0, 0));
+                let subtype = subtypes.get(slot).copied().unwrap_or(0);
+                return window_result_literal_expr(val, subtype, Span::new(0, 0));
             }
             expr.clone()
         }
@@ -126439,7 +126728,7 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
                 FunctionArgs::List(exprs) => FunctionArgs::List(
                     exprs
                         .iter()
-                        .map(|e| substitute_placeholder_values(e, vals))
+                        .map(|e| substitute_placeholder_values_with_subtypes(e, vals, subtypes))
                         .collect(),
                 ),
                 FunctionArgs::Star => FunctionArgs::Star,
@@ -126447,14 +126736,16 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             let new_order_by = order_by
                 .iter()
                 .map(|term| OrderingTerm {
-                    expr: substitute_placeholder_values(&term.expr, vals),
+                    expr: substitute_placeholder_values_with_subtypes(&term.expr, vals, subtypes),
                     direction: term.direction,
                     nulls: term.nulls,
                 })
                 .collect();
-            let new_filter = filter
-                .as_ref()
-                .map(|predicate| Box::new(substitute_placeholder_values(predicate, vals)));
+            let new_filter = filter.as_ref().map(|predicate| {
+                Box::new(substitute_placeholder_values_with_subtypes(
+                    predicate, vals, subtypes,
+                ))
+            });
             Expr::FunctionCall {
                 name: name.clone(),
                 args: new_args,
@@ -126471,9 +126762,13 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             right,
             span,
         } => Expr::BinaryOp {
-            left: Box::new(substitute_placeholder_values(left, vals)),
+            left: Box::new(substitute_placeholder_values_with_subtypes(
+                left, vals, subtypes,
+            )),
             op: *op,
-            right: Box::new(substitute_placeholder_values(right, vals)),
+            right: Box::new(substitute_placeholder_values_with_subtypes(
+                right, vals, subtypes,
+            )),
             span: *span,
         },
         Expr::UnaryOp {
@@ -126482,7 +126777,9 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             span,
         } => Expr::UnaryOp {
             op: *op,
-            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            expr: Box::new(substitute_placeholder_values_with_subtypes(
+                inner, vals, subtypes,
+            )),
             span: *span,
         },
         Expr::Between {
@@ -126492,9 +126789,15 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             not,
             span,
         } => Expr::Between {
-            expr: Box::new(substitute_placeholder_values(inner, vals)),
-            low: Box::new(substitute_placeholder_values(low, vals)),
-            high: Box::new(substitute_placeholder_values(high, vals)),
+            expr: Box::new(substitute_placeholder_values_with_subtypes(
+                inner, vals, subtypes,
+            )),
+            low: Box::new(substitute_placeholder_values_with_subtypes(
+                low, vals, subtypes,
+            )),
+            high: Box::new(substitute_placeholder_values_with_subtypes(
+                high, vals, subtypes,
+            )),
             not: *not,
             span: *span,
         },
@@ -126504,12 +126807,16 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             not,
             span,
         } => {
-            let new_inner = Box::new(substitute_placeholder_values(inner, vals));
+            let new_inner = Box::new(substitute_placeholder_values_with_subtypes(
+                inner, vals, subtypes,
+            ));
             let new_set = match set {
                 InSet::List(values) => InSet::List(
                     values
                         .iter()
-                        .map(|value_expr| substitute_placeholder_values(value_expr, vals))
+                        .map(|value_expr| {
+                            substitute_placeholder_values_with_subtypes(value_expr, vals, subtypes)
+                        })
                         .collect(),
                 ),
                 InSet::Subquery(_) | InSet::Table(_) => set.clone(),
@@ -126529,11 +126836,17 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             not,
             span,
         } => Expr::Like {
-            expr: Box::new(substitute_placeholder_values(inner, vals)),
-            pattern: Box::new(substitute_placeholder_values(pattern, vals)),
-            escape: escape
-                .as_ref()
-                .map(|escape| Box::new(substitute_placeholder_values(escape, vals))),
+            expr: Box::new(substitute_placeholder_values_with_subtypes(
+                inner, vals, subtypes,
+            )),
+            pattern: Box::new(substitute_placeholder_values_with_subtypes(
+                pattern, vals, subtypes,
+            )),
+            escape: escape.as_ref().map(|escape| {
+                Box::new(substitute_placeholder_values_with_subtypes(
+                    escape, vals, subtypes,
+                ))
+            }),
             op: *op,
             not: *not,
             span: *span,
@@ -126544,21 +126857,25 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             else_expr,
             span,
         } => {
-            let new_operand = operand
-                .as_ref()
-                .map(|operand| Box::new(substitute_placeholder_values(operand, vals)));
+            let new_operand = operand.as_ref().map(|operand| {
+                Box::new(substitute_placeholder_values_with_subtypes(
+                    operand, vals, subtypes,
+                ))
+            });
             let new_whens = whens
                 .iter()
                 .map(|(condition, result)| {
                     (
-                        substitute_placeholder_values(condition, vals),
-                        substitute_placeholder_values(result, vals),
+                        substitute_placeholder_values_with_subtypes(condition, vals, subtypes),
+                        substitute_placeholder_values_with_subtypes(result, vals, subtypes),
                     )
                 })
                 .collect();
-            let new_else_expr = else_expr
-                .as_ref()
-                .map(|else_expr| Box::new(substitute_placeholder_values(else_expr, vals)));
+            let new_else_expr = else_expr.as_ref().map(|else_expr| {
+                Box::new(substitute_placeholder_values_with_subtypes(
+                    else_expr, vals, subtypes,
+                ))
+            });
             Expr::Case {
                 operand: new_operand,
                 whens: new_whens,
@@ -126571,7 +126888,9 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             type_name,
             span,
         } => Expr::Cast {
-            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            expr: Box::new(substitute_placeholder_values_with_subtypes(
+                inner, vals, subtypes,
+            )),
             type_name: type_name.clone(),
             span: *span,
         },
@@ -126580,7 +126899,9 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             collation,
             span,
         } => Expr::Collate {
-            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            expr: Box::new(substitute_placeholder_values_with_subtypes(
+                inner, vals, subtypes,
+            )),
             collation: collation.clone(),
             span: *span,
         },
@@ -126589,7 +126910,9 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             not,
             span,
         } => Expr::IsNull {
-            expr: Box::new(substitute_placeholder_values(inner, vals)),
+            expr: Box::new(substitute_placeholder_values_with_subtypes(
+                inner, vals, subtypes,
+            )),
             not: *not,
             span: *span,
         },
@@ -126599,15 +126922,21 @@ fn substitute_placeholder_values(expr: &Expr, vals: &[SqliteValue]) -> Expr {
             arrow,
             span,
         } => Expr::JsonAccess {
-            expr: Box::new(substitute_placeholder_values(inner, vals)),
-            path: Box::new(substitute_placeholder_values(path, vals)),
+            expr: Box::new(substitute_placeholder_values_with_subtypes(
+                inner, vals, subtypes,
+            )),
+            path: Box::new(substitute_placeholder_values_with_subtypes(
+                path, vals, subtypes,
+            )),
             arrow: *arrow,
             span: *span,
         },
         Expr::RowValue(values, span) => Expr::RowValue(
             values
                 .iter()
-                .map(|value_expr| substitute_placeholder_values(value_expr, vals))
+                .map(|value_expr| {
+                    substitute_placeholder_values_with_subtypes(value_expr, vals, subtypes)
+                })
                 .collect(),
             *span,
         ),
@@ -178833,6 +179162,13 @@ thread_local! {
 /// it; for json_extract it is what that very call reported. Call right after
 /// evaluating `expr`, with `LAST_VARYING_RESULT_SUBTYPE` reset before it.
 fn evaluated_arg_json_subtype(expr: &Expr) -> u32 {
+    #[cfg(feature = "ext-json")]
+    if matches!(
+        expr,
+        Expr::Literal(Literal::String(_), span) if *span == JSON_SUBTYPE_LITERAL_SPAN
+    ) {
+        return fsqlite_func::JSON_SUBTYPE;
+    }
     let (name, arity) = match expr {
         Expr::FunctionCall { name, args, .. } => {
             let arity = match args {

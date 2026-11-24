@@ -9,8 +9,9 @@
 //! compared with rusqlite's bundled SQLite.
 //!
 //! Not covered here: `->` and json_extract() arguments (bd-ikehc, which the
-//! plain aggregates share), a window result passed to a JSON constructor
-//! (bd-0pj4x), and json()/json_extract() over duplicate labels (llk6g.14).
+//! plain aggregates share), and json()/json_extract() over duplicate labels
+//! (llk6g.14). Window results passed to JSON constructors are covered in
+//! `bd_0pj4x_json_window_aggregates_keep_subtype_in_json_constructors`.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -257,6 +258,142 @@ fn json_aggregates_as_window_functions_match_stock() {
             "{} of {} divergence(s) vs rusqlite:\n{}",
             diffs.len(),
             QUERIES.len(),
+            diffs.join("\n")
+        );
+    });
+}
+
+async fn fq_prepared(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let stmt = conn.prepare(sql).await.map_err(|e| e.to_string())?;
+    stmt.query()
+        .await
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r.values().iter().map(tag_f).collect())
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+const BD_0PJ4X_QUERIES: &[&str] = &[
+    // Fromless window engine (`eval_fromless_window_expr`).
+    "SELECT json_array(json_group_array(1) OVER ())",
+    "SELECT json_array(json_group_object('a', 1) OVER ())",
+    "SELECT json_object('a', json_group_array(1) OVER (), 'o', json_group_object('k', 2) OVER ())",
+    "SELECT json_object('a', json_group_array(1) OVER (), 'o', json_group_object('k', 2) OVER (ORDER BY 1))",
+    "SELECT json_array(json_group_array(1) FILTER (WHERE 0) OVER ())",
+    "SELECT json_object('o', json_group_object('a', 1) FILTER (WHERE 0) OVER ())",
+    "SELECT json_insert('{}', '$.w', json_group_array(1) OVER ())",
+    "SELECT json_set('{\"w\":0}', '$.w', json_group_object('a', 1) OVER ())",
+    "SELECT json_quote(json_group_array(1) OVER ())",
+    "SELECT hex(jsonb_array(json_group_array(1) OVER ()))",
+    "SELECT hex(jsonb_object('w', json_group_object('a', 1) OVER ()))",
+    "SELECT json_array(jsonb_group_array(1) OVER ())",
+    "SELECT json_object('w', jsonb_group_object('a', 1) OVER ())",
+    // Plain table window engine (`ColKind::WrappedWindow`).
+    "SELECT id, json_array(json_group_array(id) OVER ()) FROM w ORDER BY id",
+    "SELECT id, json_array(json_group_array(v) OVER (PARTITION BY g ORDER BY id ROWS 1 PRECEDING)) \
+     FROM w ORDER BY id",
+    "SELECT id, json_object('w', json_group_object(g, id) OVER (PARTITION BY g)) \
+     FROM w ORDER BY id",
+    "SELECT id, json_array(json_group_object(g, id) OVER (PARTITION BY g)) \
+     FROM w ORDER BY id",
+    "SELECT id, json_object('arr', json_group_array(v) OVER (PARTITION BY g), \
+     'obj', json_group_object(k, id) OVER (PARTITION BY g)) \
+     FROM w ORDER BY id",
+    "SELECT id, json_object('arr', json_group_array(v) OVER win, \
+     'obj', json_group_object(k, id) OVER win) \
+     FROM w WINDOW win AS (PARTITION BY g) ORDER BY id",
+    "SELECT id, json_object('arr', json_group_array(v) OVER (PARTITION BY g), \
+     'obj', json_group_object(k, id) OVER (PARTITION BY g ORDER BY id ROWS 1 PRECEDING)) \
+     FROM w ORDER BY id",
+    "SELECT id, row_number() OVER (ORDER BY id DESC), \
+     json_array(json_group_array(id) OVER (PARTITION BY g)) FROM w ORDER BY id",
+    "SELECT id, json_insert('{\"k\":1}', '$.w', json_group_array(id) OVER (PARTITION BY g)) \
+     FROM w ORDER BY id",
+    "SELECT id, json_quote(json_group_object(k, v) OVER (PARTITION BY g ORDER BY id ROWS 1 PRECEDING)) \
+     FROM w ORDER BY id",
+    "SELECT id, hex(jsonb_array(json_group_array(id) OVER (PARTITION BY g))) FROM w ORDER BY id",
+    "SELECT id, hex(jsonb_object('w', json_group_object(g, id) OVER (PARTITION BY g))) \
+     FROM w ORDER BY id",
+    "SELECT id, json_array(jsonb_group_array(id) OVER (PARTITION BY g)) FROM w ORDER BY id",
+    // GROUP BY window engine (`GbwColKind::WrappedWindow`).
+    "SELECT g, json_array(json_group_array(count(*)) OVER (ORDER BY g)) \
+     FROM w GROUP BY g ORDER BY g",
+    "SELECT g, json_object('w', json_group_object(g, sum(id)) OVER (ORDER BY g ROWS 1 PRECEDING)) \
+     FROM w GROUP BY g ORDER BY g",
+    "SELECT g, json_object('g', g, 'arr', json_group_array(count(*)) OVER (ORDER BY g), \
+     'obj', json_group_object(g, max(id)) OVER (ORDER BY g)) \
+     FROM w GROUP BY g ORDER BY g",
+    "SELECT g, json_object('g', g, 'arr', json_group_array(count(*)) OVER (), \
+     'obj', json_group_object(g, max(id)) OVER (ORDER BY g)) \
+     FROM w GROUP BY g ORDER BY g",
+    "SELECT g, json_insert('{}', '$.w', json_group_array(sum(id)) OVER (ORDER BY g)) \
+     FROM w GROUP BY g ORDER BY g",
+    "SELECT g, hex(jsonb_array(json_group_array(count(*)) OVER (ORDER BY g))) \
+     FROM w GROUP BY g ORDER BY g",
+    "SELECT g, hex(jsonb_object('w', json_group_object(g, sum(id)) OVER (ORDER BY g))) \
+     FROM w GROUP BY g ORDER BY g",
+    // Negative controls: non-JSON window results stay quoted; subquery boundaries strip subtype;
+    // aggregate directly wrapping a window call remains an error.
+    "SELECT json_array(group_concat(j) OVER ()) FROM w WHERE id = 1",
+    "SELECT id, json_array(group_concat(j) OVER (PARTITION BY g)) FROM w ORDER BY id",
+    "SELECT g, json_array(group_concat(g) OVER (ORDER BY g)) FROM w GROUP BY g ORDER BY g",
+    "SELECT json_group_array(a) FROM (SELECT json_group_array(id) OVER (PARTITION BY g) AS a FROM w ORDER BY id)",
+    "SELECT json_array(a) FROM (SELECT json_group_array(id) OVER () AS a FROM w WHERE id = 1)",
+    "SELECT json_group_array(json_group_array(1) OVER ())",
+    "SELECT json_group_array(json_group_array(id) OVER ()) FROM w",
+];
+
+#[test]
+fn bd_0pj4x_json_window_aggregates_keep_subtype_in_json_constructors() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let f_file = dir.path().join("frank.db");
+        let r_file = dir.path().join("stock.db");
+        let backends = [
+            (":memory:", None::<(&std::path::Path, &std::path::Path)>),
+            ("file", Some((f_file.as_path(), r_file.as_path()))),
+        ];
+
+        let mut diffs = Vec::new();
+        for (label, paths) in backends {
+            let (f, r) = match paths {
+                None => (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                ),
+                Some((fp, rp)) => (
+                    Connection::open(fp.to_str().unwrap()).await.unwrap(),
+                    rusqlite::Connection::open(rp).unwrap(),
+                ),
+            };
+            for sql in SETUP {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+
+            for &q in BD_0PJ4X_QUERIES {
+                let rr = rq(&r, q);
+                let fr_direct = fq(&f, q).await;
+                if fr_direct != rr {
+                    diffs.push(format!(
+                        "  [{label}/direct] `{q}`\n     frank= {fr_direct:?}\n     stock= {rr:?}"
+                    ));
+                }
+                let fr_prepared = fq_prepared(&f, q).await;
+                if fr_prepared != rr {
+                    diffs.push(format!(
+                        "  [{label}/prepared] `{q}`\n     frank= {fr_prepared:?}\n     stock= {rr:?}"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            diffs.is_empty(),
+            "{} divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
             diffs.join("\n")
         );
     });
