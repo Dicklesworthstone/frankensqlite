@@ -28668,7 +28668,7 @@ fn emit_upsert_do_update_apply(
         table,
         table_alias: Some("excluded"),
         schema: Some(schema),
-        register_base: Some(RegisterRow::columns(val_regs)),
+        register_base: Some(RegisterRow::with_rowid(val_regs, rowid_reg)),
         secondaries: &[],
     };
     let existing_ctx = ScanCtx {
@@ -28676,7 +28676,7 @@ fn emit_upsert_do_update_apply(
         table,
         table_alias,
         schema: Some(schema),
-        register_base: Some(RegisterRow::columns(old_regs)),
+        register_base: Some(RegisterRow::with_rowid(old_regs, update_rowid_reg)),
         secondaries: &excluded_secondary,
     };
     let existing_hidden_rowid_reg = ctx
@@ -43292,6 +43292,14 @@ fn resolve_in_probe_source<'a>(
     set: &'a fsqlite_ast::InSet,
     schema: &'a [TableSchema],
 ) -> Option<InProbeSource<'a>> {
+    resolve_in_probe_source_inner(set, schema, None)
+}
+
+fn resolve_in_probe_source_inner<'a>(
+    set: &'a fsqlite_ast::InSet,
+    schema: &'a [TableSchema],
+    outer_ctx: Option<&ScanCtx<'_>>,
+) -> Option<InProbeSource<'a>> {
     match set {
         fsqlite_ast::InSet::List(_) => None,
         fsqlite_ast::InSet::Table(name) => {
@@ -43362,7 +43370,33 @@ fn resolve_in_probe_source<'a>(
                 return None;
             }
             let table = find_table(schema, &qualified_table_name.name).ok()?;
-            if validate_single_table_result_columns(columns, table, table_alias, None).is_err()
+            if let Some(outer) = outer_ctx {
+                let validate_col = |col_ref: &ColumnRef| {
+                    if validate_single_table_column_ref(col_ref, table, table_alias).is_ok()
+                        || column_ref_resolves_in_ctx(col_ref, outer)
+                    {
+                        Ok(())
+                    } else {
+                        validate_single_table_column_ref(col_ref, table, table_alias)
+                    }
+                };
+                let columns_ok = columns.iter().all(|column| match column {
+                    ResultColumn::Star => true,
+                    ResultColumn::TableStar(qualifier) => {
+                        table_star_qualifier_matches_binding(qualifier, table, table_alias, None)
+                    }
+                    ResultColumn::Expr { expr, .. } => {
+                        validate_expr_columns_with(expr, &validate_col).is_ok()
+                    }
+                });
+                let where_ok = where_clause
+                    .as_deref()
+                    .is_none_or(|expr| validate_expr_columns_with(expr, &validate_col).is_ok());
+                if !columns_ok || !where_ok {
+                    return None;
+                }
+            } else if validate_single_table_result_columns(columns, table, table_alias, None)
+                .is_err()
                 || where_clause.as_deref().is_some_and(|expr| {
                     validate_single_table_expr_columns(expr, table, table_alias).is_err()
                 })
@@ -44340,7 +44374,7 @@ fn emit_in_probe_expr(
         emit_in_probe_codegen_failure(b, "missing schema");
         return;
     };
-    let Some(probe_source) = resolve_in_probe_source(set, schema) else {
+    let Some(probe_source) = resolve_in_probe_source_inner(set, schema, Some(scan_ctx)) else {
         // Try to handle complex subqueries with ORDER BY/LIMIT.
         if let fsqlite_ast::InSet::Subquery(subquery) = set
             && try_emit_complex_in_subquery(b, operand, subquery, not, reg, scan_ctx)
@@ -44356,12 +44390,10 @@ fn emit_in_probe_expr(
         return;
     }
 
-    if in_probe_source_references_outer_scan(&probe_source, scan_ctx) {
-        emit_in_probe_codegen_failure(b, "correlated probe source requires outer substitution");
-        return;
-    }
+    let is_correlated = in_probe_source_references_outer_scan(&probe_source, scan_ctx);
 
-    if can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx) {
+    if !is_correlated && can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx)
+    {
         emit_once_materialized_in_probe_source(
             b,
             operand,
@@ -44402,19 +44434,6 @@ fn emit_in_probe_expr(
     let loop_start = b.current_addr();
     b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, no_match_label, P4::None, 0);
 
-    let skip_label = probe_source.where_clause.map(|_| b.emit_label());
-    if let (Some(where_expr), Some(skip)) = (probe_source.where_clause, skip_label) {
-        emit_where_filter(
-            b,
-            where_expr,
-            probe_cursor,
-            probe_source.table,
-            probe_source.table_alias,
-            schema,
-            skip,
-        );
-    }
-
     let probe_scan = ScanCtx {
         cursor: probe_cursor,
         table: probe_source.table,
@@ -44423,18 +44442,95 @@ fn emit_in_probe_expr(
         register_base: None,
         secondaries: &[],
     };
-    emit_in_probe_value(b, probe_cursor, &probe_source, r_probe, &probe_scan);
+
+    let skip_label = probe_source.where_clause.map(|_| b.emit_label());
+    if let (Some(where_expr), Some(skip)) = (probe_source.where_clause, skip_label) {
+        if is_correlated {
+            emit_searched_case_when_condition_with_fallback(
+                b,
+                where_expr,
+                skip,
+                &probe_scan,
+                Some(scan_ctx),
+            );
+        } else {
+            emit_where_filter(
+                b,
+                where_expr,
+                probe_cursor,
+                probe_source.table,
+                probe_source.table_alias,
+                schema,
+                skip,
+            );
+        }
+    }
+
+    if is_correlated {
+        match probe_source.value {
+            InProbeValue::Expr(expr) => {
+                emit_expr_with_fallback(b, expr, r_probe, &probe_scan, Some(scan_ctx));
+            }
+            InProbeValue::FirstColumn | InProbeValue::Rowid => {
+                emit_in_probe_value(b, probe_cursor, &probe_source, r_probe, &probe_scan);
+            }
+        }
+    } else {
+        emit_in_probe_value(b, probe_cursor, &probe_source, r_probe, &probe_scan);
+    }
     // Apply the comparison affinity between the outer operand and the subquery
     // probe column, mirroring `=`/value-list IN coercion (bd-56aj2 IN-subquery).
-    let probe_aff_p5 = in_probe_comparison_affinity(
-        expr_affinity(operand, Some(scan_ctx)),
-        expr_has_declared_affinity(operand, Some(scan_ctx)),
-        &probe_source,
-        &probe_scan,
-    );
-    let comparison_collation =
+    let probe_aff_p5 = if is_correlated {
+        let (rhs_aff, rhs_declared) = match probe_source.value {
+            InProbeValue::Rowid => (b'D', true),
+            InProbeValue::FirstColumn => (
+                probe_source
+                    .table
+                    .columns
+                    .first()
+                    .map_or(b'A', schema_column_expr_affinity),
+                true,
+            ),
+            InProbeValue::Expr(expr) => (
+                fallback_expr_affinity(expr, &probe_scan, Some(scan_ctx)),
+                expr_has_declared_affinity(expr, Some(&probe_scan))
+                    || expr_has_declared_affinity(expr, Some(scan_ctx)),
+            ),
+        };
+        combine_declared_comparison_affinity(
+            expr_affinity(operand, Some(scan_ctx)),
+            expr_has_declared_affinity(operand, Some(scan_ctx)),
+            rhs_aff,
+            rhs_declared,
+        )
+    } else {
+        in_probe_comparison_affinity(
+            expr_affinity(operand, Some(scan_ctx)),
+            expr_has_declared_affinity(operand, Some(scan_ctx)),
+            &probe_source,
+            &probe_scan,
+        )
+    };
+    let comparison_collation = if is_correlated {
+        extract_collation(operand)
+            .map(str::to_owned)
+            .or_else(|| in_probe_value_explicit_collation(&probe_source))
+            .or_else(|| effective_collation_ctx(operand, Some(scan_ctx)).map(str::to_owned))
+            .or_else(|| match probe_source.value {
+                InProbeValue::Rowid => None,
+                InProbeValue::FirstColumn => probe_source
+                    .table
+                    .columns
+                    .first()
+                    .and_then(|column| column.collation.clone()),
+                InProbeValue::Expr(expr) => {
+                    fallback_effective_collation(expr, &probe_scan, Some(scan_ctx))
+                }
+            })
+    } else {
         in_probe_comparison_collation(operand, scan_ctx, &probe_source, &probe_scan)
-            .map_or(P4::None, P4::Collation);
+    }
+    .map_or(P4::None, P4::Collation);
     b.emit_jump_to_label(
         Opcode::Eq,
         r_probe,

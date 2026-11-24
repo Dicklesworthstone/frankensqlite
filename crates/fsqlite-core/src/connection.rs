@@ -66616,7 +66616,9 @@ impl Connection {
 
         // NEW = existing row with the SET assignments applied. SQLite evaluates
         // every SET RHS against the ORIGINAL row, so `old_values` is not mutated
-        // between assignments.
+        // between assignments. When the target itself is named/aliased `excluded`,
+        // `excluded.<col>` names the target row rather than the excluded pseudo-table.
+        let excluded_is_pseudo = !table_label.eq_ignore_ascii_case("excluded");
         let mut new_values = old_values.clone();
         for assignment in &bound_assignments {
             match &assignment.target {
@@ -66625,7 +66627,9 @@ impl Connection {
                         return Ok(None);
                     };
                     let mut value_expr = assignment.value.clone();
-                    substitute_excluded_columns_in_expr(&mut value_expr, &column_names, attempted);
+                    if excluded_is_pseudo {
+                        substitute_excluded_columns_in_expr(&mut value_expr, &column_names, attempted);
+                    }
                     let Ok(value) = self
                         .eval_expr_with_subqueries(&value_expr, &old_values, &col_map, None)
                         .await
@@ -66645,11 +66649,13 @@ impl Connection {
                         let Some(idx) = resolve_target_idx(name) else {
                             return Ok(None);
                         };
-                        substitute_excluded_columns_in_expr(
-                            &mut value_expr,
-                            &column_names,
-                            attempted,
-                        );
+                        if excluded_is_pseudo {
+                            substitute_excluded_columns_in_expr(
+                                &mut value_expr,
+                                &column_names,
+                                attempted,
+                            );
+                        }
                         let Ok(value) = self
                             .eval_expr_with_subqueries(&value_expr, &old_values, &col_map, None)
                             .await
@@ -66665,7 +66671,9 @@ impl Connection {
 
         let where_true = match bound_where {
             Some(mut where_expr) => {
-                substitute_excluded_columns_in_expr(&mut where_expr, &column_names, attempted);
+                if excluded_is_pseudo {
+                    substitute_excluded_columns_in_expr(&mut where_expr, &column_names, attempted);
+                }
                 let Ok(value) = self
                     .eval_expr_with_subqueries(&where_expr, &old_values, &col_map, None)
                     .await
@@ -144061,9 +144069,10 @@ fn value_to_literal_expr(val: SqliteValue) -> Expr {
 /// expression contains only target-table columns (which resolve against the
 /// existing row) and literals, so an unqualified column reference is unambiguous
 /// (a combined `existing`+`excluded` column map would make a bare `v` in
-/// `v + excluded.v` ambiguous). Subqueries/EXISTS are left untouched — a
-/// correlated `excluded.*` inside a SET subquery is a rare edge the caller
-/// handles by falling back to its prior behavior when evaluation errors.
+/// `v + excluded.v` ambiguous). Correlated `excluded.<col>` references inside
+/// subqueries (`IN (SELECT ...)`, scalar subqueries, and `EXISTS`) are also
+/// substituted unless shadowed by an inner FROM source named/aliased `excluded`
+/// (bd-tjaw5).
 fn substitute_excluded_columns_in_expr(
     expr: &mut Expr,
     column_names: &[String],
@@ -144084,9 +144093,13 @@ fn substitute_excluded_columns_in_expr(
         Expr::BoundOuterValue { .. }
         | Expr::Literal(_, _)
         | Expr::Raise { .. }
-        | Expr::Placeholder(_, _)
-        | Expr::Exists { .. }
-        | Expr::Subquery(_, _) => {}
+        | Expr::Placeholder(_, _) => {}
+        Expr::Exists { subquery, .. } => {
+            substitute_excluded_columns_in_select(subquery, column_names, attempted);
+        }
+        Expr::Subquery(subquery, _) => {
+            substitute_excluded_columns_in_select(subquery, column_names, attempted);
+        }
         Expr::BinaryOp { left, right, .. } => {
             substitute_excluded_columns_in_expr(left, column_names, attempted);
             substitute_excluded_columns_in_expr(right, column_names, attempted);
@@ -144111,10 +144124,16 @@ fn substitute_excluded_columns_in_expr(
             expr: inner, set, ..
         } => {
             substitute_excluded_columns_in_expr(inner, column_names, attempted);
-            if let InSet::List(values) = set {
-                for value in values {
-                    substitute_excluded_columns_in_expr(value, column_names, attempted);
+            match set {
+                InSet::List(values) => {
+                    for value in values {
+                        substitute_excluded_columns_in_expr(value, column_names, attempted);
+                    }
                 }
+                InSet::Subquery(subquery) => {
+                    substitute_excluded_columns_in_select(subquery, column_names, attempted);
+                }
+                InSet::Table(_) => {}
             }
         }
         Expr::Like {
@@ -144150,6 +144169,7 @@ fn substitute_excluded_columns_in_expr(
             args,
             order_by,
             filter,
+            over,
             ..
         } => {
             if let FunctionArgs::List(arg_exprs) = args {
@@ -144163,6 +144183,9 @@ fn substitute_excluded_columns_in_expr(
             if let Some(filter_expr) = filter {
                 substitute_excluded_columns_in_expr(filter_expr, column_names, attempted);
             }
+            if let Some(window_spec) = over {
+                substitute_excluded_columns_in_window_spec(window_spec, column_names, attempted);
+            }
         }
         Expr::JsonAccess {
             expr: inner, path, ..
@@ -144173,6 +144196,197 @@ fn substitute_excluded_columns_in_expr(
         Expr::RowValue(values, _) => {
             for value in values {
                 substitute_excluded_columns_in_expr(value, column_names, attempted);
+            }
+        }
+    }
+}
+
+fn substitute_excluded_columns_in_window_spec(
+    spec: &mut fsqlite_ast::WindowSpec,
+    column_names: &[String],
+    attempted: &[SqliteValue],
+) {
+    for expr in &mut spec.partition_by {
+        substitute_excluded_columns_in_expr(expr, column_names, attempted);
+    }
+    for term in &mut spec.order_by {
+        substitute_excluded_columns_in_expr(&mut term.expr, column_names, attempted);
+    }
+    if let Some(frame) = &mut spec.frame {
+        for bound in std::iter::once(&mut frame.start).chain(frame.end.as_mut()) {
+            match bound {
+                fsqlite_ast::FrameBound::Preceding(expr)
+                | fsqlite_ast::FrameBound::Following(expr) => {
+                    substitute_excluded_columns_in_expr(expr, column_names, attempted);
+                }
+                fsqlite_ast::FrameBound::UnboundedPreceding
+                | fsqlite_ast::FrameBound::CurrentRow
+                | fsqlite_ast::FrameBound::UnboundedFollowing => {}
+            }
+        }
+    }
+}
+
+fn table_or_subquery_shadows_excluded(source: &TableOrSubquery) -> bool {
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => alias
+            .as_deref()
+            .unwrap_or(&name.name)
+            .eq_ignore_ascii_case("excluded"),
+        TableOrSubquery::Subquery { alias, .. } => alias
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("excluded")),
+        TableOrSubquery::TableFunction { name, alias, .. } => alias
+            .as_deref()
+            .unwrap_or(name)
+            .eq_ignore_ascii_case("excluded"),
+        TableOrSubquery::ParenJoin(from) => from_clause_shadows_excluded(from),
+    }
+}
+
+fn from_clause_shadows_excluded(from: &FromClause) -> bool {
+    table_or_subquery_shadows_excluded(&from.source)
+        || from
+            .joins
+            .iter()
+            .any(|join| table_or_subquery_shadows_excluded(&join.table))
+}
+
+fn substitute_excluded_columns_in_table_or_subquery(
+    source: &mut TableOrSubquery,
+    column_names: &[String],
+    attempted: &[SqliteValue],
+    outer_shadowed: bool,
+) {
+    match source {
+        TableOrSubquery::Table { .. } => {}
+        TableOrSubquery::Subquery { query, .. } => {
+            substitute_excluded_columns_in_select(query, column_names, attempted);
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            if !outer_shadowed {
+                for arg in args {
+                    substitute_excluded_columns_in_expr(arg, column_names, attempted);
+                }
+            }
+        }
+        TableOrSubquery::ParenJoin(from) => {
+            let shadowed = outer_shadowed || from_clause_shadows_excluded(from);
+            substitute_excluded_columns_in_from_clause(from, column_names, attempted, shadowed);
+        }
+    }
+}
+
+fn substitute_excluded_columns_in_from_clause(
+    from: &mut FromClause,
+    column_names: &[String],
+    attempted: &[SqliteValue],
+    shadowed: bool,
+) {
+    substitute_excluded_columns_in_table_or_subquery(
+        &mut from.source,
+        column_names,
+        attempted,
+        shadowed,
+    );
+    for join in &mut from.joins {
+        substitute_excluded_columns_in_table_or_subquery(
+            &mut join.table,
+            column_names,
+            attempted,
+            shadowed,
+        );
+        if !shadowed
+            && let Some(fsqlite_ast::JoinConstraint::On(on_expr)) = &mut join.constraint
+        {
+            substitute_excluded_columns_in_expr(on_expr, column_names, attempted);
+        }
+    }
+}
+
+fn substitute_excluded_columns_in_select_core(
+    core: &mut SelectCore,
+    column_names: &[String],
+    attempted: &[SqliteValue],
+) -> bool {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            let shadowed = from.as_ref().is_some_and(from_clause_shadows_excluded);
+            if let Some(from_clause) = from {
+                substitute_excluded_columns_in_from_clause(
+                    from_clause,
+                    column_names,
+                    attempted,
+                    shadowed,
+                );
+            }
+            if !shadowed {
+                for column in columns {
+                    if let ResultColumn::Expr { expr, .. } = column {
+                        substitute_excluded_columns_in_expr(expr, column_names, attempted);
+                    }
+                }
+                if let Some(where_expr) = where_clause {
+                    substitute_excluded_columns_in_expr(where_expr, column_names, attempted);
+                }
+                for group_expr in group_by {
+                    substitute_excluded_columns_in_expr(group_expr, column_names, attempted);
+                }
+                if let Some(having_expr) = having {
+                    substitute_excluded_columns_in_expr(having_expr, column_names, attempted);
+                }
+                for window in windows {
+                    substitute_excluded_columns_in_window_spec(
+                        &mut window.spec,
+                        column_names,
+                        attempted,
+                    );
+                }
+            }
+            shadowed
+        }
+        SelectCore::Values(values) => {
+            for row in values.iter_mut() {
+                for expr in row {
+                    substitute_excluded_columns_in_expr(expr, column_names, attempted);
+                }
+            }
+            false
+        }
+    }
+}
+
+fn substitute_excluded_columns_in_select(
+    select: &mut SelectStatement,
+    column_names: &[String],
+    attempted: &[SqliteValue],
+) {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            substitute_excluded_columns_in_select(&mut cte.query, column_names, attempted);
+        }
+    }
+    let primary_shadowed =
+        substitute_excluded_columns_in_select_core(&mut select.body.select, column_names, attempted);
+    for (_, core) in &mut select.body.compounds {
+        substitute_excluded_columns_in_select_core(core, column_names, attempted);
+    }
+    if !primary_shadowed {
+        for term in &mut select.order_by {
+            substitute_excluded_columns_in_expr(&mut term.expr, column_names, attempted);
+        }
+        if let Some(limit) = &mut select.limit {
+            substitute_excluded_columns_in_expr(&mut limit.limit, column_names, attempted);
+            if let Some(offset) = &mut limit.offset {
+                substitute_excluded_columns_in_expr(offset, column_names, attempted);
             }
         }
     }
