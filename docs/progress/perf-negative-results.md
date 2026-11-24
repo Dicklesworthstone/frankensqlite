@@ -94,6 +94,118 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-23 - WIN (landed as 11382864d; past its gain kill line, -5.26k Ir per FULL autocommit INSERT in callgrind, -3.9k in perf, x8.61 -> x8.36 stock 3.54.1; prediction -3.6k to -4.6k): the commit's conflict-page prediction answers "freelist metadata dirty" once, with an exact early return, instead of building five freelist copies per commit (bd-fuwx0, single-writer lane round 13, lever F1)
+
+- Target: the autocommit one-row INSERT's commit path, #10 in bd-fuwx0's cost map.
+  - Phase A's `predicted_conflict_pages_for_wal_commit_with_inner` -> `predicted_commit_pages_with_inner` called
+    `freelist_metadata_dirty_with_inner` twice (itself, then via `page_one_in_pending_commit_surface_with_inner`).
+  - It also built the predicted durable freelist eagerly.
+  - That is five `durable_freelist_pages_with_inner` builds per commit (each clones `inner.freelist`, merges,
+    normalizes and filters), 4.23k of the 4.7k prediction per FULL INSERT on main 19c90923b.
+- Change (`crates/fsqlite-pager/src/pager.rs`):
+  - `durable_freelist_provably_unchanged_with_inner` is the early return. It requires all of: nothing allocated from
+    the freelist; no freed page at or below `committed_db_size`; no freelist page between `inner.db_size` and
+    `committed_db_size`.
+    - Both lists are the descending form of (F + restored) in (1, size] minus the lock-byte page. So under the first
+      two conditions they differ exactly by F's pages between the two sizes.
+    - The sibling Phase-A check lacks the third condition, and that is not sufficient: a peer's returned lease pages
+      below this transaction's growth make the metadata dirty.
+  - `predicted_commit_pages_with_inner` computes the answer once, passes it to the page-1 rule, and builds the
+    predicted list only when the answer is dirty.
+  - In debug builds, a `debug_assert!` checks every early return against the full comparison.
+- Ledger preflight: the O-B1 entry (79c965065) named this as its retry condition. No entry rejects it.
+- Prediction (on the bead, before the build):
+  - FULL -3.6k to -4.6k; NORMAL -3.4k to -4.4k; txn10 -0.4k to -0.8k per commit; point within +/-0.3%;
+  - the INSERT after a 253-page DROP -15k to -35k.
+  - Kill: under -2.0k per FULL INSERT; txn10 or point above +0.5%; any replicated LOSE above 1%, mt-mvcc included;
+    any keeper red.
+- Result. Arms in one rch job on hz4, K=6. The parent's 1961 source hashes were checked against git.
+  - parent 19c90923b, CLI dda6b9c164baf9af; lever CLI 5060f37263ed181e.
+  - thinkstation1, powersave, databases on ext4. Stock SQLite 3.54.1 live.
+  - callgrind, per unit = (N800 - N400)/400:
+    - FULL, 7 pairs: -5,259 (-2.88%; x8.61 -> x8.36). The lever's subtree is 4,234 -> 333.
+    - NORMAL median of 3: -4,986.
+    - txn10: -2.72k per commit, of which -0.65k is in the lever's functions. The rest is a codegen difference
+      outside them, not claimed.
+    - point: noise. 0 calls per SELECT.
+    - INSERT after a 253-page DROP: -63.3k (-25.6%; x11.65 -> x8.66).
+  - perf instructions:u, two runs: FULL -3,972 / -3,866; NORMAL -4,527 / -4,334; txn10 -2,503 / -2,329 per commit;
+    point +8 / +10 per SELECT (+0.01%). A/A at most 221 per unit.
+  - Time (layout-averaged, two valid runs): every row TIE replicated, no LOSE. The disk-backed FULL rows have
+    T 4-8% (cpu) and 11-15% (cycles).
+  - mt-mvcc-bench (--one-row-per-transaction, 200 rows per thread, 11 iters, K=6 layouts; arms in one job on
+    vmi1153651, parent b74e17c5986b82a7, lever 7fd758d26eedd231; stock the bundled rusqlite 3.54.1, live): 4 writers
+    L/P 1.018 TIE, (1.014 VOID), 0.988 TIE; 8 writers 1.012, 0.991, 0.986, all TIE. No LOSE.
+- Keepers (pager lib):
+  - `test_freelist_metadata_dirty_early_return_matches_the_full_comparison_bd_fuwx0`: 276,480 states;
+  - `test_growth_past_a_peer_returned_lease_keeps_the_freelist_dirty_bd_fuwx0`.
+  - Both pass on the parent and on the lever. Both are red on a planted mutant (the early return without the size
+    range).
+- Gate, on 19c90923b + the lever diff (2f69c428):
+  - clippy -D warnings, fsqlite-pager all targets: clean;
+  - pager lib 1135/0; core lib 4208/0;
+  - core keepers 365/1 (the known red bd-70qrk on that base);
+  - e2e concurrent 144/1: bd_3wop3_1_3, red on main 3/3, green on the lever 3/3 (bd-uk9ob);
+  - e2e cross-process 0 failed; e2e multiprocess 12/0;
+  - fsqlite crate batches 1-7, every result line 0 failed. Batch 5's step rc 1 is an rch transport error: "Remote
+    command finished: exit=0", then "completion unconfirmed ... Broken pipe".
+  - Re-gates after the rebases onto origin/main (which carries 0aa7e219b, then 280cdf109, cee9f5c71, 6ce33dfdc and
+    d274b02a9 in pager.rs):
+    - on 793f4682d (vmi1227854): clippy pager all targets clean; pager lib 1139/1. The red was
+      `test_deferred_upgrade_busy_when_writer_active` (a 10 ms wall-clock bound, bd-gp7t8's class). On hz4 it passed
+      10 of 10 alone and the full lib passed 1140/0, and the parent passed 10 of 10 and 1138/0;
+    - the final push tree (on d274b02a9, with 0954db521's clippy allow and 3229ffadf's as_chunks_mut test fix below
+      F1; pager.rs b414df99; vmi1153651): clippy -D warnings fsqlite-pager all targets rc 0; pager lib 1143/0.
+- Found on the way: the Phase-A sibling's early return published a growth past a peer's returned lease pages with
+  those pages on no durable freelist (bd-fwsyc). This lane's fix made the grower's COMMIT refuse with BusySnapshot
+  instead. It was NOT landed: superseded by 0aa7e219b, which commits instead of refusing. Runtime evidence for
+  0aa7e219b is on bd-fwsyc.
+- Retry or extend: the same shape of cost (O(freelist) work per commit) may remain in the Phase-A path
+  (`freelist_metadata_dirty_with_pending_free_pages`'s full comparison on commits that allocate or free). Measure
+  ins_fl first.
+
+## 2026-11-23 - REJECTED at phase 0, no build (the token-only part is at most -6.6k Ir per FULL autocommit INSERT, under its -9k gain kill line; x8.36 stock 3.54.1): a "solo epoch" token that runs the multi-writer protocol lazily and hands off transparently to a second writer (bd-2uxuh, single-writer lane round 14)
+
+- Design (bd-2uxuh, borrowed from biased locking):
+  - A write transaction takes a solo token at BEGIN when no other write transaction is live in-process and the
+    -shm shows no foreign writer.
+  - In a solo epoch it keeps a coarse read summary and skips conflict prediction and validation.
+  - A second writer revokes the token and waits only for an inflate into the full protocol.
+  - Commits publish through the same WAL, WAL-index and certificate bytes.
+- Phase 0, measurement only. Per INSERT = (N800 - N400)/400, inclusive, median of 7 callgrind replicate pairs.
+  - ELF: CLI fsqlite-cargo 5060f37263ed181e, r13's F1 lever arm (19c90923b + F1), whose commit path is origin/main
+    337f0bda8 plus F1. The profiles are r13's ($S/s13/cg, tags L..L7).
+  - Whole INSERT 177.5k against stock 3.54.1's 21,236 (x8.36). The commit is 113.0k and the BEGIN side 25.3k.
+- Why the token cannot pay:
+  - Stock processes do not know the token. Every row a stock process can observe or change stays, about 57k:
+    - frame append 11.8k, sync 6.8k, certificate about 12k (frozen at v5);
+    - the external WAL lock and shm locks 3.4k, the vouched WAL-index header 4.9k;
+    - the native-append preflight 6.9k (stock writers, GH#534's dead-peer tail);
+    - the conflict scan 3.3k (a stock writer can commit inside our window);
+    - the BEGIN-side refresh 13.3k.
+  - Holding stock's WAL write lock across our transactions would make a stock writer wait for our COMMIT, and
+    serializing writers is ruled out.
+  - The in-process rows need no token:
+    - fsqlite-mvcc already takes its uncontended prepare and finalize fast paths (finalize_prepared_session_state
+      "uncontended", 801 of 801 commits). The registry row (5.5k) is wrapper cost, reachable by O-B4 under a
+      "the registry holds no other session" guard.
+    - A write-only token cannot rule out live readers, and readers are the finalize record's consumers.
+    - The page plane and snapshot publication (13.8k) feed every later BEGIN on the file, not only live readers,
+      so they are not lazily skippable either.
+  - Only three rows depend on the token: the Phase-A prediction remnant after F1 (1.4k), the epoch waiter
+    bookkeeping (3.5k), and the SSI read witnesses (1.7k). That is at most 6.6k (3.7%), realistically 3-5k.
+    - The read witnesses are not consumer-free: a session live at the solo commit, with an older snapshot, that
+      writes later, can close a write-skew cycle through the solo transaction's reads.
+- Kill line: a gain under -9k (5%). That is the smallest gain that pays for revoke and inflate, their DPOR/loom
+  model, a shadow mode and the planted-mutant keepers. The token-only upper bound is under it.
+- Cost-only options on the same tree, about -18 to -25k together. Each needs its own lever:
+  - O-B1 under-gate -2.9k (measured, rejected alone, 79c965065); O-B3 -1.0k; O-B4 -2 to -3k;
+  - O-C1 -4 to -6k; O-C3 -4 to -8k;
+  - the checkpoint copying the bytes it validated instead of re-reading and comparing XXH3-128 digests, about -3.0k.
+- Retry condition: an owner decision that excludes stock writers while a token is held (a Q2-class interop change),
+  which would put about 18k of cross-process rows in reach. Or a cost-only campaign after which the three token-only
+  rows above are the largest protocol cost left.
+
 ## 2026-11-24 - REJECTED on its time kill line (gb_a_sum_c cycles a replicated layout-averaged LOSE, 1.0155 / 1.0243 at Ir 1.0000), with every statement row it targets a replicated WIN (txn point SELECT cpu x2.77 -> x2.04 / x2.09 stock 3.54.1, Ir -23.3%): an exact-guard per-connection cache of validated statements lets a repeated text statement skip its pre-dispatch rewrites and relation / semantic validation (bd-5310l, statement lane round 1)
 
 - Target: the text path's per-statement front end. On main 60386fa04 (user instructions an execution, stock 3.54.1
