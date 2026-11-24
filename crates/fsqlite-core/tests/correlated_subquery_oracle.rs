@@ -358,12 +358,6 @@ fn rowid_scope_outcome(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
 /// "no such column" refusal as fail-closed. Checked on rusqlite's bundled
 /// 3.54.1, the answer is t's rowid (0, 2, 2), so it now asks for equality,
 /// on `:memory:` and on a file.
-///
-/// Views are not covered yet (bd-lawn3 stays open for them): under the view
-/// `vu`, the correlated `(SELECT count(*) FROM vu WHERE rowid > 1)` is
-/// refused "no such column" (stock 0, 2, 2), and a top-level
-/// `SELECT rowid FROM vu` returns u's rowids where stock says "no such
-/// column".
 #[test]
 fn rowid_under_a_derived_table_resolves_like_stock() {
     let cases: &[&str] = &[
@@ -430,6 +424,77 @@ fn rowid_under_a_derived_table_resolves_like_stock() {
             diffs.len(),
             diffs.join("\n")
         );
+    });
+}
+
+#[test]
+fn rowid_under_a_stored_view_resolves_like_stock() {
+    const OUTER_ROWID: &str =
+        "SELECT a, (SELECT count(*) FROM vu WHERE rowid > 1) FROM t ORDER BY id";
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let fsqlite_file = directory.path().join("franken.db");
+        let stock_file = directory.path().join("stock.db");
+        let mut diffs = Vec::new();
+        for (filename, stock_filename) in [
+            (":memory:", ":memory:"),
+            (fsqlite_file.to_str().unwrap(), stock_file.to_str().unwrap()),
+        ] {
+            let f = Connection::open(filename).await.unwrap();
+            let r = rusqlite::Connection::open(stock_filename).unwrap();
+            for sql in ROWID_SCOPES.iter().copied().chain([
+                "CREATE VIEW vr AS SELECT b AS rowid FROM u",
+                "CREATE TABLE shadow_v(b INTEGER)",
+                "INSERT INTO shadow_v VALUES (100), (200)",
+                "CREATE TEMP VIEW shadow_v AS SELECT * FROM vu",
+            ]) {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            assert_eq!(
+                rq(&r, OUTER_ROWID),
+                [["15", "0"], ["25", "2"], ["35", "2"]],
+                "the bundled oracle must bind the enclosing rowid"
+            );
+            for sql in [
+                OUTER_ROWID,
+                "SELECT a, (SELECT count(*) FROM main.vu AS q WHERE _rowid_ > 1 AND oid < 3) \
+                 FROM t ORDER BY id",
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM vu) WHERE rowid = 2)",
+                "SELECT a, (SELECT count(*) FROM vu WHERE b > a) FROM t ORDER BY id",
+                "SELECT a, (SELECT count(*) FROM vr WHERE rowid > 15) FROM t ORDER BY id",
+                "SELECT a, (SELECT count(*) FROM shadow_v WHERE rowid = 2) FROM t ORDER BY id",
+                "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM shadow_v WHERE rowid = 2 AND b < 25)",
+                "SELECT id, EXISTS (SELECT 1 FROM shadow_v WHERE rowid = 2 AND b < 25) \
+                 FROM t ORDER BY id",
+                "SELECT id FROM t WHERE 10 IN (SELECT b FROM shadow_v WHERE rowid = 2)",
+                "SELECT id, 10 IN (SELECT b FROM shadow_v WHERE rowid = 2) FROM t ORDER BY id",
+                "SELECT rowid FROM vu",
+                "SELECT a, (SELECT count(*) FROM main.shadow_v WHERE rowid = 2) FROM t ORDER BY id",
+                "SELECT a, (SELECT count(*) FROM vu AS q WHERE q.rowid > 1) FROM t ORDER BY id",
+            ] {
+                let stock = rowid_scope_outcome(rq(&r, sql));
+                let direct = rowid_scope_outcome(fq(&f, sql).await);
+                let prepared = match f.prepare(sql).await {
+                    Ok(statement) => statement.query().await,
+                    Err(error) => Err(error),
+                };
+                let prepared = rowid_scope_outcome(match prepared {
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect(),
+                    Err(error) => vec![vec![format!("<ERR {error:?}>")]],
+                });
+                if direct != stock || prepared != stock {
+                    diffs.push(format!(
+                        "{filename}: {sql}\n  direct={direct:?}, prepared={prepared:?}, stock={stock:?}"
+                    ));
+                }
+            }
+            f.close().await.unwrap();
+        }
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
     });
 }
 
