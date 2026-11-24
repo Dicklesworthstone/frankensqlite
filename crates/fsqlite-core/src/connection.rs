@@ -45675,7 +45675,7 @@ impl Connection {
                         self.execute_correlated_subquery_where_fallback(cx, select, params)
                     })
                     .await
-                } else if select_has_correlated_in_subquery(select, &self.schema.borrow()) {
+                } else if select_has_correlated_in_subquery(select, self) {
                     // bd-zvk68: a correlated `x IN (SELECT ...)` predicate in the
                     // WHERE clause references outer columns and must be evaluated
                     // per outer row. The VDBE codegen IN-subquery path builds the
@@ -60644,10 +60644,8 @@ impl Connection {
         limit: Option<&fsqlite_ast::LimitClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<Expr>> {
-        let where_needs_select_path = where_clause.is_some_and(|wh| {
-            expr_has_correlated_in_subquery(wh, &self.schema.borrow())
-                || dml_expr_has_uncompiled_correlated_subquery(wh, self)
-        });
+        let where_needs_select_path = where_clause
+            .is_some_and(|wh| dml_expr_has_uncompiled_correlated_subquery(wh, self));
         if !where_needs_select_path {
             return Ok(None);
         }
@@ -61577,8 +61575,6 @@ impl Connection {
             }
             {
                 let schema = self.schema.borrow();
-                let shadowed_main_tables = self.shadowed_main_tables.borrow();
-                let temp_table_names = self.temp_table_names.borrow();
                 // Bind only outer references. Inner FROM scopes still read the
                 // current database, and BoundOuterValue preserves the target
                 // column's comparison affinity and declared collation.
@@ -61591,8 +61587,7 @@ impl Connection {
                     Some(&affinities),
                     Some(&declared_blob_columns),
                     &schema,
-                    Some(&shadowed_main_tables),
-                    Some(&temp_table_names),
+                    Some(self),
                 );
             }
             // BoundOuterValue's SQL display omits its affinity/collation, so
@@ -80920,20 +80915,68 @@ impl Connection {
     /// `ON CONFLICT ... DO UPDATE` clauses that touch a child/parent FK column
     /// or fire an `UPDATE` trigger open a statement journal and validate FKs
     /// after `OP_Insert`, so their failed insert updates `last_insert_rowid()`.
+    fn table_fk_keys_modified_by_update(
+        table: &TableSchema,
+        assignments: &[fsqlite_ast::Assignment],
+    ) -> Vec<usize> {
+        let assigned: Vec<usize> = assignments
+            .iter()
+            .flat_map(|assignment| match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => std::slice::from_ref(column),
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.as_slice(),
+            })
+            .filter_map(|name| {
+                table
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(name))
+                    .or_else(|| {
+                        is_hidden_rowid_alias_name(name)
+                            .then(|| table.columns.iter().position(|column| column.is_ipk))
+                            .flatten()
+                    })
+            })
+            .collect();
+        table
+            .foreign_keys
+            .iter()
+            .enumerate()
+            .filter(|(_, fk)| {
+                fk.child_columns
+                    .iter()
+                    .any(|column| assigned.contains(column))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     fn fk_parent_keys_modified_by_update(
         &self,
         parent_table_name: &str,
+        parent_schema: Option<&str>,
         assigned_cols: &[String],
     ) -> bool {
-        let schema = self.schema.borrow();
-        let parent_table = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(parent_table_name));
-        let implicit_parent_cols = Self::fk_implicit_parent_key_columns(parent_table);
+        let Some(parent_table) = self.local_dml_target_table(parent_table_name, parent_schema)
+        else {
+            return false;
+        };
+        let parent_is_temp = parent_schema.map_or_else(
+            || {
+                self.temp_table_names
+                    .borrow()
+                    .contains(&parent_table_name.to_ascii_lowercase())
+            },
+            |schema_name| schema_name.eq_ignore_ascii_case("temp"),
+        );
+        let implicit_parent_cols = Self::fk_implicit_parent_key_columns(Some(&parent_table));
         let ipk_col_name = parent_table
-            .and_then(|table| table.columns.iter().find(|col| col.is_ipk))
-            .map(|col| col.name.as_str());
-        schema.iter().any(|child| {
+            .columns
+            .iter()
+            .find(|col| col.is_ipk)
+            .map(|col| col.name.clone());
+        drop(parent_table);
+
+        let matches_child = |child: &TableSchema| {
             child.foreign_keys.iter().any(|fk| {
                 if !fk.parent_table.eq_ignore_ascii_case(parent_table_name) {
                     return false;
@@ -80946,12 +80989,36 @@ impl Connection {
                 parent_cols.iter().any(|pcol| {
                     assigned_cols.iter().any(|assigned| {
                         assigned.eq_ignore_ascii_case(pcol)
-                            || (ipk_col_name.is_some_and(|ipk| ipk.eq_ignore_ascii_case(pcol))
+                            || (ipk_col_name
+                                .as_deref()
+                                .is_some_and(|ipk| ipk.eq_ignore_ascii_case(pcol))
                                 && is_hidden_rowid_alias_name(assigned))
                     })
                 })
             })
-        })
+        };
+
+        let temp_names = self.temp_table_names.borrow();
+        let schema = self.schema.borrow();
+        if schema.iter().any(|child| {
+            let child_is_temp = temp_names.contains(&child.name.to_ascii_lowercase());
+            child_is_temp == parent_is_temp && matches_child(child)
+        }) {
+            return true;
+        }
+        drop(schema);
+        drop(temp_names);
+
+        if !parent_is_temp
+            && self
+                .shadowed_main_tables
+                .borrow()
+                .values()
+                .any(matches_child)
+        {
+            return true;
+        }
+        false
     }
 
     fn insert_immediate_fk_preserves_last_insert_rowid(
@@ -80975,38 +81042,57 @@ impl Connection {
             return false;
         }
         let table_name = insert.table.name.as_str();
+        let target_schema = insert
+            .table
+            .schema
+            .as_deref()
+            .unwrap_or_else(|| self.visible_trigger_target_schema(table_name));
         let insert_event = fsqlite_ast::TriggerEvent::Insert;
-        if self.has_matching_triggers(table_name, fsqlite_ast::TriggerTiming::Before, &insert_event)
-            || self.has_matching_triggers(
-                table_name,
-                fsqlite_ast::TriggerTiming::After,
-                &insert_event,
-            )
-        {
+        if self.has_matching_triggers_in_schema(
+            table_name,
+            target_schema,
+            fsqlite_ast::TriggerTiming::Before,
+            &insert_event,
+        ) || self.has_matching_triggers_in_schema(
+            table_name,
+            target_schema,
+            fsqlite_ast::TriggerTiming::After,
+            &insert_event,
+        ) {
             return false;
         }
         for clause in &insert.upsert {
             if let fsqlite_ast::UpsertAction::Update { assignments, .. } = &clause.action {
                 let assigned_cols = Self::assignment_target_column_names(assignments);
                 let update_event = fsqlite_ast::TriggerEvent::Update(assigned_cols.clone());
-                if self.has_matching_triggers(
+                let child_fk_modified = self
+                    .local_dml_target_table(table_name, Some(target_schema))
+                    .is_some_and(|table| {
+                        !Self::table_fk_keys_modified_by_update(&table, assignments).is_empty()
+                    });
+                if self.has_matching_triggers_in_schema(
                     table_name,
+                    target_schema,
                     fsqlite_ast::TriggerTiming::Before,
                     &update_event,
-                ) || self.has_matching_triggers(
+                ) || self.has_matching_triggers_in_schema(
                     table_name,
+                    target_schema,
                     fsqlite_ast::TriggerTiming::After,
                     &update_event,
-                ) || !self.fk_keys_modified_by_update(table_name, assignments).is_empty()
-                    || self.fk_parent_keys_modified_by_update(table_name, &assigned_cols)
+                ) || child_fk_modified
+                    || self.fk_parent_keys_modified_by_update(
+                        table_name,
+                        Some(target_schema),
+                        &assigned_cols,
+                    )
                 {
                     return false;
                 }
             }
         }
         if insert.or_conflict.is_none()
-            && let Some(table) =
-                self.local_dml_target_table(table_name, insert.table.schema.as_deref())
+            && let Some(table) = self.local_dml_target_table(table_name, Some(target_schema))
         {
             let has_schema_pk_or_unique_replace = table.columns.iter().any(|column| {
                 column.is_ipk
@@ -81229,35 +81315,7 @@ impl Connection {
         else {
             return Vec::new();
         };
-        let assigned: Vec<usize> = assignments
-            .iter()
-            .flat_map(|assignment| match &assignment.target {
-                fsqlite_ast::AssignmentTarget::Column(column) => std::slice::from_ref(column),
-                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.as_slice(),
-            })
-            .filter_map(|name| {
-                table
-                    .columns
-                    .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(name))
-                    .or_else(|| {
-                        is_hidden_rowid_alias_name(name)
-                            .then(|| table.columns.iter().position(|column| column.is_ipk))
-                            .flatten()
-                    })
-            })
-            .collect();
-        table
-            .foreign_keys
-            .iter()
-            .enumerate()
-            .filter(|(_, fk)| {
-                fk.child_columns
-                    .iter()
-                    .any(|column| assigned.contains(column))
-            })
-            .map(|(index, _)| index)
-            .collect()
+        Self::table_fk_keys_modified_by_update(table, assignments)
     }
 
     /// Check the child-side foreign keys of `row_values`, or only the keys at
@@ -81381,7 +81439,7 @@ impl Connection {
                     }
                     continue;
                 }
-                if fk.deferred {
+                if fk.deferred || self.defer_foreign_keys.get() {
                     autocommit_deferred_violation = true;
                     continue;
                 }
@@ -81442,7 +81500,7 @@ impl Connection {
                     }
                     continue;
                 }
-                if fk.deferred {
+                if fk.deferred || self.defer_foreign_keys.get() {
                     autocommit_deferred_violation = true;
                     continue;
                 }
@@ -81487,7 +81545,7 @@ impl Connection {
                     }
                     continue;
                 }
-                if fk.deferred {
+                if fk.deferred || self.defer_foreign_keys.get() {
                     autocommit_deferred_violation = true;
                     continue;
                 }
@@ -83277,6 +83335,21 @@ impl Connection {
     ) -> bool {
         self.triggers.borrow().iter().any(|trigger| {
             trigger.table_name.eq_ignore_ascii_case(table_name)
+                && trigger.timing == timing
+                && trigger_event_matches(&trigger.event, event)
+        })
+    }
+
+    fn has_matching_triggers_in_schema(
+        &self,
+        table_name: &str,
+        target_schema: &str,
+        timing: fsqlite_ast::TriggerTiming,
+        event: &fsqlite_ast::TriggerEvent,
+    ) -> bool {
+        self.triggers.borrow().iter().any(|trigger| {
+            trigger.table_name.eq_ignore_ascii_case(table_name)
+                && trigger.bound_table_schema.eq_ignore_ascii_case(target_schema)
                 && trigger.timing == timing
                 && trigger_event_matches(&trigger.event, event)
         })
@@ -100349,8 +100422,6 @@ impl Connection {
         }
 
         let schema = self.schema.borrow();
-        let shadowed_main_tables = self.shadowed_main_tables.borrow();
-        let temp_table_names = self.temp_table_names.borrow();
         let lookup = OuterReferenceLookup {
             row: &[],
             col_map: &col_map,
@@ -100360,8 +100431,7 @@ impl Connection {
             column_affinities: None,
             declared_blob_columns: None,
             schema: &schema,
-            shadowed_main_tables: Some(&shadowed_main_tables),
-            temp_table_names: Some(&temp_table_names),
+            connection: Some(self),
             probe_unqualified_external_ref: false,
         };
         let resolved = substitute_outer_refs_in_expr(
@@ -101951,7 +102021,9 @@ impl Connection {
             return None;
         }
         let (table_name, inner_binding_name) = match &from.source {
-            TableOrSubquery::Table { name, alias, .. } if name.schema.is_none() => {
+            TableOrSubquery::Table { name, alias, .. }
+                if name.schema.is_none() && self.local_view_index_for_relation(name).is_none() =>
+            {
                 (&name.name, alias.as_deref().unwrap_or(&name.name))
             }
             _ => return None,
@@ -102249,7 +102321,11 @@ impl Connection {
         else {
             return None;
         };
-        if name.schema.is_some() || index_hint.is_some() || time_travel.is_some() {
+        if name.schema.is_some()
+            || index_hint.is_some()
+            || time_travel.is_some()
+            || self.local_view_index_for_relation(name).is_some()
+        {
             return None;
         }
         let table_key = name.name.to_ascii_lowercase();
@@ -102631,8 +102707,6 @@ impl Connection {
             .as_ref()
             .map(|context| &context.declared_json_keys);
         let schema = self.schema.borrow();
-        let shadowed_main_tables = self.shadowed_main_tables.borrow();
-        let temp_table_names = self.temp_table_names.borrow();
         substitute_outer_refs_in_select_with_schema_context(
             select,
             row,
@@ -102642,8 +102716,7 @@ impl Connection {
             column_affinities,
             declared_blob_columns,
             &schema,
-            Some(&shadowed_main_tables),
-            Some(&temp_table_names),
+            Some(self),
         );
     }
 
@@ -106765,7 +106838,7 @@ impl Connection {
             || self.select_correlated_exists_where_requires_fallback(&gb_select)
             || select_has_unsupported_correlated_scalar_subquery(&gb_select, self)
             || select_has_in_subquery_operand_requiring_semantic_fallback(&gb_select, self)
-            || select_has_correlated_in_subquery(&gb_select, &self.schema.borrow());
+            || select_has_correlated_in_subquery(&gb_select, self);
         let grouped_rows = if join_like_phase_one {
             self.execute_group_by_join_select(cx, &gb_select, params)
                 .await?
@@ -114903,7 +114976,7 @@ impl Connection {
         Box::pin(async move {
             match expr {
                 Expr::Subquery(sub, span) => {
-                    if !is_correlated_subquery_with_schema(sub, &self.schema.borrow()) {
+                    if !is_correlated_subquery_in_connection(sub, self) {
                         self.validate_select_column_references(sub)?;
                         self.validate_scalar_subquery_column_count(sub)?;
                         // bd-2fong red 2: this pre-resolver serves the
@@ -114944,7 +115017,7 @@ impl Connection {
                     not,
                     span,
                 } => {
-                    if !is_correlated_subquery_with_schema(subquery, &self.schema.borrow()) {
+                    if !is_correlated_subquery_in_connection(subquery, self) {
                         let mut probe = (**subquery).clone();
                         strip_exists_subquery_projection(&mut probe);
                         self.limit_probe_to_its_first_row(&mut probe);
@@ -114970,7 +115043,7 @@ impl Connection {
                         return Ok(expr.clone());
                     }
                     if let InSet::Subquery(sub) = set {
-                        if is_correlated_subquery_with_schema(sub, &self.schema.borrow()) {
+                        if is_correlated_subquery_in_connection(sub, self) {
                             // Preserve the whole comparison for per-row ordered
                             // evaluation. Pre-resolving an otherwise constant
                             // LHS here would move it ahead of the correlated RHS.
@@ -134903,7 +134976,7 @@ fn select_has_unsupported_correlated_scalar_subquery(
         matches!(
             subquery,
             SubqueryExprRef::Scalar(inner)
-                if is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+                if is_correlated_subquery_in_connection(inner, conn)
                     && !scalar_subquery_supported_by_vdbe(inner, conn, outer)
         )
     })
@@ -134920,7 +134993,7 @@ fn select_has_unsupported_correlated_exists_subquery(
             subquery,
             SubqueryExprRef::Exists(inner)
                 if !exists_subquery_answered_by_table_scan(inner, conn)
-                    && is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+                    && is_correlated_subquery_in_connection(inner, conn)
         )
     })
 }
@@ -135401,8 +135474,6 @@ impl Connection {
         let mut probe = subquery.clone();
         let markers = vec![owned_aggregate_probe_marker(); col_map.len()];
         let schema = self.schema.borrow();
-        let shadowed_main_tables = self.shadowed_main_tables.borrow();
-        let temp_table_names = self.temp_table_names.borrow();
         let lookup = OuterReferenceLookup {
             row: &[],
             col_map,
@@ -135412,8 +135483,7 @@ impl Connection {
             column_affinities: None,
             declared_blob_columns: None,
             schema: schema.as_slice(),
-            shadowed_main_tables: Some(&*shadowed_main_tables),
-            temp_table_names: Some(&*temp_table_names),
+            connection: Some(self),
             probe_unqualified_external_ref: false,
         };
         substitute_outer_refs_in_select_scoped(
@@ -135707,8 +135777,6 @@ impl Connection {
         let mut probe = expr.clone();
         let markers = vec![owned_aggregate_probe_marker(); col_map.len()];
         let schema = self.schema.borrow();
-        let shadowed_main_tables = self.shadowed_main_tables.borrow();
-        let temp_table_names = self.temp_table_names.borrow();
         let lookup = OuterReferenceLookup {
             row: &[],
             col_map,
@@ -135718,8 +135786,7 @@ impl Connection {
             column_affinities: None,
             declared_blob_columns: None,
             schema: schema.as_slice(),
-            shadowed_main_tables: Some(&*shadowed_main_tables),
-            temp_table_names: Some(&*temp_table_names),
+            connection: Some(self),
             probe_unqualified_external_ref: false,
         };
         substitute_outer_refs_in_expr_mut(
@@ -136148,6 +136215,7 @@ fn from_is_one_base_table(from: &FromClause, conn: &Connection) -> bool {
             &from.source,
             TableOrSubquery::Table { name, .. }
                 if name.schema.is_none()
+                    && conn.local_view_index_for_relation(name).is_none()
                     && !conn.table_name_is_virtual(&name.name)
                     && conn
                         .schema
@@ -136172,7 +136240,7 @@ fn dml_expr_has_uncompiled_correlated_subquery(expr: &Expr, conn: &Connection) -
             }
             SubqueryExprRef::In(inner) => (inner, false),
         };
-        !answered && is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+        !answered && is_correlated_subquery_in_connection(inner, conn)
     })
 }
 
@@ -136183,7 +136251,7 @@ fn expr_has_correlated_subquery_deep(expr: &Expr, conn: &Connection) -> bool {
         let (SubqueryExprRef::Scalar(inner)
         | SubqueryExprRef::Exists(inner)
         | SubqueryExprRef::In(inner)) = subquery;
-        is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+        is_correlated_subquery_in_connection(inner, conn)
     })
 }
 
@@ -140484,6 +140552,18 @@ fn is_correlated_subquery(subquery: &SelectStatement) -> bool {
 /// base-table inventories protect their real columns, while opaque inventories
 /// conservatively leave the subquery on the correlated path.
 fn is_correlated_subquery_with_schema(subquery: &SelectStatement, schema: &[TableSchema]) -> bool {
+    is_correlated_subquery_with_schema_context(subquery, schema, None)
+}
+
+fn is_correlated_subquery_in_connection(subquery: &SelectStatement, conn: &Connection) -> bool {
+    is_correlated_subquery_with_schema_context(subquery, &conn.schema.borrow(), Some(conn))
+}
+
+fn is_correlated_subquery_with_schema_context(
+    subquery: &SelectStatement,
+    schema: &[TableSchema],
+    connection: Option<&Connection>,
+) -> bool {
     if is_correlated_subquery(subquery) {
         return true;
     }
@@ -140498,8 +140578,7 @@ fn is_correlated_subquery_with_schema(subquery: &SelectStatement, schema: &[Tabl
         column_affinities: None,
         declared_blob_columns: None,
         schema,
-        shadowed_main_tables: None,
-        temp_table_names: None,
+        connection,
         probe_unqualified_external_ref: true,
     };
     substitute_outer_refs_in_select_scoped(
@@ -140512,12 +140591,8 @@ fn is_correlated_subquery_with_schema(subquery: &SelectStatement, schema: &[Tabl
     probed != *subquery
 }
 
-/// bd-2fong: derive a view's output column names for correlation probing.
-///
-/// Prefers the explicit `CREATE VIEW v (cols...)` list; otherwise reads the
-/// stored definition's projection, accepting aliased expressions and plain
-/// column references. Star/complex unaliased projections return `None` and
-/// the view stays opaque (conservatively correlated) for the probe.
+/// Names available to qualified-column binding directly from a view's
+/// declaration or projection. A wildcard or unnamed expression is opaque.
 fn view_output_column_names(view: &ViewDef) -> Option<Vec<String>> {
     if !view.columns.is_empty() {
         return Some(view.columns.clone());
@@ -140545,28 +140620,17 @@ fn view_output_column_names(view: &ViewDef) -> Option<Vec<String>> {
 
 /// bd-2fong: correlation verdict for the eager subquery-rewrite decision.
 ///
-/// The schema-aware probe treats bare columns in scopes whose FROM relation
-/// is absent from the base-table schema as potential outer references —
-/// which classified every view- or sqlite_schema-sourced nested probe as
-/// correlated and starved the eager IN-rewrite that keeps
-/// `... IN (SELECT ... WHERE x IN (SELECT ... FROM view_or_sqlite_schema))`
-/// on the compiled path. When (and only when) the subquery tree references
-/// such a relation, probe against a schema augmented with synthetic
-/// inventories: the fixed sqlite_schema/sqlite_master columns and each
-/// view's derivable output columns. Views whose output cannot be derived
-/// stay opaque and keep the conservative correlated verdict.
+/// Views use the same column inventory here as during outer-value binding.
+/// Unqualified sqlite_schema/sqlite_master references need their fixed
+/// catalog columns added to the base-table inventory.
 fn rewrite_probe_is_correlated(conn: &Connection, sub: &SelectStatement) -> bool {
     let schema = conn.schema.borrow();
-    let views = conn.views.borrow();
-    let references_synthetic_relation = select_contains_relation_reference(sub, &mut |name: &QualifiedName| {
-        name.schema.is_none()
-            && (is_sqlite_schema_name(&name.name)
-                || views
-                    .iter()
-                    .any(|view| view.name.eq_ignore_ascii_case(&name.name)))
-    });
-    if !references_synthetic_relation {
-        return is_correlated_subquery_with_schema(sub, &schema);
+    let references_catalog =
+        select_contains_relation_reference(sub, &mut |name: &QualifiedName| {
+            name.schema.is_none() && is_sqlite_schema_name(&name.name)
+        });
+    if !references_catalog {
+        return is_correlated_subquery_with_schema_context(sub, &schema, Some(conn));
     }
     let synthetic_table = |name: &str, columns: Vec<String>| TableSchema {
         name: name.to_owned(),
@@ -140592,12 +140656,7 @@ fn rewrite_probe_is_correlated(conn: &Connection, sub: &SelectStatement) -> bool
                 .collect(),
         ));
     }
-    for view in views.iter() {
-        if let Some(columns) = view_output_column_names(view) {
-            augmented.push(synthetic_table(&view.name, columns));
-        }
-    }
-    is_correlated_subquery_with_schema(sub, &augmented)
+    is_correlated_subquery_with_schema_context(sub, &augmented, Some(conn))
 }
 
 fn expr_has_external_column_ref_with_schema_in_core(
@@ -140628,8 +140687,7 @@ fn expr_has_external_column_ref_with_schema_in_core_and_locals(
         column_affinities: None,
         declared_blob_columns: None,
         schema,
-        shadowed_main_tables: None,
-        temp_table_names: None,
+        connection: None,
         probe_unqualified_external_ref: true,
     };
     let protected_unqualified_columns = protected_unqualified_columns_for_core(
@@ -141690,131 +141748,12 @@ fn select_correlated_exists_in_where_all_match_count_semijoin_shape(
 /// subqueries intact (`is_correlated_subquery`), but the VDBE codegen IN path
 /// then materializes the candidate set once with no outer binding, so without
 /// this gate the predicate matches nothing.
-fn select_has_correlated_in_subquery(select: &SelectStatement, schema: &[TableSchema]) -> bool {
-    select.with.as_ref().is_some_and(|with| {
-        with.ctes
-            .iter()
-            .any(|cte| select_has_correlated_in_subquery(&cte.query, schema))
-    }) || select_core_has_correlated_in_subquery(&select.body.select, schema)
-        || select
-            .body
-            .compounds
-            .iter()
-            .any(|(_, core)| select_core_has_correlated_in_subquery(core, schema))
-        || select
-            .order_by
-            .iter()
-            .any(|term| expr_has_correlated_in_subquery(&term.expr, schema))
-        || select.limit.as_ref().is_some_and(|limit| {
-            expr_has_correlated_in_subquery(&limit.limit, schema)
-                || limit
-                    .offset
-                    .as_ref()
-                    .is_some_and(|offset| expr_has_correlated_in_subquery(offset, schema))
-        })
-}
-
-fn select_core_has_correlated_in_subquery(core: &SelectCore, schema: &[TableSchema]) -> bool {
-    match core {
-        SelectCore::Values(rows) => rows
-            .iter()
-            .flatten()
-            .any(|expr| expr_has_correlated_in_subquery(expr, schema)),
-        SelectCore::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            having,
-            windows,
-            ..
-        } => {
-            columns.iter().any(|column| {
-                matches!(
-                    column,
-                    ResultColumn::Expr { expr, .. }
-                        if expr_has_correlated_in_subquery(expr, schema)
-                )
-            }) || from
-                .as_ref()
-                .is_some_and(|from| from_clause_has_correlated_in_subquery(from, schema))
-                || where_clause
-                    .as_deref()
-                    .is_some_and(|expr| expr_has_correlated_in_subquery(expr, schema))
-                || group_by
-                    .iter()
-                    .any(|expr| expr_has_correlated_in_subquery(expr, schema))
-                || having
-                    .as_deref()
-                    .is_some_and(|expr| expr_has_correlated_in_subquery(expr, schema))
-                || windows.iter().any(|window| {
-                    window
-                        .spec
-                        .partition_by
-                        .iter()
-                        .any(|expr| expr_has_correlated_in_subquery(expr, schema))
-                        || window
-                            .spec
-                            .order_by
-                            .iter()
-                            .any(|term| expr_has_correlated_in_subquery(&term.expr, schema))
-                        || window.spec.frame.as_ref().is_some_and(|frame| {
-                            frame_bound_has_correlated_in_subquery(&frame.start, schema)
-                                || frame.end.as_ref().is_some_and(|end| {
-                                    frame_bound_has_correlated_in_subquery(end, schema)
-                                })
-                        })
-                })
-        }
-    }
-}
-
-fn from_clause_has_correlated_in_subquery(from: &FromClause, schema: &[TableSchema]) -> bool {
-    table_or_subquery_has_correlated_in_subquery(&from.source, schema)
-        || from.joins.iter().any(|join| {
-            table_or_subquery_has_correlated_in_subquery(&join.table, schema)
-                || matches!(
-                    &join.constraint,
-                    Some(JoinConstraint::On(expr))
-                        if expr_has_correlated_in_subquery(expr, schema)
-                )
-        })
-}
-
-fn table_or_subquery_has_correlated_in_subquery(
-    source: &TableOrSubquery,
-    schema: &[TableSchema],
-) -> bool {
-    match source {
-        TableOrSubquery::Table { .. } => false,
-        TableOrSubquery::Subquery { query, .. } => select_has_correlated_in_subquery(query, schema),
-        TableOrSubquery::TableFunction { args, .. } => args
-            .iter()
-            .any(|expr| expr_has_correlated_in_subquery(expr, schema)),
-        TableOrSubquery::ParenJoin(from) => from_clause_has_correlated_in_subquery(from, schema),
-    }
-}
-
-fn frame_bound_has_correlated_in_subquery(bound: &FrameBound, schema: &[TableSchema]) -> bool {
-    match bound {
-        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-            expr_has_correlated_in_subquery(expr, schema)
-        }
-        FrameBound::UnboundedPreceding
-        | FrameBound::CurrentRow
-        | FrameBound::UnboundedFollowing => false,
-    }
-}
-
-fn expr_has_correlated_in_subquery(expr: &Expr, schema: &[TableSchema]) -> bool {
-    expr_contains_subquery_match(expr, &mut |subquery| match subquery {
-        SubqueryExprRef::In(inner) => {
-            is_correlated_subquery_with_schema(inner, schema)
-                || select_has_correlated_in_subquery(inner, schema)
-        }
-        SubqueryExprRef::Scalar(inner) | SubqueryExprRef::Exists(inner) => {
-            select_has_correlated_in_subquery(inner, schema)
-        }
+fn select_has_correlated_in_subquery(select: &SelectStatement, conn: &Connection) -> bool {
+    select_contains_subquery_matching(select, conn, &|subquery, conn| {
+        matches!(
+            subquery,
+            SubqueryExprRef::In(inner) if is_correlated_subquery_in_connection(inner, conn)
+        )
     })
 }
 
@@ -142135,8 +142074,8 @@ struct OuterReferenceLookup<'a> {
     /// (GH#428). `None` keeps every BLOB entry as declared, the prior contract.
     declared_blob_columns: Option<&'a HashSet<usize>>,
     schema: &'a [TableSchema],
-    shadowed_main_tables: Option<&'a HashMap<String, TableSchema>>,
-    temp_table_names: Option<&'a HashSet<String>>,
+    /// Catalog context for stored views and explicit MAIN/TEMP bindings.
+    connection: Option<&'a Connection>,
     /// Analysis-only mode: replace any unqualified reference that survives
     /// local-scope protection with a sentinel literal. Runtime substitution
     /// always leaves this false and resolves through `row`/`col_map`.
@@ -142150,10 +142089,9 @@ struct OuterReferenceLookup<'a> {
 /// schema have a complete column inventory, so an unqualified name absent from
 /// all of them may continue resolving through outer scopes. A derived table's
 /// inventory comes from its own projection (`collect_derived_table_columns`),
-/// and a CTE's from its column list or its query (`cte_scopes_with`). Sources
-/// whose output cannot be established (views, table functions,
-/// attached/unknown relations, CTEs whose output is not derivable) return
-/// `None`.
+/// and a CTE's from its column list or its query (`cte_scopes_with`). Stored
+/// views use the lexical resolver's result metadata and expose no implicit
+/// rowid aliases. Sources with an uncertain inventory return `None`.
 /// Runtime substitution then leaves every unqualified reference untouched
 /// rather than accidentally capturing a local column as an outer value. The
 /// correlation-analysis probe still marks such a surviving reference as
@@ -142218,66 +142156,67 @@ fn collect_known_source_columns(
                 out.extend(columns.iter().cloned());
                 return Some(());
             }
-            let table = match name.schema.as_deref() {
-                None => lookup
-                    .schema
-                    .iter()
-                    .find(|table| table.name.eq_ignore_ascii_case(&name.name)),
-                Some(schema) if schema.eq_ignore_ascii_case("main") => {
-                    let (Some(shadowed_main), Some(temp_names)) =
-                        (lookup.shadowed_main_tables, lookup.temp_table_names)
-                    else {
-                        return None;
-                    };
-                    if let Some(table) = shadowed_main.get(&name_key) {
-                        Some(table)
-                    } else if temp_names.contains(&name_key) {
-                        None
-                    } else {
-                        lookup
-                            .schema
-                            .iter()
-                            .find(|table| table.name.eq_ignore_ascii_case(&name.name))
-                    }
-                }
-                Some(schema) if schema.eq_ignore_ascii_case("temp") => {
-                    let temp_names = lookup.temp_table_names?;
-                    if temp_names.contains(&name_key) {
-                        lookup
-                            .schema
-                            .iter()
-                            .find(|table| table.name.eq_ignore_ascii_case(&name.name))
-                    } else {
-                        None
-                    }
-                }
-                // Attached schemas live behind separate Connection instances;
-                // this local inventory cannot prove their output names.
-                Some(_) => None,
-            };
-            let Some(table) = table else {
-                if name.schema.is_some() {
+            // Resolve a TEMP view before looking in the base-table inventory,
+            // which can also contain a MAIN table of that name.
+            if let Some(connection) = lookup.connection
+                && connection.view_index_of(&name.name).is_some()
+                && let Some(index) = connection.local_view_index_for_relation(name)
+            {
+                let metadata = SelectColumnReferenceResolver::new(connection)
+                    .metadata_stored_view_column_names(index)
+                    .ok()?;
+                if !metadata.width_is_exact
+                    || metadata.approximate_names.iter().any(|&approximate| approximate)
+                {
                     return None;
                 }
-                // bd-kj6tg: an eponymous table-valued function named without
-                // arguments (`FROM pragma_database_list`).
-                return collect_table_function_columns(&name.name, names, out);
-            };
-            out.extend(
-                table
-                    .columns
-                    .iter()
-                    .map(|column| column.name.to_ascii_lowercase()),
-            );
-            // `*` never shows the hidden rowid.
-            if names == SourceNames::Scope {
-                for rowid_name in ["rowid", "_rowid_", "oid"] {
-                    if table_exposes_hidden_rowid_alias(table, rowid_name) {
-                        out.insert(rowid_name.to_owned());
+                out.extend(
+                    metadata
+                        .names
+                        .into_iter()
+                        .map(|name| name.to_ascii_lowercase()),
+                );
+                return Some(());
+            }
+            let mut extend_table_columns = |table: &TableSchema| {
+                out.extend(
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.to_ascii_lowercase()),
+                );
+                if names == SourceNames::Scope {
+                    for rowid_name in ["rowid", "_rowid_", "oid"] {
+                        if table_exposes_hidden_rowid_alias(table, rowid_name) {
+                            out.insert(rowid_name.to_owned());
+                        }
                     }
                 }
+            };
+            if let Some(schema) = name.schema.as_deref() {
+                let scope = if schema.eq_ignore_ascii_case("main") {
+                    PragmaSchemaScope::Main
+                } else if schema.eq_ignore_ascii_case("temp") {
+                    PragmaSchemaScope::Temp
+                } else {
+                    return None;
+                };
+                return lookup.connection?.with_local_table_schema(
+                    &name.name,
+                    scope,
+                    extend_table_columns,
+                );
             }
-            Some(())
+            if let Some(table) = lookup
+                .schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+            {
+                extend_table_columns(table);
+                return Some(());
+            }
+            // An eponymous TVF can be named without arguments.
+            collect_table_function_columns(&name.name, names, out)
         }
         TableOrSubquery::ParenJoin(from) => {
             collect_known_source_columns(&from.source, lookup, cte_scopes, names, out)?;
@@ -142935,7 +142874,6 @@ fn substitute_outer_refs_in_select(
         None,
         schema,
         None,
-        None,
     );
 }
 
@@ -142948,8 +142886,7 @@ fn substitute_outer_refs_in_select_with_schema_context(
     column_affinities: Option<&[TypeAffinity]>,
     declared_blob_columns: Option<&HashSet<usize>>,
     schema: &[TableSchema],
-    shadowed_main_tables: Option<&HashMap<String, TableSchema>>,
-    temp_table_names: Option<&HashSet<String>>,
+    connection: Option<&Connection>,
 ) {
     let lookup = OuterReferenceLookup {
         row,
@@ -142960,8 +142897,7 @@ fn substitute_outer_refs_in_select_with_schema_context(
         column_affinities,
         declared_blob_columns,
         schema,
-        shadowed_main_tables,
-        temp_table_names,
+        connection,
         probe_unqualified_external_ref: false,
     };
     substitute_outer_refs_in_select_scoped(
