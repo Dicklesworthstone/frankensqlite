@@ -5362,7 +5362,9 @@ pub fn codegen_select(
             false,
             None,
         )
-    } else if has_aggregate_columns(columns) && !group_by.is_empty() {
+    } else if (has_aggregate_columns(columns) || having.as_deref().is_some_and(is_aggregate_expr))
+        && !group_by.is_empty()
+    {
         // --- Aggregate query WITH GROUP BY ---
         codegen_select_group_by_aggregate(
             b,
@@ -5397,7 +5399,7 @@ pub fn codegen_select(
         // --- bd-2fb53: COUNT(*) over an index range, IS NULL or IS NOT NULL ---
         codegen_select_count_star_index_range(b, table, index, &range, out_regs, done_label, end_label);
         Ok(())
-    } else if has_aggregate_columns(columns) {
+    } else if has_aggregate_columns(columns) || having.as_deref().is_some_and(is_aggregate_expr) {
         // --- Aggregate query (single-group, no GROUP BY) ---
         let limit_anon_placeholder_base = stmt.limit.as_ref().map(|limit_clause| {
             let limit_placeholder_count = count_anon_placeholders(&limit_clause.limit)
@@ -24202,18 +24204,20 @@ fn codegen_select_aggregate(
     // Collect aggregates from the HAVING clause that are not in the SELECT list.
     // Without this, HAVING-only aggregates (e.g. `HAVING SUM(x) > 10` when SUM(x)
     // is not in SELECT) would never be accumulated and silently evaluate to 0.
-    let mut having_output_cols: Vec<GroupByOutputCol> = Vec::new();
+    let mut agg_exprs: Vec<Option<Expr>> = vec![None; agg_columns.len()];
     if let Some(having_expr) = having {
         collect_having_aggregates(
             having_expr,
             table,
+            table_alias,
             &mut agg_columns,
-            &mut having_output_cols,
+            &mut agg_exprs,
         );
         // GH #225: capture bare columns referenced in HAVING (first scanned row)
         // so a HAVING predicate on an unprojected column resolves to a real
         // value instead of NULL.
-        collect_having_bare_columns(having_expr, table, &mut agg_columns);
+        collect_having_bare_columns(having_expr, table, table_alias, &mut agg_columns);
+        agg_exprs.resize(agg_columns.len(), None);
     }
 
     // A single-group aggregate produces at most one row, but LIMIT/OFFSET still
@@ -26064,28 +26068,27 @@ fn codegen_select_aggregate(
     }
 
     // HAVING filter: skip ResultRow if HAVING predicate is false/NULL.
-    // For single-group aggregate (no GROUP BY), each output column maps
-    // directly to its aggregate accumulator at accum_base + i.
+    // For single-group aggregate (no GROUP BY), every finalized aggregate and
+    // captured bare column lives directly at accum_base + i.
     let output_skip_label = b.emit_label();
     if let Some(having_expr) = having {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let output_cols: Vec<GroupByOutputCol> = (0..agg_columns.len())
-            .map(|i| GroupByOutputCol::Aggregate { agg_index: i })
-            .collect();
-        emit_having_filter(
-            b,
-            having_expr,
-            &output_cols,
-            &agg_columns,
-            &[],
-            &[],
-            &ScanCtx {
-                cursor, table, table_alias, schema: Some(schema),
-                register_base: None, secondaries: &[],
-            },
+        let single_scan = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let env = HavingValueEnv {
+            prev_key_base: None,
+            group_by_keys: &[],
             accum_base,
-            output_skip_label,
-        );
+            agg_columns: &agg_columns,
+            agg_exprs: &agg_exprs,
+            scan: &single_scan,
+        };
+        emit_having_filter(b, having_expr, &env, output_skip_label);
     }
 
     // OFFSET applies after HAVING. A single-group aggregate can emit only one
@@ -27179,29 +27182,36 @@ enum GroupByOutputCol {
 /// Parse result columns for a GROUP BY query into output-column descriptors,
 /// a list of group keys (column refs or expressions), and aggregate metadata.
 ///
-/// Returns `(output_cols, group_by_keys, agg_columns)`.
+/// Returns `(output_cols, group_by_keys, agg_columns, agg_exprs)`.
 #[allow(clippy::type_complexity)]
 fn parse_group_by_output(
     columns: &[ResultColumn],
     table: &TableSchema,
+    table_alias: Option<&str>,
     group_by: &[Expr],
-) -> Result<(Vec<GroupByOutputCol>, Vec<GroupByKey>, Vec<AggColumn>), CodegenError> {
-    // Resolve GROUP BY expressions: column references become Column(idx),
-    // arbitrary expressions (e.g. length(name)) become Expression(expr).
+) -> Result<
+    (
+        Vec<GroupByOutputCol>,
+        Vec<GroupByKey>,
+        Vec<AggColumn>,
+        Vec<Option<Expr>>,
+    ),
+    CodegenError,
+> {
+    // Resolve GROUP BY expressions: plain non-IPK column references become
+    // Column(idx); IPK/rowid and arbitrary expressions (e.g. length(name))
+    // become Expression(expr) so Pass 1 evaluates them via emit_expr / Rowid.
     let group_by_keys: Vec<GroupByKey> = group_by
         .iter()
-        .map(|expr| {
-            if let Some(col_idx) = resolve_column_index(expr, table) {
-                GroupByKey::Column(col_idx)
-            } else {
-                GroupByKey::Expression(Box::new(expr.clone()))
-            }
+        .map(|expr| match resolve_column_ref(expr, table, table_alias) {
+            Some(SortKeySource::Column(col_idx)) => GroupByKey::Column(col_idx),
+            _ => GroupByKey::Expression(Box::new(expr.clone())),
         })
         .collect();
 
     let mut output_cols = Vec::with_capacity(columns.len());
     let mut agg_columns = Vec::with_capacity(columns.len());
-    let mut aggregate_exprs: Vec<&Expr> = Vec::new();
+    let mut agg_exprs: Vec<Option<Expr>> = Vec::with_capacity(columns.len());
 
     for col in columns {
         match col {
@@ -27219,104 +27229,47 @@ fn parse_group_by_output(
                 // Stock steps an identical aggregate only once, including
                 // volatile arguments. Separate subqueries and unnumbered
                 // parameters can evaluate differently at each output site.
-                if let Some(agg_index) = aggregate_exprs.iter().position(|&prior| prior == expr)
-                    && !expr_contains_non_numbered_placeholder(expr)
+                if !expr_contains_non_numbered_placeholder(expr)
                     && !expr_contains_nested_subquery(expr)
+                    && let Some(agg_index) = agg_exprs.iter().position(|prior| {
+                        prior.as_ref().is_some_and(|prior_expr| {
+                            prior_expr == expr
+                                || having_exprs_match(expr, prior_expr, table, table_alias)
+                        })
+                    })
                 {
                     output_cols.push(GroupByOutputCol::Aggregate { agg_index });
                     continue;
                 }
                 let agg_index = agg_columns.len();
-                aggregate_exprs.push(expr);
-                let canon_name = name.to_ascii_uppercase();
-                let filt = filter.clone();
-                match args {
-                    FunctionArgs::Star => {
-                        agg_columns.push(AggColumn {
-                            name: canon_name,
-                            num_args: 0,
-                            arg_col_index: None,
-                            arg_is_rowid: false,
-                            distinct: *distinct,
-                            arg_expr: None,
-                            extra_args: Vec::new(),
-                            filter: filt,
-                            wrapper_expr: None,
-                            hidden: false,
-                            multi_agg_indices: Vec::new(),
-                            bare_expr: None,
-                            collation: None,
-                        });
-                    }
-                    FunctionArgs::List(exprs) => {
-                        if exprs.is_empty() {
-                            agg_columns.push(AggColumn {
-                                name: canon_name,
-                                num_args: 0,
-                                arg_col_index: None,
-                                arg_is_rowid: false,
-                                distinct: *distinct,
-                                arg_expr: None,
-                                extra_args: Vec::new(),
-                                filter: filt,
-                                wrapper_expr: None,
-                                hidden: false,
-                                multi_agg_indices: Vec::new(),
-                                bare_expr: None,
-                                collation: None,
-                            });
-                        } else {
-                            // Try column reference first, fall back to expression.
-                            let (col_idx, is_rowid, expr) =
-                                match resolve_column_ref(&exprs[0], table, None) {
-                                    Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
-                                    Some(SortKeySource::Rowid) => (None, true, None),
-                                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
-                                };
-                            let extra: Vec<Expr> = exprs[1..].to_vec();
-                            // bd-lgwjd(a): a direct MIN/MAX under GROUP BY is lowered
-                            // through this substrate path; carry the argument's
-                            // declared collation so the runtime step compares under it
-                            // (not BINARY), mirroring the other aggregate extractors.
-                            let needs_collation =
-                                *distinct || canon_name == "MIN" || canon_name == "MAX";
-                            let agg_coll = if needs_collation {
-                                expr_collation_for_agg(&exprs[0], col_idx, table)
-                            } else {
-                                None
-                            };
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                            agg_columns.push(AggColumn {
-                                name: canon_name,
-                                num_args: exprs.len() as i32,
-                                arg_col_index: col_idx,
-                                arg_is_rowid: is_rowid,
-                                distinct: *distinct,
-                                arg_expr: expr,
-                                extra_args: extra,
-                                filter: filt,
-                                wrapper_expr: None,
-                                hidden: false,
-                                multi_agg_indices: Vec::new(),
-                                bare_expr: None,
-                                collation: agg_coll,
-                            });
-                        }
-                    }
-                }
+                agg_columns.push(build_grouped_agg_column(
+                    name,
+                    args,
+                    *distinct,
+                    filter.clone(),
+                    false,
+                    table,
+                    table_alias,
+                ));
+                agg_exprs.push(Some(expr.clone()));
                 output_cols.push(GroupByOutputCol::Aggregate { agg_index });
             }
             ResultColumn::Expr { expr, .. } => {
-                // Match result column to a GROUP BY key: try column index
-                // first, then structural expression equality.
-                let key_index = if let Some(col_idx) = resolve_column_index(expr, table) {
+                // Match result column to a GROUP BY key: try table/alias-aware
+                // column index first, then canonicalized expression matching.
+                let key_index = if let Some(SortKeySource::Column(col_idx)) =
+                    resolve_column_ref(expr, table, table_alias)
+                {
                     group_by_keys
                         .iter()
                         .position(|k| matches!(k, GroupByKey::Column(c) if *c == col_idx))
                 } else {
-                    group_by_keys
-                        .iter()
-                        .position(|k| matches!(k, GroupByKey::Expression(e) if e.as_ref() == expr))
+                    group_by_keys.iter().position(|k| match k {
+                        GroupByKey::Expression(e) => {
+                            e.as_ref() == expr || having_exprs_match(expr, e, table, table_alias)
+                        }
+                        GroupByKey::Column(_) => false,
+                    })
                 }
                 .ok_or_else(|| {
                     CodegenError::Unsupported("result column not in GROUP BY clause".to_owned())
@@ -27353,7 +27306,82 @@ fn parse_group_by_output(
         }
     }
 
-    Ok((output_cols, group_by_keys, agg_columns))
+    Ok((output_cols, group_by_keys, agg_columns, agg_exprs))
+}
+
+fn build_grouped_agg_column(
+    name: &str,
+    args: &FunctionArgs,
+    distinct: bool,
+    filter: Option<Box<Expr>>,
+    hidden: bool,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> AggColumn {
+    let canon_name = name.to_ascii_uppercase();
+    match args {
+        FunctionArgs::Star => AggColumn {
+            name: canon_name,
+            num_args: 0,
+            arg_col_index: None,
+            arg_is_rowid: false,
+            distinct,
+            arg_expr: None,
+            extra_args: Vec::new(),
+            filter,
+            wrapper_expr: None,
+            hidden,
+            multi_agg_indices: Vec::new(),
+            bare_expr: None,
+            collation: None,
+        },
+        FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
+            name: canon_name,
+            num_args: 0,
+            arg_col_index: None,
+            arg_is_rowid: false,
+            distinct,
+            arg_expr: None,
+            extra_args: Vec::new(),
+            filter,
+            wrapper_expr: None,
+            hidden,
+            multi_agg_indices: Vec::new(),
+            bare_expr: None,
+            collation: None,
+        },
+        FunctionArgs::List(exprs) => {
+            let (col_idx, is_rowid, arg_expr) =
+                match resolve_column_ref(&exprs[0], table, table_alias) {
+                    Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
+                    Some(SortKeySource::Rowid) => (None, true, None),
+                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                };
+            let extra_args: Vec<Expr> = exprs[1..].to_vec();
+            let needs_collation = distinct || canon_name == "MIN" || canon_name == "MAX";
+            let collation = if needs_collation {
+                expr_collation_for_agg(&exprs[0], col_idx, table)
+            } else {
+                None
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            AggColumn {
+                name: canon_name,
+                num_args: exprs.len() as i32,
+                arg_col_index: col_idx,
+                arg_is_rowid: is_rowid,
+                distinct,
+                arg_expr,
+                extra_args,
+                filter,
+                wrapper_expr: None,
+                hidden,
+                multi_agg_indices: Vec::new(),
+                bare_expr: None,
+                collation,
+            }
+        }
+    }
 }
 
 /// Rewrite a HAVING clause so that bare references to SELECT-list output
@@ -27708,14 +27736,15 @@ fn rewrite_having_ordering_aliases(
 }
 
 /// Walk a HAVING expression to find aggregate function calls and add any that
-/// are not already present in `agg_columns` / `output_cols`.  This ensures that
-/// aggregates referenced only in HAVING (not in the SELECT list) still get
-/// accumulator slots and `AggStep`/`AggFinal` instructions.
+/// are not already present in `agg_columns`. This ensures that aggregates
+/// referenced only in HAVING (not in the SELECT list) still get accumulator
+/// slots and `AggStep`/`AggFinal` instructions without polluting `out_regs`.
 fn collect_having_aggregates(
     expr: &Expr,
     table: &TableSchema,
+    table_alias: Option<&str>,
     agg_columns: &mut Vec<AggColumn>,
-    output_cols: &mut Vec<GroupByOutputCol>,
+    agg_exprs: &mut Vec<Option<Expr>>,
 ) {
     match expr {
         Expr::FunctionCall {
@@ -27725,106 +27754,45 @@ fn collect_having_aggregates(
             filter,
             ..
         } if is_aggregate_function_call(name, args) => {
-            let upper = name.to_ascii_uppercase();
-            // Check if this aggregate already exists in agg_columns.
-            let already_exists = agg_columns.iter().any(|agg| {
-                if agg.name != upper || agg.distinct != *distinct {
-                    return false;
-                }
-                match args {
-                    FunctionArgs::Star => agg.num_args == 0,
-                    FunctionArgs::List(exprs) => {
-                        if exprs.is_empty() {
-                            return agg.num_args == 0;
-                        }
-                        if let Some(ci) = resolve_column_index(&exprs[0], table) {
-                            agg.arg_col_index == Some(ci)
-                        } else if let Some(ref arg_expr) = agg.arg_expr {
-                            exprs.len() == 1 && **arg_expr == exprs[0]
-                        } else {
-                            false
-                        }
-                    }
-                }
-            });
+            let can_dedup = !expr_contains_non_numbered_placeholder(expr)
+                && !expr_contains_nested_subquery(expr);
+            let already_exists = can_dedup
+                && agg_columns.iter().enumerate().any(|(idx, agg)| {
+                    agg_column_matches_call(
+                        agg,
+                        agg_exprs.get(idx).and_then(Option::as_ref),
+                        expr,
+                        name,
+                        args,
+                        *distinct,
+                        filter.as_deref(),
+                        table,
+                        table_alias,
+                    )
+                });
             if !already_exists {
-                let agg_index = agg_columns.len();
-                let filt = filter.clone();
-                match args {
-                    FunctionArgs::Star => {
-                        agg_columns.push(AggColumn {
-                            name: upper.clone(),
-                            num_args: 0,
-                            arg_col_index: None,
-                            arg_is_rowid: false,
-                            distinct: *distinct,
-                            arg_expr: None,
-                            extra_args: Vec::new(),
-                            filter: filt,
-                            wrapper_expr: None,
-                            hidden: false,
-                            multi_agg_indices: Vec::new(),
-                            bare_expr: None,
-                            collation: None,
-                        });
-                    }
-                    FunctionArgs::List(exprs) => {
-                        if exprs.is_empty() {
-                            agg_columns.push(AggColumn {
-                                name: upper.clone(),
-                                num_args: 0,
-                                arg_col_index: None,
-                                arg_is_rowid: false,
-                                distinct: *distinct,
-                                arg_expr: None,
-                                extra_args: Vec::new(),
-                                filter: filt,
-                                wrapper_expr: None,
-                                hidden: false,
-                                multi_agg_indices: Vec::new(),
-                                bare_expr: None,
-                                collation: None,
-                            });
-                        } else {
-                            let (col_idx, is_rowid, arg_e) =
-                                match resolve_column_ref(&exprs[0], table, None) {
-                                    Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
-                                    Some(SortKeySource::Rowid) => (None, true, None),
-                                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
-                                };
-                            let extra: Vec<Expr> = exprs[1..].to_vec();
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                            agg_columns.push(AggColumn {
-                                name: upper,
-                                num_args: exprs.len() as i32,
-                                arg_col_index: col_idx,
-                                arg_is_rowid: is_rowid,
-                                distinct: *distinct,
-                                arg_expr: arg_e,
-                                extra_args: extra,
-                                filter: filt,
-                                wrapper_expr: None,
-                                hidden: false,
-                                multi_agg_indices: Vec::new(),
-                                bare_expr: None,
-                                collation: None,
-                            });
-                        }
-                    }
-                }
-                output_cols.push(GroupByOutputCol::Aggregate { agg_index });
+                agg_columns.push(build_grouped_agg_column(
+                    name,
+                    args,
+                    *distinct,
+                    filter.clone(),
+                    true,
+                    table,
+                    table_alias,
+                ));
+                agg_exprs.push(Some(expr.clone()));
             }
         }
         // Recurse into sub-expressions to find nested aggregates.
         Expr::BinaryOp { left, right, .. } => {
-            collect_having_aggregates(left, table, agg_columns, output_cols);
-            collect_having_aggregates(right, table, agg_columns, output_cols);
+            collect_having_aggregates(left, table, table_alias, agg_columns, agg_exprs);
+            collect_having_aggregates(right, table, table_alias, agg_columns, agg_exprs);
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Collate { expr: inner, .. }
         | Expr::Cast { expr: inner, .. } => {
-            collect_having_aggregates(inner, table, agg_columns, output_cols);
+            collect_having_aggregates(inner, table, table_alias, agg_columns, agg_exprs);
         }
         Expr::Between {
             expr: inner,
@@ -27832,17 +27800,17 @@ fn collect_having_aggregates(
             high,
             ..
         } => {
-            collect_having_aggregates(inner, table, agg_columns, output_cols);
-            collect_having_aggregates(low, table, agg_columns, output_cols);
-            collect_having_aggregates(high, table, agg_columns, output_cols);
+            collect_having_aggregates(inner, table, table_alias, agg_columns, agg_exprs);
+            collect_having_aggregates(low, table, table_alias, agg_columns, agg_exprs);
+            collect_having_aggregates(high, table, table_alias, agg_columns, agg_exprs);
         }
         Expr::In {
             expr: inner, set, ..
         } => {
-            collect_having_aggregates(inner, table, agg_columns, output_cols);
+            collect_having_aggregates(inner, table, table_alias, agg_columns, agg_exprs);
             if let InSet::List(values) = set {
                 for value in values {
-                    collect_having_aggregates(value, table, agg_columns, output_cols);
+                    collect_having_aggregates(value, table, table_alias, agg_columns, agg_exprs);
                 }
             }
         }
@@ -27852,10 +27820,10 @@ fn collect_having_aggregates(
             escape,
             ..
         } => {
-            collect_having_aggregates(inner, table, agg_columns, output_cols);
-            collect_having_aggregates(pattern, table, agg_columns, output_cols);
+            collect_having_aggregates(inner, table, table_alias, agg_columns, agg_exprs);
+            collect_having_aggregates(pattern, table, table_alias, agg_columns, agg_exprs);
             if let Some(escape) = escape {
-                collect_having_aggregates(escape, table, agg_columns, output_cols);
+                collect_having_aggregates(escape, table, table_alias, agg_columns, agg_exprs);
             }
         }
         Expr::Case {
@@ -27865,14 +27833,14 @@ fn collect_having_aggregates(
             ..
         } => {
             if let Some(operand) = operand {
-                collect_having_aggregates(operand, table, agg_columns, output_cols);
+                collect_having_aggregates(operand, table, table_alias, agg_columns, agg_exprs);
             }
             for (when_expr, then_expr) in whens {
-                collect_having_aggregates(when_expr, table, agg_columns, output_cols);
-                collect_having_aggregates(then_expr, table, agg_columns, output_cols);
+                collect_having_aggregates(when_expr, table, table_alias, agg_columns, agg_exprs);
+                collect_having_aggregates(then_expr, table, table_alias, agg_columns, agg_exprs);
             }
             if let Some(else_expr) = else_expr {
-                collect_having_aggregates(else_expr, table, agg_columns, output_cols);
+                collect_having_aggregates(else_expr, table, table_alias, agg_columns, agg_exprs);
             }
         }
         Expr::FunctionCall {
@@ -27883,25 +27851,25 @@ fn collect_having_aggregates(
         } => {
             if let FunctionArgs::List(args) = args {
                 for arg in args {
-                    collect_having_aggregates(arg, table, agg_columns, output_cols);
+                    collect_having_aggregates(arg, table, table_alias, agg_columns, agg_exprs);
                 }
             }
             if let Some(filter) = filter {
-                collect_having_aggregates(filter, table, agg_columns, output_cols);
+                collect_having_aggregates(filter, table, table_alias, agg_columns, agg_exprs);
             }
             for term in order_by {
-                collect_having_aggregates(&term.expr, table, agg_columns, output_cols);
+                collect_having_aggregates(&term.expr, table, table_alias, agg_columns, agg_exprs);
             }
         }
         Expr::JsonAccess {
             expr: inner, path, ..
         } => {
-            collect_having_aggregates(inner, table, agg_columns, output_cols);
-            collect_having_aggregates(path, table, agg_columns, output_cols);
+            collect_having_aggregates(inner, table, table_alias, agg_columns, agg_exprs);
+            collect_having_aggregates(path, table, table_alias, agg_columns, agg_exprs);
         }
         Expr::RowValue(values, _) => {
             for value in values {
-                collect_having_aggregates(value, table, agg_columns, output_cols);
+                collect_having_aggregates(value, table, table_alias, agg_columns, agg_exprs);
             }
         }
         _ => {}
@@ -27911,23 +27879,34 @@ fn collect_having_aggregates(
 /// GH #225: append every bare table column referenced by a HAVING clause OUTSIDE
 /// any aggregate as a HIDDEN `bare_expr` aggregate, so the implicit-aggregate
 /// scan captures the FIRST scanned row's value for it (matching stock sqlite3's
-/// bare-column-in-HAVING semantics). `emit_having_expr` then resolves the column
-/// to this aggregate's accumulator instead of falling back to NULL. Columns
-/// already covered by a `bare_expr` aggregate (e.g. also in the SELECT list) are
-/// not duplicated. Aggregate arguments are intentionally NOT descended into —
-/// those belong to the aggregate, not a bare column.
-fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &mut Vec<AggColumn>) {
+/// bare-column-in-HAVING semantics). `emit_having_filter` then resolves the
+/// column to this aggregate's accumulator instead of falling back to NULL.
+/// Columns already covered by a `bare_expr` aggregate (e.g. also in the SELECT
+/// list) are not duplicated. Aggregate arguments are intentionally NOT descended
+/// into — those belong to the aggregate, not a bare column.
+fn collect_having_bare_columns(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    agg_columns: &mut Vec<AggColumn>,
+) {
     match expr {
         // A column referenced directly in HAVING: capture it (first row).
         Expr::Column(_, _) => {
-            let Some(ci) = resolve_column_index(expr, table) else {
+            let Some(resolved) = resolve_column_ref(expr, table, table_alias) else {
                 return;
             };
             let already = agg_columns.iter().any(|agg| {
-                agg.bare_expr
-                    .as_deref()
-                    .and_then(|be| resolve_column_index(be, table))
-                    == Some(ci)
+                match (
+                    &resolved,
+                    agg.bare_expr
+                        .as_deref()
+                        .and_then(|be| resolve_column_ref(be, table, table_alias)),
+                ) {
+                    (SortKeySource::Column(a), Some(SortKeySource::Column(b))) => *a == b,
+                    (SortKeySource::Rowid, Some(SortKeySource::Rowid)) => true,
+                    _ => false,
+                }
             });
             if !already {
                 agg_columns.push(AggColumn {
@@ -27950,15 +27929,24 @@ fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &m
         // Do not descend into an aggregate's own arguments.
         Expr::FunctionCall { name, args, .. } if is_aggregate_function_call(name, args) => {}
         Expr::BinaryOp { left, right, .. } => {
-            collect_having_bare_columns(left, table, agg_columns);
-            collect_having_bare_columns(right, table, agg_columns);
+            collect_having_bare_columns(left, table, table_alias, agg_columns);
+            collect_having_bare_columns(right, table, table_alias, agg_columns);
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Collate { expr: inner, .. }
-        | Expr::Cast { expr: inner, .. }
-        | Expr::In { expr: inner, .. } => {
-            collect_having_bare_columns(inner, table, agg_columns);
+        | Expr::Cast { expr: inner, .. } => {
+            collect_having_bare_columns(inner, table, table_alias, agg_columns);
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            collect_having_bare_columns(inner, table, table_alias, agg_columns);
+            if let InSet::List(values) = set {
+                for value in values {
+                    collect_having_bare_columns(value, table, table_alias, agg_columns);
+                }
+            }
         }
         Expr::Between {
             expr: inner,
@@ -27966,9 +27954,9 @@ fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &m
             high,
             ..
         } => {
-            collect_having_bare_columns(inner, table, agg_columns);
-            collect_having_bare_columns(low, table, agg_columns);
-            collect_having_bare_columns(high, table, agg_columns);
+            collect_having_bare_columns(inner, table, table_alias, agg_columns);
+            collect_having_bare_columns(low, table, table_alias, agg_columns);
+            collect_having_bare_columns(high, table, table_alias, agg_columns);
         }
         Expr::Like {
             expr: inner,
@@ -27976,10 +27964,10 @@ fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &m
             escape,
             ..
         } => {
-            collect_having_bare_columns(inner, table, agg_columns);
-            collect_having_bare_columns(pattern, table, agg_columns);
+            collect_having_bare_columns(inner, table, table_alias, agg_columns);
+            collect_having_bare_columns(pattern, table, table_alias, agg_columns);
             if let Some(escape) = escape.as_deref() {
-                collect_having_bare_columns(escape, table, agg_columns);
+                collect_having_bare_columns(escape, table, table_alias, agg_columns);
             }
         }
         Expr::Case {
@@ -27989,14 +27977,14 @@ fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &m
             ..
         } => {
             if let Some(operand) = operand.as_deref() {
-                collect_having_bare_columns(operand, table, agg_columns);
+                collect_having_bare_columns(operand, table, table_alias, agg_columns);
             }
             for (when_expr, then_expr) in whens {
-                collect_having_bare_columns(when_expr, table, agg_columns);
-                collect_having_bare_columns(then_expr, table, agg_columns);
+                collect_having_bare_columns(when_expr, table, table_alias, agg_columns);
+                collect_having_bare_columns(then_expr, table, table_alias, agg_columns);
             }
             if let Some(else_expr) = else_expr.as_deref() {
-                collect_having_bare_columns(else_expr, table, agg_columns);
+                collect_having_bare_columns(else_expr, table, table_alias, agg_columns);
             }
         }
         // Non-aggregate function calls may carry bare columns in their arguments.
@@ -28005,7 +27993,18 @@ fn collect_having_bare_columns(expr: &Expr, table: &TableSchema, agg_columns: &m
             ..
         } => {
             for arg in list {
-                collect_having_bare_columns(arg, table, agg_columns);
+                collect_having_bare_columns(arg, table, table_alias, agg_columns);
+            }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            collect_having_bare_columns(inner, table, table_alias, agg_columns);
+            collect_having_bare_columns(path, table, table_alias, agg_columns);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                collect_having_bare_columns(value, table, table_alias, agg_columns);
             }
         }
         _ => {}
@@ -28041,8 +28040,18 @@ fn codegen_select_group_by_aggregate(
     order_by_len: usize,
 ) -> Result<(), CodegenError> {
     // Resolve SELECT-list aliases referenced from HAVING (e.g.
-    // `SELECT product_id, SUM(qty) AS total_qty ... HAVING total_qty >= 10`).
-    let rewritten_having = having.map(|h| rewrite_having_select_aliases(h, columns, table));
+    // `SELECT product_id, SUM(qty) AS total_qty ... HAVING total_qty >= 10`)
+    // and lower any valid row-value comparisons produced by alias expansion.
+    let rewritten_having = match having {
+        Some(h) => {
+            let mut rewritten = rewrite_having_select_aliases(h, columns, table);
+            fsqlite_ast::row_value::check_and_lower_row_values_in_expr(&mut rewritten).map_err(
+                |_| CodegenError::Unsupported("row value misused in HAVING".to_owned()),
+            )?;
+            Some(rewritten)
+        }
+        None => None,
+    };
     let having = rewritten_having.as_ref();
 
     if where_clause.is_none()
@@ -28056,19 +28065,21 @@ fn codegen_select_group_by_aggregate(
         );
     }
 
-    let (mut output_cols, group_by_keys, mut agg_columns) =
-        parse_group_by_output(columns, table, group_by)?;
+    let (mut output_cols, group_by_keys, mut agg_columns, mut agg_exprs) =
+        parse_group_by_output(columns, table, table_alias, group_by)?;
 
     // Collect aggregates from the HAVING clause that are not in the SELECT list.
-    if let Some(having_expr) = having
-        && !having_reads_grouped_output(
-            having_expr, columns, group_by, table, table_alias.unwrap_or(&table.name),
-        )
-    {
-        // A HAVING supplied entirely by finalized outputs needs no extra
-        // accumulator. Re-collecting a qualified spelling of the same call
-        // can step its volatile arguments a second time.
-        collect_having_aggregates(having_expr, table, &mut agg_columns, &mut output_cols);
+    // `collect_having_aggregates` deduplicates against existing `agg_exprs` via
+    // `having_exprs_match`, so a projected aggregate referenced again with a
+    // table qualifier or different case still steps only once.
+    if let Some(having_expr) = having {
+        collect_having_aggregates(
+            having_expr,
+            table,
+            table_alias,
+            &mut agg_columns,
+            &mut agg_exprs,
+        );
     }
 
     let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
@@ -28925,19 +28936,18 @@ fn codegen_select_group_by_aggregate(
         }
     }
     // HAVING filter: skip this group's output if HAVING predicate is false.
+    let having_placeholder_base = b.current_anon_placeholder();
+    let having_env = HavingValueEnv {
+        prev_key_base: Some(prev_key_base),
+        group_by_keys: &group_by_keys,
+        accum_base,
+        agg_columns: &agg_columns,
+        agg_exprs: &agg_exprs,
+        scan: &scan_ctx,
+    };
     let having_skip_label = b.emit_label();
     if let Some(having_expr) = having {
-        emit_having_filter(
-            b,
-            having_expr,
-            &output_cols,
-            &agg_columns,
-            &group_by_keys,
-            columns,
-            &scan_ctx,
-            out_regs,
-            having_skip_label,
-        );
+        emit_having_filter(b, having_expr, &having_env, having_skip_label);
     }
     // OFFSET: if offset counter > 0, skip this group's output.
     if let Some(off_r) = offset_reg {
@@ -29168,17 +29178,8 @@ fn codegen_select_group_by_aggregate(
     // HAVING filter for the final group.
     let final_skip = b.emit_label();
     if let Some(having_expr) = having {
-        emit_having_filter(
-            b,
-            having_expr,
-            &output_cols,
-            &agg_columns,
-            &group_by_keys,
-            columns,
-            &scan_ctx,
-            out_regs,
-            final_skip,
-        );
+        b.set_next_anon_placeholder(having_placeholder_base);
+        emit_having_filter(b, having_expr, &having_env, final_skip);
     }
     // OFFSET: if offset counter > 0, skip this group's output.
     if let Some(off_r) = offset_reg {
@@ -38758,9 +38759,226 @@ fn emit_returning_from_regs(
     Ok(())
 }
 
-/// The GROUP BY bytecode evaluates these predicates on finalized output
-/// registers. Both direct and prepared dispatch consult this check before
-/// choosing it over the full expression evaluator.
+/// Prefix for synthetic HAVING slots holding computed values (aggregates or
+/// non-column GROUP BY expressions). Unlike real column slots, these carry no
+/// declared column affinity or declared column collation (SQLite §4.2).
+const HAVING_COMPUTED_COL_PREFIX: &str = "__fsqlite_having_expr_";
+
+/// Canonicalize a table-local expression for HAVING / GROUP BY matching.
+///
+/// Unlike `normalize_table_local_expression` (used for expression indexes,
+/// where `COUNT(*)` is illegal), this accepts `FunctionArgs::Star`, normalizes
+/// `COUNT()` to `COUNT(*)`, lowercases function names, uppercases `COLLATE`
+/// names, and strips local table/alias qualifiers via `matches_table_or_alias`.
+fn normalize_having_local_expr(
+    expr: &mut Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let normalize = |e: &mut Expr| normalize_having_local_expr(e, table, table_alias);
+    match expr {
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } | Expr::Placeholder(..) => true,
+        Expr::Column(column, _) => {
+            if column
+                .table
+                .as_deref()
+                .is_some_and(|qualifier| !matches_table_or_alias(qualifier, table, table_alias))
+            {
+                return false;
+            }
+            column.table = None;
+            if let Some(index) = table.column_index(&column.column) {
+                column.column = if table.columns[index].is_ipk {
+                    "__fsqlite_local_rowid".into()
+                } else {
+                    format!("__fsqlite_local_column_{index}").into()
+                };
+                true
+            } else if table.resolves_to_hidden_rowid(&column.column) {
+                column.column = "__fsqlite_local_rowid".into();
+                true
+            } else {
+                false
+            }
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => normalize(left) && normalize(right),
+        Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } => normalize(expr),
+        Expr::Collate {
+            expr, collation, ..
+        } => {
+            collation.make_ascii_uppercase();
+            normalize(expr)
+        }
+        Expr::Cast {
+            expr, type_name, ..
+        } => {
+            type_name.name.make_ascii_lowercase();
+            if let Some(arg) = &mut type_name.arg1 {
+                arg.make_ascii_lowercase();
+            }
+            if let Some(arg) = &mut type_name.arg2 {
+                arg.make_ascii_lowercase();
+            }
+            normalize(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => normalize(expr) && normalize(low) && normalize(high),
+        Expr::In { expr, set, .. } => {
+            normalize(expr)
+                && match set {
+                    InSet::List(items) => items.iter_mut().all(normalize),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => normalize(expr) && normalize(pattern) && escape.as_deref_mut().is_none_or(normalize),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref_mut().is_none_or(normalize)
+                && whens
+                    .iter_mut()
+                    .all(|(when, then)| normalize(when) && normalize(then))
+                && else_expr.as_deref_mut().is_none_or(normalize)
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            name.make_ascii_lowercase();
+            if name == "count" && matches!(args, FunctionArgs::List(items) if items.is_empty()) {
+                *args = FunctionArgs::Star;
+            }
+            let args_ok = match args {
+                FunctionArgs::Star => true,
+                FunctionArgs::List(items) => items.iter_mut().all(normalize),
+            };
+            args_ok
+                && order_by.iter_mut().all(|term| normalize(&mut term.expr))
+                && filter.as_deref_mut().is_none_or(normalize)
+                && over.is_none()
+        }
+        Expr::RowValue(items, _) => items.iter_mut().all(normalize),
+        Expr::Exists { .. } | Expr::Subquery(..) | Expr::Raise { .. } => false,
+    }
+}
+
+fn having_exprs_match(
+    left: &Expr,
+    right: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let mut lhs = left.clone();
+    let mut rhs = right.clone();
+    normalize_having_local_expr(&mut lhs, table, table_alias)
+        && normalize_having_local_expr(&mut rhs, table, table_alias)
+        && lhs == rhs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agg_column_matches_call(
+    agg: &AggColumn,
+    agg_expr: Option<&Expr>,
+    call_expr: &Expr,
+    name: &str,
+    args: &FunctionArgs,
+    distinct: bool,
+    filter: Option<&Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    if agg.name.is_empty() || agg.bare_expr.is_some() {
+        return false;
+    }
+    if let Some(prior) = agg_expr {
+        return prior == call_expr || having_exprs_match(call_expr, prior, table, table_alias);
+    }
+    if !agg.name.eq_ignore_ascii_case(name) || agg.distinct != distinct {
+        return false;
+    }
+    let filter_matches = match (agg.filter.as_deref(), filter) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b || having_exprs_match(a, b, table, table_alias),
+        _ => false,
+    };
+    if !filter_matches {
+        return false;
+    }
+    match args {
+        FunctionArgs::Star => agg.num_args == 0,
+        FunctionArgs::List(exprs) => {
+            if exprs.is_empty() {
+                return agg.num_args == 0;
+            }
+            if usize::try_from(agg.num_args).ok() != Some(exprs.len()) {
+                return false;
+            }
+            let resolved = resolve_column_ref(&exprs[0], table, table_alias);
+            let (first_matches, col_idx) = match resolved {
+                Some(SortKeySource::Column(ci)) => {
+                    (agg.arg_col_index == Some(ci) && !agg.arg_is_rowid, Some(ci))
+                }
+                Some(SortKeySource::Rowid) => (agg.arg_is_rowid, None),
+                _ => (
+                    agg.arg_expr.as_deref().is_some_and(|prior| {
+                        prior == &exprs[0]
+                            || having_exprs_match(&exprs[0], prior, table, table_alias)
+                    }),
+                    None,
+                ),
+            };
+            if !first_matches || agg.extra_args.len() != exprs.len() - 1 {
+                return false;
+            }
+            let needs_collation = distinct
+                || agg.name.eq_ignore_ascii_case("MIN")
+                || agg.name.eq_ignore_ascii_case("MAX");
+            if needs_collation {
+                let expected_coll = expr_collation_for_agg(&exprs[0], col_idx, table);
+                if agg.collation != expected_coll {
+                    return false;
+                }
+            }
+            agg.extra_args
+                .iter()
+                .zip(&exprs[1..])
+                .all(|(a, b)| a == b || having_exprs_match(a, b, table, table_alias))
+        }
+    }
+}
+
+fn agg_call_has_nested_aggregate(args: &FunctionArgs, filter: Option<&Expr>) -> bool {
+    let args_nested = match args {
+        FunctionArgs::Star => false,
+        FunctionArgs::List(items) => items.iter().any(is_aggregate_expr),
+    };
+    args_nested || filter.is_some_and(is_aggregate_expr)
+}
+
+/// Whether the GROUP BY storage-substrate bytecode can evaluate `having`.
+///
+/// Supports finalized group keys, aggregate accumulators (including HAVING-only
+/// aggregates), and arbitrary scalar expressions over them. Both direct and
+/// prepared dispatch consult this check before choosing the substrate over the
+/// connection-level grouped evaluator.
 #[must_use]
 pub fn grouped_having_is_supported(
     having: &Expr,
@@ -38769,346 +38987,588 @@ pub fn grouped_having_is_supported(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> bool {
-    let resolved = rewrite_having_select_aliases(having, columns, table);
-    having_reads_grouped_output(
-        &resolved, columns, group_by, table, table_alias.unwrap_or(&table.name),
-    )
+    let mut resolved = rewrite_having_select_aliases(having, columns, table);
+    if fsqlite_ast::row_value::check_and_lower_row_values_in_expr(&mut resolved).is_err() {
+        return false;
+    }
+    having_expr_is_supported(&resolved, group_by, table, table_alias)
 }
 
-fn having_reads_grouped_output(
-    expr: &Expr, columns: &[ResultColumn], keys: &[Expr], table: &TableSchema, source: &str,
+fn having_expr_is_supported(
+    expr: &Expr,
+    group_by: &[Expr],
+    table: &TableSchema,
+    table_alias: Option<&str>,
 ) -> bool {
-    let supplied = |operand| having_reads_grouped_output(operand, columns, keys, table, source);
-    match expr {
-        Expr::Literal(..) | Expr::Placeholder(..) => !expr_contains_non_numbered_placeholder(expr),
-        Expr::Column(..) => {
-            keys.iter().any(|key| {
-                key == expr || bound_expressions_match(expr, source, key, source, table)
-            }) && projected_having_slot(expr, columns, table, source).is_some()
-        }
-        Expr::FunctionCall { name, args, over, .. } => {
-            over.is_none()
-                && is_aggregate_function_call(name, args)
-                && projected_having_slot(expr, columns, table, source).is_some()
-        }
-        Expr::Collate { expr, .. } | Expr::IsNull { expr, .. }
-        | Expr::UnaryOp { op: fsqlite_ast::UnaryOp::Not, expr, .. } => supplied(expr),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOp::And | BinaryOp::Or | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt
-                | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::Is | BinaryOp::IsNot,
-            right,
-            ..
-        } => supplied(left) && supplied(right),
-        _ => false,
-    }
-}
-
-// A star expands to a variable number of registers. Two anonymous parameters
-// in otherwise identical aggregate calls can also have different values.
-fn projected_having_slot(
-    expr: &Expr, columns: &[ResultColumn], table: &TableSchema, source: &str,
-) -> Option<usize> {
-    if columns.iter().any(|col| !matches!(col, ResultColumn::Expr { .. }))
-        || expr_contains_non_numbered_placeholder(expr)
-        || expr_contains_nested_subquery(expr)
+    // A sub-expression that matches a GROUP BY key directly (column, rowid, or
+    // expression key) reads its finalized value from `prev_key_base`, whether
+    // or not it is projected in the SELECT list.
+    if group_by
+        .iter()
+        .any(|key| key == expr || having_exprs_match(expr, key, table, table_alias))
     {
-        return None;
+        return true;
     }
-    columns.iter().position(|col| {
-        matches!(col, ResultColumn::Expr { expr: result, .. }
-            if result == expr || bound_expressions_match(expr, source, result, source, table))
-    })
+
+    let supported = |operand: &Expr| having_expr_is_supported(operand, group_by, table, table_alias);
+    match expr {
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } => true,
+        Expr::Placeholder(..) => !expr_contains_non_numbered_placeholder(expr),
+        Expr::FunctionCall {
+            name,
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if over.is_some() || !order_by.is_empty() {
+                return false;
+            }
+            if is_aggregate_function_call(name, args) {
+                if agg_call_has_nested_aggregate(args, filter.as_deref())
+                    || expr_contains_nested_subquery(expr)
+                    || expr_contains_non_numbered_placeholder(expr)
+                    || validate_single_table_expr_columns(expr, table, table_alias).is_err()
+                {
+                    return false;
+                }
+                // Extra aggregate arguments (e.g. group_concat separator) are
+                // emitted with no scan context in Pass 2, so column-dependent
+                // separators must stay on the semantic evaluator.
+                if let FunctionArgs::List(items) = args
+                    && items.len() > 1
+                    && items[1..]
+                        .iter()
+                        .any(|extra| expr_references_scan(extra, table, table_alias))
+                {
+                    return false;
+                }
+                true
+            } else {
+                filter.is_none()
+                    && match args {
+                        FunctionArgs::Star => true,
+                        FunctionArgs::List(items) => items.iter().all(supported),
+                    }
+            }
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => supported(left) && supported(right),
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => supported(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => supported(inner) && supported(low) && supported(high),
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            supported(inner)
+                && match set {
+                    InSet::List(items) => items.iter().all(supported),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            op,
+            ..
+        } => {
+            *op != fsqlite_ast::LikeOp::Match
+                && supported(inner)
+                && supported(pattern)
+                && escape.as_deref().is_none_or(supported)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_none_or(supported)
+                && whens
+                    .iter()
+                    .all(|(when_expr, then_expr)| supported(when_expr) && supported(then_expr))
+                && else_expr.as_deref().is_none_or(supported)
+        }
+        Expr::RowValue(items, _) => items.iter().all(supported),
+        // Bare non-grouped columns, unknown columns, subqueries, and RAISE stay
+        // on the semantic evaluator / validator.
+        Expr::Column(..) | Expr::Exists { .. } | Expr::Subquery(..) | Expr::Raise { .. } => false,
+    }
 }
 
-/// Emit a HAVING filter for GROUP BY queries.
-///
-/// Evaluates the HAVING expression against the already-built output row.
-/// Aggregate function calls and column references are resolved to the
-/// corresponding output registers. If the predicate is false, jumps to
-/// `skip_label` (skipping the `ResultRow`).
+/// Finalized-group value bindings available when evaluating a `HAVING` filter.
+struct HavingValueEnv<'a> {
+    /// Register base holding the finalized `GROUP BY` keys (`prev_key_base + k`).
+    /// `None` for single-group (no `GROUP BY`) aggregates.
+    prev_key_base: Option<i32>,
+    group_by_keys: &'a [GroupByKey],
+    /// Register base holding finalized aggregate accumulators (and single-group
+    /// captured bare columns) at `accum_base + agg_index`.
+    accum_base: i32,
+    agg_columns: &'a [AggColumn],
+    agg_exprs: &'a [Option<Expr>],
+    scan: &'a ScanCtx<'a>,
+}
+
+struct HavingSlotBuilder {
+    columns: Vec<ColumnInfo>,
+    source_regs: Vec<i32>,
+    /// Deduplication key: `(source_reg, is_computed, affinity, collation)`.
+    keys: Vec<(i32, bool, char, Option<String>)>,
+}
+
+impl HavingSlotBuilder {
+    fn new() -> Self {
+        Self {
+            columns: Vec::new(),
+            source_regs: Vec::new(),
+            keys: Vec::new(),
+        }
+    }
+
+    fn bind_computed(&mut self, source_reg: i32, span: Span) -> Expr {
+        self.bind_slot(source_reg, true, 'A', None, span)
+    }
+
+    fn bind_table_column(
+        &mut self,
+        source_reg: i32,
+        affinity: char,
+        collation: Option<String>,
+        span: Span,
+    ) -> Expr {
+        self.bind_slot(source_reg, false, affinity, collation, span)
+    }
+
+    fn bind_slot(
+        &mut self,
+        source_reg: i32,
+        is_computed: bool,
+        affinity: char,
+        collation: Option<String>,
+        span: Span,
+    ) -> Expr {
+        let slot_idx = if let Some(pos) = self.keys.iter().position(|(r, c, a, coll)| {
+            *r == source_reg && *c == is_computed && *a == affinity && *coll == collation
+        }) {
+            pos
+        } else {
+            let idx = self.columns.len();
+            let name = if is_computed {
+                format!("{HAVING_COMPUTED_COL_PREFIX}{idx}")
+            } else {
+                format!("__fsqlite_having_col_{idx}")
+            };
+            self.columns.push(ColumnInfo {
+                name,
+                affinity,
+                is_ipk: false,
+                type_name: None,
+                notnull: false,
+                unique: false,
+                default_value: None,
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: collation.clone(),
+                conflict_action: None,
+            });
+            self.source_regs.push(source_reg);
+            self.keys.push((source_reg, is_computed, affinity, collation));
+            idx
+        };
+        Expr::Column(ColumnRef::bare(self.columns[slot_idx].name.as_str()), span)
+    }
+}
+
+/// Rewrite `expr` so every finalized aggregate, GROUP BY key, or captured bare
+/// column becomes a synthetic column reference bound in `slots`, ready for the
+/// general `emit_expr` compiler.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::too_many_arguments
+    clippy::too_many_lines
 )]
+fn lower_having_expr(
+    expr: &Expr,
+    env: &HavingValueEnv<'_>,
+    slots: &mut HavingSlotBuilder,
+) -> Expr {
+    let table = env.scan.table;
+    let table_alias = env.scan.table_alias;
+
+    // 1. Aggregate function call -> finalized accumulator at `accum_base + ai`.
+    if let Expr::FunctionCall {
+        name,
+        args,
+        distinct,
+        filter,
+        span,
+        ..
+    } = expr
+        && is_aggregate_function_call(name, args)
+    {
+        if let Some(ai) = env.agg_columns.iter().enumerate().position(|(idx, agg)| {
+            agg_column_matches_call(
+                agg,
+                env.agg_exprs.get(idx).and_then(Option::as_ref),
+                expr,
+                name,
+                args,
+                *distinct,
+                filter.as_deref(),
+                table,
+                table_alias,
+            )
+        }) {
+            return slots.bind_computed(env.accum_base + ai as i32, *span);
+        }
+        return Expr::Literal(Literal::Integer(0), *span);
+    }
+
+    // 2. Expression-based GROUP BY key (including IPK/rowid keys stored as
+    //    `GroupByKey::Expression`). Check before recursing into sub-expressions
+    //    so e.g. `GROUP BY val % 3 HAVING (val % 3) + 1 > 2` binds `val % 3`.
+    if let Some(key_base) = env.prev_key_base
+        && !matches!(expr, Expr::Collate { .. })
+        && let Some((key_idx, key_expr)) = env.group_by_keys.iter().enumerate().find_map(|(k, key)| {
+            let GroupByKey::Expression(key_expr) = key else {
+                return None;
+            };
+            (key_expr.as_ref() == expr || having_exprs_match(expr, key_expr, table, table_alias))
+                .then_some((k, key_expr.as_ref()))
+        })
+    {
+        let source_reg = key_base + key_idx as i32;
+        if matches!(
+            resolve_column_ref(key_expr, table, table_alias),
+            Some(SortKeySource::Rowid)
+        ) {
+            return slots.bind_table_column(source_reg, 'D', None, expr.span());
+        }
+        return slots.bind_computed(source_reg, expr.span());
+    }
+
+    // 3. Column reference -> GROUP BY key column (or single-group captured bare
+    //    column), preserving the source column's exact affinity and collation.
+    if let Expr::Column(_, span) = expr {
+        if let Some(resolved) = resolve_column_ref(expr, table, table_alias) {
+            match resolved {
+                SortKeySource::Column(col_idx) => {
+                    let col_info = &table.columns[col_idx];
+                    if let Some(key_base) = env.prev_key_base
+                        && let Some(key_idx) = env.group_by_keys.iter().position(|key| {
+                            matches!(key, GroupByKey::Column(c) if *c == col_idx)
+                        })
+                    {
+                        return slots.bind_table_column(
+                            key_base + key_idx as i32,
+                            col_info.affinity,
+                            col_info.collation.clone(),
+                            *span,
+                        );
+                    }
+                    // Single-group aggregate bare column captured in accum_base.
+                    if let Some(agg_i) = env.agg_columns.iter().position(|agg| {
+                        matches!(
+                            agg.bare_expr
+                                .as_deref()
+                                .and_then(|be| resolve_column_ref(be, table, table_alias)),
+                            Some(SortKeySource::Column(c)) if c == col_idx
+                        )
+                    }) {
+                        return slots.bind_table_column(
+                            env.accum_base + agg_i as i32,
+                            col_info.affinity,
+                            col_info.collation.clone(),
+                            *span,
+                        );
+                    }
+                }
+                SortKeySource::Rowid => {
+                    if let Some(key_base) = env.prev_key_base
+                        && let Some(key_idx) = env.group_by_keys.iter().position(|key| match key {
+                            GroupByKey::Column(c) => table.columns[*c].is_ipk,
+                            GroupByKey::Expression(e) => matches!(
+                                resolve_column_ref(e, table, table_alias),
+                                Some(SortKeySource::Rowid)
+                            ),
+                        })
+                    {
+                        return slots.bind_table_column(key_base + key_idx as i32, 'D', None, *span);
+                    }
+                    if let Some(agg_i) = env.agg_columns.iter().position(|agg| {
+                        matches!(
+                            agg.bare_expr
+                                .as_deref()
+                                .and_then(|be| resolve_column_ref(be, table, table_alias)),
+                            Some(SortKeySource::Rowid)
+                        )
+                    }) {
+                        return slots.bind_table_column(
+                            env.accum_base + agg_i as i32,
+                            'D',
+                            None,
+                            *span,
+                        );
+                    }
+                }
+                SortKeySource::Expression(_) => {}
+            }
+        }
+        return Expr::Literal(Literal::Null, *span);
+    }
+
+    // 4. Recurse into all compound / scalar expressions.
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Expr::BinaryOp {
+            left: Box::new(lower_having_expr(left, env, slots)),
+            op: *op,
+            right: Box::new(lower_having_expr(right, env, slots)),
+            span: *span,
+        },
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(lower_having_expr(inner, env, slots)),
+            span: *span,
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+            span,
+        } => Expr::Collate {
+            expr: Box::new(lower_having_expr(inner, env, slots)),
+            collation: collation.clone(),
+            span: *span,
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            span,
+        } => Expr::Cast {
+            expr: Box::new(lower_having_expr(inner, env, slots)),
+            type_name: type_name.clone(),
+            span: *span,
+        },
+        Expr::IsNull {
+            expr: inner,
+            not,
+            span,
+        } => Expr::IsNull {
+            expr: Box::new(lower_having_expr(inner, env, slots)),
+            not: *not,
+            span: *span,
+        },
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            not,
+            span,
+        } => Expr::Between {
+            expr: Box::new(lower_having_expr(inner, env, slots)),
+            low: Box::new(lower_having_expr(low, env, slots)),
+            high: Box::new(lower_having_expr(high, env, slots)),
+            not: *not,
+            span: *span,
+        },
+        Expr::In {
+            expr: inner,
+            set,
+            not,
+            span,
+        } => Expr::In {
+            expr: Box::new(lower_having_expr(inner, env, slots)),
+            set: match set {
+                InSet::List(items) => InSet::List(
+                    items
+                        .iter()
+                        .map(|item| lower_having_expr(item, env, slots))
+                        .collect(),
+                ),
+                InSet::Subquery(_) | InSet::Table(_) => set.clone(),
+            },
+            not: *not,
+            span: *span,
+        },
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            op,
+            not,
+            span,
+        } => Expr::Like {
+            expr: Box::new(lower_having_expr(inner, env, slots)),
+            pattern: Box::new(lower_having_expr(pattern, env, slots)),
+            escape: escape
+                .as_deref()
+                .map(|esc| Box::new(lower_having_expr(esc, env, slots))),
+            op: *op,
+            not: *not,
+            span: *span,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => Expr::Case {
+            operand: operand
+                .as_deref()
+                .map(|op_expr| Box::new(lower_having_expr(op_expr, env, slots))),
+            whens: whens
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    (
+                        lower_having_expr(when_expr, env, slots),
+                        lower_having_expr(then_expr, env, slots),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_deref()
+                .map(|el| Box::new(lower_having_expr(el, env, slots))),
+            span: *span,
+        },
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } => Expr::FunctionCall {
+            name: name.clone(),
+            args: match args {
+                FunctionArgs::Star => FunctionArgs::Star,
+                FunctionArgs::List(items) => FunctionArgs::List(
+                    items
+                        .iter()
+                        .map(|arg| lower_having_expr(arg, env, slots))
+                        .collect(),
+                ),
+            },
+            distinct: *distinct,
+            order_by: order_by.clone(),
+            filter: filter.clone(),
+            over: over.clone(),
+            span: *span,
+        },
+        Expr::JsonAccess {
+            expr: inner,
+            path,
+            arrow,
+            span,
+        } => Expr::JsonAccess {
+            expr: Box::new(lower_having_expr(inner, env, slots)),
+            path: Box::new(lower_having_expr(path, env, slots)),
+            arrow: *arrow,
+            span: *span,
+        },
+        Expr::RowValue(items, span) => Expr::RowValue(
+            items
+                .iter()
+                .map(|item| lower_having_expr(item, env, slots))
+                .collect(),
+            *span,
+        ),
+        _ => expr.clone(),
+    }
+}
+
+/// Emit a HAVING filter for GROUP BY and single-group aggregate queries.
+///
+/// Lowers aggregate calls, GROUP BY keys, and captured bare columns onto a
+/// synthetic register-backed row and evaluates the full expression via
+/// `emit_expr`, preserving SQLite comparison affinity and collation rules.
+/// Jumps to `skip_label` when the predicate evaluates to false or NULL.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_having_filter(
     b: &mut ProgramBuilder,
     having_expr: &Expr,
-    output_cols: &[GroupByOutputCol],
-    agg_columns: &[AggColumn],
-    group_by_keys: &[GroupByKey],
-    projection: &[ResultColumn],
-    scan: &ScanCtx<'_>,
-    out_regs: i32,
+    env: &HavingValueEnv<'_>,
     skip_label: crate::Label,
 ) {
+    let mut slots = HavingSlotBuilder::new();
+    let lowered = lower_having_expr(having_expr, env, &mut slots);
     let result_reg = b.alloc_temp();
-    emit_having_expr(
-        b,
-        having_expr,
-        result_reg,
-        output_cols,
-        agg_columns,
-        group_by_keys,
-        projection,
-        scan,
-        out_regs,
-    );
+
+    if slots.source_regs.is_empty() {
+        let empty_table = TableSchema {
+            name: String::new(),
+            root_page: 0,
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        let empty_ctx = ScanCtx {
+            cursor: 0,
+            table: &empty_table,
+            table_alias: None,
+            schema: env.scan.schema,
+            register_base: Some(RegisterRow::columns(0)),
+            secondaries: &[],
+        };
+        emit_expr(b, &lowered, result_reg, Some(&empty_ctx));
+    } else {
+        let slot_base = b.alloc_regs(slots.source_regs.len() as i32);
+        for (idx, &src_reg) in slots.source_regs.iter().enumerate() {
+            b.emit_op(Opcode::Copy, src_reg, slot_base + idx as i32, 0, P4::None, 0);
+        }
+        let having_table = TableSchema {
+            name: String::new(),
+            root_page: 0,
+            columns: slots.columns,
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        let having_ctx = ScanCtx {
+            cursor: 0,
+            table: &having_table,
+            table_alias: None,
+            schema: env.scan.schema,
+            register_base: Some(RegisterRow::columns(slot_base)),
+            secondaries: &[],
+        };
+        emit_expr(b, &lowered, result_reg, Some(&having_ctx));
+    }
+
     // If result is falsy (0 or NULL), skip this group's ResultRow.
     // p3=1: NULL HAVING → jump (skip row), matching SQLite semantics.
     b.emit_jump_to_label(Opcode::IfNot, result_reg, 1, skip_label, P4::None, 0);
     b.free_temp(result_reg);
-}
-
-/// Evaluate a HAVING expression into `dest_reg`.
-///
-/// Maps aggregate function calls and column references to the output
-/// registers that already hold the finalized group results.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::too_many_arguments,
-    clippy::too_many_lines
-)]
-fn emit_having_expr(
-    b: &mut ProgramBuilder,
-    expr: &Expr,
-    dest_reg: i32,
-    output_cols: &[GroupByOutputCol],
-    agg_columns: &[AggColumn],
-    group_by_keys: &[GroupByKey],
-    projection: &[ResultColumn],
-    scan: &ScanCtx<'_>,
-    out_regs: i32,
-) {
-    let table = scan.table;
-    // Read a projected aggregate by its full expression, including FILTER,
-    // DISTINCT and every argument.
-    if matches!(expr, Expr::Column(..) | Expr::FunctionCall { .. })
-        && let Some(slot) = projected_having_slot(
-            expr, projection, table, scan.table_alias.unwrap_or(&table.name),
-        )
-    {
-        b.emit_op(Opcode::Copy, out_regs + slot as i32, dest_reg, 0, P4::None, 0);
-        return;
-    }
-    match expr {
-        // Aggregate function call — resolve to the corresponding output register.
-        Expr::FunctionCall { name, args, .. } if is_aggregate_function_call(name, args) => {
-            let upper = name.to_ascii_uppercase();
-            // Find the matching aggregate by name + argument structure.
-            let agg_idx = agg_columns.iter().position(|agg| {
-                if agg.name != upper {
-                    return false;
-                }
-                match args {
-                    FunctionArgs::Star => agg.num_args == 0,
-                    FunctionArgs::List(exprs) => {
-                        if exprs.is_empty() {
-                            return agg.num_args == 0;
-                        }
-                        // Match by argument column index first.
-                        if let Some(ci) = resolve_column_index(&exprs[0], table) {
-                            agg.arg_col_index == Some(ci)
-                        } else if let Some(ref arg_expr) = agg.arg_expr {
-                            // Fall back to structural expression comparison
-                            // for aggregates with expression arguments.
-                            exprs.len() == 1 && **arg_expr == exprs[0]
-                        } else {
-                            false
-                        }
-                    }
-                }
-            });
-            if let Some(ai) = agg_idx {
-                // Find the output register for this aggregate.
-                for (i, oc) in output_cols.iter().enumerate() {
-                    if matches!(oc, GroupByOutputCol::Aggregate { agg_index } if *agg_index == ai) {
-                        b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
-                        return;
-                    }
-                }
-            }
-            // Fallback: treat as zero (unknown aggregate in HAVING).
-            b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
-        }
-
-        // Column reference — resolve to the corresponding group-key output register.
-        Expr::Column(col_ref, _) => {
-            let col_name = &col_ref.column;
-            if let Some(col_idx) = table
-                .columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(col_name))
-            {
-                // Find the output column whose group key maps to this table column.
-                for (i, oc) in output_cols.iter().enumerate() {
-                    if let GroupByOutputCol::GroupKey { key_index, .. } = oc
-                        && matches!(group_by_keys.get(*key_index), Some(GroupByKey::Column(c)) if *c == col_idx)
-                    {
-                        b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
-                        return;
-                    }
-                }
-                // GH #225: a bare column referenced by HAVING (no GROUP BY, or an
-                // unprojected column) is captured as a hidden bare_expr aggregate
-                // holding the first scanned row's value. Resolve it to that
-                // aggregate's output register instead of NULL.
-                if let Some(agg_i) = agg_columns.iter().position(|agg| {
-                    agg.bare_expr
-                        .as_deref()
-                        .and_then(|be| resolve_column_index(be, table))
-                        == Some(col_idx)
-                }) {
-                    for (i, oc) in output_cols.iter().enumerate() {
-                        if matches!(oc, GroupByOutputCol::Aggregate { agg_index } if *agg_index == agg_i)
-                        {
-                            b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
-                            return;
-                        }
-                    }
-                }
-            }
-            // Fallback: emit NULL for unresolved column.
-            b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
-        }
-
-        // These wrappers must keep resolving their operands against the
-        // finalized group, not a scan cursor that is no longer positioned.
-        Expr::Collate { expr: inner, .. }
-        | Expr::UnaryOp {
-            op: fsqlite_ast::UnaryOp::Not,
-            expr: inner,
-            ..
-        } => {
-            emit_having_expr(
-                b,
-                inner,
-                dest_reg,
-                output_cols,
-                agg_columns,
-                group_by_keys,
-                projection,
-                scan,
-                out_regs,
-            );
-            if matches!(expr, Expr::UnaryOp { .. }) {
-                b.emit_op(Opcode::Not, dest_reg, dest_reg, 0, P4::None, 0);
-            }
-        }
-
-        // Binary comparison — evaluate both sides, then compare.
-        Expr::BinaryOp {
-            left, op, right, ..
-        } => {
-            let left_reg = b.alloc_temp();
-            let right_reg = b.alloc_temp();
-            emit_having_expr(
-                b,
-                left,
-                left_reg,
-                output_cols,
-                agg_columns,
-                group_by_keys,
-                projection,
-                scan,
-                out_regs,
-            );
-            emit_having_expr(
-                b,
-                right,
-                right_reg,
-                output_cols,
-                agg_columns,
-                group_by_keys,
-                projection,
-                scan,
-                out_regs,
-            );
-
-            match op {
-                fsqlite_ast::BinaryOp::Gt
-                | fsqlite_ast::BinaryOp::Lt
-                | fsqlite_ast::BinaryOp::Ge
-                | fsqlite_ast::BinaryOp::Le
-                | fsqlite_ast::BinaryOp::Eq
-                | fsqlite_ast::BinaryOp::Ne
-                | fsqlite_ast::BinaryOp::Is
-                | fsqlite_ast::BinaryOp::IsNot => {
-                    let cmp_opcode = match op {
-                        fsqlite_ast::BinaryOp::Gt => Opcode::Gt,
-                        fsqlite_ast::BinaryOp::Lt => Opcode::Lt,
-                        fsqlite_ast::BinaryOp::Ge => Opcode::Ge,
-                        fsqlite_ast::BinaryOp::Le => Opcode::Le,
-                        fsqlite_ast::BinaryOp::Eq | fsqlite_ast::BinaryOp::Is => Opcode::Eq,
-                        fsqlite_ast::BinaryOp::Ne | fsqlite_ast::BinaryOp::IsNot => Opcode::Ne,
-                        _ => unreachable!(),
-                    };
-                    if let Some((p3, p4)) = is_true_false_params(*op, right) {
-                        b.emit_op(Opcode::IsTrue, left_reg, dest_reg, p3, p4, 0);
-                    } else {
-                        let null_equal = matches!(op, BinaryOp::Is | BinaryOp::IsNot);
-                        let p4 = comparison_collation_ctx(left, right, Some(scan))
-                            .map_or(P4::None, P4::Collation);
-                        let p5 = comparison_affinity_p5(left, right, Some(scan))
-                            | if null_equal { 0x80 } else { 0 };
-                        emit_register_comparison(
-                            b, cmp_opcode, left_reg, right_reg, dest_reg, p4, p5,
-                        );
-                    }
-                }
-                fsqlite_ast::BinaryOp::And => {
-                    b.emit_op(Opcode::And, left_reg, right_reg, dest_reg, P4::None, 0);
-                }
-                fsqlite_ast::BinaryOp::Or => {
-                    b.emit_op(Opcode::Or, left_reg, right_reg, dest_reg, P4::None, 0);
-                }
-                _ => {
-                    emit_expr(b, expr, dest_reg, None);
-                }
-            }
-            b.free_temp(right_reg);
-            b.free_temp(left_reg);
-        }
-
-        // GH #225: `x IS [NOT] NULL` in HAVING must evaluate its operand through
-        // the HAVING resolver (so a bare column resolves to its captured first-row
-        // aggregate register) rather than the raw evaluator, which would leave the
-        // column NULL and wrongly satisfy `IS NULL`.
-        Expr::IsNull {
-            expr: inner, not, ..
-        } => {
-            let val_reg = b.alloc_temp();
-            emit_having_expr(
-                b,
-                inner,
-                val_reg,
-                output_cols,
-                agg_columns,
-                group_by_keys,
-                projection,
-                scan,
-                out_regs,
-            );
-            let is_null_lbl = b.emit_label();
-            let done_lbl = b.emit_label();
-            b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, is_null_lbl, P4::None, 0);
-            // Operand is non-NULL: `IS NULL` -> 0, `IS NOT NULL` -> 1.
-            b.emit_op(Opcode::Integer, i32::from(*not), dest_reg, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_lbl, P4::None, 0);
-            b.resolve_label(is_null_lbl);
-            // Operand is NULL: `IS NULL` -> 1, `IS NOT NULL` -> 0.
-            b.emit_op(Opcode::Integer, i32::from(!*not), dest_reg, 0, P4::None, 0);
-            b.resolve_label(done_lbl);
-            b.free_temp(val_reg);
-        }
-
-        // For any other expression, delegate to the standard evaluator.
-        _ => {
-            emit_expr(b, expr, dest_reg, None);
-        }
-    }
 }
 
 /// Whether a WHERE term has one value for the whole statement: it reads no
@@ -39594,7 +40054,10 @@ fn expr_has_declared_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> bool {
     match strip_collate_wrappers(expr) {
         Expr::BoundOuterValue { affinity, .. } => affinity.is_some(),
         Expr::Cast { .. } => true,
-        Expr::Column(col_ref, _) => ctx.is_some_and(|ctx| column_ref_resolves_in_ctx(col_ref, ctx)),
+        Expr::Column(col_ref, _) => {
+            !col_ref.column.starts_with(HAVING_COMPUTED_COL_PREFIX)
+                && ctx.is_some_and(|ctx| column_ref_resolves_in_ctx(col_ref, ctx))
+        }
         Expr::Subquery(select, _) => {
             matches!(scalar_subquery_affinity_in_scan(select, ctx), Some(aff) if aff != b'A')
         }
@@ -40411,16 +40874,6 @@ fn column_cmp_p5(table: &TableSchema, resolved: &SortKeySource) -> u16 {
         SortKeySource::Expression(_) => u16::from(b'A'), // BLOB (no coercion)
     };
     0x80 | affinity
-}
-
-/// Resolve a column reference to its 0-based index (ignoring rowid aliases).
-///
-/// Convenience wrapper for call sites that only care about real table columns.
-fn resolve_column_index(expr: &Expr, table: &TableSchema) -> Option<usize> {
-    match resolve_column_ref(expr, table, None) {
-        Some(SortKeySource::Column(idx)) => Some(idx),
-        _ => None,
-    }
 }
 
 fn index_column_position(index: &IndexSchema, column_name: &str) -> Option<usize> {
@@ -50010,6 +50463,9 @@ fn declared_collation_ctx<'a>(expr: &'a Expr, ctx: Option<&'a ScanCtx<'_>>) -> O
     let Expr::Column(col_ref, _) = source else {
         return None;
     };
+    if col_ref.column.starts_with(HAVING_COMPUTED_COL_PREFIX) {
+        return None;
+    }
 
     let in_table = |table: &'a TableSchema, alias: Option<&str>| -> Option<&'a str> {
         if col_ref

@@ -227,3 +227,159 @@ fn strict_file_having_uses_finalized_keys_and_aggregates() {
         conn.close().await.unwrap();
     });
 }
+
+/// bd-w4pr1.13.32: strict file-backed GROUP BY + HAVING (zero fallback) AND
+/// unloaded `:memory:` storage-substrate execution across HAVING-only
+/// aggregates, aggregates inside arbitrary expressions, aliases inside
+/// expressions, unprojected group keys, DISTINCT/FILTER HAVING aggregates,
+/// TEXT-vs-aggregate affinity, indexed streaming + LIMIT/OFFSET, parameterized
+/// HAVING, and empty tables — all compared live against bundled SQLite 3.54.1.
+#[test]
+fn strict_file_and_memory_substrate_group_by_having_expressions_match_stock() {
+    const SCHEMA: &[&str] = &[
+        "CREATE TABLE hav(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER, tag TEXT)",
+        "INSERT INTO hav VALUES \
+         (1,'a',10,'x'),(2,'a',20,'y'),(3,'a',30,'x'),\
+         (4,'b',40,'z'),(5,'b',50,'z'),(6,'c',5,'w'),(7,NULL,100,'n')",
+        "CREATE TABLE hav_idx(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
+        "INSERT INTO hav_idx VALUES (1,'a',10),(2,'a',20),(3,'a',30),(4,'b',40),(5,'b',50),(6,'c',5)",
+        "CREATE INDEX idx_hav_grp_val ON hav_idx(grp, val)",
+        "CREATE TABLE hav_empty(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
+        "CREATE TABLE num_txt(k TEXT, v INTEGER)",
+        "INSERT INTO num_txt VALUES ('2', 10), ('2', 20), ('1', 5), ('02', 99)",
+    ];
+    let queries: &[&str] = &[
+        // All bd-23kpa / bd-w4pr1.13.32 expression and HAVING-only shapes:
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(*) * 2 > 3 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING 2 * count(*) > 3 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(*) + 0 > 1 ORDER BY grp",
+        "SELECT grp, count(*) c FROM hav GROUP BY grp HAVING c + 0 > 1 ORDER BY grp",
+        "SELECT grp, count(*) c FROM hav GROUP BY grp HAVING c * 2 > 3 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING sum(val) > 50 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING sum(val) + 1 > 50 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING -count(*) < -2 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING abs(count(*)) > 2 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(*) BETWEEN 2 AND 3 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(*) IN (2, 3) ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING max(val) - min(val) > 15 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(*) > 2 AND sum(val) > 50 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(*) > 2 OR sum(val) > 80 ORDER BY grp",
+        // Aggregate ONLY in HAVING (no aggregate in SELECT list):
+        "SELECT grp FROM hav GROUP BY grp HAVING count(*) = 2 ORDER BY grp",
+        "SELECT grp FROM hav GROUP BY grp HAVING count(*) != 2 ORDER BY grp",
+        "SELECT grp FROM hav GROUP BY grp HAVING sum(val) > 50 ORDER BY grp",
+        "SELECT grp FROM hav GROUP BY grp HAVING count(*) > 1 AND sum(val) < 100 ORDER BY grp",
+        "SELECT grp FROM hav GROUP BY grp HAVING count(*) = 1 OR sum(val) > 80 ORDER BY grp",
+        // Unprojected GROUP BY key referenced in HAVING:
+        "SELECT max(id) FROM hav GROUP BY grp HAVING count(*) > 1 ORDER BY grp",
+        "SELECT count(*) FROM hav GROUP BY grp HAVING grp = 'a' ORDER BY grp",
+        "SELECT count(*) FROM hav GROUP BY grp HAVING grp IS NULL ORDER BY grp",
+        "SELECT count(*) FROM hav GROUP BY grp HAVING grp || '!' = 'b!' ORDER BY grp",
+        "SELECT count(*) FROM hav GROUP BY grp HAVING CASE WHEN grp IS NULL THEN 1 ELSE count(*) > 2 END ORDER BY grp",
+        // DISTINCT and FILTER aggregates in HAVING:
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(DISTINCT tag) > 1 ORDER BY grp",
+        "SELECT grp, sum(val), sum(DISTINCT val) FROM hav GROUP BY grp HAVING sum(DISTINCT val) = 60 ORDER BY grp",
+        "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(*) FILTER (WHERE val >= 20) >= 2 ORDER BY grp",
+        "SELECT grp FROM hav GROUP BY grp HAVING sum(val) FILTER (WHERE val > 15) > 50 ORDER BY grp",
+        // Expression GROUP BY key + HAVING referencing expression key & aggregate:
+        "SELECT val % 20, count(*) FROM hav GROUP BY val % 20 HAVING (val % 20) + 1 > 1 AND count(*) >= 1 ORDER BY val % 20",
+        // TEXT column compared against computed aggregate (aggregate has NO declared affinity -> TEXT coercion applies):
+        "SELECT k, count(*) FROM num_txt GROUP BY k HAVING k = count(*) ORDER BY k",
+        "SELECT k, count(*) FROM num_txt GROUP BY k HAVING count(*) = k ORDER BY k",
+        "SELECT k, count(*) FROM num_txt GROUP BY k HAVING k COLLATE NOCASE = '2' AND count(*) * 10 = 20 ORDER BY k",
+        // Covering / streaming index + HAVING + LIMIT/OFFSET:
+        "SELECT grp, count(*) FROM hav_idx GROUP BY grp HAVING count(*) * 2 > 3 ORDER BY grp LIMIT 1 OFFSET 1",
+        "SELECT grp, count(*) FROM hav_idx GROUP BY grp HAVING sum(val) > 50 ORDER BY grp LIMIT 1",
+        "SELECT grp FROM hav_idx GROUP BY grp HAVING count(*) >= 2 ORDER BY grp",
+        // Empty table:
+        "SELECT grp, count(*) FROM hav_empty GROUP BY grp HAVING count(*) * 2 >= 0 ORDER BY grp",
+        "SELECT grp FROM hav_empty GROUP BY grp HAVING count(*) > 0 ORDER BY grp",
+        // Single-group aggregate (no GROUP BY) with compound HAVING:
+        "SELECT count(*) FROM hav HAVING sum(val) * 2 > 400",
+        "SELECT count(*) FROM hav HAVING sum(val) * 2 > 9999",
+        "SELECT sum(val) FROM hav HAVING count(*) FILTER (WHERE val >= 30) = 4",
+    ];
+
+    let stock = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in SCHEMA {
+        stock.execute_batch(sql).unwrap();
+    }
+    let expected: Vec<(&str, String)> = queries
+        .iter()
+        .map(|&sql| (sql, stock_outcome(&stock, sql)))
+        .collect();
+
+    asupersync::test_utils::run_test(|| async {
+        // 1. Strict file-backed (parity_cert_strict=ON proves zero fallback!)
+        for prepared in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bd_w4pr1_13_32_strict.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for sql in SCHEMA {
+                conn.execute(sql).await.unwrap();
+            }
+            conn.execute("PRAGMA fsqlite.parity_cert_strict = ON")
+                .await
+                .unwrap();
+            for &(sql, ref want) in &expected {
+                let got = fsqlite_outcome(&conn, sql, prepared).await;
+                assert_eq!(
+                    &got, want,
+                    "strict file prepared={prepared}: `{sql}`"
+                );
+            }
+            // Parameterized HAVING on strict file-backed prepared & direct:
+            let param_sql =
+                "SELECT grp, count(*) FROM hav GROUP BY grp HAVING count(*) * ?1 > ?2 ORDER BY grp";
+            let stock_param: Vec<Vec<String>> = stock
+                .prepare(param_sql)
+                .unwrap()
+                .query_map([2_i64, 3_i64], |row| {
+                    Ok((0..2)
+                        .map(|i| render_stock(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+                        .collect())
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let got_param: Vec<Vec<String>> = if prepared {
+                let stmt = conn.prepare(param_sql).await.unwrap();
+                stmt.query_with_params(&[SqliteValue::Integer(2), SqliteValue::Integer(3)])
+                    .await
+                    .unwrap()
+            } else {
+                conn.query_with_params(
+                    param_sql,
+                    &[SqliteValue::Integer(2), SqliteValue::Integer(3)],
+                )
+                .await
+                .unwrap()
+            }
+            .iter()
+            .map(|r| r.values().iter().map(render_fsqlite).collect())
+            .collect();
+            assert_eq!(
+                got_param, stock_param,
+                "strict file parameterized HAVING prepared={prepared}"
+            );
+            conn.close().await.unwrap();
+        }
+
+        // 2. Unloaded `:memory:` (takes storage substrate via
+        //    group_by_substrate_replaces_unloaded_memory_mirror!)
+        for prepared in [false, true] {
+            let conn = Connection::open(":memory:").await.unwrap();
+            for sql in SCHEMA {
+                conn.execute(sql).await.unwrap();
+            }
+            for &(sql, ref want) in &expected {
+                let got = fsqlite_outcome(&conn, sql, prepared).await;
+                assert_eq!(
+                    &got, want,
+                    "memory substrate prepared={prepared}: `{sql}`"
+                );
+            }
+            conn.close().await.unwrap();
+        }
+    });
+}

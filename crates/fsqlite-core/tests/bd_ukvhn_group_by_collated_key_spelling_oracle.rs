@@ -235,6 +235,7 @@ CREATE INDEX mi_a ON mi(a);";
 /// `@T@` is replaced by `m` and by `w`.
 const MIXED_SPELLING_STRICT: &[&str] = &[
     "SELECT a, count(*) FROM @T@ GROUP BY a HAVING count(*) > 1 ORDER BY a",
+    "SELECT a, count(*) FROM @T@ GROUP BY a HAVING count(*) + 0 > 1 ORDER BY a",
     "SELECT a, count(*) FROM @T@ GROUP BY a ORDER BY a",
     "SELECT a, count(*), sum(n) FROM @T@ GROUP BY a",
     "SELECT a, max(n) FROM @T@ GROUP BY a ORDER BY a",
@@ -283,9 +284,9 @@ fn mixed_integer_real_group_by_key_spelling_matches_stock_on_a_strict_file_datab
             .await
             .unwrap();
         let error = f
-            .query("SELECT a, count(*) FROM m GROUP BY a HAVING count(*) + 0 > 1")
+            .query("SELECT a, total(n), count(n) FROM m GROUP BY a ORDER BY a DESC")
             .await
-            .expect_err("arithmetic on the aggregate needs the grouped evaluator");
+            .expect_err("DESC ORDER BY over GROUP BY needs the grouped evaluator");
         assert!(
             error
                 .to_string()

@@ -28307,20 +28307,14 @@ impl Connection {
             && self.select_group_by_storage_substrate_shape_fits(select)
     }
 
-    /// bd-w4pr1.13.23: on a private `:memory:` connection whose mirror rows are
-    /// not loaded, a single-table GROUP BY over a main-database table runs the
-    /// storage substrate (a VDBE program over the pager, as on a file) instead
-    /// of rebuilding the mirror or reading the pager into rows for the
-    /// in-memory path (20k rows: 69M against 91M and 82.5M). With the rows
-    /// loaded the mirror scan stays, as it is cheaper still (37.9M). TEMP and
-    /// materialized tables live only in the mirror and keep their path.
-    ///
-    /// A HAVING keeps the in-memory path: the substrate drops or keeps the
-    /// wrong groups when the HAVING's aggregate sits inside an expression
-    /// (`HAVING count(*) * 2 > 3` returns no rows) or is not a result column
-    /// (`SELECT max(id) ... HAVING count(*) > 1` keeps every group). File
-    /// connections give those wrong answers today (found here, reported on
-    /// bd-w4pr1.13.23); `:memory:` does not take them on.
+    /// bd-w4pr1.13.23 / bd-w4pr1.13.32: on a private `:memory:` connection whose
+    /// mirror rows are not loaded, a single-table GROUP BY over a main-database
+    /// table (including supported HAVING clauses) runs the storage substrate (a
+    /// VDBE program over the pager, as on a file) instead of rebuilding the
+    /// mirror or reading the pager into rows for the in-memory path (20k rows:
+    /// 69M against 91M and 82.5M). With the rows loaded the mirror scan stays,
+    /// as it is cheaper still (37.9M). TEMP and materialized tables live only in
+    /// the mirror and keep their path.
     fn group_by_substrate_replaces_unloaded_memory_mirror(&self, select: &SelectStatement) -> bool {
         if self.path != ":memory:"
             || self.memdb_rows_loaded.get()
@@ -28329,9 +28323,7 @@ impl Connection {
             return false;
         }
         let SelectCore::Select {
-            from: Some(from),
-            having: None,
-            ..
+            from: Some(from), ..
         } = &select.body.select
         else {
             return false;
@@ -28354,16 +28346,14 @@ impl Connection {
             .is_some_and(|table| table.root_page > 0 && !self.is_memdb_only_root_page(table.root_page))
     }
 
-    /// bd-gazf2: a `:memory:` GROUP BY whose plain-column keys an index of its
-    /// table holds in an order other than ascending key order (a DESC key
-    /// term on a group key, or the group keys in another relative order) runs
-    /// the storage substrate, also with the mirror's rows loaded. The
-    /// substrate walks that index and emits its groups in index order, as
+    /// bd-gazf2 / bd-w4pr1.13.32: a `:memory:` GROUP BY whose plain-column keys
+    /// an index of its table holds in an order other than ascending key order
+    /// (a DESC key term on a group key, or the group keys in another relative
+    /// order) runs the storage substrate, also with the mirror's rows loaded.
+    /// The substrate walks that index and emits its groups in index order, as
     /// stock does and as file databases do since d2afa758f; the mirror's
     /// grouped evaluator sorts groups ascending by key whatever the index.
-    /// Every other `:memory:` GROUP BY keeps the mirror scan, which is
-    /// cheaper. A HAVING keeps the in-memory path, as in
-    /// [`Self::group_by_substrate_replaces_unloaded_memory_mirror`].
+    /// Every other `:memory:` GROUP BY keeps the mirror scan, which is cheaper.
     fn group_by_substrate_follows_memory_index_order(&self, select: &SelectStatement) -> bool {
         if self.path != ":memory:" || self.time_travel_active.get() {
             return false;
@@ -28371,7 +28361,6 @@ impl Connection {
         let SelectCore::Select {
             from: Some(from),
             group_by,
-            having: None,
             ..
         } = &select.body.select
         else {
@@ -28518,7 +28507,10 @@ impl Connection {
                 ResultColumn::Expr { expr, .. }
                     if self.expr_has_json_subtyped_aggregate_arg(expr)
             )
-        }) {
+        }) || having
+            .as_deref()
+            .is_some_and(|expr| self.expr_has_json_subtyped_aggregate_arg(expr))
+        {
             return false;
         }
 
@@ -28527,7 +28519,7 @@ impl Connection {
                 column,
                 ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr)
             )
-        })
+        }) || having.as_deref().is_some_and(expr_has_aggregate)
     }
 
     fn select_order_by_matches_group_by_prefix(
@@ -229902,10 +229894,11 @@ mod tests {
             ] {
                 both(&conn, &oracle, sql).await;
             }
-            // The substrate's shape check refuses the HAVING shapes it answers
-            // wrongly, so a prepared statement takes the in-memory path for
-            // them, as the ad hoc dispatch does, and keeps the substrate for
-            // comparisons of result-column aggregates.
+            // bd-w4pr1.13.32: the substrate evaluates HAVING over finalized
+            // group keys and aggregate accumulators (including HAVING-only
+            // aggregates and arbitrary expressions wrapping aggregates/keys),
+            // while keeping subqueries and bare non-grouped columns on the
+            // connection-level grouped evaluator.
             let eligible = |sql: &str| {
                 let Statement::Select(select) = parse_single_statement(sql).unwrap() else {
                     panic!("expected SELECT: {sql}");
@@ -229916,10 +229909,18 @@ mod tests {
                 ("SELECT grp, count(*) FROM hav1 GROUP BY grp", true),
                 ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING count(*) > 1", true),
                 ("SELECT grp, count(*) c FROM hav1 GROUP BY grp HAVING c >= 2 AND grp <> 'z'", true),
-                ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING sum(val) > 50", false),
-                ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING count(*) * 2 > 3", false),
-                ("SELECT grp, count(*) c FROM hav1 GROUP BY grp HAVING c + 0 > 1", false),
-                ("SELECT max(id) FROM hav1 GROUP BY grp HAVING count(*) > 1", false),
+                ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING sum(val) > 50", true),
+                ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING count(*) * 2 > 3", true),
+                ("SELECT grp, count(*) c FROM hav1 GROUP BY grp HAVING c + 0 > 1", true),
+                ("SELECT max(id) FROM hav1 GROUP BY grp HAVING count(*) > 1", true),
+                ("SELECT grp FROM hav1 GROUP BY grp HAVING count(*) > 1", true),
+                // Negative controls: subqueries and bare non-grouped columns in
+                // HAVING stay off the storage substrate.
+                (
+                    "SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING sum(val) > (SELECT avg(val) FROM hav1)",
+                    false,
+                ),
+                ("SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING val > 10", false),
             ] {
                 assert_eq!(eligible(sql), substrate, "substrate eligibility of `{sql}`");
             }
@@ -229970,6 +229971,41 @@ mod tests {
             )
             .await;
             check(&conn, &oracle, "SELECT * FROM t3 ORDER BY id").await;
+
+            // bd-w4pr1.13.32 probe: verify the unloaded `:memory:` connection
+            // also routes HAVING shapes onto the storage substrate and matches
+            // rusqlite across every shape above.
+            let mem = Connection::open(":memory:").await.unwrap();
+            for sql in [
+                "CREATE TABLE hav1(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
+                "INSERT INTO hav1 VALUES (1,'a',10),(2,'a',20),(3,'a',30),(4,'b',40),(5,'b',50)",
+            ] {
+                mem.execute(sql).await.unwrap();
+            }
+            assert!(
+                !mem.memdb_rows_loaded.get(),
+                "fresh :memory: connection should keep mirror unloaded before GROUP BY HAVING"
+            );
+            for sql in [
+                "SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING count(*) * 2 > 3 ORDER BY grp",
+                "SELECT grp, count(*) FROM hav1 GROUP BY grp HAVING sum(val) > 50 ORDER BY grp",
+                "SELECT max(id) FROM hav1 GROUP BY grp HAVING count(*) > 1 ORDER BY grp",
+                "SELECT grp FROM hav1 GROUP BY grp HAVING count(*) = 2 ORDER BY grp",
+            ] {
+                let Statement::Select(select) = parse_single_statement(sql).unwrap() else {
+                    panic!("expected SELECT: {sql}");
+                };
+                assert!(
+                    mem.group_by_substrate_replaces_unloaded_memory_mirror(&select)
+                        && mem.select_group_by_storage_substrate_shape_fits(&select),
+                    ":memory: unloaded mirror should take storage substrate for `{sql}`"
+                );
+                check(&mem, &oracle, sql).await;
+            }
+            assert!(
+                !mem.memdb_rows_loaded.get(),
+                "GROUP BY HAVING substrate on :memory: should not hydrate the row mirror"
+            );
         });
     }
 

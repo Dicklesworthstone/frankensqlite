@@ -476,8 +476,9 @@ fn scans_and_column_reads_match_sqlite_on_both_sides_of_every_sync_lane_boundary
 /// key columns, on rows that change from one sorter row to the next (a lane
 /// that kept a previous row's decoded column, or read a non-key column from
 /// the key prefix, fails here).
-const SORTER_COLUMN_QUERIES: [&str; 9] = [
+const SORTER_COLUMN_QUERIES: [&str; 10] = [
     "SELECT k, count(*) FROM g GROUP BY k HAVING count(*) > 1 ORDER BY k",
+    "SELECT k, count(*) FROM g GROUP BY k HAVING count(*) + 0 > 1 ORDER BY k",
     "SELECT k, count(*), sum(n), min(r), max(r) FROM g GROUP BY k ORDER BY k",
     "SELECT k, n, count(*) FROM g GROUP BY k, n ORDER BY k, n",
     "SELECT b, count(*), sum(n) FROM g GROUP BY b ORDER BY b",
@@ -488,18 +489,17 @@ const SORTER_COLUMN_QUERIES: [&str; 9] = [
     "SELECT n, min(k), max(k), total(r) FROM g GROUP BY n ORDER BY n",
 ];
 
-/// GROUP BY shapes that strict mode refuses on the same file (an expression
-/// key with DISTINCT aggregates, `typeof(k)`, a descending ORDER BY over the
-/// key with `max(s)`, a grouped derived table): they do not run the sorter
-/// program, so they are compared with strict mode off, as plain answers.
+/// GROUP BY shapes that strict mode refuses on the same file (a descending
+/// ORDER BY over the key with `max(s)`, an expression key with DISTINCT
+/// aggregates, `typeof(k)`, a grouped derived table): they do not run the
+/// sorter program, so they are compared with strict mode off, as plain answers.
 /// (`GROUP BY s` over the NOCASE column is left out: on main it prints the
 /// first row's spelling of a group where stock prints the last row's, a
 /// divergence of the grouped evaluator reported on bd-w4pr1.13.8.)
-const SORTER_REFUSED_IN_STRICT_QUERIES: [&str; 6] = [
-    "SELECT k, count(*) FROM g GROUP BY k HAVING count(*) + 0 > 1 ORDER BY k",
+const SORTER_REFUSED_IN_STRICT_QUERIES: [&str; 5] = [
+    "SELECT n, count(*), sum(length(s)), max(s) FROM g GROUP BY n ORDER BY n DESC",
     "SELECT n % 7, count(DISTINCT k), sum(DISTINCT n), avg(r) FROM g GROUP BY n % 7 ORDER BY 1",
     "SELECT typeof(k), count(*), min(k), max(k) FROM g GROUP BY typeof(k) ORDER BY 1",
-    "SELECT n, count(*), sum(length(s)), max(s) FROM g GROUP BY n ORDER BY n DESC",
     "SELECT count(*), sum(c) FROM (SELECT n, count(*) c FROM g GROUP BY n)",
     "SELECT count(*), sum(c) FROM (SELECT k, s, count(*) c FROM g GROUP BY k, s)",
 ];
@@ -641,8 +641,9 @@ const SORTER_RUNS_SETUP: &str = "
                  ELSE 'NAME' || (i % 5) END
     FROM seq;";
 
-const SORTER_RUNS_QUERIES: [&str; 28] = [
+const SORTER_RUNS_QUERIES: [&str; 29] = [
     "SELECT a, count(*) FROM r GROUP BY a HAVING count(*) > 1 ORDER BY a",
+    "SELECT a, count(*) FROM r GROUP BY a HAVING count(*) + 0 > 1 ORDER BY a",
     "SELECT a, count(*), min(a), max(a), sum(a) FROM r GROUP BY a ORDER BY a",
     "SELECT k1, count(*) FROM r GROUP BY k1 ORDER BY k1",
     "SELECT k1, count(*), sum(k1), max(k1) FROM r GROUP BY k1 ORDER BY k1",
@@ -672,8 +673,7 @@ const SORTER_RUNS_QUERIES: [&str; 28] = [
     "SELECT t, count(*), min(t), max(t) FROM r WHERE a > 3 GROUP BY t ORDER BY t",
 ];
 
-const SORTER_RUNS_REFUSED_IN_STRICT_QUERIES: [&str; 7] = [
-    "SELECT a, count(*) FROM r GROUP BY a HAVING count(*) + 0 > 1 ORDER BY a",
+const SORTER_RUNS_REFUSED_IN_STRICT_QUERIES: [&str; 6] = [
     "SELECT a, count(*) FROM r GROUP BY a ORDER BY a DESC",
     "SELECT a % 5, count(*) FROM r GROUP BY a % 5 ORDER BY 1",
     "SELECT k1, count(*), typeof(k1) FROM r GROUP BY k1 ORDER BY k1",
