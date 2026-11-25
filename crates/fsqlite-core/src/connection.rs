@@ -76038,7 +76038,7 @@ impl Connection {
             {
                 let ddl_map = self.original_ddl_sql.borrow();
                 ddl_map.get(&obj_name.to_ascii_lowercase()).map_or_else(Vec::new, |sql| {
-                    virtual_table_shadow_drop_names(obj_name, sql, &ddl_map)
+                    catalog_virtual_table_shadow_names(obj_name, sql, &ddl_map)
                 })
             } else {
                 Vec::new()
@@ -86449,7 +86449,7 @@ impl Connection {
                 if !is_virtual_table_sql(sql) {
                     return None;
                 }
-                virtual_table_shadow_drop_names(&table.name, sql, &ddl_cache)
+                catalog_virtual_table_shadow_names(&table.name, sql, &ddl_cache)
                     .iter()
                     .any(|shadow| shadow.eq_ignore_ascii_case(table_name))
                     .then(|| table.name.clone())
@@ -173337,7 +173337,14 @@ fn is_virtual_table_sql(sql: &str) -> bool {
         .starts_with("CREATE VIRTUAL TABLE")
 }
 
-fn virtual_table_shadow_drop_names(table_name: &str, sql: &str, ddl: &HashMap<String, String>) -> Vec<String> {
+/// Resolve a virtual table's shadow ownership using its declaration and the
+/// catalog DDL keyed by lowercase table name.
+#[must_use]
+pub fn catalog_virtual_table_shadow_names<S: std::hash::BuildHasher>(
+    table_name: &str,
+    sql: &str,
+    ddl: &HashMap<String, String, S>,
+) -> Vec<String> {
     let Ok(Statement::CreateVirtualTable(stmt)) = parse_single_statement(sql) else {
         return Vec::new();
     };

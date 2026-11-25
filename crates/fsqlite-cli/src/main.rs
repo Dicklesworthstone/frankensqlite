@@ -2853,9 +2853,17 @@ struct DumpTable<'a> {
 }
 
 fn dump_tables(catalog: &[Row]) -> Vec<DumpTable<'_>> {
-    use fsqlite_ast::Statement;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
+    let catalog_ddl = catalog
+        .iter()
+        .filter_map(|row| match row.values() {
+            [SqliteValue::Text(name), SqliteValue::Text(ddl), ..] => {
+                Some((name.to_ascii_lowercase(), ddl.to_string()))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
     let mut shadows = HashSet::new();
     for row in catalog {
         let [
@@ -2867,12 +2875,9 @@ fn dump_tables(catalog: &[Row]) -> Vec<DumpTable<'_>> {
         else {
             continue;
         };
-        let Ok(Some((Statement::CreateVirtualTable(table), _))) =
-            Parser::from_sql(ddl).parse_next_statement_with_tail()
-        else {
-            continue;
-        };
-        for shadow in fsqlite_core::connection::virtual_table_shadow_names(name, &table) {
+        for shadow in
+            fsqlite_core::connection::catalog_virtual_table_shadow_names(name, ddl, &catalog_ddl)
+        {
             shadows.insert(shadow.to_ascii_lowercase());
         }
     }
@@ -6071,6 +6076,47 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
                         "{query}"
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn test_filtered_fts5_dump_checks_catalog_shadow_ownership() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("shadow-ownership.db");
+            {
+                let stock = rusqlite::Connection::open(&path).unwrap();
+                stock.execute_batch(
+                    "CREATE VIRTUAL TABLE legacy_docs USING fts5(body, columnsize=0);
+                     CREATE TABLE legacy_docs_docsize(note TEXT);
+                     INSERT INTO legacy_docs_docsize VALUES ('unrelated user data');
+                     CREATE VIRTUAL TABLE current_docs USING fts5(body, columnsize=0, columnsize=1);
+                     INSERT INTO current_docs VALUES ('search term');
+                     PRAGMA writable_schema=ON;
+                     UPDATE sqlite_schema
+                        SET sql='CREATE VIRTUAL TABLE legacy_docs USING fts5(body, columnsize=0, columnsize=1)'
+                      WHERE name='legacy_docs';",
+                )
+                .unwrap();
+            }
+            let reader = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for (filter, expected_relation, present) in [
+                (Some("legacy_docs"), "legacy_docs_docsize", false),
+                (Some("current_docs"), "current_docs_docsize", true),
+                (None, "unrelated user data", true),
+            ] {
+                let mut bytes = Vec::new();
+                super::write_dump(&reader, filter, false, &mut bytes)
+                    .await
+                    .unwrap();
+                let sql = std::str::from_utf8(&bytes).unwrap();
+                assert_eq!(
+                    sql.contains(expected_relation),
+                    present,
+                    "{filter:?}: {sql}"
+                );
             }
         });
     }
