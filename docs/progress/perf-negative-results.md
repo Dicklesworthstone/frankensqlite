@@ -94,6 +94,48 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-25 - REJECTED on two kill lines (trig_cte_20000 -58.8M Ir, x8.77 -> x8.52 stock 3.54.1, under its 60M gain line and half its -120M..-180M prediction; trig_values_20000 +2.25M, +0.106%, over its +0.1% regression line): a trigger firing that hides its caller's materialized CTE bindings keeps the table name index current in place instead of rebuilding every name index on entry and exit (bd-fpr5g, trig lane rounds 4-6, lever 6)
+
+- Target: `MaterializedBindingsVisibilityGuard` is entered once per trigger firing while the caller has materialized
+  CTE roots. Hide renamed each binding to a private name (format! plus a HashSet of every lowercased table and
+  view name) and called `rebuild_schema_indices` (tables, views and triggers, each name re-lowercased into a fresh
+  map); Drop renamed back and rebuilt all three again. Callgrind on main 4914626d8, trig_cte_20000 (20,000 firings):
+  hide_reserving 115.1M and the guard's Drop 47.5M inclusive (rebuild_schema_indices 90.0M of it), about 8.1k Ir a
+  firing.
+- Touched (not landed): `crates/fsqlite-core/src/connection.rs` (`reindex_schema_name` re-points only the old and
+  new names' keys of `schema_by_name`, front precedence as the rebuild gives it; hide records root, index, public
+  and private names and picks the private name by lookups in `schema_by_name` / `views_by_name` plus the names
+  hidden in the call; Drop restores in place under an exact guard, same length and every binding still at its
+  index under its private name, else the old restore by root plus a full rebuild; `fresh_private_relation_name`
+  takes an `is_taken` closure), and the bd_fpr5g keeper file. Patch: trig lane scratch trig6/lever6_r6_final.patch
+  (on 4914626d8).
+- Keepers (both green): fsqlite-core lib `materialized_bindings_visibility_tests` (after hide, restore, a binding
+  installed inside the scope and the restore after it, all three indices equal a rebuild), red on each planted
+  mutant (public key removed instead of re-pointed; Drop in place without the exact guard; the collision check
+  without `views_by_name`), each on its named assertion; bd_fpr5g `caller_ctes_stay_hidden_across_body_with_clauses_and_nested_triggers`
+  against stock 3.54.1 on :memory: and a file, green on main's connection.rs and on the lever.
+- Gate (rch, hz3, on 4914626d8): core lib 4,221 passed / 2 failed, both failing identically on main's sources
+  (TEMP `ReadOnly` reds that are main's, reported to the coordinator); 34 trigger / CTE / TEMP binaries 145 passed /
+  1 failed (bd_nf30k `trigger_bodies_that_do_not_compile_refuse_their_statements_like_stock`, identical on main);
+  fsqlite crate 4 binaries 2 passed. clippy -D warnings flagged `suspicious_operation_groupings` on the guard's
+  comparison (rewritten as one tuple compare before the arms were built).
+- Result. Arms in one rch job on vmi1227854 (P = 4914626d8, cargo ELF 81c2d7d5f00f1d72, sources equal git; L =
+  P + lever, 34b74f1b17dce1fb). thinkstation1, valgrind 3.26.0, stock 3.54.1 (rl12/stock354) live, 2 reps, Ir the
+  minimum, answers equal everywhere:
+  - trig_cte_20000 2,034.0M -> 1,975.2M (-58.81M, -2.89%; x8.77 -> x8.52 stock). Inclusive, rep 0: hide 115.1M ->
+    66.1M, Drop 47.5M -> 37.5M. `reindex_schema_name` alone is 55.5M inclusive (four calls a firing, each a position scan
+    with eq_ignore_ascii_case plus a String key allocation for the inserted private name), and the private name's
+    format! is still paid every firing.
+  - trig_values_20000 +2.25M (+0.106%, reps within 0.001%): 1.9M of it is glibc malloc self cost (_int_malloc
+    +1.31M, unlink_chunk +0.54M), hide_reserving +0.20M and the Drop +0.08M self: the changed allocation sequence
+    sends later mallocs down slower paths.
+  - trig_src, trig_srcw, trig_src_9999, is_notrig, notrig_cte, ctl_insert_txn, ctl_select within +-0.05%.
+  - Judge v2b not run: the Ir kill lines decided it.
+- Retry condition: not as this patch. Worth retrying as a design that pays nothing per firing for the names: the
+  private names and their index keys computed once per statement (or per caller scope) and swapped in and out
+  without allocation, or name resolution that skips the caller's materialized bindings by a scope flag instead of
+  renaming them. The ceiling on trig_cte is the guard's ~8.1k a firing (162M); this patch kept 5.2k of it.
+
 ## 2026-11-24 - SMALL WIN (landed as 2b8fb2857; inside every kill line, the all-hits band missed on the favorable side; instructions only, x4.92 -> x4.87 stock 3.54.1, time a replicated TIE): a page-cache read flight runs its waiter fanout only when a follower joined it (bd-w4pr1.13.18, read/seek round 12, lever NW)
 
 - Target: `InFlightReadLeader::finish` calls `Notify::notify_waiters` on every page-cache miss (22.8M Ir of
