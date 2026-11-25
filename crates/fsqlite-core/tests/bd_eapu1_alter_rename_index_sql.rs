@@ -35,7 +35,9 @@ fn rename_column_keeps_index_sql_minimal_bd_eapu1() {
     });
 }
 
-/// RENAME TABLE likewise re-renders the index with the new table name, minimal.
+/// RENAME TABLE edits the new table name into the index's text, which stock
+/// always writes quoted (bd-bjtl4: sqlite_rename_table quotes every token it
+/// renames). Stock 3.54.1 and 3.46.1: `CREATE INDEX ix ON "t2"(b)`.
 #[test]
 fn rename_table_keeps_index_sql_minimal_bd_eapu1() {
     asupersync::test_utils::run_test(|| async {
@@ -43,7 +45,7 @@ fn rename_table_keeps_index_sql_minimal_bd_eapu1() {
         conn.execute("CREATE TABLE t(a, b);").await.unwrap();
         conn.execute("CREATE INDEX ix ON t(b);").await.unwrap();
         conn.execute("ALTER TABLE t RENAME TO t2;").await.unwrap();
-        assert_eq!(index_sql(&conn, "ix").await, "CREATE INDEX ix ON t2(b)");
+        assert_eq!(index_sql(&conn, "ix").await, "CREATE INDEX ix ON \"t2\"(b)");
     });
 }
 

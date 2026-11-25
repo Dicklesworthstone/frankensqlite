@@ -78249,6 +78249,12 @@ impl Connection {
         let added_column_source = alter_source
             .as_deref()
             .and_then(alter_add_column_definition_source);
+        // bd-bjtl4: stock writes a renamed column `"new"` everywhere when the
+        // ALTER quoted the new name.
+        let new_name_quoted = matches!(alter.action, AlterTableAction::RenameColumn { .. })
+            && alter_source
+                .as_deref()
+                .is_some_and(alter_rename_new_name_is_quoted);
         let table_name = &alter.table.name;
         if matches!(alter.action, AlterTableAction::RenameTo(_))
             && self.has_live_vtab_instance(table_name)
@@ -78333,7 +78339,7 @@ impl Connection {
                 .map(|table| table.root_page);
             root.and_then(|root| self.temp_table_sql.borrow().get(&root).cloned())
                 .map(|sql| rewrite_create_table_sql_for_alter(
-                    &sql, &old_name, &alter.action, added_column_source,
+                    &sql, &old_name, &alter.action, added_column_source, new_name_quoted,
                 )).transpose()?
         } else {
             let original_sql = self
@@ -78351,6 +78357,7 @@ impl Connection {
                 &old_name,
                 &alter.action,
                 added_column_source,
+                new_name_quoted,
             )?)
         };
 
@@ -78405,6 +78412,7 @@ impl Connection {
                                 &old_name,
                                 Some(new_name),
                                 None,
+                                true,
                             )?
                         }
                         AlterTableAction::RenameColumn { old, new } => {
@@ -78414,6 +78422,7 @@ impl Connection {
                                 &old_name,
                                 None,
                                 Some((old, new)),
+                                new_name_quoted,
                             )?
                         }
                         AlterTableAction::AddColumn(_) | AlterTableAction::DropColumn(_) => {
@@ -78623,6 +78632,7 @@ impl Connection {
                     new,
                     &mut column_source_catalog,
                     alters_temp_table,
+                    new_name_quoted,
                 );
                 dependent_trigger_sql_updates = self.rename_dependent_triggers_for_column_rename(
                     &renamed_table.name,
@@ -78630,6 +78640,7 @@ impl Connection {
                     new,
                     &column_source_catalog,
                     alters_temp_table,
+                    new_name_quoted,
                 );
                 renamed_table
             }
@@ -79326,14 +79337,30 @@ impl Connection {
                 |index| self.index_is_implicit_autoindex(&index.name, &new_schema.name),
             )
         });
+        // bd-bjtl4: the table's indexes keep their stored text, with the
+        // rename edited in as stock does.
+        let index_text_rename = match &alter.action {
+            AlterTableAction::RenameTo(new_name) => Some(SchemaTextRename {
+                old: &old_name,
+                new: new_name,
+                always_quote: true,
+            }),
+            AlterTableAction::RenameColumn { old, new } => Some(SchemaTextRename {
+                old,
+                new,
+                always_quote: new_name_quoted,
+            }),
+            AlterTableAction::AddColumn(_) | AlterTableAction::DropColumn(_) => None,
+        };
 
         if alters_temp_table {
             let mut temp_sql = self.temp_table_sql.borrow_mut();
             temp_sql.insert(new_schema.root_page, create_sql);
-            if matches!(alter.action, AlterTableAction::RenameTo(_) | AlterTableAction::RenameColumn { .. }) {
+            if let Some(rename) = index_text_rename {
                 for index in &new_schema.indexes {
                     if let Some(sql) = temp_sql.get_mut(&index.root_page) {
-                        *sql = render_create_index_sql(index, &new_schema.name);
+                        let rendered = render_create_index_sql(index, &new_schema.name);
+                        *sql = rename.apply(Some(sql.as_str()), rendered);
                     }
                 }
             }
@@ -79400,7 +79427,7 @@ impl Connection {
                     if self.index_is_implicit_autoindex(&index.name, new_name) {
                         continue;
                     }
-                    let idx_sql = render_create_index_sql(index, new_name);
+                    let idx_sql = self.index_sql_after_rename(index, new_name, index_text_rename);
                     self.update_sqlite_master_typed_tbl_name_and_sql(
                         "index",
                         &index.name,
@@ -79424,7 +79451,8 @@ impl Connection {
                     if self.index_is_implicit_autoindex(&index.name, &new_schema.name) {
                         continue;
                     }
-                    let idx_sql = render_create_index_sql(index, &new_schema.name);
+                    let idx_sql =
+                        self.index_sql_after_rename(index, &new_schema.name, index_text_rename);
                     self.update_sqlite_master_typed_sql("index", &index.name, &idx_sql)
                         .await?;
                 }
@@ -79679,6 +79707,38 @@ impl Connection {
         Ok(())
     }
 
+    /// bd-bjtl4: an index's stored text after an ALTER rename: the stored
+    /// text with the rename edited in as stock does, else the rendering.
+    fn index_sql_after_rename(
+        &self,
+        index: &IndexSchema,
+        table_name: &str,
+        rename: Option<SchemaTextRename<'_>>,
+    ) -> String {
+        let rendered = render_create_index_sql(index, table_name);
+        let Some(rename) = rename else {
+            return rendered;
+        };
+        let original = self
+            .original_ddl_sql
+            .borrow()
+            .get(&index.name.to_ascii_lowercase())
+            .cloned();
+        rename.apply(original.as_deref(), rendered)
+    }
+
+    /// bd-bjtl4: a view's stored text, before an ALTER rewrites it.
+    fn view_stored_sql(&self, view: &ViewDef) -> Option<String> {
+        if view.temporary {
+            view.temp_create_sql.clone()
+        } else {
+            self.original_ddl_sql
+                .borrow()
+                .get(&view.name.to_ascii_lowercase())
+                .cloned()
+        }
+    }
+
     fn rename_dependent_views_for_table_rename(
         &self,
         old_name: &str,
@@ -79688,9 +79748,15 @@ impl Connection {
         let mut updates = Vec::new();
         let mut views = self.views.borrow_mut();
         let target = TableRenameTarget::new(old_name, temp_only);
+        let rename = SchemaTextRename {
+            old: old_name,
+            new: new_name,
+            always_quote: true,
+        };
         for view in views.iter_mut().filter(|view| !temp_only || view.temporary) {
             if rename_table_refs_in_select(&mut view.query, &target, new_name) {
-                let sql = render_create_view_sql(view);
+                let stored = self.view_stored_sql(view);
+                let sql = rename.apply(stored.as_deref(), render_create_view_sql(view));
                 if view.temporary {
                     view.temp_create_sql = Some(sql);
                 } else {
@@ -79737,7 +79803,14 @@ impl Connection {
                 changed |= rename_table_refs_in_statement(statement, &target, new_name);
             }
             if changed {
-                trigger.create_sql = render_create_trigger_sql(trigger);
+                // bd-bjtl4: the stored text, edited in place as stock does.
+                let rendered = render_create_trigger_sql(trigger);
+                trigger.create_sql = SchemaTextRename {
+                    old: old_name,
+                    new: new_name,
+                    always_quote: true,
+                }
+                .apply(Some(trigger.create_sql.as_str()), rendered);
                 if !trigger.temporary {
                     updates.push((
                         trigger.name.clone(),
@@ -79872,6 +79945,7 @@ impl Connection {
         new_column: &str,
         source_catalog: &mut ColumnRenameSourceCatalog,
         temp_only: bool,
+        new_name_quoted: bool,
     ) -> Vec<(String, String)> {
         let mut views = self.views.borrow_mut();
         for view in views.iter() {
@@ -79880,6 +79954,14 @@ impl Connection {
                 view_column_rename_initial_output_status(view, old_column),
             );
         }
+        // bd-bjtl4: each view's stored text, edited in place as stock does.
+        let rename = SchemaTextRename {
+            old: old_column,
+            new: new_column,
+            always_quote: new_name_quoted,
+        };
+        let stored_sql: Vec<Option<String>> =
+            views.iter().map(|view| self.view_stored_sql(view)).collect();
 
         let mut changed_views = HashSet::new();
         for _ in 0..=views.len() {
@@ -79900,9 +79982,6 @@ impl Connection {
                 pass_changed |= status_changed;
                 if view_changed {
                     changed_views.insert(view.name.to_ascii_lowercase());
-                    if view.temporary {
-                        view.temp_create_sql = Some(render_create_view_sql(view));
-                    }
                 }
             }
             if !pass_changed {
@@ -79910,13 +79989,21 @@ impl Connection {
             }
         }
 
-        views
-            .iter()
-            .filter(|view| {
-                !view.temporary && changed_views.contains(&view.name.to_ascii_lowercase())
-            })
-            .map(|view| (view.name.clone(), render_create_view_sql(view)))
-            .collect()
+        let mut updates = Vec::new();
+        for (view, stored) in views.iter_mut().zip(&stored_sql) {
+            if (temp_only && !view.temporary)
+                || !changed_views.contains(&view.name.to_ascii_lowercase())
+            {
+                continue;
+            }
+            let sql = rename.apply(stored.as_deref(), render_create_view_sql(view));
+            if view.temporary {
+                view.temp_create_sql = Some(sql);
+            } else {
+                updates.push((view.name.clone(), sql));
+            }
+        }
+        updates
     }
 
     fn rename_dependent_triggers_for_column_rename(
@@ -79926,9 +80013,16 @@ impl Connection {
         new_column: &str,
         source_catalog: &ColumnRenameSourceCatalog,
         temp_only: bool,
+        new_name_quoted: bool,
     ) -> Vec<(String, String, String)> {
         let mut updates = Vec::new();
         let mut triggers = self.triggers.borrow_mut();
+        // bd-bjtl4: each trigger's stored text, edited in place as stock does.
+        let rename = SchemaTextRename {
+            old: old_column,
+            new: new_column,
+            always_quote: new_name_quoted,
+        };
         for trigger in triggers.iter_mut().filter(|trigger| !temp_only || trigger.temporary) {
             // As in the table rename: a snapshot keeps the original.
             let trigger = Arc::make_mut(trigger);
@@ -79979,7 +80073,8 @@ impl Connection {
                 }
             }
             if changed {
-                trigger.create_sql = render_create_trigger_sql(trigger);
+                let rendered = render_create_trigger_sql(trigger);
+                trigger.create_sql = rename.apply(Some(trigger.create_sql.as_str()), rendered);
                 if !trigger.temporary {
                     updates.push((
                         trigger.name.clone(),
@@ -136075,7 +136170,11 @@ fn statement_keeps_verbatim_source(statement: &Statement) -> bool {
         | Statement::CreateIndex(_)
         | Statement::CreateView(_)
         | Statement::CreateTrigger(_) => true,
-        Statement::AlterTable(alter) => matches!(alter.action, AlterTableAction::AddColumn(_)),
+        // bd-bjtl4: a RENAME COLUMN's text says whether it quoted the new name.
+        Statement::AlterTable(alter) => matches!(
+            alter.action,
+            AlterTableAction::AddColumn(_) | AlterTableAction::RenameColumn { .. }
+        ),
         _ => false,
     }
 }
@@ -136400,11 +136499,331 @@ mod splice_added_column_tests {
     }
 }
 
+/// bd-bjtl4: one ALTER TABLE rename, as stock's `renameEditSql` writes it into
+/// every schema text it touches. Stock edits the stored text in place, token by
+/// token: a renamed token that was a bare identifier becomes the new name bare
+/// when the ALTER spelled the new name bare; every other renamed token
+/// (`"x"`, `[x]`, `` `x` ``), and every one when the ALTER quoted the new name
+/// or renames a table (stock always quotes a RENAME TO), becomes `"new"`.
+#[derive(Clone, Copy, Debug)]
+struct SchemaTextRename<'a> {
+    old: &'a str,
+    new: &'a str,
+    always_quote: bool,
+}
+
+impl SchemaTextRename<'_> {
+    /// The stored text `original` with this rename edited in, or `rendered`
+    /// (this connection's re-rendering of the renamed statement) when
+    /// `original` is unknown or the edit cannot be placed token for token.
+    fn apply(self, original: Option<&str>, rendered: String) -> String {
+        original
+            .and_then(|original| edit_schema_text_for_rename(original, &rendered, self))
+            .unwrap_or(rendered)
+    }
+}
+
+/// The identifier tokens of `sql`, each as its byte range and its name.
+fn schema_text_identifier_tokens(sql: &str) -> Vec<(usize, usize, Arc<str>)> {
+    use fsqlite_parser::TokenKind;
+
+    Lexer::tokenize(sql)
+        .into_iter()
+        .filter_map(|token| match token.kind {
+            TokenKind::Id(name) | TokenKind::QuotedId(name, _) => {
+                Some((token.span.start as usize, token.span.end as usize, name))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether two schema statements parse to the same statement.
+fn same_schema_statement(a: &str, b: &str) -> bool {
+    match (parse_single_statement(a), parse_single_statement(b)) {
+        (Ok(a), Ok(b)) => a.to_string() == b.to_string(),
+        _ => false,
+    }
+}
+
+/// bd-bjtl4: edit `original`, a stored schema statement, the way stock's
+/// `sqlite_rename_table` / `sqlite_rename_column` do. `rendered` is this
+/// connection's semantic rewrite of the same statement and says which
+/// identifiers the rename reaches: the identifier tokens of the two texts must
+/// pair up one to one, each pair naming the same identifier, except the
+/// renamed ones (the old name in `original`, the new one in `rendered`). The
+/// edited text must parse to the same statement as `rendered`. `None` when
+/// either fails, and the caller keeps `rendered`.
+fn edit_schema_text_for_rename(
+    original: &str,
+    rendered: &str,
+    rename: SchemaTextRename<'_>,
+) -> Option<String> {
+    let before = schema_text_identifier_tokens(original);
+    let after = schema_text_identifier_tokens(rendered);
+    if before.len() != after.len() {
+        return None;
+    }
+    let mut renamed = Vec::new();
+    for ((start, end, was), (_, _, now)) in before.iter().zip(&after) {
+        if was.eq_ignore_ascii_case(rename.old) && **now == *rename.new && **was != **now {
+            renamed.push((*start, *end));
+        } else if !was.eq_ignore_ascii_case(now) {
+            return None;
+        }
+    }
+    let bytes = original.as_bytes();
+    let mut edited = String::with_capacity(original.len() + renamed.len() * (rename.new.len() + 3));
+    let mut cursor = 0;
+    for (start, end) in renamed {
+        edited.push_str(original.get(cursor..start)?);
+        let bare_token = bytes
+            .get(start)
+            .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80);
+        if bare_token && !rename.always_quote {
+            edited.push_str(rename.new);
+        } else {
+            edited.push('"');
+            edited.push_str(&rename.new.replace('"', "\"\""));
+            edited.push('"');
+            // Stock keeps a following `"` from joining the quoted name.
+            if bytes.get(end) == Some(&b'"') {
+                edited.push(' ');
+            }
+        }
+        cursor = end;
+    }
+    edited.push_str(original.get(cursor..)?);
+    same_schema_statement(&edited, rendered).then_some(edited)
+}
+
+/// bd-bjtl4: stock's `sqlite_drop_column` on a stored CREATE TABLE text. The
+/// column's text is removed from its name up to the next column's name; the
+/// last column's from the last `,` before its name up to the table
+/// constraints (the `,` before the first one) or the closing parenthesis.
+/// `None` when the column list cannot be located or holds no such column.
+fn drop_column_from_schema_text(original: &str, column: &str) -> Option<String> {
+    use fsqlite_parser::TokenKind;
+
+    let tokens = Lexer::tokenize(original);
+    let open = tokens
+        .iter()
+        .position(|token| token.kind == TokenKind::LeftParen)?;
+    let mut depth = 0_usize;
+    let mut item_starts = true;
+    let mut last_comma = None;
+    let mut columns: Vec<(usize, String)> = Vec::new();
+    let mut columns_end = None;
+    for token in &tokens[open + 1..] {
+        let start = token.span.start as usize;
+        if item_starts {
+            item_starts = false;
+            if matches!(
+                token.kind,
+                TokenKind::KwConstraint
+                    | TokenKind::KwPrimary
+                    | TokenKind::KwUnique
+                    | TokenKind::KwCheck
+                    | TokenKind::KwForeign
+            ) {
+                columns_end = last_comma;
+                break;
+            }
+            let name = match &token.kind {
+                TokenKind::Id(name) | TokenKind::QuotedId(name, _) => name.to_string(),
+                TokenKind::String(name) => name.clone(),
+                _ => original
+                    .get(start..token.span.end as usize)?
+                    .to_owned(),
+            };
+            columns.push((start, name));
+        }
+        match token.kind {
+            TokenKind::LeftParen => depth += 1,
+            TokenKind::RightParen if depth == 0 => {
+                columns_end = Some(start);
+                break;
+            }
+            TokenKind::RightParen => depth -= 1,
+            TokenKind::Comma if depth == 0 => {
+                last_comma = Some(start);
+                item_starts = true;
+            }
+            TokenKind::Eof => return None,
+            _ => {}
+        }
+    }
+    let columns_end = columns_end?;
+    let position = columns
+        .iter()
+        .position(|(_, name)| name.eq_ignore_ascii_case(column))?;
+    let start = columns[position].0;
+    if let Some((next, _)) = columns.get(position + 1) {
+        return Some(format!("{}{}", original.get(..start)?, original.get(*next..)?));
+    }
+    let comma = original.get(..start)?.rfind(',')?;
+    Some(format!(
+        "{}{}",
+        original.get(..comma)?,
+        original.get(columns_end..)?
+    ))
+}
+
+/// bd-bjtl4: stock's `bQuote` for RENAME COLUMN: whether the ALTER statement
+/// spelled the new name (its last token) quoted.
+fn alter_rename_new_name_is_quoted(source: &str) -> bool {
+    use fsqlite_parser::TokenKind;
+
+    let statement = fsqlite_parser::parse_first_statement_with_tail(source)
+        .ok()
+        .flatten()
+        .and_then(|(_, end)| source.get(..end))
+        .unwrap_or(source);
+    Lexer::tokenize(statement)
+        .iter()
+        .rev()
+        .find(|token| !matches!(token.kind, TokenKind::Semicolon | TokenKind::Eof))
+        .and_then(|token| statement.as_bytes().get(token.span.start as usize))
+        .is_some_and(|&b| matches!(b, b'"' | b'\'' | b'[' | b'`'))
+}
+
+#[cfg(test)]
+mod schema_text_edit_tests {
+    use super::{
+        SchemaTextRename, alter_rename_new_name_is_quoted, drop_column_from_schema_text,
+        edit_schema_text_for_rename,
+    };
+
+    const fn rename<'a>(old: &'a str, new: &'a str, always_quote: bool) -> SchemaTextRename<'a> {
+        SchemaTextRename {
+            old,
+            new,
+            always_quote,
+        }
+    }
+
+    #[test]
+    fn renamed_tokens_keep_their_spelling_rule_and_the_rest_is_untouched() {
+        let original = "CREATE TABLE t ( a INT /* a */ , [b] TEXT , CHECK( a > b ) )";
+        assert_eq!(
+            edit_schema_text_for_rename(
+                original,
+                "CREATE TABLE t(z INT, b TEXT, CHECK (z > b))",
+                rename("a", "z", false),
+            )
+            .as_deref(),
+            Some("CREATE TABLE t ( z INT /* a */ , [b] TEXT , CHECK( z > b ) )")
+        );
+        assert_eq!(
+            edit_schema_text_for_rename(
+                original,
+                "CREATE TABLE t(a INT, z TEXT, CHECK (a > z))",
+                rename("b", "z", false),
+            )
+            .as_deref(),
+            Some("CREATE TABLE t ( a INT /* a */ , \"z\" TEXT , CHECK( a > z ) )")
+        );
+        assert_eq!(
+            edit_schema_text_for_rename(
+                "CREATE INDEX i ON t(a)",
+                "CREATE INDEX i ON u(a)",
+                rename("t", "u", true),
+            )
+            .as_deref(),
+            Some("CREATE INDEX i ON \"u\"(a)")
+        );
+        // A following `"` gets a space; an embedded `"` is doubled.
+        assert_eq!(
+            edit_schema_text_for_rename(
+                "CREATE VIEW v AS SELECT a\"x\" FROM t",
+                "CREATE VIEW v AS SELECT b AS x FROM t",
+                rename("a", "b", true),
+            )
+            .as_deref(),
+            Some("CREATE VIEW v AS SELECT \"b\" \"x\" FROM t")
+        );
+        assert_eq!(
+            edit_schema_text_for_rename(
+                "CREATE VIEW v AS SELECT x FROM t",
+                "CREATE VIEW v AS SELECT x FROM \"q\"\"r\"",
+                rename("t", "q\"r", true),
+            )
+            .as_deref(),
+            Some("CREATE VIEW v AS SELECT x FROM \"q\"\"r\"")
+        );
+    }
+
+    #[test]
+    fn an_edit_that_cannot_be_placed_or_changes_the_meaning_is_refused() {
+        // A different identifier count (the rendering added a name).
+        assert_eq!(
+            edit_schema_text_for_rename(
+                "CREATE TABLE t(a)",
+                "CREATE TABLE t(a, extra)",
+                rename("a", "b", false),
+            ),
+            None
+        );
+        // A pair that is neither the same name nor the rename.
+        assert_eq!(
+            edit_schema_text_for_rename(
+                "CREATE TABLE t(a, c)",
+                "CREATE TABLE t(b, d)",
+                rename("a", "b", false),
+            ),
+            None
+        );
+        // A name the rename does not reach stays, even when it is the old one.
+        assert_eq!(
+            edit_schema_text_for_rename(
+                "CREATE VIEW v AS SELECT a FROM u",
+                "CREATE VIEW v AS SELECT a FROM u",
+                rename("a", "b", false),
+            )
+            .as_deref(),
+            Some("CREATE VIEW v AS SELECT a FROM u")
+        );
+    }
+
+    #[test]
+    fn drop_column_removes_the_text_stock_removes() {
+        let original = "CREATE TABLE d ( a INT , b TEXT /* b */ , c BLOB , PRIMARY KEY ( c ) )";
+        assert_eq!(
+            drop_column_from_schema_text(original, "a").as_deref(),
+            Some("CREATE TABLE d ( b TEXT /* b */ , c BLOB , PRIMARY KEY ( c ) )")
+        );
+        assert_eq!(
+            drop_column_from_schema_text(original, "B").as_deref(),
+            Some("CREATE TABLE d ( a INT , c BLOB , PRIMARY KEY ( c ) )")
+        );
+        assert_eq!(
+            drop_column_from_schema_text(original, "c").as_deref(),
+            Some("CREATE TABLE d ( a INT , b TEXT /* b */ , PRIMARY KEY ( c ) )")
+        );
+        assert_eq!(
+            drop_column_from_schema_text("CREATE TABLE e(x, \"y\" DEFAULT (1, 2) )", "y").as_deref(),
+            Some("CREATE TABLE e(x)")
+        );
+        assert_eq!(drop_column_from_schema_text(original, "nosuch"), None);
+    }
+
+    #[test]
+    fn the_alter_spelling_of_the_new_name_is_read_from_its_last_token() {
+        assert!(!alter_rename_new_name_is_quoted("ALTER TABLE t RENAME COLUMN a TO b"));
+        assert!(!alter_rename_new_name_is_quoted("ALTER TABLE \"t\" RENAME \"a\" TO b ;"));
+        assert!(alter_rename_new_name_is_quoted("ALTER TABLE t RENAME COLUMN a TO \"b\""));
+        assert!(alter_rename_new_name_is_quoted("ALTER TABLE t RENAME a TO [b] ; -- c"));
+        assert!(alter_rename_new_name_is_quoted("ALTER TABLE t RENAME a TO 'b'"));
+        assert!(alter_rename_new_name_is_quoted("ALTER TABLE t RENAME a TO `b`"));
+    }
+}
+
 fn rewrite_create_table_sql_for_alter(
     original_sql: &str,
     expected_table_name: &str,
     action: &AlterTableAction,
     added_column_source: Option<&str>,
+    new_name_quoted: bool,
 ) -> Result<String> {
     let mut create = parse_create_table_for_schema_rewrite(original_sql, expected_table_name)?;
     let self_table_name = create.name.name.clone();
@@ -136516,7 +136935,30 @@ fn rewrite_create_table_sql_for_alter(
     // SQLite's ALTER rewrite emits the table name immediately followed by the
     // opening parenthesis. The general AST formatter uses a readability space;
     // normalize that one known formatter boundary for sqlite_schema parity.
-    Ok(create.to_string().replacen(" (", "(", 1))
+    let rendered = create.to_string().replacen(" (", "(", 1);
+    // bd-bjtl4: stock edits the stored text in place; the rendering above is
+    // what a rename or drop means, and the fallback where the edit cannot be
+    // placed.
+    Ok(match action {
+        AlterTableAction::RenameTo(new_name) => SchemaTextRename {
+            old: expected_table_name,
+            new: new_name,
+            always_quote: true,
+        }
+        .apply(Some(original_sql), rendered),
+        AlterTableAction::RenameColumn { old, new } => SchemaTextRename {
+            old,
+            new,
+            always_quote: new_name_quoted,
+        }
+        .apply(Some(original_sql), rendered),
+        AlterTableAction::DropColumn(column_name) => {
+            drop_column_from_schema_text(original_sql, column_name)
+                .filter(|edited| same_schema_statement(edited, &rendered))
+                .unwrap_or(rendered)
+        }
+        AlterTableAction::AddColumn(_) => rendered,
+    })
 }
 
 fn rewrite_create_table_foreign_key_parent_sql(
@@ -136525,6 +136967,7 @@ fn rewrite_create_table_foreign_key_parent_sql(
     parent_table: &str,
     renamed_parent_table: Option<&str>,
     renamed_parent_column: Option<(&str, &str)>,
+    new_name_quoted: bool,
 ) -> Result<String> {
     let mut create = parse_create_table_for_schema_rewrite(original_sql, expected_table_name)?;
     let (columns, constraints) = create_table_columns_and_constraints_mut(&mut create)?;
@@ -136542,7 +136985,25 @@ fn rewrite_create_table_foreign_key_parent_sql(
             clause.table.push_str(new_parent_table);
         }
     });
-    Ok(create.to_string().replacen(" (", "(", 1))
+    let rendered = create.to_string().replacen(" (", "(", 1);
+    // bd-bjtl4: the child's stored text, edited in place as stock does.
+    let rename = match (renamed_parent_table, renamed_parent_column) {
+        (Some(new), _) => Some(SchemaTextRename {
+            old: parent_table,
+            new,
+            always_quote: true,
+        }),
+        (None, Some((old, new))) => Some(SchemaTextRename {
+            old,
+            new,
+            always_quote: new_name_quoted,
+        }),
+        (None, None) => None,
+    };
+    let Some(rename) = rename else {
+        return Ok(rendered);
+    };
+    Ok(rename.apply(Some(original_sql), rendered))
 }
 
 fn render_create_table_sql<F>(
@@ -211584,11 +212045,8 @@ mod tests {
                 .unwrap();
             assert_eq!(sql_of!("ixk"), "CREATE INDEX ixk ON t2(\"order\")");
 
-            // NOTE (documented residual, approach-(a) limitation): ALTER TABLE RENAME
-            // *TABLE* leaves stock quoting the substituted new table name
-            // (`ON "t3"(b)`) via its textual edit, whereas the minimal re-render emits
-            // `ON t3(b)`. Both are valid; only the stored text's new-table-name quoting
-            // differs. RENAME COLUMN (the bd-eapu1 repro) is byte-exact, asserted above.
+            // RENAME *TABLE* writes the new table name quoted (`ON "t3"(b)`), as
+            // stock's textual edit does (bd-bjtl4; bd_eapu1_alter_rename_index_sql).
         });
     }
 
@@ -213681,13 +214139,20 @@ mod tests {
                 .unwrap();
             let trigger_sql = row_values(&rows[0])[0].to_text();
             let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
-            assert!(
-                lower_trigger_sql.contains("select new_col from t"),
-                "{trigger_sql}"
-            );
-            assert!(
-                lower_trigger_sql.contains("select 1 where t.new_col = new_col"),
-                "{trigger_sql}"
+            // bd-bjtl4: stock SQLite 3.54.1 edits the stored trigger text in
+            // place, renaming both the outer and the correlated reference and
+            // keeping the line breaks (its sqlite3 shell stores exactly this).
+            assert_eq!(
+                trigger_sql,
+                concat!(
+                    "CREATE TRIGGER src_ai AFTER INSERT ON src\n",
+                    "             BEGIN\n",
+                    "                INSERT INTO audit_log\n",
+                    "                SELECT new_col\n",
+                    "                FROM t\n",
+                    "                WHERE EXISTS (SELECT 1 WHERE t.new_col = new_col);\n",
+                    "             END",
+                )
             );
             assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
         });
@@ -213807,17 +214272,21 @@ mod tests {
                 .unwrap();
             let trigger_sql = row_values(&rows[0])[0].to_text();
             let lower_trigger_sql = trigger_sql.to_ascii_lowercase();
-            assert!(
-                lower_trigger_sql.contains("t (new_col, payload)"),
-                "{trigger_sql}"
-            );
-            assert!(
-                lower_trigger_sql.contains("on conflict (new_col)"),
-                "{trigger_sql}"
-            );
-            assert!(
-                lower_trigger_sql.contains("new_col = excluded.new_col"),
-                "{trigger_sql}"
+            // bd-bjtl4: stock SQLite 3.54.1 edits the stored trigger text in
+            // place: the INSERT column list, the ON CONFLICT target and both
+            // sides of the DO UPDATE assignment are renamed, the rest of the
+            // text (line breaks, `t(`, `CONFLICT(`) is kept, as its sqlite3
+            // shell stores it.
+            assert_eq!(
+                trigger_sql,
+                concat!(
+                    "CREATE TRIGGER src_ai AFTER INSERT ON src\n",
+                    "             BEGIN\n",
+                    "                INSERT INTO t(new_col, payload) VALUES (NEW.value, 'a')\n",
+                    "                ON CONFLICT(new_col) DO UPDATE\n",
+                    "                SET new_col = excluded.new_col, payload = 'b';\n",
+                    "             END",
+                )
             );
             assert!(!lower_trigger_sql.contains("old_col"), "{trigger_sql}");
         });
@@ -215216,12 +215685,19 @@ mod tests {
                 .await
                 .unwrap();
             let renamed_sql = row_values(&rows[0])[0].to_text();
-            assert!(
-            renamed_sql.contains(
-                "renamed_parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"
-            ),
-            "{renamed_sql}"
-        );
+            // bd-bjtl4: stock SQLite 3.54.1 renames the column inside the
+            // stored text and keeps its foreign key clause and line breaks
+            // as written (its sqlite3 shell stores exactly this).
+            assert_eq!(
+                renamed_sql,
+                concat!(
+                    "CREATE TABLE column_owned (\n",
+                    "                renamed_parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE\n",
+                    "                    DEFERRABLE INITIALLY DEFERRED,\n",
+                    "                keep INTEGER\n",
+                    "            )",
+                )
+            );
             conn.execute("ALTER TABLE column_owned DROP COLUMN renamed_parent_id;")
                 .await
                 .unwrap();
